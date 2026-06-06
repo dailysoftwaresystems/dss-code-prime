@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <span>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
@@ -54,7 +55,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromFile(
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadShipped(
     std::string_view name) {
     auto path = findShippedConfig({name, "targets", ".target.json", "target",
-                                   DiagnosticCode::C_InvalidLanguageName});
+                                   DiagnosticCode::C_InvalidTargetName});
     if (!path) return std::unexpected(std::move(path).error());
     return loadFromFile(*path);
 }
@@ -585,6 +586,13 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 }
             }
         }
+
+        // Implicit-register-constraint resolution + per-field
+        // validation happens at LOAD time in target_schema_json.cpp
+        // (after the register table is populated). validate() stays
+        // const + cross-opcode-only — see the loader's
+        // "Implicit-register-constraint resolution + validation"
+        // block for the resolution + per-field reject arms.
     }
 
     // ── Convergence-fix A (schema-level): `mov` opcode required ────

@@ -12,6 +12,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "hir/hir.hpp"
+#include "hir/hir_intrinsic_registry.hpp"
 #include "hir/hir_text.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 
@@ -2229,4 +2230,48 @@ TEST(HirLoweringCSubset, D5_5_EnumHirTextRoundTrip) {
     auto parsed = parseHir(out, CompilationUnitId{42}, pr);
     EXPECT_TRUE(parsed->ok)
         << "re-parsed enum program must verify cleanly";
+}
+
+// ── FAIL-LOUD TRIPWIRE for the inliner's IntrinsicCall relaxation ────
+// OPT7 cycle 6 made the MIR inliner blanket-admit IntrinsicCall-bearing
+// callees. That admission is correct ONLY while no frame-sensitive
+// intrinsic (va_start / frameaddress / setjmp-class) can reach the
+// inliner — and today NO shipped frontend emits ANY intrinsic at all (the
+// c-subset sema + CST→HIR lowering never registers or constructs one;
+// only the HIR text format can, in tests). This test PINS that
+// precondition: a breadth of representative c-subset programs each lower
+// to a HIR whose intrinsic registry is EMPTY. The day a frontend starts
+// emitting intrinsics this pin goes RED — forcing whoever adds it to
+// confront the frame-sensitivity gate (D-OPT7-INLINE-FRAME-SENSITIVE-
+// INTRINSIC) BEFORE the inliner can silently inline a frame-sensitive
+// one. A prose anchor alone is not load-bearing against a code change
+// cycles away; this RED-on-emit pin is.
+TEST(HirLoweringCSubset, NoShippedConstructLowersToIntrinsic) {
+    // Breadth of constructs (all in the shipped corpus): params +
+    // arithmetic, subtraction, a cross-function call, a conditional, a
+    // loop, a comparison. If any future lowering arm emits an intrinsic,
+    // at least one of these exercises the path that would register it.
+    char const* const programs[] = {
+        "int add(int a, int b) { return a + b; }",
+        "int sub(int a, int b) { return a - b; }",
+        "int callee(int x) { return x + 1; } "
+            "int caller(int y) { return callee(y); }",
+        "int pick(int c) { if (c) return 7; return 9; }",
+        "int loop(int n) { int s = 0; while (n) { s = s + n; n = n - 1; } "
+            "return s; }",
+        "int cmp(int a, int b) { return a < b; }",
+    };
+    for (char const* src : programs) {
+        SCOPED_TRACE(src);
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok);
+        EXPECT_TRUE(res->hir.intrinsicRegistry().intrinsics().empty())
+            << "a c-subset program lowered to a HIR with a NON-empty intrinsic "
+               "registry — a frontend now emits intrinsics. Before relying on "
+               "the inliner's blanket IntrinsicCall admission, gate it on per-"
+               "intrinsic inline-safety: D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.";
+    }
 }

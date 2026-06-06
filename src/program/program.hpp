@@ -2,6 +2,8 @@
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "opt/optimizer.hpp"
+#include "program/cli_args.hpp"      // CompileConfig
 #include "program/input_resolver.hpp"
 
 #include <filesystem>
@@ -55,6 +57,24 @@ public:
         DiagnosticReporter&             rep
     );
 
+    /// Compile each source file as its OWN CompilationUnit (CU6 multi-CU model), then
+    /// link the N CUs into ONE image per target — the linker merges them (LK11): a
+    /// cross-file reference resolves to a sibling CU's definition or a library import at
+    /// LINK time. Distinct from `compileFiles`, which builds ONE CU5 multi-file CU
+    /// (cross-file refs resolved within the unit). Same overload shape as `compileFiles`.
+    int compileUnits(
+        const std::vector<std::string>& sourceFiles,
+        const std::string& languageName,
+        const std::vector<std::string>& targets,
+        DiagnosticReporter::Config const& reporterConfig = {}
+    );
+    int compileUnits(
+        const std::vector<std::string>& sourceFiles,
+        const std::string& languageName,
+        const std::vector<std::string>& targets,
+        DiagnosticReporter&             rep
+    );
+
     /// Compile every matching source file in a directory.
     /// `mode` selects recursive vs flat scan (D-LK10-1 closure axis).
     int compileDirectory(
@@ -95,8 +115,32 @@ public:
     [[nodiscard]] std::optional<std::filesystem::path> const&
     outputDir() const noexcept { return outputDir_; }
 
+    /// D-OPT1-DIFFERENTIAL-VERIFY-RUNNER (OPT2 cycle 1): override the
+    /// MIR-optimizer pipeline for the next compileFiles/Directory call.
+    /// When set, replaces the JSON-loaded default at compile_pipeline
+    /// step 3.5. Used by the examples_runner's differential-verify arm
+    /// + MIR unit tests; production callers leave it unset (the JSON
+    /// registry resolves the pipeline by name from CompileConfig).
+    void setOptimizerPipelineOverride(std::optional<::dss::opt::OptPipeline> p) {
+        optimizerPipelineOverride_ = std::move(p);
+    }
+    [[nodiscard]] std::optional<::dss::opt::OptPipeline> const&
+    optimizerPipelineOverride() const noexcept {
+        return optimizerPipelineOverride_;
+    }
+
+    /// D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG: the build configuration.
+    /// Debug → "debug" pipeline (no optimization); Release → "release"
+    /// pipeline (full optimizer). `Program::run` stamps this from
+    /// `CliArgs::config` before dispatching to `compileFiles`; tests
+    /// can override directly.
+    void setCompileConfig(CompileConfig c) noexcept { compileConfig_ = c; }
+    [[nodiscard]] CompileConfig compileConfig() const noexcept { return compileConfig_; }
+
 private:
-    std::optional<std::filesystem::path> outputDir_;
+    std::optional<std::filesystem::path>   outputDir_;
+    std::optional<::dss::opt::OptPipeline> optimizerPipelineOverride_;
+    CompileConfig                          compileConfig_ = CompileConfig::Debug;
 };
 
 } // namespace dss

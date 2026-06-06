@@ -2,6 +2,9 @@
 
 dss_add_test(NAME link/test_object_format_schema SOURCES test_object_format_schema.cpp)
 dss_add_test(NAME link/test_linker               SOURCES test_linker.cpp)
+# Cycle 24 — the pure cross-CU DEFINITION resolver tripwire (shared by the linker
+# today + a future whole-program MIR merge). Direct value-in/value-out policy pins.
+dss_add_test(NAME link/test_cross_cu_resolve     SOURCES test_cross_cu_resolve.cpp)
 dss_add_test(NAME link/test_elf_writer           SOURCES test_elf_writer.cpp)
 dss_add_test(NAME link/test_pe_writer            SOURCES test_pe_writer.cpp)
 dss_add_test(NAME link/test_macho_writer         SOURCES test_macho_writer.cpp)

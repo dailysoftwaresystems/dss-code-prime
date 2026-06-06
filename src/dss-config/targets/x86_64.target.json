@@ -147,6 +147,107 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — CQO sign-extend (cycle 10r split, 2026-06-04). Sign-extends RAX into RDX:RAX as the pre-divide setup for signed division. REX.W 0x99 = 0x48 0x99 (2 bytes, no ModR/M). **Cycle 10r REX-overlap bug fix**: cycle 10q packaged CQO+IDIV as a single compound opcode with `opcode: [72, 153, 72, 247]`. But the encoder auto-emits one REX prefix at the start (e.g., 0x41 for REX.B when the operand is R14) — per x86 decode the LAST REX prefix before the opcode wins, so the embedded literal second 0x48 (REX.W only) superseded the auto-REX 0x41, losing REX.B for the IDIV operand. Result: IDIV reads `modrm.rm low 3 bits` as RSI (without REX.B) instead of R14, dividing by garbage — STATUS_INTEGER_DIVIDE_BY_ZERO trap. Splitting CQO into its own opcode lets each instruction get its own auto-REX correctly. implicitRegisters: inputs=[rax] (CQO reads RAX); outputs=[rdx] (CQO writes the sign-extended high half); clobbered=[rdx] (RDX's prior value is destroyed).",
+      "mnemonic":      "cqo",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "implicitRegisters": {
+        "inputs":    ["rax"],
+        "outputs":   ["rdx"],
+        "clobbered": ["rdx"]
+      },
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "rexW": true, "opcode": [153] }
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — signed-divide single op (cycle 10r split). IDIV r/m64 divides RDX:RAX by operand 0 (modrm.rm), placing quotient in RAX + remainder in RDX. Encoder auto-computes REX with W=1 + B=(operand 0's high bit), correctly handling R8-R15 operands. Cycle 10r split from the prior compound encoding to fix REX-prefix overlap silent-miscompile (see cqo $comment). implicitRegisters: inputs=[rax,rdx] (IDIV reads RDX:RAX as 128-bit dividend); outputs=[rax,rdx] (quotient + remainder); clobbered=[rax,rdx] (both prior values destroyed — required by the schema-loader `outputs ⊆ clobbered` invariant added in the 10r 7-agent review fold, since regalloc consumes `clobbered` to build its forbidden set).",
+      "mnemonic":      "idiv_op",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "implicitRegisters": {
+        "inputs":    ["rax", "rdx"],
+        "outputs":   ["rax", "rdx"],
+        "clobbered": ["rax", "rdx"]
+      },
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"] },
+            "template": { "rexW": true, "opcode": [247], "modrmRegExt": 7 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — XOR EDX, EDX as the pre-divide zero-extend for unsigned divide (cycle 10r split). 0x31 0xD2 — 32-bit XOR with explicit dest/src both = EDX. 32-bit op zero-extends to RDX, clearing all 64 bits. No REX prefix (32-bit operands). FLAG 1 silent-miscompile guard at byte-level: the unsigned-divide pre-emit uses ZERO-extend (this op); signed-divide uses SIGN-extend (cqo). implicitRegisters: outputs=[rdx]; clobbered=[rdx]. No inputs declared (the op writes a constant zero, doesn't read the prior RDX value).",
+      "mnemonic":      "xor_rdx_zero",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "implicitRegisters": {
+        "outputs":   ["rdx"],
+        "clobbered": ["rdx"]
+      },
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "opcode": [49, 210] }
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — unsigned-divide single op (cycle 10r split). DIV r/m64 divides RDX:RAX by operand 0 (modrm.rm), placing quotient in RAX + remainder in RDX. Encoder auto-computes REX with W=1 + B=(operand 0's high bit). implicitRegisters: inputs=[rax,rdx]; outputs=[rax,rdx]; clobbered=[rax,rdx] (mirrors `idiv_op` — required by the `outputs ⊆ clobbered` invariant).",
+      "mnemonic":      "div_op",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "implicitRegisters": {
+        "inputs":    ["rax", "rdx"],
+        "outputs":   ["rax", "rdx"],
+        "clobbered": ["rax", "rdx"]
+      },
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"] },
+            "template": { "rexW": true, "opcode": [247], "modrmRegExt": 6 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): integer compare (writes FLAGS, no GPR result). Two variants: reg-reg (REX.W 0x39 /r — cmp r/m64, r64) + reg-imm32 (REX.W 0x81 /7 imm32 — cmp r/m64, imm32 with sign-extended imm32). modrmRegExt=7 fills ModR/M.reg with the /7 opcode-extension digit. ML5 lowerICmp + lowerCondBr both emit `cmp` against an immediate-0 or against another reg.",
       "mnemonic":      "cmp",
       "result":        "none",
@@ -485,14 +586,25 @@
       }
     },
     {
-      "$comment": "Sign-extend integer (cycle 3c cast lowering for MIR SExt). Operands: [src_reg]. Width comes from the result reg's class + the source reg's width-of-record. AS1 emits movsx.",
+      "$comment": "Sign-extend integer (cycle 3c cast lowering for MIR SExt). D-CSUBSET-LONG-PRIMITIVE closure (cycle 10h, 2026-06-04): I32→I64 variant landed. Per Intel SDM Vol. 2A, opcode 0x63 in 64-bit mode is unconditionally MOVSXD (in legacy mode it would be ARPL, but the assembler emits only 64-bit-mode code); REX.W=1 widens `r/m32 → r64` (the canonical I32→I64 sign-extend used here), REX.W=0 widens `r/m32 → r32` (effectively a mov). ModR/M.reg = dest (r64); ModR/M.rm = src (r/m32). Pairs with the next mnemonic's zext (byte→r64) — same single-variant shape. Other widths (I8→I32/I64, I16→I32/I64) NOT encoded — anchored D-TARGET-ENCODING-WIDTH-GUARD because today's variant `guard` has no operand-width discriminator; a naïve second variant would silently first-match-win on wrong widths. Deferred until a c-subset corpus row actually emits an I8/I16→wider widening.",
       "mnemonic":      "sext",
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   1,
       "maxOperands":   1,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"] },
+            "template":   { "rexW": true, "opcode": [99] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
     },
     {
       "$comment": "D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold, code-reviewer C2): zero-extend the low BYTE of a register to a full r64. Encoding `REX.W 0F B6 /r` — movzx r64, r/m8. ModR/M.reg = result (dest, 64-bit); ModR/M.rm = operand[0] (src, low-byte). REX.W=true serves double duty: (a) sets dest to r64, (b) forces REX prefix presence so the SRC low-byte access uses the spl/bpl/sil/dil aliasing (proper 8-bit access of r4..r7) instead of the legacy ah/ch/dh/bh high-byte alias. The natural consumer is the setcc → zext pair lowered by `lowerICmp`, but it is also reused by MIR ZExt for arbitrary boolean-typed → int widening.",

@@ -141,6 +141,30 @@ struct DSS_EXPORT FieldChildrenDescriptor {
     bool          liftToEnclosingScope = false;
 };
 
+// Forward-declared as opaque enums (a fixed underlying type makes them COMPLETE
+// types, hence valid by value in the `std::optional`s below) so this header need
+// not pull the heavy `symbol_attrs.hpp` → `target_schema.hpp` include — which
+// `grammar_schema.hpp` includes early, before `LoadResult` is defined, closing a
+// cycle. The full enum definitions + name tables live in
+// `core/types/symbol_attrs.hpp`, included by the .cpp consumers that read VALUES.
+enum class SymbolBinding : std::uint8_t;
+enum class SymbolVisibility : std::uint8_t;
+
+// D-CSUBSET-LINKAGE-SPECIFIERS (pre-OPT7 P1, 2026-06-04): the effect a single
+// declaration-specifier token has on the declared symbol's linkage. A language
+// maps each specifier's SOURCE TEXT (e.g. "static", "weak", "hidden") to one of
+// these via `DeclarationRule::linkageSpecifiers`; CST→HIR lowering walks the
+// declaration's specifier-prefix subtree (see `specifierPrefixRule`), looks each
+// specifier token's text up in that map, and folds the effects onto the HIR
+// node's `LinkageAttr`. A field left `nullopt` leaves that axis at its prior
+// value (so `static` sets only `binding`; `visibility("hidden")` sets only
+// `visibility`). Agnostic: the engine performs the lookup; WHICH texts exist and
+// what binding/visibility they mean are entirely per-language config.
+struct DSS_EXPORT LinkageSpecifierEffect {
+    std::optional<SymbolBinding>    binding;
+    std::optional<SymbolVisibility> visibility;
+};
+
 struct DSS_EXPORT DeclarationRule {
     // The rule (resolved to RuleId) whose subtree introduces the decl.
     RuleId          rule{};
@@ -172,6 +196,41 @@ struct DSS_EXPORT DeclarationRule {
     // `nullopt` ⇒ the language has no variadic-marker for this
     // declaration form (the FnSig is always non-variadic).
     std::optional<SchemaTokenId> variadicMarker;
+    // D-DECL-SPECIFIER-PREFIX-SUBSTRATE (2026-06-04): an optional leading
+    // declaration-specifier prefix — a child whose rule is this RuleId, sitting
+    // BEFORE the type/name (e.g. C `static int f()` / `__attribute__((weak)) int
+    // g()`). When set AND the declaration's first visible child matches this
+    // rule, the resolver STRIPS it before resolving the positional
+    // `typeChild`/`nameChild`/`paramsChild`/`bodyChild`/`kindByChild` indices, so
+    // those indices stay stable whether or not specifiers are present (a leading
+    // optional child would otherwise shift them). The prefix subtree remains
+    // reachable for a per-language specifier→attribute scan (e.g. linkage). The
+    // engine learns nothing language-specific: WHICH rule is the prefix, and what
+    // its specifiers mean, are both per-language config. `nullopt` ⇒ this
+    // declaration form has no specifier prefix (every shipped decl today).
+    std::optional<RuleId>        specifierPrefixRule;
+    // D-CSUBSET-LINKAGE-SPECIFIERS (pre-OPT7 P1, 2026-06-04): maps a
+    // declaration-specifier token's SOURCE TEXT to its linkage effect (see
+    // `LinkageSpecifierEffect`). Consulted by CST→HIR lowering ONLY for the
+    // specifier tokens inside this declaration's `specifierPrefixRule` subtree;
+    // the resolved `LinkageAttr` is attached to the HIR Function/Global node and
+    // threaded to the MirFunc/MirGlobal binding+visibility (the DCE-protect
+    // input). Empty ⇒ this declaration form derives no linkage from specifiers
+    // (every shipped decl before c-subset `static` landed). Source/target/linker
+    // agnostic: the VALUES reuse the shared `SymbolBinding`/`SymbolVisibility`
+    // vocabulary; the token→effect MAP is per-language config.
+    std::unordered_map<std::string, LinkageSpecifierEffect> linkageSpecifiers;
+    // D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC (cycle 14): the specifier
+    // prefix's STRUCTURAL token kinds — syntax, NOT specifier-identities (e.g.
+    // `__attribute__`, `(`, `)`) — to SKIP when scanning the prefix for linkage.
+    // Any prefix token whose kind is NOT in this set MUST resolve in
+    // `linkageSpecifiers`, else it is an unrecognized specifier and fails loud
+    // (`H_UnknownLinkageSpecifier`). The skip-list's DEFAULT is fail-loud: an
+    // unanticipated/typo'd specifier (a kind not listed here) is validated, so it
+    // ERRORS rather than being silently ignored — the safe direction. Resolved
+    // loader-side from token-kind names (unknown name → fail-loud). Empty for a
+    // declaration form that derives no linkage from specifiers.
+    std::vector<SchemaTokenId> linkageSpecifierIgnoredKinds;
     DeclarationKind kind        = DeclarationKind::Variable;
     NameMatchMode   nameMatch   = NameMatchMode::Self;
     // D8 unused-variable warning: when true, a symbol minted by this
@@ -496,6 +555,26 @@ struct DSS_EXPORT SemanticConfig {
     // top of this language-level default.
     std::unordered_map<std::string, std::string> externLibraryByFormat;
 
+    // FF11 (2026-06-05): SYSTEM include search path — the per-language
+    // analogue of C's /usr/include. Each entry is a subdirectory under
+    // `src/dss-config/` (e.g. "shippedLibs/windows-x86_64"); the
+    // angle-form `#include <h>` resolves the header name against these
+    // dirs (the wiring layer walks up from cwd to find each, mirroring
+    // `findShippedConfig`). DISTINCT from the quote form's search
+    // (self-dir + includeDirs). A header found here is a c-subset SOURCE
+    // file parsed by THIS language's own grammar and merged via the
+    // existing include-following resolver — its `extern` decls then flow
+    // through FF5 `synthesizeFfiFromSourceDecls` like a program's own.
+    // Empty ⇒ the language ships no system headers (the angle form, if
+    // declared, resolves nothing and hard-fails on use).
+    //
+    // Per-language data: a second language ships its own headers under
+    // its own dir(s) with ZERO engine change. Platform auto-select
+    // (picking windows-x86_64 vs linux-x86_64 from the active target) is
+    // DEFERRED — anchored D-FFI-SHIPPED-LIB-PLATFORM-SELECT; for now the
+    // single shipped dir names its platform explicitly.
+    std::vector<std::string> shippedLibDirs;
+
     // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): per-language
     // rules governing implicit conversion between `Ptr<Void>` (untyped
     // memory) and `Ptr<T>` (typed memory). The two directions carry
@@ -588,6 +667,65 @@ struct DSS_EXPORT SemanticConfig {
         bool nullPointerConstantFromIntegerZero = false;
     };
     PointerConversionRules pointerConversions;
+
+    // Two orthogonal per-language alias-analysis opt-ins, both threaded
+    // through `MirLoweringConfig` → `Mir` and read by CSE/LICM Load
+    // admission via `Mir.aliasingMode()` + `Mir.charTypesAliasAll()`.
+    //
+    //   * `strictAliasingOnDistinctTypes` — C99 §6.5 strict aliasing.
+    //     Lets `Ptr<I32>` vs `Ptr<I64>` resolve to No (Rule 6).
+    //   * `charTypesAliasAll` — C99 §6.5 ¶7 character-type exception.
+    //     Defaults true (sound for C/C++/Objective-C/Java/Go); a Rust
+    //     frontend or strict-typed DSL sets false.
+    //
+    // The two compose: with `strict=true` + `charAliasAll=true`, a
+    // `char*` Store does not alias an `int*` Load only by character-
+    // exception (i.e., it MAY alias — Maybe). With `strict=true` +
+    // `charAliasAll=false`, the same pair resolves to No.
+    //
+    // Loader-level unknown-key fail-loud mirrors the
+    // `pointerConversions` pattern (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD
+    // discipline — a typo'd key would otherwise silently fall back to
+    // the default and flip the language's optimization polarity).
+    struct PointerAliasingRules {
+        // Per C99 §6.5 ¶7 / C++ [basic.lval]: a glvalue accessed
+        // through a pointer of a type that is NOT compatible with the
+        // dynamic object type is undefined behavior. Optimizers that
+        // honor this can prove `Ptr<I32>` and `Ptr<I64>` don't alias
+        // (Rule 6 in `mirMayAlias`). Character-type pointer behavior
+        // is controlled INDEPENDENTLY by `charTypesAliasAll` below
+        // (the two semantics compose orthogonally).
+        //
+        // C, C++, Objective-C: true. Rust (via its borrow checker) is
+        // arguably stricter but does NOT use this MIR-tier flag — it
+        // enforces non-aliasing at the type-checker tier. Java / Go /
+        // dynamic languages: false (no spec-level guarantee).
+        bool strictAliasingOnDistinctTypes = false;
+
+        // C99 §6.5 ¶7 character-type exception: a character-typed
+        // pointer (`char*` / `signed char*` / `unsigned char*` — at the
+        // MIR tier `Char`/`Byte` pointees) may alias an object of ANY
+        // type. Enables serializers, hash visitors, memcpy
+        // implementations, and bytewise inspection to be sound under
+        // strict aliasing.
+        //
+        // Default `true` is the CONSERVATIVE direction — every
+        // language gets the safe sound-but-imprecise answer until it
+        // declares otherwise. C / C++ / Objective-C declare true.
+        // Rust's `u8` does NOT have this exception (Rust enforces
+        // aliasing at the borrow-checker tier and treats `&[u8]` like
+        // any other typed slice); a Rust frontend would declare
+        // false. A hypothetical strict-typed DSL where `char` is
+        // truly opaque would also declare false.
+        //
+        // This flag is independent of `strictAliasingOnDistinctTypes`:
+        // disabling the char-exception only matters in combination
+        // with strict aliasing (the exception is what stops a Rule 5
+        // strict-TBAA verdict from firing on a char pointer). Closes
+        // `D-OPT-MIR-ALIAS-CHAR-EXCEPTION-OVERRIDE`.
+        bool charTypesAliasAll = true;
+    };
+    PointerAliasingRules pointerAliasing;
 };
 
 } // namespace dss

@@ -1,0 +1,16 @@
+{
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 41,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "inlining", "passes": ["Inlining"]}
+  ]
+}

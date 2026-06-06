@@ -37,6 +37,19 @@
 
 namespace dss {
 
+// Module-level alias-analysis polarity. Stamped by the HIR→MIR lowering
+// from the source language's `SemanticConfig.PointerAliasingRules`.
+// `Permissive` (the default) keeps the MIR-tier `mirMayAlias` predicate
+// at the conservative `Maybe` for distinct primitive pointees;
+// `StrictTBAA` opts into C-style strict-aliasing (Rule 6 returns `No`
+// for `Ptr<I32>` vs `Ptr<I64>`, etc.).
+//
+// Pairs with `Mir.charTypesAliasAll()`: the two flags compose
+// orthogonally (Rule 5 char-exception fires only when
+// `charTypesAliasAll == true`). Closes
+// `D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING` end-to-end.
+enum class MirAliasingMode : std::uint8_t { Permissive, StrictTBAA };
+
 class DSS_EXPORT Mir {
 public:
     using InstArena   = substrate::ArenaContainer<detail::MirInst,   MirInstId,   MirModuleId>;
@@ -52,11 +65,18 @@ public:
     // The empty module — the transient state before a builder hands over.
     Mir() noexcept = default;
 
+    // The 10th + 11th args (`aliasingMode`, `charTypesAliasAll`) are
+    // REQUIRED — no defaults — so a direct call site can't silently
+    // produce a sound-but-wrong-shape module by omitting them.
+    // `MirBuilder::finish` is the only intended producer and threads
+    // both through explicitly.
     Mir(InstArena instArena, BlockArena blockArena, FuncArena funcArena,
         GlobalArena globalArena,
         std::vector<MirBlockId> instBlock, std::vector<MirInstId> operandPool,
         std::vector<MirPhiIncoming> phiPool, std::vector<MirBlockId> succPool,
-        MirLiteralPool literalPool) noexcept;
+        MirLiteralPool literalPool,
+        MirAliasingMode aliasingMode,
+        bool charTypesAliasAll) noexcept;
 
     // Move-only (the arenas are move-only — their cross-arena tags must stay
     // unique). Custom moves reset the source to a default-constructed observable
@@ -201,6 +221,19 @@ public:
     }
     [[nodiscard]] MirLiteralPool const& literalPool() const noexcept { return literalPool_; }
 
+    // ── module-level alias-analysis polarity ──
+    // Read by CSE/LICM Load admission to thread the source language's
+    // strict-aliasing opt-in into `mirMayAlias`. The rebuild substrate
+    // (`mir_rebuild_helper`) propagates this mode to every pass's fresh
+    // `MirBuilder` so a release pipeline doesn't silently downgrade
+    // strict-TBAA to Permissive after the first rebuild.
+    [[nodiscard]] MirAliasingMode aliasingMode() const noexcept { return aliasingMode_; }
+    // Per-source-language C99 §6.5 ¶7 character-type exception flag.
+    // Composes with `aliasingMode`: Rule 5 in `mirMayAlias` fires only
+    // when this is `true`. Default `true` matches C/C++/Objective-C;
+    // Rust / strict-typed DSLs declare `false`.
+    [[nodiscard]] bool charTypesAliasAll() const noexcept { return charTypesAliasAll_; }
+
 private:
     InstArena                   instArena_;
     BlockArena                  blockArena_;
@@ -216,6 +249,8 @@ private:
                                                // contiguous slice is meaningful)
     std::vector<MirBlockId>     succPool_;      // terminator CFG successors
     MirLiteralPool              literalPool_;
+    MirAliasingMode             aliasingMode_ = MirAliasingMode::Permissive;
+    bool                        charTypesAliasAll_ = true;
 };
 
 // `MirAttribute<T>` — the HIR-style side-table over the instruction tier (the
@@ -260,6 +295,20 @@ public:
     MirBuilder& operator=(MirBuilder&&) noexcept = default;
 
     [[nodiscard]] MirModuleId id() const noexcept { return moduleId_; }
+
+    // ── module-level alias-analysis polarity ──
+    // Stamp the module-level alias-analysis polarity. Intended to be
+    // called at HIR→MIR lowering time from the source language's
+    // `SemanticConfig.PointerAliasingRules`. Default is `Permissive`
+    // + `charTypesAliasAll=true` (sound out of the box; every CSE/LICM
+    // Load admission stays conservative). Callable at any time before
+    // `finish()` (last value wins); the optimizer rebuild substrate
+    // (`mir_rebuild_helper`) also calls these on its own builders to
+    // propagate the mode through every pipeline pass.
+    void setAliasingMode(MirAliasingMode mode) noexcept { aliasingMode_ = mode; }
+    [[nodiscard]] MirAliasingMode aliasingMode() const noexcept { return aliasingMode_; }
+    void setCharTypesAliasAll(bool v) noexcept { charTypesAliasAll_ = v; }
+    [[nodiscard]] bool charTypesAliasAll() const noexcept { return charTypesAliasAll_; }
 
     // ── function / block lifecycle ──
     // Open a function. Closes any open function first (which requires its current
@@ -432,6 +481,8 @@ private:
     std::vector<MirPhiIncoming> phiPool_;
     std::vector<MirBlockId>     succPool_;
     MirLiteralPool              literalPool_;
+    MirAliasingMode             aliasingMode_ = MirAliasingMode::Permissive;
+    bool                        charTypesAliasAll_ = true;
 
     // Per-phi pending incomings, keyed by the phi instruction's slot (.v),
     // flushed into `phiPool_` (contiguously per phi) at `finish`.

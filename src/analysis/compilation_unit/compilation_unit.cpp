@@ -223,6 +223,13 @@ void UnitBuilder::addIncludeDir(std::filesystem::path dir) {
     includeDirs_.push_back(std::move(dir));
 }
 
+void UnitBuilder::addSystemDir(std::filesystem::path dir) {
+    if (finished_) {
+        cuFatal("UnitBuilder::addSystemDir called after finish()");
+    }
+    systemDirs_.push_back(std::move(dir));
+}
+
 TreeId UnitBuilder::loadAndAdd_(std::filesystem::path const& path, bool& ok,
                                std::shared_ptr<GrammarSchema const> schema) {
     std::error_code ec;
@@ -355,6 +362,7 @@ CompilationUnit UnitBuilder::finish() && {
         trees_,
         driverDiagnostics_,
         includeDirs_,
+        systemDirs_,
         [this](std::filesystem::path const& path, bool& ok,
                std::shared_ptr<GrammarSchema const> schema) {
             return loadAndAdd_(path, ok, std::move(schema));

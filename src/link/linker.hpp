@@ -5,9 +5,13 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"
+#include "link/symbol_kind.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 // Linker engine (plan 14, LK1–LK10 closed end-to-end 2026-05-30).
@@ -53,6 +57,42 @@ struct DSS_EXPORT LinkedImage {
     // the per-function-resolved count.
     std::size_t               expectedFuncCount = 0;
     std::size_t               resolvedFuncCount = 0;
+    // Count of indexed symbols in the EMITTED module's compound-key index (set by the
+    // emission path). Single-CU: the sole module's symbols (D-LK4-3 — the compound key
+    // keeps two CUs' colliding bare SymbolId distinct; a regression to a bare key
+    // collapses them, which the collision pin asserts). Cross-CU (N>1, LK11b): the
+    // MERGED combined module's symbols (functions + data + externs the walker emits).
+    // An N>1 merge that fail-louds BEFORE emission (a pending cross-CU reference /
+    // ambiguous entry) retains the resolution-side count. Prefer `resolvedGlobalDefs`
+    // (.size()) for the cross-CU RESOLUTION outcome — symbolCount is the EMISSION count.
+    std::size_t               symbolCount = 0;
+
+    // LK11a: the cross-CU symbol-resolution outcome — for each externally-visible
+    // NAME defined across the linked CUs, the WINNING definition's compound key after
+    // weak-vs-strong resolution (a strong/Global def shadows weak; among all-weak the
+    // lowest (cuId, SymbolId) wins deterministically). Empty for single-CU links (no
+    // cross-CU merge). Load-bearing for the OPT7 Weak-inline guard: the optimizer must
+    // not inline a weak callee whose winning definition here is a DIFFERENT, strong one.
+    std::unordered_map<std::string, LinkedSymbolKey> resolvedGlobalDefs;
+
+    // LK11a: a resolved cross-CU REFERENCE — an extern import (a reference) whose name
+    // is DEFINED in a sibling CU. A local/sibling definition shadows the extern
+    // declaration, so the reference binds to that definition (NOT a DLL import). LK11a
+    // records the symbolic edge; LK11b patches the referencing relocations to the
+    // definition's address once the merged image is laid out. An extern with NO cross-CU
+    // definition stays a real FFI import (resolved via the import table, unchanged).
+    struct CrossCuRef {
+        LinkedSymbolKey reference;   // (referencing cuId, the extern import's SymbolId)
+        LinkedSymbolKey definition;  // the winning sibling-CU definition's compound key
+    };
+    std::vector<CrossCuRef> resolvedCrossCuRefs;
+
+    // The mangled names of the extern imports the EMITTED image carries (its import-table
+    // entries). A cross-CU reference that resolved to a sibling definition is STRIPPED
+    // (LK11b — the sibling shadows the library fallback) and does NOT appear here; only
+    // real FFI imports survive. Lets a test assert the cross-CU strip directly, without
+    // re-deriving it from the format-specific import-table bytes.
+    std::vector<std::string> externImportNames;
 
     [[nodiscard]] bool ok() const noexcept {
         return expectedFuncCount > 0
@@ -90,6 +130,21 @@ namespace dss::linker {
 // Returns a `LinkedImage` whose `ok()` reflects parallel-index
 // shape. The reporter is the success channel for per-relocation
 // failures.
+// D-LK4-3 — multi-module entry. The linker indexes every module's symbols under
+// its `AssembledModule::cuId` (compound key `(cuId, SymbolId)`) so N CUs' tables
+// coexist without per-arena SymbolId collisions. A 1-element span is the single-CU
+// path (full image emission, behavior unchanged). N>1 builds the collision-proof
+// index + validates, then fail-louds `K_CrossCuMergeUnsupported` — the multi-CU
+// image MERGE (cross-CU name resolution + weak-vs-strong) is LK11.
+[[nodiscard]] DSS_EXPORT LinkedImage
+link(std::span<AssembledModule const> modules,
+     TargetSchema const&          targetSchema,
+     ObjectFormatSchema const&    objectFormatSchema,
+     DiagnosticReporter&          reporter);
+
+// Single-module convenience overload (the v1 single-CU signature). Delegates to
+// the span entry with a 1-element span — every existing single-CU caller is
+// source-unchanged.
 [[nodiscard]] DSS_EXPORT LinkedImage
 link(AssembledModule const&       module,
      TargetSchema const&          targetSchema,

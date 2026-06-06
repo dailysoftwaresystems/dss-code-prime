@@ -1,0 +1,17 @@
+# Optimizer unit tests.
+
+dss_add_test(NAME opt/test_optimizer       SOURCES test_optimizer.cpp)
+dss_add_test(NAME opt/test_const_fold      SOURCES test_const_fold.cpp)
+dss_add_test(NAME opt/test_pipeline_loader SOURCES test_pipeline_loader.cpp)
+dss_add_test(NAME opt/test_dce             SOURCES test_dce.cpp)
+dss_add_test(NAME opt/test_dce_linkage     SOURCES test_dce_linkage.cpp)
+dss_add_test(NAME opt/test_mem2reg         SOURCES test_mem2reg.cpp)
+dss_add_test(NAME opt/test_copy_prop       SOURCES test_copy_prop.cpp)
+dss_add_test(NAME opt/test_cse             SOURCES test_cse.cpp)
+dss_add_test(NAME opt/test_simplify_cfg    SOURCES test_simplify_cfg.cpp)
+dss_add_test(NAME opt/test_licm            SOURCES test_licm.cpp)
+dss_add_test(NAME opt/test_inlining        SOURCES test_inlining.cpp)
+dss_add_test(NAME opt/test_compile_options SOURCES test_compile_options.cpp)
+dss_add_test(NAME opt/test_mir_alias       SOURCES test_mir_alias.cpp)
+dss_add_test(NAME opt/test_call_graph_scc  SOURCES test_call_graph_scc.cpp)
+dss_add_test(NAME opt/test_mir_rebuild_helper SOURCES test_mir_rebuild_helper.cpp)

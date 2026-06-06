@@ -1,18 +1,23 @@
 #include "link/linker.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
+#include "link/cross_cu_resolve.hpp"
 #include "link/entry_trampoline.hpp"
 #include "link/format/elf.hpp"
 #include "link/format/macho.hpp"
 #include "link/format/pe.hpp"
 #include "link/format/spirv.hpp"
 #include "link/format/wasm.hpp"
+#include "link/symbol_kind.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <format>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace dss::linker {
 
@@ -20,15 +25,401 @@ namespace {
 
 using dss::report;
 
+// D-LK4-3 — build the collision-proof compound-key symbol index for one module.
+// Every function / data item / extern import is keyed by `(module.cuId, SymbolId)`
+// so two CUs minting the same bare SymbolId stay distinct. A duplicate COMPOUND
+// key — the same SymbolId declared twice in THIS CU (across functions, data, or
+// externs) — is an ambiguous-resolution error: the `emplace`-failure detects it,
+// unifying the former cross-table + within-table duplicate checks into one gate.
+void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
+                        AssembledModule const& m,
+                        DiagnosticReporter& reporter) {
+    auto declare = [&](SymbolId sym, SymbolKind kind, char const* what) {
+        if (!index.emplace(LinkedSymbolKey{m.cuId, sym}, kind).second) {
+            report(reporter, DiagnosticCode::K_SymbolUndefined,
+                   DiagnosticSeverity::Error,
+                   "symbol #" + std::to_string(sym.v) + " (CU #" +
+                   std::to_string(m.cuId.v) + ") is declared more than once — this " +
+                   what + " collides with a prior function / data item / extern import "
+                   "of the same SymbolId in this CompilationUnit (ambiguous resolution).");
+        }
+    };
+    for (auto const& fn : m.functions) declare(fn.symbol, SymbolKind::Defined, "function");
+    for (auto const& di : m.dataItems) declare(di.symbol, SymbolKind::Data, "data item");
+    for (std::size_t i = 0; i < m.externImports.size(); ++i) {
+        auto const& ext = m.externImports[i];
+        // Empty mangledName / libraryPath silently produce broken imports
+        // (GetProcAddress("") → null IAT slot; empty DT_SONAME / LC_LOAD_DYLIB).
+        // Fail loud so the toolchain owns the diagnostic.
+        if (ext.mangledName.empty()) {
+            report(reporter, DiagnosticCode::K_SymbolUndefined,
+                   DiagnosticSeverity::Error,
+                   "ExternImport[" + std::to_string(i) + "] (symbol #" +
+                   std::to_string(ext.symbol.v) + ") has empty mangledName — "
+                   "import-table entries require a non-empty symbol name.");
+        }
+        if (ext.libraryPath.empty()) {
+            report(reporter, DiagnosticCode::K_SymbolUndefined,
+                   DiagnosticSeverity::Error,
+                   "ExternImport[" + std::to_string(i) + "] (symbol #" +
+                   std::to_string(ext.symbol.v) + ") has empty libraryPath — "
+                   "import-table entries require a non-empty DLL / SO / dylib name.");
+        }
+        declare(ext.symbol, SymbolKind::Extern, "extern import");
+    }
+}
+
+// LK11a — the cross-CU symbol merge + resolution, in three steps:
+//  (1) DEFINITION merge + weak-vs-strong: only Global/Weak definitions participate
+//      (Local stays module-private); the surviving definition of each name lands in
+//      `image.resolvedGlobalDefs` (name -> winning (cuId, SymbolId)). Order-INDEPENDENT:
+//      a strong (Global) def always shadows weak; two strong defs of one name are an
+//      ambiguous redefinition (K_SymbolRedefinedAcrossUnits); among all-weak defs the
+//      lowest (cuId, SymbolId) wins (same result regardless of module order).
+//  (2) REFERENCE resolution: an extern import whose name is DEFINED in a sibling CU is a
+//      cross-CU reference — a local/sibling definition shadows the extern declaration, so
+//      the reference binds to that definition (recorded in `image.resolvedCrossCuRefs`),
+//      NOT a DLL import. An extern with no cross-CU definition stays a real FFI import.
+//  (3) per-CU relocation resolution: every relocation target must be declared in its own
+//      CU (a definition or an extern import) per the compound index, else K_SymbolUndefined.
+// Byte patching against the resolved addresses is LK11b (needs the merged-image layout).
+void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
+                           std::unordered_map<LinkedSymbolKey, SymbolKind> const& compoundIndex,
+                           LinkedImage&        image,
+                           DiagnosticReporter& reporter) {
+    // (1) DEFINITION merge + weak-vs-strong — delegated to the PURE, tier-neutral
+    // `resolveCrossCuDefs` kernel (Cycle 24). Flatten every module's symbol table into
+    // `(name, binding, key)` triples (Local stays in — the kernel excludes it), resolve,
+    // then emit ONE K_SymbolRedefinedAcrossUnits per recorded conflict event (K strong
+    // defs of one name → K-1 events, so the diagnostic count is unchanged). The kernel
+    // owns the strong-shadows-weak / all-weak-lowest-key policy AND hands back the
+    // colliding key PAIR per conflict; this caller owns the diagnostic. Each conflict
+    // names BOTH defining CompilationUnits (existing + incoming) — byte-for-byte the
+    // original wording, before the conflict data was reduced to a name. The winner table
+    // flows into reference-resolution + the resolvedGlobalDefs copy below.
+    std::vector<CrossCuDef> defs;
+    for (auto const& m : modules) {
+        for (auto const& s : m.symbols) {
+            defs.push_back(CrossCuDef{s.name, s.binding, LinkedSymbolKey{m.cuId, s.symbol}});
+        }
+    }
+    CrossCuResolution const resolution = resolveCrossCuDefs(defs);
+    for (auto const& c : resolution.conflicts) {
+        report(reporter, DiagnosticCode::K_SymbolRedefinedAcrossUnits,
+               DiagnosticSeverity::Error,
+               "symbol \"" + c.name + "\" has multiple strong (Global) "
+               "definitions across CompilationUnits (CU #" +
+               std::to_string(c.existing.cuId.v) + " and CU #" +
+               std::to_string(c.incoming.cuId.v) + ") — a strong symbol may be "
+               "defined only once across the linked image.");
+    }
+    // (2) Reference resolution — an extern import whose name is DEFINED in a sibling CU
+    // binds to that definition (the definition shadows the extern declaration). Record
+    // the symbolic edge; LK11b patches the referencing relocations to the def's address.
+    // An extern with no cross-CU definition stays a real FFI import (resolved via the
+    // import table — unchanged). Local defs are not in `winners`, so a Local of the same
+    // name never satisfies an extern (correct — Local is module-private).
+    image.resolvedCrossCuRefs.clear();
+    for (auto const& m : modules) {
+        for (auto const& ext : m.externImports) {
+            auto it = resolution.winners.find(ext.mangledName);
+            if (it != resolution.winners.end()) {
+                image.resolvedCrossCuRefs.push_back(LinkedImage::CrossCuRef{
+                    LinkedSymbolKey{m.cuId, ext.symbol}, it->second});
+            }
+        }
+    }
+    // (3) Per-CU relocation resolution — every relocation target must resolve to a symbol
+    // declared in its own CU (a definition or an extern import). An unresolved target is
+    // undefined. (The compound index is keyed by (cuId, SymbolId), so the lookup is
+    // per-CU.) Byte patching against the resolved address is LK11b.
+    for (auto const& m : modules) {
+        for (auto const& fn : m.functions) {
+            for (auto const& rel : fn.relocations) {
+                if (!compoundIndex.contains(LinkedSymbolKey{m.cuId, rel.target})) {
+                    report(reporter, DiagnosticCode::K_SymbolUndefined,
+                           DiagnosticSeverity::Error,
+                           "relocation in CU #" + std::to_string(m.cuId.v) +
+                           " targets symbol #" + std::to_string(rel.target.v) +
+                           " which is not defined or imported in that CompilationUnit "
+                           "(a cross-CU reference must be declared as an extern import).");
+                }
+            }
+        }
+    }
+    image.resolvedGlobalDefs.clear();
+    for (auto const& [name, key] : resolution.winners) image.resolvedGlobalDefs.emplace(name, key);
+    image.symbolCount = image.resolvedGlobalDefs.size();
+}
+
+// LK11b — pre-merge N resolved CUs into ONE combined AssembledModule, so the existing
+// single-CU format walker emits the merged image (no per-format N-module rewrite).
+// Symbols are remapped into a fresh unified id space: each winning Global/Weak
+// DEFINITION (image.resolvedGlobalDefs) gets one fresh id that all same-name versions
+// fold onto (dedup); a Local symbol gets a distinct fresh id (module-private — two CUs'
+// SymbolId{3} locals are different functions). Every function's relocations are
+// retargeted from (its cuId, old SymbolId) to the merged id.
+//
+// Cross-CU REFERENCE resolution via a GOT-like THUNK SLOT (the c-subset extern call is
+// INDIRECT — `call qword ptr [slot]`, x86 `FF 15 disp32`, which DEREFERENCES the slot;
+// see `mir_to_lir.cpp` CallIndirectViaExtern). For each extern bound to a sibling-CU
+// definition (image.resolvedCrossCuRefs) the merge mints a fresh 8-byte data item — the
+// thunk slot — carrying ONE absolute-64-bit-pointer relocation to the definition, and
+// retargets the reference's merged id to THAT SLOT (not the def). So the indirect call
+// reads a slot that the walker fills with the def's runtime address. The extern import is
+// STRIPPED (the sibling def shadows the library fallback). An extern with NO cross-CU
+// definition is a real FFI import, kept (remapped) for the library tier (FF11).
+//
+// The absolute-pointer relocation kind is found AGNOSTICALLY from the `TargetSchema` —
+// the row whose `relocationInfo` reports `widthBytes == 8 && !pcRelative` — never by a
+// hardcoded "abs64" name / kind constant (the standing source/target/format agnosticism
+// veto). If no such row exists, fail loud (K_AbsolutePointerRelocMissing); a thunk slot
+// without its abs64 fixup would be a broken null pointer.
+AssembledModule mergeModules(std::span<AssembledModule const> modules,
+                             LinkedImage const&  image,
+                             TargetSchema const& targetSchema,
+                             DiagnosticReporter& reporter) {
+    AssembledModule combined;
+
+    // Find the target's ABSOLUTE 64-bit pointer relocation kind by FORMULA (never by
+    // name/constant — agnosticism). This is the relocation the thunk slot carries so the
+    // format walker writes the sibling def's runtime address into the slot bytes.
+    // Resolved ONCE; consumed only if there is at least one cross-CU reference to thunk.
+    std::optional<RelocationKind> absPtrKind;
+    for (auto const& r : targetSchema.relocations()) {
+        if (r.widthBytes == 8 && !r.pcRelative) { absPtrKind = r.kind; break; }
+    }
+
+    // Per-module SymbolId.v -> ModuleSymbol for O(1) name/binding lookup during remap.
+    std::vector<std::unordered_map<std::uint32_t, ModuleSymbol const*>> byId(modules.size());
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        for (auto const& ms : modules[i].symbols) byId[i].emplace(ms.symbol.v, &ms);
+    }
+
+    // (cuId, old SymbolId) -> fresh merged SymbolId.v. Pre-assign one fresh id per
+    // resolved global name (the winning definition); same-name versions fold onto it.
+    std::unordered_map<LinkedSymbolKey, std::uint32_t> remap;
+    std::unordered_map<std::string, std::uint32_t>     nameToId;
+    std::uint32_t nextId = 1;
+    for (auto const& [name, key] : image.resolvedGlobalDefs) {
+        std::uint32_t const id = nextId++;
+        remap.emplace(key, id);
+        nameToId.emplace(name, id);
+    }
+    auto mergedIdFor = [&](std::size_t modIdx, SymbolId old) -> std::uint32_t {
+        LinkedSymbolKey const key{modules[modIdx].cuId, old};
+        if (auto it = remap.find(key); it != remap.end()) return it->second;
+        // Not a pre-assigned winner: fold an externally-visible same-name def onto its
+        // winner; otherwise mint a fresh id (Local / extern import / unnamed).
+        if (auto sit = byId[modIdx].find(old.v); sit != byId[modIdx].end()) {
+            ModuleSymbol const& ms = *sit->second;
+            if (ms.binding != SymbolBinding::Local) {
+                if (auto nit = nameToId.find(ms.name); nit != nameToId.end()) {
+                    remap.emplace(key, nit->second);
+                    return nit->second;
+                }
+            }
+        }
+        std::uint32_t const id = nextId++;
+        remap.emplace(key, id);
+        return id;
+    };
+    // Single chokepoint for relocation retargeting — functions AND data items route
+    // through it, so a future change can't retarget one kind and miss the other.
+    auto retargetRelocs = [&](std::size_t modIdx, std::vector<Relocation>& relocs) {
+        for (auto& rel : relocs) rel.target = SymbolId{mergedIdFor(modIdx, rel.target)};
+    };
+
+    // Cross-CU REFERENCE resolution via a GOT-like THUNK SLOT. An extern import bound to a
+    // sibling-CU definition (image.resolvedCrossCuRefs) resolves to that def. Because the
+    // c-subset extern call is INDIRECT (`call qword ptr [slot]` — dereferences a slot), the
+    // referencing relocation must point at a SLOT that CONTAINS the def's address, NOT at
+    // the def directly (a direct retarget would make the indirect call read def bytes as a
+    // pointer). So for each cross-CU reference the merge:
+    //   * mints a fresh thunk-slot SymbolId (8 zero bytes) carrying ONE absolute-64-bit
+    //     relocation to the definition's merged id (the walker writes the def's runtime VA
+    //     into the slot);
+    //   * retargets the reference's merged id to the THUNK SLOT (via `remap` — every
+    //     referencing reloc then routes through `retargetRelocs` to the slot);
+    //   * STRIPS the extern import (the sibling def shadows the library fallback).
+    // A real FFI extern (no sibling def, absent from resolvedCrossCuRefs) is untouched —
+    // that is FF11's library tier. The definition's merged id is resolvable from `remap`
+    // here (the def is a winning global, pre-assigned above).
+    std::unordered_map<std::uint32_t, std::size_t> cuIdToIdx;
+    for (std::size_t i = 0; i < modules.size(); ++i) cuIdToIdx.emplace(modules[i].cuId.v, i);
+    std::unordered_set<LinkedSymbolKey> strippedExterns;
+    if (!image.resolvedCrossCuRefs.empty() && !absPtrKind.has_value()) {
+        // The target cannot express a 64-bit absolute pointer fixup — a thunk slot would be
+        // an un-relocated null. Fail loud rather than emit an image whose cross-CU indirect
+        // calls dereference a null slot.
+        report(reporter, DiagnosticCode::K_AbsolutePointerRelocMissing,
+               DiagnosticSeverity::Error,
+               "cross-CU reference resolution needs an absolute 64-bit pointer relocation "
+               "(widthBytes == 8 && !pcRelative) to mint a thunk slot, but target schema '" +
+               std::string{targetSchema.name()} + "' declares no such relocation kind — "
+               "an indirect cross-CU call would dereference an un-relocated null slot. Add "
+               "the absolute-64-bit relocation row to the target's *.target.json.");
+        return combined;  // half-merge aborted; caller's errorCount delta short-circuits emit
+    }
+    for (auto const& ref : image.resolvedCrossCuRefs) {
+        auto const dit = cuIdToIdx.find(ref.definition.cuId.v);
+        if (dit == cuIdToIdx.end()) {
+            // INVARIANT: resolveCrossCuSymbols populated `ref.definition` from THIS same
+            // `modules` span, so its CU is always present. A miss means a future refactor
+            // breached that contract — fail LOUD instead of silently skipping: a silent
+            // `continue` would leave the indirect call un-thunked (no slot minted) yet the
+            // extern un-stripped, surfacing as a confusing downstream undefined rather than
+            // pointing at the breached merge contract here.
+            report(reporter, DiagnosticCode::K_SymbolUndefined, DiagnosticSeverity::Error,
+                   "cross-CU reference resolution: the definition's CompilationUnit (cuId " +
+                   std::to_string(ref.definition.cuId.v) + ") is not in the merge span — the "
+                   "resolvedCrossCuRefs invariant (definition comes from a merged CU) was "
+                   "breached.");
+            continue;
+        }
+        std::uint32_t const defId = mergedIdFor(dit->second, ref.definition.symbol);
+        std::uint32_t const thunkSlotId = nextId++;
+        AssembledData slot;
+        slot.symbol  = SymbolId{thunkSlotId};
+        slot.section = DataSectionKind::Rodata;     // read-only pointer table (loader fills via base-reloc)
+        slot.bytes.assign(8, std::uint8_t{0});      // 8 zero bytes — the abs64 fixup site
+        Relocation slotRel;
+        slotRel.offset = 0;
+        slotRel.target = SymbolId{defId};           // the sibling def's merged id
+        slotRel.kind   = *absPtrKind;               // abs64 (found by formula)
+        slotRel.addend = 0;
+        slot.relocations.push_back(slotRel);
+        combined.dataItems.push_back(std::move(slot));
+        remap[ref.reference] = thunkSlotId;         // the indirect call's reloc → the slot
+        strippedExterns.insert(ref.reference);
+    }
+
+    // A defined symbol (function or data) is SHADOWED when it is an externally-visible
+    // (Global/Weak) definition whose name's WINNING definition (image.resolvedGlobalDefs)
+    // lives at a DIFFERENT (cuId, SymbolId) — i.e. this body lost the weak-vs-strong /
+    // all-weak resolution. Its body MUST be DROPPED (not emitted): every reference to the
+    // name already folds onto the winner's merged id via `mergedIdFor`, so emitting the
+    // loser's body would mint a SECOND function/data item carrying the SAME merged id —
+    // the within-image duplicate-SymbolId collision the compound index rejects. This is
+    // the EMISSION-tier completion of strong-over-weak: the resolution layer picks the
+    // winner; here we drop the loser's bytes (exactly what a real linker does — the
+    // shadowed weak body never lands in the image). Local / unnamed bodies are never
+    // shadowed (Local is module-private; absent from resolvedGlobalDefs).
+    auto isShadowedDuplicate = [&](std::size_t modIdx, SymbolId sym) -> bool {
+        auto sit = byId[modIdx].find(sym.v);
+        if (sit == byId[modIdx].end()) return false;          // unnamed / synthesized — keep
+        ModuleSymbol const& ms = *sit->second;
+        if (ms.binding == SymbolBinding::Local) return false; // module-private — keep
+        auto wit = image.resolvedGlobalDefs.find(ms.name);
+        if (wit == image.resolvedGlobalDefs.end()) return false;  // not a resolved global — keep
+        LinkedSymbolKey const winner = wit->second;
+        LinkedSymbolKey const self{modules[modIdx].cuId, sym};
+        return !(winner == self);  // a different key won → this body is shadowed
+    };
+
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        auto const& m = modules[i];
+        for (auto const& fn : m.functions) {
+            if (isShadowedDuplicate(i, fn.symbol)) continue;  // shadowed weak body — drop
+            AssembledFunction out = fn;  // bytes + relocations + sourceMap copied
+            out.symbol = SymbolId{mergedIdFor(i, fn.symbol)};
+            retargetRelocs(i, out.relocations);
+            combined.functions.push_back(std::move(out));
+        }
+        for (auto const& di : m.dataItems) {
+            if (isShadowedDuplicate(i, di.symbol)) continue;  // shadowed global data — drop
+            AssembledData out = di;
+            out.symbol = SymbolId{mergedIdFor(i, di.symbol)};
+            retargetRelocs(i, out.relocations);  // same chokepoint as the function path
+            combined.dataItems.push_back(std::move(out));
+        }
+        for (auto const& ext : m.externImports) {
+            // A cross-CU-resolved extern was bound to a sibling def + retargeted above —
+            // strip it so the walker emits no (spurious) library import for it.
+            if (strippedExterns.contains(LinkedSymbolKey{m.cuId, ext.symbol})) continue;
+            ExternImport out = ext;
+            out.symbol = SymbolId{mergedIdFor(i, ext.symbol)};
+            combined.externImports.push_back(std::move(out));
+        }
+    }
+    combined.expectedFuncCount = combined.functions.size();
+
+    // Exactly one CU may name the user entry; more than one is an ambiguous cross-CU
+    // entry (the merged image has exactly one entry point) — fail loud.
+    bool entrySet = false;
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        if (!modules[i].userEntrySymbol.has_value()) continue;
+        if (entrySet) {
+            report(reporter, DiagnosticCode::K_SymbolRedefinedAcrossUnits,
+                   DiagnosticSeverity::Error,
+                   "more than one CompilationUnit names a user entry symbol — the merged "
+                   "image has exactly one entry point.");
+            continue;
+        }
+        combined.userEntrySymbol = SymbolId{mergedIdFor(i, *modules[i].userEntrySymbol)};
+        entrySet = true;
+    }
+    // combined.cuId stays default — the merged image is not a single CU.
+    return combined;
+}
+
 } // namespace
 
-LinkedImage link(AssembledModule const&    inputModule,
+LinkedImage link(std::span<AssembledModule const> modules,
                  TargetSchema const&       targetSchema,
                  ObjectFormatSchema const& objectFormatSchema,
                  DiagnosticReporter&       reporter) {
     LinkedImage image;
     image.format = objectFormatSchema.kind();
+
+    // D-LK4-3 — N==0 is a caller error; N>1 (cross-CU) builds the collision-proof
+    // compound-key index + validates each CU, then fail-louds: the multi-CU image
+    // MERGE (cross-CU name resolution + weak-vs-strong) is LK11. N==1 is the
+    // single-CU path below (full image emission, behavior unchanged).
+    if (modules.empty()) {
+        report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported,
+               DiagnosticSeverity::Error,
+               "linker::link received no modules to link.");
+        return image;
+    }
+    // N>1: cross-CU merge (LK11a resolution + LK11b pre-merge emission). Validate each
+    // CU, resolve symbols, then pre-merge the resolved CUs into ONE combined module that
+    // flows through the SAME single-CU emission path below (kind validation + walker).
+    // N==1 uses the sole module directly (path unchanged).
+    AssembledModule mergedStorage;                 // populated only for N>1
+    AssembledModule const* selectedInput = &modules[0];
+    if (modules.size() > 1) {
+        std::size_t const errsBeforeMerge = reporter.errorCount();
+        // Per-CU validation (within-CU duplicate SymbolId + empty extern name/path) via
+        // the same compound-key gate the single-CU path uses; cross-CU entries never
+        // collide (distinct cuId), so one shared index validates every CU.
+        std::unordered_map<LinkedSymbolKey, SymbolKind> compoundIndex;
+        for (auto const& m : modules) buildCompoundIndex(compoundIndex, m, reporter);
+        // DEFINITION merge + weak-vs-strong (-> resolvedGlobalDefs) + REFERENCE
+        // resolution (-> resolvedCrossCuRefs) + per-CU undefined-reloc check.
+        resolveCrossCuSymbols(modules, compoundIndex, image, reporter);
+        if (reporter.errorCount() != errsBeforeMerge) {
+            // A within-CU duplicate, a cross-CU redefinition, or an undefined reference —
+            // fail-loud already reported; do not emit a half-merged image.
+            return image;
+        }
+        // Pre-merge into one combined module + flow it through the emission path below.
+        // `targetSchema` is threaded in so the merge can find the absolute-64-bit pointer
+        // relocation kind by formula (thunk-slot minting) — never by a hardcoded name.
+        mergedStorage = mergeModules(modules, image, targetSchema, reporter);
+        if (reporter.errorCount() != errsBeforeMerge) {
+            return image;  // merge fail-loud (ambiguous entry / cross-CU ref pending).
+        }
+        selectedInput = &mergedStorage;
+    }
+    AssembledModule const& inputModule = *selectedInput;
     image.expectedFuncCount = inputModule.expectedFuncCount;
+    // The import-table symbol names the emitted image carries (cross-CU-resolved externs
+    // were stripped from the merged module, so they do not appear — see externImportNames).
+    image.externImportNames.clear();
+    for (auto const& ext : inputModule.externImports) {
+        image.externImportNames.push_back(ext.mangledName);
+    }
 
     // D-LK10-ENTRY Slice C (plan 14 §2.13): when the format declares
     // a `processExit` block + `entryCallingConvention` (validated by
@@ -75,82 +466,16 @@ LinkedImage link(AssembledModule const&    inputModule,
     // only when the first passed.
     std::size_t const errorsAtEntry = reporter.errorCount();
 
-    // Index every function symbol the assembler declared (defined
-    // intra-module) PLUS every extern import the assembler stamped
-    // for FFI resolution. Single-CU resolution; cross-CU symbol-
-    // table merge is LK11 (D-LK4-3). Externs are resolved against
-    // import-table emission in the per-format walker (LK6 cycle 2
-    // — PE IAT lands at cycle 2a; ELF GOT/PLT at 2b; Mach-O
-    // chained-fixups at 2c).
-    std::unordered_set<SymbolId> declaredSymbols;
-    declaredSymbols.reserve(module.functions.size());
-    for (auto const& fn : module.functions) {
-        declaredSymbols.insert(fn.symbol);
-    }
-    // D-LK4-RODATA-PRODUCER (2026-06-02): rodata `AssembledData`
-    // items are also valid reloc targets. The format walker
-    // (pe.cpp::encodeExec for PE) merges them into its symbolVa
-    // map at `rdata->rva + section-offset`. The linker's
-    // pre-walker cross-reference check must accept them here so
-    // a .text → rodata REL32 doesn't fire K_SymbolUndefined.
-    std::unordered_set<SymbolId> dataSymbols;
-    dataSymbols.reserve(module.dataItems.size());
-    for (auto const& di : module.dataItems) {
-        dataSymbols.insert(di.symbol);
-    }
-    std::unordered_set<SymbolId> externSymbols;
-    externSymbols.reserve(module.externImports.size());
-    for (std::size_t i = 0; i < module.externImports.size(); ++i) {
-        auto const& ext = module.externImports[i];
-        // Empty mangledName / libraryPath silently produce broken
-        // imports (Windows: GetProcAddress("") → null IAT slot;
-        // ELF: empty DT_SONAME; Mach-O: empty LC_LOAD_DYLIB path).
-        // The loaders accept the binary at link time and crash at
-        // first call. Fail loud here so the toolchain owns the
-        // diagnostic. (3-agent convergence: silent-failure C2 +
-        // type-design O1 + architect O4.)
-        if (ext.mangledName.empty()) {
-            report(reporter, DiagnosticCode::K_SymbolUndefined,
-                   DiagnosticSeverity::Error,
-                   "ExternImport[" + std::to_string(i) +
-                   "] (symbol #" + std::to_string(ext.symbol.v) +
-                   ") has empty mangledName — import-table entries "
-                   "require a non-empty symbol name.");
-        }
-        if (ext.libraryPath.empty()) {
-            report(reporter, DiagnosticCode::K_SymbolUndefined,
-                   DiagnosticSeverity::Error,
-                   "ExternImport[" + std::to_string(i) +
-                   "] (symbol #" + std::to_string(ext.symbol.v) +
-                   ") has empty libraryPath — import-table entries "
-                   "require a non-empty DLL / SO / dylib name.");
-        }
-        // Cross-table SymbolId uniqueness: a SymbolId cannot appear
-        // in BOTH `functions` and `externImports` — the resolution
-        // would silently pick whichever the walker's map-emplace
-        // saw first (silent-failure C1 + type-design O2 2-agent
-        // convergence).
-        if (declaredSymbols.contains(ext.symbol)) {
-            report(reporter, DiagnosticCode::K_SymbolUndefined,
-                   DiagnosticSeverity::Error,
-                   "symbol #" + std::to_string(ext.symbol.v) +
-                   " is BOTH a defined AssembledFunction AND an "
-                   "ExternImport — ambiguous resolution; the same "
-                   "SymbolId cannot reference both an intra-module "
-                   "function and an external library symbol.");
-        }
-        // Within-table duplicate ExternImport: two ExternImports
-        // with the same SymbolId silently overwrite each other in
-        // the walker's emplace.
-        if (!externSymbols.insert(ext.symbol).second) {
-            report(reporter, DiagnosticCode::K_SymbolUndefined,
-                   DiagnosticSeverity::Error,
-                   "ExternImport symbol #" +
-                   std::to_string(ext.symbol.v) +
-                   " is declared more than once in "
-                   "AssembledModule.externImports.");
-        }
-    }
+    // D-LK4-3: index every symbol this CU declares — functions, rodata data items,
+    // and FFI extern imports — into the collision-proof compound-key map (keyed by
+    // (cuId, SymbolId)). `buildCompoundIndex` fails loud on a duplicate compound key
+    // (the same SymbolId declared twice in this CU, across any kind) and on empty
+    // extern mangledName / libraryPath. Single-CU resolution here; cross-CU symbol-
+    // table merge is LK11. Externs resolve against the per-format walker's import-
+    // table emission (LK6 cycle 2 — PE IAT / ELF GOT+PLT / Mach-O chained-fixups).
+    std::unordered_map<LinkedSymbolKey, SymbolKind> symbolIndex;
+    buildCompoundIndex(symbolIndex, module, reporter);
+    image.symbolCount = symbolIndex.size();
 
     for (auto const& fn : module.functions) {
         bool funcResolved = true;
@@ -208,9 +533,7 @@ LinkedImage link(AssembledModule const&    inputModule,
             //       2026-06-02 — the per-format walker merges these
             //       into its symbolVa map at section-relative offsets).
             // Anything else is a hard undefined.
-            if (!declaredSymbols.contains(reloc.target)
-             && !externSymbols.contains(reloc.target)
-             && !dataSymbols.contains(reloc.target)) {
+            if (!symbolIndex.contains(LinkedSymbolKey{module.cuId, reloc.target})) {
                 std::string msg = "relocation in symbol #";
                 msg += std::to_string(fn.symbol.v);
                 msg += " references undefined symbol #";
@@ -377,6 +700,16 @@ LinkedImage link(AssembledModule const&    inputModule,
     }
 
     return image;
+}
+
+// D-LK4-3 single-module convenience overload — delegates to the span entry with a
+// 1-element span. Keeps every existing single-CU caller source-unchanged.
+LinkedImage link(AssembledModule const&    module,
+                 TargetSchema const&       targetSchema,
+                 ObjectFormatSchema const& objectFormatSchema,
+                 DiagnosticReporter&       reporter) {
+    return link(std::span<AssembledModule const>{&module, 1},
+                targetSchema, objectFormatSchema, reporter);
 }
 
 } // namespace dss::linker

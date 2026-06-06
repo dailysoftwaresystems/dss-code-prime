@@ -12,6 +12,7 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -851,6 +852,79 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 }
             }
         }
+        // Implicit-register-constraint (cycle 10p substrate,
+        // 2026-06-04). Optional per-opcode block. Field-shape rejects
+        // here; name→ordinal resolution + cross-field rejects happen
+        // post-register-load (see "Implicit-register-constraint
+        // resolution + validation" block lower in this function).
+        // See `ImplicitRegisterConstraint` docblock in
+        // target_schema.hpp for the full contract.
+        if (o.contains("implicitRegisters")) {
+            auto const& ir = o.at("implicitRegisters");
+            if (!ir.is_object()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format("/opcodes/{}/implicitRegisters", i),
+                          "'implicitRegisters' must be an object with "
+                          "optional 'inputs', 'outputs', 'clobbered' "
+                          "string-array fields");
+                // continue past this opcode arm: a malformed block must
+                // not leave a partial-state opcode pushed downstream.
+                // Mirror the duplicate-mnemonic pattern below.
+            } else {
+                // Per `D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD`
+                // discipline (closed 2026-06-04 elsewhere): a typo
+                // like `"inpts": [...]` would silently leave inputs
+                // empty + slip through to a misleading "empty block"
+                // reject. Allowlist the 3 known sub-keys + emit per
+                // unknown key.
+                static constexpr std::array<std::string_view, 3>
+                    kKnownKeys{"inputs", "outputs", "clobbered"};
+                for (auto it = ir.begin(); it != ir.end(); ++it) {
+                    bool known = false;
+                    for (auto const& k : kKnownKeys) {
+                        if (it.key() == k) { known = true; break; }
+                    }
+                    if (!known) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/opcodes/{}/implicitRegisters/{}",
+                                              i, it.key()),
+                                  std::format("unknown key '{}' — allowed "
+                                              "keys are 'inputs', 'outputs', "
+                                              "'clobbered' (typo discriminator)",
+                                              it.key()));
+                    }
+                }
+                ImplicitRegisterConstraint irc;
+                auto readRegArray = [&](char const* field,
+                                        std::vector<std::string>& out) {
+                    if (!ir.contains(field)) return;
+                    auto const& arr = ir.at(field);
+                    if (!arr.is_array()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/opcodes/{}/implicitRegisters/{}",
+                                              i, field),
+                                  "must be an array of register-name strings");
+                        return;
+                    }
+                    out.reserve(arr.size());
+                    for (std::size_t j = 0; j < arr.size(); ++j) {
+                        auto const& s = arr.at(j);
+                        if (!s.is_string()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("/opcodes/{}/implicitRegisters/{}/{}",
+                                                  i, field, j),
+                                      "every entry must be a string");
+                            continue;
+                        }
+                        out.push_back(s.get<std::string>());
+                    }
+                };
+                readRegArray("inputs",    irc.inputNames);
+                readRegArray("outputs",   irc.outputNames);
+                readRegArray("clobbered", irc.clobberedNames);
+                info.implicitRegisters = std::move(irc);
+            }
+        }
         // Slot-0 Invalid-sentinel sanity check.
         if (i == 0 && info.mnemonic != "invalid") {
             coll.emit(DiagnosticCode::C_MalformedJson, "/opcodes/0",
@@ -1089,6 +1163,127 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     continue;  // skip push_back so vector & index stay in sync
                 }
                 data.callingConventions.push_back(std::move(cc));
+            }
+        }
+    }
+
+    // ── Implicit-register-constraint resolution + validation ──────
+    // Cycle 10p: resolves each opcode's `implicitRegisters` names to
+    // register ordinals via `data.registerIndex` (which is fully
+    // populated by this point — registers were loaded above). Also
+    // enforces the per-opcode invariants that depend on a populated
+    // register table: unknown-name reject, within-array duplicate
+    // reject, empty-block reject (typo discriminator). Cross-array
+    // overlap is allowed (idiv's RAX is both an input dividend AND
+    // an output quotient). This LOAD-time placement keeps `validate()`
+    // pure-const + cross-OPCODE-only; per-opcode field resolution
+    // happens once at construction. Closes the 7-agent fold's silent-
+    // failure F1 (const_cast smell removed) + the code-reviewer's
+    // ordinal-resolution-should-live-in-loader recommendation.
+    for (std::size_t opIdx = 0; opIdx < data.opcodes.size(); ++opIdx) {
+        auto& info = data.opcodes[opIdx];
+        if (!info.implicitRegisters.has_value()) continue;
+        auto& ir = *info.implicitRegisters;
+        if (ir.inputNames.empty()
+         && ir.outputNames.empty()
+         && ir.clobberedNames.empty()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/opcodes/{}/implicitRegisters", opIdx),
+                      std::format("opcode '{}': `implicitRegisters` is an "
+                                  "empty block — either declare at least "
+                                  "one entry in 'inputs'/'outputs'/"
+                                  "'clobbered' or omit the block entirely. "
+                                  "An empty block is a typo discriminator "
+                                  "(author meant to constrain something).",
+                                  info.mnemonic));
+            continue;
+        }
+        auto resolveArr = [&](std::vector<std::string> const& names,
+                              std::vector<std::uint16_t>& ordinals,
+                              char const* field) {
+            ordinals.clear();
+            ordinals.reserve(names.size());
+            // Per-array duplicate detection via a forward scan over
+            // already-emitted names — preserves ordinal-index
+            // parity with names (`ordinals[k]` always corresponds to
+            // `names[k]` that was admitted; a name failing resolution
+            // OR duplication still occupies its index in `names` but
+            // gets a sentinel ordinal, so consumers iterating both
+            // arrays in lockstep see the failure).
+            for (std::size_t j = 0; j < names.size(); ++j) {
+                auto const& n = names[j];
+                bool duplicate = false;
+                for (std::size_t k = 0; k < j; ++k) {
+                    if (names[k] == n) { duplicate = true; break; }
+                }
+                if (duplicate) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format(
+                                  "/opcodes/{}/implicitRegisters/{}/{}",
+                                  opIdx, field, j),
+                              std::format("opcode '{}': duplicate register "
+                                          "'{}' in implicitRegisters.{}",
+                                          info.mnemonic, n, field));
+                    continue;
+                }
+                auto it = data.registerIndex.find(n);
+                if (it == data.registerIndex.end()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format(
+                                  "/opcodes/{}/implicitRegisters/{}/{}",
+                                  opIdx, field, j),
+                              std::format("opcode '{}': implicitRegisters.{} "
+                                          "names unknown register '{}' "
+                                          "(must resolve through this "
+                                          "target's register table)",
+                                          info.mnemonic, field, n));
+                    continue;
+                }
+                ordinals.push_back(static_cast<std::uint16_t>(it->second));
+            }
+        };
+        resolveArr(ir.inputNames,     ir.inputOrdinals,     "inputs");
+        resolveArr(ir.outputNames,    ir.outputOrdinals,    "outputs");
+        resolveArr(ir.clobberedNames, ir.clobberedOrdinals, "clobbered");
+
+        // D-TARGET-IMPLICIT-REGISTER-CONSTRAINT cross-array invariant
+        // (cycle 10r 7-agent review fold F1 CRITICAL 9/10, 2026-06-04):
+        // every `outputs` register MUST also appear in `clobbered`. An
+        // implicit-output is a register the instruction WRITES — by
+        // definition any vreg whose live range covers this op gets
+        // destroyed if it lives in that register, which is exactly
+        // what `clobbered` declares to regalloc's
+        // `collectImplicitClobberPositions`. The regalloc consumes
+        // only `inputs` + `clobbered` to build the forbidden set;
+        // `outputs` informs the lowering's ordinal lookup but does
+        // not by itself constrain allocation. A JSON edit that drops
+        // `clobbered: ["rdx"]` from `xor_rdx_zero` while keeping
+        // `outputs: ["rdx"]` is internally inconsistent + would
+        // silently allow divisor vregs into RDX → zeroed by xor →
+        // divide-by-zero trap. Fail loud at load time.
+        std::set<std::uint16_t> const clobberedSet(
+            ir.clobberedOrdinals.begin(),
+            ir.clobberedOrdinals.end());
+        for (std::size_t k = 0; k < ir.outputOrdinals.size(); ++k) {
+            if (clobberedSet.find(ir.outputOrdinals[k]) == clobberedSet.end()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format(
+                              "/opcodes/{}/implicitRegisters/outputs/{}",
+                              opIdx, k),
+                          std::format("opcode '{}': implicit-output "
+                                      "register '{}' must also be "
+                                      "declared in implicitRegisters."
+                                      "clobbered (every register the "
+                                      "instruction WRITES is by "
+                                      "definition clobbered for any "
+                                      "prior live value — the regalloc "
+                                      "consumes clobbered to build its "
+                                      "forbidden set; missing this "
+                                      "declaration would silently admit "
+                                      "vregs into a register the op is "
+                                      "about to overwrite)",
+                                      info.mnemonic,
+                                      ir.outputNames[k]));
             }
         }
     }

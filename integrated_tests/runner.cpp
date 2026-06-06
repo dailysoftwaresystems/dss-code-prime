@@ -103,7 +103,14 @@ struct ExampleTarget {
 
 struct ExampleManifest {
     std::string                language;
-    std::string                source;
+    // Multi-CU (CU6): "sources":[...] makes each file its OWN CompilationUnit; the CLI's
+    // `--compile a.c b.c` links them into one image (gcc/clang semantics — separate TUs,
+    // the linker resolves cross-file references, LK11). The single "source":"x.c" form is
+    // one file. `sources` is the canonical file list for either form (single → a 1-element
+    // list); `multiCu` records which spelling the manifest used (diagnostic only — the CLI
+    // derives multi-vs-single from the file count, not from this flag).
+    std::vector<std::string>   sources;
+    bool                       multiCu = false;
     std::int64_t               exitCode = 0;
     std::vector<ExampleTarget> targets;
 };
@@ -122,7 +129,30 @@ struct ExampleManifest {
         return false;
     }
     out.language = j.value("language", "");
-    out.source   = j.value("source", "");
+    // "sources":[...] (multi-CU, CU6) takes precedence over "source" (single file). Mirror
+    // the in-process examples_runner so BOTH corpus harnesses accept the same manifests.
+    if (j.contains("sources")) {
+        if (!j.at("sources").is_array() || j.at("sources").empty()) {
+            std::cerr << "  'sources' must be a non-empty array of file names in "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+        for (auto const& s : j.at("sources")) {
+            if (!s.is_string()) {
+                std::cerr << "  'sources' entries must be strings in "
+                          << path.generic_string() << "\n";
+                return false;
+            }
+            out.sources.push_back(s.get<std::string>());
+        }
+        out.multiCu = true;
+    } else if (auto single = j.value("source", std::string{}); !single.empty()) {
+        out.sources = {single};
+    } else {
+        std::cerr << "  manifest requires 'source' (single CU) or 'sources' (multi-CU): "
+                  << path.generic_string() << "\n";
+        return false;
+    }
     if (!j.contains("exitCode") || !j.at("exitCode").is_number_integer()) {
         std::cerr << "  missing integer 'exitCode' in "
                   << path.generic_string() << "\n";
@@ -193,16 +223,23 @@ void runExampleViaCli(std::string const& compiler,
     auto const outDir =
         outputBase / "ex" / exampleName / specDir;
     fs::create_directories(outDir);
-    auto const srcPath = exampleDir / m.source;
-
     // Build the CLI invocation. The compiler binary path may
     // contain spaces (Visual Studio tooling drops it under
     // "C:\Program Files (x86)\..."); quote both the binary AND
     // every path argument. Redirect stdout+stderr to a file so
     // failures retain the compiler diagnostics for diagnosis.
+    //
+    // `--compile <file>...` takes a space-separated file list in ONE invocation; a multi-CU
+    // example passes ALL its sources here and the CLI links each as its own translation unit
+    // (the driver routes >1 file to compileUnits — gcc/clang semantics). Each path is quoted
+    // independently.
+    std::string compileArgs;
+    for (auto const& s : m.sources) {
+        compileArgs += " " + quote((exampleDir / s).string());
+    }
     auto const cliLog = outDir / "cli.log";
     std::string cmd = quote(compiler)
-        + " --compile "  + quote(srcPath.string())
+        + " --compile"   + compileArgs
         + " --language " + m.language
         + " --target "   + target->spec
         + " --output "   + quote(outDir.string())

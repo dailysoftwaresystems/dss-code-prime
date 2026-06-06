@@ -266,6 +266,28 @@ struct MirOpcodeInfo {
 [[nodiscard]] constexpr bool isPhi(MirOpcode op) noexcept {
     return op == MirOpcode::Phi;
 }
+// Operand-order-insensitive opcodes: `op(a, b)` and `op(b, a)` yield
+// equal results. CSE / GVN consults this to canonicalize the value-
+// numbering key (sort operands by id before hashing) so the two
+// surface forms hash equal. Asymmetric comparisons (Slt/Ult/Sgt/Ugt
+// and unequal-predicate FCmp variants) are NOT commutative; Sub /
+// SDiv / Shl / etc. are NOT commutative. The `cse_noncommutative`
+// corpus example pins the buggy-vs-correct exit divergence
+// (D-OPT1-CSE-NONCOMMUTATIVE-PIN).
+[[nodiscard]] constexpr bool isCommutative(MirOpcode op) noexcept {
+    switch (op) {
+        case MirOpcode::Add:    case MirOpcode::Mul:
+        case MirOpcode::And:    case MirOpcode::Or:    case MirOpcode::Xor:
+        case MirOpcode::FAdd:   case MirOpcode::FMul:
+        case MirOpcode::ICmpEq: case MirOpcode::ICmpNe:
+        case MirOpcode::FCmpOeq: case MirOpcode::FCmpOne:
+        case MirOpcode::FCmpUeq: case MirOpcode::FCmpUne:
+        case MirOpcode::VAdd:   case MirOpcode::VMul:
+            return true;
+        default:
+            return false;
+    }
+}
 [[nodiscard]] constexpr MirResultRule resultRule(MirOpcode op) noexcept {
     return opcodeInfo(op).result;
 }

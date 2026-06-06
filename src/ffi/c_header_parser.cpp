@@ -34,7 +34,7 @@ struct HeaderReadErrorRow {
     DiagnosticCode      code;
 };
 
-constexpr std::array<HeaderReadErrorRow, 9> kHeaderReadErrorTable{{
+constexpr std::array<HeaderReadErrorRow, 8> kHeaderReadErrorTable{{
     { HeaderReadErrorKind::FileOpenFailed,               "FileOpenFailed",               DiagnosticCode::F_FileOpenFailed               },
     { HeaderReadErrorKind::HeaderParseFailed,            "HeaderParseFailed",            DiagnosticCode::F_HeaderParseFailed            },
     { HeaderReadErrorKind::HeaderHasFunctionBody,        "HeaderHasFunctionBody",        DiagnosticCode::F_HeaderHasFunctionBody        },
@@ -43,10 +43,9 @@ constexpr std::array<HeaderReadErrorRow, 9> kHeaderReadErrorTable{{
     { HeaderReadErrorKind::GrammarLoadFailed,            "GrammarLoadFailed",            DiagnosticCode::F_HeaderGrammarLoadFailed      },
     { HeaderReadErrorKind::HeaderHasUnsupportedTopLevel, "HeaderHasUnsupportedTopLevel", DiagnosticCode::F_HeaderHasUnsupportedTopLevel },
     { HeaderReadErrorKind::InternalInvariant,            "InternalInvariant",            DiagnosticCode::F_HeaderInternalInvariant      },
-    { HeaderReadErrorKind::InvalidShippedPath,           "InvalidShippedPath",           DiagnosticCode::F_HeaderInvalidShippedPath     },
 }};
 
-static_assert(static_cast<std::uint8_t>(HeaderReadErrorKind::InvalidShippedPath) + 1u
+static_assert(static_cast<std::uint8_t>(HeaderReadErrorKind::InternalInvariant) + 1u
                   == kHeaderReadErrorTable.size(),
               "kHeaderReadErrorTable must hold one row per HeaderReadErrorKind "
               "variant — add a row when adding a variant.");
@@ -423,38 +422,6 @@ readCHeader(std::filesystem::path const& headerPath,
     if (!contents) return std::unexpected(contents.error());
     return readCHeaderFromText(*contents, headerPath.generic_string(),
                                 importLibrary, reporter);
-}
-
-std::expected<std::vector<ImportSurface>, HeaderReadError>
-readCHeaderShipped(std::string_view    headerRelPath,
-                   std::string_view    importLibrary,
-                   DiagnosticReporter& reporter) {
-    auto located = findShippedFfiHeader(headerRelPath);
-    if (!located) {
-        // Split outcomes: invalid relative path (caller-API bug) vs.
-        // valid path but no file found (deploy/install bug). Inspect
-        // the first ConfigDiagnostic's code to route. Inline the
-        // cause text so the wrap is self-sufficient under
-        // `--suppress=C_*` (silent-failure C2 + H2 folds).
-        bool const isPathInvalid =
-            !located.error().empty()
-            && located.error().front().code
-                   == DiagnosticCode::C_InvalidShippedFfiHeaderPath;
-        std::string const cause = firstConfigCauseInline(located.error());
-        forwardConfigDiagnostics(located.error(), reporter);
-        HeaderReadErrorKind const kind = isPathInvalid
-            ? HeaderReadErrorKind::InvalidShippedPath
-            : HeaderReadErrorKind::FileOpenFailed;
-        return std::unexpected(emitAndReturn(
-            kind,
-            (isPathInvalid
-                ? std::string{"invalid shipped FFI header path '"}
-                : std::string{"shipped FFI header not found: '"})
-                + std::string{headerRelPath} + "'"
-                + (cause.empty() ? "" : " (" + cause + ")"),
-            reporter));
-    }
-    return readCHeader(*located, importLibrary, reporter);
 }
 
 } // namespace dss::ffi

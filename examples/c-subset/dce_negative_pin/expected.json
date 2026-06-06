@@ -1,0 +1,16 @@
+{
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 100,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "dce-only", "passes": ["Dce"]}
+  ]
+}

@@ -154,6 +154,13 @@ struct Lowerer {
     // `synthesizeFfiFromSourceDecls` to populate the
     // `HirFfiMap` between HIR and MIR lowering.
     std::vector<HirExternRecord>& externDecls;
+    // D-CSUBSET-LINKAGE-SPECIFIERS (pre-OPT7 P1, 2026-06-04): shared accumulator
+    // of (decl HIR node → LinkageAttr) pairs derived from each declaration's
+    // specifier-prefix subtree. Applied to the result's HirLinkageMap AFTER
+    // finish() — the side-table binds to the FROZEN hir, so (exactly like
+    // `spans`) it cannot be written during lowering. Only NON-default linkage is
+    // recorded (absence ⇒ Global/Default ⇒ externally visible), keeping it sparse.
+    std::vector<std::pair<HirNodeId, LinkageAttr>>& linkage;
 
     // O(1) lookups.
     std::unordered_map<std::uint32_t, std::size_t> ruleMap_;     // RuleId.v → ruleMappings idx
@@ -362,9 +369,11 @@ struct Lowerer {
     Lowerer(SemanticModel& m, HirLoweringConfig const& c, SemanticConfig const& s,
             NumberStyle const* ns, DiagnosticReporter& r, HirBuilder& b,
             HirLiteralPool& lits, std::vector<std::pair<HirNodeId, HirSourceLoc>>& sp,
-            std::vector<HirExternRecord>& ed)
+            std::vector<HirExternRecord>& ed,
+            std::vector<std::pair<HirNodeId, LinkageAttr>>& lk)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
-          reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed) {
+          reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
+          linkage(lk) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -435,6 +444,97 @@ struct Lowerer {
         return out;
     }
     [[nodiscard]] bool isToken(NodeId n) const { return tree().kind(n) == NodeKind::Token; }
+
+    // ── declaration-specifier prefix (D-DECL-SPECIFIER-PREFIX-SUBSTRATE consumer)
+    // The c-subset's `static`/`__attribute__` prefix rides as an OPTIONAL leading
+    // child of a declaration. These helpers mirror the semantic analyzer's
+    // `declRoleChildren`/`descendVisibleDecl` so CST→HIR resolves the same
+    // prefix-free positional indices the analyzer minted symbols against — without
+    // the strip, a leading prefix shifts name/type/params/body/kindByChild by one
+    // (silent wrong-child). The prefix subtree stays reachable for `linkageFrom`.
+    // NOTE (D-DECL-PREFIX-STRIP-SHARED-HELPER): this is the 3rd file-local copy of
+    // the strip guard (analyzer + cst_const_eval + here) — a shared helper is
+    // pinned for extraction.
+
+    // The declaration's specifier-prefix subtree, or invalid if none/not-first.
+    [[nodiscard]] NodeId specifierPrefix(NodeId node, DeclarationRule const& decl) const {
+        if (!decl.specifierPrefixRule.has_value()) return {};
+        auto vis = visible(node);
+        if (!vis.empty() && tree().kind(vis.front()) == NodeKind::Internal
+            && tree().rule(vis.front()) == *decl.specifierPrefixRule)
+            return vis.front();
+        return {};
+    }
+    // Visible children with a leading specifier prefix stripped — the list the
+    // positional name/type/params/body indices resolve against.
+    [[nodiscard]] std::vector<NodeId> declVisible(NodeId node, DeclarationRule const& decl) const {
+        auto vis = visible(node);
+        if (specifierPrefix(node, decl).valid()) vis.erase(vis.begin());
+        return vis;
+    }
+    // `descend` whose FIRST step resolves against the prefix-stripped children
+    // (start IS the declaration); deeper steps use ordinary `visible` (past any
+    // prefix). Mirrors the analyzer's `descendVisibleDecl`.
+    [[nodiscard]] NodeId descendDecl(NodeId start, std::vector<std::uint32_t> const& path,
+                                     DeclarationRule const& decl) {
+        if (path.empty()) return start;
+        auto vis = declVisible(start, decl);
+        if (path.front() >= vis.size()) return {};
+        NodeId cur = vis[path.front()];
+        for (std::size_t i = 1; i < path.size(); ++i) {
+            if (!cur.valid()) return {};
+            auto v = visible(cur);
+            if (path[i] >= v.size()) return {};
+            cur = v[path[i]];
+        }
+        return cur;
+    }
+    // Fold the linkage effects of every specifier token in `prefixNode` onto a
+    // LinkageAttr, per the declaration's `linkageSpecifiers` facet (token SOURCE
+    // TEXT → effect). A token whose KIND is in `linkageSpecifierIgnoredKinds` (the
+    // prefix's declared STRUCTURAL syntax — `__attribute__`, parens) is skipped;
+    // any OTHER token MUST resolve in `linkageSpecifiers`, else it is an
+    // unrecognized specifier and fails loud (`H_UnknownLinkageSpecifier`) — a typo
+    // (`__attribute__((wek))`) or an unsupported attribute, never a silent no-op
+    // (D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC). Agnostic: BOTH the effect
+    // map and the ignored-kind set are per-language config; the engine compares
+    // resolved SchemaTokenIds + source text, never a hardcoded kind/identity.
+    [[nodiscard]] LinkageAttr linkageFrom(NodeId prefixNode, DeclarationRule const& decl) {
+        LinkageAttr attr{};
+        if (!prefixNode.valid() || decl.linkageSpecifiers.empty()) return attr;
+        std::vector<NodeId> stack{prefixNode};
+        while (!stack.empty()) {
+            NodeId n = stack.back();
+            stack.pop_back();
+            if (isToken(n)) {
+                SchemaTokenId const kind = tree().tokenKind(n);
+                bool ignored = false;
+                for (SchemaTokenId k : decl.linkageSpecifierIgnoredKinds)
+                    if (k == kind) { ignored = true; break; }
+                if (ignored) continue;  // declared structural syntax (e.g. __attribute__, parens)
+                auto it = decl.linkageSpecifiers.find(std::string{tree().text(n)});
+                if (it != decl.linkageSpecifiers.end()) {
+                    if (it->second.binding)    attr.binding    = *it->second.binding;
+                    if (it->second.visibility) attr.visibility = *it->second.visibility;
+                } else {
+                    emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
+                          std::format("'{}' is not a recognized linkage specifier",
+                                      tree().text(n)));
+                }
+            } else {
+                for (NodeId c : visible(n)) stack.push_back(c);
+            }
+        }
+        return attr;
+    }
+    // Record NON-default linkage for a lowered decl node (sparse: default linkage
+    // is the implicit externally-visible state and needn't be stored).
+    void recordLinkage(HirNodeId node, LinkageAttr attr) {
+        if (attr.binding != SymbolBinding::Global
+            || attr.visibility != SymbolVisibility::Default)
+            linkage.push_back({node, attr});
+    }
+
     [[nodiscard]] bool isExprNode(NodeId n) const {
         if (tree().kind(n) != NodeKind::Internal) return false;
         std::uint32_t const r = tree().rule(n).v;
@@ -2542,20 +2642,24 @@ struct Lowerer {
         auto it = declMap_.find(tree().rule(node).v);
         if (it == declMap_.end()) { unsupported(node, "top-level decl has no semantics rule"); return errorNode(node); }
         DeclarationRule const& decl = sem.declarations[it->second];
-        auto vis = visible(node);
+        auto vis = declVisible(node, decl);
         SymbolId sym{};
         TypeId type = InvalidType;
         if (decl.nameChild && *decl.nameChild < vis.size()) {
             sym = model.symbolAt(vis[*decl.nameChild]);
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
         }
+        // D-CSUBSET-LINKAGE-SPECIFIERS: linkage from the (optional) specifier
+        // prefix, attached below to the lowered Function/Global node and threaded
+        // to MIR for DCE protection.
+        LinkageAttr const linkAttr = linkageFrom(specifierPrefix(node, decl), decl);
         // Function iff the kindByChild discriminator matches funcDefTail.
         NodeId discNode{};
         if (decl.kindByChild) {
-            discNode = descend(node, decl.kindByChild->childPath);
+            discNode = descendDecl(node, decl.kindByChild->childPath, decl);
             if (discNode.valid() && tree().kind(discNode) == NodeKind::Internal
                 && tree().rule(discNode).v == decl.kindByChild->whenRule.v) {
-                return lowerFunction(node, sym, type, decl, *decl.kindByChild, discNode);
+                return lowerFunction(node, sym, type, decl, *decl.kindByChild, discNode, linkAttr);
             }
         }
         // Global.
@@ -2578,7 +2682,9 @@ struct Lowerer {
             init = coerced.id;
             break;
         }
-        return track(builder.makeGlobal(type, sym.v, init), node);
+        HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
+        recordLinkage(g, linkAttr);
+        return g;
     }
 
     // A function declared by a DEDICATED rule (e.g. toy's `funcDef`), as opposed
@@ -2651,13 +2757,14 @@ struct Lowerer {
         auto it = declMap_.find(tree().rule(node).v);
         if (it == declMap_.end()) return reportedError(node, "function decl has no semantics rule");
         DeclarationRule const& decl = sem.declarations[it->second];
-        auto vis = visible(node);
+        auto vis = declVisible(node, decl);
         SymbolId sym{};
         TypeId sig = InvalidType;
         if (decl.nameChild && *decl.nameChild < vis.size()) {
             sym = model.symbolAt(vis[*decl.nameChild]);
             if (auto const* rec = model.recordFor(sym)) sig = rec->type;
         }
+        LinkageAttr const linkAttr = linkageFrom(specifierPrefix(node, decl), decl);
         std::vector<HirNodeId> params;
         if (decl.paramsChild && *decl.paramsChild < vis.size())
             collectParams(vis[*decl.paramsChild], params);
@@ -2675,7 +2782,9 @@ struct Lowerer {
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
-        return track(builder.makeFunction(sig, sym.v, params, body), node);
+        HirNodeId const fn_ = track(builder.makeFunction(sig, sym.v, params, body), node);
+        recordLinkage(fn_, linkAttr);
+        return fn_;
     }
 
     // extern function / global (no body). The FnSig/var type comes from the
@@ -2684,7 +2793,7 @@ struct Lowerer {
         auto it = declMap_.find(tree().rule(node).v);
         if (it == declMap_.end()) return reportedError(node, "extern decl has no semantics rule");
         DeclarationRule const& decl = sem.declarations[it->second];
-        auto vis = visible(node);
+        auto vis = declVisible(node, decl);
         SymbolId sym{};
         TypeId type = InvalidType;
         if (decl.nameChild && *decl.nameChild < vis.size()) {
@@ -2760,6 +2869,14 @@ struct Lowerer {
         // FIRST and short-circuits before the per-extern guard.
         // Both surfaces are unsuppressable + upstream-of-link.
         auto recordExtern = [&](HirNodeId h) {
+            // D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC (cycle 14, design-audit
+            // Gate 1): route the extern arm through the SAME linkageFrom chokepoint
+            // as lowerTopLevel/lowerFunctionDecl, so specifier validation is
+            // by-construction for EVERY decl-lowering arm, not a hand-picked subset.
+            // A no-op today (externDecl declares no specifierPrefix → specifierPrefix
+            // returns invalid → linkageFrom early-returns); structural for the day an
+            // extern gains specifiers.
+            recordLinkage(h, linkageFrom(specifierPrefix(node, decl), decl));
             auto const* rec = model.recordFor(sym);
             externDecls.push_back({h,
                                    rec ? rec->name : std::string{},
@@ -2852,7 +2969,8 @@ struct Lowerer {
 
     HirNodeId lowerFunction(NodeId node, SymbolId sym, TypeId sig,
                             DeclarationRule const& decl,
-                            KindDiscriminator const& disc, NodeId discNode) {
+                            KindDiscriminator const& disc, NodeId discNode,
+                            LinkageAttr linkAttr) {
         std::vector<HirNodeId> params;
         NodeId paramsNode = descend(discNode, disc.paramsPath);
         if (paramsNode.valid()) collectParams(paramsNode, params);
@@ -2865,7 +2983,9 @@ struct Lowerer {
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
-        return track(builder.makeFunction(sig, sym.v, params, body), node);
+        HirNodeId const fn_ = track(builder.makeFunction(sig, sym.v, params, body), node);
+        recordLinkage(fn_, linkAttr);
+        return fn_;
     }
 
     // Gather param VarDecls under a funcParams subtree (nodes mapped to VarDecl).
@@ -2964,6 +3084,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // declared externs across every per-schema Lowerer. Moved
     // into the result struct after lowering completes.
     std::vector<HirExternRecord> externDecls;
+    // D-CSUBSET-LINKAGE-SPECIFIERS: shared (decl node → LinkageAttr) accumulator,
+    // moved onto result->linkageMap after finish() (see Lowerer::linkage).
+    std::vector<std::pair<HirNodeId, LinkageAttr>> linkage;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -2974,7 +3097,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         if (lowerers.contains(sch.schemaId().v)) continue;
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
-            reporter, builder, literals, spans, externDecls));
+            reporter, builder, literals, spans, externDecls, linkage));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -2990,6 +3113,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
 
     auto result = std::make_unique<CstToHirResult>(std::move(hir), std::move(literals));
     for (auto& [id, loc] : spans) result->sourceMap.set(id, loc);
+    for (auto& [id, attr] : linkage) result->linkageMap.set(id, attr);
     result->externDecls = std::move(externDecls);
 
     // verify-on-load.

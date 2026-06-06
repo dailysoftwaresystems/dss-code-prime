@@ -1257,6 +1257,52 @@ findTerminatorShape(TargetTerminatorKind k) noexcept {
 }
 
 // Per-opcode descriptor — populated from the JSON `opcodes` array.
+// Implicit-register constraint declaration (cycle 10p substrate,
+// 2026-06-04). Carried on per-opcode `TargetOpcodeInfo`; arrays are
+// register NAMES (e.g. "rax") at this struct's level, resolved to
+// register ordinals at TargetSchema load time by the validator (any
+// unknown name fails loud — same precedent as TargetCallingConvention's
+// argGprs/callerSaved validation). Resolved ordinals live alongside
+// the names so downstream consumers (regalloc, future-MIR-verifier
+// reload-from-text round-trip) read O(1) without a re-resolution
+// walk.
+//
+// All three arrays are SEMANTICALLY distinct:
+//   * `inputs` — registers whose values are implicitly READ by the
+//     instruction. Regalloc must keep these live across the
+//     instruction's def site OR materialize the value into the named
+//     register before the instruction.
+//   * `outputs` — registers implicitly WRITTEN. Regalloc must
+//     consume the value FROM the named register after the
+//     instruction (or insert a move out if downstream wants it in a
+//     different reg).
+//   * `clobbered` — registers DESTROYED (values become indeterminate
+//     post-instruction) but not modeled as outputs. Regalloc must
+//     spill any live vreg that occupied this physical register
+//     across the instruction boundary.
+//
+// An opcode CAN have a register appear in multiple sets (idiv's RAX
+// is both input dividend AND output quotient; RDX is both input
+// dividend-high AND output remainder). This is structurally legal —
+// the sets describe orthogonal aspects of the contract.
+struct DSS_EXPORT ImplicitRegisterConstraint {
+    // Source-of-truth: register names as authored in the JSON. The
+    // shape mirrors TargetCallingConvention.argGprs (vector of
+    // strings). Authored at load time; validator resolves each name
+    // through the target's register table.
+    std::vector<std::string>   inputNames;
+    std::vector<std::string>   outputNames;
+    std::vector<std::string>   clobberedNames;
+
+    // Validator-populated ordinals — parallel to the names arrays.
+    // Empty iff the names array is empty. Consumers (regalloc) read
+    // these directly; the names are kept for diagnostics + .target
+    // round-trip + .dsslir round-trip.
+    std::vector<std::uint16_t> inputOrdinals;
+    std::vector<std::uint16_t> outputOrdinals;
+    std::vector<std::uint16_t> clobberedOrdinals;
+};
+
 // One row per opcode; index in the vector IS the opcode's numeric
 // value (stored as `std::uint16_t` in the LIR instruction PODs).
 //
@@ -1306,6 +1352,14 @@ struct DSS_EXPORT TargetOpcodeInfo {
     // reg-reg arithmetic is 3-address natively and leaves this
     // false.
     bool                 requires2Address = false;
+
+    // Implicit-register constraint (cycle 10p substrate, 2026-06-04).
+    // Optional per-opcode block describing fixed-register semantics
+    // (e.g., x86 idiv ties RDX:RAX). See `ImplicitRegisterConstraint`
+    // docblock above for the full contract + canonical examples.
+    // Pre-cycle-10q invariant: shipped opcodes leave this nullopt;
+    // regalloc consumer wiring lands in 10q.
+    std::optional<ImplicitRegisterConstraint> implicitRegisters;
 
     // Terminator-ness derives from `terminatorKind` — single source of
     // truth. Callers ported from the old `isTerminator` bool field

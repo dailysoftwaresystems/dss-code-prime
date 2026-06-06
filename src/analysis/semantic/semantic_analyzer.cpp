@@ -22,12 +22,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <format>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -181,6 +183,46 @@ descendVisible(Tree const& tree, NodeId start,
         auto kids = visibleChildren(tree, cur);
         if (idx >= kids.size()) return {};
         cur = kids[idx];
+    }
+    return cur;
+}
+
+// D-DECL-SPECIFIER-PREFIX-SUBSTRATE (2026-06-04): a declaration's "role
+// children" — its visible children with a leading declaration-specifier prefix
+// stripped, when the rule declares a `specifierPrefixRule` AND that rule is the
+// first visible child. Positional name/type/params/body/kindByChild indices
+// resolve against THESE, so they stay stable whether or not specifiers
+// (`static`, `__attribute__((...))`) are present. With no prefix
+// declared/present this is exactly `visibleChildren` — the no-op that keeps
+// every shipped declaration (none declare a prefix today) unchanged.
+[[nodiscard]] std::vector<NodeId>
+declRoleChildren(Tree const& tree, NodeId node, DeclarationRule const& decl) {
+    auto kids = visibleChildren(tree, node);
+    if (decl.specifierPrefixRule.has_value() && !kids.empty()
+        && tree.kind(kids.front()) == NodeKind::Internal
+        && tree.rule(kids.front()) == *decl.specifierPrefixRule) {
+        kids.erase(kids.begin());
+    }
+    return kids;
+}
+
+// `descendVisible` whose FIRST path step indexes into the declaration's
+// role-children (specifier-prefix stripped); later steps descend via the
+// ordinary `visibleChildren`. Lets a `kindByChild` childPath be authored
+// against the same prefix-free numbering as name/type/etc.
+[[nodiscard]] NodeId
+descendVisibleDecl(Tree const& tree, NodeId start,
+                   std::vector<std::uint32_t> const& path,
+                   DeclarationRule const& decl) {
+    if (path.empty()) return start;
+    auto roleKids = declRoleChildren(tree, start, decl);
+    if (path.front() >= roleKids.size()) return {};
+    NodeId cur = roleKids[path.front()];
+    for (std::size_t i = 1; i < path.size(); ++i) {
+        if (!cur.valid()) return {};
+        auto kids = visibleChildren(tree, cur);
+        if (path[i] >= kids.size()) return {};
+        cur = kids[path[i]];
     }
     return cur;
 }
@@ -667,7 +709,7 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         auto declIt = s.idx().declByRule.find(rule.v);
         if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
-            auto kids = visibleChildren(tree, node);
+            auto kids = declRoleChildren(tree, node, decl);
 
             // Evaluate the kindByChild discriminator (if any) BEFORE
             // minting the symbol so its `kind` reflects the structural
@@ -676,7 +718,7 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             DeclarationKind effectiveKind = decl.kind;
             if (decl.kindByChild.has_value()) {
                 auto const& disc = *decl.kindByChild;
-                NodeId const disChild = descendVisible(tree, node, disc.childPath);
+                NodeId const disChild = descendVisibleDecl(tree, node, disc.childPath, decl);
                 if (disChild.valid()
                     && tree.kind(disChild) == NodeKind::Internal
                     && tree.rule(disChild) == disc.whenRule) {
@@ -819,7 +861,7 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
         auto declIt = s.idx().declByRule.find(rule.v);
         if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
-            auto kids = visibleChildren(tree, node);
+            auto kids = declRoleChildren(tree, node, decl);
             if (decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
                 auto resolved = extractNameNode(
                     tree, kids[*decl.nameChild], decl.nameMatch, cfg.identifierToken,
@@ -846,7 +888,7 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                     if (decl.kindByChild.has_value()) {
                         auto const& disc = *decl.kindByChild;
                         NodeId const disChild =
-                            descendVisible(tree, node, disc.childPath);
+                            descendVisibleDecl(tree, node, disc.childPath, decl);
                         if (disChild.valid()
                             && tree.kind(disChild) == NodeKind::Internal
                             && tree.rule(disChild) == disc.whenRule) {
@@ -977,16 +1019,43 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                             std::int64_t value = nextValue;
                                             bool hadExplicit = false;
                                             bool explicitFailed = false;
-                                            auto eKids = visibleChildren(tree, erec.declRuleNode);
-                                            for (NodeId c : eKids) {
-                                                if (tree.kind(c) != NodeKind::Internal) continue;
+                                            // D-DECL-SPECIFIER-PREFIX-SUBSTRATE (cycle-13 audit fix):
+                                            // resolve the enumerator's `= expr` value through the SHARED
+                                            // `findInitExprInDecl` chokepoint (mirrors
+                                            // `resolveConstSymbolInit` ~:598) instead of an open-coded
+                                            // "first Internal child" scan. The chokepoint STRIPS a leading
+                                            // specifier prefix before selecting the value child; the old
+                                            // raw scan bypassed it, so an enumerator decl carrying a future
+                                            // `static`/`__attribute__` prefix would select the specifier
+                                            // subtree as its value (silent-wrong value / phantom
+                                            // S_NonConstantEnumeratorValue). `enumerator` is a registered
+                                            // decl rule, so the lookup resolves; the defensive branch keeps
+                                            // the prior behavior for any enumerator minted by a rule with
+                                            // no DeclarationRule (⇒ no specifierPrefixRule possible).
+                                            std::optional<NodeId> valueExpr;
+                                            if (auto eDeclIt = s.idx().declByRule.find(
+                                                    tree.rule(erec.declRuleNode).v);
+                                                eDeclIt != s.idx().declByRule.end()) {
+                                                valueExpr = findInitExprInDecl(
+                                                    tree, cfg.declarations[eDeclIt->second],
+                                                    erec.declRuleNode);
+                                            } else {
+                                                for (NodeId c :
+                                                     visibleChildren(tree, erec.declRuleNode))
+                                                    if (tree.kind(c) == NodeKind::Internal) {
+                                                        valueExpr = c;
+                                                        break;
+                                                    }
+                                            }
+                                            if (valueExpr.has_value()) {
                                                 hadExplicit = true;
-                                                if (auto iv = constIntExpr(s, tree, c, erec.scope, &cfg); iv.has_value()) {
+                                                if (auto iv = constIntExpr(
+                                                        s, tree, *valueExpr, erec.scope, &cfg);
+                                                    iv.has_value()) {
                                                     value = *iv;
                                                 } else {
                                                     explicitFailed = true;
                                                 }
-                                                break;  // exactly one expression child per enumerator
                                             }
                                             if (hadExplicit && explicitFailed) {
                                                 ParseDiagnostic d2;
@@ -1149,7 +1218,7 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 auto parentDeclIt = s.idx().declByRule.find(parentRule.v);
                 if (parentDeclIt != s.idx().declByRule.end()) {
                     auto const& parentDecl = cfg.declarations[parentDeclIt->second];
-                    auto kids = visibleChildren(tree, parent);
+                    auto kids = declRoleChildren(tree, parent, parentDecl);
                     if (parentDecl.nameChild.has_value()
                         && *parentDecl.nameChild < kids.size()
                         && kids[*parentDecl.nameChild].v == node.v) {
@@ -1409,7 +1478,7 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         auto declIt = s.idx().declByRule.find(rule.v);
         if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
-            auto kids = visibleChildren(tree, node);
+            auto kids = declRoleChildren(tree, node, decl);
             if (decl.initChild.has_value() && *decl.initChild < kids.size()
                 && decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
                 NodeId initNode = kids[*decl.initChild];
@@ -1562,7 +1631,7 @@ void collectParamTypes(EngineState& s, SemanticConfig const& cfg,
         auto declIt = s.idx().declByRule.find(tree.rule(cur).v);
         if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
-            auto kids = visibleChildren(tree, cur);
+            auto kids = declRoleChildren(tree, cur, decl);
             if (decl.typeChild.has_value() && *decl.typeChild < kids.size()) {
                 TypeId pty = resolveTypeNode(
                     s, cfg, tree, kids[*decl.typeChild], scope);
@@ -2143,11 +2212,96 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
     // defining/included tree. To make the referencing file see the
     // defining file's symbols we inject every binding of the TARGET tree's
     // root scope into the SOURCE tree's root scope.
+    //
+    // Conflict detection (FF11 GOAL-2): if the SOURCE tree ALREADY declares
+    // a top-level symbol of the same name in its OWN root scope (a genuine
+    // user declaration — `SymbolRecord.tree == sourceTree`), then including
+    // a header that ALSO declares that name is a redeclaration — exactly C's
+    // rule that `#include <stdio.h>` + your own `extern ... puts(...)` is a
+    // duplicate. Emit S_RedeclaredSymbol at the SOURCE decl (where the user
+    // wrote the conflicting line) rather than silently shadowing. We do NOT
+    // flag injected-vs-injected collisions (a diamond/transitive include
+    // making the same target symbol visible via two edges): those are
+    // idempotent visibility, not a user conflict — gated by the
+    // `tree == sourceTree` check (an injected binding carries the DEFINING
+    // tree's id, never the source's).
+    //
+    // De-duplication: the ImportResolver emits one crossRefs edge per
+    // `#include` directive, so `#include <h>` written TWICE produces two
+    // edges with the same (sourceTree, targetTree). Without de-dup, one
+    // logical name collision would emit S_RedeclaredSymbol once PER
+    // duplicate edge (over-reporting). Track the (sourceTree, name) pairs
+    // already reported across the WHOLE loop so a given colliding name in a
+    // given source tree fails loud exactly once — independent of how many
+    // include directives (or how many distinct headers) re-declare it. A
+    // genuine single conflict still fires once; a DIFFERENT colliding name
+    // (whether via the same or another header) is a distinct key and still
+    // fires.
+    std::unordered_set<std::string> reportedConflicts;
+    auto const conflictKey = [](std::uint32_t treeV,
+                                std::string_view name) {
+        // EXACT (collision-free) composite key: the tree id's decimal digits,
+        // a NUL separator (never present in an identifier), then the name. Two
+        // trees declaring the same colliding name stay distinct. A 64-bit HASH
+        // key would risk a (vanishingly rare) collision silently dropping a
+        // genuinely-distinct second conflict — exact-over-probabilistic is the
+        // right standard for a correctness-bearing dedup set.
+        std::string key = std::to_string(treeV);
+        key.push_back('\0');
+        key.append(name);
+        return key;
+    };
     for (auto const& edge : cu->crossRefs()) {
         auto srcIt = treeRootScope.find(edge.sourceTree.v);
         auto tgtIt = treeRootScope.find(edge.targetTree.v);
         if (srcIt == treeRootScope.end() || tgtIt == treeRootScope.end()) continue;
+
+        // The source tree's OWN top-level bindings (declared in pass 1),
+        // keyed by name. An entry here whose symbol's tree is the source
+        // tree is a real user declaration; a later same-name inject is a
+        // conflict. Built once per edge from the source root scope.
+        std::unordered_map<std::string_view, SymbolId> ownByName;
+        for (auto const& [name, sym] : s.scopes.bindingsOf(srcIt->second)) {
+            if (sym.valid() && s.symbols.at(sym).tree.v == edge.sourceTree.v) {
+                ownByName.emplace(name, sym);
+            }
+        }
+
         for (auto const& [name, sym] : s.scopes.bindingsOf(tgtIt->second)) {
+            if (auto it = ownByName.find(name); it != ownByName.end()) {
+                // The source file declared `name` itself AND includes a
+                // header declaring it — duplicate. Fail loud at the source,
+                // but only ONCE per (sourceTree, name): a second include of
+                // the same (or another) header re-declaring `name` is the
+                // same logical conflict, already reported.
+                if (!reportedConflicts.insert(
+                        conflictKey(edge.sourceTree.v, name)).second) {
+                    continue;   // already reported; still skip injection
+                }
+                auto const& srcTree = *std::find_if(
+                    trees.begin(), trees.end(),
+                    [&](Tree const& t) { return t.id().v == edge.sourceTree.v; });
+                auto const& ownRec = s.symbols.at(it->second);
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_RedeclaredSymbol;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = srcTree.source().id();
+                d.span     = srcTree.span(ownRec.declNode);
+                d.actual   = std::string{name};
+                auto const& hdrRec = s.symbols.at(sym);
+                auto const tgtTreeIt = std::find_if(
+                    trees.begin(), trees.end(),
+                    [&](Tree const& t) { return t.id().v == edge.targetTree.v; });
+                if (tgtTreeIt != trees.end()) {
+                    d.related.push_back(RelatedLocation{
+                        tgtTreeIt->source().id(),
+                        tgtTreeIt->span(hdrRec.declNode),
+                        "also declared by the included header",
+                    });
+                }
+                s.reporter.report(std::move(d));
+                continue;   // do not inject the conflicting binding
+            }
             s.scopes.injectBinding(srcIt->second, std::string{name}, sym);
         }
     }

@@ -151,14 +151,28 @@ enum class DiagnosticCode : std::uint16_t {
     // construction — the schema loader in `core` cannot see the `hir`-layer
     // enums — and reported as H_UnsupportedLoweringForKind.)
     C_InvalidHirLowering          = 0xC033,
-    // C_InvalidShippedFfiHeaderPath: `findShippedFfiHeader` was called
-    // with a relative path that is empty / absolute / starts with `.`
-    // / contains a `..` component. Distinct from C_InvalidLanguageName
-    // because the remediation prose is path-shaped, not name-shaped:
-    // the caller passes something like `"libc/stdio.h"`, NOT a logical
-    // language identifier. Post-FF2-#2 fold (silent-failure HIGH-2 +
-    // code-reviewer HIGH).
-    C_InvalidShippedFfiHeaderPath = 0xC034,
+    // C_InvalidShippedFfiHeaderPath: RETIRED 2026-06-03. The shipped
+    // FFI-headers tree (`src/dss-config/ffi-headers/`) + the
+    // `findShippedFfiHeader` resolver + `readCHeaderShipped` consumer
+    // were removed in the OPT2 cycle 1 commit — the only caller path
+    // was tests of the shipped headers themselves, with no production
+    // consumer (production routes through `synthesizeFfiFromSourceDecls`).
+    // The number is kept reserved (NOT renumbered) so historical
+    // diagnostics remain decodeable. The FF1/FF2/FF5 in-memory +
+    // arbitrary-path header substrate (readCHeader / readCHeaderFromText)
+    // stays as unused-feature substrate awaiting its trigger.
+    C_InvalidShippedFfiHeaderPath = 0xC034,  // RETIRED — see comment
+    // D-CONFIG-DIAGNOSTIC-CODE-PER-KIND closure (cycle 10m, 2026-06-04):
+    // pre-cycle `findShippedConfig`'s `invalidNameCode` field carried
+    // `C_InvalidLanguageName` regardless of whether the lookup was for
+    // a language, target, or object-format config. The kindLabel prose
+    // differentiated; the diagnostic code did not. These per-kind
+    // codes let downstream consumers (LSP, diff-verify harnesses,
+    // human readers) attribute "invalid-name" errors to the correct
+    // config tier without parsing the message string. Mirrors
+    // `D-OPT-DIAGNOSTIC-CODE-SPLIT-OOR-VS-FILE` precedent.
+    C_InvalidTargetName           = 0xC035,
+    C_InvalidFormatName           = 0xC036,
 
     // ── S0xxx — semantic analysis (phase #8; see 08.6-semantic-plan §3) ──
     // Emitted by the language-agnostic semantic analyzer
@@ -413,6 +427,15 @@ enum class DiagnosticCode : std::uint16_t {
     //   error — language hasn't configured kindByChild) and from
     //   `H_ExternHasInitializer` (user-source init contradiction).
     H_ExternDeclMalformed         = 0xF00B,
+    // H_UnknownLinkageSpecifier: a declaration's specifier-prefix subtree held a
+    // token that is neither a declared structural-syntax kind
+    // (`linkageSpecifierIgnoredKinds` — e.g. `__attribute__`, parens) nor a
+    // recognized entry in the language's `linkageSpecifiers` map — a typo
+    // (`__attribute__((wek))`) or an unsupported attribute (`((noinline))`). Fail
+    // loud rather than silently ignore it (D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-
+    // DIAGNOSTIC). Source-agnostic: the recognized + ignored sets are both
+    // per-language config; the engine never hardcodes a specifier identity.
+    H_UnknownLinkageSpecifier     = 0xF00C,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
@@ -592,6 +615,72 @@ enum class DiagnosticCode : std::uint16_t {
     // being absent without a function-tier diagnostic.
     A_FunctionEncodeAborted        = 0x1006,
 
+    // ── Optimizer (renders as `X`) ────────────────────────────────────
+    //
+    // X_* family at 0x2xxx per plan 22 PR1. The optimizer (OPT1+ — the
+    // `src/opt/` tier) emits these for pass-engine + pass-internal
+    // failures. Stable across optimizer versions.
+    //
+    // X_UnknownPassId: the `optimize()` engine dispatched a `PassId`
+    //   value with no matching arm in `runPass`'s switch. This is a
+    //   substrate-shape violation (a new PassId enumerator was added
+    //   without a handler) — fires before any MIR mutation. Closes
+    //   the silent-fallback gap code-reviewer C2 flagged in OPT1
+    //   cycle 1. D-OPT1-PASS-ID-STABILITY's enforcement surface.
+    X_UnknownPassId                = 0x2001,
+    // X_PipelineVersionMismatch: a `*.pipeline.json` file is missing
+    //   `dssPipelineVersion` or carries a version this build doesn't
+    //   speak. Same shape as C_VersionMismatch for target/format
+    //   schemas — fail-loud at load time so a config-tier mismatch
+    //   never silently maps to the wrong pipeline.
+    X_PipelineVersionMismatch      = 0x2002,
+    // X_UnknownPassName: a `*.pipeline.json` `passes[]` entry names a
+    //   string that `optPassIdFromName` does not recognize. The
+    //   config-load-time analog of X_UnknownPassId (which fires at
+    //   runtime dispatch). Catches typos + drift between JSON and
+    //   the PassId enum.
+    X_UnknownPassName              = 0x2003,
+    // X_PipelineMalformed: `*.pipeline.json` has a structural issue
+    //   the loader can't recover from — missing required field,
+    //   wrong type, unknown sub-key in a closed-key object (per
+    //   D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD).
+    X_PipelineMalformed            = 0x2004,
+    // X_PipelineNameResolutionFailed: compile_pipeline asked for a
+    //   pipeline by name (e.g. "release") but `loadShipped(name)`
+    //   couldn't locate a matching `*.pipeline.json` under
+    //   `src/dss-config/pipelines/`. Distinguished from
+    //   X_PipelineMalformed (which means the file was found but
+    //   broken).
+    X_PipelineNameResolutionFailed = 0x2005,
+    // X_OptReturnFalseWithoutDiagnostic: the optimize() engine's
+    //   belt-and-suspenders guard fired — a pass returned ok=false
+    //   WITHOUT reporting any new diagnostic. Distinct from
+    //   X_UnknownPassId (which means a fabricated PassId reached
+    //   the switch fallback). Pre-fold both shared X_UnknownPassId
+    //   making it impossible to distinguish enum-drift from contract-
+    //   violation in test pins.
+    X_OptReturnFalseWithoutDiagnostic = 0x2006,
+    // X_OptPassSkipped: emitted at Info severity when a pass declines
+    //   to run on a specific module because of a feature carve-out
+    //   (e.g. ConstFold skipping modules with runtime-init globals —
+    //   D-OPT2-CONST-FOLD-RUNTIME-INIT-GLOBALS). Lets the user / tooling
+    //   learn that the optimizer ran but produced no rewrite for THIS
+    //   module, distinct from "ran 0 mutations because the code was
+    //   already optimal."
+    X_OptPassSkipped                  = 0x2007,
+    // X_InlineMalformedCallSite: the Inlining pass (OPT7) selected a
+    //   call site for inlining (callee passed the §2.9 legality gate —
+    //   a defined, non-Weak, non-recursive, non-escaping single-block
+    //   leaf) but the call's argument count does NOT match the callee's
+    //   Arg-parameter count, so the Arg(i)→actual-operand substitution
+    //   cannot preserve SSA. This is a structural violation of the
+    //   MIR contract (the HIR→MIR lowering pairs a Call's args 1:1 with
+    //   the callee signature), NOT a normal "decline to inline" — the
+    //   ordinary gate refusals leave the call as-is silently. Fail loud
+    //   so a malformed call never silently miscompiles into a wrong-arity
+    //   splice (D-OPT7-INLINE-LEGALITY-GATE).
+    X_InlineMalformedCallSite         = 0x2008,
+
     // ── Linker (renders as `K`) ───────────────────────────────────────
     //
     // The link pass (plan 14 LK4 substrate) emits these when an
@@ -733,7 +822,42 @@ enum class DiagnosticCode : std::uint16_t {
     //   convergence as K_DuplicateDataSymbol above.
     K_DuplicateDataSymbol          = 0x800E,
     K_BssDataHasBytes              = 0x800F,
-    // K-NEXT-SLOT: 0x8010 — grep this marker before adding a K_* code.
+    // K_CrossCuMergeUnsupported: a cross-CU link the engine cannot perform. At LK11a
+    //   (2026-06-04) this narrowed to the N==0 caller error (link() received no
+    //   modules to merge). The former "extern import vs cross-CU definition" use is
+    //   GONE — LK11a's reference resolution now BINDS such a reference to the sibling
+    //   definition (the definition shadows the extern declaration; see
+    //   `LinkedImage::resolvedCrossCuRefs`). Reserved for any future genuinely-
+    //   unsupported merge interaction so callers keep a code distinct from the
+    //   resolution diagnostics (K_SymbolRedefinedAcrossUnits / K_CrossCuImageEmitDeferred).
+    K_CrossCuMergeUnsupported      = 0x8010,
+    // K_SymbolRedefinedAcrossUnits: two or more STRONG (Global) definitions of the
+    //   same symbol NAME across CUs. The cross-CU analog of K_DuplicateDataSymbol
+    //   (which is within-module). Weak defs never trip this (a strong def shadows
+    //   weak; multiple weak resolve to a deterministic pick); Local defs never trip
+    //   it (they stay module-private and are matched only within their own module).
+    K_SymbolRedefinedAcrossUnits   = 0x8011,
+    // K_CrossCuImageEmitDeferred: RETIRED at LK11b (2026-06-04). It signalled
+    //   "cross-CU resolution succeeded, merged bytes pending" while LK11a deferred
+    //   emission. LK11b now PRE-MERGES the resolved CUs into one combined module that
+    //   the existing format walker emits — there is no deferral, so this code is no
+    //   longer emitted. Retained (not reused — diagnostic codes are append-only) for
+    //   log-decode back-compat; the slot stays burned.
+    K_CrossCuImageEmitDeferred     = 0x8012,
+    // K_AbsolutePointerRelocMissing: the cross-CU merge (LK11b) needs an
+    //   ABSOLUTE 64-bit pointer relocation kind to mint a GOT-like thunk
+    //   slot (so an INDIRECT cross-CU call — `call qword ptr [slot]` — reads
+    //   a slot containing the sibling definition's address). The merge finds
+    //   that kind AGNOSTICALLY by formula (`widthBytes == 8 && !pcRelative`)
+    //   on the active `TargetSchema` — never by a hardcoded "abs64" name /
+    //   kind constant. This fires when NO relocation row on the target schema
+    //   satisfies that formula: the target cannot express a 64-bit absolute
+    //   pointer fixup, so a thunk slot would be a broken (un-relocated) zero.
+    //   Fail loud rather than emit an image whose cross-CU calls dereference
+    //   a null slot. (A target that genuinely has no abs64 reloc must add the
+    //   row to its `*.target.json` before it can host cross-CU indirect calls.)
+    K_AbsolutePointerRelocMissing  = 0x8013,
+    // K-NEXT-SLOT: 0x8014 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission
@@ -802,12 +926,13 @@ enum class DiagnosticCode : std::uint16_t {
     //   numeric kind embedded in the diagnostic detail). Remediation:
     //   remove the construct from the curated header OR extend FF2 to
     //   accept it.
-    // F_HeaderInvalidShippedPath: `readCHeaderShipped` was called with
-    //   a relative path that is empty / absolute / contains a `..`
-    //   component / starts with `.` — caller-API bug separate from
-    //   genuine "file not found in any ancestor dir" (F_FileOpenFailed).
-    //   Remediation: caller passes a valid relative path like
-    //   `"libc/stdio.h"`.
+    // F_HeaderInvalidShippedPath: RETIRED 2026-06-03. The shipped-
+    //   header consumer (`readCHeaderShipped`) was deleted alongside
+    //   `findShippedFfiHeader` + `src/dss-config/ffi-headers/` — no
+    //   production caller. Number kept reserved to preserve the band
+    //   layout. (FF1/FF2 substrate stays — `readCHeader` /
+    //   `readCHeaderFromText` are unused-feature substrate awaiting
+    //   their trigger; only the shipped-path-loading variant retired.)
     // F_HeaderInternalInvariant: an internal-invariant violation
     //   reached the header walker — a compiler bug, not a user-fixable
     //   issue. Remediation: file a bug.
@@ -822,7 +947,7 @@ enum class DiagnosticCode : std::uint16_t {
     F_HeaderGrammarLoadFailed      = 0x500C,
     F_HeaderHasUnsupportedTopLevel = 0x500D,
     F_HeaderInternalInvariant      = 0x500E,
-    F_HeaderInvalidShippedPath     = 0x500F,
+    F_HeaderInvalidShippedPath     = 0x500F,  // RETIRED — see comment
     // ── FF3 ABI catalog (plan 11 §2.4) ──
     // F_AbiUnknownTuple: the (target.name, format.kind) pair has no
     //   row in FF3's catalog. Remediation: ship the format.json for
@@ -931,6 +1056,20 @@ enum class DiagnosticCode : std::uint16_t {
     //   declaration for source-declared externs". (FF6 Slice 2,
     //   2026-06-02.)
     F_FfiNoImportLibraryForFormat  = 0x5019,
+    // F_ShippedHeaderNotFound: FF11 angle-include resolution. A
+    //   `#include <h.h>` (the SYSTEM/angle form) named a header that
+    //   was NOT found on any of the language's `shippedLibDirs` (the
+    //   /usr/include analogue). A missing SYSTEM header is a HARD error
+    //   in C — distinct from the missing QUOTE-include
+    //   (`#include "x.h"`), which surfaces as the soft
+    //   `D_UnresolvedImport` Warning (a local include may legitimately
+    //   be provided by a later build step). Remediation: ship the
+    //   header under `src/dss-config/<shippedLibDir>/<name>`, OR add
+    //   the dir to the language's `semantics.shippedLibDirs`, OR fix
+    //   the spelling. Member of `kUnsuppressableCodes` — a dropped
+    //   system-header miss would silently compile a program that calls
+    //   an undeclared library symbol. (FF11, 2026-06-05.)
+    F_ShippedHeaderNotFound        = 0x501A,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

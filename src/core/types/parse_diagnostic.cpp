@@ -72,6 +72,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_UnknownArtifactProfile:   return "C_UnknownArtifactProfile";
         case DiagnosticCode::C_InvalidHirLowering:       return "C_InvalidHirLowering";
         case DiagnosticCode::C_InvalidShippedFfiHeaderPath: return "C_InvalidShippedFfiHeaderPath";
+        case DiagnosticCode::C_InvalidTargetName:        return "C_InvalidTargetName";
+        case DiagnosticCode::C_InvalidFormatName:        return "C_InvalidFormatName";
         case DiagnosticCode::S_UndeclaredIdentifier:     return "S_UndeclaredIdentifier";
         case DiagnosticCode::S_RedeclaredSymbol:         return "S_RedeclaredSymbol";
         case DiagnosticCode::S_TypeMismatch:             return "S_TypeMismatch";
@@ -107,6 +109,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_UnsupportedLoweringForKind: return "H_UnsupportedLoweringForKind";
         case DiagnosticCode::H_ExternHasInitializer:     return "H_ExternHasInitializer";
         case DiagnosticCode::H_ExternDeclMalformed:      return "H_ExternDeclMalformed";
+        case DiagnosticCode::H_UnknownLinkageSpecifier:  return "H_UnknownLinkageSpecifier";
         case DiagnosticCode::I_VerifierFailure:          return "I_VerifierFailure";
         case DiagnosticCode::I_NoEntryBlock:             return "I_NoEntryBlock";
         case DiagnosticCode::I_MultipleEntryBlocks:      return "I_MultipleEntryBlocks";
@@ -156,6 +159,9 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::K_EntryPointResolvesToExtern:   return "K_EntryPointResolvesToExtern";
         case DiagnosticCode::K_DuplicateDataSymbol:          return "K_DuplicateDataSymbol";
         case DiagnosticCode::K_BssDataHasBytes:              return "K_BssDataHasBytes";
+        case DiagnosticCode::K_CrossCuMergeUnsupported:      return "K_CrossCuMergeUnsupported";
+        case DiagnosticCode::K_SymbolRedefinedAcrossUnits:   return "K_SymbolRedefinedAcrossUnits";
+        case DiagnosticCode::K_CrossCuImageEmitDeferred:     return "K_CrossCuImageEmitDeferred";
 
         case DiagnosticCode::D_TargetFormatMismatch:         return "D_TargetFormatMismatch";
         case DiagnosticCode::D_TargetMachineCodeMismatch:    return "D_TargetMachineCodeMismatch";
@@ -187,6 +193,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::F_FfiIngestEmptyCanonical:      return "F_FfiIngestEmptyCanonical";
         case DiagnosticCode::F_BinaryReaderPartialCorruption: return "F_BinaryReaderPartialCorruption";
         case DiagnosticCode::F_FfiNoImportLibraryForFormat:  return "F_FfiNoImportLibraryForFormat";
+        case DiagnosticCode::F_ShippedHeaderNotFound:        return "F_ShippedHeaderNotFound";
     }
     return "Unknown";
 }

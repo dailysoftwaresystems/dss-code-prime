@@ -52,6 +52,89 @@ struct Built {
 
 } // namespace
 
+// D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d): proves the
+// MirLoweringConfig.strictAliasingOnDistinctTypes flag is honored at
+// HIR→MIR boundary. The compile_pipeline reads from
+// `grammar.semantics().pointerAliasing.strictAliasingOnDistinctTypes`
+// and threads into MirLoweringConfig; lowerToMir calls
+// MirBuilder::setAliasingMode based on the field. Paired
+// (default false / explicit true) so a regression that ignores the
+// field fails one arm.
+TEST(MirLoweringExtern, MirAliasingModeDefaultsToPermissive) {
+    TypeInterner ti = makeInterner();
+    auto built = buildModuleWithExtern(ti);
+    HirFfiMap ffi{built.hir};
+    FfiMetadata meta;
+    meta.mangledName   = "printf";
+    meta.importLibrary = "libc.so.6";
+    ffi.set(built.externNode, meta);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    MirLoweringConfig cfg;  // strictAliasingOnDistinctTypes defaults false
+    auto result = lowerToMir(built.hir, pool, ti, rep,
+                             /*sourceMap=*/nullptr, cfg, &ffi);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(result.mir.aliasingMode(), MirAliasingMode::Permissive);
+}
+
+// Bridge pin (covers BOTH alias flags' MirLoweringConfig → lowerToMir
+// → Mir threading in one fixture): set both flags to NON-DEFAULT
+// values and assert both on the resulting Mir. Catches the "knob
+// that lies" silent-failure class — e.g. a typo at hir_to_mir.cpp's
+// setter calls that forwards one flag's value into the other field,
+// OR a future maintainer wiring up a third flag who copies the
+// pattern wrong. Without this pin, individual round-trip tests + a
+// per-flag predicate test still pass while the bridge is broken.
+TEST(MirLoweringExtern, MirAliasingFlagsBothBridgeThroughLowerToMir) {
+    TypeInterner ti = makeInterner();
+    auto built = buildModuleWithExtern(ti);
+    HirFfiMap ffi{built.hir};
+    FfiMetadata meta;
+    meta.mangledName   = "printf";
+    meta.importLibrary = "libc.so.6";
+    ffi.set(built.externNode, meta);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    MirLoweringConfig cfg;
+    // Both NON-DEFAULT: opt into strict-TBAA AND opt OUT of the C99
+    // §6.5 ¶7 character-type exception (a hypothetical Rust-like
+    // strict-typed language).
+    cfg.strictAliasingOnDistinctTypes = true;
+    cfg.charTypesAliasAll             = false;
+    auto result = lowerToMir(built.hir, pool, ti, rep,
+                             /*sourceMap=*/nullptr, cfg, &ffi);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(result.mir.aliasingMode(), MirAliasingMode::StrictTBAA)
+        << "MirLoweringConfig.strictAliasingOnDistinctTypes=true must "
+           "translate to StrictTBAA on the lowered Mir";
+    EXPECT_FALSE(result.mir.charTypesAliasAll())
+        << "MirLoweringConfig.charTypesAliasAll=false must translate "
+           "to charTypesAliasAll()==false on the lowered Mir";
+}
+
+TEST(MirLoweringExtern, MirAliasingModeFlipsToStrictTBAAWhenConfigOptsIn) {
+    TypeInterner ti = makeInterner();
+    auto built = buildModuleWithExtern(ti);
+    HirFfiMap ffi{built.hir};
+    FfiMetadata meta;
+    meta.mangledName   = "printf";
+    meta.importLibrary = "libc.so.6";
+    ffi.set(built.externNode, meta);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    MirLoweringConfig cfg;
+    cfg.strictAliasingOnDistinctTypes = true;
+    auto result = lowerToMir(built.hir, pool, ti, rep,
+                             /*sourceMap=*/nullptr, cfg, &ffi);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(result.mir.aliasingMode(), MirAliasingMode::StrictTBAA)
+        << "MirLoweringConfig.strictAliasingOnDistinctTypes=true must "
+           "translate to StrictTBAA on the lowered Mir";
+}
+
 TEST(MirLoweringExtern, ExternFunctionWithFfiMetadataPopulatesExternImports) {
     TypeInterner ti = makeInterner();
     auto built = buildModuleWithExtern(ti);

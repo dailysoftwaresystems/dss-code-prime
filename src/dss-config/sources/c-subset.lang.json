@@ -10,15 +10,28 @@
   "artifactProfiles": ["cli", "lib", "staticlib"],
 
   "imports": {
-    "strategy":      "include-following",
-    "directiveRule": "includeDirective",
-    "pathToken":     "StringStart"
+    "strategy":        "include-following",
+    "directiveRule":   "includeDirective",
+    "pathToken":       "StringStart",
+    "systemPathToken": "HeaderStart"
   },
 
   "lexerModes": {
     "main":          { "tokens": "default" },
     "string":        { "defaultToken": { "kind": "StringLiteral", "coalesce": true } },
     "charBody":      { "defaultToken": { "kind": "CharLiteral",   "coalesce": true } },
+
+    "include-directive": {
+      "tokens": {
+        "<": [{
+          "kind": "HeaderStart",
+          "modeOp": "replaceMode", "modeArg": "header-body",
+          "stringStyle": { "escapeKind": "none", "endsAt": ">" }
+        }]
+      },
+      "popAtNewline": true
+    },
+    "header-body":   { "defaultToken": { "kind": "HeaderPath",    "coalesce": true } },
     "line-comment":  {
       "defaultToken":    { "kind": "CommentChar", "flags": ["EmptySpace"] },
       "unterminatedAs":  "comment"
@@ -28,6 +41,8 @@
       "unterminatedAs":  "comment"
     }
   },
+
+  "$ff11AngleIncludeComment": "FF11 angle-include lexing. `#` pushes the line-scoped `include-directive` mode (popAtNewline:true -> the frame auto-pops at the next newline, so a malformed `#include` with no header -- or any directive -- never leaks `<`-as-header-opener into the following line; C preprocessor directives are line-oriented). That mode inherits the top-level token map (tokens:default) so `include`, `\"...\"`, and identifiers all lex normally; the ONLY override is `<`, which there OPENS a header path (replaceMode -> header-body, stringStyle.endsAt `>`) instead of meaning LtOp. The override-first longest-match rule (language-config-spec section 9.6) means `<` wins at length 1 and the global `<<`/`<=` are deliberately suppressed inside a directive -- correct, since `#include <<x>>` is not valid C. The `header-body` mode mirrors the `string` body: a coalesced `HeaderPath` token captures the raw path bytes between `<` and the closing `>` (which pops the frame back to main); escapeKind:none -- header paths have no escapes. The quote form keeps the global `\"`->StringStart->string body unchanged (additive: both `#include <h>` and `#include \"h\"` work). The resolver reads the raw path slice (a filename, not a decoded string) for both forms, and picks the search path by which token kind it finds under the directive (imports.pathToken=StringStart -> self-dir+includeDirs; imports.systemPathToken=HeaderStart -> shippedLibDirs).",
 
   "tokens": {
     " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
@@ -57,7 +72,7 @@
     ",":  [{ "kind": "Comma" }],
     ":":  [{ "kind": "Colon" }],
 
-    "#": [{ "kind": "HashOp" }],
+    "#": [{ "kind": "HashOp", "modeOp": "pushMode", "modeArg": "include-directive" }],
     "\"": [{
       "kind": "StringStart",
       "modeOp": "pushMode", "modeArg": "string",
@@ -162,6 +177,7 @@
 
     { "word": "void",    "kind": "VoidKeyword"    },
     { "word": "int",     "kind": "IntKeyword"     },
+    { "word": "long",    "kind": "LongKeyword"    },
     { "word": "char",    "kind": "CharKeyword"    },
     { "word": "const",   "kind": "ConstKeyword"   },
     { "word": "typedef", "kind": "TypedefKeyword" },
@@ -181,7 +197,10 @@
     { "word": "break",    "kind": "BreakKeyword"    },
     { "word": "continue", "kind": "ContinueKeyword" },
 
-    { "word": "extern",  "kind": "ExternKeyword"  }
+    { "word": "extern",  "kind": "ExternKeyword"  },
+
+    { "word": "static",        "kind": "StaticKeyword"    },
+    { "word": "__attribute__", "kind": "AttributeKeyword" }
   ],
 
   "shapes": {
@@ -266,7 +285,17 @@
     },
 
     "topLevelDecl": {
-      "sequence": [ "typeRef", "Identifier", "topLevelDeclTail" ]
+      "sequence": [ { "optional": "declSpecifiers" }, "typeRef", "Identifier", "topLevelDeclTail" ]
+    },
+
+    "declSpecifiers": {
+      "sequence": [ "singleDeclSpecifier", { "repeat": "singleDeclSpecifier" } ]
+    },
+    "singleDeclSpecifier": {
+      "alt": [ "StaticKeyword", "attrSpec" ]
+    },
+    "attrSpec": {
+      "sequence": [ "AttributeKeyword", "ParenOpen", "ParenOpen", { "optional": "Identifier" }, "ParenClose", "ParenClose" ]
     },
 
     "topLevelDeclTail": {
@@ -286,7 +315,17 @@
     },
 
     "includeDirective": {
-      "sequence": [ "HashOp", "IncludeKeyword", "StringStart", "StringLiteral" ]
+      "sequence": [ "HashOp", "IncludeKeyword", "includeTarget" ]
+    },
+
+    "includeTarget": {
+      "alt": [ "includeQuoteTarget", "includeAngleTarget" ]
+    },
+    "includeQuoteTarget": {
+      "sequence": [ "StringStart", "StringLiteral" ]
+    },
+    "includeAngleTarget": {
+      "sequence": [ "HeaderStart", "HeaderPath" ]
     },
 
     "externDecl": {
@@ -333,7 +372,7 @@
       ]
     },
 
-    "typeBase": { "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword", "Identifier" ] },
+    "typeBase": { "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "Identifier" ] },
 
     "typeRef": {
       "sequence": [
@@ -345,7 +384,7 @@
     },
 
     "typeBaseAllowingStruct": {
-      "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
+      "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
     },
 
     "typeRefAllowingStruct": {
@@ -566,11 +605,18 @@
       "elf":   "libc.so.6",
       "macho": "/usr/lib/libSystem.B.dylib"
     },
+    "$shippedLibDirsComment": "FF11 (2026-06-05): the SYSTEM include search path (C's /usr/include analogue) for the angle form `#include <h>`. A subdirectory under src/dss-config/; the header is a c-subset SOURCE file (extern prototypes) parsed by THIS grammar + merged via the existing include-following resolver, then annotated by FF5 synthesizeFfiFromSourceDecls. Platform auto-select (windows-x86_64 vs linux-x86_64 from the active target) is DEFERRED — D-FFI-SHIPPED-LIB-PLATFORM-SELECT; the dir names its platform explicitly for now.",
+    "shippedLibDirs": ["shippedLibs/windows-x86_64"],
     "$pointerConversionsComment": "D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): C-standard §6.3.2.3 — `void*` converts implicitly to/from any object-pointer type without a cast. The two directions are configured INDEPENDENTLY (matching C++'s split, where only the safe direction is implicit). c-subset declares BOTH true (C-family semantics). A future C++ frontend would declare {implicitToVoidPtr: true, implicitFromVoidPtr: false} matching ISO C++ §7.11. Rust/Swift would declare both false. DEFAULT is false (struct-init); strict typing is the safety-respecting default, opposite of the Array→Ptr decay opt-out direction (which is pervasive C-family idiom; void-ptr conversion is a safety relaxation). Pointer arithmetic on void* and void*↔fn-pointer conversions are separate concerns anchored at D-LANG-VOIDPTR-ARITH-REJECT and D-LANG-VOIDPTR-FN-CONVERT respectively.",
     "pointerConversions": {
       "implicitToVoidPtr":                  true,
       "implicitFromVoidPtr":                true,
       "nullPointerConstantFromIntegerZero": true
+    },
+    "$pointerAliasingComment": "Two orthogonal C99-derived alias-analysis opt-ins. `strictAliasingOnDistinctTypes` (C99 §6.5): accessing an object through a pointer of an incompatible type is undefined behavior — lets the MIR optimizer's CSE/LICM Load admission prove Ptr<I32> and Ptr<I64> don't alias (Rule 6 in mirMayAlias). `charTypesAliasAll` (C99 §6.5 ¶7): character-type pointers may alias an object of any type — the canonical strict-aliasing carve-out for serializers/hash-visitors/memcpy. C-family languages declare both true. A Rust frontend or strict-typed DSL would declare `charTypesAliasAll: false` (the type-checker enforces aliasing at a higher tier). See D-OPT-LOAD-ALIAS-ANALYSIS for the substrate's design.",
+    "pointerAliasing": {
+      "strictAliasingOnDistinctTypes":      true,
+      "charTypesAliasAll":                  true
     },
     "declarations": [
       { "rule": "varDeclHead", "name": 1, "type": 0, "kind": "variable",
@@ -580,6 +626,13 @@
         "constMarker": "ConstKeyword" },
       { "rule": "topLevelDecl", "name": 1, "type": 0, "kind": "variable",
         "constMarker": "ConstKeyword",
+        "$linkageSpecifiersComment": "D-CSUBSET-LINKAGE-SPECIFIERS (pre-OPT7 P1): 'static' -> internal (Local) binding; '__attribute__((weak))' -> Weak. 'specifierPrefix' names the optional leading declSpecifiers rule the resolver strips before positional name/type/body resolution; 'linkageSpecifiers' maps each specifier token's SOURCE TEXT to its binding/visibility effect, stamped onto the HIR/MIR symbol so DCE preserves externally-visible symbols and elides a static-with-no-callers. Visibility (__attribute__((visibility(\"hidden\")))) is substrate-ready (facet + HIR + MIR all carry visibility) but the c-subset string-arg grammar form is deferred -- see plan 22 + the deferred-anchor registry.",
+        "specifierPrefix": "declSpecifiers",
+        "linkageSpecifiers": {
+          "static": { "binding": "local" },
+          "weak":   { "binding": "weak"  }
+        },
+        "linkageSpecifierIgnoredKinds": ["AttributeKeyword", "ParenOpen", "ParenClose"],
         "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
         "kindByChild": {
           "childPath": [2, 0],
@@ -648,6 +701,7 @@
     "loopControls": [ { "rule": "breakStmt" }, { "rule": "continueStmt" } ],
     "builtinTypes": [
       { "name": "int",  "core": "I32"  },
+      { "name": "long", "core": "I64"  },
       { "name": "char", "core": "Char" },
       { "name": "void", "core": "Void" }
     ],

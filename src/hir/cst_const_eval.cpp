@@ -350,6 +350,17 @@ findInitExprInDecl(Tree const& tree, DeclarationRule const& decl,
     for (auto const& child : tree.children(declRuleNode)) {
         if (!isEmptySpace(tree.flags(child))) kids.push_back(child);
     }
+    // D-DECL-SPECIFIER-PREFIX-SUBSTRATE: strip a leading declaration-specifier
+    // prefix so both the positional `initChild` path and the role-fallback loop
+    // below resolve against the same prefix-free child numbering the analyzer's
+    // `declRoleChildren` uses — otherwise a `static`/`__attribute__` prefix node
+    // shifts initChild AND (being a non-skip-listed Internal child) would be
+    // wrongly returned as the init by the fallback. Mirrors `declRoleChildren`.
+    if (decl.specifierPrefixRule.has_value() && !kids.empty()
+        && tree.kind(kids.front()) == NodeKind::Internal
+        && tree.rule(kids.front()) == *decl.specifierPrefixRule) {
+        kids.erase(kids.begin());
+    }
     // Explicit positional `initChild` wins when configured.
     if (decl.initChild.has_value()) {
         if (*decl.initChild >= kids.size()) return std::nullopt;

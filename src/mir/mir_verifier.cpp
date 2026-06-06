@@ -3,9 +3,10 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "mir/mir_cfg.hpp"   // shared mirReversePostOrder
+#include "mir/mir_dom.hpp"   // shared computeMirDomTree + mirBuildPredecessors
 #include "mir/mir_opcode.hpp"
 
-#include <algorithm>
 #include <format>
 #include <unordered_set>
 #include <vector>
@@ -60,195 +61,6 @@ void forEachBlock(Mir const& mir, Fn fn) {
     }
 }
 
-// Build the predecessor adjacency: preds[blockSlot] is the list of
-// MirBlockIds that name this block as a successor. O(V + E). An out-
-// of-range successor block-id is reported as a structural violation
-// (rather than silently dropped) so the caller sees ONE clear blame
-// instead of a downstream PhiPredNotInCfg cascade.
-[[nodiscard]] std::vector<std::vector<MirBlockId>>
-buildPredecessors(Mir const& mir, DiagnosticReporter& reporter) {
-    std::vector<std::vector<MirBlockId>> preds(mir.blockCount());
-    for (std::uint32_t i = 1; i < mir.blockCount(); ++i) {
-        MirBlockId const from{i, mir.id().v};
-        for (MirBlockId const to : mir.blockSuccessors(from)) {
-            if (to.v < preds.size()) {
-                preds[to.v].push_back(from);
-            } else {
-                // Edge-anchored: the corruption is the EDGE (from→to),
-                // not the source block alone. Encode both ids in the
-                // diagnostic prefix so the reader knows precisely which
-                // edge is bad (not just "block #from is broken").
-                report(reporter, DiagnosticCode::I_VerifierFailure,
-                    std::format("mir cfg edge #{} → #{}: successor block "
-                                "out of range (blockCount = {})",
-                        from.v, to.v, preds.size()));
-            }
-        }
-    }
-    return preds;
-}
-
-// Reverse post-order over the CFG starting at `entry`. Unreachable
-// blocks are excluded by construction.
-[[nodiscard]] std::vector<MirBlockId>
-reversePostOrder(Mir const& mir, MirBlockId entry) {
-    std::vector<MirBlockId> order;
-    if (!entry.valid()) return order;
-    std::unordered_set<std::uint32_t> visited;
-    struct Frame { MirBlockId block; std::size_t nextSucc; };
-    std::vector<Frame> stack;
-    auto push = [&](MirBlockId b) {
-        if (b.valid() && visited.insert(b.v).second) stack.push_back({b, 0});
-    };
-    push(entry);
-    while (!stack.empty()) {
-        Frame& top = stack.back();
-        auto succs = mir.blockSuccessors(top.block);
-        if (top.nextSucc < succs.size()) {
-            MirBlockId const s = succs[top.nextSucc++];
-            push(s);
-        } else {
-            order.push_back(top.block);
-            stack.pop_back();
-        }
-    }
-    std::reverse(order.begin(), order.end());
-    return order;
-}
-
-// Cooper-Harvey-Kennedy iterative dominators ("A Simple, Fast
-// Dominance Algorithm"). Returns `idom[blockSlot] = MirBlockId` mapping
-// each reachable block (in `order`) to its immediate dominator (entry's
-// idom is itself). Unreachable blocks have InvalidMirBlock.
-//
-// Termination safety: the inner `intersect` walks idom-chains; an idom
-// cycle (which can only arise on malformed direct-`Mir`-ctor input —
-// the algorithm itself cannot produce one on a well-formed CFG) would
-// loop forever. We guard with a bounded step count derived from the
-// idom array size; on overflow the caller treats the result as "could
-// not resolve" rather than infinite-loop.
-// Per-block dominator state. `idom[b.v]` is the immediate dominator;
-// `gaveUp[b.v]` is true iff intersect bailed for at least one
-// predecessor of `b`, meaning the computed idom is under-conservative
-// (potentially missing real use-dom-def violations). The caller
-// emits `I_VerifierFailure` for any block flagged here.
-struct DomState {
-    std::vector<MirBlockId> idom;
-    std::vector<bool>       gaveUp;
-};
-
-[[nodiscard]] DomState
-computeIDoms(Mir const&                                  mir,
-             MirBlockId                                  entry,
-             std::vector<MirBlockId> const&              order,
-             std::vector<std::vector<MirBlockId>> const& preds) {
-    DomState st;
-    st.idom.resize(mir.blockCount());
-    st.gaveUp.resize(mir.blockCount(), false);
-    auto& idom = st.idom;
-    std::vector<std::uint32_t> rpoIndex(mir.blockCount(),
-        static_cast<std::uint32_t>(-1));
-    for (std::uint32_t i = 0; i < order.size(); ++i) {
-        rpoIndex[order[i].v] = i;
-    }
-    if (!entry.valid()) return st;
-    idom[entry.v] = entry;
-    std::uint32_t const stepCap = static_cast<std::uint32_t>(idom.size() * 2 + 4);
-    auto intersect = [&](MirBlockId b1, MirBlockId b2) {
-        MirBlockId finger1 = b1;
-        MirBlockId finger2 = b2;
-        std::uint32_t steps = 0;
-        while (finger1.v != finger2.v) {
-            if (++steps > stepCap) return MirBlockId{};
-            // Unreachable-block / invalid-idom safety: each finger
-            // walks via idom-chain. An unreachable block has
-            // rpoIndex == -1 (sentinel) and idom == invalid; both
-            // exits prevent the unbounded `0xFFFFFFFF > anything`
-            // loop the textbook formulation would hit.
-            if (rpoIndex[finger1.v] == static_cast<std::uint32_t>(-1)
-             || rpoIndex[finger2.v] == static_cast<std::uint32_t>(-1)) {
-                return MirBlockId{};
-            }
-            while (rpoIndex[finger1.v] > rpoIndex[finger2.v]) {
-                MirBlockId const next = idom[finger1.v];
-                if (!next.valid()
-                 || rpoIndex[next.v] == static_cast<std::uint32_t>(-1)) {
-                    return MirBlockId{};
-                }
-                finger1 = next;
-                if (++steps > stepCap) return MirBlockId{};
-            }
-            while (rpoIndex[finger2.v] > rpoIndex[finger1.v]) {
-                MirBlockId const next = idom[finger2.v];
-                if (!next.valid()
-                 || rpoIndex[next.v] == static_cast<std::uint32_t>(-1)) {
-                    return MirBlockId{};
-                }
-                finger2 = next;
-                if (++steps > stepCap) return MirBlockId{};
-            }
-        }
-        return finger1;
-    };
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (std::size_t i = 1; i < order.size(); ++i) {
-            MirBlockId const b = order[i];
-            MirBlockId newIdom{};
-            for (MirBlockId const p : preds[b.v]) {
-                if (rpoIndex[p.v] == static_cast<std::uint32_t>(-1)) continue;
-                if (!idom[p.v].valid()) continue;
-                if (!newIdom.valid()) {
-                    newIdom = p;
-                } else {
-                    MirBlockId const interBlock = intersect(newIdom, p);
-                    if (!interBlock.valid()) {
-                        // Intersect couldn't resolve — tag the block
-                        // so the caller emits a `I_VerifierFailure`
-                        // ("dominator analysis gave up") instead of
-                        // silently producing an under-conservative
-                        // idom that suppresses real violations.
-                        st.gaveUp[b.v] = true;
-                        continue;
-                    }
-                    newIdom = interBlock;
-                }
-            }
-            if (newIdom.valid() && idom[b.v].v != newIdom.v) {
-                idom[b.v] = newIdom;
-                changed = true;
-            }
-        }
-    }
-    return st;
-}
-
-// Tri-state dominance result. `GaveUp` means the iteration-count
-// guard fired (malformed idom — cycle, missing self-loop at entry,
-// etc.) — the caller MUST map this to `I_VerifierFailure` ("dominator
-// analysis gave up") rather than the wrong-blame `I_NotDominated`.
-enum class DomResult : std::uint8_t { Dominates, DoesNot, GaveUp };
-
-// Does `a` dominate `b`? Iteration-count guarded so a malformed idom
-// never loops forever — on overflow returns `GaveUp` so the caller
-// can emit the correct "analysis aborted" diagnostic instead of a
-// wrong "use-before-def" one.
-[[nodiscard]] DomResult
-dominates(MirBlockId a, MirBlockId b, std::vector<MirBlockId> const& idom) {
-    if (!a.valid() || !b.valid()) return DomResult::DoesNot;
-    if (a.v == b.v) return DomResult::Dominates;
-    MirBlockId cur = b;
-    std::uint32_t steps = 0;
-    std::uint32_t const stepCap = static_cast<std::uint32_t>(idom.size() + 2);
-    while (idom[cur.v].valid() && idom[cur.v].v != cur.v) {
-        if (++steps > stepCap) return DomResult::GaveUp;
-        cur = idom[cur.v];
-        if (cur.v == a.v) return DomResult::Dominates;
-    }
-    return DomResult::DoesNot;
-}
-
 } // namespace
 
 bool MirVerifier::verify(DiagnosticReporter& reporter) const {
@@ -301,6 +113,25 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
             }
         }
     });
+    // CFG-successor range validation. `mirBuildPredecessors` (the
+    // shared dom helper) silently skips out-of-range successor edges
+    // — the diagnostic is the verifier's responsibility, emitted
+    // here once per bad edge so downstream consumers see the actual
+    // corruption (the edge), not a cascade of follow-on phi / dom
+    // failures. The check was previously embedded in `buildPredecessors`
+    // before extraction to `mir_dom.hpp` (D-OPT-DOMTREE-EXTRACTION).
+    std::size_t const blockCount = mir_.blockCount();
+    for (std::uint32_t i = 1; i < blockCount; ++i) {
+        MirBlockId const from{i, mir_.id().v};
+        for (MirBlockId const to : mir_.blockSuccessors(from)) {
+            if (to.v >= blockCount) {
+                reportBlock(reporter, DiagnosticCode::I_VerifierFailure, from,
+                    std::format("mir cfg edge #{} → #{}: successor block "
+                                "out of range (blockCount = {})",
+                                from.v, to.v, blockCount));
+            }
+        }
+    }
 }
 
 void MirVerifier::checkEntryBlocks(DiagnosticReporter& reporter) const {
@@ -433,7 +264,7 @@ void MirVerifier::checkStructCfMarkers(DiagnosticReporter& reporter) const {
 }
 
 void MirVerifier::checkPhiIncomings(DiagnosticReporter& reporter) const {
-    auto preds = buildPredecessors(mir_, reporter);
+    auto preds = mirBuildPredecessors(mir_);
     forEachInst(mir_, [&](MirInstId id) {
         if (mir_.instOpcode(id) != MirOpcode::Phi) return;
         MirBlockId const phiBlock = mir_.instBlock(id);
@@ -458,7 +289,7 @@ void MirVerifier::checkPhiIncomings(DiagnosticReporter& reporter) const {
 }
 
 void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
-    auto preds = buildPredecessors(mir_, reporter);
+    auto preds = mirBuildPredecessors(mir_);
     for (std::uint32_t fi = 0; fi < mir_.moduleFuncCount(); ++fi) {
         MirFuncId const f = mir_.funcAt(fi);
         if (mir_.funcBlockCount(f) == 0) continue;
@@ -468,9 +299,8 @@ void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
                 "funcEntry() returned InvalidMirBlock; skipping dominance check");
             continue;
         }
-        auto rpo  = reversePostOrder(mir_, entry);
-        DomState const domState = computeIDoms(mir_, entry, rpo, preds);
-        auto const& idom = domState.idom;
+        auto rpo  = mirReversePostOrder(mir_, entry);
+        MirDomTree const domState = computeMirDomTree(mir_, entry, rpo, preds);
         // Emit `I_VerifierFailure` for every block whose idom couldn't
         // be computed (intersect bailed). Without this signal the
         // caller would silently see an under-conservative idom and
@@ -517,7 +347,7 @@ void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
             if (mir_.blockMarker(b) != StructCfMarker::LoopHeader) continue;
             bool hasBackEdge = false;
             for (MirBlockId const p : preds[b.v]) {
-                if (dominates(b, p, idom) == DomResult::Dominates) {
+                if (mirDominatesBlock(b, p, domState) == MirDomResult::Dominates) {
                     hasBackEdge = true;
                     break;
                 }
@@ -539,15 +369,15 @@ void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
                     for (MirPhiIncoming const& inc : mir_.phiIncomings(use)) {
                         if (!inc.value.valid()) continue;
                         MirBlockId const defBlock = mir_.instBlock(inc.value);
-                        DomResult const dr = dominates(defBlock, inc.pred, idom);
-                        if (dr == DomResult::DoesNot) {
+                        MirDomResult const dr = mirDominatesBlock(defBlock, inc.pred, domState);
+                        if (dr == MirDomResult::DoesNot) {
                             reportInst(reporter, DiagnosticCode::I_NotDominated, use,
                                 std::format("(phi in block #{}) incoming value "
                                             "#{} defined in block #{} does not "
                                             "dominate predecessor block #{}",
                                     useBlock.v, inc.value.v,
                                     defBlock.v, inc.pred.v));
-                        } else if (dr == DomResult::GaveUp) {
+                        } else if (dr == MirDomResult::GaveUp) {
                             reportInst(reporter, DiagnosticCode::I_VerifierFailure, use,
                                 std::format("dominance check aborted for phi-"
                                             "incoming value #{} against pred #{} "
@@ -575,13 +405,13 @@ void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
                                     op.v, useBlock.v, i, defIdx));
                         }
                     } else {
-                        DomResult const dr = dominates(defBlock, useBlock, idom);
-                        if (dr == DomResult::DoesNot) {
+                        MirDomResult const dr = mirDominatesBlock(defBlock, useBlock, domState);
+                        if (dr == MirDomResult::DoesNot) {
                             reportInst(reporter, DiagnosticCode::I_NotDominated, use,
                                 std::format("uses value #{} defined in block #{} "
                                             "which does not dominate use block #{}",
                                     op.v, defBlock.v, useBlock.v));
-                        } else if (dr == DomResult::GaveUp) {
+                        } else if (dr == MirDomResult::GaveUp) {
                             reportInst(reporter, DiagnosticCode::I_VerifierFailure, use,
                                 std::format("dominance check aborted for value "
                                             "#{} (def block #{}, use block #{}) "

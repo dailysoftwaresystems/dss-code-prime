@@ -745,6 +745,227 @@ TEST(Tokenizer, UnterminatedBlockCommentEmitsDiagnostic) {
     EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_UnterminatedComment);
 }
 
+// ── Context-sensitive per-mode lexing (agnostic engine capability) ─────────
+//
+// A grammar declares a lexer mode carrying a per-mode `tokens` override
+// table. While the tokenizer is in that mode the scanner consults the
+// override table FIRST and falls back to the global table for anything the
+// mode does not override. So the SAME source character lexes to a
+// DIFFERENT token kind depending on the active mode — the substrate FF11
+// will use to make `<` open a header path inside `#include` while staying
+// a normal operator everywhere else. Proven here on a SYNTHETIC grammar
+// (loadFromText, no shipped .lang.json) so the capability is pinned even
+// though it ships UNCONSUMED.
+namespace {
+
+// `[` pushes the `hdr` mode; inside `hdr`, `<` is overridden to
+// HeaderOpen (vs LtOp globally) and `]` pops back. `<` is NOT listed in
+// the override table outside its single in-mode meaning, so OUTSIDE the
+// mode it must still resolve to the global LtOp via the fallback.
+constexpr std::string_view kPerModeOverrideSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "PerMode", "version": "0.1.0" },
+  "tokens": {
+    "<": [{ "kind": "LtOp" }],
+    "<<": [{ "kind": "ShlOp" }],
+    "[": [{ "kind": "OpenBracket", "modeOp": "pushMode", "modeArg": "hdr" }],
+    "]": [{ "kind": "CloseBracket" }]
+  },
+  "shapes": { "root": { "sequence": [ "LtOp" ] } },
+  "lexerModes": {
+    "hdr": {
+      "tokens": {
+        "<": [{ "kind": "HeaderOpen" }],
+        "]": [{ "kind": "CloseBracket", "modeOp": "popMode" }]
+      }
+    }
+  }
+})JSON";
+
+} // namespace
+
+TEST(Tokenizer, PerModeOverrideLexesSameCharDifferentlyInsideMode) {
+    auto loaded = GrammarSchema::loadFromText(kPerModeOverrideSchema);
+    ASSERT_TRUE(loaded.has_value()) << "synthetic per-mode override schema must load";
+    auto schema = *loaded;
+
+    const auto ltOp       = schema->schemaTokens().find("LtOp");
+    const auto headerOpen = schema->schemaTokens().find("HeaderOpen");
+    const auto openBr     = schema->schemaTokens().find("OpenBracket");
+    const auto closeBr     = schema->schemaTokens().find("CloseBracket");
+    ASSERT_TRUE(ltOp.valid());
+    ASSERT_TRUE(headerOpen.valid());
+    // The override kind and the global kind are genuinely distinct ids —
+    // otherwise the test could pass trivially.
+    ASSERT_NE(ltOp, headerOpen);
+
+    // Input crosses the mode boundary twice: `<` in main → `[` enters hdr
+    // → `<` in hdr → `]` exits hdr → `<` back in main. (No whitespace so
+    // the token indices are exact.)
+    H h{
+        .src    = SourceBuffer::fromString("<[<]<", "<permode>"),
+        .schema = schema,
+    };
+    auto result = lex(h);
+
+    // 5 operator tokens, no whitespace.
+    ASSERT_EQ(result.tokens.size(), 5u);
+    EXPECT_EQ(result.tokens[0].schemaKind, ltOp)
+        << "`<` OUTSIDE the mode must be the global LtOp";
+    EXPECT_EQ(result.tokens[1].schemaKind, openBr);
+    EXPECT_EQ(result.tokens[2].schemaKind, headerOpen)
+        << "`<` INSIDE the mode must use the per-mode HeaderOpen override "
+           "(RED-on-disable: falls back to LtOp if the mode lookup is unwired)";
+    EXPECT_EQ(result.tokens[3].schemaKind, closeBr);
+    EXPECT_EQ(result.tokens[4].schemaKind, ltOp)
+        << "after popping the mode, `<` must return to the global LtOp — "
+           "lexing OUTSIDE the mode is unchanged";
+
+    // The same byte `<` produced two different schema kinds in one stream.
+    EXPECT_NE(result.tokens[0].schemaKind, result.tokens[2].schemaKind);
+    EXPECT_EQ(result.tokens[0].schemaKind, result.tokens[4].schemaKind);
+    EXPECT_TRUE(result.diags.empty());
+}
+
+TEST(Tokenizer, PerModeOverrideFallsBackToGlobalForNonOverriddenLexeme) {
+    // Inside `hdr` the only overrides are `<` and `]`. A `<`-adjacent but
+    // non-overridden global lexeme encountered in the mode must resolve
+    // via the global fallback. Here `[` is global-only; reaching it inside
+    // the mode (via a nested push is not modeled, so instead we prove the
+    // fallback by checking a global operator that the mode omits: `]` pops,
+    // then in main `[` pushes again). The decisive fallback check: the
+    // FIRST `<` (main) and a global-only token both resolve normally while
+    // the override is active only for the chars it lists.
+    auto loaded = GrammarSchema::loadFromText(kPerModeOverrideSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    const auto headerOpen = schema->schemaTokens().find("HeaderOpen");
+    const auto openBr     = schema->schemaTokens().find("OpenBracket");
+
+    // `[<[` — outer `[` enters hdr, `<` is HeaderOpen, then `[` inside hdr
+    // is NOT overridden so it falls back to the GLOBAL `[` (OpenBracket,
+    // which pushes hdr again — harmless for tokenization).
+    H h{
+        .src    = SourceBuffer::fromString("[<[", "<permode-fallback>"),
+        .schema = schema,
+    };
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 3u);
+    EXPECT_EQ(result.tokens[0].schemaKind, openBr);
+    EXPECT_EQ(result.tokens[1].schemaKind, headerOpen)
+        << "`<` inside hdr uses the override";
+    EXPECT_EQ(result.tokens[2].schemaKind, openBr)
+        << "`[` inside hdr is NOT overridden → resolves via the global fallback";
+}
+
+TEST(Tokenizer, PerModeOverrideShortCircuitsLongerGlobalLexeme) {
+    // The documented override-first short-circuit (language-config-spec.md): a per-mode
+    // override wins at ITS length even if a LONGER global lexeme shares the prefix. The
+    // `hdr` mode overrides 1-char `<` but NOT 2-char `<<`; the global table has `<<`→ShlOp.
+    // INSIDE the mode, `<<` lexes as TWO HeaderOpen (the override hits at len 1, SUPPRESSING
+    // the global 2-char `<<`); OUTSIDE, `<<` is the global ShlOp. This is the intended
+    // context-sensitive semantic (a mode redefines what `<` means); the footgun is documented.
+    auto loaded = GrammarSchema::loadFromText(kPerModeOverrideSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    const auto headerOpen = schema->schemaTokens().find("HeaderOpen");
+    const auto shlOp      = schema->schemaTokens().find("ShlOp");
+    const auto openBr     = schema->schemaTokens().find("OpenBracket");
+    ASSERT_TRUE(headerOpen.valid());
+    ASSERT_TRUE(shlOp.valid());
+    ASSERT_NE(headerOpen, shlOp);
+
+    // OUTSIDE the mode: `<<` is the global 2-char ShlOp (longest-match within the main table).
+    {
+        H h{ .src = SourceBuffer::fromString("<<", "<sc-out>"), .schema = schema };
+        auto r = lex(h);
+        ASSERT_EQ(r.tokens.size(), 1u);
+        EXPECT_EQ(r.tokens[0].schemaKind, shlOp)
+            << "`<<` outside any override mode is the global 2-char ShlOp";
+    }
+    // INSIDE the mode: `[` enters hdr; `<<` → TWO 1-char HeaderOpen (the override short-circuits
+    // the global `<<`); then `]` pops. (RED if `longestMatchInMode` consulted global first.)
+    {
+        H h{ .src = SourceBuffer::fromString("[<<]", "<sc-in>"), .schema = schema };
+        auto r = lex(h);
+        ASSERT_EQ(r.tokens.size(), 4u);
+        EXPECT_EQ(r.tokens[0].schemaKind, openBr);
+        EXPECT_EQ(r.tokens[1].schemaKind, headerOpen)
+            << "first `<` in hdr → override HeaderOpen (len 1)";
+        EXPECT_EQ(r.tokens[2].schemaKind, headerOpen)
+            << "second `<` in hdr → override HeaderOpen — the global 2-char `<<` is SUPPRESSED "
+               "(override-first short-circuit)";
+        EXPECT_NE(r.tokens[1].schemaKind, shlOp)
+            << "the global `<<` must NOT win inside the override mode";
+    }
+}
+
+// FF11 drift-guard scoping (footgun pin): a NON-MAIN mode whose `tokens` is
+// the literal `"default"` is a verbatim copy of the GLOBAL lexeme table — it
+// introduces no new kind meaning. The `modeIntroducedKinds` harvest must
+// NOT dump that copied global table into the builder's synthetic-meaning
+// drift-guard exception set, which would broadly weaken the guard. Only a
+// REAL inline override (a mode whose table genuinely differs) may contribute
+// its kinds. This synthetic grammar pairs BOTH: a `"default"` mode (`dfl`)
+// and an inline-override mode (`hdr` → `HeaderOpen`).
+namespace {
+constexpr std::string_view kDefaultModeHarvestSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "DefaultModeHarvest", "version": "0.1.0" },
+  "tokens": {
+    "<": [{ "kind": "LtOp" }],
+    "[": [{ "kind": "OpenBracket", "modeOp": "pushMode", "modeArg": "hdr" }],
+    "{": [{ "kind": "OpenBrace", "modeOp": "pushMode", "modeArg": "dfl" }],
+    "]": [{ "kind": "CloseBracket" }],
+    "}": [{ "kind": "CloseBrace" }]
+  },
+  "shapes": { "root": { "sequence": [ "LtOp" ] } },
+  "lexerModes": {
+    "hdr": {
+      "tokens": {
+        "<": [{ "kind": "HeaderOpen" }],
+        "]": [{ "kind": "CloseBracket", "modeOp": "popMode" }]
+      }
+    },
+    "dfl": {
+      "tokens": "default"
+    }
+  }
+})JSON";
+} // namespace
+
+TEST(Tokenizer, DefaultModeDoesNotDumpGlobalKindsIntoModeIntroducedSet) {
+    auto loaded = GrammarSchema::loadFromText(kDefaultModeHarvestSchema);
+    ASSERT_TRUE(loaded.has_value())
+        << "synthetic default-mode-harvest schema must load";
+    auto schema = *loaded;
+
+    const auto ltOp       = schema->schemaTokens().find("LtOp");
+    const auto openBr     = schema->schemaTokens().find("OpenBracket");
+    const auto headerOpen = schema->schemaTokens().find("HeaderOpen");
+    ASSERT_TRUE(ltOp.valid());
+    ASSERT_TRUE(openBr.valid());
+    ASSERT_TRUE(headerOpen.valid());
+
+    // THE FIX: a global kind that appears in the `dfl` mode ONLY because
+    // `tokens: "default"` copied the whole global table must NOT be treated
+    // as mode-introduced. RED-on-regression: without the `"default"`-skip
+    // guard, the harvest inserts EVERY global kind (LtOp, OpenBracket, ...)
+    // into modeIntroducedKinds, broadly weakening the drift guard.
+    EXPECT_FALSE(schema->isModeIntroducedKind(ltOp))
+        << "`LtOp` is a global kind — a `tokens:\"default\"` copy must not "
+           "make it mode-introduced";
+    EXPECT_FALSE(schema->isModeIntroducedKind(openBr))
+        << "no global kind copied via `tokens:\"default\"` may enter the "
+           "drift-guard exception set";
+
+    // CONTROL: a genuine inline override (`hdr` introduces `HeaderOpen`,
+    // which has NO global entry) MUST still be mode-introduced — the fix
+    // narrows the harvest to real overrides, it does not disable it.
+    EXPECT_TRUE(schema->isModeIntroducedKind(headerOpen))
+        << "a real inline-override kind must remain mode-introduced";
+}
+
 TEST(Tokenizer, UnterminatedCoalescedStringEmitsDiagnostic) {
     // A `"`-opened string with no closing quote. The coalesce-body path scans
     // the body to EOF, emits ONE StringLiteral token, leaves the mode open, and
@@ -1641,4 +1862,218 @@ TEST(Tokenizer, TsqlNumberStyleSmoke) {
         EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::IntLiteral);
         EXPECT_EQ(textOf(*src, tokens[0]), "0");
     }
+}
+
+// ─── FF11: angle-include (`#include <h>`) context-sensitive lexing ────────
+//
+// `#` pushes the line-scoped `include-directive` mode; inside it `<` opens
+// a header path (replaceMode → header-body) instead of meaning LtOp; the
+// coalesced `HeaderPath` body captures the path bytes; `>` (the
+// stringStyle.endsAt) closes it. These pin the cycle-20 per-mode capability
+// as FF11's first consumer — and that the ADDITIVE paths (quote include,
+// `<` as an operator) are untouched.
+
+namespace {
+
+// Non-trivia tokens (drops Whitespace/Newline) for compact sequence pins.
+[[nodiscard]] std::vector<Token> codeTokens(LexResult const& r) {
+    std::vector<Token> out;
+    for (auto const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Whitespace
+            || t.coreKind == CoreTokenKind::Newline
+            || t.coreKind == CoreTokenKind::Eof) continue;
+        out.push_back(t);
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(Tokenizer, FF11AngleIncludeLexesAsOpenerPathCloser) {
+    auto h = loadCSubset("#include <stdio.h>\n");
+    auto schema = h.schema;
+    ASSERT_TRUE(schema != nullptr);
+    auto srcBuf = h.src;   // keep the buffer alive past lex()'s by-value consume
+    auto result = lex(std::move(h));
+    EXPECT_TRUE(result.diags.empty()) << "well-formed angle include must lex cleanly";
+
+    const auto hashOp      = schema->schemaTokens().find("HashOp");
+    const auto includeKw   = schema->schemaTokens().find("IncludeKeyword");
+    const auto headerStart = schema->schemaTokens().find("HeaderStart");
+    const auto headerPath  = schema->schemaTokens().find("HeaderPath");
+    const auto ltOp        = schema->schemaTokens().find("LtOp");
+    ASSERT_TRUE(headerStart.valid());
+    ASSERT_TRUE(headerPath.valid());
+    ASSERT_NE(headerStart, ltOp) << "HeaderStart and LtOp must be distinct kinds";
+
+    auto code = codeTokens(result);
+    // Exactly: HashOp, IncludeKeyword(Word), HeaderStart, HeaderPath.
+    ASSERT_EQ(code.size(), 4u);
+    EXPECT_EQ(code[0].schemaKind, hashOp);
+    EXPECT_EQ(code[1].schemaKind, includeKw);
+    EXPECT_EQ(code[2].schemaKind, headerStart)
+        << "`<` after `#include` must be HeaderStart (RED-on-disable: would "
+           "be LtOp if the include-directive mode override is unwired)";
+    EXPECT_EQ(code[3].schemaKind, headerPath);
+    // The path token captures exactly the bytes between `<` and `>`.
+    EXPECT_EQ(textOf(*srcBuf, code[3]), "stdio.h");
+}
+
+TEST(Tokenizer, FF11AngleBracketIsLtOpOutsideDirective) {
+    // The SAME `<` byte outside a directive stays the LtOp operator —
+    // the mode override is scoped to the directive, not global.
+    auto h = loadCSubset("a < b;\n");
+    auto schema = h.schema;
+    auto result = lex(std::move(h));
+    const auto ltOp = schema->schemaTokens().find("LtOp");
+    auto code = codeTokens(result);
+    bool sawLt = false;
+    for (auto const& t : code) if (t.schemaKind == ltOp) sawLt = true;
+    EXPECT_TRUE(sawLt) << "`<` outside a directive must remain LtOp";
+}
+
+TEST(Tokenizer, FF11QuoteIncludeStillProducesStringStart) {
+    // ADDITIVE: the quote form is unchanged — `#` enters the directive
+    // mode (popAtNewline), but `"` still uses the GLOBAL StringStart →
+    // string body, so `imports.pathToken: StringStart` keeps matching.
+    auto h = loadCSubset("#include \"local.h\"\n");
+    auto schema = h.schema;
+    auto result = lex(std::move(h));
+    EXPECT_TRUE(result.diags.empty());
+    const auto stringStart = schema->schemaTokens().find("StringStart");
+    auto code = codeTokens(result);
+    bool sawStringStart = false;
+    for (auto const& t : code) if (t.schemaKind == stringStart) sawStringStart = true;
+    EXPECT_TRUE(sawStringStart)
+        << "quote include must still produce StringStart (additive path)";
+}
+
+TEST(Tokenizer, FF11DirectiveModeDoesNotLeakToNextLine) {
+    // The line-scoped `include-directive` mode (popAtNewline) must NOT
+    // carry `<`-as-header-opener past the newline. A malformed `#include`
+    // (no header) on line 1, then `a < b` on line 2: the line-2 `<` must
+    // be LtOp, proving the directive frame popped at the newline.
+    auto h = loadCSubset("#include\na < b;\n");
+    auto schema = h.schema;
+    auto result = lex(std::move(h));
+    const auto ltOp        = schema->schemaTokens().find("LtOp");
+    const auto headerStart = schema->schemaTokens().find("HeaderStart");
+    auto code = codeTokens(result);
+    bool sawLt = false, sawHeaderStart = false;
+    for (auto const& t : code) {
+        if (t.schemaKind == ltOp)        sawLt = true;
+        if (t.schemaKind == headerStart) sawHeaderStart = true;
+    }
+    EXPECT_TRUE(sawLt)
+        << "line-2 `<` must be LtOp (RED-on-disable: would be HeaderStart "
+           "if the directive mode leaked past the newline)";
+    EXPECT_FALSE(sawHeaderStart)
+        << "no HeaderStart — the line-2 `<` is an operator, not a header opener";
+}
+
+// FF11 fail-loud pin: a malformed angle include `#include <foo` with NO
+// closing `>` must be reported (a diagnostic), NOT silently accepted. The
+// `header-body` mode mirrors the string body — `<` opens a coalesced
+// HeaderPath whose `endsAt` is `>`; reaching EOF without `>` leaves the
+// body frame open and the post-loop unterminated handler emits
+// P_UnterminatedString (same flavor as an unterminated `"`). This guards
+// against a future silent-acceptance regression. (The UX polish — a
+// header-specific flavor + newline-scoped termination so the rest of the
+// file is not consumed — is deferred: anchor
+// D-FFI-ANGLE-INCLUDE-LINE-SCOPED-HEADER. This test only pins fail-loud.)
+TEST(Tokenizer, FF11MalformedAngleIncludeNoCloserFailsLoud) {
+    auto h      = loadCSubset("#include <foo\n");
+    auto result = lex(std::move(h));
+    EXPECT_FALSE(result.diags.empty())
+        << "a malformed `#include <foo` (no closing `>`) must fail loud — "
+           "a diagnostic, not silent acceptance";
+    // Today's flavor is the string-body P_UnterminatedString (identical to
+    // an unterminated `\"`). Asserted to document the CURRENT behavior; the
+    // load-bearing guarantee is the fail-loud check above. If the deferred
+    // anchor lands a header-specific flavor, update this line.
+    bool sawUnterminated = false;
+    for (auto const& d : result.diags)
+        if (d.code == DiagnosticCode::P_UnterminatedString) sawUnterminated = true;
+    EXPECT_TRUE(sawUnterminated)
+        << "the unterminated header body reports P_UnterminatedString "
+           "(string-body flavor) today";
+}
+
+// ─── General `popAtNewline` capability (NOT c-subset-specific) ────────────
+//
+// A line-scoped mode that auto-pops at the next newline. Synthetic schema
+// so the capability is pinned independently of FF11's grammar. C
+// preprocessor directives and assembly lines are the motivating general
+// use case.
+
+namespace {
+
+constexpr std::string_view kPopAtNewlineSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "PopLine", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "#":  [{ "kind": "Hash", "modeOp": "pushMode", "modeArg": "directive" }],
+    "<":  [{ "kind": "LtOp" }]
+  },
+  "shapes": { "root": { "sequence": [ "LtOp" ] } },
+  "lexerModes": {
+    "main":      { "tokens": "default" },
+    "directive": {
+      "tokens": { "<": [{ "kind": "AngleOpen" }] },
+      "popAtNewline": true
+    }
+  }
+})JSON";
+
+} // namespace
+
+TEST(Tokenizer, PopAtNewlineModeAutoPopsAtNewline) {
+    auto loaded = GrammarSchema::loadFromText(kPopAtNewlineSchema);
+    ASSERT_TRUE(loaded.has_value()) << "popAtNewline synthetic schema must load";
+    auto schema = *loaded;
+    const auto ltOp      = schema->schemaTokens().find("LtOp");
+    const auto angleOpen = schema->schemaTokens().find("AngleOpen");
+    ASSERT_TRUE(angleOpen.valid());
+    ASSERT_NE(ltOp, angleOpen);
+
+    // Line 1: `#` pushes directive → `<` is AngleOpen. Newline pops the
+    // directive frame. Line 2: `<` is back to the global LtOp.
+    H h{
+        .src    = SourceBuffer::fromString("#<\n<", "<popline>"),
+        .schema = schema,
+    };
+    auto result = lex(h);
+    EXPECT_TRUE(result.diags.empty())
+        << "no unterminated diagnostic — the directive popped at the newline";
+
+    std::vector<Token> code;
+    for (auto const& t : result.tokens) {
+        if (t.coreKind == CoreTokenKind::Whitespace
+            || t.coreKind == CoreTokenKind::Newline
+            || t.coreKind == CoreTokenKind::Eof) continue;
+        code.push_back(t);
+    }
+    ASSERT_EQ(code.size(), 3u);   // Hash, AngleOpen, LtOp
+    EXPECT_EQ(code[1].schemaKind, angleOpen)
+        << "`<` inside the directive uses the override";
+    EXPECT_EQ(code[2].schemaKind, ltOp)
+        << "after the newline auto-pop, `<` returns to the global LtOp "
+           "(RED-on-disable: stays AngleOpen if popAtNewline is unwired)";
+}
+
+TEST(Tokenizer, PopAtNewlineModeAutoPopsAtEofWithoutNewline) {
+    // A line-scoped mode left open at EOF (no trailing newline) is NOT
+    // unterminated — EOF validly ends the last line. No diagnostic.
+    auto loaded = GrammarSchema::loadFromText(kPopAtNewlineSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    H h{
+        .src    = SourceBuffer::fromString("#<", "<popline-eof>"),
+        .schema = schema,
+    };
+    auto result = lex(h);
+    EXPECT_TRUE(result.diags.empty())
+        << "a popAtNewline mode at EOF closes silently — not unterminated";
 }

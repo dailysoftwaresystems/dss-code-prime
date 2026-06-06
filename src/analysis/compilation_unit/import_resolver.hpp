@@ -71,6 +71,19 @@ struct DSS_EXPORT ResolutionContext {
     DiagnosticReporter&                    diagnostics;
     std::span<std::filesystem::path const> includeDirs;
 
+    // FF11: the SYSTEM include search path (absolute dirs) for the
+    // angle form (`#include <h>` → `imports.systemPathToken`). The
+    // analogue of C's /usr/include; DISTINCT from `includeDirs` (the
+    // quote form's search). The wiring layer resolves the language's
+    // `semantics.shippedLibDirs` config strings to absolute dirs (the
+    // cwd-walk to find `src/dss-config/` lives there, mirroring
+    // `findShippedConfig`) and passes them here. Empty ⇒ no system
+    // headers ship; an angle include then HARD-FAILS
+    // (F_ShippedHeaderNotFound) on use. A missing system header is a
+    // fatal C error, unlike the soft D_UnresolvedImport for a missing
+    // quote include.
+    std::span<std::filesystem::path const> systemDirs;
+
     // Load + tokenize + parse `path` UNDER `schema` (the including tree's
     // language — an `#include` in a c-subset file loads another c-subset file),
     // append its Tree to `trees` (deduplicating by weakly-canonical path), and

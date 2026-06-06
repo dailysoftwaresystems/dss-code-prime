@@ -221,8 +221,10 @@ struct DSS_EXPORT GrammarSchemaData {
     // sentinel via `subspan(1)`. Real ids dense 1..N; "main"
     // synthesized at id 1 even when JSON omits `lexerModes`.
     // `lexerModeTokens` keyed by id; "main" mirrors `lexemeTable`;
-    // modes with `tokens: "default"` inherit it; inline
-    // `tokens: {...}` parsing is deferred (loader warns).
+    // modes with `tokens: "default"` inherit it; an inline
+    // `tokens: {...}` object is parsed into a per-mode override table,
+    // consulted BEFORE `lexemeTable` with global fallback (see
+    // `lookupLexemeInMode`) — context-sensitive lexing.
     std::vector<LexerMode>                            lexerModes;
     std::unordered_map<std::string, LexerModeId>      lexerModeIds;
     std::unordered_map<std::uint32_t,
@@ -233,6 +235,20 @@ struct DSS_EXPORT GrammarSchemaData {
     // Off-grammar body-token kinds — see
     // `GrammarSchema::bodyDefaultTokenKinds()` for the contract.
     std::unordered_set<SchemaTokenId>                 bodyDefaultTokenKinds;
+
+    // Mode-introduced token kinds (FF11): kinds the tokenizer may
+    // pre-resolve from a NON-MAIN mode context that have NO entry in the
+    // GLOBAL per-lexeme table for the matched lexeme — i.e. (a) kinds
+    // declared in a per-mode `tokens` override (e.g. `HeaderStart`, the
+    // in-`include-directive` meaning of `<`, distinct from the global
+    // `<`→LtOp) and (b) COALESCED `defaultToken` kinds that aren't
+    // built-in literals (e.g. `HeaderPath`). The builder's
+    // `resolveMeaning` consults only the global table (it doesn't track
+    // lexer modes — the tokenizer is authoritative about mode context),
+    // so without this set a legitimately mode-introduced kind would trip
+    // the synthetic-meaning DRIFT guard. Populated by the loader once;
+    // queried via `isModeIntroducedKind`.
+    std::unordered_set<SchemaTokenId>                 modeIntroducedKinds;
 
     // Pool indexed by `LexemeMeaning::stringStyleId`. Slot 0 is the
     // InvalidStringStyle sentinel; real ids 1..N. Each StringStyle
@@ -400,6 +416,17 @@ public:
     }
     [[nodiscard]] std::unordered_set<SchemaTokenId> const&
         bodyDefaultTokenKinds() const noexcept { return d_.bodyDefaultTokenKinds; }
+
+    // FF11: true iff `id` is a token kind the tokenizer may pre-resolve
+    // from a NON-MAIN mode context without a matching GLOBAL per-lexeme
+    // entry — a per-mode `tokens` override kind, or a coalesced
+    // `defaultToken` kind. See `Data::modeIntroducedKinds`. The builder's
+    // synthetic-meaning drift guard accepts these (alongside body-default
+    // and built-in-literal kinds) so a per-mode override token (e.g.
+    // `HeaderStart`) is a clean leaf, not a fatal drift.
+    [[nodiscard]] bool isModeIntroducedKind(SchemaTokenId id) const noexcept {
+        return d_.modeIntroducedKinds.contains(id);
+    }
 
     // Per-`SchemaTokenId` flags channel used by tokenizer emit sites
     // that don't pass through the lexeme-meaning lookup (e.g. numeric

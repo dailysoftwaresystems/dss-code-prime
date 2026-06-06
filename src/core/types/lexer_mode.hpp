@@ -123,12 +123,22 @@ struct DSS_EXPORT LexerMode {
     LexerModeId                       id;
     std::optional<DefaultTokenSpec>   defaultToken;
     UnterminatedFlavor                unterminatedFlavor = UnterminatedFlavor::String;
+    // Line-scoped mode: when true, the tokenizer pops THIS frame the
+    // moment it scans a newline (the newline token is still emitted in
+    // this mode, then the frame is dropped). General capability for
+    // line-oriented constructs — C preprocessor directives, assembly —
+    // where a mode entered mid-line must not leak its lexing rules into
+    // the next line. A defaultToken-bearing body mode (a "consume until
+    // endsAt" scanner) may NOT set this — the two close mechanisms are
+    // mutually exclusive (loader rejects the combination). Default false.
+    bool                              popAtNewline = false;
 
     [[nodiscard]] static LexerMode make(std::string name,
                                         LexerModeId id,
                                         std::optional<DefaultTokenSpec> defaultToken,
-                                        UnterminatedFlavor flavor = UnterminatedFlavor::String) {
-        return LexerMode{std::move(name), id, defaultToken, flavor};
+                                        UnterminatedFlavor flavor = UnterminatedFlavor::String,
+                                        bool popAtNewline = false) {
+        return LexerMode{std::move(name), id, defaultToken, flavor, popAtNewline};
     }
 };
 

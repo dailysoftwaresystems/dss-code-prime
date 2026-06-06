@@ -905,6 +905,141 @@ encodeExec(AssembledModule const&    module,
         return {};
     }
 
+    // ── Apply DATA-ITEM relocations into the .rdata bytes ─────────
+    //
+    // `applyExecRelocations` above patches FUNCTION relocations into `.text`. A data item
+    // may ALSO carry relocations — e.g. the cross-CU thunk slot (LK11b), an 8-byte rodata
+    // pointer the linker mints whose single absolute-64-bit reloc targets a sibling-CU
+    // definition (so an indirect cross-CU call `call qword ptr [slot]` dereferences a slot
+    // holding the def's runtime address). The def's VA already lives in `symbolVa` (built
+    // above for functions + externs/IAT + rodata items). Patch each data-item relocation
+    // directly into `rdataBytes` at the item's section-relative offset + the reloc's
+    // intra-item offset, writing the absolute VA `widthBytes` LE. This runs against the
+    // SAME `rdataBytes` buffer that is emitted into the image below — patch BEFORE emit.
+    //
+    // Only ABSOLUTE relocations are meaningful for a data pointer; a PC-relative kind here
+    // would be a producer bug (data items have no instruction-pointer base). Fail loud on
+    // (a) an unresolved target, (b) a pc-relative kind, (c) an unknown kind, (d) a write
+    // that overruns the item — never emit a half-patched slot.
+    //
+    // Each absolute fixup ALSO needs a PE base relocation (.reloc) so the loader rebases it
+    // when ASLR slides the image. Collect every absolute-64 fixup SITE RVA here for the
+    // `.reloc` block builder below. (`rdata->rva` is the .rdata section base RVA; the site
+    // is at that base + the item's section offset + the reloc's intra-item offset.)
+    std::vector<std::uint32_t> baseRelocSiteRvas;
+    for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+        auto const& di = module.dataItems[i];
+        for (auto const& rel : di.relocations) {
+            auto const sIt = symbolVa.find(rel.target);
+            if (sIt == symbolVa.end()) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"pe::encodeExec: data-item SymbolId #"}
+                     + std::to_string(di.symbol.v)
+                     + " has a relocation targeting symbol #"
+                     + std::to_string(rel.target.v)
+                     + " that is not defined by any function / extern / data item — a "
+                       "cross-CU thunk slot's definition must be present in the merged image.");
+                return {};
+            }
+            auto const* tri = targetSchema.relocationInfo(rel.kind);
+            if (tri == nullptr) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::string{"pe::encodeExec: data-item SymbolId #"}
+                     + std::to_string(di.symbol.v) + " relocation kind "
+                     + std::to_string(rel.kind.v)
+                     + " has no TargetRelocationInfo on the target schema.");
+                return {};
+            }
+            if (tri->pcRelative || tri->widthBytes == 0) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::string{"pe::encodeExec: data-item SymbolId #"}
+                     + std::to_string(di.symbol.v) + " relocation '" + tri->name
+                     + "' is pc-relative or has widthBytes=0 — a data pointer requires an "
+                       "absolute fixup with a concrete write width.");
+                return {};
+            }
+            std::size_t const itemBase = rdataItemOffsets[i];
+            std::size_t const patchOff = itemBase + rel.offset;
+            if (patchOff + tri->widthBytes > itemBase + di.bytes.size()) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::string{"pe::encodeExec: data-item SymbolId #"}
+                     + std::to_string(di.symbol.v) + " relocation offset "
+                     + std::to_string(rel.offset) + " + widthBytes "
+                     + std::to_string(static_cast<int>(tri->widthBytes))
+                     + " overruns the item's " + std::to_string(di.bytes.size())
+                     + " bytes.");
+                return {};
+            }
+            std::uint64_t const value =
+                static_cast<std::uint64_t>(
+                    static_cast<std::int64_t>(sIt->second) + rel.addend);
+            for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {
+                rdataBytes[patchOff + b] =
+                    static_cast<std::uint8_t>((value >> (8u * b)) & 0xFFu);
+            }
+            // Record the base-relocation site. Only an 8-byte absolute fixup maps to
+            // IMAGE_REL_BASED_DIR64; a different-width absolute data reloc has no DIR64
+            // representation (HIGHLOW/etc. are anchored for when a 32-bit-abs data
+            // producer lands) — fail loud rather than ship an un-rebased fixup that
+            // ASLR would leave pointing at the preferred-base address.
+            if (tri->widthBytes != 8) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::string{"pe::encodeExec: data-item SymbolId #"}
+                     + std::to_string(di.symbol.v) + " absolute relocation '" + tri->name
+                     + "' has widthBytes=" + std::to_string(static_cast<int>(tri->widthBytes))
+                     + " — only an 8-byte absolute fixup (IMAGE_REL_BASED_DIR64) is "
+                       "supported in the .reloc base-relocation table today.");
+                return {};
+            }
+            baseRelocSiteRvas.push_back(
+                rdata->rva + static_cast<std::uint32_t>(patchOff));
+        }
+    }
+
+    // ── Build the .reloc (base relocation) section bytes ──────────
+    //
+    // The image keeps ASLR (dllCharacteristics carries DYNAMIC_BASE), so every absolute
+    // 64-bit fixup the linker wrote into the image (the cross-CU thunk slots) needs an
+    // IMAGE_BASE_RELOCATION entry telling the loader to add the load-bias to that 8-byte
+    // word. Group the fixup site RVAs by 4 KiB page; each page becomes a block:
+    //   { u32 PageRVA (4 KiB-aligned), u32 BlockSize } then u16 entries
+    //   (IMAGE_REL_BASED_DIR64(=10) << 12) | (siteRVA & 0xFFF).
+    // Pad each block's entry list to a 4-byte multiple (one u16 zero pad when the entry
+    // count is odd — a 0-entry pad is IMAGE_REL_BASED_ABSOLUTE, a no-op the loader skips);
+    // BlockSize = 8 (header) + 2 * paddedEntryCount.
+    std::vector<std::uint8_t> relocBytes;
+    if (!baseRelocSiteRvas.empty()) {
+        std::sort(baseRelocSiteRvas.begin(), baseRelocSiteRvas.end());
+        constexpr std::uint32_t kPageSize          = 0x1000u;
+        constexpr std::uint16_t kImageRelBasedDir64 = 10u;
+        std::size_t cursor = 0;
+        while (cursor < baseRelocSiteRvas.size()) {
+            std::uint32_t const pageBase = baseRelocSiteRvas[cursor] & ~(kPageSize - 1u);
+            std::size_t blockEnd = cursor;
+            while (blockEnd < baseRelocSiteRvas.size()
+                   && (baseRelocSiteRvas[blockEnd] & ~(kPageSize - 1u)) == pageBase) {
+                ++blockEnd;
+            }
+            std::size_t const entryCount = blockEnd - cursor;
+            // Pad entry list to a 4-byte boundary (each entry is 2 bytes): a trailing
+            // ABSOLUTE(0) no-op entry when entryCount is odd.
+            std::size_t const paddedEntries = entryCount + (entryCount & 1u);
+            std::uint32_t const blockSize =
+                static_cast<std::uint32_t>(8u + 2u * paddedEntries);
+            appendU32LE(relocBytes, pageBase);
+            appendU32LE(relocBytes, blockSize);
+            for (std::size_t k = cursor; k < blockEnd; ++k) {
+                std::uint16_t const entry = static_cast<std::uint16_t>(
+                    (kImageRelBasedDir64 << 12)
+                    | (baseRelocSiteRvas[k] & 0x0FFFu));
+                appendU16LE(relocBytes, entry);
+            }
+            if (entryCount & 1u) appendU16LE(relocBytes, 0u);  // ABSOLUTE no-op pad
+            cursor = blockEnd;
+        }
+    }
+    bool const hasBaseRelocs = !relocBytes.empty();
+
     // ── (d) Layout constants ──────────────────────────────────
     //
     // Header layout for PE32+ (spec §3.2-3.4):
@@ -1006,6 +1141,38 @@ encodeExec(AssembledModule const&    module,
         sectionHeaders.push_back(hIData);
         idata = iLayout;
     }
+    // .reloc section header (when the image carries absolute fixups — cross-CU thunk
+    // slots). Placed in VA space after .idata (or .rdata, or .text). Characteristics =
+    // IMAGE_SCN_CNT_INITIALIZED_DATA (0x40) | IMAGE_SCN_MEM_DISCARDABLE (0x02000000) |
+    // IMAGE_SCN_MEM_READ (0x40000000) = 0x42000040 — the loader consumes the base-reloc
+    // table during load and may discard the section afterward.
+    constexpr std::uint32_t kRelocCharacteristics = 0x42000040u;
+    std::optional<DataSectionLayout> reloc;
+    if (hasBaseRelocs) {
+        std::uint32_t const prevVaEnd =
+            idata.has_value() ? idata->rva + idata->virtualSize
+          : rdata.has_value() ? rdata->rva + rdata->virtualSize
+          : static_cast<std::uint32_t>(secText.virtualAddress) + textVirtualSizeE;
+        std::uint32_t const relocRva =
+            static_cast<std::uint32_t>(alignUp(prevVaEnd, sectionAlign));
+        PeSectionHeader hReloc{};
+        hReloc.name                  = encodeSectionName(".reloc", 0);
+        hReloc.virtualSize           = static_cast<std::uint32_t>(relocBytes.size());
+        hReloc.virtualAddress        = relocRva;
+        // sizeOfRawData / pointerToRawData filled below.
+        hReloc.pointerToRelocations  = 0;
+        hReloc.pointerToLinenumbers  = 0;
+        hReloc.numberOfRelocations   = 0;
+        hReloc.numberOfLinenumbers   = 0;
+        hReloc.characteristics       = kRelocCharacteristics;
+        DataSectionLayout rLayout;
+        rLayout.rva         = relocRva;
+        rLayout.virtualSize = static_cast<std::uint32_t>(
+            alignUp(relocBytes.size(), sectionAlign));
+        rLayout.headerIndex = sectionHeaders.size();
+        sectionHeaders.push_back(hReloc);
+        reloc = rLayout;
+    }
 
     std::uint32_t const numSections =
         static_cast<std::uint32_t>(sectionHeaders.size());
@@ -1043,9 +1210,23 @@ encodeExec(AssembledModule const&    module,
         sectionHeaders[idata->headerIndex].pointerToRawData =
             idata->rawPointer;
     }
+    // .reloc raw size + file pointer: file-aligned, placed immediately after the last
+    // prior section's raw data (.idata, else .rdata, else .text).
+    if (reloc.has_value()) {
+        reloc->rawSize = static_cast<std::uint32_t>(
+            alignUp(relocBytes.size(), fileAlign));
+        reloc->rawPointer =
+            idata.has_value() ? idata->rawPointer + idata->rawSize
+          : rdata.has_value() ? rdata->rawPointer + rdata->rawSize
+          : textRawPointer + textRawSize;
+        sectionHeaders[reloc->headerIndex].sizeOfRawData =
+            reloc->rawSize;
+        sectionHeaders[reloc->headerIndex].pointerToRawData =
+            reloc->rawPointer;
+    }
     // SizeOfImage = alignUp(highest_section_va + virtualSize,
     // sectionAlignment) per PE/COFF §3.4. The highest VA-extent
-    // is `.idata` when present, else `.rdata` when present, else
+    // is `.reloc` when present, else `.idata`, else `.rdata`, else
     // `.text`. The linear walk over present DataSectionLayouts
     // generalizes naturally when a 4th section type lands.
     std::uint32_t const textVirtualSize = textVirtualSizeE;
@@ -1057,6 +1238,9 @@ encodeExec(AssembledModule const&    module,
     }
     if (idata.has_value()) {
         lastSectionVaEnd = idata->rva + idata->virtualSize;
+    }
+    if (reloc.has_value()) {
+        lastSectionVaEnd = reloc->rva + reloc->virtualSize;
     }
     std::uint32_t const sizeOfImage = static_cast<std::uint32_t>(
         alignUp(lastSectionVaEnd, sectionAlign));
@@ -1108,10 +1292,13 @@ encodeExec(AssembledModule const&    module,
     appendU32LE(bytes, textRawSize);           // SizeOfCode
     // PE/COFF §3.4: SizeOfInitializedData is the sum of file-aligned
     // sizes of all sections carrying IMAGE_SCN_CNT_INITIALIZED_DATA.
-    // Both `.rdata` (D-LK2-RODATA) and `.idata` carry that flag.
+    // `.rdata` (D-LK2-RODATA), `.idata`, AND `.reloc` all carry that
+    // flag (.reloc's 0x42000040 sets CNT_INITIALIZED_DATA; its
+    // MEM_DISCARDABLE bit does not exempt it from the §3.4 sum).
     std::uint32_t const sizeOfInitializedData =
         (rdata.has_value() ? rdata->rawSize : 0u)
-        + (idata.has_value() ? idata->rawSize : 0u);
+        + (idata.has_value() ? idata->rawSize : 0u)
+        + (reloc.has_value() ? reloc->rawSize : 0u);
     appendU32LE(bytes, sizeOfInitializedData);
     appendU32LE(bytes, 0);                     // SizeOfUninitializedData
     appendU32LE(bytes, addressOfEntryPoint);   // AddressOfEntryPoint
@@ -1192,6 +1379,11 @@ encodeExec(AssembledModule const&    module,
             static_cast<std::uint64_t>(idata->rawPointer)
             + idata->rawSize;
     }
+    if (reloc.has_value()) {
+        sectionsEndFileOff =
+            static_cast<std::uint64_t>(reloc->rawPointer)
+            + reloc->rawSize;
+    }
     std::uint64_t const certTableFileOff64 = emitCertReservation
         ? ((sectionsEndFileOff + 7u) & ~std::uint64_t{7})
         : 0u;
@@ -1214,6 +1406,14 @@ encodeExec(AssembledModule const&    module,
     }
     std::uint32_t const certTableFileOff =
         static_cast<std::uint32_t>(certTableFileOff64);
+    // IMAGE_DIRECTORY_ENTRY_BASERELOC (index 5): RVA + byte size of the .reloc
+    // section's base-relocation table. The loader walks it to rebase every absolute
+    // fixup when ASLR slides the image. Size is the table's VIRTUAL size (unpadded
+    // block bytes), not the file-aligned raw size.
+    std::uint32_t const baseRelocDirRva  =
+        reloc.has_value() ? reloc->rva : 0u;
+    std::uint32_t const baseRelocDirSize =
+        reloc.has_value() ? static_cast<std::uint32_t>(relocBytes.size()) : 0u;
     for (std::size_t i = 0; i < kNumberOfRvaAndSizes; ++i) {
         if (i == 1u) {
             appendU32LE(bytes, importDirRva);
@@ -1222,6 +1422,10 @@ encodeExec(AssembledModule const&    module,
             // IMAGE_DIRECTORY_ENTRY_SECURITY: file offset, not RVA.
             appendU32LE(bytes, certTableFileOff);
             appendU32LE(bytes, oh.attributeCertReserveSize);
+        } else if (i == 5u) {
+            // IMAGE_DIRECTORY_ENTRY_BASERELOC.
+            appendU32LE(bytes, baseRelocDirRva);
+            appendU32LE(bytes, baseRelocDirSize);
         } else if (i == 12u) {
             appendU32LE(bytes, iatDirRva);
             appendU32LE(bytes, iatDirSize);
@@ -1331,6 +1535,17 @@ encodeExec(AssembledModule const&    module,
         while (bytes.size()
                 < static_cast<std::size_t>(idata->rawPointer)
                     + idata->rawSize) {
+            bytes.push_back(0);
+        }
+    }
+
+    // .reloc body (base relocation table), padded to fileAlignment. The block bytes
+    // were precomputed above (grouped by 4 KiB page); just emit + pad.
+    if (reloc.has_value()) {
+        bytes.insert(bytes.end(), relocBytes.begin(), relocBytes.end());
+        while (bytes.size()
+                < static_cast<std::size_t>(reloc->rawPointer)
+                    + reloc->rawSize) {
             bytes.push_back(0);
         }
     }

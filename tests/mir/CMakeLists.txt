@@ -6,6 +6,7 @@ dss_add_test(NAME mir/test_mir_node         SOURCES test_mir_node.cpp)
 dss_add_test(NAME mir/test_mir_literal_pool SOURCES test_mir_literal_pool.cpp)
 dss_add_test(NAME mir/test_mir              SOURCES test_mir.cpp)
 dss_add_test(NAME mir/test_mir_verifier     SOURCES test_mir_verifier.cpp)
+dss_add_test(NAME mir/test_mir_dom          SOURCES test_mir_dom.cpp)
 dss_add_test(NAME mir/test_mir_text         SOURCES test_mir_text.cpp)
 
 # ML2 lowering tests.
@@ -13,3 +14,6 @@ dss_add_test(NAME mir/test_mir_lowering_c_subset SOURCES test_mir_lowering_c_sub
 
 # LK6 cycle 2d — HIR ExternFunction → MIR.externImports thread-through.
 dss_add_test(NAME mir/test_mir_lowering_extern SOURCES test_mir_lowering_extern.cpp)
+
+# Cycle 25 Stage B — cross-module MIR merge (mergeCuMirs) tested in isolation.
+dss_add_test(NAME mir/test_mir_merge SOURCES test_mir_merge.cpp)

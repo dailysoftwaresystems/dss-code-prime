@@ -370,6 +370,98 @@ TEST(LirRegAlloc, HighPressureFunctionSpillsSome) {
         << "high-pressure function should require ≥ 1 spill";
 }
 
+// D-CSUBSET-DIVISION-OP-CODEGEN regalloc unit pin (cycle 10r split,
+// 2026-06-04). Per user mandate (cycle 10r non-negotiable #2):
+// the regalloc's implicit-register-clobber exclusion must be
+// PROVEN at the unit level. The split divide opcodes
+// (cqo + idiv_op, xor_rdx_zero + div_op) each declare
+// implicitRegisters; the regalloc consumer reads these and
+// forbids RAX/RDX for any vreg whose range COVERS the pre or core
+// op (the "covers" semantics, NOT the "crosses past" semantics
+// used for caller-saved across calls). idiv_op declares
+// implicitInputs=[rax,rdx] + implicitClobbered=[rdx]; cqo
+// declares implicitInputs=[rax] + implicitOutputs=[rdx] +
+// implicitClobbered=[rdx]. The divisor vreg is live at BOTH cqo
+// and idiv_op, so the regalloc must exclude RAX + RDX from its
+// allocation candidates at both positions.
+//
+// **The red-on-disable demonstration**: manually disabling the
+// `excludedCount = implicitClobbersCrossedBy(...)` line in
+// lir_regalloc.cpp + re-running this test shows the divisor vreg
+// ALLOCATED to RDX (ordinal 2) because cc.argGprs[1] = RDX on
+// SysV — without the exclusion, the linear-scan picks the
+// already-occupied register. The test goes RED, proving the
+// guard catches the regression class.
+TEST(LirRegAlloc, DivisorVregExcludesImplicitClobberSet) {
+    // Source: a helper with TWO params. The divisor (param 1) is
+    // the use site we want to verify NEVER lands in RAX (ord 0)
+    // or RDX (ord 2) — the compound-div implicit-input + clobber
+    // set. Returns the quotient.
+    auto lowered = lowerCSubsetToLir(
+        "int q(int a, int b) { return a / b; }\n");
+    ASSERT_TRUE(lowered.lir.ok);
+    LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
+    DiagnosticReporter regallocRep;
+    LirAllocation const out = allocateRegisters(
+        lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0,
+        regallocRep);
+    ASSERT_TRUE(out.ok());
+    ASSERT_EQ(out.perFunc.size(), 1u);
+    auto const& alloc = out.perFunc[0];
+
+    // Find the divisor vreg — the SECOND `arg` instruction's
+    // result. The structural shape from MIR→LIR: the function's
+    // entry block starts with arg(0) (dividend), arg(1) (divisor),
+    // then the lowerDiv 3-op sequence. We scan the first block
+    // for the second `arg` opcode.
+    Lir const& lir = lowered.lir.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const argOp = lowered.target->opcodeByMnemonic("arg");
+    ASSERT_TRUE(argOp.has_value());
+    LirReg divisorVreg = InvalidLirReg;
+    int argsSeen = 0;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const inst = lir.blockInstAt(bb, i);
+        if (lir.instOpcode(inst) == *argOp) {
+            if (argsSeen == 1) {
+                divisorVreg = lir.instResult(inst);
+                break;
+            }
+            ++argsSeen;
+        }
+    }
+    ASSERT_TRUE(divisorVreg.valid())
+        << "expected to find the second `arg` (divisor) in the "
+           "function's entry block";
+
+    // Look up the allocation for the divisor vreg.
+    ASSERT_LT(divisorVreg.id, alloc.assignments.size());
+    auto const& assignment = alloc.assignments[divisorVreg.id];
+    ASSERT_TRUE(assignment.vreg.valid())
+        << "divisor vreg id " << divisorVreg.id
+        << " has no allocation entry";
+    ASSERT_FALSE(assignment.isSpilled())
+        << "divisor was unexpectedly spilled — expected register "
+           "assignment with implicit-clobber exclusion respected";
+
+    std::uint16_t const assignedOrdinal =
+        static_cast<std::uint16_t>(assignment.physReg().id);
+    auto const raxOrd = (*lowered.target).registerByName("rax");
+    auto const rdxOrd = (*lowered.target).registerByName("rdx");
+    ASSERT_TRUE(raxOrd.has_value());
+    ASSERT_TRUE(rdxOrd.has_value());
+    EXPECT_NE(assignedOrdinal, *raxOrd)
+        << "FLAG-2 silent-miscompile guard: divisor allocated to "
+           "RAX would be overwritten by `mov rax, dividend` (the "
+           "implicit-input pin) BEFORE the compound op reads it.";
+    EXPECT_NE(assignedOrdinal, *rdxOrd)
+        << "FLAG-1/2 silent-miscompile guard: divisor allocated to "
+           "RDX would be destroyed by CQO (the compound op's pre-"
+           "extend phase) BEFORE IDIV reads it — divide by "
+           "sign-extension-of-RAX = divide by zero trap for "
+           "positive dividends.";
+}
+
 TEST(LirRegAlloc, CrossCallRangesLandInCalleeSavedOrSpill) {
     // A vreg live across a call must NOT be in a caller-saved register
     // — the SysV AMD64 cc's callerSaved set is well known and the

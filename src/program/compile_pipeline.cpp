@@ -17,10 +17,14 @@
 #include "lir/lir_rewrite.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
+#include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly consumes it)
+#include "opt/optimizer.hpp"
 
 #include <algorithm>
 #include <format>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -48,13 +52,72 @@ namespace {
 
 } // namespace
 
-bool compileSingleUnit(CompilationUnit const&        cu,
-                       GrammarSchema const&          grammar,
-                       TargetSchema const&           target,
-                       ObjectFormatSchema const&     format,
-                       std::uint16_t                 callingConventionIndex,
-                       std::filesystem::path const&  outPath,
-                       DiagnosticReporter&           reporter) {
+// MIR optimizer driver (Cycle 26 extraction). Resolves the pipeline — explicit
+// `opts.pipelineOverride` (examples_runner differential-verify arm + unit tests) else
+// the shipped JSON named by `resolvePipelineName(opts.config)` — then runs
+// `opt::optimize` over `mir` in place, returning `ok && tierClean`. Fails loud (false)
+// on an out-of-range CompileConfig ordinal or a pipeline load failure. The verifier
+// runs after every pass (D-OPT1-VERIFY-AFTER-EVERY-PASS), so this is the safety net
+// for the merged module too.
+//
+// `buildCuMir` calls this with the per-CU lattice's interner; the N>1 merged path
+// (`Program::compileOneTarget`) calls it with the merged host lattice's interner so
+// cross-CU calls — made intra-module DIRECT by the cycle-25 merge — get inlined
+// (D-OPT7-1). Agnostic: no language/target/format branch — the pipeline is
+// config-driven and `optimize` is target-blind at the MIR tier.
+bool optimizeModule(Mir&                  mir,
+                    TargetSchema const&   target,
+                    TypeInterner const&   interner,
+                    CompileOptions const& opts,
+                    DiagnosticReporter&   reporter) {
+    auto const optEntry = reporter.errorCount();
+    ::dss::opt::OptPipeline loadedPipeline;
+    ::dss::opt::OptPipeline const* effectivePipeline = opts.pipelineOverride;
+    if (effectivePipeline == nullptr) {
+        auto const name = resolvePipelineName(opts.config);
+        if (!name.has_value()) {
+            // Out-of-range CompileConfig ordinal — fail loud rather
+            // than silently degrade to "debug" (which would let a
+            // buggy CLI parser silently demote a release build).
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::X_PipelineNameResolutionFailed;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "compile_pipeline: CompileConfig ordinal {} out of range "
+                "(kCompileConfigCount = {}) — substrate-shape violation "
+                "(D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG).",
+                static_cast<int>(opts.config), kCompileConfigCount);
+            reporter.report(std::move(d));
+            return false;
+        }
+        auto loaded = ::dss::opt::loadShippedPipeline(*name);
+        if (!loaded.has_value()) {
+            // The pipeline file ships with the repo; a load failure
+            // here is a deploy/install bug. Drain config diagnostics
+            // so the user sees the JSON-path context.
+            forwardConfigDiagnostics(loaded.error(), reporter);
+            return false;
+        }
+        loadedPipeline = std::move(loaded).value();
+        effectivePipeline = &loadedPipeline;
+    }
+    auto const optResult = ::dss::opt::optimize(
+        mir, target, interner, *effectivePipeline, reporter);
+    return optResult.ok && tierClean(reporter, optEntry);
+}
+
+// BUILD half (Cycle 24): semantic analysis → HIR → FFI synthesis → MIR → optimize for
+// ONE CompilationUnit, returning the `CuMirModule` the LOWER half consumes. The
+// `SemanticModel` is MOVED into the result so its `TypeLattice` interner stays alive
+// past this call — `lowerCuMirToAssembly` re-opens it for MIR→LIR + the symbol-table
+// populate. Returns nullopt on any front-half tier failure (diagnostics via `reporter`).
+std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
+                                      GrammarSchema const&          grammar,
+                                      TargetSchema const&           target,
+                                      ObjectFormatSchema const&     format,
+                                      std::uint16_t                 callingConventionIndex,
+                                      DiagnosticReporter&           reporter,
+                                      CompileOptions const&         opts) {
     // Take a CU pointer matching `analyze()`'s shared_ptr signature.
     // The CU is borrowed (caller owns); we re-wrap as a shared_ptr
     // with a null deleter so `analyze`'s ref-counting contract is
@@ -76,14 +139,14 @@ bool compileSingleUnit(CompilationUnit const&        cu,
     auto model = analyze(std::move(borrowed));
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 2. CST → HIR.
     auto const hirEntry = reporter.errorCount();
     auto hir = lowerToHir(model, reporter);
     if (!hir || !hir->ok || !tierClean(reporter, hirEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 2.5. FFI metadata synthesis for source-declared externs
@@ -150,7 +213,7 @@ bool compileSingleUnit(CompilationUnit const&        cu,
             refs, importLibrary, target, format, ffiMap, reporter);
         (void)ffiResult;  // shape inspected via reporter.errorCount()
         if (!tierClean(reporter, ffiEntry)) {
-            return false;
+            return std::nullopt;
         }
     }
 
@@ -161,20 +224,89 @@ bool compileSingleUnit(CompilationUnit const&        cu,
     MirLoweringConfig mirCfg;
     mirCfg.globalsAllowFloat =
         grammar.hirLowering().globalsConstEval.allowFloat;
+    // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d): thread
+    // the source-language strict-aliasing opt-in from the SemanticConfig
+    // through to the HIR→MIR lowering, which stamps it onto the Mir
+    // for CSE/LICM Load admission. Multi-language CUs will eventually
+    // AND each schema's knob; today's single-language-per-CU shape
+    // reads directly.
+    mirCfg.strictAliasingOnDistinctTypes =
+        grammar.semantics().pointerAliasing.strictAliasingOnDistinctTypes;
+    mirCfg.charTypesAliasAll =
+        grammar.semantics().pointerAliasing.charTypesAliasAll;
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,
-                          &hir->sourceMap, mirCfg, &ffiMap);
+                          &hir->sourceMap, mirCfg, &ffiMap,
+                          &hir->linkageMap);
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
-        return false;
+        return std::nullopt;
     }
 
+    // 3.5. MIR optimizer (plan 22). Pipeline resolution + optimize + tier-clean gate
+    //      extracted to the shared `optimizeModule` (Cycle 26) so the N>1 whole-program
+    //      path can run the SAME pipeline over the MERGED module. Pure code-motion —
+    //      same arguments as the former inline block, so the per-CU output is identical.
+    if (!optimizeModule(mir.mir, target, model.lattice().interner(), opts, reporter)) {
+        return std::nullopt;
+    }
+
+    // BUILD half complete — hand the optimized MIR + the SemanticModel (interner
+    // owner) + extern imports + the schema refs across the MIR/LIR seam. The model
+    // is MOVED in so the interner survives for `lowerCuMirToAssembly`. Loop 1 of the
+    // multi-CU driver collects these; loop 2 lowers each (Cycle 24 re-sequence).
+    CuMirModule cuMir{
+        std::move(mir.mir),
+        std::move(model),
+        std::move(mir.externImports),
+        cu.id(),
+        &grammar,
+        &target,
+        callingConventionIndex,
+    };
+    return cuMir;
+}
+
+// LOWER half body (Cycle 25, Stage C): MIR → LIR → liveness → regalloc → rewrite →
+// legalize → callconv → assemble → the LK11a symbol-table populate → the user-entry
+// resolution, producing the `AssembledModule` (NO link, NO write). PARAMETERIZED on
+// the seam state so BOTH the single-CU path (`lowerCuMirToAssembly`) and the merged
+// whole-program path (`lowerMergedToAssembly`) share one body:
+//   * `mir`               — the module to lower (per-CU optimized OR whole-program merged).
+//   * `interner`          — the type interner the module's TypeIds index into (the per-CU
+//                           lattice's interner OR the merged host lattice's interner).
+//   * `nameOf`            — merged/declared symbol-id → declared name; powers the LK11a
+//                           symbol-table populate (replaces the per-CU `model.recordFor`).
+//   * `externImports`     — the module's surviving real-FFI imports (MOVED into MIR→LIR).
+//   * `userEntrySymbol`   — the caller's pre-resolved user-entry symbol (its CALLER ran
+//                           the entry-name scan: the single-CU path against the
+//                           SemanticModel, the merged path inside `mergeCuMirs`). When
+//                           set it is stamped onto `AssembledModule.userEntrySymbol`;
+//                           nullopt leaves it nullopt (no entry found — pre-Cycle-25 shape).
+//   * `target`            — the MIR→LIR + assemble target.
+//   * `cuId`              — stamped onto the AssembledModule so the linker keys symbols.
+// Returns nullopt on any back-half tier failure (diagnostics already emitted via `reporter`).
+//
+// The grammar's entry-name list is intentionally NOT a parameter — the entry-name SCAN
+// needs to ENUMERATE symbols + names (which `nameOf` cannot do) plus the ambiguity
+// fail-loud, so each caller runs it and hands the resolved id here. Keeping a dead
+// `grammar` param just to mirror the old monolith would be a smell.
+static std::optional<AssembledModule>
+lowerMirModuleToAssembly(Mir&                                        mir,
+                         TypeInterner const&                         interner,
+                         std::function<std::string(SymbolId)> const& nameOf,
+                         std::vector<ExternImport>                    externImports,
+                         std::optional<SymbolId>                     userEntrySymbol,
+                         TargetSchema const&                         target,
+                         std::uint16_t                               callingConventionIndex,
+                         CompilationUnitId                           cuId,
+                         DiagnosticReporter&                         reporter) {
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
     auto const lirEntry = reporter.errorCount();
-    auto lir = lowerToLir(mir.mir, target,
-                          model.lattice().interner(), reporter,
-                          std::move(mir.externImports));
+    auto lir = lowerToLir(mir, target,
+                          interner, reporter,
+                          std::move(externImports));
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 5. Liveness analysis (input to regalloc).
@@ -185,21 +317,21 @@ bool compileSingleUnit(CompilationUnit const&        cu,
     auto const alloc = allocateRegisters(lir.lir, target, liveness,
                                           callingConventionIndex, reporter);
     if (!alloc.ok() || !tierClean(reporter, allocEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 7. Rewrite vregs → physical registers.
     auto const rewriteEntry = reporter.errorCount();
     auto rewritten = rewriteWithAllocation(lir.lir, target, alloc, reporter);
     if (!rewritten.ok || !tierClean(reporter, rewriteEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 8. Two-address legalize (post-regalloc).
     auto const legalEntry = reporter.errorCount();
     auto legal = legalizeTwoAddress(rewritten.lir, target, reporter);
     if (!legal.ok() || !tierClean(reporter, legalEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 9. Calling-convention materialization (prologue/epilogue,
@@ -208,7 +340,7 @@ bool compileSingleUnit(CompilationUnit const&        cu,
     auto const ccEntry = reporter.errorCount();
     auto cc = materializeCallingConvention(legal.lir, target, alloc, reporter);
     if (!cc.ok() || !tierClean(reporter, ccEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 10. Assemble. `lirToMir` is all-invalid at this stage — the
@@ -223,80 +355,22 @@ bool compileSingleUnit(CompilationUnit const&        cu,
     auto assembled = assemble(cc.lir, target, lirToMir, reporter,
                               lir.externImports);
     if (!assembled.ok() || !tierClean(reporter, asmEntry)) {
-        return false;
+        return std::nullopt;
     }
 
-    // D-CSUBSET-MULTI-FN-WIN64-CC (step 13.5 cycle 2 post-fold,
-    // 2026-06-03): plumb the source-language entry-function symbol
-    // into AssembledModule.userEntrySymbol. The language config's
-    // declaration rules carry an `implicitReturnZeroForFunctionNames`
-    // list — c-subset names "main" there; toy / future languages
-    // name their own entry. Scan the semantic model's symbol records
-    // for a function symbol whose name appears in ANY decl rule's
-    // entry-name list, and stamp it on the AssembledModule so the
-    // trampoline injector's `resolveUserEntrySymbol` doesn't fall
-    // through to the `functions[0]` default (which silently picked
-    // the FIRST-declared function — wrong when the entry isn't
-    // declared first in source order).
-    //
-    // Source-agnostic: the trigger comes from grammar config, not
-    // a hardcoded "main" string. Multiple symbols matching the
-    // entry-name list fail-loud (silent-failure post-fold HIGH #1
-    // 2026-06-03 — never pick silently between candidates).
-    if (!assembled.userEntrySymbol.has_value()) {
-        std::vector<std::string_view> entryNames;
-        for (auto const& decl : grammar.semantics().declarations) {
-            for (auto const& n : decl.implicitReturnZeroForFunctionNames) {
-                entryNames.push_back(n);
-            }
-        }
-        if (!entryNames.empty()) {
-            // Silent-failure HIGH #1 post-fold (2026-06-03): walk
-            // EVERY function symbol matching the entry-name list;
-            // fail-loud on multiple matches rather than silently
-            // first-match-wins. A future language declaring
-            // `["main", "_start"]` (both defined in the source)
-            // OR a duplicate-name config (same name across two
-            // decl rules) would otherwise re-introduce the silent
-            // wrong-entry bug class this fix is supposed to close.
-            std::vector<SymbolId> matches;
-            std::vector<std::string_view> matchNames;
-            for (auto const& rec : model.symbols()) {
-                if (rec.kind != DeclarationKind::Function) continue;
-                bool const isEntry = std::any_of(
-                    entryNames.begin(), entryNames.end(),
-                    [&](std::string_view n){ return n == rec.name; });
-                if (isEntry) {
-                    SymbolId const sym{static_cast<std::uint32_t>(
-                        &rec - model.symbols().data())};
-                    matches.push_back(sym);
-                    matchNames.push_back(rec.name);
-                }
-            }
-            if (matches.size() > 1) {
-                std::string list;
-                for (std::size_t i = 0; i < matchNames.size(); ++i) {
-                    if (i) list += ", ";
-                    list += matchNames[i];
-                }
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::K_SymbolUndefined;
-                d.severity = DiagnosticSeverity::Error;
-                d.actual   = std::format(
-                    "compile_pipeline: ambiguous user-entry — {} "
-                    "function symbol(s) match the language's entry-"
-                    "name list (matched: {}). The trampoline injector "
-                    "cannot silently pick one. Declare distinct entry "
-                    "names per decl rule OR restrict the source to "
-                    "exactly one of these (D-CSUBSET-MULTI-FN-WIN64-CC "
-                    "ambiguity gate).", matches.size(), list);
-                reporter.report(std::move(d));
-                return false;
-            }
-            if (matches.size() == 1) {
-                assembled.userEntrySymbol = matches[0];
-            }
-        }
+    // Cycle 25 Stage C — stamp the user-entry symbol the CALLER pre-resolved
+    // (D-CSUBSET-MULTI-FN-WIN64-CC). The entry-name SCAN lives in each caller because
+    // it ENUMERATES symbols + names (which `nameOf` cannot do) plus the ambiguity
+    // fail-loud:
+    //   * single-CU (`lowerCuMirToAssembly`) scans the SemanticModel's symbol records
+    //     — verbatim the scan this body ran pre-Cycle-25, so the result is identical;
+    //   * merged whole-program (`lowerMergedToAssembly`) reads the id `mergeCuMirs`
+    //     already computed against the merged functions.
+    // `assembled.userEntrySymbol` is nullopt out of `assemble()`, so a caller passing
+    // nullopt (no entry found) leaves it nullopt — exactly the pre-Cycle-25 shape (the
+    // trampoline injector then falls through to its own default).
+    if (userEntrySymbol.has_value()) {
+        assembled.userEntrySymbol = userEntrySymbol;
     }
 
     // D-LK4-RODATA-PRODUCER (2026-06-02): materialize MIR globals
@@ -308,23 +382,261 @@ bool compileSingleUnit(CompilationUnit const&        cu,
     // since the assembler had no globals-bytes path. The new pass
     // closes the producer thread end-to-end.
     auto dataItems = lowerMirGlobalsToDataItems(
-        mir.mir, model.lattice().interner(), reporter);
+        mir, interner, reporter);
     if (!tierClean(reporter, asmEntry)) {
         // Any per-global encoding error already raised a loud
         // diagnostic via the function's internal `emit`.
-        return false;
+        return std::nullopt;
     }
     assembled.dataItems = std::move(dataItems);
 
-    // 11. Link.
+    // D-LK4-3: stamp the owning CompilationUnit's id so the linker keys this
+    // module's symbols by `(cuId, SymbolId)`. Single-CU build → one cuId; a merged
+    // whole-program image carries CU0's id (cosmetic — the merge already collapsed
+    // every CU into one symbol space, so the linker receives a single module).
+    assembled.cuId = cuId;
+
+    // LK11a: build the per-module symbol table the linker matches by NAME across
+    // CUs (cross-CU resolution + weak-vs-strong). One entry per DEFINED function /
+    // global — extern imports are references, not definitions, and are carried
+    // separately in `externImports`. The name comes from `nameOf` (raw declared
+    // identifier, no mangling — the SemanticModel name for a CU, the merged symbol
+    // name for a whole-program module); binding/visibility from MIR. IRs stay
+    // numeric — the name is resolved here via `nameOf`, not threaded through MIR/LIR.
+    // (Source/target/format-agnostic: reads `nameOf` + MIR linkage, no language/CPU/
+    // format branch.)
+    //
+    // Cycle 25 Stage C — `nameOf` returns "" for a symbol with NO declared name. That
+    // covers two cases, both module-private and SKIPPED here (no symbol-table entry):
+    //   * a compiler-SYNTHESIZED symbol — e.g. a string-literal rodata global (minted
+    //     ABOVE the semantic range per D-LK4-RODATA-PRODUCER-STRING) or a synthesized
+    //     init thunk. Never referenced across CUs by name; resolved intra-module by id.
+    //   * (single-CU) a SymbolId with no SemanticModel record at all — `nameOf`'s
+    //     `recordFor(s) ? name : ""` returns "" exactly as the old `rec == nullptr`
+    //     skip did. Byte-identical: every REAL c-subset func/global has a non-empty
+    //     declared name, so only synthesized symbols hit the "" skip in the corpus.
+    // (The pre-Cycle-25 monolith ALSO had an `empty-name && non-Local` fail-loud arm;
+    // it required a symbol with a record but an empty name — a state the semantic
+    // analyzer never produces, and indistinguishable from a synthesized symbol once
+    // names flow through `nameOf`. The merged module legitimately carries empty-named
+    // externally-visible synthesized globals, so an empty name is no longer a breach.
+    // The merge's own `MirVerifier` + `mergedSymbolOf` fail-louds guard merged-module
+    // integrity in that arm's place.)
+    {
+        auto appendSym = [&](SymbolId sym, SymbolBinding bind,
+                             SymbolVisibility vis) {
+            std::string name = nameOf(sym);
+            if (name.empty()) return;  // module-private (synthesized / no record)
+            assembled.symbols.push_back(
+                ModuleSymbol{sym, std::move(name), bind, vis});
+        };
+        for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i) {
+            MirFuncId const fid = mir.funcAt(i);
+            appendSym(mir.funcSymbol(fid), mir.funcBinding(fid),
+                      mir.funcVisibility(fid));
+        }
+        for (std::uint32_t i = 0; i < mir.moduleGlobalCount(); ++i) {
+            MirGlobalId const gid = mir.globalAt(i);
+            appendSym(mir.globalSymbol(gid), mir.globalBinding(gid),
+                      mir.globalVisibility(gid));
+        }
+    }
+
+    // Assembly complete — return the per-CU module; linking + writing is the shared
+    // `linkAndWrite` phase below, so N CUs can each assemble before one merged link.
+    return assembled;
+}
+
+namespace {
+
+// Resolve the user-entry symbol for a SINGLE CU by scanning its SemanticModel's
+// symbol records for a function symbol whose declared name appears in ANY decl
+// rule's entry-name list (D-CSUBSET-MULTI-FN-WIN64-CC). Returns the matched
+// SymbolId, or nullopt when no function matches. Fail-loud on MULTIPLE matches
+// (sets `*ok=false` + reports K_SymbolUndefined) — the trampoline injector cannot
+// silently pick one.
+//
+// This is the entry-name SCAN that used to live inline in the LOWER half (pre-
+// Cycle-25); it stays CU-specific because it ENUMERATES the model's symbol records
+// (which the merged path's symbol→name `nameOf` cannot express). The merged path's
+// equivalent runs inside `mergeCuMirs` against the merged functions. Source-agnostic:
+// the trigger is the grammar's `implicitReturnZeroForFunctionNames`, never a
+// hardcoded "main".
+[[nodiscard]] std::optional<SymbolId>
+resolveSingleCuUserEntry(SemanticModel const& model, GrammarSchema const& grammar,
+                         DiagnosticReporter& reporter, bool& ok) {
+    ok = true;
+    std::vector<std::string_view> entryNames;
+    for (auto const& decl : grammar.semantics().declarations) {
+        for (auto const& n : decl.implicitReturnZeroForFunctionNames) {
+            entryNames.push_back(n);
+        }
+    }
+    if (entryNames.empty()) return std::nullopt;
+
+    // Silent-failure HIGH #1 (2026-06-03): walk EVERY function symbol matching the
+    // entry-name list; fail-loud on multiple matches rather than silently
+    // first-match-wins (a future `["main", "_start"]` both-defined, or a duplicate-
+    // name config, would otherwise re-introduce the silent wrong-entry bug class).
+    std::vector<SymbolId> matches;
+    std::vector<std::string_view> matchNames;
+    for (auto const& rec : model.symbols()) {
+        if (rec.kind != DeclarationKind::Function) continue;
+        bool const isEntry = std::any_of(
+            entryNames.begin(), entryNames.end(),
+            [&](std::string_view n){ return n == rec.name; });
+        if (isEntry) {
+            SymbolId const sym{static_cast<std::uint32_t>(
+                &rec - model.symbols().data())};
+            matches.push_back(sym);
+            matchNames.push_back(rec.name);
+        }
+    }
+    if (matches.size() > 1) {
+        std::string list;
+        for (std::size_t i = 0; i < matchNames.size(); ++i) {
+            if (i) list += ", ";
+            list += matchNames[i];
+        }
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_SymbolUndefined;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "compile_pipeline: ambiguous user-entry — {} "
+            "function symbol(s) match the language's entry-"
+            "name list (matched: {}). The trampoline injector "
+            "cannot silently pick one. Declare distinct entry "
+            "names per decl rule OR restrict the source to "
+            "exactly one of these (D-CSUBSET-MULTI-FN-WIN64-CC "
+            "ambiguity gate).", matches.size(), list);
+        reporter.report(std::move(d));
+        ok = false;
+        return std::nullopt;
+    }
+    if (matches.size() == 1) return matches[0];
+    return std::nullopt;
+}
+
+} // namespace
+
+// LOWER half (single-CU): thin wrapper over the shared `lowerMirModuleToAssembly`.
+// Binds the seam state from the `CuMirModule`: the per-CU type interner, a
+// `nameOf` that reads the SemanticModel's symbol records, the CU's extern imports,
+// and the entry symbol resolved by the CU-specific scan above. Produces output
+// byte-identical to the pre-Cycle-25 monolith for any single-CU build.
+std::optional<AssembledModule>
+lowerCuMirToAssembly(CuMirModule& cuMir, DiagnosticReporter& reporter) {
+    SemanticModel&       model   = cuMir.model;
+    GrammarSchema const& grammar = *cuMir.grammar;
+
+    // Resolve the user-entry FIRST (fail-loud on ambiguity, exactly as the inline
+    // scan did) so a multi-entry source halts before lowering — same observable
+    // failure point as pre-Cycle-25.
+    bool entryOk = true;
+    std::optional<SymbolId> const userEntry =
+        resolveSingleCuUserEntry(model, grammar, reporter, entryOk);
+    if (!entryOk) return std::nullopt;
+
+    // `nameOf`: SymbolId → declared name. A SymbolId with no record (synthesized /
+    // out-of-range) yields "" — the LK11a symbol-table populate then skips it as
+    // module-private, exactly as the old `rec == nullptr` skip did.
+    auto nameOf = [&](SymbolId s) -> std::string {
+        SymbolRecord const* r = model.recordFor(s);
+        return r ? r->name : std::string{};
+    };
+
+    return lowerMirModuleToAssembly(
+        cuMir.mir, model.lattice().interner(), nameOf,
+        std::move(cuMir.externImports), userEntry, *cuMir.target,
+        cuMir.callingConventionIndex, cuMir.cuId, reporter);
+}
+
+// LOWER half (merged whole-program): thin wrapper over the shared
+// `lowerMirModuleToAssembly` for the N>1 merge path. `mergeCuMirs` already unified
+// the N CUs into ONE module over a host lattice, resolved cross-CU calls to DIRECT
+// intra-module calls (stripping the resolved extern imports), and computed the
+// user-entry symbol. This drives that single module through the same LOWER body,
+// so the linker downstream receives exactly ONE AssembledModule (no assembled-tier
+// cross-CU thunk — the cycle-19 GOT-like rodata slot is never minted).
+//
+// `merged` is taken by non-const ref because the shared body needs a mutable `Mir&`
+// (MIR→LIR may intern lowered-expression types into the host) + the surviving
+// externImports are MOVED into MIR→LIR. The host lattice's interner is the type
+// space for the merged module's TypeIds. `cuId` is CU0's (the merge stamped CU0's
+// symbol values preferentially; cosmetic, since the linker gets one module).
+std::optional<AssembledModule>
+lowerMergedToAssembly(MergedMirModule&    merged,
+                      GrammarSchema const& /*grammar*/,
+                      TargetSchema const& target,
+                      std::uint16_t       callingConventionIndex,
+                      CompilationUnitId   cuId,
+                      DiagnosticReporter& reporter) {
+    // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
+    // A synthesized / nameless merged symbol is absent from the map → "" → skipped
+    // by the LK11a symbol-table populate (module-private), exactly as in the CU path.
+    auto nameOf = [&](SymbolId s) -> std::string {
+        auto const it = merged.symbolNames.find(s.v);
+        return it != merged.symbolNames.end() ? it->second : std::string{};
+    };
+
+    return lowerMirModuleToAssembly(
+        merged.mir, merged.host.interner(), nameOf,
+        std::move(merged.externImports), merged.userEntrySymbol, target,
+        callingConventionIndex, cuId, reporter);
+}
+
+// Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU
+// path; N>1 the linker merges the CUs (LK11a resolution + LK11b byte emission)
+// before the format walker emits. `outPath` is caller-owned.
+bool linkAndWrite(std::span<AssembledModule const> modules,
+                  TargetSchema const&              target,
+                  ObjectFormatSchema const&        format,
+                  std::filesystem::path const&     outPath,
+                  DiagnosticReporter&              reporter) {
     auto const linkEntry = reporter.errorCount();
-    auto image = linker::link(assembled, target, format, reporter);
+    auto image = linker::link(modules, target, format, reporter);
     if (!image.ok() || !tierClean(reporter, linkEntry)) {
         return false;
     }
-
-    // 12. Commit to disk.
     return linker::writeImage(image, outPath, reporter);
+}
+
+// Assemble ONE CompilationUnit to its AssembledModule (no link/write). Returns
+// nullopt on any tier failure (diagnostics already emitted via `reporter`). The
+// multi-CU driver calls this per CU, collects the modules, then `linkAndWrite`s once.
+//
+// = `buildCuMir(...)` composed with `lowerCuMirToAssembly(...)`. Single-CU callers
+// (`compileSingleUnit`, `compileFiles`) get byte-identical output to the former
+// monolithic `buildAssembledModule` — the two halves run back-to-back with no
+// state held between them other than the `CuMirModule` that carried the MIR/LIR
+// seam state inline before the split.
+std::optional<AssembledModule>
+assembleUnit(CompilationUnit const&        cu,
+             GrammarSchema const&          grammar,
+             TargetSchema const&           target,
+             ObjectFormatSchema const&     format,
+             std::uint16_t                 callingConventionIndex,
+             DiagnosticReporter&           reporter,
+             CompileOptions const&         opts) {
+    auto cuMir = buildCuMir(cu, grammar, target, format,
+                            callingConventionIndex, reporter, opts);
+    if (!cuMir) return std::nullopt;
+    return lowerCuMirToAssembly(*cuMir, reporter);
+}
+
+bool compileSingleUnit(CompilationUnit const&        cu,
+                       GrammarSchema const&          grammar,
+                       TargetSchema const&           target,
+                       ObjectFormatSchema const&     format,
+                       std::uint16_t                 callingConventionIndex,
+                       std::filesystem::path const&  outPath,
+                       DiagnosticReporter&           reporter,
+                       CompileOptions const&         opts) {
+    auto mod = assembleUnit(cu, grammar, target, format,
+                            callingConventionIndex, reporter, opts);
+    if (!mod) return false;
+    return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
+                        target, format, outPath, reporter);
 }
 
 } // namespace dss

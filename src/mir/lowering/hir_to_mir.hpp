@@ -59,6 +59,23 @@ struct DSS_EXPORT HirToMirResult {
 // `false`) until per-Global routing lands in plan 20.
 struct DSS_EXPORT MirLoweringConfig {
     bool globalsAllowFloat = true;
+    // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: threaded from the
+    // source-language schema's
+    // `semantics.pointerAliasing.strictAliasingOnDistinctTypes`. When
+    // true, `lowerToMir` calls `MirBuilder::setAliasingMode(StrictTBAA)`
+    // before `finish()` — CSE/LICM Load admission then admits Rule 6
+    // (distinct primitive pointees). Default false (sound — every
+    // CSE/LICM admission stays conservative without opt-in).
+    bool strictAliasingOnDistinctTypes = false;
+
+    // D-OPT-MIR-ALIAS-CHAR-EXCEPTION-OVERRIDE: per-source-language
+    // C99 §6.5 ¶7 character-type-alias-all opt-in. Threaded from
+    // `semantics.pointerAliasing.charTypesAliasAll`. Default `true`
+    // matches C/C++/Objective-C; a Rust frontend or strict-typed DSL
+    // would set false. Lowered to `Mir::charTypesAliasAll()` so the
+    // MIR-tier alias predicate (`mirMayAlias` Rule 5) reads it without
+    // language identity branches.
+    bool charTypesAliasAll = true;
 };
 
 // Lower the frozen `hir` module to MIR. `literals` is the HirLiteralPool
@@ -91,6 +108,15 @@ lowerToMir(Hir const&               hir,
            // declarations are unaffected by the parameter and
            // produce an empty `HirToMirResult.externImports`.
            // (LK6 cycle 2d — D-LK6-6 closure.)
-           HirFfiMap const*         ffiMap    = nullptr);
+           HirFfiMap const*         ffiMap    = nullptr,
+           // D-CSUBSET-LINKAGE-SPECIFIERS / D-OPT7-LINKAGE-HIR-TO-MIR-MAPPING
+           // (pre-OPT7 P2): native-declaration linkage side-table, populated by
+           // the CST→HIR lowerer from the language's `linkageSpecifiers` facet.
+           // Optional: if nullptr (or a decl carries no entry) the
+           // function/global defaults to (Global, Default) — externally visible
+           // — exactly the pre-linkage behavior. Read here to stamp
+           // MirFunc/MirGlobal binding+visibility, the input the optimizer's
+           // DCE-protect predicate `isExternallyVisible()` consults.
+           HirLinkageMap const*     linkageMap = nullptr);
 
 } // namespace dss

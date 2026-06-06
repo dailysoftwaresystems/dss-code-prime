@@ -5,8 +5,10 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "core/types/type_lattice/type_lattice.hpp"  // TypeLattice (fresh merge host)
 #include "ffi/abi/abi_catalog.hpp"
 #include "link/object_format_schema.hpp"
+#include "mir/merge/mir_merge.hpp"  // MergeCuInput, mergeCuMirs (N>1 whole-program merge)
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
 #include "lsp/thread_pool.hpp"
@@ -160,13 +162,14 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
 // disambiguates same-named outputs across formats). When unset,
 // the legacy `<cwd>/target/<formatName>/<sourceStem><ext>`
 // convention applies — keeps existing call sites unchanged.
-[[nodiscard]] bool compileOneTarget(CompilationUnit const& cu,
+[[nodiscard]] bool compileOneTarget(std::span<CompilationUnit const> cus,
                                     GrammarSchema const&   grammar,
                                     std::string const&     sourceStem,
                                     std::string const&     targetSpecStr,
                                     DiagnosticReporter&    reporter,
                                     std::optional<std::filesystem::path> const& outputDir,
-                                    bool                   multiTargetBuild) {
+                                    bool                   multiTargetBuild,
+                                    CompileOptions const&  compileOpts) {
     auto parsed = TargetSpec::parse(targetSpecStr);
     if (!parsed) {
         emitDriver(reporter, DiagnosticCode::D_InvalidTargetSpec,
@@ -281,8 +284,164 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     }
     auto const outPath = outDir / (std::string{sourceStem} + std::string{ext});
 
-    return compileSingleUnit(cu, grammar, **targetR, **formatR,
-                             ccIndex, outPath, reporter);
+    // Cycle 24/25 build-then-lower sequence. LOOP 1: build EVERY CU's MIR up front
+    // (`buildCuMir` — sem→HIR→FFI→MIR→optimize), holding each `CuMirModule` (which keeps
+    // its SemanticModel — the interner owner — alive). Early-return on the FIRST CU's
+    // build failure preserves the fail-fast contract (diagnostics already reported).
+    std::vector<CuMirModule> cuMirs;
+    cuMirs.reserve(cus.size());
+    for (auto const& cu : cus) {
+        auto cuMir = buildCuMir(cu, grammar, **targetR, **formatR,
+                                ccIndex, reporter, compileOpts);
+        if (!cuMir) return false;  // front-half tier failure already reported via `reporter`
+        cuMirs.push_back(std::move(*cuMir));
+    }
+
+    // N==1 (the CU5 multi-file-single-CU case): lower the sole CU + link it. UNCHANGED
+    // from cycle 24 — byte-identical single-CU output. Routing N==1 through the merge
+    // would re-intern CU0's types into a fresh host (a no-op for correctness, but extra
+    // work + a different code path); keep the proven single-CU lowering for byte-identity.
+    if (cuMirs.size() == 1) {
+        auto mod = lowerCuMirToAssembly(cuMirs[0], reporter);
+        if (!mod) return false;  // back-half tier failure already reported via `reporter`
+        return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
+                            **targetR, **formatR, outPath, reporter);
+    }
+
+    // N>1 (CU6 multi-CU): WHOLE-PROGRAM MIR MERGE (Cycle 25 Stage C). Fold the N per-CU
+    // modules into ONE module over a fresh host lattice, resolving cross-CU calls to
+    // DIRECT intra-module calls (no cycle-19 assembled-tier thunk), then lower that single
+    // module ONCE and link it (the linker takes its single-module path). The merge reads
+    // each CU's `nameOf` (SemanticModel symbol names + extern mangledNames) while cloning,
+    // so `cuMirs` must stay alive through `mergeCuMirs` — it does (function-local, no CU's
+    // lattice is moved out: the host is FRESH, leaving every SemanticModel intact).
+    std::vector<MergeCuInput> mergeInputs;
+    mergeInputs.reserve(cuMirs.size());
+    for (auto& cuMir : cuMirs) {
+        MergeCuInput in;
+        in.mir      = &cuMir.mir;
+        in.interner = &cuMir.model.lattice().interner();
+        // nameOf: symbol id → declared name. Covers DEFINITIONS (SemanticModel record)
+        // AND extern IMPORTS (the import's mangledName, when the symbol has no record —
+        // an extern reference's SymbolId is not in the semantic symbol table). The merge
+        // keys cross-CU matching on this name exactly as the linker keys on the on-binary
+        // symbol name. Capturing `&cuMir` is safe — `cuMirs` is done growing.
+        in.nameOf = [cuMirP = &cuMir](SymbolId s) -> std::string {
+            if (SymbolRecord const* r = cuMirP->model.recordFor(s)) return r->name;
+            for (auto const& e : cuMirP->externImports) {
+                if (e.symbol.v == s.v) return e.mangledName;
+            }
+            return std::string{};
+        };
+        in.externImports = cuMir.externImports;
+        mergeInputs.push_back(std::move(in));
+    }
+
+    // Fresh host TypeLattice for the merged module: seeded with CU0's id + source
+    // language (cosmetic — the registry's sourceLanguage tags extension types; c-subset
+    // has none). The merge re-interns ALL CUs (incl CU0) into this fresh host, so no
+    // SemanticModel's lattice is mutated or moved — still "re-intern at merge", just a
+    // fresh host rather than CU0's in-place. Agnostic: id + language string, no branch.
+    TypeLattice host{cuMirs[0].cuId,
+                     std::string{cuMirs[0].model.lattice().registry().sourceLanguage()}};
+
+    // entryNames: the grammar's entry-function name list (the same list the single-CU
+    // user-entry scan reads). The merge uses it to compute the merged `userEntrySymbol`.
+    std::vector<std::string> entryNames;
+    for (auto const& decl : grammar.semantics().declarations) {
+        for (auto const& n : decl.implicitReturnZeroForFunctionNames) {
+            entryNames.push_back(n);
+        }
+    }
+
+    auto merged = mergeCuMirs(
+        std::span<MergeCuInput const>{mergeInputs.data(), mergeInputs.size()},
+        std::move(host),
+        std::span<std::string const>{entryNames.data(), entryNames.size()},
+        reporter);
+    if (!merged) return false;  // merge failure (conflict / verify) already reported.
+
+    // Cycle 26 (D-OPT7-1): optimize the WHOLE-PROGRAM merged module with the configured
+    // pipeline. The merge made every cross-CU call an intra-module DIRECT call, so the
+    // inliner's `symToFunc` now resolves the callee — a cross-CU call becomes inline-
+    // eligible exactly like an intra-CU one. `merged->host.interner()` is the type space
+    // the merged TypeIds index into (the same interner `lowerMergedToAssembly` uses). The
+    // optimizer runs MirVerifier after every pass (the merged-module safety net). DOUBLE-
+    // OPT is correct: a cross-CU call's per-CU inline was a no-op (extern, unresolvable
+    // per-CU); the merged inline does the work. Same pipeline resolution as the per-CU
+    // path (`optimizeModule`), so the examples-runner's `["Inlining"]` override flows here
+    // via `compileOpts.pipelineOverride`.
+    //
+    // D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE (deferred, efficiency-only): the N>1 path
+    // currently optimizes each CU's MIR in `buildCuMir` AND optimizes the merged module
+    // here (DOUBLE-OPT). Correct but redundant work — a true LTO shape would skip the
+    // per-CU optimize for multi-CU builds and optimize the whole-program merged module
+    // ONCE. Not done now because `buildCuMir` is shared with the N==1 path (which must
+    // still optimize per-CU) and the redundant per-CU pass is correctness-neutral.
+    if (!optimizeModule(merged->mir, **targetR, merged->host.interner(),
+                        compileOpts, reporter)) {
+        return false;  // optimize / verify failure already reported via `reporter`
+    }
+
+    auto mod = lowerMergedToAssembly(*merged, grammar, **targetR,
+                                     ccIndex, cuMirs[0].cuId, reporter);
+    if (!mod) return false;  // back-half tier failure already reported via `reporter`
+    return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
+                        **targetR, **formatR, outPath, reporter);
+}
+
+// Drain N CUs' parse / driver-tier diagnostics into the run-wide reporter, then compile
+// them to each target — the linker MERGES the N CUs into ONE image per target (LK11).
+// Shared by `compileFiles` (one CU5 multi-file CU → 1-element span) and `compileUnits`
+// (N single-file CUs). The only difference between those two entries is how the CUs are
+// constructed; everything downstream (drain, per-target scratch-reporter merge, link) is
+// identical and lives here. Returns 0 on success, 1 on any error.
+int runCusToTargets(std::span<CompilationUnit const>            cus,
+                    GrammarSchema const&                        grammar,
+                    std::string const&                          sourceStem,
+                    std::vector<std::string> const&             targets,
+                    DiagnosticReporter&                         rep,
+                    std::optional<std::filesystem::path> const& outputDir,
+                    CompileConfig                               config,
+                    ::dss::opt::OptPipeline const*              pipelineOverride) {
+    // Drain each CU's driver-tier + per-Tree diagnostics (D_FileNotFound, parser/lexer
+    // errors) into the run-wide reporter. Without this drain, a missing source file
+    // produces rc=1 with ZERO stderr — the substrate silent-failure archetype.
+    for (auto const& cu : cus) {
+        copyDiagnostics(cu.driverDiagnostics(), rep);
+        for (auto const& tree : cu.trees()) {
+            copyDiagnostics(tree.diagnostics(), rep);
+        }
+    }
+    // If parsing already failed, the per-target loop would only produce derivative noise.
+    if (rep.hasErrors()) {
+        drainDiagnosticsToStderr(rep);
+        return 1;
+    }
+
+    int exitCode = 0;
+    for (auto const& spec : targets) {
+        // Per-target scratch reporter inheriting `rep`'s POLICY axes (suppress / overrides
+        // / warningsAsErrors) but with the CAP/DEDUP axes RELAXED — those run-wide limits
+        // are enforced once at `rep` during merge (silent-failure-hunter F9 / H1 fix; see
+        // D-MERGE-POLICY-IDEMPOTENCY / D-MERGE-SCRATCH-FRESH / D-COMPILE-ONE-TARGET-NO-LEAK).
+        auto scratchCfg = rep.config();
+        scratchCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
+        scratchCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
+        scratchCfg.dedupWindow    = 0;
+        DiagnosticReporter scratch{scratchCfg};
+        CompileOptions compileOpts;
+        compileOpts.config           = config;
+        compileOpts.pipelineOverride = pipelineOverride;
+        bool const ok = compileOneTarget(
+            cus, grammar, sourceStem, spec, scratch,
+            outputDir, /*multiTargetBuild*/ targets.size() > 1u, compileOpts);
+        mergeWithTargetContext(scratch, spec, rep);
+        if (!ok || scratch.hasErrors()) exitCode = 1;
+    }
+
+    drainDiagnosticsToStderr(rep);
+    return exitCode;
 }
 
 } // namespace
@@ -314,6 +473,10 @@ int Program::run(int argc, char* argv[]) {
     auto const cfg = buildReporterConfig(args);
     // D-LK10-ENTRY Slice C companion: route emitted binaries.
     setOutputDir(args.outputDir);
+    // D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG: thread the CLI's
+    // `--config=<debug|release>` into the kernel so the right
+    // shipped pipeline gets loaded at compile_pipeline step 3.5.
+    setCompileConfig(args.config);
     if (args.projectPath.has_value()) {
         return compileProject(*args.projectPath, cfg);
     }
@@ -326,8 +489,21 @@ int Program::run(int argc, char* argv[]) {
                                 args.targets, args.directoryMode, cfg);
     }
     if (!args.sourceFiles.empty()) {
-        return compileFiles(args.sourceFiles, args.languageName,
-                            args.targets, cfg);
+        // Each `--compile` file is its OWN translation unit; more than one file links them
+        // into a single image (gcc/clang `cc a.c b.c` semantics — separate TUs, the LINKER
+        // resolves cross-file references: a sibling CU's definition shadows a library
+        // import, per the cross-CU resolution chain LK11). A single file is the degenerate
+        // 1-TU case, kept on the unchanged `compileFiles` path — `compileUnits` with N==1
+        // is behaviorally identical (both funnel one CU through `runCusToTargets`), so the
+        // 38 single-source examples are untouched. The unity-build (many files → ONE CU5
+        // unit) is deliberately NOT a CLI surface: no language's file model concatenates
+        // translation units, so there is no source-agnostic CLI spelling for it; a future
+        // explicit opt-in flag can route to `compileFiles` when a real consumer needs it.
+        // The `size() > 1` test keys on translation-unit COUNT, not on any language / CPU /
+        // format identity — the standing agnosticism veto is held.
+        return args.sourceFiles.size() > 1
+            ? compileUnits(args.sourceFiles, args.languageName, args.targets, cfg)
+            : compileFiles(args.sourceFiles, args.languageName, args.targets, cfg);
     }
 
     // No mode flags set — print the ready message + usage hint. The
@@ -403,6 +579,35 @@ int Program::transpile(
     return 1;
 }
 
+// FF11: declare the language's SYSTEM include dirs (its
+// `semantics.shippedLibDirs`, the /usr/include analogue) on `builder`
+// so the angle form `#include <h>` resolves against them. Each config
+// string is a subdirectory under `src/dss-config/`; resolve it to an
+// absolute dir by walking up from cwd (mirroring `findShippedConfig`'s
+// 8-level walk, so it works from repo root, build/, or a nested ctest
+// cwd). A dir not found in the ancestry is skipped — a header miss then
+// hard-fails downstream with F_ShippedHeaderNotFound, which is the
+// correct fail-loud surface (vs. silently swallowing here). NO language
+// branch: the dirs come entirely from the schema's per-language config.
+void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar) {
+    auto const& dirs = grammar.semantics().shippedLibDirs;
+    if (dirs.empty()) return;
+    std::error_code ec;
+    for (std::string const& sub : dirs) {
+        fs::path here = fs::current_path(ec);
+        for (int i = 0; i < 8 && !here.empty(); ++i) {
+            fs::path const candidate = here / "src" / "dss-config" / sub;
+            if (fs::is_directory(candidate, ec)) {
+                builder.addSystemDir(candidate);
+                break;
+            }
+            fs::path const parent = here.parent_path();
+            if (parent == here) break;   // hit filesystem root
+            here = parent;
+        }
+    }
+}
+
 int Program::compileFiles(
     const std::vector<std::string>& sourceFiles,
     const std::string& languageName,
@@ -451,91 +656,87 @@ int Program::compileFiles(
     }
     auto grammar = *grammarR;
 
-    // Build ONE CompilationUnit for all source files. Multi-file
-    // CU is the canonical shape (HR11/CU5 — same engine the multi-
-    // language tests exercise); each file routes to the language's
-    // schema by extension. Cross-CU symbol merge (multi-CU →
-    // single image) is LK11; cycle 2 stays single-CU.
+    // Build ONE CompilationUnit for ALL source files — the CU5 multi-file-single-CU shape
+    // (cross-file references resolved WITHIN the CU; each file routes to the language's
+    // schema by extension). For one CU per file (a multi-CU image the linker MERGES, LK11)
+    // use `compileUnits` — this entry's single-CU semantics are unchanged.
     UnitBuilder builder{grammar};
+    applySystemDirs(builder, *grammar);
     for (auto const& path : sourceFiles) {
         builder.addFile(fs::path{path});
     }
     auto cu = std::move(builder).finish();
 
-    // Drain the CU's driver-tier diagnostics (D_FileNotFound,
-    // D_DuplicateFile, parser/lexer errors per Tree) into the
-    // run-wide reporter. Without this drain, a missing source
-    // file produces rc=1 with ZERO stderr output — the substrate
-    // silent-failure rule's archetype. (code-reviewer F1 fold.)
-    copyDiagnostics(cu.driverDiagnostics(), rep);
-    for (auto const& tree : cu.trees()) {
-        copyDiagnostics(tree.diagnostics(), rep);
+    // Stem of the first source file names the artifact (one artifact per target). Plan 06
+    // will eventually let artifact profiles override this.
+    std::string const sourceStem = fs::path{sourceFiles.front()}.stem().string();
+    return runCusToTargets(
+        std::span<CompilationUnit const>{&cu, 1}, *grammar, sourceStem, targets, rep,
+        outputDir_, compileConfig_,
+        optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr);
+}
+
+int Program::compileUnits(
+    const std::vector<std::string>& sourceFiles,
+    const std::string& languageName,
+    const std::vector<std::string>& targets,
+    DiagnosticReporter::Config const& reporterConfig
+) {
+    DiagnosticReporter rep{reporterConfig};
+    return compileUnits(sourceFiles, languageName, targets, rep);
+}
+
+int Program::compileUnits(
+    const std::vector<std::string>& sourceFiles,
+    const std::string& languageName,
+    const std::vector<std::string>& targets,
+    DiagnosticReporter&             rep
+) {
+    if (sourceFiles.empty()) {
+        emitDriver(rep, DiagnosticCode::D_EmptyInput,
+                   "compileUnits: source file list is empty.");
+        drainDiagnosticsToStderr(rep);
+        return 1;
     }
-    // If the CU's parse stage already failed (file-not-found,
-    // unparseable file, …), the per-target loop below would only
-    // produce derivative noise. Surface the upstream failure and
-    // stop here so the operator sees the actual root cause.
-    if (rep.hasErrors()) {
+    if (targets.empty()) {
+        emitDriver(rep, DiagnosticCode::D_InvalidTargetSpec,
+                   "compileUnits: targets list is empty — at least one "
+                   "'<targetName>:<formatName>' entry required.");
         drainDiagnosticsToStderr(rep);
         return 1;
     }
 
-    // Stem of the first source file names the artifact (the
-    // multi-file CU produces ONE artifact per target; the stem is
-    // the conventional human-readable label). Plan 06 will
-    // eventually let artifact profiles override this.
-    std::string const sourceStem =
-        fs::path{sourceFiles.front()}.stem().string();
+    auto grammarR = GrammarSchema::loadShipped(languageName);
+    if (!grammarR.has_value()) {
+        forwardConfigDiagnostics(grammarR.error(), rep);
+        emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                   "language schema '" + languageName
+                   + "' could not be loaded — check that "
+                     "src/dss-config/sources/" + languageName
+                   + ".lang.json exists and parses cleanly.");
+        drainDiagnosticsToStderr(rep);
+        return 1;
+    }
+    auto grammar = *grammarR;
 
-    int exitCode = 0;
-    for (auto const& spec : targets) {
-        // Per-target scratch reporter — its contents are merged
-        // into the run-wide reporter with a `[target=<spec>]` prefix
-        // so interleaved diagnostics from multi-target runs can be
-        // routed by tooling. (silent-failure-hunter F9 fold.)
-        //
-        // H1 silent-failure fix 2026-06-01 + F1b/F1c double-policy fix:
-        // scratch inherits `rep.config()`'s POLICY axes (suppress /
-        // overrides / warningsAsErrors / unsuppressable gate) so
-        // per-target diagnostics honor the same user policy as run-
-        // wide `rep`. (Post-d312c1c rep-injection overload: the
-        // source of truth is `rep.config()` not the prior explicit
-        // `reporterConfig` parameter — the Config-taking wrapper
-        // constructs `rep` from `reporterConfig` upstream.) But the CAP / DEDUP axes (maxDiagnostics /
-        // maxPerCode / dedupWindow) are intentionally RELAXED on
-        // scratch — those are run-wide limits enforced once at `rep`
-        // during merge. Without the relax, both scratch AND rep would
-        // apply caps, silently dropping diagnostics + emitting two
-        // P_TooManyDiagnostics markers per run, AND the per-target
-        // cap would fire long before the user's intended run-wide
-        // cap. The merge architecture predates the H1 fix; the relax
-        // restores its single-chokepoint cap semantic.
-        //
-        // Related concerns anchored separately:
-        // D-MERGE-POLICY-IDEMPOTENCY (overrides absolute-set
-        // semantic), D-MERGE-SCRATCH-FRESH (tripwire if scratch
-        // becomes reused), D-COMPILE-ONE-TARGET-NO-LEAK (contract
-        // pin: compileOneTarget never writes to `rep` directly).
-        // D-MERGE-DEDUP-PREFIX-COLLISION was CLOSED at eb2c6c7:
-        // `mergeWithTargetContext` now stamps the per-target prefix
-        // into `contextPrefix` (excluded from hashKey) rather than
-        // mutating `actual`, so cross-target legitimate duplicates
-        // collapse at the merge destination.
-        auto scratchCfg = rep.config();
-        scratchCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
-        scratchCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
-        scratchCfg.dedupWindow    = 0;
-        DiagnosticReporter scratch{scratchCfg};
-        bool const ok = compileOneTarget(cu, *grammar, sourceStem,
-                                          spec, scratch,
-                                          outputDir_,
-                                          /*multiTargetBuild*/ targets.size() > 1u);
-        mergeWithTargetContext(scratch, spec, rep);
-        if (!ok || scratch.hasErrors()) exitCode = 1;
+    // Build ONE CompilationUnit PER source file — the multi-CU model the linker MERGES
+    // into one image (CU6 + LK11). Distinct from `compileFiles` (one CU5 multi-file CU);
+    // here cross-file references are resolved at LINK time (a sibling CU's definition or a
+    // library import), not within a single CU.
+    std::vector<CompilationUnit> cus;
+    cus.reserve(sourceFiles.size());
+    for (auto const& path : sourceFiles) {
+        UnitBuilder builder{grammar};
+        applySystemDirs(builder, *grammar);
+        builder.addFile(fs::path{path});
+        cus.push_back(std::move(builder).finish());
     }
 
-    drainDiagnosticsToStderr(rep);
-    return exitCode;
+    std::string const sourceStem = fs::path{sourceFiles.front()}.stem().string();
+    return runCusToTargets(
+        std::span<CompilationUnit const>{cus.data(), cus.size()}, *grammar, sourceStem,
+        targets, rep, outputDir_, compileConfig_,
+        optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr);
 }
 
 // D-CAP-MARKER-COMPILE-DIR-PIN anchor: compileDirectory has NO

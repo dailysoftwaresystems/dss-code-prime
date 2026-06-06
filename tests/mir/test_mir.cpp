@@ -692,7 +692,9 @@ TEST(MirDeathTest, DirectCtorArenaTagMismatchAborts) {
     // EXPECT_DEATH macro nor a braced-init-list splits the arguments).
     EXPECT_DEATH((void)Mir(std::move(ia), std::move(ba), std::move(fa), std::move(ga),
                            std::move(instBlock),
-                           {}, {}, {}, MirLiteralPool{}),
+                           {}, {}, {}, MirLiteralPool{},
+                           MirAliasingMode::Permissive,
+                           /*charTypesAliasAll=*/true),
                  "module-tag mismatch");
 }
 
@@ -709,7 +711,9 @@ TEST(MirDeathTest, DirectCtorInstBlockSizeMismatchAborts) {
     std::vector<MirBlockId> instBlock{};  // size 0 ≠ ia.nodeCount() (1)
     EXPECT_DEATH((void)Mir(std::move(ia), std::move(ba), std::move(fa), std::move(ga),
                            std::move(instBlock),
-                           {}, {}, {}, MirLiteralPool{}),
+                           {}, {}, {}, MirLiteralPool{},
+                           MirAliasingMode::Permissive,
+                           /*charTypesAliasAll=*/true),
                  "size mismatch");
 }
 
@@ -727,7 +731,9 @@ TEST(MirDeathTest, DirectCtorGlobalArenaTagMismatchAborts) {
     std::vector<MirBlockId> instBlock{InvalidMirBlock};
     EXPECT_DEATH((void)Mir(std::move(ia), std::move(ba), std::move(fa), std::move(ga),
                            std::move(instBlock),
-                           {}, {}, {}, MirLiteralPool{}),
+                           {}, {}, {}, MirLiteralPool{},
+                           MirAliasingMode::Permissive,
+                           /*charTypesAliasAll=*/true),
                  "module-tag mismatch");
 }
 

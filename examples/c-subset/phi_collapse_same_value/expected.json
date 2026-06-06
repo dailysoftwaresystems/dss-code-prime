@@ -1,0 +1,17 @@
+{
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "mem2reg-then-copyprop", "passes": ["Mem2Reg", "CopyProp"]},
+    {"label": "constfold-mem2reg-copyprop", "passes": ["ConstFold", "Mem2Reg", "CopyProp"]}
+  ]
+}

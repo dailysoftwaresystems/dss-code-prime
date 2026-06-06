@@ -187,6 +187,98 @@ TEST(ImportResolver, CSubsetIncludeDirResolvesAcrossDirectories) {
     EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport));
 }
 
+// ── FF11: angle-form `#include <h>` system-path resolution ───────────────────
+
+// `#include <X.h>` resolves the header on the SYSTEM search path
+// (addSystemDir, the shippedLibDirs analogue) — NOT the quote form's
+// self-dir/includeDirs. The header is a c-subset source loaded + merged,
+// and its extern decl reaches the merged unit (so FF5 can annotate it).
+TEST(ImportResolver, CSubsetAngleIncludeResolvesOnSystemDir) {
+    TempDir srcDir;
+    TempDir sysDir;
+    auto main = srcDir.write("main.c",
+        "#include <api.h>\nint main() { return use(); }\n");
+    sysDir.write("api.h", "extern int use();\n");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addSystemDir(sysDir.path());       // the system (shippedLibDirs) path
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    // api.h was discovered + loaded by following the ANGLE directive.
+    ASSERT_EQ(cu.trees().size(), 2u);
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors());
+    EXPECT_FALSE(cu.trees()[1].diagnostics().hasErrors());
+    EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::F_ShippedHeaderNotFound));
+    EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport));
+
+    ASSERT_EQ(cu.crossRefs().size(), 1u);
+    auto const& ref = cu.crossRefs()[0];
+    Tree const& mainTree = cu.trees()[0];
+    EXPECT_EQ(ref.sourceTree, mainTree.id());
+    EXPECT_EQ(ref.targetTree, cu.trees()[1].id());           // → api.h
+    EXPECT_EQ(ref.targetNode, cu.trees()[1].root());
+    // The edge anchors on the same includeDirective rule node as the quote form.
+    EXPECT_EQ(mainTree.rule(ref.sourceNode), mainTree.rules().find("includeDirective"));
+
+    // The loaded header's `extern int use();` is present in the merged unit —
+    // a real declaration WITH its signature, ready for FF5 synthesis.
+    bool sawExtern = false;
+    Tree const& sysTree = cu.trees()[1];
+    walkPreOrder(sysTree, [&](TreeCursor const& cursor) {
+        NodeId const node = cursor.current();
+        if (sysTree.kind(node) == NodeKind::Internal
+            && sysTree.rule(node) == sysTree.rules().find("externDecl")) {
+            sawExtern = true;
+        }
+    });
+    EXPECT_TRUE(sawExtern) << "the system header's externDecl must reach the unit";
+}
+
+// A SYSTEM-header miss is a HARD error (F_ShippedHeaderNotFound), NOT the
+// soft D_UnresolvedImport the quote form uses. (FF11 fail-loud contract.)
+TEST(ImportResolver, CSubsetAngleIncludeMissIsHardError) {
+    TempDir srcDir;
+    TempDir sysDir;   // empty — the header is absent
+    auto main = srcDir.write("main.c",
+        "#include <nope.h>\nint main() { return 0; }\n");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addSystemDir(sysDir.path());
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_EQ(cu.trees().size(), 1u);                // nothing loaded
+    EXPECT_TRUE(cu.crossRefs().empty());
+    EXPECT_EQ(countCode(cu.driverDiagnostics(),
+                        DiagnosticCode::F_ShippedHeaderNotFound), 1u)
+        << "a missing system header must fire F_ShippedHeaderNotFound";
+    // It is NOT the soft quote-form diagnostic.
+    EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport));
+}
+
+// The quote form does NOT search the system dir, and the angle form does
+// NOT search includeDirs — the two paths are distinct (config-driven by
+// pathToken vs systemPathToken, no language branch).
+TEST(ImportResolver, CSubsetAngleAndQuotePathsAreDistinct) {
+    TempDir srcDir;
+    TempDir sysDir;
+    // The header lives ONLY on the system dir. A QUOTE include of the same
+    // name must NOT find it there → soft D_UnresolvedImport, no hard error.
+    auto main = srcDir.write("main.c",
+        "#include \"sysonly.h\"\nint main() { return 0; }\n");
+    sysDir.write("sysonly.h", "extern int s();\n");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addSystemDir(sysDir.path());   // declared as SYSTEM, not include
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_EQ(cu.trees().size(), 1u);      // quote form did not reach the system dir
+    EXPECT_EQ(countCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport), 1u);
+    EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::F_ShippedHeaderNotFound));
+}
+
 // ── tsql-subset: cross-statement table-name matching ─────────────────────────
 
 TEST(ImportResolver, TsqlTableReferenceResolvesAcrossFiles) {

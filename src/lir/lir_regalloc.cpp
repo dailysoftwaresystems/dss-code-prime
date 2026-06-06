@@ -148,6 +148,138 @@ rangeCrossesCall(LirLiveRange const& r,
     return *lo + 1u < r.end;
 }
 
+// Per-opcode implicit-clobber consumer (cycle 10q closure of the
+// 10p substrate). Some opcodes (x86 idiv/div, future x86 shift-by-CL,
+// future mul-1-op-for-128-bit-result) destroy specific physical
+// registers as part of their semantic contract — distinct from
+// caller-saved (which is target-wide, applies to all calls) and
+// distinct from requires2Address (which forces ops[0]==result).
+// The 10p substrate declared the constraint per-opcode JSON-side;
+// 10q wires the regalloc to read + respect it.
+//
+// Mechanism mirrors callPositions: scan the LIR once, collect a
+// (position, clobbered-ordinals) entry per opcode-with-clobbers.
+// Per-range allocation then checks crossings + adds the union of
+// crossed clobbers to the exclusion set passed to tryAllocate
+// Excluding. Universal across CPUs: the constraint is per-opcode-
+// JSON-declared; no `if (opcode == idiv)` ever.
+// `forbiddenOrdinals` = (implicitRegisters.inputs ∪
+// implicitRegisters.clobbered) at this position. Cycle-10r fix:
+// the operand vregs USED AT a compound op must avoid BOTH input
+// AND clobbered regs:
+//   - Operand allocated to an implicit-INPUT reg: the implicit-
+//     input-pinning mov (e.g., `mov rax, dividend` in lowerDiv)
+//     happens BEFORE the op reads the operand — overwriting the
+//     operand's value with the implicit-input's value. Silent
+//     miscompile (divisor reads as dividend; 100/100 = 1).
+//   - Operand allocated to an implicit-CLOBBERED reg: the op's
+//     pre-emit (CQO writes RDX before IDIV reads operand 0)
+//     destroys the operand's value mid-op. Silent miscompile
+//     (operand becomes sign-extension of dividend; 100/0 = trap).
+// Outputs are not forbidden (the op reads the operand BEFORE
+// writing outputs; same-reg overlap is fine).
+struct ImplicitClobberAt {
+    std::uint32_t              position;
+    std::vector<std::uint16_t> forbiddenOrdinals;
+};
+
+[[nodiscard]] std::vector<ImplicitClobberAt>
+collectImplicitClobberPositions(Lir const& lir, TargetSchema const& schema,
+                                LirFuncLiveness const& flow) {
+    std::vector<ImplicitClobberAt> out;
+    std::uint32_t pos = 0;
+    for (auto const& b : flow.blockOrder) {
+        std::uint32_t const n = lir.blockInstCount(b);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const inst = lir.blockInstAt(b, i);
+            auto const* info = schema.opcodeInfo(lir.instOpcode(inst));
+            if (info != nullptr
+             && info->implicitRegisters.has_value()) {
+                auto const& ir = *info->implicitRegisters;
+                if (!ir.inputOrdinals.empty()
+                 || !ir.clobberedOrdinals.empty()) {
+                    std::vector<std::uint16_t> forbidden;
+                    forbidden.reserve(ir.inputOrdinals.size()
+                                      + ir.clobberedOrdinals.size());
+                    for (auto const o : ir.inputOrdinals)     forbidden.push_back(o);
+                    for (auto const o : ir.clobberedOrdinals) {
+                        // dedup against inputs (idiv's RDX is both
+                        // input + clobbered)
+                        bool dup = false;
+                        for (auto const e : forbidden) if (e == o) { dup = true; break; }
+                        if (!dup) forbidden.push_back(o);
+                    }
+                    out.push_back({pos, std::move(forbidden)});
+                }
+            }
+            pos += 2u;
+        }
+    }
+    return out;
+}
+
+// Returns the union of clobbered-register ordinals across every
+// implicit-clobber opcode whose position is COVERED by the range
+// (range.start <= pos < range.end). This is DIFFERENT from
+// rangeCrossesCall's "strictly past" semantics — discovered cycle
+// 10r catastrophically:
+//
+// A call clobbers its caller-saved registers AFTER the call returns
+// — args consumed at call.early are safe even if held in
+// caller-saved. So `rangeCrossesCall` uses `pos + 1 < r.end`
+// (range must extend PAST the call's late slot).
+//
+// A compound op (x86 sdiv_compound = CQO + IDIV; udiv_compound =
+// XOR + DIV) clobbers MID-OP: CQO destroys RDX BEFORE IDIV reads
+// its operand 0. A divisor vreg whose range ENDS at the compound
+// op (range.end = pos + 1, the "consumed by op" case in
+// `rangeCrossesCall`'s reasoning) is STILL READ AFTER THE
+// CLOBBER — the call-style "safe because consumed at early slot"
+// invariant DOES NOT hold for compound ops. Pre-10r-fix this
+// shipped silent-miscompile: a divisor allocated to RDX would be
+// destroyed by CQO before IDIV read it, producing IDIV by
+// (sign-extension-of-RAX) which traps with STATUS_INTEGER_DIVIDE_
+// BY_ZERO when the dividend happens to be a small positive value.
+// Caught by `examples/c-subset/division/` exiting with the OS's
+// trap signature instead of 47.
+//
+// The fix: use "covers position P" semantics — exclude clobbers
+// from any range with `r.start <= pos < r.end`. Captures both
+// (a) ranges crossing past, AND (b) ranges with use-at-pos.
+template <std::size_t N>
+[[nodiscard]] std::size_t
+implicitClobbersCrossedBy(LirLiveRange const& r,
+                          std::vector<ImplicitClobberAt> const& clobbers,
+                          std::array<std::uint16_t, N>& out,
+                          std::size_t outAlreadyFilled) {
+    std::size_t filled = outAlreadyFilled;
+    for (auto const& c : clobbers) {
+        if (c.position < r.start) continue;
+        if (c.position >= r.end) continue;
+        for (std::uint16_t const ord : c.forbiddenOrdinals) {
+            // Dedup against what's already in `out` (the
+            // requires2Address pass populated the leading slice;
+            // multiple implicit-clobber positions may repeat the
+            // same ordinal).
+            bool already = false;
+            for (std::size_t k = 0; k < filled; ++k) {
+                if (out[k] == ord) { already = true; break; }
+            }
+            if (already) continue;
+            if (filled >= out.size()) {
+                regallocFatal(
+                    "implicit-clobber + 2-addr exclusion union "
+                    "exceeds fixed exclusion buffer size — extend "
+                    "excludedStorage in lir_regalloc.cpp OR re-shape "
+                    "the schema so the high-pressure case lands "
+                    "differently (D-OPT-REGALLOC-EXCLUSION-BUFFER)");
+            }
+            out[filled++] = ord;
+        }
+    }
+    return filled;
+}
+
 struct ActiveEntry {
     LirLiveRange  range;
     LirRegClass   cls;
@@ -407,6 +539,11 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
     FreeListsByClass free = buildFreeLists(schema, *cc);
     std::vector<std::uint32_t> const callPositions =
         collectCallPositions(lir, schema, flow);
+    // Cycle 10q closure of 10p substrate: per-opcode implicit
+    // clobbers (e.g., x86 idiv/div clobber RDX). One scan, consumed
+    // by every range that crosses an implicit-clobber position.
+    std::vector<ImplicitClobberAt> const implicitClobbers =
+        collectImplicitClobberPositions(lir, schema, flow);
 
     std::uint32_t maxVRegId = 0;
     for (auto const& r : flow.ranges) {
@@ -463,7 +600,17 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         // Universal across commutativity: the bug fires for both
         // commutative and non-commutative 2-addr ops; both want
         // the same exclusion.
-        std::array<std::uint16_t, 4> excludedStorage{};
+        // Exclusion buffer holds the union of (a) requires2Address
+        // operand[1..N] clobber-prevention + (b) cycle-10q implicit-
+        // register clobbers from crossed opcodes (e.g., x86 idiv's
+        // RDX). Size 8 = 4 (existing 2-addr headroom) + 4 (current
+        // max implicit-clobber set on any one op; idiv/div clobber 1
+        // each, future mul-1-op clobbers 1, future shift-by-CL
+        // clobbers 0). A schema row that pushes the union past 8
+        // fails loud via `regallocFatal` in
+        // `implicitClobbersCrossedBy` (D-OPT-REGALLOC-EXCLUSION-
+        // BUFFER anchored there).
+        std::array<std::uint16_t, 8> excludedStorage{};
         std::size_t excludedCount = 0;
         if (LirInstId const producingInst =
                 (r.start < flow.positionToInst.size())
@@ -538,6 +685,13 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
                 }
             }
         }
+        // Augment exclusion with implicit-register clobbers from any
+        // opcode this range crosses (cycle 10q substrate consumer).
+        // Universal across CPUs — driven entirely by the per-opcode
+        // schema declaration; no `if (opcode == idiv)` branch.
+        excludedCount = implicitClobbersCrossedBy(
+            r, implicitClobbers, excludedStorage, excludedCount);
+
         std::span<std::uint16_t const> const excluded{
             excludedStorage.data(), excludedCount};
 
