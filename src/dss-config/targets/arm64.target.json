@@ -345,6 +345,34 @@
           }
         ]
       }
+    },
+    {
+      "$comment": "Load-effective-address — AArch64 ADRP+ADD pair (D-AS4-3 multi-instruction macro-op materializing a module symbol's address into Xd). Mirrors x86_64's 1-operand RIP-relative `lea reg, [rip+sym]` so `lowerGlobalAddr` is target-blind: ONE SymbolRef operand wired into BOTH words. word0 = ADRP Xd, sym@PG (0x90000000=2415919104): Rd at bits 0..4; immlo[30:29]+immhi[23:5] left ZERO — the adr_prel_pg_hi21 reloc patches the ±4 GiB page delta. word1 = ADD Xd, Xd, #:lo12:sym (0x91000000=2432696320, the ADD-imm base shared with `add`'s imm variant): Rd at 0..4 AND Rn at 5..9 (BOTH = the result reg via extraResultSlots — ADD reads its own dest as the source base); imm12[21:10] left ZERO — the add_abs_lo12_nc reloc patches. Both relocs target the SAME symbol at byte offsets base+0 and base+4. The two `sym.patch` wires write NO immediate bits (the linker owns them); they carry only relocationKind + wordIndex.",
+      "mnemonic":      "lea",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["symbol"] },
+            "template":   { "fixedWords": [2415919104, 2432696320] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "sym.patch", "wordIndex": 0, "relocationKind": "adr_prel_pg_hi21" },
+              { "index": 0, "slotKind": "sym.patch", "wordIndex": 1, "relocationKind": "add_abs_lo12_nc" }
+            ]
+          }
+        ]
+      }
     }
   ],
   "$registersComment": "AAPCS64 general-purpose registers x0..x30 + zero-register XZR (encoded as 31 in source operands; uses register's hwEncoding). Stack pointer `sp` is also encoded as 31 but in the SP-slot context — hwEncoding=31 with class GPR is shared between XZR and SP at the byte level. NEON/FP regs v0..v31 use the same 5-bit field but in a separate class. Cycle-3 declares enough registers for AAPCS64 callconv + the encoded mov/ret/brk subset.",

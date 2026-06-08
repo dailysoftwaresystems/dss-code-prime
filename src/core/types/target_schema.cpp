@@ -299,6 +299,12 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 checkSlotShape(v.wires[wi].slotKind,
                                std::format("/opcodes/{}/encoding/variants/{}/wires/{}/slotKind", i, vi, wi));
             }
+            // D-AS4-3: extra result placements (multi-word macros) must
+            // also belong to the opcode's shape.
+            for (std::size_t ei = 0; ei < v.extraResultSlots.size(); ++ei) {
+                checkSlotShape(v.extraResultSlots[ei].slotKind,
+                               std::format("/opcodes/{}/encoding/variants/{}/extraResultSlots/{}/slotKind", i, vi, ei));
+            }
 
             // ── Convergence-fix B: `modrmRegExt` + ModRmReg wire ─────
             // The `/digit` extension fills the ModR/M.reg field; co-
@@ -349,13 +355,74 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 }
             }
 
+            // ── D-AS4-3: multi-word (multi-instruction-macro) invariants ─
+            // The number of 32-bit words this variant emits. 1 for the
+            // single-word `fixedWord` path; N for `fixedWords`.
+            std::size_t const nWords = v.tmpl.wordCount();
+            // (a) `fixedWords` is a fixed32-only construct — a multi-word
+            //     x86 macro would need a different (variable-length)
+            //     emission model. Reject a multi-word template on any
+            //     non-fixed32 shape.
+            if (!v.tmpl.fixedWords.empty()
+                && o.encoding.shape != TargetEncodingShape::Fixed32) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}/template/fixedWords", i, vi),
+                     std::format("opcode '{}' variant {}: 'fixedWords' "
+                                 "(multi-word macro) is only valid on the "
+                                 "'fixed32' shape, but the opcode declares "
+                                 "shape '{}'",
+                                 o.mnemonic, vi,
+                                 targetEncodingShapeName(o.encoding.shape)));
+            }
+            // (b) extra result placements require a primary resultSlot —
+            //     an extra placement of a result that has no primary slot
+            //     is malformed (nothing to thread through the words).
+            if (!v.extraResultSlots.empty() && !v.resultSlot.has_value()) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}/extraResultSlots", i, vi),
+                     std::format("opcode '{}' variant {}: 'extraResultSlots' "
+                                 "is set but the variant has no 'resultSlot' "
+                                 "— an extra placement of the result register "
+                                 "requires a primary result slot",
+                                 o.mnemonic, vi));
+            }
+            // (c) every wire / extra-result `wordIndex` must address a
+            //     word the template actually emits — an out-of-range
+            //     index would write into a non-existent word at encode
+            //     time (the walker bounds-checks too; surface at load).
+            for (std::size_t wi = 0; wi < v.wires.size(); ++wi) {
+                if (v.wires[wi].wordIndex >= nWords) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/wires/{}/wordIndex", i, vi, wi),
+                         std::format("opcode '{}' variant {}: wire wordIndex "
+                                     "{} addresses a word beyond the template's "
+                                     "{} word(s)",
+                                     o.mnemonic, vi, v.wires[wi].wordIndex, nWords));
+                }
+            }
+            for (std::size_t ei = 0; ei < v.extraResultSlots.size(); ++ei) {
+                if (v.extraResultSlots[ei].wordIndex >= nWords) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/extraResultSlots/{}/wordIndex", i, vi, ei),
+                         std::format("opcode '{}' variant {}: extra-result "
+                                     "wordIndex {} addresses a word beyond the "
+                                     "template's {} word(s)",
+                                     o.mnemonic, vi,
+                                     v.extraResultSlots[ei].wordIndex, nWords));
+                }
+            }
+
             // ── Convergence-fix A (validate half): slot uniqueness ────
-            // Two writers to the same single-writer slot would silently
-            // overwrite each other at encode time. Multi-Imm32 wires
-            // are legal (a future variant could append two immediates
-            // in sequence). All other slots are single-writer.
-            // Convergence-fix D extension: fixed32 (Rd/Rn/Rm) slots
-            // are equally single-writer — extend the same rule there.
+            // Two writers to the same single-writer slot WITHIN ONE WORD
+            // would silently overwrite each other at encode time. Multi-
+            // Imm32 wires are legal (a future variant could append two
+            // immediates in sequence). All other slots are single-writer.
+            // Convergence-fix D extension: fixed32 (Rd/Rn/Rm) slots are
+            // equally single-writer.
+            //
+            // D-AS4-3: uniqueness is PER-WORD. The SAME slot kind
+            // legitimately appears once in EACH word of a multi-word
+            // macro — AArch64 `lea` writes Rd into word 0 (ADRP) AND
+            // word 1 (ADD), and the symbol-patch marker into both words.
+            // Those are distinct byte positions, not a double-write, so
+            // the tracker is keyed by (wordIndex, slotKind), and a
+            // collision is a violation only WITHIN one word.
             {
                 auto const isMultiWriterSlot = [](EncodingSlotKind s) noexcept {
                     // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1):
@@ -369,36 +436,45 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                     return s == EncodingSlotKind::Imm32
                         || s == EncodingSlotKind::BlockRel32;
                 };
-                // Track each non-multi-writer slot's first writer.
-                // Sized from the shared `kEncodingSlotKindCount` so
-                // adding a new slot (Disp32 / Imm26 / etc.) is the
-                // SAME change as updating the enum table, no manual
-                // size update.
-                std::array<bool, kEncodingSlotKindCount> sawSlot{};
+                // Per-word slot tracking — one bitset PER WORD. Each
+                // bitset sized from the shared `kEncodingSlotKindCount`
+                // so adding a slot to the enum table is the SAME change,
+                // no manual size update.
+                std::vector<std::array<bool, kEncodingSlotKindCount>>
+                    sawSlot(nWords);
                 auto const markOrFail = [&](EncodingSlotKind slot,
+                                            std::uint8_t word,
                                             std::string const& kindLabel,
                                             std::string const& path) {
                     if (isMultiWriterSlot(slot)) return;
                     auto const idx = static_cast<std::size_t>(slot);
-                    if (idx < sawSlot.size() && sawSlot[idx]) {
+                    // Out-of-range word/slot already reported by the
+                    // wordIndex-bounds + enum invariants — skip here to
+                    // avoid OOB access + a duplicate diagnostic.
+                    if (word >= sawSlot.size() || idx >= kEncodingSlotKindCount)
+                        return;
+                    if (sawSlot[word][idx]) {
                         fail(path,
                              std::format("opcode '{}' variant {}: "
-                                         "{} writer targets '{}' — "
-                                         "the second writer would "
-                                         "silently overwrite the "
-                                         "first at encode time",
+                                         "{} writer targets '{}' in word {} — "
+                                         "the second writer would silently "
+                                         "overwrite the first at encode time",
                                          o.mnemonic, vi, kindLabel,
-                                         encodingSlotKindName(slot)));
-                    } else if (idx < sawSlot.size()) {
-                        sawSlot[idx] = true;
+                                         encodingSlotKindName(slot), word));
+                    } else {
+                        sawSlot[word][idx] = true;
                     }
                 };
                 if (v.resultSlot.has_value()) {
-                    markOrFail(*v.resultSlot, "result",
+                    markOrFail(*v.resultSlot, /*word=*/0, "result",
                                std::format("/opcodes/{}/encoding/variants/{}/resultSlot", i, vi));
                 }
+                for (auto const& e : v.extraResultSlots) {
+                    markOrFail(e.slotKind, e.wordIndex, "extra result",
+                               std::format("/opcodes/{}/encoding/variants/{}/extraResultSlots", i, vi));
+                }
                 for (auto const& w : v.wires) {
-                    markOrFail(w.slotKind, "wire",
+                    markOrFail(w.slotKind, w.wordIndex, "wire",
                                std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi));
                 }
             }

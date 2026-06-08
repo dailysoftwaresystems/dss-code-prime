@@ -724,11 +724,29 @@ enum class EncodingSlotKind : std::uint8_t {
     // size here. Range 0..4095; a larger frame needs the shifted
     // imm12<<12 form (future). Unsigned (frame sizes are non-negative).
     Imm12          = 18,
+    // D-AS4-3 (multi-instruction-macro / multi-relocation encoder):
+    // a SYMBOL-PATCH MARKER — a write-no-bits (width-0) slot that
+    // marks an operand position as a linker-patched symbol reference.
+    // The walker writes NO immediate bits (the bit-window is {0,0},
+    // exactly like `MemBaseNoScale`) and emits a Relocation at the
+    // START of the slot's word (the wire's `wordIndex`); the linker
+    // owns the patched field ENTIRELY, computing the bits from the
+    // wire's `relocationKind` formula. Generic over the patch shape:
+    // the SAME marker serves AArch64 `ADRP Xd, sym@PG` (word 0,
+    // `adr_prel_pg_hi21` — a split immlo[30:29]+immhi[23:5] field no
+    // single bit-window could express) AND `ADD Xd, Xd, #:lo12:sym`
+    // (word 1, `add_abs_lo12_nc`), and is reusable by any ISA's
+    // linker-patched symbol field (RISC-V `auipc`+`addi`, etc.). The
+    // distinguishing facts — which word, which patch formula — live
+    // on the WIRE (`wordIndex` + `relocationKind`), NOT on the slot,
+    // so one marker covers every such position. isSymbolBearingSlot
+    // returns true (a `relocationKind` is required + emitted).
+    SymbolPatchMarker = 19,
     // Future fixed32 slots (paired with their consumer cycle):
     //   ImmShift / Sf-flag / scaled LDR imm12 / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 19> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 20> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -748,6 +766,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 19> kEncodingSlotKindTable{{{
     { EncodingSlotKind::Imm9,          "imm9"           },
     { EncodingSlotKind::MemBaseNoScale, "membase.noscale" },
     { EncodingSlotKind::Imm12,         "imm12"          },
+    { EncodingSlotKind::SymbolPatchMarker, "sym.patch"   },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -766,7 +785,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 19,
+static_assert(kEncodingSlotKindCount == 20,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -801,6 +820,7 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Imm9:
         case EncodingSlotKind::MemBaseNoScale:
         case EncodingSlotKind::Imm12:
+        case EncodingSlotKind::SymbolPatchMarker:
             return TargetEncodingShape::Fixed32;
     }
     return TargetEncodingShape::None;  // unreachable; satisfies non-exhaustive switches
@@ -882,6 +902,38 @@ struct DSS_EXPORT TargetEncodingTemplate {
     // first ISA needs the zero-base, promote this to
     // `std::optional<std::uint32_t>`.
     std::uint32_t fixedWord = 0;
+
+    // D-AS4-3 (multi-instruction-macro encoder): the base bit pattern
+    // of a MULTI-WORD `fixed32` instruction (an N-word macro-op such
+    // as AArch64 `lea` = ADRP+ADD, or a future RISC-V `auipc`+`addi`).
+    // EMPTY by default — every existing single-word opcode keeps
+    // `fixedWord` and emits byte-identically. When non-empty, the
+    // walker emits one 32-bit word per element (LE) in order, each
+    // word's slots OR'd per the wires' `wordIndex`; per-word
+    // relocations stamp at the START of their word. `fixedWord` and
+    // `fixedWords` are MUTUALLY EXCLUSIVE — validate() rejects a
+    // template that sets both (the single-word default would be
+    // silently shadowed). Only meaningful for the `fixed32` shape.
+    std::vector<std::uint32_t> fixedWords;
+
+    // Number of 32-bit words this template emits: the multi-word
+    // count when `fixedWords` is set, else 1 (the single-word
+    // `fixedWord` path). The walker + validate() size their per-word
+    // structures (the `words` vector, the per-word slot-tracking) from
+    // this — a single source of truth for the word count.
+    [[nodiscard]] std::size_t wordCount() const noexcept {
+        return fixedWords.empty() ? 1u : fixedWords.size();
+    }
+
+    // The base bit pattern of word `i` (0-based). For the single-word
+    // path (`fixedWords` empty) word 0 is `fixedWord`; any other index
+    // is out of range. For the multi-word path it is `fixedWords[i]`.
+    // Caller guarantees `i < wordCount()` (the walker loops to
+    // wordCount(); validate() bounds every `wordIndex`).
+    [[nodiscard]] std::uint32_t wordAt(std::size_t i) const noexcept {
+        if (fixedWords.empty()) return fixedWord;  // i==0 by precondition
+        return fixedWords[i];
+    }
 };
 
 // True iff the slot kind carries a SYMBOL-RELATIVE value that the
@@ -898,6 +950,10 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Disp32:
         case EncodingSlotKind::Imm26:
         case EncodingSlotKind::RipRelDisp32:
+        // D-AS4-3: the generic symbol-patch marker is symbol-bearing —
+        // the walker emits a Relocation (per the wire's relocationKind)
+        // and writes no immediate bits; the linker patches the field.
+        case EncodingSlotKind::SymbolPatchMarker:
             return true;
         case EncodingSlotKind::ModRmReg:
         case EncodingSlotKind::ModRmRm:
@@ -947,6 +1003,14 @@ struct DSS_EXPORT TargetEncodingWire {
     std::uint8_t     index           = 0;
     EncodingSlotKind slotKind        = EncodingSlotKind::ModRmReg;
     std::optional<RelocationKind> relocationKind;
+    // D-AS4-3 (multi-instruction-macro encoder): which 32-bit word
+    // (0-based) of a multi-word `fixed32` template this wire's slot
+    // lives in. DEFAULT 0 — every existing single-word wire is
+    // unchanged (its slot is interpreted within word 0). The slot's
+    // bit-window (`windowFor`) is applied INSIDE word[wordIndex]; a
+    // symbol-bearing wire's relocation stamps at word[wordIndex]'s
+    // byte offset. validate() requires `wordIndex < template.wordCount()`.
+    std::uint8_t     wordIndex       = 0;
     // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): bytes
     // emitted IMMEDIATELY BEFORE this wire's slot bytes (between
     // the previous wire's emission and this one). Used by jcc's
@@ -978,6 +1042,21 @@ struct DSS_EXPORT TargetEncodingWire {
 //     overwrite at encode time.
 //   * Every guard position must have a matching wire (or be unused
 //     by-design; the validator's positional check pins this).
+// D-AS4-3 (multi-instruction-macro encoder): an ADDITIONAL placement
+// of the instruction's RESULT register, beyond the primary `resultSlot`
+// (which is implicitly word 0). The same result register's hwEncoding
+// is OR'd into `slotKind` of `word[wordIndex]`. Needed when a multi-word
+// macro repeats the destination across words — AArch64 `lea` is
+// `ADRP Xd, sym; ADD Xd, Xd, #:lo12:sym`, so Xd lands in word0.Rd
+// (resultSlot), word1.Rd, AND word1.Rn (the ADD reads its own dest as
+// the source base). Generic: any ISA whose multi-word materialization
+// threads the destination register through later words uses this — no
+// per-opcode special case. Empty for every single-result opcode.
+struct DSS_EXPORT ResultSlotExtra {
+    EncodingSlotKind slotKind  = EncodingSlotKind::Rd;
+    std::uint8_t     wordIndex = 0;
+};
+
 struct DSS_EXPORT TargetEncodingVariant {
     std::vector<OperandKindFilter>     operandKinds;
     TargetEncodingTemplate             tmpl;
@@ -985,8 +1064,16 @@ struct DSS_EXPORT TargetEncodingVariant {
     // has a result). Nullopt for value-less instructions (e.g.
     // `ret`). Most binary/unary register opcodes use ModRmReg here;
     // immediate-destination forms use ModRmRm with `modrmRegExt`
-    // filling the reg field.
+    // filling the reg field. Implicitly word 0 for multi-word
+    // templates; additional placements go in `extraResultSlots`.
     std::optional<EncodingSlotKind>    resultSlot;
+    // D-AS4-3: additional placements of the SAME result register in a
+    // multi-word template (see `ResultSlotExtra`). Empty for every
+    // single-word / single-placement opcode. validate() requires a
+    // `resultSlot` when this is non-empty (an extra placement of a
+    // result that has no primary slot is malformed) and bounds each
+    // `wordIndex < template.wordCount()`.
+    std::vector<ResultSlotExtra>       extraResultSlots;
     // Where each LIR source operand (`inst.operands[wire.index]`)
     // goes in the emitted bytes.
     std::vector<TargetEncodingWire>    wires;

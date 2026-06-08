@@ -72,6 +72,12 @@ windowFor(EncodingSlotKind s) noexcept {
         // unsigned 12-bit field at bits 10..21 (frame-size stack
         // adjust). Range-checked 0..4095 in the wire loop.
         case EncodingSlotKind::Imm12: return SlotBitWindow{ 10, 12 };
+        // SymbolPatchMarker (D-AS4-3): width-0 symbol-patch marker, like
+        // MemBaseNoScale. The walker writes NO bits (the linker patches
+        // the whole field via the wire's relocationKind); the slot only
+        // marks the position consumed + emits the relocation. lsb is
+        // irrelevant at width 0.
+        case EncodingSlotKind::SymbolPatchMarker: return SlotBitWindow{ 0, 0 };
         // x86-variable slots — never reached on a fixed32 variant
         // (validate() rejects). Returning nullopt makes the walker
         // fail loud if a schema bypasses validate() somehow.
@@ -134,26 +140,39 @@ bool encode(Lir const&                  lir,
         return false;
     }
 
+    // D-AS4-3 (multi-instruction-macro encoder): the instruction emits
+    // ONE OR MORE 32-bit words. `words[i]` is the working value of word
+    // i (seeded from the template's base bit pattern); single-word
+    // opcodes (the vast majority) have words.size()==1 == the prior
+    // `fixedWord` path, byte-identical.
+    std::vector<std::uint32_t> words(selected->tmpl.wordCount());
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        words[i] = selected->tmpl.wordAt(i);
+    }
+
     // Track which slot windows have been written — defense-in-depth
     // mirror of x86_variable's `wroteModRm*` guard. validate() should
     // have rejected schemas declaring two writers to the same slot,
     // but if a future synthetic Lir reaches the encoder, the
     // assertion fails loud rather than silently OR-corrupting bits.
-    // One bit per EncodingSlotKind value — sized from the shared
-    // `kEncodingSlotKindCount` so adding a new slot to the enum +
+    // PER-WORD (D-AS4-3): one bitset per emitted word — the same slot
+    // kind legitimately appears once in EACH word of a multi-word macro
+    // (lea writes Rd into word 0 AND word 1). Each bitset is sized from
+    // the shared `kEncodingSlotKindCount` so adding a slot to the enum +
     // table is the SAME change, no manual array-size update.
-    std::array<bool, kEncodingSlotKindCount> wroteSlot{};
-
-    std::uint32_t word = selected->tmpl.fixedWord;
+    std::vector<std::array<bool, kEncodingSlotKindCount>>
+        wroteSlot(words.size());
 
     // `value` is uint32 so the SAME helper writes both 5-bit register
     // encodings (hwEncoding ≤ 31) and wider immediates (e.g. the
     // 16-bit MOVZ Imm16 slot). The width mask below clips to the
     // slot's declared bit-width; the wire loop range-checks an
     // immediate BEFORE calling this (a too-wide value fails loud,
-    // never silently masked here).
+    // never silently masked here). `wordIndex` selects which emitted
+    // word the slot's bit-window is OR'd into.
     auto const orInto = [&](EncodingSlotKind slot,
-                            std::uint32_t value) -> bool {
+                            std::uint32_t value,
+                            std::uint8_t wordIndex) -> bool {
         auto const w = windowFor(slot);
         if (!w.has_value()) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
@@ -166,52 +185,71 @@ bool encode(Lir const&                  lir,
                                encodingSlotKindName(slot)));
             return false;
         }
+        if (wordIndex >= words.size()) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': slot '{}' wordIndex {} "
+                               "exceeds the template's {} word(s) "
+                               "(validate() should have rejected the schema)",
+                               info->mnemonic, encodingSlotKindName(slot),
+                               wordIndex, words.size()));
+            return false;
+        }
         auto const slotIdx = static_cast<std::size_t>(slot);
         // `slotIdx < kSlotCount` holds by the closed-enum invariant
         // (every enum value has a row in `kEncodingSlotKindTable`)
         // — but check defensively in case a future entry skips a row.
-        if (slotIdx >= wroteSlot.size()) {
+        if (slotIdx >= kEncodingSlotKindCount) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': slot kind ordinal {} "
                                "exceeds tracked-slot count {} "
                                "(enum-vs-table drift)",
-                               info->mnemonic, slotIdx, wroteSlot.size()));
+                               info->mnemonic, slotIdx,
+                               kEncodingSlotKindCount));
             return false;
         }
-        if (wroteSlot[slotIdx]) {
+        if (wroteSlot[wordIndex][slotIdx]) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': second writer to "
-                               "fixed32 slot '{}' (validate() "
+                               "fixed32 slot '{}' in word {} (validate() "
                                "should have rejected the schema)",
                                info->mnemonic,
-                               encodingSlotKindName(slot)));
+                               encodingSlotKindName(slot), wordIndex));
             return false;
         }
-        wroteSlot[slotIdx] = true;
+        wroteSlot[wordIndex][slotIdx] = true;
         std::uint32_t const mask = ((1u << w->width) - 1u) << w->lsb;
         std::uint32_t const bits =
             (static_cast<std::uint32_t>(value) & ((1u << w->width) - 1u))
             << w->lsb;
-        word = (word & ~mask) | bits;
+        words[wordIndex] = (words[wordIndex] & ~mask) | bits;
         return true;
     };
 
-    // Wire the result register into its declared slot.
+    // Wire the result register into its declared slot (word 0), plus any
+    // extra placements (D-AS4-3 — a multi-word macro threading the SAME
+    // destination register through later words, e.g. lea's ADD reads
+    // Xd as both its dest AND its source base).
     if (selected->resultSlot.has_value()) {
         auto const hw = hwEncodingOf(result, schema, info->mnemonic,
                                       kFixed32RegFieldBits, reporter);
         if (!hw.has_value()) return false;
-        if (!orInto(*selected->resultSlot, *hw)) return false;
+        if (!orInto(*selected->resultSlot, *hw, /*wordIndex=*/0)) return false;
+        for (auto const& extra : selected->extraResultSlots) {
+            if (!orInto(extra.slotKind, *hw, extra.wordIndex)) return false;
+        }
     }
 
     // Wire each declared source operand into its slot.
-    // Plan 13 AS4: a `SymbolRef` operand on a symbol-bearing slot
-    // (Imm26) emits a Relocation entry; the slot's bits stay 0 in
-    // the emitted word (linker patches at link time). At most one
-    // symbol-relative wire per fixed32 instruction (cycle-4 cap).
-    std::optional<PendingRelocSlot> pendingReloc;
+    // Plan 13 AS4: a `SymbolRef` operand on a symbol-bearing slot emits
+    // a Relocation entry; the slot's bits stay 0 in the emitted word
+    // (linker patches at link time). D-AS4-3: an instruction may now
+    // emit MULTIPLE relocations (lea = ADRP page-reloc on word 0 + ADD
+    // lo12-reloc on word 1), accumulated here and stamped per-word in
+    // the emit loop below.
+    std::vector<PendingRelocSlot> pendingRelocs;
     for (auto const& wire : selected->wires) {
         if (wire.index >= instOps.size()) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
@@ -226,15 +264,23 @@ bool encode(Lir const&                  lir,
             auto const hw = hwEncodingOf(srcOp.reg, schema, info->mnemonic,
                                           kFixed32RegFieldBits, reporter);
             if (!hw.has_value()) return false;
-            if (!orInto(wire.slotKind, *hw)) return false;
+            if (!orInto(wire.slotKind, *hw, wire.wordIndex)) return false;
         } else if (srcOp.kind == LirOperandKind::SymbolRef) {
-            if (wire.slotKind != EncodingSlotKind::Imm26) {
+            // D-AS4-3: a SymbolRef may be wired to ANY symbol-bearing
+            // slot (Imm26 for BL, or the generic SymbolPatchMarker for
+            // ADRP/ADD-lo12). The walker emits a Relocation + writes no
+            // immediate bits; the linker patches the field per the
+            // wire's relocationKind. Widened from the prior Imm26-only
+            // restriction to the generic `isSymbolBearingSlot` predicate
+            // — no per-slot enumeration, so any future symbol-patched
+            // ISA field is admitted with its relocationKind.
+            if (!isSymbolBearingSlot(wire.slotKind)) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
                        std::format("opcode '{}': SymbolRef operand wired "
-                                   "to non-Imm26 slot '{}' — cycle-4 "
-                                   "fixed32 supports symbol references "
-                                   "only on Imm26 slots",
+                                   "to non-symbol-bearing slot '{}' — a "
+                                   "symbol reference needs a symbol-bearing "
+                                   "slot (e.g. imm26 or sym.patch)",
                                    info->mnemonic,
                                    encodingSlotKindName(wire.slotKind)));
                 return false;
@@ -242,56 +288,56 @@ bool encode(Lir const&                  lir,
             if (!wire.relocationKind.has_value()) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
-                       std::format("opcode '{}': wire to Imm26 has no "
-                                   "`relocationKind` — validate() "
-                                   "should have rejected this schema",
-                                   info->mnemonic));
+                       std::format("opcode '{}': SymbolRef wire to slot "
+                                   "'{}' has no `relocationKind` — "
+                                   "validate() should have rejected this "
+                                   "schema",
+                                   info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind)));
                 return false;
             }
-            if (pendingReloc.has_value()) {
+            if (wire.wordIndex >= words.size()) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
-                       std::format("opcode '{}': second symbol-relative "
-                                   "wire — only one per fixed32 "
-                                   "instruction in cycle-4",
-                                   info->mnemonic));
+                       std::format("opcode '{}': SymbolRef wire wordIndex "
+                                   "{} exceeds the template's {} word(s)",
+                                   info->mnemonic, wire.wordIndex,
+                                   words.size()));
                 return false;
             }
-            // Mark the slot as "written" so the wroteSlot guard
-            // catches a same-slot collision with a Reg wire.
-            //
-            // Convergence-fix A (code-reviewer + silent-failure
-            // 2-agent): an out-of-range slotIdx must fail loud (the
-            // enum-vs-table drift case `orInto` already guards in
-            // the Reg arm). Silently skipping the check here would
-            // let a future enum addition propagate as wrong-byte
-            // encoding.
+            // Mark the (word, slot) as "written" so the per-word
+            // wroteSlot guard catches a same-word same-slot collision.
+            // An out-of-range slotIdx must fail loud (enum-vs-table
+            // drift) — silently skipping would let a future enum
+            // addition propagate as wrong-byte encoding.
             auto const slotIdx = static_cast<std::size_t>(wire.slotKind);
-            if (slotIdx >= wroteSlot.size()) {
+            if (slotIdx >= kEncodingSlotKindCount) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
                        std::format("opcode '{}': SymbolRef slot kind "
                                    "ordinal {} exceeds tracked-slot "
                                    "count {} (enum-vs-table drift)",
                                    info->mnemonic, slotIdx,
-                                   wroteSlot.size()));
+                                   kEncodingSlotKindCount));
                 return false;
             }
-            if (wroteSlot[slotIdx]) {
+            if (wroteSlot[wire.wordIndex][slotIdx]) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
                        std::format("opcode '{}': SymbolRef wire "
                                    "collides with already-written "
-                                   "slot '{}'",
+                                   "slot '{}' in word {}",
                                    info->mnemonic,
-                                   encodingSlotKindName(wire.slotKind)));
+                                   encodingSlotKindName(wire.slotKind),
+                                   wire.wordIndex));
                 return false;
             }
-            wroteSlot[slotIdx] = true;
-            pendingReloc = PendingRelocSlot{
+            wroteSlot[wire.wordIndex][slotIdx] = true;
+            pendingRelocs.push_back(PendingRelocSlot{
                 *wire.relocationKind,
-                SymbolId{srcOp.symbolV}
-            };
+                SymbolId{srcOp.symbolV},
+                wire.wordIndex
+            });
         } else if (srcOp.kind == LirOperandKind::ImmInt) {
             // Immediate operand → an UNSIGNED immediate fixed32 slot.
             // Cycle scope (D-LK10-ENTRY-ARM64): Imm16 (AArch64 MOVZ
@@ -347,7 +393,8 @@ bool encode(Lir const&                  lir,
             }
             // orInto marks wroteSlot (same collision/double-write guard
             // as the Reg arm).
-            if (!orInto(wire.slotKind, static_cast<std::uint32_t>(imm)))
+            if (!orInto(wire.slotKind, static_cast<std::uint32_t>(imm),
+                        wire.wordIndex))
                 return false;
         } else if (srcOp.kind == LirOperandKind::MemOffset) {
             // AArch64 LDUR/STUR signed 9-bit byte displacement → the
@@ -398,7 +445,8 @@ bool encode(Lir const&                  lir,
             }
             // orInto masks to the slot's bit-window (two's-complement for
             // a negative displacement) + marks wroteSlot.
-            if (!orInto(wire.slotKind, static_cast<std::uint32_t>(disp)))
+            if (!orInto(wire.slotKind, static_cast<std::uint32_t>(disp),
+                        wire.wordIndex))
                 return false;
         } else if (srcOp.kind == LirOperandKind::MemBase) {
             // The memory-base SCALE marker. AArch64 unscaled addressing
@@ -429,7 +477,7 @@ bool encode(Lir const&                  lir,
             }
             // orInto with the width-0 slot writes no bits but marks
             // wroteSlot[MemBaseNoScale] (collision/consumed tracking).
-            if (!orInto(wire.slotKind, 0u)) return false;
+            if (!orInto(wire.slotKind, 0u, wire.wordIndex)) return false;
         } else {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
@@ -443,19 +491,23 @@ bool encode(Lir const&                  lir,
         }
     }
 
-    // Emit the relocation BEFORE the word bytes — the reloc's offset
-    // is `out.size()` at this point (the byte position the linker
-    // patches into). INVARIANT (silent-failure F4): in cycle-4 the
-    // symbol-bearing slot's bytes are coincident with the only word
-    // this walker writes, so the offset captured here points AT the
-    // patch site. When a future fixed32 instruction has multiple
-    // words OR a non-trailing symbol slot, the offset computation
-    // must move to a per-slot byte-offset table on the variant
-    // template (anchored at plan 13 §3.1 D-AS4-3).
-    if (pendingReloc.has_value()) {
-        walker_util::appendPendingReloc(relocs, out, *pendingReloc);
+    // Emit each word LE, stamping that word's relocations at the word's
+    // START (D-AS4-3 — the multi-word / multi-relocation closure). For
+    // each word i, every pending reloc whose `wordIndex == i` is appended
+    // at the CURRENT `out.size()` — which, because word i's 4 bytes are
+    // appended immediately after, is exactly word i's start (the byte
+    // position the linker's `readInst32` reads). The per-word offset is
+    // DERIVED from the emit cursor, never a separately computed
+    // `base + i*4`. Single-word opcodes (words.size()==1, all relocs at
+    // wordIndex 0) behave exactly as the prior single-trailing-slot model.
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        for (auto const& pr : pendingRelocs) {
+            if (pr.wordIndex == i) {
+                walker_util::appendPendingReloc(relocs, out, pr);
+            }
+        }
+        asm_byte_emit::appendU32LE(out, words[i]);
     }
-    asm_byte_emit::appendU32LE(out, word);
     return true;
 }
 

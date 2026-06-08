@@ -126,6 +126,20 @@ disassemble(TargetSchema const&            schema,
         DisassembledInst result{};
         result.opcode        = opcode;
         result.variantIndex  = vi;
+        // D-AS5-MULTIWORD-DISASM (deferred): this disassembler reads a
+        // SINGLE 32-bit word. A multi-word `fixed32` macro (D-AS4-3,
+        // e.g. AArch64 `lea` = ADRP+ADD) has `tmpl.fixedWords.size() > 1`
+        // and would need a per-word match loop + summed bytesConsumed;
+        // until then, asking this oracle to decode a multi-word opcode
+        // fails loud (the variant's `fixedWord` base is 0, so no match →
+        // A_RoundTripMismatch) rather than silently mis-decoding. The
+        // shipped multi-word opcode (lea) is proven by exact byte-pins +
+        // the linker reloc-formula tests, not the round-trip oracle.
+        // When multi-word disasm lands, the symbol-bearing-slot
+        // special-case in the wire loop below (currently Imm26-only)
+        // must ALSO generalize to `isSymbolBearingSlot(wire.slotKind)`
+        // so the `SymbolPatchMarker` slot disassembles to `std::nullopt`
+        // (consult the Relocation, not the bytes) like Imm26 does today.
         result.bytesConsumed = 4;
         if (variant.resultSlot.has_value()) {
             result.result = DisassembledSlot{
