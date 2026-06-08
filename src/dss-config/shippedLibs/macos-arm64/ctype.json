@@ -1,0 +1,20 @@
+{
+  "header": "ctype.h",
+  "standard": "c89",
+  "library": "libSystem.B.dylib",
+  "symbols": [
+    { "name": "isalnum", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "isalpha", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "iscntrl", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "isdigit", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "isgraph", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "islower", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "isprint", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "ispunct", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "isspace", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "isupper", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "isxdigit","signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "tolower", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "toupper", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" }
+  ]
+}

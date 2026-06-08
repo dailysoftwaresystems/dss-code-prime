@@ -19,12 +19,26 @@
 // language-agnostic schema, not a c-subset `.h`.
 //
 // Shape (`stdio.json`):
-//   { "library": "msvcrt.dll",
+//   { "header": "stdio.h", "standard": "c89", "library": "msvcrt.dll",
 //     "symbols": [
 //       { "name": "puts", "signature": "fn(ptr<char>) -> i32",
 //         "kind": "function", "linkage": "external" }
 //     ] }
 //
+// PROVENANCE — every shipped symbol traces to header → standard → library →
+// platform (the directory). The `header` + `standard` fields make that origin
+// FIRST-CLASS data, not just a filename convention: a tool / diagnostic can
+// answer "where does `strlen` come from?" from the descriptor alone.
+//
+//   * `header`    — REQUIRED. The C (or other-language) header this descriptor
+//                   represents, e.g. "stdio.h". The angle-include resolver maps
+//                   `<stdio.h>` → `stdio.json` by filename; this field is the
+//                   authoritative, machine-readable provenance (and should match
+//                   the filename stem). A descriptor with no header is a
+//                   provenance hole — fail loud.
+//   * `standard`  — optional. The language standard the header/symbols belong to
+//                   (e.g. "c89" / "c99" / "c11" / "posix"). Provenance only;
+//                   carried for tooling, not consumed by lowering.
 //   * `library`   — optional. The runtime import library every symbol routes
 //                   to. Empty ⇒ the CST→HIR lowering falls back to the active
 //                   language's `externLibraryByFormat[format]` default (so a
@@ -87,9 +101,13 @@ struct DSS_EXPORT ShippedSymbol {
     ShippedSymbolLinkage linkage = ShippedSymbolLinkage::External;
 };
 
-// A decoded shipped-library descriptor. `library` MAY be empty (the lowering
-// then falls back to the language's per-format default).
+// A decoded shipped-library descriptor. `header` is the authoritative
+// provenance (which header these symbols come from); `standard` is optional
+// provenance; `library` MAY be empty (the lowering then falls back to the
+// language's per-format default).
 struct DSS_EXPORT ShippedLibDescriptor {
+    std::string                header;    // REQUIRED provenance, e.g. "stdio.h".
+    std::string                standard;  // optional provenance, e.g. "c89".
     std::string                library;
     std::vector<ShippedSymbol> symbols;
 };

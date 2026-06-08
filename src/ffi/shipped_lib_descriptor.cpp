@@ -120,6 +120,31 @@ readShippedLibDescriptor(std::filesystem::path const& path,
 
     ShippedLibDescriptor out;
 
+    // (1.5) Required `header` provenance string (non-empty). Every shipped
+    // descriptor must declare which header its symbols come from — a missing
+    // header is a provenance hole (the user must be able to know where a
+    // symbol like `strlen` originates).
+    if (!doc.contains("header") || !doc.at("header").is_string()
+        || doc.at("header").get<std::string>().empty()) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor '"} + path.generic_string()
+                + "': missing or empty required 'header' provenance string "
+                  "(e.g. \"stdio.h\")");
+        return std::nullopt;
+    }
+    out.header = doc.at("header").get<std::string>();
+
+    // (1.6) Optional `standard` provenance string (e.g. "c89"/"c99"/"posix").
+    if (doc.contains("standard")) {
+        if (!doc.at("standard").is_string()) {
+            emitMalformed(reporter,
+                std::string{"shipped-lib descriptor '"} + path.generic_string()
+                    + "': 'standard' must be a string");
+            return std::nullopt;
+        }
+        out.standard = doc.at("standard").get<std::string>();
+    }
+
     // (2) Optional `library` string. Absent ⇒ empty (the lowering then falls
     // back to the language's externLibraryByFormat default).
     if (doc.contains("library")) {
@@ -149,7 +174,8 @@ readShippedLibDescriptor(std::filesystem::path const& path,
     }
 
     // Reject unknown top-level keys (closed key set).
-    (void)rejectUnknownKeys(reporter, doc, "(root)", {"library", "symbols"});
+    (void)rejectUnknownKeys(reporter, doc, "(root)",
+                            {"header", "standard", "library", "symbols"});
 
     // (4) Each symbol. Collect-all: a malformed symbol is reported but the
     // loop continues so the operator sees every problem in one pass; the

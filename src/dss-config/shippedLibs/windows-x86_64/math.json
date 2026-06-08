@@ -1,0 +1,24 @@
+{
+  "header": "math.h",
+  "standard": "c89",
+  "library": "msvcrt.dll",
+  "symbols": [
+    { "name": "sqrt",  "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
+    { "name": "pow",   "signature": "fn(f64, f64) -> f64", "kind": "function", "linkage": "external" },
+    { "name": "sin",   "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
+    { "name": "cos",   "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
+    { "name": "tan",   "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
+    { "name": "asin",  "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
+    { "name": "acos",  "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
+    { "name": "atan",  "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
+    { "name": "atan2", "signature": "fn(f64, f64) -> f64", "kind": "function", "linkage": "external" },
+    { "name": "exp",   "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
+    { "name": "log",   "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
+    { "name": "log10", "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
+    { "name": "fabs",  "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
+    { "name": "floor", "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
+    { "name": "ceil",  "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
+    { "name": "fmod",  "signature": "fn(f64, f64) -> f64", "kind": "function", "linkage": "external" },
+    { "name": "ldexp", "signature": "fn(f64, i32) -> f64", "kind": "function", "linkage": "external" }
+  ]
+}

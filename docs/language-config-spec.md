@@ -698,7 +698,9 @@ The reader is `dss::ffi::readShippedLibDescriptor` ([`src/ffi/shipped_lib_descri
 
 ```jsonc
 {
-  "library": "msvcrt.dll",                 // optional — see below
+  "header":   "stdio.h",                   // required — provenance: which header
+  "standard": "c89",                       // optional — provenance: which standard
+  "library":  "msvcrt.dll",                // optional — see below
   "symbols": [                             // required, non-empty
     {
       "name":      "puts",                 // required — the canonical symbol name
@@ -710,10 +712,12 @@ The reader is `dss::ffi::readShippedLibDescriptor` ([`src/ffi/shipped_lib_descri
 }
 ```
 
-The shipped `stdio.json` (`src/dss-config/shippedLibs/windows-x86_64/stdio.json`) is exactly this, with the single `puts` symbol.
+The shipped `stdio.json` (`src/dss-config/shippedLibs/windows-x86_64/stdio.json`) is exactly this shape, carrying the standard stdio surface (`puts`, `fopen`, `fread`, …). The full set of shipped surfaces and their per-platform ABI deltas are catalogued in [`src/dss-config/shippedLibs/README.md`](../src/dss-config/shippedLibs/README.md).
 
 | Field | Level | Required | Notes |
 |---|---|---|---|
+| `header` | top | **yes** | **Provenance.** The header these symbols come from (e.g. `"stdio.h"`) — the machine-readable answer to *"where does `puts` come from?"*, which is the whole point of a shipped descriptor. Must be a non-empty string; a missing or empty `header` is a malformed descriptor (fails loud), never silently provenance-less. |
+| `standard` | top | no | **Provenance.** The language standard the surface targets (e.g. `"c89"`, `"c99"`). Descriptive only — it drives no behavior. |
 | `library` | top | no | The runtime import library every symbol in this descriptor routes to (e.g. `"msvcrt.dll"`). **Optional** — when absent (or empty), the CST→HIR lowering falls back to the active language's per-object-format default (`externLibraryByFormat[format]` in the `.lang.json`). A descriptor MAY omit it and inherit the language's default. |
 | `symbols` | top | **yes** | A **non-empty** array of symbol objects. A descriptor that declares no symbols is a no-op artifact and is rejected rather than shipped silently. |
 | `name` | symbol | **yes** | The canonical, undecorated symbol identifier (e.g. `"puts"`). Must be a non-empty string. The linker-visible decorated name is produced downstream by name mangling — the descriptor carries the source name only. |
@@ -738,11 +742,11 @@ The reader never returns a partial result — if **any** diagnostic is emitted d
 
 | Code | When |
 |---|---|
-| `F_ShippedLibDescriptorMalformed` | The descriptor is structurally bad: unreadable file, invalid JSON, non-object top level, missing/wrong-typed required key (`symbols`, `name`, `signature`), empty `symbols`, empty `name`, an unknown key (closed key sets are enforced at both the top level and per symbol), or an unrecognized `kind`/`linkage` enum value. |
+| `F_ShippedLibDescriptorMalformed` | The descriptor is structurally bad: unreadable file, invalid JSON, non-object top level, missing/wrong-typed required key (`header`, `symbols`, `name`, `signature`), empty `header`, empty `symbols`, empty `name`, an unknown key (closed key sets are enforced at both the top level and per symbol), or an unrecognized `kind`/`linkage` enum value. |
 | `F_ShippedLibUnsupportedType` | A symbol's `signature` string failed to decode as a type (`parseTypeFromText` returned `InvalidType`). **Critical:** such a symbol is *never* appended with an invalid type — the whole read fails, so no extern is ever synthesized with an unresolved signature. |
 
 (Distinct from `F_ShippedHeaderNotFound`, also unsuppressable, which the import resolver emits earlier when an angle include resolves to no descriptor at all on the `shippedLibDirs` path — a missing system header is a fatal error, matching C.)
 
 ### 12.5 Platform note
 
-The descriptor directory is named **per-platform** (`windows-x86_64`), and the language's `shippedLibDirs` names that exact platform subdirectory. Automatic platform selection — picking `windows-x86_64` vs. `linux-x86_64` from the active target — is **deferred** (anchor `D-FFI-SHIPPED-LIB-PLATFORM-SELECT`); for now each shipped dir names its platform explicitly and the language config points at the one it ships.
+The descriptor directory is named **per-platform** (`windows-x86_64`), and the language's `shippedLibDirs` names that exact platform subdirectory. Three platform surfaces are shipped and validated to decode (`windows-x86_64`, `linux-x86_64`, `macos-arm64`) — the latter two differ from Windows on the `long`-width ABI (LP64 vs. LLP64; see the shippedLibs README). Automatic platform selection — picking the directory from the active target's triple — is **deferred** (anchor `D-FFI-SHIPPED-LIB-PLATFORM-SELECT`); for now each shipped dir names its platform explicitly, the language config points at `windows-x86_64`, and the other two are staged for the selector.

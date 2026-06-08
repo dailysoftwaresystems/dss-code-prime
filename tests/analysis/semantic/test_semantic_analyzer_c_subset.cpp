@@ -1304,7 +1304,7 @@ TEST(SemanticAnalyzerCSubset, FF11AngleIncludeResolvesPutsViaDescriptor) {
     ScratchDir sysDir{Location::Temp, "ff11-desc"};
     auto cu = buildAngleDescriptorUnit(
         sysDir, "io.json",
-        R"({ "library": "msvcrt.dll",
+        R"({ "header": "io.h", "library": "msvcrt.dll",
              "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ] })",
         "#include <io.h>\nint main() { puts(\"hi\"); return 0; }\n");
     // NO second tree — the descriptor is not parsed source.
@@ -1346,7 +1346,7 @@ TEST(SemanticAnalyzerCSubset, FF11AngleIncludePlusInlineExternUserDeclWins) {
     // skips nothing (puts doubled) AND RED if it skips everything (fputs lost).
     auto cu = buildAngleDescriptorUnit(
         sysDir, "io.json",
-        R"({ "library": "msvcrt.dll",
+        R"({ "header": "io.h", "library": "msvcrt.dll",
              "symbols": [ { "name": "puts",  "signature": "fn(ptr<char>) -> i32" },
                           { "name": "fputs", "signature": "fn(ptr<char>) -> i32" } ] })",
         "extern char puts(int x);\n"
@@ -1395,7 +1395,7 @@ TEST(SemanticAnalyzerCSubset, FF11SameDescriptorIncludedTwiceInjectsOnce) {
     ScratchDir sysDir{Location::Temp, "ff11-desc"};
     auto cu = buildAngleDescriptorUnit(
         sysDir, "io.json",
-        R"({ "library": "msvcrt.dll",
+        R"({ "header": "io.h", "library": "msvcrt.dll",
              "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ] })",
         "#include <io.h>\n"
         "#include <io.h>\n"
@@ -1423,7 +1423,8 @@ TEST(SemanticAnalyzerCSubset, FF11MultipleDescriptorsEachSymbolInjectedOnce) {
     ScratchDir sysDir{Location::Temp, "ff11-desc-multi"};
     auto writeDesc = [&](std::string const& stem, std::string const& sym) {
         std::ofstream(sysDir.path() / (stem + ".json"), std::ios::binary)
-            << R"({ "library": "msvcrt.dll", "symbols": [ { "name": ")"
+            << R"({ "header": ")" << stem << R"(.h", "library": "msvcrt.dll", )"
+            << R"("symbols": [ { "name": ")"
             << sym << R"(", "signature": "fn() -> i32" } ] })";
     };
     writeDesc("dup", "dup");
