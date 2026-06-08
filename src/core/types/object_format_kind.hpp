@@ -71,4 +71,47 @@ objectFormatKindFromName(std::string_view s) noexcept {
     return kObjectFormatKindTable.fromName(s);
 }
 
+// ── Extern-call dispatch model (D-FFI-EXTERN-CALL-DISPATCH) ────────
+//
+// How an extern (shipped-library / cross-image) CALL is reached AT THE
+// CALL SITE — a property of the OBJECT FORMAT's dynamic-import model,
+// NOT the CPU target. This is keyed by the format because the SAME CPU
+// target needs OPPOSITE call shapes under different formats (x86_64-PE
+// vs x86_64-ELF), so it cannot live on the target schema.
+//
+//   * `indirect-slot` (PE IAT, Mach-O __got): the linker points the
+//     extern symbol's VA at a POINTER SLOT; the call site DEREFERENCES
+//     it (x86_64 `FF 15 disp32` = `call [RIP+disp32]`). The loader
+//     fixes the slot to the resolved callee address.
+//   * `direct-plt` (ELF PLT/GOT): the linker points the extern symbol's
+//     VA at a PLT STUB (code); the call site is a PLAIN DIRECT call to
+//     the stub (x86_64 `E8 disp32`, ARM64 `BL imm26`), and the stub
+//     performs the GOT indirection internally.
+//
+// Selecting the wrong shape MISCOMPILES: a `direct-plt` format reached
+// via the `indirect-slot` opcode dereferences the PLT stub's CODE bytes
+// as a function pointer → SIGSEGV. Consumed by MIR→LIR `lowerCall`,
+// which picks `call_indirect_via_extern` (indirect-slot) vs the plain
+// `call` opcode (direct-plt). Cross-tier vocabulary (the LIR lowerer
+// needs it) so it lives here beside `ObjectFormatKind`, not in the
+// link substrate header.
+enum class ExternCallDispatch : std::uint8_t {
+    IndirectSlot = 1,  // PE IAT / Mach-O __got: deref a pointer slot
+    DirectPlt    = 2,  // ELF PLT: direct call to the linker's PLT stub
+};
+
+inline constexpr EnumNameTable<ExternCallDispatch, 2> kExternCallDispatchTable{{{
+    { ExternCallDispatch::IndirectSlot, "indirect-slot" },
+    { ExternCallDispatch::DirectPlt,    "direct-plt"    },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+externCallDispatchName(ExternCallDispatch d) noexcept {
+    return kExternCallDispatchTable.name(d);
+}
+[[nodiscard]] constexpr std::optional<ExternCallDispatch>
+externCallDispatchFromName(std::string_view s) noexcept {
+    return kExternCallDispatchTable.fromName(s);
+}
+
 } // namespace dss

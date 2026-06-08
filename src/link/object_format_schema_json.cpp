@@ -179,6 +179,13 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // vocabulary, not via the cross-format dataItems
             // pipeline).
             "supportedDataSections",
+            // D-FFI-EXTERN-CALL-DISPATCH: the PLT-stub vs IAT-slot
+            // extern-call shape is an ELF/PE/Mach-O dynamic-import
+            // notion; WASM/SPIR-V reach imports through their own
+            // format-native mechanisms (WASM import section / SPIR-V
+            // linkage decorations), so a top-level declaration here
+            // would be dead data.
+            "externCallDispatch",
         };
         for (auto const* field : universalFields) {
             if (doc.contains(field)) {
@@ -243,6 +250,39 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                           "callingConventionByName(...)`).");
             } else {
                 data.entryCallingConvention = cc;
+            }
+        }
+    }
+
+    // D-FFI-EXTERN-CALL-DISPATCH: `externCallDispatch` — the format's
+    // extern-call shape ("indirect-slot" / "direct-plt"). Optional in
+    // the JSON (a relocatable / WASM / SPIR-V format, or an exec format
+    // built for a non-FFI purpose, omits it). validate() does NOT require
+    // it — the real requirement ("a format that LOWERS an extern call
+    // needs a dispatch shape") is enforced at MIR→LIR (the `Lowerer` ctor
+    // guard fails loud on extern-imports-under-nullopt). Present-but-
+    // unknown IS a fail-loud HERE at load (a typo must NOT silently fall
+    // through to a default extern-call shape).
+    if (doc.contains("externCallDispatch")) {
+        if (!doc.at("externCallDispatch").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/externCallDispatch",
+                      "'externCallDispatch' must be a string "
+                      "(\"indirect-slot\" or \"direct-plt\")");
+        } else {
+            auto const s =
+                doc.at("externCallDispatch").get<std::string>();
+            auto const d = externCallDispatchFromName(s);
+            if (!d.has_value()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/externCallDispatch",
+                          std::format("unknown externCallDispatch '{}' "
+                                      "— accepted: \"indirect-slot\" "
+                                      "(PE IAT / Mach-O __got), "
+                                      "\"direct-plt\" (ELF PLT stub)",
+                                      s));
+            } else {
+                data.externCallDispatch = *d;
             }
         }
     }

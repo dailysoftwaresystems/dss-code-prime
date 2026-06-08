@@ -574,6 +574,25 @@ struct DSS_EXPORT ObjectFormatData {
     // together).
     std::string entryCallingConvention;
 
+    // ── D-FFI-EXTERN-CALL-DISPATCH: extern-call shape ────────────
+    //
+    // How a call to an extern import is reached at the CALL SITE for
+    // THIS format: `indirect-slot` (PE IAT / Mach-O __got: deref a
+    // pointer slot via the target's `call_indirect_via_extern` opcode)
+    // vs `direct-plt` (ELF PLT: a plain direct `call` to the linker's
+    // PLT stub). See `ExternCallDispatch` (core/types/object_format_kind.hpp)
+    // for the full rationale. Consumed by MIR-to-LIR `lowerCall`.
+    //
+    // `std::nullopt` = the format did not declare a dispatch model — NOT
+    // a silent default to either shape: MIR→LIR fails loud iff a module
+    // declares extern imports under a nullopt-dispatch format. Enforced at
+    // that precise point (lowering), NOT at validate(): a format that never
+    // lowers an extern call (a relocatable / WASM / SPIR-V format, or an
+    // exec format built for a non-FFI purpose like the codesign fixtures)
+    // may legitimately omit it. The shipped exec formats DO declare it; an
+    // unknown VALUE still fails loud at load (the loader's enum check).
+    std::optional<ExternCallDispatch> externCallDispatch;
+
     // ── D-LK2-RODATA closure: producer-data-section capability set ──
     //
     // Schema-declared set of `DataSectionKind` values the format's
@@ -711,6 +730,16 @@ public:
     }
     [[nodiscard]] std::string_view entryCallingConvention() const noexcept {
         return d_.entryCallingConvention;
+    }
+
+    // ── D-FFI-EXTERN-CALL-DISPATCH accessor ──────────────────────
+    // The format's extern-call shape (`indirect-slot` / `direct-plt`),
+    // or nullopt if the format declared none. MIR→LIR `lowerCall`
+    // reads this to choose `call_indirect_via_extern` vs plain `call`;
+    // a nullopt under a module with extern imports is a fail-loud.
+    [[nodiscard]] std::optional<ExternCallDispatch>
+    externCallDispatch() const noexcept {
+        return d_.externCallDispatch;
     }
 
     // ── D-LK2-RODATA producer-data-section capability gate ─────

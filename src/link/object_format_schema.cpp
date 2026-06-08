@@ -851,6 +851,19 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "capability gate. (D-LK2-RODATA closure.)");
     }
 
+    // D-FFI-EXTERN-CALL-DISPATCH: `externCallDispatch` is NOT validate-
+    // required, even on exec formats. The precise requirement is "a format
+    // that LOWERS AN EXTERN CALL needs a dispatch shape", which is enforced
+    // exactly at MIR→LIR (a module with extern imports under a no-dispatch
+    // format fails loud — `L_RequiredLirOpcodeMissing`, pinned by
+    // `MirToLir.ExternImportsWithNoDispatchFailLoud`). Requiring it on EVERY
+    // exec format would over-broadly force formats built for non-FFI
+    // purposes (e.g. the codesign-placeholder fixtures) to carry an
+    // unrelated field. The shipped exec formats DO declare it (and their FFI
+    // corpora exercise it); an unknown VALUE still fails loud at load (the
+    // loader's enum check). This keeps the "no silent default to a broken
+    // call shape" invariant at the point it actually matters.
+
     return problems;
 }
 

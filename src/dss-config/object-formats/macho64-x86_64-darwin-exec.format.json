@@ -11,6 +11,8 @@
 
   "$entryPointComment": "Empty defaults to module.functions[0] (cycle-2 convention). LC_MAIN.entryoff is computed as (entry_function_offset_in_.text) — relative to the __TEXT segment start, NOT to file offset.",
   "entryPoint": "",
+  "$externCallDispatchComment": "Mach-O resolves imports through the __got: the linker (LC_DYLD_INFO_ONLY bind opcodes / chained fixups) points each extern symbol's VA at a __got POINTER slot, and the call site dereferences it (x86_64 FF 15 disp32). Same indirect-slot model as PE. D-FFI-EXTERN-CALL-DISPATCH.",
+  "externCallDispatch": "indirect-slot",
 
   "$processExitDeferredComment": "D-LK10-ENTRY Slice B (plan 14 §2.13) intentionally OMITS `processExit` + `entryCallingConvention` here. macOS Mach-O exit mechanism is TBD per D-LK10-ENTRY-MACHO-EXIT: trade-off between (a) by-name-import via libSystem `_exit` (mirrors PE+ExitProcess but ties binary to dyld+libSystem loading) and (b) raw BSD syscall `0x2000001` (hermetic but Apple discourages — 'syscall numbers unstable across macOS versions'). Decision deferred to the first Mach-O runnable-binary trigger. Slice C's linker hook (`format.processExit().has_value()`) silently skips trampoline emission for this format until the choice is made + populated — intentional, not a defect.",
 

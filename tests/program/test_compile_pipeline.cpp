@@ -883,9 +883,13 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
                "call is now a direct intra-module call, so no thunk is needed";
     }
 
-    // Lower the single merged module → ONE AssembledModule.
+    // Lower the single merged module → ONE AssembledModule. The cross-CU
+    // extern (add5) was stripped to a DIRECT call by the merge, so the
+    // merged module has no surviving externs — the extern-call dispatch is
+    // never consumed (nullopt is the faithful value; a guard fires only if
+    // an extern import survives without one). D-FFI-EXTERN-CALL-DISPATCH.
     auto mod = lowerMergedToAssembly(*merged, *grammar, **targetR, ccIndex,
-                                     cuMirs[0].cuId, rep);
+                                     cuMirs[0].cuId, std::nullopt, rep);
     ASSERT_TRUE(mod.has_value()) << "errorCount=" << rep.errorCount();
 
     // (2) The lowered module carries no `add5` import either (direct call).

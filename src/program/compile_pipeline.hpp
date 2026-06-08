@@ -208,6 +208,12 @@ struct DSS_EXPORT CuMirModule {
     GrammarSchema const*      grammar = nullptr;  // entry-name list + (unused-by-lower) policy
     TargetSchema const*       target  = nullptr;  // MIR→LIR + assemble target
     std::uint16_t             callingConventionIndex = 0;
+    // D-FFI-EXTERN-CALL-DISPATCH: the active object format's extern-call
+    // shape (indirect-slot / direct-plt), captured at build time from the
+    // `ObjectFormatSchema` so the LOWER half (which sees only this struct)
+    // selects the right call-site opcode. nullopt iff the format declared
+    // none — MIR→LIR then fails loud on any extern call.
+    std::optional<ExternCallDispatch> externCallDispatch;
 };
 
 // BUILD half: semantic analysis → HIR → FFI synthesis → MIR → optimize. Returns the
@@ -268,6 +274,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       TargetSchema const&  target,
                       std::uint16_t        callingConventionIndex,
                       CompilationUnitId    cuId,
+                      std::optional<ExternCallDispatch> externCallDispatch,
                       DiagnosticReporter&  reporter);
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of

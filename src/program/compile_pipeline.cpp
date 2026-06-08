@@ -262,6 +262,9 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
         &grammar,
         &target,
         callingConventionIndex,
+        // D-FFI-EXTERN-CALL-DISPATCH: capture the active format's extern-call
+        // shape now (the LOWER half sees only this struct, not the format).
+        format.externCallDispatch(),
     };
     return cuMir;
 }
@@ -299,12 +302,17 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          TargetSchema const&                         target,
                          std::uint16_t                               callingConventionIndex,
                          CompilationUnitId                           cuId,
+                         std::optional<ExternCallDispatch>           externCallDispatch,
                          DiagnosticReporter&                         reporter) {
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
+    // D-FFI-EXTERN-CALL-DISPATCH: the active format's extern-call shape
+    // selects the call-site opcode (indirect-slot → call_indirect_via_extern;
+    // direct-plt → plain call). Threaded from the format at the driver.
     auto const lirEntry = reporter.errorCount();
     auto lir = lowerToLir(mir, target,
                           interner, reporter,
-                          std::move(externImports));
+                          std::move(externImports),
+                          externCallDispatch);
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -548,7 +556,8 @@ lowerCuMirToAssembly(CuMirModule& cuMir, DiagnosticReporter& reporter) {
     return lowerMirModuleToAssembly(
         cuMir.mir, model.lattice().interner(), nameOf,
         std::move(cuMir.externImports), userEntry, *cuMir.target,
-        cuMir.callingConventionIndex, cuMir.cuId, reporter);
+        cuMir.callingConventionIndex, cuMir.cuId,
+        cuMir.externCallDispatch, reporter);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -570,6 +579,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       TargetSchema const& target,
                       std::uint16_t       callingConventionIndex,
                       CompilationUnitId   cuId,
+                      std::optional<ExternCallDispatch> externCallDispatch,
                       DiagnosticReporter& reporter) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
@@ -582,7 +592,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
     return lowerMirModuleToAssembly(
         merged.mir, merged.host.interner(), nameOf,
         std::move(merged.externImports), merged.userEntrySymbol, target,
-        callingConventionIndex, cuId, reporter);
+        callingConventionIndex, cuId, externCallDispatch, reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU

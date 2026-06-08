@@ -269,6 +269,15 @@ struct Lowerer {
     // bytes as code).
     std::unordered_set<std::uint32_t> externSymbols;
 
+    // D-FFI-EXTERN-CALL-DISPATCH: the ACTIVE OBJECT FORMAT's extern-call
+    // shape. `lowerCall` reads this to pick `CallIndirectViaExtern`
+    // (indirect-slot — PE/Mach-O deref an IAT/__got pointer slot) vs the
+    // plain `Call` opcode (direct-plt — ELF direct branch to the linker
+    // PLT stub). `std::nullopt` = the format declared none; a module with
+    // extern imports under a nullopt dispatch is a fail-loud at ctor (no
+    // silent default — the wrong shape miscompiles).
+    std::optional<ExternCallDispatch> externCallDispatch_;
+
     // Whether the running lowering pass added any error-severity
     // diagnostics. Mirrors ML2's delta-on-errorCount; reset by the ctor.
     std::uint32_t baselineErrors = 0;
@@ -278,9 +287,11 @@ struct Lowerer {
 
     Lowerer(Mir const& m, TargetSchema const& t, TypeInterner const& i,
             DiagnosticReporter& r,
-            std::span<ExternImport const> externImports)
+            std::span<ExternImport const> externImports,
+            std::optional<ExternCallDispatch> externCallDispatch)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
-          valueToReg(m), mirBlockToLirBlock(m.blockArena()) {
+          valueToReg(m), mirBlockToLirBlock(m.blockArena()),
+          externCallDispatch_(externCallDispatch) {
         baselineErrors = reporter.errorCount();
         externSymbols.reserve(externImports.size());
         for (auto const& e : externImports) {
@@ -307,37 +318,62 @@ struct Lowerer {
             cache_[i].id       = target.opcodeByMnemonic(r.mnemonic);
         }
 
-        // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY 2nd-order audit fold
-        // (silent-failure H2, 2026-06-02): if the module declares
-        // ANY externs AND the target schema doesn't declare
-        // `call_indirect_via_extern`, the per-call site would
-        // surface the missing-opcode diagnostic mid-lowering —
-        // technically loud (the MnemonicCache's missingReported
-        // flag fires it ONCE per pass) but at a downstream tier
-        // that doesn't name the upstream config gap. Fail loud
-        // UPFRONT at Lowerer construction so the operator sees
-        // "this target schema can't dispatch extern calls" before
-        // any lowering work happens. Targets without dynamic-import
-        // support (no externs in the module) skip the guard — they
-        // legitimately may omit the opcode.
-        if (!externImports.empty()
-            && !cache_[static_cast<std::size_t>(
-                   MnemonicSlot::CallIndirectViaExtern)].id.has_value()
-            && !cache_[static_cast<std::size_t>(
-                   MnemonicSlot::CallIndirectViaExtern)].missingReported) {
-            dss::report(reporter,
-                DiagnosticCode::L_RequiredLirOpcodeMissing,
-                DiagnosticSeverity::Error,
-                "MIR→LIR: module declares extern imports but the target "
-                "schema does not declare a `call_indirect_via_extern` "
-                "opcode — extern calls cannot be lowered without it. "
-                "Add the indirect-call encoding to the target's "
-                "`.target.json` `opcodes[]` array (x86_64 PE uses "
-                "`FF 15 disp32`; ARM64 GOT/PLT macro-op is anchored at "
-                "D-LK10-ENTRY-ARM64).");
-            cache_[static_cast<std::size_t>(
-                MnemonicSlot::CallIndirectViaExtern)]
-                    .missingReported = true;
+        // D-FFI-EXTERN-CALL-DISPATCH (was D-LK10-ENTRY-ML7-FRAME-BIAS-
+        // UNIFY 2nd-order audit fold): fail loud UPFRONT at construction
+        // if the module declares extern imports but the active object
+        // FORMAT cannot dispatch an extern call — before any lowering
+        // work. The extern-call shape is a property of the FORMAT (its
+        // dynamic-import model), NOT the target: the SAME x86_64 target
+        // needs `call_indirect_via_extern` (FF 15, deref the IAT slot)
+        // under PE but the plain `call` (E8, direct branch to the PLT
+        // stub) under ELF — picking the wrong one miscompiles (FF 15
+        // through an ELF PLT stub dereferences code as a pointer →
+        // SIGSEGV). So the gate is keyed on `externCallDispatch_`:
+        //   * nullopt          → the format declared no dispatch model
+        //                        (NO silent default to either shape).
+        //   * indirect-slot    → requires `call_indirect_via_extern`.
+        //   * direct-plt       → requires the universal `call` opcode.
+        // Static modules (no externs) skip the gate entirely — they
+        // legitimately need neither the dispatch model nor the opcode.
+        if (!externImports.empty()) {
+            auto const callIndirectMissing = !cache_[static_cast<std::size_t>(
+                MnemonicSlot::CallIndirectViaExtern)].id.has_value();
+            auto const callMissing =
+                !cache_[static_cast<std::size_t>(MnemonicSlot::Call)]
+                     .id.has_value();
+            if (!externCallDispatch_.has_value()) {
+                dss::report(reporter,
+                    DiagnosticCode::L_RequiredLirOpcodeMissing,
+                    DiagnosticSeverity::Error,
+                    "MIR→LIR: module declares extern imports but the active "
+                    "object format declares no `externCallDispatch` shape — "
+                    "extern calls have no defined call-site form. Declare "
+                    "`externCallDispatch` in the format's `.format.json` "
+                    "(\"indirect-slot\" for PE IAT / Mach-O __got, "
+                    "\"direct-plt\" for ELF PLT). (D-FFI-EXTERN-CALL-DISPATCH.)");
+            } else if (*externCallDispatch_ == ExternCallDispatch::IndirectSlot
+                       && callIndirectMissing) {
+                dss::report(reporter,
+                    DiagnosticCode::L_RequiredLirOpcodeMissing,
+                    DiagnosticSeverity::Error,
+                    "MIR→LIR: the active format uses `indirect-slot` extern "
+                    "dispatch but the target schema does not declare a "
+                    "`call_indirect_via_extern` opcode — IAT/__got-indirect "
+                    "extern calls cannot be lowered. Add the indirect-call "
+                    "encoding to the target's `.target.json` `opcodes[]` "
+                    "(x86_64 uses `FF 15 disp32`). (D-FFI-EXTERN-CALL-DISPATCH.)");
+            } else if (*externCallDispatch_ == ExternCallDispatch::DirectPlt
+                       && callMissing) {
+                dss::report(reporter,
+                    DiagnosticCode::L_RequiredLirOpcodeMissing,
+                    DiagnosticSeverity::Error,
+                    "MIR→LIR: the active format uses `direct-plt` extern "
+                    "dispatch but the target schema does not declare a "
+                    "`call` opcode — extern calls lower to a plain direct "
+                    "call to the linker-synthesized PLT stub, which needs "
+                    "the universal `call` encoding (x86_64 `E8 disp32`, "
+                    "ARM64 `BL imm26`). (D-FFI-EXTERN-CALL-DISPATCH.)");
+            }
         }
     }
 
@@ -878,12 +914,27 @@ struct Lowerer {
             calleeIsExtern = externSymbols.contains(calleeSym.v);
         }
 
-        MnemonicSlot const callSlot = calleeIsExtern
+        // D-FFI-EXTERN-CALL-DISPATCH: an extern call's CALL-SITE shape is
+        // the ACTIVE OBJECT FORMAT's, not a fixed assumption. Only an
+        // `indirect-slot` format (PE IAT / Mach-O __got) dereferences a
+        // pointer slot via `call_indirect_via_extern` (FF 15); a
+        // `direct-plt` format (ELF) makes a PLAIN DIRECT `call` (E8 / BL)
+        // to the linker-synthesized PLT stub — byte-identical to an
+        // intra-module call, the linker's symbolVa→stub mapping + the
+        // call reloc do the indirection. A non-extern call is always the
+        // direct `Call`. (The ctor guard already fail-louded if externs
+        // are present under a nullopt / under-equipped format, so an
+        // extern reaching here has a valid, opcode-backed dispatch model;
+        // a nullopt compares unequal to IndirectSlot → falls to `Call`.)
+        bool const useIndirectExtern =
+            calleeIsExtern
+            && externCallDispatch_ == ExternCallDispatch::IndirectSlot;
+        MnemonicSlot const callSlot = useIndirectExtern
             ? MnemonicSlot::CallIndirectViaExtern
             : MnemonicSlot::Call;
         if (!opcode(callSlot).has_value()) {
             reportMissingOpcode(callSlot,
-                calleeIsExtern
+                useIndirectExtern
                     ? "MIR Call (extern-import target)"
                     : "MIR Call");
             return;
@@ -1945,12 +1996,18 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           TargetSchema const& target,
                           TypeInterner const& interner,
                           DiagnosticReporter& reporter,
-                          std::vector<ExternImport> externImports) {
+                          std::vector<ExternImport> externImports,
+                          std::optional<ExternCallDispatch> externCallDispatch) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
-    // extern-targeting calls (CallIndirectViaExtern — FF 15) from
-    // module-internal direct calls (Call — E8).
-    Lowerer L{mir, target, interner, reporter, externImports};
+    // extern-targeting calls from module-internal direct calls.
+    // D-FFI-EXTERN-CALL-DISPATCH: also pass the active format's
+    // extern-call shape — `lowerCall` selects `call_indirect_via_extern`
+    // (indirect-slot: PE/Mach-O IAT/__got) vs the plain `call`
+    // (direct-plt: ELF PLT stub) from it. nullopt + extern imports =
+    // fail-loud (no silent default to either shape).
+    Lowerer L{mir, target, interner, reporter, externImports,
+              externCallDispatch};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

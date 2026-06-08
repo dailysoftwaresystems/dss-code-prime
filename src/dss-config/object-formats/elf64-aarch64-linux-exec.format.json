@@ -11,6 +11,8 @@
 
   "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention). Once D-LK1-1 closes (real symbol-name thread through HIR→LIR→AssembledFunction), this field will name the entry symbol and the walker will resolve it by name.",
   "entryPoint": "",
+  "$externCallDispatchComment": "ELF resolves imports through the PLT: the linker synthesizes a 16-byte ARM64 PLT stub per extern (ADRP+LDR+BR+NOP through the GOT slot) and points the extern symbol's VA at the STUB, so the call site is a PLAIN DIRECT call (BL imm26 to the stub, R_AARCH64_CALL26). No inline ADRP+LDR+BLR macro-op is needed at the call site -- the stub does the GOT indirection. D-FFI-EXTERN-CALL-DISPATCH.",
+  "externCallDispatch": "direct-plt",
 
   "$processExitComment": "D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): the Linux AArch64 runnable-binary spine — a raw `exit_group` syscall (no libc dependency). The trampoline emitter loads the syscall number into x8 via `mov x8, 94` (the new MOVZ Imm16 encoding — see arm64.target.json), moves the user fn's return value from returnGprs[0] (x0) into argGprs[0] (x0 — a no-op mov here since both are x0, emitted for ABI uniformity with x86_64's rax→rdi), then issues SVC #0 (the target's `syscall` opcode). Linux AArch64 syscall ABI: x8 = syscall number, x0 = arg0 (exit status). syscallOpcodeBytes [1, 0, 0, 212] = the LITTLE-ENDIAN byte stream of 0xD4000001 (SVC #0); it cross-checks the target's `syscall` opcode fixedWord. Self-contained exit mechanism — no ADRP+LDR+BLR `call_indirect_via_extern` is needed (that GOT/PLT path stays deferred at D-LK6-8).",
   "processExit": {
