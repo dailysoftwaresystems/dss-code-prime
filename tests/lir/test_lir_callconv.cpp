@@ -61,8 +61,9 @@ struct RewrittenBundle {
 // must pass `1` explicitly; the default exists so the dozens of
 // pre-existing non-cc tests don't have to be rewritten.
 [[nodiscard]] RewrittenBundle
-lowerThroughRewrite(std::string src, std::uint16_t ccIndex = 0) {
-    RewrittenBundle out{lowerCSubsetToLir(std::move(src))};
+lowerThroughRewrite(std::string src, std::uint16_t ccIndex = 0,
+                    std::string targetName = "x86_64") {
+    RewrittenBundle out{lowerCSubsetToLir(std::move(src), std::move(targetName))};
     if (!out.lowered.lir.ok) return out;
     out.liveness = analyzeLiveness(out.lowered.lir.lir);
     out.alloc = allocateRegisters(out.lowered.lir.lir, *out.lowered.target,
@@ -108,6 +109,18 @@ anyMovTouchesPhysReg(Lir const& lir, std::uint16_t physOrd,
     return false;
 }
 
+// D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER helper: does a FrameLayout's
+// callee-save set include the given physical-register ordinal? Used to
+// assert the link-register (x30) spill is present on non-leaf frames and
+// absent on leaf frames.
+[[nodiscard]] bool
+savedRegsContain(FrameLayout const& layout, std::uint16_t ord) {
+    for (LirReg const& r : layout.savedRegs) {
+        if (r.isPhysical != 0 && r.id == ord) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 TEST(LirCallconv, StraightLineFunctionGetsPrologueEpilogueAndZeroFrameOps) {
@@ -146,6 +159,78 @@ TEST(LirCallconv, StraightLineFunctionGetsPrologueEpilogueAndZeroFrameOps) {
             }
         }
     }
+}
+
+// D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER (2026-06-08): a NON-LEAF function
+// under a calling convention with a LINK REGISTER (AAPCS64 -> x30) MUST spill
+// + reload that register in its frame, because every `bl`/`call` clobbers it.
+// Without the spill, the epilogue `ret` jumps to the clobbered link reg (the
+// address after the last call), and the repeated epilogue SP-restore walks SP
+// off the stack — the exact arm64-FFI SIGSEGV this anchor closed. This pins the
+// spill at the LIR tier so it is exercised on EVERY CI leg (incl. Windows
+// MSVC), where the arm64 *runtime* corpus is gated out by the cross-arch guard.
+TEST(LirCallconv, NonLeafAarch64FunctionSpillsLinkRegister) {
+    // `f` calls `g` -> f is non-leaf, g is leaf. No optimizer runs in this
+    // pipeline (lower -> liveness -> regalloc -> rewrite -> callconv), so g is
+    // NOT inlined: f keeps a real call and stays non-leaf.
+    auto bundle = lowerThroughRewrite(
+        "int g(int x) { return x * 2; }\n"
+        "int f(int x) { return g(x) + 1; }\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->linkRegister.has_value())
+        << "aapcs64 must declare a link register (x30)";
+    std::uint16_t const lrOrd = cc->linkRegister->ordinal;
+
+    // Partition the per-function frames into the non-leaf (f, hasCalls) and
+    // leaf (g) layouts. f MUST save x30; g must NOT (no call clobbers it).
+    FrameLayout const* nonLeaf = nullptr;
+    FrameLayout const* leaf    = nullptr;
+    for (auto const& l : result.perFunc) {
+        if (l.hasCalls) nonLeaf = &l;
+        else            leaf    = &l;
+    }
+    ASSERT_NE(nonLeaf, nullptr) << "f must produce a non-leaf frame (calls g)";
+    ASSERT_NE(leaf, nullptr)    << "g must produce a leaf frame";
+    EXPECT_TRUE(savedRegsContain(*nonLeaf, lrOrd))
+        << "non-leaf AAPCS64 function MUST spill x30 (the link register) — "
+           "without it the epilogue `ret` returns to a clobbered LR (SIGSEGV)";
+    EXPECT_FALSE(savedRegsContain(*leaf, lrOrd))
+        << "leaf AAPCS64 function must NOT spill x30 — no call clobbers it, so "
+           "its minimal frame is preserved";
+}
+
+// Agnosticism pin: the SAME non-leaf source on x86_64 has NO link register to
+// spill — the SysV/x86_64 calling convention carries the return address on the
+// stack (callPushBytes=8) and declares no `linkRegister`. This proves the fix
+// takes its no-op path off `cc.linkRegister.has_value()`, NOT an
+// `if (arch == arm64)` branch in shared substrate.
+TEST(LirCallconv, NonLeafX8664FunctionHasNoLinkRegisterToSpill) {
+    auto bundle = lowerThroughRewrite(
+        "int g(int x) { return x * 2; }\n"
+        "int f(int x) { return g(x) + 1; }\n",
+        /*ccIndex=*/0, /*targetName=*/"x86_64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    EXPECT_FALSE(cc->linkRegister.has_value())
+        << "x86_64 SysV declares NO link register — `call` pushes the return "
+           "address on the stack; the link-register spill must take its no-op "
+           "path here (config-driven, not arch-hardcoded)";
 }
 
 TEST(LirCallconv, BlockTopologyPreservedForBranchingFunction) {

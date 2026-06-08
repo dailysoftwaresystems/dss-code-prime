@@ -429,7 +429,7 @@
       "redZoneBytes":     0,
       "$entryStackPointerBiasComment": "D-LK10-ENTRY-TRAMP-PROLOGUE: AArch64 BL does NOT push a return address (it writes LR / x30 directly), so process entry — whether by kernel-jump (Linux/Mac) or `RtlUserThreadStart`-BL (Windows) — leaves SP 16-byte-aligned (bias 0 mod 16). Trampoline `sub sp, 0` is emitted as nothing — `alignedSizeWithBias(shadowSpaceBytes=0, stackAlignment=16, bias=0) = 0`.",
       "entryStackPointerBias": 0,
-      "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: AArch64 BL writes the return address into LR/x30 — no stack push. callPushBytes=0 is the right ISA-level fact for ARM64. Non-leaf functions on ARM64 still save x30 in their prologue (via `stp x29, x30, [sp, #-16]!`), which lands in `savedRegAreaSize` via the existing callee-saved tracking — independent of the call-push bias.",
+      "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: AArch64 BL writes the return address into LR/x30 — no stack push. callPushBytes=0 is the right ISA-level fact for ARM64. Non-leaf functions on ARM64 still save x30 in their prologue + reload it before `ret`; because x30 is the `linkRegister` (deliberately NOT in `calleeSaved` — it must not be allocatable), this is realized by the link-register fold in `lir_callconv.cpp::materializeOneFunc` (gated on hasCalls + cc.linkRegister), which adds x30 to `savedRegs` so it lands in `savedRegAreaSize`. Without it the epilogue `ret` returns to a clobbered LR — see D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER. Independent of the call-push bias.",
       "callPushBytes": 0
     }
   ],
