@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <format>
+#include "asm/asm.hpp"
+#include "lir/lir_2addr_legalize.hpp"
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_regalloc.hpp"
@@ -231,6 +233,101 @@ TEST(LirCallconv, NonLeafX8664FunctionHasNoLinkRegisterToSpill) {
         << "x86_64 SysV declares NO link register — `call` pushes the return "
            "address on the stack; the link-register spill must take its no-op "
            "path here (config-driven, not arch-hardcoded)";
+}
+
+// D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER (host-independent byte-pin, 2026-06-08):
+// the structural pin above proves x30 is SCHEDULED into savedRegs; the runtime
+// corpus (extern_call_elf arm64) proves the frame EXECUTES — but only on the
+// single native-arm64 CI leg. Neither pins, on EVERY leg, that the scheduled x30
+// spill ASSEMBLES to the right store at the right stack offset. The per-instruction
+// arm64 byte-pins (Arm64Encoder.StoreSturEncodes, RetEncodes…) prove each
+// instruction in isolation; nothing pinned the COMPOSED non-leaf frame. This closes
+// that last mile: it drives the SAME production tail compile_pipeline.cpp uses
+// (lowerThroughRewrite -> legalizeTwoAddress -> materializeCallingConvention ->
+// assemble) and byte-pins the assembled prologue + epilogue against hand-verified
+// ARM-ARM literals — a pure byte compare, no runOn/emulator gate, so it runs (and
+// is red-on-disable) on EVERY leg incl. Windows MSVC. The catch it guards: 2b07e3b
+// byte-pinned green per-instruction yet SIGSEGV'd because the COMPOSED non-leaf
+// frame omitted the x30 spill (dbf84b0 fixed it). Keep all THREE layers (structural
+// + this byte-pin + runtime corpus); none replaces another.
+TEST(LirCallconv, NonLeafAarch64FramePrologueEpilogueByteExact) {
+    // f calls g -> f is non-leaf (frame holds x30), g is leaf (no x30). No
+    // optimizer runs in this pipeline, so g is not inlined and f stays non-leaf.
+    auto bundle = lowerThroughRewrite(
+        "int g(int x) { return x * 2; }\n"
+        "int f(int x) { return g(x) + 1; }\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    // The EXACT production pass order (compile_pipeline.cpp:340-363):
+    // legalizeTwoAddress -> materializeCallingConvention -> assemble.
+    DiagnosticReporter legRep;
+    auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
+                                    legRep);
+    ASSERT_TRUE(legal.ok());
+    DiagnosticReporter ccRep;
+    auto cc = materializeCallingConvention(legal.lir, *bundle.lowered.target,
+                                           bundle.alloc, ccRep);
+    ASSERT_TRUE(cc.ok());
+    // lirToMir is only consumed for the source-map; the callconv-inserted
+    // prologue/epilogue insts have no MIR predecessor -> InvalidMirInst (this pin
+    // checks BYTES, not source-map fidelity, exactly like assembleEndToEnd).
+    std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    DiagnosticReporter asmRep;
+    auto mod = assemble(cc.lir, *bundle.lowered.target, lirToMir, asmRep);
+    ASSERT_EQ(mod.functions.size(), cc.perFunc.size());
+
+    // Partition by FrameLayout.hasCalls: f = non-leaf, g = leaf.
+    std::size_t fIdx = cc.perFunc.size(), gIdx = cc.perFunc.size();
+    for (std::size_t i = 0; i < cc.perFunc.size(); ++i) {
+        if (cc.perFunc[i].hasCalls) fIdx = i;
+        else                        gIdx = i;
+    }
+    ASSERT_LT(fIdx, cc.perFunc.size()) << "f must be the non-leaf frame (calls g)";
+    ASSERT_LT(gIdx, cc.perFunc.size()) << "g must be the leaf frame";
+    auto const& fBytes = mod.functions[fIdx].bytes;
+    auto const& gBytes = mod.functions[gIdx].bytes;
+
+    // EXACT non-leaf PROLOGUE — 4 insts / 16 bytes, each decoded from the ARM ARM
+    // (little-endian):
+    //   sub  sp, sp, #0x20     d10083ff   (SUB imm: 0xD1000000|(32<<10)|(31<<5)|31)
+    //   stur x28, [sp]         f80003fc   (STUR : 0xF8000000|(0<<12)|(31<<5)|28)
+    //   stur x29, [sp, #8]     f80083fd   (        |(8<<12)|...|29)
+    //   stur x30, [sp, #16]    f80103fe   (the LINK-REGISTER spill: |(16<<12)|...|30)
+    static constexpr std::array<std::uint8_t, 16> kProlog{
+        0xff, 0x83, 0x00, 0xd1,  0xfc, 0x03, 0x00, 0xf8,
+        0xfd, 0x83, 0x00, 0xf8,  0xfe, 0x03, 0x01, 0xf8};
+    // EXACT non-leaf EPILOGUE — 5 insts / 20 bytes:
+    //   ldur x28, [sp]         f84003fc   (LDUR : 0xF8400000|...)
+    //   ldur x29, [sp, #8]     f84083fd
+    //   ldur x30, [sp, #16]    f84103fe   (the LINK-REGISTER reload, before ret)
+    //   add  sp, sp, #0x20     910083ff   (ADD imm: 0x91000000|(32<<10)|(31<<5)|31)
+    //   ret                    d65f03c0   (RET X30: 0xD65F0000|(30<<5))
+    static constexpr std::array<std::uint8_t, 20> kEpilog{
+        0xfc, 0x03, 0x40, 0xf8,  0xfd, 0x83, 0x40, 0xf8,
+        0xfe, 0x03, 0x41, 0xf8,  0xff, 0x83, 0x00, 0x91,
+        0xc0, 0x03, 0x5f, 0xd6};
+    ASSERT_GE(fBytes.size(), kProlog.size() + kEpilog.size());
+    EXPECT_TRUE(std::equal(kProlog.begin(), kProlog.end(), fBytes.begin()))
+        << "non-leaf AAPCS64 prologue must byte-match exactly — incl. "
+           "`stur x30,[sp,#16]` (f80103fe) at offset 12; without the link-register "
+           "spill the frame shrinks to 0x10 and these bytes diverge (red-on-disable)";
+    EXPECT_TRUE(std::equal(kEpilog.rbegin(), kEpilog.rend(), fBytes.rbegin()))
+        << "non-leaf AAPCS64 epilogue must byte-match exactly — incl. "
+           "`ldur x30,[sp,#16]` (f84103fe) reloaded BEFORE `ret`, so the return "
+           "targets the caller, not the bl-clobbered x30";
+
+    // Leaf control: g saves x28/x29 (the x*2 scratch) but must contain NO
+    // `stur x30,[sp,#16]` anywhere — no `bl` clobbers x30 in a leaf. Proves the pin
+    // discriminates the x30 spill specifically, not "matches any prologue". (This
+    // byte check is offset-specific to #16; the offset-INDEPENDENT "x30 ∉ savedRegs"
+    // guarantee for the leaf is the sibling NonLeafAarch64FunctionSpillsLinkRegister
+    // — this corroborates it at the byte tier.)
+    static constexpr std::array<std::uint8_t, 4> kSturX30{0xfe, 0x03, 0x01, 0xf8};
+    EXPECT_EQ(std::search(gBytes.begin(), gBytes.end(),
+                          kSturX30.begin(), kSturX30.end()),
+              gBytes.end())
+        << "leaf AAPCS64 function must NOT spill x30 — the discrimination check";
 }
 
 TEST(LirCallconv, BlockTopologyPreservedForBranchingFunction) {
