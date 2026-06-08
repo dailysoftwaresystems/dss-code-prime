@@ -22,6 +22,9 @@ add_library(core OBJECT
     types/tree_cursor.cpp
     types/type_lattice/type_lattice.cpp
     types/type_lattice/type_reintern.cpp
+
+    # ── crypto/ — self-contained hashing primitives (codesign foundation) ──
+    crypto/sha256.cpp
 )
 
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
