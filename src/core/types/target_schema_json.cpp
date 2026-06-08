@@ -177,6 +177,41 @@ void parseVariantTemplate(json const& v, std::size_t opIdx, std::size_t vi,
             tmpl.condCodeFromPayload = t.at("condCodeFromPayload").get<bool>();
         }
     }
+    // D-AS3-COND-CODE-ARM64: `condBitPos` — LSB inside word 0 where the
+    // fixed32 walker OR's the cond nibble. DEFAULT 0 (x86 / B.cond low
+    // nibble). Range [0, 28] (a 4-bit nibble must fit inside the 32-bit
+    // word). 12 for AArch64 CSET. (The x86-variable walker ignores this;
+    // it places the nibble in the opcode byte regardless.)
+    if (t.contains("condBitPos")) {
+        auto const path = std::format("/opcodes/{}/encoding/variants/{}/template/condBitPos", opIdx, vi);
+        if (!t.at("condBitPos").is_number_integer()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "'condBitPos' must be an integer in [0, 28]");
+        } else {
+            std::int64_t const cb = t.at("condBitPos").get<std::int64_t>();
+            if (cb < 0 || cb > 28) {
+                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                          std::format("'condBitPos' ({}) must be in [0, 28] "
+                                      "(a 4-bit nibble must fit within the "
+                                      "32-bit word)", cb));
+            } else {
+                tmpl.condBitPos = static_cast<std::uint8_t>(cb);
+            }
+        }
+    }
+    // D-AS3-COND-CODE-ARM64: `condInvert` — XOR the cond nibble with 1
+    // before placing it (the AArch64 inverse-condition trick used by
+    // CSET = CSINC with the inverted condition). DEFAULT false (x86 /
+    // B.cond place the cond verbatim).
+    if (t.contains("condInvert")) {
+        auto const path = std::format("/opcodes/{}/encoding/variants/{}/template/condInvert", opIdx, vi);
+        if (!t.at("condInvert").is_boolean()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "'condInvert' must be a boolean");
+        } else {
+            tmpl.condInvert = t.at("condInvert").get<bool>();
+        }
+    }
     // D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold): force a
     // REX prefix even when no REX bit is set — required by x86 byte-
     // register-bearing opcodes (setcc) to access the spl/bpl/sil/dil

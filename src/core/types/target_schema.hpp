@@ -742,11 +742,28 @@ enum class EncodingSlotKind : std::uint8_t {
     // so one marker covers every such position. isSymbolBearingSlot
     // returns true (a `relocationKind` is required + emitted).
     SymbolPatchMarker = 19,
+    // D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow): the
+    // SIGNED 19-bit PC-relative branch offset of the AArch64 `B.cond`
+    // instruction (`B.cond <label>`), bits 5..23 of the 32-bit word
+    // (the cond nibble occupies bits 0..3). BLOCK-RELATIVE, NOT
+    // symbol-bearing: like the INTRA-FUNCTION use of Imm26 (the
+    // `B <label>` form), the value is the displacement to an intra-
+    // function basic block, resolved at ASSEMBLE time by the asm.cpp
+    // resolver (NOT a linker relocation). The walker writes ZERO bits
+    // + pushes a `walker_util::BlockRelPatch{ kind = Arm64Imm19 }`;
+    // the resolver computes `(target - patchOffset) >> 2` (no +4 bias
+    // — ARM64 branches are PC-relative to the instruction itself) and
+    // read-modify-writes the 19-bit field. The displacement is SCALED
+    // by 4 (word-aligned), a ±1 MiB reach; a larger intra-function
+    // span needs inverted-cond + long `B` (future, anchored
+    // D-CSUBSET-LONG-BRANCH). `isSymbolBearingSlot` returns FALSE (no
+    // relocationKind — resolved intra-function, not at link time).
+    Imm19 = 20,
     // Future fixed32 slots (paired with their consumer cycle):
     //   ImmShift / Sf-flag / scaled LDR imm12 / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 20> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 21> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -767,6 +784,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 20> kEncodingSlotKindTable{{{
     { EncodingSlotKind::MemBaseNoScale, "membase.noscale" },
     { EncodingSlotKind::Imm12,         "imm12"          },
     { EncodingSlotKind::SymbolPatchMarker, "sym.patch"   },
+    { EncodingSlotKind::Imm19,         "imm19"          },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -785,7 +803,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 20,
+static_assert(kEncodingSlotKindCount == 21,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -821,6 +839,7 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::MemBaseNoScale:
         case EncodingSlotKind::Imm12:
         case EncodingSlotKind::SymbolPatchMarker:
+        case EncodingSlotKind::Imm19:
             return TargetEncodingShape::Fixed32;
     }
     return TargetEncodingShape::None;  // unreachable; satisfies non-exhaustive switches
@@ -871,6 +890,26 @@ struct DSS_EXPORT TargetEncodingTemplate {
     // `condCodeEncoding[]` (A_NoCondCodeEncoding) — silently OR'ing
     // zero would map every condition to `eq`.
     bool condCodeFromPayload = false;
+
+    // D-AS3-COND-CODE-ARM64 (ARM64 control-flow): cond-nibble PLACEMENT
+    // + INVERSION knobs for the `fixed32` walker's `condCodeFromPayload`
+    // arm. Both default to the x86 / B.cond shape (LSB 0, no invert) so
+    // every existing cond-bearing opcode is byte-identical after these
+    // fields land.
+    //   * `condBitPos` — the LSB inside word 0 where the 4-bit cond
+    //     nibble is OR'd. 0 for AArch64 `B.cond` (bits 0..3); 12 for
+    //     AArch64 `CSET` (= `CSINC Xd,XZR,XZR,invcond`, cond at bits
+    //     12..15). (The x86-variable walker has its own opcode-byte
+    //     placement and ignores this field.)
+    //   * `condInvert` — when true, XOR the cond nibble with 1 before
+    //     placing it (the AArch64 inverse-condition trick). `CSET cond`
+    //     materializes 1-when-cond by encoding `CSINC` with the INVERTED
+    //     condition (the false-arm increments XZR→1); so `cset x,gt`
+    //     (GT=0xC) encodes condition 0xC^1 = 0xD. `B.cond` does NOT
+    //     invert (false here).
+    // Only meaningful when `condCodeFromPayload` is true.
+    std::uint8_t condBitPos = 0;
+    bool         condInvert = false;
 
     // D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold,
     // code-reviewer C2): force a REX prefix even when no REX bit
@@ -971,6 +1010,13 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::SibIndex:
         case EncodingSlotKind::CondCodeNibble:
         case EncodingSlotKind::BlockRel32:
+        // D-AS3-BLOCK-REL-IMM19/26: Imm19 (ARM64 B.cond displacement) is
+        // block-relative like BlockRel32 / the intra-function Imm26 use —
+        // resolved at assemble time, no linker relocation. (Imm26 itself
+        // stays symbol-bearing above for the BL/`call` form; the encoder
+        // distinguishes Imm26's dual use by operand kind — a BlockRef
+        // operand is block-relative, a SymbolRef operand emits the reloc.)
+        case EncodingSlotKind::Imm19:
             // D-AS4-1 / D-AS4-5 memory-addressing slots write immediate
             // displacements / register encodings (not symbol-relative).
             // The companion symbol-bearing slot for RIP-relative `lea`

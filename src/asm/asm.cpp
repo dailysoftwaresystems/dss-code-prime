@@ -325,16 +325,78 @@ AssembledModule assemble(Lir const&                 lir,
                 }
                 case walker_util::BlockRelPatchKind::Arm64Imm19:
                 case walker_util::BlockRelPatchKind::Arm64Imm26: {
-                    report(reporter, DiagnosticCode::A_NoEncodingShapeWalker,
-                           DiagnosticSeverity::Error,
-                           std::format("intra-function ARM64 branch patch in "
-                                       "fn '{}' targets shape {} — resolver "
-                                       "not yet implemented (anchored "
-                                       "D-AS3-BLOCK-REL-IMM19/26; lands when "
-                                       "ARM64 control-flow corpus lands)",
-                                       outFn.symbol.v,
-                                       static_cast<int>(patch.kind)));
-                    patchOk = false;
+                    // D-AS3-BLOCK-REL-IMM19/26: AArch64 intra-function
+                    // branch resolution. The displacement is PC-relative
+                    // TO THE INSTRUCTION ITSELF (no +4 bias, unlike x86's
+                    // rel32-after-disp) and SCALED by 4 (branch targets
+                    // are word-aligned). Imm19 (B.cond) occupies bits
+                    // 5..23; Imm26 (B) occupies bits 0..25. We READ-
+                    // MODIFY-WRITE only that bit-field so the opcode /
+                    // cond-nibble / register bits already emitted into
+                    // the word survive (writeU32LEAt over all 4 bytes
+                    // would clobber them).
+                    bool const isImm19 =
+                        patch.kind == walker_util::BlockRelPatchKind::Arm64Imm19;
+                    std::uint32_t const lsb   = isImm19 ? 5u : 0u;
+                    std::uint32_t const width = isImm19 ? 19u : 26u;
+                    std::int64_t const delta =
+                        static_cast<std::int64_t>(it->second)
+                      - static_cast<std::int64_t>(patch.patchOffset);
+                    // 4-byte alignment is a hard invariant — every ARM64
+                    // instruction (and thus every block boundary) is
+                    // word-aligned. A non-multiple delta means the
+                    // block-offset table or the patch offset is corrupt;
+                    // fail loud rather than silently drop the low bits.
+                    if ((delta & 0x3) != 0) {
+                        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                               DiagnosticSeverity::Error,
+                               std::format("intra-function ARM64 branch in fn "
+                                           "'{}' has unaligned displacement {} "
+                                           "(not a multiple of 4) — block "
+                                           "offsets must be word-aligned "
+                                           "(D-AS3-BLOCK-REL-IMM19/26)",
+                                           outFn.symbol.v, delta));
+                        patchOk = false;
+                        break;
+                    }
+                    std::int64_t const disp = delta >> 2;  // arithmetic, signed
+                    // Signed range derived from the field WIDTH:
+                    // Imm19 ∈ [-(1<<18), (1<<18)-1]; Imm26 ∈
+                    // [-(1<<25), (1<<25)-1]. Out-of-range = the function
+                    // body exceeds the branch's reach; fail loud (a long-
+                    // branch thunk is the future generalization, anchored
+                    // D-CSUBSET-LONG-BRANCH).
+                    std::int64_t const lo = -(std::int64_t{1} << (width - 1));
+                    std::int64_t const hi =  (std::int64_t{1} << (width - 1)) - 1;
+                    if (disp < lo || disp > hi) {
+                        report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                               DiagnosticSeverity::Error,
+                               std::format("intra-function ARM64 branch in fn "
+                                           "'{}' needs scaled displacement {} "
+                                           "which exceeds the signed {}-bit "
+                                           "field range [{}..{}] — function "
+                                           "body too large for branch reach "
+                                           "(anchor D-CSUBSET-LONG-BRANCH for "
+                                           "inverted-cond + long B thunks)",
+                                           outFn.symbol.v, disp, width, lo, hi));
+                        patchOk = false;
+                        break;
+                    }
+                    // READ the existing 32-bit LE word at the patch site,
+                    // OR in the masked displacement, write the whole word
+                    // back. The mask clears only the [lsb, lsb+width) bits.
+                    std::uint32_t const o = patch.patchOffset;
+                    std::uint32_t word =
+                        static_cast<std::uint32_t>(outFn.bytes[o])
+                      | (static_cast<std::uint32_t>(outFn.bytes[o + 1]) << 8)
+                      | (static_cast<std::uint32_t>(outFn.bytes[o + 2]) << 16)
+                      | (static_cast<std::uint32_t>(outFn.bytes[o + 3]) << 24);
+                    std::uint32_t const mask = (width >= 32u)
+                        ? 0xFFFFFFFFu
+                        : ((1u << width) - 1u);
+                    word = (word & ~(mask << lsb))
+                         | ((static_cast<std::uint32_t>(disp) & mask) << lsb);
+                    asm_byte_emit::writeU32LEAt(outFn.bytes, o, word);
                     break;
                 }
             }

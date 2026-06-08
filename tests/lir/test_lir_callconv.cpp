@@ -34,6 +34,7 @@
 
 #include <array>
 #include <cstdint>
+#include <ios>
 #include <vector>
 
 using namespace dss;
@@ -328,6 +329,114 @@ TEST(LirCallconv, NonLeafAarch64FramePrologueEpilogueByteExact) {
                           kSturX30.begin(), kSturX30.end()),
               gBytes.end())
         << "leaf AAPCS64 function must NOT spill x30 — the discrimination check";
+}
+
+// D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow) byte-pin.
+//
+// HAND-BUILT LIR exercising the three control-flow opcodes (cmp / jcc / jmp)
+// directly through assemble(), laid out as a while-loop control-flow skeleton:
+//   header: cmp x0, xzr ; jcc(sgt) -> body, exit       (b.cond + trailing b)
+//   body:   sub x0, x0, x0 ; jmp header                (unconditional b, back-edge)
+//   exit:   ret
+//
+// This pins (a) the cmp → SUBS XZR encoding, (b) the b.cond (0x54) with the GT
+// condition nibble, (c) the forward unconditional b (0x14), (d) the NEGATIVE
+// back-edge b, and (e) ret — AND, crucially, that the block-relative resolver
+// fills the Imm19 (b.cond) and Imm26 (b) displacement fields with the correct
+// scaled, instruction-PC-relative offsets. The back-edge word 0x17FFFFFC is the
+// signed-resolver witness: header is at offset 0, the back-edge `b` is at offset
+// +16, so disp = (0 - 16) >> 2 = -4, which in the 26-bit field is 0x3FFFFFC →
+// 0x14000000 | 0x3FFFFFC = 0x17FFFFFC. Every value below is hand-verified
+// against the ARM ARM; a regression in the resolver (wrong bias, wrong scale,
+// or a sign error on the back-edge) diverges these bytes (red-on-disable).
+TEST(LirCallconv, Arm64ControlFlowSkeletonEncodesCmpBcondBWithResolvedOffsets) {
+    auto sOpt = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(sOpt.has_value());
+    auto const& s = **sOpt;
+
+    auto opc = [&](char const* m) {
+        auto o = s.opcodeByMnemonic(m);
+        EXPECT_TRUE(o.has_value()) << "arm64 missing opcode '" << m << "'";
+        return o.value_or(0);
+    };
+    std::uint16_t const cmpOp = opc("cmp");
+    std::uint16_t const jccOp = opc("jcc");
+    std::uint16_t const jmpOp = opc("jmp");
+    std::uint16_t const subOp = opc("sub");
+    std::uint16_t const retOp = opc("ret");
+
+    auto xreg = [&](char const* name) {
+        auto ord = s.registerByName(name);
+        EXPECT_TRUE(ord.has_value());
+        return LirReg{static_cast<std::uint32_t>(ord.value_or(0)), 1,
+                      static_cast<std::uint8_t>(LirRegClass::GPR)};
+    };
+    LirReg const x0  = xreg("x0");
+    LirReg const xzr = xreg("xzr");
+
+    LirBuilder b{s};
+    (void)b.addFunction(SymbolId{1});
+    LirBlockId const header = b.createBlock();
+    LirBlockId const body   = b.createBlock();
+    LirBlockId const exit   = b.createBlock();
+
+    // header: cmp x0, xzr ; jcc(sgt) body, exit
+    b.beginBlock(header);
+    {
+        std::array<LirOperand, 2> cmpOps{LirOperand::makeReg(x0),
+                                         LirOperand::makeReg(xzr)};
+        (void)b.addInst(cmpOp, InvalidLirReg, cmpOps);
+        std::array<LirOperand, 2> jccOps{LirOperand::makeBlockRef(body.v),
+                                         LirOperand::makeBlockRef(exit.v)};
+        (void)b.addCondBr(jccOp, jccOps, body, exit,
+                          static_cast<std::uint32_t>(TargetCondCode::Sgt));
+    }
+    // body: sub x0, x0, x0 ; jmp header (back-edge — exercises a NEGATIVE disp)
+    b.beginBlock(body);
+    {
+        std::array<LirOperand, 2> subOps{LirOperand::makeReg(x0),
+                                         LirOperand::makeReg(x0)};
+        (void)b.addInst(subOp, x0, subOps);
+        (void)b.addBr(jmpOp, header);
+    }
+    // exit: ret
+    b.beginBlock(exit);
+    (void)b.addReturn(retOp, {});
+
+    Lir lir = std::move(b).finish();
+    std::vector<MirInstId> lirToMir(lir.instCount(), InvalidMirInst);
+    DiagnosticReporter asmRep;
+    auto mod = assemble(lir, s, lirToMir, asmRep);
+    EXPECT_EQ(asmRep.errorCount(), 0u)
+        << "hand-built cmp/jcc/jmp must assemble — a failed encode or branch "
+           "resolution drops the function bytes";
+    ASSERT_FALSE(mod.functions.empty());
+
+    // The exact 6-word AArch64 sequence (each instruction hand-verified
+    // against the ARM ARM):
+    //   [+0x00] cmp x0, xzr      0xEB1F001F  (SUBS XZR, X0, XZR)
+    //   [+0x04] b.sgt body       0x5400004C  (B.cond, cond GT=0xC, imm19=+2)
+    //   [+0x08] b exit           0x14000003  (B, imm26=+3 → +12 bytes)
+    //   [+0x0C] sub x0, x0, x0   0xCB000000  (SUB X0, X0, X0)
+    //   [+0x10] b header         0x17FFFFFC  (B, imm26=-4 → -16 bytes back-edge)
+    //   [+0x14] ret              0xD65F03C0  (RET X30)
+    static constexpr std::array<std::uint32_t, 6> kExpectedWords{
+        0xEB1F001Fu, 0x5400004Cu, 0x14000003u,
+        0xCB000000u, 0x17FFFFFCu, 0xD65F03C0u};
+    auto const& bytes = mod.functions[0].bytes;
+    ASSERT_EQ(bytes.size(), kExpectedWords.size() * 4u)
+        << "skeleton must emit exactly 6 AArch64 words (24 bytes)";
+    auto const wordAt = [&](std::size_t off) {
+        return static_cast<std::uint32_t>(bytes[off])
+             | (static_cast<std::uint32_t>(bytes[off + 1]) << 8)
+             | (static_cast<std::uint32_t>(bytes[off + 2]) << 16)
+             | (static_cast<std::uint32_t>(bytes[off + 3]) << 24);
+    };
+    for (std::size_t i = 0; i < kExpectedWords.size(); ++i) {
+        EXPECT_EQ(wordAt(i * 4), kExpectedWords[i])
+            << "AArch64 word at +0x" << std::hex << (i * 4) << std::dec
+            << " diverged from the hand-verified ARM-ARM value";
+    }
 }
 
 TEST(LirCallconv, BlockTopologyPreservedForBranchingFunction) {

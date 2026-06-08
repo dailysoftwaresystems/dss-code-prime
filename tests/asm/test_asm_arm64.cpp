@@ -194,6 +194,100 @@ TEST(Arm64Encoder, MovX19FromX2DerivesBitFields) {
     EXPECT_EQ(bytes[3], 0xAA);
 }
 
+// ── setcc (CSET) + zext byte-pins — D-AS3-COND-CODE-ARM64 ─────────
+//
+// These pin the two register-result control-flow-helper opcodes in
+// ISOLATION from regalloc (hand-built LIR → assemble → exact bytes),
+// hand-verified against the ARM ARM:
+//   * `cset Xd, cc` lowers to CSINC Xd, XZR, XZR, INVERT(cc) — base
+//     0x9A9F07E0 (Rd=0, Rn=Rm=XZR=31) OR'd with the INVERTED 4-bit
+//     condition at bit 12. The invert is what makes "set 1 iff cc"
+//     out of CSINC's "Rd = Rn+1 unless cond" semantics, so the pin
+//     uses TWO conditions to prove the invert is applied PER-condition
+//     (a single condition could pass with a constant nibble bug).
+//   * `zext Xd, Wm` (32→64 zero-extension) lowers to ORR Wd, WZR, Wm
+//     — the W-form ORR implicitly zeroes the upper 32 bits. Base
+//     0x2A0003E0 (Rd=0, Rn=WZR=31) | Rm<<16.
+
+TEST(Arm64Encoder, CsetEncodesInvertedCondAtBits12) {
+    // CSINC base 0x9A9F07E0; the condition stored is INVERT(requested):
+    //   cset x0, gt : GT(0xC) ^ 1 = 0xD  → 0x9A9F07E0 | (0xD<<12) = 0x9A9FD7E0  (LE: E0 D7 9F 9A)
+    //   cset x0, eq : EQ(0x0) ^ 1 = 0x1  → 0x9A9F07E0 | (0x1<<12) = 0x9A9F17E0  (LE: E0 17 9F 9A)
+    // Two conditions prove the invert is per-condition, not a constant.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const setccOp = (*s)->opcodeByMnemonic("setcc");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(setccOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+
+    auto const encodeCset = [&](TargetCondCode cc) {
+        LirBuilder b{**s};
+        (void)b.addFunction(SymbolId{1});
+        auto blk = b.createBlock();
+        b.beginBlock(blk);
+        (void)b.addInst(*setccOp, x0, std::span<LirOperand const>{},
+                        static_cast<std::uint32_t>(cc));
+        (void)b.addReturn(*retOp, {});
+        Lir lir = std::move(b).finish();
+        DiagnosticReporter rep;
+        auto bytes = assembleFirstFn(lir, **s, rep);
+        EXPECT_EQ(rep.errorCount(), 0u);
+        return bytes;
+    };
+
+    // cset x0, gt  → 0x9A9FD7E0  (LE: E0 D7 9F 9A)
+    {
+        auto bytes = encodeCset(TargetCondCode::Sgt);
+        ASSERT_GE(bytes.size(), 4u);
+        EXPECT_EQ(bytes[0], 0xE0);
+        EXPECT_EQ(bytes[1], 0xD7);
+        EXPECT_EQ(bytes[2], 0x9F);
+        EXPECT_EQ(bytes[3], 0x9A);
+    }
+    // cset x0, eq  → 0x9A9F17E0  (LE: E0 17 9F 9A)
+    {
+        auto bytes = encodeCset(TargetCondCode::Eq);
+        ASSERT_GE(bytes.size(), 4u);
+        EXPECT_EQ(bytes[0], 0xE0);
+        EXPECT_EQ(bytes[1], 0x17);
+        EXPECT_EQ(bytes[2], 0x9F);
+        EXPECT_EQ(bytes[3], 0x9A);
+    }
+}
+
+TEST(Arm64Encoder, ZextEncodesOrrW) {
+    // zext x0, w1 → ORR W0, WZR, W1 = 0x2A0103E0 (LE: E0 03 01 2A).
+    //   base 0x2A0003E0 (Rd=0, Rn=WZR=31) | Rm=1<<16 = 0x10000.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const zextOp = (*s)->opcodeByMnemonic("zext");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(zextOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const zops[] = { LirOperand::makeReg(x1) };
+    (void)b.addInst(*zextOp, x0, zops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE0);
+    EXPECT_EQ(bytes[1], 0x03);
+    EXPECT_EQ(bytes[2], 0x01);
+    EXPECT_EQ(bytes[3], 0x2A);
+}
+
 // ── fixed32 walker — `mov Xd, #imm16` (MOVZ) — D-LK10-ENTRY-ARM64 ──
 
 TEST(Arm64Encoder, MovImm16EncodesMOVZ) {
@@ -435,6 +529,87 @@ TEST(Arm64Encoder, MemOffsetWiderThanImm9FailsLoud) {
     }
     EXPECT_TRUE(sawOutOfRange)
         << "a >9-bit memory offset must emit A_ImmediateOperandOutOfRange";
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(Arm64Encoder, FrameRelativeLeaEncodesAddImm12) {
+    // The ML7 callconv's `emitFrameAddr` materializes a body-local's
+    // address (`alloca`) into a frame-relative `lea Xd, [sp + #disp]` =
+    // AArch64 `ADD Xd, sp, #imm12` — the 3-op no-index lea variant
+    // [base_reg, MemBase(1), MemOffset]. This is the HOST-INDEPENDENT
+    // byte-pin for the new MemOffset→Imm12 (UNSIGNED, bits 10..21)
+    // encoder branch + the frame-lea variant: at runtime that path is
+    // exercised only by the qemu-gated arm64_control_flow corpus (a
+    // single frame offset), so without this pin it is unguarded on every
+    // non-arm64 CI leg (§A.5 cross-target closure — encoding pins guard
+    // on every leg, the corpus is the one-leg end-to-end witness).
+    //   lea X2, [SP, #24] → ADD X2, SP, #24. Base 0x91000000.
+    //   Rd   = X2 (2)  at bits 0..4   → 0x002
+    //   Rn   = SP (31) at bits 5..9   → 0x3E0
+    //   Imm12 = 24     at bits 10..21 → 24<<10 = 0x6000
+    // word = 0x910063E2; LE: E2 63 00 91. Distinct Rd≠Rn + non-zero disp
+    // → a dropped offset, a wrong bit-window, or an Rd/Rn swap all fail.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(24)
+    };
+    (void)b.addInst(*leaOp, gpr(**s, "x2"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE2);
+    EXPECT_EQ(bytes[1], 0x63);
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0x91);
+}
+
+TEST(Arm64Encoder, FrameLeaOffsetWiderThanImm12FailsLoud) {
+    // RED-on-disable for the UNSIGNED Imm12 range guard on the frame-lea:
+    // a frame offset wider than unsigned 12-bit (0..4095) must fail loud
+    // rather than silently truncate to a WRONG stack slot. 5000 > 4095.
+    // The shifted `ADD imm12<<12` form for larger frames is a future
+    // generalization — D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(5000)
+    };
+    (void)b.addInst(*leaOp, gpr(**s, "x2"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    (void)assemble(lir, **s, lirToMir, rep);
+    bool sawOutOfRange = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange) {
+            sawOutOfRange = true;
+        }
+    }
+    EXPECT_TRUE(sawOutOfRange)
+        << "a >12-bit frame-lea offset must emit A_ImmediateOperandOutOfRange";
     EXPECT_GT(rep.errorCount(), 0u);
 }
 

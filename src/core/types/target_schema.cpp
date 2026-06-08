@@ -204,15 +204,18 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             // ARM64 (v0.0.2 V2-1) — ImmInt (the Imm16 immediate slot,
             // AArch64 MOVZ) plus MemBase + MemOffset (the unscaled
             // LDUR/STUR memory form: base reg → Rn, MemOffset → the
-            // signed Imm9 slot, MemBase's scale validated == 1). The
-            // remaining operand kinds (block-ref / index forms) have no
-            // fixed32 walker yet and land alongside their consumer
-            // cycle. Surfacing at schema-load time catches a misauthored
-            // variant once, not per-instruction. (The walker still
-            // enforces the operand→slot pairing — ImmInt→Imm16,
-            // MemOffset→Imm9, SymbolRef→Imm26 — the immediate/offset
-            // range, and MemBase scale==1; this gate only screens the
-            // KIND.)
+            // signed Imm9 slot, MemBase's scale validated == 1). Since
+            // D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow)
+            // it ALSO handles BlockRef (an intra-function branch target
+            // on the Imm19 [B.cond] or Imm26 [B] slot — resolved at
+            // assemble time, no relocation). The remaining operand kinds
+            // (index forms) have no fixed32 walker yet and land alongside
+            // their consumer cycle. Surfacing at schema-load time catches
+            // a misauthored variant once, not per-instruction. (The
+            // walker still enforces the operand→slot pairing — ImmInt→
+            // Imm16, MemOffset→Imm9, SymbolRef→Imm26, BlockRef→Imm19/
+            // Imm26 — the immediate/offset range, and MemBase scale==1;
+            // this gate only screens the KIND.)
             if (o.encoding.shape == TargetEncodingShape::Fixed32) {
                 for (std::size_t ki = 0; ki < v.operandKinds.size(); ++ki) {
                     auto const k = v.operandKinds[ki];
@@ -220,15 +223,17 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                         && k != OperandKindFilter::SymbolRef
                         && k != OperandKindFilter::ImmInt
                         && k != OperandKindFilter::MemBase
-                        && k != OperandKindFilter::MemOffset) {
+                        && k != OperandKindFilter::MemOffset
+                        && k != OperandKindFilter::BlockRef) {
                         fail(std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/{}", i, vi, ki),
                              std::format("opcode '{}' variant {}: "
                                          "fixed32 supports register, "
-                                         "symbol-ref, immediate, and "
-                                         "memory (base+offset) operands — "
+                                         "symbol-ref, immediate, memory "
+                                         "(base+offset), and block-ref "
+                                         "operands — "
                                          "operand kind '{}' at position {} "
                                          "needs a fixed32 walker for that "
-                                         "kind (block-ref / indexed forms, "
+                                         "kind (indexed forms, "
                                          "per plan 13 §3.1 D-AS3-6)",
                                          o.mnemonic, vi,
                                          operandKindFilterName(k),
@@ -244,8 +249,29 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             // The loader has already resolved the name into the
             // `RelocationKind` opaque tag; here we just check
             // presence-vs-required.
+            //
+            // D-AS3-BLOCK-REL-IMM19/26 (operand-aware exemption): the
+            // Imm26 slot is DUAL-USE — symbol-bearing for the BL/`call`
+            // form (a SymbolRef operand → `call26` relocation) but
+            // BLOCK-relative for the `B` form (a BlockRef operand →
+            // assemble-time patch, NO relocation). `isSymbolBearingSlot`
+            // keys on the slot alone and so reports Imm26 as symbol-
+            // bearing; cross-reference the WIRE's guard operand kind to
+            // tell the two uses apart. A wire whose guard operand is a
+            // BlockRef is the block-relative use: it is EXEMPT from the
+            // "must declare relocationKind" rule AND must NOT carry one
+            // (the assemble-time resolver owns the field, no linker
+            // reloc). x86 sidesteps this by using a distinct non-symbol
+            // slot (BlockRel32); ARM64 reuses Imm26, so the disambiguator
+            // lives here. (The `Imm19` slot is plainly non-symbol-bearing
+            // — only the dual-use Imm26 needs the operand-kind check, but
+            // applying it uniformly is harmless and future-proof.)
             for (auto const& w : v.wires) {
-                bool const needsReloc = isSymbolBearingSlot(w.slotKind);
+                bool const wireIsBlockRef =
+                    w.index < v.operandKinds.size()
+                    && v.operandKinds[w.index] == OperandKindFilter::BlockRef;
+                bool const needsReloc =
+                    isSymbolBearingSlot(w.slotKind) && !wireIsBlockRef;
                 bool const hasReloc   = w.relocationKind.has_value();
                 if (needsReloc && !hasReloc) {
                     fail(std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi),

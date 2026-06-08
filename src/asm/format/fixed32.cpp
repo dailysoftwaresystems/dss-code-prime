@@ -62,6 +62,15 @@ windowFor(EncodingSlotKind s) noexcept {
         // byte offset at bits 12..20. The wire-loop range-checks signed
         // -256..255 and writes the low 9 bits (two's-complement).
         case EncodingSlotKind::Imm9:  return SlotBitWindow{ 12, 9 };
+        // Imm19 (D-AS3-BLOCK-REL-IMM19/26): AArch64 B.cond signed 19-bit
+        // PC-relative branch offset at bits 5..23 (the cond nibble sits
+        // at bits 0..3). BLOCK-RELATIVE — the walker writes ZERO bits
+        // here (a BlockRef operand pushes a BlockRelPatch instead; the
+        // asm.cpp resolver patches the 19-bit field at assemble time).
+        // Present so windowFor knows the slot's bit-position for the
+        // resolver-side lsb/width derivation symmetry; the encoder's
+        // BlockRef arm bypasses orInto (no immediate written upfront).
+        case EncodingSlotKind::Imm19: return SlotBitWindow{ 5,  19 };
         // MemBaseNoScale (D-LK10-ENTRY-ARM64): width-0 marker for a
         // memory-base operand on an ISA with no scale field (AArch64
         // unscaled). orInto with width 0 writes nothing but marks the
@@ -108,13 +117,14 @@ bool encode(Lir const&                  lir,
             std::vector<std::uint8_t>&  out,
             std::vector<Relocation>&    relocs,
             std::vector<SourceMapEntry>& /*srcMap*/,
-            // D-CSUBSET-WHILE-LOOP-SUBSTRATE: BlockRel32 (x86-style
-            // 32-bit intra-function branch displacement) is not used
-            // by fixed32 — ARM64 uses Imm26/Imm19 with different
-            // patch arithmetic. Anchored as D-AS3-BLOCK-REL-IMM19/26
-            // when ARM64 control-flow lands. Parameter unused here
-            // for signature parity with x86_variable::encode.
-            std::vector<walker_util::BlockRelPatch>& /*blockPatches*/,
+            // D-AS3-BLOCK-REL-IMM19/26 (ARM64 control-flow): fixed32
+            // now USES blockPatches — a `BlockRef` operand on the Imm19
+            // (B.cond) or Imm26 (B) slot is an intra-function branch
+            // resolved at assemble time. The walker pushes a
+            // `BlockRelPatch{ kind = Arm64Imm19 | Arm64Imm26 }`; the
+            // asm.cpp resolver patches the bit-field (different
+            // arithmetic from x86's BlockRel32 — no +4 bias, /4 scale).
+            std::vector<walker_util::BlockRelPatch>& blockPatches,
             DiagnosticReporter&         reporter) {
     assert(info != nullptr && "fixed32::encode requires non-null info");
 
@@ -148,6 +158,58 @@ bool encode(Lir const&                  lir,
     std::vector<std::uint32_t> words(selected->tmpl.wordCount());
     for (std::size_t i = 0; i < words.size(); ++i) {
         words[i] = selected->tmpl.wordAt(i);
+    }
+
+    // D-AS3-COND-CODE-ARM64 (mirror of x86_variable's condCodeFromPayload):
+    // when the selected variant's template declares `condCodeFromPayload`,
+    // read the inst's payload as a `TargetCondCode`, look up the schema's
+    // `condCodeEncoding` nibble, and OR it into WORD 0 bits 0..3. AArch64
+    // `B.cond` carries the 4-bit condition field at bits [3:0] of the
+    // instruction word (word 0 of the jcc macro; word 1 is the trailing
+    // unconditional `B`). Fail-loud when the target hasn't loaded a
+    // `condCodeEncoding` table — a missing table would silently OR zero
+    // (= TargetCondCode::Eq's nibble on x86, but ARM64's EQ is also 0) and
+    // EVERY conditional branch would resolve as `b.eq`. Same payload
+    // range-gate as x86 (0..9 = the 10-arm TargetCondCode enum).
+    if (selected->tmpl.condCodeFromPayload) {
+        auto const condValue = lir.instPayload(inst);
+        if (condValue > 9u) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': cond-code payload {} is out of "
+                               "range [0..9] for TargetCondCode "
+                               "(eq/ne/slt/sle/sgt/sge/ult/ule/ugt/uge)",
+                               info->mnemonic, condValue));
+            return false;
+        }
+        auto const condNibble = schema.condCodeEncoding(
+            static_cast<TargetCondCode>(condValue));
+        if (!condNibble.has_value()) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': variant declares "
+                               "condCodeFromPayload but target schema '{}' "
+                               "has no `condCodeEncoding` table",
+                               info->mnemonic, schema.name()));
+            return false;
+        }
+        // Place the 4-bit cond nibble at the template's declared bit
+        // position, optionally inverted (D-AS3-COND-CODE-ARM64). Both
+        // knobs default to the B.cond shape (condBitPos=0, condInvert=
+        // false), so the OR is `words[0] |= nibble` — byte-identical to
+        // the pre-knob behavior. AArch64 `CSET` sets condBitPos=12 +
+        // condInvert=true: `CSET Xd,cond` = `CSINC Xd,XZR,XZR,invert(cond)`
+        // (the false-arm increments XZR→1), so the encoded condition is
+        // the INVERSE of the requested one (e.g. GT=0xC → 0xD at bits
+        // 12..15). The XOR-with-1 is the standard AArch64 condition-
+        // inversion (it flips the low bit of the 4-bit code, pairing
+        // EQ↔NE, GT↔LE, GE↔LT, etc.). The base word leaves the target
+        // bits zero, so the OR is non-destructive.
+        std::uint32_t condNib = static_cast<std::uint32_t>(*condNibble);
+        if (selected->tmpl.condInvert) {
+            condNib ^= 1u;
+        }
+        words[0] |= (condNib & 0x0Fu) << selected->tmpl.condBitPos;
     }
 
     // Track which slot windows have been written — defense-in-depth
@@ -250,6 +312,22 @@ bool encode(Lir const&                  lir,
     // lo12-reloc on word 1), accumulated here and stamped per-word in
     // the emit loop below.
     std::vector<PendingRelocSlot> pendingRelocs;
+    // D-AS3-BLOCK-REL-IMM19/26: a `BlockRef` operand wired to an Imm19
+    // (B.cond) or Imm26 (B) slot is an INTRA-FUNCTION branch — resolved
+    // at assemble time (NOT a linker relocation). Accumulated here, the
+    // patch stamped at the START of the wire's word in the emit loop
+    // (the patch byte-offset is DERIVED from the emit cursor, never a
+    // separately computed base+i*4 — same discipline as the per-word
+    // reloc stamping). One macro word may carry its own block patch:
+    // the jcc 2-word macro pushes a `B.cond` Imm19 patch at word 0 AND
+    // a `B` Imm26 patch at word 1 (the fallthrough). `kind` selects the
+    // resolver arithmetic. `wordIndex` defers the byte-offset to emit.
+    struct PendingBlockPatch {
+        std::uint32_t                     targetBlock;
+        walker_util::BlockRelPatchKind    kind;
+        std::uint8_t                      wordIndex;
+    };
+    std::vector<PendingBlockPatch> pendingBlockPatches;
     for (auto const& wire : selected->wires) {
         if (wire.index >= instOps.size()) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
@@ -338,6 +416,73 @@ bool encode(Lir const&                  lir,
                 SymbolId{srcOp.symbolV},
                 wire.wordIndex
             });
+        } else if (srcOp.kind == LirOperandKind::BlockRef) {
+            // D-AS3-BLOCK-REL-IMM19/26 (ARM64 intra-function branch):
+            // the BlockRef names a target basic block resolved at
+            // assemble time. The slot MUST be Imm19 (B.cond) or Imm26
+            // (B) — the two ARM64 block-relative branch displacement
+            // fields. The walker writes NO immediate bits here (the
+            // word's base pattern leaves the field zero); it records a
+            // `BlockRelPatch` whose `kind` carries the per-ISA resolver
+            // arithmetic, stamped at the word's start in the emit loop.
+            //
+            // (Imm26 is DUAL-USE: a SymbolRef operand on Imm26 above
+            // emits a `call26` linker relocation [BL]; a BlockRef
+            // operand on Imm26 here is the intra-function `B`. The
+            // encoder distinguishes by OPERAND KIND, not by slot.)
+            walker_util::BlockRelPatchKind patchKind;
+            if (wire.slotKind == EncodingSlotKind::Imm19) {
+                patchKind = walker_util::BlockRelPatchKind::Arm64Imm19;
+            } else if (wire.slotKind == EncodingSlotKind::Imm26) {
+                patchKind = walker_util::BlockRelPatchKind::Arm64Imm26;
+            } else {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': BlockRef operand wired to "
+                                   "slot '{}' — fixed32 supports intra-"
+                                   "function branch targets only on the "
+                                   "Imm19 (B.cond) or Imm26 (B) slots",
+                                   info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind)));
+                return false;
+            }
+            if (wire.wordIndex >= words.size()) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': BlockRef wire wordIndex {} "
+                                   "exceeds the template's {} word(s)",
+                                   info->mnemonic, wire.wordIndex,
+                                   words.size()));
+                return false;
+            }
+            // Mark the (word, slot) consumed so the per-word wroteSlot
+            // guard catches a same-word same-slot collision. Out-of-range
+            // slotIdx fails loud (enum-vs-table drift) — mirrors the
+            // SymbolRef arm.
+            auto const slotIdx = static_cast<std::size_t>(wire.slotKind);
+            if (slotIdx >= kEncodingSlotKindCount) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': BlockRef slot kind ordinal "
+                                   "{} exceeds tracked-slot count {} "
+                                   "(enum-vs-table drift)",
+                                   info->mnemonic, slotIdx,
+                                   kEncodingSlotKindCount));
+                return false;
+            }
+            if (wroteSlot[wire.wordIndex][slotIdx]) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': BlockRef wire collides with "
+                                   "already-written slot '{}' in word {}",
+                                   info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind),
+                                   wire.wordIndex));
+                return false;
+            }
+            wroteSlot[wire.wordIndex][slotIdx] = true;
+            pendingBlockPatches.push_back(PendingBlockPatch{
+                srcOp.blockSlot, patchKind, wire.wordIndex});
         } else if (srcOp.kind == LirOperandKind::ImmInt) {
             // Immediate operand → an UNSIGNED immediate fixed32 slot.
             // Cycle scope (D-LK10-ENTRY-ARM64): Imm16 (AArch64 MOVZ
@@ -397,17 +542,30 @@ bool encode(Lir const&                  lir,
                         wire.wordIndex))
                 return false;
         } else if (srcOp.kind == LirOperandKind::MemOffset) {
-            // AArch64 LDUR/STUR signed 9-bit byte displacement → the
-            // Imm9 slot (bits 12..20). Mirrors the ImmInt arm's
-            // single-slot restriction; the scaled imm12 form (large
-            // frames) adds its own slot when its consumer cycle lands.
-            if (wire.slotKind != EncodingSlotKind::Imm9) {
+            // A memory displacement → one of two AArch64 displacement
+            // fields, distinguished by slot:
+            //   * Imm9  — SIGNED 9-bit unscaled LDUR/STUR byte offset
+            //             (bits 12..20), range -256..255.
+            //   * Imm12 — UNSIGNED 12-bit ADD-immediate field (bits
+            //             10..21), range 0..4095. The frame-relative
+            //             `lea Xd, [sp + #disp]` materialized by the
+            //             callconv (alloca → ADD Xd, sp, #imm12) wires
+            //             its non-negative frame offset here. (Same slot
+            //             the `add`/`sub` immediate variants already use;
+            //             frame offsets are non-negative, so the unsigned
+            //             imm12 reach is the right fit — larger than Imm9.)
+            // A future scaled LDR/STR form adds its own slot when that
+            // consumer lands. Mirrors the ImmInt arm's dual-slot shape.
+            bool const isSignedSlot = wire.slotKind == EncodingSlotKind::Imm9;
+            bool const isUnsignedSlot = wire.slotKind == EncodingSlotKind::Imm12;
+            if (!isSignedSlot && !isUnsignedSlot) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
                        std::format("opcode '{}': MemOffset operand wired to "
                                    "slot '{}' — fixed32 supports memory "
-                                   "displacements only on the Imm9 slot "
-                                   "(unscaled LDUR/STUR) in this cycle",
+                                   "displacements on the Imm9 slot (signed, "
+                                   "unscaled LDUR/STUR) or the Imm12 slot "
+                                   "(unsigned, ADD-immediate frame address)",
                                    info->mnemonic,
                                    encodingSlotKindName(wire.slotKind)));
                 return false;
@@ -422,29 +580,53 @@ bool encode(Lir const&                  lir,
                 return false;
             }
             std::int32_t const disp = srcOp.offset;
-            // SIGNED range derived from the slot WIDTH (two's-complement):
-            // [-(2^(w-1)), 2^(w-1)-1] — for Imm9 that is -256..255.
-            // Deriving from width (not a baked literal) keeps the signed
-            // path as generic as the unsigned ImmInt arm above; fail loud
-            // rather than silently truncate to a WRONG stack slot. A
-            // larger frame needs the scaled LDR/STR imm12 form (future).
-            std::int32_t const lo = -(1 << (w->width - 1));
-            std::int32_t const hi = (1 << (w->width - 1)) - 1;
-            if (disp < lo || disp > hi) {
-                report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
-                       DiagnosticSeverity::Error,
-                       std::format("opcode '{}': memory offset {} is out of "
-                                   "range for the signed {}-bit '{}' slot "
-                                   "(valid {}..{}) — a larger frame needs the "
-                                   "scaled LDR/STR imm12 form, not yet "
-                                   "supported",
-                                   info->mnemonic, disp, w->width,
-                                   encodingSlotKindName(wire.slotKind),
-                                   lo, hi));
-                return false;
+            if (isSignedSlot) {
+                // SIGNED range derived from the slot WIDTH (two's-
+                // complement): [-(2^(w-1)), 2^(w-1)-1] — for Imm9 that is
+                // -256..255. Deriving from width (not a baked literal)
+                // keeps the signed path as generic as the unsigned arm;
+                // fail loud rather than silently truncate to a WRONG
+                // stack slot. A larger frame needs the scaled LDR/STR
+                // imm12 form (future).
+                std::int32_t const lo = -(1 << (w->width - 1));
+                std::int32_t const hi = (1 << (w->width - 1)) - 1;
+                if (disp < lo || disp > hi) {
+                    report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': memory offset {} is out "
+                                       "of range for the signed {}-bit '{}' "
+                                       "slot (valid {}..{}) — a larger frame "
+                                       "needs the scaled LDR/STR imm12 form, "
+                                       "not yet supported",
+                                       info->mnemonic, disp, w->width,
+                                       encodingSlotKindName(wire.slotKind),
+                                       lo, hi));
+                    return false;
+                }
+            } else {
+                // UNSIGNED range derived from the slot WIDTH: 0..2^w-1 —
+                // for Imm12 that is 0..4095. A negative frame offset is a
+                // lowering bug (locals sit at non-negative SP offsets
+                // post-prologue), and a larger frame needs the shifted
+                // imm12<<12 form (future); fail loud rather than silently
+                // wrap a negative into a huge positive offset.
+                std::int64_t const maxVal = (std::int64_t{1} << w->width) - 1;
+                if (disp < 0 || disp > maxVal) {
+                    report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': memory offset {} is out "
+                                       "of range for the unsigned {}-bit '{}' "
+                                       "slot (valid 0..{}) — a larger frame "
+                                       "needs the shifted ADD imm12<<12 form, "
+                                       "not yet supported",
+                                       info->mnemonic, disp, w->width,
+                                       encodingSlotKindName(wire.slotKind),
+                                       maxVal));
+                    return false;
+                }
             }
             // orInto masks to the slot's bit-window (two's-complement for
-            // a negative displacement) + marks wroteSlot.
+            // a negative Imm9 displacement) + marks wroteSlot.
             if (!orInto(wire.slotKind, static_cast<std::uint32_t>(disp),
                         wire.wordIndex))
                 return false;
@@ -483,8 +665,8 @@ bool encode(Lir const&                  lir,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': variant operand {} has "
                                "unsupported kind for fixed32 (not Reg / "
-                               "SymbolRef / ImmInt / MemOffset / MemBase; "
-                               "ordinal {})",
+                               "SymbolRef / BlockRef / ImmInt / MemOffset / "
+                               "MemBase; ordinal {})",
                                info->mnemonic, wire.index,
                                static_cast<int>(srcOp.kind)));
             return false;
@@ -504,6 +686,21 @@ bool encode(Lir const&                  lir,
         for (auto const& pr : pendingRelocs) {
             if (pr.wordIndex == i) {
                 walker_util::appendPendingReloc(relocs, out, pr);
+            }
+        }
+        // D-AS3-BLOCK-REL-IMM19/26: stamp each intra-function branch
+        // patch at the START of its word — `out.size()` here is exactly
+        // word i's first byte (its 4 bytes are appended immediately
+        // after), the offset the asm.cpp resolver read-modify-writes.
+        // The word already carries zero in the Imm19/Imm26 field (the
+        // base pattern leaves it clear), so no placeholder write is
+        // needed beyond the word itself.
+        for (auto const& bp : pendingBlockPatches) {
+            if (bp.wordIndex == i) {
+                blockPatches.push_back(walker_util::BlockRelPatch{
+                    static_cast<std::uint32_t>(out.size()),
+                    bp.targetBlock,
+                    bp.kind});
             }
         }
         asm_byte_emit::appendU32LE(out, words[i]);
