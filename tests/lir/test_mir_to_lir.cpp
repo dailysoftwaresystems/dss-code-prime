@@ -1662,19 +1662,28 @@ TEST(MirToLir, ExternCallOnDirectPltFormatEmitsPlainCall) {
            "would dereference the ELF PLT stub's code bytes as a pointer";
 }
 
-// NOTE — ARM64 + direct-plt → plain `call`: the extern-call SELECTION is
-// arch-AGNOSTIC (`lowerCall`'s `calleeIsExtern && dispatch==IndirectSlot`
-// has no target branch), so `ExternCallOnDirectPltFormatEmitsPlainCall`
-// (x86_64) proves the direct-plt → `call` selection for EVERY target, and
-// `IndirectSlotWithoutOpcodeFailsLoud` (below) proves ARM64 has NO
-// `call_indirect_via_extern` opcode — so ARM64 is FORCED onto the
-// direct-plt `call` path. A full ARM64 lowering pin (and the end-to-end
-// runnable ARM64 FFI corpus) is DEFERRED to the next cycle with the ARM64
-// FFI runnable work: a call-with-result ARM64 fixture surfaced an UNRELATED
-// ARM64 isel gap (L_RequiredLirOpcodeMissing on a reg-move-class op for the
-// call result) — pinned `D-LK10-ENTRY-ARM64-FFI-ISEL` (the ARM64 isel
-// completeness for an FFI corpus), tangential to this cycle's format-driven
-// dispatch subject.
+// ARM64 + direct-plt call-WITH-RESULT lowering (D-LK10-ENTRY-ARM64-FFI-ISEL).
+// The extern-call SELECTION is arch-AGNOSTIC (`lowerCall` has no target
+// branch); this pin proves the FULL ARM64 lowering of a call-with-result
+// completes with NO L_RequiredLirOpcodeMissing — the gap a prior cycle hit
+// closed once the ARM64 `lea` (ADRP+ADD) landed (the GlobalAddr callee
+// materialization). Same fixture as the x86_64 direct-plt pin, under the
+// arm64 schema + AAPCS64.
+TEST(MirToLir, Arm64ExternCallWithResultLowersUnderDirectPlt) {
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const lowered = lowerStdExternFixture(
+        **target, ::dss::ExternCallDispatch::DirectPlt, rep,
+        ::dss::CallConv::CcAAPCS64);
+    ASSERT_TRUE(lowered.result.ok) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(lowered.directCalls, 2u)
+        << "ARM64 direct-plt: both the extern and internal call lower to the "
+           "plain `call` (BL) opcode";
+    EXPECT_EQ(lowered.externCalls, 0u)
+        << "ARM64 has no call_indirect_via_extern — forced onto direct-plt";
+}
 
 TEST(MirToLir, ExternImportsWithNoDispatchFailLoud) {
     // No silent default: a module with extern imports under a format that
