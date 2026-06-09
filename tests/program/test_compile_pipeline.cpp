@@ -549,6 +549,69 @@ TEST(Program_CompileFiles, StderrIncludesTargetContextPrefixOnPerTargetError) {
            "got stderr:\n" << stderrOut;
 }
 
+// ── Plan 06 V2-4 Part A: positioned source-context diagnostics ──────
+// The driver drain now routes a buffer-bearing diagnostic (parser /
+// semantic, with a span into real source) through DSS's OWN renderer
+// (`DiagnosticReporter::format` — hand-written over our SourceBuffer /
+// SourceSpan; NO clang / LLVM dependency): `--> file:line:col` + the
+// source line + a `^` caret. The BufferRegistry that resolves the
+// diagnostic's BufferId is built in `runCusToTargets` from the CUs'
+// trees. Buffer-LESS driver `D_*` diagnostics keep the code-only line.
+
+// A malformed-source compile prints the positioned context + caret at
+// the exact offending column. RED-on-disable: revert
+// `drainDiagnosticsToStderr` to the old code-only loop (drop the
+// `format()` branch) and the `-->` / `bad.c:2:12` / `^` assertions all
+// go red — this is the cycle's effectiveness lever.
+TEST(Program_CompileFiles, MalformedSourceRendersPositionedCaret) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    // Illegal character '@' at line 2, column 12 (after `return `).
+    auto const src = writeCSubsetSource(
+        scratch.path(), "bad.c", "int main() {\n    return @;\n}\n");
+    scratch.useAsCwd();
+    Program prog;
+    testing::internal::CaptureStderr();
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+    auto const err = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(rc, 0) << "malformed source must fail the build";
+    // `--> <file>:<line>:<col>` header at the exact position of '@'. The
+    // parser stamps the span; format() resolves it via the registry.
+    EXPECT_NE(err.find("bad.c:2:12"), std::string::npos)
+        << "expected positioned header '<file>:2:12'; got:\n" << err;
+    EXPECT_NE(err.find("-->"), std::string::npos)
+        << "expected a '-->' source-location header; got:\n" << err;
+    EXPECT_NE(err.find('^'), std::string::npos)
+        << "expected a '^' caret underline; got:\n" << err;
+    // The source line is echoed (the positioned context the renderer adds).
+    EXPECT_NE(err.find("return @"), std::string::npos)
+        << "expected the offending source line echoed; got:\n" << err;
+}
+
+// A buffer-LESS driver-tier diagnostic (no source span) stays on the
+// code-only path: NO bogus `--> <unknown-buffer>` line, NO caret, and
+// the human-readable SYMBOLIC code name (not the numeric band). Pins
+// the per-diagnostic routing split. Empty targets → D_InvalidTargetSpec
+// is emitted buffer-less, before any CU/source is touched.
+TEST(Program_CompileFiles, BufferlessDriverDiagnosticStaysCodeOnly) {
+    Program prog;
+    testing::internal::CaptureStderr();
+    int const rc = prog.compileFiles({"unused.c"}, "c-subset", /*targets*/ {});
+    auto const err = testing::internal::GetCapturedStderr();
+
+    EXPECT_EQ(rc, 1);
+    EXPECT_NE(err.find("[D_InvalidTargetSpec]"), std::string::npos)
+        << "a buffer-less driver diagnostic must render the code-only line "
+           "with the SYMBOLIC code name; got:\n" << err;
+    EXPECT_EQ(err.find("-->"), std::string::npos)
+        << "a buffer-less diagnostic must NOT print a source-location line; "
+           "got:\n" << err;
+    EXPECT_EQ(err.find("<unknown-buffer"), std::string::npos)
+        << "a buffer-less diagnostic must NOT print '<unknown-buffer>'; "
+           "got:\n" << err;
+}
+
 // D-CAP-MARKER-MULTI-TARGET-E2E-PIN close (e4508b9 → next 2026-06-01):
 // the prior anchor was reserved because `D_TargetMachineCodeMismatch`
 // joined `kUnsuppressableCodes` and bypasses all cap/dedup gates —

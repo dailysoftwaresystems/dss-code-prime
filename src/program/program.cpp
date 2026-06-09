@@ -80,13 +80,47 @@ namespace {
 // fold the prefix lives in its own field (excluded from dedup hash)
 // and every render path must spell out the inclusion. LSP
 // `composeMessage` performs the symmetric prepend.
-void drainDiagnosticsToStderr(DiagnosticReporter const& rep) {
+// Render the reporter's diagnostics to stderr (plan 06 V2-4 Part A).
+//
+// Per-diagnostic routing — the agnostic split is on whether the
+// diagnostic carries a source buffer, NOT on any language/target/format:
+//   * buffer-VALID (parser/semantic errors, span into real source) →
+//     DSS's OWN positioned renderer `DiagnosticReporter::format(d, bufs)`:
+//     `--> file:line:col` + the source line + a `^` caret + related-
+//     location notes. (No clang/LLVM: this is hand-written DSS code over
+//     our SourceBuffer/SourceSpan; `bufs` resolves BufferId → buffer.)
+//   * buffer-LESS (driver-tier `D_*` emitted via `emitDriver`, default
+//     `BufferId{}`, no span) → the established code-only one-liner. These
+//     have no source location to point at; routing them through the
+//     positioned renderer would print a bogus `<unknown-buffer:0>` line
+//     and a spurious `got ` prefix for driver prose.
+//
+// `bufs` is built by the driver from the compiled CUs' source buffers
+// (see `runCusToTargets`). Pre-parse error sites (no CUs yet) pass an
+// empty registry — their diagnostics are all buffer-less, so the split
+// keeps them on the code-only path regardless.
+void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
+                              BufferRegistry const&     bufs) {
     for (auto const& d : rep.all()) {
-        std::cerr << severityName(d.severity)
-                  << "[" << diagnosticCodeName(d.code) << "] "
-                  << d.contextPrefix
-                  << d.actual << '\n';
+        if (d.buffer.valid()) {
+            std::cerr << rep.format(d, bufs);
+        } else {
+            std::cerr << severityName(d.severity)
+                      << "[" << diagnosticCodeName(d.code) << "] "
+                      << d.contextPrefix
+                      << d.actual << '\n';
+        }
     }
+}
+
+// Overload for the pre-parse / buffer-less call sites (empty registry):
+// every diagnostic at those sites is driver-tier (buffer-less), so this
+// renders them code-only via the routing above. Keeps the 13 early-error
+// sites a one-token change while the 2 post-parse sites (in
+// `runCusToTargets`, which owns the CUs) pass the real registry.
+void drainDiagnosticsToStderr(DiagnosticReporter const& rep) {
+    static BufferRegistry const kEmpty;
+    drainDiagnosticsToStderr(rep, kEmpty);
 }
 
 // Emit a driver-tier D_* diagnostic. Wraps `dss::report` so all
@@ -413,15 +447,31 @@ int runCusToTargets(std::span<CompilationUnit const>            cus,
     // Drain each CU's driver-tier + per-Tree diagnostics (D_FileNotFound, parser/lexer
     // errors) into the run-wide reporter. Without this drain, a missing source file
     // produces rc=1 with ZERO stderr — the substrate silent-failure archetype.
+    // Build the BufferRegistry (BufferId -> source buffer) from the CUs' trees
+    // alongside the diagnostic drain, so positioned rendering can resolve each
+    // parser/semantic diagnostic's `buffer` to its source (plan 06 V2-4 Part A).
+    // `add` keys on the buffer's own id (the same id the parser stamped onto
+    // `ParseDiagnostic.buffer`), so the registry resolves by construction;
+    // duplicate ids (a header shared across trees) are idempotent.
+    BufferRegistry bufs;
     for (auto const& cu : cus) {
         copyDiagnostics(cu.driverDiagnostics(), rep);
         for (auto const& tree : cu.trees()) {
             copyDiagnostics(tree.diagnostics(), rep);
+            // Defense-in-depth: every driver-produced tree has a non-null
+            // source (the UnitBuilder early-returns before pushing a tree
+            // when `SourceBuffer::fromFile` fails), so this is non-null on
+            // the real path. Guard anyway — `BufferRegistry::add` THROWS on
+            // null, and a future tree-producer (or a hand-built test tree)
+            // must not abort the diagnostic drain.
+            if (auto src = tree.sourceShared()) {
+                bufs.add(std::move(src));
+            }
         }
     }
     // If parsing already failed, the per-target loop would only produce derivative noise.
     if (rep.hasErrors()) {
-        drainDiagnosticsToStderr(rep);
+        drainDiagnosticsToStderr(rep, bufs);
         return 1;
     }
 
@@ -446,7 +496,7 @@ int runCusToTargets(std::span<CompilationUnit const>            cus,
         if (!ok || scratch.hasErrors()) exitCode = 1;
     }
 
-    drainDiagnosticsToStderr(rep);
+    drainDiagnosticsToStderr(rep, bufs);
     return exitCode;
 }
 

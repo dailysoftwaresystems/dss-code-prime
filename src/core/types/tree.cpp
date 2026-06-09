@@ -47,6 +47,10 @@ SourceBuffer const& Tree::source() const noexcept {
     return *data_.source;
 }
 
+std::shared_ptr<SourceBuffer> Tree::sourceShared() const noexcept {
+    return data_.source;
+}
+
 RuleInterner const& Tree::rules() const noexcept {
     return *data_.rules;
 }

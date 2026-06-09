@@ -88,6 +88,14 @@ public:
     // ── identity ──
     [[nodiscard]] TreeId                     id()        const noexcept;
     [[nodiscard]] SourceBuffer const&        source()    const noexcept;
+    // The owning `shared_ptr` to this tree's source buffer. Needed to
+    // populate a `BufferRegistry` (BufferId -> shared_ptr<SourceBuffer>)
+    // for positioned diagnostic rendering (plan 06 V2-4 Part A) without
+    // copying the buffer text. Unlike `source()` (which dereferences and
+    // requires non-null), this returns the raw pointer — it MAY be null
+    // for a hand-fabricated `TreeData`; callers that cannot guarantee a
+    // builder-produced tree should check before use.
+    [[nodiscard]] std::shared_ptr<SourceBuffer> sourceShared() const noexcept;
     [[nodiscard]] RuleInterner const&        rules()     const noexcept;
     [[nodiscard]] NodeId                     root()      const noexcept;
     [[nodiscard]] std::size_t                nodeCount() const noexcept;
