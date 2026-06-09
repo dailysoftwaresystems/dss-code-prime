@@ -14,6 +14,9 @@
   "$externCallDispatchComment": "ELF resolves imports through the PLT: the linker synthesizes a PLT stub per extern (jmp through the GOT slot) and points the extern symbol's VA at the STUB, so the call site is a PLAIN DIRECT call (E8 disp32 = call rel32 to the stub). An indirect-slot (FF 15) call site would dereference the stub's CODE bytes as a pointer -> SIGSEGV. D-FFI-EXTERN-CALL-DISPATCH.",
   "externCallDispatch": "direct-plt",
 
+  "$supportedDataSectionsComment": "D-LK1-ELF-EXEC-DATA-SECTIONS (rodata-only scope): the ELF ET_EXEC walker emits `.rodata` from `AssembledModule.dataItems` items with `section=Rodata`. The linker's pre-walker gate (linker.cpp) consults this set per-item — `Data` and `Bss` remain anchored under D-LK4-RODATA-PRODUCER. Mirrors the PE walker's `.rdata` arm (D-LK2-RODATA). Cross-format agnosticism: this is the SAME field PE/Mach-O exec formats declare; the gate has zero format-name branches.",
+  "supportedDataSections": ["rodata"],
+
   "$processExitComment": "D-LK10-ENTRY Slice B (plan 14 §2.13): the Linux runnable-binary spine — raw `exit_group` syscall (no libc dependency). The trampoline emitter loads the syscall number into rax via `mov eax, 231` (Slice A's `mov` opcode), moves the user fn's return value from rax into rdi (argGprs[0] of sysv_amd64), then issues SYSCALL (Slice A's new `syscall` opcode). x86_64 Linux syscall ABI: rax = syscall number, rdi = arg0 (status). syscallOpcodeBytes [15, 5] = 0x0F 0x05 = SYSCALL (stored-order byte stream).",
   "processExit": {
     "mechanism": "syscall",
@@ -49,6 +52,16 @@
       "addrAlign": 16,
       "entrySize": 0,
       "virtualAddress": 4198400
+    },
+    {
+      "$comment": "Read-only initialized data (string literals, const/primitive globals). sh_type=SHT_PROGBITS(1); sh_flags=SHF_ALLOC(2) — readable, NOT writable/executable (it is folded into the R+X text PT_LOAD this cycle, which is strictly less permissive than writable; W^X preserved). sh_addralign=8. virtualAddress=0 — the writer COMPUTES the rodata VA contiguously after .text (secText.virtualAddress + alignUp(text.size, 8)); a fixed VA would collide with .text. D-LK1-ELF-EXEC-DATA-SECTIONS.",
+      "kind": "rodata",
+      "name": ".rodata",
+      "type": 1,
+      "flags": 2,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
     },
     {
       "$comment": "Symbol table — even in ET_EXEC files, .symtab is conventional for debugger support. sh_type = SHT_SYMTAB (2); sh_addralign = 8; sh_entsize = 24 (Elf64_Sym).",

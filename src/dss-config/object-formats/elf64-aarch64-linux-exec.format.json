@@ -14,6 +14,9 @@
   "$externCallDispatchComment": "ELF resolves imports through the PLT: the linker synthesizes a 16-byte ARM64 PLT stub per extern (ADRP+LDR+BR+NOP through the GOT slot) and points the extern symbol's VA at the STUB, so the call site is a PLAIN DIRECT call (BL imm26 to the stub, R_AARCH64_CALL26). No inline ADRP+LDR+BLR macro-op is needed at the call site -- the stub does the GOT indirection. D-FFI-EXTERN-CALL-DISPATCH.",
   "externCallDispatch": "direct-plt",
 
+  "$supportedDataSectionsComment": "D-LK1-ELF-EXEC-DATA-SECTIONS (rodata-only scope): the ELF ET_EXEC walker emits `.rodata` from `AssembledModule.dataItems` items with `section=Rodata`. The linker's pre-walker gate (linker.cpp) consults this set per-item — `Data` and `Bss` remain anchored under D-LK4-RODATA-PRODUCER. Same field + same shared `elf.cpp` code path as the x86_64-ELF exec format; arch differs only via config (pageAlign/machine). Cross-format agnosticism: zero format-name branches in the gate.",
+  "supportedDataSections": ["rodata"],
+
   "$processExitComment": "D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): the Linux AArch64 runnable-binary spine — a raw `exit_group` syscall (no libc dependency). The trampoline emitter loads the syscall number into x8 via `mov x8, 94` (the new MOVZ Imm16 encoding — see arm64.target.json), moves the user fn's return value from returnGprs[0] (x0) into argGprs[0] (x0 — a no-op mov here since both are x0, emitted for ABI uniformity with x86_64's rax→rdi), then issues SVC #0 (the target's `syscall` opcode). Linux AArch64 syscall ABI: x8 = syscall number, x0 = arg0 (exit status). syscallOpcodeBytes [1, 0, 0, 212] = the LITTLE-ENDIAN byte stream of 0xD4000001 (SVC #0); it cross-checks the target's `syscall` opcode fixedWord. Self-contained exit mechanism — no ADRP+LDR+BLR `call_indirect_via_extern` is needed (that GOT/PLT path stays deferred at D-LK6-8).",
   "processExit": {
     "mechanism": "syscall",
@@ -49,6 +52,16 @@
       "addrAlign": 16,
       "entrySize": 0,
       "virtualAddress": 4194304
+    },
+    {
+      "$comment": "Read-only initialized data (string literals, const/primitive globals). sh_type=SHT_PROGBITS(1); sh_flags=SHF_ALLOC(2) — readable, NOT writable/executable (it is folded into the R+X text PT_LOAD this cycle, which is strictly less permissive than writable; W^X preserved). sh_addralign=8. virtualAddress=0 — the writer COMPUTES the rodata VA contiguously after .text (secText.virtualAddress + alignUp(text.size, 8)); a fixed VA would collide with .text. D-LK1-ELF-EXEC-DATA-SECTIONS.",
+      "kind": "rodata",
+      "name": ".rodata",
+      "type": 1,
+      "flags": 2,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
     },
     {
       "$comment": "Symbol table — conventional for debugger support. sh_type = SHT_SYMTAB (2); sh_addralign = 8; sh_entsize = 24 (Elf64_Sym).",
