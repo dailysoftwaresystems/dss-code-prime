@@ -14,6 +14,14 @@
 //     rejected — proves the real grammar's declared span flows through.
 //   * Routing (routesToMultiUnit): the shared >1 threshold.
 //   * Diagnostic-code name/prefix round-trip.
+//
+// Plan 06 AP4 — per-language ONBOARDING matrix (appended at the end).
+// AP2/AP3 exercised the gates with c-subset ONLY; AP4 completes the
+// matrix across ALL THREE shipped languages (toy / c-subset / tsql-
+// subset) and adds the single real end-to-end emit through
+// compileProject. See the "AP4" banner below for the scope + honesty
+// notes (no shipped format serves a non-cli profile; the profile does
+// NOT yet drive artifact shape — that is D-AP2-COMPILATION-CONTEXT).
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -494,4 +502,230 @@ TEST(ProjectConfigDiagnostics, DArtifactProfileNotSupportedRoundTrip) {
               "D_ArtifactProfileNotSupported");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::D_ArtifactProfileNotSupported),
               "D0010");
+}
+
+// ════════════════════════════════════════════════════════════════
+// AP4 — per-language onboarding matrix (plan 06 §5 AP4 / §7)
+// ════════════════════════════════════════════════════════════════
+//
+// AP2/AP3 exercised the two driver gates with c-subset ONLY. AP4
+// completes the per-language matrix: each shipped language driven
+// through `compileProject` across its declared / undeclared profiles
+// and the served / unserved format axis. The shipped declared SETS
+// themselves are already exact-pinned in tests/core
+// (`GrammarSchema.ShippedConfigsDeclareArtifactProfiles`) — these
+// cells pin the DRIVER's gate OUTCOME per language instead.
+//
+// Each cell is a THREE-SIDED assertion so a regression is RED, never
+// silently green:
+//   (a) the EXACT expected gate-code count == 1,
+//   (b) the OTHER gate's code count == 0  (gate distinctness),
+//   (c) the return code (1 = the gate STOPPED the build).
+// A swap of the two codes, extra diagnostic noise, or a failure to
+// stop the build each breaks at least one side.
+//
+// HONESTY NOTES (the matrix's scope — stated so no reader over-reads):
+//   * No shipped object format SERVES a non-cli profile (the four exec
+//     formats serve ["cli"]; relocatable/spirv/wasm serve nothing). So
+//     lib/staticlib/script/sproc have NO positive format-gate cell —
+//     here they can only ever be REJECTED. A future shared-library /
+//     SQL-emit backend would add the serving format + the positive
+//     cell with ZERO gate-code change (the gate is generic set-
+//     membership, never a format-name branch).
+//   * toy & tsql-subset are onboarded here in the GATE sense only —
+//     they emit no artifact in this matrix. c-subset is the sole real
+//     end-to-end emit (`RealCliProjectEmitsElfExecutable`, last test).
+//   * The profile does NOT yet drive artifact SHAPE (entry-symbol /
+//     PE subsystem / extension); that codegen-threading is deferred
+//     (D-AP2-COMPILATION-CONTEXT, trigger-gated on a non-format-
+//     redundant consumer, e.g. a gui profile). AP4 therefore asserts
+//     GATE behavior — never a profile-driven shape, which today would
+//     be VACUOUS (the shape comes from the (target:format) spec, so
+//     such a test would pass even if the profile were ignored).
+
+namespace {
+
+// One exec format used for every matrix cell. It serves ["cli"] and is
+// host-agnostic to EMIT (DSS cross-compiles); cells that reach the
+// build use a guaranteed-absent source so they fail downstream, never
+// on the gate.
+constexpr std::string_view kExecTarget = "x86_64:elf64-x86_64-linux-exec";
+
+std::string matrixProjectJson(std::string_view language,
+                              std::string_view profile,
+                              std::string_view targetSpec) {
+    // A deliberately-absent source: gate-reject cells never read it,
+    // and the one "passes both gates" cell must fail DOWNSTREAM (not on
+    // a gate) when the build tries to open it.
+    return std::string{"{\n  \"language\": \""} + std::string{language}
+        + "\",\n  \"artifactProfile\": \"" + std::string{profile}
+        + "\",\n  \"targets\": [\"" + std::string{targetSpec}
+        + "\"],\n  \"sources\": [\"ap4-absent-source.c\"]\n}";
+}
+
+// First human message carried for `code` (stored in `actual` by the
+// `report()` shim) — for the §7-#3 actionable-message pin.
+std::string firstMessageForCode(DiagnosticReporter const& rep,
+                                DiagnosticCode code) {
+    for (auto const& d : rep.all()) {
+        if (d.code == code) return d.actual;
+    }
+    return {};
+}
+
+// Drive `compileProject` on a scratch project file. Location::Temp + NO
+// useAsCwd: every cell either rejects at a gate BEFORE the compile (so
+// the source need not exist) or fails downstream on the absent source —
+// and `loadShipped` walks UP from the unchanged test cwd to find
+// src/dss-config/ (exactly like the AP2/AP3 cells above). `rep` is the
+// caller's, so the emitted codes outlive the scratch dir's teardown.
+int runMatrixCell(std::string_view language, std::string_view profile,
+                  std::string_view targetSpec, DiagnosticReporter& rep) {
+    dss::test_support::ScratchDir scratch{
+        dss::test_support::Location::Temp, "program"};
+    auto path = writeProjectFile(
+        scratch.path(), matrixProjectJson(language, profile, targetSpec));
+    Program prog;
+    return prog.compileProject(path.string(), rep);
+}
+
+} // namespace
+
+// ── toy: declares ["cli"] ───────────────────────────────────────
+
+// cli IS declared by toy AND served by the exec format → BOTH gates
+// pass; the build then fails DOWNSTREAM on the absent source (not a
+// gate). Proves toy flows THROUGH compileProject (toy had never been
+// driven through it before AP4).
+TEST(ArtifactProfileMatrix, ToyCliPassesBothGatesThenFailsDownstream) {
+    DiagnosticReporter rep;
+    int const rc = runMatrixCell("toy", "cli", kExecTarget, rep);
+    EXPECT_NE(rc, 0) << "absent source must fail the build downstream";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 0u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 0u);
+}
+
+TEST(ArtifactProfileMatrix, ToyGuiRejectedByLanguageGate) {
+    DiagnosticReporter rep;
+    int const rc = runMatrixCell("toy", "gui", kExecTarget, rep);
+    EXPECT_EQ(rc, 1);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 0u);
+}
+
+TEST(ArtifactProfileMatrix, ToyLibRejectedByLanguageGate) {
+    DiagnosticReporter rep;
+    int const rc = runMatrixCell("toy", "lib", kExecTarget, rep);
+    EXPECT_EQ(rc, 1);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 0u);
+}
+
+// ── c-subset: declares ["cli","lib","staticlib"] ────────────────
+// (AP2/AP3 already cover cli-passes + lib-mismatch; AP4 adds staticlib
+//  + the §7-#3 actionable-message pin.)
+
+TEST(ArtifactProfileMatrix, CSubsetStaticlibMismatchByFormatGate) {
+    DiagnosticReporter rep;
+    int const rc = runMatrixCell("c-subset", "staticlib", kExecTarget, rep);
+    EXPECT_EQ(rc, 1);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 0u)
+        << "staticlib IS declared by c-subset — the LANGUAGE gate must not fire";
+}
+
+// §7 criterion #3: the language-gate message must NAME the language and
+// LIST the supported set (actionable remediation) — not just a code.
+// (red-on-disable: if enforceArtifactProfile dropped the list, the
+// "staticlib" find() fails.)
+TEST(ArtifactProfileMatrix, CSubsetGuiMessageNamesLanguageAndSupportedSet) {
+    DiagnosticReporter rep;
+    (void) runMatrixCell("c-subset", "gui", kExecTarget, rep);
+    ASSERT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 1u);
+    std::string const m =
+        firstMessageForCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported);
+    EXPECT_NE(m.find("c-subset"), std::string::npos)
+        << "message must name the language; got: " << m;
+    EXPECT_NE(m.find("staticlib"), std::string::npos)
+        << "message must list the supported profiles; got: " << m;
+}
+
+// ── tsql-subset: declares ["script","sproc"] ────────────────────
+// (never driven through compileProject before AP4.)
+
+// script IS declared by tsql → the LANGUAGE gate passes; but NO shipped
+// format serves script → the FORMAT gate rejects. Proves the two gates
+// are distinct AND that a declared-but-unserved profile reaches (and is
+// caught by) the format gate.
+TEST(ArtifactProfileMatrix, TsqlScriptMismatchByFormatGate) {
+    DiagnosticReporter rep;
+    int const rc = runMatrixCell("tsql-subset", "script", kExecTarget, rep);
+    EXPECT_EQ(rc, 1);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 0u)
+        << "script IS declared by tsql-subset — the LANGUAGE gate must not fire";
+}
+
+TEST(ArtifactProfileMatrix, TsqlSprocMismatchByFormatGate) {
+    DiagnosticReporter rep;
+    int const rc = runMatrixCell("tsql-subset", "sproc", kExecTarget, rep);
+    EXPECT_EQ(rc, 1);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 0u);
+}
+
+// cli is NOT declared by tsql-subset → the LANGUAGE gate rejects first
+// (the format gate never runs).
+TEST(ArtifactProfileMatrix, TsqlCliRejectedByLanguageGate) {
+    DiagnosticReporter rep;
+    int const rc = runMatrixCell("tsql-subset", "cli", kExecTarget, rep);
+    EXPECT_EQ(rc, 1);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 0u);
+}
+
+// ── the ONE real end-to-end emit through compileProject ─────────
+// Every other compileProject test (AP2/AP3 + the matrix above) uses an
+// ABSENT source and asserts only gate behavior. This one proves the
+// project-config path actually COMPILES + EMITS: a real cli c-subset
+// program → a real ELF executable on disk. Host-agnostic — DSS cross-
+// emits, so we assert the bytes (ELF magic), never RUN. It is also the
+// positive cli FORMAT-gate cell, end-to-end. Uses Location::InsideRepo
+// + useAsCwd (the cwd-rooted output + schema-loader walk contract).
+TEST(CompileProjectIntegration, RealCliProjectEmitsElfExecutable) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    {
+        std::ofstream f{scratch.path() / "main.c", std::ios::binary};
+        f << "int main() { return 42; }\n";
+    }
+    auto path = writeProjectFile(scratch.path(), R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"]
+    })");
+    scratch.useAsCwd();
+
+    Program prog;
+    DiagnosticReporter rep;
+    int const rc = prog.compileProject(path.string(), rep);
+    ASSERT_EQ(rc, 0)
+        << "a real cli c-subset project must compile + emit via compileProject";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 0u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 0u);
+
+    // ELF Exec ⇒ no output extension (TargetSpec::outputExtension); the
+    // artifact stem is the source stem ("main").
+    auto const out =
+        scratch.path() / "target" / "elf64-x86_64-linux-exec" / "main";
+    ASSERT_TRUE(std::filesystem::exists(out))
+        << "expected artifact at " << out.string();
+    ASSERT_GT(std::filesystem::file_size(out), 0u);
+    std::ifstream in{out, std::ios::binary};
+    unsigned char hdr[4] = {0};
+    in.read(reinterpret_cast<char*>(hdr), 4);
+    EXPECT_EQ(hdr[0], 0x7Fu);
+    EXPECT_EQ(hdr[1], static_cast<unsigned char>('E'));
+    EXPECT_EQ(hdr[2], static_cast<unsigned char>('L'));
+    EXPECT_EQ(hdr[3], static_cast<unsigned char>('F'));
 }

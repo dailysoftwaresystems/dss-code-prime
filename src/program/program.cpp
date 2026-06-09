@@ -540,12 +540,18 @@ int Program::compileProject(
     const std::string& projectFilePath,
     DiagnosticReporter&             rep
 ) {
-    // Plan 06 AP2: load the `.dss-project.json` project config, enforce
-    // the requested `artifactProfile` against the language's declared
-    // set (AP1's `GrammarSchema::artifactProfiles()`), then delegate to
-    // the existing compile path. AP2 = validate + delegate; threading
-    // the resolved profile to codegen / a CompilationContext is AP3/AP4
-    // (D-AP2-COMPILATION-CONTEXT).
+    // Plan 06 artifactProfile gates: load the `.dss-project.json`, then
+    // enforce the requested `artifactProfile` through TWO generic set-
+    // membership gates before delegating to the existing compile path —
+    // AP2 = the LANGUAGE gate (profile ∈ AP1's
+    // `GrammarSchema::artifactProfiles()` → D_ArtifactProfileNotSupported);
+    // AP3 = the per-target FORMAT gate (profile ∈ the object format's
+    // served set → D_ArtifactProfileFormatMismatch). Threading the
+    // resolved profile onward to CODEGEN (entry-symbol / subsystem /
+    // extension) is deferred — NOT to a fixed AP slice but to the first
+    // non-format-redundant profile consumer (e.g. gui), since no shipped
+    // profile's codegen differs from what its (target:format) already
+    // encodes; building it now would be a dead knob (D-AP2-COMPILATION-CONTEXT).
     auto pcOpt = loadProjectConfig(fs::path{projectFilePath}, rep);
     if (!pcOpt.has_value()) {
         // loadProjectConfig already emitted the structural diagnostic

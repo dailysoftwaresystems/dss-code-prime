@@ -656,7 +656,7 @@ Languages with no numeric literals omit the block entirely. Configs that referen
 
 ### 11.6 `artifactProfiles` — supported output shapes (plan 06 AP1)
 
-An **optional** top-level array naming the **artifact profiles** a language can be compiled into — the shape its output takes (a console binary, a shared library, a SQL script, …). It is per-language data: each `.lang.json` declares its own set. AP1 is the schema-field + loader-validation slice only; no codegen or driver consumes it yet (the driver-enforcement layer, AP2+, reads this set to reject a project asking for a profile the language can't produce).
+An **optional** top-level array naming the **artifact profiles** a language can be compiled into — the shape its output takes (a console binary, a shared library, a SQL script, …). It is per-language data: each `.lang.json` declares its own set. The **driver consumes this set** (plan 06 AP2/AP3): a `.dss-project.json` build is rejected (`D_ArtifactProfileNotSupported`) when its requested `artifactProfile` is not in the language's declared set — see [`project-config-spec.md`](./project-config-spec.md). Threading the resolved profile onward to *codegen* (entry-point symbol, PE subsystem, output extension) is deferred until a profile actually drives a codegen difference its `(target:format)` doesn't already encode (e.g. a `gui` profile) — `D-AP2-COMPILATION-CONTEXT`.
 
 ```jsonc
 {
@@ -672,13 +672,13 @@ An **optional** top-level array naming the **artifact profiles** a language can 
 
 - **Optional.** Absent ⇒ the language declares no profiles (`artifactProfiles()` returns an empty span); the config still loads cleanly.
 - Each entry must be a name in the **registered profile set**: `cli`, `gui`, `lib`, `staticlib`, `script`, `sproc`, `transpile`, `shader`, `hdl` (plan 06 §3). The set is loader-owned vocabulary, not a config-authored name — a new profile arrives with the backend plan that introduces it.
-- An unknown name → `C_UnknownArtifactProfile`. A malformed block (not an array, or a non-string entry) → the same `C_UnknownArtifactProfile`. A duplicate entry → `C_RedundantField` (the duplicate is dropped).
+- An unknown name → `C_UnknownArtifactProfile`. A malformed block (not an array, or a non-string entry) → the same `C_UnknownArtifactProfile`. A duplicate entry → `C_ConflictingField` and the load **hard-fails** (matching the `typeExtensions` duplicate-name precedent — a duplicate is an authoring error, not silently dropped).
 - The shipped languages declare: `toy` → `["cli"]`; `c-subset` → `["cli", "lib", "staticlib"]`; `tsql-subset` → `["script", "sproc"]`.
 
 | Symptom | Likely fix |
 |---|---|
 | `C_UnknownArtifactProfile` | An entry isn't in the registered set, OR `artifactProfiles` isn't an array, OR an entry isn't a string. Use one of `cli`/`gui`/`lib`/`staticlib`/`script`/`sproc`/`transpile`/`shader`/`hdl`. |
-| `C_RedundantField` on `artifactProfiles` | The same profile is listed twice; remove the duplicate. |
+| `C_ConflictingField` on `artifactProfiles` | The same profile is listed twice; remove the duplicate (the load hard-fails until you do). |
 
 ---
 
