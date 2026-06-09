@@ -1,7 +1,7 @@
 {
   "header": "string.h",
   "standard": "c89",
-  "library": "libc.so.6",
+  "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "symbols": [
     { "name": "strlen",  "signature": "fn(ptr<char>) -> u64",                  "kind": "function", "linkage": "external" },
     { "name": "strcmp",  "signature": "fn(ptr<char>, ptr<char>) -> i32",       "kind": "function", "linkage": "external" },

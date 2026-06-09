@@ -1,6 +1,7 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/object_format_kind.hpp"     // objectFormatKindFromName (library-map key vocabulary)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/strong_ids.hpp"            // InvalidType
 #include "hir/hir_text.hpp"                      // parseTypeFromText (the ONE type decoder)
@@ -145,16 +146,40 @@ readShippedLibDescriptor(std::filesystem::path const& path,
         out.standard = doc.at("standard").get<std::string>();
     }
 
-    // (2) Optional `library` string. Absent ⇒ empty (the lowering then falls
-    // back to the language's externLibraryByFormat default).
+    // (2) Optional `library` MAP (Model 3): per-object-format runtime image,
+    // keyed by the canonical `objectFormatKindName` vocabulary
+    // ("pe"/"elf"/"macho"). Absent ⇒ empty map (the lowering then falls back to
+    // the language's externLibraryByFormat default for every format). A present
+    // map: each key MUST be a known object-format name (a typo like "pee" fails
+    // loud HERE, not at a user's link), each value MUST be a string. A map that
+    // omits a format is legal — that format inherits the language default at
+    // resolution. AGNOSTIC: the key set is the `objectFormatKindFromName`
+    // vocabulary, never an `if (key == "pe")` identity branch.
     if (doc.contains("library")) {
-        if (!doc.at("library").is_string()) {
+        if (!doc.at("library").is_object()) {
             emitMalformed(reporter,
                 std::string{"shipped-lib descriptor '"} + path.generic_string()
-                    + "': 'library' must be a string");
+                    + "': 'library' must be a per-object-format object, e.g. "
+                      "{\"pe\":\"msvcrt.dll\",\"elf\":\"libc.so.6\"}");
             return std::nullopt;
         }
-        out.library = doc.at("library").get<std::string>();
+        for (auto const& kv : doc.at("library").items()) {
+            if (!objectFormatKindFromName(kv.key()).has_value()) {
+                emitMalformed(reporter,
+                    std::string{"shipped-lib descriptor '"} + path.generic_string()
+                        + "': 'library' has unknown object-format key '" + kv.key()
+                        + "' (expected one of the object-format names, e.g. "
+                          "\"pe\"/\"elf\"/\"macho\")");
+                continue;
+            }
+            if (!kv.value().is_string()) {
+                emitMalformed(reporter,
+                    std::string{"shipped-lib descriptor '"} + path.generic_string()
+                        + "': 'library." + kv.key() + "' must be a string");
+                continue;
+            }
+            out.library.emplace(kv.key(), kv.value().get<std::string>());
+        }
     }
 
     // (3) Required `symbols` array (non-empty — a descriptor that declares no
@@ -173,9 +198,12 @@ readShippedLibDescriptor(std::filesystem::path const& path,
         return std::nullopt;
     }
 
-    // Reject unknown top-level keys (closed key set).
+    // Reject unknown top-level keys (closed key set). `$comment` is the
+    // repo-wide config-documentation convention (a `$`-prefixed key carrying a
+    // human note, e.g. the LP64-vs-LLP64 deferral rationale in stdio/stdlib) —
+    // accepted + ignored, never consumed by lowering.
     (void)rejectUnknownKeys(reporter, doc, "(root)",
-                            {"header", "standard", "library", "symbols"});
+                            {"header", "standard", "library", "symbols", "$comment"});
 
     // (4) Each symbol. Collect-all: a malformed symbol is reported but the
     // loop continues so the operator sees every problem in one pass; the

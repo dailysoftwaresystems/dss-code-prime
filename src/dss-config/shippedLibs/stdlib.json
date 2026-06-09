@@ -1,7 +1,8 @@
 {
   "header": "stdlib.h",
   "standard": "c89",
-  "library": "libSystem.B.dylib",
+  "$comment": "Model 3 (2026-06-09): PLATFORM-NEUTRAL descriptor. `library` is a per-object-format map; the active target's format selects its runtime image at compile_pipeline resolution. `atol`/`strtol` (result), `strtoul` (result), and `labs` (arg+result) are the C `long`/`unsigned long` type, encoded here in the LP64 (i64/u64) form correct for the runnable elf/macho targets. The Windows LLP64 (i32/u32) form for these 4 is latently deferred — UNEXERCISED by any corpus/test — and tracked by D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH.",
+  "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "symbols": [
     { "name": "malloc",  "signature": "fn(u64) -> ptr<void>",            "kind": "function", "linkage": "external" },
     { "name": "calloc",  "signature": "fn(u64, u64) -> ptr<void>",       "kind": "function", "linkage": "external" },

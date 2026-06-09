@@ -5,13 +5,15 @@
 // well-formed JSON that decodes in a unit test.
 //
 // `#include <stdlib.h>` pulls `abs`'s prototype off the system search path
-// (semantics.shippedLibDirs → src/dss-config/shippedLibs/windows-x86_64/
-// stdlib.json) with NO inline extern anywhere in this file — exactly like
-// real C. The language-neutral descriptor carries the signature
-// (`fn(i32) -> i32`, a hir-text type string); the descriptor-injected
-// `abs` extern is synthesized before Pass 2, flows through FF5
-// synthesizeFfiFromSourceDecls, and the linker resolves `abs` against the
-// default runtime (msvcrt.dll via externLibraryByFormat).
+// (semantics.shippedLibDirs → src/dss-config/shippedLibs/stdlib.json — the
+// flat, platform-NEUTRAL descriptor, Model 3) with NO inline extern anywhere
+// in this file — exactly like real C. The language-neutral descriptor carries
+// the signature (`fn(i32) -> i32`, a hir-text type string) + a per-format
+// `library` map; the descriptor-injected `abs` extern is synthesized before
+// Pass 2, flows through FF5 synthesizeFfiFromSourceDecls, and the linker
+// resolves `abs` against the per-format library from that map (msvcrt.dll for
+// PE, libc.so.6 for ELF, libSystem for Mach-O; externLibraryByFormat is the
+// missing-key fallback).
 //
 // What this proves that shipped_include_puts does not:
 //   * The angle resolver maps a DIFFERENT stem (`<stdlib.h>` → stdlib.json,

@@ -272,19 +272,40 @@ TEST(LK10EntrySliceB, ShippedPeExecHasByNameImportProcessExit) {
     EXPECT_EQ((*r)->entryCallingConvention(), "ms_x64");
 }
 
-TEST(LK10EntrySliceB, ShippedElfExecHasSyscallProcessExit) {
+// STDIO-FLUSH-AT-EXIT (2026-06-09): the shipped ELF exec formats now
+// terminate via libc `exit(3)` (a by-name-import that flushes stdio +
+// runs atexit), NOT the raw `exit_group(2)` syscall (which skipped the
+// flush). This pin asserts the SHIPPED format's new shape; the Syscall
+// MECHANISM itself stays a supported emitter capability, exercised by
+// the schema-validation tests below + the synthetic-format syscall pins
+// in test_lk10_entry_slice_c.cpp.
+//
+// RED-on-disable: revert elf64-x86_64-linux-exec.format.json's
+// processExit back to `mechanism:"syscall"` (the old exit_group) and
+// this test fails on the first EXPECT — the shipped policy is libc exit.
+TEST(LK10EntrySliceB, ShippedElfExecExitsViaLibcExitImport) {
     auto r = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
     ASSERT_TRUE(r.has_value());
     auto const& pe = (*r)->processExit();
     ASSERT_TRUE(pe.has_value())
         << "ELF Exec must declare processExit (D-LK10-ENTRY Slice B)";
-    EXPECT_EQ(pe->mechanism, ExitMechanism::Syscall);
-    EXPECT_EQ(pe->syscallNumber, 231u);  // Linux x86_64 exit_group
-    EXPECT_EQ(pe->syscallNumGpr, "rax");
-    ASSERT_EQ(pe->syscallOpcodeBytes.size(), 2u);
-    EXPECT_EQ(pe->syscallOpcodeBytes[0], 0x0F);
-    EXPECT_EQ(pe->syscallOpcodeBytes[1], 0x05);
+    EXPECT_EQ(pe->mechanism, ExitMechanism::ByNameImport)
+        << "ELF exec must terminate via libc exit(3) (flushes stdio), "
+           "NOT the raw exit_group syscall (skips the flush).";
+    EXPECT_EQ(pe->importMangledName, "exit")
+        << "the canonical C name `exit` — ELF adds no leading underscore";
+    EXPECT_EQ(pe->importLibraryPath, "libc.so.6")
+        << "libc.so.6 becomes a DT_NEEDED + PLT stub for `exit`";
     EXPECT_EQ((*r)->entryCallingConvention(), "sysv_amd64");
+    // The aarch64 ELF exec mirrors the x86_64 form (same libc exit).
+    auto rArm = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
+    ASSERT_TRUE(rArm.has_value());
+    auto const& peArm = (*rArm)->processExit();
+    ASSERT_TRUE(peArm.has_value());
+    EXPECT_EQ(peArm->mechanism, ExitMechanism::ByNameImport);
+    EXPECT_EQ(peArm->importMangledName, "exit");
+    EXPECT_EQ(peArm->importLibraryPath, "libc.so.6");
+    EXPECT_EQ((*rArm)->entryCallingConvention(), "aapcs64");
 }
 
 TEST(LK10EntrySliceB, EntryCallingConventionResolvesAgainstTarget) {

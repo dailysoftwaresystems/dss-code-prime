@@ -484,6 +484,33 @@ encodeElfExecDynamic(
         return {};
     }
 
+    // ── (a.5) Build `.rodata` for the dynamic image ────────────────
+    //
+    // D-LK1-ELF-EXEC-DATA-SECTIONS extended to the DYNAMIC-FFI arm
+    // (2026-06-09): a program that passes a rodata constant's address to
+    // a shipped extern (`puts("hello")` → the string literal is a rodata
+    // `AssembledData`, its address `lea`'d for the call's pointer arg)
+    // needs `.rodata` IN the dynamic image — the static ET_EXEC arm had
+    // it, this dynamic arm did not, so the string's `.text` relocation
+    // failed loud (`K_SymbolUndefined`). `.rodata` is read-only → it
+    // folds into the R+X PT_LOAD #1, laid out between `.text` and `.plt`.
+    // Reuses the SAME shared `buildExecRodata` + `addDataSymbolVas`
+    // helpers the static path + Mach-O `__const` writer use — zero copy,
+    // zero `if(format)`. An EMPTY dataItems list yields an empty layout
+    // and a zero-size section (no-op, byte-identical to the prior image
+    // for the no-rodata externs case).
+    ObjectFormatSectionInfo const* secRodataDyn =
+        fmt.sectionByKind(SectionKind::Rodata);
+    std::uint64_t const rodataDynAlignFloor =
+        secRodataDyn != nullptr ? secRodataDyn->addrAlign : 1;
+    auto const rodataDynLayoutOpt = link::format::buildExecRodata(
+        module.dataItems, rodataDynAlignFloor,
+        "elf::encodeElfExecDynamic", reporter);
+    if (!rodataDynLayoutOpt.has_value()) return {};
+    auto const& rodataDynLayout = *rodataDynLayoutOpt;
+    bool const hasRodataDyn = !module.dataItems.empty();
+    std::vector<std::uint8_t> const& rodataDyn = rodataDynLayout.bytes;
+
     // ── (b) Group externs by library (preserve declaration order)
     std::vector<std::string> libraryOrder;
     std::unordered_map<std::string, std::vector<std::size_t>>
@@ -602,9 +629,21 @@ encodeElfExecDynamic(
     std::uint64_t const textOff = pageAlign;   // .text at page boundary
     std::uint64_t const textVa  = secText.virtualAddress;
 
+    // `.rodata` immediately after `.text` (both R+X PT_LOAD #1). Aligned
+    // to the layout's max item alignment (gABI sh_addralign). Empty when
+    // the module has no rodata → zero-size section, `.plt` follows `.text`
+    // directly (byte-identical to the pre-rodata image).
+    std::uint64_t const rodataAlignDyn =
+        hasRodataDyn ? rodataDynLayout.maxAlign : 1;
+    std::uint64_t const rodataOff =
+        hasRodataDyn ? alignUp(textOff + text.size(), rodataAlignDyn)
+                     : textOff + text.size();
+    std::uint64_t const rodataVa  = baseImageVa + rodataOff;
+    std::uint64_t const rodataSz  = rodataDyn.size();
+
     // Subsequent sections in PT_LOAD #1; VA = baseImageVa + fileOff
     // (PT_LOAD with fileoff=0 and vaddr=baseImageVa maps verbatim).
-    std::uint64_t const pltOff = alignUp(textOff + text.size(), 16);
+    std::uint64_t const pltOff = alignUp(rodataOff + rodataSz, 16);
     std::uint64_t const pltVa  = baseImageVa + pltOff;
     std::uint64_t const pltSize = plt.size();
 
@@ -724,6 +763,11 @@ encodeElfExecDynamic(
     StringTable shstrtab;
     auto const shsInterp   = shstrtab.add(".interp");
     auto const shsText     = shstrtab.add(".text");
+    // `.rodata` section name (schema row when present, else the literal).
+    // Added unconditionally to shstrtab (a few unused bytes when no rodata);
+    // the SHT entry below is what's gated on `hasRodataDyn`.
+    auto const shsRodata   = shstrtab.add(
+        secRodataDyn != nullptr ? std::string{secRodataDyn->name} : std::string{".rodata"});
     auto const shsPlt      = shstrtab.add(".plt");
     auto const shsDynsym   = shstrtab.add(".dynsym");
     auto const shsDynstr   = shstrtab.add(".dynstr");
@@ -770,10 +814,24 @@ encodeElfExecDynamic(
     // failure C2 convergence — same defect exists in PE walker
     // and is anchored for parallel fold).
     std::unordered_map<SymbolId, std::uint64_t> symbolVa;
-    symbolVa.reserve(module.functions.size() + numExterns);
+    symbolVa.reserve(module.functions.size() + numExterns
+                     + module.dataItems.size());
     for (std::size_t i = 0; i < module.functions.size(); ++i) {
         symbolVa.emplace(module.functions[i].symbol,
                          textVa + funcTextStart[i]);
+    }
+    // D-LK1-ELF-EXEC-DATA-SECTIONS (dynamic arm): each NAMED rodata item
+    // joins symbolVa at `rodataVa + itemOffset[i]` via the SAME shared
+    // `addDataSymbolVas` helper the static path uses, so a `.text`
+    // relocation that targets a rodata SymbolId (the `lea reg,[rip+str]`
+    // for a string-literal pointer arg) resolves through the shared
+    // `applyExecRelocations` kernel. Anonymous items are skipped (M1).
+    if (hasRodataDyn) {
+        if (!link::format::addDataSymbolVas(
+                module.dataItems, rodataVa, rodataDynLayout.itemOffsets,
+                symbolVa, "elf::encodeElfExecDynamic", reporter)) {
+            return {};
+        }
     }
     for (std::size_t i = 0; i < numExterns; ++i) {
         // D-LK6-8: extern symbol VA points at the PLT stub. Stub
@@ -841,6 +899,7 @@ encodeElfExecDynamic(
     // #1 + #4 fold using local padToOffset / appendBytes helpers).
     padToOffset(bytes, interpOff);    appendBytes(bytes, interp);
     padToOffset(bytes, textOff);      appendBytes(bytes, text);
+    if (hasRodataDyn) { padToOffset(bytes, rodataOff); appendBytes(bytes, rodataDyn); }
     padToOffset(bytes, pltOff);       appendBytes(bytes, plt);
     padToOffset(bytes, dynsymOff);    appendBytes(bytes, dynsym);
                                        appendBytes(bytes, dynstr);  // align 1
@@ -854,18 +913,23 @@ encodeElfExecDynamic(
                                        appendBytes(bytes, shstrtab.view());
     padToOffset(bytes, shtOff);
 
-    // ── (o) Section Header Table — 13 entries ─────────────────
-    //   0: SHT_NULL, 1: .interp, 2: .text, 3: .plt,
-    //   4: .dynsym, 5: .dynstr, 6: .hash, 7: .rela.dyn,
-    //   8: .got, 9: .dynamic, 10: .symtab, 11: .strtab, 12: .shstrtab
-    constexpr std::uint16_t IDX_INTERP   = 1;
-    constexpr std::uint16_t IDX_TEXT     = 2;
-    constexpr std::uint16_t IDX_DYNSYM   = 4;
-    constexpr std::uint16_t IDX_DYNSTR   = 5;
-    constexpr std::uint16_t IDX_STRTAB   = 11;
-    constexpr std::uint16_t IDX_SHSTRTAB = 12;
-    constexpr std::uint16_t kNumSections = 13;
-    (void)IDX_INTERP; (void)IDX_TEXT;
+    // ── (o) Section Header Table ──────────────────────────────
+    //   0: SHT_NULL, 1: .interp, 2: .text, [.rodata,] .plt,
+    //   .dynsym, .dynstr, .hash, .rela.dyn, .got, .dynamic,
+    //   .symtab, .strtab, .shstrtab
+    //
+    // D-LK1-ELF-EXEC-DATA-SECTIONS (dynamic arm): `.rodata`, WHEN present,
+    // occupies index 3 (after `.text`@2, before `.plt`) — mirroring the
+    // static ET_EXEC arm's `.rodata`@idx2 insertion. Every section after
+    // it shifts +1, so the cross-reference indices (.link/.info/e_shstrndx)
+    // are computed with `rodataShift` (1 when present, 0 when absent) so
+    // the no-rodata image is byte-identical to the pre-fix layout.
+    std::uint16_t const rodataShift = hasRodataDyn ? 1 : 0;
+    std::uint16_t const IDX_DYNSYM   = static_cast<std::uint16_t>(4 + rodataShift);
+    std::uint16_t const IDX_DYNSTR   = static_cast<std::uint16_t>(5 + rodataShift);
+    std::uint16_t const IDX_STRTAB   = static_cast<std::uint16_t>(11 + rodataShift);
+    std::uint16_t const IDX_SHSTRTAB = static_cast<std::uint16_t>(12 + rodataShift);
+    std::uint16_t const kNumSections = static_cast<std::uint16_t>(13 + rodataShift);
 
     // Designated initializers per `SectionHeader` field — type-design
     // #1 + simplifier #3 fold: 10-arg positional pushShdr lambda
@@ -880,6 +944,15 @@ encodeElfExecDynamic(
         .name_offset = shsText, .type = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_EXECINSTR,
         .addr = textVa, .offset = textOff, .size = text.size(),
         .addr_align = 16});
+    // `.rodata` (SHF_ALLOC, R) — present only when the module carries
+    // rodata; folds into the R+X PT_LOAD #1. Read-only data, NO
+    // SHF_EXECINSTR / SHF_WRITE.
+    if (hasRodataDyn) {
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsRodata, .type = SHT_PROGBITS, .flags = SHF_ALLOC,
+            .addr = rodataVa, .offset = rodataOff, .size = rodataSz,
+            .addr_align = rodataAlignDyn});
+    }
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsPlt, .type = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_EXECINSTR,
         .addr = pltVa, .offset = pltOff, .size = pltSize,

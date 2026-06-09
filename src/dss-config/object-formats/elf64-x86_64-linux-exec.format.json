@@ -17,12 +17,11 @@
   "$supportedDataSectionsComment": "D-LK1-ELF-EXEC-DATA-SECTIONS (rodata-only scope): the ELF ET_EXEC walker emits `.rodata` from `AssembledModule.dataItems` items with `section=Rodata`. The linker's pre-walker gate (linker.cpp) consults this set per-item — `Data` and `Bss` remain anchored under D-LK4-RODATA-PRODUCER. Mirrors the PE walker's `.rdata` arm (D-LK2-RODATA). Cross-format agnosticism: this is the SAME field PE/Mach-O exec formats declare; the gate has zero format-name branches.",
   "supportedDataSections": ["rodata"],
 
-  "$processExitComment": "D-LK10-ENTRY Slice B (plan 14 §2.13): the Linux runnable-binary spine — raw `exit_group` syscall (no libc dependency). The trampoline emitter loads the syscall number into rax via `mov eax, 231` (Slice A's `mov` opcode), moves the user fn's return value from rax into rdi (argGprs[0] of sysv_amd64), then issues SYSCALL (Slice A's new `syscall` opcode). x86_64 Linux syscall ABI: rax = syscall number, rdi = arg0 (status). syscallOpcodeBytes [15, 5] = 0x0F 0x05 = SYSCALL (stored-order byte stream).",
+  "$processExitComment": "STDIO-FLUSH-AT-EXIT (2026-06-09): terminate via libc `exit(3)`, NOT the raw `exit_group(2)` syscall. The C standard says returning from `main` ≡ calling `exit(3)`, which flushes line-/full-buffered stdio + runs `atexit` handlers before the process dies. The prior raw `exit_group` syscall skipped that flush, so a program that did `puts(\"hello\")` then returned exited cleanly but with stdout still buffered (empty on a pipe). By-name-import of libc `exit` makes the trampoline emit a DIRECT `call` to the PLT stub for `exit` (per externCallDispatch=direct-plt), exactly as a user-level FFI call (`puts`) lowers — so `exit` flushes stdout, runs atexit, then calls `_exit`/`exit_group` itself. This routes EVERY ELF program through the dynamic writer (libc.so.6 becomes a DT_NEEDED, a PLT stub + GOT slot is synthesized for `exit`, ld-linux resolves it) — the SAME machinery `extern_call_elf` already uses; a program whose ONLY extern is this `exit` works because it is identical in shape to the FFI case. importMangledName is the canonical C name `exit` (ELF adds no leading underscore — cFormatAddsLeadingUnderscore(Elf)=false). Uniform with macho (libSystem `exit`) + pe (kernel32 `ExitProcess`, which flushes via msvcrt's DLL-detach handler): all three terminate through a libc-level, stdio-flushing primitive.",
   "processExit": {
-    "mechanism": "syscall",
-    "syscallNumber": 231,
-    "syscallNumGpr": "rax",
-    "syscallOpcodeBytes": [15, 5]
+    "mechanism": "by-name-import",
+    "importMangledName": "exit",
+    "importLibraryPath": "libc.so.6"
   },
 
   "$entryCallingConventionComment": "SysV AMD64 calling convention — status (user fn return value in rax) is moved into argGprs[0] = rdi before SYSCALL. Read via `target.callingConventionByName(\"sysv_amd64\")` at trampoline-build time.",

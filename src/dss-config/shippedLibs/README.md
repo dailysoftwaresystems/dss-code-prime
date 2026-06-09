@@ -10,9 +10,18 @@ When a c-subset program writes `#include <stdio.h>` with **no** inline
 `extern`, the angle-include resolver maps the header stem to the matching
 `*.json` here (on the `semantics.shippedLibDirs` system search path), the
 semantic analyzer injects the descriptor's symbols into scope before name
-resolution, and the linker resolves them against the platform runtime — exactly
-like real C. See `examples/c-subset/shipped_include_puts/` (stdio) and
+resolution, and the linker resolves them against the runtime image for the
+active compilation target's object format — exactly like real C. See
+`examples/c-subset/shipped_include_puts/` (stdio) and
 `examples/c-subset/shipped_include_abs/` (stdlib) for end-to-end proofs.
+
+**Model 3 (2026-06-09)** — descriptors are **platform-neutral**: ONE descriptor
+per header (a flat `<stem>.json`, no per-platform directories), carrying a
+per-object-format `library` map (`{"pe":…,"elf":…,"macho":…}`). The active
+target's object format selects its runtime image at `compile_pipeline`
+resolution time (keyed by `objectFormatKindName`), so the same descriptor serves
+every target. This dissolved the former per-platform-directory layout and the
+`D-FFI-SHIPPED-LIB-PLATFORM-SELECT` deferral.
 
 The universal reader is `src/ffi/shipped_lib_descriptor.{hpp,cpp}`. It is
 **source/target/linker agnostic**: pure `nlohmann/json` + the single
@@ -24,17 +33,16 @@ The universal reader is `src/ffi/shipped_lib_descriptor.{hpp,cpp}`. It is
 
 ```
 shippedLibs/
-  <platform>/            e.g. windows-x86_64, linux-x86_64, macos-arm64
-    stdio.json           <stdio.h>   — I/O
-    stdlib.json          <stdlib.h>  — general utilities, alloc, conversion
-    string.json          <string.h>  — byte-string / memory ops
-    ctype.json           <ctype.h>   — character classification
-    math.json            <math.h>    — floating-point math
+  stdio.json             <stdio.h>   — I/O
+  stdlib.json            <stdlib.h>  — general utilities, alloc, conversion
+  string.json            <string.h>  — byte-string / memory ops
+  ctype.json             <ctype.h>   — character classification
+  math.json              <math.h>    — floating-point math
 ```
 
-Each `<platform>` directory is a self-contained ABI surface. The platform name
-is `<arch>-<os>`-shaped so a future target-driven selector can pick the right
-directory from the target triple.
+FLAT and platform-neutral (Model 3): one descriptor per header, each carrying a
+per-object-format `library` map. There are no per-platform subdirectories — the
+target's object format picks the runtime image from the map at resolution time.
 
 ---
 
@@ -44,7 +52,11 @@ directory from the target triple.
 {
   "header":   "stdio.h",        // REQUIRED — provenance: which C header
   "standard": "c89",            // optional — provenance: which language standard
-  "library":  "msvcrt.dll",     // the runtime that exports these symbols
+  "library": {                  // per-object-format runtime image (Model 3)
+    "pe":    "msvcrt.dll",
+    "elf":   "libc.so.6",
+    "macho": "/usr/lib/libSystem.B.dylib"
+  },
   "symbols": [
     { "name": "puts",
       "signature": "fn(ptr<char>) -> i32",
@@ -58,7 +70,7 @@ directory from the target triple.
 |-------------|----------|---------|
 | `header`    | **yes**  | The header these symbols come from (`stdio.h`). This is the provenance answer to *"where does `puts` come from?"* — a descriptor that omitted it would defeat the purpose, so the reader **fails loud** (`F_ShippedLibDescriptorMalformed`) if it is missing or empty. |
 | `standard`  | no       | The language standard the surface targets (`c89`, `c99`, …). Provenance only. |
-| `library`   | no       | The runtime image that exports the symbols (provenance + the eventual link target — today the linker resolves against the format's default runtime via `externLibraryByFormat`). **Optional** in the reader: when absent/empty the lowering inherits the language's per-format default. Every shipped descriptor here sets it by convention, but a descriptor MAY omit it. |
+| `library`   | no       | A per-OBJECT-FORMAT MAP (`"pe"`/`"elf"`/`"macho"` → runtime image). The active compilation target's object format selects its entry at `compile_pipeline` resolution (keyed by `objectFormatKindName`). **Optional**: a map MISSING the active format's key (or absent entirely) inherits the language's `externLibraryByFormat[format]` default for that format. A key NOT in the object-format vocabulary (a typo like `"pee"`) **fails loud** (`F_ShippedLibDescriptorMalformed`) on read. |
 | `symbols`   | yes      | The exported surface. Each entry: `name`, `signature` (a hir-text type string), `kind`, `linkage`. |
 
 The `signature` grammar is the IR type-text vocabulary documented in
@@ -70,34 +82,31 @@ language. C types map as: `int`→`i32`, `unsigned int`→`u32`, `size_t`→`u64
 
 ---
 
-## ABI deltas — why a signature differs per platform
+## ABI deltas — the `long`-width data-model split (deferred)
 
-The C type `long` (and `unsigned long`) is **not** the same width everywhere,
-so the descriptors are **not** byte-identical across platforms. Two data models
-are in play:
+The C type `long` (and `unsigned long`) is **not** the same width everywhere:
+**LP64** (Linux + macOS) makes it 64-bit; **LLP64** (Windows) makes it 32-bit.
+Six symbols across two headers bear a `long` and so are data-model-dependent:
 
-| Data model | Platforms here          | `long` / `unsigned long` |
-|------------|-------------------------|--------------------------|
-| **LP64**   | `linux-x86_64`, `macos-arm64` | 64-bit → `i64` / `u64` |
-| **LLP64**  | `windows-x86_64`        | 32-bit → `i32` / `u32` |
+| Symbol (header)        | LP64 (linux/macos) — the form authored here | LLP64 (windows) — deferred |
+|------------------------|---------------------------------------------|----------------------------|
+| `atol` (stdlib)        | `fn(ptr<char>) -> i64`                      | `… -> i32`                 |
+| `strtol` (stdlib)      | `… -> i64`                                  | `… -> i32`                 |
+| `strtoul` (stdlib)     | `… -> u64`                                  | `… -> u32`                 |
+| `labs` (stdlib)        | `fn(i64) -> i64`                            | `fn(i32) -> i32`           |
+| `fseek` offset (stdio) | `fn(ptr<…FILE…>, i64, i32) -> i32`          | `fn(ptr<…FILE…>, i32, …)`  |
+| `ftell` (stdio)        | `… -> i64`                                  | `… -> i32`                 |
 
-This changes the encoded signature of every function that takes or returns a
-`long`:
-
-| Symbol (header)        | LP64 (linux/macos)                    | LLP64 (windows)                       |
-|------------------------|---------------------------------------|---------------------------------------|
-| `atol` (stdlib)        | `fn(ptr<char>) -> i64`                | `fn(ptr<char>) -> i32`                |
-| `strtol` (stdlib)      | `… -> i64`                            | `… -> i32`                            |
-| `strtoul` (stdlib)     | `… -> u64`                            | `… -> u32`                            |
-| `labs` (stdlib)        | `fn(i64) -> i64`                      | `fn(i32) -> i32`                      |
-| `fseek` offset (stdio) | `fn(ptr<…FILE…>, i64, i32) -> i32`    | `fn(ptr<…FILE…>, i32, i32) -> i32`    |
-| `ftell` (stdio)        | `… -> i64`                            | `… -> i32`                            |
-
-The `linux-x86_64` and `macos-arm64` surfaces are signature-identical (both
-LP64); they differ only in `library` (`libc.so.6` vs `libSystem.B.dylib`).
-
-Functions whose C signatures use fixed-width or model-invariant types
-(`int`, `double`, `size_t`, pointers) are identical across all three platforms.
+Because a descriptor is now **platform-neutral** (Model 3), these six carry a
+SINGLE authored form — the **LP64 (i64/u64)** form, correct for the runnable
+linux/macos targets. The Windows LLP64 (i32/u32) form is **latently deferred**:
+it is UNEXERCISED by any corpus/test, and is tracked by
+**`D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH`** (a `long` whose width depends on
+the data model). When that anchor lands a per-target primitive-width model, the
+neutral `long` will resolve to i32 on Windows and i64 on Unix automatically; the
+test `ShippedLibDescriptor.ShippedStdlibSignaturesAreLp64` guards the current
+form. Every other symbol uses fixed-width or model-invariant types
+(`int`, `double`, `size_t`, pointers) and is width-identical everywhere.
 
 ---
 
@@ -114,29 +123,35 @@ the concrete arity it calls.
 
 ---
 
-## Platform selection — current status
+## Per-target library selection (Model 3)
 
 The active c-subset config (`src/dss-config/sources/c-subset.lang.json`) sets
-`"shippedLibDirs": ["shippedLibs/windows-x86_64"]`, so today the
-**`windows-x86_64`** surface is the one live on the search path. The
-`linux-x86_64` and `macos-arm64` surfaces are authored and validated (every
-descriptor is proven to decode by `tests/ffi/test_shipped_lib_descriptor.cpp ::
-AllShippedDescriptorsDecode`) but await **target-driven selection** — choosing
-the directory from the compilation target's triple instead of a fixed config
-string. That wiring is pinned as **`D-FFI-SHIPPED-LIB-PLATFORM-SELECT`**.
+`"shippedLibDirs": ["shippedLibs"]` — the single neutral directory. There is no
+per-platform directory to choose: every target reads the SAME descriptors, and
+each descriptor's `library` MAP names the runtime image per object format. At
+`compile_pipeline` resolution the active target's format (`objectFormatKindName`
+→ `"pe"`/`"elf"`/`"macho"`) selects its entry; a map missing that format inherits
+the language's `externLibraryByFormat[format]` default. This is the same neutral
+descriptor + per-format map design throughout — agnostic, no `if(format)` in
+shared substrate, and it dissolved the former `D-FFI-SHIPPED-LIB-PLATFORM-SELECT`
+deferral entirely (a single descriptor set serves all targets).
 
-The fixed platform string lives in **config** (`*.lang.json`), never in engine
-code — the engine reads `shippedLibDirs` generically — so this is an honest
-staged deferral, not a hardcode in shared substrate.
+`examples/c-subset/shipped_include_puts` proves it end to end: `#include
+<stdio.h>` + `puts("hello")` links `puts` against msvcrt.dll on Windows-PE,
+libc.so.6 on Linux-ELF (x86_64 + arm64), and libSystem on macOS-Mach-O — from
+the one `stdio.json`.
 
 ---
 
 ## Adding or extending a descriptor
 
-1. Pick the right `<platform>/<header>.json` (create it if the header is new).
+1. Pick the right `<header>.json` (create it if the header is new — flat, no
+   per-platform subdir).
 2. Add the symbol with its hir-text signature (see `docs/ir-type-text.md` for
-   the vocabulary). Mind the ABI delta if it involves `long`.
-3. Set `header` (required) and `library`; `standard` is optional provenance.
+   the vocabulary). If it involves `long`, author the **LP64** (i64/u64) form
+   and note the `D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH` deferral (see above).
+3. Set `header` (required) and the per-format `library` map (`pe`/`elf`/`macho`);
+   `standard` is optional provenance.
 4. `AllShippedDescriptorsDecode` will validate the new file decodes and every
    signature parses. Add an end-to-end corpus under `examples/c-subset/` if it
    introduces a runtime-observable path not yet exercised.

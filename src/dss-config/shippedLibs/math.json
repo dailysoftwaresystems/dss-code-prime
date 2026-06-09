@@ -1,7 +1,7 @@
 {
   "header": "math.h",
   "standard": "c89",
-  "library": "msvcrt.dll",
+  "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "symbols": [
     { "name": "sqrt",  "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
     { "name": "pow",   "signature": "fn(f64, f64) -> f64", "kind": "function", "linkage": "external" },

@@ -17,12 +17,11 @@
   "$supportedDataSectionsComment": "D-LK1-ELF-EXEC-DATA-SECTIONS (rodata-only scope): the ELF ET_EXEC walker emits `.rodata` from `AssembledModule.dataItems` items with `section=Rodata`. The linker's pre-walker gate (linker.cpp) consults this set per-item — `Data` and `Bss` remain anchored under D-LK4-RODATA-PRODUCER. Same field + same shared `elf.cpp` code path as the x86_64-ELF exec format; arch differs only via config (pageAlign/machine). Cross-format agnosticism: zero format-name branches in the gate.",
   "supportedDataSections": ["rodata"],
 
-  "$processExitComment": "D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): the Linux AArch64 runnable-binary spine — a raw `exit_group` syscall (no libc dependency). The trampoline emitter loads the syscall number into x8 via `mov x8, 94` (the new MOVZ Imm16 encoding — see arm64.target.json), moves the user fn's return value from returnGprs[0] (x0) into argGprs[0] (x0 — a no-op mov here since both are x0, emitted for ABI uniformity with x86_64's rax→rdi), then issues SVC #0 (the target's `syscall` opcode). Linux AArch64 syscall ABI: x8 = syscall number, x0 = arg0 (exit status). syscallOpcodeBytes [1, 0, 0, 212] = the LITTLE-ENDIAN byte stream of 0xD4000001 (SVC #0); it cross-checks the target's `syscall` opcode fixedWord. Self-contained exit mechanism — no ADRP+LDR+BLR `call_indirect_via_extern` is needed (that GOT/PLT path stays deferred at D-LK6-8).",
+  "$processExitComment": "STDIO-FLUSH-AT-EXIT (2026-06-09): terminate via libc `exit(3)`, NOT the raw `exit_group(2)` syscall. The C standard says returning from `main` ≡ calling `exit(3)`, which flushes stdio + runs `atexit` before the process dies; the prior raw `exit_group` SVC skipped that flush (a `puts(\"hello\")`-then-return program exited cleanly but with stdout still buffered). By-name-import of libc `exit` makes the trampoline emit a DIRECT `BL` to the AArch64 PLT stub for `exit` (per externCallDispatch=direct-plt), exactly as a user FFI call lowers — so `exit` flushes, runs atexit, then issues the raw exit syscall itself. This routes EVERY AArch64-ELF program through the dynamic writer (libc.so.6 → DT_NEEDED, a 16-byte ARM64 PLT stub + GOT slot for `exit`, ld-linux-aarch64 resolves it) — the SAME machinery `extern_call_elf`'s arm64 arm already uses (D-LK6-8 ✅); the prior cycle's deferral of the GOT/PLT path for the exit mechanism is now realized via that proven dynamic-FFI substrate. importMangledName is the canonical C name `exit` (ELF adds no leading underscore). Uniform with macho (libSystem `exit`) + pe (kernel32 `ExitProcess`, msvcrt DLL-detach flush): all three terminate through a stdio-flushing libc-level primitive.",
   "processExit": {
-    "mechanism": "syscall",
-    "syscallNumber": 94,
-    "syscallNumGpr": "x8",
-    "syscallOpcodeBytes": [1, 0, 0, 212]
+    "mechanism": "by-name-import",
+    "importMangledName": "exit",
+    "importLibraryPath": "libc.so.6"
   },
 
   "$entryCallingConventionComment": "AAPCS64 calling convention — the user fn's return value (returnGprs[0] = x0) is moved into argGprs[0] (= x0) before SVC. Read via `target.callingConventionByName(\"aapcs64\")` at trampoline-build time.",

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ── LANGUAGE-NEUTRAL shipped-library FFI descriptor reader ───────────────────
@@ -19,14 +20,24 @@
 // language-agnostic schema, not a c-subset `.h`.
 //
 // Shape (`stdio.json`):
-//   { "header": "stdio.h", "standard": "c89", "library": "msvcrt.dll",
+//   { "header": "stdio.h", "standard": "c89",
+//     "library": { "pe": "msvcrt.dll", "elf": "libc.so.6",
+//                  "macho": "/usr/lib/libSystem.B.dylib" },
 //     "symbols": [
 //       { "name": "puts", "signature": "fn(ptr<char>) -> i32",
 //         "kind": "function", "linkage": "external" }
 //     ] }
 //
+// Model 3 (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC, 2026-06-09): a descriptor is
+// PLATFORM-NEUTRAL — ONE descriptor per header, with a per-OBJECT-FORMAT
+// `library` MAP keyed by the canonical `objectFormatKindName` vocabulary
+// ("pe"/"elf"/"macho"). The active compilation target's format selects its
+// runtime image at resolution time (compile_pipeline), so the SAME descriptor
+// serves every target — no per-platform directory selection. This dissolves
+// the former per-platform-directory layout + `D-FFI-SHIPPED-LIB-PLATFORM-SELECT`.
+//
 // PROVENANCE — every shipped symbol traces to header → standard → library →
-// platform (the directory). The `header` + `standard` fields make that origin
+// (object format). The `header` + `standard` fields make that origin
 // FIRST-CLASS data, not just a filename convention: a tool / diagnostic can
 // answer "where does `strlen` come from?" from the descriptor alone.
 //
@@ -39,10 +50,15 @@
 //   * `standard`  — optional. The language standard the header/symbols belong to
 //                   (e.g. "c89" / "c99" / "c11" / "posix"). Provenance only;
 //                   carried for tooling, not consumed by lowering.
-//   * `library`   — optional. The runtime import library every symbol routes
-//                   to. Empty ⇒ the CST→HIR lowering falls back to the active
-//                   language's `externLibraryByFormat[format]` default (so a
-//                   descriptor MAY omit it and inherit the language's default).
+//   * `library`   — optional per-OBJECT-FORMAT map ("pe"/"elf"/"macho" →
+//                   runtime image name). At resolution the active target's
+//                   format selects its entry. A map MISSING the active format's
+//                   key ⇒ the lowering falls back to the active language's
+//                   `externLibraryByFormat[format]` default (so a descriptor MAY
+//                   omit a format and inherit the language's default; an entirely
+//                   absent map inherits for every format). A key NOT in the
+//                   `objectFormatKindFromName` vocabulary is a typo/garbage and
+//                   FAILS LOUD on read (F_ShippedLibDescriptorMalformed).
 //   * `symbols`   — required, non-empty array.
 //   * `name`      — required. The undecorated C identifier (the linker-visible
 //                   name is produced downstream by FF4 mangling).
@@ -103,12 +119,17 @@ struct DSS_EXPORT ShippedSymbol {
 
 // A decoded shipped-library descriptor. `header` is the authoritative
 // provenance (which header these symbols come from); `standard` is optional
-// provenance; `library` MAY be empty (the lowering then falls back to the
-// language's per-format default).
+// provenance; `library` is a per-OBJECT-FORMAT map ("pe"/"elf"/"macho" → image
+// name) that MAY be empty or omit a format (the resolution then falls back to
+// the language's per-format default). Keys are validated against the
+// `objectFormatKindFromName` vocabulary on read — an unknown key fails loud.
 struct DSS_EXPORT ShippedLibDescriptor {
     std::string                header;    // REQUIRED provenance, e.g. "stdio.h".
     std::string                standard;  // optional provenance, e.g. "c89".
-    std::string                library;
+    // Per-object-format runtime image, keyed by `objectFormatKindName`
+    // ("pe"/"elf"/"macho"). The compile pipeline selects the active target's
+    // entry; a missing key inherits `externLibraryByFormat[format]`.
+    std::unordered_map<std::string, std::string> library;
     std::vector<ShippedSymbol> symbols;
 };
 

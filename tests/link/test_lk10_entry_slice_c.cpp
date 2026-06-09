@@ -88,6 +88,80 @@ namespace {
     return mod;
 }
 
+// STDIO-FLUSH-AT-EXIT (2026-06-09): the SHIPPED elf64-*-linux-exec
+// formats now terminate via libc `exit(3)` (a by-name-import — see
+// test_object_format_schema.cpp ShippedElfExecExitsViaLibcExitImport).
+// The Syscall ARM of the trampoline emitter is still a fully supported
+// capability (the right shape for a future hermetic/no-libc target), so
+// the two byte/structure pins below keep exercising it via SYNTHETIC
+// syscall formats rather than the shipped JSON — decoupling the
+// Syscall-arm regression coverage from the shipped formats' policy.
+//
+// The synthetic format is a COMPLETE inline ELF-exec schema (all the
+// fields the loader requires for a successful load — `elf` identity with
+// pageAlign/type, entryPoint, externCallDispatch, sections), differing
+// from the shipped format ONLY in the processExit block (syscall, not
+// the libc-exit by-name-import). Built as a raw string (no nlohmann dep
+// on this test target). injectEntryTrampoline reads only processExit /
+// entryCallingConvention / externCallDispatch / entryPoint.
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
+makeSyscallElfExecFormat() {
+    // x86_64 Linux exit_group=231 via SYSCALL (0x0F 0x05) in rax.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": { "name": "synth-elf-syscall-x64", "version": "0.1", "kind": "elf" },
+      "entryPoint": "",
+      "externCallDispatch": "direct-plt",
+      "elf": {
+        "class": "elf64", "data": "lsb", "osabi": "sysv", "machine": 62,
+        "type": "exec", "pageAlign": 4096,
+        "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": true
+      },
+      "entryCallingConvention": "sysv_amd64",
+      "processExit": {
+        "mechanism": "syscall",
+        "syscallNumber": 231,
+        "syscallNumGpr": "rax",
+        "syscallOpcodeBytes": [15, 5]
+      },
+      "sections": [
+        { "kind": "text", "name": ".text", "type": 1, "flags": 6,
+          "addrAlign": 16, "entrySize": 0, "virtualAddress": 4198400 }
+      ]
+    })");
+    if (!r.has_value()) return nullptr;
+    return *r;
+}
+
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
+makeSyscallElfExecFormatArm64() {
+    // AArch64 Linux exit_group=94 via SVC #0 (0xD4000001) in x8.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": { "name": "synth-elf-syscall-arm64", "version": "0.1", "kind": "elf" },
+      "entryPoint": "",
+      "externCallDispatch": "direct-plt",
+      "elf": {
+        "class": "elf64", "data": "lsb", "osabi": "sysv", "machine": 183,
+        "type": "exec", "pageAlign": 4096,
+        "interpreter": "/lib/ld-linux-aarch64.so.1", "bindNow": true
+      },
+      "entryCallingConvention": "aapcs64",
+      "processExit": {
+        "mechanism": "syscall",
+        "syscallNumber": 94,
+        "syscallNumGpr": "x8",
+        "syscallOpcodeBytes": [1, 0, 0, 212]
+      },
+      "sections": [
+        { "kind": "text", "name": ".text", "type": 1, "flags": 6,
+          "addrAlign": 16, "entrySize": 0, "virtualAddress": 4194304 }
+      ]
+    })");
+    if (!r.has_value()) return nullptr;
+    return *r;
+}
+
 // Build a PE-Exec ObjectFormatSchema by loading the shipped
 // pe64-x86_64-windows-exec format JSON and patching its
 // `entryPoint` field. Used by the D-LK10-ENTRY-EXTERN-ENTRY-DIAG
@@ -341,20 +415,27 @@ TEST(LK10EntrySliceC, SymbolIdSpaceExhaustionFailsLoud) {
 // tests exercise the PE/ByNameImport arm of the trampoline. The
 // ELF/Syscall arm (Linux exit_group=231 via SYSCALL) is structurally
 // covered by the same emitter but has no dedicated pin. Bytes-only
-// pin via injectEntryTrampoline on `elf64-x86_64-linux-exec` format
-// — avoids the POSIX-RUN-HARNESS wait (anchored D-LK10-ENTRY-POSIX-
-// RUN-HARNESS) while still catching Syscall-arm regressions.
+// pin via injectEntryTrampoline — avoids the POSIX-RUN-HARNESS wait
+// (anchored D-LK10-ENTRY-POSIX-RUN-HARNESS) while still catching
+// Syscall-arm regressions.
+//
+// STDIO-FLUSH-AT-EXIT (2026-06-09): the SHIPPED elf64-x86_64-linux-exec
+// now terminates via libc `exit(3)` (by-name-import), so this Syscall-arm
+// pin uses a SYNTHETIC syscall ELF-exec format (makeSyscallElfExecFormat)
+// — keeping the Syscall-arm emitter coverage real + independent of the
+// shipped format's policy.
 TEST(LK10EntrySliceC, SyscallArmInjectsCleanlyOnElfExec) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
-    auto format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
-    ASSERT_TRUE(format.has_value());
+    auto format = makeSyscallElfExecFormat();
+    ASSERT_TRUE(format != nullptr)
+        << "synthetic syscall ELF-exec format must load";
     auto mod = makeReturn42Module();
     DiagnosticReporter rep;
     ASSERT_TRUE(linker::injectEntryTrampoline(
-        mod, **target, **format, rep))
-        << "Syscall-arm trampoline injection must succeed on "
-           "elf64-x86_64-linux-exec";
+        mod, **target, *format, rep))
+        << "Syscall-arm trampoline injection must succeed on a "
+           "syscall-mechanism ELF-exec format";
     EXPECT_EQ(rep.errorCount(), 0u);
     // Module post-injection: 2 functions (trampoline at [0], user
     // at [1]) + ZERO synthetic externImports (Syscall arm doesn't
@@ -484,24 +565,30 @@ TEST(LK10EntrySliceC, SysvElfTrampolineEmitsNoPrologue) {
 
 // ── D-LK10-ENTRY-ARM64 trampoline byte pin (v0.0.2 V2-1) ───────────
 //
-// The deterministic, host-independent proof that the ARM64 exit
+// The deterministic, host-independent proof that the ARM64 SYSCALL exit
 // mechanism encodes correctly. Asserts the EXACT 20-byte `_start`
-// sequence for the aapcs64/syscall trampoline on arm64 +
-// elf64-aarch64-linux-exec. RED-on-disable across the whole cycle's
-// substrate: break the MOVZ Imm16 encoding → bytes[8..11] wrong;
-// break the bl→call rename → injectEntryTrampoline returns false;
-// break the syscall opcode → bytes[12..15] wrong. This is the proof
-// that lands green on EVERY host (the runnable corpus example runs
-// under QEMU only where present).
+// sequence for the aapcs64/syscall trampoline on arm64. RED-on-disable
+// across the whole V2-1 substrate: break the MOVZ Imm16 encoding →
+// bytes[8..11] wrong; break the bl→call rename → injectEntryTrampoline
+// returns false; break the syscall opcode → bytes[12..15] wrong.
+//
+// STDIO-FLUSH-AT-EXIT (2026-06-09): the SHIPPED elf64-aarch64-linux-exec
+// now terminates via libc `exit(3)` (by-name-import → a BL to the `exit`
+// PLT stub, NOT MOVZ x8/SVC). This Syscall-arm byte pin therefore drives
+// a SYNTHETIC arm64 syscall ELF-exec format (makeSyscallElfExecFormatArm64)
+// — preserving the exact syscall-trampoline encoding coverage independent
+// of the shipped format's libc-exit policy. The shipped libc-exit shape is
+// covered separately by ShippedElfArm64TrampolineCallsLibcExit below.
 TEST(LK10EntrySliceC, Arm64TrampolineEmitsExactExitSequence) {
     auto target = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
-    auto format = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
-    ASSERT_TRUE(format.has_value());
+    auto format = makeSyscallElfExecFormatArm64();
+    ASSERT_TRUE(format != nullptr)
+        << "synthetic arm64 syscall ELF-exec format must load";
     auto mod = makeReturn42ModuleArm64();
     DiagnosticReporter rep;
     ASSERT_TRUE(linker::injectEntryTrampoline(
-        mod, **target, **format, rep))
+        mod, **target, *format, rep))
         << "ARM64 syscall-arm trampoline injection must succeed — "
            "requires the `call` (BL), `mov` reg+MOVZ, `syscall` (SVC), "
            "and `unreachable` (BRK) opcodes all present on arm64.";
@@ -540,6 +627,131 @@ TEST(LK10EntrySliceC, Arm64TrampolineEmitsExactExitSequence) {
         << "trampoline's BL must carry a call26 reloc to user_entry";
     EXPECT_TRUE(mod.imageEntryOverride.has_value());
     EXPECT_EQ(*mod.imageEntryOverride, 0u);
+}
+
+// ── STDIO-FLUSH-AT-EXIT (2026-06-09): shipped ELF → libc exit ──────
+//
+// The shipped elf64-*-linux-exec formats terminate via libc `exit(3)`
+// (a by-name-import → DIRECT call/BL to the `exit` PLT stub under
+// externCallDispatch=direct-plt), so stdio is flushed + atexit runs
+// before the process dies. These pins prove the SHIPPED trampoline:
+//   (1) injects a synthetic `exit` ExternImport (libc.so.6) — so
+//       libc.so.6 becomes a DT_NEEDED + a PLT stub/GOT slot is emitted;
+//   (2) emits a CALL/BL to that import (NOT a raw exit_group syscall);
+//   (3) does NOT load a syscall number / emit a SYSCALL/SVC.
+//
+// RED-on-disable: revert either shipped ELF format's processExit to
+// `mechanism:"syscall"` (the old exit_group) and these fail — the
+// `exit` import vanishes (1) and the trampoline reverts to MOVZ+SVC /
+// mov-eax+SYSCALL (2,3). This is the strict guard the libc-exit policy
+// rides on (the runtime witnesses are the native linux CI legs + the
+// local WSL/qemu run of shipped_include_puts → "hello\n" + exit 42).
+TEST(LK10EntrySliceC, ShippedElfX64TrampolineCallsLibcExit) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(format.has_value());
+    auto mod = makeReturn42Module();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(linker::injectEntryTrampoline(
+        mod, **target, **format, rep))
+        << "shipped ELF-x64 libc-exit trampoline injection must succeed";
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(mod.functions.size(), 2u);
+
+    // (1) The synthetic `exit` import (libc.so.6) was appended.
+    bool sawExitImport = false;
+    for (auto const& e : mod.externImports) {
+        if (e.mangledName == "exit") {
+            sawExitImport = true;
+            EXPECT_EQ(e.libraryPath, "libc.so.6")
+                << "libc exit must import from libc.so.6 (→ DT_NEEDED)";
+        }
+    }
+    EXPECT_TRUE(sawExitImport)
+        << "by-name-import exit arm must inject an `exit` ExternImport "
+           "(none → the format reverted to the raw exit_group syscall).";
+
+    // (2)+(3) The trampoline body: `call user_entry` (E8) + `mov ecx/edi`
+    // + `call exit` (E8) — under direct-plt the exit call is a PLAIN
+    // DIRECT `call` (E8 disp32), NOT FF 15 (indirect) and NOT a SYSCALL
+    // (0F 05). Count E8 opcodes: exactly two direct calls.
+    auto const& tramp = mod.functions[0].bytes;
+    int e8Count = 0;
+    bool sawSyscall = false;
+    for (std::size_t i = 0; i + 1 < tramp.size(); ++i) {
+        if (tramp[i] == 0xE8u) ++e8Count;
+        if (tramp[i] == 0x0Fu && tramp[i + 1] == 0x05u) sawSyscall = true;
+    }
+    EXPECT_EQ(e8Count, 2)
+        << "expected two direct calls: E8 → user_entry + E8 → exit stub";
+    EXPECT_FALSE(sawSyscall)
+        << "libc-exit trampoline must NOT contain a raw SYSCALL (0F 05) "
+           "— the whole point is to route through libc exit(3), which "
+           "flushes stdio, instead of the raw exit_group syscall.";
+
+    // Two relocations: user_entry (SymbolId{1}) + the exit import. The
+    // exit import got a fresh SymbolId; its reloc target is whichever
+    // externImports[].symbol carries mangledName=="exit".
+    SymbolId exitSym{0};
+    for (auto const& e : mod.externImports)
+        if (e.mangledName == "exit") exitSym = e.symbol;
+    bool sawUserReloc = false, sawExitReloc = false;
+    for (auto const& r : mod.functions[0].relocations) {
+        if (r.target == SymbolId{1}) sawUserReloc = true;
+        if (exitSym.v != 0 && r.target == exitSym) sawExitReloc = true;
+    }
+    EXPECT_TRUE(sawUserReloc) << "trampoline must call user_entry";
+    EXPECT_TRUE(sawExitReloc)
+        << "trampoline's exit call must carry a REL32 reloc to the "
+           "synthetic `exit` import (direct-plt → patched to the stub VA)";
+}
+
+TEST(LK10EntrySliceC, ShippedElfArm64TrampolineCallsLibcExit) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
+    ASSERT_TRUE(format.has_value());
+    auto mod = makeReturn42ModuleArm64();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(linker::injectEntryTrampoline(
+        mod, **target, **format, rep))
+        << "shipped ELF-arm64 libc-exit trampoline injection must succeed";
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(mod.functions.size(), 2u);
+
+    // (1) The synthetic `exit` import (libc.so.6) was appended.
+    bool sawExitImport = false;
+    for (auto const& e : mod.externImports)
+        if (e.mangledName == "exit") {
+            sawExitImport = true;
+            EXPECT_EQ(e.libraryPath, "libc.so.6");
+        }
+    EXPECT_TRUE(sawExitImport)
+        << "by-name-import exit arm must inject an `exit` ExternImport.";
+
+    // (2)+(3) Two BLs (0x94......): BL user_entry + BL exit stub. NO SVC
+    // (0xD4000001) — the MOVZ x8/SVC syscall sequence must be gone.
+    auto const& tramp = mod.functions[0].bytes;
+    ASSERT_EQ(tramp.size() % 4u, 0u);
+    int blCount = 0;
+    bool sawSvc = false;
+    for (std::size_t i = 0; i + 3 < tramp.size(); i += 4) {
+        std::uint32_t const w = static_cast<std::uint32_t>(tramp[i])
+            | (static_cast<std::uint32_t>(tramp[i + 1]) << 8)
+            | (static_cast<std::uint32_t>(tramp[i + 2]) << 16)
+            | (static_cast<std::uint32_t>(tramp[i + 3]) << 24);
+        if ((w & 0xFC000000u) == 0x94000000u) ++blCount;   // BL imm26
+        if (w == 0xD4000001u) sawSvc = true;               // SVC #0
+    }
+    EXPECT_EQ(blCount, 2)
+        << "expected two BLs: BL → user_entry + BL → exit stub "
+           "(direct-plt). A single BL means the exit call regressed to "
+           "the raw syscall arm.";
+    EXPECT_FALSE(sawSvc)
+        << "libc-exit trampoline must NOT contain SVC #0 (0xD4000001) — "
+           "it routes through libc exit(3) (flushes stdio), not the raw "
+           "exit_group syscall.";
 }
 
 // ── D-LK10-ENTRY-EXTERN-ENTRY-DIAG distinct diagnostic ─────────────

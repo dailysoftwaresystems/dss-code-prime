@@ -206,7 +206,7 @@ TEST(ImportResolver, CSubsetAngleIncludeResolvesToDescriptorOnSystemDir) {
         "#include <api.h>\nint main() { return 0; }\n");
     // The shipped artifact is a NEUTRAL JSON descriptor, NOT a c-subset `.h`.
     auto descPath = sysDir.write("api.json",
-        R"({ "library": "lib.dll",
+        R"({ "library": { "pe": "lib.dll" },
              "symbols": [ { "name": "use", "signature": "fn() -> i32" } ] })");
 
     UnitBuilder builder{loadShippedSchema("c-subset")};

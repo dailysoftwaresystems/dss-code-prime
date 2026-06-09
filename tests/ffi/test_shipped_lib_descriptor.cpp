@@ -47,7 +47,8 @@ namespace {
 TEST(ShippedLibDescriptor, ReadsPutsWithDecodedFnSig) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "stdio.json", R"({
-        "header": "stdio.h", "library": "msvcrt.dll",
+        "header": "stdio.h",
+        "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
         "symbols": [
             { "name": "puts", "signature": "fn(ptr<char>) -> i32",
               "kind": "function", "linkage": "external" }
@@ -61,7 +62,11 @@ TEST(ShippedLibDescriptor, ReadsPutsWithDecodedFnSig) {
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
     ASSERT_TRUE(desc.has_value());
     EXPECT_FALSE(rep.hasErrors());
-    EXPECT_EQ(desc->library, "msvcrt.dll");
+    // Model 3: `library` is a per-object-format map; assert each entry.
+    EXPECT_EQ(desc->library.size(), 3u);
+    EXPECT_EQ(desc->library.at("pe"), "msvcrt.dll");
+    EXPECT_EQ(desc->library.at("elf"), "libc.so.6");
+    EXPECT_EQ(desc->library.at("macho"), "/usr/lib/libSystem.B.dylib");
     EXPECT_EQ(desc->header, "stdio.h");   // provenance, first-class
     ASSERT_EQ(desc->symbols.size(), 1u);
 
@@ -83,8 +88,8 @@ TEST(ShippedLibDescriptor, ReadsPutsWithDecodedFnSig) {
     EXPECT_EQ(interner.kind(ptrElem[0]), TypeKind::Char);
 }
 
-// `library` is optional — absent ⇒ empty (the lowering falls back to the
-// language's externLibraryByFormat default).
+// `library` is optional — absent ⇒ empty map (resolution then falls back to the
+// language's externLibraryByFormat default for every format).
 TEST(ShippedLibDescriptor, LibraryIsOptional) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "nolib.json", R"({
@@ -109,7 +114,7 @@ TEST(ShippedLibDescriptor, LibraryIsOptional) {
 TEST(ShippedLibDescriptor, ObjectKindDecodes) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "obj.json", R"({
-        "header": "stdio.h", "library": "msvcrt.dll",
+        "header": "stdio.h", "library": { "pe": "msvcrt.dll" },
         "symbols": [ { "name": "errno", "signature": "i32", "kind": "object" } ]
     })");
 
@@ -142,7 +147,7 @@ TEST(ShippedLibDescriptor, MalformedJsonFailsLoud) {
 
 TEST(ShippedLibDescriptor, MissingSymbolsKeyFailsLoud) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
-    auto const path = writeTemp(dir, "nosyms.json", R"({ "header": "x.h", "library": "msvcrt.dll" })");
+    auto const path = writeTemp(dir, "nosyms.json", R"({ "header": "x.h", "library": { "pe": "msvcrt.dll" } })");
 
     TypeInterner interner{CompilationUnitId{1}};
     TypeRegistry typeReg;
@@ -157,7 +162,7 @@ TEST(ShippedLibDescriptor, MissingSymbolsKeyFailsLoud) {
 TEST(ShippedLibDescriptor, MissingSignatureKeyFailsLoud) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "nosig.json", R"({
-        "header": "stdio.h", "library": "msvcrt.dll",
+        "header": "stdio.h", "library": { "pe": "msvcrt.dll" },
         "symbols": [ { "name": "puts" } ]
     })");
 
@@ -174,7 +179,7 @@ TEST(ShippedLibDescriptor, MissingSignatureKeyFailsLoud) {
 TEST(ShippedLibDescriptor, UnknownKeyFailsLoud) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "unknownkey.json", R"({
-        "header": "stdio.h", "library": "msvcrt.dll",
+        "header": "stdio.h", "library": { "pe": "msvcrt.dll" },
         "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32",
                        "calling_convention": "stdcall" } ]
     })");
@@ -192,7 +197,7 @@ TEST(ShippedLibDescriptor, UnknownKeyFailsLoud) {
 TEST(ShippedLibDescriptor, UnknownEnumFailsLoud) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "badenum.json", R"({
-        "header": "stdio.h", "library": "msvcrt.dll",
+        "header": "stdio.h", "library": { "pe": "msvcrt.dll" },
         "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32",
                        "kind": "macro" } ]
     })");
@@ -212,7 +217,7 @@ TEST(ShippedLibDescriptor, UnknownEnumFailsLoud) {
 TEST(ShippedLibDescriptor, TruncatedSignatureFailsLoud) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "truncsig.json", R"({
-        "header": "stdio.h", "library": "msvcrt.dll",
+        "header": "stdio.h", "library": { "pe": "msvcrt.dll" },
         "symbols": [ { "name": "puts", "signature": "fn(ptr<" } ]
     })");
 
@@ -231,7 +236,7 @@ TEST(ShippedLibDescriptor, TruncatedSignatureFailsLoud) {
 TEST(ShippedLibDescriptor, UnknownTypeSignatureFailsLoud) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "unknowntype.json", R"({
-        "header": "stdio.h", "library": "msvcrt.dll",
+        "header": "stdio.h", "library": { "pe": "msvcrt.dll" },
         "symbols": [ { "name": "puts", "signature": "fn(wat) -> i32" } ]
     })");
 
@@ -250,7 +255,7 @@ TEST(ShippedLibDescriptor, UnknownTypeSignatureFailsLoud) {
 TEST(ShippedLibDescriptor, MissingHeaderFailsLoud) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "noheader.json", R"({
-        "library": "msvcrt.dll",
+        "library": { "pe": "msvcrt.dll" },
         "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ]
     })");
 
@@ -278,13 +283,14 @@ TEST(ShippedLibDescriptor, MissingHeaderFailsLoud) {
     return {};
 }
 
-// Every descriptor SHIPPED under src/dss-config/shippedLibs/<platform>/*.json
-// must read + decode cleanly: valid JSON, a non-empty `header` that AGREES with
-// the filename stem (the resolver routes `<stdlib.h>`→stdlib.json by stem, so a
-// descriptor whose `header` provenance lies about its origin is a real bug), and
-// EVERY symbol's `signature` decodes via the one type-text codec. A malformed
-// JSON or an unencodable signature in a shipped descriptor breaks the standard-
-// library surface for that platform — fail loud HERE, not at a user's `#include`.
+// Every descriptor SHIPPED under src/dss-config/shippedLibs/*.json (Model 3: a
+// FLAT, platform-neutral layout — one descriptor per header) must read + decode
+// cleanly: valid JSON, a non-empty `header` that AGREES with the filename stem
+// (the resolver routes `<stdlib.h>`→stdlib.json by stem, so a descriptor whose
+// `header` provenance lies about its origin is a real bug), and EVERY symbol's
+// `signature` decodes via the one type-text codec. A malformed JSON or an
+// unencodable signature in a shipped descriptor breaks the standard-library
+// surface — fail loud HERE, not at a user's `#include`.
 TEST(ShippedLibDescriptor, AllShippedDescriptorsDecode) {
     fs::path const shippedRoot = shippedLibsRoot();
     ASSERT_FALSE(shippedRoot.empty())
@@ -327,51 +333,57 @@ TEST(ShippedLibDescriptor, AllShippedDescriptorsDecode) {
         << "no shipped descriptors found under " << shippedRoot.generic_string();
 }
 
-// The LP64-vs-LLP64 ABI delta is the ENTIRE reason the linux/macos stdlib
-// descriptors differ from windows: C `long` is 64-bit on LP64 (Linux/macOS) but
-// 32-bit on LLP64 (Windows), so `atol`/`labs`/`strtoul` return different widths.
-// `AllShippedDescriptorsDecode` only proves the signatures DECODE — both `i32`
-// and `i64` are valid types, so a copy-paste leaving macos with the Windows i32
-// widths (or a Win/Linux file swap) would stay GREEN there. This pins the ACTUAL
-// per-platform result widths STRUCTURALLY (interner accessors, not string
-// compare) so a width regression goes RED.
-TEST(ShippedLibDescriptor, ShippedStdlibAbiDeltaIsLp64VsLlp64) {
+// Model 3 (2026-06-09): the descriptors are PLATFORM-NEUTRAL — ONE stdlib.json /
+// stdio.json with a per-format `library` map. The 6 `long`-bearing symbols carry
+// the C `long`/`unsigned long` type in the **LP64** (i64/u64) form, which is
+// correct for the runnable linux/macos targets. `AllShippedDescriptorsDecode`
+// only proves the signatures DECODE — both `i32` and `i64` are valid types, so a
+// regression that reverted these to the Windows LLP64 (i32/u32) widths would
+// stay GREEN there. This pins the ACTUAL neutral result widths STRUCTURALLY
+// (interner accessors, not a string compare) so a width revert goes RED.
+//
+// The Windows LLP64 (i32/u32) form for these 6 is latently DEFERRED — UNEXERCISED
+// by any corpus/test — and tracked by `D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH`
+// (a `long` whose width depends on the data model). When that anchor lands a
+// per-target primitive-width model, the neutral descriptor's `long` will resolve
+// to i32 on Windows and i64 on Unix; until then the neutral i64/u64 is the single
+// authored form and this test guards it.
+TEST(ShippedLibDescriptor, ShippedStdlibSignaturesAreLp64) {
     fs::path const root = shippedLibsRoot();
     ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
 
-    // Find a named function symbol in <platform>/<lib>.json and return its
-    // FnSig (interner kept alive by the caller via the returned descriptor).
-    auto fnSigOf = [&](TypeInterner& interner, char const* platform,
-                       char const* lib, char const* symName) -> TypeId {
+    // Find a named function symbol in the FLAT <lib>.json and return its FnSig
+    // (interner kept alive by the caller via the returned descriptor).
+    auto fnSigOf = [&](TypeInterner& interner, char const* lib,
+                       char const* symName) -> TypeId {
         TypeRegistry typeReg;
         DiagnosticReporter rep;
         auto desc = readShippedLibDescriptor(
-            root / platform / (std::string(lib) + ".json"), interner, typeReg, rep);
-        EXPECT_TRUE(desc.has_value())
-            << platform << "/" << lib << ".json failed to load";
+            root / (std::string(lib) + ".json"), interner, typeReg, rep);
+        EXPECT_TRUE(desc.has_value()) << lib << ".json failed to load";
+        EXPECT_FALSE(rep.hasErrors()) << lib << ".json emitted diagnostics";
         if (!desc.has_value()) return {};
         for (auto const& s : desc->symbols) {
             if (s.name == symName) {
                 EXPECT_EQ(interner.kind(s.signature), TypeKind::FnSig)
-                    << symName << " is not a function in " << platform;
+                    << symName << " is not a function in " << lib;
                 return s.signature;
             }
         }
-        ADD_FAILURE() << symName << " not found in " << platform << "/" << lib;
+        ADD_FAILURE() << symName << " not found in " << lib;
         return {};
     };
-    // The FnSig RESULT kind of <platform>/<lib>::<sym>.
-    auto resultKindOf = [&](char const* platform, char const* lib,
-                            char const* symName) -> TypeKind {
+    // The FnSig RESULT kind of <lib>::<sym>.
+    auto resultKindOf = [&](char const* lib, char const* symName) -> TypeKind {
         TypeInterner interner{CompilationUnitId{1}};
-        TypeId const sig = fnSigOf(interner, platform, lib, symName);
+        TypeId const sig = fnSigOf(interner, lib, symName);
         return sig.valid() ? interner.kind(interner.fnResult(sig)) : TypeKind::Void;
     };
-    // The FnSig PARAM[i] kind of <platform>/<lib>::<sym> (for fseek's offset).
-    auto paramKindOf = [&](char const* platform, char const* lib,
-                           char const* symName, std::size_t i) -> TypeKind {
+    // The FnSig PARAM[i] kind of <lib>::<sym> (for fseek's offset).
+    auto paramKindOf = [&](char const* lib, char const* symName,
+                           std::size_t i) -> TypeKind {
         TypeInterner interner{CompilationUnitId{1}};
-        TypeId const sig = fnSigOf(interner, platform, lib, symName);
+        TypeId const sig = fnSigOf(interner, lib, symName);
         if (!sig.valid()) return TypeKind::Void;
         auto const params = interner.fnParams(sig);
         EXPECT_GT(params.size(), i) << symName << " has too few params";
@@ -381,23 +393,79 @@ TEST(ShippedLibDescriptor, ShippedStdlibAbiDeltaIsLp64VsLlp64) {
     // Pin EVERY `long`-bearing symbol (not a subset — a per-symbol copy-paste is
     // the exact failure mode). stdlib: atol/strtol return long, strtoul returns
     // unsigned long, labs takes+returns long. stdio: ftell returns long, fseek's
-    // offset (param[1]) is long.
-    for (char const* lp64 : {"linux-x86_64", "macos-arm64"}) {
-        // LP64: `long` = 64-bit → i64; `unsigned long` → u64.
-        EXPECT_EQ(resultKindOf(lp64, "stdlib", "atol"),    TypeKind::I64) << lp64;
-        EXPECT_EQ(resultKindOf(lp64, "stdlib", "strtol"),  TypeKind::I64) << lp64;
-        EXPECT_EQ(resultKindOf(lp64, "stdlib", "strtoul"), TypeKind::U64) << lp64;
-        EXPECT_EQ(resultKindOf(lp64, "stdlib", "labs"),    TypeKind::I64) << lp64;
-        EXPECT_EQ(resultKindOf(lp64, "stdio",  "ftell"),   TypeKind::I64) << lp64;
-        EXPECT_EQ(paramKindOf(lp64,  "stdio",  "fseek", 1), TypeKind::I64) << lp64;
-    }
-    // LLP64 (Windows): `long` = 32-bit → i32; `unsigned long` → u32.
-    EXPECT_EQ(resultKindOf("windows-x86_64", "stdlib", "atol"),    TypeKind::I32);
-    EXPECT_EQ(resultKindOf("windows-x86_64", "stdlib", "strtol"),  TypeKind::I32);
-    EXPECT_EQ(resultKindOf("windows-x86_64", "stdlib", "strtoul"), TypeKind::U32);
-    EXPECT_EQ(resultKindOf("windows-x86_64", "stdlib", "labs"),    TypeKind::I32);
-    EXPECT_EQ(resultKindOf("windows-x86_64", "stdio",  "ftell"),   TypeKind::I32);
-    EXPECT_EQ(paramKindOf("windows-x86_64",  "stdio",  "fseek", 1), TypeKind::I32);
+    // offset (param[1]) is long. LP64: `long` = 64-bit → i64; `unsigned long` → u64.
+    EXPECT_EQ(resultKindOf("stdlib", "atol"),    TypeKind::I64);
+    EXPECT_EQ(resultKindOf("stdlib", "strtol"),  TypeKind::I64);
+    EXPECT_EQ(resultKindOf("stdlib", "strtoul"), TypeKind::U64);
+    EXPECT_EQ(resultKindOf("stdlib", "labs"),    TypeKind::I64);
+    EXPECT_EQ(resultKindOf("stdio",  "ftell"),   TypeKind::I64);
+    EXPECT_EQ(paramKindOf("stdio",   "fseek", 1), TypeKind::I64);
+    // labs takes long too (param[0]) — pin it so a revert of the ARG width
+    // (not just the result) also goes RED.
+    EXPECT_EQ(paramKindOf("stdlib",  "labs", 0),  TypeKind::I64);
+}
+
+// Model 3 per-format `library` MAP: a shipped descriptor routes a DIFFERENT
+// runtime image per object format, keyed by the canonical objectFormatKindName
+// vocabulary ("pe"/"elf"/"macho"). Pin that the SHIPPED stdio.json carries all
+// three (RED if a clone drops one or hardcodes a single string), AND that an
+// UNKNOWN format key fails loud (the typo-catch the map's vocabulary check buys).
+TEST(ShippedLibDescriptor, ShippedStdioLibraryMapRoutesPerObjectFormat) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(root / "stdio.json", interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    // The neutral descriptor names the correct runtime per format — the whole
+    // point of Model 3. RED if a future edit reverts to one string or swaps them.
+    EXPECT_EQ(desc->library.at("pe"),    "msvcrt.dll");
+    EXPECT_EQ(desc->library.at("elf"),   "libc.so.6");
+    EXPECT_EQ(desc->library.at("macho"), "/usr/lib/libSystem.B.dylib");
+}
+
+// An UNKNOWN object-format key in the `library` map is a typo/garbage and fails
+// loud on read (F_ShippedLibDescriptorMalformed) — NOT a silently-ignored key
+// that would route nothing. RED-on-disable: drop the objectFormatKindFromName
+// check and "pee" decodes silently.
+TEST(ShippedLibDescriptor, UnknownLibraryFormatKeyFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "badfmt.json", R"({
+        "header": "stdio.h", "library": { "pee": "msvcrt.dll" },
+        "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
+}
+
+// A non-OBJECT `library` (the pre-Model-3 single-string shape) is now malformed —
+// the schema requires the per-format map. Pin the rejection so a stale string
+// descriptor fails loud rather than silently losing its routing.
+TEST(ShippedLibDescriptor, NonObjectLibraryFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "strlib.json", R"({
+        "header": "stdio.h", "library": "msvcrt.dll",
+        "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
 }
 
 // `standard` is optional provenance — it round-trips when present, and a
@@ -407,7 +475,7 @@ TEST(ShippedLibDescriptor, StandardProvenanceRoundTripsAndTypeChecks) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     {
         auto const path = writeTemp(dir, "std.json", R"({
-            "header": "stdio.h", "standard": "c99", "library": "msvcrt.dll",
+            "header": "stdio.h", "standard": "c99", "library": { "pe": "msvcrt.dll" },
             "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ]
         })");
         TypeInterner interner{CompilationUnitId{1}};

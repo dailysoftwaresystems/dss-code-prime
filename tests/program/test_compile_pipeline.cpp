@@ -1053,3 +1053,119 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
                "— the inlining in arm 1 is what removes it (RED-on-disable witness)";
     }
 }
+
+// ── Model 3 per-OBJECT-FORMAT shipped-library resolution (2026-06-09) ─────────
+//
+// The END-TO-END pin of the Model-3 fold: a PLATFORM-NEUTRAL `stdio.json` whose
+// `library` is a per-format MAP, pulled in by `#include <stdio.h>`, must resolve
+// the synthesized `puts` import to the runtime image of the ACTIVE target's
+// object FORMAT — `libc.so.6` for an ELF target, `msvcrt.dll` for a PE target,
+// `/usr/lib/libSystem.B.dylib` for a Mach-O target — all from the SAME descriptor.
+// `buildCuMir` runs the front half (resolve → semantic inject → HIR synthesize →
+// the compile_pipeline fold), and the resolved image lands on the `puts`
+// `ExternImport.libraryPath`. This is what makes `puts("hello")` link on
+// linux/macos that previously fixed every target to msvcrt.dll.
+//
+// AGNOSTIC: the per-format selection is keyed by objectFormatKindName, exercised
+// here by driving the SAME source+descriptor across three formats and asserting
+// three different images — no `if(format)` anywhere on the path.
+//
+// RED-on-disable: hardcode the descriptor's `library.elf` wrong (or revert the
+// fold to ignore the map) and the ELF arm's libraryPath assertion fails.
+namespace {
+// The resolved `libraryPath` of the `puts` import after the front-half fold, for
+// a `#include <stdio.h>; puts("hi")` CU built against `descJson` on a system dir,
+// for the given target/format. Empty string ⇒ no `puts` import was produced.
+[[nodiscard]] std::string resolvedPutsLibraryFor(
+        std::string const& descJson, char const* targetName, char const* formatName) {
+    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    EXPECT_TRUE(grammarR.has_value());
+    if (!grammarR) return {};
+    auto grammar = *grammarR;
+    auto targetR = TargetSchema::loadShipped(targetName);
+    EXPECT_TRUE(targetR.has_value()) << targetName;
+    auto formatR = ObjectFormatSchema::loadShipped(formatName);
+    EXPECT_TRUE(formatR.has_value()) << formatName;
+    if (!targetR || !formatR) return {};
+
+    DiagnosticReporter rep;
+    auto const abi = dss::ffi::resolveAbi(**targetR, **formatR, rep);
+    EXPECT_TRUE(abi.has_value());
+    if (!abi) return {};
+    auto const ccSpan = (*targetR)->callingConventions();
+    auto const ccIndex = static_cast<std::uint16_t>(
+        std::distance(ccSpan.data(), abi->cc));
+
+    ScratchDir sysDir{Location::InsideRepo, "model3-libresolve"};
+    std::ofstream(sysDir.path() / "stdio.json", std::ios::binary) << descJson;
+    UnitBuilder builder{grammar};
+    builder.addSystemDir(sysDir.path());
+    builder.addInMemory("#include <stdio.h>\nint main() { puts(\"hi\"); return 0; }\n",
+                        "main.c");
+    CompilationUnit cu = std::move(builder).finish();
+
+    auto cuMir = buildCuMir(cu, *grammar, **targetR, **formatR, ccIndex, rep);
+    EXPECT_TRUE(cuMir.has_value()) << formatName << " errorCount=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u) << formatName;
+    if (!cuMir) return {};
+    for (auto const& e : cuMir->externImports) {
+        if (e.mangledName == "puts" || e.mangledName == "_puts") return e.libraryPath;
+    }
+    return {};
+}
+} // namespace
+
+TEST(Program_ShippedLibModel3, PerFormatLibraryResolvesFromNeutralDescriptor) {
+    // ONE neutral descriptor — different runtime image per object format.
+    std::string const desc = R"({
+        "header": "stdio.h",
+        "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+        "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ]
+    })";
+
+    // ELF target → libc.so.6 (NOT msvcrt.dll — the whole point of Model 3; the
+    // pre-Model-3 hardcoded windows dir always produced msvcrt.dll here).
+    EXPECT_EQ(resolvedPutsLibraryFor(desc, "x86_64", "elf64-x86_64-linux-exec"),
+              "libc.so.6");
+    // PE target → msvcrt.dll (Windows byte-identity preserved).
+    EXPECT_EQ(resolvedPutsLibraryFor(desc, "x86_64", "pe64-x86_64-windows-exec"),
+              "msvcrt.dll");
+    // Mach-O target → libSystem (the macos image, from the same descriptor).
+    EXPECT_EQ(resolvedPutsLibraryFor(desc, "arm64", "macho64-arm64-darwin-exec"),
+              "/usr/lib/libSystem.B.dylib");
+}
+
+// A descriptor whose `library` map OMITS the active format's key falls back to
+// the language's `externLibraryByFormat[format]` default (the pre-Model-3
+// "empty library inherits default" contract, preserved per format). Here the map
+// has only "pe", so an ELF build inherits the c-subset ELF default (libc.so.6).
+TEST(Program_ShippedLibModel3, MissingFormatKeyInheritsLanguageDefault) {
+    std::string const descPeOnly = R"({
+        "header": "stdio.h", "library": { "pe": "msvcrt.dll" },
+        "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ]
+    })";
+    // ELF build, map has no "elf" key → inherit c-subset externLibraryByFormat.elf.
+    EXPECT_EQ(resolvedPutsLibraryFor(descPeOnly, "x86_64", "elf64-x86_64-linux-exec"),
+              "libc.so.6");
+}
+
+// RED-on-disable for the knob-that-lies: the descriptor's `library.elf` value is
+// AUTHORITATIVE — the fold MUST read the map, not silently fall through to the
+// language default. PerFormatLibraryResolvesFromNeutralDescriptor uses real-world
+// images (libc.so.6 …) that are byte-IDENTICAL to c-subset's externLibraryByFormat
+// fallback, so it passes whether the map is read OR ignored — it cannot disprove
+// the knob-that-lies. Here the map's `elf` image is a DISCRIMINATING value that is
+// NOT the format default, so the ELF assertion goes RED iff the compile_pipeline
+// map-read is deleted (every key would then inherit the default "libc.so.6").
+TEST(Program_ShippedLibModel3, MapValueIsAuthoritativeOverFormatDefault) {
+    std::string const descCustom = R"({
+        "header": "stdio.h",
+        "library": { "elf": "libcustom.so.9", "pe": "msvcrt.dll", "macho": "/usr/lib/libSystem.B.dylib" },
+        "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ]
+    })";
+    // The map's "elf"="libcustom.so.9" MUST win over c-subset's
+    // externLibraryByFormat.elf default ("libc.so.6"). This can ONLY pass if the
+    // fold genuinely reads the descriptor's per-format library map.
+    EXPECT_EQ(resolvedPutsLibraryFor(descCustom, "x86_64", "elf64-x86_64-linux-exec"),
+              "libcustom.so.9");
+}

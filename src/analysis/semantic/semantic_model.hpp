@@ -114,7 +114,12 @@ struct DSS_EXPORT ShippedExternSymbol {
     SymbolId    symbol;       // the minted extern symbol
     std::string name;         // the undecorated identifier → HirExternRecord.canonicalName
     TypeId      signature;    // its FnSig (function) or value type (object)
-    std::string library;      // descriptor `library` → HirExternRecord.libraryOverride
+    // Model 3 (2026-06-09): the descriptor's per-object-format `library` map
+    // ("pe"/"elf"/"macho" → image name) → HirExternRecord.libraryOverride. The
+    // map is carried target-agnostically through HIR; compile_pipeline folds it
+    // to a single string for the ACTIVE target's format (where the format is in
+    // scope). A missing format key inherits externLibraryByFormat[format].
+    std::unordered_map<std::string, std::string> library;
     bool        isFunction = true;  // ExternFunction vs ExternGlobal
 };
 

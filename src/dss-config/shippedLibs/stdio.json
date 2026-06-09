@@ -1,7 +1,8 @@
 {
   "header": "stdio.h",
   "standard": "c89",
-  "library": "libSystem.B.dylib",
+  "$comment": "Model 3 (2026-06-09): PLATFORM-NEUTRAL descriptor. `library` is a per-object-format map; the active target's format selects its runtime image at compile_pipeline resolution. The `fseek` offset (param[1]) and `ftell` result are the C `long` type, encoded here in the LP64 (i64) form correct for the runnable elf/macho targets. The Windows LLP64 (i32) form for these 2 is latently deferred — UNEXERCISED by any corpus/test — and tracked by D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH.",
+  "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "symbols": [
     { "name": "puts",     "signature": "fn(ptr<char>) -> i32",            "kind": "function", "linkage": "external" },
     { "name": "putchar",  "signature": "fn(i32) -> i32",                  "kind": "function", "linkage": "external" },

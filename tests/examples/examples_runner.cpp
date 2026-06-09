@@ -124,6 +124,12 @@ struct ExampleTarget {
     // "qemu-aarch64") used when the target arch differs from the host
     // arch. Empty ⇒ native execution only (the pre-V2-1 default).
     std::string                  emulator;
+    // Model 3 (2026-06-09): optional PER-TARGET expected stdout. When present it
+    // OVERRIDES the manifest-level `expectedStdout` for THIS target only — needed
+    // when one source prints platform-divergent bytes (e.g. `puts` emits
+    // "hello\r\n" via Windows msvcrt CRLF translation but "hello\n" on
+    // linux/macos). Absent ⇒ the manifest-level pin applies (existing behavior).
+    std::optional<std::string>   expectedStdoutOverride;
 };
 
 // D-OPT1-DIFFERENTIAL-VERIFY-RUNNER (OPT2 cycle 1): a per-manifest
@@ -235,6 +241,16 @@ struct ExampleManifest {
             for (auto const& s : t.at("runOn")) {
                 if (s.is_string()) et.runOn.push_back(s.get<std::string>());
             }
+        }
+        // Model 3: optional per-target stdout override (a string; empty-string is
+        // a VALID pin — asserts the binary printed nothing on this target).
+        if (t.contains("expectedStdout")) {
+            if (!t.at("expectedStdout").is_string()) {
+                ADD_FAILURE() << "manifest " << path.generic_string()
+                              << " target 'expectedStdout' must be a string";
+                return m;
+            }
+            et.expectedStdoutOverride = t.at("expectedStdout").get<std::string>();
         }
         m.targets.push_back(std::move(et));
     }
@@ -439,7 +455,10 @@ compileAndRunArm(fs::path const& exampleDir,
         launcherPrefix.push_back(emuPath);
     }
 
-    bool const captureStdout = m.expectedStdout.has_value();
+    // Model 3: capture stdout when EITHER the manifest-level pin OR this target's
+    // override is present (so a per-target override alone still routes the pipe).
+    bool const captureStdout =
+        m.expectedStdout.has_value() || t.expectedStdoutOverride.has_value();
     auto const result = runBinary(artifactPath,
                                   std::chrono::milliseconds{5000},
                                   captureStdout,
@@ -486,13 +505,21 @@ void runOneTarget(fs::path const&        exampleDir,
         return;
     }
 
+    // Model 3: the per-target override (when present) is the authority for THIS
+    // target's stdout; otherwise the manifest-level pin applies. The differential
+    // arm below compares the optimized arm to the BASELINE's captured stdout, so it
+    // follows this choice for free.
+    std::optional<std::string> const effectiveStdout =
+        t.expectedStdoutOverride.has_value() ? t.expectedStdoutOverride
+                                             : m.expectedStdout;
+
     // Baseline strict pins against the manifest.
     ASSERT_EQ(static_cast<std::int64_t>(baseline.exitCode), m.exitCode)
         << "baseline exit-code mismatch (manifest=" << m.exitCode
         << "; OS=" << baseline.exitCode << ")";
-    if (m.expectedStdout.has_value()) {
-        ASSERT_EQ(baseline.capturedStdout, *m.expectedStdout)
-            << "baseline stdout mismatch (manifest=" << m.expectedStdout->size()
+    if (effectiveStdout.has_value()) {
+        ASSERT_EQ(baseline.capturedStdout, *effectiveStdout)
+            << "baseline stdout mismatch (expected=" << effectiveStdout->size()
             << " bytes; OS=" << baseline.capturedStdout.size() << " bytes)";
     }
 
@@ -521,7 +548,7 @@ void runOneTarget(fs::path const&        exampleDir,
             << "' produced exit code " << optResult.exitCode
             << " vs baseline " << baseline.exitCode
             << " — pipeline regression";
-        if (m.expectedStdout.has_value()) {
+        if (effectiveStdout.has_value()) {
             ASSERT_EQ(optResult.capturedStdout, baseline.capturedStdout)
                 << "differential-verify FAIL: optimized arm '" << arm.label
                 << "' stdout differs from baseline";

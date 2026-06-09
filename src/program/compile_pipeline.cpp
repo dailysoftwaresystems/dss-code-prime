@@ -197,15 +197,34 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
         // Build the temporary ExternDeclRef span from the lowerer's
         // owning records. The views are valid for the duration of
         // this call only (the underlying strings live on
-        // `hir->externDecls`).
+        // `hir->externDecls` and the `resolvedLibs` backing store below).
+        //
+        // Model 3 (2026-06-09): `HirExternRecord.libraryOverride` is a
+        // per-OBJECT-FORMAT MAP (a shipped descriptor routes a different image
+        // per format; a source `"libname"` override is the same string under
+        // every format key). This is the ONE site where the active target's
+        // object format is in scope, so this is where the map is FOLDED to the
+        // single string `ExternDeclRef.libraryOverride` carries. The fold keys
+        // on `formatKey` (= objectFormatKindName(format.kind())) — no
+        // `if(format)`. A key present ⇒ that image; a key ABSENT ⇒ empty
+        // override, which (per the existing ExternDeclRef contract) makes the
+        // FFI synthesize stage fall back to the format-level default
+        // `importLibrary` (externLibraryByFormat[format]).
+        std::vector<std::string> resolvedLibs;
+        resolvedLibs.reserve(hir->externDecls.size());
+        for (auto const& r : hir->externDecls) {
+            if (auto it = r.libraryOverride.find(formatKey);
+                it != r.libraryOverride.end()) {
+                resolvedLibs.push_back(it->second);
+            } else {
+                resolvedLibs.emplace_back();  // empty ⇒ inherit format default
+            }
+        }
         std::vector<ffi::ExternDeclRef> refs;
         refs.reserve(hir->externDecls.size());
-        for (auto const& r : hir->externDecls) {
-            // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3):
-            // propagate the per-symbol library override decoded by
-            // the lowerer from the optional trailing string literal.
-            // Empty = use format-level default (existing behavior).
-            refs.push_back({r.node, r.canonicalName, r.libraryOverride});
+        for (std::size_t i = 0; i < hir->externDecls.size(); ++i) {
+            auto const& r = hir->externDecls[i];
+            refs.push_back({r.node, r.canonicalName, resolvedLibs[i]});
         }
 
         auto const ffiEntry = reporter.errorCount();
