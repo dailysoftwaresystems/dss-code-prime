@@ -6,12 +6,31 @@
 #include "program/cli_args.hpp"      // CompileConfig
 #include "program/input_resolver.hpp"
 
+#include <cstddef>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace dss {
+
+// Route decision for a list of source files — the SINGLE source of
+// truth for the multi-vs-single-CU threshold, shared by the CLI
+// dispatcher (`Program::run`) and the project driver
+// (`Program::compileProject`, plan 06 AP2) so they can never drift.
+//
+//   > 1 source ⇒ N independent translation units the LINKER merges
+//     into one image (`compileUnits`, `cc a.c b.c` semantics, LK11);
+//   ≤ 1 source ⇒ the single-CU path (`compileFiles`), where N==1 is
+//     the degenerate case and a multi-file CU5 unit (cross-file refs
+//     resolved WITHIN the unit) is the >1-on-compileFiles shape that
+//     this routing deliberately avoids for the project driver.
+//
+// The decision keys ONLY on translation-unit COUNT — never on any
+// language / CPU / format identity (the standing agnosticism veto).
+[[nodiscard]] inline bool routesToMultiUnit(std::size_t sourceCount) noexcept {
+    return sourceCount > 1;
+}
 
 class DSS_EXPORT Program {
 public:
@@ -28,6 +47,18 @@ public:
     int compileProject(
         const std::string& projectFilePath,
         DiagnosticReporter::Config const& reporterConfig = {}
+    );
+
+    /// Rep-injection overload — caller owns `rep` and may inspect it
+    /// after return (the same testability pattern as `compileFiles`).
+    /// The Config-taking overload constructs `rep` internally and
+    /// forwards here. Lets the program test suite assert the EXACT
+    /// driver-tier code the AP2 wiring emits (D_FileNotFound /
+    /// C_MalformedJson / C_MissingField / D_SchemaLoadFailed /
+    /// D_ArtifactProfileNotSupported), not merely the exit code.
+    int compileProject(
+        const std::string& projectFilePath,
+        DiagnosticReporter&             rep
     );
 
     /// Compile explicit source files for a language to one or more

@@ -17,6 +17,7 @@
 #include "program/compile_pipeline.hpp"
 #include "program/cross_validate_target_format.hpp"
 #include "program/input_resolver.hpp"
+#include "program/project_config.hpp"
 #include "program/target_spec.hpp"
 
 #include <algorithm>
@@ -504,9 +505,11 @@ int Program::run(int argc, char* argv[]) {
         // unit) is deliberately NOT a CLI surface: no language's file model concatenates
         // translation units, so there is no source-agnostic CLI spelling for it; a future
         // explicit opt-in flag can route to `compileFiles` when a real consumer needs it.
-        // The `size() > 1` test keys on translation-unit COUNT, not on any language / CPU /
-        // format identity — the standing agnosticism veto is held.
-        return args.sourceFiles.size() > 1
+        // The route keys on translation-unit COUNT, not on any language / CPU /
+        // format identity — the standing agnosticism veto is held. `routesToMultiUnit`
+        // (program.hpp) is the single source of truth for the threshold, shared with
+        // `compileProject` (plan 06 AP2) so the two dispatch sites never drift.
+        return routesToMultiUnit(args.sourceFiles.size())
             ? compileUnits(args.sourceFiles, args.languageName, args.targets, cfg)
             : compileFiles(args.sourceFiles, args.languageName, args.targets, cfg);
     }
@@ -525,29 +528,69 @@ int Program::compileProject(
     const std::string& projectFilePath,
     DiagnosticReporter::Config const& reporterConfig
 ) {
-    // Plan 06 (.dsp parser + artifact profile) is unstarted; cycle 2
-    // anchors the fail-loud surface so a caller passing a project
-    // path gets a structural diagnostic rather than silent success
-    // and a zero-byte target dir. Policy-aware overload (H2 fold):
-    // `--warnings-as-errors` + `--suppress=<code>` apply here too —
-    // a user who explicitly suppresses `D_PlanNotLanded` gets the
-    // diagnostic dropped before stderr, not silently ignored.
+    // Thin wrapper around the rep-injection overload (mirrors
+    // `compileFiles`). `reporterConfig` threads `--warnings-as-errors`
+    // + `--suppress=<code>` through every tier; the rep-taking overload
+    // lets tests inspect the emitted code after return.
     DiagnosticReporter rep{reporterConfig};
-    emitDriver(rep, DiagnosticCode::D_PlanNotLanded,
-               "compileProject: .dsp project-file parsing is not "
-               "yet implemented — plan 06 (artifact profile) owns "
-               "the .dsp schema. Path: '" + projectFilePath + "'.");
-    drainDiagnosticsToStderr(rep);
-    // Unconditional non-zero exit — `D_PlanNotLanded` signals "the
-    // requested operation cannot be performed by this build", a hard
-    // capability gap that `--suppress` MUST NOT absorb into a silent
-    // success exit. (silent-failure audit post-fold #2: H2's
-    // `errorCount() == 0 ? 0 : 1` allowed `--suppress=D_PlanNotLanded`
-    // to exit 0 with zero-byte output, exactly the silent-failure
-    // class the fold was meant to close.) The user's `--suppress`
-    // still hides the message via the policy applied at emit time;
-    // it just no longer hides the exit code.
-    return 1;
+    return compileProject(projectFilePath, rep);
+}
+
+int Program::compileProject(
+    const std::string& projectFilePath,
+    DiagnosticReporter&             rep
+) {
+    // Plan 06 AP2: load the `.dss-project.json` project config, enforce
+    // the requested `artifactProfile` against the language's declared
+    // set (AP1's `GrammarSchema::artifactProfiles()`), then delegate to
+    // the existing compile path. AP2 = validate + delegate; threading
+    // the resolved profile to codegen / a CompilationContext is AP3/AP4
+    // (D-AP2-COMPILATION-CONTEXT).
+    auto pcOpt = loadProjectConfig(fs::path{projectFilePath}, rep);
+    if (!pcOpt.has_value()) {
+        // loadProjectConfig already emitted the structural diagnostic
+        // (D_FileNotFound / C_MalformedJson / C_MissingField).
+        drainDiagnosticsToStderr(rep);
+        return 1;
+    }
+    ProjectConfig const& pc = *pcOpt;
+
+    // Load the language grammar to read its declared `artifactProfiles`.
+    // The delegated `compileFiles`/`compileUnits` re-loads it by name;
+    // the redundant load is benign for a project-build entry point and
+    // keeps the delegate signatures unchanged (no pre-loaded-grammar
+    // overload to add this cycle).
+    auto grammarR = GrammarSchema::loadShipped(pc.language);
+    if (!grammarR.has_value()) {
+        forwardConfigDiagnostics(grammarR.error(), rep);
+        emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                   "language schema '" + pc.language
+                   + "' could not be loaded — check that "
+                     "src/dss-config/sources/" + pc.language
+                   + ".lang.json exists and parses cleanly.");
+        drainDiagnosticsToStderr(rep);
+        return 1;
+    }
+    auto grammar = *grammarR;
+
+    // AP2 driver gate: the requested profile must be ∈ the language's
+    // declared set. Empty set ⇒ reject (fail-closed). One predicate, no
+    // per-profile-name branch — the agnosticism veto holds.
+    if (!enforceArtifactProfile(grammar->artifactProfiles(),
+                                pc.artifactProfile, pc.language, rep)) {
+        drainDiagnosticsToStderr(rep);
+        return 1;
+    }
+
+    // Route by source COUNT via the shared `routesToMultiUnit` threshold
+    // (identical to the CLI dispatcher): >1 source ⇒ N independent CUs
+    // the linker merges (`compileUnits`, `cc a.c b.c` semantics); ≤1 ⇒
+    // the single-CU path (`compileFiles`). The delegate validates each
+    // `<targetName>:<formatName>` spec (D_InvalidTargetSpec) and drains
+    // `rep` at its end (runCusToTargets), so we do NOT drain here.
+    return routesToMultiUnit(pc.sources.size())
+        ? compileUnits(pc.sources, pc.language, pc.targets, rep)
+        : compileFiles(pc.sources, pc.language, pc.targets, rep);
 }
 
 int Program::transpile(

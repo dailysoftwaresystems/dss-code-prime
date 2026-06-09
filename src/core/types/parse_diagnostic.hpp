@@ -318,6 +318,23 @@ enum class DiagnosticCode : std::uint16_t {
     //   Distinct from `D_PlanNotLanded` (pending-arrival surface).
     //   (post-fold #6 silent-failure C2 fix.)
     D_TargetAbiModelUnsupportedByDriver = 0xD00F,
+    // D_ArtifactProfileNotSupported (plan 06 AP2): a project config
+    //   (`.dss-project.json`) requested an `artifactProfile` the
+    //   selected language does not declare in its `artifactProfiles[]`
+    //   set (grammar schema, AP1). Two sub-cases share this one code
+    //   (one logical failure — "the requested profile is not in the
+    //   supported set"; the message discriminates):
+    //     * the language declares a non-empty set that excludes the
+    //       requested profile (e.g. c-subset declares {cli,lib,
+    //       staticlib} and the project asks for "gui");
+    //     * the language declares NO profiles at all (empty set) — a
+    //       fail-CLOSED reject, aligning with §2.1's trajectory toward
+    //       making `artifactProfiles[]` required (a language must
+    //       declare ≥1 profile to be project-buildable).
+    //   The check belongs at project-load time (plan 06 §1) so the
+    //   failure surfaces here, not "deep in codegen". AP3/AP4 own the
+    //   downstream consumption (CompilationContext + codegen).
+    D_ArtifactProfileNotSupported = 0xD010,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──

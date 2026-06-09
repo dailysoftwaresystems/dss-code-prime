@@ -651,25 +651,36 @@ TEST(Program_CompileFiles, NoCapMarkerWhenDiagnosticsBudgetExceedsErrorCount) {
         << "both per-target schema-load failures must surface in rep";
 }
 
-// ── compileProject: plan 06 fail-loud stub ────────────────────
+// ── compileProject: plan 06 AP2 (project-config loader + profile gate) ──
+// (Was the `D_PlanNotLanded` stub pre-AP2; the stub is gone — these now
+// pin the real loader's fail-loud surface. Deeper AP2 wiring — the
+// profile-enforcement gate against a real `.dss-project.json` — is pinned
+// in `tests/program/test_project_config.cpp`.)
 
-TEST(Program_CompileProject, FailsLoudPlanNotLanded) {
+TEST(Program_CompileProject, FailsLoudMissingProjectFile) {
     Program prog;
-    EXPECT_EQ(prog.compileProject("any.dsp"), 1);
+    DiagnosticReporter rep;
+    // A nonexistent project-config path fails loud with D_FileNotFound
+    // (loadProjectConfig's open-failure arm), not the removed
+    // D_PlanNotLanded stub.
+    EXPECT_EQ(prog.compileProject("does-not-exist.dss-project.json", rep), 1);
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::D_FileNotFound), 1u);
 }
 
-// H2 behavioral pin (silent-failure audit post-fold #2): even with
-// --suppress=D_PlanNotLanded, compileProject + transpile must return
-// non-zero. The suppress hides the stderr message but MUST NOT
-// absorb the "the operation didn't happen" signal into a silent
-// success exit. Without this, build systems downstream of
-// dss-code-prime treat exit 0 as "transpile happened" and consume
-// nonexistent outputs.
-TEST(Program_CompileProject, SuppressedPlanNotLandedStillReturnsNonZero) {
+// H2 behavioral pin (silent-failure audit post-fold #2), re-aimed at a
+// code compileProject ACTUALLY emits: even with the fail-loud code
+// suppressed, compileProject must return non-zero. The suppress hides
+// the stderr message but MUST NOT absorb the "the operation didn't
+// happen" signal into a silent success exit — compileProject returns 1
+// on the failure path explicitly, not via `errorCount() == 0 ? 0 : 1`.
+// Without this, build systems downstream treat exit 0 as "build
+// happened" and consume nonexistent outputs.
+TEST(Program_CompileProject, SuppressedFailLoudStillReturnsNonZero) {
     Program prog;
     DiagnosticReporter::Config cfg;
-    cfg.policy.suppress.insert(DiagnosticCode::D_PlanNotLanded);
-    EXPECT_EQ(prog.compileProject("any.dsp", cfg), 1);
+    cfg.policy.suppress.insert(DiagnosticCode::D_FileNotFound);
+    EXPECT_EQ(prog.compileProject("does-not-exist.dss-project.json", cfg), 1);
 }
 
 TEST(Program_Transpile, FailsLoudPlanNotLanded) {

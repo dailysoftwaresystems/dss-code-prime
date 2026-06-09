@@ -537,8 +537,11 @@ parseCliArgs(int argc, char* argv[]) {
         return out;
     }
     if (mode == Mode::Project) {
-        // compileProject fails-loud at the dispatch layer with
-        // `D_PlanNotLanded`. No further CLI validation needed.
+        // `--project <file>` carries its own config (language, targets,
+        // sources) inside the `.dss-project.json`; the CLI does not
+        // require --language/--target here. `compileProject` (plan 06
+        // AP2) loads + validates that file and fails loud on any
+        // structural / profile error. No further CLI validation needed.
         return out;
     }
     // Compile / Transpile / Directory modes require language + at
