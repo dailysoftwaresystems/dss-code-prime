@@ -84,36 +84,32 @@ TEST(FfiAbiCatalog, Arm64ElfResolvesToAAPCS64) {
     EXPECT_EQ(r->cc->name, "aapcs64");
 }
 
-// ── Catalog anchored but cc not shipped → loud reject ──────
+// ── arm64 + Mach-O resolves to apple_arm64 (D-FF3-5 CLOSED) ──
 
-// NOTE: This test FLIPS BEHAVIOR when arm64.target.json ships the
-// `apple_arm64` cc row. Today the catalog says (arm64, MachO) →
-// "apple_arm64" but target.json lacks the row, producing
-// NoMatchingCcInTarget. The cycle that ships the cc row must
-// either DELETE this test and replace with a happy-path mirror
-// (see `Arm64ElfResolvesToAAPCS64`) OR rewrite to assert the
-// successful resolution. Anchored as D-FF3-5 with the trigger
-// "apple_arm64 cc row ships in arm64.target.json".
-TEST(FfiAbiCatalog, Arm64MachOFailsLoudUntilAppleArm64CcShipped) {
-    // The catalog has a row for (arm64, MachO) → "apple_arm64",
-    // but arm64.target.json doesn't ship that cc yet. FF3 must
-    // fail loud — silent fallback to aapcs64 would silently
-    // generate the wrong ABI for Apple Silicon binaries.
+// D-FF3-5 CLOSED (macOS-ARM64 backend cycle): arm64.target.json now
+// ships the `apple_arm64` cc row, so the catalog's (arm64, MachO) →
+// "apple_arm64" tuple resolves successfully. This test FLIPPED from the
+// prior fail-loud assertion (NoMatchingCcInTarget while the row was
+// absent) to the happy-path mirror, exactly as the D-FF3-5 anchor's
+// trigger instructed ("apple_arm64 cc row ships in arm64.target.json").
+// A silent fallback to aapcs64 would have generated the wrong ABI for
+// Apple Silicon binaries; resolveAbi resolves the DISTINCT apple_arm64
+// cc instead.
+TEST(FfiAbiCatalog, Arm64MachOResolvesToAppleArm64) {
     auto target = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
-    // Use the shipped x86_64-darwin Mach-O format — cross-validate
-    // would reject the (arm64, x86_64-Mach-O) machine-code pair,
-    // but resolveAbi runs independently and reads only the format
-    // KIND (MachO) for catalog lookup. The catalog row says
-    // arm64+MachO needs cc "apple_arm64", which arm64.target.json
-    // doesn't ship → NoMatchingCcInTarget.
+    // Use the shipped x86_64-darwin Mach-O format — resolveAbi reads
+    // only the format KIND (MachO) for the catalog lookup, so the
+    // (arm64, MachO) tuple is exercised regardless of the format's CPU.
     auto format = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin");
     ASSERT_TRUE(format.has_value());
     DiagnosticReporter rep;
     auto r = resolveAbi(**target, **format, rep);
-    ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error().kind, AbiResolveErrorKind::NoMatchingCcInTarget);
-    EXPECT_GE(countCode(rep, DiagnosticCode::F_AbiNoMatchingCcInTarget), 1u);
+    ASSERT_TRUE(r.has_value()) << abiResolveErrorKindName(r.error().kind);
+    EXPECT_EQ(r->callingConvention, CallConv::CcApple);
+    ASSERT_NE(r->cc, nullptr);
+    EXPECT_EQ(r->cc->name, "apple_arm64");
+    EXPECT_EQ(countCode(rep, DiagnosticCode::F_AbiNoMatchingCcInTarget), 0u);
 }
 
 // ── Unknown catalog tuple → loud reject ────────────────────

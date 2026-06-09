@@ -7,8 +7,10 @@
 #include "lir/lir_node.hpp"
 #include "lir/lir_reg.hpp"
 
+#include <cstdint>
 #include <format>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -450,21 +452,57 @@ bool injectEntryTrampoline(AssembledModule&          module,
         }
         (void)b.addInst(*syscallOp, InvalidLirReg, {});
     } else {  // ByNameImport
-        // 3. call_indirect_via_extern <exit_import_symbol>.
-        auto const callIndOp =
-            target.opcodeByMnemonic("call_indirect_via_extern");
-        if (!callIndOp.has_value()) {
+        // 3. Call the exit import. The CALL-SITE SHAPE is the ACTIVE
+        //    OBJECT FORMAT's, exactly as MIR→LIR `lowerCall` picks it
+        //    for user-level FFI calls — both consult the SAME rule
+        //    (`externCallUsesIndirectShape`, object_format_kind.hpp) so
+        //    the trampoline can never drift to the opposite shape from
+        //    the FFI path (D-FFI-EXTERN-CALL-DISPATCH; the wrong shape
+        //    SIGSEGVs). An `indirect-slot` format (PE IAT / Mach-O
+        //    __got) DEREFERENCES the import's pointer slot via
+        //    `call_indirect_via_extern` (FF 15); a `direct-plt` format
+        //    (ELF / Mach-O — symbolVa points at the linker's stub)
+        //    makes a PLAIN DIRECT `call` (E8 / BL) to that stub, which
+        //    performs the GOT indirection itself. The synthetic
+        //    ExternImport appended above means this module HAS an
+        //    extern, so a format with no declared dispatch model is a
+        //    fail-loud (no silent default to either shape).
+        auto const dispatch = format.externCallDispatch();
+        if (!dispatch.has_value()) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("entry-trampoline: target '{}' lacks "
-                             "the `call_indirect_via_extern` "
-                             "opcode required by Slice A.",
-                             std::string{target.name()}));
+                 std::format("entry-trampoline: format '{}' uses a "
+                             "by-name-import exit but declares no "
+                             "`externCallDispatch` — the exit call "
+                             "has no defined call-site shape. Declare "
+                             "`externCallDispatch` (\"direct-plt\" or "
+                             "\"indirect-slot\") in the format JSON "
+                             "(D-FFI-EXTERN-CALL-DISPATCH).",
+                             std::string{format.name()}));
+            return false;
+        }
+        bool const useIndirect = externCallUsesIndirectShape(*dispatch);
+        // direct-plt reuses the universal `call` opcode resolved above;
+        // indirect-slot needs the format-specific indirect-call opcode.
+        std::optional<std::uint16_t> const exitCallOp = useIndirect
+            ? target.opcodeByMnemonic("call_indirect_via_extern")
+            : callOp;
+        if (!exitCallOp.has_value()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("entry-trampoline: target '{}' lacks the "
+                             "`{}` opcode required to lower the "
+                             "by-name-import exit call under the "
+                             "format's `{}` dispatch model "
+                             "(D-FFI-EXTERN-CALL-DISPATCH).",
+                             std::string{target.name()},
+                             useIndirect ? "call_indirect_via_extern"
+                                         : "call",
+                             externCallDispatchName(*dispatch)));
             return false;
         }
         LirOperand const exitOps[] = {
             LirOperand::makeSymbolRef(exitImportSym.v)
         };
-        (void)b.addInst(*callIndOp, InvalidLirReg, exitOps);
+        (void)b.addInst(*exitCallOp, InvalidLirReg, exitOps);
     }
 
     // 5. unreachable — verifier hint that control never returns

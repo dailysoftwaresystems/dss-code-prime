@@ -928,7 +928,8 @@ struct Lowerer {
         // a nullopt compares unequal to IndirectSlot → falls to `Call`.)
         bool const useIndirectExtern =
             calleeIsExtern
-            && externCallDispatch_ == ExternCallDispatch::IndirectSlot;
+            && externCallDispatch_.has_value()
+            && externCallUsesIndirectShape(*externCallDispatch_);
         MnemonicSlot const callSlot = useIndirectExtern
             ? MnemonicSlot::CallIndirectViaExtern
             : MnemonicSlot::Call;

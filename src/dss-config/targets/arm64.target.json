@@ -578,6 +578,23 @@
       "entryStackPointerBias": 0,
       "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: AArch64 BL writes the return address into LR/x30 — no stack push. callPushBytes=0 is the right ISA-level fact for ARM64. Non-leaf functions on ARM64 still save x30 in their prologue + reload it before `ret`; because x30 is the `linkRegister` (deliberately NOT in `calleeSaved` — it must not be allocatable), this is realized by the link-register fold in `lir_callconv.cpp::materializeOneFunc` (gated on hasCalls + cc.linkRegister), which adds x30 to `savedRegs` so it lands in `savedRegAreaSize`. Without it the epilogue `ret` returns to a clobbered LR — see D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER. Independent of the call-push bias.",
       "callPushBytes": 0
+    },
+    {
+      "$comment": "apple_arm64 — Apple's ARM64 ABI for Apple platforms (developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms). The ABI catalog (abi_catalog.cpp) maps (arm64, MachO) → CcApple → \"apple_arm64\"; shipping this row CLOSES D-FF3-5 (trigger: 'apple_arm64 cc row ships in arm64.target.json') and is what lets `resolveAbi` + the entry trampoline resolve a Mach-O-ARM64 cc. The general-purpose REGISTER vocabulary is IDENTICAL to AAPCS64 — integer args x0..x7, returns x0/x1, callee-saved x19..x28+x29, link x30, sp, 16-byte stack alignment, bias 0 (BL writes LR, no push). The Apple ABI's documented DIVERGENCES from AAPCS64 are NOT register-assignment differences: (1) variadic args are ALWAYS passed on the stack (vs AAPCS64's register-then-stack) and (2) a different indirect-result-location rule. Neither is modeled at today's scalar-only asm tier (variadic support is gated at D-FFI-DESCRIPTOR-VARIADIC-SIGNATURE), so for the scalar register-passing this row carries the same fields as aapcs64; a SEPARATE named row keeps the ABI identity explicit and correct, so when variadic/indirect-result lands it is updated HERE, not by silently reusing aapcs64. The always-stack variadic rule + indirect-result-location divergence are pinned at D-FF3-APPLE-ARM64-ABI-DIVERGENCE (they land WITH the proper CcApple field set when the trigger fires — a variadic OR struct-return call on arm64-Apple — not as a silent aapcs64 reuse; distinct from D-FF3-4, which is the Microsoft CcMSARM64 split).",
+      "name":             "apple_arm64",
+      "argGprs":          ["x0","x1","x2","x3","x4","x5","x6","x7"],
+      "argFprs":          [],
+      "returnGprs":       ["x0","x1"],
+      "returnFprs":       [],
+      "callerSaved":      ["x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x18"],
+      "calleeSaved":      ["x19","x20","x21","x22","x23","x24","x25","x26","x27","x28","x29"],
+      "linkRegister":     "x30",
+      "stackPointer":     "sp",
+      "stackAlignment":   16,
+      "shadowSpaceBytes": 0,
+      "redZoneBytes":     0,
+      "entryStackPointerBias": 0,
+      "callPushBytes": 0
     }
   ],
   "$relocationsComment": "AArch64 ELF relocation kinds (plan 13 AS4 + plan 14 LK6 cycle 1 + D-LK6-1 closure 2026-06-01). The 'formula' field is a closed-enum discriminator (RelocFormulaKind in target_schema.hpp): 'aarch64_call26' = (S+A-P)>>2, signed-26-bit, OR into BL/B inst[25:0]; 'aarch64_adr_prel_pg_hi21' = ((S+A)>>12)-(P>>12), signed-21-bit, ADRP-split into immlo[30:29]+immhi[23:5]; 'aarch64_add_abs_lo12' = (S+A)&0xFFF, ADD imm12[21:10]; 'linear' (used for abs64) writes 8 LE bytes. Tag values are arbitrary per-target — only the NAME round-trips with format.json cross-reference. Paired anchors: D-LK6-8 (ARM64 PLT stub bytes) + D-LK6-14 (Apple Silicon chained-fixups dispatch) remain open and are independent of the formula reshape.",

@@ -12,6 +12,8 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <format>
+#include <limits>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -144,8 +146,174 @@ constexpr std::uint8_t BIND_TYPE_POINTER                          = 1;
 
 constexpr std::size_t kDyldInfoCommandSize = 48;
 constexpr std::size_t kDysymtabCommandSize = 80;
-constexpr std::size_t kStubSize            = 6;  // FF 25 disp32
 constexpr std::size_t kGotSlotSize         = 8;
+
+// ── Per-cputype __stubs substrate (MIRRORS elf.cpp's emitPltStub) ──
+//
+// Mach-O `__stubs` plays the same role as ELF's PLT: one stub per
+// extern, pointing at the extern's `__got` slot. symbolVa[extern] is
+// the STUB (direct-plt), so the call site is a plain direct call/BL to
+// the stub and the stub does the __got indirection itself.
+//
+// CPU_TYPE values (<mach-o/machine.h>): the high bit 0x01000000 is
+// CPU_ARCH_ABI64; x86_64 = (7 | ABI64) = 0x01000007; arm64 = (12 |
+// ABI64) = 0x0100000C. The walker dispatches on the schema's cputype
+// (read as data) — adding a 3rd ISA = a new size arm + a new emitter +
+// a new dispatch case, all localized to this file (the elf.cpp
+// precedent). x86_64 stub = 6-byte `FF 25 disp32`; arm64 stub = 12-byte
+// ADRP+LDR+BR macro.
+constexpr std::uint32_t kCpuTypeX86_64 = 0x01000007u;
+constexpr std::uint32_t kCpuTypeArm64  = 0x0100000Cu;
+
+constexpr std::size_t kX86_64MachoStubSize = 6;   // FF 25 disp32
+constexpr std::size_t kArm64MachoStubSize  = 12;  // ADRP+LDR+BR (3×4)
+
+// Per-cputype __stubs entry size in bytes. Returns 0 for an unhandled
+// cputype — every CALLER pairs the size query with `emitMachoStub`,
+// whose `default` arm fails loud, so a 0 here never silently ships a
+// zero-stride __stubs section.
+[[nodiscard]] constexpr std::size_t
+machoStubSizeFor(std::uint32_t cputype) noexcept {
+    switch (cputype) {
+        case kCpuTypeX86_64: return kX86_64MachoStubSize;
+        case kCpuTypeArm64:  return kArm64MachoStubSize;
+    }
+    return 0u;
+}
+
+// Emit one x86_64 `__stubs` entry: 6-byte `FF 25 disp32` =
+// `jmp *(rip + disp32)` jumping indirectly through the __got slot.
+// disp32 is PC-relative from the END of the 6-byte instruction.
+// (Byte-IDENTICAL to the original inline x86 stub body — extracted
+// verbatim so the existing macho tests keep passing.)
+[[nodiscard]] inline bool emitX86_64MachoStub(
+        std::vector<std::uint8_t>& stubs,
+        std::uint64_t              stubVa,
+        std::uint64_t              gotSlotVa,
+        std::size_t                externIdx,
+        DiagnosticReporter&        reporter) {
+    std::int64_t const disp =
+        static_cast<std::int64_t>(gotSlotVa) -
+        static_cast<std::int64_t>(stubVa + kX86_64MachoStubSize);
+    if (disp < std::numeric_limits<std::int32_t>::min()
+     || disp > std::numeric_limits<std::int32_t>::max()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: __stubs disp32 "
+                         "overflow (0x{:x}) for extern #{}; image too "
+                         "large for 32-bit PC-relative __got reference.",
+                         static_cast<std::uint64_t>(disp), externIdx));
+        return false;
+    }
+    std::uint32_t const d32 =
+        static_cast<std::uint32_t>(static_cast<std::int32_t>(disp));
+    stubs.push_back(0xFF);
+    stubs.push_back(0x25);
+    stubs.push_back(static_cast<std::uint8_t>(d32 & 0xFF));
+    stubs.push_back(static_cast<std::uint8_t>((d32 >> 8) & 0xFF));
+    stubs.push_back(static_cast<std::uint8_t>((d32 >> 16) & 0xFF));
+    stubs.push_back(static_cast<std::uint8_t>((d32 >> 24) & 0xFF));
+    return true;
+}
+
+// Emit one arm64 `__stubs` entry: 12 bytes = ADRP x16, page-of(got)
+// → LDR x16, [x16, #lo12(got)] → BR x16. This is the canonical macOS
+// `dyld_stub` shape. The ADRP page-pair + LDR imm12 math is IDENTICAL
+// to elf.cpp's `emitArm64PltStub` (kept consistent so the page/lo12
+// derivation lives in one mental model) — the only differences are
+// (a) x16-only here (vs ELF's x16→x17 split; both are AAPCS64 IP
+// scratch, ARM IHI 0055 §6.1.1) so dyld's stub-binder convention is
+// matched, and (b) BR x16 + NO trailing NOP (12 bytes, not 16).
+[[nodiscard]] inline bool emitArm64MachoStub(
+        std::vector<std::uint8_t>& stubs,
+        std::uint64_t              stubVa,
+        std::uint64_t              gotSlotVa,
+        std::size_t                externIdx,
+        DiagnosticReporter&        reporter) {
+    auto const pageOf = [](std::uint64_t v) noexcept -> std::uint64_t {
+        return v & ~std::uint64_t{0xFFF};
+    };
+    std::int64_t const pageDiff =
+        static_cast<std::int64_t>(pageOf(gotSlotVa))
+      - static_cast<std::int64_t>(pageOf(stubVa));
+    std::int64_t const adrpValue = pageDiff >> 12;
+    constexpr std::int64_t kAdrpMax =  (std::int64_t{1} << 20) - 1;
+    constexpr std::int64_t kAdrpMin = -(std::int64_t{1} << 20);
+    if (adrpValue < kAdrpMin || adrpValue > kAdrpMax) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic (arm64 __stubs): "
+                         "ADRP page-pair value {} for extern #{} is out "
+                         "of signed 21-bit range — __stubs and __got "
+                         "too far apart (>±4 GiB).",
+                         adrpValue, externIdx));
+        return false;
+    }
+    // LDR (immediate, unsigned offset) 64-bit scales imm12 by 8, so the
+    // __got slot's low-12 must be 8-byte aligned. __got slots are 8
+    // bytes each and __got is page-aligned by construction.
+    std::uint64_t const lo12 = gotSlotVa & std::uint64_t{0xFFF};
+    if ((lo12 & 0x7u) != 0u) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic (arm64 __stubs): "
+                         "__got slot VA for extern #{} is not 8-byte "
+                         "aligned (low12=0x{:x}) — the AArch64 64-bit "
+                         "LDR encoding requires an 8-byte-aligned "
+                         "offset; __got layout is broken.",
+                         externIdx, lo12));
+        return false;
+    }
+    // ADRP x16: base 0x90000010 (Rd=x16); immlo at bits[30:29], immhi
+    // at bits[23:5] carrying the 21-bit two's-complement page value.
+    std::uint32_t const adrpV =
+        static_cast<std::uint32_t>(adrpValue) & 0x1FFFFFu;
+    std::uint32_t const immlo = (adrpV & 0x3u) << 29;
+    std::uint32_t const immhi = ((adrpV >> 2) & 0x7FFFFu) << 5;
+    std::uint32_t const adrp  = 0x90000010u | immlo | immhi;
+    // LDR x16, [x16, #lo12]: base 0xF9400000; imm12 at bits[21:10]
+    // (scaled by 8), Rn=x16 at bits[9:5], Rt=x16 at bits[4:0].
+    // Pre-shifted base 0xF9400210 carries Rn=16 + Rt=16.
+    std::uint32_t const imm12 = static_cast<std::uint32_t>(lo12 >> 3);
+    std::uint32_t const ldr   = 0xF9400210u | (imm12 << 10);
+    // BR x16 (unconditional indirect branch to x16).
+    constexpr std::uint32_t kBrX16 = 0xD61F0200u;
+    auto const pushInst = [&](std::uint32_t inst) {
+        stubs.push_back(static_cast<std::uint8_t>(inst         & 0xFFu));
+        stubs.push_back(static_cast<std::uint8_t>((inst >>  8) & 0xFFu));
+        stubs.push_back(static_cast<std::uint8_t>((inst >> 16) & 0xFFu));
+        stubs.push_back(static_cast<std::uint8_t>((inst >> 24) & 0xFFu));
+    };
+    pushInst(adrp);
+    pushInst(ldr);
+    pushInst(kBrX16);
+    return true;
+}
+
+// Per-cputype __stubs dispatch (mirrors elf.cpp's emitPltStub). Appends
+// exactly `machoStubSizeFor(cputype)` bytes on success. Fail-loud
+// `default` — NO silent zero-byte stub for an unhandled cputype.
+[[nodiscard]] inline bool emitMachoStub(
+        std::uint32_t              cputype,
+        std::vector<std::uint8_t>& stubs,
+        std::uint64_t              stubVa,
+        std::uint64_t              gotSlotVa,
+        std::size_t                externIdx,
+        DiagnosticReporter&        reporter) {
+    switch (cputype) {
+        case kCpuTypeX86_64:
+            return emitX86_64MachoStub(stubs, stubVa, gotSlotVa,
+                                       externIdx, reporter);
+        case kCpuTypeArm64:
+            return emitArm64MachoStub(stubs, stubVa, gotSlotVa,
+                                      externIdx, reporter);
+    }
+    emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+         std::format("macho::encodeExecDynamic: cputype 0x{:x} has no "
+                     "__stubs emitter — the Mach-O dynamic-import path "
+                     "supports x86_64 (0x{:x}) and arm64 (0x{:x}). Add "
+                     "a per-cputype emitter (see emitMachoStub) to ship "
+                     "FFI for this architecture.",
+                     cputype, kCpuTypeX86_64, kCpuTypeArm64));
+    return false;
+}
 
 // LC byte-size of a path-bearing load command: fixed header + path
 // bytes (NUL-terminated) + pad to kLoadCmdAlign. Used by
@@ -952,8 +1120,8 @@ encodeExec(AssembledModule const&    module,
 namespace {
 
 // LC_DYLD_INFO_ONLY / LC_DYSYMTAB / S_* / BIND_OPCODE_* /
-// kStubSize / kGotSlotSize / appendULEB128 are file-level
-// constants/helpers at the top of this file (shared with
+// machoStubSizeFor + emitMachoStub / kGotSlotSize / appendULEB128 are
+// file-level constants/helpers at the top of this file (shared with
 // encodeExec; code-simplifier REQUIRED fold, LK6 cycle 2c review).
 
 // D-LK6-14 chained-fixups payload builder hoisted to private
@@ -1047,6 +1215,35 @@ encodeExecDynamic(AssembledModule const&    module,
         }
     }
 
+    // Dispatch ↔ symbolVa-target coherence guard (D-FFI-EXTERN-CALL-
+    // DISPATCH). This walker points every extern's symbolVa at its
+    // `__stubs` STUB (see `symbolVa.emplace(..., stubVa)` below) and the
+    // stub does the __got indirection — that is `direct-plt` semantics.
+    // A format that declares `indirect-slot` would make the call site
+    // DEREFERENCE the stub's CODE bytes as a function pointer (`FF 15`
+    // through stubVa) → SIGSEGV at the first extern call. The two facts
+    // (where symbolVa points + the declared call shape) MUST agree;
+    // surface the contradiction at link rather than emit a binary that
+    // crashes at runtime. (`direct-plt` and nullopt are both fine here:
+    // direct-plt matches the stub target; a nullopt format would already
+    // have fail-louded at MIR→LIR `lowerCall` for any module with
+    // externs — defense-in-depth, no silent acceptance of indirect-slot.)
+    if (fmt.externCallDispatch().has_value()
+     && externCallUsesIndirectShape(*fmt.externCallDispatch())) {
+        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+             std::format("macho::encodeExecDynamic: object format '{}' "
+                         "declares externCallDispatch='indirect-slot' but "
+                         "the Mach-O walker points each extern symbol's "
+                         "VA at its __stubs STUB (direct-plt semantics) "
+                         "— an indirect-slot call site would dereference "
+                         "the stub's code bytes as a function pointer and "
+                         "SIGSEGV. Set externCallDispatch='direct-plt' "
+                         "(Mach-O symbolVa→stub is direct-plt, like ELF). "
+                         "D-FFI-EXTERN-CALL-DISPATCH.",
+                         fmt.name()));
+        return {};
+    }
+
     std::size_t const numExterns = module.externImports.size();
 
     // ── (b) Group externs by library (preserve declaration order)
@@ -1102,6 +1299,24 @@ encodeExecDynamic(AssembledModule const&    module,
 
     // ── (e) Symbol-VA map: intra-fn VAs + extern __stubs slot VAs.
     //       __stubs lives right after __text within __TEXT.
+    //
+    // Per-cputype __stubs entry stride (6 for x86_64, 12 for arm64).
+    // Computed ONCE here and threaded through every layout site below
+    // so the stub size is single-sourced. A 0 (unhandled cputype) is
+    // a fail-loud up front — defense-in-depth ahead of `emitMachoStub`,
+    // which also fails loud, but a 0 stride would corrupt the layout
+    // arithmetic before emission if not caught here.
+    std::size_t const stubSize = machoStubSizeFor(id.cputype);
+    if (stubSize == 0u) {
+        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+             std::format("macho::encodeExecDynamic: cputype 0x{:x} has "
+                         "no __stubs entry size — the Mach-O dynamic-"
+                         "import path supports x86_64 (0x{:x}) and arm64 "
+                         "(0x{:x}). Add a per-cputype arm to "
+                         "machoStubSizeFor + emitMachoStub.",
+                         id.cputype, kCpuTypeX86_64, kCpuTypeArm64));
+        return {};
+    }
     std::uint64_t const stubsVa = sectionVa + textBody.size();
     std::unordered_map<SymbolId, std::uint64_t> symbolVa;
     symbolVa.reserve(module.functions.size() + numExterns);
@@ -1119,7 +1334,7 @@ encodeExecDynamic(AssembledModule const&    module,
     }
     for (std::size_t i = 0; i < numExterns; ++i) {
         std::uint64_t const stubVa =
-            stubsVa + static_cast<std::uint64_t>(i) * kStubSize;
+            stubsVa + static_cast<std::uint64_t>(i) * stubSize;
         if (!symbolVa.emplace(module.externImports[i].symbol,
                               stubVa).second) {
             emit(reporter, DiagnosticCode::K_SymbolUndefined,
@@ -1140,13 +1355,14 @@ encodeExecDynamic(AssembledModule const&    module,
         return {};
     }
 
-    // ── (g) Build __stubs body: N × `FF 25 disp32` (PC-rel jump
-    //       through __got slot N).
-    //       __got lives in __DATA_CONST at a separate VA computed
-    //       once we know the section layout below.
-    //       Stub at offset i resolves to: jmp *(rip + (gotVa[i] -
-    //       (stubVa_i + 6))). The +6 is the rip value after the
-    //       `FF 25 disp32` instruction (its own length).
+    // ── (g) Build __stubs body: N per-cputype stubs, each reaching
+    //       __got slot N. x86_64 = 6-byte `FF 25 disp32` (PC-relative
+    //       jmp through the slot); arm64 = 12-byte ADRP x16 → LDR x16,
+    //       [x16,#lo12] → BR x16. __got lives in __DATA_CONST at a
+    //       separate VA computed once the section layout is known
+    //       below. The actual byte emission is `emitMachoStub` (the
+    //       file-level stub substrate); see section (l) where gotVa is
+    //       resolved.
 
     // ── (h) Build LC_LOAD_DYLINKER + LC_LOAD_DYLIB sizes ────────
     std::size_t const dylinkerCmdSize =
@@ -1443,7 +1659,7 @@ encodeExecDynamic(AssembledModule const&    module,
     std::uint64_t const textFileSize = textBody.size();
     std::uint64_t const stubsFileOff = textFileOff + textFileSize;
     std::uint64_t const stubsFileSize =
-        static_cast<std::uint64_t>(numExterns) * kStubSize;
+        static_cast<std::uint64_t>(numExterns) * stubSize;
 
     // __got lives in __DATA_CONST — separate segment, separate page.
     // dyld maps each segment independently. Place __got's file
@@ -1466,36 +1682,37 @@ encodeExecDynamic(AssembledModule const&    module,
     std::uint64_t const gotVa =
         sectionVa + (gotFileOff - textFileOff);
 
-    // Now patch __stubs disp32: jmp [rip + (gotVa[i] - stubVa_i+6)].
+    // Build the __stubs body: one per-cputype stub per extern, each
+    // pointing at its __got slot. The per-cputype emitter (x86_64
+    // `FF 25 disp32`; arm64 ADRP+LDR+BR x16) is localized to the file-
+    // level stub substrate above (mirrors elf.cpp's emitPltStub). The
+    // walker stays shape-blind — it threads (stubVa, gotSlotVa) and the
+    // emitter writes `stubSize` bytes or fails loud.
     std::vector<std::uint8_t> stubsBody;
     stubsBody.reserve(stubsFileSize);
     for (std::size_t i = 0; i < numExterns; ++i) {
         std::uint64_t const stubVa = stubsVa +
-            static_cast<std::uint64_t>(i) * kStubSize;
+            static_cast<std::uint64_t>(i) * stubSize;
         std::uint64_t const gotSlotVa = gotVa +
             static_cast<std::uint64_t>(i) * kGotSlotSize;
-        // disp32 = gotSlotVa - (stubVa + 6) (signed, fits in i32).
-        std::int64_t const disp =
-            static_cast<std::int64_t>(gotSlotVa) -
-            static_cast<std::int64_t>(stubVa + kStubSize);
-        if (disp < std::numeric_limits<std::int32_t>::min()
-         || disp > std::numeric_limits<std::int32_t>::max()) {
-            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("macho::encodeExecDynamic: __stubs "
-                             "disp32 overflow (0x{:x}) for extern "
-                             "#{}; image too large for 32-bit "
-                             "PC-relative __got reference.",
-                             static_cast<std::uint64_t>(disp), i));
+        if (!emitMachoStub(id.cputype, stubsBody, stubVa, gotSlotVa, i,
+                           reporter)) {
             return {};
         }
-        stubsBody.push_back(0xFF);
-        stubsBody.push_back(0x25);
-        std::uint32_t const d32 =
-            static_cast<std::uint32_t>(static_cast<std::int32_t>(disp));
-        stubsBody.push_back(static_cast<std::uint8_t>(d32 & 0xFF));
-        stubsBody.push_back(static_cast<std::uint8_t>((d32 >> 8) & 0xFF));
-        stubsBody.push_back(static_cast<std::uint8_t>((d32 >> 16) & 0xFF));
-        stubsBody.push_back(static_cast<std::uint8_t>((d32 >> 24) & 0xFF));
+    }
+    // Substrate invariant: the emitter wrote exactly `stubSize` bytes
+    // per extern. A mismatch means an emitter's byte count diverged
+    // from `machoStubSizeFor` — that would desync every later layout
+    // offset (LC_SEGMENT_64 filesizes, __got page). Fail loud.
+    if (stubsBody.size() != stubsFileSize) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: emitted {} __stubs "
+                         "bytes but layout reserved {} ({} externs × {} "
+                         "stride) — emitMachoStub and machoStubSizeFor "
+                         "disagree (substrate invariant violation).",
+                         stubsBody.size(), stubsFileSize, numExterns,
+                         stubSize));
+        return {};
     }
 
     // ── (l.5) D-LK6-14-INTEGRATION-GOT-SLOTS: now that gotVa is
@@ -1732,7 +1949,7 @@ encodeExecDynamic(AssembledModule const&    module,
                 S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS |
                     S_ATTR_SOME_INSTRUCTIONS);
     appendU32LE(bytes, kStubsReserved1);    // index of first indirect sym
-    appendU32LE(bytes, static_cast<std::uint32_t>(kStubSize));  // stub size
+    appendU32LE(bytes, static_cast<std::uint32_t>(stubSize));  // stub size
     appendU32LE(bytes, 0);
 
     // LC_SEGMENT_64 __DATA_CONST (1 section: __got)

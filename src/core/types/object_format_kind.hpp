@@ -79,14 +79,17 @@ objectFormatKindFromName(std::string_view s) noexcept {
 // target needs OPPOSITE call shapes under different formats (x86_64-PE
 // vs x86_64-ELF), so it cannot live on the target schema.
 //
-//   * `indirect-slot` (PE IAT, Mach-O __got): the linker points the
-//     extern symbol's VA at a POINTER SLOT; the call site DEREFERENCES
-//     it (x86_64 `FF 15 disp32` = `call [RIP+disp32]`). The loader
-//     fixes the slot to the resolved callee address.
-//   * `direct-plt` (ELF PLT/GOT): the linker points the extern symbol's
-//     VA at a PLT STUB (code); the call site is a PLAIN DIRECT call to
-//     the stub (x86_64 `E8 disp32`, ARM64 `BL imm26`), and the stub
-//     performs the GOT indirection internally.
+//   * `indirect-slot` (PE IAT): the linker points the extern symbol's
+//     VA at a POINTER SLOT; the call site DEREFERENCES it (x86_64
+//     `FF 15 disp32` = `call [RIP+disp32]`). The loader fixes the slot
+//     to the resolved callee address.
+//   * `direct-plt` (ELF PLT/GOT, Mach-O __stubs): the linker points the
+//     extern symbol's VA at a STUB (code) — ELF's PLT entry or Mach-O's
+//     `__stubs` entry — and the call site is a PLAIN DIRECT call to the
+//     stub (x86_64 `E8 disp32`, ARM64 `BL imm26`); the stub performs
+//     the GOT/__got indirection internally. (Mach-O's `symbolVa[extern]
+//     = stubVa` is why it is direct-plt, NOT indirect-slot — the slot
+//     the symbol's VA names is the STUB, not the __got pointer.)
 //
 // Selecting the wrong shape MISCOMPILES: a `direct-plt` format reached
 // via the `indirect-slot` opcode dereferences the PLT stub's CODE bytes
@@ -112,6 +115,27 @@ externCallDispatchName(ExternCallDispatch d) noexcept {
 [[nodiscard]] constexpr std::optional<ExternCallDispatch>
 externCallDispatchFromName(std::string_view s) noexcept {
     return kExternCallDispatchTable.fromName(s);
+}
+
+// THE single source of truth for the extern-call-site SHAPE selection
+// (D-FFI-EXTERN-CALL-DISPATCH). `true`  → the call site DEREFERENCES a
+// pointer slot (x86_64 `FF 15 disp32` = `call [RIP+disp]`); the LIR
+// opcode is `call_indirect_via_extern`. `false` → the call site is a
+// PLAIN DIRECT call (x86_64 `E8 disp32`, ARM64 `BL imm26`) to the
+// linker-synthesized PLT/stub which performs the indirection itself;
+// the LIR opcode is the universal `call`.
+//
+// Two independent producers select the call shape from this rule:
+//   * `mir_to_lir.cpp::lowerCall`     — user-level extern calls (FFI).
+//   * `entry_trampoline.cpp`          — the synthesized `_exit` /
+//                                       `ExitProcess` ByNameImport call.
+// Both call THIS function so the rule lives exactly once (no `if(arch)`,
+// no second copy that could drift to the opposite — and opposite is a
+// SIGSEGV: dereferencing a PLT stub's code as a pointer). Keyed on the
+// OBJECT FORMAT's dispatch model, never the CPU target.
+[[nodiscard]] constexpr bool
+externCallUsesIndirectShape(ExternCallDispatch d) noexcept {
+    return d == ExternCallDispatch::IndirectSlot;
 }
 
 } // namespace dss
