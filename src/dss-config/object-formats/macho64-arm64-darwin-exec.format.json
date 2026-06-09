@@ -33,24 +33,30 @@
   },
 
   "image": {
-    "$comment": "Mach-O image fields for MH_EXECUTE. pageZeroSize = 0x100000000 (4 GiB) — __PAGEZERO at vmaddr=0 catches null derefs. dylinkerPath = '/usr/lib/dyld'. loadDylibs = ['/usr/lib/libSystem.B.dylib'] — required for any user-space process (and the home of the `_exit` the trampoline imports). bindNow = true (eager binding, the v1 stance, parallel to x86_64-darwin-exec + ELF's DF_1_NOW). codeSignature = ad-hoc SHA-256 (Apple Silicon REQUIRES every executable be code-signed; an ad-hoc signature is the minimum the kernel accepts for a locally-built binary). pageSize 16384 = Apple Silicon's 16 KiB page.",
+    "$comment": "Mach-O image fields for MH_EXECUTE. pageZeroSize = 0x100000000 (4 GiB) — __PAGEZERO at vmaddr=0 catches null derefs. segmentPageSize = 16384 (0x4000) — Apple Silicon REQUIRES 16 KiB-aligned LC_SEGMENT_64 vmaddr/vmsize/fileoff; 4 KiB-aligned segments are rejected at exec with EBADMACHO. This is a DISTINCT concept from codeSignature.pageSize (the code-hash page) and from pageZeroSize. dylinkerPath = '/usr/lib/dyld'. loadDylibs = ['/usr/lib/libSystem.B.dylib'] — required for any user-space process (and the home of the `_exit` the trampoline imports). bindNow = true (eager binding, the v1 stance, parallel to x86_64-darwin-exec + ELF's DF_1_NOW). buildVersion = macos / minOs 11.0 — modern dyld (macOS 11+ / Apple Silicon) needs an LC_BUILD_VERSION platform load command or it rejects the main executable at load (a second EBADMACHO-class blocker independent of segment alignment). codeSignature = ad-hoc SHA-256 (Apple Silicon REQUIRES every executable be code-signed; an ad-hoc signature is the minimum the kernel accepts for a locally-built binary). codeSignature.pageSize = 4096 = the conventional code-hash page Apple uses on BOTH x86_64 and arm64 (independent of the 16 KiB VM segment page).",
     "pageZeroSize": 4294967296,
+    "segmentPageSize": 16384,
     "dylinkerPath": "/usr/lib/dyld",
     "loadDylibs": [
       "/usr/lib/libSystem.B.dylib"
     ],
     "bindNow": true,
+    "buildVersion": {
+      "platform": "macos",
+      "minOs": "11.0",
+      "sdk": "11.0"
+    },
     "codeSignature": {
       "kind": "adhoc",
       "hashAlgorithm": "sha256",
-      "pageSize": 16384,
+      "pageSize": 4096,
       "identifier": "com.dss.macho_arm64_exit"
     }
   },
 
   "sections": [
     {
-      "$comment": "__text within __TEXT. virtualAddress = 0x100000000 + 0x1000 = 0x100001000 — __TEXT loads immediately after __PAGEZERO at the page boundary. flags (substrate `type`) = S_REGULAR (0) | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x00000400) = 0x80000400. addrAlign = 16 (log2 not used here; raw 16 matches the x86_64-darwin-exec schema convention).",
+      "$comment": "__text within __TEXT. virtualAddress = 0x100000000 + 0x4000 = 0x100004000 — one 16 KiB segmentPageSize above __PAGEZERO. __text's file offset is textFileOff = alignUp(headerAndCmds, segmentPageSize); since the binary's header+load-commands total ~840 bytes (< 0x4000), textFileOff = 0x4000, so the section VA must be pageZeroSize + 0x4000 for the kernel's mmap congruence (vmaddr % page == fileoff % page). If a future cycle grows the load commands past 0x4000, this value must follow textFileOff (the walker's congruence guard in macho.cpp fails loud if it does not). flags (substrate `type`) = S_REGULAR (0) | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x00000400) = 0x80000400. addrAlign = 16 (log2 not used here; raw 16 matches the x86_64-darwin-exec schema convention).",
       "kind": "text",
       "name": "__text",
       "segment": "__TEXT",
@@ -58,7 +64,7 @@
       "flags": 0,
       "addrAlign": 16,
       "entrySize": 0,
-      "virtualAddress": 4294971392
+      "virtualAddress": 4294983680
     }
   ],
 

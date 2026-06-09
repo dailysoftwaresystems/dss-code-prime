@@ -486,8 +486,64 @@ machoCodeSignatureHashAlgoFromName(std::string_view s) noexcept {
     return kMachOCodeSignatureHashAlgoTable.fromName(s);
 }
 
+// LC_BUILD_VERSION (`build_version_command`). Declares the executable's
+// target PLATFORM and minimum-OS / SDK versions. Modern dyld (macOS 11+ /
+// Apple Silicon, i.e. dyld4) identifies a main executable's platform from
+// this command; an executable carrying NO platform load command (neither
+// LC_BUILD_VERSION nor the legacy LC_VERSION_MIN_MACOSX) is rejected at
+// load — a distinct EBADMACHO-class blocker from segment misalignment.
+// `minOs`/`sdk` use the on-wire nibble encoding `(major<<16) |
+// (minor<<8) | patch` (e.g. 11.0.0 → 0x000B0000). Optional in the
+// schema (`image.buildVersion`) — absent → no LC_BUILD_VERSION emitted
+// (the pre-arm64 / MH_OBJECT behaviour, byte-identical). The platform is
+// a CLOSED enum (name → value) so a typo fails loud at load rather than
+// silently picking a platform. (D-LK10-ENTRY-MACHO-EXIT.)
+struct DSS_EXPORT MachOBuildVersion {
+    enum class Platform : std::uint32_t {
+        MacOs = 1,  // PLATFORM_MACOS
+    };
+    Platform      platform = Platform::MacOs;
+    std::uint32_t minOs = 0;  // (major<<16)|(minor<<8)|patch
+    std::uint32_t sdk   = 0;  // (major<<16)|(minor<<8)|patch
+};
+
+inline constexpr EnumNameTable<MachOBuildVersion::Platform, 1>
+kMachOBuildVersionPlatformTable{{{
+    { MachOBuildVersion::Platform::MacOs, "macos" },
+}}};
+
+[[nodiscard]] constexpr std::optional<MachOBuildVersion::Platform>
+machoBuildVersionPlatformFromName(std::string_view s) noexcept {
+    return kMachOBuildVersionPlatformTable.fromName(s);
+}
+
+// Default VM segment page size for Mach-O segment layout (the x86_64 /
+// 4 KiB convention). Apple Silicon (arm64) requires 16 KiB (0x4000);
+// see `MachOImage::segmentPageSize`. A named constant so validate()'s
+// MH_OBJECT "no image block" detection can tell the default apart from
+// an explicitly-set value.
+inline constexpr std::uint64_t kDefaultMachoSegmentPageSize = 0x1000u;  // 4 KiB
+
 struct DSS_EXPORT MachOImage {
     std::uint64_t pageZeroSize = 0;        // __PAGEZERO vmsize
+    // VM segment page size — the granularity at which every
+    // LC_SEGMENT_64's vmaddr / vmsize / fileoff is aligned (and the
+    // file is padded between segments). The kernel's mmap-congruence
+    // rule is `vmaddr % segmentPageSize == fileoff % segmentPageSize`;
+    // misaligned segments are rejected at exec with errno == EBADMACHO
+    // ("Malformed Mach-O file"). x86_64-darwin uses 4 KiB (the default);
+    // **Apple Silicon (arm64-darwin) REQUIRES 16 KiB (0x4000)** — the
+    // dominant cause of EBADMACHO for hand-built arm64 binaries. This is
+    // a DISTINCT concept from `pageZeroSize` (the __PAGEZERO vmsize) and
+    // from `codeSignature.pageSize` (the code-directory HASH page size,
+    // which Apple allows at 4 KiB or 16 KiB independently). Read by
+    // `macho.cpp` at both the static (`encodeExec`) and dynamic
+    // (`encodeExecDynamic`) layout sites. Declared in `.format.json`
+    // (`image.segmentPageSize`) — NOT inferred from the cputype — to
+    // keep the writer source/target/format-agnostic. validate() requires
+    // a power of two. Default 4 KiB → every pre-arm64 Mach-O schema is
+    // byte-identical (D-LK10-ENTRY-MACHO-EXIT).
+    std::uint64_t segmentPageSize = kDefaultMachoSegmentPageSize;
     std::string   dylinkerPath;            // LC_LOAD_DYLINKER name
     std::vector<MachODylibRef> loadDylibs; // each → LC_LOAD_DYLIB
     // Eager-vs-lazy dynamic-binding choice (parallel to
@@ -528,6 +584,13 @@ struct DSS_EXPORT MachOImage {
     // is preserved unchanged. validate() rejects this block on a
     // MH_OBJECT (like the rest of the image block).
     std::optional<MachOCodeSignature> codeSignature;
+    // LC_BUILD_VERSION platform / min-OS / SDK (D-LK10-ENTRY-MACHO-EXIT).
+    // When set, BOTH Mach-O exec walkers emit a `build_version_command`
+    // so dyld can identify the platform — REQUIRED for a main executable
+    // to load on macOS 11+ / Apple Silicon. Absent → no LC_BUILD_VERSION
+    // (byte-identical to every pre-arm64 / MH_OBJECT schema). validate()
+    // rejects this block on a MH_OBJECT (like the rest of the image).
+    std::optional<MachOBuildVersion> buildVersion;
     // Modern dyld binding format (Xcode 12+ / macOS 12+). When
     // `true`, the walker emits `LC_DYLD_CHAINED_FIXUPS` (0x80000034)
     // pointing at a `dyld_chained_fixups_header` + chained-pointer
@@ -558,8 +621,9 @@ struct DSS_EXPORT MachOImage {
     // FormatGuess::MachO32).
     //
     // Default `false` preserves the legacy LC_DYLD_INFO_ONLY path so
-    // shipped formats opt in explicitly (currently the new
-    // `macho64-arm64-darwin-exec.format.json` enables it).
+    // shipped formats opt in explicitly. (No shipped format enables it
+    // yet — both darwin-exec formats use the legacy opcode-stream bind;
+    // the chained-fixups emitter is exercised by unit tests only.)
     bool          useChainedFixups = false;
 };
 

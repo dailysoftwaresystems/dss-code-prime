@@ -111,6 +111,7 @@ constexpr std::uint32_t LC_DYLD_INFO_ONLY      = 0x80000022u;  // |= LC_REQ_DYLD
 constexpr std::uint32_t LC_DYLD_CHAINED_FIXUPS = 0x80000034u;  // |= LC_REQ_DYLD — D-LK6-14
 constexpr std::uint32_t LC_DYSYMTAB            = 0x0B;
 constexpr std::uint32_t LC_CODE_SIGNATURE = 0x1D;
+constexpr std::uint32_t LC_BUILD_VERSION  = 0x32;  // build_version_command
 // linkedit_data_command shape (16 bytes): cmd / cmdsize / dataoff /
 // datasize. Both LC_CODE_SIGNATURE and LC_DYLD_CHAINED_FIXUPS use
 // this exact layout — the alias documents the shared shape so
@@ -122,10 +123,34 @@ constexpr std::uint32_t LC_CODE_SIGNATURE = 0x1D;
 // so a future Apple change to one struct doesn't diverge silently.)
 constexpr std::size_t   kCodeSigCommandSize = 16;
 constexpr std::size_t   kLinkeditDataCommandSize = 16;
+// build_version_command (<mach-o/loader.h>): cmd / cmdsize / platform /
+// minos / sdk / ntools — 6 × u32 = 24 bytes with ntools = 0 (no trailing
+// build_tool_version records). Modern dyld (macOS 11+ / Apple Silicon)
+// identifies the executable's PLATFORM from this command; a main
+// executable without it (nor the legacy LC_VERSION_MIN_MACOSX) is
+// rejected at load. (D-LK10-ENTRY-MACHO-EXIT.)
+constexpr std::size_t   kBuildVersionCommandSize = 24;
 static_assert(kCodeSigCommandSize == kLinkeditDataCommandSize,
               "linkedit_data_command shape is wire-frozen at 16 bytes; "
               "both LC_CODE_SIGNATURE and LC_DYLD_CHAINED_FIXUPS use it.");
 constexpr std::uint64_t kLoadCmdAlign     = 8;  // pad LCs to 8 bytes
+
+// Emit one `build_version_command` (LC_BUILD_VERSION, 24 bytes, ntools=0)
+// — the SINGLE chokepoint shared by both the static (encodeExec) and
+// dynamic (encodeExecDynamic) arms, so the 6-u32 wire layout is written
+// in exactly one place. platform / minos / sdk are little-endian u32s;
+// minos/sdk carry the (major<<16)|(minor<<8)|patch nibble encoding the
+// schema loader produced. (D-LK10-ENTRY-MACHO-EXIT.)
+void appendBuildVersionCommand(std::vector<std::uint8_t>& out,
+                               MachOBuildVersion const& bv) {
+    appendU32LE(out, LC_BUILD_VERSION);
+    appendU32LE(out,
+                static_cast<std::uint32_t>(kBuildVersionCommandSize));
+    appendU32LE(out, static_cast<std::uint32_t>(bv.platform));
+    appendU32LE(out, bv.minOs);
+    appendU32LE(out, bv.sdk);
+    appendU32LE(out, 0u);  // ntools = 0 (no trailing build_tool_version)
+}
 
 // section_64.flags (S_*) — <mach-o/loader.h>
 constexpr std::uint32_t S_NON_LAZY_SYMBOL_POINTERS = 0x6;
@@ -859,6 +884,24 @@ encodeExec(AssembledModule const&    module,
              "plan 14 §3.1 D-LK7-1.");
         return {};
     }
+    // LC_BUILD_VERSION is emitted only on the dynamic exec path
+    // (encodeExecDynamic) — the sole path the runnable arm64-darwin
+    // corpus uses. A static exec carrying `image.buildVersion` is a
+    // legitimate future combination (e.g. an x86_64-darwin static exec
+    // wanting a platform LC), but it has no shipped consumer today; fail
+    // loud here rather than silently drop the platform command.
+    // D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION (trigger: first static
+    // Mach-O exec format that declares image.buildVersion).
+    if (im.buildVersion.has_value()) {
+        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+             "macho::encodeExec: 'image.buildVersion' (LC_BUILD_VERSION) "
+             "is currently emitted only on the dynamic Mach-O exec path "
+             "(encodeExecDynamic). The static path does not yet emit it "
+             "— route through the dynamic exec path or omit "
+             "image.buildVersion. Anchored "
+             "D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION.");
+        return {};
+    }
     std::uint32_t const ncmds = static_cast<std::uint32_t>(
         2u + 1u + 1u + im.loadDylibs.size() + 1u);
     std::size_t const sizeofcmds =
@@ -899,7 +942,12 @@ encodeExec(AssembledModule const&    module,
     // [fileoff, fileoff+filesize) including the header). vmsize =
     // page-aligned size of all sections. Sections within __TEXT
     // have offset = (their byte position in the file).
-    constexpr std::uint64_t kPageSize = 0x1000;
+    //
+    // VM segment page size is config-driven (`image.segmentPageSize`):
+    // 4 KiB for x86_64-darwin, 16 KiB (0x4000) for arm64-darwin (Apple
+    // Silicon rejects 4 KiB-aligned segments with EBADMACHO). validate()
+    // guarantees a power of two. (D-LK10-ENTRY-MACHO-EXIT.)
+    std::uint64_t const kPageSize = im.segmentPageSize;
     std::uint64_t const textFileOff =
         alignUp(headerAndCmds, kPageSize);
     std::uint64_t const textFileSize = textBody.size();
@@ -1163,7 +1211,11 @@ encodeExecDynamic(AssembledModule const&    module,
              "needs at least one entry function.");
         return {};
     }
-    constexpr std::uint64_t kPageSize = 0x1000;
+    // VM segment page size is config-driven (`image.segmentPageSize`):
+    // 4 KiB x86_64-darwin / 16 KiB (0x4000) arm64-darwin. Apple Silicon
+    // rejects 4 KiB-aligned segments with EBADMACHO. validate() proves
+    // it is a power of two. (D-LK10-ENTRY-MACHO-EXIT.)
+    std::uint64_t const kPageSize = im.segmentPageSize;
     std::uint64_t const sectionVa = secText.virtualAddress;
     if (sectionVa < im.pageZeroSize) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
@@ -1629,17 +1681,22 @@ encodeExecDynamic(AssembledModule const&    module,
     // whether to emit the load command at all.
     bool const emitCodeSig =
         im.codeSignatureSize != 0 || im.codeSignature.has_value();
+    // LC_BUILD_VERSION (platform/min-OS) is emitted iff the schema
+    // declares `image.buildVersion` — required for the image to load on
+    // macOS 11+ / Apple Silicon (D-LK10-ENTRY-MACHO-EXIT).
+    bool const emitBuildVersion = im.buildVersion.has_value();
     // ncmds = 4 segments + LC_DYLD_{INFO_ONLY|CHAINED_FIXUPS}
     //       + LC_LOAD_DYLINKER + LC_MAIN + N × LC_LOAD_DYLIB
     //       + LC_SYMTAB + (LC_DYSYMTAB when !useChainedFixups —
     //       D-LK6-14-INTEGRATION-GOT-SLOTS drops it because chained
     //       pointers in __got encode the import ordinal directly, so
     //       the indirect symbol table is redundant) + LC_CODE_SIGNATURE
-    //       when emitCodeSig.
+    //       when emitCodeSig + LC_BUILD_VERSION when emitBuildVersion.
     std::uint32_t const ncmds = static_cast<std::uint32_t>(
         4u + 1u + 1u + 1u + im.loadDylibs.size() + 1u
         + (useChainedFixups ? 0u : 1u)
-        + (emitCodeSig ? 1u : 0u));
+        + (emitCodeSig ? 1u : 0u)
+        + (emitBuildVersion ? 1u : 0u));
     // sizeofcmds: LC_DYLD_CHAINED_FIXUPS is 16 bytes (linkedit_data_
     // command shape — same as LC_CODE_SIGNATURE); LC_DYLD_INFO_ONLY
     // is 48 bytes. Pick the right size for the dyld-binding command.
@@ -1651,7 +1708,8 @@ encodeExecDynamic(AssembledModule const&    module,
         kSegCmdLinkeditSize + dyldBindCmdSize + dylinkerCmdSize +
         kLcMainSize + totalDylibCmdSize + kSymtabCommandSize +
         (useChainedFixups ? 0u : kDysymtabCommandSize) +
-        (emitCodeSig ? kCodeSigCommandSize : 0u);
+        (emitCodeSig ? kCodeSigCommandSize : 0u) +
+        (emitBuildVersion ? kBuildVersionCommandSize : 0u);
     std::size_t const headerAndCmds = kMachHeader64Size + sizeofcmds;
 
     std::uint64_t const textFileOff =
@@ -1723,22 +1781,24 @@ encodeExecDynamic(AssembledModule const&    module,
     //          populated in section (i)'s else-arm.)
     if (useChainedFixups) {
         // Single-page __DATA_CONST guard. v1 supports at most one
-        // page of __got (kPageSize / kGotSlotSize = 4096 / 8 = 512
-        // externs on a 4 KiB page; 2048 on a 16 KiB page). Multi-page
-        // support requires computing page_starts[i] for each page —
-        // anchored D-LK6-14-MULTI-PAGE-GOT (trigger: first module
-        // with > 512 extern imports OR first 16 KiB-page target).
+        // page of __got: kPageSize / kGotSlotSize slots (512 on a
+        // 4 KiB page, 2048 on a 16 KiB page — kPageSize is now the
+        // config-driven segmentPageSize). Multi-page support requires
+        // computing page_starts[i] for each page — anchored
+        // D-LK6-14-MULTI-PAGE-GOT (trigger: first module with more
+        // extern imports than fit one segmentPageSize of __got).
         if (gotFileSize > kPageSize) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  std::format("macho::encodeExecDynamic: chained-fixups "
                              "__got spans {} bytes > kPageSize {} "
-                             "(= {} extern slots at {} bytes each on "
-                             "a 4 KiB page) — v1 supports single-page "
+                             "(= {} extern slots at {} bytes each on a "
+                             "{}-byte page) — v1 supports single-page "
                              "chains only. Reduce extern count or "
                              "fall back to LC_DYLD_INFO_ONLY. Anchored "
                              "D-LK6-14-MULTI-PAGE-GOT.",
                              gotFileSize, kPageSize,
-                             kPageSize / kGotSlotSize, kGotSlotSize));
+                             kPageSize / kGotSlotSize, kGotSlotSize,
+                             kPageSize));
             return {};
         }
         dss::macho::detail::ChainedSegInfo segInfo;
@@ -1992,6 +2052,15 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, /*initprot=*/1);
     appendU32LE(bytes, 0);
     appendU32LE(bytes, 0);
+
+    // LC_BUILD_VERSION — emitted after the four LC_SEGMENT_64 commands
+    // (so it does NOT shift the segment indices the bind opcodes
+    // reference) and before the dyld-binding command. Declares the
+    // platform / min-OS so dyld accepts the image on macOS 11+ / Apple
+    // Silicon (D-LK10-ENTRY-MACHO-EXIT).
+    if (emitBuildVersion) {
+        appendBuildVersionCommand(bytes, *im.buildVersion);
+    }
 
     if (useChainedFixups) {
         // LC_DYLD_CHAINED_FIXUPS (modern dyld binding format).

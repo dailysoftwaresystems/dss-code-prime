@@ -39,6 +39,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -193,8 +194,17 @@ TEST(MachOArm64Exit, ShippedFormatLoadsWithArm64Identity) {
               "/usr/lib/libSystem.B.dylib");
     EXPECT_EQ(fmt->entryCallingConvention(), "apple_arm64");
     // Ad-hoc code signature reserved (Apple Silicon requires signing).
+    // The code-hash page size is the conventional 4096 — a SEPARATE knob
+    // from the 16 KiB VM segment page (segmentPageSize) below.
     ASSERT_TRUE(fmt->machoImage().codeSignature.has_value());
-    EXPECT_EQ(fmt->machoImage().codeSignature->pageSize, 16384u);
+    EXPECT_EQ(fmt->machoImage().codeSignature->pageSize, 4096u);
+    // 16 KiB VM segment page — the Apple-Silicon EBADMACHO fix.
+    EXPECT_EQ(fmt->machoImage().segmentPageSize, 16384u);
+    // LC_BUILD_VERSION platform = macos, minOs = 11.0.0 (0x000B0000).
+    ASSERT_TRUE(fmt->machoImage().buildVersion.has_value());
+    EXPECT_TRUE(fmt->machoImage().buildVersion->platform
+                == MachOBuildVersion::Platform::MacOs);
+    EXPECT_EQ(fmt->machoImage().buildVersion->minOs, 0x000B0000u);
 }
 
 // ── emitArm64MachoStub: exact ADRP+LDR+BR bytes (independent recompute)
@@ -447,5 +457,166 @@ TEST(MachOArm64Exit, AdHocCodeSignatureSuperBlobWellFormed) {
     std::uint32_t const codeLimit = readU32BE(cd + 32);
     EXPECT_EQ(codeLimit, dataOff);               // sig offset == codeLimit
     EXPECT_EQ(bytes[cd + 37], 2u);               // hashType = SHA-256
-    EXPECT_EQ(bytes[cd + 39], 14u);              // pageSize = log2(16384)
+    EXPECT_EQ(bytes[cd + 39], 12u);              // pageSize = log2(4096)
+}
+
+// ── 16 KiB segment alignment — the EBADMACHO fix, red-on-disable ──────
+//
+// Apple Silicon rejects an executable whose LC_SEGMENT_64 vmaddr / vmsize
+// / fileoff are not 16 KiB-aligned (errno EBADMACHO). EVERY segment must
+// be 16 KiB-aligned in all three fields. This is the host-independent
+// structural guard: it runs on every CI leg and goes RED if
+// `segmentPageSize` ever reverts to 4096 (the segments downstream of
+// __TEXT — __DATA_CONST.vmaddr/fileoff and __LINKEDIT — fall on a 4 KiB
+// boundary that is NOT a 16 KiB boundary).
+TEST(MachOArm64Exit, Arm64SegmentsAre16KAligned) {
+    auto target = loadArm64Target();
+    auto fmt    = loadArm64DarwinExecFormat();
+    ASSERT_TRUE(target);
+    ASSERT_TRUE(fmt);
+
+    AssembledModule mod = makeArm64DynamicModule();
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    constexpr std::uint64_t k16K = 16384u;
+    // Walk every load command; for each LC_SEGMENT_64 (cmd 0x19) assert
+    // vmaddr@24 / vmsize@32 / fileoff@40 are all 16 KiB-aligned.
+    std::uint32_t const ncmds = readU32LE(bytes, 16);
+    std::size_t off = 32;
+    int segments = 0;
+    for (std::uint32_t i = 0; i < ncmds; ++i) {
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
+        ASSERT_NE(cmdsize, 0u);
+        if (cmd == 0x19u) {  // LC_SEGMENT_64
+            ++segments;
+            std::string seg(reinterpret_cast<char const*>(&bytes[off + 8]),
+                            ::strnlen(reinterpret_cast<char const*>(
+                                          &bytes[off + 8]), 16));
+            std::uint64_t const vmaddr   = readU64LE(bytes, off + 24);
+            std::uint64_t const vmsize   = readU64LE(bytes, off + 32);
+            std::uint64_t const fileoff  = readU64LE(bytes, off + 40);
+            EXPECT_EQ(vmaddr  % k16K, 0u) << seg << ".vmaddr 0x"
+                << std::hex << vmaddr << " not 16 KiB-aligned";
+            EXPECT_EQ(vmsize  % k16K, 0u) << seg << ".vmsize 0x"
+                << std::hex << vmsize << " not 16 KiB-aligned";
+            EXPECT_EQ(fileoff % k16K, 0u) << seg << ".fileoff 0x"
+                << std::hex << fileoff << " not 16 KiB-aligned";
+        }
+        off += cmdsize;
+    }
+    // __PAGEZERO + __TEXT + __DATA_CONST + __LINKEDIT.
+    EXPECT_EQ(segments, 4) << "expected 4 LC_SEGMENT_64 commands";
+}
+
+// ── LC_BUILD_VERSION byte-pin (the platform LC dyld needs) ────────────
+TEST(MachOArm64Exit, Arm64ExecEmitsBuildVersionMacOs) {
+    auto target = loadArm64Target();
+    auto fmt    = loadArm64DarwinExecFormat();
+    ASSERT_TRUE(target);
+    ASSERT_TRUE(fmt);
+
+    AssembledModule mod = makeArm64DynamicModule();
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    // LC_BUILD_VERSION = 0x32. build_version_command (all u32 LE):
+    //   cmd@0 cmdsize@4 platform@8 minos@12 sdk@16 ntools@20.
+    std::span<std::uint8_t const> sp{bytes};
+    auto bvOff = dss::macho::test::findLoadCommand(sp, 0x32u);
+    ASSERT_TRUE(bvOff.has_value())
+        << "arm64 exec must carry LC_BUILD_VERSION (dyld platform LC)";
+    EXPECT_EQ(readU32LE(bytes, *bvOff + 4), 24u);   // cmdsize (ntools=0)
+    EXPECT_EQ(readU32LE(bytes, *bvOff + 8), 1u);    // PLATFORM_MACOS
+    EXPECT_EQ(readU32LE(bytes, *bvOff + 12), 0x000B0000u);  // minos 11.0.0
+    EXPECT_EQ(readU32LE(bytes, *bvOff + 16), 0x000B0000u);  // sdk 11.0.0
+    EXPECT_EQ(readU32LE(bytes, *bvOff + 20), 0u);   // ntools = 0
+}
+
+// ── Backward-compat: x86_64-darwin defaults to a 4 KiB segment page ───
+//
+// macho64-x86_64-darwin-exec declares NO segmentPageSize → it defaults to
+// 4096, so the x86 layout is byte-identical to before this cycle. Pin the
+// default explicitly (a knob-that-lies guard: prove the absence path
+// yields 4096, not 0 or 16384).
+TEST(MachOArm64Exit, X86DarwinExecDefaultsTo4KSegmentPageSize) {
+    auto fmt = loadDarwinExecByName("macho64-x86_64-darwin-exec.format.json");
+    ASSERT_TRUE(fmt);
+    EXPECT_EQ(fmt->machoImage().segmentPageSize, 4096u);
+    // x86 declares no buildVersion (Intel/Rosetta is lenient).
+    EXPECT_FALSE(fmt->machoImage().buildVersion.has_value());
+}
+
+// ── validate() fail-loud: a non-power-of-two segmentPageSize ──────────
+TEST(MachOArm64Exit, SegmentPageSizeNonPowerOfTwoFailsLoud) {
+    // segmentPageSize = 12288 (0x3000) — a multiple of 4096 but NOT a
+    // power of two; alignUp() would corrupt the layout. Must reject.
+    std::string const json = R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-badpage","kind":"macho"},
+      "entryPoint": "",
+      "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "segmentPageSize": 12288,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "bindNow": true
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294983680}
+      ],
+      "relocations":[{"name":"ARM64_RELOC_BRANCH26","kind":1,"nativeId":620756992}]
+    })";
+    auto res = ObjectFormatSchema::loadFromText(json);
+    ASSERT_FALSE(res.has_value())
+        << "non-power-of-two segmentPageSize must fail validate";
+    bool sawMsg = false;
+    for (auto const& d : res.error())
+        if (d.message.find("segmentPageSize") != std::string::npos
+         && d.message.find("power of two") != std::string::npos)
+            sawMsg = true;
+    EXPECT_TRUE(sawMsg) << "expected a segmentPageSize power-of-two diag";
+}
+
+// ── validate() fail-loud: the EXACT 16 KiB-vs-4 KiB-VA bug ────────────
+//
+// segmentPageSize = 16384 but __text.virtualAddress = 0x100001000 (only
+// 4 KiB above pageZeroSize) — the canonical arm64 EBADMACHO. validate()
+// must reject it at schema-load (host-independent, fast), not leave it to
+// the encode-time walker. This pins the congruence guard red-on-disable.
+TEST(MachOArm64Exit, TextVaNotCongruentTo16KPageFailsLoud) {
+    std::string const json = R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-badva","kind":"macho"},
+      "entryPoint": "",
+      "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "segmentPageSize": 16384,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "bindNow": true
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ],
+      "relocations":[{"name":"ARM64_RELOC_BRANCH26","kind":1,"nativeId":620756992}]
+    })";
+    auto res = ObjectFormatSchema::loadFromText(json);
+    ASSERT_FALSE(res.has_value())
+        << "4 KiB-congruent text VA under a 16 KiB page must fail validate";
+    bool sawMsg = false;
+    for (auto const& d : res.error())
+        if (d.message.find("EBADMACHO") != std::string::npos
+         || d.message.find("segmentPageSize") != std::string::npos)
+            sawMsg = true;
+    EXPECT_TRUE(sawMsg) << "expected an mmap-congruence diag";
 }
