@@ -88,17 +88,32 @@ windowFor(EncodingSlotKind s) noexcept {
         // irrelevant at width 0.
         case EncodingSlotKind::SymbolPatchMarker: return SlotBitWindow{ 0, 0 };
         // x86-variable slots — never reached on a fixed32 variant
-        // (validate() rejects). Returning nullopt makes the walker
-        // fail loud if a schema bypasses validate() somehow.
+        // (validate() rejects cross-shape variants). Returning nullopt
+        // makes the walker fail loud (`orInto`) if a schema bypasses
+        // validate() somehow. Listed EXHAUSTIVELY (every x86-variable
+        // EncodingSlotKind, no `default:`) so a newly-added enumerator
+        // re-triggers -Wswitch / -Werror=switch here and forces a
+        // deliberate fixed32-vs-x86 classification — the compile-time
+        // lockstep gate D-AS-ENCODINGSLOT-EXHAUSTIVE-WARN.
         case EncodingSlotKind::ModRmReg:
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Disp32:
+        case EncodingSlotKind::ModRmRmMem:
+        case EncodingSlotKind::MemBaseScale:
+        case EncodingSlotKind::Disp32Mem:
+        case EncodingSlotKind::SibIndex:
+        case EncodingSlotKind::RipRelDisp32:
+        case EncodingSlotKind::CondCodeNibble:
+        case EncodingSlotKind::BlockRel32:
             return std::nullopt;
     }
-    // Enum-drift fallback — a new EncodingSlotKind value added
-    // without a matching arm above falls here. Returning nullopt
-    // makes the walker fail loud (`orInto` emits a hard diagnostic).
+    // Unreachable for any in-range EncodingSlotKind — the switch above
+    // is exhaustive. Retained as the out-of-range-ordinal backstop and
+    // to satisfy the compiler's reachability rule: a constexpr function
+    // must return on every path, and GCC/Clang (-Wreturn-type) / MSVC
+    // (C4715) do not treat an enum switch as exhaustive for control
+    // flow. Mirrors `slotShapeFor`'s trailing return.
     return std::nullopt;
 }
 

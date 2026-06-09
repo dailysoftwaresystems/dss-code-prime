@@ -244,7 +244,45 @@ disassemble(TargetSchema const&            schema,
                                        info->mnemonic, vi,
                                        encodingSlotKindName(slot)));
                     return std::nullopt;
+                // Remaining slots disassemble to nullopt (value undefined
+                // here). Behavior-PRESERVED from the prior trailing
+                // fallback — two sub-classes, both undecoded by this x86
+                // walker today:
+                //   * x86-variable slots not yet decoded (ModRmRmMem,
+                //     Disp32Mem, SibIndex, MemBaseScale, RipRelDisp32,
+                //     CondCodeNibble, BlockRel32) — the disasm-completeness
+                //     gap tracked by D-AS5-MULTIWORD-DISASM.
+                //   * fixed32 slots (Imm16/Imm9/Imm12/Imm19/MemBaseNoScale/
+                //     SymbolPatchMarker) that the Rd/Rn/Rm/Imm26 arm above
+                //     would fail-loud on (CRITICAL-2): a silent `nullopt`
+                //     here would let such a slot masquerade as a patched
+                //     SymbolRef in `roundTripVerify` (the exact hazard the
+                //     loud arm guards). They reach here only under a cross-
+                //     shape variant validate() already rejects, so
+                //     converging them onto that fail-loud arm is a behavior
+                //     change deferred out of this hygiene cycle
+                //     (D-AS-DISASM-FIXED32-SLOT-FAILLOUD).
+                // Listed EXHAUSTIVELY (no `default:`) so a new enumerator
+                // re-triggers the -Werror=switch gate here.
+                case EncodingSlotKind::ModRmRmMem:
+                case EncodingSlotKind::MemBaseScale:
+                case EncodingSlotKind::Disp32Mem:
+                case EncodingSlotKind::SibIndex:
+                case EncodingSlotKind::RipRelDisp32:
+                case EncodingSlotKind::CondCodeNibble:
+                case EncodingSlotKind::BlockRel32:
+                case EncodingSlotKind::Imm16:
+                case EncodingSlotKind::Imm9:
+                case EncodingSlotKind::MemBaseNoScale:
+                case EncodingSlotKind::Imm12:
+                case EncodingSlotKind::SymbolPatchMarker:
+                case EncodingSlotKind::Imm19:
+                    return std::nullopt;
             }
+            // Unreachable for any in-range EncodingSlotKind (the switch is
+            // exhaustive). Out-of-range-ordinal backstop + satisfies
+            // GCC-Clang -Wreturn-type / MSVC C4715 (an enum switch is not
+            // treated as exhaustive for control flow).
             return std::nullopt;
         };
 

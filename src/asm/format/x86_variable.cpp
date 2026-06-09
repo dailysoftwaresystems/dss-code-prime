@@ -211,9 +211,14 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
             return true;
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Disp32Mem:
-            // Imm32 / Disp32Mem expect an immediate-style value, not a
-            // register hwEnc. Wired separately via the operand-kind
-            // dispatch below. Reaching here means the JSON wired a
+        case EncodingSlotKind::RipRelDisp32:
+        case EncodingSlotKind::CondCodeNibble:
+        case EncodingSlotKind::BlockRel32:
+            // x86-variable slots that carry an immediate / displacement /
+            // condition / block-relative value, NOT a register hwEnc.
+            // They are filled by other paths (the operand-kind dispatch
+            // below, the cond-from-payload path, the block-patch list),
+            // never by wireSlot. Reaching here means the JSON wired a
             // register into a non-register slot — fail loud.
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
@@ -235,10 +240,17 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:
         case EncodingSlotKind::Imm26:
-            // Other shapes — not handled by the x86 walker (the
-            // schema's slotShapeFor + validate cross-check prevents
-            // reaching here under a clean schema). Defense-in-depth
-            // fail-loud.
+        case EncodingSlotKind::Imm16:
+        case EncodingSlotKind::Imm9:
+        case EncodingSlotKind::MemBaseNoScale:
+        case EncodingSlotKind::Imm12:
+        case EncodingSlotKind::SymbolPatchMarker:
+        case EncodingSlotKind::Imm19:
+            // Other shapes — the fixed32 register/immediate slots plus
+            // the symbol-bearing Disp32, none handled by the x86
+            // register-wiring walker. slotShapeFor + validate's cross-
+            // shape check prevents reaching here under a clean schema.
+            // Defense-in-depth fail-loud.
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': slot '{}' belongs to a "
@@ -248,15 +260,18 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
                                encodingSlotKindName(slot)));
             return false;
     }
-    // Enum-drift fallback. A new `EncodingSlotKind` value added without
-    // a matching switch arm would otherwise silently `return false` —
-    // fail loud per the silent-failure review (mirrors the same pattern
-    // in asm.cpp's TargetEncodingShape dispatch).
+    // Unreachable for any in-range EncodingSlotKind — the switch above is
+    // exhaustive, so a NEW enumerator is caught at compile time by
+    // -Werror=switch / /we4062 (D-AS-ENCODINGSLOT-EXHAUSTIVE-WARN), not
+    // here. This arm backstops only a truly out-of-range ordinal (an
+    // invalid cast / corrupted value) — which -Wswitch cannot catch — and
+    // satisfies MSVC C4715 / GCC-Clang -Wreturn-type (an enum switch is
+    // not treated as exhaustive for control flow). Fail loud.
     report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
            DiagnosticSeverity::Error,
-           std::format("opcode '{}': unknown encoding-slot ordinal {} "
-                       "(internal-invariant: a new EncodingSlotKind "
-                       "value was added without updating the x86 walker)",
+           std::format("opcode '{}': out-of-range encoding-slot ordinal {} "
+                       "(internal-invariant: EncodingSlotKind value outside "
+                       "the declared enum range)",
                        mnemonic, static_cast<int>(slot)));
     return false;
 }
