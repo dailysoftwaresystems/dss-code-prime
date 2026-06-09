@@ -44,7 +44,7 @@ reference — when this skill and a doc disagree, **the doc and the plan win**.
 |-----------|---------|
 | `src/core/` | The static `core` library — compiled into `libdss-code-prime.dll` |
 | `src/core/types/` | The tree/node model and friends (22 headers, 11 `.cpp` files) |
-| `src/source-config/languages/` | Shipped `.lang.json` grammar configs (`toy.lang.json` only so far) |
+| `src/dss-config/sources/` | Shipped `.lang.json` grammar configs (`toy`, `c-subset`, `tsql-subset`) |
 | `tests/core/` | GoogleTest unit + integration tests (one executable per file) |
 | `docs/` | User-facing onboarding docs (`tree-model.md`, `language-config-spec.md`) |
 | `.plans/` | Internal design records and roadmap (`00-compiler-implementation-plan - tbd.md`, `01-tree-node-model-plan - ok.md`, `02-schema-expressiveness-v2-plan - ok.md`) |
@@ -225,7 +225,7 @@ See [`docs/language-config-spec.md`](../../../docs/language-config-spec.md) for 
 ### 5.1 Loading
 
 ```cpp
-auto loaded = GrammarSchema::loadShipped("toy");    // from src/source-config/languages/toy.lang.json
+auto loaded = GrammarSchema::loadShipped("toy");    // from src/dss-config/sources/toy.lang.json
 auto loaded = GrammarSchema::loadFromText(jsonText); // from an inline JSON literal
 ```
 
@@ -527,7 +527,7 @@ a drop-in starting point. Key steps:
 
 See the cookbook in `docs/language-config-spec.md` §7. The full Calc-language template is
 copy-pasteable and verified by `GrammarSchema.DocsCookbookCalcExampleLoadsCleanly`. Drop a
-new file in `src/source-config/languages/`, load via `GrammarSchema::loadShipped("yourname")`.
+new file in `src/dss-config/sources/`, load via `GrammarSchema::loadShipped("yourname")`.
 
 ### 10.4 Adding a diagnostic code
 
@@ -615,7 +615,7 @@ the first time. Expect a v2-fixup pass once the tokenizer surfaces gaps.
 | A typed view | `src/core/types/tree_views.hpp` (all 7 views, ~250 lines) |
 | The fatal helper pattern | `src/core/types/tree.cpp:20-25` (`treeFatal`) or `src/core/types/tree_attrs.hpp:35-40` (`attrFatal`) |
 | Driving `TreeBuilder` from a test | `tests/core/test_tree_builder.cpp` (40+ tests covering every recovery flavor) |
-| The shipped grammar config | `src/source-config/languages/toy.lang.json` |
+| The shipped grammar config | `src/dss-config/sources/toy.lang.json` |
 | Onboarding docs writing style | `docs/tree-model.md` (the WhileStmtView cookbook is the template) |
 
 ---
