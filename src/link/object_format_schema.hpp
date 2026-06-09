@@ -429,6 +429,63 @@ struct DSS_EXPORT MachODylibRef {
     //   std::uint32_t compatibilityVersion = 0;
 };
 
+// Ad-hoc code-signature request (D-LK7-ADHOC-CODESIGN-MACHO, increment
+// 2/2). When present on a MH_EXECUTE image, the Mach-O walker FILLS the
+// LC_CODE_SIGNATURE reservation with a real ad-hoc CodeDirectory +
+// SuperBlob (page-hash table over the signed file bytes) so the binary
+// satisfies the macOS / Apple-Silicon AMFI loader, which refuses any
+// unsigned executable. "Ad-hoc" = no CMS / identity / certificate; the
+// CodeDirectory carries the CS_ADHOC flag and dyld trusts the embedded
+// page hashes alone. The reservation SIZE is DERIVED from this block
+// (`adHocCodeSignatureSize`), so a hand-typed `codeSignatureSize` is not
+// needed when `codeSignature` is set.
+//
+// The two enums are closed (one variant each today) so a typo in the
+// JSON fails loud at load (mirrors `ExternCallDispatch`'s closed-enum
+// `…FromName` discipline) rather than silently selecting a default
+// signing scheme. Additional schemes (e.g. a CMS-signed `Authenticode`-
+// equivalent, or SHA-1 legacy slots) add an enum slot + a name-table
+// row, never a magic string.
+struct DSS_EXPORT MachOCodeSignature {
+    enum class Kind : std::uint8_t {
+        AdHoc = 1,  // CS_ADHOC CodeDirectory, no CMS / identity
+    };
+    enum class HashAlgo : std::uint8_t {
+        Sha256 = 1,  // CS_HASHTYPE_SHA256 (hashType=2 on the wire)
+    };
+
+    Kind          kind          = Kind::AdHoc;
+    HashAlgo      hashAlgorithm = HashAlgo::Sha256;
+    // Code-slot page size in bytes; one SHA-256 hash per page of the
+    // signed region. Must be a power of two (the CodeDirectory stores
+    // log2(pageSize) in a single byte). Apple uses 4096 (0x1000)
+    // universally for code pages regardless of the VM page size.
+    std::uint32_t pageSize      = 4096;
+    // CodeDirectory identifier C-string (the `identOffset` payload).
+    // Apple uses the bundle id or, for a bare executable, its leaf
+    // name. Must be non-empty (the kernel keys the signature on it).
+    std::string   identifier;
+};
+
+inline constexpr EnumNameTable<MachOCodeSignature::Kind, 1>
+kMachOCodeSignatureKindTable{{{
+    { MachOCodeSignature::Kind::AdHoc, "adhoc" },
+}}};
+
+inline constexpr EnumNameTable<MachOCodeSignature::HashAlgo, 1>
+kMachOCodeSignatureHashAlgoTable{{{
+    { MachOCodeSignature::HashAlgo::Sha256, "sha256" },
+}}};
+
+[[nodiscard]] constexpr std::optional<MachOCodeSignature::Kind>
+machoCodeSignatureKindFromName(std::string_view s) noexcept {
+    return kMachOCodeSignatureKindTable.fromName(s);
+}
+[[nodiscard]] constexpr std::optional<MachOCodeSignature::HashAlgo>
+machoCodeSignatureHashAlgoFromName(std::string_view s) noexcept {
+    return kMachOCodeSignatureHashAlgoTable.fromName(s);
+}
+
 struct DSS_EXPORT MachOImage {
     std::uint64_t pageZeroSize = 0;        // __PAGEZERO vmsize
     std::string   dylinkerPath;            // LC_LOAD_DYLINKER name
@@ -462,6 +519,15 @@ struct DSS_EXPORT MachOImage {
     //  alignment; the walker rejects any other value at
     //  `validate()`).
     std::uint32_t codeSignatureSize = 0;
+    // Ad-hoc code-signature FILL request (D-LK7-ADHOC-CODESIGN-MACHO
+    // increment 2/2). When set, the walker DERIVES the reservation size
+    // from this block (via `adHocCodeSignatureSize`) — overriding any
+    // hand-typed `codeSignatureSize` — and writes a real CodeDirectory +
+    // SuperBlob into the reserved region instead of zeroes. When unset,
+    // the legacy `codeSignatureSize`-only placeholder path (zero-fill)
+    // is preserved unchanged. validate() rejects this block on a
+    // MH_OBJECT (like the rest of the image block).
+    std::optional<MachOCodeSignature> codeSignature;
     // Modern dyld binding format (Xcode 12+ / macOS 12+). When
     // `true`, the walker emits `LC_DYLD_CHAINED_FIXUPS` (0x80000034)
     // pointing at a `dyld_chained_fixups_header` + chained-pointer

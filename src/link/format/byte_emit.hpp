@@ -42,6 +42,28 @@ inline void appendU64LE(std::vector<std::uint8_t>& out, std::uint64_t v) {
         out.push_back(static_cast<std::uint8_t>(v >> (i * 8)));
 }
 
+// Big-endian (network-byte-order) append helpers.
+//
+// WHY these exist alongside the LE variants: every Mach-O POD record
+// (mach_header_64, load commands, nlist_64, the chained-fixups payload)
+// is LITTLE-endian — so the LE helpers above serve the whole walker.
+// The Apple code-signature SuperBlob is the ONE exception: every field
+// in the `CS_SuperBlob` / `CS_BlobIndex` / `CS_CodeDirectory` headers is
+// BIG-endian (Apple's `cs_blobs.h` stores them via `htonl` / `OSSwapHostToBigInt*`).
+// This is the universal codesign gotcha — emit a magic or length LE and
+// the kernel's `cs_validate_csblob` rejects the signature. Hoisted here
+// (not buried in `macho_codesign.cpp`) so the BE/LE pair lives in one
+// place and a future format that needs BE records can reuse it.
+inline void appendU32BE(std::vector<std::uint8_t>& out, std::uint32_t v) {
+    for (int i = 3; i >= 0; --i)
+        out.push_back(static_cast<std::uint8_t>(v >> (i * 8)));
+}
+
+inline void appendU64BE(std::vector<std::uint8_t>& out, std::uint64_t v) {
+    for (int i = 7; i >= 0; --i)
+        out.push_back(static_cast<std::uint8_t>(v >> (i * 8)));
+}
+
 inline void appendI16LE(std::vector<std::uint8_t>& out, std::int16_t v) {
     appendU16LE(out, static_cast<std::uint16_t>(v));
 }

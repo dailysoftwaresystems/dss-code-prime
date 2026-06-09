@@ -4,6 +4,7 @@
 #include "link/format/byte_emit.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/macho_chained_fixups.hpp"
+#include "link/format/macho_codesign.hpp"
 #include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -1394,11 +1395,24 @@ encodeExecDynamic(AssembledModule const&    module,
     constexpr std::size_t kSegCmdLinkeditSize = kSegmentCommand64Size;
     constexpr std::size_t kLcMainSize         = 24;
 
-    // LK7: when `codeSignatureSize > 0`, append LC_CODE_SIGNATURE
-    // (16-byte linkedit_data_command). The reservation lives at
-    // the tail of __LINKEDIT so plan 16 can fill it without
-    // disturbing earlier layout.
-    bool const emitCodeSig = im.codeSignatureSize != 0;
+    // LK7: when `codeSignatureSize > 0` OR an ad-hoc `codeSignature`
+    // block is present, append LC_CODE_SIGNATURE (16-byte
+    // linkedit_data_command). The reservation lives at the tail of
+    // __LINKEDIT so the fill (this cycle, for the ad-hoc block; or
+    // plan 16's full Apple SuperBlob) lands without disturbing earlier
+    // layout.
+    //
+    // D-LK7-ADHOC-CODESIGN-MACHO (increment 2/2): when `codeSignature`
+    // is set the reservation size is DERIVED from the ad-hoc blob's
+    // exact byte length — `adHocCodeSignatureSize` over the SAME
+    // (codeLimit, pageSize, identifier) the fill uses below — NOT the
+    // hand-typed `codeSignatureSize`. `codeLimit` (= the signature's
+    // file offset) is not known until the __LINKEDIT layout completes,
+    // so the derivation happens at the `codeSigReserveSize` assignment
+    // further down (after `codeSigFileOff`). Here we only decide
+    // whether to emit the load command at all.
+    bool const emitCodeSig =
+        im.codeSignatureSize != 0 || im.codeSignature.has_value();
     // ncmds = 4 segments + LC_DYLD_{INFO_ONLY|CHAINED_FIXUPS}
     //       + LC_LOAD_DYLINKER + LC_MAIN + N × LC_LOAD_DYLIB
     //       + LC_SYMTAB + (LC_DYSYMTAB when !useChainedFixups —
@@ -1599,8 +1613,21 @@ encodeExecDynamic(AssembledModule const&    module,
                          codeSigFileOff));
         return {};
     }
+    // The reservation byte count. For the ad-hoc `codeSignature` path
+    // it is DERIVED from the exact blob length (Condition 2 — never a
+    // hand-typed size); `codeSigFileOff` is the signature's file offset
+    // == the CodeDirectory `codeLimit` (everything before the signature
+    // is hashed), and was just proven to fit in u32. For the legacy
+    // placeholder path it stays the schema's `codeSignatureSize`.
+    std::uint32_t const codeSigReserveSize =
+        im.codeSignature.has_value()
+            ? dss::macho::detail::adHocCodeSignatureSize(
+                  static_cast<std::uint32_t>(codeSigFileOff),
+                  im.codeSignature->pageSize,
+                  im.codeSignature->identifier)
+            : im.codeSignatureSize;
     std::uint64_t const linkeditFileSize = emitCodeSig
-        ? ((codeSigFileOff + im.codeSignatureSize) - linkeditFileOff)
+        ? ((codeSigFileOff + codeSigReserveSize) - linkeditFileOff)
         : ((strtabOff + strtabSize) - linkeditFileOff);
 
     // Segment VAs:
@@ -1852,7 +1879,11 @@ encodeExecDynamic(AssembledModule const&    module,
                     static_cast<std::uint32_t>(kCodeSigCommandSize));
         appendU32LE(bytes,
                     static_cast<std::uint32_t>(codeSigFileOff));
-        appendU32LE(bytes, im.codeSignatureSize);
+        // datasize = the reserved byte count: the derived ad-hoc blob
+        // length on the codeSignature path, else the schema placeholder
+        // size. The ad-hoc fill below asserts the built blob is exactly
+        // this many bytes.
+        appendU32LE(bytes, codeSigReserveSize);
     }
 
     // Sanity: emitted exactly sizeofcmds bytes.
@@ -1898,12 +1929,50 @@ encodeExecDynamic(AssembledModule const&    module,
     auto strtabBytes = std::move(strtab).release();
     bytes.insert(bytes.end(), strtabBytes.begin(), strtabBytes.end());
 
-    // LK7: pad to 8-byte-aligned codesign reservation then append
-    // `codeSignatureSize` zero bytes inside __LINKEDIT. The
-    // segment's filesize was computed to include this region.
+    // LK7 / D-LK7-ADHOC-CODESIGN-MACHO: pad to the 8-byte-aligned
+    // codesign reservation, then fill it. At this point `bytes.size()`
+    // has been padded to exactly `codeSigFileOff`, so `bytes[0,
+    // codeSigFileOff)` is the complete signed region (everything before
+    // the signature). The CodeDirectory's `codeLimit` is therefore
+    // `codeSigFileOff` and the page hashes cover those bytes.
     if (emitCodeSig) {
         while (bytes.size() < codeSigFileOff) bytes.push_back(0);
-        bytes.insert(bytes.end(), im.codeSignatureSize, std::uint8_t{0});
+        if (im.codeSignature.has_value()) {
+            // Build the real ad-hoc CodeDirectory + SuperBlob over the
+            // signed bytes and write it into the reservation. execSeg
+            // limit = the __TEXT segment file size (the kernel maps it
+            // as the main binary's executable region).
+            std::vector<std::uint8_t> const sig =
+                dss::macho::detail::buildAdHocCodeSignature(
+                    std::span<std::uint8_t const>{bytes.data(),
+                                                  codeSigFileOff},
+                    static_cast<std::uint32_t>(codeSigFileOff),
+                    im.codeSignature->pageSize,
+                    im.codeSignature->identifier,
+                    textSegFileSize);
+            // Substrate invariant: the built blob occupies the reserved
+            // region EXACTLY (no overrun, no slack). The reservation
+            // size was derived from `adHocCodeSignatureSize` over the
+            // same arguments, so any mismatch is an internal bug —
+            // fail loud rather than emit a corrupt signature.
+            if (sig.size() != codeSigReserveSize) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("macho::encodeExecDynamic: ad-hoc "
+                                 "code-signature blob is {} bytes but "
+                                 "the reservation is {} — "
+                                 "adHocCodeSignatureSize and "
+                                 "buildAdHocCodeSignature disagree "
+                                 "(substrate invariant violation).",
+                                 sig.size(), codeSigReserveSize));
+                return {};
+            }
+            bytes.insert(bytes.end(), sig.begin(), sig.end());
+        } else {
+            // Legacy placeholder path: `codeSignatureSize` zero bytes
+            // for a later (plan 16) post-link fill.
+            bytes.insert(bytes.end(), codeSigReserveSize,
+                         std::uint8_t{0});
+        }
     }
 
     return bytes;

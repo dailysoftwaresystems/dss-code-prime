@@ -8,6 +8,7 @@ add_library(link OBJECT
     format/pe.cpp
     format/macho.cpp
     format/macho_chained_fixups.cpp
+    format/macho_codesign.cpp
     format/spirv.cpp
     format/wasm.cpp
     writer.cpp

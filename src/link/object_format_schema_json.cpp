@@ -1070,6 +1070,155 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                         im.at("useChainedFixups").get<bool>();
                 }
             }
+            // D-LK7-ADHOC-CODESIGN-MACHO (increment 2/2) — ad-hoc
+            // code-signature FILL request. Optional nested object;
+            // absent = the legacy `codeSignatureSize`-only placeholder
+            // path. When present the walker DERIVES the reservation
+            // size and writes a real CodeDirectory + SuperBlob. The two
+            // enums are CLOSED — a typo fails loud here (mirrors the
+            // `externCallDispatchFromName` + unknown-value-rejects-loud
+            // discipline) rather than defaulting silently to a signing
+            // scheme. `pageSize` power-of-two and non-empty `identifier`
+            // are likewise fail-loud here (a malformed value must not
+            // reach the size derivation / blob builder).
+            if (im.contains("codeSignature")) {
+                auto const& cs = im.at("codeSignature");
+                if (!cs.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/image/codeSignature",
+                              "'codeSignature' must be an object "
+                              "{kind, hashAlgorithm, pageSize, "
+                              "identifier}");
+                } else {
+                    MachOCodeSignature sig;
+                    bool ok = true;
+                    // kind (closed enum; default "adhoc").
+                    if (cs.contains("kind")) {
+                        if (!cs.at("kind").is_string()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/image/codeSignature/kind",
+                                      "'kind' must be a string "
+                                      "(\"adhoc\")");
+                            ok = false;
+                        } else {
+                            auto const s =
+                                cs.at("kind").get<std::string>();
+                            auto const k =
+                                machoCodeSignatureKindFromName(s);
+                            if (!k.has_value()) {
+                                coll.emit(
+                                    DiagnosticCode::C_MalformedJson,
+                                    "/image/codeSignature/kind",
+                                    std::format("unknown codeSignature "
+                                                "kind '{}' — accepted: "
+                                                "\"adhoc\" (CS_ADHOC "
+                                                "CodeDirectory, no CMS).",
+                                                s));
+                                ok = false;
+                            } else {
+                                sig.kind = *k;
+                            }
+                        }
+                    }
+                    // hashAlgorithm (closed enum; default "sha256").
+                    if (cs.contains("hashAlgorithm")) {
+                        if (!cs.at("hashAlgorithm").is_string()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/image/codeSignature/hashAlgorithm",
+                                      "'hashAlgorithm' must be a string "
+                                      "(\"sha256\")");
+                            ok = false;
+                        } else {
+                            auto const s = cs.at("hashAlgorithm")
+                                               .get<std::string>();
+                            auto const h =
+                                machoCodeSignatureHashAlgoFromName(s);
+                            if (!h.has_value()) {
+                                coll.emit(
+                                    DiagnosticCode::C_MalformedJson,
+                                    "/image/codeSignature/hashAlgorithm",
+                                    std::format("unknown codeSignature "
+                                                "hashAlgorithm '{}' — "
+                                                "accepted: \"sha256\" "
+                                                "(CS_HASHTYPE_SHA256).",
+                                                s));
+                                ok = false;
+                            } else {
+                                sig.hashAlgorithm = *h;
+                            }
+                        }
+                    }
+                    // pageSize (power of two; default 4096).
+                    if (cs.contains("pageSize")) {
+                        if (!cs.at("pageSize").is_number_integer()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/image/codeSignature/pageSize",
+                                      "'pageSize' must be an integer "
+                                      "power of two (code-slot page "
+                                      "size; typical 4096).");
+                            ok = false;
+                        } else {
+                            std::int64_t const v =
+                                cs.at("pageSize").get<std::int64_t>();
+                            // Power of two in [4096, 65536]: the
+                            // conventional code-signing hash-page size is
+                            // 4096; the bounded range keeps log2(pageSize)
+                            // in [12,16] (one byte) AND keeps the
+                            // nCodeSlots*hashSize layout math safely within
+                            // u32 for any in-range codeLimit (a sub-page
+                            // pageSize like 1 would overflow the slot table
+                            // on a multi-GiB binary — D-LK7-CODESIGN-
+                            // PAGESIZE-OVERFLOW-HARDENING for the residual
+                            // ~4 GiB-codeLimit case).
+                            if (v < 4096
+                             || v > 65536
+                             || (static_cast<std::uint64_t>(v)
+                                 & (static_cast<std::uint64_t>(v) - 1u))
+                                    != 0u) {
+                                coll.emit(
+                                    DiagnosticCode::C_MalformedJson,
+                                    "/image/codeSignature/pageSize",
+                                    std::format("'pageSize' ({}) must be "
+                                                "a power of two in "
+                                                "[4096, 65536] (the "
+                                                "CodeDirectory stores "
+                                                "log2(pageSize) in one "
+                                                "byte; 4096 is the "
+                                                "conventional value).",
+                                                v));
+                                ok = false;
+                            } else {
+                                sig.pageSize =
+                                    static_cast<std::uint32_t>(v);
+                            }
+                        }
+                    }
+                    // identifier (non-empty; required).
+                    if (!cs.contains("identifier")) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/image/codeSignature/identifier",
+                                  "'identifier' is required and must be "
+                                  "a non-empty string (the CodeDirectory "
+                                  "identOffset payload; the kernel keys "
+                                  "the signature on it).");
+                        ok = false;
+                    } else if (!cs.at("identifier").is_string()
+                            || cs.at("identifier").get<std::string>()
+                                   .empty()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/image/codeSignature/identifier",
+                                  "'identifier' must be a non-empty "
+                                  "string.");
+                        ok = false;
+                    } else {
+                        sig.identifier =
+                            cs.at("identifier").get<std::string>();
+                    }
+                    if (ok) {
+                        data.machoImage.codeSignature = std::move(sig);
+                    }
+                }
+            }
         }
     }
 

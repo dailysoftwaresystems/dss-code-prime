@@ -637,15 +637,16 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                 || !mi.dylinkerPath.empty()
                 || !mi.loadDylibs.empty()
                 || !mi.bindNow
-                || mi.codeSignatureSize != 0;
+                || mi.codeSignatureSize != 0
+                || mi.codeSignature.has_value();
             if (anySet) {
                 fail("/image",
                      "Mach-O MH_OBJECT format must NOT declare an "
                      "'image' block — pageZeroSize / dylinkerPath / "
-                     "loadDylibs / bindNow / codeSignatureSize live "
-                     "only in MH_EXECUTE / MH_DYLIB images. Set "
-                     "macho.filetype = 2 (MH_EXECUTE) if this schema "
-                     "describes an executable.");
+                     "loadDylibs / bindNow / codeSignatureSize / "
+                     "codeSignature live only in MH_EXECUTE / MH_DYLIB "
+                     "images. Set macho.filetype = 2 (MH_EXECUTE) if "
+                     "this schema describes an executable.");
             }
         } else if (macho.filetype == MachOObjectType::Execute) {
             if (mi.pageZeroSize == 0) {
