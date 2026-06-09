@@ -3,6 +3,7 @@
 #include "core/cpp_invariants.hpp"  // arithmetic-right-shift assert
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
+#include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -1088,34 +1090,30 @@ encode(AssembledModule const&    module,
     // does not yet patch dataItem relocations into `.rodata`
     // (D-LK1-ELF-RODATA-DATAITEM-RELOC). `int g=42;` produces neither.
     using link::format::detail::alignUp;
-    // L1 — these two scans run for BOTH forms (the non-Rodata / reloc
-    // checks below precede the `!isExec` dataItems reject), so the
-    // message form-qualifier must be computed, not hardcoded ET_EXEC.
-    char const* const formKind = isExec ? "(ET_EXEC)" : "(ET_REL)";
-    for (auto const& d : module.dataItems) {
-        if (d.section != DataSectionKind::Rodata) {
-            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("elf::encode {}: AssembledData with "
-                             "section={} not yet supported by the ELF "
-                             "walker — only Rodata closes at "
-                             "D-LK1-ELF-EXEC-DATA-SECTIONS; Data/Bss "
-                             "arms remain anchored under "
-                             "D-LK4-RODATA-PRODUCER.",
-                             formKind, dataSectionKindName(d.section)));
-            return {};
-        }
-        if (!d.relocations.empty()) {
-            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("elf::encode {}: rodata AssembledData "
-                             "SymbolId={{ {} }} carries {} relocation(s) — "
-                             "data->data references in .rodata are deferred "
-                             "this cycle (the ELF writer patches FUNCTION "
-                             "relocations only). Anchored "
-                             "D-LK1-ELF-RODATA-DATAITEM-RELOC.",
-                             formKind, d.symbol.v, d.relocations.size()));
-            return {};
-        }
-    }
+    // ── Validate + lay out `.rodata` via the shared exec data-section
+    // substrate (`exec_data_section.hpp`) — the SAME helper the Mach-O
+    // `__const` writer uses, so the per-item validation (Rodata-only +
+    // no-data->data-relocs) + the byte layout + the H1 section-align
+    // raise are single-sourced (no copy in two walkers). The
+    // `writerName` carries the ET_EXEC/ET_REL qualifier so the format-
+    // neutral diagnostics still pinpoint the ELF form. The validation
+    // runs for BOTH forms (it precedes the `!isExec` reject below), so
+    // a module carrying ONLY Data/Bss items cannot slip past.
+    // D-LK1-ELF-EXEC-DATA-SECTIONS.
+    std::string const elfDataWriterName =
+        isExec ? "elf::encode (ET_EXEC)" : "elf::encode (ET_REL)";
+    // Floor = the schema's `.rodata` addrAlign when the row exists
+    // (peeked WITHOUT a diagnostic; the mandatory fail-loud
+    // `requireSection` on the exec path below is what enforces the row).
+    ObjectFormatSectionInfo const* secRodataPeek =
+        fmt.sectionByKind(SectionKind::Rodata);
+    std::uint64_t const rodataAlignFloor =
+        secRodataPeek != nullptr ? secRodataPeek->addrAlign : 1;
+    auto const rodataLayoutOpt = link::format::buildExecRodata(
+        module.dataItems, rodataAlignFloor, elfDataWriterName, reporter);
+    if (!rodataLayoutOpt.has_value()) return {};
+    auto const& rodataLayout = *rodataLayoutOpt;
+
     bool const hasRodata = isExec && !module.dataItems.empty();
     // Reject dataItems on the ET_REL (.o) path loudly — the linker's
     // per-format gate already advertises rodata only on the exec
@@ -1130,47 +1128,25 @@ encode(AssembledModule const&    module,
              "exec-only.");
         return {};
     }
+    // On the exec path the `.rodata` section row is MANDATORY — fail
+    // loud (the format JSON must declare it). `secRodata` also feeds
+    // the section-header sh_type / sh_flags / name below.
     ObjectFormatSectionInfo const* secRodata =
         hasRodata ? requireSection(fmt, SectionKind::Rodata,
                                    "ELF writer", reporter)
                   : nullptr;
     if (hasRodata && secRodata == nullptr) return {};
-    // The schema row's addrAlign is the FLOOR for the section; H1
-    // below raises it to the strictest member alignment. Mutable.
-    std::uint64_t rodataAlign =
-        hasRodata ? std::max<std::uint64_t>(1, secRodata->addrAlign) : 1;
-    std::vector<std::uint8_t> rodataBytes;
-    // Per-dataItems index → section-relative byte offset (the start of
-    // that item's bytes within the concatenated `.rodata` payload).
-    // Used below to extend the symbolVa map so a `.text` relocation
-    // targeting a rodata SymbolId resolves to
-    // `rodataSectionVa + rodataItemOffsets[i]`. Mirrors pe.cpp. u64
-    // (NOT u32 like pe.cpp, whose wire fields are u32) — ELF
-    // sh_size/sh_offset and the symbolVa values these feed are u64.
-    std::vector<std::uint64_t> rodataItemOffsets;
-    rodataItemOffsets.reserve(module.dataItems.size());
-    if (hasRodata) {
-        for (auto const& d : module.dataItems) {
-            std::uint64_t const aligned = d.alignment.alignUp(
-                static_cast<std::uint64_t>(rodataBytes.size()));
-            while (rodataBytes.size() < aligned) rodataBytes.push_back(0);
-            rodataItemOffsets.push_back(
-                static_cast<std::uint64_t>(rodataBytes.size()));
-            rodataBytes.insert(rodataBytes.end(),
-                               d.bytes.begin(), d.bytes.end());
-        }
-        // H1 — section alignment must cover the strictest item (gABI:
-        // sh_addralign = max of member alignments) so EVERY item's
-        // section-relative offset is also its absolute-VA alignment.
-        // The schema row's addrAlign is the floor. (Reachable: a
-        // 16-aligned i128/u128 rodata global from the producer —
-        // asm.cpp:692 reads primitiveByteSize→16 for I128/U128/F128.)
-        // For the single-int corpus max(8,4)=8 → bytes unchanged.
-        // D-LK1-ELF-EXEC-DATA-SECTIONS.
-        for (auto const& d : module.dataItems)
-            rodataAlign = std::max<std::uint64_t>(rodataAlign,
-                                                  d.alignment.bytes());
-    }
+    // The H1-raised section alignment + the laid-out bytes + per-item
+    // section-relative offsets (the start of each item's bytes within
+    // the concatenated `.rodata` payload). The offsets extend the
+    // symbolVa map below so a `.text` relocation targeting a rodata
+    // SymbolId resolves to `rodataSectionVa + rodataItemOffsets[i]`.
+    // u64 (ELF sh_size/sh_offset + the symbolVa values these feed are
+    // u64). For the no-rodata case these are empty / 1 → no-op.
+    std::uint64_t const rodataAlign = hasRodata ? rodataLayout.maxAlign : 1;
+    std::vector<std::uint8_t> const& rodataBytes = rodataLayout.bytes;
+    std::vector<std::uint64_t> const& rodataItemOffsets =
+        rodataLayout.itemOffsets;
 
     // ── Build .text + per-function symbols ─────────────────────
     //
@@ -1228,44 +1204,23 @@ encode(AssembledModule const&    module,
             symbolVa.emplace(module.functions[i].symbol,
                              secText->virtualAddress + funcTextStart[i]);
         }
-        // D-LK1-ELF-EXEC-DATA-SECTIONS: each rodata `AssembledData`
-        // item joins the symbolVa map at `rodataSectionVa +
-        // rodataItemOffsets[i]`. A `.text` relocation that targets a
+        // D-LK1-ELF-EXEC-DATA-SECTIONS: each NAMED rodata
+        // `AssembledData` item joins the symbolVa map at
+        // `rodataSectionVa + rodataItemOffsets[i]` via the shared
+        // `addDataSymbolVas` substrate (the SAME helper the Mach-O
+        // `__const` writer uses). A `.text` relocation that targets a
         // rodata SymbolId (the code's `lea reg, [rip + g]`) now
         // resolves through the SAME shared `applyExecRelocations`
         // kernel — no rodata loop is added to that kernel; it stays
-        // functions-only, and the code-reloc→data-symbol simply needs
-        // `g` present in `symbolVa`. Mirrors pe.cpp:875-901. A rodata
-        // SymbolId colliding with a function SymbolId is a caller
-        // bug (REDEFINITION, not undefined); use the semantically-
-        // correct `K_DuplicateDataSymbol` so a test pinning it isn't
-        // satisfied by an unrelated undefined-symbol regression.
+        // functions-only. Anonymous `SymbolId{}` items are skipped (M1
+        // — offset-referenced, never reloc targets). A rodata SymbolId
+        // colliding with a function SymbolId is a caller bug
+        // (REDEFINITION); the helper emits K_DuplicateDataSymbol.
         if (hasRodata) {
-            for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
-                auto const& di = module.dataItems[i];
-                // M1 — anonymous items (the `SymbolId{}` sentinel:
-                // read-only constants / padding, per asm.hpp
-                // "Multiple sentinel items are legitimate") are
-                // referenced by section offset, NOT by symbol, so
-                // they are never reloc targets and must NOT join
-                // symbolVa — emplace'ing two `SymbolId{}` items would
-                // otherwise false-fire K_DuplicateDataSymbol. (PE
-                // pe.cpp:891 carries the SAME latent bug; that parity
-                // fix is anchored separately — NOT touched here.)
-                if (di.symbol == SymbolId{}) continue;
-                std::uint64_t const va =
-                    rodataSectionVa + rodataItemOffsets[i];
-                if (!symbolVa.emplace(di.symbol, va).second) {
-                    emit(reporter,
-                         DiagnosticCode::K_DuplicateDataSymbol,
-                         std::format("elf::encode (ET_EXEC): rodata "
-                                     "SymbolId={{ {} }} collides with "
-                                     "another symbol — caller must give "
-                                     "each data item a unique SymbolId "
-                                     "distinct from function ids.",
-                                     di.symbol.v));
-                    return {};
-                }
+            if (!link::format::addDataSymbolVas(
+                    module.dataItems, rodataSectionVa, rodataItemOffsets,
+                    symbolVa, "elf::encode (ET_EXEC)", reporter)) {
+                return {};
             }
         }
         if (!link::format::applyExecRelocations(

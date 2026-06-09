@@ -14,6 +14,9 @@
   "$externCallDispatchComment": "DIRECT-PLT. Mach-O points each extern symbol's VA at its __stubs STUB (code) — `symbolVa[extern] = stubVa` in macho.cpp — and the stub does the __got indirection internally (ARM64: ADRP x16, page → LDR x16,[x16,#lo12] → BR x16). The call site is therefore a PLAIN DIRECT call (ARM64 `BL imm26`, R_*/ARM64_RELOC_BRANCH26) to the stub, NOT a deref-the-stub-as-pointer. This is the SAME direct-plt model ELF uses; it matches what the trampoline + MIR→LIR `lowerCall` emit (both via `externCallUsesIndirectShape`). ARM64 has no `call_indirect_via_extern` opcode, so direct-plt is also the only lowerable shape. D-FFI-EXTERN-CALL-DISPATCH.",
   "externCallDispatch": "direct-plt",
 
+  "$supportedDataSectionsComment": "the exec read-only data-section arm, mirrors ELF D-LK1-ELF-EXEC-DATA-SECTIONS (rodata-only scope): the Mach-O MH_EXECUTE walker emits a loadable `__TEXT,__const` from `AssembledModule.dataItems` items with `section=Rodata` (the parallel of the ELF `.rodata` arm, commit 8040410). The linker's pre-walker gate (linker.cpp) consults this set per-item — `Data`/`Bss` remain anchored under D-LK4-RODATA-PRODUCER. Cross-format agnosticism: this is the SAME field ELF + PE exec formats declare; the gate has ZERO format-name branches, and the validation+layout reuses the shared `exec_data_section.hpp` substrate (`buildExecRodata`/`addDataSymbolVas`) used by elf.cpp. macho64-x86_64-darwin-exec deliberately does NOT declare it yet (no macOS-x86_64 CI leg to runtime-prove it).",
+  "supportedDataSections": ["rodata"],
+
   "$processExitComment": "D-LK10-ENTRY-MACHO-EXIT: the macOS-Apple-Silicon runnable-binary exit. ByNameImport of libSystem `_exit` (leading underscore = the C ABI mangling D-FF4 applies on Mach-O). The trampoline moves the user fn's return value (returnGprs[0]=x0) into argGprs[0]=x0 (a no-op mov under AAPCS64, emitted for ABI uniformity with x86_64's rax→rdi), then makes a DIRECT BL to the `_exit` __stubs entry (per externCallDispatch=direct-plt). The chosen path over a raw BSD syscall (0x2000001) because Apple declares BSD syscall numbers unstable across macOS versions; libSystem is loaded by every macOS process anyway. importLibraryPath must also appear in image.loadDylibs so dyld can resolve it.",
   "processExit": {
     "mechanism": "by-name-import",
@@ -65,6 +68,17 @@
       "addrAlign": 16,
       "entrySize": 0,
       "virtualAddress": 4294983680
+    },
+    {
+      "$comment": "__const within __TEXT — read-only data globals (the exec read-only data-section arm, mirrors ELF D-LK1-ELF-EXEC-DATA-SECTIONS). Folded into the R+X __TEXT segment (SHF-equivalent S_REGULAR, no write/exec attrs — strictly read-only, W^X preserved), mirroring the ELF `.rodata`-in-R+X-PT_LOAD arm. `type` (the substrate section flags/type field, exactly like the __text row above) = S_REGULAR = 0 (no attribute bits; __const is plain regular data). virtualAddress = 0 because __const's VA is COMPUTED by the walker (macho.cpp) — it depends on the __text + __stubs sizes, so it cannot be a static schema constant; the walker places it H1-aligned right after __stubs and writes the section_64 addr. addrAlign = 8 is the schema FLOOR; the walker raises it (H1) to the strictest data item's alignment. entrySize = 0 (not a fixed-stride table).",
+      "kind": "rodata",
+      "name": "__const",
+      "segment": "__TEXT",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
     }
   ],
 

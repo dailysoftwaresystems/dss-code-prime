@@ -316,10 +316,10 @@ TEST(Aarch64AddAbsLo12, IgnoresHighBitsOfPositiveSplusA) {
     auto tgt = loadOneRelocTarget("aarch64_add_abs_lo12");
     ASSERT_NE(tgt, nullptr);
 
-    // Positive symbol VA within UINT32_MAX — only low 12 bits matter
-    // (high bits ignored via the `& 0xFFFu` mask). post-fold #2: SA
-    // > UINT32_MAX now rejects (silent-failure CRITICAL-1), so the
-    // ignore-high-bits contract is pinned within the valid range.
+    // Positive symbol VA — only the low 12 bits matter (high bits ignored
+    // via the `& 0xFFFu` mask), regardless of magnitude. This case stays
+    // below UINT32_MAX; ResolvesSplusAAboveUint32Max pins the same
+    // ignore-high-bits contract for VAs above 4 GiB (Mach-O PIE).
     auto p = applyOneReloc(tgt, 0x91000000u,
                             /*symbolVa*/ 0xDEAD0ABCu,
                             /*addend*/   0,
@@ -493,18 +493,29 @@ TEST(RelocFormulaKind, ParseRejectsTrailingWhitespace) {
     EXPECT_EQ(parseRelocFormulaKind(" linear"), std::nullopt);
 }
 
-// silent-failure CRITICAL-1 post-fold #2: AddAbsLo12 rejects S+A above UINT32_MAX.
-TEST(Aarch64AddAbsLo12, RejectsSplusAAboveUint32Max) {
+// D-LK6-AARCH64-ADDABSLO12-HIGH-VA: AddAbsLo12 RESOLVES S+A above UINT32_MAX.
+// ADD_ABS_LO12_NC ("No Check") is a magnitude-INDEPENDENT low-12 extraction;
+// the paired ADRP (adr_prel_pg_hi21) range-checks the magnitude. The prior
+// ELF-centric `S+A ≤ UINT32_MAX` upper bound WRONGLY rejected Mach-O PIE VAs
+// (which sit above the 4 GiB __PAGEZERO), blocking the macOS-arm64 data
+// access path. Relaxed to keep only `S+A ≥ 0` (RejectsNegativeSplusA below).
+// RED-ON-DISABLE: re-adding the UINT32_MAX bound flips this back to a reject.
+TEST(Aarch64AddAbsLo12, ResolvesSplusAAboveUint32Max) {
     auto tgt = loadOneRelocTarget("aarch64_add_abs_lo12");
     ASSERT_NE(tgt, nullptr);
 
-    // symbolVa = 0x100000000 (= UINT32_MAX + 1) → reject.
+    // symbolVa = 0x100004040 (a real Mach-O arm64 __const VA, > UINT32_MAX)
+    // → low 12 = 0x040 → ADD imm12 = 0x040 << 10. The bits above 4 GiB are
+    // carried by the paired ADRP; the ADD needs only the magnitude-free low-12.
     auto p = applyOneReloc(tgt, 0x91000000u,
-                            /*symbolVa*/ 0x100000000ULL,
+                            /*symbolVa*/ 0x100004040ULL,
                             /*addend*/   0,
                             /*patchSectionVa*/ 0,
                             /*funcOffset*/ 0);
-    EXPECT_FALSE(p.ok);
+    ASSERT_TRUE(p.ok)
+        << "S+A above UINT32_MAX must RESOLVE (low-12 extraction is "
+           "magnitude-independent; D-LK6-AARCH64-ADDABSLO12-HIGH-VA)";
+    EXPECT_EQ(readInst(p.text, 0), 0x91000000u | (0x040u << 10));
 }
 
 TEST(Aarch64AddAbsLo12, AcceptsSplusAAtUint32Max) {

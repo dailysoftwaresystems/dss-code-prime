@@ -38,6 +38,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -619,4 +621,338 @@ TEST(MachOArm64Exit, TextVaNotCongruentTo16KPageFailsLoud) {
          || d.message.find("segmentPageSize") != std::string::npos)
             sawMsg = true;
     EXPECT_TRUE(sawMsg) << "expected an mmap-congruence diag";
+}
+
+// ── __TEXT,__const read-only data section (D-LK1-MACHO-EXEC-DATA-SECTIONS)
+//
+// The parallel of the ELF `.rodata` cycle: a c-subset `int answer=42;`
+// global reaches a loadable __const folded into the R+X __TEXT segment.
+// These host-independent pins run on EVERY CI leg (the runtime "exit 42"
+// proof only spawns on macos-latest).
+
+namespace {
+
+using dss::macho::test::findSegment;
+
+// Read the __TEXT nsects field (LC_SEGMENT_64 __TEXT, nsects@64) and the
+// __const section_64 record (if present) from an emitted Mach-O.
+struct ConstSectionView {
+    std::uint32_t textNsects = 0;
+    bool          hasConst   = false;
+    std::uint64_t addr       = 0;   // section_64.addr  @32
+    std::uint64_t size       = 0;   // section_64.size  @40
+    std::uint32_t offset     = 0;   // section_64.offset@48
+    std::uint32_t align      = 0;   // section_64.align @52 (log2)
+    std::uint32_t flags      = 0;   // section_64.flags @64
+};
+
+[[nodiscard]] ConstSectionView readConstView(
+        std::vector<std::uint8_t> const& bytes) {
+    ConstSectionView v;
+    std::span<std::uint8_t const> sp{bytes};
+    auto const segOff = findSegment(sp, "__TEXT");
+    if (segOff) v.textNsects = readU32LE(bytes, *segOff + 64);
+    auto const secOff = findSection(sp, "__TEXT", "__const");
+    if (secOff) {
+        v.hasConst = true;
+        v.addr   = readU64LE(bytes, *secOff + 32);
+        v.size   = readU64LE(bytes, *secOff + 40);
+        v.offset = readU32LE(bytes, *secOff + 48);
+        v.align  = readU32LE(bytes, *secOff + 52);
+        v.flags  = readU32LE(bytes, *secOff + 64);
+    }
+    return v;
+}
+
+// `CodeReloc` selects which code→data relocation shape the fixture's
+// function carries into the __const data symbol (SymbolId{50}).
+enum class CodeReloc {
+    None,      // BL extern + RET; no reloc into the data symbol
+    AdrpPage,  // ADRP x0, page(answer) — the PC-relative page-pair half
+               //   (Aarch64AdrPrelPgHi21). PC-relative, NO 32-bit guard,
+               //   so it resolves cleanly even at Mach-O's >4 GiB VAs.
+    AdrpAdd,   // ADRP + ADD lo12(answer) — the FULL GlobalAddr lea. The
+               //   ADD half is Aarch64AddAbsLo12, a magnitude-INDEPENDENT
+               //   low-12 extraction; the page magnitude is range-checked
+               //   by the paired ADRP. Resolves cleanly even at Mach-O's
+               //   >4 GiB VAs (D-LK6-AARCH64-ADDABSLO12-HIGH-VA relaxed the
+               //   prior ELF-centric UINT32_MAX upper bound).
+};
+
+// Build an extern-importing arm64 module (routes the dynamic path) that
+// ALSO carries a rodata data item. The function optionally references the
+// data symbol so the reloc kernel patches the data VA into the code — the
+// host-independent "wire" proof.
+[[nodiscard]] AssembledModule makeArm64ModuleWithConst(CodeReloc shape) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    if (shape == CodeReloc::AdrpAdd) {
+        // ADRP x0, page(answer)        (reloc kind 2 @ off 0)
+        // ADD  x0, x0, lo12(answer)    (reloc kind 3 @ off 4)
+        // BL   <extern>                (reloc kind 1 @ off 8)
+        // RET
+        fn.bytes = {0x00, 0x00, 0x00, 0x90,   // ADRP x0 (imm cleared)
+                    0x00, 0x00, 0x00, 0x91,   // ADD  x0,x0 (imm12 cleared)
+                    0x00, 0x00, 0x00, 0x94,   // BL (imm26 cleared)
+                    0xC0, 0x03, 0x5F, 0xD6};  // RET
+        fn.relocations.push_back(
+            Relocation{/*offset=*/0, SymbolId{50}, RelocationKind{2}, 0});
+        fn.relocations.push_back(
+            Relocation{/*offset=*/4, SymbolId{50}, RelocationKind{3}, 0});
+        fn.relocations.push_back(
+            Relocation{/*offset=*/8, SymbolId{99}, RelocationKind{1}, 0});
+    } else if (shape == CodeReloc::AdrpPage) {
+        // ADRP x0, page(answer)        (reloc kind 2 @ off 0)
+        // <NOP padding to push __const onto a DIFFERENT 4 KiB page than
+        //  this ADRP patch site, so the resolved page-pair is NON-ZERO —
+        //  a genuine page-of(constVa) encoding, not a degenerate 0 that a
+        //  same-page layout would produce>
+        // BL   <extern>
+        // RET
+        fn.bytes = {0x00, 0x00, 0x00, 0x90};  // ADRP x0 (imm cleared)
+        fn.relocations.push_back(
+            Relocation{/*offset=*/0, SymbolId{50}, RelocationKind{2}, 0});
+        // Pad with NOPs (0xD503201F LE) so the function spans > 4 KiB; the
+        // __stubs + __const that follow then land on a higher page.
+        constexpr std::uint32_t kNop = 0xD503201Fu;
+        while (fn.bytes.size() < 0x1010u) {
+            fn.bytes.push_back(static_cast<std::uint8_t>(kNop & 0xFFu));
+            fn.bytes.push_back(static_cast<std::uint8_t>((kNop >> 8) & 0xFFu));
+            fn.bytes.push_back(static_cast<std::uint8_t>((kNop >> 16) & 0xFFu));
+            fn.bytes.push_back(static_cast<std::uint8_t>((kNop >> 24) & 0xFFu));
+        }
+        std::uint32_t const blOff = static_cast<std::uint32_t>(fn.bytes.size());
+        fn.bytes.insert(fn.bytes.end(),
+                        {0x00, 0x00, 0x00, 0x94,   // BL (imm26 cleared)
+                         0xC0, 0x03, 0x5F, 0xD6}); // RET
+        fn.relocations.push_back(
+            Relocation{/*offset=*/blOff, SymbolId{99}, RelocationKind{1}, 0});
+    } else {
+        fn.bytes = {0x00, 0x00, 0x00, 0x94, 0xC0, 0x03, 0x5F, 0xD6}; // BL;RET
+        fn.relocations.push_back(
+            Relocation{/*offset=*/0, SymbolId{99}, RelocationKind{1}, 0});
+    }
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_abs", "/usr/lib/libSystem.B.dylib"});
+    AssembledData d;
+    d.symbol    = SymbolId{50};
+    d.section   = DataSectionKind::Rodata;
+    d.bytes     = {0x2a, 0x00, 0x00, 0x00};   // int answer = 42;
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+    return mod;
+}
+
+} // namespace
+
+TEST(MachOArm64Exit, MachoArm64ConstSectionFollowsStubsWithComputedVa) {
+    auto target = loadArm64Target();
+    auto fmt    = loadArm64DarwinExecFormat();
+    ASSERT_TRUE(target);
+    ASSERT_TRUE(fmt);
+
+    AssembledModule mod = makeArm64ModuleWithConst(CodeReloc::None);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    auto const cv = readConstView(bytes);
+    EXPECT_EQ(cv.textNsects, 3u) << "__TEXT must carry __text+__stubs+__const";
+    ASSERT_TRUE(cv.hasConst) << "a rodata dataItem must emit __TEXT,__const";
+
+    // __const sits H1-aligned right after __stubs. The single extern's
+    // stub stride is 12, so stubsFileSize = 12. The schema floor is 8 and
+    // the item alignment is 4, so H1 maxAlign = max(8,4) = 8 → align field
+    // log2(8) = 3 (NOT 2: the floor dominates the 4-byte item — identical
+    // to the ELF writer, whose .rodata floor is also 8). stubsVa is the
+    // page-aligned sectionVa + the 8-byte __text body.
+    auto const stubsSec = findSection(std::span<std::uint8_t const>{bytes},
+                                      "__TEXT", "__stubs");
+    ASSERT_TRUE(stubsSec.has_value());
+    std::uint64_t const stubsVa   = readU64LE(bytes, *stubsSec + 32);
+    std::uint64_t const stubsSize = readU64LE(bytes, *stubsSec + 40);
+    auto const alignUp8 = [](std::uint64_t n) { return (n + 7u) & ~std::uint64_t{7}; };
+    EXPECT_EQ(cv.addr, alignUp8(stubsVa + stubsSize))
+        << "__const VA = alignUp(stubsVa+stubsSize, 8)";
+    EXPECT_EQ(cv.size, 4u) << "the single int global is 4 bytes";
+    EXPECT_EQ(cv.align, 3u) << "align (log2) = log2(max(floor 8, item 4)) = 3";
+    EXPECT_EQ(cv.flags, 0u) << "__const is S_REGULAR (no attribute bits)";
+
+    // The 4 const bytes `2a 00 00 00` appear at the section's file offset.
+    ASSERT_GE(bytes.size(), static_cast<std::size_t>(cv.offset) + 4u);
+    EXPECT_EQ(bytes[cv.offset + 0], 0x2au);
+    EXPECT_EQ(bytes[cv.offset + 1], 0x00u);
+    EXPECT_EQ(bytes[cv.offset + 2], 0x00u);
+    EXPECT_EQ(bytes[cv.offset + 3], 0x00u);
+}
+
+TEST(MachOArm64Exit, MachoArm64ConstDataSymbolEntersSymbolVaAndPatchesCode) {
+    auto target = loadArm64Target();
+    auto fmt    = loadArm64DarwinExecFormat();
+    ASSERT_TRUE(target);
+    ASSERT_TRUE(fmt);
+
+    // The host-independent end-to-end "wire" proof short of execution: a
+    // code reloc INTO the __const data symbol resolves through the SAME
+    // shared applyExecRelocations kernel. We use the ADRP page-pair half
+    // (Aarch64AdrPrelPgHi21) — it is PC-relative, so it resolves cleanly
+    // at Mach-O's >4 GiB VAs (the ADD lo12 companion hits a pre-existing
+    // kernel guard at those VAs; see the deferral pin below). The ADRP
+    // word ALONE proves the data symbol entered symbolVa: its encoded
+    // page-pair value is computed from constVa, so a wrong/absent
+    // symbolVa entry would either fail loud or encode a different page.
+    AssembledModule mod = makeArm64ModuleWithConst(CodeReloc::AdrpPage);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "an ADRP code reloc into the __const data symbol must resolve "
+           "through the shared applyExecRelocations kernel";
+    ASSERT_FALSE(bytes.empty());
+
+    auto const cv = readConstView(bytes);
+    ASSERT_TRUE(cv.hasConst);
+    std::uint64_t const constVa = cv.addr;
+
+    // The function's __text VA = secText VA (it is functions[0] at offset
+    // 0). Read the patched ADRP (word 0) from __text and recompute the
+    // expected encoding INDEPENDENTLY from constVa + the patch-site VA
+    // (ARM ARM C6.2.10 ADRP). If the data symbol had NOT entered symbolVa,
+    // applyExecRelocations would have failed loud (K_SymbolUndefined) and
+    // rep.errorCount() != 0 above.
+    auto const textSec = findSection(std::span<std::uint8_t const>{bytes},
+                                     "__TEXT", "__text");
+    ASSERT_TRUE(textSec.has_value());
+    std::uint64_t const textVa  = readU64LE(bytes, *textSec + 32);
+    std::uint32_t const textOff = readU32LE(bytes, *textSec + 48);
+    std::uint32_t const adrp = readU32LE(bytes, textOff + 0);
+
+    auto const pageOf = [](std::uint64_t v) { return v & ~std::uint64_t{0xFFF}; };
+    std::uint64_t const adrpPatchVa = textVa + 0;     // ADRP at off 0
+    std::int64_t const pageDiff =
+        static_cast<std::int64_t>(pageOf(constVa)) -
+        static_cast<std::int64_t>(pageOf(adrpPatchVa));
+    std::int64_t const adrpValue = pageDiff >> 12;
+    std::uint32_t const adrpV = static_cast<std::uint32_t>(adrpValue) & 0x1FFFFFu;
+    std::uint32_t const expectAdrp =
+        0x90000000u | ((adrpV & 0x3u) << 29) | (((adrpV >> 2) & 0x7FFFFu) << 5);
+    EXPECT_EQ(adrp, expectAdrp)
+        << "ADRP x0 must encode page(constVa) — data symbol VA resolved "
+           "through symbolVa (constVa=0x" << std::hex << constVa << ")";
+    // The fixture pads __text past 4 KiB so __const lands on a HIGHER page
+    // than the ADRP patch site: the page-pair is NON-ZERO, so the ADRP
+    // immediate field genuinely carries page-of(constVa) (not a degenerate
+    // same-page 0). A missing symbolVa entry would have fail-louded
+    // (K_SymbolUndefined) above; this byte-equality additionally cross-
+    // checks symbolVa-target ↔ section_64.addr coherence.
+    EXPECT_NE(adrp, 0x90000000u)
+        << "ADRP page-pair must be non-zero (constVa is a page above textVa)";
+}
+
+// ── POSITIVE pin: the FULL GlobalAddr lea (ADRP + ADD lo12) into __const
+//    RESOLVES at Mach-O's >4 GiB VAs — the proof of the high-VA relaxation
+//    (D-LK6-AARCH64-ADDABSLO12-HIGH-VA).
+//
+// `Aarch64AddAbsLo12` (the ADD companion of the ADRP page-pair) computes
+// `(S+A) & 0xFFF` — a magnitude-INDEPENDENT low-12 extraction. The shared
+// `applyExecRelocations` kernel previously carried an ELF-centric
+// `S+A ≤ UINT32_MAX` upper bound that WRONGLY rejected Mach-O PIE VAs (all
+// above the 4 GiB pageZeroSize), blocking a real `int answer; return
+// answer;` lea (which the producer lowers to ADRP+ADD). The relaxation
+// dropped that bound (keeping `S+A ≥ 0`); the ADRP carries the high bits
+// PC-relative + range-checked, the ADD needs only the low-12. This pin is
+// RED-ON-DISABLE: restoring the UINT32_MAX bound makes encode fail loud
+// (errorCount > 0), flipping the errorCount assertion below.
+TEST(MachOArm64Exit, MachoArm64ConstAdrpAddLeaHighVaResolvesLowTwelve) {
+    auto target = loadArm64Target();
+    auto fmt    = loadArm64DarwinExecFormat();
+    ASSERT_TRUE(target);
+    ASSERT_TRUE(fmt);
+
+    AssembledModule mod = makeArm64ModuleWithConst(CodeReloc::AdrpAdd);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "ADRP+ADD lea into a >4 GiB __const VA must RESOLVE: the ADD "
+           "lo12 is magnitude-independent (D-LK6-AARCH64-ADDABSLO12-HIGH-VA)";
+    ASSERT_FALSE(bytes.empty());
+
+    auto const cv = readConstView(bytes);
+    ASSERT_TRUE(cv.hasConst);
+    std::uint64_t const constVa = cv.addr;
+
+    // The ADD is word 1 (offset 4) of __text. Recompute the expected
+    // encoding INDEPENDENTLY: ADD (imm) base 0x91000000 (x0,x0) OR the
+    // low-12 of constVa shifted into imm12 [21:10]. constVa is > 4 GiB
+    // (0x1_0000_40xx), so this would have fail-louded under the old bound.
+    auto const textSec = findSection(std::span<std::uint8_t const>{bytes},
+                                     "__TEXT", "__text");
+    ASSERT_TRUE(textSec.has_value());
+    std::uint32_t const textOff = readU32LE(bytes, *textSec + 48);
+    std::uint32_t const add = readU32LE(bytes, textOff + 4);
+    std::uint32_t const expectAdd =
+        0x91000000u | (static_cast<std::uint32_t>(constVa & 0xFFFu) << 10);
+    EXPECT_EQ(add, expectAdd)
+        << "ADD imm12 must encode lo12(constVa)=0x" << std::hex
+        << (constVa & 0xFFFu) << " (constVa=0x" << constVa
+        << ") — the high-VA low-12 extraction resolved through the kernel";
+    // Non-vacuity: constVa genuinely exceeds UINT32_MAX (the old bound), so
+    // this test actually exercises the high-VA path the relaxation enables.
+    EXPECT_GT(constVa, std::uint64_t{0xFFFFFFFFu})
+        << "the proof is vacuous unless constVa is actually > 4 GiB";
+}
+
+TEST(MachOArm64Exit, MachoArm64NoDataItemsByteIdenticalToBaseline) {
+    auto target = loadArm64Target();
+    auto fmt    = loadArm64DarwinExecFormat();
+    ASSERT_TRUE(target);
+    ASSERT_TRUE(fmt);
+
+    // The mandatory control: the EXISTING macho_arm64_exit-shaped module
+    // (extern + function, NO dataItems) → the hasConst=false path. __TEXT
+    // must carry exactly 2 sections and NO __const, and the __DATA_CONST
+    // segment + __got VAs are exactly where they are WITHOUT a __const
+    // section — proving an empty dataItems leaves the output unchanged.
+    AssembledModule mod = makeArm64DynamicModule();
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    auto const cv = readConstView(bytes);
+    EXPECT_EQ(cv.textNsects, 2u) << "no dataItems → __TEXT keeps 2 sections";
+    EXPECT_FALSE(cv.hasConst) << "no dataItems → NO __const section emitted";
+
+    // The __got slot VA + __DATA_CONST segment VA are byte-pinned by the
+    // existing decodeSoleStub-based pins (StubEmitsAdrpLdrBrThroughGot et
+    // al.) against this SAME no-dataItems fixture. Re-assert the structural
+    // VA here: __DATA_CONST starts on the page above __stubs end, with NO
+    // __const in between (the hasConst=false control). stubsVa + stubsSize
+    // → gotVa = alignUp(that_fileoff, 16384)-relative VA == __got addr.
+    std::span<std::uint8_t const> sp{bytes};
+    auto const gotSec = findSection(sp, "__DATA_CONST", "__got");
+    ASSERT_TRUE(gotSec.has_value())
+        << "__got must still exist on the no-dataItems path";
+    auto const stubsSec = findSection(sp, "__TEXT", "__stubs");
+    ASSERT_TRUE(stubsSec.has_value());
+    std::uint64_t const stubsVa   = readU64LE(bytes, *stubsSec + 32);
+    std::uint64_t const stubsSize = readU64LE(bytes, *stubsSec + 40);
+    std::uint64_t const stubsOff  = readU32LE(bytes, *stubsSec + 48);
+    std::uint64_t const gotOff    = readU32LE(bytes, *gotSec + 48);
+    // __got file offset = alignUp(stubsEnd_fileoff, 16384) — directly above
+    // __stubs (NO __const padding), unchanged from before this cycle.
+    std::uint64_t const stubsEndOff = stubsOff + stubsSize;
+    auto const alignUp16k = [](std::uint64_t n) {
+        return (n + 16383u) & ~std::uint64_t{16383};
+    };
+    EXPECT_EQ(gotOff, alignUp16k(stubsEndOff))
+        << "__got file offset sits directly above __stubs (no __const gap)";
+    (void)stubsVa;
 }

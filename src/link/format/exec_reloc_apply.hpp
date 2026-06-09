@@ -9,7 +9,6 @@
 
 #include <cstdint>
 #include <format>
-#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -297,27 +296,38 @@ namespace dss::link::format {
                 }
                 case RelocFormulaKind::Aarch64AddAbsLo12: {
                     // value = (S+A) & 0xFFF; ADD imm12 at bits[21:10].
-                    // Reject S+A outside [0, UINT32_MAX]: ADD_ABS_LO12_NC
-                    // requires a non-negative absolute address that fits
-                    // in 32 bits (the paired ADRP companion computes the
-                    // page base from the same 32-bit space). Negative
-                    // SA cast to uint32_t produces garbage low-12;
-                    // SA > UINT32_MAX silently truncates the high bits
-                    // with no ADRP-companion correspondence. (architect
-                    // Q6 post-fold #1 + silent-failure audit CRITICAL-1
-                    // post-fold #2.)
+                    // ADD_ABS_LO12_NC ("NC" = No Check) is a magnitude-
+                    // INDEPENDENT low-12-bits extraction: `(S+A) & 0xFFF`
+                    // takes exactly the bottom 12 bits, so the result is
+                    // identical whether S+A is below or above UINT32_MAX
+                    // (the uint32 cast cannot perturb the low 12 bits:
+                    // (uint32)0x1'0000'4040 & 0xFFF == 0x040 == 0x1'0000'4040
+                    // & 0xFFF). The address MAGNITUDE is range-checked by the
+                    // PAIRED ADRP companion (adr_prel_pg_hi21), whose signed-
+                    // 21-bit page-delta `((S+A)>>12)-(P>>12)` fails loud on an
+                    // out-of-range target — so the ADD itself needs no upper
+                    // bound. We DO reject SA < 0: a negative absolute address
+                    // is nonsensical and `(uint32_t)negative & 0xFFF` would be
+                    // garbage. The prior `SA > UINT32_MAX` upper bound was an
+                    // ELF-centric assumption (ELF ET_EXEC VAs sit below 4 GiB)
+                    // that WRONGLY rejected valid Mach-O PIE VAs, which sit
+                    // ABOVE the 4 GiB `__PAGEZERO` (e.g. 0x1'0000'4040) — it
+                    // blocked the macOS-arm64 data-global access path.
+                    // (D-LK6-AARCH64-ADDABSLO12-HIGH-VA — supersedes the
+                    // architect-Q6 / silent-failure-audit UINT32_MAX bound,
+                    // whose "low-12 truncates with no ADRP correspondence"
+                    // premise was unsound; ELF/PE VAs are < UINT32_MAX so
+                    // this relaxation is a no-op for them.)
                     std::int64_t const SA = static_cast<std::int64_t>(S) + A;
-                    if (SA < 0
-                     || SA > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+                    if (SA < 0) {
                         emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                              prefixStr + ": relocation '" + tri->name
                                  + "' got S+A=" + std::to_string(SA)
-                                 + " — ADD_ABS_LO12_NC requires "
-                                   "0 ≤ S+A ≤ UINT32_MAX (paired with an "
-                                   "ADRP that computes the page base from "
-                                   "the same 32-bit space; out-of-range "
-                                   "values would silently truncate to "
-                                   "garbage low-12).");
+                                 + " — ADD_ABS_LO12_NC requires a non-negative "
+                                   "absolute address (a negative VA is "
+                                   "nonsensical; the paired ADRP "
+                                   "adr_prel_pg_hi21 range-checks the "
+                                   "magnitude).");
                         return false;
                     }
                     auto const v = static_cast<std::uint32_t>(SA) & 0xFFFu;

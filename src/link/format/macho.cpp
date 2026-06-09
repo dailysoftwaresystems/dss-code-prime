@@ -2,6 +2,7 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
+#include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/macho_chained_fixups.hpp"
 #include "link/format/macho_codesign.hpp"
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <format>
@@ -801,6 +803,24 @@ encodeExec(AssembledModule const&    module,
              "AssembledFunction contributed zero bytes.");
         return {};
     }
+    // The static (no-extern) path emits no __TEXT,__const yet — a
+    // read-only data global routes through encodeExecDynamic (the
+    // global_int corpus reaches it via the _exit trampoline, which
+    // appends an extern). Fail loud rather than silently drop the
+    // data globals (the exec read-only data-section arm is dynamic-
+    // only; mirrors ELF D-LK1-ELF-EXEC-DATA-SECTIONS).
+    if (!module.dataItems.empty()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExec: {} AssembledData item(s) "
+                         "present but the static (no-extern) Mach-O "
+                         "path emits no __TEXT,__const — read-only data "
+                         "globals are supported only on the dynamic "
+                         "path (encodeExecDynamic). The exec read-only "
+                         "data-section arm mirrors ELF "
+                         "D-LK1-ELF-EXEC-DATA-SECTIONS.",
+                         module.dataItems.size()));
+        return {};
+    }
 
     // ── (b) Resolve entry function index from schema.entryPoint
     // D-LK10-ENTRY Slice C audit fold: shared resolver. Mach-O
@@ -1399,6 +1419,62 @@ encodeExecDynamic(AssembledModule const&    module,
         }
     }
 
+    // ── (e.5) D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror: __TEXT,__const ──────
+    //
+    // A loadable read-only data section folded into the R+X __TEXT
+    // segment (mirrors the ELF `.rodata`-in-R+X-PT_LOAD arm, commit
+    // 8040410). `__const` holds the module's read-only data globals
+    // (`int answer=42;`). Like ELF, the section's VA is computed
+    // EARLY here (from `stubsVa` + the stubs byte count, both known
+    // now) so a NAMED data symbol can join `symbolVa` BEFORE the
+    // shared `applyExecRelocations` kernel runs — a code reloc into
+    // the data symbol (the `lea`/ADRP+ADD) then resolves through the
+    // SAME kernel, no rodata loop added to it. The matching FILE
+    // offset (`constFileOff`/`constEnd`) is computed once the layout
+    // is known below, and a fail-loud guard asserts file/VA
+    // congruence inside __TEXT (__TEXT.fileoff = 0 ⇒ VA−fileoff is
+    // constant). Validation + byte layout + the H1 section-align come
+    // from the shared `buildExecRodata` substrate (the SAME helper
+    // the ELF writer uses — single-sourced, format-neutral). EVERY
+    // change below is gated on `hasConst` so an empty `dataItems`
+    // leaves the output byte-identical to the no-data path (the
+    // mandatory control).
+    bool const hasConst = !module.dataItems.empty();
+    // The schema's __const section row is MANDATORY when data globals
+    // are present — fail loud (the format JSON must declare it). Its
+    // addrAlign is the alignment FLOOR (H1 raises it to the strictest
+    // item). secConst also feeds the section_64 record below.
+    ObjectFormatSectionInfo const* secConst =
+        hasConst ? requireSection(fmt, SectionKind::Rodata,
+                                  "macho::encodeExecDynamic", reporter)
+                 : nullptr;
+    if (hasConst && secConst == nullptr) return {};
+    auto const constLayoutOpt = link::format::buildExecRodata(
+        module.dataItems,
+        secConst != nullptr ? secConst->addrAlign : 1,
+        "macho::encodeExecDynamic", reporter);
+    if (!constLayoutOpt.has_value()) return {};
+    auto const& constLayout = *constLayoutOpt;
+    std::uint64_t const constSize = constLayout.bytes.size();
+    // __stubs occupies `numExterns * stubSize` bytes contiguously
+    // after __text; __const starts at the H1-aligned VA above them.
+    std::uint64_t const stubsBytes =
+        static_cast<std::uint64_t>(numExterns) * stubSize;
+    std::uint64_t const constSectionVa =
+        hasConst
+            ? alignUp(stubsVa + stubsBytes, constLayout.maxAlign)
+            : 0;
+    // Each NAMED data item joins symbolVa at `constSectionVa +
+    // itemOffsets[i]` (anonymous SymbolId{} items skipped — M1). A
+    // duplicate symbol fails loud (K_DuplicateDataSymbol).
+    if (hasConst) {
+        if (!link::format::addDataSymbolVas(
+                module.dataItems, constSectionVa, constLayout.itemOffsets,
+                symbolVa, "macho::encodeExecDynamic", reporter)) {
+            return {};
+        }
+    }
+
     // ── (f) Apply intra-module relocations in-place ─────────────
     if (!link::format::applyExecRelocations(
             textBody, module, funcTextStart, symbolVa,
@@ -1656,8 +1732,16 @@ encodeExecDynamic(AssembledModule const&    module,
     //   (bind opcodes → indirect symtab → nlist → strtab)
 
     constexpr std::size_t kSegCmdPageZeroSize = kSegmentCommand64Size;
-    constexpr std::size_t kSegCmdTextSize =
-        kSegmentCommand64Size + kSection64Size * 2;  // __text + __stubs
+    // __TEXT carries __text + __stubs, plus __const when data globals
+    // are present (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror). One extra 80-byte
+    // section_64 grows `sizeofcmds` → `headerAndCmds` →
+    // `textFileOff = alignUp(headerAndCmds, kPageSize)`. The full
+    // load-command region is well under one page (~840 bytes for the
+    // arm64 corpus + 80 = ~920 ≪ 0x4000 segmentPageSize), so
+    // `textFileOff` stays 0x4000 and `__text.virtualAddress`
+    // congruence (the guard at the top of this function) still holds.
+    std::size_t const kSegCmdTextSize =
+        kSegmentCommand64Size + kSection64Size * (hasConst ? 3u : 2u);
     constexpr std::size_t kSegCmdDataConstSize =
         kSegmentCommand64Size + kSection64Size;      // __got
     constexpr std::size_t kSegCmdLinkeditSize = kSegmentCommand64Size;
@@ -1719,12 +1803,44 @@ encodeExecDynamic(AssembledModule const&    module,
     std::uint64_t const stubsFileSize =
         static_cast<std::uint64_t>(numExterns) * stubSize;
 
+    // __TEXT,__const file offset — H1-aligned above __stubs, inside the
+    // same __TEXT segment (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror). Because
+    // __TEXT.fileoff = 0 (Apple convention), VA−fileoff is constant
+    // across __text/__stubs/__const, so `sectionVa + (constFileOff -
+    // textFileOff)` must equal the EARLY `constSectionVa` computed from
+    // `stubsVa`. Assert that congruence fail-loud (a future layout
+    // change or non-divisor align would silently desync the data
+    // symbol VAs the reloc kernel already resolved against).
+    std::uint64_t const constFileOff =
+        hasConst
+            ? alignUp(stubsFileOff + stubsFileSize, constLayout.maxAlign)
+            : (stubsFileOff + stubsFileSize);
+    std::uint64_t const constEnd =
+        hasConst ? (constFileOff + constSize)
+                 : (stubsFileOff + stubsFileSize);
+    if (hasConst
+     && constSectionVa != sectionVa + (constFileOff - textFileOff)) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: __const file/VA "
+                         "congruence broken — constSectionVa(0x{:x}) != "
+                         "sectionVa(0x{:x}) + (constFileOff(0x{:x}) - "
+                         "textFileOff(0x{:x})). The __TEXT segment "
+                         "requires the on-disk __const-from-__text "
+                         "offset to equal the VA offset (the exec "
+                         "read-only data-section arm; mirrors ELF "
+                         "D-LK1-ELF-EXEC-DATA-SECTIONS).",
+                         constSectionVa, sectionVa, constFileOff,
+                         textFileOff));
+        return {};
+    }
+
     // __got lives in __DATA_CONST — separate segment, separate page.
     // dyld maps each segment independently. Place __got's file
-    // offset on a page boundary above stubs (and above the
-    // header/cmds region in VA via __DATA_CONST.vmaddr).
+    // offset on a page boundary above __const (when present) / __stubs
+    // (and above the header/cmds region in VA via __DATA_CONST.vmaddr).
     std::uint64_t const gotFileOff =
-        alignUp(stubsFileOff + stubsFileSize, kPageSize);
+        alignUp(hasConst ? constEnd : (stubsFileOff + stubsFileSize),
+                kPageSize);
     std::uint64_t const gotFileSize =
         static_cast<std::uint64_t>(numExterns) * kGotSlotSize;
     // gotVa derives from the file-offset delta because __TEXT.fileoff
@@ -1910,16 +2026,22 @@ encodeExecDynamic(AssembledModule const&    module,
     // Segment VAs:
     std::uint64_t const textSegVmaddr = im.pageZeroSize;
     std::uint64_t const textSecOffsetInSeg = sectionVa - textSegVmaddr;
+    // The __TEXT segment covers __text + __stubs, plus __const when
+    // present (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror). `constEnd` already
+    // equals `stubsFileOff + stubsFileSize` on the no-data path, so
+    // this is byte-identical when hasConst is false.
+    std::uint64_t const textSegCoveredEnd = hasConst
+        ? constEnd
+        : (stubsFileOff + stubsFileSize);
     std::uint64_t const textSegVmsize =
-        alignUp((stubsFileOff + stubsFileSize) - textFileOff
-                + textSecOffsetInSeg,
+        alignUp(textSegCoveredEnd - textFileOff + textSecOffsetInSeg,
                 kPageSize);
     // __TEXT.fileoff = 0 by Apple convention (the mach header sits
-    // inside __TEXT). The segment therefore spans [0, stubsEnd) in
-    // the file — its filesize must equal stubsEnd, NOT
-    // (stubsEnd - textFileOff) which would truncate the mmap before
+    // inside __TEXT). The segment therefore spans [0, coveredEnd) in
+    // the file — its filesize must equal coveredEnd, NOT
+    // (coveredEnd - textFileOff) which would truncate the mmap before
     // reaching .text (code-reviewer C1 fold, dyld correctness).
-    std::uint64_t const textSegFileSize = stubsFileOff + stubsFileSize;
+    std::uint64_t const textSegFileSize = textSegCoveredEnd;
 
     std::uint64_t const dataConstSegVmaddr = gotVa;
     std::uint64_t const dataConstSegVmsize =
@@ -1968,7 +2090,8 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, 0);
     appendU32LE(bytes, 0);
 
-    // LC_SEGMENT_64 __TEXT (2 sections: __text + __stubs)
+    // LC_SEGMENT_64 __TEXT (__text + __stubs, plus __const when data
+    // globals are present — D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror).
     constexpr std::int32_t kVmProtRx = 5;
     appendU32LE(bytes, LC_SEGMENT_64);
     appendU32LE(bytes, static_cast<std::uint32_t>(kSegCmdTextSize));
@@ -1979,7 +2102,7 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU64LE(bytes, textSegFileSize);
     appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRx));
     appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRx));
-    appendU32LE(bytes, 2);
+    appendU32LE(bytes, hasConst ? 3u : 2u);   // nsects
     appendU32LE(bytes, 0);
 
     // section_64 __text
@@ -2011,6 +2134,27 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, kStubsReserved1);    // index of first indirect sym
     appendU32LE(bytes, static_cast<std::uint32_t>(stubSize));  // stub size
     appendU32LE(bytes, 0);
+
+    // section_64 __const (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror) — read-only
+    // data globals, inside __TEXT after __stubs. flags = S_REGULAR (0).
+    // The `align` field is log2 (the section_64 convention — matches
+    // __got writing 3 for log2(8)), derived via std::countr_zero from
+    // the H1-raised section alignment.
+    if (hasConst) {
+        appendName16(bytes, secConst->name);
+        appendName16(bytes, secConst->segment);
+        appendU64LE(bytes, constSectionVa);
+        appendU64LE(bytes, constSize);
+        appendU32LE(bytes, static_cast<std::uint32_t>(constFileOff));
+        appendU32LE(bytes, static_cast<std::uint32_t>(
+                               std::countr_zero(constLayout.maxAlign)));
+        appendU32LE(bytes, 0);                 // reloff
+        appendU32LE(bytes, 0);                 // nreloc
+        appendU32LE(bytes, 0);                 // flags = S_REGULAR
+        appendU32LE(bytes, 0);                 // reserved1
+        appendU32LE(bytes, 0);                 // reserved2
+        appendU32LE(bytes, 0);                 // reserved3
+    }
 
     // LC_SEGMENT_64 __DATA_CONST (1 section: __got)
     constexpr std::int32_t kVmProtRw = 3;
@@ -2191,6 +2335,18 @@ encodeExecDynamic(AssembledModule const&    module,
 
     // __stubs body
     bytes.insert(bytes.end(), stubsBody.begin(), stubsBody.end());
+
+    // __TEXT,__const body — read-only data globals, H1-aligned above
+    // __stubs (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror). Pad to constFileOff
+    // then emit the laid-out bytes; the EXISTING pad-to-gotFileOff
+    // below then advances to the __DATA_CONST page. No-op when
+    // hasConst is false (the const block is empty + constFileOff
+    // collapses into the stubs end).
+    if (hasConst) {
+        while (bytes.size() < constFileOff) bytes.push_back(0);
+        bytes.insert(bytes.end(), constLayout.bytes.begin(),
+                     constLayout.bytes.end());
+    }
 
     // Pad to gotFileOff (separate page from __TEXT)
     while (bytes.size() < gotFileOff) bytes.push_back(0);
