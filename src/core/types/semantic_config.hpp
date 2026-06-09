@@ -561,10 +561,15 @@ struct DSS_EXPORT SemanticConfig {
     // angle-form `#include <h>` resolves the header name against these
     // dirs (the wiring layer walks up from cwd to find each, mirroring
     // `findShippedConfig`). DISTINCT from the quote form's search
-    // (self-dir + includeDirs). A header found here is a c-subset SOURCE
-    // file parsed by THIS language's own grammar and merged via the
-    // existing include-following resolver — its `extern` decls then flow
-    // through FF5 `synthesizeFfiFromSourceDecls` like a program's own.
+    // (self-dir + includeDirs). The angle name (`<stdio.h>`) resolves to a
+    // language-NEUTRAL JSON descriptor `<stem>.json` (D-FFI-SHIPPED-LIB-
+    // DESCRIPTOR-AGNOSTIC, v0.0.2 V2-2): its symbols (name + a hir-text
+    // type-string signature decoded by `parseTypeFromText`) are injected
+    // into semantic scope BEFORE Pass 2 (the `builtinFunctions` seam) so a
+    // call resolves with NO inline `extern`, then synthesized as externs
+    // flowing through FF5 `synthesizeFfiFromSourceDecls` like a program's
+    // own. (Pre-v0.0.2 a header here was a c-subset SOURCE `.h` parsed +
+    // tree-merged; that source-tree path is retired for shipped descriptors.)
     // Empty ⇒ the language ships no system headers (the angle form, if
     // declared, resolves nothing and hard-fails on use).
     //

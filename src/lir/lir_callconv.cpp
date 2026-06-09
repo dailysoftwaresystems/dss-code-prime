@@ -131,12 +131,18 @@ collectUsedCalleeSaved(Lir const& lir, LirFuncId fn,
 //   (post-CALL) to ≡0 mod 16 (callee-entry-aligned). No shadow
 //   space needed; alignment-only.
 //
-// ARM64 example (aapcs64, no callee-saved beyond x30, no spills,
-// calls foo):
-//   raw_with_shadow = max(0, 0) = 0
-//   totalFrameSize  = alignedSizeWithBias(0, 16, 0) = 0
-//   No SP delta needed — the x30 save lands in `savedRegAreaSize`
-//   via the existing callee-saved tracking.
+// ARM64 example (aapcs64, no GENERAL callee-saved, no spills, calls
+// foo — therefore a NON-LEAF function):
+//   The x30 link-register save is folded into `savedRegs` by
+//   `materializeOneFunc` (gated on hasCalls + cc.linkRegister) — see
+//   D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER. x30 is NOT in
+//   cc.calleeSaved (it must not be allocatable), so the fold — not the
+//   `collectUsedCalleeSaved` walk — is what makes it land here:
+//   savedRegAreaSize = 8 (one slot for x30):
+//   raw_with_shadow = max(8, 0) = 8
+//   totalFrameSize  = alignedSizeWithBias(8, 16, 0) = 16
+//   Prologue: `sub sp, 0x10` + `stur x30, [sp]`; epilogue reloads x30
+//   before `ret` so the return targets the caller, not a clobbered LR.
 //
 // Leaf function (any cc, no calls):
 //   totalFrameSize  = alignUp(savedRegAreaSize + spillAreaSize,
@@ -722,6 +728,34 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
 
     std::vector<LirReg> usedSaved = collectUsedCalleeSaved(src, fn, schema, cc);
     bool const hasCalls = functionHasCalls(src, fn, schema);
+    // D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER (2026-06-08): a calling
+    // convention that carries the return address in a LINK REGISTER
+    // (AAPCS64 -> x30) instead of pushing it on the stack at the call
+    // site (x86_64 `call` -> callPushBytes=8) makes that register live
+    // across the ENTIRE body of a NON-LEAF function: every `bl`/`call`
+    // overwrites it. Such a function MUST spill the link register in its
+    // prologue and reload it before `ret`, or the epilogue `ret` jumps
+    // to the clobbered link reg (the address after the last call) rather
+    // than the caller — a self-loop whose repeated epilogue `add sp`
+    // walks SP off the stack into a guard page (SIGSEGV). The link reg is
+    // deliberately ABSENT from `cc.calleeSaved` (it must never be handed
+    // to the register allocator as a general callee-save), so it is
+    // folded into the saved set HERE, gated on `hasCalls` so leaf
+    // functions keep their minimal frame. Fully config-driven: an
+    // architecture with no `cc.linkRegister` (x86_64 — return address is
+    // on the stack) takes the no-op path; there is no arch/format branch.
+    if (hasCalls && cc.linkRegister.has_value()) {
+        LirReg const lr =
+            makePhysicalReg(cc.linkRegister->ordinal, LirRegClass::GPR);
+        bool alreadySaved = false;
+        for (LirReg const& r : usedSaved) {
+            if (r.isPhysical != 0 && r.id == lr.id) {
+                alreadySaved = true;
+                break;
+            }
+        }
+        if (!alreadySaved) usedSaved.push_back(lr);
+    }
     // D-ML7-2.2: pre-scan call sites for the maximum stack-arg
     // overflow across all calls. The prologue reserves enough
     // outgoing-arg-area bytes for the widest call.

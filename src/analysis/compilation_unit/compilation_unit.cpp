@@ -62,12 +62,14 @@ CompilationUnit::CompilationUnit(PrivateTag,
                                  std::shared_ptr<GrammarSchema const> schema,
                                  std::vector<Tree>                    trees,
                                  DiagnosticReporter                   driverDiagnostics,
-                                 std::vector<CrossTreeRef>            crossRefs)
+                                 std::vector<CrossTreeRef>            crossRefs,
+                                 std::vector<std::filesystem::path>   shippedLibDescriptors)
     : id_(id)
     , schema_(std::move(schema))
     , trees_(std::move(trees))
     , driverDiagnostics_(std::move(driverDiagnostics))
-    , crossRefs_(std::move(crossRefs)) {}
+    , crossRefs_(std::move(crossRefs))
+    , shippedLibDescriptors_(std::move(shippedLibDescriptors)) {}
 
 CompilationUnit::~CompilationUnit()                                            = default;
 CompilationUnit::CompilationUnit(CompilationUnit&&) noexcept                   = default;
@@ -78,6 +80,8 @@ CompilationUnitId             CompilationUnit::id()                const noexcep
 std::span<Tree const>         CompilationUnit::trees()             const noexcept { return trees_; }
 DiagnosticReporter const&     CompilationUnit::driverDiagnostics() const noexcept { return driverDiagnostics_; }
 std::span<CrossTreeRef const> CompilationUnit::crossRefs()         const noexcept { return crossRefs_; }
+std::span<std::filesystem::path const>
+CompilationUnit::shippedLibDescriptors() const noexcept { return shippedLibDescriptors_; }
 
 std::string CompilationUnit::compositeSourceLanguage() const {
     std::string out;
@@ -358,6 +362,7 @@ CompilationUnit UnitBuilder::finish() && {
     // loadFile callback carries the including tree's schema so an #include loads
     // its target under the same language.
     std::vector<CrossTreeRef> crossRefs;
+    std::vector<std::filesystem::path> shippedLibDescriptors;
     ResolutionContext context{
         trees_,
         driverDiagnostics_,
@@ -368,6 +373,7 @@ CompilationUnit UnitBuilder::finish() && {
             return loadAndAdd_(path, ok, std::move(schema));
         },
         crossRefs,
+        shippedLibDescriptors,
     };
     // One resolver per DISTINCT schema (dedup by SchemaId — registerSchema does
     // not dedup, and a duplicate would double-run a resolver over the same trees,
@@ -388,6 +394,7 @@ CompilationUnit UnitBuilder::finish() && {
         std::move(trees_),
         std::move(driverDiagnostics_),
         std::move(crossRefs),
+        std::move(shippedLibDescriptors),
     };
 }
 

@@ -197,15 +197,34 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
         // Build the temporary ExternDeclRef span from the lowerer's
         // owning records. The views are valid for the duration of
         // this call only (the underlying strings live on
-        // `hir->externDecls`).
+        // `hir->externDecls` and the `resolvedLibs` backing store below).
+        //
+        // Model 3 (2026-06-09): `HirExternRecord.libraryOverride` is a
+        // per-OBJECT-FORMAT MAP (a shipped descriptor routes a different image
+        // per format; a source `"libname"` override is the same string under
+        // every format key). This is the ONE site where the active target's
+        // object format is in scope, so this is where the map is FOLDED to the
+        // single string `ExternDeclRef.libraryOverride` carries. The fold keys
+        // on `formatKey` (= objectFormatKindName(format.kind())) — no
+        // `if(format)`. A key present ⇒ that image; a key ABSENT ⇒ empty
+        // override, which (per the existing ExternDeclRef contract) makes the
+        // FFI synthesize stage fall back to the format-level default
+        // `importLibrary` (externLibraryByFormat[format]).
+        std::vector<std::string> resolvedLibs;
+        resolvedLibs.reserve(hir->externDecls.size());
+        for (auto const& r : hir->externDecls) {
+            if (auto it = r.libraryOverride.find(formatKey);
+                it != r.libraryOverride.end()) {
+                resolvedLibs.push_back(it->second);
+            } else {
+                resolvedLibs.emplace_back();  // empty ⇒ inherit format default
+            }
+        }
         std::vector<ffi::ExternDeclRef> refs;
         refs.reserve(hir->externDecls.size());
-        for (auto const& r : hir->externDecls) {
-            // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3):
-            // propagate the per-symbol library override decoded by
-            // the lowerer from the optional trailing string literal.
-            // Empty = use format-level default (existing behavior).
-            refs.push_back({r.node, r.canonicalName, r.libraryOverride});
+        for (std::size_t i = 0; i < hir->externDecls.size(); ++i) {
+            auto const& r = hir->externDecls[i];
+            refs.push_back({r.node, r.canonicalName, resolvedLibs[i]});
         }
 
         auto const ffiEntry = reporter.errorCount();
@@ -262,6 +281,9 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
         &grammar,
         &target,
         callingConventionIndex,
+        // D-FFI-EXTERN-CALL-DISPATCH: capture the active format's extern-call
+        // shape now (the LOWER half sees only this struct, not the format).
+        format.externCallDispatch(),
     };
     return cuMir;
 }
@@ -299,12 +321,17 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          TargetSchema const&                         target,
                          std::uint16_t                               callingConventionIndex,
                          CompilationUnitId                           cuId,
+                         std::optional<ExternCallDispatch>           externCallDispatch,
                          DiagnosticReporter&                         reporter) {
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
+    // D-FFI-EXTERN-CALL-DISPATCH: the active format's extern-call shape
+    // selects the call-site opcode (indirect-slot → call_indirect_via_extern;
+    // direct-plt → plain call). Threaded from the format at the driver.
     auto const lirEntry = reporter.errorCount();
     auto lir = lowerToLir(mir, target,
                           interner, reporter,
-                          std::move(externImports));
+                          std::move(externImports),
+                          externCallDispatch);
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -548,7 +575,8 @@ lowerCuMirToAssembly(CuMirModule& cuMir, DiagnosticReporter& reporter) {
     return lowerMirModuleToAssembly(
         cuMir.mir, model.lattice().interner(), nameOf,
         std::move(cuMir.externImports), userEntry, *cuMir.target,
-        cuMir.callingConventionIndex, cuMir.cuId, reporter);
+        cuMir.callingConventionIndex, cuMir.cuId,
+        cuMir.externCallDispatch, reporter);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -570,6 +598,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       TargetSchema const& target,
                       std::uint16_t       callingConventionIndex,
                       CompilationUnitId   cuId,
+                      std::optional<ExternCallDispatch> externCallDispatch,
                       DiagnosticReporter& reporter) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
@@ -582,7 +611,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
     return lowerMirModuleToAssembly(
         merged.mir, merged.host.interner(), nameOf,
         std::move(merged.externImports), merged.userEntrySymbol, target,
-        callingConventionIndex, cuId, reporter);
+        callingConventionIndex, cuId, externCallDispatch, reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU

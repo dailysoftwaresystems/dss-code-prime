@@ -3,12 +3,14 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
+#include "core/types/object_format_kind.hpp"  // ExternCallDispatch (extern-call shape)
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "lir/lir.hpp"
 #include "mir/mir.hpp"
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 // MIR → LIR instruction selection (plan 12 ML5 cycle 3). Takes a frozen
@@ -96,6 +98,21 @@ lowerToLir(Mir const&          mir,
            // — dereferences the IAT/GOT slot); a call whose target
            // is module-internal lowers to `call` (E8 disp32 — direct
            // rel32). Defaults to empty for static modules.
-           std::vector<ExternImport> externImports = {});
+           std::vector<ExternImport> externImports = {},
+           // D-FFI-EXTERN-CALL-DISPATCH: the ACTIVE OBJECT FORMAT's
+           // extern-call shape, read from `ObjectFormatSchema::
+           // externCallDispatch()`. `indirect-slot` (PE/Mach-O) →
+           // extern calls lower to `call_indirect_via_extern` (deref
+           // the IAT/__got pointer slot); `direct-plt` (ELF) → extern
+           // calls lower to the plain `call` opcode (direct branch to
+           // the linker-synthesized PLT stub). `std::nullopt` = the
+           // format declared none: lowering an extern call then fails
+           // loud (NO silent default — picking the wrong shape
+           // miscompiles, e.g. FF 15 through an ELF PLT stub SIGSEGVs).
+           // Defaults to nullopt; the production driver passes the
+           // active format's value, and only extern-bearing modules
+           // consume it (a static module never reaches the guard).
+           std::optional<ExternCallDispatch> externCallDispatch =
+               std::nullopt);
 
 } // namespace dss

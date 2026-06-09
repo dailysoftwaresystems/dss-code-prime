@@ -1585,3 +1585,441 @@ TEST(ElfRelWriter, ExternImportsFailLoudOnEtRelAlso) {
     }
     EXPECT_TRUE(sawCode);
 }
+
+// ── D-LK1-ELF-EXEC-DATA-SECTIONS: .rodata emitted from dataItems ──
+//
+// The ET_EXEC walker emits a loadable `.rodata` section (folded into
+// the single R+X PT_LOAD) whenever `module.dataItems` carries any
+// item with `section == DataSectionKind::Rodata`. These pins are
+// host-independent (decided entirely from the emitted bytes — the
+// .rodata section content/placement IS the deliverable, fully
+// decidable from the wire image; not a runtime claim). Runtime
+// behavior (`int g=42; return g;` → exit 42) is the corpus
+// `examples/c-subset/global_int`'s ELF arms on the Linux + native-
+// arm64 CI legs.
+namespace {
+
+// Each Elf64_Shdr is 64 bytes. Field offsets within a header:
+//   sh_name(u32)@0, sh_type(u32)@4, sh_flags(u64)@8, sh_addr(u64)@16,
+//   sh_offset(u64)@24, sh_size(u64)@32.
+constexpr std::size_t kShdrSize = 64;
+
+// Locate the `.rodata` section header index by its distinguishing
+// fields: SHT_PROGBITS(1) + SHF_ALLOC(2) + the expected sh_addr.
+// Returns the header's file offset, or 0 if not found (0 is the
+// SHT_NULL header, never .rodata, so it doubles as "not found").
+[[nodiscard]] std::size_t findRodataShdrOff(
+        std::span<std::uint8_t const> bytes, std::uint64_t expectedAddr) {
+    std::uint64_t const shoff  = readU64LE(bytes, 40);
+    std::uint16_t const shnum  = readU16LE(bytes, 60);
+    for (std::uint16_t i = 1; i < shnum; ++i) {
+        std::size_t const off = static_cast<std::size_t>(shoff)
+                              + static_cast<std::size_t>(i) * kShdrSize;
+        if (readU32LE(bytes, off + 4) == 1u            // SHT_PROGBITS
+         && readU64LE(bytes, off + 8) == 2u            // SHF_ALLOC
+         && readU64LE(bytes, off + 16) == expectedAddr) {
+            return off;
+        }
+    }
+    return 0;
+}
+
+// Build a module with one trivial function + one rodata dataItem
+// {42,0,0,0} (an `int g=42;`-shaped item), NO relocations.
+[[nodiscard]] AssembledModule makeModuleWithRodata() {
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);  // ret
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Rodata;
+    d.bytes     = {42, 0, 0, 0};            // int 42, little-endian
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+    return mod;
+}
+
+} // namespace
+
+TEST(ElfExecWriter, RodataSectionHeaderPinnedFromDataItems) {
+    auto loaded = loadShipped();
+    AssembledModule mod = makeModuleWithRodata();
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    // .text sh_addr = secText.virtualAddress (0x401000); .rodata VA =
+    // 0x401000 + alignUp(textSize=1, 8) = 0x401008.
+    constexpr std::uint64_t kTextVa   = 0x401000ull;
+    constexpr std::uint64_t kRodataVa = kTextVa + 8;  // alignUp(1,8)=8
+    std::size_t const off = findRodataShdrOff(bytes, kRodataVa);
+    ASSERT_NE(off, 0u)
+        << "no .rodata section header with SHT_PROGBITS/SHF_ALLOC and "
+           "sh_addr=0x401008 — D-LK1-ELF-EXEC-DATA-SECTIONS not emitted";
+    EXPECT_EQ(readU32LE(bytes, off + 4), 1u)   << "sh_type SHT_PROGBITS";
+    EXPECT_EQ(readU64LE(bytes, off + 8), 2u)   << "sh_flags SHF_ALLOC";
+    EXPECT_EQ(readU64LE(bytes, off + 16), kRodataVa) << "sh_addr";
+    EXPECT_EQ(readU64LE(bytes, off + 32), 4u)  << "sh_size == 4 bytes";
+    // The .rodata bytes in the file equal {42,0,0,0}.
+    std::uint64_t const rodataFileOff = readU64LE(bytes, off + 24);
+    ASSERT_GE(bytes.size(), rodataFileOff + 4u);
+    EXPECT_EQ(bytes[rodataFileOff + 0], 42u);
+    EXPECT_EQ(bytes[rodataFileOff + 1], 0u);
+    EXPECT_EQ(bytes[rodataFileOff + 2], 0u);
+    EXPECT_EQ(bytes[rodataFileOff + 3], 0u);
+}
+
+TEST(ElfExecWriter, RodataExtendsSinglePtLoadAndStaysReadExecute) {
+    // The single PT_LOAD's p_filesz must cover THROUGH the rodata
+    // extent (p_filesz == rodataFileEnd - textFileOffset), and p_flags
+    // stays R+X (5) — SHF_ALLOC-only rodata adds NO write permission.
+    //
+    // RED-on-disable: this is the load-bearing pin. If the PT_LOAD
+    // extension in elf.cpp is reverted to `p_filesz = text.size()`,
+    // this p_filesz assertion FAILS (text.size()=1 != the rodata-
+    // covering extent), so the loader would never map the global's
+    // page → `return g` reads an unmapped VA → SIGSEGV at runtime.
+    auto loaded = loadShipped();
+    AssembledModule mod = makeModuleWithRodata();
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // e_phnum @ +56 = 1 (still a SINGLE PT_LOAD — no 2nd segment).
+    EXPECT_EQ(readU16LE(bytes, 56), 1u)
+        << "rodata folds into the existing PT_LOAD — kPtLoadCount stays 1";
+    // PT_LOAD program header at byte 64.
+    EXPECT_EQ(readU32LE(bytes, 64 + 0), 1u);   // p_type PT_LOAD
+    EXPECT_EQ(readU32LE(bytes, 64 + 4), 5u)    // p_flags PF_R|PF_X
+        << "rodata is SHF_ALLOC-only — the segment stays R+X (W^X "
+           "preserved); a write bit here would be a regression";
+    std::uint64_t const pOffset = readU64LE(bytes, 64 + 8);
+    std::uint64_t const pFilesz = readU64LE(bytes, 64 + 32);
+    std::uint64_t const pMemsz  = readU64LE(bytes, 64 + 40);
+    // Locate .rodata to derive its file end.
+    constexpr std::uint64_t kRodataVa = 0x401000ull + 8;
+    std::size_t const roOff = findRodataShdrOff(bytes, kRodataVa);
+    ASSERT_NE(roOff, 0u);
+    std::uint64_t const rodataFileOff = readU64LE(bytes, roOff + 24);
+    std::uint64_t const rodataFileEnd = rodataFileOff + 4u;
+    EXPECT_EQ(pFilesz, rodataFileEnd - pOffset)
+        << "p_filesz must span .text through end of .rodata";
+    EXPECT_EQ(pMemsz, pFilesz)
+        << "p_memsz == p_filesz (no BSS this cycle)";
+}
+
+TEST(ElfExecWriter, RodataShiftsShnumAndShstrndxVsControl) {
+    // A no-dataItems control and the rodata module differ by exactly
+    // one section header, and e_shstrndx tracks the +1 index shift.
+    auto loaded = loadShipped();
+
+    // Control: identical function, NO dataItems.
+    AssembledModule control = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter repC;
+    auto bytesC = elf::encode(control, *loaded.target, *loaded.format, repC);
+    ASSERT_EQ(repC.errorCount(), 0u);
+    std::uint16_t const shnumC     = readU16LE(bytesC, 60);
+    std::uint16_t const shstrndxC  = readU16LE(bytesC, 62);
+
+    AssembledModule mod = makeModuleWithRodata();
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    std::uint16_t const shnum     = readU16LE(bytes, 60);
+    std::uint16_t const shstrndx  = readU16LE(bytes, 62);
+
+    EXPECT_EQ(shnum, shnumC + 1u)
+        << "e_shnum increases by exactly 1 (the .rodata header)";
+    EXPECT_EQ(shstrndx, shstrndxC + 1u)
+        << "e_shstrndx shifts +1 (.rodata at index 2 pushes .shstrtab)";
+    // e_shstrndx must point at the ACTUAL .shstrtab: verify the
+    // section it indexes is SHT_STRTAB(3). (Defends against the IDX
+    // shift desyncing the header table order from the e_shstrndx math.)
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    std::size_t const shstrtabHdr = static_cast<std::size_t>(shoff)
+        + static_cast<std::size_t>(shstrndx) * kShdrSize;
+    EXPECT_EQ(readU32LE(bytes, shstrtabHdr + 4), 3u)
+        << "e_shstrndx must index a SHT_STRTAB section (the real "
+           ".shstrtab), proving the +1 shift is coherent";
+}
+
+TEST(ElfExecWriter, NoDataItemsEmitsNoRodataByteIdenticalToBaseline) {
+    // Control / agnosticism pin: a module with NO dataItems emits NO
+    // .rodata section. This is the byte-identity guarantee — the
+    // rodata path is fully gated on `!module.dataItems.empty()`, so
+    // the no-rodata static-exec output is unchanged from before
+    // D-LK1-ELF-EXEC-DATA-SECTIONS landed.
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTrivialModule({0x90, 0x90, 0xC3}, 7);
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // 5 sections (NULL, .text, .symtab, .strtab, .shstrtab) — NO
+    // .rodata. Same count the RelaTextSlotDroppedForExec pin asserts.
+    EXPECT_EQ(readU16LE(bytes, 60), 5u);
+    // No SHT_PROGBITS+SHF_ALLOC header other than .text (which has
+    // SHF_ALLOC|SHF_EXECINSTR = 6, not 2) — scan confirms zero
+    // SHF_ALLOC-only PROGBITS sections.
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    std::uint16_t const shnum = readU16LE(bytes, 60);
+    int rodataLike = 0;
+    for (std::uint16_t i = 1; i < shnum; ++i) {
+        std::size_t const off = static_cast<std::size_t>(shoff)
+                              + static_cast<std::size_t>(i) * kShdrSize;
+        if (readU32LE(bytes, off + 4) == 1u
+         && readU64LE(bytes, off + 8) == 2u) {
+            ++rodataLike;
+        }
+    }
+    EXPECT_EQ(rodataLike, 0)
+        << "no-dataItems module must not emit any SHF_ALLOC-only "
+           "PROGBITS (.rodata) section";
+}
+
+TEST(ElfExecWriter, RodataAlsoEmittedOnArm64SharedCodePath) {
+    // Agnosticism pin: the SAME elf.cpp code path emits .rodata on the
+    // aarch64 exec format — arch differs only via config (machine /
+    // pageAlign), zero `if(arch)` branches. arm64 .text base = 0x400000;
+    // rodata VA = 0x400000 + alignUp(textSize=4, 8) = 0x400008 (the
+    // arm64 function body is RET = 4 bytes).
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod = makeTrivialModule(
+        {0xC0, 0x03, 0x5F, 0xD6}, 1);  // RET (0xD65F03C0 LE)
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Rodata;
+    d.bytes     = {42, 0, 0, 0};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    constexpr std::uint64_t kRodataVa = 0x400000ull + 8;
+    std::size_t const off = findRodataShdrOff(bytes, kRodataVa);
+    ASSERT_NE(off, 0u)
+        << "arm64 ELF exec must emit .rodata via the same code path";
+    EXPECT_EQ(readU64LE(bytes, off + 32), 4u);
+    std::uint64_t const rodataFileOff = readU64LE(bytes, off + 24);
+    EXPECT_EQ(bytes[rodataFileOff + 0], 42u);
+    // p_flags still R+X (5) — same W^X invariant cross-arch.
+    EXPECT_EQ(readU32LE(bytes, 64 + 4), 5u);
+}
+
+TEST(ElfExecWriter, NonRodataDataItemFailsLoud) {
+    // Fail-loud: a Data/Bss item is rejected (only Rodata closes this
+    // cycle). The non-Rodata scan runs UNCONDITIONALLY so a module
+    // carrying ONLY non-Rodata items can't slip past.
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Data;       // NOT Rodata
+    d.bytes     = {1, 2, 3, 4};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawCode = false;
+    for (auto const& diag : rep.all()) {
+        if (diag.code == DiagnosticCode::K_NoMatchingObjectFormat
+         && diag.actual.find("D-LK4-RODATA-PRODUCER") != std::string::npos) {
+            sawCode = true;
+        }
+    }
+    EXPECT_TRUE(sawCode)
+        << "Data/Bss dataItem must fail loud citing D-LK4-RODATA-PRODUCER";
+}
+
+TEST(ElfExecWriter, RodataDataItemWithRelocationFailsLoud) {
+    // Fail-loud: a rodata item carrying its OWN relocations (data->data
+    // reference) is deferred this cycle — the ELF writer patches
+    // FUNCTION relocations only. Cited anchor: D-LK1-ELF-RODATA-
+    // DATAITEM-RELOC.
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Rodata;
+    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};    // 8-byte pointer slot
+    d.alignment = Alignment::of<8>();
+    Relocation r;
+    r.offset = 0; r.target = SymbolId{1}; r.kind = RelocationKind{2};
+    d.relocations.push_back(r);
+    mod.dataItems.push_back(std::move(d));
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawCode = false;
+    for (auto const& diag : rep.all()) {
+        if (diag.code == DiagnosticCode::K_NoMatchingObjectFormat
+         && diag.actual.find("D-LK1-ELF-RODATA-DATAITEM-RELOC")
+                != std::string::npos) {
+            sawCode = true;
+        }
+    }
+    EXPECT_TRUE(sawCode)
+        << "rodata dataItem with relocations must fail loud citing "
+           "D-LK1-ELF-RODATA-DATAITEM-RELOC";
+}
+
+// ── Code-review FOLD pins (H1 / M1 / L1) ──────────────────────────
+
+TEST(ElfExecWriter, ElfExecRejectsDataItemsOnRelocatable) {
+    // L1 / defence-in-depth: dataItems on the ET_REL (.o) path are
+    // rejected loudly — rodata in a .o rides the symbol+section table,
+    // NOT the dataItems pipeline. We call elf::encode DIRECTLY against
+    // the ET_REL schema (`elf64-x86_64-linux`, the .o format) so the
+    // writer's own `!isExec && !dataItems.empty()` guard fires (the
+    // linker's per-format gate would otherwise reject earlier).
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Rodata;   // a VALID rodata item —
+    d.bytes     = {42, 0, 0, 0};             // it sails past the
+    d.alignment = Alignment::of<4>();        // Rodata/no-reloc scans
+    mod.dataItems.push_back(std::move(d));    // and hits the !isExec gate
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_GT(rep.errorCount(), 0u);
+    bool sawCode = false;
+    for (auto const& diag : rep.all()) {
+        if (diag.code == DiagnosticCode::K_NoMatchingObjectFormat
+         && diag.actual.find("(ET_REL)") != std::string::npos
+         && diag.actual.find("D-LK1-ELF-EXEC-DATA-SECTIONS")
+                != std::string::npos) {
+            sawCode = true;
+        }
+    }
+    EXPECT_TRUE(sawCode)
+        << "dataItems on ET_REL must fail loud as (ET_REL) citing "
+           "D-LK1-ELF-EXEC-DATA-SECTIONS";
+}
+
+TEST(ElfExecWriter, ElfExecMultipleRodataItemsLayoutWithAlignmentPadding) {
+    // H1 + offset placement: TWO rodata items with DIFFERENT alignments,
+    // the STRICTER exceeding the schema floor (8) so H1's section-align
+    // raise is load-bearing (NOT a no-op against the floor):
+    //   item0 = {1,0,0,0}       align 4   → section offset 0  (size 4)
+    //   item1 = {0x2a × 16}     align 16  → section offset 16 (item0's
+    //                                       4-byte tail padded up to 16)
+    // H1 raises sh_addralign to max(schema 8, 4, 16) = 16 (WITHOUT H1
+    // it would stay 8). So .rodata VA = textVa + alignUp(textSize=1,16)
+    // = 0x401010 (without H1: alignUp(1,8)=0x401008 — the VA itself
+    // differs, the RED-on-disable lever). Each data symbol resolves to
+    // sectionBaseVa + its offset; the single PT_LOAD's p_filesz spans
+    // .text through end of .rodata.
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);   // 1-byte .text
+    AssembledData d0;
+    d0.symbol    = SymbolId{10};
+    d0.section   = DataSectionKind::Rodata;
+    d0.bytes     = {1, 0, 0, 0};
+    d0.alignment = Alignment::of<4>();
+    AssembledData d1;
+    d1.symbol    = SymbolId{11};
+    d1.section   = DataSectionKind::Rodata;
+    d1.bytes     = std::vector<std::uint8_t>(16, 0x2a);   // i128-shaped
+    d1.alignment = Alignment::of<16>();                    // > schema floor 8
+    mod.dataItems.push_back(std::move(d0));
+    mod.dataItems.push_back(std::move(d1));
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    constexpr std::uint64_t kTextVa     = 0x401000ull;
+    constexpr std::uint64_t kRodataVa   = kTextVa + 16;  // H1: alignUp(1,16)=16
+    constexpr std::uint64_t kItem0Va    = kRodataVa + 0; // offset 0
+    constexpr std::uint64_t kItem1Va    = kRodataVa + 16;// offset 16 (4→16 pad)
+
+    std::size_t const off = findRodataShdrOff(bytes, kRodataVa);
+    ASSERT_NE(off, 0u)
+        << "two-item .rodata must sit at H1-raised sh_addr 0x401010";
+    // H1 DIRECT proof: sh_addralign (Elf64_Shdr field @ +48: name@0,
+    // type@4, flags@8, addr@16, offset@24, size@32, link@40, info@44,
+    // addralign@48) carries the raised value (16), NOT the schema
+    // floor (8).
+    EXPECT_EQ(readU64LE(bytes, off + 48), 16u)
+        << "sh_addralign must be H1-raised to 16 (the strictest item)";
+    // sh_size spans both items + the inter-item pad: 16 (item1 start) +
+    // 16 (item1 size) = 32 bytes.
+    EXPECT_EQ(readU64LE(bytes, off + 32), 32u) << "sh_size == 32";
+    EXPECT_EQ(readU64LE(bytes, off + 16), kRodataVa) << "sh_addr";
+    // The 12-byte padding gap between item0 (4 bytes) and item1 (at
+    // offset 16) is zero-filled.
+    std::uint64_t const roFileOff = readU64LE(bytes, off + 24);
+    ASSERT_GE(bytes.size(), roFileOff + 32u);
+    EXPECT_EQ(bytes[roFileOff + 0], 1u);                 // item0 byte 0
+    for (std::size_t i = 4; i < 16; ++i)
+        EXPECT_EQ(bytes[roFileOff + i], 0u) << "pad byte " << i;
+    EXPECT_EQ(bytes[roFileOff + 16], 0x2au);             // item1 byte 0
+    EXPECT_EQ(bytes[roFileOff + 31], 0x2au);             // item1 byte 15
+
+    // Each data symbol's VA == sectionBaseVa + its section offset. The
+    // symbolVa map (rodataSectionVa + rodataItemOffsets[i]) that the
+    // reloc kernel resolves against is INTERNAL — ELF data items are
+    // NOT emitted as symtab entries this cycle (the symtab loop emits
+    // only STT_FUNC symbols). So the per-item VAs are proven through
+    // the two wire facts pinned above: the section base VA (sh_addr =
+    // 0x401010) and each item's byte offset within .rodata (item0 @ +0,
+    // item1 @ +16, the 4→16 alignment pad observed as the zero gap).
+    //   item0 VA == 0x401010 + 0 == kItem0Va, item1 VA == +16 == kItem1Va.
+    EXPECT_EQ(readU64LE(bytes, off + 16) + 0u,  kItem0Va) << "item0 VA";
+    EXPECT_EQ(readU64LE(bytes, off + 16) + 16u, kItem1Va) << "item1 VA";
+
+    // The single PT_LOAD's p_filesz covers .text through end of .rodata.
+    EXPECT_EQ(readU16LE(bytes, 56), 1u) << "still ONE PT_LOAD";
+    std::uint64_t const pOffset = readU64LE(bytes, 64 + 8);
+    std::uint64_t const pFilesz = readU64LE(bytes, 64 + 32);
+    std::uint64_t const rodataFileEnd = roFileOff + 32u;
+    EXPECT_EQ(pFilesz, rodataFileEnd - pOffset)
+        << "p_filesz spans .text through end of both rodata items";
+}
+
+TEST(ElfExecWriter, ElfExecAnonymousRodataItemsDoNotCollide) {
+    // M1: TWO anonymous rodata items (the `SymbolId{}` sentinel —
+    // read-only constants / padding, per asm.hpp "Multiple sentinel
+    // items are legitimate"). They are referenced by section offset,
+    // NOT by symbol, so they must NOT join symbolVa — encode SUCCEEDS
+    // (no K_DuplicateDataSymbol false-fire on the 2nd SymbolId{}).
+    // Distinct bytes so the two items are individually meaningful.
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledData a0;
+    a0.symbol    = SymbolId{};                // anonymous sentinel
+    a0.section   = DataSectionKind::Rodata;
+    a0.bytes     = {0xAA, 0xBB, 0xCC, 0xDD};
+    a0.alignment = Alignment::of<4>();
+    AssembledData a1;
+    a1.symbol    = SymbolId{};                // ALSO anonymous — legit
+    a1.section   = DataSectionKind::Rodata;
+    a1.bytes     = {0x11, 0x22, 0x33, 0x44};
+    a1.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(a0));
+    mod.dataItems.push_back(std::move(a1));
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "two anonymous SymbolId{} rodata items must NOT collide";
+    ASSERT_FALSE(bytes.empty());
+    for (auto const& diag : rep.all()) {
+        EXPECT_NE(diag.code, DiagnosticCode::K_DuplicateDataSymbol)
+            << "anonymous items are offset-referenced, never reloc "
+               "targets — must not join symbolVa";
+    }
+    // Both items still land in .rodata contiguously: 4 + 4 = 8 bytes.
+    constexpr std::uint64_t kRodataVa = 0x401000ull + 8;
+    std::size_t const off = findRodataShdrOff(bytes, kRodataVa);
+    ASSERT_NE(off, 0u);
+    EXPECT_EQ(readU64LE(bytes, off + 32), 8u) << "sh_size == 8 (4+4)";
+    std::uint64_t const roFileOff = readU64LE(bytes, off + 24);
+    ASSERT_GE(bytes.size(), roFileOff + 8u);
+    EXPECT_EQ(bytes[roFileOff + 0], 0xAAu);
+    EXPECT_EQ(bytes[roFileOff + 4], 0x11u);
+}

@@ -218,10 +218,16 @@ private:
     //   * QUOTE form (`config_.pathToken`, e.g. StringStart): a LOCAL
     //     include. Searched on the including file's dir + includeDirs; a
     //     miss is the SOFT D_UnresolvedImport (a local include may be
-    //     provided by a later build step).
+    //     provided by a later build step). The resolved file is LOADED as
+    //     source under THIS schema and becomes a CrossTreeRef edge.
     //   * ANGLE/SYSTEM form (`config_.systemPathToken`, e.g.
-    //     HeaderStart): a SYSTEM include. Searched on `systemDirs`
-    //     (shippedLibDirs); a miss is the HARD F_ShippedHeaderNotFound
+    //     HeaderStart): a SYSTEM include resolving to a LANGUAGE-NEUTRAL
+    //     JSON DESCRIPTOR (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). The
+    //     requested `<stdio.h>` is mapped to `<stem>.json` (`stdio.json`)
+    //     and searched on `systemDirs` (shippedLibDirs); a HIT records the
+    //     resolved path on `context.shippedLibDescriptors` (the semantic
+    //     phase reads it + injects its extern symbols — NOT a source Tree,
+    //     so no CrossTreeRef). A miss is the HARD F_ShippedHeaderNotFound
     //     (a missing system header is a fatal C error). Absent token ⇒
     //     the language declares no angle form.
     void resolveIncludeFollowing(ResolutionContext& context) const {
@@ -298,13 +304,33 @@ private:
                     }
                 };
                 if (directive.filename.empty()) { unresolved(); continue; }
-                // Quote form searches self-dir + includeDirs; angle form
-                // searches systemDirs (shippedLibDirs). Both load the
-                // resolved header under THIS schema (the included header
-                // is a source file in the same language).
-                auto const resolved = directive.isSystem
-                    ? findInDirs(directive.filename, context.systemDirs)
-                    : resolveIncludePath(directive.filename, includingDir, context.includeDirs);
+
+                // ANGLE/SYSTEM form → NEUTRAL JSON DESCRIPTOR
+                // (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). A system include
+                // resolves to `<stem>.json` on the systemDirs path, NOT a
+                // source header: `#include <stdio.h>` maps to `stdio.json`.
+                // The descriptor is a language-neutral symbol table, so it is
+                // recorded (for the semantic phase to read) rather than loaded
+                // + parsed as a Tree — it has no source syntax and produces no
+                // CrossTreeRef. A miss is the SAME hard F_ShippedHeaderNotFound
+                // as before (a missing system header is a fatal C error). The
+                // mapping is `stem(filename) + ".json"` — agnostic of the
+                // requested extension spelling (`<stdio.h>`, `<stdio>` both map
+                // to `stdio.json`).
+                if (directive.isSystem) {
+                    std::string const descriptorName =
+                        fs::path(directive.filename).stem().string() + ".json";
+                    auto const resolved = findInDirs(descriptorName, context.systemDirs);
+                    if (!resolved) { unresolved(); continue; }
+                    context.shippedLibDescriptors.push_back(*resolved);
+                    continue;
+                }
+
+                // QUOTE form: a LOCAL include, loaded as source under THIS
+                // schema (the included header is a source file in the same
+                // language) and recorded as a CrossTreeRef edge.
+                auto const resolved =
+                    resolveIncludePath(directive.filename, includingDir, context.includeDirs);
                 if (!resolved) { unresolved(); continue; }
 
                 bool ok = false;

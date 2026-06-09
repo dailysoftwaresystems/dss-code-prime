@@ -95,6 +95,18 @@ struct DSS_EXPORT ResolutionContext {
 
     // Output: the resolved cross-tree edges. Resolvers append; never cleared.
     std::vector<CrossTreeRef>&             crossRefs;
+
+    // Output: resolved SHIPPED-LIBRARY DESCRIPTOR paths (FF11 neutral-JSON
+    // model, D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). An angle/system include
+    // (`#include <stdio.h>`) no longer loads a per-language source header; it
+    // resolves to a LANGUAGE-NEUTRAL JSON descriptor (`<stem>.json`) on the
+    // systemDirs path. The descriptor is NOT a Tree (it carries no source
+    // syntax — only a symbol table) so it produces no CrossTreeRef; instead the
+    // resolver records its absolute path here. The semantic phase reads each
+    // path via `readShippedLibDescriptor`, interns each symbol's signature into
+    // the CU lattice, and mints an extern symbol into scope — the analogue of
+    // the builtinFunctions injection. Resolvers append; never cleared.
+    std::vector<std::filesystem::path>&    shippedLibDescriptors;
 };
 
 class DSS_EXPORT ImportResolver {

@@ -1,0 +1,504 @@
+// Neutral shipped-lib descriptor reader tests (closes the reader half of
+// D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC).
+//
+// `readShippedLibDescriptor` reads a LANGUAGE-NEUTRAL JSON descriptor + decodes
+// each symbol's hir-text `signature` via the ONE `parseTypeFromText` decoder
+// into the caller's interner. Pins (strict, red-on-disable):
+//   * a well-formed stdio.json → `puts` with signature decoded to EXACTLY
+//     FnSig(result I32, one param Ptr<Char>) — inspected STRUCTURALLY via the
+//     interner accessors, never a string compare.
+//   * malformed JSON / missing required key → F_ShippedLibDescriptorMalformed
+//     + nullopt.
+//   * a truncated / unknown signature → F_ShippedLibUnsupportedType + nullopt,
+//     and NO symbol returned with InvalidType (the CRITICAL fail-loud).
+
+#include "core/types/diagnostic_reporter.hpp"
+#include "core/types/parse_diagnostic.hpp"
+#include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_registry.hpp"
+#include "diagnostic_count.hpp"
+#include "ffi/shipped_lib_descriptor.hpp"
+#include "scratch_dir.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+using namespace dss;
+using namespace dss::ffi;
+using dss::test_support::Location;
+using dss::test_support::ScratchDir;
+namespace fs = std::filesystem;
+
+namespace {
+
+// Write `content` to a fresh `<scratch>/<name>` and return the path.
+[[nodiscard]] fs::path writeTemp(ScratchDir const& dir, std::string const& name,
+                                 std::string const& content) {
+    fs::path const p = dir.path() / name;
+    std::ofstream(p, std::ios::binary) << content;
+    return p;
+}
+
+// ── Happy path: structural FnSig inspection ──────────────────────────────────
+
+TEST(ShippedLibDescriptor, ReadsPutsWithDecodedFnSig) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "stdio.json", R"({
+        "header": "stdio.h",
+        "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+        "symbols": [
+            { "name": "puts", "signature": "fn(ptr<char>) -> i32",
+              "kind": "function", "linkage": "external" }
+        ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    // Model 3: `library` is a per-object-format map; assert each entry.
+    EXPECT_EQ(desc->library.size(), 3u);
+    EXPECT_EQ(desc->library.at("pe"), "msvcrt.dll");
+    EXPECT_EQ(desc->library.at("elf"), "libc.so.6");
+    EXPECT_EQ(desc->library.at("macho"), "/usr/lib/libSystem.B.dylib");
+    EXPECT_EQ(desc->header, "stdio.h");   // provenance, first-class
+    ASSERT_EQ(desc->symbols.size(), 1u);
+
+    auto const& sym = desc->symbols[0];
+    EXPECT_EQ(sym.name, "puts");
+    EXPECT_EQ(sym.kind, ShippedSymbolKind::Function);
+    EXPECT_EQ(sym.linkage, ShippedSymbolLinkage::External);
+
+    // Structural inspection — NOT a string compare. The signature must be a
+    // FnSig(result=I32, params=[Ptr<Char>]).
+    ASSERT_TRUE(sym.signature.valid());
+    ASSERT_EQ(interner.kind(sym.signature), TypeKind::FnSig);
+    EXPECT_EQ(interner.kind(interner.fnResult(sym.signature)), TypeKind::I32);
+    auto const params = interner.fnParams(sym.signature);
+    ASSERT_EQ(params.size(), 1u);
+    ASSERT_EQ(interner.kind(params[0]), TypeKind::Ptr);
+    auto const ptrElem = interner.operands(params[0]);
+    ASSERT_EQ(ptrElem.size(), 1u);
+    EXPECT_EQ(interner.kind(ptrElem[0]), TypeKind::Char);
+}
+
+// `library` is optional — absent ⇒ empty map (resolution then falls back to the
+// language's externLibraryByFormat default for every format).
+TEST(ShippedLibDescriptor, LibraryIsOptional) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "nolib.json", R"({
+        "header": "x.h",
+        "symbols": [ { "name": "f", "signature": "fn() -> void" } ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(desc->library.empty());
+    ASSERT_EQ(desc->symbols.size(), 1u);
+    EXPECT_EQ(desc->symbols[0].kind, ShippedSymbolKind::Function);     // default
+    EXPECT_EQ(desc->symbols[0].linkage, ShippedSymbolLinkage::External); // default
+}
+
+// An "object" kind decodes to ShippedSymbolKind::Object (→ ExternGlobal).
+TEST(ShippedLibDescriptor, ObjectKindDecodes) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "obj.json", R"({
+        "header": "stdio.h", "library": { "pe": "msvcrt.dll" },
+        "symbols": [ { "name": "errno", "signature": "i32", "kind": "object" } ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    ASSERT_EQ(desc->symbols.size(), 1u);
+    EXPECT_EQ(desc->symbols[0].kind, ShippedSymbolKind::Object);
+    EXPECT_EQ(interner.kind(desc->symbols[0].signature), TypeKind::I32);
+}
+
+// ── Malformed JSON → F_ShippedLibDescriptorMalformed + nullopt ───────────────
+
+TEST(ShippedLibDescriptor, MalformedJsonFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad.json", R"({ "library": )");  // truncated
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
+}
+
+TEST(ShippedLibDescriptor, MissingSymbolsKeyFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "nosyms.json", R"({ "header": "x.h", "library": { "pe": "msvcrt.dll" } })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_GT(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+}
+
+TEST(ShippedLibDescriptor, MissingSignatureKeyFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "nosig.json", R"({
+        "header": "stdio.h", "library": { "pe": "msvcrt.dll" },
+        "symbols": [ { "name": "puts" } ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_GT(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+}
+
+TEST(ShippedLibDescriptor, UnknownKeyFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "unknownkey.json", R"({
+        "header": "stdio.h", "library": { "pe": "msvcrt.dll" },
+        "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32",
+                       "calling_convention": "stdcall" } ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_GT(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+}
+
+TEST(ShippedLibDescriptor, UnknownEnumFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "badenum.json", R"({
+        "header": "stdio.h", "library": { "pe": "msvcrt.dll" },
+        "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32",
+                       "kind": "macro" } ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_GT(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+}
+
+// ── Bad signature → F_ShippedLibUnsupportedType, NO InvalidType extern ───────
+
+TEST(ShippedLibDescriptor, TruncatedSignatureFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "truncsig.json", R"({
+        "header": "stdio.h", "library": { "pe": "msvcrt.dll" },
+        "symbols": [ { "name": "puts", "signature": "fn(ptr<" } ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    // The CRITICAL fail-loud: a signature that fails to decode → nullopt, the
+    // dedicated code fires, and NO symbol was ever returned carrying InvalidType.
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibUnsupportedType), 1u);
+}
+
+TEST(ShippedLibDescriptor, UnknownTypeSignatureFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "unknowntype.json", R"({
+        "header": "stdio.h", "library": { "pe": "msvcrt.dll" },
+        "symbols": [ { "name": "puts", "signature": "fn(wat) -> i32" } ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_GT(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibUnsupportedType), 0u);
+}
+
+// `header` is REQUIRED provenance — a descriptor without it fails loud (the
+// user must always be able to know where a shipped symbol comes from).
+TEST(ShippedLibDescriptor, MissingHeaderFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "noheader.json", R"({
+        "library": { "pe": "msvcrt.dll" },
+        "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_GT(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+}
+
+// Ancestor-walk for the shipped dir (mirrors `findShippedConfig`) so tests work
+// whether ctest runs from build/ or the repo root. Returns empty if not found.
+[[nodiscard]] fs::path shippedLibsRoot() {
+    fs::path here = fs::current_path();
+    for (int i = 0; i < 8 && !here.empty(); ++i) {
+        fs::path const cand = here / "src" / "dss-config" / "shippedLibs";
+        if (fs::exists(cand)) return cand;
+        fs::path const parent = here.parent_path();
+        if (parent == here) break;
+        here = parent;
+    }
+    return {};
+}
+
+// Every descriptor SHIPPED under src/dss-config/shippedLibs/*.json (Model 3: a
+// FLAT, platform-neutral layout — one descriptor per header) must read + decode
+// cleanly: valid JSON, a non-empty `header` that AGREES with the filename stem
+// (the resolver routes `<stdlib.h>`→stdlib.json by stem, so a descriptor whose
+// `header` provenance lies about its origin is a real bug), and EVERY symbol's
+// `signature` decodes via the one type-text codec. A malformed JSON or an
+// unencodable signature in a shipped descriptor breaks the standard-library
+// surface — fail loud HERE, not at a user's `#include`.
+TEST(ShippedLibDescriptor, AllShippedDescriptorsDecode) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty())
+        << "could not locate src/dss-config/shippedLibs from cwd";
+
+    std::size_t count = 0;
+    for (auto const& entry : fs::recursive_directory_iterator(shippedRoot)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".json")
+            continue;
+        ++count;
+        // Fresh interner per descriptor — each shipped lib is read into its
+        // consuming CU's interner in production.
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(entry.path(), interner, typeReg, rep);
+        EXPECT_TRUE(desc.has_value())
+            << "shipped descriptor failed to load: "
+            << entry.path().generic_string();
+        EXPECT_FALSE(rep.hasErrors())
+            << "shipped descriptor emitted diagnostics: "
+            << entry.path().generic_string();
+        if (desc.has_value()) {
+            EXPECT_FALSE(desc->header.empty())
+                << "shipped descriptor has empty header: "
+                << entry.path().generic_string();
+            // Provenance integrity: `header` MUST match the filename stem the
+            // resolver routes by (RED if a clone left stdlib.json saying stdio.h).
+            EXPECT_EQ(desc->header, entry.path().stem().string() + ".h")
+                << "header provenance must match the filename stem in "
+                << entry.path().generic_string();
+            for (auto const& s : desc->symbols) {
+                EXPECT_TRUE(s.signature.valid())
+                    << "symbol '" << s.name << "' has invalid signature in "
+                    << entry.path().generic_string();
+            }
+        }
+    }
+    EXPECT_GT(count, 0u)
+        << "no shipped descriptors found under " << shippedRoot.generic_string();
+}
+
+// Model 3 (2026-06-09): the descriptors are PLATFORM-NEUTRAL — ONE stdlib.json /
+// stdio.json with a per-format `library` map. The 6 `long`-bearing symbols carry
+// the C `long`/`unsigned long` type in the **LP64** (i64/u64) form, which is
+// correct for the runnable linux/macos targets. `AllShippedDescriptorsDecode`
+// only proves the signatures DECODE — both `i32` and `i64` are valid types, so a
+// regression that reverted these to the Windows LLP64 (i32/u32) widths would
+// stay GREEN there. This pins the ACTUAL neutral result widths STRUCTURALLY
+// (interner accessors, not a string compare) so a width revert goes RED.
+//
+// The Windows LLP64 (i32/u32) form for these 6 is latently DEFERRED — UNEXERCISED
+// by any corpus/test — and tracked by `D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH`
+// (a `long` whose width depends on the data model). When that anchor lands a
+// per-target primitive-width model, the neutral descriptor's `long` will resolve
+// to i32 on Windows and i64 on Unix; until then the neutral i64/u64 is the single
+// authored form and this test guards it.
+TEST(ShippedLibDescriptor, ShippedStdlibSignaturesAreLp64) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+
+    // Find a named function symbol in the FLAT <lib>.json and return its FnSig
+    // (interner kept alive by the caller via the returned descriptor).
+    auto fnSigOf = [&](TypeInterner& interner, char const* lib,
+                       char const* symName) -> TypeId {
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(
+            root / (std::string(lib) + ".json"), interner, typeReg, rep);
+        EXPECT_TRUE(desc.has_value()) << lib << ".json failed to load";
+        EXPECT_FALSE(rep.hasErrors()) << lib << ".json emitted diagnostics";
+        if (!desc.has_value()) return {};
+        for (auto const& s : desc->symbols) {
+            if (s.name == symName) {
+                EXPECT_EQ(interner.kind(s.signature), TypeKind::FnSig)
+                    << symName << " is not a function in " << lib;
+                return s.signature;
+            }
+        }
+        ADD_FAILURE() << symName << " not found in " << lib;
+        return {};
+    };
+    // The FnSig RESULT kind of <lib>::<sym>.
+    auto resultKindOf = [&](char const* lib, char const* symName) -> TypeKind {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeId const sig = fnSigOf(interner, lib, symName);
+        return sig.valid() ? interner.kind(interner.fnResult(sig)) : TypeKind::Void;
+    };
+    // The FnSig PARAM[i] kind of <lib>::<sym> (for fseek's offset).
+    auto paramKindOf = [&](char const* lib, char const* symName,
+                           std::size_t i) -> TypeKind {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeId const sig = fnSigOf(interner, lib, symName);
+        if (!sig.valid()) return TypeKind::Void;
+        auto const params = interner.fnParams(sig);
+        EXPECT_GT(params.size(), i) << symName << " has too few params";
+        return i < params.size() ? interner.kind(params[i]) : TypeKind::Void;
+    };
+
+    // Pin EVERY `long`-bearing symbol (not a subset — a per-symbol copy-paste is
+    // the exact failure mode). stdlib: atol/strtol return long, strtoul returns
+    // unsigned long, labs takes+returns long. stdio: ftell returns long, fseek's
+    // offset (param[1]) is long. LP64: `long` = 64-bit → i64; `unsigned long` → u64.
+    EXPECT_EQ(resultKindOf("stdlib", "atol"),    TypeKind::I64);
+    EXPECT_EQ(resultKindOf("stdlib", "strtol"),  TypeKind::I64);
+    EXPECT_EQ(resultKindOf("stdlib", "strtoul"), TypeKind::U64);
+    EXPECT_EQ(resultKindOf("stdlib", "labs"),    TypeKind::I64);
+    EXPECT_EQ(resultKindOf("stdio",  "ftell"),   TypeKind::I64);
+    EXPECT_EQ(paramKindOf("stdio",   "fseek", 1), TypeKind::I64);
+    // labs takes long too (param[0]) — pin it so a revert of the ARG width
+    // (not just the result) also goes RED.
+    EXPECT_EQ(paramKindOf("stdlib",  "labs", 0),  TypeKind::I64);
+}
+
+// Model 3 per-format `library` MAP: a shipped descriptor routes a DIFFERENT
+// runtime image per object format, keyed by the canonical objectFormatKindName
+// vocabulary ("pe"/"elf"/"macho"). Pin that the SHIPPED stdio.json carries all
+// three (RED if a clone drops one or hardcodes a single string), AND that an
+// UNKNOWN format key fails loud (the typo-catch the map's vocabulary check buys).
+TEST(ShippedLibDescriptor, ShippedStdioLibraryMapRoutesPerObjectFormat) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(root / "stdio.json", interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    // The neutral descriptor names the correct runtime per format — the whole
+    // point of Model 3. RED if a future edit reverts to one string or swaps them.
+    EXPECT_EQ(desc->library.at("pe"),    "msvcrt.dll");
+    EXPECT_EQ(desc->library.at("elf"),   "libc.so.6");
+    EXPECT_EQ(desc->library.at("macho"), "/usr/lib/libSystem.B.dylib");
+}
+
+// An UNKNOWN object-format key in the `library` map is a typo/garbage and fails
+// loud on read (F_ShippedLibDescriptorMalformed) — NOT a silently-ignored key
+// that would route nothing. RED-on-disable: drop the objectFormatKindFromName
+// check and "pee" decodes silently.
+TEST(ShippedLibDescriptor, UnknownLibraryFormatKeyFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "badfmt.json", R"({
+        "header": "stdio.h", "library": { "pee": "msvcrt.dll" },
+        "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
+}
+
+// A non-OBJECT `library` (the pre-Model-3 single-string shape) is now malformed —
+// the schema requires the per-format map. Pin the rejection so a stale string
+// descriptor fails loud rather than silently losing its routing.
+TEST(ShippedLibDescriptor, NonObjectLibraryFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "strlib.json", R"({
+        "header": "stdio.h", "library": "msvcrt.dll",
+        "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ]
+    })");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
+}
+
+// `standard` is optional provenance — it round-trips when present, and a
+// non-string `standard` fails loud (it is type-checked on read). Brand-new field,
+// so pin both the populate path and the rejection path directly.
+TEST(ShippedLibDescriptor, StandardProvenanceRoundTripsAndTypeChecks) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    {
+        auto const path = writeTemp(dir, "std.json", R"({
+            "header": "stdio.h", "standard": "c99", "library": { "pe": "msvcrt.dll" },
+            "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ]
+        })");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+        ASSERT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_EQ(desc->standard, "c99");
+    }
+    {
+        auto const path = writeTemp(dir, "badstd.json", R"({
+            "header": "stdio.h", "standard": 89,
+            "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ]
+        })");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+        EXPECT_FALSE(desc.has_value());
+        EXPECT_GT(dss::test_support::countCode(
+                      rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
+    }
+}
+
+} // namespace

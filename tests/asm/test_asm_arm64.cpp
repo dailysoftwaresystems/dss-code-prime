@@ -194,6 +194,425 @@ TEST(Arm64Encoder, MovX19FromX2DerivesBitFields) {
     EXPECT_EQ(bytes[3], 0xAA);
 }
 
+// ── setcc (CSET) + zext byte-pins — D-AS3-COND-CODE-ARM64 ─────────
+//
+// These pin the two register-result control-flow-helper opcodes in
+// ISOLATION from regalloc (hand-built LIR → assemble → exact bytes),
+// hand-verified against the ARM ARM:
+//   * `cset Xd, cc` lowers to CSINC Xd, XZR, XZR, INVERT(cc) — base
+//     0x9A9F07E0 (Rd=0, Rn=Rm=XZR=31) OR'd with the INVERTED 4-bit
+//     condition at bit 12. The invert is what makes "set 1 iff cc"
+//     out of CSINC's "Rd = Rn+1 unless cond" semantics, so the pin
+//     uses TWO conditions to prove the invert is applied PER-condition
+//     (a single condition could pass with a constant nibble bug).
+//   * `zext Xd, Wm` (32→64 zero-extension) lowers to ORR Wd, WZR, Wm
+//     — the W-form ORR implicitly zeroes the upper 32 bits. Base
+//     0x2A0003E0 (Rd=0, Rn=WZR=31) | Rm<<16.
+
+TEST(Arm64Encoder, CsetEncodesInvertedCondAtBits12) {
+    // CSINC base 0x9A9F07E0; the condition stored is INVERT(requested):
+    //   cset x0, gt : GT(0xC) ^ 1 = 0xD  → 0x9A9F07E0 | (0xD<<12) = 0x9A9FD7E0  (LE: E0 D7 9F 9A)
+    //   cset x0, eq : EQ(0x0) ^ 1 = 0x1  → 0x9A9F07E0 | (0x1<<12) = 0x9A9F17E0  (LE: E0 17 9F 9A)
+    // Two conditions prove the invert is per-condition, not a constant.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const setccOp = (*s)->opcodeByMnemonic("setcc");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(setccOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+
+    auto const encodeCset = [&](TargetCondCode cc) {
+        LirBuilder b{**s};
+        (void)b.addFunction(SymbolId{1});
+        auto blk = b.createBlock();
+        b.beginBlock(blk);
+        (void)b.addInst(*setccOp, x0, std::span<LirOperand const>{},
+                        static_cast<std::uint32_t>(cc));
+        (void)b.addReturn(*retOp, {});
+        Lir lir = std::move(b).finish();
+        DiagnosticReporter rep;
+        auto bytes = assembleFirstFn(lir, **s, rep);
+        EXPECT_EQ(rep.errorCount(), 0u);
+        return bytes;
+    };
+
+    // cset x0, gt  → 0x9A9FD7E0  (LE: E0 D7 9F 9A)
+    {
+        auto bytes = encodeCset(TargetCondCode::Sgt);
+        ASSERT_GE(bytes.size(), 4u);
+        EXPECT_EQ(bytes[0], 0xE0);
+        EXPECT_EQ(bytes[1], 0xD7);
+        EXPECT_EQ(bytes[2], 0x9F);
+        EXPECT_EQ(bytes[3], 0x9A);
+    }
+    // cset x0, eq  → 0x9A9F17E0  (LE: E0 17 9F 9A)
+    {
+        auto bytes = encodeCset(TargetCondCode::Eq);
+        ASSERT_GE(bytes.size(), 4u);
+        EXPECT_EQ(bytes[0], 0xE0);
+        EXPECT_EQ(bytes[1], 0x17);
+        EXPECT_EQ(bytes[2], 0x9F);
+        EXPECT_EQ(bytes[3], 0x9A);
+    }
+}
+
+TEST(Arm64Encoder, ZextEncodesOrrW) {
+    // zext x0, w1 → ORR W0, WZR, W1 = 0x2A0103E0 (LE: E0 03 01 2A).
+    //   base 0x2A0003E0 (Rd=0, Rn=WZR=31) | Rm=1<<16 = 0x10000.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const zextOp = (*s)->opcodeByMnemonic("zext");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(zextOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const zops[] = { LirOperand::makeReg(x1) };
+    (void)b.addInst(*zextOp, x0, zops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE0);
+    EXPECT_EQ(bytes[1], 0x03);
+    EXPECT_EQ(bytes[2], 0x01);
+    EXPECT_EQ(bytes[3], 0x2A);
+}
+
+// ── fixed32 walker — `mov Xd, #imm16` (MOVZ) — D-LK10-ENTRY-ARM64 ──
+
+TEST(Arm64Encoder, MovImm16EncodesMOVZ) {
+    // mov X8, #94 via MOVZ X8, #94 (the entry trampoline's syscall-
+    // number load). MOVZ base = 0xD2800000.
+    //   Rd    = X8 (enc 8) at bits 0..4  → 0x8
+    //   Imm16 = 94          at bits 5..20 → 94 << 5 = 0xBC0
+    // word = 0xD2800000 | 0xBC0 | 0x8 = 0xD2800BC8; LE: C8 0B 80 D2.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const movOp = (*s)->opcodeByMnemonic("mov");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(movOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x8{
+        static_cast<std::uint32_t>(*(*s)->registerByName("x8")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeImmInt32(94) };
+    (void)b.addInst(*movOp, x8, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xC8);
+    EXPECT_EQ(bytes[1], 0x0B);
+    EXPECT_EQ(bytes[2], 0x80);
+    EXPECT_EQ(bytes[3], 0xD2);
+}
+
+TEST(Arm64Encoder, MovImm16DerivesBitFields) {
+    // mov X5, #0xABCD — pins the Imm16 window (bits 5..20) + Rd (0..4)
+    // independently of the trampoline value.
+    //   Rd    = X5 (enc 5)  at bits 0..4  → 0x5
+    //   Imm16 = 0xABCD       at bits 5..20 → 0xABCD << 5 = 0x1579A0
+    // word = 0xD2800000 | 0x1579A0 | 0x5 = 0xD29579A5; LE: A5 79 95 D2.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const movOp = (*s)->opcodeByMnemonic("mov");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x5{
+        static_cast<std::uint32_t>(*(*s)->registerByName("x5")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeImmInt32(0xABCD) };
+    (void)b.addInst(*movOp, x5, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xA5);
+    EXPECT_EQ(bytes[1], 0x79);
+    EXPECT_EQ(bytes[2], 0x95);
+    EXPECT_EQ(bytes[3], 0xD2);
+}
+
+TEST(Arm64Encoder, ImmediateWiderThanImm16FailsLoud) {
+    // RED-on-disable for the immediate range guard: a value wider than
+    // the 16-bit Imm16 slot must fail loud (A_ImmediateOperandOutOfRange)
+    // rather than silently truncate to a WRONG machine-code constant
+    // (e.g. a wrong syscall number). 70000 > 0xFFFF.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const movOp = (*s)->opcodeByMnemonic("mov");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{
+        static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeImmInt32(70000) };
+    (void)b.addInst(*movOp, x0, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    (void)assemble(lir, **s, lirToMir, rep);
+    bool sawOutOfRange = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange) {
+            sawOutOfRange = true;
+        }
+    }
+    EXPECT_TRUE(sawOutOfRange)
+        << "a >16-bit immediate must emit A_ImmediateOperandOutOfRange";
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+// ── fixed32 walker — load/store (LDUR/STUR) + ADD-imm — D-LK10-ENTRY-ARM64 ──
+
+namespace {
+[[nodiscard]] LirReg gpr(TargetSchema const& s, std::string_view name) {
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    return LirReg{static_cast<std::uint32_t>(*s.registerByName(name)), 1, cls};
+}
+} // namespace
+
+TEST(Arm64Encoder, LoadLdurEncodes) {
+    // load X1, [SP, #8] → LDUR X1, [SP, #8]. Base 0xF8400000.
+    //   Rt   = X1 (1)  at bits 0..4  → 0x01
+    //   Rn   = SP (31) at bits 5..9  → 0x3E0
+    //   Imm9 = 8       at bits 12..20 → 0x8000
+    // word = 0xF84083E1; LE: E1 83 40 F8.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const loadOp = (*s)->opcodeByMnemonic("load");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(loadOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(8)
+    };
+    (void)b.addInst(*loadOp, gpr(**s, "x1"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE1);
+    EXPECT_EQ(bytes[1], 0x83);
+    EXPECT_EQ(bytes[2], 0x40);
+    EXPECT_EQ(bytes[3], 0xF8);
+}
+
+TEST(Arm64Encoder, StoreSturEncodes) {
+    // store X1, [SP, #8] → STUR X1, [SP, #8]. Base 0xF8000000.
+    //   Rt(value) = X1 (1) at 0..4, Rn = SP (31) at 5..9, Imm9 = 8.
+    // word = 0xF80083E1; LE: E1 83 00 F8.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const storeOp = (*s)->opcodeByMnemonic("store");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(storeOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(8)
+    };
+    (void)b.addInst(*storeOp, InvalidLirReg, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE1);
+    EXPECT_EQ(bytes[1], 0x83);
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0xF8);
+}
+
+TEST(Arm64Encoder, AddImm12Encodes) {
+    // add SP, SP, #16 → ADD SP, SP, #16. Base 0x91000000.
+    //   Rd = SP (31) at 0..4 → 0x1F, Rn = SP (31) at 5..9 → 0x3E0,
+    //   Imm12 = 16 at bits 10..21 → 0x4000.
+    // word = 0x910043FF; LE: FF 43 00 91.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const addOp = (*s)->opcodeByMnemonic("add");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(addOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(16)
+    };
+    (void)b.addInst(*addOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xFF);
+    EXPECT_EQ(bytes[1], 0x43);
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0x91);
+}
+
+TEST(Arm64Encoder, MemOffsetWiderThanImm9FailsLoud) {
+    // RED-on-disable for the Imm9 range guard: a memory offset wider
+    // than signed 9-bit (-256..255) must fail loud rather than silently
+    // truncate to a WRONG stack slot. 300 > 255.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const loadOp = (*s)->opcodeByMnemonic("load");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(300)
+    };
+    (void)b.addInst(*loadOp, gpr(**s, "x1"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    (void)assemble(lir, **s, lirToMir, rep);
+    bool sawOutOfRange = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange) {
+            sawOutOfRange = true;
+        }
+    }
+    EXPECT_TRUE(sawOutOfRange)
+        << "a >9-bit memory offset must emit A_ImmediateOperandOutOfRange";
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(Arm64Encoder, FrameRelativeLeaEncodesAddImm12) {
+    // The ML7 callconv's `emitFrameAddr` materializes a body-local's
+    // address (`alloca`) into a frame-relative `lea Xd, [sp + #disp]` =
+    // AArch64 `ADD Xd, sp, #imm12` — the 3-op no-index lea variant
+    // [base_reg, MemBase(1), MemOffset]. This is the HOST-INDEPENDENT
+    // byte-pin for the new MemOffset→Imm12 (UNSIGNED, bits 10..21)
+    // encoder branch + the frame-lea variant: at runtime that path is
+    // exercised only by the qemu-gated arm64_control_flow corpus (a
+    // single frame offset), so without this pin it is unguarded on every
+    // non-arm64 CI leg (§A.5 cross-target closure — encoding pins guard
+    // on every leg, the corpus is the one-leg end-to-end witness).
+    //   lea X2, [SP, #24] → ADD X2, SP, #24. Base 0x91000000.
+    //   Rd   = X2 (2)  at bits 0..4   → 0x002
+    //   Rn   = SP (31) at bits 5..9   → 0x3E0
+    //   Imm12 = 24     at bits 10..21 → 24<<10 = 0x6000
+    // word = 0x910063E2; LE: E2 63 00 91. Distinct Rd≠Rn + non-zero disp
+    // → a dropped offset, a wrong bit-window, or an Rd/Rn swap all fail.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(24)
+    };
+    (void)b.addInst(*leaOp, gpr(**s, "x2"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE2);
+    EXPECT_EQ(bytes[1], 0x63);
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0x91);
+}
+
+TEST(Arm64Encoder, FrameLeaOffsetWiderThanImm12FailsLoud) {
+    // RED-on-disable for the UNSIGNED Imm12 range guard on the frame-lea:
+    // a frame offset wider than unsigned 12-bit (0..4095) must fail loud
+    // rather than silently truncate to a WRONG stack slot. 5000 > 4095.
+    // The shifted `ADD imm12<<12` form for larger frames is a future
+    // generalization — D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(5000)
+    };
+    (void)b.addInst(*leaOp, gpr(**s, "x2"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    (void)assemble(lir, **s, lirToMir, rep);
+    bool sawOutOfRange = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange) {
+            sawOutOfRange = true;
+        }
+    }
+    EXPECT_TRUE(sawOutOfRange)
+        << "a >12-bit frame-lea offset must emit A_ImmediateOperandOutOfRange";
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
 // ── Shape-vs-slot validate rejection ──────────────────────────────
 
 TEST(EncodingValidate, RejectsModRmSlotInFixed32Variant) {
@@ -241,4 +660,320 @@ TEST(EncodingValidate, RejectsRdSlotInX86VariableVariant) {
         ]
     })";
     EXPECT_FALSE(TargetSchema::loadFromText(kJson, "x.json").has_value());
+}
+
+// ── D-AS4-3: multi-instruction-macro encoder + ARM64 lea (ADRP+ADD) ──
+//
+// `lea Xd, [sym]` lowers to the AArch64 ADRP+ADD pair — the FIRST
+// multi-word fixed32 opcode. These pins lock the 8-byte output, the
+// two per-word relocations, the single source-map entry, and (via
+// the synthetic-schema validate tests below) the word-aware slot
+// uniqueness that the generic encoder substrate relies on.
+
+TEST(Arm64Encoder, LeaEmitsAdrpAddWordPair) {
+    // word0 = ADRP base 0x90000000 | Rd(bits 0..4)
+    // word1 = ADD-imm base 0x91000000 | Rd(0..4) | Rn(5..9)  [Rn == Rd]
+    // The page immediate (immlo[30:29]+immhi[23:5]) and lo12 (imm12
+    // bits 21..10) are left ZERO — the linker patches them via the two
+    // relocations (rejectIfBitfieldDirty requires the fields be zero).
+    //
+    // RED-on-disable for the per-word `wroteSlot` (plan-lock must-fix 6):
+    // a flat (word-blind) slot tracker would treat word1's Rd write as a
+    // collision with word0's Rd → the lea fails to encode → this test
+    // (8 bytes, no errors) goes red.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value()) << "arm64 must declare a `lea` opcode";
+    ASSERT_TRUE(retOp.has_value());
+
+    auto const word = [](std::vector<std::uint8_t> const& by, std::size_t off) {
+        return static_cast<std::uint32_t>(by[off])
+             | (static_cast<std::uint32_t>(by[off + 1]) << 8)
+             | (static_cast<std::uint32_t>(by[off + 2]) << 16)
+             | (static_cast<std::uint32_t>(by[off + 3]) << 24);
+    };
+    // The lea is the FIRST instruction (byte offset 0); a `ret`
+    // terminator follows (functions require a terminator). The lea
+    // occupies bytes [0,8); its exact 8-byte span is pinned separately
+    // by LeaProducesOneSrcMapEntrySpanning8Bytes.
+    auto const encodeLea = [&](std::string_view reg) {
+        LirBuilder b{**s};
+        (void)b.addFunction(SymbolId{1});
+        auto blk = b.createBlock();
+        b.beginBlock(blk);
+        LirOperand const ops[] = { LirOperand::makeSymbolRef(55) };
+        (void)b.addInst(*leaOp, gpr(**s, reg), ops);
+        (void)b.addReturn(*retOp, {});
+        Lir lir = std::move(b).finish();
+        DiagnosticReporter rep;
+        auto bytes = assembleFirstFn(lir, **s, rep);
+        EXPECT_EQ(rep.errorCount(), 0u);
+        return bytes;
+    };
+
+    // Rd = x0 (hwEncoding 0): pure base words.
+    {
+        auto bytes = encodeLea("x0");
+        ASSERT_GE(bytes.size(), 8u);
+        EXPECT_EQ(word(bytes, 0), 0x90000000u);
+        EXPECT_EQ(word(bytes, 4), 0x91000000u);
+    }
+    // Rd = x3 (hwEncoding 3): Rd in word0 bits 0..4; Rd AND Rn in word1.
+    {
+        auto bytes = encodeLea("x3");
+        ASSERT_GE(bytes.size(), 8u);
+        std::uint32_t const w0 = word(bytes, 0);
+        std::uint32_t const w1 = word(bytes, 4);
+        EXPECT_EQ(w0, 0x90000003u);                 // ADRP Rd=3
+        EXPECT_EQ(w1, 0x91000063u);                 // ADD Rd=3 (0x03) | Rn=3 (0x60)
+        EXPECT_EQ((w0 >> 29) & 0x3u,     0u) << "ADRP immlo must be zero";
+        EXPECT_EQ((w0 >> 5)  & 0x7FFFFu, 0u) << "ADRP immhi must be zero";
+        EXPECT_EQ((w1 >> 10) & 0xFFFu,   0u) << "ADD lo12 imm12 must be zero";
+    }
+}
+
+TEST(Arm64Encoder, LeaStampsTwoRelocsAtWordOffsets) {
+    // D-AS4-3 multi-relocation proof: lea emits TWO relocations — ADRP
+    // page-reloc at word0 (offset 0) + ADD lo12-reloc at word1 (offset 4),
+    // both targeting the SAME symbol.
+    //
+    // RED-on-disable for the deleted single-reloc cap: re-introducing the
+    // "only one symbol-relative wire per fixed32 instruction" cap would
+    // reject the second reloc → lea fails to encode → this test goes red.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeSymbolRef(55) };
+    (void)b.addInst(*leaOp, gpr(**s, "x0"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    auto result = assemble(lir, **s, lirToMir, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(result.functions.size(), 1u);
+    // `ret` carries no symbol → no extra relocation; the two relocs are
+    // the lea's ADRP + ADD patches.
+    auto const& relocs = result.functions[0].relocations;
+    ASSERT_EQ(relocs.size(), 2u);
+
+    auto const* adrp = (*s)->relocationByName("adr_prel_pg_hi21");
+    auto const* add  = (*s)->relocationByName("add_abs_lo12_nc");
+    ASSERT_NE(adrp, nullptr);
+    ASSERT_NE(add, nullptr);
+
+    // reloc[0]: ADRP page-reloc at the START of word0 (offset 0).
+    EXPECT_EQ(relocs[0].offset, 0u);
+    EXPECT_EQ(relocs[0].kind, adrp->kind);
+    EXPECT_EQ(relocs[0].target.v, 55u);
+    // reloc[1]: ADD lo12-reloc at the START of word1 (offset 4).
+    EXPECT_EQ(relocs[1].offset, 4u);
+    EXPECT_EQ(relocs[1].kind, add->kind);
+    EXPECT_EQ(relocs[1].target.v, 55u);
+}
+
+TEST(Arm64Encoder, LeaProducesOneSrcMapEntrySpanning8Bytes) {
+    // D-AS4-3: a multi-word macro is ONE LIR instruction → ONE srcMap
+    // entry spanning all 8 bytes (NOT one per word). The next inst (ret)
+    // starts at offset 8 — the stride is byte-offset-derived, never a
+    // hardcoded 4.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeSymbolRef(55) };
+    (void)b.addInst(*leaOp, gpr(**s, "x0"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    auto result = assemble(lir, **s, lirToMir, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(result.functions.size(), 1u);
+    auto const& fn = result.functions[0];
+    ASSERT_EQ(fn.sourceMap.size(), 2u);              // lea + ret
+    EXPECT_EQ(fn.sourceMap[0].byteOffset, 0u);       // lea at 0
+    EXPECT_EQ(fn.sourceMap[1].byteOffset, 8u);       // ret at 8 — lea spans 8
+    EXPECT_EQ(fn.bytes.size(), 12u);                 // 8 (lea) + 4 (ret)
+}
+
+// ── D-AS4-3 word-aware validate (plan-lock must-fix 6, validate half) ──
+
+TEST(EncodingValidate, MultiWordPerWordSlotReuseLoads) {
+    // The SAME slot kind in DIFFERENT words is NOT a double-write — a
+    // 2-word macro placing Rd in word0 (resultSlot) AND word1
+    // (extraResultSlots) must LOAD. (The shipped arm64 `lea` exercises
+    // this; this synthetic pin isolates the accept pole.)
+    constexpr char const* kJson = R"({
+        "dssTargetVersion": 1,
+        "target": { "name": "synth_mw", "version": "0.1" },
+        "opcodes": [
+            { "mnemonic": "invalid", "result": "none" },
+            { "mnemonic": "macro", "result": "value",
+              "minOperands": 1, "maxOperands": 1,
+              "encoding": {
+                "format": "fixed32",
+                "variants": [
+                  { "guard": { "operandKinds": ["symbol"] },
+                    "template": { "fixedWords": [2415919104, 2432696320] },
+                    "resultSlot": "rd",
+                    "extraResultSlots": [ { "slotKind": "rd", "wordIndex": 1 } ],
+                    "wires": [
+                      { "index": 0, "slotKind": "sym.patch", "wordIndex": 0, "relocationKind": "r" }
+                    ]
+                  }
+                ]
+              } }
+        ],
+        "relocations": [
+          { "name": "r", "kind": 1, "formula": "linear", "pcRelative": false, "addendBias": 0, "widthBytes": 4 }
+        ]
+    })";
+    EXPECT_TRUE(TargetSchema::loadFromText(kJson, "x.json").has_value())
+        << "the same slot kind in distinct words is not a double-write";
+}
+
+TEST(EncodingValidate, SameWordSlotDoubleWriteRejected) {
+    // Per-word uniqueness (must-fix 6): the SAME slot twice in the SAME
+    // word IS a double-write and must fail loud — here resultSlot=rd
+    // (word0) collides with an extraResultSlots rd ALSO in word0.
+    constexpr char const* kJson = R"({
+        "dssTargetVersion": 1,
+        "target": { "name": "synth_dup", "version": "0.1" },
+        "opcodes": [
+            { "mnemonic": "invalid", "result": "none" },
+            { "mnemonic": "op", "result": "value",
+              "minOperands": 1, "maxOperands": 1,
+              "encoding": {
+                "format": "fixed32",
+                "variants": [
+                  { "guard": { "operandKinds": ["reg"] },
+                    "template": { "fixedWord": 1 },
+                    "resultSlot": "rd",
+                    "extraResultSlots": [ { "slotKind": "rd", "wordIndex": 0 } ],
+                    "wires": [ { "index": 0, "slotKind": "rn" } ]
+                  }
+                ]
+              } }
+        ]
+    })";
+    EXPECT_FALSE(TargetSchema::loadFromText(kJson, "x.json").has_value())
+        << "the same slot kind twice in one word must be rejected";
+}
+
+TEST(EncodingValidate, MultiWordRejectsFixedWordPlusFixedWords) {
+    // A template must not declare BOTH `fixedWord` and `fixedWords`
+    // (the single-word default would be silently shadowed).
+    constexpr char const* kJson = R"({
+        "dssTargetVersion": 1,
+        "target": { "name": "synth_both", "version": "0.1" },
+        "opcodes": [
+            { "mnemonic": "invalid", "result": "none" },
+            { "mnemonic": "op", "result": "none",
+              "minOperands": 0, "maxOperands": 0,
+              "encoding": {
+                "format": "fixed32",
+                "variants": [
+                  { "guard": { "operandKinds": [] },
+                    "template": { "fixedWord": 1, "fixedWords": [1, 2] } }
+                ]
+              } }
+        ]
+    })";
+    EXPECT_FALSE(TargetSchema::loadFromText(kJson, "x.json").has_value())
+        << "fixedWord + fixedWords together must be rejected";
+}
+
+TEST(EncodingValidate, MultiWordRejectsWordIndexBeyondTemplate) {
+    // A wire wordIndex addressing a word the template does not emit must
+    // fail loud (would write into a non-existent word at encode time).
+    constexpr char const* kJson = R"({
+        "dssTargetVersion": 1,
+        "target": { "name": "synth_oob", "version": "0.1" },
+        "opcodes": [
+            { "mnemonic": "invalid", "result": "none" },
+            { "mnemonic": "op", "result": "value",
+              "minOperands": 1, "maxOperands": 1,
+              "encoding": {
+                "format": "fixed32",
+                "variants": [
+                  { "guard": { "operandKinds": ["reg"] },
+                    "template": { "fixedWords": [1, 2] },
+                    "resultSlot": "rd",
+                    "wires": [ { "index": 0, "slotKind": "rn", "wordIndex": 5 } ]
+                  }
+                ]
+              } }
+        ]
+    })";
+    EXPECT_FALSE(TargetSchema::loadFromText(kJson, "x.json").has_value())
+        << "a wire wordIndex beyond the template's word count must be rejected";
+}
+
+TEST(EncodingValidate, MultiWordRejectsFixedWordsOnNonFixed32) {
+    // `fixedWords` (multi-word macro) is a fixed32-only construct — a
+    // multi-word x86 template has no defined emission model. Reject it
+    // on an x86-variable opcode. (Isolated negative pole for validate
+    // rule (a); the shipped arm64 lea exercises the positive case.)
+    constexpr char const* kJson = R"({
+        "dssTargetVersion": 1,
+        "target": { "name": "synth_mw_x86", "version": "0.1" },
+        "opcodes": [
+            { "mnemonic": "invalid", "result": "none" },
+            { "mnemonic": "op", "result": "none",
+              "minOperands": 0, "maxOperands": 0,
+              "encoding": {
+                "format": "x86-variable",
+                "variants": [
+                  { "guard": { "operandKinds": [] },
+                    "template": { "fixedWords": [1, 2] } }
+                ]
+              } }
+        ]
+    })";
+    EXPECT_FALSE(TargetSchema::loadFromText(kJson, "x.json").has_value())
+        << "'fixedWords' on a non-fixed32 shape must be rejected";
+}
+
+TEST(EncodingValidate, MultiWordRejectsExtraResultSlotsWithoutResultSlot) {
+    // `extraResultSlots` is an ADDITIONAL placement of the result reg —
+    // meaningless without a primary `resultSlot`. result=none + no
+    // resultSlot isolates validate rule (b) (no Convergence-fix G
+    // result-needs-a-slot conflict, since result is none).
+    constexpr char const* kJson = R"({
+        "dssTargetVersion": 1,
+        "target": { "name": "synth_extra_noresult", "version": "0.1" },
+        "opcodes": [
+            { "mnemonic": "invalid", "result": "none" },
+            { "mnemonic": "op", "result": "none",
+              "minOperands": 0, "maxOperands": 0,
+              "encoding": {
+                "format": "fixed32",
+                "variants": [
+                  { "guard": { "operandKinds": [] },
+                    "template": { "fixedWord": 1 },
+                    "extraResultSlots": [ { "slotKind": "rd", "wordIndex": 0 } ] }
+                ]
+              } }
+        ]
+    })";
+    EXPECT_FALSE(TargetSchema::loadFromText(kJson, "x.json").has_value())
+        << "'extraResultSlots' without a 'resultSlot' must be rejected";
 }

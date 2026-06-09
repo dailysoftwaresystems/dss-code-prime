@@ -37,6 +37,13 @@ src/codesign/
 ├── CMakeLists.txt
 ├── crypto/                         # CS1 — cryptographic substrate
 │   ├── sha256.hpp / .cpp           # SHA-256, SHA-384
+│   │   # ⚠️ SHA-256 ALREADY LANDED EARLY at src/core/crypto/sha256.{hpp,cpp}
+│   │   #    (dss::crypto, 2026-06-08, pulled forward by the ad-hoc Mach-O
+│   │   #    codesign cycle D-LK7-ADHOC-CODESIGN-MACHO — a hash is a core
+│   │   #    utility, and src/link consuming src/codesign would be a layering
+│   │   #    inversion). CS1 MUST CONSUME core/crypto/sha256 (adding SHA-384
+│   │   #    beside it), NEVER fork a 2nd SHA-256. See D-CRYPTO-SHA256-HOME-
+│   │   #    CONVERGENCE in the deferred-anchor registry.
 │   ├── der_encoder.hpp / .cpp      # ASN.1 DER writer
 │   ├── der_parser.hpp / .cpp       # ASN.1 DER reader (cert chain ingestion)
 │   ├── x509.hpp / .cpp             # X.509 cert + chain

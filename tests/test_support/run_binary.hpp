@@ -50,6 +50,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>     // launcherPrefix (emulator argv prefix)
 
 #if defined(_WIN32)
   #ifndef WIN32_LEAN_AND_MEAN
@@ -105,11 +106,23 @@ struct RunResult {
 // stdin; we anchor the split-pipe variant as
 // `D-RUN-HARNESS-STDIO-SPLIT` if a future case needs separate
 // stdout/stderr streams).
+//
+// `launcherPrefix` (D-LK10-ENTRY-ARM64, v0.0.2 V2-1): an optional
+// argv prefix prepended ahead of `binaryPath`. EMPTY by default —
+// the binary is exec'd directly (byte-identical to the pre-V2-1
+// behavior; every existing exit-code/stdout pin is unaffected).
+// NON-EMPTY runs the binary under an emulator, e.g. {"<full path
+// to>/qemu-aarch64"} so an AArch64 ELF executes on an x86_64 host.
+// `launcherPrefix[0]` is the program actually exec'd (a full path —
+// the caller resolves it on PATH first); the binary becomes its
+// argument. AGNOSTIC: the caller supplies the launcher; this harness
+// has no per-arch knowledge.
 [[nodiscard]] inline RunResult
 runBinary(std::filesystem::path const&     binaryPath,
           std::chrono::milliseconds        timeout =
               std::chrono::milliseconds{5000},
-          bool                             captureStdout = false) {
+          bool                             captureStdout = false,
+          std::vector<std::string> const&  launcherPrefix = {}) {
     RunResult out;
 
 #if defined(_WIN32)
@@ -166,10 +179,23 @@ runBinary(std::filesystem::path const&     binaryPath,
     // which is environment-dependent) don't cause CreateProcess to
     // parse the first space-delimited token as argv[0] for the
     // child. Code-reviewer M1 at Slice C audit fold.
-    std::string cmdline = "\"" + pathStr + "\"";
+    // With a launcher prefix the emulator is argv[0] (lpApplicationName)
+    // and the binary becomes its trailing argument; without it the
+    // binary is launched directly (byte-identical to pre-V2-1).
+    std::string appName = pathStr;
+    std::string cmdline;
+    if (!launcherPrefix.empty()) {
+        appName = launcherPrefix.front();
+        for (auto const& a : launcherPrefix) {
+            cmdline += "\"" + a + "\" ";
+        }
+        cmdline += "\"" + pathStr + "\"";
+    } else {
+        cmdline = "\"" + pathStr + "\"";
+    }
 
     BOOL const ok = ::CreateProcessA(
-        pathStr.c_str(),
+        appName.c_str(),
         cmdline.data(),
         /*lpProcessAttributes*/ nullptr,
         /*lpThreadAttributes*/  nullptr,
@@ -339,17 +365,30 @@ runBinary(std::filesystem::path const&     binaryPath,
         ::posix_spawn_file_actions_addclose(&actions, pipeFds[0]);
     }
 
-    char const* const argv[] = {pathStr.c_str(), nullptr};
+    // Build argv: [launcherPrefix..., binary, nullptr]. With no prefix
+    // this is exactly [binary, nullptr] (byte-identical to pre-V2-1).
+    // The program exec'd is argv[0] — the emulator's full path when a
+    // prefix is present (caller-resolved on PATH), else the binary.
+    std::vector<std::string> argStrings;
+    argStrings.reserve(launcherPrefix.size() + 1);
+    for (auto const& p : launcherPrefix) argStrings.push_back(p);
+    argStrings.push_back(pathStr);
+    std::vector<char const*> argvVec;
+    argvVec.reserve(argStrings.size() + 1);
+    for (auto const& a : argStrings) argvVec.push_back(a.c_str());
+    argvVec.push_back(nullptr);
+    char const* const execPath = argStrings.front().c_str();
+
     pid_t pid = -1;
     int const rc = ::posix_spawn(
         &pid,
-        pathStr.c_str(),
+        execPath,
         /*file_actions*/ captureStdout ? &actions : nullptr,
         /*attrp*/        nullptr,
         // posix_spawn signature wants `char* const argv[]` — cast
         // here because the strings we own are read-only by contract;
         // the child won't mutate them across exec.
-        const_cast<char* const*>(argv),
+        const_cast<char* const*>(argvVec.data()),
         environ);
     if (captureStdout && actionsInited) {
         ::posix_spawn_file_actions_destroy(&actions);
@@ -359,8 +398,8 @@ runBinary(std::filesystem::path const&     binaryPath,
             ::close(pipeFds[0]);
             ::close(pipeFds[1]);
         }
-        out.diagnostic = "posix_spawn('" + pathStr + "') failed: rc="
-                       + std::to_string(rc);
+        out.diagnostic = "posix_spawn('" + argStrings.front()
+                       + "') failed: rc=" + std::to_string(rc);
         return out;
     }
     out.spawned = true;

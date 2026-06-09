@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // CST→HIR lowering (plan 09 HR8) — the single, language-agnostic engine.
@@ -49,15 +50,20 @@ class DiagnosticReporter;
 struct DSS_EXPORT HirExternRecord {
     HirNodeId   node;
     std::string canonicalName;  // undecorated source identifier
-    // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3, 2026-06-02):
-    // per-symbol import-library override decoded from an optional
-    // trailing `"libname"` string literal in the source's extern
-    // declaration. Empty when the source declared no override; the
-    // FFI synthesize stage falls back to the language's
-    // `externLibraryByFormat[format]` entry. Source-agnostic: any
-    // language whose grammar produces an externDecl + populates this
-    // string at lowering time gets per-symbol routing for free.
-    std::string libraryOverride;
+    // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3, 2026-06-02) +
+    // Model 3 (2026-06-09): per-symbol import-library override, now a
+    // per-OBJECT-FORMAT map keyed by `objectFormatKindName`
+    // ("pe"/"elf"/"macho"/…). Two producers populate it target-agnostically:
+    //   * a SHIPPED descriptor passes its per-format `library` map verbatim
+    //     (Model 3 — different image per format);
+    //   * a SOURCE-declared `extern "libname" …` override populates the SAME
+    //     string under every known format key (the user's choice is
+    //     format-independent), so the fold below yields it whatever the target.
+    // EMPTY map ⇒ the FFI synthesize stage falls back to the language's
+    // `externLibraryByFormat[format]` default. The map is folded to ONE string
+    // for the ACTIVE target's format at `compile_pipeline` (step 2.5), where
+    // the object format is in scope — keeping this lowering target-agnostic.
+    std::unordered_map<std::string, std::string> libraryOverride;
 };
 
 struct DSS_EXPORT CstToHirResult {

@@ -28,6 +28,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>  // std::sort (do not rely on a transitive include)
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -69,6 +70,66 @@ void check(std::string const& description, bool condition,
 #endif
 }
 
+// D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): host ARCH detection, returning the
+// SAME identifier strings target specs use as their prefix (so a spec's
+// target arch can be compared directly). The subprocess runner gates the
+// cross-arch RUN exactly like the in-process examples_runner: a binary
+// whose target arch differs from the host's needs an emulator, else the
+// run is SKIPPED (never a spawn-failure). Without this gate an AArch64
+// ELF reaches posix_spawn on an x86_64 host → ENOEXEC → false failure.
+[[nodiscard]] std::string currentHostArch() noexcept {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return "arm64";
+#elif defined(__x86_64__) || defined(_M_X64)
+    return "x86_64";
+#else
+    return "unknown";
+#endif
+}
+
+// The target portion of a manifest spec ("arm64:elf64-aarch64-linux-exec"
+// → "arm64"). This IS the arch identifier compared against
+// currentHostArch().
+[[nodiscard]] std::string specTargetArch(std::string const& spec) {
+    auto const colon = spec.find(':');
+    return colon == std::string::npos ? spec : spec.substr(0, colon);
+}
+
+// Resolve an executable name against $PATH (e.g. "qemu-aarch64"),
+// returning its full path or "" if not found. Gates cross-arch example
+// runs on emulator availability — absent ⇒ skip (never a test failure).
+// AGNOSTIC: the emulator name is supplied by the manifest, not hardcoded.
+[[nodiscard]] std::string findOnPath(std::string const& exe) {
+    char const* const pathEnv = std::getenv("PATH");
+    if (pathEnv == nullptr) return {};
+#if defined(_WIN32)
+    char const sep = ';';
+    std::vector<std::string> const exts = {"", ".exe"};
+#else
+    char const sep = ':';
+    std::vector<std::string> const exts = {""};
+#endif
+    std::string const path = pathEnv;
+    std::size_t start = 0;
+    while (start <= path.size()) {
+        auto const end = path.find(sep, start);
+        std::string const dir = path.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        if (!dir.empty()) {
+            for (auto const& ext : exts) {
+                fs::path const cand = fs::path(dir) / (exe + ext);
+                std::error_code ec;
+                if (fs::exists(cand, ec) && fs::is_regular_file(cand, ec)) {
+                    return cand.generic_string();
+                }
+            }
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return {};
+}
+
 // Quote a path for safe inclusion in a `std::system` command line
 // — wraps in double quotes (PowerShell + cmd.exe + POSIX shells
 // all honor "..." for argument grouping). The path's own contents
@@ -99,6 +160,10 @@ struct ExampleTarget {
     std::string              spec;
     std::string              artifact;
     std::vector<std::string> runOn;
+    // D-LK10-ENTRY-ARM64: optional emulator command (e.g. "qemu-aarch64")
+    // used when the target arch differs from the host arch. Empty ⇒
+    // native execution only (the pre-V2-1 default).
+    std::string              emulator;
 };
 
 struct ExampleManifest {
@@ -168,6 +233,7 @@ struct ExampleManifest {
         ExampleTarget et;
         et.spec     = t.value("spec", "");
         et.artifact = t.value("artifact", "");
+        et.emulator = t.value("emulator", "");
         if (t.contains("runOn") && t.at("runOn").is_array()) {
             for (auto const& s : t.at("runOn")) {
                 if (s.is_string()) et.runOn.push_back(s.get<std::string>());
@@ -268,7 +334,36 @@ void runExampleViaCli(std::string const& compiler,
     check(exampleName + ": artifact non-empty", artifactNonEmpty);
     if (!artifactNonEmpty) return;
 
-    auto const result = dss::test_support::runBinary(artifactPath);
+    // D-LK10-ENTRY-ARM64: cross-ARCH execution gate. The runOn match
+    // above reconciled the host OS; now reconcile the host ARCH. A
+    // binary whose target arch differs from the host's cannot exec
+    // natively — it needs the manifest's emulator (e.g. qemu-aarch64
+    // for an AArch64 ELF on x86_64). Absent emulator (or not on PATH)
+    // ⇒ SKIP the run (never a spawn-failure — the compile already
+    // asserted clean). Mirrors the in-process examples_runner so the
+    // subprocess path does not false-fail on an x86_64 CI host that
+    // lacks qemu; the native-arm64 CI leg runs it for real.
+    std::vector<std::string> launcherPrefix;
+    if (std::string const targetArch = specTargetArch(target->spec);
+        !targetArch.empty() && targetArch != currentHostArch()) {
+        if (target->emulator.empty()) {
+            std::cout << "  [SKIP] " << exampleName << " — target arch '"
+                      << targetArch << "' != host '" << currentHostArch()
+                      << "' with no emulator declared\n";
+            return;
+        }
+        auto const emuPath = findOnPath(target->emulator);
+        if (emuPath.empty()) {
+            std::cout << "  [SKIP] " << exampleName << " — emulator '"
+                      << target->emulator
+                      << "' not found on PATH (cross-arch run)\n";
+            return;
+        }
+        launcherPrefix.push_back(emuPath);
+    }
+
+    auto const result = dss::test_support::runBinary(
+        artifactPath, std::chrono::milliseconds{5000}, false, launcherPrefix);
     check(exampleName + ": spawn succeeded (diag='"
           + result.diagnostic + "')", result.spawned);
     if (!result.spawned) return;

@@ -11,6 +11,8 @@
 
   "$entryPointComment": "Empty defaults to module.functions[0] (cycle-2 convention). LC_MAIN.entryoff is computed as (entry_function_offset_in_.text) — relative to the __TEXT segment start, NOT to file offset.",
   "entryPoint": "",
+  "$externCallDispatchComment": "DIRECT-PLT (corrected from the original mislabel). Mach-O resolves imports through a per-extern __stubs entry: the linker points each extern symbol's VA at its __stubs STUB (code) — see `symbolVa[extern] = stubVa` in macho.cpp — and the stub does the __got indirection internally (x86_64 `FF 25 disp32` jmp through the __got slot; ARM64 ADRP+LDR+BR x16). The call site is therefore a PLAIN DIRECT call (x86_64 `E8 disp32`, ARM64 `BL`) to the stub — byte-identical in shape to an intra-module call — NOT an `FF 15`-through-the-stub deref (that would dereference the stub's CODE bytes as a function pointer → SIGSEGV). This is the SAME direct-plt model ELF uses, and it matches what the trampoline + MIR→LIR `lowerCall` emit. D-FFI-EXTERN-CALL-DISPATCH.",
+  "externCallDispatch": "direct-plt",
 
   "$processExitDeferredComment": "D-LK10-ENTRY Slice B (plan 14 §2.13) intentionally OMITS `processExit` + `entryCallingConvention` here. macOS Mach-O exit mechanism is TBD per D-LK10-ENTRY-MACHO-EXIT: trade-off between (a) by-name-import via libSystem `_exit` (mirrors PE+ExitProcess but ties binary to dyld+libSystem loading) and (b) raw BSD syscall `0x2000001` (hermetic but Apple discourages — 'syscall numbers unstable across macOS versions'). Decision deferred to the first Mach-O runnable-binary trigger. Slice C's linker hook (`format.processExit().has_value()`) silently skips trampoline emission for this format until the choice is made + populated — intentional, not a defect.",
 

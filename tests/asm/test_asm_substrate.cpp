@@ -133,36 +133,42 @@ TEST(AsmSubstrate, AssembledModuleCarriesDataItemsField) {
         << "C-string nul terminator must round-trip verbatim";
 }
 
-// D-LK2-RODATA CLOSED 2026-06-02: PE walker emits `.rdata`. The
-// FLIP-MARKER for PE is now NE(nullptr) — the format JSON declares
-// the row. ELF (D-LK1-RODATA) and Mach-O (D-LK3-RODATA) remain
-// anchored; their assertions stay EQ(nullptr) until the matching
+// D-LK2-RODATA CLOSED 2026-06-02: PE walker emits `.rdata`.
+// D-LK1-ELF-EXEC-DATA-SECTIONS CLOSED: the ELF ET_EXEC walker emits
+// `.rodata` (both x86_64 and aarch64 exec formats declare the row +
+// `supportedDataSections: ["rodata"]`). The FLIP-MARKER for PE and
+// BOTH ELF exec formats is now NE(nullptr). Mach-O (D-LK3-RODATA)
+// remains anchored; its assertion stays EQ(nullptr) until that
 // walker arm closes.
 TEST(AsmSubstrate, ShippedExecFormatsRodataSectionPerWalkerArm) {
-    // PE: walker arm CLOSED — must declare the row.
-    {
-        auto fmt = ObjectFormatSchema::loadShipped(
-            "pe64-x86_64-windows-exec");
-        ASSERT_TRUE(fmt.has_value());
-        EXPECT_NE((*fmt)->sectionByKind(SectionKind::Rodata), nullptr)
-            << "pe64-x86_64-windows-exec: D-LK2-RODATA closed — the "
-               "format JSON must declare a `.rdata` (Rodata) section "
-               "row that the walker reads at emit time. If this fails, "
-               "the JSON row was removed without re-anchoring the "
-               "walker arm.";
-    }
-    // ELF + Mach-O: walker arms still anchored (D-LK1-RODATA /
-    // D-LK3-RODATA) — must NOT yet declare the row. When the walker
-    // arm closes, flip the corresponding EQ to NE.
+    // PE + ELF (x86_64 + aarch64): walker arms CLOSED — must declare
+    // the row. ELF arm closure = D-LK1-ELF-EXEC-DATA-SECTIONS; both
+    // arches share the SAME elf.cpp code path (arch differs only via
+    // config), so both must declare the rodata section row.
     for (auto const* formatName : {
+             "pe64-x86_64-windows-exec",
              "elf64-x86_64-linux-exec",
-             "macho64-x86_64-darwin-exec"}) {
+             "elf64-aarch64-linux-exec"}) {
         auto fmt = ObjectFormatSchema::loadShipped(formatName);
         ASSERT_TRUE(fmt.has_value()) << formatName;
-        EXPECT_EQ((*fmt)->sectionByKind(SectionKind::Rodata), nullptr)
+        EXPECT_NE((*fmt)->sectionByKind(SectionKind::Rodata), nullptr)
             << formatName
-            << " declares a rodata section row — the matching walker "
-               "arm (D-LK1-RODATA for ELF / D-LK3-RODATA for Mach-O) "
+            << ": its rodata walker arm is CLOSED (D-LK2-RODATA for "
+               "PE / D-LK1-ELF-EXEC-DATA-SECTIONS for ELF) — the format "
+               "JSON must declare a rodata (`.rdata` / `.rodata`) "
+               "section row that the walker reads at emit time. If this "
+               "fails, the JSON row was removed without re-anchoring "
+               "the walker arm.";
+    }
+    // Mach-O: walker arm still anchored (D-LK3-RODATA) — must NOT yet
+    // declare the row. When the walker arm closes, flip this EQ to NE.
+    {
+        auto fmt = ObjectFormatSchema::loadShipped(
+            "macho64-x86_64-darwin-exec");
+        ASSERT_TRUE(fmt.has_value());
+        EXPECT_EQ((*fmt)->sectionByKind(SectionKind::Rodata), nullptr)
+            << "macho64-x86_64-darwin-exec declares a rodata section "
+               "row — the matching walker arm (D-LK3-RODATA for Mach-O) "
                "must land in the SAME slice; flip this assertion from "
                "EQ(nullptr) to NE(nullptr) when that closes.";
     }

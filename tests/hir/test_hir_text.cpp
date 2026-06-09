@@ -8,6 +8,7 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_registry.hpp"
 #include "hir/attributes/diagnostic_info.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/attributes/shader_intrinsic.hpp"
@@ -562,4 +563,104 @@ TEST(HirText, GoldenCorpus) {
         EXPECT_EQ(out, emitHir(res2->hir, ctx2, r4));
     }
     EXPECT_TRUE(sawAny) << "no .dsshir corpus files found under " << root.string();
+}
+
+// ── parseTypeFromText: standalone type-string decoder ────────────────────────
+//
+// `parseTypeFromText` exposes the module parser's SINGLE `parseType` production
+// as a public entry that interns into a CALLER-provided interner/registry. The
+// tests walk the produced type STRUCTURALLY via the interner's accessors (never
+// a string compare), so they pin the decoded shape, not the spelling.
+
+// (1) `fn(ptr<char>) -> i32` decodes to EXACTLY: FnSig / result I32 / one param /
+// param Ptr / pointee Char. Inspected via fnResult/fnParams + raw operands().
+TEST(ParseTypeFromText, DecodesFnPtrCharToI32) {
+    TypeInterner interner{CompilationUnitId{42}};
+    TypeRegistry reg;
+    DiagnosticReporter rep;
+
+    TypeId const fn = parseTypeFromText("fn(ptr<char>) -> i32", interner, reg, rep);
+
+    ASSERT_TRUE(fn.valid());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(interner.kind(fn), TypeKind::FnSig);
+
+    // operands=[result, params...] — verify both via the decoders and the raw
+    // operand span so the storage convention itself is pinned.
+    auto const ops = interner.operands(fn);
+    ASSERT_EQ(ops.size(), 2u);                       // result + exactly one param
+    EXPECT_EQ(interner.kind(ops[0]), TypeKind::I32); // operands[0] == result
+    EXPECT_EQ(interner.kind(ops[1]), TypeKind::Ptr); // operands[1] == sole param
+
+    EXPECT_EQ(interner.kind(interner.fnResult(fn)), TypeKind::I32);
+    auto const params = interner.fnParams(fn);
+    ASSERT_EQ(params.size(), 1u);
+    TypeId const param = params[0];
+    ASSERT_EQ(interner.kind(param), TypeKind::Ptr);
+
+    auto const pointee = interner.operands(param);   // ptr<T>: operands=[T]
+    ASSERT_EQ(pointee.size(), 1u);
+    EXPECT_EQ(interner.kind(pointee[0]), TypeKind::Char);
+}
+
+// (2) Representative types each decode to the right structure AND intern into the
+// caller's interner (the produced TypeId is owned by the caller's CU, proving the
+// result is reusable in that CU's IR — not built in a throwaway interner).
+TEST(ParseTypeFromText, RoundTripsViaInterner) {
+    TypeInterner interner{CompilationUnitId{9}};
+    TypeRegistry reg;
+    DiagnosticReporter rep;
+
+    // primitive — `interner.kind(i32)` only succeeds if `i32` is a TypeId of THIS
+    // interner's arena (a foreign id trips the arena bounds/tag guard), so a clean
+    // structural read here is itself the proof the result interned into the
+    // caller's interner rather than a throwaway.
+    TypeId const i32 = parseTypeFromText("i32", interner, reg, rep);
+    ASSERT_TRUE(i32.valid());
+    EXPECT_EQ(interner.kind(i32), TypeKind::I32);
+    EXPECT_TRUE(interner.operands(i32).empty());
+
+    // ptr<char>
+    TypeId const pc = parseTypeFromText("ptr<char>", interner, reg, rep);
+    ASSERT_TRUE(pc.valid());
+    ASSERT_EQ(interner.kind(pc), TypeKind::Ptr);
+    auto const pointee = interner.operands(pc);
+    ASSERT_EQ(pointee.size(), 1u);
+    EXPECT_EQ(interner.kind(pointee[0]), TypeKind::Char);
+
+    // fn sig — structural check + interning provenance
+    TypeId const fn = parseTypeFromText("fn(ptr<char>) -> i32", interner, reg, rep);
+    ASSERT_TRUE(fn.valid());
+    ASSERT_EQ(interner.kind(fn), TypeKind::FnSig);
+    EXPECT_EQ(interner.kind(interner.fnResult(fn)), TypeKind::I32);
+    ASSERT_EQ(interner.fnParams(fn).size(), 1u);
+    EXPECT_EQ(interner.kind(interner.fnParams(fn)[0]), TypeKind::Ptr);
+
+    // canonicalization: the `ptr<char>` interned standalone is the SAME TypeId as
+    // the fn sig's param — one decoder, one interner, structural sharing holds.
+    EXPECT_EQ(interner.fnParams(fn)[0], pc);
+
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+// (3) Truncated text (`fn(ptr<`) returns InvalidType AND emits ≥1 error. RED-on-
+// disable: if the decoder silently handed back a partial type, `valid()` would be
+// true (or no error would be reported) and this fails.
+TEST(ParseTypeFromText, MalformedReturnsInvalidAndDiagnoses) {
+    TypeInterner interner{CompilationUnitId{3}};
+    TypeRegistry reg;
+    DiagnosticReporter rep;
+
+    TypeId const bad = parseTypeFromText("fn(ptr<", interner, reg, rep);
+
+    EXPECT_FALSE(bad.valid());        // never a partial type
+    EXPECT_EQ(bad, InvalidType);
+    EXPECT_GE(rep.errorCount(), 1u);  // the malformed text is reported
+
+    // A trailing-token form is malformed too (a standalone type is exactly one
+    // type): the input must be fully consumed.
+    DiagnosticReporter rep2;
+    TypeId const trailing = parseTypeFromText("i32 i32", interner, reg, rep2);
+    EXPECT_FALSE(trailing.valid());
+    EXPECT_GE(rep2.errorCount(), 1u);
 }

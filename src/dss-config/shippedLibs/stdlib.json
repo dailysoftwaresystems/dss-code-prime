@@ -1,0 +1,28 @@
+{
+  "header": "stdlib.h",
+  "standard": "c89",
+  "$comment": "Model 3 (2026-06-09): PLATFORM-NEUTRAL descriptor. `library` is a per-object-format map; the active target's format selects its runtime image at compile_pipeline resolution. `atol`/`strtol` (result), `strtoul` (result), and `labs` (arg+result) are the C `long`/`unsigned long` type, encoded here in the LP64 (i64/u64) form correct for the runnable elf/macho targets. The Windows LLP64 (i32/u32) form for these 4 is latently deferred — UNEXERCISED by any corpus/test — and tracked by D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH.",
+  "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "symbols": [
+    { "name": "malloc",  "signature": "fn(u64) -> ptr<void>",            "kind": "function", "linkage": "external" },
+    { "name": "calloc",  "signature": "fn(u64, u64) -> ptr<void>",       "kind": "function", "linkage": "external" },
+    { "name": "realloc", "signature": "fn(ptr<void>, u64) -> ptr<void>", "kind": "function", "linkage": "external" },
+    { "name": "free",    "signature": "fn(ptr<void>) -> void",           "kind": "function", "linkage": "external" },
+    { "name": "abort",   "signature": "fn() -> void",                    "kind": "function", "linkage": "external" },
+    { "name": "exit",    "signature": "fn(i32) -> void",                 "kind": "function", "linkage": "external" },
+    { "name": "atoi",    "signature": "fn(ptr<char>) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "atol",    "signature": "fn(ptr<char>) -> i64",            "kind": "function", "linkage": "external" },
+    { "name": "atof",    "signature": "fn(ptr<char>) -> f64",            "kind": "function", "linkage": "external" },
+    { "name": "strtol",  "signature": "fn(ptr<char>, ptr<ptr<char>>, i32) -> i64", "kind": "function", "linkage": "external" },
+    { "name": "strtoul", "signature": "fn(ptr<char>, ptr<ptr<char>>, i32) -> u64", "kind": "function", "linkage": "external" },
+    { "name": "strtod",  "signature": "fn(ptr<char>, ptr<ptr<char>>) -> f64", "kind": "function", "linkage": "external" },
+    { "name": "abs",     "signature": "fn(i32) -> i32",                  "kind": "function", "linkage": "external" },
+    { "name": "labs",    "signature": "fn(i64) -> i64",                  "kind": "function", "linkage": "external" },
+    { "name": "rand",    "signature": "fn() -> i32",                     "kind": "function", "linkage": "external" },
+    { "name": "srand",   "signature": "fn(u32) -> void",                 "kind": "function", "linkage": "external" },
+    { "name": "getenv",  "signature": "fn(ptr<char>) -> ptr<char>",      "kind": "function", "linkage": "external" },
+    { "name": "system",  "signature": "fn(ptr<char>) -> i32",           "kind": "function", "linkage": "external" },
+    { "name": "qsort",   "signature": "fn(ptr<void>, u64, u64, ptr<fn(ptr<void>, ptr<void>) -> i32>) -> void", "kind": "function", "linkage": "external" },
+    { "name": "bsearch", "signature": "fn(ptr<void>, ptr<void>, u64, u64, ptr<fn(ptr<void>, ptr<void>) -> i32>) -> ptr<void>", "kind": "function", "linkage": "external" }
+  ]
+}

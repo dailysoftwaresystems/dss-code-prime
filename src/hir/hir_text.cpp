@@ -1019,12 +1019,29 @@ struct PendingAttrs {
 
 class Parser {
 public:
+    // Module path: the Parser OWNS a fresh interner/registry (tagged with `cuId`),
+    // and the `interner_`/`typeReg_` references bind to them. `parseHir` later
+    // moves the owned interner out of `ownedInterner_` into the HirParseResult.
     Parser(std::string_view text, CompilationUnitId cuId, DiagnosticReporter& reporter)
-        : interner_(cuId), lex_(text), reporter_(reporter) {}
+        : ownedInterner_(std::in_place, cuId), ownedTypeReg_(std::in_place),
+          interner_(*ownedInterner_), typeReg_(*ownedTypeReg_),
+          lex_(text), reporter_(reporter) {}
+
+    // Type-text path (`parseTypeFromText`): the caller OWNS the interner/registry,
+    // so the owned storage stays empty and the references bind to the externals —
+    // the produced TypeId interns into the caller's CU. The same `parseType`
+    // production runs unchanged; only where it interns differs.
+    Parser(std::string_view text, TypeInterner& extInterner, TypeRegistry& extTypeReg,
+           DiagnosticReporter& reporter)
+        : interner_(extInterner), typeReg_(extTypeReg), lex_(text), reporter_(reporter) {}
 
     HirBuilder              builder_;
-    TypeInterner            interner_;
-    TypeRegistry            typeReg_;
+    // Owned only on the module path (empty on the type-text path); the references
+    // below are the single point of use for every production.
+    std::optional<TypeInterner> ownedInterner_;
+    std::optional<TypeRegistry> ownedTypeReg_;
+    TypeInterner&           interner_;
+    TypeRegistry&           typeReg_;
     std::vector<std::string> symbolNames_;     // SymbolId.v -> name; slot 0 unused
 
     std::vector<std::pair<HirNodeId, HirSourceLoc>>   pLoc_;
@@ -1052,6 +1069,16 @@ public:
         }
         parsePreamble();
         return parseModule();
+    }
+
+    // Entry for `parseTypeFromText`: decode a STANDALONE type string via the same
+    // `parseType` production used by the module parser, then require the input to
+    // be exhausted (no second type, no stray tokens). The grammar itself is the
+    // private `parseType` below — this is only the single-type framing.
+    [[nodiscard]] TypeId parseTypeFromTextEntry() {
+        TypeId const t = parseType();
+        if (!peekIs(Tk::Eof)) malformed("unexpected trailing tokens after type");
+        return t;
     }
 
 private:
@@ -1742,14 +1769,14 @@ std::unique_ptr<HirParseResult> parseHir(std::string_view text, CompilationUnitI
         HirNodeId const empty = parser.builder_.makeModule({});
         auto res = std::make_unique<HirParseResult>(
             std::move(parser.builder_).finish(empty),
-            std::move(parser.interner_), std::move(parser.symbolNames_));
+            std::move(*parser.ownedInterner_), std::move(parser.symbolNames_));
         res->ok = false;
         return res;
     }
 
     Hir hir = std::move(parser.builder_).finish(root);
     auto res = std::make_unique<HirParseResult>(
-        std::move(hir), std::move(parser.interner_), std::move(parser.symbolNames_));
+        std::move(hir), std::move(*parser.ownedInterner_), std::move(parser.symbolNames_));
 
     // Hand back the rebuilt literal pool (empty if the source used `#index`).
     res->literalPool = std::move(parser.pLiterals_);
@@ -1774,6 +1801,26 @@ std::unique_ptr<HirParseResult> parseHir(std::string_view text, CompilationUnitI
 
     res->ok = reporter.errorCount() == errBefore;
     return res;
+}
+
+TypeId parseTypeFromText(std::string_view typeText, TypeInterner& interner,
+                         TypeRegistry& typeReg, DiagnosticReporter& reporter) {
+    std::size_t const errBefore = reporter.errorCount();
+
+    // Reuse the ONE type-grammar decoder: drive the module parser's `parseType`
+    // production over `typeText`, interning into the caller's interner/registry.
+    Parser parser{typeText, interner, typeReg, reporter};
+    TypeId const ty = parser.parseTypeFromTextEntry();
+
+    // A standalone type string must be exactly one type. Trailing tokens (e.g.
+    // `"i32 i32"`) are malformed — `parseTypeFromTextEntry` reports them.
+    //
+    // Fail loud, never partial: if ANY error was emitted while decoding (a
+    // truncated `"fn(ptr<"`, an unknown keyword, leftover tokens), the text did
+    // not name a well-formed type — return InvalidType rather than let a
+    // half-built type escape as if it were valid.
+    if (reporter.errorCount() != errBefore) return InvalidType;
+    return ty;
 }
 
 } // namespace dss

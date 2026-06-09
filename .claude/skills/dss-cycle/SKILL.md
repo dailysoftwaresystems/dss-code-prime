@@ -82,6 +82,37 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      e.g. single-CU `static`→Local DCE just drops an unused symbol — a behavior-preserving
      refactor) is proven by its appropriate-tier strict test (+ red-on-disable); a corpus that
      exercises nothing is itself the masked-effectiveness trap.
+   - **Cross-target runtime closure — encoding pins are NOT runtime proof.** When a feature's
+     correctness is *runtime control-flow* on a target the local gate cannot execute (any
+     non-host CPU/ABI — e.g. an ARM64 binary on an x86_64 host), byte/encoding pins prove the
+     bytes are *right*, never that the program *runs* right: a function can encode every
+     instruction perfectly yet omit the link-register (x30) spill in a non-leaf frame → perfect
+     bytes, runtime SIGSEGV (the v0.0.2 catch — `2b07e3b` shipped a "Runnable ARM64-ELF FFI
+     proof" that byte-pinned green then SIGSEGV'd on the native-arm64 leg; `dbf84b0` was the x30
+     fix). So such a feature is **NOT `✅ CLOSED` on local-green + byte-pins** — it stays
+     *runtime-pending* until the binary has actually **executed on the target** and produced the
+     asserted exit/stdout. Each cross-target has a matching CI leg that builds AND runs `ctest`
+     **natively** — gate the closure on that leg going **green** (push, confirm via next cycle's
+     Step 0 baseline or `gh run watch`, then mark CLOSED; never on the push alone):
+       - **ARM64-Linux** → the native `ubuntu-24.04-arm` leg (`run-linux-arm64: true`); RISC-V /
+         WASM → an emulator-gated leg.
+       - **macOS-ARM64** → the **`macos-latest` (Apple Silicon) leg** (`run-macos: true`) — it
+         runs `ctest` on real arm64 hardware, so it auto-executes a Mach-O corpus exactly like the
+         arm64-Linux leg (it is NOT leg-less).
+     **Local pre-push run — native when the host matches the target.** If you build ON the
+     target's own OS/arch, the corpus executes in your LOCAL `ctest` and goes **green locally**
+     before the push: e.g. **on a macOS (Apple Silicon) machine the macOS-ARM64 corpus runs in
+     local `ctest` → green → push → the `macos-latest` leg re-confirms** (no human step). Off the
+     target host, ARM64-Linux can still run locally under `qemu-aarch64`, but **macOS-ARM64 is the
+     one target with no off-Mac emulator** (nothing runs a Mach-O on Windows/Linux) — so from a
+     non-Mac host (the loop's usual env) either hand the Mach-O to a Mac for a manual pre-push run
+     (a 2-step, **§B** hand-off: present the binary + expected exit/stdout) or rely on the
+     `macos-latest` CI leg to execute it post-push.
+     In every case ALSO ship a **host-independent** structural pin that is red-on-disable on
+     *every* leg (e.g. the non-leaf frame puts the link register into `savedRegs`), so a
+     regression is caught even when the one execution path is unavailable — the execution run is
+     the end-to-end witness, the structural pin the always-on guard; keep both, never collapse
+     them.
 6. **The full commit gate.** The operational checklist (with commands) is **Step 6 (§C)** —
    the single source of truth for the gate items. **Any red the cycle cannot self-repair →
    STOP and report. Do not push.** Self-repair = a mechanical fix obvious from the failure

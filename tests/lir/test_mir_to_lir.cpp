@@ -1507,8 +1507,13 @@ TEST(MirToLir, ExternCallEmitsCallIndirectViaExternOpcode) {
     std::vector<::dss::ExternImport> externImports{ext};
 
     ::dss::DiagnosticReporter rep;
+    // D-FFI-EXTERN-CALL-DISPATCH: indirect-slot is the PE/Mach-O IAT model —
+    // an extern call dereferences the import POINTER slot via FF 15. (This
+    // is what the historical x86_64-PE path used unconditionally; it is now
+    // selected by the format's dispatch, not assumed.)
     auto const result = ::dss::lowerToLir(m, sch, interner, rep,
-                                          externImports);
+                                          externImports,
+                                          ::dss::ExternCallDispatch::IndirectSlot);
     ASSERT_TRUE(result.ok)
         << "extern-call MIR must lower cleanly with externImports passed";
     EXPECT_EQ(rep.errorCount(), 0u);
@@ -1540,6 +1545,176 @@ TEST(MirToLir, ExternCallEmitsCallIndirectViaExternOpcode) {
     EXPECT_EQ(externCalls, 1u)
         << "call to extern symbol must lower to `call_indirect_via_extern` "
            "(FF 15 disp32) — direct E8 would SEGV at runtime";
+}
+
+// ── D-FFI-EXTERN-CALL-DISPATCH: format-driven extern-call shape ──────
+//
+// The plan-lock CONFIRMED (byte-level) that x86_64-ELF FFI was latently
+// broken: the linker points an extern's symbolVa at its PLT STUB (code),
+// but `call_indirect_via_extern` (FF 15 = call [ptr]) dereferences those
+// code bytes as a function pointer → SIGSEGV. ELF needs a PLAIN DIRECT
+// call (E8 / BL) to the stub; PE/Mach-O dereference an IAT/__got pointer
+// slot. The shape is a property of the OBJECT FORMAT, not the CPU target
+// (the SAME x86_64 needs opposite opcodes under PE vs ELF), so
+// `lowerToLir` selects the call opcode from `ExternCallDispatch`. These
+// pins prove the selection at the LIR tier; each is RED-on-disable if
+// `lowerCall` ignored the dispatch and reverted to FF-15-for-all-externs.
+namespace {
+struct ExternCallLowering {
+    ::dss::MirToLirResult result;
+    std::uint32_t         directCalls = 0;  // plain `call` (E8 / BL)
+    std::uint32_t         externCalls = 0;  // `call_indirect_via_extern` (FF 15)
+};
+
+// Lower a fixed "1 extern + 1 internal + 1 caller calling both" MIR under
+// (target, dispatch) and count the caller's call opcodes. Mirrors the
+// fixture in `ExternCallEmitsCallIndirectViaExternOpcode` so the dispatch
+// is the ONLY variable across the pins.
+[[nodiscard]] ExternCallLowering
+lowerStdExternFixture(::dss::TargetSchema const& sch,
+                      std::optional<::dss::ExternCallDispatch> dispatch,
+                      ::dss::DiagnosticReporter& rep,
+                      ::dss::CallConv cc = ::dss::CallConv::CcMS64) {
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const i32  = interner.primitive(::dss::TypeKind::I32);
+    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const internalSig = interner.fnSig(
+        std::span<::dss::TypeId const>{}, i32, cc);
+
+    constexpr std::uint32_t kExternSym   = 100u;
+    constexpr std::uint32_t kInternalSym = 101u;
+    constexpr std::uint32_t kCallerSym   = 102u;
+
+    ::dss::MirBuilder mb;
+    mb.addFunction(internalSig, ::dss::SymbolId{kInternalSym});
+    {
+        auto const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+        mb.beginBlock(bb);
+        ::dss::MirLiteralValue lv; lv.value = std::int64_t{0};
+        lv.core = ::dss::TypeKind::I32;
+        mb.addReturn(mb.addConst(lv, i32));
+    }
+    mb.addFunction(internalSig, ::dss::SymbolId{kCallerSym});
+    {
+        auto const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+        mb.beginBlock(bb);
+        ::dss::MirLiteralValue lv; lv.value = std::int64_t{0};
+        lv.core = ::dss::TypeKind::I32;
+        ::dss::MirInstId const zero = mb.addConst(lv, i32);
+        ::dss::MirInstId const externAddr =
+            mb.addGlobalAddr(::dss::SymbolId{kExternSym}, ptrT);
+        std::array<::dss::MirInstId, 2> externOps{externAddr, zero};
+        ::dss::MirInstId const externResult =
+            mb.addInst(::dss::MirOpcode::Call, externOps, i32);
+        ::dss::MirInstId const intAddr =
+            mb.addGlobalAddr(::dss::SymbolId{kInternalSym}, ptrT);
+        std::array<::dss::MirInstId, 1> intOps{intAddr};
+        ::dss::MirInstId const intResult =
+            mb.addInst(::dss::MirOpcode::Call, intOps, i32);
+        std::array<::dss::MirInstId, 2> addOps{externResult, intResult};
+        mb.addReturn(mb.addInst(::dss::MirOpcode::Add, addOps, i32));
+    }
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::ExternImport ext{};
+    ext.symbol      = ::dss::SymbolId{kExternSym};
+    ext.mangledName = "extern_fn";
+    ext.libraryPath = "fictional.lib";
+    std::vector<::dss::ExternImport> externImports{ext};
+
+    ExternCallLowering out{
+        ::dss::lowerToLir(m, sch, interner, rep, externImports, dispatch),
+        0u, 0u};
+    auto const callOp         = sch.opcodeByMnemonic("call");
+    auto const callIndirectOp = sch.opcodeByMnemonic("call_indirect_via_extern");
+    ::dss::Lir const& lir = out.result.lir;
+    if (lir.moduleFuncCount() < 2) return out;
+    ::dss::LirFuncId const callerFn = lir.funcAt(1);
+    ::dss::LirBlockId const entry   = lir.funcEntry(callerFn);
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        auto const op = lir.instOpcode(lir.blockInstAt(entry, i));
+        if (callOp && op == *callOp)                 ++out.directCalls;
+        if (callIndirectOp && op == *callIndirectOp) ++out.externCalls;
+    }
+    return out;
+}
+} // namespace
+
+TEST(MirToLir, ExternCallOnDirectPltFormatEmitsPlainCall) {
+    // direct-plt (ELF): the extern call is a PLAIN DIRECT `call` (E8 on
+    // x86_64) to the linker-synthesized PLT stub — the SAME opcode as an
+    // internal call — NOT the FF-15 indirect form. RED-on-disable: if
+    // lowerCall ignored the dispatch (old FF-15-for-all-externs), the
+    // extern call would be `call_indirect_via_extern` and externCalls==1.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const lowered = lowerStdExternFixture(
+        **target, ::dss::ExternCallDispatch::DirectPlt, rep);
+    ASSERT_TRUE(lowered.result.ok) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(lowered.directCalls, 2u)
+        << "under direct-plt BOTH the extern and the internal call use the "
+           "plain `call` opcode (direct branch; the linker's PLT stub does "
+           "the GOT indirection)";
+    EXPECT_EQ(lowered.externCalls, 0u)
+        << "direct-plt must NOT emit call_indirect_via_extern (FF 15) — that "
+           "would dereference the ELF PLT stub's code bytes as a pointer";
+}
+
+// ARM64 + direct-plt call-WITH-RESULT lowering (D-LK10-ENTRY-ARM64-FFI-ISEL).
+// The extern-call SELECTION is arch-AGNOSTIC (`lowerCall` has no target
+// branch); this pin proves the FULL ARM64 lowering of a call-with-result
+// completes with NO L_RequiredLirOpcodeMissing — the gap a prior cycle hit
+// closed once the ARM64 `lea` (ADRP+ADD) landed (the GlobalAddr callee
+// materialization). Same fixture as the x86_64 direct-plt pin, under the
+// arm64 schema + AAPCS64.
+TEST(MirToLir, Arm64ExternCallWithResultLowersUnderDirectPlt) {
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const lowered = lowerStdExternFixture(
+        **target, ::dss::ExternCallDispatch::DirectPlt, rep,
+        ::dss::CallConv::CcAAPCS64);
+    ASSERT_TRUE(lowered.result.ok) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(lowered.directCalls, 2u)
+        << "ARM64 direct-plt: both the extern and internal call lower to the "
+           "plain `call` (BL) opcode";
+    EXPECT_EQ(lowered.externCalls, 0u)
+        << "ARM64 has no call_indirect_via_extern — forced onto direct-plt";
+}
+
+TEST(MirToLir, ExternImportsWithNoDispatchFailLoud) {
+    // No silent default: a module with extern imports under a format that
+    // declared NO externCallDispatch (nullopt) fails loud at lowering —
+    // a silent fall-through to either shape would miscompile one import
+    // model. RED-on-disable if the ctor guard's nullopt arm is removed.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const lowered = lowerStdExternFixture(**target, std::nullopt, rep);
+    EXPECT_FALSE(lowered.result.ok)
+        << "extern imports under a nullopt dispatch must NOT lower cleanly";
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "the no-dispatch guard must fire (L_RequiredLirOpcodeMissing)";
+}
+
+TEST(MirToLir, IndirectSlotWithoutOpcodeFailsLoud) {
+    // Symmetric guard arm: `indirect-slot` requires a
+    // `call_indirect_via_extern` opcode. ARM64 declares none, so an
+    // indirect-slot format on ARM64 fails loud rather than silently
+    // mis-lowering. RED-on-disable if the indirect-slot guard arm is removed.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const lowered = lowerStdExternFixture(
+        **target, ::dss::ExternCallDispatch::IndirectSlot, rep);
+    EXPECT_FALSE(lowered.result.ok)
+        << "indirect-slot on a target lacking call_indirect_via_extern must "
+           "NOT lower cleanly";
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "the indirect-slot-missing-opcode guard must fire";
 }
 
 TEST(MirToLir, NoExternImportsAllCallsLowerAsDirectCall) {

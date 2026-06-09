@@ -686,12 +686,84 @@ enum class EncodingSlotKind : std::uint8_t {
     // which already encodes the target both as operand[0] and via
     // successors[0].
     BlockRel32     = 14,
+    // D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): 16-bit UNSIGNED immediate for
+    // the AArch64 MOVZ wide-immediate form (`MOVZ Xd, #imm16`). Bits
+    // 5..20 of the fixed word (Rd occupies bits 0..4). This is the
+    // FIRST fixed32 immediate slot: the entry trampoline loads the
+    // exit-syscall number into x8 via `mov x8, #94` → MOVZ. Unlike
+    // the symbol-bearing Imm26, the walker writes the operand's
+    // immediate value DIRECTLY into the bit window (range-checked —
+    // a value wider than the slot fails loud, never silently
+    // truncates), no relocation. Reusable by RV32 `addi`/`lui`-style
+    // immediate forms when a RISC-V target lands (its own slot when
+    // the bit-window differs).
+    Imm16          = 15,
+    // D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): SIGNED 9-bit offset for the
+    // AArch64 unscaled load/store form (`LDUR/STUR Xt, [Xn, #simm9]`),
+    // bits 12..20. The frame load/store materialized by the callconv
+    // (spill reload / store, callee-saved save/restore) encodes its
+    // byte offset here — a RAW byte displacement (unscaled), range
+    // -256..255; a wider frame offset fails loud (a scaled LDR/STR
+    // imm12 form is the future generalization). Two's-complement: the
+    // walker writes the low 9 bits; negative offsets carry bit 8 set.
+    Imm9           = 16,
+    // D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): the memory-base operand
+    // position in a fixed32 memory instruction whose ISA encoding has
+    // NO scale field (AArch64 unscaled LDUR/STUR). The shared LIR
+    // load/store form carries a MemBase(scale) operand (an x86-SIB-ism);
+    // on AArch64 it is a structural marker that must be wired (the
+    // "every guard position is wired" validate rule) yet contributes
+    // ZERO bits — a width-0 slot. The walker validates scale==1 here
+    // and writes nothing. (A scaled ISA would use a real bit-field slot
+    // instead, like x86's MemBaseScale.)
+    MemBaseNoScale = 17,
+    // D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): UNSIGNED 12-bit immediate for
+    // the AArch64 ADD/SUB-immediate form (`ADD/SUB Xd, Xn, #imm12`),
+    // bits 10..21. The callconv's prologue/epilogue stack adjust
+    // (`sub sp, sp, #frame` / `add sp, sp, #frame`) encodes the frame
+    // size here. Range 0..4095; a larger frame needs the shifted
+    // imm12<<12 form (future). Unsigned (frame sizes are non-negative).
+    Imm12          = 18,
+    // D-AS4-3 (multi-instruction-macro / multi-relocation encoder):
+    // a SYMBOL-PATCH MARKER — a write-no-bits (width-0) slot that
+    // marks an operand position as a linker-patched symbol reference.
+    // The walker writes NO immediate bits (the bit-window is {0,0},
+    // exactly like `MemBaseNoScale`) and emits a Relocation at the
+    // START of the slot's word (the wire's `wordIndex`); the linker
+    // owns the patched field ENTIRELY, computing the bits from the
+    // wire's `relocationKind` formula. Generic over the patch shape:
+    // the SAME marker serves AArch64 `ADRP Xd, sym@PG` (word 0,
+    // `adr_prel_pg_hi21` — a split immlo[30:29]+immhi[23:5] field no
+    // single bit-window could express) AND `ADD Xd, Xd, #:lo12:sym`
+    // (word 1, `add_abs_lo12_nc`), and is reusable by any ISA's
+    // linker-patched symbol field (RISC-V `auipc`+`addi`, etc.). The
+    // distinguishing facts — which word, which patch formula — live
+    // on the WIRE (`wordIndex` + `relocationKind`), NOT on the slot,
+    // so one marker covers every such position. isSymbolBearingSlot
+    // returns true (a `relocationKind` is required + emitted).
+    SymbolPatchMarker = 19,
+    // D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow): the
+    // SIGNED 19-bit PC-relative branch offset of the AArch64 `B.cond`
+    // instruction (`B.cond <label>`), bits 5..23 of the 32-bit word
+    // (the cond nibble occupies bits 0..3). BLOCK-RELATIVE, NOT
+    // symbol-bearing: like the INTRA-FUNCTION use of Imm26 (the
+    // `B <label>` form), the value is the displacement to an intra-
+    // function basic block, resolved at ASSEMBLE time by the asm.cpp
+    // resolver (NOT a linker relocation). The walker writes ZERO bits
+    // + pushes a `walker_util::BlockRelPatch{ kind = Arm64Imm19 }`;
+    // the resolver computes `(target - patchOffset) >> 2` (no +4 bias
+    // — ARM64 branches are PC-relative to the instruction itself) and
+    // read-modify-writes the 19-bit field. The displacement is SCALED
+    // by 4 (word-aligned), a ±1 MiB reach; a larger intra-function
+    // span needs inverted-cond + long `B` (future, anchored
+    // D-CSUBSET-LONG-BRANCH). `isSymbolBearingSlot` returns FALSE (no
+    // relocationKind — resolved intra-function, not at link time).
+    Imm19 = 20,
     // Future fixed32 slots (paired with their consumer cycle):
-    //   Imm12 bits 10..21  (12-bit immediate for ADD/SUB-imm forms)
-    //   ImmShift / Sf-flag / etc.
+    //   ImmShift / Sf-flag / scaled LDR imm12 / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 15> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 21> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -707,6 +779,12 @@ inline constexpr EnumNameTable<EncodingSlotKind, 15> kEncodingSlotKindTable{{{
     { EncodingSlotKind::RipRelDisp32, "riprel.disp32" },
     { EncodingSlotKind::CondCodeNibble, "condcode.nibble" },
     { EncodingSlotKind::BlockRel32,    "block.rel32"    },
+    { EncodingSlotKind::Imm16,         "imm16"          },
+    { EncodingSlotKind::Imm9,          "imm9"           },
+    { EncodingSlotKind::MemBaseNoScale, "membase.noscale" },
+    { EncodingSlotKind::Imm12,         "imm12"          },
+    { EncodingSlotKind::SymbolPatchMarker, "sym.patch"   },
+    { EncodingSlotKind::Imm19,         "imm19"          },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -725,7 +803,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 15,
+static_assert(kEncodingSlotKindCount == 21,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -756,6 +834,12 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:
         case EncodingSlotKind::Imm26:
+        case EncodingSlotKind::Imm16:
+        case EncodingSlotKind::Imm9:
+        case EncodingSlotKind::MemBaseNoScale:
+        case EncodingSlotKind::Imm12:
+        case EncodingSlotKind::SymbolPatchMarker:
+        case EncodingSlotKind::Imm19:
             return TargetEncodingShape::Fixed32;
     }
     return TargetEncodingShape::None;  // unreachable; satisfies non-exhaustive switches
@@ -807,6 +891,26 @@ struct DSS_EXPORT TargetEncodingTemplate {
     // zero would map every condition to `eq`.
     bool condCodeFromPayload = false;
 
+    // D-AS3-COND-CODE-ARM64 (ARM64 control-flow): cond-nibble PLACEMENT
+    // + INVERSION knobs for the `fixed32` walker's `condCodeFromPayload`
+    // arm. Both default to the x86 / B.cond shape (LSB 0, no invert) so
+    // every existing cond-bearing opcode is byte-identical after these
+    // fields land.
+    //   * `condBitPos` — the LSB inside word 0 where the 4-bit cond
+    //     nibble is OR'd. 0 for AArch64 `B.cond` (bits 0..3); 12 for
+    //     AArch64 `CSET` (= `CSINC Xd,XZR,XZR,invcond`, cond at bits
+    //     12..15). (The x86-variable walker has its own opcode-byte
+    //     placement and ignores this field.)
+    //   * `condInvert` — when true, XOR the cond nibble with 1 before
+    //     placing it (the AArch64 inverse-condition trick). `CSET cond`
+    //     materializes 1-when-cond by encoding `CSINC` with the INVERTED
+    //     condition (the false-arm increments XZR→1); so `cset x,gt`
+    //     (GT=0xC) encodes condition 0xC^1 = 0xD. `B.cond` does NOT
+    //     invert (false here).
+    // Only meaningful when `condCodeFromPayload` is true.
+    std::uint8_t condBitPos = 0;
+    bool         condInvert = false;
+
     // D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold,
     // code-reviewer C2): force a REX prefix even when no REX bit
     // (W/R/X/B) is set. Required by x86 byte-register-bearing
@@ -837,6 +941,38 @@ struct DSS_EXPORT TargetEncodingTemplate {
     // first ISA needs the zero-base, promote this to
     // `std::optional<std::uint32_t>`.
     std::uint32_t fixedWord = 0;
+
+    // D-AS4-3 (multi-instruction-macro encoder): the base bit pattern
+    // of a MULTI-WORD `fixed32` instruction (an N-word macro-op such
+    // as AArch64 `lea` = ADRP+ADD, or a future RISC-V `auipc`+`addi`).
+    // EMPTY by default — every existing single-word opcode keeps
+    // `fixedWord` and emits byte-identically. When non-empty, the
+    // walker emits one 32-bit word per element (LE) in order, each
+    // word's slots OR'd per the wires' `wordIndex`; per-word
+    // relocations stamp at the START of their word. `fixedWord` and
+    // `fixedWords` are MUTUALLY EXCLUSIVE — validate() rejects a
+    // template that sets both (the single-word default would be
+    // silently shadowed). Only meaningful for the `fixed32` shape.
+    std::vector<std::uint32_t> fixedWords;
+
+    // Number of 32-bit words this template emits: the multi-word
+    // count when `fixedWords` is set, else 1 (the single-word
+    // `fixedWord` path). The walker + validate() size their per-word
+    // structures (the `words` vector, the per-word slot-tracking) from
+    // this — a single source of truth for the word count.
+    [[nodiscard]] std::size_t wordCount() const noexcept {
+        return fixedWords.empty() ? 1u : fixedWords.size();
+    }
+
+    // The base bit pattern of word `i` (0-based). For the single-word
+    // path (`fixedWords` empty) word 0 is `fixedWord`; any other index
+    // is out of range. For the multi-word path it is `fixedWords[i]`.
+    // Caller guarantees `i < wordCount()` (the walker loops to
+    // wordCount(); validate() bounds every `wordIndex`).
+    [[nodiscard]] std::uint32_t wordAt(std::size_t i) const noexcept {
+        if (fixedWords.empty()) return fixedWord;  // i==0 by precondition
+        return fixedWords[i];
+    }
 };
 
 // True iff the slot kind carries a SYMBOL-RELATIVE value that the
@@ -853,6 +989,10 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Disp32:
         case EncodingSlotKind::Imm26:
         case EncodingSlotKind::RipRelDisp32:
+        // D-AS4-3: the generic symbol-patch marker is symbol-bearing —
+        // the walker emits a Relocation (per the wire's relocationKind)
+        // and writes no immediate bits; the linker patches the field.
+        case EncodingSlotKind::SymbolPatchMarker:
             return true;
         case EncodingSlotKind::ModRmReg:
         case EncodingSlotKind::ModRmRm:
@@ -860,12 +1000,23 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:
+        case EncodingSlotKind::Imm16:
+        case EncodingSlotKind::Imm9:
+        case EncodingSlotKind::MemBaseNoScale:
+        case EncodingSlotKind::Imm12:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
         case EncodingSlotKind::Disp32Mem:
         case EncodingSlotKind::SibIndex:
         case EncodingSlotKind::CondCodeNibble:
         case EncodingSlotKind::BlockRel32:
+        // D-AS3-BLOCK-REL-IMM19/26: Imm19 (ARM64 B.cond displacement) is
+        // block-relative like BlockRel32 / the intra-function Imm26 use —
+        // resolved at assemble time, no linker relocation. (Imm26 itself
+        // stays symbol-bearing above for the BL/`call` form; the encoder
+        // distinguishes Imm26's dual use by operand kind — a BlockRef
+        // operand is block-relative, a SymbolRef operand emits the reloc.)
+        case EncodingSlotKind::Imm19:
             // D-AS4-1 / D-AS4-5 memory-addressing slots write immediate
             // displacements / register encodings (not symbol-relative).
             // The companion symbol-bearing slot for RIP-relative `lea`
@@ -898,6 +1049,14 @@ struct DSS_EXPORT TargetEncodingWire {
     std::uint8_t     index           = 0;
     EncodingSlotKind slotKind        = EncodingSlotKind::ModRmReg;
     std::optional<RelocationKind> relocationKind;
+    // D-AS4-3 (multi-instruction-macro encoder): which 32-bit word
+    // (0-based) of a multi-word `fixed32` template this wire's slot
+    // lives in. DEFAULT 0 — every existing single-word wire is
+    // unchanged (its slot is interpreted within word 0). The slot's
+    // bit-window (`windowFor`) is applied INSIDE word[wordIndex]; a
+    // symbol-bearing wire's relocation stamps at word[wordIndex]'s
+    // byte offset. validate() requires `wordIndex < template.wordCount()`.
+    std::uint8_t     wordIndex       = 0;
     // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): bytes
     // emitted IMMEDIATELY BEFORE this wire's slot bytes (between
     // the previous wire's emission and this one). Used by jcc's
@@ -929,6 +1088,21 @@ struct DSS_EXPORT TargetEncodingWire {
 //     overwrite at encode time.
 //   * Every guard position must have a matching wire (or be unused
 //     by-design; the validator's positional check pins this).
+// D-AS4-3 (multi-instruction-macro encoder): an ADDITIONAL placement
+// of the instruction's RESULT register, beyond the primary `resultSlot`
+// (which is implicitly word 0). The same result register's hwEncoding
+// is OR'd into `slotKind` of `word[wordIndex]`. Needed when a multi-word
+// macro repeats the destination across words — AArch64 `lea` is
+// `ADRP Xd, sym; ADD Xd, Xd, #:lo12:sym`, so Xd lands in word0.Rd
+// (resultSlot), word1.Rd, AND word1.Rn (the ADD reads its own dest as
+// the source base). Generic: any ISA whose multi-word materialization
+// threads the destination register through later words uses this — no
+// per-opcode special case. Empty for every single-result opcode.
+struct DSS_EXPORT ResultSlotExtra {
+    EncodingSlotKind slotKind  = EncodingSlotKind::Rd;
+    std::uint8_t     wordIndex = 0;
+};
+
 struct DSS_EXPORT TargetEncodingVariant {
     std::vector<OperandKindFilter>     operandKinds;
     TargetEncodingTemplate             tmpl;
@@ -936,8 +1110,16 @@ struct DSS_EXPORT TargetEncodingVariant {
     // has a result). Nullopt for value-less instructions (e.g.
     // `ret`). Most binary/unary register opcodes use ModRmReg here;
     // immediate-destination forms use ModRmRm with `modrmRegExt`
-    // filling the reg field.
+    // filling the reg field. Implicitly word 0 for multi-word
+    // templates; additional placements go in `extraResultSlots`.
     std::optional<EncodingSlotKind>    resultSlot;
+    // D-AS4-3: additional placements of the SAME result register in a
+    // multi-word template (see `ResultSlotExtra`). Empty for every
+    // single-word / single-placement opcode. validate() requires a
+    // `resultSlot` when this is non-empty (an extra placement of a
+    // result that has no primary slot is malformed) and bounds each
+    // `wordIndex < template.wordCount()`.
+    std::vector<ResultSlotExtra>       extraResultSlots;
     // Where each LIR source operand (`inst.operands[wire.index]`)
     // goes in the emitted bytes.
     std::vector<TargetEncodingWire>    wires;

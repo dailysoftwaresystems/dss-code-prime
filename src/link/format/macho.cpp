@@ -2,15 +2,20 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
+#include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/macho_chained_fixups.hpp"
+#include "link/format/macho_codesign.hpp"
 #include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstring>
+#include <format>
+#include <limits>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -108,6 +113,7 @@ constexpr std::uint32_t LC_DYLD_INFO_ONLY      = 0x80000022u;  // |= LC_REQ_DYLD
 constexpr std::uint32_t LC_DYLD_CHAINED_FIXUPS = 0x80000034u;  // |= LC_REQ_DYLD — D-LK6-14
 constexpr std::uint32_t LC_DYSYMTAB            = 0x0B;
 constexpr std::uint32_t LC_CODE_SIGNATURE = 0x1D;
+constexpr std::uint32_t LC_BUILD_VERSION  = 0x32;  // build_version_command
 // linkedit_data_command shape (16 bytes): cmd / cmdsize / dataoff /
 // datasize. Both LC_CODE_SIGNATURE and LC_DYLD_CHAINED_FIXUPS use
 // this exact layout — the alias documents the shared shape so
@@ -119,10 +125,34 @@ constexpr std::uint32_t LC_CODE_SIGNATURE = 0x1D;
 // so a future Apple change to one struct doesn't diverge silently.)
 constexpr std::size_t   kCodeSigCommandSize = 16;
 constexpr std::size_t   kLinkeditDataCommandSize = 16;
+// build_version_command (<mach-o/loader.h>): cmd / cmdsize / platform /
+// minos / sdk / ntools — 6 × u32 = 24 bytes with ntools = 0 (no trailing
+// build_tool_version records). Modern dyld (macOS 11+ / Apple Silicon)
+// identifies the executable's PLATFORM from this command; a main
+// executable without it (nor the legacy LC_VERSION_MIN_MACOSX) is
+// rejected at load. (D-LK10-ENTRY-MACHO-EXIT.)
+constexpr std::size_t   kBuildVersionCommandSize = 24;
 static_assert(kCodeSigCommandSize == kLinkeditDataCommandSize,
               "linkedit_data_command shape is wire-frozen at 16 bytes; "
               "both LC_CODE_SIGNATURE and LC_DYLD_CHAINED_FIXUPS use it.");
 constexpr std::uint64_t kLoadCmdAlign     = 8;  // pad LCs to 8 bytes
+
+// Emit one `build_version_command` (LC_BUILD_VERSION, 24 bytes, ntools=0)
+// — the SINGLE chokepoint shared by both the static (encodeExec) and
+// dynamic (encodeExecDynamic) arms, so the 6-u32 wire layout is written
+// in exactly one place. platform / minos / sdk are little-endian u32s;
+// minos/sdk carry the (major<<16)|(minor<<8)|patch nibble encoding the
+// schema loader produced. (D-LK10-ENTRY-MACHO-EXIT.)
+void appendBuildVersionCommand(std::vector<std::uint8_t>& out,
+                               MachOBuildVersion const& bv) {
+    appendU32LE(out, LC_BUILD_VERSION);
+    appendU32LE(out,
+                static_cast<std::uint32_t>(kBuildVersionCommandSize));
+    appendU32LE(out, static_cast<std::uint32_t>(bv.platform));
+    appendU32LE(out, bv.minOs);
+    appendU32LE(out, bv.sdk);
+    appendU32LE(out, 0u);  // ntools = 0 (no trailing build_tool_version)
+}
 
 // section_64.flags (S_*) — <mach-o/loader.h>
 constexpr std::uint32_t S_NON_LAZY_SYMBOL_POINTERS = 0x6;
@@ -143,8 +173,174 @@ constexpr std::uint8_t BIND_TYPE_POINTER                          = 1;
 
 constexpr std::size_t kDyldInfoCommandSize = 48;
 constexpr std::size_t kDysymtabCommandSize = 80;
-constexpr std::size_t kStubSize            = 6;  // FF 25 disp32
 constexpr std::size_t kGotSlotSize         = 8;
+
+// ── Per-cputype __stubs substrate (MIRRORS elf.cpp's emitPltStub) ──
+//
+// Mach-O `__stubs` plays the same role as ELF's PLT: one stub per
+// extern, pointing at the extern's `__got` slot. symbolVa[extern] is
+// the STUB (direct-plt), so the call site is a plain direct call/BL to
+// the stub and the stub does the __got indirection itself.
+//
+// CPU_TYPE values (<mach-o/machine.h>): the high bit 0x01000000 is
+// CPU_ARCH_ABI64; x86_64 = (7 | ABI64) = 0x01000007; arm64 = (12 |
+// ABI64) = 0x0100000C. The walker dispatches on the schema's cputype
+// (read as data) — adding a 3rd ISA = a new size arm + a new emitter +
+// a new dispatch case, all localized to this file (the elf.cpp
+// precedent). x86_64 stub = 6-byte `FF 25 disp32`; arm64 stub = 12-byte
+// ADRP+LDR+BR macro.
+constexpr std::uint32_t kCpuTypeX86_64 = 0x01000007u;
+constexpr std::uint32_t kCpuTypeArm64  = 0x0100000Cu;
+
+constexpr std::size_t kX86_64MachoStubSize = 6;   // FF 25 disp32
+constexpr std::size_t kArm64MachoStubSize  = 12;  // ADRP+LDR+BR (3×4)
+
+// Per-cputype __stubs entry size in bytes. Returns 0 for an unhandled
+// cputype — every CALLER pairs the size query with `emitMachoStub`,
+// whose `default` arm fails loud, so a 0 here never silently ships a
+// zero-stride __stubs section.
+[[nodiscard]] constexpr std::size_t
+machoStubSizeFor(std::uint32_t cputype) noexcept {
+    switch (cputype) {
+        case kCpuTypeX86_64: return kX86_64MachoStubSize;
+        case kCpuTypeArm64:  return kArm64MachoStubSize;
+    }
+    return 0u;
+}
+
+// Emit one x86_64 `__stubs` entry: 6-byte `FF 25 disp32` =
+// `jmp *(rip + disp32)` jumping indirectly through the __got slot.
+// disp32 is PC-relative from the END of the 6-byte instruction.
+// (Byte-IDENTICAL to the original inline x86 stub body — extracted
+// verbatim so the existing macho tests keep passing.)
+[[nodiscard]] inline bool emitX86_64MachoStub(
+        std::vector<std::uint8_t>& stubs,
+        std::uint64_t              stubVa,
+        std::uint64_t              gotSlotVa,
+        std::size_t                externIdx,
+        DiagnosticReporter&        reporter) {
+    std::int64_t const disp =
+        static_cast<std::int64_t>(gotSlotVa) -
+        static_cast<std::int64_t>(stubVa + kX86_64MachoStubSize);
+    if (disp < std::numeric_limits<std::int32_t>::min()
+     || disp > std::numeric_limits<std::int32_t>::max()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: __stubs disp32 "
+                         "overflow (0x{:x}) for extern #{}; image too "
+                         "large for 32-bit PC-relative __got reference.",
+                         static_cast<std::uint64_t>(disp), externIdx));
+        return false;
+    }
+    std::uint32_t const d32 =
+        static_cast<std::uint32_t>(static_cast<std::int32_t>(disp));
+    stubs.push_back(0xFF);
+    stubs.push_back(0x25);
+    stubs.push_back(static_cast<std::uint8_t>(d32 & 0xFF));
+    stubs.push_back(static_cast<std::uint8_t>((d32 >> 8) & 0xFF));
+    stubs.push_back(static_cast<std::uint8_t>((d32 >> 16) & 0xFF));
+    stubs.push_back(static_cast<std::uint8_t>((d32 >> 24) & 0xFF));
+    return true;
+}
+
+// Emit one arm64 `__stubs` entry: 12 bytes = ADRP x16, page-of(got)
+// → LDR x16, [x16, #lo12(got)] → BR x16. This is the canonical macOS
+// `dyld_stub` shape. The ADRP page-pair + LDR imm12 math is IDENTICAL
+// to elf.cpp's `emitArm64PltStub` (kept consistent so the page/lo12
+// derivation lives in one mental model) — the only differences are
+// (a) x16-only here (vs ELF's x16→x17 split; both are AAPCS64 IP
+// scratch, ARM IHI 0055 §6.1.1) so dyld's stub-binder convention is
+// matched, and (b) BR x16 + NO trailing NOP (12 bytes, not 16).
+[[nodiscard]] inline bool emitArm64MachoStub(
+        std::vector<std::uint8_t>& stubs,
+        std::uint64_t              stubVa,
+        std::uint64_t              gotSlotVa,
+        std::size_t                externIdx,
+        DiagnosticReporter&        reporter) {
+    auto const pageOf = [](std::uint64_t v) noexcept -> std::uint64_t {
+        return v & ~std::uint64_t{0xFFF};
+    };
+    std::int64_t const pageDiff =
+        static_cast<std::int64_t>(pageOf(gotSlotVa))
+      - static_cast<std::int64_t>(pageOf(stubVa));
+    std::int64_t const adrpValue = pageDiff >> 12;
+    constexpr std::int64_t kAdrpMax =  (std::int64_t{1} << 20) - 1;
+    constexpr std::int64_t kAdrpMin = -(std::int64_t{1} << 20);
+    if (adrpValue < kAdrpMin || adrpValue > kAdrpMax) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic (arm64 __stubs): "
+                         "ADRP page-pair value {} for extern #{} is out "
+                         "of signed 21-bit range — __stubs and __got "
+                         "too far apart (>±4 GiB).",
+                         adrpValue, externIdx));
+        return false;
+    }
+    // LDR (immediate, unsigned offset) 64-bit scales imm12 by 8, so the
+    // __got slot's low-12 must be 8-byte aligned. __got slots are 8
+    // bytes each and __got is page-aligned by construction.
+    std::uint64_t const lo12 = gotSlotVa & std::uint64_t{0xFFF};
+    if ((lo12 & 0x7u) != 0u) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic (arm64 __stubs): "
+                         "__got slot VA for extern #{} is not 8-byte "
+                         "aligned (low12=0x{:x}) — the AArch64 64-bit "
+                         "LDR encoding requires an 8-byte-aligned "
+                         "offset; __got layout is broken.",
+                         externIdx, lo12));
+        return false;
+    }
+    // ADRP x16: base 0x90000010 (Rd=x16); immlo at bits[30:29], immhi
+    // at bits[23:5] carrying the 21-bit two's-complement page value.
+    std::uint32_t const adrpV =
+        static_cast<std::uint32_t>(adrpValue) & 0x1FFFFFu;
+    std::uint32_t const immlo = (adrpV & 0x3u) << 29;
+    std::uint32_t const immhi = ((adrpV >> 2) & 0x7FFFFu) << 5;
+    std::uint32_t const adrp  = 0x90000010u | immlo | immhi;
+    // LDR x16, [x16, #lo12]: base 0xF9400000; imm12 at bits[21:10]
+    // (scaled by 8), Rn=x16 at bits[9:5], Rt=x16 at bits[4:0].
+    // Pre-shifted base 0xF9400210 carries Rn=16 + Rt=16.
+    std::uint32_t const imm12 = static_cast<std::uint32_t>(lo12 >> 3);
+    std::uint32_t const ldr   = 0xF9400210u | (imm12 << 10);
+    // BR x16 (unconditional indirect branch to x16).
+    constexpr std::uint32_t kBrX16 = 0xD61F0200u;
+    auto const pushInst = [&](std::uint32_t inst) {
+        stubs.push_back(static_cast<std::uint8_t>(inst         & 0xFFu));
+        stubs.push_back(static_cast<std::uint8_t>((inst >>  8) & 0xFFu));
+        stubs.push_back(static_cast<std::uint8_t>((inst >> 16) & 0xFFu));
+        stubs.push_back(static_cast<std::uint8_t>((inst >> 24) & 0xFFu));
+    };
+    pushInst(adrp);
+    pushInst(ldr);
+    pushInst(kBrX16);
+    return true;
+}
+
+// Per-cputype __stubs dispatch (mirrors elf.cpp's emitPltStub). Appends
+// exactly `machoStubSizeFor(cputype)` bytes on success. Fail-loud
+// `default` — NO silent zero-byte stub for an unhandled cputype.
+[[nodiscard]] inline bool emitMachoStub(
+        std::uint32_t              cputype,
+        std::vector<std::uint8_t>& stubs,
+        std::uint64_t              stubVa,
+        std::uint64_t              gotSlotVa,
+        std::size_t                externIdx,
+        DiagnosticReporter&        reporter) {
+    switch (cputype) {
+        case kCpuTypeX86_64:
+            return emitX86_64MachoStub(stubs, stubVa, gotSlotVa,
+                                       externIdx, reporter);
+        case kCpuTypeArm64:
+            return emitArm64MachoStub(stubs, stubVa, gotSlotVa,
+                                      externIdx, reporter);
+    }
+    emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+         std::format("macho::encodeExecDynamic: cputype 0x{:x} has no "
+                     "__stubs emitter — the Mach-O dynamic-import path "
+                     "supports x86_64 (0x{:x}) and arm64 (0x{:x}). Add "
+                     "a per-cputype emitter (see emitMachoStub) to ship "
+                     "FFI for this architecture.",
+                     cputype, kCpuTypeX86_64, kCpuTypeArm64));
+    return false;
+}
 
 // LC byte-size of a path-bearing load command: fixed header + path
 // bytes (NUL-terminated) + pad to kLoadCmdAlign. Used by
@@ -607,6 +803,24 @@ encodeExec(AssembledModule const&    module,
              "AssembledFunction contributed zero bytes.");
         return {};
     }
+    // The static (no-extern) path emits no __TEXT,__const yet — a
+    // read-only data global routes through encodeExecDynamic (the
+    // global_int corpus reaches it via the _exit trampoline, which
+    // appends an extern). Fail loud rather than silently drop the
+    // data globals (the exec read-only data-section arm is dynamic-
+    // only; mirrors ELF D-LK1-ELF-EXEC-DATA-SECTIONS).
+    if (!module.dataItems.empty()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExec: {} AssembledData item(s) "
+                         "present but the static (no-extern) Mach-O "
+                         "path emits no __TEXT,__const — read-only data "
+                         "globals are supported only on the dynamic "
+                         "path (encodeExecDynamic). The exec read-only "
+                         "data-section arm mirrors ELF "
+                         "D-LK1-ELF-EXEC-DATA-SECTIONS.",
+                         module.dataItems.size()));
+        return {};
+    }
 
     // ── (b) Resolve entry function index from schema.entryPoint
     // D-LK10-ENTRY Slice C audit fold: shared resolver. Mach-O
@@ -690,6 +904,24 @@ encodeExec(AssembledModule const&    module,
              "plan 14 §3.1 D-LK7-1.");
         return {};
     }
+    // LC_BUILD_VERSION is emitted only on the dynamic exec path
+    // (encodeExecDynamic) — the sole path the runnable arm64-darwin
+    // corpus uses. A static exec carrying `image.buildVersion` is a
+    // legitimate future combination (e.g. an x86_64-darwin static exec
+    // wanting a platform LC), but it has no shipped consumer today; fail
+    // loud here rather than silently drop the platform command.
+    // D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION (trigger: first static
+    // Mach-O exec format that declares image.buildVersion).
+    if (im.buildVersion.has_value()) {
+        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+             "macho::encodeExec: 'image.buildVersion' (LC_BUILD_VERSION) "
+             "is currently emitted only on the dynamic Mach-O exec path "
+             "(encodeExecDynamic). The static path does not yet emit it "
+             "— route through the dynamic exec path or omit "
+             "image.buildVersion. Anchored "
+             "D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION.");
+        return {};
+    }
     std::uint32_t const ncmds = static_cast<std::uint32_t>(
         2u + 1u + 1u + im.loadDylibs.size() + 1u);
     std::size_t const sizeofcmds =
@@ -730,7 +962,12 @@ encodeExec(AssembledModule const&    module,
     // [fileoff, fileoff+filesize) including the header). vmsize =
     // page-aligned size of all sections. Sections within __TEXT
     // have offset = (their byte position in the file).
-    constexpr std::uint64_t kPageSize = 0x1000;
+    //
+    // VM segment page size is config-driven (`image.segmentPageSize`):
+    // 4 KiB for x86_64-darwin, 16 KiB (0x4000) for arm64-darwin (Apple
+    // Silicon rejects 4 KiB-aligned segments with EBADMACHO). validate()
+    // guarantees a power of two. (D-LK10-ENTRY-MACHO-EXIT.)
+    std::uint64_t const kPageSize = im.segmentPageSize;
     std::uint64_t const textFileOff =
         alignUp(headerAndCmds, kPageSize);
     std::uint64_t const textFileSize = textBody.size();
@@ -951,8 +1188,8 @@ encodeExec(AssembledModule const&    module,
 namespace {
 
 // LC_DYLD_INFO_ONLY / LC_DYSYMTAB / S_* / BIND_OPCODE_* /
-// kStubSize / kGotSlotSize / appendULEB128 are file-level
-// constants/helpers at the top of this file (shared with
+// machoStubSizeFor + emitMachoStub / kGotSlotSize / appendULEB128 are
+// file-level constants/helpers at the top of this file (shared with
 // encodeExec; code-simplifier REQUIRED fold, LK6 cycle 2c review).
 
 // D-LK6-14 chained-fixups payload builder hoisted to private
@@ -994,7 +1231,11 @@ encodeExecDynamic(AssembledModule const&    module,
              "needs at least one entry function.");
         return {};
     }
-    constexpr std::uint64_t kPageSize = 0x1000;
+    // VM segment page size is config-driven (`image.segmentPageSize`):
+    // 4 KiB x86_64-darwin / 16 KiB (0x4000) arm64-darwin. Apple Silicon
+    // rejects 4 KiB-aligned segments with EBADMACHO. validate() proves
+    // it is a power of two. (D-LK10-ENTRY-MACHO-EXIT.)
+    std::uint64_t const kPageSize = im.segmentPageSize;
     std::uint64_t const sectionVa = secText.virtualAddress;
     if (sectionVa < im.pageZeroSize) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
@@ -1044,6 +1285,35 @@ encodeExecDynamic(AssembledModule const&    module,
                 return {};
             }
         }
+    }
+
+    // Dispatch ↔ symbolVa-target coherence guard (D-FFI-EXTERN-CALL-
+    // DISPATCH). This walker points every extern's symbolVa at its
+    // `__stubs` STUB (see `symbolVa.emplace(..., stubVa)` below) and the
+    // stub does the __got indirection — that is `direct-plt` semantics.
+    // A format that declares `indirect-slot` would make the call site
+    // DEREFERENCE the stub's CODE bytes as a function pointer (`FF 15`
+    // through stubVa) → SIGSEGV at the first extern call. The two facts
+    // (where symbolVa points + the declared call shape) MUST agree;
+    // surface the contradiction at link rather than emit a binary that
+    // crashes at runtime. (`direct-plt` and nullopt are both fine here:
+    // direct-plt matches the stub target; a nullopt format would already
+    // have fail-louded at MIR→LIR `lowerCall` for any module with
+    // externs — defense-in-depth, no silent acceptance of indirect-slot.)
+    if (fmt.externCallDispatch().has_value()
+     && externCallUsesIndirectShape(*fmt.externCallDispatch())) {
+        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+             std::format("macho::encodeExecDynamic: object format '{}' "
+                         "declares externCallDispatch='indirect-slot' but "
+                         "the Mach-O walker points each extern symbol's "
+                         "VA at its __stubs STUB (direct-plt semantics) "
+                         "— an indirect-slot call site would dereference "
+                         "the stub's code bytes as a function pointer and "
+                         "SIGSEGV. Set externCallDispatch='direct-plt' "
+                         "(Mach-O symbolVa→stub is direct-plt, like ELF). "
+                         "D-FFI-EXTERN-CALL-DISPATCH.",
+                         fmt.name()));
+        return {};
     }
 
     std::size_t const numExterns = module.externImports.size();
@@ -1101,6 +1371,24 @@ encodeExecDynamic(AssembledModule const&    module,
 
     // ── (e) Symbol-VA map: intra-fn VAs + extern __stubs slot VAs.
     //       __stubs lives right after __text within __TEXT.
+    //
+    // Per-cputype __stubs entry stride (6 for x86_64, 12 for arm64).
+    // Computed ONCE here and threaded through every layout site below
+    // so the stub size is single-sourced. A 0 (unhandled cputype) is
+    // a fail-loud up front — defense-in-depth ahead of `emitMachoStub`,
+    // which also fails loud, but a 0 stride would corrupt the layout
+    // arithmetic before emission if not caught here.
+    std::size_t const stubSize = machoStubSizeFor(id.cputype);
+    if (stubSize == 0u) {
+        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+             std::format("macho::encodeExecDynamic: cputype 0x{:x} has "
+                         "no __stubs entry size — the Mach-O dynamic-"
+                         "import path supports x86_64 (0x{:x}) and arm64 "
+                         "(0x{:x}). Add a per-cputype arm to "
+                         "machoStubSizeFor + emitMachoStub.",
+                         id.cputype, kCpuTypeX86_64, kCpuTypeArm64));
+        return {};
+    }
     std::uint64_t const stubsVa = sectionVa + textBody.size();
     std::unordered_map<SymbolId, std::uint64_t> symbolVa;
     symbolVa.reserve(module.functions.size() + numExterns);
@@ -1118,7 +1406,7 @@ encodeExecDynamic(AssembledModule const&    module,
     }
     for (std::size_t i = 0; i < numExterns; ++i) {
         std::uint64_t const stubVa =
-            stubsVa + static_cast<std::uint64_t>(i) * kStubSize;
+            stubsVa + static_cast<std::uint64_t>(i) * stubSize;
         if (!symbolVa.emplace(module.externImports[i].symbol,
                               stubVa).second) {
             emit(reporter, DiagnosticCode::K_SymbolUndefined,
@@ -1131,6 +1419,62 @@ encodeExecDynamic(AssembledModule const&    module,
         }
     }
 
+    // ── (e.5) D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror: __TEXT,__const ──────
+    //
+    // A loadable read-only data section folded into the R+X __TEXT
+    // segment (mirrors the ELF `.rodata`-in-R+X-PT_LOAD arm, commit
+    // 8040410). `__const` holds the module's read-only data globals
+    // (`int answer=42;`). Like ELF, the section's VA is computed
+    // EARLY here (from `stubsVa` + the stubs byte count, both known
+    // now) so a NAMED data symbol can join `symbolVa` BEFORE the
+    // shared `applyExecRelocations` kernel runs — a code reloc into
+    // the data symbol (the `lea`/ADRP+ADD) then resolves through the
+    // SAME kernel, no rodata loop added to it. The matching FILE
+    // offset (`constFileOff`/`constEnd`) is computed once the layout
+    // is known below, and a fail-loud guard asserts file/VA
+    // congruence inside __TEXT (__TEXT.fileoff = 0 ⇒ VA−fileoff is
+    // constant). Validation + byte layout + the H1 section-align come
+    // from the shared `buildExecRodata` substrate (the SAME helper
+    // the ELF writer uses — single-sourced, format-neutral). EVERY
+    // change below is gated on `hasConst` so an empty `dataItems`
+    // leaves the output byte-identical to the no-data path (the
+    // mandatory control).
+    bool const hasConst = !module.dataItems.empty();
+    // The schema's __const section row is MANDATORY when data globals
+    // are present — fail loud (the format JSON must declare it). Its
+    // addrAlign is the alignment FLOOR (H1 raises it to the strictest
+    // item). secConst also feeds the section_64 record below.
+    ObjectFormatSectionInfo const* secConst =
+        hasConst ? requireSection(fmt, SectionKind::Rodata,
+                                  "macho::encodeExecDynamic", reporter)
+                 : nullptr;
+    if (hasConst && secConst == nullptr) return {};
+    auto const constLayoutOpt = link::format::buildExecRodata(
+        module.dataItems,
+        secConst != nullptr ? secConst->addrAlign : 1,
+        "macho::encodeExecDynamic", reporter);
+    if (!constLayoutOpt.has_value()) return {};
+    auto const& constLayout = *constLayoutOpt;
+    std::uint64_t const constSize = constLayout.bytes.size();
+    // __stubs occupies `numExterns * stubSize` bytes contiguously
+    // after __text; __const starts at the H1-aligned VA above them.
+    std::uint64_t const stubsBytes =
+        static_cast<std::uint64_t>(numExterns) * stubSize;
+    std::uint64_t const constSectionVa =
+        hasConst
+            ? alignUp(stubsVa + stubsBytes, constLayout.maxAlign)
+            : 0;
+    // Each NAMED data item joins symbolVa at `constSectionVa +
+    // itemOffsets[i]` (anonymous SymbolId{} items skipped — M1). A
+    // duplicate symbol fails loud (K_DuplicateDataSymbol).
+    if (hasConst) {
+        if (!link::format::addDataSymbolVas(
+                module.dataItems, constSectionVa, constLayout.itemOffsets,
+                symbolVa, "macho::encodeExecDynamic", reporter)) {
+            return {};
+        }
+    }
+
     // ── (f) Apply intra-module relocations in-place ─────────────
     if (!link::format::applyExecRelocations(
             textBody, module, funcTextStart, symbolVa,
@@ -1139,13 +1483,14 @@ encodeExecDynamic(AssembledModule const&    module,
         return {};
     }
 
-    // ── (g) Build __stubs body: N × `FF 25 disp32` (PC-rel jump
-    //       through __got slot N).
-    //       __got lives in __DATA_CONST at a separate VA computed
-    //       once we know the section layout below.
-    //       Stub at offset i resolves to: jmp *(rip + (gotVa[i] -
-    //       (stubVa_i + 6))). The +6 is the rip value after the
-    //       `FF 25 disp32` instruction (its own length).
+    // ── (g) Build __stubs body: N per-cputype stubs, each reaching
+    //       __got slot N. x86_64 = 6-byte `FF 25 disp32` (PC-relative
+    //       jmp through the slot); arm64 = 12-byte ADRP x16 → LDR x16,
+    //       [x16,#lo12] → BR x16. __got lives in __DATA_CONST at a
+    //       separate VA computed once the section layout is known
+    //       below. The actual byte emission is `emitMachoStub` (the
+    //       file-level stub substrate); see section (l) where gotVa is
+    //       resolved.
 
     // ── (h) Build LC_LOAD_DYLINKER + LC_LOAD_DYLIB sizes ────────
     std::size_t const dylinkerCmdSize =
@@ -1387,29 +1732,55 @@ encodeExecDynamic(AssembledModule const&    module,
     //   (bind opcodes → indirect symtab → nlist → strtab)
 
     constexpr std::size_t kSegCmdPageZeroSize = kSegmentCommand64Size;
-    constexpr std::size_t kSegCmdTextSize =
-        kSegmentCommand64Size + kSection64Size * 2;  // __text + __stubs
+    // __TEXT carries __text + __stubs, plus __const when data globals
+    // are present (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror). One extra 80-byte
+    // section_64 grows `sizeofcmds` → `headerAndCmds` →
+    // `textFileOff = alignUp(headerAndCmds, kPageSize)`. The full
+    // load-command region is well under one page (~840 bytes for the
+    // arm64 corpus + 80 = ~920 ≪ 0x4000 segmentPageSize), so
+    // `textFileOff` stays 0x4000 and `__text.virtualAddress`
+    // congruence (the guard at the top of this function) still holds.
+    std::size_t const kSegCmdTextSize =
+        kSegmentCommand64Size + kSection64Size * (hasConst ? 3u : 2u);
     constexpr std::size_t kSegCmdDataConstSize =
         kSegmentCommand64Size + kSection64Size;      // __got
     constexpr std::size_t kSegCmdLinkeditSize = kSegmentCommand64Size;
     constexpr std::size_t kLcMainSize         = 24;
 
-    // LK7: when `codeSignatureSize > 0`, append LC_CODE_SIGNATURE
-    // (16-byte linkedit_data_command). The reservation lives at
-    // the tail of __LINKEDIT so plan 16 can fill it without
-    // disturbing earlier layout.
-    bool const emitCodeSig = im.codeSignatureSize != 0;
+    // LK7: when `codeSignatureSize > 0` OR an ad-hoc `codeSignature`
+    // block is present, append LC_CODE_SIGNATURE (16-byte
+    // linkedit_data_command). The reservation lives at the tail of
+    // __LINKEDIT so the fill (this cycle, for the ad-hoc block; or
+    // plan 16's full Apple SuperBlob) lands without disturbing earlier
+    // layout.
+    //
+    // D-LK7-ADHOC-CODESIGN-MACHO (increment 2/2): when `codeSignature`
+    // is set the reservation size is DERIVED from the ad-hoc blob's
+    // exact byte length — `adHocCodeSignatureSize` over the SAME
+    // (codeLimit, pageSize, identifier) the fill uses below — NOT the
+    // hand-typed `codeSignatureSize`. `codeLimit` (= the signature's
+    // file offset) is not known until the __LINKEDIT layout completes,
+    // so the derivation happens at the `codeSigReserveSize` assignment
+    // further down (after `codeSigFileOff`). Here we only decide
+    // whether to emit the load command at all.
+    bool const emitCodeSig =
+        im.codeSignatureSize != 0 || im.codeSignature.has_value();
+    // LC_BUILD_VERSION (platform/min-OS) is emitted iff the schema
+    // declares `image.buildVersion` — required for the image to load on
+    // macOS 11+ / Apple Silicon (D-LK10-ENTRY-MACHO-EXIT).
+    bool const emitBuildVersion = im.buildVersion.has_value();
     // ncmds = 4 segments + LC_DYLD_{INFO_ONLY|CHAINED_FIXUPS}
     //       + LC_LOAD_DYLINKER + LC_MAIN + N × LC_LOAD_DYLIB
     //       + LC_SYMTAB + (LC_DYSYMTAB when !useChainedFixups —
     //       D-LK6-14-INTEGRATION-GOT-SLOTS drops it because chained
     //       pointers in __got encode the import ordinal directly, so
     //       the indirect symbol table is redundant) + LC_CODE_SIGNATURE
-    //       when emitCodeSig.
+    //       when emitCodeSig + LC_BUILD_VERSION when emitBuildVersion.
     std::uint32_t const ncmds = static_cast<std::uint32_t>(
         4u + 1u + 1u + 1u + im.loadDylibs.size() + 1u
         + (useChainedFixups ? 0u : 1u)
-        + (emitCodeSig ? 1u : 0u));
+        + (emitCodeSig ? 1u : 0u)
+        + (emitBuildVersion ? 1u : 0u));
     // sizeofcmds: LC_DYLD_CHAINED_FIXUPS is 16 bytes (linkedit_data_
     // command shape — same as LC_CODE_SIGNATURE); LC_DYLD_INFO_ONLY
     // is 48 bytes. Pick the right size for the dyld-binding command.
@@ -1421,7 +1792,8 @@ encodeExecDynamic(AssembledModule const&    module,
         kSegCmdLinkeditSize + dyldBindCmdSize + dylinkerCmdSize +
         kLcMainSize + totalDylibCmdSize + kSymtabCommandSize +
         (useChainedFixups ? 0u : kDysymtabCommandSize) +
-        (emitCodeSig ? kCodeSigCommandSize : 0u);
+        (emitCodeSig ? kCodeSigCommandSize : 0u) +
+        (emitBuildVersion ? kBuildVersionCommandSize : 0u);
     std::size_t const headerAndCmds = kMachHeader64Size + sizeofcmds;
 
     std::uint64_t const textFileOff =
@@ -1429,14 +1801,46 @@ encodeExecDynamic(AssembledModule const&    module,
     std::uint64_t const textFileSize = textBody.size();
     std::uint64_t const stubsFileOff = textFileOff + textFileSize;
     std::uint64_t const stubsFileSize =
-        static_cast<std::uint64_t>(numExterns) * kStubSize;
+        static_cast<std::uint64_t>(numExterns) * stubSize;
+
+    // __TEXT,__const file offset — H1-aligned above __stubs, inside the
+    // same __TEXT segment (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror). Because
+    // __TEXT.fileoff = 0 (Apple convention), VA−fileoff is constant
+    // across __text/__stubs/__const, so `sectionVa + (constFileOff -
+    // textFileOff)` must equal the EARLY `constSectionVa` computed from
+    // `stubsVa`. Assert that congruence fail-loud (a future layout
+    // change or non-divisor align would silently desync the data
+    // symbol VAs the reloc kernel already resolved against).
+    std::uint64_t const constFileOff =
+        hasConst
+            ? alignUp(stubsFileOff + stubsFileSize, constLayout.maxAlign)
+            : (stubsFileOff + stubsFileSize);
+    std::uint64_t const constEnd =
+        hasConst ? (constFileOff + constSize)
+                 : (stubsFileOff + stubsFileSize);
+    if (hasConst
+     && constSectionVa != sectionVa + (constFileOff - textFileOff)) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: __const file/VA "
+                         "congruence broken — constSectionVa(0x{:x}) != "
+                         "sectionVa(0x{:x}) + (constFileOff(0x{:x}) - "
+                         "textFileOff(0x{:x})). The __TEXT segment "
+                         "requires the on-disk __const-from-__text "
+                         "offset to equal the VA offset (the exec "
+                         "read-only data-section arm; mirrors ELF "
+                         "D-LK1-ELF-EXEC-DATA-SECTIONS).",
+                         constSectionVa, sectionVa, constFileOff,
+                         textFileOff));
+        return {};
+    }
 
     // __got lives in __DATA_CONST — separate segment, separate page.
     // dyld maps each segment independently. Place __got's file
-    // offset on a page boundary above stubs (and above the
-    // header/cmds region in VA via __DATA_CONST.vmaddr).
+    // offset on a page boundary above __const (when present) / __stubs
+    // (and above the header/cmds region in VA via __DATA_CONST.vmaddr).
     std::uint64_t const gotFileOff =
-        alignUp(stubsFileOff + stubsFileSize, kPageSize);
+        alignUp(hasConst ? constEnd : (stubsFileOff + stubsFileSize),
+                kPageSize);
     std::uint64_t const gotFileSize =
         static_cast<std::uint64_t>(numExterns) * kGotSlotSize;
     // gotVa derives from the file-offset delta because __TEXT.fileoff
@@ -1452,36 +1856,37 @@ encodeExecDynamic(AssembledModule const&    module,
     std::uint64_t const gotVa =
         sectionVa + (gotFileOff - textFileOff);
 
-    // Now patch __stubs disp32: jmp [rip + (gotVa[i] - stubVa_i+6)].
+    // Build the __stubs body: one per-cputype stub per extern, each
+    // pointing at its __got slot. The per-cputype emitter (x86_64
+    // `FF 25 disp32`; arm64 ADRP+LDR+BR x16) is localized to the file-
+    // level stub substrate above (mirrors elf.cpp's emitPltStub). The
+    // walker stays shape-blind — it threads (stubVa, gotSlotVa) and the
+    // emitter writes `stubSize` bytes or fails loud.
     std::vector<std::uint8_t> stubsBody;
     stubsBody.reserve(stubsFileSize);
     for (std::size_t i = 0; i < numExterns; ++i) {
         std::uint64_t const stubVa = stubsVa +
-            static_cast<std::uint64_t>(i) * kStubSize;
+            static_cast<std::uint64_t>(i) * stubSize;
         std::uint64_t const gotSlotVa = gotVa +
             static_cast<std::uint64_t>(i) * kGotSlotSize;
-        // disp32 = gotSlotVa - (stubVa + 6) (signed, fits in i32).
-        std::int64_t const disp =
-            static_cast<std::int64_t>(gotSlotVa) -
-            static_cast<std::int64_t>(stubVa + kStubSize);
-        if (disp < std::numeric_limits<std::int32_t>::min()
-         || disp > std::numeric_limits<std::int32_t>::max()) {
-            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("macho::encodeExecDynamic: __stubs "
-                             "disp32 overflow (0x{:x}) for extern "
-                             "#{}; image too large for 32-bit "
-                             "PC-relative __got reference.",
-                             static_cast<std::uint64_t>(disp), i));
+        if (!emitMachoStub(id.cputype, stubsBody, stubVa, gotSlotVa, i,
+                           reporter)) {
             return {};
         }
-        stubsBody.push_back(0xFF);
-        stubsBody.push_back(0x25);
-        std::uint32_t const d32 =
-            static_cast<std::uint32_t>(static_cast<std::int32_t>(disp));
-        stubsBody.push_back(static_cast<std::uint8_t>(d32 & 0xFF));
-        stubsBody.push_back(static_cast<std::uint8_t>((d32 >> 8) & 0xFF));
-        stubsBody.push_back(static_cast<std::uint8_t>((d32 >> 16) & 0xFF));
-        stubsBody.push_back(static_cast<std::uint8_t>((d32 >> 24) & 0xFF));
+    }
+    // Substrate invariant: the emitter wrote exactly `stubSize` bytes
+    // per extern. A mismatch means an emitter's byte count diverged
+    // from `machoStubSizeFor` — that would desync every later layout
+    // offset (LC_SEGMENT_64 filesizes, __got page). Fail loud.
+    if (stubsBody.size() != stubsFileSize) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: emitted {} __stubs "
+                         "bytes but layout reserved {} ({} externs × {} "
+                         "stride) — emitMachoStub and machoStubSizeFor "
+                         "disagree (substrate invariant violation).",
+                         stubsBody.size(), stubsFileSize, numExterns,
+                         stubSize));
+        return {};
     }
 
     // ── (l.5) D-LK6-14-INTEGRATION-GOT-SLOTS: now that gotVa is
@@ -1492,22 +1897,24 @@ encodeExecDynamic(AssembledModule const&    module,
     //          populated in section (i)'s else-arm.)
     if (useChainedFixups) {
         // Single-page __DATA_CONST guard. v1 supports at most one
-        // page of __got (kPageSize / kGotSlotSize = 4096 / 8 = 512
-        // externs on a 4 KiB page; 2048 on a 16 KiB page). Multi-page
-        // support requires computing page_starts[i] for each page —
-        // anchored D-LK6-14-MULTI-PAGE-GOT (trigger: first module
-        // with > 512 extern imports OR first 16 KiB-page target).
+        // page of __got: kPageSize / kGotSlotSize slots (512 on a
+        // 4 KiB page, 2048 on a 16 KiB page — kPageSize is now the
+        // config-driven segmentPageSize). Multi-page support requires
+        // computing page_starts[i] for each page — anchored
+        // D-LK6-14-MULTI-PAGE-GOT (trigger: first module with more
+        // extern imports than fit one segmentPageSize of __got).
         if (gotFileSize > kPageSize) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  std::format("macho::encodeExecDynamic: chained-fixups "
                              "__got spans {} bytes > kPageSize {} "
-                             "(= {} extern slots at {} bytes each on "
-                             "a 4 KiB page) — v1 supports single-page "
+                             "(= {} extern slots at {} bytes each on a "
+                             "{}-byte page) — v1 supports single-page "
                              "chains only. Reduce extern count or "
                              "fall back to LC_DYLD_INFO_ONLY. Anchored "
                              "D-LK6-14-MULTI-PAGE-GOT.",
                              gotFileSize, kPageSize,
-                             kPageSize / kGotSlotSize, kGotSlotSize));
+                             kPageSize / kGotSlotSize, kGotSlotSize,
+                             kPageSize));
             return {};
         }
         dss::macho::detail::ChainedSegInfo segInfo;
@@ -1599,23 +2006,42 @@ encodeExecDynamic(AssembledModule const&    module,
                          codeSigFileOff));
         return {};
     }
+    // The reservation byte count. For the ad-hoc `codeSignature` path
+    // it is DERIVED from the exact blob length (Condition 2 — never a
+    // hand-typed size); `codeSigFileOff` is the signature's file offset
+    // == the CodeDirectory `codeLimit` (everything before the signature
+    // is hashed), and was just proven to fit in u32. For the legacy
+    // placeholder path it stays the schema's `codeSignatureSize`.
+    std::uint32_t const codeSigReserveSize =
+        im.codeSignature.has_value()
+            ? dss::macho::detail::adHocCodeSignatureSize(
+                  static_cast<std::uint32_t>(codeSigFileOff),
+                  im.codeSignature->pageSize,
+                  im.codeSignature->identifier)
+            : im.codeSignatureSize;
     std::uint64_t const linkeditFileSize = emitCodeSig
-        ? ((codeSigFileOff + im.codeSignatureSize) - linkeditFileOff)
+        ? ((codeSigFileOff + codeSigReserveSize) - linkeditFileOff)
         : ((strtabOff + strtabSize) - linkeditFileOff);
 
     // Segment VAs:
     std::uint64_t const textSegVmaddr = im.pageZeroSize;
     std::uint64_t const textSecOffsetInSeg = sectionVa - textSegVmaddr;
+    // The __TEXT segment covers __text + __stubs, plus __const when
+    // present (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror). `constEnd` already
+    // equals `stubsFileOff + stubsFileSize` on the no-data path, so
+    // this is byte-identical when hasConst is false.
+    std::uint64_t const textSegCoveredEnd = hasConst
+        ? constEnd
+        : (stubsFileOff + stubsFileSize);
     std::uint64_t const textSegVmsize =
-        alignUp((stubsFileOff + stubsFileSize) - textFileOff
-                + textSecOffsetInSeg,
+        alignUp(textSegCoveredEnd - textFileOff + textSecOffsetInSeg,
                 kPageSize);
     // __TEXT.fileoff = 0 by Apple convention (the mach header sits
-    // inside __TEXT). The segment therefore spans [0, stubsEnd) in
-    // the file — its filesize must equal stubsEnd, NOT
-    // (stubsEnd - textFileOff) which would truncate the mmap before
+    // inside __TEXT). The segment therefore spans [0, coveredEnd) in
+    // the file — its filesize must equal coveredEnd, NOT
+    // (coveredEnd - textFileOff) which would truncate the mmap before
     // reaching .text (code-reviewer C1 fold, dyld correctness).
-    std::uint64_t const textSegFileSize = stubsFileOff + stubsFileSize;
+    std::uint64_t const textSegFileSize = textSegCoveredEnd;
 
     std::uint64_t const dataConstSegVmaddr = gotVa;
     std::uint64_t const dataConstSegVmsize =
@@ -1664,7 +2090,8 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, 0);
     appendU32LE(bytes, 0);
 
-    // LC_SEGMENT_64 __TEXT (2 sections: __text + __stubs)
+    // LC_SEGMENT_64 __TEXT (__text + __stubs, plus __const when data
+    // globals are present — D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror).
     constexpr std::int32_t kVmProtRx = 5;
     appendU32LE(bytes, LC_SEGMENT_64);
     appendU32LE(bytes, static_cast<std::uint32_t>(kSegCmdTextSize));
@@ -1675,7 +2102,7 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU64LE(bytes, textSegFileSize);
     appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRx));
     appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRx));
-    appendU32LE(bytes, 2);
+    appendU32LE(bytes, hasConst ? 3u : 2u);   // nsects
     appendU32LE(bytes, 0);
 
     // section_64 __text
@@ -1705,8 +2132,29 @@ encodeExecDynamic(AssembledModule const&    module,
                 S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS |
                     S_ATTR_SOME_INSTRUCTIONS);
     appendU32LE(bytes, kStubsReserved1);    // index of first indirect sym
-    appendU32LE(bytes, static_cast<std::uint32_t>(kStubSize));  // stub size
+    appendU32LE(bytes, static_cast<std::uint32_t>(stubSize));  // stub size
     appendU32LE(bytes, 0);
+
+    // section_64 __const (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror) — read-only
+    // data globals, inside __TEXT after __stubs. flags = S_REGULAR (0).
+    // The `align` field is log2 (the section_64 convention — matches
+    // __got writing 3 for log2(8)), derived via std::countr_zero from
+    // the H1-raised section alignment.
+    if (hasConst) {
+        appendName16(bytes, secConst->name);
+        appendName16(bytes, secConst->segment);
+        appendU64LE(bytes, constSectionVa);
+        appendU64LE(bytes, constSize);
+        appendU32LE(bytes, static_cast<std::uint32_t>(constFileOff));
+        appendU32LE(bytes, static_cast<std::uint32_t>(
+                               std::countr_zero(constLayout.maxAlign)));
+        appendU32LE(bytes, 0);                 // reloff
+        appendU32LE(bytes, 0);                 // nreloc
+        appendU32LE(bytes, 0);                 // flags = S_REGULAR
+        appendU32LE(bytes, 0);                 // reserved1
+        appendU32LE(bytes, 0);                 // reserved2
+        appendU32LE(bytes, 0);                 // reserved3
+    }
 
     // LC_SEGMENT_64 __DATA_CONST (1 section: __got)
     constexpr std::int32_t kVmProtRw = 3;
@@ -1748,6 +2196,15 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, /*initprot=*/1);
     appendU32LE(bytes, 0);
     appendU32LE(bytes, 0);
+
+    // LC_BUILD_VERSION — emitted after the four LC_SEGMENT_64 commands
+    // (so it does NOT shift the segment indices the bind opcodes
+    // reference) and before the dyld-binding command. Declares the
+    // platform / min-OS so dyld accepts the image on macOS 11+ / Apple
+    // Silicon (D-LK10-ENTRY-MACHO-EXIT).
+    if (emitBuildVersion) {
+        appendBuildVersionCommand(bytes, *im.buildVersion);
+    }
 
     if (useChainedFixups) {
         // LC_DYLD_CHAINED_FIXUPS (modern dyld binding format).
@@ -1852,7 +2309,11 @@ encodeExecDynamic(AssembledModule const&    module,
                     static_cast<std::uint32_t>(kCodeSigCommandSize));
         appendU32LE(bytes,
                     static_cast<std::uint32_t>(codeSigFileOff));
-        appendU32LE(bytes, im.codeSignatureSize);
+        // datasize = the reserved byte count: the derived ad-hoc blob
+        // length on the codeSignature path, else the schema placeholder
+        // size. The ad-hoc fill below asserts the built blob is exactly
+        // this many bytes.
+        appendU32LE(bytes, codeSigReserveSize);
     }
 
     // Sanity: emitted exactly sizeofcmds bytes.
@@ -1874,6 +2335,18 @@ encodeExecDynamic(AssembledModule const&    module,
 
     // __stubs body
     bytes.insert(bytes.end(), stubsBody.begin(), stubsBody.end());
+
+    // __TEXT,__const body — read-only data globals, H1-aligned above
+    // __stubs (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror). Pad to constFileOff
+    // then emit the laid-out bytes; the EXISTING pad-to-gotFileOff
+    // below then advances to the __DATA_CONST page. No-op when
+    // hasConst is false (the const block is empty + constFileOff
+    // collapses into the stubs end).
+    if (hasConst) {
+        while (bytes.size() < constFileOff) bytes.push_back(0);
+        bytes.insert(bytes.end(), constLayout.bytes.begin(),
+                     constLayout.bytes.end());
+    }
 
     // Pad to gotFileOff (separate page from __TEXT)
     while (bytes.size() < gotFileOff) bytes.push_back(0);
@@ -1898,12 +2371,50 @@ encodeExecDynamic(AssembledModule const&    module,
     auto strtabBytes = std::move(strtab).release();
     bytes.insert(bytes.end(), strtabBytes.begin(), strtabBytes.end());
 
-    // LK7: pad to 8-byte-aligned codesign reservation then append
-    // `codeSignatureSize` zero bytes inside __LINKEDIT. The
-    // segment's filesize was computed to include this region.
+    // LK7 / D-LK7-ADHOC-CODESIGN-MACHO: pad to the 8-byte-aligned
+    // codesign reservation, then fill it. At this point `bytes.size()`
+    // has been padded to exactly `codeSigFileOff`, so `bytes[0,
+    // codeSigFileOff)` is the complete signed region (everything before
+    // the signature). The CodeDirectory's `codeLimit` is therefore
+    // `codeSigFileOff` and the page hashes cover those bytes.
     if (emitCodeSig) {
         while (bytes.size() < codeSigFileOff) bytes.push_back(0);
-        bytes.insert(bytes.end(), im.codeSignatureSize, std::uint8_t{0});
+        if (im.codeSignature.has_value()) {
+            // Build the real ad-hoc CodeDirectory + SuperBlob over the
+            // signed bytes and write it into the reservation. execSeg
+            // limit = the __TEXT segment file size (the kernel maps it
+            // as the main binary's executable region).
+            std::vector<std::uint8_t> const sig =
+                dss::macho::detail::buildAdHocCodeSignature(
+                    std::span<std::uint8_t const>{bytes.data(),
+                                                  codeSigFileOff},
+                    static_cast<std::uint32_t>(codeSigFileOff),
+                    im.codeSignature->pageSize,
+                    im.codeSignature->identifier,
+                    textSegFileSize);
+            // Substrate invariant: the built blob occupies the reserved
+            // region EXACTLY (no overrun, no slack). The reservation
+            // size was derived from `adHocCodeSignatureSize` over the
+            // same arguments, so any mismatch is an internal bug —
+            // fail loud rather than emit a corrupt signature.
+            if (sig.size() != codeSigReserveSize) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("macho::encodeExecDynamic: ad-hoc "
+                                 "code-signature blob is {} bytes but "
+                                 "the reservation is {} — "
+                                 "adHocCodeSignatureSize and "
+                                 "buildAdHocCodeSignature disagree "
+                                 "(substrate invariant violation).",
+                                 sig.size(), codeSigReserveSize));
+                return {};
+            }
+            bytes.insert(bytes.end(), sig.begin(), sig.end());
+        } else {
+            // Legacy placeholder path: `codeSignatureSize` zero bytes
+            // for a later (plan 16) post-link fill.
+            bytes.insert(bytes.end(), codeSigReserveSize,
+                         std::uint8_t{0});
+        }
     }
 
     return bytes;

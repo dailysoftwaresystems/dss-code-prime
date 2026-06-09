@@ -3,6 +3,7 @@
 #include "core/cpp_invariants.hpp"  // arithmetic-right-shift assert
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
+#include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -82,6 +84,24 @@ constexpr std::uint32_t PT_PHDR    = 6;
 constexpr std::uint32_t PF_X = 1;
 constexpr std::uint32_t PF_W = 2;
 constexpr std::uint32_t PF_R = 4;
+
+// Map ELF section flags (sh_flags) to program-header permission flags
+// (p_flags). gABI: SHF_ALLOC→PF_R (occupies memory ⇒ readable),
+// SHF_WRITE→PF_W, SHF_EXECINSTR→PF_X. A PT_LOAD covering several
+// sections takes the OR of its members' mapped flags. This replaces
+// the previously-hardcoded `p_flags = 5` for the single .text PT_LOAD
+// with a derivation from the actual sections' sh_flags (D-LK1-ELF-
+// EXEC-DATA-SECTIONS, plan-lock MF-5): .text(6→R+X=5) | .rodata(2→R=4)
+// = 5, so the static-exec byte output is unchanged when no rodata is
+// present, and stays R+X (5) once SHF_ALLOC-only rodata folds in.
+[[nodiscard]] constexpr std::uint32_t
+shFlagsToPFlags(std::uint64_t shFlags) noexcept {
+    std::uint32_t p = 0;
+    if (shFlags & SHF_ALLOC)     p |= PF_R;
+    if (shFlags & SHF_WRITE)     p |= PF_W;
+    if (shFlags & SHF_EXECINSTR) p |= PF_X;
+    return p;
+}
 
 // Elf64 d_tag (gABI 5.10).
 constexpr std::uint64_t DT_NULL    = 0;
@@ -464,6 +484,33 @@ encodeElfExecDynamic(
         return {};
     }
 
+    // ── (a.5) Build `.rodata` for the dynamic image ────────────────
+    //
+    // D-LK1-ELF-EXEC-DATA-SECTIONS extended to the DYNAMIC-FFI arm
+    // (2026-06-09): a program that passes a rodata constant's address to
+    // a shipped extern (`puts("hello")` → the string literal is a rodata
+    // `AssembledData`, its address `lea`'d for the call's pointer arg)
+    // needs `.rodata` IN the dynamic image — the static ET_EXEC arm had
+    // it, this dynamic arm did not, so the string's `.text` relocation
+    // failed loud (`K_SymbolUndefined`). `.rodata` is read-only → it
+    // folds into the R+X PT_LOAD #1, laid out between `.text` and `.plt`.
+    // Reuses the SAME shared `buildExecRodata` + `addDataSymbolVas`
+    // helpers the static path + Mach-O `__const` writer use — zero copy,
+    // zero `if(format)`. An EMPTY dataItems list yields an empty layout
+    // and a zero-size section (no-op, byte-identical to the prior image
+    // for the no-rodata externs case).
+    ObjectFormatSectionInfo const* secRodataDyn =
+        fmt.sectionByKind(SectionKind::Rodata);
+    std::uint64_t const rodataDynAlignFloor =
+        secRodataDyn != nullptr ? secRodataDyn->addrAlign : 1;
+    auto const rodataDynLayoutOpt = link::format::buildExecRodata(
+        module.dataItems, rodataDynAlignFloor,
+        "elf::encodeElfExecDynamic", reporter);
+    if (!rodataDynLayoutOpt.has_value()) return {};
+    auto const& rodataDynLayout = *rodataDynLayoutOpt;
+    bool const hasRodataDyn = !module.dataItems.empty();
+    std::vector<std::uint8_t> const& rodataDyn = rodataDynLayout.bytes;
+
     // ── (b) Group externs by library (preserve declaration order)
     std::vector<std::string> libraryOrder;
     std::unordered_map<std::string, std::vector<std::size_t>>
@@ -582,9 +629,21 @@ encodeElfExecDynamic(
     std::uint64_t const textOff = pageAlign;   // .text at page boundary
     std::uint64_t const textVa  = secText.virtualAddress;
 
+    // `.rodata` immediately after `.text` (both R+X PT_LOAD #1). Aligned
+    // to the layout's max item alignment (gABI sh_addralign). Empty when
+    // the module has no rodata → zero-size section, `.plt` follows `.text`
+    // directly (byte-identical to the pre-rodata image).
+    std::uint64_t const rodataAlignDyn =
+        hasRodataDyn ? rodataDynLayout.maxAlign : 1;
+    std::uint64_t const rodataOff =
+        hasRodataDyn ? alignUp(textOff + text.size(), rodataAlignDyn)
+                     : textOff + text.size();
+    std::uint64_t const rodataVa  = baseImageVa + rodataOff;
+    std::uint64_t const rodataSz  = rodataDyn.size();
+
     // Subsequent sections in PT_LOAD #1; VA = baseImageVa + fileOff
     // (PT_LOAD with fileoff=0 and vaddr=baseImageVa maps verbatim).
-    std::uint64_t const pltOff = alignUp(textOff + text.size(), 16);
+    std::uint64_t const pltOff = alignUp(rodataOff + rodataSz, 16);
     std::uint64_t const pltVa  = baseImageVa + pltOff;
     std::uint64_t const pltSize = plt.size();
 
@@ -704,6 +763,11 @@ encodeElfExecDynamic(
     StringTable shstrtab;
     auto const shsInterp   = shstrtab.add(".interp");
     auto const shsText     = shstrtab.add(".text");
+    // `.rodata` section name (schema row when present, else the literal).
+    // Added unconditionally to shstrtab (a few unused bytes when no rodata);
+    // the SHT entry below is what's gated on `hasRodataDyn`.
+    auto const shsRodata   = shstrtab.add(
+        secRodataDyn != nullptr ? std::string{secRodataDyn->name} : std::string{".rodata"});
     auto const shsPlt      = shstrtab.add(".plt");
     auto const shsDynsym   = shstrtab.add(".dynsym");
     auto const shsDynstr   = shstrtab.add(".dynstr");
@@ -750,10 +814,24 @@ encodeElfExecDynamic(
     // failure C2 convergence — same defect exists in PE walker
     // and is anchored for parallel fold).
     std::unordered_map<SymbolId, std::uint64_t> symbolVa;
-    symbolVa.reserve(module.functions.size() + numExterns);
+    symbolVa.reserve(module.functions.size() + numExterns
+                     + module.dataItems.size());
     for (std::size_t i = 0; i < module.functions.size(); ++i) {
         symbolVa.emplace(module.functions[i].symbol,
                          textVa + funcTextStart[i]);
+    }
+    // D-LK1-ELF-EXEC-DATA-SECTIONS (dynamic arm): each NAMED rodata item
+    // joins symbolVa at `rodataVa + itemOffset[i]` via the SAME shared
+    // `addDataSymbolVas` helper the static path uses, so a `.text`
+    // relocation that targets a rodata SymbolId (the `lea reg,[rip+str]`
+    // for a string-literal pointer arg) resolves through the shared
+    // `applyExecRelocations` kernel. Anonymous items are skipped (M1).
+    if (hasRodataDyn) {
+        if (!link::format::addDataSymbolVas(
+                module.dataItems, rodataVa, rodataDynLayout.itemOffsets,
+                symbolVa, "elf::encodeElfExecDynamic", reporter)) {
+            return {};
+        }
     }
     for (std::size_t i = 0; i < numExterns; ++i) {
         // D-LK6-8: extern symbol VA points at the PLT stub. Stub
@@ -821,6 +899,7 @@ encodeElfExecDynamic(
     // #1 + #4 fold using local padToOffset / appendBytes helpers).
     padToOffset(bytes, interpOff);    appendBytes(bytes, interp);
     padToOffset(bytes, textOff);      appendBytes(bytes, text);
+    if (hasRodataDyn) { padToOffset(bytes, rodataOff); appendBytes(bytes, rodataDyn); }
     padToOffset(bytes, pltOff);       appendBytes(bytes, plt);
     padToOffset(bytes, dynsymOff);    appendBytes(bytes, dynsym);
                                        appendBytes(bytes, dynstr);  // align 1
@@ -834,18 +913,23 @@ encodeElfExecDynamic(
                                        appendBytes(bytes, shstrtab.view());
     padToOffset(bytes, shtOff);
 
-    // ── (o) Section Header Table — 13 entries ─────────────────
-    //   0: SHT_NULL, 1: .interp, 2: .text, 3: .plt,
-    //   4: .dynsym, 5: .dynstr, 6: .hash, 7: .rela.dyn,
-    //   8: .got, 9: .dynamic, 10: .symtab, 11: .strtab, 12: .shstrtab
-    constexpr std::uint16_t IDX_INTERP   = 1;
-    constexpr std::uint16_t IDX_TEXT     = 2;
-    constexpr std::uint16_t IDX_DYNSYM   = 4;
-    constexpr std::uint16_t IDX_DYNSTR   = 5;
-    constexpr std::uint16_t IDX_STRTAB   = 11;
-    constexpr std::uint16_t IDX_SHSTRTAB = 12;
-    constexpr std::uint16_t kNumSections = 13;
-    (void)IDX_INTERP; (void)IDX_TEXT;
+    // ── (o) Section Header Table ──────────────────────────────
+    //   0: SHT_NULL, 1: .interp, 2: .text, [.rodata,] .plt,
+    //   .dynsym, .dynstr, .hash, .rela.dyn, .got, .dynamic,
+    //   .symtab, .strtab, .shstrtab
+    //
+    // D-LK1-ELF-EXEC-DATA-SECTIONS (dynamic arm): `.rodata`, WHEN present,
+    // occupies index 3 (after `.text`@2, before `.plt`) — mirroring the
+    // static ET_EXEC arm's `.rodata`@idx2 insertion. Every section after
+    // it shifts +1, so the cross-reference indices (.link/.info/e_shstrndx)
+    // are computed with `rodataShift` (1 when present, 0 when absent) so
+    // the no-rodata image is byte-identical to the pre-fix layout.
+    std::uint16_t const rodataShift = hasRodataDyn ? 1 : 0;
+    std::uint16_t const IDX_DYNSYM   = static_cast<std::uint16_t>(4 + rodataShift);
+    std::uint16_t const IDX_DYNSTR   = static_cast<std::uint16_t>(5 + rodataShift);
+    std::uint16_t const IDX_STRTAB   = static_cast<std::uint16_t>(11 + rodataShift);
+    std::uint16_t const IDX_SHSTRTAB = static_cast<std::uint16_t>(12 + rodataShift);
+    std::uint16_t const kNumSections = static_cast<std::uint16_t>(13 + rodataShift);
 
     // Designated initializers per `SectionHeader` field — type-design
     // #1 + simplifier #3 fold: 10-arg positional pushShdr lambda
@@ -860,6 +944,15 @@ encodeElfExecDynamic(
         .name_offset = shsText, .type = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_EXECINSTR,
         .addr = textVa, .offset = textOff, .size = text.size(),
         .addr_align = 16});
+    // `.rodata` (SHF_ALLOC, R) — present only when the module carries
+    // rodata; folds into the R+X PT_LOAD #1. Read-only data, NO
+    // SHF_EXECINSTR / SHF_WRITE.
+    if (hasRodataDyn) {
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsRodata, .type = SHT_PROGBITS, .flags = SHF_ALLOC,
+            .addr = rodataVa, .offset = rodataOff, .size = rodataSz,
+            .addr_align = rodataAlignDyn});
+    }
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsPlt, .type = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_EXECINSTR,
         .addr = pltVa, .offset = pltOff, .size = pltSize,
@@ -1048,6 +1141,86 @@ encode(AssembledModule const&    module,
         return {};
     }
 
+    // ── Build .rodata bytes from AssembledData.dataItems ───────────
+    //
+    // D-LK1-ELF-EXEC-DATA-SECTIONS (rodata-only scope): the ET_EXEC
+    // walker emits a loadable `.rodata` section when the module
+    // carries any `AssembledData` item with `section ==
+    // DataSectionKind::Rodata`. Mirrors the PE walker's `.rdata` arm
+    // (pe.cpp:655-714) precisely: per-item bytes are placed at the
+    // item's `Alignment` (padding zero-filled); the section's VA is
+    // computed contiguously after `.text`. This rodata is folded
+    // into the SAME R+X `.text` PT_LOAD (SHF_ALLOC only — strictly
+    // less permissive than writable; W^X preserved).
+    //
+    // Discipline pin (mirrors the PE fold): the non-Rodata fail-loud
+    // below runs UNCONDITIONALLY across `module.dataItems` (NOT
+    // guarded by a hasRodata bool), so a module carrying ONLY
+    // Data/Bss items cannot slip past the gate via a dropped scan.
+    // Data/Bss arms remain anchored under D-LK4-RODATA-PRODUCER.
+    // A data item carrying its OWN relocations (data→data references —
+    // a vtable / pointer table) is deferred this cycle: this writer
+    // does not yet patch dataItem relocations into `.rodata`
+    // (D-LK1-ELF-RODATA-DATAITEM-RELOC). `int g=42;` produces neither.
+    using link::format::detail::alignUp;
+    // ── Validate + lay out `.rodata` via the shared exec data-section
+    // substrate (`exec_data_section.hpp`) — the SAME helper the Mach-O
+    // `__const` writer uses, so the per-item validation (Rodata-only +
+    // no-data->data-relocs) + the byte layout + the H1 section-align
+    // raise are single-sourced (no copy in two walkers). The
+    // `writerName` carries the ET_EXEC/ET_REL qualifier so the format-
+    // neutral diagnostics still pinpoint the ELF form. The validation
+    // runs for BOTH forms (it precedes the `!isExec` reject below), so
+    // a module carrying ONLY Data/Bss items cannot slip past.
+    // D-LK1-ELF-EXEC-DATA-SECTIONS.
+    std::string const elfDataWriterName =
+        isExec ? "elf::encode (ET_EXEC)" : "elf::encode (ET_REL)";
+    // Floor = the schema's `.rodata` addrAlign when the row exists
+    // (peeked WITHOUT a diagnostic; the mandatory fail-loud
+    // `requireSection` on the exec path below is what enforces the row).
+    ObjectFormatSectionInfo const* secRodataPeek =
+        fmt.sectionByKind(SectionKind::Rodata);
+    std::uint64_t const rodataAlignFloor =
+        secRodataPeek != nullptr ? secRodataPeek->addrAlign : 1;
+    auto const rodataLayoutOpt = link::format::buildExecRodata(
+        module.dataItems, rodataAlignFloor, elfDataWriterName, reporter);
+    if (!rodataLayoutOpt.has_value()) return {};
+    auto const& rodataLayout = *rodataLayoutOpt;
+
+    bool const hasRodata = isExec && !module.dataItems.empty();
+    // Reject dataItems on the ET_REL (.o) path loudly — the linker's
+    // per-format gate already advertises rodata only on the exec
+    // schema, but defend in depth: a hand-built ET_REL module with
+    // dataItems would otherwise silently drop them (no .rodata in .o).
+    if (!isExec && !module.dataItems.empty()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "elf::encode (ET_REL): AssembledData items are not "
+             "emitted into relocatable .o output — rodata in a .o "
+             "rides through the symbol+section table, not the "
+             "dataItems pipeline. D-LK1-ELF-EXEC-DATA-SECTIONS is "
+             "exec-only.");
+        return {};
+    }
+    // On the exec path the `.rodata` section row is MANDATORY — fail
+    // loud (the format JSON must declare it). `secRodata` also feeds
+    // the section-header sh_type / sh_flags / name below.
+    ObjectFormatSectionInfo const* secRodata =
+        hasRodata ? requireSection(fmt, SectionKind::Rodata,
+                                   "ELF writer", reporter)
+                  : nullptr;
+    if (hasRodata && secRodata == nullptr) return {};
+    // The H1-raised section alignment + the laid-out bytes + per-item
+    // section-relative offsets (the start of each item's bytes within
+    // the concatenated `.rodata` payload). The offsets extend the
+    // symbolVa map below so a `.text` relocation targeting a rodata
+    // SymbolId resolves to `rodataSectionVa + rodataItemOffsets[i]`.
+    // u64 (ELF sh_size/sh_offset + the symbolVa values these feed are
+    // u64). For the no-rodata case these are empty / 1 → no-op.
+    std::uint64_t const rodataAlign = hasRodata ? rodataLayout.maxAlign : 1;
+    std::vector<std::uint8_t> const& rodataBytes = rodataLayout.bytes;
+    std::vector<std::uint64_t> const& rodataItemOffsets =
+        rodataLayout.itemOffsets;
+
     // ── Build .text + per-function symbols ─────────────────────
     //
     // Concatenate every AssembledFunction's bytes into one .text
@@ -1073,6 +1246,17 @@ encode(AssembledModule const&    module,
                             static_cast<std::uint64_t>(fn.bytes.size())});
     }
 
+    // .rodata runtime VA — contiguous after `.text`, rounded up to
+    // the rodata section's addralign (D-LK1-ELF-EXEC-DATA-SECTIONS).
+    // Computed HERE (now that `text.size()` is known) so it is in
+    // scope for BOTH the symbolVa map below AND the file-layout pass
+    // further down. The file-offset congruence (rodata-from-text on
+    // disk == rodata-from-text in VA) is asserted at layout time.
+    std::uint64_t const rodataSectionVa =
+        hasRodata
+            ? secText->virtualAddress + alignUp(text.size(), rodataAlign)
+            : 0;
+
     // ── ET_EXEC: apply intra-module relocations in-place ───────
     //
     // Delegated to the shared `applyExecRelocations` kernel in
@@ -1087,10 +1271,30 @@ encode(AssembledModule const&    module,
         // when externs land, they extend this same map with GOT
         // / PLT slot VAs.
         std::unordered_map<SymbolId, std::uint64_t> symbolVa;
-        symbolVa.reserve(module.functions.size());
+        symbolVa.reserve(module.functions.size()
+                         + module.dataItems.size());
         for (std::size_t i = 0; i < module.functions.size(); ++i) {
             symbolVa.emplace(module.functions[i].symbol,
                              secText->virtualAddress + funcTextStart[i]);
+        }
+        // D-LK1-ELF-EXEC-DATA-SECTIONS: each NAMED rodata
+        // `AssembledData` item joins the symbolVa map at
+        // `rodataSectionVa + rodataItemOffsets[i]` via the shared
+        // `addDataSymbolVas` substrate (the SAME helper the Mach-O
+        // `__const` writer uses). A `.text` relocation that targets a
+        // rodata SymbolId (the code's `lea reg, [rip + g]`) now
+        // resolves through the SAME shared `applyExecRelocations`
+        // kernel — no rodata loop is added to that kernel; it stays
+        // functions-only. Anonymous `SymbolId{}` items are skipped (M1
+        // — offset-referenced, never reloc targets). A rodata SymbolId
+        // colliding with a function SymbolId is a caller bug
+        // (REDEFINITION); the helper emits K_DuplicateDataSymbol.
+        if (hasRodata) {
+            if (!link::format::addDataSymbolVas(
+                    module.dataItems, rodataSectionVa, rodataItemOffsets,
+                    symbolVa, "elf::encode (ET_EXEC)", reporter)) {
+                return {};
+            }
         }
         if (!link::format::applyExecRelocations(
                 text, module, funcTextStart, symbolVa,
@@ -1223,11 +1427,15 @@ encode(AssembledModule const&    module,
     StringTable shstrtab;
     SectionHeader hNull{};
     SectionHeader hText{};
+    SectionHeader hRodata{};
     SectionHeader hRela{};
     SectionHeader hSymtab{};
     SectionHeader hStrtab{};
     SectionHeader hShStrtab{};
     hText.name_offset      = shstrtab.add(secText->name);
+    if (hasRodata) {
+        hRodata.name_offset = shstrtab.add(secRodata->name);
+    }
     if (secRela != nullptr) {
         hRela.name_offset  = shstrtab.add(secRela->name);
     }
@@ -1237,17 +1445,26 @@ encode(AssembledModule const&    module,
 
     // Section indices — IDX_TEXT==1 is pinned (the STT_SECTION sym
     // emitted above hardcodes st_shndx=1). Other indices depend on
-    // whether the `.rela.text` slot is present:
-    //   ET_REL:  Null(0), Text(1), Rela(2), Symtab(3), Strtab(4), ShStrtab(5).
-    //   ET_EXEC: Null(0), Text(1), Symtab(2), Strtab(3), ShStrtab(4).
+    // whether the `.rela.text` slot is present AND whether `.rodata`
+    // is present:
+    //   ET_REL:               Null(0), Text(1), Rela(2), Symtab(3), Strtab(4), ShStrtab(5).
+    //   ET_EXEC (no rodata):  Null(0), Text(1),          Symtab(2), Strtab(3), ShStrtab(4).
+    //   ET_EXEC (+ rodata):   Null(0), Text(1), Rodata(2), Symtab(3), Strtab(4), ShStrtab(5).
     // The phantom SHT_NULL placeholder in ET_EXEC was an LK1-cycle-2
     // first draft; architect convergence pulled it out so `readelf
     // -S` doesn't show a blank slot at idx 2 and the index math is
-    // honest.
+    // honest. `.rodata` (D-LK1-ELF-EXEC-DATA-SECTIONS) sits at index
+    // 2 when present, shifting the trailing sections +1.
     constexpr std::uint16_t IDX_TEXT     = 1;
-    std::uint16_t const IDX_SYMTAB   = isExec ? 2u : 3u;
-    std::uint16_t const IDX_STRTAB   = isExec ? 3u : 4u;
-    std::uint16_t const IDX_SHSTRTAB = isExec ? 4u : 5u;
+    // `.rodata`, when present, occupies index 2 (see the table above)
+    // and shifts every trailing section +1 via `rodataShift`. There is
+    // no `IDX_RODATA` constant: the header table is built by ordered
+    // `push_back`, not index lookup, so the trailing-section indices
+    // are the only ones that need computing.
+    std::uint16_t const rodataShift  = hasRodata ? 1u : 0u;
+    std::uint16_t const IDX_SYMTAB   = static_cast<std::uint16_t>((isExec ? 2u : 3u) + rodataShift);
+    std::uint16_t const IDX_STRTAB   = static_cast<std::uint16_t>((isExec ? 3u : 4u) + rodataShift);
+    std::uint16_t const IDX_SHSTRTAB = static_cast<std::uint16_t>((isExec ? 4u : 5u) + rodataShift);
 
     hText.type       = secText->type;
     hText.flags      = secText->flags;
@@ -1257,6 +1474,20 @@ encode(AssembledModule const&    module,
     // sh_addr — ET_EXEC fills from schema's virtualAddress; ET_REL
     // leaves it 0 (unbound in .o).
     hText.addr       = isExec ? secText->virtualAddress : 0;
+
+    // .rodata section header (D-LK1-ELF-EXEC-DATA-SECTIONS). sh_type
+    // / sh_flags / sh_addralign are read from the schema row (NOT
+    // hardcoded — `secRodata->flags` is the config sh_flags=SHF_ALLOC).
+    // sh_addr = the contiguous-after-.text VA computed above; sh_offset
+    // is filled by layoutSection below.
+    if (hasRodata) {
+        hRodata.type       = secRodata->type;
+        hRodata.flags      = secRodata->flags;
+        hRodata.addr_align = rodataAlign;
+        hRodata.entry_size = secRodata->entrySize;
+        hRodata.size       = rodataBytes.size();
+        hRodata.addr       = rodataSectionVa;
+    }
 
     if (secRela != nullptr) {
         hRela.type       = secRela->type;
@@ -1331,6 +1562,34 @@ encode(AssembledModule const&    module,
     std::uint64_t const pageAlign = fmt.elf().pageAlign;
     if (isExec) padTo(bytes, pageAlign);
     layoutSection(hText, text);
+    // `.rodata` immediately after `.text` (D-LK1-ELF-EXEC-DATA-
+    // SECTIONS). The on-disk rodata-from-text delta MUST equal the
+    // VA rodata-from-text delta so the single PT_LOAD's file<->mem
+    // mapping is congruent: hText.offset is page-aligned (already
+    // rodataAlign-aligned since rodataAlign | pageAlign for the
+    // shipped 8|4096 case), and layoutSection pads rodata to
+    // rodataAlign — so `hRodata.offset - hText.offset ==
+    // alignUp(text.size(), rodataAlign)`, matching the early
+    // `rodataSectionVa`. Defend that congruence with a fail-loud
+    // guard (a non-divisor rodataAlign or future layout change would
+    // otherwise silently desync VA from file offset → the loader
+    // maps the wrong bytes at the global's runtime address).
+    if (hasRodata) {
+        layoutSection(hRodata, rodataBytes);
+        std::uint64_t const fileDelta = hRodata.offset - hText.offset;
+        if (secText->virtualAddress + fileDelta != rodataSectionVa) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("elf::encode (ET_EXEC): .rodata file/VA "
+                             "congruence broken — textVa({}) + "
+                             "fileDelta({}) != rodataSectionVa({}). The "
+                             "single PT_LOAD requires the on-disk "
+                             ".rodata-from-.text offset to equal the VA "
+                             "offset. D-LK1-ELF-EXEC-DATA-SECTIONS.",
+                             secText->virtualAddress, fileDelta,
+                             rodataSectionVa));
+            return {};
+        }
+    }
     if (secRela != nullptr) layoutSection(hRela, relaText);
     layoutSection(hSymtab, symtab);
     layoutSection(hStrtab, strtab.view());
@@ -1347,9 +1606,14 @@ encode(AssembledModule const&    module,
     // actually-emitted slots — same architect B-LK1-2 / D-LK2-5
     // discipline that LK1 cycle 1 + LK2 already adopt.
     std::vector<SectionHeader const*> headers;
-    headers.reserve(6);
+    headers.reserve(7);
     headers.push_back(&hNull);
     headers.push_back(&hText);
+    // `.rodata` at index 2 when present (D-LK1-ELF-EXEC-DATA-SECTIONS)
+    // — this push order is what puts it at index 2 and keeps the
+    // `rodataShift` of the trailing IDX_* coherent with the header
+    // table ordering.
+    if (hasRodata) headers.push_back(&hRodata);
     if (!isExec) headers.push_back(&hRela);
     headers.push_back(&hSymtab);
     headers.push_back(&hStrtab);
@@ -1447,18 +1711,35 @@ encode(AssembledModule const&    module,
     if (isExec) {
         std::vector<std::uint8_t> phdr;
         phdr.reserve(kProgramHeaderSize);
+        // The single PT_LOAD covers `.text` and — when present —
+        // `.rodata` (D-LK1-ELF-EXEC-DATA-SECTIONS). Both are
+        // contiguous on disk and in VA (the layout congruence guard
+        // above proves it), so ONE segment maps them. p_flags is the
+        // OR of the segment's sections' mapped permissions (NOT the
+        // old hardcoded 5): .text(R+X) | .rodata(R) = R+X = 5, so the
+        // no-rodata output is byte-identical and the rodata case stays
+        // R+X — strictly no new write permission (W^X preserved).
+        std::uint32_t pFlags = shFlagsToPFlags(secText->flags);
+        if (hasRodata) pFlags |= shFlagsToPFlags(secRodata->flags);
+        // p_filesz / p_memsz span .text through the end of .rodata
+        // when present (file offsets are contiguous post-layout), else
+        // just .text. Derived from the on-disk extent so it tracks the
+        // actual emitted bytes.
+        std::uint64_t const segByteLen =
+            hasRodata ? (hRodata.offset + rodataBytes.size() - hText.offset)
+                      : text.size();
         // p_type = PT_LOAD = 1
         appendU32LE(phdr, 1);
-        // p_flags = PF_X | PF_R = 5 (.text is executable + readable)
-        appendU32LE(phdr, 5);
-        // p_offset = file offset of .text
+        // p_flags — derived above (R / W / X from section sh_flags).
+        appendU32LE(phdr, pFlags);
+        // p_offset = file offset of .text (segment start)
         appendU64LE(phdr, hText.offset);
-        // p_vaddr / p_paddr = virtual address of .text
+        // p_vaddr / p_paddr = virtual address of .text (segment start)
         appendU64LE(phdr, secText->virtualAddress);
         appendU64LE(phdr, secText->virtualAddress);
-        // p_filesz / p_memsz = byte length of .text
-        appendU64LE(phdr, text.size());
-        appendU64LE(phdr, text.size());
+        // p_filesz / p_memsz = byte length of the segment (.text [+ .rodata])
+        appendU64LE(phdr, segByteLen);
+        appendU64LE(phdr, segByteLen);
         // p_align — declared by the format schema per (arch × OS).
         // See the `padTo(bytes, pageAlign)` call above; both must
         // use the SAME value or the kernel's congruence check

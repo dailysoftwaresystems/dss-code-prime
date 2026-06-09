@@ -133,21 +133,31 @@ readU32LE(std::span<std::uint8_t const> bytes, std::size_t offset) noexcept {
 // calls `appendPendingReloc` to push a `Relocation` entry into the
 // AssembledFunction.relocations list AT THE BYTE OFFSET that the
 // linker will patch (the current `out.size()` — i.e. the position
-// the placeholder bytes are ABOUT to be written into). Cycle-4
-// encoders accumulate AT MOST ONE per instruction (one symbol-
-// relative wire per opcode — Disp32 on x86, Imm26 on fixed32);
-// `std::optional<PendingRelocSlot>` carries this cleanly.
+// the placeholder bytes are ABOUT to be written into).
+//
+// D-AS4-3 (multi-instruction-macro / multi-relocation encoder): a
+// single instruction may now accumulate MULTIPLE pending relocations
+// (AArch64 `lea` emits two — `adr_prel_pg_hi21` on word 0 and
+// `add_abs_lo12_nc` on word 1). `wordIndex` records which 32-bit
+// word of a multi-word `fixed32` template the slot lives in, so the
+// emit loop stamps each reloc at the START of its word (the byte
+// offset the linker's `readInst32` reads). Single-word encoders
+// (x86 Disp32, fixed32 Imm26) leave `wordIndex` at its default 0 —
+// behaviour-identical to the prior single-trailing-slot model.
 struct PendingRelocSlot {
     RelocationKind kind;
     SymbolId       target;
+    std::uint8_t   wordIndex = 0;
 };
 
 // Push a `Relocation` entry at the current end of `out`. The reloc's
 // `offset` points AT the bytes the linker will patch — capture
-// happens BEFORE the placeholder bytes are appended (cycle-4 scope:
-// the symbol slot is always at the trailing position of an
-// instruction; D-AS4-3 captures the per-slot byte-offset table for
-// future non-trailing symbol slots). `addend` is 0 in cycle scope
+// happens BEFORE the placeholder bytes are appended. The CALLER
+// controls the emit cursor: for a multi-word template the walker
+// invokes this immediately before appending word `pending.wordIndex`,
+// so `out.size()` is exactly that word's start (D-AS4-3 — the per-word
+// byte offset is DERIVED from the emit cursor, never a separately
+// computed `base + wordIndex*4`). `addend` is 0 in cycle scope
 // (D-AS4-4 anchors wire-declared addend bias).
 inline void
 appendPendingReloc(std::vector<Relocation>&   relocs,

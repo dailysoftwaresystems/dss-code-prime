@@ -21,6 +21,22 @@ A config that loads cleanly produces a `GrammarSchema` you can pass to `TreeBuil
 
 ---
 
+## 1.1 Configuration file types
+
+The bulk of this spec covers `sources/<lang>.lang.json` — the grammar config — because that is the one you author when adding a language. But the compiler is driven by **several** JSON config types, all under `src/dss-config/`. Each is loaded by its own reader and answers a different agnosticism axis (source language / CPU target / object format / optimizer / shipped libraries). The full set:
+
+| Config type | Location (under `src/dss-config/`) | Purpose |
+|---|---|---|
+| Source language | `sources/<lang>.lang.json` | A source language's grammar + lexer + keywords + scopes + shapes (+ v3 `typeExtensions`, v4 `imports`, semantics, and HIR-lowering data). The subject of the rest of this spec. Shipped: `c-subset`, `toy`, `tsql-subset`. |
+| Target | `targets/<arch>.target.json` | Per-CPU backend data: instruction encoding, registers, calling conventions, and relocation kinds. Shipped: `x86_64`, `arm64`. |
+| Object format | `object-formats/<fmt>.format.json` | Per-object-format layout/relocation/process-exit data (section layout, relocation mapping, entry/exit conventions). Shipped: PE, ELF (x86-64 + aarch64), Mach-O, SPIR-V, WASM variants. |
+| Pipeline | `pipelines/<name>.pipeline.json` | An optimizer pass pipeline: the ordered pass list plus tuning knobs (`maxIterations`, `inlineThreshold`). Shipped: `debug`, `release`. |
+| Shipped-library FFI descriptor | `shippedLibs/<platform>/<lib>.json` | **New (this cycle).** A language-neutral descriptor of a shipped system library's exported symbols, so a program can `#include <stdio.h>` (or a language's import equivalent) and use `puts` with no inline `extern` re-declaration. See [§12](#12-shipped-library-ffi-descriptor). |
+
+These divide cleanly along the project's agnosticism axes: the **source-language** config is the only one that varies per language; the **target** and **object-format** configs are what keep the backend CPU- and format-agnostic; the **pipeline** config is target/format/language-neutral optimizer data; and the **shipped-library** descriptor is deliberately language-neutral (one descriptor serves every source language on that platform). `schemas/` alongside them holds JSON-schema validation aids, not loadable compiler config.
+
+---
+
 ## 2. Top-level structure
 
 ```jsonc
@@ -663,3 +679,74 @@ An **optional** top-level array naming the **artifact profiles** a language can 
 |---|---|
 | `C_UnknownArtifactProfile` | An entry isn't in the registered set, OR `artifactProfiles` isn't an array, OR an entry isn't a string. Use one of `cli`/`gui`/`lib`/`staticlib`/`script`/`sproc`/`transpile`/`shader`/`hdl`. |
 | `C_RedundantField` on `artifactProfiles` | The same profile is listed twice; remove the duplicate. |
+
+---
+
+## 12. Shipped-library FFI descriptor
+
+> A different config **type** from `.lang.json` (see [§1.1](#11-configuration-file-types)). This one is **language-neutral**: a single descriptor serves every source language compiling on that platform.
+
+### 12.1 Purpose
+
+A shipped system library — libc / `msvcrt.dll`, `kernel32`, `libSystem`, … — exports symbols (`puts`, `malloc`, `GetStdHandle`) that programs call without ever defining them. To call one in C you `#include <stdio.h>` and the header carries the prototype; you never re-declare `puts` yourself.
+
+DSS Code Prime ships those prototypes **once**, language-neutrally, as a JSON descriptor under `src/dss-config/shippedLibs/<platform>/<lib>.json`. A program does an angle/system include (`#include <stdio.h>`, or whatever import form the source language declares) and the symbols become visible to the call — with **no inline `extern` re-declaration** in the program. Because the descriptor is neutral JSON (not per-language source), one `stdio.json` serves c-subset and any other language that imports it; a second language reuses the same descriptors with zero engine change.
+
+The reader is `dss::ffi::readShippedLibDescriptor` ([`src/ffi/shipped_lib_descriptor.hpp`](../src/ffi/shipped_lib_descriptor.hpp)). It is a pure function of `(path, interner, typeReg, reporter)` — it branches on no source language, no CPU target, no object format. Every type it builds is interned through the caller's `TypeInterner`.
+
+### 12.2 Shape
+
+```jsonc
+{
+  "header":   "stdio.h",                   // required — provenance: which header
+  "standard": "c89",                       // optional — provenance: which standard
+  "library":  "msvcrt.dll",                // optional — see below
+  "symbols": [                             // required, non-empty
+    {
+      "name":      "puts",                 // required — the canonical symbol name
+      "signature": "fn(ptr<char>) -> i32", // required — an IR type-text string
+      "kind":      "function",             // optional — "function" | "object"
+      "linkage":   "external"              // optional — "external" | "weak"
+    }
+  ]
+}
+```
+
+The shipped `stdio.json` (`src/dss-config/shippedLibs/windows-x86_64/stdio.json`) is exactly this shape, carrying the standard stdio surface (`puts`, `fopen`, `fread`, …). The full set of shipped surfaces and their per-platform ABI deltas are catalogued in [`src/dss-config/shippedLibs/README.md`](../src/dss-config/shippedLibs/README.md).
+
+| Field | Level | Required | Notes |
+|---|---|---|---|
+| `header` | top | **yes** | **Provenance.** The header these symbols come from (e.g. `"stdio.h"`) — the machine-readable answer to *"where does `puts` come from?"*, which is the whole point of a shipped descriptor. Must be a non-empty string; a missing or empty `header` is a malformed descriptor (fails loud), never silently provenance-less. |
+| `standard` | top | no | **Provenance.** The language standard the surface targets (e.g. `"c89"`, `"c99"`). Descriptive only — it drives no behavior. |
+| `library` | top | no | The runtime import library every symbol in this descriptor routes to (e.g. `"msvcrt.dll"`). **Optional** — when absent (or empty), the CST→HIR lowering falls back to the active language's per-object-format default (`externLibraryByFormat[format]` in the `.lang.json`). A descriptor MAY omit it and inherit the language's default. |
+| `symbols` | top | **yes** | A **non-empty** array of symbol objects. A descriptor that declares no symbols is a no-op artifact and is rejected rather than shipped silently. |
+| `name` | symbol | **yes** | The canonical, undecorated symbol identifier (e.g. `"puts"`). Must be a non-empty string. The linker-visible decorated name is produced downstream by name mangling — the descriptor carries the source name only. |
+| `signature` | symbol | **yes** | An **IR type-text string** — a full `fn(...) -> ...` signature for a function, or a value type for an object. Decoded by the single shared `parseTypeFromText`; see [`ir-type-text.md`](./ir-type-text.md) for the complete grammar. The example `"fn(ptr<char>) -> i32"` is the C `int puts(const char*)` signature. |
+| `kind` | symbol | no (default `"function"`) | Closed enum: `"function"` \| `"object"`. Selects which HIR extern node the lowering synthesizes — `"function"` → an extern function (the `signature` is its `fn` signature); `"object"` → an extern global data symbol (the `signature` is its value type). |
+| `linkage` | symbol | no (default `"external"`) | Closed enum: `"external"` \| `"weak"`. Declared linkage of the symbol. Validated on read and carried for forward-compatibility (the current source-declared FFI synthesis path emits strong linkage uniformly — a shipped symbol is an authoritative import). |
+
+> **Enum values are exactly two each.** `kind` accepts only `"function"` / `"object"`; `linkage` accepts only `"external"` / `"weak"`. There is no `"local"` linkage and no third `kind` in the descriptor schema — any other string is a malformed descriptor.
+
+### 12.3 Resolution flow
+
+How a `#include <stdio.h>` ends up as a resolved call to `puts`:
+
+1. **Angle/system include.** The source language declares the angle/system include form via its `imports` block's `systemPathToken` ([§11.1](#111-imports--config-driven-import-resolution)). The angle form `#include <stdio.h>` is the **system** form (distinct from the quote form's local-source search).
+2. **Map to a descriptor.** The import resolver maps the requested header to `<stem>.json` — `<stdio.h>` (or `<stdio>`) becomes `stdio.json` — and searches the `shippedLibDirs` system search path (the per-language analogue of C's `/usr/include`, declared in `SemanticConfig.shippedLibDirs`, e.g. `shippedLibs/windows-x86_64`). A hit records the resolved descriptor path on the compilation unit; unlike a quote include it is **not** parsed as a source Tree and produces no `CrossTreeRef`.
+3. **Inject into scope.** The semantic phase reads each recorded descriptor via `readShippedLibDescriptor`, decoding every `signature` into the CU's interner and injecting the symbols (as extern functions / globals) into the semantic scope — so the program's call to `puts` resolves to a declared symbol.
+4. **FFI synthesis → linker import.** The decoded externs flow through the FFI synthesis path (synthesizing the HIR extern records) and on to the linker as library imports, with the owning library taken from `library` (or the language's `externLibraryByFormat` fallback).
+
+### 12.4 Fail-loud
+
+The reader never returns a partial result — if **any** diagnostic is emitted during the read, it returns nothing rather than hand back a surface that silently dropped symbols. Both codes below are **unsuppressable**:
+
+| Code | When |
+|---|---|
+| `F_ShippedLibDescriptorMalformed` | The descriptor is structurally bad: unreadable file, invalid JSON, non-object top level, missing/wrong-typed required key (`header`, `symbols`, `name`, `signature`), empty `header`, empty `symbols`, empty `name`, an unknown key (closed key sets are enforced at both the top level and per symbol), or an unrecognized `kind`/`linkage` enum value. |
+| `F_ShippedLibUnsupportedType` | A symbol's `signature` string failed to decode as a type (`parseTypeFromText` returned `InvalidType`). **Critical:** such a symbol is *never* appended with an invalid type — the whole read fails, so no extern is ever synthesized with an unresolved signature. |
+
+(Distinct from `F_ShippedHeaderNotFound`, also unsuppressable, which the import resolver emits earlier when an angle include resolves to no descriptor at all on the `shippedLibDirs` path — a missing system header is a fatal error, matching C.)
+
+### 12.5 Platform note
+
+The descriptor directory is named **per-platform** (`windows-x86_64`), and the language's `shippedLibDirs` names that exact platform subdirectory. Three platform surfaces are shipped and validated to decode (`windows-x86_64`, `linux-x86_64`, `macos-arm64`) — the latter two differ from Windows on the `long`-width ABI (LP64 vs. LLP64; see the shippedLibs README). Automatic platform selection — picking the directory from the active target's triple — is **deferred** (anchor `D-FFI-SHIPPED-LIB-PLATFORM-SELECT`); for now each shipped dir names its platform explicitly, the language config points at `windows-x86_64`, and the other two are staged for the selector.

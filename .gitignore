@@ -42,6 +42,7 @@
 
 # Build directory
 build/
+build-wsl/
 !scripts/build/
 
 # CTest leftover when ctest is invoked from the repo root (e.g. inside

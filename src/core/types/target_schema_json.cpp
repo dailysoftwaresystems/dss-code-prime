@@ -177,6 +177,41 @@ void parseVariantTemplate(json const& v, std::size_t opIdx, std::size_t vi,
             tmpl.condCodeFromPayload = t.at("condCodeFromPayload").get<bool>();
         }
     }
+    // D-AS3-COND-CODE-ARM64: `condBitPos` — LSB inside word 0 where the
+    // fixed32 walker OR's the cond nibble. DEFAULT 0 (x86 / B.cond low
+    // nibble). Range [0, 28] (a 4-bit nibble must fit inside the 32-bit
+    // word). 12 for AArch64 CSET. (The x86-variable walker ignores this;
+    // it places the nibble in the opcode byte regardless.)
+    if (t.contains("condBitPos")) {
+        auto const path = std::format("/opcodes/{}/encoding/variants/{}/template/condBitPos", opIdx, vi);
+        if (!t.at("condBitPos").is_number_integer()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "'condBitPos' must be an integer in [0, 28]");
+        } else {
+            std::int64_t const cb = t.at("condBitPos").get<std::int64_t>();
+            if (cb < 0 || cb > 28) {
+                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                          std::format("'condBitPos' ({}) must be in [0, 28] "
+                                      "(a 4-bit nibble must fit within the "
+                                      "32-bit word)", cb));
+            } else {
+                tmpl.condBitPos = static_cast<std::uint8_t>(cb);
+            }
+        }
+    }
+    // D-AS3-COND-CODE-ARM64: `condInvert` — XOR the cond nibble with 1
+    // before placing it (the AArch64 inverse-condition trick used by
+    // CSET = CSINC with the inverted condition). DEFAULT false (x86 /
+    // B.cond place the cond verbatim).
+    if (t.contains("condInvert")) {
+        auto const path = std::format("/opcodes/{}/encoding/variants/{}/template/condInvert", opIdx, vi);
+        if (!t.at("condInvert").is_boolean()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "'condInvert' must be a boolean");
+        } else {
+            tmpl.condInvert = t.at("condInvert").get<bool>();
+        }
+    }
     // D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold): force a
     // REX prefix even when no REX bit is set — required by x86 byte-
     // register-bearing opcodes (setcc) to access the spl/bpl/sil/dil
@@ -207,6 +242,49 @@ void parseVariantTemplate(json const& v, std::size_t opIdx, std::size_t vi,
             }
         }
     }
+    // `fixedWords` (D-AS4-3 — multi-word `fixed32` macro) — an array of
+    // 32-bit base words, one per emitted instruction (e.g. AArch64
+    // `lea` = [ADRP, ADD]). MUTUALLY EXCLUSIVE with `fixedWord`: a
+    // template that declares BOTH is rejected here (the single-word
+    // default would otherwise be silently shadowed by the multi-word
+    // path — a config typo discriminator). Each element is range-
+    // checked [0, 0xFFFFFFFF] exactly like `fixedWord`.
+    if (t.contains("fixedWords")) {
+        auto const path = std::format("/opcodes/{}/encoding/variants/{}/template/fixedWords", opIdx, vi);
+        if (t.contains("fixedWord")) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "a template must not declare BOTH 'fixedWord' and "
+                      "'fixedWords' — use 'fixedWord' for a single-word "
+                      "opcode or 'fixedWords' for a multi-word macro, "
+                      "never both");
+        } else if (!t.at("fixedWords").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "'fixedWords' must be an array of 32-bit unsigned "
+                      "integers (one per emitted word)");
+        } else if (t.at("fixedWords").empty()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "'fixedWords' must be non-empty (a multi-word macro "
+                      "emits at least one word — omit the key entirely for "
+                      "the single-word `fixedWord` path)");
+        } else {
+            for (auto const& wn : t.at("fixedWords")) {
+                if (!wn.is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "every 'fixedWords' entry must be a 32-bit "
+                              "unsigned integer");
+                    continue;
+                }
+                std::int64_t const wv = wn.get<std::int64_t>();
+                if (wv < 0 || wv > 0xFFFFFFFFLL) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("'fixedWords' entry ({}) must fit "
+                                          "in 32 bits", wv));
+                    continue;
+                }
+                tmpl.fixedWords.push_back(static_cast<std::uint32_t>(wv));
+            }
+        }
+    }
 }
 
 void parseVariantResultSlot(json const& v, std::size_t opIdx, std::size_t vi,
@@ -228,6 +306,68 @@ void parseVariantResultSlot(json const& v, std::size_t opIdx, std::size_t vi,
         return;
     }
     variant.resultSlot = *r;
+}
+
+// D-AS4-3 (multi-instruction-macro encoder): parse `extraResultSlots`
+// — additional placements of the SAME result register beyond the
+// primary `resultSlot` (word 0). Each entry is { "slotKind": <name>,
+// "wordIndex": <int> }. Optional; absent leaves the vector empty
+// (every single-placement opcode). validate() requires a `resultSlot`
+// to exist when this is non-empty and bounds each wordIndex.
+void parseVariantExtraResultSlots(json const& v, std::size_t opIdx,
+                                  std::size_t vi,
+                                  TargetEncodingVariant& variant,
+                                  Collector& coll) {
+    if (!v.contains("extraResultSlots")) return;
+    auto const path = std::format("/opcodes/{}/encoding/variants/{}/extraResultSlots", opIdx, vi);
+    auto const& arr = v.at("extraResultSlots");
+    if (!arr.is_array()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                  "'extraResultSlots' must be an array of "
+                  "{ slotKind, wordIndex } objects");
+        return;
+    }
+    for (std::size_t ei = 0; ei < arr.size(); ++ei) {
+        auto const& e = arr[ei];
+        auto const ePath = std::format("{}/{}", path, ei);
+        if (!e.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, ePath,
+                      "each 'extraResultSlots' entry must be an object");
+            continue;
+        }
+        if (!e.contains("slotKind") || !e.at("slotKind").is_string()) {
+            coll.emit(DiagnosticCode::C_MissingField,
+                      std::format("{}/slotKind", ePath),
+                      "missing or non-string 'slotKind'");
+            continue;
+        }
+        auto const sk = encodingSlotKindFromName(e.at("slotKind").get<std::string>());
+        if (!sk.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("{}/slotKind", ePath),
+                      "unknown 'slotKind' for an extra result placement");
+            continue;
+        }
+        ResultSlotExtra extra;
+        extra.slotKind = *sk;
+        // wordIndex optional, default 0.
+        if (e.contains("wordIndex")) {
+            auto const wiPath = std::format("{}/wordIndex", ePath);
+            if (!e.at("wordIndex").is_number_integer()) {
+                coll.emit(DiagnosticCode::C_MalformedJson, wiPath,
+                          "'wordIndex' must be an integer in [0, 255]");
+                continue;
+            }
+            std::int64_t const wiv = e.at("wordIndex").get<std::int64_t>();
+            if (wiv < 0 || wiv > 255) {
+                coll.emit(DiagnosticCode::C_MalformedJson, wiPath,
+                          std::format("'wordIndex' ({}) must fit in [0, 255]", wiv));
+                continue;
+            }
+            extra.wordIndex = static_cast<std::uint8_t>(wiv);
+        }
+        variant.extraResultSlots.push_back(extra);
+    }
 }
 
 void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
@@ -309,6 +449,26 @@ void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
                 }
             }
         }
+        // `wordIndex` (D-AS4-3 — multi-word `fixed32` macro): which
+        // 32-bit word of the template this wire's slot lives in.
+        // Optional, default 0 (every single-word wire). Range
+        // [0, 255]; validate() further bounds it < template.wordCount().
+        if (o2.contains("wordIndex")) {
+            auto const wiPath = std::format("{}/wordIndex", wirePath);
+            if (!o2.at("wordIndex").is_number_integer()) {
+                coll.emit(DiagnosticCode::C_MalformedJson, wiPath,
+                          "'wordIndex' must be an integer in [0, 255]");
+            } else {
+                std::int64_t const wiv = o2.at("wordIndex").get<std::int64_t>();
+                if (wiv < 0 || wiv > 255) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, wiPath,
+                              std::format("'wordIndex' ({}) must fit in "
+                                          "[0, 255]", wiv));
+                } else {
+                    wire.wordIndex = static_cast<std::uint8_t>(wiv);
+                }
+            }
+        }
         // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1):
         // optional `prefixOpcodeBytes` — bytes emitted IMMEDIATELY
         // BEFORE this wire's slot bytes (between the previous
@@ -371,6 +531,7 @@ void parseEncodingVariants(json const& vs,
         parseVariantGuard      (v, opIdx, vi, variant, coll);
         parseVariantTemplate   (v, opIdx, vi, variant.tmpl, coll);
         parseVariantResultSlot (v, opIdx, vi, variant, coll);
+        parseVariantExtraResultSlots(v, opIdx, vi, variant, coll);
         parseVariantWires      (v, opIdx, vi, variant, data, coll);
         out.push_back(std::move(variant));
     }

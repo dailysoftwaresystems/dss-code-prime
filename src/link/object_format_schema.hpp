@@ -429,8 +429,121 @@ struct DSS_EXPORT MachODylibRef {
     //   std::uint32_t compatibilityVersion = 0;
 };
 
+// Ad-hoc code-signature request (D-LK7-ADHOC-CODESIGN-MACHO, increment
+// 2/2). When present on a MH_EXECUTE image, the Mach-O walker FILLS the
+// LC_CODE_SIGNATURE reservation with a real ad-hoc CodeDirectory +
+// SuperBlob (page-hash table over the signed file bytes) so the binary
+// satisfies the macOS / Apple-Silicon AMFI loader, which refuses any
+// unsigned executable. "Ad-hoc" = no CMS / identity / certificate; the
+// CodeDirectory carries the CS_ADHOC flag and dyld trusts the embedded
+// page hashes alone. The reservation SIZE is DERIVED from this block
+// (`adHocCodeSignatureSize`), so a hand-typed `codeSignatureSize` is not
+// needed when `codeSignature` is set.
+//
+// The two enums are closed (one variant each today) so a typo in the
+// JSON fails loud at load (mirrors `ExternCallDispatch`'s closed-enum
+// `…FromName` discipline) rather than silently selecting a default
+// signing scheme. Additional schemes (e.g. a CMS-signed `Authenticode`-
+// equivalent, or SHA-1 legacy slots) add an enum slot + a name-table
+// row, never a magic string.
+struct DSS_EXPORT MachOCodeSignature {
+    enum class Kind : std::uint8_t {
+        AdHoc = 1,  // CS_ADHOC CodeDirectory, no CMS / identity
+    };
+    enum class HashAlgo : std::uint8_t {
+        Sha256 = 1,  // CS_HASHTYPE_SHA256 (hashType=2 on the wire)
+    };
+
+    Kind          kind          = Kind::AdHoc;
+    HashAlgo      hashAlgorithm = HashAlgo::Sha256;
+    // Code-slot page size in bytes; one SHA-256 hash per page of the
+    // signed region. Must be a power of two (the CodeDirectory stores
+    // log2(pageSize) in a single byte). Apple uses 4096 (0x1000)
+    // universally for code pages regardless of the VM page size.
+    std::uint32_t pageSize      = 4096;
+    // CodeDirectory identifier C-string (the `identOffset` payload).
+    // Apple uses the bundle id or, for a bare executable, its leaf
+    // name. Must be non-empty (the kernel keys the signature on it).
+    std::string   identifier;
+};
+
+inline constexpr EnumNameTable<MachOCodeSignature::Kind, 1>
+kMachOCodeSignatureKindTable{{{
+    { MachOCodeSignature::Kind::AdHoc, "adhoc" },
+}}};
+
+inline constexpr EnumNameTable<MachOCodeSignature::HashAlgo, 1>
+kMachOCodeSignatureHashAlgoTable{{{
+    { MachOCodeSignature::HashAlgo::Sha256, "sha256" },
+}}};
+
+[[nodiscard]] constexpr std::optional<MachOCodeSignature::Kind>
+machoCodeSignatureKindFromName(std::string_view s) noexcept {
+    return kMachOCodeSignatureKindTable.fromName(s);
+}
+[[nodiscard]] constexpr std::optional<MachOCodeSignature::HashAlgo>
+machoCodeSignatureHashAlgoFromName(std::string_view s) noexcept {
+    return kMachOCodeSignatureHashAlgoTable.fromName(s);
+}
+
+// LC_BUILD_VERSION (`build_version_command`). Declares the executable's
+// target PLATFORM and minimum-OS / SDK versions. Modern dyld (macOS 11+ /
+// Apple Silicon, i.e. dyld4) identifies a main executable's platform from
+// this command; an executable carrying NO platform load command (neither
+// LC_BUILD_VERSION nor the legacy LC_VERSION_MIN_MACOSX) is rejected at
+// load — a distinct EBADMACHO-class blocker from segment misalignment.
+// `minOs`/`sdk` use the on-wire nibble encoding `(major<<16) |
+// (minor<<8) | patch` (e.g. 11.0.0 → 0x000B0000). Optional in the
+// schema (`image.buildVersion`) — absent → no LC_BUILD_VERSION emitted
+// (the pre-arm64 / MH_OBJECT behaviour, byte-identical). The platform is
+// a CLOSED enum (name → value) so a typo fails loud at load rather than
+// silently picking a platform. (D-LK10-ENTRY-MACHO-EXIT.)
+struct DSS_EXPORT MachOBuildVersion {
+    enum class Platform : std::uint32_t {
+        MacOs = 1,  // PLATFORM_MACOS
+    };
+    Platform      platform = Platform::MacOs;
+    std::uint32_t minOs = 0;  // (major<<16)|(minor<<8)|patch
+    std::uint32_t sdk   = 0;  // (major<<16)|(minor<<8)|patch
+};
+
+inline constexpr EnumNameTable<MachOBuildVersion::Platform, 1>
+kMachOBuildVersionPlatformTable{{{
+    { MachOBuildVersion::Platform::MacOs, "macos" },
+}}};
+
+[[nodiscard]] constexpr std::optional<MachOBuildVersion::Platform>
+machoBuildVersionPlatformFromName(std::string_view s) noexcept {
+    return kMachOBuildVersionPlatformTable.fromName(s);
+}
+
+// Default VM segment page size for Mach-O segment layout (the x86_64 /
+// 4 KiB convention). Apple Silicon (arm64) requires 16 KiB (0x4000);
+// see `MachOImage::segmentPageSize`. A named constant so validate()'s
+// MH_OBJECT "no image block" detection can tell the default apart from
+// an explicitly-set value.
+inline constexpr std::uint64_t kDefaultMachoSegmentPageSize = 0x1000u;  // 4 KiB
+
 struct DSS_EXPORT MachOImage {
     std::uint64_t pageZeroSize = 0;        // __PAGEZERO vmsize
+    // VM segment page size — the granularity at which every
+    // LC_SEGMENT_64's vmaddr / vmsize / fileoff is aligned (and the
+    // file is padded between segments). The kernel's mmap-congruence
+    // rule is `vmaddr % segmentPageSize == fileoff % segmentPageSize`;
+    // misaligned segments are rejected at exec with errno == EBADMACHO
+    // ("Malformed Mach-O file"). x86_64-darwin uses 4 KiB (the default);
+    // **Apple Silicon (arm64-darwin) REQUIRES 16 KiB (0x4000)** — the
+    // dominant cause of EBADMACHO for hand-built arm64 binaries. This is
+    // a DISTINCT concept from `pageZeroSize` (the __PAGEZERO vmsize) and
+    // from `codeSignature.pageSize` (the code-directory HASH page size,
+    // which Apple allows at 4 KiB or 16 KiB independently). Read by
+    // `macho.cpp` at both the static (`encodeExec`) and dynamic
+    // (`encodeExecDynamic`) layout sites. Declared in `.format.json`
+    // (`image.segmentPageSize`) — NOT inferred from the cputype — to
+    // keep the writer source/target/format-agnostic. validate() requires
+    // a power of two. Default 4 KiB → every pre-arm64 Mach-O schema is
+    // byte-identical (D-LK10-ENTRY-MACHO-EXIT).
+    std::uint64_t segmentPageSize = kDefaultMachoSegmentPageSize;
     std::string   dylinkerPath;            // LC_LOAD_DYLINKER name
     std::vector<MachODylibRef> loadDylibs; // each → LC_LOAD_DYLIB
     // Eager-vs-lazy dynamic-binding choice (parallel to
@@ -462,6 +575,22 @@ struct DSS_EXPORT MachOImage {
     //  alignment; the walker rejects any other value at
     //  `validate()`).
     std::uint32_t codeSignatureSize = 0;
+    // Ad-hoc code-signature FILL request (D-LK7-ADHOC-CODESIGN-MACHO
+    // increment 2/2). When set, the walker DERIVES the reservation size
+    // from this block (via `adHocCodeSignatureSize`) — overriding any
+    // hand-typed `codeSignatureSize` — and writes a real CodeDirectory +
+    // SuperBlob into the reserved region instead of zeroes. When unset,
+    // the legacy `codeSignatureSize`-only placeholder path (zero-fill)
+    // is preserved unchanged. validate() rejects this block on a
+    // MH_OBJECT (like the rest of the image block).
+    std::optional<MachOCodeSignature> codeSignature;
+    // LC_BUILD_VERSION platform / min-OS / SDK (D-LK10-ENTRY-MACHO-EXIT).
+    // When set, BOTH Mach-O exec walkers emit a `build_version_command`
+    // so dyld can identify the platform — REQUIRED for a main executable
+    // to load on macOS 11+ / Apple Silicon. Absent → no LC_BUILD_VERSION
+    // (byte-identical to every pre-arm64 / MH_OBJECT schema). validate()
+    // rejects this block on a MH_OBJECT (like the rest of the image).
+    std::optional<MachOBuildVersion> buildVersion;
     // Modern dyld binding format (Xcode 12+ / macOS 12+). When
     // `true`, the walker emits `LC_DYLD_CHAINED_FIXUPS` (0x80000034)
     // pointing at a `dyld_chained_fixups_header` + chained-pointer
@@ -492,8 +621,9 @@ struct DSS_EXPORT MachOImage {
     // FormatGuess::MachO32).
     //
     // Default `false` preserves the legacy LC_DYLD_INFO_ONLY path so
-    // shipped formats opt in explicitly (currently the new
-    // `macho64-arm64-darwin-exec.format.json` enables it).
+    // shipped formats opt in explicitly. (No shipped format enables it
+    // yet — both darwin-exec formats use the legacy opcode-stream bind;
+    // the chained-fixups emitter is exercised by unit tests only.)
     bool          useChainedFixups = false;
 };
 
@@ -573,6 +703,25 @@ struct DSS_EXPORT ObjectFormatData {
     // `processExit.has_value()` (paired closure — both fields go
     // together).
     std::string entryCallingConvention;
+
+    // ── D-FFI-EXTERN-CALL-DISPATCH: extern-call shape ────────────
+    //
+    // How a call to an extern import is reached at the CALL SITE for
+    // THIS format: `indirect-slot` (PE IAT / Mach-O __got: deref a
+    // pointer slot via the target's `call_indirect_via_extern` opcode)
+    // vs `direct-plt` (ELF PLT: a plain direct `call` to the linker's
+    // PLT stub). See `ExternCallDispatch` (core/types/object_format_kind.hpp)
+    // for the full rationale. Consumed by MIR-to-LIR `lowerCall`.
+    //
+    // `std::nullopt` = the format did not declare a dispatch model — NOT
+    // a silent default to either shape: MIR→LIR fails loud iff a module
+    // declares extern imports under a nullopt-dispatch format. Enforced at
+    // that precise point (lowering), NOT at validate(): a format that never
+    // lowers an extern call (a relocatable / WASM / SPIR-V format, or an
+    // exec format built for a non-FFI purpose like the codesign fixtures)
+    // may legitimately omit it. The shipped exec formats DO declare it; an
+    // unknown VALUE still fails loud at load (the loader's enum check).
+    std::optional<ExternCallDispatch> externCallDispatch;
 
     // ── D-LK2-RODATA closure: producer-data-section capability set ──
     //
@@ -711,6 +860,16 @@ public:
     }
     [[nodiscard]] std::string_view entryCallingConvention() const noexcept {
         return d_.entryCallingConvention;
+    }
+
+    // ── D-FFI-EXTERN-CALL-DISPATCH accessor ──────────────────────
+    // The format's extern-call shape (`indirect-slot` / `direct-plt`),
+    // or nullopt if the format declared none. MIR→LIR `lowerCall`
+    // reads this to choose `call_indirect_via_extern` vs plain `call`;
+    // a nullopt under a module with extern imports is a fail-loud.
+    [[nodiscard]] std::optional<ExternCallDispatch>
+    externCallDispatch() const noexcept {
+        return d_.externCallDispatch;
     }
 
     // ── D-LK2-RODATA producer-data-section capability gate ─────

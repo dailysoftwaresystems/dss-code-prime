@@ -94,6 +94,35 @@ struct DSS_EXPORT SymbolRecord {
     std::int64_t    enumValue = 0;
 };
 
+// FF11 neutral-JSON shipped-library descriptor extern
+// (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). One row per symbol the semantic
+// phase MINTED from a resolved shipped-lib descriptor (e.g. `puts` from
+// `stdio.json`, pulled in by `#include <stdio.h>`). The semantic phase injects
+// each as an extern `SymbolRecord` into scope (so a call resolves like any
+// declared function) AND records this row so the CST→HIR lowerer can synthesize
+// the matching `ExternFunction`/`ExternGlobal` HIR node + an `HirExternRecord`
+// (which FF5 `synthesizeFfiFromSourceDecls` then binds to the library). A
+// descriptor symbol that a user declaration already claimed (goal-2) is SKIPPED
+// at injection — no row here — so the user's decl is the sole authority and
+// nothing is double-declared. The `signature` TypeId is interned in THIS
+// model's lattice (the CU interner the lowerer also lowers through).
+//
+// Kept decoupled from the ffi descriptor enums: `isFunction` selects
+// ExternFunction (true) vs ExternGlobal (false) at lowering, the only
+// distinction the lowerer needs.
+struct DSS_EXPORT ShippedExternSymbol {
+    SymbolId    symbol;       // the minted extern symbol
+    std::string name;         // the undecorated identifier → HirExternRecord.canonicalName
+    TypeId      signature;    // its FnSig (function) or value type (object)
+    // Model 3 (2026-06-09): the descriptor's per-object-format `library` map
+    // ("pe"/"elf"/"macho" → image name) → HirExternRecord.libraryOverride. The
+    // map is carried target-agnostically through HIR; compile_pipeline folds it
+    // to a single string for the ACTIVE target's format (where the format is in
+    // scope). A missing format key inherits externLibraryByFormat[format].
+    std::unordered_map<std::string, std::string> library;
+    bool        isFunction = true;  // ExternFunction vs ExternGlobal
+};
+
 class DSS_EXPORT SemanticModel {
 public:
     // The analyzer is the only producer; construction is by move out of
@@ -106,7 +135,8 @@ public:
                   UnitAttribute<TypeId>                  nodeToType,
                   DiagnosticReporter                     diagnostics,
                   std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
-                  std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType) noexcept
+                  std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
+                  std::vector<ShippedExternSymbol>       shippedExterns) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
           scopes_(std::move(scopes)),
@@ -115,7 +145,8 @@ public:
           nodeToType_(std::move(nodeToType)),
           diagnostics_(std::move(diagnostics)),
           usesBySymbol_(std::move(usesBySymbol)),
-          compositeScopeByType_(std::move(compositeScopeByType)) {}
+          compositeScopeByType_(std::move(compositeScopeByType)),
+          shippedExterns_(std::move(shippedExterns)) {}
 
     SemanticModel(SemanticModel const&)            = delete;
     SemanticModel& operator=(SemanticModel const&) = delete;
@@ -172,6 +203,14 @@ public:
     [[nodiscard]] UnitAttribute<SymbolId> const& nodeToSymbol() const noexcept { return nodeToSymbol_; }
     [[nodiscard]] UnitAttribute<TypeId>   const& nodeToType()   const noexcept { return nodeToType_; }
 
+    // FF11 shipped-lib descriptor externs the semantic phase minted (one per
+    // injected descriptor symbol; goal-2-skipped names are absent). The CST→HIR
+    // lowerer reads this to synthesize the matching extern HIR nodes +
+    // HirExternRecords. Empty unless the CU resolved a shipped-lib descriptor.
+    [[nodiscard]] std::span<ShippedExternSymbol const> shippedExterns() const noexcept {
+        return shippedExterns_;
+    }
+
 private:
     std::shared_ptr<CompilationUnit const> cu_;
     TypeLattice                            lattice_;
@@ -186,6 +225,10 @@ private:
     // Pass 1.5 when a struct's TypeId is interned (see
     // `compositeScopeByType` in semantic_analyzer.cpp's EngineState).
     std::unordered_map<std::uint32_t, ScopeId>             compositeScopeByType_;
+    // FF11: descriptor externs minted from resolved shipped-lib JSON
+    // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the
+    // CST→HIR lowerer.
+    std::vector<ShippedExternSymbol>                       shippedExterns_;
 };
 
 // Pin move-only / non-copyable at compile time so a future refactor

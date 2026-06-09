@@ -614,6 +614,17 @@ enum class DiagnosticCode : std::uint16_t {
     // is missing) so the user/test isn't surprised by the bytes
     // being absent without a function-tier diagnostic.
     A_FunctionEncodeAborted        = 0x1006,
+    // A_ImmediateOperandOutOfRange (D-LK10-ENTRY-ARM64, v0.0.2 V2-1):
+    //   a fixed32 encoder wire targeting an immediate slot (e.g. the
+    //   AArch64 MOVZ `Imm16` slot) received an operand value that does
+    //   not fit the slot's bit width (negative, or wider than the
+    //   field). The encoder REFUSES to silently truncate — a truncated
+    //   immediate is a wrong machine-code constant (e.g. a wrong
+    //   syscall number), the exact miscompile class the round-trip
+    //   oracle exists to prevent. Fix: materialize the constant with a
+    //   multi-instruction sequence (MOVZ+MOVK / shifted MOVZ) once that
+    //   lowering lands, or narrow the value. Unsuppressable.
+    A_ImmediateOperandOutOfRange   = 0x1007,
 
     // ── Optimizer (renders as `X`) ────────────────────────────────────
     //
@@ -1070,6 +1081,32 @@ enum class DiagnosticCode : std::uint16_t {
     //   system-header miss would silently compile a program that calls
     //   an undeclared library symbol. (FF11, 2026-06-05.)
     F_ShippedHeaderNotFound        = 0x501A,
+    // F_ShippedLibDescriptorMalformed: the LANGUAGE-NEUTRAL shipped-
+    //   library JSON descriptor (`src/dss-config/shippedLibs/<platform>/
+    //   <name>.json`, read by `dss::ffi::readShippedLibDescriptor`) is
+    //   not well-formed: invalid JSON, a missing required key
+    //   (`library` / `symbols` / a symbol's `name` or `signature`), a
+    //   value of the wrong type, an unknown key (closed-key rejection,
+    //   mirroring D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD), or an
+    //   unrecognized `kind` / `linkage` enum string. Remediation: fix
+    //   the descriptor JSON shape. Member of `kUnsuppressableCodes` — a
+    //   dropped descriptor-malformed miss would silently synthesize no
+    //   externs (or the wrong ones), compiling a program whose
+    //   `#include <stdio.h>` symbols resolve to nothing. (Neutral
+    //   shipped-lib descriptor, closes D-FFI-SHIPPED-LIB-DESCRIPTOR-
+    //   AGNOSTIC, 2026-06-06.)
+    F_ShippedLibDescriptorMalformed = 0x501B,
+    // F_ShippedLibUnsupportedType: a shipped-library descriptor symbol's
+    //   `signature` hir-text type string failed to decode —
+    //   `dss::parseTypeFromText` returned `InvalidType` (a truncated
+    //   `"fn(ptr<"`, an unknown type keyword, or trailing tokens).
+    //   CRITICAL fail-loud: a symbol whose signature does not decode
+    //   MUST error rather than synthesize an `ExternFunction` carrying
+    //   `InvalidType` — that would be a silently dropped / wrong-typed
+    //   import. Remediation: fix the symbol's `signature` to a
+    //   well-formed hir-text type. Member of `kUnsuppressableCodes`.
+    //   (Neutral shipped-lib descriptor, 2026-06-06.)
+    F_ShippedLibUnsupportedType    = 0x501C,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

@@ -29,6 +29,7 @@ dss_add_test(NAME core/test_checkpoint          SOURCES test_checkpoint.cpp)
 dss_add_test(NAME core/test_lexer_modes         SOURCES test_lexer_modes.cpp)
 dss_add_test(NAME core/test_string_style        SOURCES test_string_style.cpp)
 dss_add_test(NAME core/test_tsql_subset         SOURCES test_tsql_subset.cpp)
+dss_add_test(NAME core/test_sha256              SOURCES test_sha256.cpp)
 
 # Generalized arena substrate (SP1). The test sources live under substrate/
 # and include the shared `substrate/arena_test_types.hpp`, so this directory

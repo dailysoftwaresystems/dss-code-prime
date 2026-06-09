@@ -1477,14 +1477,15 @@ namespace {
 }
 } // namespace
 
-TEST(LinkerEndToEnd, ElfRejectsDataItemsUntilD_LK1_RODATA) {
-    // Format capability gate (linker.cpp): ELF declares NO
-    // `supportedDataSections` in its JSON, so the schema-declared
-    // gate rejects all dataItems with K_NoMatchingObjectFormat
-    // (D-LK1-RODATA still anchored). Pin the diagnostic identity
-    // so a future capability-gate refactor doesn't silently let
-    // dataItems pass through to the ELF walker before its arm
-    // closes.
+TEST(LinkerEndToEnd, ElfAcceptsRodataDataItemsAfterD_LK1_ELF_EXEC_DATA_SECTIONS) {
+    // FLIP-MARKER: D-LK1-ELF-EXEC-DATA-SECTIONS CLOSED. The ELF exec
+    // format JSON now advertises `supportedDataSections: ["rodata"]`,
+    // so the schema-declared capability gate (linker.cpp) lets a
+    // Rodata dataItem through to the ELF walker, which emits a loadable
+    // `.rodata` section. A one-function module + one rodata item now
+    // links cleanly (was K_NoMatchingObjectFormat before the arm
+    // closed). When this fails, the format JSON's supportedDataSections
+    // row was removed without re-anchoring the walker arm.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped(
@@ -1493,15 +1494,19 @@ TEST(LinkerEndToEnd, ElfRejectsDataItemsUntilD_LK1_RODATA) {
     DiagnosticReporter rep;
     LinkedImage img =
         runLinkerWithRodataItem(**target, **fmt, rep);
-    EXPECT_FALSE(img.ok());
-    EXPECT_EQ(::dss::test_support::countCode(rep,
-                  DiagnosticCode::K_NoMatchingObjectFormat),
-              1u);
-    EXPECT_EQ(img.resolvedFuncCount, 0u);
-    EXPECT_FALSE((**fmt).acceptsDataSection(
+    EXPECT_TRUE(img.ok())
+        << "ELF exec must now accept a Rodata dataItem end-to-end "
+           "(D-LK1-ELF-EXEC-DATA-SECTIONS)";
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // resolvedFuncCount == 2: the user `ret` function PLUS the
+    // synthetic `_start` trampoline the linker prepends for exec
+    // images (D-LK10-ENTRY Slice C). A clean link (vs the pre-close
+    // rejection at resolvedFuncCount==0) is the marker.
+    EXPECT_EQ(img.resolvedFuncCount, 2u);
+    EXPECT_TRUE((**fmt).acceptsDataSection(
         DataSectionKind::Rodata))
-        << "ELF exec format JSON must not advertise rodata until "
-           "D-LK1-RODATA closes";
+        << "ELF exec format JSON must advertise rodata now that "
+           "D-LK1-ELF-EXEC-DATA-SECTIONS has closed";
 }
 
 TEST(LinkerEndToEnd, MachORejectsDataItemsUntilD_LK3_RODATA) {

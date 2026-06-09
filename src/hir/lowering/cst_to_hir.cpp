@@ -6,6 +6,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/char_decode.hpp"
 #include "core/types/hir_lowering_config.hpp"
+#include "core/types/object_format_kind.hpp"     // kObjectFormatKindTable (per-format library-map keys)
 #include "core/types/number_decode.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
@@ -113,6 +114,30 @@ namespace {
         default:
             return false;
     }
+}
+
+// Model 3 (2026-06-09): a SOURCE-declared `extern "libname" …` override is the
+// user's format-INDEPENDENT choice, but `HirExternRecord.libraryOverride` is a
+// per-OBJECT-FORMAT map (so a SHIPPED descriptor can route a different image
+// per format). Project the single override under EVERY real object-format key
+// so the compile-pipeline fold yields it whatever the active target's format —
+// preserving the pre-Model-3 behavior exactly. AGNOSTIC: the key set is the
+// `kObjectFormatKindTable` vocabulary (skipping the `Unknown` sentinel), never
+// a hand-written `{"pe","elf","macho"}` identity list. Empty input → empty map
+// (no override → the FFI synthesize stage uses the language default).
+[[nodiscard]] std::unordered_map<std::string, std::string>
+uniformLibraryMap(std::string lib) {
+    std::unordered_map<std::string, std::string> out;
+    if (lib.empty()) return out;
+    // Deliberately projects the override under EVERY real format key (incl.
+    // wasm/spirv, which have no runnable exec path yet) — the per-target fold
+    // (compile_pipeline) reads only the ACTIVE format's key, so the extra keys
+    // are harmless + future-proof (a new format inherits the override).
+    for (auto const& [kind, formatName] : kObjectFormatKindTable.rows) {
+        if (kind == ObjectFormatKind::Unknown) continue;
+        out.emplace(std::string{formatName}, lib);
+    }
+    return out;
 }
 
 // Post-fold #8 simplifier R2 + code-reviewer I1: the
@@ -2878,9 +2903,12 @@ struct Lowerer {
             // extern gains specifiers.
             recordLinkage(h, linkageFrom(specifierPrefix(node, decl), decl));
             auto const* rec = model.recordFor(sym);
+            // Model 3: the source `"libname"` override is format-independent →
+            // project it under every object-format key so the compile-pipeline
+            // fold yields it for whatever the active target's format is.
             externDecls.push_back({h,
                                    rec ? rec->name : std::string{},
-                                   extractLibraryOverride()});
+                                   uniformLibraryMap(extractLibraryOverride())});
         };
         if (decl.kindByChild) {
             NodeId disc = descend(node, decl.kindByChild->childPath);
@@ -3105,6 +3133,36 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     std::vector<HirNodeId> decls;
     for (Tree const& t : trees) {
         lowerers.at(t.schema().schemaId().v)->lowerTree(t, decls);
+    }
+
+    // FF11 shipped-library descriptor externs
+    // (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC): synthesize one extern HIR node
+    // per descriptor symbol the semantic phase minted (e.g. `puts` from
+    // `stdio.json`, pulled in by `#include <stdio.h>`). These have NO source
+    // CST — the semantic phase already minted the SymbolId + interned the
+    // signature into the CU lattice (`model.lattice().interner()`, the same
+    // interner `builder` lowers through), and applied the goal-2 skip (a symbol
+    // a user decl claimed is absent from `shippedExterns()`). Each synthesized
+    // node is appended to BOTH the module `decls` (so `collectExterns` in
+    // HIR→MIR finds it) and `externDecls` with the descriptor's `library` as the
+    // `libraryOverride` — so the EXISTING FF5 `synthesizeFfiFromSourceDecls`
+    // (compile_pipeline step 2.5) binds it to the import library exactly like a
+    // source-declared extern. A function symbol synthesizes ExternFunction (the
+    // FnSig carries the param types, so the node needs NO param children — the
+    // HIR→MIR extern pre-pass reads the signature, never the children); an
+    // object symbol synthesizes ExternGlobal.
+    for (ShippedExternSymbol const& ext : model.shippedExterns()) {
+        HirNodeId const node = ext.isFunction
+            ? builder.makeExternFunction(ext.signature, ext.symbol.v, {})
+            : builder.makeExternGlobal(ext.signature, ext.symbol.v);
+        decls.push_back(node);
+        // libraryOverride = the descriptor's per-object-format `library` MAP
+        // (Model 3), carried verbatim. The compile-pipeline fold (step 2.5)
+        // selects the ACTIVE target's format entry; an empty map OR a map
+        // missing that format ⇒ FF5 falls back to the language's
+        // `externLibraryByFormat[format]` default.
+        externDecls.push_back(HirExternRecord{
+            node, ext.name, ext.library});
     }
 
     HirNodeId const root = builder.makeModule(decls);

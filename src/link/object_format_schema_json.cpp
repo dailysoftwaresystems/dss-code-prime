@@ -179,6 +179,13 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // vocabulary, not via the cross-format dataItems
             // pipeline).
             "supportedDataSections",
+            // D-FFI-EXTERN-CALL-DISPATCH: the PLT-stub vs IAT-slot
+            // extern-call shape is an ELF/PE/Mach-O dynamic-import
+            // notion; WASM/SPIR-V reach imports through their own
+            // format-native mechanisms (WASM import section / SPIR-V
+            // linkage decorations), so a top-level declaration here
+            // would be dead data.
+            "externCallDispatch",
         };
         for (auto const* field : universalFields) {
             if (doc.contains(field)) {
@@ -243,6 +250,39 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                           "callingConventionByName(...)`).");
             } else {
                 data.entryCallingConvention = cc;
+            }
+        }
+    }
+
+    // D-FFI-EXTERN-CALL-DISPATCH: `externCallDispatch` — the format's
+    // extern-call shape ("indirect-slot" / "direct-plt"). Optional in
+    // the JSON (a relocatable / WASM / SPIR-V format, or an exec format
+    // built for a non-FFI purpose, omits it). validate() does NOT require
+    // it — the real requirement ("a format that LOWERS an extern call
+    // needs a dispatch shape") is enforced at MIR→LIR (the `Lowerer` ctor
+    // guard fails loud on extern-imports-under-nullopt). Present-but-
+    // unknown IS a fail-loud HERE at load (a typo must NOT silently fall
+    // through to a default extern-call shape).
+    if (doc.contains("externCallDispatch")) {
+        if (!doc.at("externCallDispatch").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/externCallDispatch",
+                      "'externCallDispatch' must be a string "
+                      "(\"indirect-slot\" or \"direct-plt\")");
+        } else {
+            auto const s =
+                doc.at("externCallDispatch").get<std::string>();
+            auto const d = externCallDispatchFromName(s);
+            if (!d.has_value()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/externCallDispatch",
+                          std::format("unknown externCallDispatch '{}' "
+                                      "— accepted: \"indirect-slot\" "
+                                      "(PE IAT / Mach-O __got), "
+                                      "\"direct-plt\" (ELF PLT stub)",
+                                      s));
+            } else {
+                data.externCallDispatch = *d;
             }
         }
     }
@@ -928,6 +968,29 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     }
                 }
             }
+            // VM segment page size (LC_SEGMENT_64 vmaddr/vmsize/fileoff
+            // alignment). Optional; default 4 KiB. Power-of-two enforced
+            // at validate(). Apple Silicon arm64-darwin sets 16384.
+            if (im.contains("segmentPageSize")) {
+                if (!im.at("segmentPageSize").is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/image/segmentPageSize",
+                              "'segmentPageSize' must be an integer");
+                } else {
+                    std::int64_t const v =
+                        im.at("segmentPageSize").get<std::int64_t>();
+                    if (v <= 0) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/image/segmentPageSize",
+                                  "'segmentPageSize' must be positive "
+                                  "(a power-of-two VM page size; 4096 for "
+                                  "x86_64-darwin, 16384 for arm64-darwin)");
+                    } else {
+                        data.machoImage.segmentPageSize =
+                            static_cast<std::uint64_t>(v);
+                    }
+                }
+            }
             if (im.contains("dylinkerPath")) {
                 if (!im.at("dylinkerPath").is_string()) {
                     coll.emit(DiagnosticCode::C_MalformedJson,
@@ -1028,6 +1091,278 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 } else {
                     data.machoImage.useChainedFixups =
                         im.at("useChainedFixups").get<bool>();
+                }
+            }
+            // D-LK7-ADHOC-CODESIGN-MACHO (increment 2/2) — ad-hoc
+            // code-signature FILL request. Optional nested object;
+            // absent = the legacy `codeSignatureSize`-only placeholder
+            // path. When present the walker DERIVES the reservation
+            // size and writes a real CodeDirectory + SuperBlob. The two
+            // enums are CLOSED — a typo fails loud here (mirrors the
+            // `externCallDispatchFromName` + unknown-value-rejects-loud
+            // discipline) rather than defaulting silently to a signing
+            // scheme. `pageSize` power-of-two and non-empty `identifier`
+            // are likewise fail-loud here (a malformed value must not
+            // reach the size derivation / blob builder).
+            if (im.contains("codeSignature")) {
+                auto const& cs = im.at("codeSignature");
+                if (!cs.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/image/codeSignature",
+                              "'codeSignature' must be an object "
+                              "{kind, hashAlgorithm, pageSize, "
+                              "identifier}");
+                } else {
+                    MachOCodeSignature sig;
+                    bool ok = true;
+                    // kind (closed enum; default "adhoc").
+                    if (cs.contains("kind")) {
+                        if (!cs.at("kind").is_string()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/image/codeSignature/kind",
+                                      "'kind' must be a string "
+                                      "(\"adhoc\")");
+                            ok = false;
+                        } else {
+                            auto const s =
+                                cs.at("kind").get<std::string>();
+                            auto const k =
+                                machoCodeSignatureKindFromName(s);
+                            if (!k.has_value()) {
+                                coll.emit(
+                                    DiagnosticCode::C_MalformedJson,
+                                    "/image/codeSignature/kind",
+                                    std::format("unknown codeSignature "
+                                                "kind '{}' — accepted: "
+                                                "\"adhoc\" (CS_ADHOC "
+                                                "CodeDirectory, no CMS).",
+                                                s));
+                                ok = false;
+                            } else {
+                                sig.kind = *k;
+                            }
+                        }
+                    }
+                    // hashAlgorithm (closed enum; default "sha256").
+                    if (cs.contains("hashAlgorithm")) {
+                        if (!cs.at("hashAlgorithm").is_string()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/image/codeSignature/hashAlgorithm",
+                                      "'hashAlgorithm' must be a string "
+                                      "(\"sha256\")");
+                            ok = false;
+                        } else {
+                            auto const s = cs.at("hashAlgorithm")
+                                               .get<std::string>();
+                            auto const h =
+                                machoCodeSignatureHashAlgoFromName(s);
+                            if (!h.has_value()) {
+                                coll.emit(
+                                    DiagnosticCode::C_MalformedJson,
+                                    "/image/codeSignature/hashAlgorithm",
+                                    std::format("unknown codeSignature "
+                                                "hashAlgorithm '{}' — "
+                                                "accepted: \"sha256\" "
+                                                "(CS_HASHTYPE_SHA256).",
+                                                s));
+                                ok = false;
+                            } else {
+                                sig.hashAlgorithm = *h;
+                            }
+                        }
+                    }
+                    // pageSize (power of two; default 4096).
+                    if (cs.contains("pageSize")) {
+                        if (!cs.at("pageSize").is_number_integer()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/image/codeSignature/pageSize",
+                                      "'pageSize' must be an integer "
+                                      "power of two (code-slot page "
+                                      "size; typical 4096).");
+                            ok = false;
+                        } else {
+                            std::int64_t const v =
+                                cs.at("pageSize").get<std::int64_t>();
+                            // Power of two in [4096, 65536]: the
+                            // conventional code-signing hash-page size is
+                            // 4096; the bounded range keeps log2(pageSize)
+                            // in [12,16] (one byte) AND keeps the
+                            // nCodeSlots*hashSize layout math safely within
+                            // u32 for any in-range codeLimit (a sub-page
+                            // pageSize like 1 would overflow the slot table
+                            // on a multi-GiB binary — D-LK7-CODESIGN-
+                            // PAGESIZE-OVERFLOW-HARDENING for the residual
+                            // ~4 GiB-codeLimit case).
+                            if (v < 4096
+                             || v > 65536
+                             || (static_cast<std::uint64_t>(v)
+                                 & (static_cast<std::uint64_t>(v) - 1u))
+                                    != 0u) {
+                                coll.emit(
+                                    DiagnosticCode::C_MalformedJson,
+                                    "/image/codeSignature/pageSize",
+                                    std::format("'pageSize' ({}) must be "
+                                                "a power of two in "
+                                                "[4096, 65536] (the "
+                                                "CodeDirectory stores "
+                                                "log2(pageSize) in one "
+                                                "byte; 4096 is the "
+                                                "conventional value).",
+                                                v));
+                                ok = false;
+                            } else {
+                                sig.pageSize =
+                                    static_cast<std::uint32_t>(v);
+                            }
+                        }
+                    }
+                    // identifier (non-empty; required).
+                    if (!cs.contains("identifier")) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/image/codeSignature/identifier",
+                                  "'identifier' is required and must be "
+                                  "a non-empty string (the CodeDirectory "
+                                  "identOffset payload; the kernel keys "
+                                  "the signature on it).");
+                        ok = false;
+                    } else if (!cs.at("identifier").is_string()
+                            || cs.at("identifier").get<std::string>()
+                                   .empty()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/image/codeSignature/identifier",
+                                  "'identifier' must be a non-empty "
+                                  "string.");
+                        ok = false;
+                    } else {
+                        sig.identifier =
+                            cs.at("identifier").get<std::string>();
+                    }
+                    if (ok) {
+                        data.machoImage.codeSignature = std::move(sig);
+                    }
+                }
+            }
+            // LC_BUILD_VERSION platform / min-OS / SDK (D-LK10-ENTRY-
+            // MACHO-EXIT). Optional nested object; absent → no
+            // LC_BUILD_VERSION emitted. `platform` is a CLOSED enum (a
+            // typo fails loud, mirroring codeSignature). `minOs`/`sdk`
+            // are dotted "X.Y[.Z]" version strings encoded to the on-wire
+            // (major<<16)|(minor<<8)|patch nibble form; a malformed
+            // version fails loud rather than silently shipping 0.0.0.
+            if (im.contains("buildVersion")) {
+                auto const& bv = im.at("buildVersion");
+                if (!bv.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/image/buildVersion",
+                              "'buildVersion' must be an object "
+                              "{platform, minOs, sdk}");
+                } else {
+                    // "X.Y" / "X.Y.Z" → (major<<16)|(minor<<8)|patch.
+                    // major 16-bit, minor/patch 8-bit each (the
+                    // build_version_command field layout).
+                    auto parseVer = [](std::string_view s)
+                                      -> std::optional<std::uint32_t> {
+                        std::uint32_t parts[3] = {0u, 0u, 0u};
+                        std::size_t idx = 0;
+                        std::uint32_t cur = 0;
+                        bool any = false;
+                        for (char c : s) {
+                            if (c == '.') {
+                                if (idx >= 2) return std::nullopt;
+                                if (!any) return std::nullopt;
+                                parts[idx++] = cur;
+                                cur = 0;
+                                any = false;
+                            } else if (c >= '0' && c <= '9') {
+                                cur = cur * 10u
+                                    + static_cast<std::uint32_t>(c - '0');
+                                if (cur > 0xFFFFu) return std::nullopt;
+                                any = true;
+                            } else {
+                                return std::nullopt;
+                            }
+                        }
+                        if (!any) return std::nullopt;  // empty / trailing '.'
+                        parts[idx] = cur;
+                        if (parts[1] > 0xFFu || parts[2] > 0xFFu)
+                            return std::nullopt;
+                        return (parts[0] << 16) | (parts[1] << 8) | parts[2];
+                    };
+                    MachOBuildVersion ver;
+                    bool ok = true;
+                    // platform (closed enum; required).
+                    if (!bv.contains("platform")
+                     || !bv.at("platform").is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/image/buildVersion/platform",
+                                  "'platform' is required and must be a "
+                                  "string (\"macos\").");
+                        ok = false;
+                    } else {
+                        auto const s =
+                            bv.at("platform").get<std::string>();
+                        auto const p =
+                            machoBuildVersionPlatformFromName(s);
+                        if (!p.has_value()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/image/buildVersion/platform",
+                                      std::format("unknown buildVersion "
+                                                  "platform '{}' — "
+                                                  "accepted: \"macos\" "
+                                                  "(PLATFORM_MACOS).", s));
+                            ok = false;
+                        } else {
+                            ver.platform = *p;
+                        }
+                    }
+                    // minOs (version string; required).
+                    if (!bv.contains("minOs")
+                     || !bv.at("minOs").is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/image/buildVersion/minOs",
+                                  "'minOs' is required and must be a "
+                                  "version string (\"11.0\" / \"11.0.0\").");
+                        ok = false;
+                    } else {
+                        auto const v =
+                            parseVer(bv.at("minOs").get<std::string>());
+                        if (!v.has_value()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/image/buildVersion/minOs",
+                                      "'minOs' must be a dotted version "
+                                      "\"X.Y[.Z]\" (major<65536, "
+                                      "minor/patch<256).");
+                            ok = false;
+                        } else {
+                            ver.minOs = *v;
+                        }
+                    }
+                    // sdk (version string; optional — defaults to minOs).
+                    if (bv.contains("sdk")) {
+                        if (!bv.at("sdk").is_string()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/image/buildVersion/sdk",
+                                      "'sdk' must be a version string.");
+                            ok = false;
+                        } else {
+                            auto const v =
+                                parseVer(bv.at("sdk").get<std::string>());
+                            if (!v.has_value()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          "/image/buildVersion/sdk",
+                                          "'sdk' must be a dotted version "
+                                          "\"X.Y[.Z]\".");
+                                ok = false;
+                            } else {
+                                ver.sdk = *v;
+                            }
+                        }
+                    } else {
+                        ver.sdk = ver.minOs;
+                    }
+                    if (ok) {
+                        data.machoImage.buildVersion = ver;
+                    }
                 }
             }
         }

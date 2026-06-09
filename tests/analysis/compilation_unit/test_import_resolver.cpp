@@ -189,50 +189,48 @@ TEST(ImportResolver, CSubsetIncludeDirResolvesAcrossDirectories) {
 
 // ── FF11: angle-form `#include <h>` system-path resolution ───────────────────
 
-// `#include <X.h>` resolves the header on the SYSTEM search path
-// (addSystemDir, the shippedLibDirs analogue) — NOT the quote form's
-// self-dir/includeDirs. The header is a c-subset source loaded + merged,
-// and its extern decl reaches the merged unit (so FF5 can annotate it).
-TEST(ImportResolver, CSubsetAngleIncludeResolvesOnSystemDir) {
+// `#include <X.h>` resolves to a LANGUAGE-NEUTRAL JSON DESCRIPTOR on the SYSTEM
+// search path (addSystemDir, the shippedLibDirs analogue) — NOT a c-subset
+// source header (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC, the descriptor model
+// that REPLACED cycle-21's source-`.h` load). The requested `<api.h>` maps to
+// `api.json`; on a hit the resolver records its ABSOLUTE PATH on
+// `cu.shippedLibDescriptors()` and loads NO extra Tree (a descriptor is a
+// neutral symbol table, not parsed source, so it yields no CrossTreeRef). The
+// semantic phase reads that path + mints the descriptor's externs (proven
+// end-to-end by examples/c-subset/shipped_include_puts and by
+// SemanticAnalyzerCSubset.FF11* below).
+TEST(ImportResolver, CSubsetAngleIncludeResolvesToDescriptorOnSystemDir) {
     TempDir srcDir;
     TempDir sysDir;
     auto main = srcDir.write("main.c",
-        "#include <api.h>\nint main() { return use(); }\n");
-    sysDir.write("api.h", "extern int use();\n");
+        "#include <api.h>\nint main() { return 0; }\n");
+    // The shipped artifact is a NEUTRAL JSON descriptor, NOT a c-subset `.h`.
+    auto descPath = sysDir.write("api.json",
+        R"({ "library": { "pe": "lib.dll" },
+             "symbols": [ { "name": "use", "signature": "fn() -> i32" } ] })");
 
     UnitBuilder builder{loadShippedSchema("c-subset")};
     builder.addSystemDir(sysDir.path());       // the system (shippedLibDirs) path
     builder.addFile(main);
     auto cu = std::move(builder).finish();
 
-    // api.h was discovered + loaded by following the ANGLE directive.
-    ASSERT_EQ(cu.trees().size(), 2u);
+    // NO second Tree: the descriptor is recorded, not loaded as source.
+    ASSERT_EQ(cu.trees().size(), 1u) << "a descriptor is NOT parsed as a Tree";
     EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors());
-    EXPECT_FALSE(cu.trees()[1].diagnostics().hasErrors());
     EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::F_ShippedHeaderNotFound));
     EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport));
+    // A descriptor include produces NO cross-tree edge (it has no source syntax).
+    EXPECT_TRUE(cu.crossRefs().empty()) << "descriptor includes yield no CrossTreeRef";
 
-    ASSERT_EQ(cu.crossRefs().size(), 1u);
-    auto const& ref = cu.crossRefs()[0];
-    Tree const& mainTree = cu.trees()[0];
-    EXPECT_EQ(ref.sourceTree, mainTree.id());
-    EXPECT_EQ(ref.targetTree, cu.trees()[1].id());           // → api.h
-    EXPECT_EQ(ref.targetNode, cu.trees()[1].root());
-    // The edge anchors on the same includeDirective rule node as the quote form.
-    EXPECT_EQ(mainTree.rule(ref.sourceNode), mainTree.rules().find("includeDirective"));
-
-    // The loaded header's `extern int use();` is present in the merged unit —
-    // a real declaration WITH its signature, ready for FF5 synthesis.
-    bool sawExtern = false;
-    Tree const& sysTree = cu.trees()[1];
-    walkPreOrder(sysTree, [&](TreeCursor const& cursor) {
-        NodeId const node = cursor.current();
-        if (sysTree.kind(node) == NodeKind::Internal
-            && sysTree.rule(node) == sysTree.rules().find("externDecl")) {
-            sawExtern = true;
-        }
-    });
-    EXPECT_TRUE(sawExtern) << "the system header's externDecl must reach the unit";
+    // The resolved descriptor PATH is recorded — and it is the `api.json` we
+    // wrote (stem-mapped from `<api.h>`), by weakly-canonical path identity.
+    ASSERT_EQ(cu.shippedLibDescriptors().size(), 1u)
+        << "the angle include must record exactly one descriptor path";
+    std::error_code ec;
+    auto const got  = std::filesystem::weakly_canonical(cu.shippedLibDescriptors()[0], ec);
+    auto const want = std::filesystem::weakly_canonical(descPath, ec);
+    EXPECT_EQ(got, want)
+        << "<api.h> must map to api.json on the system dir";
 }
 
 // A SYSTEM-header miss is a HARD error (F_ShippedHeaderNotFound), NOT the

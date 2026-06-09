@@ -383,8 +383,13 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         return false;  // optimize / verify failure already reported via `reporter`
     }
 
+    // D-FFI-EXTERN-CALL-DISPATCH: the merged module compiles to ONE
+    // (target, format); pass that format's extern-call shape so MIR→LIR
+    // selects the right call-site opcode for any surviving extern import.
     auto mod = lowerMergedToAssembly(*merged, grammar, **targetR,
-                                     ccIndex, cuMirs[0].cuId, reporter);
+                                     ccIndex, cuMirs[0].cuId,
+                                     (*formatR)->externCallDispatch(),
+                                     reporter);
     if (!mod) return false;  // back-half tier failure already reported via `reporter`
     return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
                         **targetR, **formatR, outPath, reporter);

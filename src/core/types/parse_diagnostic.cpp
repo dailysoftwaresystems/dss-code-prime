@@ -145,6 +145,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::A_LirToMirSizeMismatch:         return "A_LirToMirSizeMismatch";
         case DiagnosticCode::A_NoMatchingEncodingVariant:    return "A_NoMatchingEncodingVariant";
         case DiagnosticCode::A_RoundTripMismatch:            return "A_RoundTripMismatch";
+        case DiagnosticCode::A_ImmediateOperandOutOfRange:   return "A_ImmediateOperandOutOfRange";
         case DiagnosticCode::K_SymbolUndefined:              return "K_SymbolUndefined";
         case DiagnosticCode::K_RelocationKindMismatch:       return "K_RelocationKindMismatch";
         case DiagnosticCode::K_NoMatchingObjectFormat:       return "K_NoMatchingObjectFormat";
@@ -194,6 +195,27 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::F_BinaryReaderPartialCorruption: return "F_BinaryReaderPartialCorruption";
         case DiagnosticCode::F_FfiNoImportLibraryForFormat:  return "F_FfiNoImportLibraryForFormat";
         case DiagnosticCode::F_ShippedHeaderNotFound:        return "F_ShippedHeaderNotFound";
+        case DiagnosticCode::F_ShippedLibDescriptorMalformed: return "F_ShippedLibDescriptorMalformed";
+        case DiagnosticCode::F_ShippedLibUnsupportedType:    return "F_ShippedLibUnsupportedType";
+
+        // Semantic (S_) + assembler (A_) + linker (K_) enumerators added in
+        // later cycles but not mirrored here until the per-file -Werror=switch
+        // gate (below) caught the drift.
+        case DiagnosticCode::S_NotAComposite:                return "S_NotAComposite";
+        case DiagnosticCode::S_NotAPointer:                  return "S_NotAPointer";
+        case DiagnosticCode::A_FunctionEncodeAborted:        return "A_FunctionEncodeAborted";
+        case DiagnosticCode::K_AbsolutePointerRelocMissing:  return "K_AbsolutePointerRelocMissing";
+
+        // Optimizer/pipeline (X_) family.
+        case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";
+        case DiagnosticCode::X_UnknownPassName:              return "X_UnknownPassName";
+        case DiagnosticCode::X_PipelineVersionMismatch:      return "X_PipelineVersionMismatch";
+        case DiagnosticCode::X_PipelineMalformed:            return "X_PipelineMalformed";
+        case DiagnosticCode::X_PipelineNameResolutionFailed: return "X_PipelineNameResolutionFailed";
+        case DiagnosticCode::X_OptPassSkipped:               return "X_OptPassSkipped";
+        case DiagnosticCode::X_OptReturnFalseWithoutDiagnostic:
+            return "X_OptReturnFalseWithoutDiagnostic";
+        case DiagnosticCode::X_InlineMalformedCallSite:      return "X_InlineMalformedCallSite";
     }
     return "Unknown";
 }

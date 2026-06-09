@@ -48,6 +48,15 @@
               { "$comment": "ORR Xd, XZR, Xm — bits 16..20 hold Rm (the source register's encoding). The fixed word's bits 9..5 = 0b11111 (XZR) are baked in; the wire only adds Rm bits.",
                 "index": 0, "slotKind": "rm" }
             ]
+          },
+          {
+            "$comment": "MOVZ Xd, #imm16 — move a 16-bit UNSIGNED immediate (zeroing the rest of the register; hw shift = 0). Fixed word 0xD2800000 (sf=1, opc=10, fixed bits 100101, hw=00). The Imm16 slot writes imm16 at bits 5..20; Rd at bits 0..4. Selected by the `imm32` operand-kind guard (the engine's immediate-operand filter — the SLOT is 16-bit, MOVZ-specific). The entry trampoline uses this to load the exit-syscall number into x8 (D-LK10-ENTRY-ARM64). A value wider than 16 bits fails loud (A_ImmediateOperandOutOfRange) — MOVZ+MOVK / shifted-MOVZ materialization is a future cycle.",
+            "guard":      { "operandKinds": ["imm32"] },
+            "template":   { "fixedWord": 3531603968 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "imm16" }
+            ]
           }
         ]
       }
@@ -109,6 +118,16 @@
               { "index": 0, "slotKind": "rn" },
               { "index": 1, "slotKind": "rm" }
             ]
+          },
+          {
+            "$comment": "ADD Xd, Xn, #imm12 (immediate). Fixed word 0x91000000 (sf=1, op=0 add, S=0, sh=0). imm12 at bits 10..21 via the Imm12 slot; Rd 0..4, Rn 5..9. Used by the callconv prologue/epilogue stack adjust (`add sp, sp, #frame`). 2-operand LIR form [reg, imm]: operand 0 → Rn (also the dest via resultSlot), operand 1 → Imm12. Range 0..4095.",
+            "guard":      { "operandKinds": ["reg", "imm32"] },
+            "template":   { "fixedWord": 2432696320 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"    },
+              { "index": 1, "slotKind": "imm12" }
+            ]
           }
         ]
       }
@@ -128,6 +147,16 @@
             "wires":      [
               { "index": 0, "slotKind": "rn" },
               { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "SUB Xd, Xn, #imm12 (immediate). Fixed word 0xD1000000 (sf=1, op=1 sub, S=0, sh=0). imm12 at bits 10..21; Rd 0..4, Rn 5..9. Used by the callconv prologue stack adjust (`sub sp, sp, #frame`). Same 2-operand [reg, imm] LIR form as ADD-immediate.",
+            "guard":      { "operandKinds": ["reg", "imm32"] },
+            "template":   { "fixedWord": 3506438144 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"    },
+              { "index": 1, "slotKind": "imm12" }
             ]
           }
         ]
@@ -216,8 +245,61 @@
       }
     },
     {
-      "$comment": "BL imm26 — branch with link to symbol. Fixed-word base = 0x94000000 (opcode bits 26..31 = 0b100101). Imm26 wire at bits 0..25 emits a call26 relocation; the bits are left at 0 (linker patches at link time).",
-      "mnemonic":         "bl",
+      "$comment": "D-AS3-COND-CODE-ARM64 (ARM64 control-flow): materialize a 0/1 GPR from the NZCV flags by condition — the AArch64 analog of x86 `setcc`. ARM64 has no `setcc`; the canonical idiom is `CSET Xd, <cond>` = `CSINC Xd, XZR, XZR, invert(cond)` (when the INVERTED condition is FALSE — i.e. the requested condition is TRUE — the false-arm increments XZR→1; otherwise 0). Single fixed word base 0x9A9F07E0 (2594113504): sf=1, CSINC opcode, Rm=XZR=31<<16, Rn=XZR=31<<5, op2=01, Rd at bits 0..4. The cond nibble is placed at bits 12..15 (condBitPos=12) and INVERTED (condInvert=true) from the inst payload via condCodeFromPayload + the schema's condCodeEncoding table. LIR shape mirrors x86 setcc: result=value, ZERO value operands (reads FLAGS), cond from payload. lowerICmp emits `cmp` then `setcc(cond)` then `zext`. VERIFY: `cset x0, gt` = GT(0xC) inverted to 0xD at bits 12..15 = 0x9A9FD7E0.",
+      "mnemonic":      "setcc",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": [] },
+            "template":   { "fixedWord": 2594113504, "condCodeFromPayload": true, "condBitPos": 12, "condInvert": true },
+            "resultSlot": "rd"
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Zero-extend a 32-bit value to 64-bit — AArch64 `MOV Wd, Wm` = `ORR Wd, WZR, Wm` (a 32-bit register op auto-zeroes the upper 32 bits of the X register, so a W-form ORR IS the W→X zero-extend). Single fixed word base 0x2A0003E0 (704644064): sf=0 (32-bit), ORR opc=01, Rn=WZR=31<<5, Rd at bits 0..4, Rm (source) at bits 16..20 via the one reg wire. Mirrors x86_64's `zext` (movzx) LIR shape: result=value, ONE reg operand. The natural consumer is lowerICmp's setcc→zext pair (a clean 0/1 r64); also reused by MIR ZExt. VERIFY: zext of w1→x0 (Rd=0, Rm=1) = 0x2A0103E0.",
+      "mnemonic":      "zext",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"] },
+            "template":   { "fixedWord": 704644064 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Allocate a stack-frame slot (virtual / pseudo-op — NO encoding, exactly like x86_64's `alloca`). Payload = spill-slot/local index threaded verbatim from MIR Alloca. Result is a pointer-class virtreg holding the slot's effective address. The ML7 callconv pass (lir_callconv) materializes this into a frame-relative `lea result, [sp + offset]` once the frame layout is known — target-blind, and arm64 already has `lea` (ADRP+ADD), so no encoder change is needed; this declaration just lets MIR Alloca lower on arm64. A function with body locals (`int n = 42;`) emits one alloca per local.",
+      "mnemonic":      "alloca",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Direct call to a symbol — AArch64 `BL imm26` (branch-with-link). Declared under the engine's GENERIC `call` verb (NOT the ISA spelling 'bl'), the same convention every other opcode in this file already follows (`mov`=ORR-alias, `add`=ADD, `xor`=EOR, `or`=ORR): the target's mnemonics ARE the engine's verb vocabulary; the real ISA mnemonic lives in this comment. This is what lets the format-blind trampoline emitter (`opcodeByMnemonic(\"call\")`) and the MIR→LIR `MnemonicSlot::Call` resolve the direct call on ANY target. Fixed-word base = 0x94000000 (opcode bits 26..31 = 0b100101). Imm26 wire at bits 0..25 emits a call26 relocation; the bits are left at 0 (linker patches at link time).",
+      "mnemonic":         "call",
       "result":           "none",
       "hasSideEffects":   true,
       "isCall":           true,
@@ -235,8 +317,211 @@
           }
         ]
       }
+    },
+    {
+      "$comment": "AArch64 SVC #0 = 0xD4000001 — supervisor call (the syscall instruction). Zero-operand at LIR level; the Linux AArch64 syscall ABI puts the syscall number in x8 (the format's processExit.syscallNumGpr), args in x0..x7, return in x0. Mirrors x86_64's `syscall` (0F 05). Added at D-LK10-ENTRY-ARM64 so the entry trampoline can issue the exit_group syscall and terminate the process. fixedWord 3556769793 = 0xD4000001 (SVC with imm16=0).",
+      "mnemonic":      "syscall",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "fixedWord": 3556769793 }
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Spill-reload pseudo-op (target-blind, NO encoding — exactly like x86_64's). Payload = spill-slot index. The ML7 callconv pass materializes this into the target's real `load` (the LDUR opcode below) ONLY when a function actually spills / restores a callee-saved reg; the spill-rewrite pass requires the mnemonic to EXIST upfront. A register-pressure-light leaf (e.g. `return 42`) never emits one.",
+      "mnemonic": "frame_load", "result": "value",
+      "minOperands": 0, "maxOperands": 0,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Spill-store pseudo-op (target-blind, NO encoding). Payload = spill-slot index. Operand[0] = the physical reg being stored. Materialized into the target's real `store` (the STUR opcode below) by the ML7 callconv pass, only when a function spills / saves a callee-saved reg.",
+      "mnemonic": "frame_store", "result": "none",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Memory LOAD — AArch64 LDUR Xt, [Xn, #simm9] (unscaled, signed 9-bit byte offset). Fixed word 0xF8400000 (size=11 64-bit, opc=01 load, unscaled mode bits 11..10 = 00). Operand layout (shared LIR load form): [base_reg, MemBase(scale=1), MemOffset(disp)] + result. Wires: result→Rt (rd, bits 0..4), base_reg(index 0)→Rn (bits 5..9), MemOffset(index 2)→Imm9 (bits 12..20, signed). The MemBase(index 1) carries no AArch64 bits (scale must be 1; the walker validates it). The callconv materializes frame_load into this. Offset range -256..255; a wider frame fails loud (scaled LDR imm12 = future).",
+      "mnemonic":      "load",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template":   { "fixedWord": 4164943872 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm9"           }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Memory STORE — AArch64 STUR Xt, [Xn, #simm9] (unscaled). Fixed word 0xF8000000 (opc=00 store). Operand layout (shared LIR store form): [value_reg, base_reg, MemBase(scale=1), MemOffset(disp)], no result. Wires: value_reg(index 0)→Rt (rd, bits 0..4), base_reg(index 1)→Rn (bits 5..9), MemOffset(index 3)→Imm9 (bits 12..20, signed). MemBase(index 2) carries no bits (scale must be 1). The callconv materializes frame_store into this.",
+      "mnemonic":      "store",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "template": { "fixedWord": 4160749568 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm9"           }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Load-effective-address — AArch64 ADRP+ADD pair (D-AS4-3 multi-instruction macro-op materializing a module symbol's address into Xd). Mirrors x86_64's 1-operand RIP-relative `lea reg, [rip+sym]` so `lowerGlobalAddr` is target-blind: ONE SymbolRef operand wired into BOTH words. word0 = ADRP Xd, sym@PG (0x90000000=2415919104): Rd at bits 0..4; immlo[30:29]+immhi[23:5] left ZERO — the adr_prel_pg_hi21 reloc patches the ±4 GiB page delta. word1 = ADD Xd, Xd, #:lo12:sym (0x91000000=2432696320, the ADD-imm base shared with `add`'s imm variant): Rd at 0..4 AND Rn at 5..9 (BOTH = the result reg via extraResultSlots — ADD reads its own dest as the source base); imm12[21:10] left ZERO — the add_abs_lo12_nc reloc patches. Both relocs target the SAME symbol at byte offsets base+0 and base+4. The two `sym.patch` wires write NO immediate bits (the linker owns them); they carry only relocationKind + wordIndex.",
+      "mnemonic":      "lea",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["symbol"] },
+            "template":   { "fixedWords": [2415919104, 2432696320] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "sym.patch", "wordIndex": 0, "relocationKind": "adr_prel_pg_hi21" },
+              { "index": 0, "slotKind": "sym.patch", "wordIndex": 1, "relocationKind": "add_abs_lo12_nc" }
+            ]
+          },
+          {
+            "$comment": "FRAME-RELATIVE lea — `lea Xd, [base + #disp]` = AArch64 `ADD Xd, Xn, #imm12`. This is the form the ML7 callconv's `emitFrameAddr` materializes from `alloca` (a body-local's effective address): 3-op no-index shape [base_reg, MemBase(scale=1), MemOffset(disp)] + result, MIRRORING x86_64's 3-op `lea` (so the callconv stays target-blind — it emits the same operand layout for both ISAs). Single fixed word 0x91000000 (2432696320, the ADD-imm base, shared with `add`'s imm variant + the SymbolRef lea's word1): base_reg→Rn (bits 5..9), result→Rd (bits 0..4), MemOffset→Imm12 (UNSIGNED, bits 10..21; frame offsets are non-negative). MemBase carries no AArch64 bits (scale must be 1; the walker validates it via membase.noscale). A frame offset >4095 fails loud at the walker (A_ImmediateOperandOutOfRange) — the shifted ADD imm12<<12 form for larger frames is a future generalization (D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE, parallel to the unscaled-vs-scaled LDR/STR split).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template":   { "fixedWord": 2432696320 },
+            "resultSlot": "rd",
+            "wires": [
+              { "index": 0, "slotKind": "rn"              },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12"           }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow): integer compare writing the NZCV flags, no GPR result. AArch64 `CMP Xn, Xm` is an alias for `SUBS XZR, Xn, Xm` (subtract-and-set-flags discarding the result into the zero register). Fixed word 0xEB00001F = SUBS (sf=1, op=1, S=1) with Rd=31 (XZR) baked in; Rn at bits 5..9, Rm at bits 16..20. Mirrors x86's `cmp` LIR shape (InvalidLirReg result, 2 reg operands) — ML5 lowerICmp + lowerCondBr emit it before the conditional branch. NO resultSlot (the flags are the implicit output). Reuses the Rn/Rm slots already exercised by the add/sub reg-reg variants.",
+      "mnemonic":      "cmp",
+      "result":        "none",
+      "hasSideEffects": false,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"] },
+            "template": { "fixedWord": 3942645791 },
+            "wires":    [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-AS3-BLOCK-REL-IMM19/26: unconditional intra-function jump. AArch64 `B <label>` (encoding 0x14000000, opcode bits 26..31 = 0b000101). The 26-bit imm field (bits 0..25, SCALED by 4) is the SIGNED word displacement to the target block — resolved at ASSEMBLE time via the Imm26 slot + per-function patch list (NOT a linker relocation; the same Imm26 slot is symbol-bearing for the BL/`call` form, but a BlockRef operand here selects the intra-function path). Operand[0] is a BlockRef naming the target basic block. Mirrors x86's `jmp` (E9 rel32). Imm26's ±128 MiB reach covers any single function.",
+      "mnemonic":      "jmp",
+      "result":        "none",
+      "terminatorKind": "br",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 1,
+      "maxSuccessors": 1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["blockref"] },
+            "template": { "fixedWord": 335544320 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm26" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-AS3-BLOCK-REL-IMM19/26: conditional intra-function jump with mandatory fallthrough. 2-WORD macro: `B.cond <ifTrue>` (word 0) then `B <ifFalse>` (word 1) — the AArch64 analog of x86's `0F 8x rel32; E9 rel32` compound. word0 = B.cond base 0x54000000 (opcode bits 24..31 = 0b01010100, bit 4 = 0); the cond nibble (bits 0..3) comes from the inst's payload (TargetCondCode) via `condCodeFromPayload` + the schema's `condCodeEncoding` table; the 19-bit signed PC-relative offset (bits 5..23, scaled by 4) goes to the Imm19 slot → ifTrue block. word1 = B base 0x14000000 with the Imm26 slot → ifFalse (fallthrough) block. Both displacements resolve at assemble time (BlockRef operands, no relocation). operand[0]=ifTrue (taken when cond holds), operand[1]=ifFalse. A future optimizer elides word1 when ifFalse is the next-laid-out block (D-OPT-JCC-FALLTHROUGH). Mirrors the x86 jcc wiring + the lea multi-word fixedWords+wordIndex shape.",
+      "mnemonic":      "jcc",
+      "result":        "none",
+      "terminatorKind": "cond-br",
+      "hasSideEffects": true,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 2,
+      "maxSuccessors": 2,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["blockref", "blockref"] },
+            "template": { "fixedWords": [1409286144, 335544320], "condCodeFromPayload": true },
+            "wires":    [
+              { "index": 0, "slotKind": "imm19", "wordIndex": 0 },
+              { "index": 1, "slotKind": "imm26", "wordIndex": 1 }
+            ]
+          }
+        ]
+      }
     }
   ],
+  "$condCodeEncodingComment": "D-AS3-COND-CODE-ARM64 (mirror of x86's table): per-cond-code nibble for the AArch64 B.cond instruction's bits [3:0]. Numeric values are the AArch64 condition codes (ARM ARM C1.2.4): EQ=0, NE=1, CS/HS=2, CC/LO=3, HI=8, LS=9, GE=10(0xA), LT=11(0xB), GT=12(0xC), LE=13(0xD). Signed comparisons map slt→LT(0xB)=11, sle→LE(0xD)=13, sgt→GT(0xC)=12, sge→GE(0xA)=10; unsigned map ult→CC/LO=3, ule→LS=9, ugt→HI=8, uge→CS/HS=2. The encoder ORs this nibble into word 0 bits 0..3 of the jcc macro (vs x86's low 4 bits of the opcode byte — same field-position abstraction, different ISA placement). 10-arm coverage matches the substrate's TargetCondCode enum exactly.",
+  "condCodeEncoding": {
+    "eq":  0,
+    "ne":  1,
+    "slt": 11,
+    "sle": 13,
+    "sgt": 12,
+    "sge": 10,
+    "ult": 3,
+    "ule": 9,
+    "ugt": 8,
+    "uge": 2
+  },
   "$registersComment": "AAPCS64 general-purpose registers x0..x30 + zero-register XZR (encoded as 31 in source operands; uses register's hwEncoding). Stack pointer `sp` is also encoded as 31 but in the SP-slot context — hwEncoding=31 with class GPR is shared between XZR and SP at the byte level. NEON/FP regs v0..v31 use the same 5-bit field but in a separate class. Cycle-3 declares enough registers for AAPCS64 callconv + the encoded mov/ret/brk subset.",
   "registers": [
     { "name": "x0",  "class": "gpr", "widthBytes": 8, "hwEncoding": 0 },
@@ -291,7 +576,24 @@
       "redZoneBytes":     0,
       "$entryStackPointerBiasComment": "D-LK10-ENTRY-TRAMP-PROLOGUE: AArch64 BL does NOT push a return address (it writes LR / x30 directly), so process entry — whether by kernel-jump (Linux/Mac) or `RtlUserThreadStart`-BL (Windows) — leaves SP 16-byte-aligned (bias 0 mod 16). Trampoline `sub sp, 0` is emitted as nothing — `alignedSizeWithBias(shadowSpaceBytes=0, stackAlignment=16, bias=0) = 0`.",
       "entryStackPointerBias": 0,
-      "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: AArch64 BL writes the return address into LR/x30 — no stack push. callPushBytes=0 is the right ISA-level fact for ARM64. Non-leaf functions on ARM64 still save x30 in their prologue (via `stp x29, x30, [sp, #-16]!`), which lands in `savedRegAreaSize` via the existing callee-saved tracking — independent of the call-push bias.",
+      "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: AArch64 BL writes the return address into LR/x30 — no stack push. callPushBytes=0 is the right ISA-level fact for ARM64. Non-leaf functions on ARM64 still save x30 in their prologue + reload it before `ret`; because x30 is the `linkRegister` (deliberately NOT in `calleeSaved` — it must not be allocatable), this is realized by the link-register fold in `lir_callconv.cpp::materializeOneFunc` (gated on hasCalls + cc.linkRegister), which adds x30 to `savedRegs` so it lands in `savedRegAreaSize`. Without it the epilogue `ret` returns to a clobbered LR — see D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER. Independent of the call-push bias.",
+      "callPushBytes": 0
+    },
+    {
+      "$comment": "apple_arm64 — Apple's ARM64 ABI for Apple platforms (developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms). The ABI catalog (abi_catalog.cpp) maps (arm64, MachO) → CcApple → \"apple_arm64\"; shipping this row CLOSES D-FF3-5 (trigger: 'apple_arm64 cc row ships in arm64.target.json') and is what lets `resolveAbi` + the entry trampoline resolve a Mach-O-ARM64 cc. The general-purpose REGISTER vocabulary is IDENTICAL to AAPCS64 — integer args x0..x7, returns x0/x1, callee-saved x19..x28+x29, link x30, sp, 16-byte stack alignment, bias 0 (BL writes LR, no push). The Apple ABI's documented DIVERGENCES from AAPCS64 are NOT register-assignment differences: (1) variadic args are ALWAYS passed on the stack (vs AAPCS64's register-then-stack) and (2) a different indirect-result-location rule. Neither is modeled at today's scalar-only asm tier (variadic support is gated at D-FFI-DESCRIPTOR-VARIADIC-SIGNATURE), so for the scalar register-passing this row carries the same fields as aapcs64; a SEPARATE named row keeps the ABI identity explicit and correct, so when variadic/indirect-result lands it is updated HERE, not by silently reusing aapcs64. The always-stack variadic rule + indirect-result-location divergence are pinned at D-FF3-APPLE-ARM64-ABI-DIVERGENCE (they land WITH the proper CcApple field set when the trigger fires — a variadic OR struct-return call on arm64-Apple — not as a silent aapcs64 reuse; distinct from D-FF3-4, which is the Microsoft CcMSARM64 split).",
+      "name":             "apple_arm64",
+      "argGprs":          ["x0","x1","x2","x3","x4","x5","x6","x7"],
+      "argFprs":          [],
+      "returnGprs":       ["x0","x1"],
+      "returnFprs":       [],
+      "callerSaved":      ["x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x18"],
+      "calleeSaved":      ["x19","x20","x21","x22","x23","x24","x25","x26","x27","x28","x29"],
+      "linkRegister":     "x30",
+      "stackPointer":     "sp",
+      "stackAlignment":   16,
+      "shadowSpaceBytes": 0,
+      "redZoneBytes":     0,
+      "entryStackPointerBias": 0,
       "callPushBytes": 0
     }
   ],

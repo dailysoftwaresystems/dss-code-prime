@@ -1,0 +1,111 @@
+{
+  "$comment": "Mach-O EXECUTABLE (MH_EXECUTE) for ARM64 Darwin/macOS (Apple Silicon). The macOS-ARM64 runnable-binary backend (v0.0.3, D-LK10-ENTRY-MACHO-EXIT). Cloned from `macho64-x86_64-darwin-exec.format.json` and re-pointed at arm64: `macho.cputype = 0x0100000C` (CPU_TYPE_ARM64 = 12 | CPU_ARCH_ABI64), `cpusubtype = 0` (CPU_SUBTYPE_ARM64_ALL); `processExit` populated for the libSystem `_exit` by-name import (the macOS-Apple-Silicon exit mechanism — no raw BSD syscall, whose numbers Apple declares unstable); `entryCallingConvention = aapcs64`; `externCallDispatch = direct-plt` (Mach-O symbolVa→__stubs stub, like ELF — see macho.cpp). Consumed by `src/link/format/macho.cpp` via the format-blind linker engine; the per-cputype __stubs bytes (12-byte ADRP+LDR+BR x16) live in `emitArm64MachoStub`, mirroring elf.cpp's `emitArm64PltStub`. The runnable corpus is `examples/c-subset/macho_arm64_exit` (return 42 → AArch64 Mach-O exec; runs natively on the macos-latest=arm64 CI leg).",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "macho64-arm64-darwin-exec",
+    "version": "1.0",
+    "kind": "macho"
+  },
+
+  "$entryPointComment": "Empty defaults to module.functions[0] (cycle-2 convention). LC_MAIN.entryoff is computed as (entry_function_offset_in_.text) — relative to the __TEXT segment start.",
+  "entryPoint": "",
+  "$externCallDispatchComment": "DIRECT-PLT. Mach-O points each extern symbol's VA at its __stubs STUB (code) — `symbolVa[extern] = stubVa` in macho.cpp — and the stub does the __got indirection internally (ARM64: ADRP x16, page → LDR x16,[x16,#lo12] → BR x16). The call site is therefore a PLAIN DIRECT call (ARM64 `BL imm26`, R_*/ARM64_RELOC_BRANCH26) to the stub, NOT a deref-the-stub-as-pointer. This is the SAME direct-plt model ELF uses; it matches what the trampoline + MIR→LIR `lowerCall` emit (both via `externCallUsesIndirectShape`). ARM64 has no `call_indirect_via_extern` opcode, so direct-plt is also the only lowerable shape. D-FFI-EXTERN-CALL-DISPATCH.",
+  "externCallDispatch": "direct-plt",
+
+  "$supportedDataSectionsComment": "the exec read-only data-section arm, mirrors ELF D-LK1-ELF-EXEC-DATA-SECTIONS (rodata-only scope): the Mach-O MH_EXECUTE walker emits a loadable `__TEXT,__const` from `AssembledModule.dataItems` items with `section=Rodata` (the parallel of the ELF `.rodata` arm, commit 8040410). The linker's pre-walker gate (linker.cpp) consults this set per-item — `Data`/`Bss` remain anchored under D-LK4-RODATA-PRODUCER. Cross-format agnosticism: this is the SAME field ELF + PE exec formats declare; the gate has ZERO format-name branches, and the validation+layout reuses the shared `exec_data_section.hpp` substrate (`buildExecRodata`/`addDataSymbolVas`) used by elf.cpp. macho64-x86_64-darwin-exec deliberately does NOT declare it yet (no macOS-x86_64 CI leg to runtime-prove it).",
+  "supportedDataSections": ["rodata"],
+
+  "$processExitComment": "STDIO-FLUSH-AT-EXIT (2026-06-09) / D-LK10-ENTRY-MACHO-EXIT: the macOS runnable-binary exit terminates via the C-standard `exit(3)` — which flushes stdio + runs `atexit` before the process dies (returning from `main` ≡ `exit(3)`). importMangledName `_exit` is the MACH-O SYMBOL for the C function `exit`: Apple's C ABI prefixes every C symbol with ONE leading underscore (cFormatAddsLeadingUnderscore(MachO)=true; applyCMangling(\"exit\",MachO)=\"_exit\"), so libSystem exports the flushing `exit(3)` AS `_exit`. (The non-flushing POSIX `_exit(2)` is a DIFFERENT symbol, `__exit` — two underscores — and is NOT what this imports.) The trampoline places this name VERBATIM into the synthetic ExternImport (entry_trampoline.cpp does not re-mangle a processExit import), so the on-disk undefined symbol the dyld bind stream requests is exactly `_exit`. It moves the user fn's return value (x0) into argGprs[0]=x0 (a no-op mov under apple_arm64, emitted for ABI uniformity with x86_64's rax→rdi), then makes a DIRECT BL to the `_exit` __stubs entry (externCallDispatch=direct-plt). Chosen over a raw BSD syscall (0x2000001) because Apple declares BSD syscall numbers unstable; libSystem is loaded by every macOS process anyway. importLibraryPath must also appear in image.loadDylibs so dyld can resolve it. Uniform with elf (libc `exit`) + pe (kernel32 `ExitProcess`, msvcrt DLL-detach flush): all three terminate through a stdio-flushing libc-level primitive.",
+  "processExit": {
+    "mechanism": "by-name-import",
+    "importMangledName": "_exit",
+    "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+  },
+
+  "$entryCallingConventionComment": "apple_arm64 — Apple's ARM64 ABI (the ABI catalog maps (arm64, MachO) → apple_arm64; the entry trampoline + resolveAbi both resolve THIS name against arm64.target.json's callingConventions). The user fn's return value (returnGprs[0]=x0) is moved into argGprs[0]=x0 (a no-op mov under apple_arm64, emitted for ABI uniformity) before the exit call. Read via `target.callingConventionByName(\"apple_arm64\")` at trampoline-build time. apple_arm64's register vocabulary matches AAPCS64; its documented divergences (always-stack varargs, indirect-result) are not exercised by the scalar exit call.",
+  "entryCallingConvention": "apple_arm64",
+
+  "macho": {
+    "$comment": "mach_header_64 identity. cputype = CPU_TYPE_ARM64 = (12 | CPU_ARCH_ABI64 0x01000000) = 0x0100000C = 16777228. cpusubtype = CPU_SUBTYPE_ARM64_ALL (0). filetype = 'execute' (MH_EXECUTE). flags = MH_NOUNDEFS (0x1) | MH_DYLDLINK (0x4) | MH_TWOLEVEL (0x80) | MH_PIE (0x200000) = 0x200085 — modern macOS exec convention (same flag set as the x86_64-darwin-exec schema; PIE + two-level namespace + dyld).",
+    "cputype": 16777228,
+    "cpusubtype": 0,
+    "filetype": "execute",
+    "flags": 2097285
+  },
+
+  "image": {
+    "$comment": "Mach-O image fields for MH_EXECUTE. pageZeroSize = 0x100000000 (4 GiB) — __PAGEZERO at vmaddr=0 catches null derefs. segmentPageSize = 16384 (0x4000) — Apple Silicon REQUIRES 16 KiB-aligned LC_SEGMENT_64 vmaddr/vmsize/fileoff; 4 KiB-aligned segments are rejected at exec with EBADMACHO. This is a DISTINCT concept from codeSignature.pageSize (the code-hash page) and from pageZeroSize. dylinkerPath = '/usr/lib/dyld'. loadDylibs = ['/usr/lib/libSystem.B.dylib'] — required for any user-space process (and the home of the `_exit` the trampoline imports). bindNow = true (eager binding, the v1 stance, parallel to x86_64-darwin-exec + ELF's DF_1_NOW). buildVersion = macos / minOs 11.0 — modern dyld (macOS 11+ / Apple Silicon) needs an LC_BUILD_VERSION platform load command or it rejects the main executable at load (a second EBADMACHO-class blocker independent of segment alignment). codeSignature = ad-hoc SHA-256 (Apple Silicon REQUIRES every executable be code-signed; an ad-hoc signature is the minimum the kernel accepts for a locally-built binary). codeSignature.pageSize = 4096 = the conventional code-hash page Apple uses on BOTH x86_64 and arm64 (independent of the 16 KiB VM segment page).",
+    "pageZeroSize": 4294967296,
+    "segmentPageSize": 16384,
+    "dylinkerPath": "/usr/lib/dyld",
+    "loadDylibs": [
+      "/usr/lib/libSystem.B.dylib"
+    ],
+    "bindNow": true,
+    "buildVersion": {
+      "platform": "macos",
+      "minOs": "11.0",
+      "sdk": "11.0"
+    },
+    "codeSignature": {
+      "kind": "adhoc",
+      "hashAlgorithm": "sha256",
+      "pageSize": 4096,
+      "identifier": "com.dss.macho_arm64_exit"
+    }
+  },
+
+  "sections": [
+    {
+      "$comment": "__text within __TEXT. virtualAddress = 0x100000000 + 0x4000 = 0x100004000 — one 16 KiB segmentPageSize above __PAGEZERO. __text's file offset is textFileOff = alignUp(headerAndCmds, segmentPageSize); since the binary's header+load-commands total ~840 bytes (< 0x4000), textFileOff = 0x4000, so the section VA must be pageZeroSize + 0x4000 for the kernel's mmap congruence (vmaddr % page == fileoff % page). If a future cycle grows the load commands past 0x4000, this value must follow textFileOff (the walker's congruence guard in macho.cpp fails loud if it does not). flags (substrate `type`) = S_REGULAR (0) | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x00000400) = 0x80000400. addrAlign = 16 (log2 not used here; raw 16 matches the x86_64-darwin-exec schema convention).",
+      "kind": "text",
+      "name": "__text",
+      "segment": "__TEXT",
+      "type": 2147484672,
+      "flags": 0,
+      "addrAlign": 16,
+      "entrySize": 0,
+      "virtualAddress": 4294983680
+    },
+    {
+      "$comment": "__const within __TEXT — read-only data globals (the exec read-only data-section arm, mirrors ELF D-LK1-ELF-EXEC-DATA-SECTIONS). Folded into the R+X __TEXT segment (SHF-equivalent S_REGULAR, no write/exec attrs — strictly read-only, W^X preserved), mirroring the ELF `.rodata`-in-R+X-PT_LOAD arm. `type` (the substrate section flags/type field, exactly like the __text row above) = S_REGULAR = 0 (no attribute bits; __const is plain regular data). virtualAddress = 0 because __const's VA is COMPUTED by the walker (macho.cpp) — it depends on the __text + __stubs sizes, so it cannot be a static schema constant; the walker places it H1-aligned right after __stubs and writes the section_64 addr. addrAlign = 8 is the schema FLOOR; the walker raises it (H1) to the strictest data item's alignment. entrySize = 0 (not a fixed-stride table).",
+      "kind": "rodata",
+      "name": "__const",
+      "segment": "__TEXT",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    }
+  ],
+
+  "relocations": [
+    {
+      "$comment": "ARM64 Mach-O relocation kinds. `kind` MUST match arm64.target.json's relocation table (call26=1, adr_prel_pg_hi21=2, add_abs_lo12_nc=3, abs64=4) — that is the cross-reference the assembler emits and the walker validates. `nativeId` packs (r_type<<28)|(r_length<<25)|(r_pcrel<<24) for MH_OBJECT relocation_info records; MH_EXECUTE applies relocs in-place via the target's formula (the records are not emitted), so nativeId is descriptive here. ARM64_RELOC_BRANCH26 = 2, length 2 (4 bytes), pcrel 1 → (2<<28)|(2<<25)|(1<<24) = 0x25000000.",
+      "name": "ARM64_RELOC_BRANCH26",
+      "kind": 1,
+      "nativeId": 620756992
+    },
+    {
+      "$comment": "ARM64_RELOC_PAGE21 = 3, length 2, pcrel 1 → (3<<28)|(2<<25)|(1<<24) = 0x35000000.",
+      "name": "ARM64_RELOC_PAGE21",
+      "kind": 2,
+      "nativeId": 889192448
+    },
+    {
+      "$comment": "ARM64_RELOC_PAGEOFF12 = 4, length 2, pcrel 0 → (4<<28)|(2<<25)|(0<<24) = 0x44000000.",
+      "name": "ARM64_RELOC_PAGEOFF12",
+      "kind": 3,
+      "nativeId": 1140850688
+    },
+    {
+      "$comment": "ARM64_RELOC_UNSIGNED = 0, length 3 (8 bytes), pcrel 0 → (0<<28)|(3<<25)|(0<<24) = 0x06000000.",
+      "name": "ARM64_RELOC_UNSIGNED",
+      "kind": 4,
+      "nativeId": 100663296
+    }
+  ]
+}

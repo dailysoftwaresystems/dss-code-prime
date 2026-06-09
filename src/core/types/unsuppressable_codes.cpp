@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 58> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 61> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -71,6 +71,21 @@ constexpr std::array<DiagnosticCode, 58> kUnsuppressableCodes{{
     // symbol compile SILENTLY, exactly the silent-miscompile this
     // fail-loud closes. The closed-table membership pins it.
     DiagnosticCode::F_ShippedHeaderNotFound,
+    // F_ShippedLibDescriptorMalformed / F_ShippedLibUnsupportedType
+    // (neutral shipped-lib descriptor, 2026-06-06): the LANGUAGE-NEUTRAL
+    // shipped-library JSON descriptor read by
+    // `dss::ffi::readShippedLibDescriptor`. The first fires on a
+    // malformed descriptor (bad JSON / missing-required-key / wrong-type
+    // / unknown-key / bad enum); the second on a symbol whose
+    // `signature` hir-text type fails to decode. Both are load-bearing:
+    // suppressing either would let the lowering synthesize NO externs
+    // (or skip a symbol that fails to decode) and silently compile a
+    // program whose `#include <stdio.h>` symbols resolve to nothing —
+    // exactly the silent dropped-import surface these fail-louds close.
+    // The CRITICAL invariant is that a signature that does not decode
+    // MUST NOT reach `makeExternFunction` with InvalidType.
+    DiagnosticCode::F_ShippedLibDescriptorMalformed,
+    DiagnosticCode::F_ShippedLibUnsupportedType,
 
     // H_* HIR-lowering / verifier band — structural invariants (cannot
     // reach MIR codegen without violating downstream contracts). Post-
@@ -192,6 +207,11 @@ constexpr std::array<DiagnosticCode, 58> kUnsuppressableCodes{{
     DiagnosticCode::A_RoundTripMismatch,
     DiagnosticCode::A_NoEncodingDeclared,
     DiagnosticCode::A_NoEncodingShapeWalker,
+    // D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): a too-wide immediate that
+    // can't fit a fixed32 immediate slot must never be silently
+    // truncated to a wrong machine-code constant (e.g. wrong syscall
+    // number). Same bytes-on-disk-invariant band as the others above.
+    DiagnosticCode::A_ImmediateOperandOutOfRange,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

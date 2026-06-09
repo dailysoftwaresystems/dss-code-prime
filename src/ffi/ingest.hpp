@@ -87,9 +87,12 @@ struct DSS_EXPORT ExternDeclRef {
     // empty = the FFI synthesize stage uses the caller-supplied
     // format-level default `importLibrary`; non-empty = per-symbol
     // override (e.g. "kernel32.dll" for GetStdHandle/WriteFile when
-    // the language default is "msvcrt.dll"). Source-language
-    // agnostic — any language whose lowerer populates this field
-    // gets per-symbol routing.
+    // the language default is "msvcrt.dll"). A SINGLE string — already
+    // resolved for the active object format by the caller (Model 3,
+    // 2026-06-09): the upstream `HirExternRecord.libraryOverride` is a
+    // per-format map, FOLDED to this string by compile_pipeline where the
+    // format is in scope, so FF5 stays target-agnostic. Source-language
+    // agnostic — any language whose lowerer populates the map gets routing.
     std::string_view libraryOverride{};
 };
 

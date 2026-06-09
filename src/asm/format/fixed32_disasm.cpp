@@ -25,12 +25,47 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Rn:    return SlotBitWindow{ 5,  5 };
         case EncodingSlotKind::Rm:    return SlotBitWindow{ 16, 5 };
         case EncodingSlotKind::Imm26: return SlotBitWindow{ 0,  26 };
+        // D-LK10-ENTRY-ARM64: MOVZ Imm16 at bits 5..20. NOT
+        // symbol-bearing — extracted as a normal value (the Imm26
+        // must-be-zero symbol-slot path below does not apply).
+        case EncodingSlotKind::Imm16: return SlotBitWindow{ 5,  16 };
+        // Every remaining slot decodes to nullopt. This is an
+        // intentionally PARTIAL mirror of `fixed32::windowFor`: the
+        // round-trip decoder only needs the register/immediate windows
+        // the shipped fixed32 opcodes actually use (Rd/Rn/Rm/Imm26/Imm16).
+        //   * x86-variable slots (ModRm*, Imm32, Disp32*, SibIndex,
+        //     RipRelDisp32, CondCodeNibble, BlockRel32, MemBaseScale)
+        //     never appear on a fixed32 variant — validate() rejects
+        //     cross-shape variants.
+        //   * The other fixed32 slots (Imm9/Imm12/Imm19/MemBaseNoScale/
+        //     SymbolPatchMarker) are not decoded by this mirror yet — the
+        //     disasm-completeness gap tracked by D-AS5-MULTIWORD-DISASM.
+        // Both return nullopt — behavior unchanged from the prior
+        // enum-drift fallback. Listed EXHAUSTIVELY (no `default:`) so the
+        // D-AS-ENCODINGSLOT-EXHAUSTIVE-WARN gate flags a new enumerator.
         case EncodingSlotKind::ModRmReg:
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Disp32:
+        case EncodingSlotKind::ModRmRmMem:
+        case EncodingSlotKind::MemBaseScale:
+        case EncodingSlotKind::Disp32Mem:
+        case EncodingSlotKind::SibIndex:
+        case EncodingSlotKind::RipRelDisp32:
+        case EncodingSlotKind::CondCodeNibble:
+        case EncodingSlotKind::BlockRel32:
+        case EncodingSlotKind::Imm9:
+        case EncodingSlotKind::MemBaseNoScale:
+        case EncodingSlotKind::Imm12:
+        case EncodingSlotKind::SymbolPatchMarker:
+        case EncodingSlotKind::Imm19:
             return std::nullopt;
     }
+    // Unreachable for any in-range EncodingSlotKind (the switch is
+    // exhaustive). Retained as the out-of-range-ordinal backstop and to
+    // satisfy constexpr's every-path-returns rule / GCC-Clang
+    // -Wreturn-type / MSVC C4715 (an enum switch is not treated as
+    // exhaustive for control flow). Mirrors `slotShapeFor`.
     return std::nullopt;
 }
 
@@ -122,6 +157,20 @@ disassemble(TargetSchema const&            schema,
         DisassembledInst result{};
         result.opcode        = opcode;
         result.variantIndex  = vi;
+        // D-AS5-MULTIWORD-DISASM (deferred): this disassembler reads a
+        // SINGLE 32-bit word. A multi-word `fixed32` macro (D-AS4-3,
+        // e.g. AArch64 `lea` = ADRP+ADD) has `tmpl.fixedWords.size() > 1`
+        // and would need a per-word match loop + summed bytesConsumed;
+        // until then, asking this oracle to decode a multi-word opcode
+        // fails loud (the variant's `fixedWord` base is 0, so no match →
+        // A_RoundTripMismatch) rather than silently mis-decoding. The
+        // shipped multi-word opcode (lea) is proven by exact byte-pins +
+        // the linker reloc-formula tests, not the round-trip oracle.
+        // When multi-word disasm lands, the symbol-bearing-slot
+        // special-case in the wire loop below (currently Imm26-only)
+        // must ALSO generalize to `isSymbolBearingSlot(wire.slotKind)`
+        // so the `SymbolPatchMarker` slot disassembles to `std::nullopt`
+        // (consult the Relocation, not the bytes) like Imm26 does today.
         result.bytesConsumed = 4;
         if (variant.resultSlot.has_value()) {
             result.result = DisassembledSlot{

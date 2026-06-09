@@ -22,6 +22,9 @@ add_library(core OBJECT
     types/tree_cursor.cpp
     types/type_lattice/type_lattice.cpp
     types/type_lattice/type_reintern.cpp
+
+    # ── crypto/ — self-contained hashing primitives (codesign foundation) ──
+    crypto/sha256.cpp
 )
 
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
@@ -38,3 +41,28 @@ target_compile_definitions(core PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 # transitive consumers — every other file in `core` (and every consumer
 # of `core`) sees just our public headers, never <nlohmann/json.hpp>.
 target_link_libraries(core PRIVATE nlohmann_json::nlohmann_json)
+
+# D-DIAG-CODENAME-EXHAUSTIVE-WARN (2026-06-09): enforce EXHAUSTIVE
+# DiagnosticCode / DiagnosticSeverity dispatch in parse_diagnostic.cpp. Both
+# switches (`diagnosticCodeName`, `severityName`) are written with NO
+# `default:` arm — one explicit case per enumerator + a post-switch
+# out-of-range backstop `return` — so the "no-default + missing case = error"
+# flavor (GCC/Clang `-Werror=switch`; MSVC `/we4062`) turns a future
+# DiagnosticCode enumerator added without a matching name arm into a BUILD
+# ERROR, on local MSVC too. Closes the gap this gate was born from: 12 codes
+# (the X_* optimizer/pipeline family + A_FunctionEncodeAborted /
+# K_AbsolutePointerRelocMissing / S_NotAComposite / S_NotAPointer) had drifted
+# unhandled, surfacing only as a `-Wswitch` warning on the macOS / linux-clang
+# CI legs and INVISIBLE on local MSVC. Mirrors the sibling gates in
+# src/asm/CMakeLists.txt (D-AS-ENCODINGSLOT-EXHAUSTIVE-WARN) and
+# src/opt/CMakeLists.txt (D-OPT-RUNPASS-EXHAUSTIVE-WARN). Per-file scope is
+# load-bearing: parse_diagnostic.cpp's only two switches are both no-default
+# exhaustive; do NOT spread this to grammar_schema.cpp / target_schema.cpp etc.,
+# whose switches legitimately use subset-with-`default` forms.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    set_source_files_properties(types/parse_diagnostic.cpp PROPERTIES
+        COMPILE_OPTIONS "-Werror=switch")
+elseif(MSVC)
+    set_source_files_properties(types/parse_diagnostic.cpp PROPERTIES
+        COMPILE_OPTIONS "/we4062")
+endif()

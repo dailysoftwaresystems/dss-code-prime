@@ -18,6 +18,16 @@ dss_add_test(NAME link/test_aarch64_reloc_formulas SOURCES test_aarch64_reloc_fo
 # Plan 14 LK7 — codesign-placeholder reservation tests.
 dss_add_test(NAME link/test_codesign_placeholder SOURCES test_codesign_placeholder.cpp)
 
+# D-LK7-ADHOC-CODESIGN-MACHO (increment 2/2) — ad-hoc CodeDirectory +
+# SuperBlob FILL (real page-hash signature, not just a zero reservation).
+dss_add_test(NAME link/test_macho_codesign       SOURCES test_macho_codesign.cpp)
+
+# D-LK10-ENTRY-MACHO-EXIT — macOS-ARM64 runnable backend host-
+# independent byte-pins (arm64 __stubs encoder + direct-plt trampoline
+# dispatch + dispatch/symbolVa fail-loud + ad-hoc signature). The
+# always-on guard; the runtime corpus runs only on the macos-arm64 leg.
+dss_add_test(NAME link/test_macho_arm64_exit     SOURCES test_macho_arm64_exit.cpp)
+
 # Plan 14 LK8 — WebAssembly module writer (skeleton).
 dss_add_test(NAME link/test_wasm_writer          SOURCES test_wasm_writer.cpp)
 

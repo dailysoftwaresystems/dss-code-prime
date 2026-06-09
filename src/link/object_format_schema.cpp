@@ -634,18 +634,21 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
             // `bindNow == true` case is structurally a no-op (the
             // default) on .o paths.
             bool const anySet = mi.pageZeroSize != 0
+                || mi.segmentPageSize != kDefaultMachoSegmentPageSize
                 || !mi.dylinkerPath.empty()
                 || !mi.loadDylibs.empty()
                 || !mi.bindNow
-                || mi.codeSignatureSize != 0;
+                || mi.codeSignatureSize != 0
+                || mi.codeSignature.has_value()
+                || mi.buildVersion.has_value();
             if (anySet) {
                 fail("/image",
                      "Mach-O MH_OBJECT format must NOT declare an "
-                     "'image' block — pageZeroSize / dylinkerPath / "
-                     "loadDylibs / bindNow / codeSignatureSize live "
-                     "only in MH_EXECUTE / MH_DYLIB images. Set "
-                     "macho.filetype = 2 (MH_EXECUTE) if this schema "
-                     "describes an executable.");
+                     "'image' block — pageZeroSize / segmentPageSize / "
+                     "dylinkerPath / loadDylibs / bindNow / "
+                     "codeSignatureSize / codeSignature live only in "
+                     "MH_EXECUTE / MH_DYLIB images. Set macho.filetype = 2 "
+                     "(MH_EXECUTE) if this schema describes an executable.");
             }
         } else if (macho.filetype == MachOObjectType::Execute) {
             if (mi.pageZeroSize == 0) {
@@ -688,6 +691,26 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "fileoff % page).",
                                  mi.pageZeroSize));
             }
+            // segmentPageSize is the LC_SEGMENT_64 vmaddr/vmsize/fileoff
+            // alignment the walker feeds to alignUp() — it MUST be a
+            // positive power of two (alignUp masks with page-1) or the
+            // emitted segments overlap / misalign and the kernel rejects
+            // with EBADMACHO. 4 KiB (x86_64-darwin default) and 16 KiB
+            // (arm64-darwin, the Apple-Silicon requirement) are the live
+            // values. (D-LK10-ENTRY-MACHO-EXIT.)
+            if (mi.segmentPageSize == 0
+             || (mi.segmentPageSize & (mi.segmentPageSize - 1u)) != 0u) {
+                fail("/image/segmentPageSize",
+                     std::format("'image.segmentPageSize' (0x{:x}) must "
+                                 "be a positive power of two — it is the "
+                                 "VM segment alignment fed to alignUp(); "
+                                 "a non-power-of-two misaligns every "
+                                 "LC_SEGMENT_64 and the kernel rejects "
+                                 "the image with EBADMACHO. Use 4096 "
+                                 "(x86_64-darwin) or 16384 (arm64-darwin "
+                                 "/ Apple Silicon).",
+                                 mi.segmentPageSize));
+            }
             for (std::size_t i = 0; i < mi.loadDylibs.size(); ++i) {
                 if (mi.loadDylibs[i].path.empty()) {
                     fail(std::format("/image/loadDylibs/{}/path", i),
@@ -701,8 +724,8 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
             // emitted segment vmsize wraps (silent-failure H4 + code-
             // reviewer C2 convergence).
             for (auto const& s : sections) {
-                if (s.kind == SectionKind::Text
-                 && s.virtualAddress < mi.pageZeroSize) {
+                if (s.kind != SectionKind::Text) continue;
+                if (s.virtualAddress < mi.pageZeroSize) {
                     fail("/sections/<text>/virtualAddress",
                          std::format("Mach-O MH_EXECUTE: __text "
                                      "virtualAddress 0x{:x} is below "
@@ -710,6 +733,33 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                      "— __TEXT would overlap __PAGEZERO; "
                                      "loader rejects.",
                                      s.virtualAddress, mi.pageZeroSize));
+                } else if (mi.segmentPageSize != 0
+                        && ((s.virtualAddress - mi.pageZeroSize)
+                                % mi.segmentPageSize) != 0) {
+                    // mmap congruence: __TEXT.fileoff = 0 by Apple
+                    // convention, so __text's VM offset within __TEXT
+                    // (virtualAddress - pageZeroSize) must be a multiple
+                    // of segmentPageSize to match its page-aligned file
+                    // offset. A 4 KiB-congruent VA (e.g. 0x100001000)
+                    // under a 16 KiB page is the canonical arm64 EBADMACHO
+                    // (the kernel maps __text at the wrong VA). Catch the
+                    // misconfiguration here rather than ship a binary that
+                    // fails to load. (D-LK10-ENTRY-MACHO-EXIT.)
+                    fail("/sections/<text>/virtualAddress",
+                         std::format("Mach-O MH_EXECUTE: __text "
+                                     "virtualAddress 0x{:x} is not aligned "
+                                     "to segmentPageSize 0x{:x} relative to "
+                                     "pageZeroSize 0x{:x} (offset 0x{:x} "
+                                     "violates vmaddr % page == fileoff % "
+                                     "page — the kernel rejects with "
+                                     "EBADMACHO). On a 0x{:x} page, set "
+                                     "virtualAddress to a multiple of it "
+                                     "above pageZeroSize.",
+                                     s.virtualAddress, mi.segmentPageSize,
+                                     mi.pageZeroSize,
+                                     (s.virtualAddress - mi.pageZeroSize)
+                                         % mi.segmentPageSize,
+                                     mi.segmentPageSize));
                 }
             }
             // Plan 14 LK7 — codesign placeholder reservation must
@@ -850,6 +900,19 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "emit rodata via symbol tables, not via the dataItems "
              "capability gate. (D-LK2-RODATA closure.)");
     }
+
+    // D-FFI-EXTERN-CALL-DISPATCH: `externCallDispatch` is NOT validate-
+    // required, even on exec formats. The precise requirement is "a format
+    // that LOWERS AN EXTERN CALL needs a dispatch shape", which is enforced
+    // exactly at MIR→LIR (a module with extern imports under a no-dispatch
+    // format fails loud — `L_RequiredLirOpcodeMissing`, pinned by
+    // `MirToLir.ExternImportsWithNoDispatchFailLoud`). Requiring it on EVERY
+    // exec format would over-broadly force formats built for non-FFI
+    // purposes (e.g. the codesign-placeholder fixtures) to carry an
+    // unrelated field. The shipped exec formats DO declare it (and their FFI
+    // corpora exercise it); an unknown VALUE still fails loud at load (the
+    // loader's enum check). This keeps the "no silent default to a broken
+    // call shape" invariant at the point it actually matters.
 
     return problems;
 }

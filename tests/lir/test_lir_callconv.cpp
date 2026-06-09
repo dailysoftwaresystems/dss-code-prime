@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <format>
+#include "asm/asm.hpp"
+#include "lir/lir_2addr_legalize.hpp"
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_regalloc.hpp"
@@ -32,6 +34,7 @@
 
 #include <array>
 #include <cstdint>
+#include <ios>
 #include <vector>
 
 using namespace dss;
@@ -61,8 +64,9 @@ struct RewrittenBundle {
 // must pass `1` explicitly; the default exists so the dozens of
 // pre-existing non-cc tests don't have to be rewritten.
 [[nodiscard]] RewrittenBundle
-lowerThroughRewrite(std::string src, std::uint16_t ccIndex = 0) {
-    RewrittenBundle out{lowerCSubsetToLir(std::move(src))};
+lowerThroughRewrite(std::string src, std::uint16_t ccIndex = 0,
+                    std::string targetName = "x86_64") {
+    RewrittenBundle out{lowerCSubsetToLir(std::move(src), std::move(targetName))};
     if (!out.lowered.lir.ok) return out;
     out.liveness = analyzeLiveness(out.lowered.lir.lir);
     out.alloc = allocateRegisters(out.lowered.lir.lir, *out.lowered.target,
@@ -108,6 +112,18 @@ anyMovTouchesPhysReg(Lir const& lir, std::uint16_t physOrd,
     return false;
 }
 
+// D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER helper: does a FrameLayout's
+// callee-save set include the given physical-register ordinal? Used to
+// assert the link-register (x30) spill is present on non-leaf frames and
+// absent on leaf frames.
+[[nodiscard]] bool
+savedRegsContain(FrameLayout const& layout, std::uint16_t ord) {
+    for (LirReg const& r : layout.savedRegs) {
+        if (r.isPhysical != 0 && r.id == ord) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 TEST(LirCallconv, StraightLineFunctionGetsPrologueEpilogueAndZeroFrameOps) {
@@ -145,6 +161,281 @@ TEST(LirCallconv, StraightLineFunctionGetsPrologueEpilogueAndZeroFrameOps) {
                 EXPECT_NE(op, *fs) << "frame_store must not survive callconv";
             }
         }
+    }
+}
+
+// D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER (2026-06-08): a NON-LEAF function
+// under a calling convention with a LINK REGISTER (AAPCS64 -> x30) MUST spill
+// + reload that register in its frame, because every `bl`/`call` clobbers it.
+// Without the spill, the epilogue `ret` jumps to the clobbered link reg (the
+// address after the last call), and the repeated epilogue SP-restore walks SP
+// off the stack — the exact arm64-FFI SIGSEGV this anchor closed. This pins the
+// spill at the LIR tier so it is exercised on EVERY CI leg (incl. Windows
+// MSVC), where the arm64 *runtime* corpus is gated out by the cross-arch guard.
+TEST(LirCallconv, NonLeafAarch64FunctionSpillsLinkRegister) {
+    // `f` calls `g` -> f is non-leaf, g is leaf. No optimizer runs in this
+    // pipeline (lower -> liveness -> regalloc -> rewrite -> callconv), so g is
+    // NOT inlined: f keeps a real call and stays non-leaf.
+    auto bundle = lowerThroughRewrite(
+        "int g(int x) { return x * 2; }\n"
+        "int f(int x) { return g(x) + 1; }\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->linkRegister.has_value())
+        << "aapcs64 must declare a link register (x30)";
+    std::uint16_t const lrOrd = cc->linkRegister->ordinal;
+
+    // Partition the per-function frames into the non-leaf (f, hasCalls) and
+    // leaf (g) layouts. f MUST save x30; g must NOT (no call clobbers it).
+    FrameLayout const* nonLeaf = nullptr;
+    FrameLayout const* leaf    = nullptr;
+    for (auto const& l : result.perFunc) {
+        if (l.hasCalls) nonLeaf = &l;
+        else            leaf    = &l;
+    }
+    ASSERT_NE(nonLeaf, nullptr) << "f must produce a non-leaf frame (calls g)";
+    ASSERT_NE(leaf, nullptr)    << "g must produce a leaf frame";
+    EXPECT_TRUE(savedRegsContain(*nonLeaf, lrOrd))
+        << "non-leaf AAPCS64 function MUST spill x30 (the link register) — "
+           "without it the epilogue `ret` returns to a clobbered LR (SIGSEGV)";
+    EXPECT_FALSE(savedRegsContain(*leaf, lrOrd))
+        << "leaf AAPCS64 function must NOT spill x30 — no call clobbers it, so "
+           "its minimal frame is preserved";
+}
+
+// Agnosticism pin: the SAME non-leaf source on x86_64 has NO link register to
+// spill — the SysV/x86_64 calling convention carries the return address on the
+// stack (callPushBytes=8) and declares no `linkRegister`. This proves the fix
+// takes its no-op path off `cc.linkRegister.has_value()`, NOT an
+// `if (arch == arm64)` branch in shared substrate.
+TEST(LirCallconv, NonLeafX8664FunctionHasNoLinkRegisterToSpill) {
+    auto bundle = lowerThroughRewrite(
+        "int g(int x) { return x * 2; }\n"
+        "int f(int x) { return g(x) + 1; }\n",
+        /*ccIndex=*/0, /*targetName=*/"x86_64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    EXPECT_FALSE(cc->linkRegister.has_value())
+        << "x86_64 SysV declares NO link register — `call` pushes the return "
+           "address on the stack; the link-register spill must take its no-op "
+           "path here (config-driven, not arch-hardcoded)";
+}
+
+// D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER (host-independent byte-pin, 2026-06-08):
+// the structural pin above proves x30 is SCHEDULED into savedRegs; the runtime
+// corpus (extern_call_elf arm64) proves the frame EXECUTES — but only on the
+// single native-arm64 CI leg. Neither pins, on EVERY leg, that the scheduled x30
+// spill ASSEMBLES to the right store at the right stack offset. The per-instruction
+// arm64 byte-pins (Arm64Encoder.StoreSturEncodes, RetEncodes…) prove each
+// instruction in isolation; nothing pinned the COMPOSED non-leaf frame. This closes
+// that last mile: it drives the SAME production tail compile_pipeline.cpp uses
+// (lowerThroughRewrite -> legalizeTwoAddress -> materializeCallingConvention ->
+// assemble) and byte-pins the assembled prologue + epilogue against hand-verified
+// ARM-ARM literals — a pure byte compare, no runOn/emulator gate, so it runs (and
+// is red-on-disable) on EVERY leg incl. Windows MSVC. The catch it guards: 2b07e3b
+// byte-pinned green per-instruction yet SIGSEGV'd because the COMPOSED non-leaf
+// frame omitted the x30 spill (dbf84b0 fixed it). Keep all THREE layers (structural
+// + this byte-pin + runtime corpus); none replaces another.
+TEST(LirCallconv, NonLeafAarch64FramePrologueEpilogueByteExact) {
+    // f calls g -> f is non-leaf (frame holds x30), g is leaf (no x30). No
+    // optimizer runs in this pipeline, so g is not inlined and f stays non-leaf.
+    auto bundle = lowerThroughRewrite(
+        "int g(int x) { return x * 2; }\n"
+        "int f(int x) { return g(x) + 1; }\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    // The EXACT production pass order (compile_pipeline.cpp:340-363):
+    // legalizeTwoAddress -> materializeCallingConvention -> assemble.
+    DiagnosticReporter legRep;
+    auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
+                                    legRep);
+    ASSERT_TRUE(legal.ok());
+    DiagnosticReporter ccRep;
+    auto cc = materializeCallingConvention(legal.lir, *bundle.lowered.target,
+                                           bundle.alloc, ccRep);
+    ASSERT_TRUE(cc.ok());
+    // lirToMir is only consumed for the source-map; the callconv-inserted
+    // prologue/epilogue insts have no MIR predecessor -> InvalidMirInst (this pin
+    // checks BYTES, not source-map fidelity, exactly like assembleEndToEnd).
+    std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    DiagnosticReporter asmRep;
+    auto mod = assemble(cc.lir, *bundle.lowered.target, lirToMir, asmRep);
+    ASSERT_EQ(mod.functions.size(), cc.perFunc.size());
+
+    // Partition by FrameLayout.hasCalls: f = non-leaf, g = leaf.
+    std::size_t fIdx = cc.perFunc.size(), gIdx = cc.perFunc.size();
+    for (std::size_t i = 0; i < cc.perFunc.size(); ++i) {
+        if (cc.perFunc[i].hasCalls) fIdx = i;
+        else                        gIdx = i;
+    }
+    ASSERT_LT(fIdx, cc.perFunc.size()) << "f must be the non-leaf frame (calls g)";
+    ASSERT_LT(gIdx, cc.perFunc.size()) << "g must be the leaf frame";
+    auto const& fBytes = mod.functions[fIdx].bytes;
+    auto const& gBytes = mod.functions[gIdx].bytes;
+
+    // EXACT non-leaf PROLOGUE — 4 insts / 16 bytes, each decoded from the ARM ARM
+    // (little-endian):
+    //   sub  sp, sp, #0x20     d10083ff   (SUB imm: 0xD1000000|(32<<10)|(31<<5)|31)
+    //   stur x28, [sp]         f80003fc   (STUR : 0xF8000000|(0<<12)|(31<<5)|28)
+    //   stur x29, [sp, #8]     f80083fd   (        |(8<<12)|...|29)
+    //   stur x30, [sp, #16]    f80103fe   (the LINK-REGISTER spill: |(16<<12)|...|30)
+    static constexpr std::array<std::uint8_t, 16> kProlog{
+        0xff, 0x83, 0x00, 0xd1,  0xfc, 0x03, 0x00, 0xf8,
+        0xfd, 0x83, 0x00, 0xf8,  0xfe, 0x03, 0x01, 0xf8};
+    // EXACT non-leaf EPILOGUE — 5 insts / 20 bytes:
+    //   ldur x28, [sp]         f84003fc   (LDUR : 0xF8400000|...)
+    //   ldur x29, [sp, #8]     f84083fd
+    //   ldur x30, [sp, #16]    f84103fe   (the LINK-REGISTER reload, before ret)
+    //   add  sp, sp, #0x20     910083ff   (ADD imm: 0x91000000|(32<<10)|(31<<5)|31)
+    //   ret                    d65f03c0   (RET X30: 0xD65F0000|(30<<5))
+    static constexpr std::array<std::uint8_t, 20> kEpilog{
+        0xfc, 0x03, 0x40, 0xf8,  0xfd, 0x83, 0x40, 0xf8,
+        0xfe, 0x03, 0x41, 0xf8,  0xff, 0x83, 0x00, 0x91,
+        0xc0, 0x03, 0x5f, 0xd6};
+    ASSERT_GE(fBytes.size(), kProlog.size() + kEpilog.size());
+    EXPECT_TRUE(std::equal(kProlog.begin(), kProlog.end(), fBytes.begin()))
+        << "non-leaf AAPCS64 prologue must byte-match exactly — incl. "
+           "`stur x30,[sp,#16]` (f80103fe) at offset 12; without the link-register "
+           "spill the frame shrinks to 0x10 and these bytes diverge (red-on-disable)";
+    EXPECT_TRUE(std::equal(kEpilog.rbegin(), kEpilog.rend(), fBytes.rbegin()))
+        << "non-leaf AAPCS64 epilogue must byte-match exactly — incl. "
+           "`ldur x30,[sp,#16]` (f84103fe) reloaded BEFORE `ret`, so the return "
+           "targets the caller, not the bl-clobbered x30";
+
+    // Leaf control: g saves x28/x29 (the x*2 scratch) but must contain NO
+    // `stur x30,[sp,#16]` anywhere — no `bl` clobbers x30 in a leaf. Proves the pin
+    // discriminates the x30 spill specifically, not "matches any prologue". (This
+    // byte check is offset-specific to #16; the offset-INDEPENDENT "x30 ∉ savedRegs"
+    // guarantee for the leaf is the sibling NonLeafAarch64FunctionSpillsLinkRegister
+    // — this corroborates it at the byte tier.)
+    static constexpr std::array<std::uint8_t, 4> kSturX30{0xfe, 0x03, 0x01, 0xf8};
+    EXPECT_EQ(std::search(gBytes.begin(), gBytes.end(),
+                          kSturX30.begin(), kSturX30.end()),
+              gBytes.end())
+        << "leaf AAPCS64 function must NOT spill x30 — the discrimination check";
+}
+
+// D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow) byte-pin.
+//
+// HAND-BUILT LIR exercising the three control-flow opcodes (cmp / jcc / jmp)
+// directly through assemble(), laid out as a while-loop control-flow skeleton:
+//   header: cmp x0, xzr ; jcc(sgt) -> body, exit       (b.cond + trailing b)
+//   body:   sub x0, x0, x0 ; jmp header                (unconditional b, back-edge)
+//   exit:   ret
+//
+// This pins (a) the cmp → SUBS XZR encoding, (b) the b.cond (0x54) with the GT
+// condition nibble, (c) the forward unconditional b (0x14), (d) the NEGATIVE
+// back-edge b, and (e) ret — AND, crucially, that the block-relative resolver
+// fills the Imm19 (b.cond) and Imm26 (b) displacement fields with the correct
+// scaled, instruction-PC-relative offsets. The back-edge word 0x17FFFFFC is the
+// signed-resolver witness: header is at offset 0, the back-edge `b` is at offset
+// +16, so disp = (0 - 16) >> 2 = -4, which in the 26-bit field is 0x3FFFFFC →
+// 0x14000000 | 0x3FFFFFC = 0x17FFFFFC. Every value below is hand-verified
+// against the ARM ARM; a regression in the resolver (wrong bias, wrong scale,
+// or a sign error on the back-edge) diverges these bytes (red-on-disable).
+TEST(LirCallconv, Arm64ControlFlowSkeletonEncodesCmpBcondBWithResolvedOffsets) {
+    auto sOpt = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(sOpt.has_value());
+    auto const& s = **sOpt;
+
+    auto opc = [&](char const* m) {
+        auto o = s.opcodeByMnemonic(m);
+        EXPECT_TRUE(o.has_value()) << "arm64 missing opcode '" << m << "'";
+        return o.value_or(0);
+    };
+    std::uint16_t const cmpOp = opc("cmp");
+    std::uint16_t const jccOp = opc("jcc");
+    std::uint16_t const jmpOp = opc("jmp");
+    std::uint16_t const subOp = opc("sub");
+    std::uint16_t const retOp = opc("ret");
+
+    auto xreg = [&](char const* name) {
+        auto ord = s.registerByName(name);
+        EXPECT_TRUE(ord.has_value());
+        return LirReg{static_cast<std::uint32_t>(ord.value_or(0)), 1,
+                      static_cast<std::uint8_t>(LirRegClass::GPR)};
+    };
+    LirReg const x0  = xreg("x0");
+    LirReg const xzr = xreg("xzr");
+
+    LirBuilder b{s};
+    (void)b.addFunction(SymbolId{1});
+    LirBlockId const header = b.createBlock();
+    LirBlockId const body   = b.createBlock();
+    LirBlockId const exit   = b.createBlock();
+
+    // header: cmp x0, xzr ; jcc(sgt) body, exit
+    b.beginBlock(header);
+    {
+        std::array<LirOperand, 2> cmpOps{LirOperand::makeReg(x0),
+                                         LirOperand::makeReg(xzr)};
+        (void)b.addInst(cmpOp, InvalidLirReg, cmpOps);
+        std::array<LirOperand, 2> jccOps{LirOperand::makeBlockRef(body.v),
+                                         LirOperand::makeBlockRef(exit.v)};
+        (void)b.addCondBr(jccOp, jccOps, body, exit,
+                          static_cast<std::uint32_t>(TargetCondCode::Sgt));
+    }
+    // body: sub x0, x0, x0 ; jmp header (back-edge — exercises a NEGATIVE disp)
+    b.beginBlock(body);
+    {
+        std::array<LirOperand, 2> subOps{LirOperand::makeReg(x0),
+                                         LirOperand::makeReg(x0)};
+        (void)b.addInst(subOp, x0, subOps);
+        (void)b.addBr(jmpOp, header);
+    }
+    // exit: ret
+    b.beginBlock(exit);
+    (void)b.addReturn(retOp, {});
+
+    Lir lir = std::move(b).finish();
+    std::vector<MirInstId> lirToMir(lir.instCount(), InvalidMirInst);
+    DiagnosticReporter asmRep;
+    auto mod = assemble(lir, s, lirToMir, asmRep);
+    EXPECT_EQ(asmRep.errorCount(), 0u)
+        << "hand-built cmp/jcc/jmp must assemble — a failed encode or branch "
+           "resolution drops the function bytes";
+    ASSERT_FALSE(mod.functions.empty());
+
+    // The exact 6-word AArch64 sequence (each instruction hand-verified
+    // against the ARM ARM):
+    //   [+0x00] cmp x0, xzr      0xEB1F001F  (SUBS XZR, X0, XZR)
+    //   [+0x04] b.sgt body       0x5400004C  (B.cond, cond GT=0xC, imm19=+2)
+    //   [+0x08] b exit           0x14000003  (B, imm26=+3 → +12 bytes)
+    //   [+0x0C] sub x0, x0, x0   0xCB000000  (SUB X0, X0, X0)
+    //   [+0x10] b header         0x17FFFFFC  (B, imm26=-4 → -16 bytes back-edge)
+    //   [+0x14] ret              0xD65F03C0  (RET X30)
+    static constexpr std::array<std::uint32_t, 6> kExpectedWords{
+        0xEB1F001Fu, 0x5400004Cu, 0x14000003u,
+        0xCB000000u, 0x17FFFFFCu, 0xD65F03C0u};
+    auto const& bytes = mod.functions[0].bytes;
+    ASSERT_EQ(bytes.size(), kExpectedWords.size() * 4u)
+        << "skeleton must emit exactly 6 AArch64 words (24 bytes)";
+    auto const wordAt = [&](std::size_t off) {
+        return static_cast<std::uint32_t>(bytes[off])
+             | (static_cast<std::uint32_t>(bytes[off + 1]) << 8)
+             | (static_cast<std::uint32_t>(bytes[off + 2]) << 16)
+             | (static_cast<std::uint32_t>(bytes[off + 3]) << 24);
+    };
+    for (std::size_t i = 0; i < kExpectedWords.size(); ++i) {
+        EXPECT_EQ(wordAt(i * 4), kExpectedWords[i])
+            << "AArch64 word at +0x" << std::hex << (i * 4) << std::dec
+            << " diverged from the hand-verified ARM-ARM value";
     }
 }
 
