@@ -18,6 +18,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "link/object_format_schema.hpp"  // ObjectFormatSchema::loadShipped (AP3 format-gate integration)
 #include "program/program.hpp"          // Program, routesToMultiUnit
 #include "program/project_config.hpp"
 #include "scratch_dir.hpp"
@@ -364,6 +365,114 @@ TEST(CompileProjectIntegration, SupportedProfileProceedsPastGate) {
     EXPECT_NE(prog.compileProject(path.string(), rep), 0);
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 0u)
         << "a supported profile must NOT trip the gate — failure is downstream";
+}
+
+// ── AP3: enforceArtifactProfileFormat (the FORMAT-side gate) ────
+// The format-side twin of the AP2 language gate — same generic
+// `artifactProfileSupported` predicate, distinct code/message.
+
+TEST(EnforceArtifactProfileFormat, ServedProfileAcceptedSilently) {
+    std::vector<std::string> served = {"cli"};
+    DiagnosticReporter rep;
+    EXPECT_TRUE(enforceArtifactProfileFormat(asSpan(served), "cli",
+                                             "elf64-x86_64-linux-exec", rep));
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+// RED-on-disable: make artifactProfileSupported always-true → this flips green.
+TEST(EnforceArtifactProfileFormat, UnservedProfileFailsLoud) {
+    std::vector<std::string> served = {"cli"};  // an exec format
+    DiagnosticReporter rep;
+    EXPECT_FALSE(enforceArtifactProfileFormat(asSpan(served), "lib",
+                                              "elf64-x86_64-linux-exec", rep));
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
+}
+
+// A relocatable / backend-less format serves NOTHING → rejects any profile
+// (fail-closed, the format-side twin of the empty-language-set reject).
+TEST(EnforceArtifactProfileFormat, EmptyServedSetRejects) {
+    std::vector<std::string> served = {};
+    DiagnosticReporter rep;
+    EXPECT_FALSE(enforceArtifactProfileFormat(asSpan(served), "cli",
+                                              "elf64-x86_64-linux", rep));
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
+}
+
+// Integration with the REAL shipped format's served set.
+TEST(EnforceArtifactProfileFormatShipped, ExecServesCliRejectsLib) {
+    auto f = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(f.has_value());
+    EXPECT_FALSE((*f)->artifactProfiles().empty());
+    DiagnosticReporter rep1;
+    EXPECT_TRUE(enforceArtifactProfileFormat((*f)->artifactProfiles(), "cli",
+                                             "elf64-x86_64-linux-exec", rep1));
+    DiagnosticReporter rep2;
+    EXPECT_FALSE(enforceArtifactProfileFormat((*f)->artifactProfiles(), "lib",
+                                              "elf64-x86_64-linux-exec", rep2));
+    EXPECT_EQ(countCode(rep2, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
+}
+
+// ── AP3: compileProject end-to-end format gate (the deliverable) ────
+// (reuses writeProjectFile + ScratchDir from the integration section above)
+
+// A profile served by the chosen format passes BOTH gates → proceeds to the
+// compile (which then fails downstream on the missing source — NOT via a
+// profile gate). Proves the format gate accepts + control flowed past it.
+TEST(CompileProjectIntegration, CliProfilePassesFormatGate) {
+    dss::test_support::ScratchDir scratch{
+        dss::test_support::Location::Temp, "program"};
+    auto path = writeProjectFile(scratch.path(), R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["nonexistent-src.c"]
+    })");
+    Program prog;
+    DiagnosticReporter rep;
+    EXPECT_NE(prog.compileProject(path.string(), rep), 0);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 0u)
+        << "cli IS served by an exec format — the format gate must not trip";
+}
+
+// The AP3 deliverable end-to-end: a profile the LANGUAGE declares (lib ∈
+// c-subset) but the CHOSEN FORMAT (an executable) does NOT serve →
+// D_ArtifactProfileFormatMismatch, rejected before any compile. The AP2
+// language gate must NOT fire (lib is declared by c-subset) — proving the two
+// gates are distinct.
+TEST(CompileProjectIntegration, LibProfileOnExecFormatMismatch) {
+    dss::test_support::ScratchDir scratch{
+        dss::test_support::Location::Temp, "program"};
+    auto path = writeProjectFile(scratch.path(), R"({
+      "language": "c-subset", "artifactProfile": "lib",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"]
+    })");
+    Program prog;
+    DiagnosticReporter rep;
+    EXPECT_EQ(prog.compileProject(path.string(), rep), 1);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 0u);
+}
+
+// N1: multi-target — one serving, one not — fails the build with the mismatch
+// (the gate checks EVERY target; order-independent). The relocatable format
+// serves nothing, so the cli profile trips on that target.
+TEST(CompileProjectIntegration, MultiTargetOneMismatchFailsLoud) {
+    dss::test_support::ScratchDir scratch{
+        dss::test_support::Location::Temp, "program"};
+    auto path = writeProjectFile(scratch.path(), R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec", "x86_64:elf64-x86_64-linux"],
+      "sources": ["main.c"]
+    })");
+    Program prog;
+    DiagnosticReporter rep;
+    EXPECT_EQ(prog.compileProject(path.string(), rep), 1);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
+}
+
+TEST(ProjectConfigDiagnostics, DArtifactProfileFormatMismatchRoundTrip) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_ArtifactProfileFormatMismatch),
+              "D_ArtifactProfileFormatMismatch");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::D_ArtifactProfileFormatMismatch),
+              "D0011");
 }
 
 // ── Routing: routesToMultiUnit (the shared >1 threshold) ────────

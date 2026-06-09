@@ -582,6 +582,28 @@ int Program::compileProject(
         return 1;
     }
 
+    // AP3 driver gate: the requested profile must be SERVED by EACH target's
+    // object format (`project.artifactProfile ∈ format.artifactProfiles()`).
+    // Symmetric with the language gate above — the same generic predicate,
+    // no per-profile-name / format-identity branch. A spec that doesn't
+    // parse, or a format that doesn't load, is SKIPPED here (the delegated
+    // compile emits the precise D_InvalidTargetSpec / D_SchemaLoadFailed —
+    // no duplication); such a target still fails the whole build downstream,
+    // so nothing slips past silently. The format is re-loaded by the build
+    // (the same benign redundancy as the grammar above).
+    for (auto const& spec : pc.targets) {
+        auto parsed = TargetSpec::parse(spec);
+        if (!parsed.has_value()) continue;           // delegate → D_InvalidTargetSpec
+        auto fmtR = ObjectFormatSchema::loadShipped(parsed->formatName);
+        if (!fmtR.has_value()) continue;             // delegate → D_SchemaLoadFailed
+        if (!enforceArtifactProfileFormat((*fmtR)->artifactProfiles(),
+                                          pc.artifactProfile,
+                                          parsed->formatName, rep)) {
+            drainDiagnosticsToStderr(rep);
+            return 1;
+        }
+    }
+
     // Route by source COUNT via the shared `routesToMultiUnit` threshold
     // (identical to the CLI dispatcher): >1 source ⇒ N independent CUs
     // the linker merges (`compileUnits`, `cc a.c b.c` semantics); ≤1 ⇒

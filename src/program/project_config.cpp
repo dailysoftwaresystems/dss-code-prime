@@ -240,4 +240,38 @@ bool enforceArtifactProfile(std::span<std::string const> declared,
     return false;
 }
 
+bool enforceArtifactProfileFormat(std::span<std::string const> served,
+                                  std::string_view profile,
+                                  std::string_view formatName,
+                                  DiagnosticReporter& rep) {
+    // Same generic membership predicate as the language gate — only the
+    // diagnostic code + message differ (remediation-distinct: fix the
+    // .lang.json [language gate] vs pick a different target/format or ship
+    // the backend [this format gate]).
+    if (artifactProfileSupported(served, profile)) return true;
+
+    std::string msg;
+    if (served.empty()) {
+        // Empty served-set sub-case (message-only discrimination; the
+        // decision is the single predicate above). A relocatable/object
+        // format, or a format whose backend isn't shipped, serves nothing.
+        msg = "object format '" + std::string{formatName}
+            + "' serves no artifact profiles — it cannot produce profile '"
+            + std::string{profile} + "'. Choose a target whose object format "
+              "produces this profile (or ship the backend that emits it).";
+    } else {
+        std::string list;
+        for (auto const& p : served) {
+            if (!list.empty()) list += ", ";
+            list += p;
+        }
+        msg = "artifact profile '" + std::string{profile}
+            + "' is not served by object format '" + std::string{formatName}
+            + "' (serves: " + list + ").";
+    }
+    report(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch,
+           DiagnosticSeverity::Error, std::move(msg));
+    return false;
+}
+
 } // namespace dss

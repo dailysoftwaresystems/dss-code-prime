@@ -8,6 +8,7 @@
 #include "core/types/schema_token_interner.hpp"
 #include "core/types/scope_kind.hpp"
 #include "core/types/tree_node.hpp"
+#include "core/types/artifact_profile.hpp"     // kRegisteredArtifactProfiles / isRegisteredArtifactProfile (shared with the object-format loader, AP3)
 #include "core/types/object_format_kind.hpp"  // objectFormatKindFromName
 #include "core/types/symbol_attrs.hpp"         // symbolBindingFromName / symbolVisibilityFromName
 
@@ -2397,20 +2398,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     // The registered set is the loader-owned vocabulary; new profiles arrive
     // with the backend plan that introduces them (plan 06 §3 "registered set,
     // not compile-time enum"). Listed here as the v1 ship set.
-    static constexpr std::string_view kRegisteredArtifactProfiles[] = {
-        "cli", "gui", "lib", "staticlib", "script", "sproc",
-        "transpile", "shader", "hdl",
-    };
-    // Single source of truth for the human-readable list in diagnostics —
-    // derived from the array above so the two can never drift.
-    auto registeredProfileList = [&] {
-        std::string out;
-        for (auto const& p : kRegisteredArtifactProfiles) {
-            if (!out.empty()) out += ", ";
-            out += p;
-        }
-        return out;
-    };
+    // The registered profile vocabulary + the human-readable list now live
+    // in the shared `core/types/artifact_profile.hpp` (AP3 hoist — also
+    // consumed by the object-format loader; closes D-AP2-PROFILE-REGISTRY-SPLIT).
     if (doc.contains("artifactProfiles")) {
         json const& ap = doc.at("artifactProfiles");
         if (!ap.is_array()) {
@@ -2427,14 +2417,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     continue;
                 }
                 auto profile = entry.get<std::string>();
-                const bool known = std::any_of(
-                    std::begin(kRegisteredArtifactProfiles),
-                    std::end(kRegisteredArtifactProfiles),
-                    [&](std::string_view p) { return p == profile; });
-                if (!known) {
+                if (!isRegisteredArtifactProfile(profile)) {
                     coll.emit(DiagnosticCode::C_UnknownArtifactProfile, path,
                               std::format("unknown artifact profile '{}' (registered "
-                                          "profiles: {})", profile, registeredProfileList()));
+                                          "profiles: {})", profile, registeredArtifactProfileList()));
                     continue;
                 }
                 if (!seen.insert(profile).second) {

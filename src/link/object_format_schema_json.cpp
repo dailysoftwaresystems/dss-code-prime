@@ -3,6 +3,7 @@
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table.hpp"
+#include "core/types/artifact_profile.hpp"  // isRegisteredArtifactProfile / registeredArtifactProfileList (AP3, shared w/ grammar loader)
 #include "core/types/parse_diagnostic.hpp"
 
 #include <nlohmann/json.hpp>
@@ -452,6 +453,54 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                                   name));
                         } else {
                             data.supportedDataSections.push_back(*k);
+                        }
+                    }
+                }
+                ++i;
+            }
+        }
+    }
+
+    // artifactProfiles ── which profiles this format SERVES (plan 06 AP3;
+    // the format-side symmetric twin of the language's `artifactProfiles[]`,
+    // AP1). Each entry is validated against the SHARED registered vocabulary
+    // (`isRegisteredArtifactProfile`) — a typo like "clii" fails loud here
+    // (`C_UnknownArtifactProfile`) at its source rather than silently
+    // mis-serving downstream. Absent ⇒ empty ⇒ serves no profile
+    // (fail-closed). Zero C++ changes per new format — pure config; the
+    // driver gate is a generic set-membership, never a profile-name branch.
+    if (doc.contains("artifactProfiles")) {
+        if (!doc.at("artifactProfiles").is_array()) {
+            coll.emit(DiagnosticCode::C_UnknownArtifactProfile,
+                      "/artifactProfiles",
+                      "'artifactProfiles' must be an array of profile names");
+        } else {
+            auto const& arr = doc.at("artifactProfiles");
+            std::size_t i = 0;
+            for (auto const& elem : arr) {
+                auto const path = std::format("/artifactProfiles/{}", i);
+                if (!elem.is_string()) {
+                    coll.emit(DiagnosticCode::C_UnknownArtifactProfile, path,
+                              "each 'artifactProfiles' entry must be a string");
+                } else {
+                    auto const name = elem.get<std::string>();
+                    if (!isRegisteredArtifactProfile(name)) {
+                        coll.emit(DiagnosticCode::C_UnknownArtifactProfile, path,
+                                  std::format("unknown artifact profile '{}' "
+                                              "(registered profiles: {})",
+                                              name, registeredArtifactProfileList()));
+                    } else {
+                        bool dup = false;
+                        for (auto const& existing : data.artifactProfiles) {
+                            if (existing == name) { dup = true; break; }
+                        }
+                        if (dup) {
+                            coll.emit(DiagnosticCode::C_ConflictingField, path,
+                                      std::format("artifact profile '{}' declared "
+                                                  "more than once in artifactProfiles",
+                                                  name));
+                        } else {
+                            data.artifactProfiles.push_back(name);
                         }
                     }
                 }

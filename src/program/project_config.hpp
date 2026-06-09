@@ -68,26 +68,43 @@ parseProjectConfig(std::string_view jsonText,
 loadProjectConfig(std::filesystem::path const& path,
                   DiagnosticReporter& rep);
 
-// Pure membership predicate: is `profile` in the language's `declared`
-// artifact-profile set? Returns false on an EMPTY set — the fail-CLOSED
-// reject (plan 06 §2.1 trajectory: a language must declare ≥1 profile to
-// be project-buildable). ONE predicate serves both the mismatch and the
-// empty-set cases; there is NO per-profile-name branch (agnostic — a
-// generic string-set lookup over config vocabulary).
+// Pure membership predicate: is `profile` in a `declared` artifact-profile
+// set? Returns false on an EMPTY set — the fail-CLOSED reject. ONE generic
+// predicate serves BOTH callers (no per-profile-name branch; a string-set
+// lookup over config vocabulary):
+//   * the LANGUAGE set (AP1, `grammar.artifactProfiles()`) — which profiles
+//     the language SUPPORTS (via `enforceArtifactProfile`);
+//   * the FORMAT set (AP3, `format.artifactProfiles()`) — which profiles the
+//     object format SERVES (via `enforceArtifactProfileFormat`).
+// Empty-set ⇒ false aligns both: a language that declares no profiles isn't
+// project-buildable; a format that serves no profiles can't be targeted.
 [[nodiscard]] DSS_EXPORT bool
 artifactProfileSupported(std::span<std::string const> declared,
                          std::string_view profile) noexcept;
 
-// The AP2 driver gate. Returns true iff `profile` is supported by the
+// The AP2 driver gate (LANGUAGE side). Returns true iff `profile` is in the
 // language's `declared` set. On rejection emits exactly one
-// `D_ArtifactProfileNotSupported` — the message discriminates the
-// empty-set sub-case ("declares no artifact profiles") from the plain
-// mismatch ("not supported … supported: …") — and returns false.
-// `language` names the language in the message.
+// `D_ArtifactProfileNotSupported` — the message discriminates the empty-set
+// sub-case ("declares no artifact profiles") from the plain mismatch
+// ("not supported … supported: …") — and returns false. `language` names
+// the language in the message.
 [[nodiscard]] DSS_EXPORT bool
 enforceArtifactProfile(std::span<std::string const> declared,
                        std::string_view profile,
                        std::string_view language,
                        DiagnosticReporter& rep);
+
+// The AP3 driver gate (FORMAT side). Returns true iff `profile` is SERVED by
+// the chosen object format's `served` set. On rejection emits exactly one
+// `D_ArtifactProfileFormatMismatch` — the message names the format + its
+// served set (empty-set discriminated as "serves no artifact profiles") —
+// and returns false. `formatName` names the object format in the message.
+// Calls the SAME `artifactProfileSupported` predicate as the language gate;
+// only the diagnostic code + message differ (remediation-distinct).
+[[nodiscard]] DSS_EXPORT bool
+enforceArtifactProfileFormat(std::span<std::string const> served,
+                             std::string_view profile,
+                             std::string_view formatName,
+                             DiagnosticReporter& rep);
 
 } // namespace dss

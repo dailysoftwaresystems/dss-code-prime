@@ -335,6 +335,20 @@ enum class DiagnosticCode : std::uint16_t {
     //   failure surfaces here, not "deep in codegen". AP3/AP4 own the
     //   downstream consumption (CompilationContext + codegen).
     D_ArtifactProfileNotSupported = 0xD010,
+    // D_ArtifactProfileFormatMismatch (plan 06 AP3): a project config's
+    //   `artifactProfile` is not SERVED by the chosen object format —
+    //   i.e. the profile is not in that format's declared
+    //   `artifactProfiles[]` set (the format-side symmetric twin of AP1's
+    //   language-side set). Example: a `cli` project pointed at a
+    //   shared-library format, or a `lib` project pointed at an executable
+    //   format, or any profile pointed at a format that declares no served
+    //   profiles (e.g. a relocatable `.o` format — fail-CLOSED). Distinct
+    //   from `D_ArtifactProfileNotSupported` (0xD010): that is
+    //   "the LANGUAGE doesn't declare this profile" (fix the `.lang.json`);
+    //   this is "the chosen FORMAT doesn't produce this profile" (fix the
+    //   target/format, or ship the backend that emits it). Remediation-
+    //   distinct → distinct code.
+    D_ArtifactProfileFormatMismatch = 0xD011,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──
