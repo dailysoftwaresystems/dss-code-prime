@@ -281,8 +281,9 @@ enum class DiagnosticCode : std::uint16_t {
     //   driver-tier failure so downstream tooling can route on it.
     // D_PlanNotLanded: an entry point reached an arm whose backing
     //   plan substrate is not yet shipped. Currently fires only on
-    //   `compileProject` (plan 06 `.dsp` parser pending); appending
-    //   future plan-gated arms re-uses this code.
+    //   `transpile` (plan 10 source-translation pending); the original
+    //   `compileProject` consumer landed for real (plan 06 AP2,
+    //   `.dss-project.json`). Future plan-gated arms re-use this code.
     D_InvalidTargetSpec           = 0xD007,
     D_SchemaLoadFailed            = 0xD008,
     D_PlanNotLanded               = 0xD009,
