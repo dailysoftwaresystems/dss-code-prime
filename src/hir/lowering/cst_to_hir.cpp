@@ -22,9 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <cerrno>
 #include <cstdint>
-#include <cstdlib>
 #include <format>
 #include <limits>
 #include <optional>
@@ -61,24 +59,12 @@ namespace {
 // engine's BinaryOp branch. A new comparison-shaped op (e.g. `Spaceship`)
 // would otherwise need updates in all three sites.
 
-// decodeInteger lives in core/types/number_decode.hpp — shared with the
-// semantic phase so a literal's text is interpreted identically everywhere.
-
-[[nodiscard]] double decodeFloat(std::string_view text, NumberStyle const* ns, bool& ok) {
-    std::string s;
-    s.reserve(text.size());
-    char const sep = (ns && ns->digitSeparator) ? *ns->digitSeparator : '\0';
-    for (char c : text) {
-        if (sep != '\0' && c == sep) continue;
-        if (c == 'f' || c == 'F') continue;  // float suffix
-        s += c;
-    }
-    errno = 0;
-    char* end = nullptr;
-    double const d = std::strtod(s.c_str(), &end);
-    ok = (end != s.c_str()) && errno != ERANGE;   // parsed something, in range
-    return d;
-}
+// decodeInteger + decodeFloat live in core/types/number_decode.hpp —
+// shared so a literal's text is interpreted identically everywhere.
+// (FC1 cycle 2, 2026-06-10: decodeFloat was hoisted from here; its old
+// local body stripped EVERY 'f'/'F' char — a hardcoded C-ism that
+// value-corrupted hex-float mantissas like `0x1.fp3`. The shared one
+// strips only a trailing DECLARED suffix.)
 
 [[nodiscard]] bool isSignedCore(TypeKind k) noexcept {
     switch (k) {

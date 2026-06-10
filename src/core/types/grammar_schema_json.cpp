@@ -14,6 +14,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -2699,6 +2700,72 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             } else {
                 NumberStyle style;
 
+                // Shared exponent-object parser (FC1 cycle 2): the
+                // top-level decimal `exponent` block and each prefix's
+                // `float.exponent` block carry the SAME field shape
+                // (letters + signOptional) — one parser, no second
+                // drifting copy. Returns false when the shape is
+                // invalid (diagnostics already emitted).
+                auto parseExponentFields =
+                    [&](json const& e, std::string const& path,
+                        std::vector<char>& letters,
+                        bool& signOptional) -> bool {
+                    // Unknown-key typo discriminator (FC1c2 review
+                    // fold): `signOptionl` must reject, not silently
+                    // default. Tightens BOTH consumers (the top-level
+                    // exponent + each prefix's float.exponent) in one
+                    // place.
+                    static constexpr std::array<std::string_view, 2>
+                        kExponentKeys{"letters", "signOptional"};
+                    for (auto it = e.begin(); it != e.end(); ++it) {
+                        bool known = false;
+                        for (auto const& k : kExponentKeys) {
+                            if (it.key() == k) { known = true; break; }
+                        }
+                        if (!known) {
+                            coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                      std::format("{}/{}", path, it.key()),
+                                      std::format("unknown key '{}' — allowed "
+                                                  "keys are 'letters', "
+                                                  "'signOptional' (typo "
+                                                  "discriminator)", it.key()));
+                            return false;
+                        }
+                    }
+                    if (!e.contains("letters") || !e.at("letters").is_array()
+                        || e.at("letters").empty()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  std::format("{}/letters", path),
+                                  "'letters' must be a non-empty array of "
+                                  "single-character strings");
+                        return false;
+                    }
+                    bool ok = true;
+                    for (std::size_t i = 0; i < e.at("letters").size(); ++i) {
+                        auto const& lj = e.at("letters")[i];
+                        if (!lj.is_string() || lj.get<std::string>().size() != 1) {
+                            coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                      std::format("{}/letters/{}", path, i),
+                                      "each exponent letter must be a "
+                                      "single-character string");
+                            ok = false;
+                            continue;
+                        }
+                        letters.push_back(lj.get<std::string>()[0]);
+                    }
+                    if (!ok) return false;
+                    if (e.contains("signOptional")) {
+                        if (!e.at("signOptional").is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                      std::format("{}/signOptional", path),
+                                      "'signOptional' must be a boolean");
+                        } else {
+                            signOptional = e.at("signOptional").get<bool>();
+                        }
+                    }
+                    return true;
+                };
+
                 // decimal — optional bool, default false.
                 if (ns.contains("decimal")) {
                     if (!ns.at("decimal").is_boolean()) {
@@ -2758,12 +2825,106 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 continue;
                             }
                             np.digits = arr[i].at("digits").get<std::string>();
+                            // Per-prefix FLOAT continuation (FC1 cycle 2 —
+                            // C23 hex-floats). Optional `float` object:
+                            //   { "exponent": { "letters": [...],
+                            //                   "signOptional": bool },
+                            //     "exponentDigits": "<class>" }
+                            // The exponent sub-object is REQUIRED (a
+                            // prefix-float without an exponent grammar
+                            // cannot complete — C23 mandates the
+                            // binary-exponent-part). Unknown keys reject
+                            // (typo discriminator). Every exponent letter
+                            // must NOT land in the prefix's mantissa digit
+                            // class — the digit run would consume it first
+                            // and the float branch would be silently
+                            // unreachable (a dead config).
+                            if (arr[i].contains("float")) {
+                                json const& fj = arr[i].at("float");
+                                const auto fpath = std::format("{}/float", ppath);
+                                if (!fj.is_object()) {
+                                    coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                              fpath,
+                                              "'float' must be an object with an "
+                                              "'exponent' sub-object and an optional "
+                                              "'exponentDigits' class string");
+                                    continue;
+                                }
+                                static constexpr std::array<std::string_view, 2>
+                                    kFloatKeys{"exponent", "exponentDigits"};
+                                bool badKey = false;
+                                for (auto it = fj.begin(); it != fj.end(); ++it) {
+                                    bool known = false;
+                                    for (auto const& k : kFloatKeys) {
+                                        if (it.key() == k) { known = true; break; }
+                                    }
+                                    if (!known) {
+                                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                                  std::format("{}/{}", fpath, it.key()),
+                                                  std::format("unknown key '{}' — allowed "
+                                                              "keys are 'exponent', "
+                                                              "'exponentDigits' (typo "
+                                                              "discriminator)", it.key()));
+                                        badKey = true;
+                                    }
+                                }
+                                if (badKey) continue;
+                                if (!fj.contains("exponent")
+                                    || !fj.at("exponent").is_object()) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              std::format("{}/exponent", fpath),
+                                              "'float.exponent' is required — a "
+                                              "prefix-float without an exponent "
+                                              "grammar can never complete (C23 "
+                                              "hex-floats mandate the exponent)");
+                                    continue;
+                                }
+                                NumberPrefixFloat pf{};
+                                if (!parseExponentFields(
+                                        fj.at("exponent"),
+                                        std::format("{}/exponent", fpath),
+                                        pf.exponentLetters,
+                                        pf.exponentSignOptional)) {
+                                    continue;
+                                }
+                                if (fj.contains("exponentDigits")) {
+                                    if (!fj.at("exponentDigits").is_string()
+                                        || fj.at("exponentDigits")
+                                               .get<std::string>().empty()) {
+                                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                                  std::format("{}/exponentDigits", fpath),
+                                                  "'exponentDigits' must be a non-empty "
+                                                  "character-class string (e.g. \"0-9\")");
+                                        continue;
+                                    }
+                                    pf.exponentDigits =
+                                        fj.at("exponentDigits").get<std::string>();
+                                }
+                                bool deadLetter = false;
+                                for (char l : pf.exponentLetters) {
+                                    if (digitClassMatches(np.digits, l)) {
+                                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                                  std::format("{}/exponent/letters", fpath),
+                                                  std::format(
+                                                      "exponent letter '{}' is inside the "
+                                                      "prefix's digit class '{}' — the "
+                                                      "digit run would always consume it, "
+                                                      "making the float continuation "
+                                                      "silently unreachable", l, np.digits));
+                                        deadLetter = true;
+                                    }
+                                }
+                                if (deadLetter) continue;
+                                np.floating = std::move(pf);
+                            }
                             style.integerPrefixes.push_back(std::move(np));
                         }
                     }
                 }
 
-                // exponent — optional object.
+                // exponent — optional object. Parsed via the shared
+                // exponent parser (the same field shape as each
+                // prefix's `float.exponent` — FC1 cycle 2).
                 if (ns.contains("exponent")) {
                     json const& e = ns.at("exponent");
                     if (!e.is_object()) {
@@ -2772,38 +2933,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                   "'numberStyle.exponent' must be an object");
                     } else {
                         NumberExponent ne{};
-                        if (!e.contains("letters") || !e.at("letters").is_array()
-                            || e.at("letters").empty()) {
-                            coll.emit(DiagnosticCode::C_MissingField,
-                                      "/numberStyle/exponent/letters",
-                                      "'exponent.letters' must be a non-empty "
-                                      "array of single-character strings");
-                        } else {
-                            bool ok = true;
-                            for (std::size_t i = 0; i < e.at("letters").size(); ++i) {
-                                auto const& lj = e.at("letters")[i];
-                                if (!lj.is_string() || lj.get<std::string>().size() != 1) {
-                                    coll.emit(DiagnosticCode::C_InvalidNumberStyle,
-                                              std::format("/numberStyle/exponent/letters/{}", i),
-                                              "each exponent letter must be a "
-                                              "single-character string");
-                                    ok = false;
-                                    continue;
-                                }
-                                ne.letters.push_back(lj.get<std::string>()[0]);
-                            }
-                            if (ok) {
-                                if (e.contains("signOptional")) {
-                                    if (!e.at("signOptional").is_boolean()) {
-                                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
-                                                  "/numberStyle/exponent/signOptional",
-                                                  "'signOptional' must be a boolean");
-                                    } else {
-                                        ne.signOptional = e.at("signOptional").get<bool>();
-                                    }
-                                }
-                                style.exponent = std::move(ne);
-                            }
+                        if (parseExponentFields(e, "/numberStyle/exponent",
+                                                ne.letters, ne.signOptional)) {
+                            style.exponent = std::move(ne);
                         }
                     }
                 }
@@ -2833,6 +2965,34 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         style.digitSeparator = ns.at("digitSeparator").get<std::string>()[0];
                     }
                 }
+
+                // trailingFraction / leadingFraction — optional bools
+                // (FC1 cycle 2: C23 decimal fractional-constant edge
+                // forms `1.` and `.5`). Both REQUIRE `fractionPoint`
+                // to be declared — a fraction knob with no fraction
+                // char is internally inconsistent (and would be a
+                // silently-dead config).
+                auto readFractionFlag = [&](char const* key, bool& out) {
+                    if (!ns.contains(key)) return;
+                    if (!ns.at(key).is_boolean()) {
+                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                  std::format("/numberStyle/{}", key),
+                                  std::format("'numberStyle.{}' must be a boolean",
+                                              key));
+                        return;
+                    }
+                    out = ns.at(key).get<bool>();
+                    if (out && !style.fractionPoint.has_value()) {
+                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                  std::format("/numberStyle/{}", key),
+                                  std::format("'numberStyle.{}' requires "
+                                              "'fractionPoint' to be declared",
+                                              key));
+                        out = false;
+                    }
+                };
+                readFractionFlag("trailingFraction", style.trailingFraction);
+                readFractionFlag("leadingFraction",  style.leadingFraction);
 
                 // integerSuffixes / floatSuffixes — optional string arrays.
                 auto readSuffixes = [&](char const* key,
@@ -2895,11 +3055,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         out = data.schemaTokens->find(n);
                     };
                     readKind("integer", style.emitKind.integer, /*required=*/true);
-                    // `float` is required iff any float-producing facet is declared.
+                    // `float` is required iff any float-producing facet is
+                    // declared (incl. the FC1c2 facets: a prefix-float
+                    // continuation or a fraction edge-form knob).
+                    bool anyPrefixFloat = false;
+                    for (auto const& p : style.integerPrefixes) {
+                        if (p.floating.has_value()) { anyPrefixFloat = true; break; }
+                    }
                     const bool needsFloat =
                         style.exponent.has_value()
                         || style.fractionPoint.has_value()
-                        || !style.floatSuffixes.empty();
+                        || !style.floatSuffixes.empty()
+                        || style.trailingFraction
+                        || style.leadingFraction
+                        || anyPrefixFloat;
                     readKind("float", style.emitKind.floating, needsFloat);
                 }
 

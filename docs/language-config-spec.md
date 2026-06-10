@@ -614,7 +614,11 @@ Every `expr` shape now declares the three Pratt-walker wrapper rule names the en
 "numberStyle": {
   "decimal":         true,             // permit bare decimal digits
   "integerPrefixes": [                 // optional; empty = decimal only
-    { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F" },
+    { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F",
+      "float": {                       // optional (FC1c2): prefix-float continuation
+        "exponent": { "letters": ["p", "P"], "signOptional": true },
+        "exponentDigits": "0-9"        // default "0-9" — C hex-float exponents are DECIMAL
+      } },
     { "prefix": "0b", "radix": 2,  "digits": "01" },
     { "prefix": "0o", "radix": 8,  "digits": "0-7" }
   ],
@@ -623,7 +627,9 @@ Every `expr` shape now declares the three Pratt-walker wrapper rule names the en
     "signOptional": true
   },
   "fractionPoint":   ".",              // optional; absent = no float literal
-  "digitSeparator":  "_",              // optional; absent = no separators
+  "trailingFraction": true,            // optional (FC1c2, default false): `1.` is a float
+  "leadingFraction":  true,            // optional (FC1c2, default false): `.5` is a float
+  "digitSeparator":  "'",              // optional; absent = no separators
   "integerSuffixes": ["u","U","l","L","ll","LL","ul","UL","ull","ULL"],
   "floatSuffixes":   ["f","F","d","D"],
   "emitKind": {                        // which token kinds the scanner emits
@@ -634,13 +640,16 @@ Every `expr` shape now declares the three Pratt-walker wrapper rule names the en
 ```
 
 - `decimal` (bool, default `false`) — permit bare digits at start of a number.
-- `integerPrefixes[*]` — `{ prefix, radix, digits }`. The scanner walks prefixes in declaration order; the first whose `digits` class accepts the byte after the prefix wins. `radix` ∈ [2, 36]. `digits` is a character class string supporting `a-z` ranges (e.g. `"0-9a-fA-F"`).
-- `exponent` — `{ letters, signOptional }`. `letters[*]` are single ASCII characters; the scanner accepts any one of them as the exponent introducer. `signOptional` defaults to `true`. **Semantics**: `signOptional: true` means a `+` or `-` MAY appear between the exponent letter and digits (`1e+3`, `1e-3`, `1e3` all accepted — the C-style default). `signOptional: false` means NO sign is permitted there — `1e+3` tokenizes as `1` + identifier-or-token `e` + `+` + `3`, NOT as one float. The name does NOT mean "sign required"; that mode is intentionally not modeled.
+- `integerPrefixes[*]` — `{ prefix, radix, digits, float? }`. The scanner walks prefixes in declaration order; the first whose `digits` class accepts the byte after the prefix wins. `radix` ∈ [2, 36]. `digits` is a character class string supporting `a-z` ranges (e.g. `"0-9a-fA-F"`).
+- `integerPrefixes[*].float` — optional **prefix-float continuation** (FC1 cycle 2 — C23 hex-floats `0x1.8p3`). The prefix may continue past its integer digit run into an optional fraction (the language's `fractionPoint` + the PREFIX's digit class, digits required on at least ONE side of the point — `0x1.p3` and `0x.8p3` are valid, `0x.p3` is not) followed by a **required** exponent: one of `float.exponent.letters` + an optional sign (per `float.exponent.signOptional`) + ≥1 digit from `float.exponentDigits` (its OWN class — C hex-float exponents are decimal while the mantissa is hex). Separators are flanked-by-digits in every run. Once the continuation **commits** (a fraction or an exponent letter was consumed) and cannot complete, the whole span is ONE malformed token + `P_MalformedNumber` — never a silent split. Only `floatSuffixes` apply to a completed prefix-float; the decimal arm's f-suffix INT→FLOAT *promotion* deliberately does **not** apply in the prefix arm (suffix letters can BE digits there: `0x1f` is an integer, `0b1f` is `0b1` + a word). The loader rejects an exponent letter that lands inside the prefix's digit class (the digit run would consume it first — a silently-dead config) and unknown keys in the `float` block. An `exponentRequired: false` knob is intentionally not modeled until a language consumes it.
+- `exponent` — `{ letters, signOptional }`. `letters[*]` are single ASCII characters; the scanner accepts any one of them as the exponent introducer. `signOptional` defaults to `true`. **Semantics**: `signOptional: true` means a `+` or `-` MAY appear between the exponent letter and digits (`1e+3`, `1e-3`, `1e3` all accepted — the C-style default). `signOptional: false` means NO sign is permitted there — `1e+3` tokenizes as `1` + identifier-or-token `e` + `+` + `3`, NOT as one float. The name does NOT mean "sign required"; that mode is intentionally not modeled. **Note the divergence in the prefix-float context**: a prefix-float exponent letter that cannot complete yields the loud committed-malformed token (above), not the decimal split — a prefix-float has no valid split to fall back to.
 - `fractionPoint` — single ASCII char (typically `.`). When set AND followed by a digit, the scanner promotes the literal to float.
-- `digitSeparator` — single ASCII char. Accepted (and consumed silently) between digits.
-- `integerSuffixes` / `floatSuffixes` — string arrays; the scanner longest-matches against them after the number body. A float-suffix match promotes the kind.
+- `trailingFraction` (bool, default `false`; FC1 cycle 2) — `digit-sequence .` (C23 `1.`) lexes as ONE float. Off, `1.` splits into the integer + the dot token — the right default for range-operator languages (`1..5`). Requires `fractionPoint`.
+- `leadingFraction` (bool, default `false`; FC1 cycle 2) — `. digit-sequence` (C23 `.5`) lexes as ONE float; the number-entry dispatch admits the fraction point ONLY when the next byte is a decimal digit (a bare `.` / `.foo` stays the language's dot token). Requires `fractionPoint`.
+- `digitSeparator` — single ASCII char. Consumed only **between digits** (C23 6.4.4.1 flanked-by-digits, FC1): a leading, trailing, or doubled separator ends the number at the last digit.
+- `integerSuffixes` / `floatSuffixes` — string arrays; the scanner longest-matches against them after the number body. A float-suffix match promotes the kind (decimal arm only — see the prefix-float note above).
 - `emitKind.integer` — required; names the token kind the scanner emits for integer literals.
-- `emitKind.float` — required IFF any float-producing facet is declared (`exponent` / `fractionPoint` / non-empty `floatSuffixes`).
+- `emitKind.float` — required IFF any float-producing facet is declared (`exponent` / `fractionPoint` / non-empty `floatSuffixes` / any prefix `float` block / `trailingFraction` / `leadingFraction`).
 
 Languages with no numeric literals omit the block entirely. Configs that reference `IntLiteral`/`FloatLiteral` in any shape but declare no `numberStyle` fail to load (`C_MissingNumberStyle`).
 
@@ -651,7 +660,8 @@ Languages with no numeric literals omit the block entirely. Configs that referen
 | `C_MissingWrapperRules` | An `expr` shape was declared without a complete `wrapperRules` block, or one of `binary`/`unary`/`postfix` is missing/empty/non-string. Names declared here cannot collide with top-level `shapes`. |
 | `C_MissingNumberStyle` | The language declared `IntLiteral`/`FloatLiteral` in any shape but omitted the `numberStyle` block entirely. |
 | `C_MissingField` on `numberStyle/...` | A required sub-field is absent or empty (e.g. `emitKind`, `emitKind.integer`, a prefix's `prefix`/`radix`/`digits`). |
-| `C_InvalidNumberStyle` | The block is present but malformed: wrong JSON type, `radix` outside `[2, 36]`, `fractionPoint`/`digitSeparator` not single-char, non-bool `signOptional`, etc. |
+| `C_InvalidNumberStyle` | The block is present but malformed: wrong JSON type, `radix` outside `[2, 36]`, `fractionPoint`/`digitSeparator` not single-char, non-bool `signOptional`, an unknown key in a prefix's `float` block, an empty `float.exponentDigits`, a float exponent letter inside the prefix's digit class (a silently-dead config), or `trailingFraction`/`leadingFraction` without `fractionPoint`. |
+| `C_MissingField` on `.../float/exponent` | A prefix declared a `float` block without its required `exponent` sub-object (a prefix-float can never complete without one). |
 | `C_UnknownToken` on `numberStyle/emitKind/*` | The named token kind isn't declared anywhere (built-in or `tokens`). |
 
 ### 11.6 `artifactProfiles` — supported output shapes (plan 06 AP1)

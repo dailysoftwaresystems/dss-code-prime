@@ -154,8 +154,12 @@
   "numberStyle": {
     "decimal": true,
     "integerPrefixes": [
-      { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F" },
-      { "prefix": "0X", "radix": 16, "digits": "0-9a-fA-F" },
+      { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F",
+        "float": { "exponent": { "letters": ["p", "P"], "signOptional": true },
+                   "exponentDigits": "0-9" } },
+      { "prefix": "0X", "radix": 16, "digits": "0-9a-fA-F",
+        "float": { "exponent": { "letters": ["p", "P"], "signOptional": true },
+                   "exponentDigits": "0-9" } },
       { "prefix": "0b", "radix": 2,  "digits": "01"        },
       { "prefix": "0B", "radix": 2,  "digits": "01"        },
       { "prefix": "0o", "radix": 8,  "digits": "0-7"       },
@@ -164,6 +168,8 @@
     ],
     "exponent":         { "letters": ["e", "E"], "signOptional": true },
     "fractionPoint":    ".",
+    "trailingFraction": true,
+    "leadingFraction":  true,
     "digitSeparator":   "'",
     "integerSuffixes":  ["u", "U", "l", "L", "ll", "LL", "ul", "UL", "lu", "LU",
                           "ull", "ULL", "llu", "LLU"],
