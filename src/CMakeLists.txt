@@ -16,6 +16,40 @@ add_subdirectory(ffi)
 add_subdirectory(lsp)
 add_subdirectory(program)
 
+# ── Precompiled headers across the object libs (see DSS_PCH_HEADERS) ──
+# Each object lib precompiles the heavy STL set PRIVATEly. Per-lib PRIVATE is
+# the canonical, toolchain-portable PCH pattern — identical behavior on GCC
+# (.gch) and MSVC (.pch) with NO cross-target reuse-compatibility constraint.
+# That portability is the deciding factor here: the cold-build ceiling only
+# bites on the windows-msvc leg, and that is the one toolchain we cannot
+# validate locally (the local Ninja build is GCC/MinGW), so we use the pattern
+# that is provably safe on MSVC rather than a shared REUSE_FROM whose MSVC
+# acceptance we could not check before pushing. PCH is build-time only: the
+# same headers in the same order, zero emitted-code change.
+#
+# Tiny libs (≤2 TUs) are skipped — for a lib with too few TUs to amortize it
+# over, building its own PCH costs more than the reparse it saves.
+#
+# The list mirrors the $<TARGET_OBJECTS:...> set below; the FATAL_ERROR makes a
+# drift (renamed/removed lib) fail configure loudly instead of silently
+# dropping PCH coverage.
+foreach(_dss_obj_lib
+        core tokenizer analysis_syntactic analysis_compilation_unit
+        analysis_semantic hir hir_lowering mir mir_lowering mir_merge opt
+        lir lir_lowering asm link ffi ffi_shipped ffi_abi ffi_mangling
+        lsp program)
+    if(NOT TARGET ${_dss_obj_lib})
+        message(FATAL_ERROR
+            "DSS PCH: expected object lib '${_dss_obj_lib}' does not exist — "
+            "update the PCH list in src/CMakeLists.txt to match the object libs")
+    endif()
+    get_target_property(_dss_obj_srcs ${_dss_obj_lib} SOURCES)
+    list(LENGTH _dss_obj_srcs _dss_obj_nsrc)
+    if(_dss_obj_nsrc GREATER 2)
+        target_precompile_headers(${_dss_obj_lib} PRIVATE ${DSS_PCH_HEADERS})
+    endif()
+endforeach()
+
 # ── Shared library (DLL / .so / .dylib) ──
 # All compiler functionality in a single shared library for embedding in other projects.
 add_library(dss-code-prime-lib SHARED

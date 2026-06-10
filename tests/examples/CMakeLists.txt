@@ -29,6 +29,11 @@ target_include_directories(dss_examples_runner
         ${CMAKE_SOURCE_DIR}/tests/test_support
 )
 
+# Reuse the shared test PCH (defined in tests/CMakeLists.txt). The extra
+# nlohmann_json include dir on this target is additive and does not affect the
+# precompiled STL/gtest set. No-op in Debug (PCH disabled).
+target_precompile_headers(dss_examples_runner REUSE_FROM dss_test_pch)
+
 file(GLOB_RECURSE EXAMPLE_MANIFESTS
     CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/examples/*/*/expected.json")

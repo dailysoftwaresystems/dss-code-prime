@@ -18,8 +18,32 @@ function(dss_add_test)
             ${CMAKE_SOURCE_DIR}/tests/test_support
     )
 
+    # Reuse the shared test PCH (heavy STL + <gtest/gtest.h>). All test
+    # targets compile with identical flags (DSS_SHARED_BUILD via the lib's
+    # PUBLIC define, the same includes), so the one precompiled header is
+    # valid for every one of them. No-op in Debug (CMAKE_DISABLE_PRECOMPILE_
+    # HEADERS), so the linux-clang-asan leg builds PCH-free.
+    target_precompile_headers(${target} REUSE_FROM dss_test_pch)
+
     add_test(NAME ${DSS_NAME} COMMAND ${target})
 endfunction()
+
+# Shared PCH producer for the test executables (see DSS_PCH_HEADERS in the
+# top-level CMakeLists). The ~166 test TUs are the larger half of the cold
+# compile and every one of them includes <gtest/gtest.h> + the heavy STL set;
+# precompiling them ONCE here and reusing across all test targets removes that
+# reparse. It links dss-code-prime-lib + GTest::gtest purely to inherit their
+# usage-requirement flags (the PUBLIC DSS_SHARED_BUILD define, the gtest include
+# dir) so the precompiled header matches every consumer's compile line exactly.
+# `dss_test_pch` is never linked anywhere; REUSE_FROM wires the build dependency.
+add_library(dss_test_pch STATIC ${CMAKE_CURRENT_SOURCE_DIR}/test_support/pch_stub.cpp)
+target_link_libraries(dss_test_pch PRIVATE dss-code-prime-lib GTest::gtest)
+target_include_directories(dss_test_pch
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/tests/test_support
+)
+target_precompile_headers(dss_test_pch PRIVATE ${DSS_PCH_HEADERS} <gtest/gtest.h>)
 
 add_subdirectory(core)
 add_subdirectory(test_support)
