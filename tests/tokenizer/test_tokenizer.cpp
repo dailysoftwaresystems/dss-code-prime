@@ -212,20 +212,22 @@ TEST(Tokenizer, HexLiteralLexedAsOneIntToken) {
     EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0xff");
 }
 
-TEST(Tokenizer, HexLiteralWithUnderscoreSeparators) {
-    auto h      = loadCSubset("0xDEAD_BEEF");
+TEST(Tokenizer, HexLiteralWithApostropheSeparators) {
+    // FC1 (2026-06-10): c-subset's digitSeparator flipped `_` → `'`
+    // (the C23 separator — `_` was never C).
+    auto h      = loadCSubset("0xDEAD'BEEF");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
-    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0xDEAD_BEEF");
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0xDEAD'BEEF");
 }
 
 TEST(Tokenizer, BinaryLiteralLexedAsOneIntToken) {
-    auto h      = loadCSubset("0b1010_0101");
+    auto h      = loadCSubset("0b1010'0101");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
-    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0b1010_0101");
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0b1010'0101");
 }
 
 TEST(Tokenizer, OctalLiteralLexedAsOneIntToken) {
@@ -377,40 +379,63 @@ TEST(Tokenizer, BareOctalPrefixAtEofIsMalformed) {
     EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_MalformedNumber);
 }
 
-TEST(Tokenizer, HexPrefixFollowedByUnderscoreOnlyEmitsMalformedDiagnostic) {
-    // `0x_` has no actual hex digits — only the underscore that the
-    // base-prefix branch accepts as a body char. The tokenizer still
-    // emits a single IntLiteral spanning `0x_` (so the source span is
-    // covered) but flags it with P_MalformedNumber for the downstream
-    // value parser. Companion: `0b_`, `0o_` behave identically.
-    auto h      = loadCSubset("0x_");
+TEST(Tokenizer, HexPrefixFollowedBySeparatorOnlyEmitsMalformedDiagnostic) {
+    // FC1 rewrite (2026-06-10): the pre-FC1 form used `0x_` (the old
+    // `_` separator). With c-subset's separator now `'` (C23) and the
+    // flanked-by-digits rule, `0x'` enters the hex-prefix arm (the
+    // entry check admits a separator after the prefix so the typo is
+    // DIAGNOSED rather than split into `0` + identifier), finds no
+    // digit body, and emits a malformed `0x` IntLiteral. The dangling
+    // `'` re-enters the dispatch as a char-literal start, so only the
+    // first token + the malformed count are pinned. (`0x_` itself now
+    // lexes as `0` + identifier `x_` — `_` is no longer special.)
+    auto h      = loadCSubset("0x'");
     auto result = lex(h);
-    ASSERT_EQ(result.tokens.size(), 1u);
+    ASSERT_GE(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
-    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0x_");
-    ASSERT_EQ(result.diags.size(), 1u);
-    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_MalformedNumber);
-    EXPECT_EQ(result.diags[0].severity, DiagnosticSeverity::Error);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0x");
+    std::size_t malformedCount = 0;
+    for (auto const& d : result.diags) {
+        if (d.code == DiagnosticCode::P_MalformedNumber) ++malformedCount;
+    }
+    EXPECT_EQ(malformedCount, 1u);
 }
 
-TEST(Tokenizer, BinaryPrefixFollowedByUnderscoreOnlyIsMalformed) {
-    auto h      = loadCSubset("0b___");
+TEST(Tokenizer, BinaryPrefixWithoutDigitsIsMalformed) {
+    // FC1 rewrite (2026-06-10): the pre-FC1 form of this test
+    // (`0b___`) relied on the OLD unconditional separator consume —
+    // separators are now flanked-by-digits (C23 6.4.4.1), so a
+    // separator-only body no longer extends the token. The intent —
+    // a multi-char prefix with no digit body is ONE malformed
+    // IntLiteral — is pinned via the EOF-after-prefix form.
+    auto h      = loadCSubset("0b");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
-    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0b___");
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0b");
     ASSERT_EQ(result.diags.size(), 1u);
     EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_MalformedNumber);
 }
 
-TEST(Tokenizer, ValidHexWithLeadingUnderscoreThenDigitIsAccepted) {
-    // `0x_ff` is well-formed: the underscore is a digit-separator and
-    // `ff` provides actual hex digits. No P_MalformedNumber.
-    auto h      = loadCSubset("0x_ff");
+TEST(Tokenizer, HexPrefixFollowedBySeparatorIsMalformedPerC23) {
+    // FC1 INVERSION (2026-06-10) of the pre-FC1
+    // `ValidHexWithLeadingUnderscoreThenDigitIsAccepted`: C23
+    // 6.4.4.1 requires every digit separator to be flanked by
+    // digits, so `0x'ff` is ill-formed — the prefix arm stops at the
+    // leading separator and `0x` surfaces as a malformed IntLiteral
+    // (exactly one P_MalformedNumber). The tail `'ff` re-enters the
+    // dispatch as a char-literal start, so only the FIRST token +
+    // the malformed-count are pinned here (the tail's char-literal
+    // diagnostics are its own feature's concern).
+    auto h      = loadCSubset("0x'ff");
     auto result = lex(h);
-    ASSERT_EQ(result.tokens.size(), 1u);
+    ASSERT_GE(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
-    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0x_ff");
-    EXPECT_TRUE(result.diags.empty());
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0x");
+    std::size_t malformedCount = 0;
+    for (auto const& d : result.diags) {
+        if (d.code == DiagnosticCode::P_MalformedNumber) ++malformedCount;
+    }
+    EXPECT_EQ(malformedCount, 1u);
 }
 
 TEST(Tokenizer, ZeroFollowedByLetterPinsSchemaKindAsIntLiteral) {
@@ -1680,6 +1705,45 @@ TEST(Tokenizer, GenericNumberStyleApostropheSeparator) {
     ASSERT_EQ(tokens.size(), 1u);
     EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::IntLiteral);
     EXPECT_EQ(textOf(*src, tokens[0]), "1'000'000");
+}
+
+TEST(Tokenizer, GenericSeparatorTrailingIsNotConsumed) {
+    // FC1 between-digits rule (C23 6.4.4.1, applied universally to
+    // any schema-declared separator): a TRAILING separator is not
+    // part of the number. Pre-FC1 the scanner consumed it
+    // unconditionally — `1'000'` lexed as ONE token swallowing the
+    // final quote (red-on-disable lever: revert the flanked-by-
+    // digits guard and tokens[0] becomes "1'000'"). The synthetic
+    // non-C schema proves the rule is engine-universal, not a
+    // c-subset special case.
+    auto loaded = GrammarSchema::loadFromText(kGenericNumSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("1'000'", "<gen>");
+    Tokenizer tk{src, schema};
+    auto [stream, _] = std::move(tk).tokenize();
+    std::vector<Token> tokens;
+    while (!stream.isAtEnd()) tokens.push_back(stream.advance());
+    ASSERT_GE(tokens.size(), 1u);
+    EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*src, tokens[0]), "1'000");
+}
+
+TEST(Tokenizer, GenericSeparatorMustBeFlankedByDigits) {
+    // FC1: a DOUBLED separator ends the number at the last digit —
+    // `1''2` is two-sided ill-formed per C23, so the number is just
+    // "1" (pre-FC1 the loose scanner produced one "1''2" token).
+    auto loaded = GrammarSchema::loadFromText(kGenericNumSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("1''2", "<gen>");
+    Tokenizer tk{src, schema};
+    auto [stream, _] = std::move(tk).tokenize();
+    std::vector<Token> tokens;
+    while (!stream.isAtEnd()) tokens.push_back(stream.advance());
+    ASSERT_GE(tokens.size(), 1u);
+    EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*src, tokens[0]), "1");
 }
 
 TEST(Tokenizer, GenericNumberStyleFloatSuffixPromotesKind) {

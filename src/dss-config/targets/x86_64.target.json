@@ -171,7 +171,7 @@
       }
     },
     {
-      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — signed-divide single op (cycle 10r split). IDIV r/m64 divides RDX:RAX by operand 0 (modrm.rm), placing quotient in RAX + remainder in RDX. Encoder auto-computes REX with W=1 + B=(operand 0's high bit), correctly handling R8-R15 operands. Cycle 10r split from the prior compound encoding to fix REX-prefix overlap silent-miscompile (see cqo $comment). implicitRegisters: inputs=[rax,rdx] (IDIV reads RDX:RAX as 128-bit dividend); outputs=[rax,rdx] (quotient + remainder); clobbered=[rax,rdx] (both prior values destroyed — required by the schema-loader `outputs ⊆ clobbered` invariant added in the 10r 7-agent review fold, since regalloc consumes `clobbered` to build its forbidden set).",
+      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — signed-divide single op (cycle 10r split). IDIV r/m64 divides RDX:RAX by operand 0 (modrm.rm), placing quotient in RAX + remainder in RDX. Encoder auto-computes REX with W=1 + B=(operand 0's high bit), correctly handling R8-R15 operands. Cycle 10r split from the prior compound encoding to fix REX-prefix overlap silent-miscompile (see cqo $comment). implicitRegisters: inputs=[rax,rdx] (IDIV reads RDX:RAX as 128-bit dividend); outputs=[rax,rdx] (quotient + remainder); clobbered=[rax,rdx] (both prior values destroyed — required by the schema-loader `outputs ⊆ clobbered` invariant added in the 10r 7-agent review fold, since regalloc consumes `clobbered` to build its forbidden set). inputRoles/outputRoles (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT, 2026-06-10): the MIR→LIR div/mod lowering pins the dividend + captures the quotient (SDiv) or remainder (SMod) BY ROLE — a reorder of the positional arrays can no longer silently flip the projected register.",
       "mnemonic":      "idiv_op",
       "result":        "none",
       "hasSideEffects": true,
@@ -182,7 +182,9 @@
       "implicitRegisters": {
         "inputs":    ["rax", "rdx"],
         "outputs":   ["rax", "rdx"],
-        "clobbered": ["rax", "rdx"]
+        "clobbered": ["rax", "rdx"],
+        "inputRoles":  { "dividend": "rax" },
+        "outputRoles": { "quotient": "rax", "remainder": "rdx" }
       },
       "encoding": {
         "format": "x86-variable",
@@ -221,7 +223,7 @@
       }
     },
     {
-      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — unsigned-divide single op (cycle 10r split). DIV r/m64 divides RDX:RAX by operand 0 (modrm.rm), placing quotient in RAX + remainder in RDX. Encoder auto-computes REX with W=1 + B=(operand 0's high bit). implicitRegisters: inputs=[rax,rdx]; outputs=[rax,rdx]; clobbered=[rax,rdx] (mirrors `idiv_op` — required by the `outputs ⊆ clobbered` invariant).",
+      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — unsigned-divide single op (cycle 10r split). DIV r/m64 divides RDX:RAX by operand 0 (modrm.rm), placing quotient in RAX + remainder in RDX. Encoder auto-computes REX with W=1 + B=(operand 0's high bit). implicitRegisters: inputs=[rax,rdx]; outputs=[rax,rdx]; clobbered=[rax,rdx] (mirrors `idiv_op` — required by the `outputs ⊆ clobbered` invariant). inputRoles/outputRoles mirror `idiv_op` (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT): UDiv captures role 'quotient', UMod captures role 'remainder'.",
       "mnemonic":      "div_op",
       "result":        "none",
       "hasSideEffects": true,
@@ -232,7 +234,9 @@
       "implicitRegisters": {
         "inputs":    ["rax", "rdx"],
         "outputs":   ["rax", "rdx"],
-        "clobbered": ["rax", "rdx"]
+        "clobbered": ["rax", "rdx"],
+        "inputRoles":  { "dividend": "rax" },
+        "outputRoles": { "quotient": "rax", "remainder": "rdx" }
       },
       "encoding": {
         "format": "x86-variable",

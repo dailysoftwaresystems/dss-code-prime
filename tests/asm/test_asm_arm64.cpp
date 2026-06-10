@@ -288,6 +288,124 @@ TEST(Arm64Encoder, ZextEncodesOrrW) {
     EXPECT_EQ(bytes[3], 0x2A);
 }
 
+// ── FC1 (V2-4.X): NEG — surfaced by the modulo corpus' negatives ───
+
+TEST(Arm64Encoder, NegEncodesSubFromXzr) {
+    // neg X0, X1 = SUB X0, XZR, X1:
+    //   base 0xCB0003E0 (SUB shifted-reg 0xCB000000 | Rn=XZR=31<<5)
+    //   | Rm = X1 (enc 1) << 16 → 0x00010000
+    //   = 0xCB0103E0 — LE bytes: E0 03 01 CB.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const negOp = (*s)->opcodeByMnemonic("neg");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(negOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const nops[] = { LirOperand::makeReg(x1) };
+    (void)b.addInst(*negOp, x0, nops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE0);
+    EXPECT_EQ(bytes[1], 0x03);
+    EXPECT_EQ(bytes[2], 0x01);
+    EXPECT_EQ(bytes[3], 0xCB);
+}
+
+// ── FC1 (V2-4.X): SDIV/UDIV — the Rule-1 native divide opcodes ─────
+// (D-MIR-TO-LIR-DIV-SEQUENCE-AGNOSTIC closure: arm64's divide is one
+// result-bearing 3-address instruction, no implicit RDX:RAX dance.)
+
+TEST(Arm64Encoder, SdivEncodesDataProc2Source) {
+    // sdiv X0, X1, X2 — data-processing (2 source), sf=1:
+    //   base 0x9AC00C00 (sf=1 | S=0 | 11010110 | opcode 000011)
+    //   | Rm = X2 (enc 2)  << 16 → 0x00020000
+    //   | Rn = X1 (enc 1)  << 5  → 0x00000020
+    //   | Rd = X0 (enc 0)        → 0
+    //   = 0x9AC20C20 — LE bytes: 20 0C C2 9A.
+    // Hand-verified against the ARM ARM (C6.2.281 SDIV).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const sdivOp = (*s)->opcodeByMnemonic("sdiv");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(sdivOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x2{static_cast<std::uint32_t>(*(*s)->registerByName("x2")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const dops[] = { LirOperand::makeReg(x1),
+                                LirOperand::makeReg(x2) };
+    (void)b.addInst(*sdivOp, x0, dops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0x0C);
+    EXPECT_EQ(bytes[2], 0xC2);
+    EXPECT_EQ(bytes[3], 0x9A);
+}
+
+TEST(Arm64Encoder, UdivEncodesDataProc2SourceHighRegs) {
+    // udiv X3, X4, X14 — UDIV's opcode field is 000010 (bit 11:10 =
+    // 10 vs SDIV's 11; a flipped bit here silently turns every
+    // unsigned divide into a signed one):
+    //   base 0x9AC00800
+    //   | Rm = X14 (enc 14) << 16 → 0x000E0000
+    //   | Rn = X4  (enc 4)  << 5  → 0x00000080
+    //   | Rd = X3  (enc 3)        → 0x00000003
+    //   = 0x9ACE0883 — LE bytes: 83 08 CE 9A.
+    // X14 covers a >7 register encoding (5-bit field, no x86-style
+    // REX pitfalls, but pins the full-width Rm window).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const udivOp = (*s)->opcodeByMnemonic("udiv");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(udivOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x3 {static_cast<std::uint32_t>(*(*s)->registerByName("x3")),  1, cls};
+    LirReg const x4 {static_cast<std::uint32_t>(*(*s)->registerByName("x4")),  1, cls};
+    LirReg const x14{static_cast<std::uint32_t>(*(*s)->registerByName("x14")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const dops[] = { LirOperand::makeReg(x4),
+                                LirOperand::makeReg(x14) };
+    (void)b.addInst(*udivOp, x3, dops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x83);
+    EXPECT_EQ(bytes[1], 0x08);
+    EXPECT_EQ(bytes[2], 0xCE);
+    EXPECT_EQ(bytes[3], 0x9A);
+}
+
 // ── fixed32 walker — `mov Xd, #imm16` (MOVZ) — D-LK10-ENTRY-ARM64 ──
 
 TEST(Arm64Encoder, MovImm16EncodesMOVZ) {

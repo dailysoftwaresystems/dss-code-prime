@@ -335,7 +335,21 @@ struct NumberScan {
         while (true) {
             const char c = r.peek();
             if (matchesDigitClass(p.digits, c)) { sawDigit = true; r.advance(1); continue; }
-            if (isSeparator(style, c))         { r.advance(1); continue; }
+            // FC1 (V2-4.X, 2026-06-10): a digit separator is consumed
+            // only BETWEEN digits (C23 6.4.4.1 — each separator must
+            // be flanked by digits). The previous unconditional
+            // consume silently swallowed trailing/leading separators
+            // (`1'` lexed as the value 1, eating the quote) — fatal
+            // once a language's separator collides with another token
+            // start (C23's `'` is also the char-literal quote: `1'+'a'`
+            // must NOT lex as 1 then garbage). Universal rule, no
+            // language identity: any schema-declared separator gets
+            // the flanked-by-digits requirement.
+            if (sawDigit && isSeparator(style, c)
+                && matchesDigitClass(p.digits, r.peek(1))) {
+                r.advance(1);
+                continue;
+            }
             break;
         }
         // Optional integer suffix.
@@ -355,7 +369,14 @@ struct NumberScan {
         while (true) {
             const char c = r.peek();
             if (c >= '0' && c <= '9') { sawDigit = true; r.advance(1); continue; }
-            if (isSeparator(style, c)) { r.advance(1); continue; }
+            // Between-digits separator rule — see the prefix-body loop
+            // above (C23 6.4.4.1 flanked-by-digits; universal for any
+            // schema-declared separator).
+            if (sawDigit && isSeparator(style, c)
+                && r.peek(1) >= '0' && r.peek(1) <= '9') {
+                r.advance(1);
+                continue;
+            }
             break;
         }
     };

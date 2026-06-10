@@ -184,6 +184,68 @@
       }
     },
     {
+      "$comment": "FC1 V2-4.X (2026-06-10): NEG Xd, Xm = SUB Xd, XZR, Xm (shifted-register alias, Rn=XZR baked). Base = 0xCB000000 | (XZR=31 << 5) = 0xCB0003E0. Slots: Rd, Rm. Surfaced by the modulo corpus' negative literals — under the BASELINE (no-ConstFold) pipeline a unary minus reaches LIR as a live `neg`, and arm64 had never declared one (every prior arm64 corpus avoided unary minus).",
+      "mnemonic":      "neg",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"] },
+            "template":   { "fixedWord": 3405775840 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC1 V2-4.X (2026-06-10): SDIV Xd, Xn, Xm — data-processing (2 source), sf=1. Base = 0x9AC00C00 (sf=1 | S=0 | 11010110 | Rm[20:16] | opcode 000011[15:10] | Rn[9:5] | Rd[4:0]). The MIR→LIR div lowering's Rule-1 NATIVE realization: result-bearing 3-address op, no implicit registers, no pre-op (contrast x86 cqo+idiv_op). ARM64 SDIV never traps — divide-by-zero yields 0 and INT_MIN/-1 wraps (A-profile), so the C-UB divide cases are non-trapping on this target. SMod has no hardware instruction: the lowering expands rem = n - (n/d)*d via sdiv+mul+sub (a fused MSUB realization is pinned D-LIR-MOD-MSUB-FUSION).",
+      "mnemonic":      "sdiv",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg"] },
+            "template":   { "fixedWord": 2596277248 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC1 V2-4.X (2026-06-10): UDIV Xd, Xn, Xm — base = 0x9AC00800 (opcode field 000010 vs SDIV's 000011). Unsigned divide; same Rule-1 native shape as sdiv. UMod expands via udiv+mul+sub.",
+      "mnemonic":      "udiv",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg"] },
+            "template":   { "fixedWord": 2596276224 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "mnemonic":      "and",
       "result":        "value",
       "minOperands":   2,

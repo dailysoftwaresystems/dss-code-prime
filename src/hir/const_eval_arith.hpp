@@ -156,12 +156,31 @@ applyBinaryInt(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
                     : ConstEvalFailure::NotAConstantExpression;
                 return std::nullopt;
             }
+            // INT64_MIN / -1: the quotient (2^63) is unrepresentable —
+            // C UB (6.5.5p6) AND host UB (the `av / bv` below would
+            // overflow inside the COMPILER; the linux-clang UBSan CI
+            // leg would trip). Refuse unconditionally: the op stays
+            // live and the TARGET defines the outcome (x86 idiv #DE
+            // trap; arm64 sdiv wraps) — folding would hide it.
+            if (av == std::numeric_limits<std::int64_t>::min() && bv == -1) {
+                outFailure = ConstEvalFailure::Overflow;
+                return std::nullopt;
+            }
             folded.value = av / bv; return folded;
         case HirOpKind::Rem:
             if (bv == 0) {
                 outFailure = opts.refuseOnDivByZero
                     ? ConstEvalFailure::DivisionByZero
                     : ConstEvalFailure::NotAConstantExpression;
+                return std::nullopt;
+            }
+            // INT64_MIN % -1: mathematically 0, but C UB (6.5.5p6 —
+            // `a/b` must be representable for `a%b` to be defined)
+            // and host UB (x86's own idiv traps computing it; the
+            // C++ `%` below is UB the same way `/` is). Mirror the
+            // Div guard — refuse, keep the runtime op.
+            if (av == std::numeric_limits<std::int64_t>::min() && bv == -1) {
+                outFailure = ConstEvalFailure::Overflow;
                 return std::nullopt;
             }
             folded.value = av % bv; return folded;

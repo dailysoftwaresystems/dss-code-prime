@@ -271,6 +271,50 @@ TEST(Licm, TrapEligibleSDivNotHoisted) {
            "would change observable behavior (D-OPT6-LICM-TRAP-SAFE-HOIST)";
 }
 
+// FC1 (V2-4.X, 2026-06-10): SMod is trap-eligible exactly like SDiv
+// (x86 lowers `%` through the SAME idiv instruction — `x % 0` traps).
+// `isTrapEligible` already listed SMod/UMod; this pin makes the
+// listing load-bearing — removing SMod from that opcode-enumerated
+// list goes RED here, not silently hoist-and-trap.
+TEST(Licm, TrapEligibleSModNotHoisted) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+    mb.beginBlock(entry);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirLiteralValue v4; v4.value = std::int64_t{4}; v4.core = TypeKind::I32;
+    MirInstId const a = mb.addConst(v3, i32);
+    MirInstId const b = mb.addConst(v4, i32);
+    mb.addBr(header);
+    mb.beginBlock(header);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    mb.addCondBr(cond, body, exitB);
+    mb.beginBlock(body);
+    MirInstId const ops[] = {a, b};
+    (void)mb.addInst(MirOpcode::SMod, ops, i32);
+    mb.addBr(header);
+    mb.beginBlock(exitB);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runLicm(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsHoisted, 0u)
+        << "SMod could trap (x86 `%` goes through idiv); hoisting it "
+           "out of a 0-trip-count loop would change observable "
+           "behavior (D-OPT6-LICM-TRAP-SAFE-HOIST discipline).";
+}
+
 // Cycle 10b: Load IS a hoist candidate now. A loop-invariant Load
 // (pointer defined outside loop AND no may-aliasing Store in body)
 // hoists to the preheader.

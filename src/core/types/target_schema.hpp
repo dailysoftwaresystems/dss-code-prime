@@ -15,6 +15,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -1483,6 +1484,45 @@ struct DSS_EXPORT ImplicitRegisterConstraint {
     std::vector<std::uint16_t> inputOrdinals;
     std::vector<std::uint16_t> outputOrdinals;
     std::vector<std::uint16_t> clobberedOrdinals;
+
+    // Role-tagged projection contract (D-CSUBSET-MOD-OP-CODEGEN-
+    // OUTPUT-INDEX-CONTRACT closure, 2026-06-10). Optional JSON
+    // objects `inputRoles` / `outputRoles` map a ROLE name (from the
+    // loader's registered role vocabulary — "dividend", "quotient",
+    // "remainder") to a register name that must ALSO appear in the
+    // corresponding positional array. The MIR→LIR div/mod lowering
+    // reads its pinned/captured registers BY ROLE, never by
+    // positional index — so a JSON reorder of `outputs` can no
+    // longer silently flip a quotient capture into a remainder
+    // capture (the silent-miscompile class the anchor named). The
+    // positional arrays REMAIN the regalloc/invariant surface
+    // (outputs ⊆ clobbered; forbidden-set construction); ops whose
+    // implicit registers are never projected by the lowering (cqo,
+    // xor_rdx_zero) simply omit the role maps.
+    std::vector<std::pair<std::string, std::string>> inputRoleNames;
+    std::vector<std::pair<std::string, std::string>> outputRoleNames;
+
+    // Validator-populated {role, ordinal} pairs — only successfully
+    // resolved roles appear (a role whose register fails resolution
+    // is diagnosed at load and omitted here, so consumers see the
+    // failure as a missing role, fail-loud at the query site).
+    std::vector<std::pair<std::string, std::uint16_t>> inputRoleOrdinals;
+    std::vector<std::pair<std::string, std::uint16_t>> outputRoleOrdinals;
+
+    [[nodiscard]] std::optional<std::uint16_t>
+    inputOrdinalForRole(std::string_view role) const noexcept {
+        for (auto const& [r, ord] : inputRoleOrdinals) {
+            if (r == role) return ord;
+        }
+        return std::nullopt;
+    }
+    [[nodiscard]] std::optional<std::uint16_t>
+    outputOrdinalForRole(std::string_view role) const noexcept {
+        for (auto const& [r, ord] : outputRoleOrdinals) {
+            if (r == role) return ord;
+        }
+        return std::nullopt;
+    }
 };
 
 // One row per opcode; index in the vector IS the opcode's numeric
