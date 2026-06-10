@@ -394,3 +394,96 @@ TEST(ParserRecoveryDeath, ZeroSyncScanCapAborts) {
         Parser(src, schema, std::move(empty), std::move(cfg)),
         "maxSyncScanTokens must be >= 1");
 }
+
+// ── missing required production before a stop-point ─────────────────────
+//
+// A required rule that can't start at the current token, where that token is
+// a STOP-POINT (a sync token or in an enclosing FOLLOW), is recovered by
+// SYNTHESIZING the missing rule and letting the enclosing frame consume the
+// token — NOT by panic-consuming it. Panic-consuming a scope-closer would
+// leave the scope stack unbalanced (`P_BuilderInvariant` at finish) and
+// strand the rest of the input as a Missing-node cascade.
+
+namespace {
+// Recursive: does the subtree rooted at `n` contain an Internal node for
+// `rule`? Proves recovery RESTORED post-error structure vs discarding it.
+[[nodiscard]] bool treeContainsRule(Tree const& t, NodeId n, RuleId rule) {
+    if (t.kind(n) == NodeKind::Internal && t.rule(n).v == rule.v) return true;
+    for (auto c : t.children(n)) {
+        if (treeContainsRule(t, c, rule)) return true;
+    }
+    return false;
+}
+} // namespace
+
+// THE headline pin (RED-on-disable). `int x = ;` — a declaration with `=`
+// then an immediately-absent initializer expression. Pre-fix the `initValue`
+// RuleLeaf recovery left the schema cursor frozen; panic recovery then
+// consumed the `}` block-closer via `tokens.advance()` (never `pushToken`, so
+// `closesScope` never fired) → `P_BuilderInvariant` "scope stack non-empty at
+// finish" + a 3x `P_MissingRequiredChild` EOF cascade. The fix synthesizes the
+// missing `initValue` and lets `varDeclHead` consume the `;`, the block consume
+// + scope-close its `}`, and `return undefined_thing;` parse normally.
+TEST(ParserRecovery, MissingInitializerExpressionRecoversCleanly) {
+    auto h = loadShipped("c-subset",
+        "int main() {\n    int x = ;\n    return undefined_thing;\n}\n");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t     = result.tree;
+    auto const& diags = t.diagnostics().all();
+
+    // Exactly ONE positioned parse diagnostic for the missing expression
+    // (pre-fix: 3). This count is the primary RED-on-disable lever.
+    ASSERT_EQ(countCode(diags, DiagnosticCode::P_NoAlternativeMatched), 1u);
+    // ...located at the `;` (line 2, column 13).
+    for (auto const& d : diags) {
+        if (d.code == DiagnosticCode::P_NoAlternativeMatched) {
+            const auto lc = t.source().lineCol(d.span.start());
+            EXPECT_EQ(lc.line, 2u);
+            EXPECT_EQ(lc.column, 13u);
+        }
+    }
+    // ZERO builder-internal invariants: the block scope balanced (pre-fix 1).
+    EXPECT_EQ(countCode(diags, DiagnosticCode::P_BuilderInvariant), 0u);
+    // ZERO EOF Missing-node cascade: recovery returned to the block (pre-fix 3).
+    EXPECT_EQ(countCode(diags, DiagnosticCode::P_MissingRequiredChild), 0u);
+
+    // Positive structural proof recovery restored the block: the
+    // `return undefined_thing;` after the broken decl appears in the tree
+    // (pre-fix those tokens were panic-discarded entirely).
+    const auto returnRule = t.schema().rules().find("returnStmt");
+    ASSERT_TRUE(returnRule.valid());
+    EXPECT_TRUE(treeContainsRule(t, t.root(), returnRule))
+        << "the post-error `return ...;` must survive recovery in the tree";
+}
+
+// Suppression-reset invariant. TWO separate broken decls (`int x = ;` then
+// `int y = ;`) each emit their OWN diagnostic: the clean `int y =` dispatch
+// between the two errors resets `stepRecovered_` at the top of `stepOnce`, so
+// the second synthesis is NOT mid-recovery and is NOT suppressed. This guards
+// that the one-diagnostic-per-region suppression collapses only a CONTIGUOUS
+// recovery run, never two genuinely-distinct errors separated by clean parse.
+TEST(ParserRecovery, MissingInitDiagnosticsAreNotSuppressedAcrossCleanParse) {
+    auto h = loadShipped("c-subset",
+        "int main() {\n    int x = ;\n    int y = ;\n    return 0;\n}\n");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& diags = result.tree.diagnostics().all();
+
+    // Both missing initializers diagnosed — not collapsed to one.
+    EXPECT_EQ(countCode(diags, DiagnosticCode::P_NoAlternativeMatched), 2u);
+    // Still clean recovery — no invariant, no EOF cascade.
+    EXPECT_EQ(countCode(diags, DiagnosticCode::P_BuilderInvariant), 0u);
+    EXPECT_EQ(countCode(diags, DiagnosticCode::P_MissingRequiredChild), 0u);
+}
+
+// AGNOSTICISM is proven by the by-construction diagnostic-corpus harness
+// (tests/analysis/test_diagnostic_corpus.cpp): the SAME grammar-driven fix
+// (isStopPoint = schema `syncTokens` + FOLLOW; synthesize the missing
+// RuleLeaf) fires for THREE shipped grammars with no engine identity branch —
+// c-subset (`missing_init.c`, the scope-bearing block case above), toy
+// (`unknown_token.toy`), and tsql-subset (`broken_select.sql`), whose goldens
+// each shed the pre-fix spurious EOF cascade. The garbage path (a non-stop-
+// point bad token still panic-scans, NOT synthesize-and-skip) is held by the
+// toy `@ noise more` resync pins earlier in this file — they would RED if the
+// stop-point branch over-fired on garbage.

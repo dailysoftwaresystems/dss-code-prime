@@ -1,4 +1,2 @@
 P_IllegalChar 1:15-1:16
-P_MissingRequiredChild 2:1-2:1
 P_NoAlternativeMatched 1:15-1:16
-P_NoAlternativeMatched 1:16-1:17
