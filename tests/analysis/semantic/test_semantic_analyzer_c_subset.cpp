@@ -1467,3 +1467,97 @@ TEST(SemanticAnalyzerCSubset, FF11MultipleDescriptorsEachSymbolInjectedOnce) {
     EXPECT_EQ(model.shippedExterns().size(), 5u)
         << "five distinct descriptor symbols → five extern rows (no duplicate)";
 }
+
+// ── FC2: explicit C-style casts (`semantics.casts`) ─────────────────────
+
+// THE Part-B integration point: the IMPLICIT F64→I32 narrowing in
+// `return 1.7 + 2.5;` is rejected (S_ReturnTypeMismatch — the strict
+// no-silent-conversion bar), while the EXPLICIT `(int)(1.7 + 2.5)` form
+// is accepted: the cast node's result type is the stamped target (I32),
+// which assigns cleanly into main's I32 result. Both directions in one
+// test so the contrast is pinned, not assumed.
+TEST(SemanticAnalyzerCSubset, ExplicitFloatToIntCastAcceptedWhereImplicitRejected) {
+    auto implicitModel = analyzeShipped("c-subset", {
+        "int main() { return 1.7 + 2.5; }\n",
+    });
+    EXPECT_EQ(countCode(implicitModel.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 1u)
+        << "the implicit F64->I32 narrowing must stay rejected";
+
+    auto castModel = analyzeShipped("c-subset", {
+        "int main() { return (int)(1.7 + 2.5); }\n",
+    });
+    EXPECT_FALSE(castModel.hasErrors())
+        << (castModel.diagnostics().all().empty()
+                ? ""
+                : castModel.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(castModel.diagnostics(),
+                        DiagnosticCode::S_InvalidCast), 0u);
+}
+
+// A typedef name in cast position resolves through the SAME type-position
+// resolver declarations use (SE5 alias resolution) — `(T)4` yields I64,
+// then `(int)` narrows it back; both casts legal, zero diagnostics.
+TEST(SemanticAnalyzerCSubset, TypedefNameInCastPositionResolves) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef long T;\n"
+        "int main() { return (int)(T)4; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
+// An unknown type name inside a COMMITTED cast (`(q) z` — the non-
+// operator follower made the cast the only viable parse) fails loud at
+// type resolution: exactly one S_UnknownType for `q`. (`z` additionally
+// fails name resolution — a distinct code, deliberately not conflated.)
+TEST(SemanticAnalyzerCSubset, UnknownTypeNameInCommittedCastFiresUnknownType) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() { (q) z; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "the operand `z` is an ordinary undeclared value reference";
+}
+
+// C forbids casts to (and the MIR lattice cannot lower casts from)
+// composite VALUES: both the struct→int and int… to-struct directions
+// emit S_InvalidCast — one per illegal cast site, nothing silent.
+TEST(SemanticAnalyzerCSubset, StructValueCastsAreRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int x; };\n"
+        "int main() { struct S s; int y = (int)s; (struct S)s; return y; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 2u)
+        << "struct->int AND ->struct directions must BOTH fail loud";
+}
+
+// Pointer casts: ptr↔ptr, int→ptr (the null-constant idiom and beyond),
+// and ptr→int are all in the explicit-cast matrix (mapCast: Bitcast /
+// IntToPtr / PtrToInt). Zero diagnostics.
+TEST(SemanticAnalyzerCSubset, PointerCastsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() {\n"
+        "  int* p; void* v;\n"
+        "  p = (int*)0;\n"
+        "  v = (void*)p;\n"
+        "  p = (int*)v;\n"
+        "  long bits = (long)p;\n"
+        "  return (int)bits;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
+// Float↔pointer stays ILLEGAL (a C constraint mapCast mirrors: no
+// FPToPtr arm exists) — S_InvalidCast, never a silent miscompile.
+TEST(SemanticAnalyzerCSubset, FloatToPointerCastRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() { int* p; p = (int*)1.5; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 1u);
+}

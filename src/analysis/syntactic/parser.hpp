@@ -1,5 +1,6 @@
 #pragma once
 
+#include "analysis/syntactic/binder_sketch.hpp"
 #include "analysis/syntactic/pratt_walker.hpp"
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
@@ -11,14 +12,29 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <type_traits>
+#include <vector>
 
 namespace dss {
 
 // Outcome of `Parser::parse() &&`. Owns the assembled tree; the
 // tree's diagnostic stream is reachable via `tree.diagnostics()`.
+//
+// The two FC2 sidecars travel WITH the tree (not on it — Tree stays a
+// pure frozen CST):
+//   * `typeNameCandidates` — ambiguous lone-identifier type-name sites
+//     the parser rolled back to the value reading (triage rule 4).
+//     The compilation unit's oracle (UnitBuilder::finish) resolves them
+//     against cross-file type names and reparses once on a hit.
+//   * `globalTypeNames` — the GLOBAL-scope TYPE names this parse bound
+//     (typedefs / struct tags / …, per `semantics.declarations`), the
+//     export surface the oracle harvests. Empty for binder-less
+//     languages.
 struct DSS_EXPORT ParseResult {
-    Tree tree;
+    Tree                                    tree;
+    std::vector<AmbiguousTypeNameCandidate> typeNameCandidates;
+    std::vector<std::string>                globalTypeNames;
 };
 
 // How the dispatch loop's recovery sites behave when they see an
@@ -70,6 +86,14 @@ struct DSS_EXPORT ParserConfig {
     // tests or for languages whose expression dispatch needs
     // bespoke logic. Move-only ownership.
     std::unique_ptr<PrattWalker> prattWalker;
+
+    // FC2: names seeded into the binder sketch's GLOBAL scope as TYPE
+    // bindings before parsing — the compilation-unit oracle's cross-file
+    // typedef channel. A reparse triggered by an ambiguous type-name
+    // candidate passes the resolved candidate names here so the
+    // type-name commit triage sees them as types (case 2) instead of
+    // unknowns (case 4). Empty (the default) for every first parse.
+    std::vector<std::string> seedGlobalTypeNames;
 };
 
 // Schema-driven recursive-descent parser.

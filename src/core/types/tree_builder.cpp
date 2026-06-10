@@ -1009,6 +1009,49 @@ RuleId TreeBuilder::currentRule() const noexcept {
     return open_.empty() ? InvalidRule : open_.back().rule;
 }
 
+// ── built-subtree introspection (FC2 binder sketch + type-name triage) ───
+//
+// Thin reads over the in-progress arena. Bounds/ownership violations abort
+// via the arena's strong-id contract (`arena_.at`), matching Tree's
+// accessor posture.
+
+NodeKind TreeBuilder::nodeKind(NodeId id) const {
+    return arena_.at(id).kind;
+}
+
+NodeFlags TreeBuilder::nodeFlags(NodeId id) const {
+    return arena_.at(id).flags;
+}
+
+RuleId TreeBuilder::nodeRule(NodeId id) const {
+    return arena_.at(id).rule;
+}
+
+SchemaTokenId TreeBuilder::nodeTokenKind(NodeId id) const {
+    return arena_.at(id).tokenKind;
+}
+
+SourceSpan TreeBuilder::nodeSpan(NodeId id) const {
+    return arena_.at(id).span;
+}
+
+std::span<NodeId const> TreeBuilder::nodeChildren(NodeId id) const {
+    detail::Node const& n = arena_.at(id);
+    if (n.childCount == 0) return {};
+    // Defensive bounds check mirroring Tree::children — a corrupt
+    // firstChild/childCount must abort, not read out of bounds.
+    if (n.firstChild > childIndex_.size()
+        || n.childCount > childIndex_.size() - n.firstChild) {
+        tbFatal("TreeBuilder::nodeChildren: child range out of bounds");
+    }
+    return std::span<NodeId const>{childIndex_}.subspan(n.firstChild,
+                                                        n.childCount);
+}
+
+std::span<NodeId const> TreeBuilder::currentFramePendingChildren() const noexcept {
+    return topFramePendingChildren_();
+}
+
 std::size_t TreeBuilder::openFrameCount() const noexcept {
     return open_.size();
 }

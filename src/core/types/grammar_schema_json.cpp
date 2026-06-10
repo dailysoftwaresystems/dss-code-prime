@@ -956,6 +956,55 @@ void buildPositionTables(GrammarSchemaData& data, json const& shapesJson,
                 }
             }
         }
+
+        // `commitRequiresTypeName` (FC2 cast-expression disambiguation):
+        // names the child rule in this shape's TYPE position. The parser's
+        // speculative-probe commit consults the generic type-name triage
+        // for rules carrying this guard (see CompiledRule::
+        // typeNameCommitRule). Validated here: must be a string naming a
+        // declared shape. The semantics-side requirement (the language
+        // must declare `semantics.identifierToken` so "lone identifier"
+        // is decidable) is validated late, after the `semantics` block is
+        // parsed — see validateTypeNameCommitGuards.
+        if (body.is_object() && body.contains("commitRequiresTypeName")) {
+            json const& guard = body.at("commitRequiresTypeName");
+            if (!guard.is_string() || guard.get<std::string>().empty()) {
+                coll.emit(DiagnosticCode::C_UnknownShape,
+                          std::format("{}/commitRequiresTypeName", shapePath),
+                          "'commitRequiresTypeName' must be a non-empty string "
+                          "naming the shape's type-position child rule");
+            } else {
+                const auto& typeRuleName = guard.get<std::string>();
+                if (!data.rules->contains(typeRuleName)) {
+                    coll.emit(DiagnosticCode::C_UnknownShape,
+                              std::format("{}/commitRequiresTypeName", shapePath),
+                              std::format("'commitRequiresTypeName' names unknown "
+                                          "shape '{}'", typeRuleName));
+                } else {
+                    rule.typeNameCommitRule = data.rules->find(typeRuleName);
+                }
+            }
+        }
+    }
+}
+
+// Late cross-block validation for `commitRequiresTypeName` guards (runs
+// after the `semantics` block is parsed). The triage's "lone identifier"
+// test is decidable only when the language declares
+// `semantics.identifierToken`; a guard without one would silently degrade
+// to commit-always — the wrong failure mode. Fail loud at load instead.
+void validateTypeNameCommitGuards(GrammarSchemaData& data, Collector& coll) {
+    for (auto const& [rid, rule] : data.compiledRules) {
+        if (!rule.typeNameCommitRule.valid()) continue;
+        if (!data.semantics.identifierToken.valid()) {
+            coll.emit(DiagnosticCode::C_MissingField,
+                      std::format("/shapes/{}/commitRequiresTypeName",
+                                  data.rules->name(RuleId{rid})),
+                      "'commitRequiresTypeName' requires the language to "
+                      "declare 'semantics.identifierToken' — the type-name "
+                      "triage cannot decide what a lone identifier is "
+                      "without it");
+        }
     }
 }
 
@@ -4624,6 +4673,50 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── casts (FC2 explicit casts) ──
+            // `{ rule, typeChild, operandChild }` — the explicit-cast
+            // expression shape; Pass 2 resolves + stamps the type child
+            // and validates the pair against the explicit-cast matrix.
+            if (sem.contains("casts")) {
+                json const& arr = sem.at("casts");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/casts",
+                              "'semantics.casts' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/casts/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'casts' entry must be an object");
+                            continue;
+                        }
+                        if (!entry.contains("rule") || !entry.at("rule").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/rule",
+                                      "'rule' is required and must be a string");
+                            continue;
+                        }
+                        CastRule rule;
+                        rule.ruleName = entry.at("rule").get<std::string>();
+                        if (!data.rules->contains(rule.ruleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path + "/rule",
+                                      std::format("'casts[{}].rule' references "
+                                                  "unknown shape '{}'", i, rule.ruleName));
+                            continue;
+                        }
+                        rule.rule = data.rules->find(rule.ruleName);
+
+                        bool ok = true;
+                        readReqIndex(entry, "typeChild",    path, rule.typeChild,    ok);
+                        readReqIndex(entry, "operandChild", path, rule.operandChild, ok);
+                        if (!ok) continue;
+
+                        cfg.castRules.push_back(std::move(rule));
+                    }
+                }
+            }
+
             // ── builtinFunctions (SE6) ──
             // A named function the engine interns + binds into a CU-wide
             // builtins scope. `params` is an array of core-kind names;
@@ -5306,6 +5399,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readExprRule("designatedFieldRule", cfg.designatedFieldRule, cfg.designatedFieldRuleName);
             readExprRule("designatedIndexRule", cfg.designatedIndexRule, cfg.designatedIndexRuleName);
             readExprRule("compoundLiteralRule", cfg.compoundLiteralRule, cfg.compoundLiteralRuleName);
+            // FC2: explicit cast `(T)expr` → core HirKind::Cast.
+            readExprRule("castRule",            cfg.castRule,            cfg.castRuleName);
 
             // ── HR10: extensionKinds [{ name, lang }] ──
             if (hl.contains("extensionKinds")) {
@@ -5557,6 +5652,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             data.hirLowering = std::move(cfg);
         }
     }
+
+    // Late cross-block validation: `commitRequiresTypeName` guards need
+    // `semantics.identifierToken` (parsed above) — see the function's doc.
+    validateTypeNameCommitGuards(data, coll);
 
     // Freeze interners — post-load, no further internment allowed.
     data.rules->freeze();

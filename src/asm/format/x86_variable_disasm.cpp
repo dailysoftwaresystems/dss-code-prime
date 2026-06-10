@@ -55,6 +55,17 @@ tryMatchPrefix(TargetEncodingVariant const& variant,
                std::size_t&                  cursor) {
     DisasmState st;
 
+    // 0) Mandatory legacy-prefix bytes (FC2 Part B) — the encoder
+    //    emits them BEFORE the REX prefix, so the disasm consumes
+    //    them first. A variant whose declared prefix doesn't match
+    //    the byte head cannot be this variant.
+    for (auto const expectedByte : variant.tmpl.mandatoryPrefix) {
+        if (cursor >= bytes.size() || bytes[cursor] != expectedByte) {
+            return std::nullopt;
+        }
+        ++cursor;
+    }
+
     // 1) Optional REX prefix: byte starts with 0x40..0x4F.
     if (cursor < bytes.size() && (bytes[cursor] & 0xF0) == 0x40) {
         auto const rex = bytes[cursor];

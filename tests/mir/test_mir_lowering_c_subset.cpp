@@ -23,6 +23,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <variant>
 
 using namespace dss;
 
@@ -1649,4 +1650,83 @@ TEST(MirLoweringCSubset, Ml4TextFormatRoundTripsRealMir) {
     EXPECT_EQ(first, second)
         << "byte-equal round-trip failed\nfirst:\n" << first
         << "\nsecond:\n" << second;
+}
+
+// FC2 Part B (F64 constant materialization): a function-body F64
+// float literal lowers the way STRING literals do — an anonymous
+// module-level rodata global carrying the value + GlobalAddr + Load
+// — NEVER a MIR `Const` (register machines have no float-immediate
+// form; the old Const route dead-ended in the LIR literal pool).
+// `1.7 + 2.5;` (a bare expression statement — c-subset has no float
+// TYPE keyword and no implicit float→int return coercion yet, so the
+// expression statement is the one body position a float literal can
+// legally occupy until Part A's casts land) carries TWO body float
+// literals through HR's F64 common-type unification into one FAdd.
+TEST(MirLoweringCSubset, BodyF64LiteralPromotesToAnonymousGlobalPlusLoad) {
+    auto L = lowerCSubset("int f() { 1.7 + 2.5; return 4; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "semantic phase: " << (L.model.diagnostics().all().empty()
+            ? "" : std::string(diagnosticCodeName(
+                       L.model.diagnostics().all()[0].code))
+                   + " " + L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "HIR lowering: " << (L.hirReporter.all().empty()
+            ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+
+    // TWO promoted globals (one per literal occurrence — the string-
+    // literal convention: per-occurrence, no dedup), each typed F64
+    // with a constant-init double literal carrying the exact value.
+    ASSERT_EQ(m.moduleGlobalCount(), 2u)
+        << "each body F64 literal must mint one anonymous rodata global";
+    bool saw17 = false, saw25 = false;
+    for (std::uint32_t gi = 0; gi < m.moduleGlobalCount(); ++gi) {
+        MirGlobalId const g = m.globalAt(gi);
+        EXPECT_EQ(interner.kind(m.globalType(g)), TypeKind::F64);
+        EXPECT_TRUE(m.globalSymbol(g).valid())
+            << "promoted global needs a real (minted) SymbolId so the "
+               "rodata relocation resolves — not the anonymous sentinel";
+        std::uint32_t const lit = m.globalInitLiteralIndex(g);
+        ASSERT_NE(lit, UINT32_MAX) << "promoted global must be constant-init";
+        auto const* dv = std::get_if<double>(&m.literalValue(lit).value);
+        ASSERT_NE(dv, nullptr);
+        if (*dv == 1.7) saw17 = true;
+        if (*dv == 2.5) saw25 = true;
+    }
+    EXPECT_TRUE(saw17 && saw25)
+        << "the two globals must carry the two literal values";
+
+    // The body: NO float Const anywhere; two GlobalAddr + two F64
+    // Loads feeding the FAdd (the float expression statement's value
+    // is unused — the int return is a plain literal).
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    std::uint32_t nGlobalAddr = 0, nF64Load = 0, nFAdd = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const inst = m.blockInstAt(entry, i);
+        switch (m.instOpcode(inst)) {
+            case MirOpcode::Const:
+                EXPECT_FALSE(std::holds_alternative<double>(
+                    m.literalValue(m.constLiteralIndex(inst)).value))
+                    << "a float Const in the body means the promotion "
+                       "did NOT fire — the LIR literal-pool dead end";
+                break;
+            case MirOpcode::GlobalAddr: ++nGlobalAddr; break;
+            case MirOpcode::Load:
+                if (interner.kind(m.instType(inst)) == TypeKind::F64) {
+                    ++nF64Load;
+                }
+                break;
+            case MirOpcode::FAdd:   ++nFAdd;   break;
+            default: break;
+        }
+    }
+    EXPECT_EQ(nGlobalAddr, 2u);
+    EXPECT_EQ(nF64Load, 2u);
+    EXPECT_EQ(nFAdd, 1u);
 }

@@ -225,6 +225,34 @@ public:
     // empty post-finish).
     [[nodiscard]] RuleId       currentRule()  const noexcept;
 
+    // ── built-subtree introspection (FC2 binder sketch + type-name triage) ──
+    //
+    // Read-only access to ALREADY-BUILT nodes while the build is still in
+    // progress. The parser's binder sketch reads a just-closed declaration
+    // subtree to extract its declared name, and the speculative type-name
+    // commit triage inspects a just-built branch subtree — both BEFORE
+    // `finish()` freezes the Tree. Mirrors `Tree`'s per-node accessor
+    // names with a `node` prefix.
+    //
+    // Contract: `nodeChildren` is meaningful only for CLOSED internal
+    // nodes (an open frame's children still live in the pending-children
+    // staging area and its childCount is 0 until close); token/error
+    // leaves are complete the moment they're attached. All accessors
+    // abort (via the arena's strong-id bounds contract) on an id this
+    // builder never emitted.
+    [[nodiscard]] NodeKind      nodeKind(NodeId id)      const;
+    [[nodiscard]] NodeFlags     nodeFlags(NodeId id)     const;
+    [[nodiscard]] RuleId        nodeRule(NodeId id)      const;
+    [[nodiscard]] SchemaTokenId nodeTokenKind(NodeId id) const;
+    [[nodiscard]] SourceSpan    nodeSpan(NodeId id)      const;
+    [[nodiscard]] std::span<NodeId const> nodeChildren(NodeId id) const;
+
+    // The pending (not-yet-flushed) children of the CURRENT top open
+    // frame, in attach order. Empty when no frame is open. The back
+    // element after a child frame closes is that just-closed subtree —
+    // the seam both FC2 consumers read from.
+    [[nodiscard]] std::span<NodeId const> currentFramePendingChildren() const noexcept;
+
     // Snapshot full builder state (arena, child-index, pending children,
     // open frames, scope stack, cursor + stack, cookie counter, closed-
     // cookie set, desync latch, watchdog latch, reporter accumulator).

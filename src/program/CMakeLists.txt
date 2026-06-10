@@ -22,6 +22,14 @@ target_compile_definitions(program PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 # every backend.
 target_link_libraries(program PUBLIC core lsp ffi ffi_abi opt)
 
+# MSVC: compile_pipeline.cpp's whole-pipeline include surface exceeds the
+# default COFF object section limit (C1128) in Debug builds (tripped when
+# FC2 grew compilation_unit.hpp's include chain). /bigobj lifts the format
+# cap only — zero codegen/behavior change.
+if(MSVC)
+    target_compile_options(program PRIVATE /bigobj)
+endif()
+
 # `project_config.cpp` parses the `.dss-project.json` project file with
 # nlohmann/json. `core` links it PRIVATE, so the include path does NOT
 # propagate transitively — `program` needs its own (PRIVATE: only this

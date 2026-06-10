@@ -1,4 +1,5 @@
 add_library(analysis_syntactic OBJECT
+    binder_sketch.cpp
     parser.cpp
 )
 

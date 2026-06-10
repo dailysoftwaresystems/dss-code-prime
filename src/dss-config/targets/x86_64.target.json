@@ -703,10 +703,24 @@
       }
     },
     {
-      "$comment": "Float arithmetic (cycle 3d FPR wave). FAdd → `addsd`/`addss` per width; cycle 3d emits the abstract opcode and lets AS1 pick the right scalar variant from the operand width.",
+      "$comment": "Float arithmetic (cycle 3d FPR wave). FC2 Part B: ADDSD xmm1, xmm2 — F2 0F 58 /r (scalar double add). Mandatory prefix F2 selects the scalar-double form and is emitted BEFORE the auto-REX (xmm8-15 operands set REX.R/REX.B with rexW=false). 2-address like `mul`: dest goes to ModR/M.reg (op[0] IS the destination after lir_2addr_legalize), source-2 to ModR/M.rm. F64-WIDTH ONLY: the variant guard has no width discriminator (D-TARGET-ENCODING-WIDTH-GUARD), so MIR→LIR fail-louds non-F64 FAdd before it could silently match this addsd row (addss F3 0F 58 lands when an F32 consumer exists).",
       "mnemonic": "fadd", "result": "value",
+      "requires2Address": true,
       "minOperands": 2, "maxOperands": 2,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"] },
+            "template": { "mandatoryPrefix": [242], "opcode": [15, 88] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
     },
     {
       "mnemonic": "fsub", "result": "value",
@@ -736,10 +750,21 @@
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
-      "$comment": "Float-to-signed-integer conversion (FPToSI). AS1 emits cvttss2si / cvttsd2si (truncating).",
+      "$comment": "Float-to-signed-integer conversion (FPToSI). FC2 Part B: CVTTSD2SI r64, xmm — F2 REX.W 0F 2C /r (truncating scalar-double → signed 64-bit). Operand roles per Intel SDM: ModR/M.reg = the GPR DESTINATION (resultSlot), ModR/M.rm = the xmm SOURCE. REX.W widens the destination to r64 (the sign-extended result also serves i32 results — the backend's i32-in-r64 convention). F64-SOURCE ONLY: cvttss2si (F3) lands when an F32 consumer exists (D-TARGET-ENCODING-WIDTH-GUARD); MIR→LIR fail-louds a non-F64 source before it could silently match this row.",
       "mnemonic": "fp_to_si", "result": "value",
       "minOperands": 1, "maxOperands": 1,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"] },
+            "template":   { "mandatoryPrefix": [242], "rexW": true, "opcode": [15, 44] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
     },
     {
       "$comment": "Float-to-unsigned-integer conversion (FPToUI). x86 has no direct opcode; AS1 emits a guarded cvttsd2si sequence.",
@@ -782,6 +807,76 @@
       "mnemonic": "frame_store", "result": "none",
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "FC2 Part B: FPR-class register-register copy — MOVAPS xmm1, xmm2 = 0F 28 /r (NO mandatory prefix; the F2-prefixed reg-reg MOVSD form merges into the destination's upper lane, creating a false dependency on dst's prior value — MOVAPS copies the full register, the classic codegen choice). ModR/M.reg = destination (resultSlot), ModR/M.rm = source; xmm8-15 set REX.R/REX.B automatically. Bound to the `fpr` class's `move` slot in registerClassOps[] — consumed by the 2-addr legalize implicit copy, MIR→LIR mov-to-fresh/phi-edge copies, and callconv arg/return moves whenever the register class is FPR.",
+      "mnemonic": "movaps", "result": "value",
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"] },
+            "template":   { "opcode": [15, 40] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC2 Part B: FPR-class 8-byte load — MOVSD xmm, m64 = F2 0F 10 /r. Two variants: (a) the 3-op [base + disp32] form mirroring the universal `load` operand shape ([base_reg, MemBase(scale), MemOffset(disp)]) — what MIR Load-of-pointer lowers to (GlobalAddr → `lea reg, [rip+sym]` materializes the address, this loads through it); (b) the 1-op RIP-relative SymbolRef form mirroring `lea`'s riprel.disp32 variant (F2 0F 10 05 rel32 + rel32 relocation) — byte-pinned now, consumed end-to-end when a GlobalAddr+Load fold peephole lands. Bound to the `fpr` class's `load` slot in registerClassOps[]. The STORE form is `movsd_store` (next row — landed with its first consumer, the ms_x64 FPR saved-reg prologue spill). F64-WIDTH ONLY (movss F3 0F 10 when an F32 consumer exists — D-TARGET-ENCODING-WIDTH-GUARD).",
+      "mnemonic": "movsd_load", "result": "value",
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template":   { "mandatoryPrefix": [242], "opcode": [15, 16] },
+            "resultSlot": "modrm.reg",
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["symbol"] },
+            "template":   { "mandatoryPrefix": [242], "opcode": [15, 16] },
+            "resultSlot": "modrm.reg",
+            "wires":      [
+              { "index": 0, "slotKind": "riprel.disp32", "relocationKind": "rel32" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC2 (PE float witness, 2026-06-10): FPR-class 8-byte store — MOVSD m64, xmm = F2 0F 11 /r. ModRM DIRECTION is the load's mirror (Intel SDM): 0F 10 loads (xmm ← r/m), 0F 11 stores (r/m ← xmm) — the ModRM ROLES are identical in both (reg = the xmm, rm = the memory operand); only the opcode's direction bit decides which one is read vs written. One variant: the 4-op [value_reg, base_reg, MemBase(scale), MemOffset(disp)] form mirroring the universal `store` operand shape exactly (value → modrm.reg, base → modrm.rm.mem — emitFrameStore's operand order works unchanged). First consumer: the ms_x64 prologue/epilogue saved-reg spill — Win64 declares xmm6-15 CALLEE-SAVED and regalloc prefers callee-saved, so the FIRST FPR vreg under ms_x64 needs this store (SysV has no callee-saved XMMs, never reached it). Bound to the `fpr` class's `store` slot in registerClassOps[]. F64-WIDTH ONLY: the full 16-byte XMM is NOT preserved (Win64 requires only the low 64 bits of xmm6-15 to survive — MOVSD's m64 store IS the ABI contract; movss F3 0F 11 when an F32 consumer exists — D-TARGET-ENCODING-WIDTH-GUARD).",
+      "mnemonic": "movsd_store", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 4, "maxOperands": 4,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "template": { "mandatoryPrefix": [242], "opcode": [15, 17] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
     }
   ],
   "$registersComment": "Physical register file. Ordinal = position in this array (consumed by `LirReg::id` post-regalloc). Only the registers ML6 regalloc + ML7 callconv reference are declared here — sub-byte aliases (al/ah/bl/...) are omitted until a real consumer needs them. Width is in bytes (8/4/2/1). hwEncoding = ModR/M ordinal the assembler/encoder will read.",
@@ -821,6 +916,10 @@
     { "name": "xmm15", "class": "fpr", "widthBytes": 16, "hwEncoding": 15 },
 
     { "name": "rflags", "class": "flags", "widthBytes": 8, "hwEncoding": 0 }
+  ],
+  "$registerClassOpsComment": "FC2 Part B: per-register-class move/load/store mnemonics. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (a GPR mov against an XMM hwEncoding assembles to valid-looking-but-WRONG bytes — the class-blind silent miscompile this table kills). fpr's `store` landed with its FIRST consumer (trigger discipline honored): the ms_x64 prologue saved-reg spill — Win64 callee-saved xmm6-15 + regalloc's callee-saved-first policy put the first FPR vreg in a callee-saved xmm, and classOpHandle failed loud L_RequiredLirOpcodeMissing until movsd_store was declared.",
+  "registerClassOps": [
+    { "class": "fpr", "move": "movaps", "load": "movsd_load", "store": "movsd_store" }
   ],
   "$callingConventionsComment": "Per-platform x86_64 ABIs. ML7 callconv lowering selects one based on driver flag / function attribute. SysV AMD64 = Linux/macOS/BSD; ms_x64 = Windows. argGprs/argFprs ordering is significant (caller MUST place int args in those registers in that order, then spill to stack).",
   "callingConventions": [

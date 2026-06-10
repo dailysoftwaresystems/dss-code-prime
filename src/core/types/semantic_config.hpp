@@ -371,6 +371,27 @@ struct DSS_EXPORT MemberAccessRule {
     std::string   ruleName;
 };
 
+// FC2: an explicit cast expression (`(T)expr` in C-family syntax). When
+// Pass 2 sees a node with this rule, it (a) resolves the TYPE-position
+// subtree at visible child `typeChild` via the standard type-position
+// resolver (builtins + pointer stars + struct refs + typedef aliases —
+// S_UnknownType on a name that resolves to nothing), (b) stamps the
+// resolved target type on BOTH the type child (so the HIR lowering's
+// stamped-type probe finds it, the compound-literal precedent) and the
+// cast node itself (the expression's RESULT type for enclosing checks),
+// and (c) validates the (target, operand) pair against the explicit-cast
+// matrix (`isExplicitCastable`) — emitting S_InvalidCast on illegal
+// pairs (struct-value casts, void, arrays). The operand's type is read
+// from the visible child at `operandChild` (post-order traversal has
+// already typed it). Engine-generic: WHICH rule is a cast and WHERE its
+// children sit is per-language config.
+struct DSS_EXPORT CastRule {
+    RuleId        rule{};
+    std::uint32_t typeChild    = 0;   // visible-child index of the type subtree
+    std::uint32_t operandChild = 0;   // visible-child index of the operand expr
+    std::string   ruleName;           // source spelling, for diagnostics
+};
+
 // Identifier-use recognition. The named rule (whose RuleId the loader
 // resolves) is a "reference site": when Pass 2 sees a node with this
 // rule, it extracts the identifier text per `nameMatch` and does a
@@ -492,6 +513,7 @@ struct DSS_EXPORT SemanticConfig {
     std::vector<LiteralTypeMapping> literalTypes;
     std::vector<AssignmentRule>     assignments;       // SE4 const-correctness
     std::vector<CallRule>           callRules;         // SE6 call checking
+    std::vector<CastRule>           castRules;         // FC2 explicit casts
     std::vector<BuiltinFunctionMapping> builtinFunctions;  // SE6 builtins
     std::vector<ReturnRule>         returnRules;       // GAP A return-type checking
     // Rules that establish a break/continue-valid context (while/for/do/

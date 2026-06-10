@@ -26,10 +26,13 @@
 #include "link/object_format_schema.hpp"  // FLIP-MARKER test loads shipped formats
 #include "lowered_lir_fixture.hpp"
 #include "mir/mir_node.hpp"
+#include "mutate_target_schema.hpp"
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 using namespace dss;
@@ -843,6 +846,164 @@ TEST(TargetSchemaEncoding, NonStringFormatIsLoadTimeFatal) {
         ]
     })";
     EXPECT_FALSE(TargetSchema::loadFromText(kJson, "f.json").has_value());
+}
+
+// ── FC2 Part B: mandatoryPrefix (SSE legacy-prefix bytes) ─────────────
+
+TEST(TargetSchemaEncoding, MandatoryPrefixParsesOnX86Variant) {
+    constexpr char const* kJson = R"({
+        "dssTargetVersion": 1,
+        "target": { "name": "synth", "version": "0.1" },
+        "opcodes": [
+            { "mnemonic": "invalid", "result": "none" },
+            { "mnemonic": "addsdx",
+              "result": "none",
+              "terminatorKind": "unreachable",
+              "encoding": {
+                "format": "x86-variable",
+                "variants": [
+                  { "guard": { "operandKinds": [] },
+                    "template": { "mandatoryPrefix": [242], "opcode": [15, 88] } }
+                ]
+              } }
+        ]
+    })";
+    auto schema = TargetSchema::loadFromText(kJson, "synth.target.json");
+    ASSERT_TRUE(schema.has_value());
+    auto const* info =
+        (*schema)->opcodeInfo(*(*schema)->opcodeByMnemonic("addsdx"));
+    ASSERT_NE(info, nullptr);
+    ASSERT_EQ(info->encoding.variants.size(), 1u);
+    auto const& tmpl = info->encoding.variants[0].tmpl;
+    ASSERT_EQ(tmpl.mandatoryPrefix.size(), 1u);
+    EXPECT_EQ(tmpl.mandatoryPrefix[0], 0xF2);
+    ASSERT_EQ(tmpl.opcodeBytes.size(), 2u);
+    EXPECT_EQ(tmpl.opcodeBytes[0], 0x0F);
+    EXPECT_EQ(tmpl.opcodeBytes[1], 0x58);
+}
+
+TEST(TargetSchemaEncoding, MandatoryPrefixOnFixed32VariantIsLoadTimeFatal) {
+    // The fixed32 walker has no legacy-prefix concept — silently
+    // accepting the field would let a misauthored ARM64-style row
+    // believe its prefix is emitted. Mirrors the opcodeBytes /
+    // modrmRegExt fixed32 rejections.
+    constexpr char const* kJson = R"({
+        "dssTargetVersion": 1,
+        "target": { "name": "synth", "version": "0.1" },
+        "opcodes": [
+            { "mnemonic": "invalid", "result": "none" },
+            { "mnemonic": "wordop",
+              "result": "none",
+              "terminatorKind": "unreachable",
+              "encoding": {
+                "format": "fixed32",
+                "variants": [
+                  { "guard": { "operandKinds": [] },
+                    "template": { "fixedWord": 2, "mandatoryPrefix": [242] } }
+                ]
+              } }
+        ]
+    })";
+    EXPECT_FALSE(TargetSchema::loadFromText(kJson, "p.json").has_value());
+}
+
+// ── FC2 Part B: registerClassOps (per-class move/load/store) ──────────
+
+TEST(TargetSchemaRegisterClassOps, ShippedX64ResolvesDeclaredAndDefaultOps) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const& s = **schema;
+
+    // fpr: declared row — move=movaps, load=movsd_load, store=
+    // movsd_store (the store landed with its first consumer — the
+    // ms_x64 callee-saved-xmm prologue spill; resolving to the GPR
+    // `store` here would mis-encode an XMM hwEncoding).
+    EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::FPR, RegClassOp::Move),
+              s.opcodeByMnemonic("movaps"));
+    EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::FPR, RegClassOp::Load),
+              s.opcodeByMnemonic("movsd_load"));
+    EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::FPR, RegClassOp::Store),
+              s.opcodeByMnemonic("movsd_store"))
+        << "fpr store must resolve to MOVSD's store form, never the "
+           "GPR store";
+
+    // gpr: no row — the universal default bindings.
+    EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::GPR, RegClassOp::Move),
+              s.opcodeByMnemonic("mov"));
+    EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::GPR, RegClassOp::Load),
+              s.opcodeByMnemonic("load"));
+    EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::GPR, RegClassOp::Store),
+              s.opcodeByMnemonic("store"));
+
+    // vr: no row + not the default class → nothing (a future vector
+    // class must declare its ops, never inherit the GPR forms).
+    EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::VR, RegClassOp::Move),
+              std::nullopt);
+}
+
+TEST(TargetSchemaRegisterClassOps, StrippedTableLosesFprOpsButKeepsGprDefaults) {
+    // Strip the whole registerClassOps section (the red-on-disable
+    // lever for every consumer test): fpr ops vanish, gpr defaults
+    // survive (they come from the universal bindings, not the table).
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) { doc.erase("registerClassOps"); });
+    ASSERT_TRUE(mutated.has_value());
+    auto const& s = **mutated;
+    EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::FPR, RegClassOp::Move),
+              std::nullopt);
+    EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::FPR, RegClassOp::Load),
+              std::nullopt);
+    EXPECT_EQ(s.regClassOpOpcode(TargetRegClass::GPR, RegClassOp::Move),
+              s.opcodeByMnemonic("mov"));
+}
+
+TEST(TargetSchemaRegisterClassOps, UnresolvableMnemonicIsLoadTimeFatal) {
+    // A declared per-class mnemonic that names no opcode row is a
+    // schema typo — load-time fatal (at the consumer it would be
+    // indistinguishable from trigger-disciplined omission).
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            doc["registerClassOps"][0]["move"] = "no_such_opcode";
+        });
+    EXPECT_FALSE(mutated.has_value());
+}
+
+TEST(TargetSchemaRegisterClassOps, UnknownClassNameIsLoadTimeFatal) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            doc["registerClassOps"][0]["class"] = "made-up-class";
+        });
+    EXPECT_FALSE(mutated.has_value());
+}
+
+TEST(TargetSchemaRegisterClassOps, DuplicateClassRowIsLoadTimeFatal) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            doc["registerClassOps"].push_back(
+                doc["registerClassOps"][0]);  // second fpr row
+        });
+    EXPECT_FALSE(mutated.has_value());
+}
+
+TEST(TargetSchemaEncoding, MandatoryPrefixByteOutOfRangeIsLoadTimeFatal) {
+    constexpr char const* kJson = R"({
+        "dssTargetVersion": 1,
+        "target": { "name": "synth", "version": "0.1" },
+        "opcodes": [
+            { "mnemonic": "invalid", "result": "none" },
+            { "mnemonic": "op",
+              "result": "none",
+              "terminatorKind": "unreachable",
+              "encoding": {
+                "format": "x86-variable",
+                "variants": [
+                  { "guard": { "operandKinds": [] },
+                    "template": { "mandatoryPrefix": [256], "opcode": [1] } }
+                ]
+              } }
+        ]
+    })";
+    EXPECT_FALSE(TargetSchema::loadFromText(kJson, "r.json").has_value());
 }
 
 // ── Diagnostic surface: A_* renders with the `A` prefix ───────────────

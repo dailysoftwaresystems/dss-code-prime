@@ -1,0 +1,22 @@
+{
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 16,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "constfold-only", "passes": ["ConstFold"]},
+    {"label": "inlining", "passes": ["Inlining"]}
+  ]
+}

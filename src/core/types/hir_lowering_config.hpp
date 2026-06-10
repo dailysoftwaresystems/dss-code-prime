@@ -214,6 +214,14 @@ struct DSS_EXPORT HirLoweringConfig {
     RuleId      designatedIndexRule{}; std::string designatedIndexRuleName;
     RuleId      compoundLiteralRule{}; std::string compoundLiteralRuleName;
 
+    // FC2: explicit cast `(T)expr` — the operand-alt rule whose subtree
+    // lowers to a core `HirKind::Cast` (explicit flags, NOT Synthetic).
+    // The target type is read from the semantic phase's per-node stamp
+    // below the type-ref child (the same stamped-type probe the compound
+    // literal uses); the operand child lowers as an ordinary expression.
+    // Invalid ⇒ the language has no explicit-cast surface.
+    RuleId      castRule{};            std::string castRuleName;
+
     // Per-language MIR-globals const-evaluation policy. The shared
     // const-eval engine (plan 12.5) supports a float-folding gate via
     // its `allowFloat` knob; today every v1 schema is IEEE 754 so the

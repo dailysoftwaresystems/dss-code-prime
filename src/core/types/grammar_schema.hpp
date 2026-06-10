@@ -556,6 +556,15 @@ public:
     [[nodiscard]] RuleId       exprAtom(RuleId rule)          const noexcept;
     [[nodiscard]] std::int32_t exprMinPrecedence(RuleId rule) const noexcept;
 
+    // Type-name commit guard (`commitRequiresTypeName` on the shape body;
+    // FC2 cast-expression disambiguation). Returns the RuleId of the
+    // declared type-position child rule, or InvalidRule when the shape
+    // declares no guard (every rule before FC2). When valid, a
+    // structurally-successful speculative probe of `rule` must pass the
+    // parser's generic type-name triage before committing — see
+    // `Parser::Impl::typeNameCommitApproved_`.
+    [[nodiscard]] RuleId       typeNameCommitRule(RuleId rule) const noexcept;
+
     // Pratt-walker wrapper rule ids declared by `expr.wrapperRules`
     // for `rule`. The loader auto-interned the declared names and
     // validated all three were present, so for an `isExprRule(rule)`

@@ -232,6 +232,14 @@ enum class DiagnosticCode : std::uint16_t {
     // Implicit (no `= expr`) enumerators auto-increment from the prior;
     // this diagnostic is reserved for the explicit-non-literal case.
     S_NonConstantEnumeratorValue  = 0xE00F,
+    // FC2: an explicit cast (`semantics.casts` rule, e.g. C's `(T)expr`)
+    // whose (target, operand) type pair is outside the language's legal
+    // cast matrix — struct/union VALUE casts (C forbids casts to
+    // composite types), casts to/from `void`, array-typed operands, or
+    // any pair the MIR cast lattice cannot lower. Distinct from
+    // S_TypeMismatch (implicit-conversion failures) so tooling can route
+    // on the explicit-cast shape.
+    S_InvalidCast                 = 0xE010,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

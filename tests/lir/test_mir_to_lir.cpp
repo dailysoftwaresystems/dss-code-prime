@@ -1616,13 +1616,24 @@ TEST(MirToLir, PhiResolutionUsesFprClassForFloatPhi) {
     mb.beginBlock(entry);
     ::dss::MirInstId const cond = mb.addArg(0, boolT);
     mb.addCondBr(cond, thenB, elseB);
-    mb.beginBlock(thenB);
+    // FC2 Part B: F64 constants reach MIR as promoted rodata globals
+    // (GlobalAddr + Load — the HIR→MIR promotion shape); a raw F64
+    // `Const` is now a loud MIR→LIR error. Build the phi inputs the
+    // promoted way.
+    auto const ptrF64 = interner.pointer(f64);
     ::dss::MirLiteralValue lvOne;  lvOne.value  = 1.0;  lvOne.core  = ::dss::TypeKind::F64;
-    ::dss::MirInstId const constOne = mb.addConst(lvOne, f64);
+    ::dss::MirLiteralValue lvTwo;  lvTwo.value  = 2.0;  lvTwo.core  = ::dss::TypeKind::F64;
+    (void)mb.addGlobal(f64, ::dss::SymbolId{500}, mb.literalPoolAdd(lvOne));
+    (void)mb.addGlobal(f64, ::dss::SymbolId{501}, mb.literalPoolAdd(lvTwo));
+    mb.beginBlock(thenB);
+    ::dss::MirInstId const addrOne = mb.addGlobalAddr(::dss::SymbolId{500}, ptrF64);
+    std::array<::dss::MirInstId, 1> loadOneOps{addrOne};
+    ::dss::MirInstId const constOne = mb.addInst(::dss::MirOpcode::Load, loadOneOps, f64);
     mb.addBr(join);
     mb.beginBlock(elseB);
-    ::dss::MirLiteralValue lvTwo;  lvTwo.value  = 2.0;  lvTwo.core  = ::dss::TypeKind::F64;
-    ::dss::MirInstId const constTwo = mb.addConst(lvTwo, f64);
+    ::dss::MirInstId const addrTwo = mb.addGlobalAddr(::dss::SymbolId{501}, ptrF64);
+    std::array<::dss::MirInstId, 1> loadTwoOps{addrTwo};
+    ::dss::MirInstId const constTwo = mb.addInst(::dss::MirOpcode::Load, loadTwoOps, f64);
     mb.addBr(join);
     mb.beginBlock(join);
     ::dss::MirInstId const phi = mb.addPhi(f64);
@@ -1689,11 +1700,15 @@ TEST(MirToLir, WideLiteralStringRoutesThroughLiteralPool) {
     EXPECT_EQ(*asStr, "hello world");
 }
 
-TEST(MirToLir, WideLiteralDoubleRoutesThroughFprLiteralPool) {
-    // Cycle 3d enabled double-literal lowering: F64 MIR Const flows
-    // through the LirLiteralPool with an FPR-class result register
-    // (the cycle-3c stub previously fail-loud-deferred this case
-    // because no FPR-class machinery existed). Pin the result is FPR.
+TEST(MirToLir, FprConstAtMirToLirFailsLoudPointingAtPromotion) {
+    // FC2 Part B retired the cycle-3d F64→LirLiteralPool route: it was
+    // a DEAD END (no encoding variant consumes a LiteralIndex operand
+    // → A_NoMatchingEncodingVariant at assemble time, after regalloc
+    // had already burned an FPR). F64 constants are now promoted at
+    // HIR→MIR to anonymous rodata globals (GlobalAddr + Load). A raw
+    // F64 `Const` reaching MIR→LIR — hand-built MIR, or a future
+    // producer that forgets the promotion — must FAIL LOUD naming the
+    // contract, never silently re-enter the pool dead-end.
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto const& sch = **target;
@@ -1714,32 +1729,220 @@ TEST(MirToLir, WideLiteralDoubleRoutesThroughFprLiteralPool) {
 
     ::dss::DiagnosticReporter rep;
     auto const result = ::dss::lowerToLir(m, sch, interner, rep);
-    ASSERT_TRUE(result.ok)
-        << "F64 literal must lower cleanly via FPR-class + LirLiteralPool";
-
-    // The pool must contain the double, and the mov's result must be
-    // FPR-class (regClassForType maps F64 → FPR).
-    ::dss::Lir const& lir = result.lir;
-    ASSERT_EQ(lir.literalPool().size(), 1u);
-    auto const* asDbl = std::get_if<double>(&lir.literalValue(0).value);
-    ASSERT_NE(asDbl, nullptr);
-    EXPECT_DOUBLE_EQ(*asDbl, 3.14);
-
-    auto const movOp = *sch.opcodeByMnemonic("mov");
-    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
-    bool foundFprMov = false;
-    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
-        LirInstId const inst = lir.blockInstAt(entry, i);
-        if (lir.instOpcode(inst) != movOp) continue;
-        auto const ops = lir.instOperands(inst);
-        if (ops.size() == 1 && ops[0].kind == LirOperandKind::LiteralIndex) {
-            EXPECT_EQ(lir.instResult(inst).regClass(), LirRegClass::FPR)
-                << "double literal must materialize into an FPR-class vreg";
-            foundFprMov = true;
-            break;
+    EXPECT_FALSE(result.ok)
+        << "an F64 Const at MIR→LIR must fail loud (the LiteralIndex "
+           "route is a dead end; promotion happens at HIR→MIR)";
+    bool sawPromotionDiag = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode
+            && d.actual.find("promoted to anonymous rodata globals")
+                   != std::string::npos) {
+            sawPromotionDiag = true;
         }
     }
-    EXPECT_TRUE(foundFprMov);
+    EXPECT_TRUE(sawPromotionDiag)
+        << "the diagnostic must point the producer at the HIR→MIR "
+           "promotion contract";
+}
+
+// FC2 Part B width gate (D-TARGET-ENCODING-WIDTH-GUARD): with the F64
+// addsd encoding live, a non-F64 float FAdd would otherwise SILENTLY
+// match the F2 0F 58 variant (the guard has no width discriminator)
+// and run double-width arithmetic on F32 values. Pin the fail-loud.
+TEST(MirToLir, F32FAddFailsLoudUntilWidthDiscriminatedEncodings) {
+    std::array<::dss::TypeKind, 2> paramKinds{
+        ::dss::TypeKind::F32, ::dss::TypeKind::F32};
+    auto syn = ::dss::test_support::buildSyntheticFn(
+        paramKinds, ::dss::TypeKind::F32,
+        [](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+           std::span<::dss::TypeId const> params, ::dss::TypeId retT) {
+            ::dss::MirInstId const a = mb.addArg(0, params[0]);
+            ::dss::MirInstId const b = mb.addArg(1, params[1]);
+            ::dss::MirInstId const ops[] = {a, b};
+            ::dss::MirInstId const r =
+                mb.addInst(::dss::MirOpcode::FAdd, ops, retT);
+            mb.addReturn(r);
+        });
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    EXPECT_FALSE(result.ok)
+        << "F32 FAdd must fail loud — lowering it would silently select "
+           "the F64 addsd encoding";
+    bool sawWidthDiag = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode
+            && d.actual.find("D-TARGET-ENCODING-WIDTH-GUARD")
+                   != std::string::npos) {
+            sawWidthDiag = true;
+        }
+    }
+    EXPECT_TRUE(sawWidthDiag)
+        << "the width-gate diagnostic must name "
+           "D-TARGET-ENCODING-WIDTH-GUARD";
+}
+
+// Shared MIR shape for the FPR-store pair below: f(f64 v, f64* p)
+// { Store v -> p; return 0; }. The stored VALUE is FPR-class, so the
+// store mnemonic must resolve through the class table.
+namespace {
+[[nodiscard]] std::pair<::dss::Mir, ::dss::TypeInterner>
+buildF64StoreMir() {
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f64  = interner.primitive(::dss::TypeKind::F64);
+    auto const ptrT = interner.pointer(f64);
+    auto const i32  = interner.primitive(::dss::TypeKind::I32);
+    ::dss::TypeId const params[] = {f64, ptrT};
+    auto const sig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb =
+        mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const v = mb.addArg(0, f64);
+    ::dss::MirInstId const p = mb.addArg(1, ptrT);
+    ::dss::MirInstId const storeOps[] = {v, p};
+    (void)mb.addInst(::dss::MirOpcode::Store, storeOps, ::dss::InvalidType);
+    ::dss::MirLiteralValue zero; zero.value = std::int64_t{0};
+    zero.core = ::dss::TypeKind::I32;
+    mb.addReturn(mb.addConst(zero, i32));
+    return {std::move(mb).finish(), std::move(interner)};
+}
+} // namespace
+
+// FC2 PE-float closure (2026-06-10): the shipped x86_64 schema now
+// DECLARES the fpr store (movsd_store, F2 0F 11 /r — landed with its
+// first consumer, the ms_x64 callee-saved-xmm prologue spill). A MIR
+// Store of an F64 value must lower through THAT mnemonic — never the
+// GPR `store` (which would 8-byte-GPR-write the XMM ordinal —
+// valid-looking, silently wrong bytes).
+TEST(MirToLir, FprStoreLowersViaDeclaredMovsdStore) {
+    auto [m, interner] = buildF64StoreMir();
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    auto const movsdStoreOp = (*target)->opcodeByMnemonic("movsd_store");
+    auto const gprStoreOp   = (*target)->opcodeByMnemonic("store");
+    ASSERT_TRUE(movsdStoreOp.has_value());
+    ASSERT_TRUE(gprStoreOp.has_value());
+    ::dss::Lir const& lir = result.lir;
+    ::dss::LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool foundMovsdStore = false;
+    bool foundGprStore   = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const op = lir.instOpcode(lir.blockInstAt(bb, i));
+        if (op == *movsdStoreOp) foundMovsdStore = true;
+        if (op == *gprStoreOp)   foundGprStore   = true;
+    }
+    EXPECT_TRUE(foundMovsdStore)
+        << "the F64 Store must lower to the fpr class's declared "
+           "store mnemonic (movsd_store)";
+    EXPECT_FALSE(foundGprStore)
+        << "the F64 Store must NOT emit the GPR `store` — that form "
+           "would silently mis-encode the XMM ordinal";
+}
+
+// FC2 Part B (registerClassOps) fail-loud lever, PRESERVED after the
+// shipped schema gained its fpr store: erase the row's "store" key
+// (the StrippedClassOpsTable pattern) → MIR Store of an F64 value
+// must FAIL LOUD naming the class+op, never fall back to the GPR
+// `store`. This is the same lever the pre-consumer shipped schema
+// exercised by omission.
+TEST(MirToLir, FprStoreFailsLoudWithoutDeclaredStoreOp) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            doc["registerClassOps"][0].erase("store");
+        });
+    ASSERT_TRUE(mutated.has_value())
+        << "a registerClassOps row with no 'store' slot is legal at "
+           "load (trigger discipline) — only the consumer fails";
+
+    auto [m, interner] = buildF64StoreMir();
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, **mutated, interner, rep);
+    EXPECT_FALSE(result.ok);
+    bool sawClassDiag = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_RequiredLirOpcodeMissing
+            && d.actual.find("'store'") != std::string::npos
+            && d.actual.find("'fpr'") != std::string::npos) {
+            sawClassDiag = true;
+        }
+    }
+    EXPECT_TRUE(sawClassDiag)
+        << "the diagnostic must name the class ('fpr') and the op "
+           "('store') so the schema author knows what to declare";
+}
+
+// RED-ON-DISABLE lever for the class table being READ: strip the
+// registerClassOps section from the shipped x86_64 schema → an F64
+// load (FPR-class) must fail loud naming 'load'/'fpr' (the table is
+// the ONLY source of the fpr load mnemonic; without it the lowering
+// must never silently use the GPR `load`).
+TEST(MirToLir, StrippedClassOpsTableFailsLoudOnFprLoad) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) { doc.erase("registerClassOps"); });
+    ASSERT_TRUE(mutated.has_value())
+        << "registerClassOps is OPTIONAL at load — stripping it must "
+           "not fail the loader, only the FPR lowering";
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f64  = interner.primitive(::dss::TypeKind::F64);
+    auto const ptrT = interner.pointer(f64);
+    ::dss::TypeId const params[] = {ptrT};
+    auto const sig = interner.fnSig(params, f64, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb =
+        mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const p = mb.addArg(0, ptrT);
+    ::dss::MirInstId const loadOps[] = {p};
+    ::dss::MirInstId const v =
+        mb.addInst(::dss::MirOpcode::Load, loadOps, f64);
+    mb.addReturn(v);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, **mutated, interner, rep);
+    EXPECT_FALSE(result.ok);
+    bool sawClassDiag = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_RequiredLirOpcodeMissing
+            && d.actual.find("'load'") != std::string::npos
+            && d.actual.find("'fpr'") != std::string::npos) {
+            sawClassDiag = true;
+        }
+    }
+    EXPECT_TRUE(sawClassDiag);
+}
+
+// The FPToSI twin: cvttsd2si consumes an F64 SOURCE; an F32 source
+// must fail loud rather than convert 4 garbage upper bytes.
+TEST(MirToLir, F32FpToSiSourceFailsLoudUntilWidthDiscriminatedEncodings) {
+    std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::F32};
+    auto syn = ::dss::test_support::buildSyntheticFn(
+        paramKinds, ::dss::TypeKind::I32,
+        [](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+           std::span<::dss::TypeId const> params, ::dss::TypeId retT) {
+            ::dss::MirInstId const a = mb.addArg(0, params[0]);
+            ::dss::MirInstId const ops[] = {a};
+            ::dss::MirInstId const r =
+                mb.addInst(::dss::MirOpcode::FPToSI, ops, retT);
+            mb.addReturn(r);
+        });
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    EXPECT_FALSE(result.ok)
+        << "F32-source FPToSI must fail loud — lowering it would "
+           "silently select the F64 cvttsd2si encoding";
 }
 
 // ─── cycle 3e: Calls + Aggregates + LirVerifier ─────────────────────────

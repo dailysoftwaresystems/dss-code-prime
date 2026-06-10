@@ -148,6 +148,36 @@ void parseVariantTemplate(json const& v, std::size_t opIdx, std::size_t vi,
             }
         }
     }
+    // FC2 Part B (SSE float backend): mandatory legacy-prefix bytes
+    // (F2/F3/66 — the SSE opcode-form selectors). Same shape +
+    // validation rigor as `opcode` above; emitted BEFORE the REX
+    // prefix by the x86-variable walker. validate() rejects the
+    // field on a fixed32 variant.
+    if (t.contains("mandatoryPrefix")) {
+        auto const& mp = t.at("mandatoryPrefix");
+        if (!mp.is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/opcodes/{}/encoding/variants/{}/template/mandatoryPrefix", opIdx, vi),
+                      "'mandatoryPrefix' must be an array of byte integers");
+        } else {
+            for (auto const& bn : mp) {
+                if (!bn.is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/opcodes/{}/encoding/variants/{}/template/mandatoryPrefix", opIdx, vi),
+                              "every mandatoryPrefix entry must be an integer in [0, 255]");
+                    continue;
+                }
+                std::int64_t const bv = bn.get<std::int64_t>();
+                if (bv < 0 || bv > 255) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/opcodes/{}/encoding/variants/{}/template/mandatoryPrefix", opIdx, vi),
+                              std::format("mandatoryPrefix byte {} out of range [0, 255]", bv));
+                    continue;
+                }
+                tmpl.mandatoryPrefix.push_back(static_cast<std::uint8_t>(bv));
+            }
+        }
+    }
     if (t.contains("modrmRegExt")) {
         auto const path = std::format("/opcodes/{}/encoding/variants/{}/template/modrmRegExt", opIdx, vi);
         if (!t.at("modrmRegExt").is_number_integer()) {
@@ -1195,6 +1225,66 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     continue;  // skip push_back so vector & index stay in sync
                 }
                 data.registers.push_back(std::move(info));
+            }
+        }
+    }
+
+    // ── registerClassOps (FC2 Part B — optional) ───────────────────
+    // Per-register-class move/load/store mnemonic table. A class with
+    // no row resolves to the universal defaults iff it is GPR (see
+    // TargetSchema::regClassOpOpcode); a declared row may omit slots
+    // (consumers fail loud on an omitted slot — trigger discipline).
+    if (doc.contains("registerClassOps")) {
+        if (!doc.at("registerClassOps").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/registerClassOps",
+                      "'registerClassOps' must be an array");
+        } else {
+            auto const& rows = doc.at("registerClassOps");
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                auto const& r = rows[i];
+                if (!r.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/registerClassOps/{}", i),
+                              "registerClassOps entry must be an object");
+                    continue;
+                }
+                if (!r.contains("class") || !r.at("class").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("/registerClassOps/{}/class", i),
+                              "missing or non-string 'class'");
+                    continue;
+                }
+                auto const cls =
+                    targetRegClassFromName(r.at("class").get<std::string>());
+                if (!cls.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/registerClassOps/{}/class", i),
+                              "expected 'gpr' / 'fpr' / 'vr' / 'flags'");
+                    continue;
+                }
+                auto& row = data.registerClassOps[static_cast<std::size_t>(*cls)];
+                if (row.declared) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/registerClassOps/{}/class", i),
+                              std::format("duplicate registerClassOps row for "
+                                          "class '{}'",
+                                          targetRegClassName(*cls)));
+                    continue;
+                }
+                row.declared = true;
+                auto readOp = [&](char const* field, std::string& out) {
+                    if (!r.contains(field)) return;
+                    if (!r.at(field).is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/registerClassOps/{}/{}", i, field),
+                                  "must be a mnemonic string");
+                        return;
+                    }
+                    out = r.at(field).get<std::string>();
+                };
+                readOp("move",  row.move);
+                readOp("load",  row.load);
+                readOp("store", row.store);
             }
         }
     }
