@@ -22,6 +22,7 @@
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/source_buffer.hpp"
 #include "opt/optimizer.hpp"
 #include "program/program.hpp"
 #include "run_binary.hpp"
@@ -31,12 +32,15 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -144,6 +148,19 @@ struct OptimizedArm {
     std::vector<std::string>     passes;  // PassId names (resolved via optPassIdFromName)
 };
 
+// V2-4 Part C (D-DIAG-CLI-POSITION-RENDER-AND-ASSERT): one declared
+// expected diagnostic for an EXPECT-ERROR example. `code` is the
+// DiagnosticCode NAME (e.g. "S_UndeclaredIdentifier"); line/col are the
+// 1-based start position the compiler's own `SourceBuffer::lineCol` must
+// resolve the diagnostic's span to. This is the driver/e2e-tier twin of
+// the analyzer-tier golden harness — it pins a SPECIFIC diagnostic at a
+// SPECIFIC location through the full `Program::compileFiles` path.
+struct ExpectedDiagnostic {
+    std::string   code;
+    std::uint32_t line = 0;
+    std::uint32_t col  = 0;
+};
+
 struct ExampleManifest {
     std::string                  language;
     std::string                  source;
@@ -170,6 +187,12 @@ struct ExampleManifest {
     // source with the listed pipeline + asserts baseline-equal
     // exit code + stdout.
     std::vector<OptimizedArm>    optimizedPipelines;
+    // V2-4 Part C: when NON-EMPTY this is an EXPECT-ERROR example — the
+    // source is malformed, the compile MUST fail, and the produced
+    // diagnostics MUST equal this declared set EXACTLY (code + 1-based
+    // line:col). Mutually exclusive with the run path: no binary is
+    // spawned and `exitCode` is not required.
+    std::vector<ExpectedDiagnostic> expectDiagnostics;
 };
 
 [[nodiscard]] ExampleManifest readManifest(fs::path const& path) {
@@ -212,12 +235,46 @@ struct ExampleManifest {
                       << " requires 'source' (single CU) or 'sources' (multi-CU)";
         return m;
     }
-    if (!j.contains("exitCode") || !j.at("exitCode").is_number_integer()) {
+    // V2-4 Part C: parse the expect-error diagnostics FIRST — their
+    // presence makes this an error manifest, which relaxes the exitCode
+    // requirement (no binary is produced or run).
+    if (j.contains("expectDiagnostics")) {
+        if (!j.at("expectDiagnostics").is_array() || j.at("expectDiagnostics").empty()) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " 'expectDiagnostics' must be a non-empty array";
+            return m;
+        }
+        for (auto const& d : j.at("expectDiagnostics")) {
+            if (!d.is_object()
+                || !d.contains("code") || !d.at("code").is_string()
+                || !d.contains("line") || !d.at("line").is_number_unsigned()
+                || !d.contains("col")  || !d.at("col").is_number_unsigned()) {
+                ADD_FAILURE() << "manifest " << path.generic_string()
+                              << " each expectDiagnostics entry needs string 'code'"
+                                 " + unsigned 'line' + unsigned 'col'";
+                return m;
+            }
+            ExpectedDiagnostic ed;
+            ed.code = d.at("code").get<std::string>();
+            ed.line = d.at("line").get<std::uint32_t>();
+            ed.col  = d.at("col").get<std::uint32_t>();
+            m.expectDiagnostics.push_back(std::move(ed));
+        }
+    }
+    // exitCode: required for a run example; not for an expect-error one.
+    if (j.contains("exitCode")) {
+        if (!j.at("exitCode").is_number_integer()) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " 'exitCode' must be an integer";
+            return m;
+        }
+        m.exitCode = j.at("exitCode").get<std::int64_t>();
+    } else if (m.expectDiagnostics.empty()) {
         ADD_FAILURE() << "manifest " << path.generic_string()
-                      << " missing integer 'exitCode'";
+                      << " missing integer 'exitCode' (required unless"
+                         " 'expectDiagnostics' is present)";
         return m;
     }
-    m.exitCode = j.at("exitCode").get<std::int64_t>();
     if (j.contains("expectedStdout")) {
         if (!j.at("expectedStdout").is_string()) {
             ADD_FAILURE() << "manifest " << path.generic_string()
@@ -556,6 +613,91 @@ void runOneTarget(fs::path const&        exampleDir,
     }
 }
 
+// V2-4 Part C (D-DIAG-CLI-POSITION-RENDER-AND-ASSERT): drive the FULL
+// Program::compileFiles path on a malformed source and assert the EXACT
+// positioned diagnostic set. The compile MUST fail; no binary is spawned.
+// AGNOSTIC: the expected diagnostics are JSON-declared and compared
+// generically (code NAME + 1-based line:col) — no language/code hardcoded.
+void runErrorTarget(fs::path const&        exampleDir,
+                    ExampleManifest const& m,
+                    ExampleTarget const&   t) {
+    ASSERT_FALSE(t.spec.empty())
+        << "expect-error target needs a 'spec' to drive the compile";
+    // Single-source keeps position resolution unambiguous: one source
+    // buffer, so a diagnostic's span offset maps to exactly this file.
+    ASSERT_EQ(m.sources.size(), 1u)
+        << "expectDiagnostics examples must be single-source";
+
+    ScratchDir scratch{Location::InsideRepo, "examples"};
+    auto const srcRel  = m.sources.front();
+    auto const srcPath = scratch.path() / srcRel;
+    fs::copy_file(exampleDir / srcRel, srcPath,
+                  fs::copy_options::overwrite_existing);
+    scratch.useAsCwd();
+
+    Program            prog;
+    DiagnosticReporter rep;
+    prog.setOutputDir(scratch.path() / "out");
+    int const rc =
+        prog.compileFiles({srcPath.generic_string()}, m.language, {t.spec}, rep);
+
+    // A malformed source MUST be rejected — both the driver return code and
+    // the error-severity count confirm the compile failed (not a silent pass).
+    EXPECT_NE(rc, 0)
+        << "expect-error example compiled with rc=0 (should be rejected): "
+        << exampleDir.generic_string();
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "expect-error example produced no error-severity diagnostics: "
+        << exampleDir.generic_string();
+
+    // Resolve every diagnostic's START position through the SAME
+    // SourceBuffer::lineCol the compiler uses, so the asserted 1-based
+    // line:col matches its convention exactly (read binary so the byte
+    // offsets line up with the compiler's own buffer).
+    std::ifstream in(srcPath, std::ios::binary);
+    std::string const srcBytes{std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>()};
+    auto const srcBuf = SourceBuffer::fromString(srcBytes, srcRel);
+
+    auto const render = [](std::string_view code,
+                           std::uint32_t line, std::uint32_t col) {
+        std::string s(code);
+        s += ' ';
+        s += std::to_string(line);
+        s += ':';
+        s += std::to_string(col);
+        return s;
+    };
+
+    std::vector<std::string> actual;
+    actual.reserve(rep.all().size());
+    for (auto const& d : rep.all()) {
+        auto const lc = srcBuf->lineCol(d.span.start());
+        actual.push_back(render(diagnosticCodeName(d.code), lc.line, lc.column));
+    }
+    std::vector<std::string> expected;
+    expected.reserve(m.expectDiagnostics.size());
+    for (auto const& e : m.expectDiagnostics) {
+        expected.push_back(render(e.code, e.line, e.col));
+    }
+    std::sort(actual.begin(), actual.end());
+    std::sort(expected.begin(), expected.end());
+
+    auto const join = [](std::vector<std::string> const& v) {
+        std::string s;
+        for (auto const& x : v) { s += "\n    "; s += x; }
+        return s;
+    };
+    // EXACT set equality — the strongest pin (the user's strict-assert
+    // invariant): every produced diagnostic is declared and vice versa,
+    // each at its precise positioned line:col.
+    ASSERT_EQ(actual, expected)
+        << "expect-error diagnostic-set mismatch for "
+        << exampleDir.generic_string()
+        << "\n  expected:" << join(expected)
+        << "\n  actual:"   << join(actual);
+}
+
 } // namespace
 
 // argv[1] = absolute path to the example dir (registered by cmake).
@@ -577,6 +719,13 @@ TEST(Examples, RunFromManifest) {
     ASSERT_FALSE(m.targets.empty()) << "manifest declared no targets";
     for (auto const& t : m.targets) {
         SCOPED_TRACE("target spec=" + t.spec);
-        runOneTarget(exampleDir, m, t);
+        // V2-4 Part C: an `expectDiagnostics` manifest asserts a failed
+        // compile + positioned diagnostics; otherwise the source must
+        // compile + run cleanly.
+        if (m.expectDiagnostics.empty()) {
+            runOneTarget(exampleDir, m, t);
+        } else {
+            runErrorTarget(exampleDir, m, t);
+        }
     }
 }
