@@ -95,6 +95,7 @@ struct SchemaIndexes {
     // check picks the one whose operator token is present in the node.
     std::unordered_map<std::uint32_t, std::vector<std::size_t>> assignByRule;
     std::unordered_map<std::uint32_t, std::size_t> callByRule;
+    std::unordered_map<std::uint32_t, std::size_t> castByRule;      // FC2 explicit casts
     std::unordered_map<std::uint32_t, std::size_t> returnByRule;   // GAP A
     std::unordered_map<std::uint32_t, bool>        loopByRule;      // GAP C loop contexts
     std::unordered_map<std::uint32_t, bool>        loopControlByRule; // GAP C break/continue
@@ -416,6 +417,9 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
     }
     for (std::size_t i = 0; i < cfg.callRules.size(); ++i) {
         idx.callByRule[cfg.callRules[i].rule.v] = i;
+    }
+    for (std::size_t i = 0; i < cfg.castRules.size(); ++i) {
+        idx.castByRule[cfg.castRules[i].rule.v] = i;
     }
     for (std::size_t i = 0; i < cfg.returnRules.size(); ++i) {
         idx.returnByRule[cfg.returnRules[i].rule.v] = i;
@@ -1293,6 +1297,52 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             }
         }
 
+        // FC2: explicit-cast typing + legality (`semantics.casts`).
+        // Post-order means the operand subtree is already typed. The
+        // type-position child resolves through the SAME resolver a
+        // declaration's typeChild uses (builtins + pointer stars +
+        // struct refs + typedef aliases — incl. cross-tree-injected
+        // typedefs; an unresolvable name emits S_UnknownType there).
+        // The resolved target is stamped on BOTH the type child (the
+        // HIR lowering probes for a stamped type below the cast node —
+        // the compound-literal precedent) and the cast node itself
+        // (the expression's RESULT type for enclosing checks). The
+        // (target, operand) pair is then validated against the
+        // explicit-cast matrix — S_InvalidCast on illegal pairs
+        // (struct/union values, void, arrays).
+        auto castIt = s.idx().castByRule.find(rule.v);
+        if (castIt != s.idx().castByRule.end()) {
+            auto const& castRule = cfg.castRules[castIt->second];
+            auto kids = visibleChildren(tree, node);
+            if (castRule.typeChild < kids.size()
+                && castRule.operandChild < kids.size()) {
+                NodeId const typeNode    = kids[castRule.typeChild];
+                NodeId const operandNode = kids[castRule.operandChild];
+                TypeId const target =
+                    resolveTypeNode(s, cfg, tree, typeNode, here);
+                if (target.valid()) {
+                    s.nodeToType.set(typeNode, target);
+                    s.nodeToType.set(node, target);
+                    TypeId const operandTy =
+                        subtreeType(s, tree, operandNode);
+                    if (operandTy.valid()
+                        && !isExplicitCastable(s.lattice.interner(),
+                                               target, operandTy)) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::S_InvalidCast;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(node);
+                        d.actual   = std::string{tree.text(node)};
+                        s.reporter.report(std::move(d));
+                    }
+                }
+                // target invalid ⇒ resolveTypeNode already emitted
+                // S_UnknownType (fail loud); the cast node stays
+                // untyped and enclosing checks cascade-suppress.
+            }
+        }
+
         // D5.1: member-access resolution (`obj.field` and `ptr->field`).
         // Pass 2 visits post-order so the LHS's type is already in
         // `nodeToType` by the time we reach the member-access internal
@@ -1941,13 +1991,14 @@ admitsNullPointerConstant(EngineState const& s, Tree const& tree,
 // with `voidPtr` typed `Ptr<Void>` and pass 2 forgetting to type the
 // castExpr wrapper — subtreeType returns `Ptr<Void>`, the init-arm fires
 // `implicitFromVoidPtr` (admits), and the verifier sees a Ptr<Void> at
-// the slot expecting Ptr<I32>. Latent today (no castExpr in c-subset);
-// closure: when castExpr lands (likely co-cycle with D-CSUBSET-CONST-PTR-DECAY
-// or D-LK10-CRT-INIT-INVOKE's CRT helper imports), promote `subtreeType`
-// to take a wrapper-rule allowlist from `SemanticConfig` declaring which
-// rules are type-transparent — or assert at pass-2-completion that every
-// declared type-changing rule has set its wrapper-node type. Trigger:
-// first c-subset construct whose wrapper-rule semantically re-types its
+// the slot expecting Ptr<I32>. The CAST case is CLOSED (FC2, 2026-06-10):
+// the castExpr pass-2 arm stamps the wrapper node's own type with the
+// target type, so `subtreeType` returns it before descending. Still open
+// for the remaining listed wrappers (sizeof-expression, future
+// address-of/dereference re-typing rules) — when one lands, its pass-2
+// arm must stamp the wrapper node the same way, or promote `subtreeType`
+// to a `SemanticConfig`-declared type-transparent allowlist. Trigger:
+// next c-subset construct whose wrapper-rule semantically re-types its
 // inner expression.
 [[nodiscard]] TypeId
 subtreeType(EngineState const& s, Tree const& tree, NodeId node) {

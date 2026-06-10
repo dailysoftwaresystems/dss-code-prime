@@ -755,6 +755,53 @@ TEST(Optimizer, EffectivenessUDivSurvivesShippedReleasePipeline) {
            "`xor_rdx_zero + div_op` shape until unsigned types land.";
 }
 
+// FC1 (V2-4.X, 2026-06-10) — the SMod analog of the two effectiveness
+// pins above (D-CSUBSET-MOD-OP-CODEGEN closure-gate). The modulo
+// corpus example uses runtime-call operands under the BASELINE
+// (unoptimized) pipeline; this MIR-level pin is what keeps the
+// OPTIMIZED codegen path honest: an SMod whose operands are
+// runtime-opaque MirArgs must survive the shipped release pipeline
+// exactly once (ConstFold cannot fold args; a regression that folds
+// or duplicates it would let the codegen-tier remainder-capture shape
+// rot unobserved).
+TEST(Optimizer, EffectivenessSModSurvivesShippedReleasePipeline) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+
+    auto buildModuloArgsMir = [](TypeInterner& interner) -> Mir {
+        TypeId const i32 = interner.primitive(TypeKind::I32);
+        TypeId const params[] = {i32, i32};
+        TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+        MirBuilder b;
+        b.addFunction(fnSig, SymbolId{100},
+                      SymbolBinding::Global, SymbolVisibility::Default);
+        MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+        b.beginBlock(entry);
+        MirInstId const a = b.addArg(0, i32);  // runtime-opaque
+        MirInstId const c = b.addArg(1, i32);  // runtime-opaque
+        MirInstId const ops[] = {a, c};
+        MirInstId const m = b.addInst(MirOpcode::SMod, ops, i32);
+        b.addReturn(m);
+        return std::move(b).finish();
+    };
+
+    auto pipelineR = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(pipelineR.has_value());
+
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildModuloArgsMir(interner);
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(mir, target, interner, *pipelineR, rep);
+    ASSERT_TRUE(result.ok);
+
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::SMod), 1u)
+        << "MIR SMod with runtime-opaque (MirArg) operands MUST survive "
+           "the shipped release pipeline exactly once — the optimized "
+           "arm of the modulo feature is only as honest as this pin "
+           "(D-CSUBSET-MOD-OP-CODEGEN closure gate).";
+}
+
 // D-OPT1-PASS-DUP-POLICY engine-arm pin: a pipeline declaring
 // `{ConstFold, ConstFold}` doesn't get silently de-duped by the engine.
 // The loader admits the shape (test_pipeline_loader); the engine must

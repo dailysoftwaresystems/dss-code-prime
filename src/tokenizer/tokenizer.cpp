@@ -241,23 +241,13 @@ struct LookupHit {
 //     real digit (only separators) follows — `0x_`, `0b__`.
 //   - `P_IllegalChar` is owned by the dispatch loop (unchanged).
 
-// Test whether `c` lands in the digit character-class string. The
-// class syntax supports literal chars and `a-z` ranges (the same shape
-// every shipped config uses); unknown forms are interpreted literally.
+// Digit-class membership: hoisted to `digitClassMatches` in
+// number_style.hpp (FC1 cycle 2) — single source shared with the
+// schema loader's prefix-float validation and the decode helpers.
+// The local name is kept as a thin alias so the scanner reads the
+// same as before.
 [[nodiscard]] bool matchesDigitClass(std::string_view digits, char c) noexcept {
-    const auto u = static_cast<unsigned char>(c);
-    for (std::size_t i = 0; i < digits.size(); ++i) {
-        // `a-z` range form.
-        if (i + 2 < digits.size() && digits[i + 1] == '-') {
-            const auto lo = static_cast<unsigned char>(digits[i]);
-            const auto hi = static_cast<unsigned char>(digits[i + 2]);
-            if (u >= lo && u <= hi) return true;
-            i += 2;
-            continue;
-        }
-        if (static_cast<unsigned char>(digits[i]) == u) return true;
-    }
-    return false;
+    return digitClassMatches(digits, c);
 }
 
 [[nodiscard]] bool isSeparator(NumberStyle const& s, char c) noexcept {
@@ -325,9 +315,21 @@ struct NumberScan {
             // longest-match otherwise).
             continue;
         }
+        // FC1 cycle 2 (2026-06-10): a prefix declaring a FLOAT
+        // continuation also admits the language's fraction point
+        // right after the prefix — C23 6.4.4.2 allows `0x.8p3`
+        // (fraction digits only). Without this admission the prefix
+        // arm is never entered and `0x.8p3` would mis-lex as `0` +
+        // `x` + … . `0x.p3` (no digit either side of the point)
+        // still enters and falls out as the malformed `0x` — the
+        // same loud shape as the separator-after-prefix admission.
+        const bool floatPointAfterPrefix =
+            p.floating.has_value() && style.fractionPoint.has_value()
+            && !atEofAfterPrefix && afterPrefix == *style.fractionPoint;
         if (!atEofAfterPrefix
             && !matchesDigitClass(p.digits, afterPrefix)
-            && !isSeparator(style, afterPrefix)) {
+            && !isSeparator(style, afterPrefix)
+            && !floatPointAfterPrefix) {
             continue;
         }
         r.advance(p.prefix.size());
@@ -335,8 +337,119 @@ struct NumberScan {
         while (true) {
             const char c = r.peek();
             if (matchesDigitClass(p.digits, c)) { sawDigit = true; r.advance(1); continue; }
-            if (isSeparator(style, c))         { r.advance(1); continue; }
+            // FC1 (V2-4.X, 2026-06-10): a digit separator is consumed
+            // only BETWEEN digits (C23 6.4.4.1 — each separator must
+            // be flanked by digits). The previous unconditional
+            // consume silently swallowed trailing/leading separators
+            // (`1'` lexed as the value 1, eating the quote) — fatal
+            // once a language's separator collides with another token
+            // start (C23's `'` is also the char-literal quote: `1'+'a'`
+            // must NOT lex as 1 then garbage). Universal rule, no
+            // language identity: any schema-declared separator gets
+            // the flanked-by-digits requirement.
+            if (sawDigit && isSeparator(style, c)
+                && matchesDigitClass(p.digits, r.peek(1))) {
+                r.advance(1);
+                continue;
+            }
             break;
+        }
+        // FC1 cycle 2 (2026-06-10): per-prefix FLOAT continuation —
+        // C23 hex-floats (`0x1.8p3`). Grammar per 6.4.4.2:
+        //   prefix [mantissa-digits] [. [mantissa-digits]]
+        //          exp-letter [sign] exp-digits [float-suffix]
+        // with digits required on at least ONE side of the point and
+        // the EXPONENT REQUIRED (the binary-exponent-part is
+        // mandatory; an `exponentRequired:false` knob is deliberately
+        // not modeled until a language consumes it). Once the float
+        // continuation COMMITS (a fraction was consumed, or an
+        // exponent letter was) and cannot complete, the WHOLE span is
+        // ONE malformed token + P_MalformedNumber — never a silent
+        // split (a split would re-lex `.8p3` into value-corrupting
+        // pieces). Exponent digits use their OWN class (C hex-float
+        // exponents are DECIMAL while the mantissa is hex).
+        if (p.floating.has_value()) {
+            auto const& pf = *p.floating;
+            bool committed    = false;
+            bool exponentDone = false;
+            if (style.fractionPoint.has_value()
+                && r.peek() == *style.fractionPoint
+                && (sawDigit || matchesDigitClass(p.digits, r.peek(1)))) {
+                committed = true;
+                r.advance(1);
+                while (true) {
+                    const char c2 = r.peek();
+                    if (matchesDigitClass(p.digits, c2)) {
+                        sawDigit = true;
+                        r.advance(1);
+                        continue;
+                    }
+                    if (sawDigit && isSeparator(style, c2)
+                        && matchesDigitClass(p.digits, r.peek(1))) {
+                        r.advance(1);
+                        continue;
+                    }
+                    break;
+                }
+            }
+            bool letterMatched = false;
+            for (char l : pf.exponentLetters) {
+                if (r.peek() == l) { letterMatched = true; break; }
+            }
+            if (letterMatched) {
+                committed = true;
+                std::size_t look = 1;
+                if (pf.exponentSignOptional
+                    && (r.peek(1) == '+' || r.peek(1) == '-')) {
+                    look = 2;
+                }
+                if (matchesDigitClass(pf.exponentDigits, r.peek(look))) {
+                    r.advance(look);
+                    bool sawExpDigit = false;
+                    while (true) {
+                        const char c2 = r.peek();
+                        if (matchesDigitClass(pf.exponentDigits, c2)) {
+                            sawExpDigit = true;
+                            r.advance(1);
+                            continue;
+                        }
+                        if (sawExpDigit && isSeparator(style, c2)
+                            && matchesDigitClass(pf.exponentDigits,
+                                                 r.peek(1))) {
+                            r.advance(1);
+                            continue;
+                        }
+                        break;
+                    }
+                    exponentDone = sawExpDigit;
+                } else {
+                    // Letter (+ sign) present but no exponent digit:
+                    // consume them so the malformed token spans the
+                    // committed float text (`0x1.8p`, `0x1.8p+`).
+                    r.advance(look);
+                }
+            }
+            if (committed) {
+                out.isFloat = true;
+                if (exponentDone && sawDigit) {
+                    // Complete prefix-float: only FLOAT suffixes
+                    // apply (`0x1.8p3f`). The integer-suffix path
+                    // below is deliberately NOT taken — and the
+                    // decimal arm's f-suffix INT→FLOAT promotion is
+                    // deliberately not mirrored here: in a prefix
+                    // digit class the suffix letters can BE digits
+                    // (`0x1f` is the integer 31, `0b1f` is `0b1` +
+                    // an identifier — never a float).
+                    if (const auto fn =
+                            matchLongestSuffix(r, style.floatSuffixes);
+                        fn > 0) {
+                        r.advance(fn);
+                    }
+                } else {
+                    out.malformed = true;
+                }
+                return out;
+            }
         }
         // Optional integer suffix.
         if (const auto n = matchLongestSuffix(r, style.integerSuffixes); n > 0) {
@@ -347,25 +460,42 @@ struct NumberScan {
     }
 
     // 2. Decimal body — only when the schema opts into bare decimals.
-    //    The dispatch loop ensures we entered on an isDigit byte; if
-    //    the schema sets `decimal: false`, we still consume the bare
-    //    digit run to make progress (caller treats it as malformed).
+    //    The dispatch loop ensures we entered on an isDigit byte OR —
+    //    under `leadingFraction` (FC1 cycle 2) — on the fraction
+    //    point with a digit right behind it (`.5`); in that case this
+    //    run consumes nothing and the fraction arm below takes over.
+    //    If the schema sets `decimal: false`, we still consume the
+    //    bare digit run to make progress (caller treats it as
+    //    malformed).
     bool sawDigit = false;
     auto consumeDecimalRun = [&] {
         while (true) {
             const char c = r.peek();
             if (c >= '0' && c <= '9') { sawDigit = true; r.advance(1); continue; }
-            if (isSeparator(style, c)) { r.advance(1); continue; }
+            // Between-digits separator rule — see the prefix-body loop
+            // above (C23 6.4.4.1 flanked-by-digits; universal for any
+            // schema-declared separator).
+            if (sawDigit && isSeparator(style, c)
+                && r.peek(1) >= '0' && r.peek(1) <= '9') {
+                r.advance(1);
+                continue;
+            }
             break;
         }
     };
     consumeDecimalRun();
 
     // 3. Fractional part — when fractionPoint is set AND followed by a
-    //    digit (`a.b` member access doesn't gobble the dot).
+    //    digit (`a.b` member access doesn't gobble the dot), OR — when
+    //    the language opts into C23 trailing fractions
+    //    (`trailingFraction`, FC1 cycle 2) — preceded by at least one
+    //    digit (`1.` is the float 1.0; C23 6.4.4.2 fractional-constant
+    //    `digit-sequence .`). Default OFF so range-operator languages
+    //    (`1..5`) keep the split.
     if (style.fractionPoint.has_value()
         && r.peek() == *style.fractionPoint
-        && (r.peek(1) >= '0' && r.peek(1) <= '9')) {
+        && ((r.peek(1) >= '0' && r.peek(1) <= '9')
+            || (style.trailingFraction && sawDigit))) {
         out.isFloat = true;
         r.advance(1);            // fraction point
         consumeDecimalRun();
@@ -857,6 +987,18 @@ TokenizeResult Tokenizer::tokenize() && {
         auto startsNumberLiteral = [&]() -> bool {
             if (numberStyle == nullptr) return false;
             if (numberStyle->decimal && isDigit(c)) return true;
+            // C23 leading fractions (`.5`) — opt-in via
+            // `leadingFraction` (FC1 cycle 2): the fraction point
+            // enters the numeric scanner ONLY when the next byte is
+            // a decimal digit, so a bare `.` / `.foo` member access
+            // keeps lexing as the language's dot token (the classic
+            // C lexer rule: dot-followed-by-digit is a number).
+            if (numberStyle->leadingFraction
+                && numberStyle->fractionPoint.has_value()
+                && c == *numberStyle->fractionPoint
+                && isDigit(r.peek(1))) {
+                return true;
+            }
             for (auto const& p : numberStyle->integerPrefixes) {
                 if (!p.prefix.empty() && p.prefix[0] == c) return true;
             }

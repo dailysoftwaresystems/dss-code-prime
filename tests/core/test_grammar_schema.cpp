@@ -1367,6 +1367,167 @@ TEST(GrammarSchema, NumberStyleNotAnObjectReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidNumberStyle));
 }
 
+// ─── FC1 cycle 2 (2026-06-10): per-prefix float-block loader arms ──────────
+
+namespace {
+// Wrap a numberStyle JSON fragment in a minimal loadable schema. Every
+// prefix-float loader test differs only in the numberStyle body.
+[[nodiscard]] std::string wrapNumberStyle(std::string_view numberStyle) {
+    return std::format(R"JSON({{
+      "dssSchemaVersion": 4,
+      "language": {{ "name": "PfxFloat", "version": "0.1.0" }},
+      "tokens": {{ ";": [{{ "kind": "Semi" }}] }},
+      "numberStyle": {},
+      "shapes": {{
+        "root": {{ "sequence": ["IntLiteral", "Semi"] }}
+      }}
+    }})JSON", numberStyle);
+}
+}  // namespace
+
+TEST(GrammarSchema, PrefixFloatValidBlockLoads) {
+    auto result = GrammarSchema::loadFromText(wrapNumberStyle(R"JSON({
+        "decimal": true,
+        "integerPrefixes": [
+          { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F",
+            "float": { "exponent": { "letters": ["p","P"], "signOptional": true },
+                       "exponentDigits": "0-9" } }
+        ],
+        "fractionPoint": ".",
+        "emitKind": { "integer": "IntLiteral", "float": "FloatLiteral" }
+      })JSON"));
+    ASSERT_TRUE(result.has_value());
+    auto const* ns = (*result)->numberStyle();
+    ASSERT_NE(ns, nullptr);
+    ASSERT_EQ(ns->integerPrefixes.size(), 1u);
+    ASSERT_TRUE(ns->integerPrefixes[0].floating.has_value());
+    auto const& pf = *ns->integerPrefixes[0].floating;
+    ASSERT_EQ(pf.exponentLetters.size(), 2u);
+    EXPECT_EQ(pf.exponentLetters[0], 'p');
+    EXPECT_EQ(pf.exponentLetters[1], 'P');
+    EXPECT_TRUE(pf.exponentSignOptional);
+    EXPECT_EQ(pf.exponentDigits, "0-9");
+}
+
+TEST(GrammarSchema, PrefixFloatUnknownKeyRejected) {
+    // Typo discriminator: `exponentDigitz` must reject, never be
+    // silently ignored (the author would believe the class is set
+    // while the engine used the default).
+    auto result = GrammarSchema::loadFromText(wrapNumberStyle(R"JSON({
+        "decimal": true,
+        "integerPrefixes": [
+          { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F",
+            "float": { "exponent": { "letters": ["p"] },
+                       "exponentDigitz": "0-9" } }
+        ],
+        "fractionPoint": ".",
+        "emitKind": { "integer": "IntLiteral", "float": "FloatLiteral" }
+      })JSON"));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidNumberStyle));
+}
+
+TEST(GrammarSchema, PrefixFloatMissingExponentRejected) {
+    // A prefix-float without an exponent grammar can never complete
+    // (C23 mandates the exponent) — a silently-dead config, rejected.
+    auto result = GrammarSchema::loadFromText(wrapNumberStyle(R"JSON({
+        "decimal": true,
+        "integerPrefixes": [
+          { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F",
+            "float": { "exponentDigits": "0-9" } }
+        ],
+        "fractionPoint": ".",
+        "emitKind": { "integer": "IntLiteral", "float": "FloatLiteral" }
+      })JSON"));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingField));
+}
+
+TEST(GrammarSchema, PrefixFloatExponentLetterInsideDigitClassRejected) {
+    // `e` IS a hex mantissa digit — the digit run would always consume
+    // it, making the float branch silently unreachable. Load-reject.
+    auto result = GrammarSchema::loadFromText(wrapNumberStyle(R"JSON({
+        "decimal": true,
+        "integerPrefixes": [
+          { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F",
+            "float": { "exponent": { "letters": ["e"] } } }
+        ],
+        "fractionPoint": ".",
+        "emitKind": { "integer": "IntLiteral", "float": "FloatLiteral" }
+      })JSON"));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidNumberStyle));
+}
+
+TEST(GrammarSchema, PrefixFloatRequiresFloatEmitKind) {
+    // A prefix-float is a float-producing facet — emitKind.float
+    // becomes required (the same invariant as exponent/fractionPoint).
+    auto result = GrammarSchema::loadFromText(wrapNumberStyle(R"JSON({
+        "decimal": true,
+        "integerPrefixes": [
+          { "prefix": "$", "radix": 16, "digits": "0-9a-fA-F",
+            "float": { "exponent": { "letters": ["^"] } } }
+        ],
+        "emitKind": { "integer": "IntLiteral" }
+      })JSON"));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingField));
+}
+
+TEST(GrammarSchema, FractionFlagsRequireFractionPoint) {
+    // `trailingFraction`/`leadingFraction` without a declared
+    // `fractionPoint` is internally inconsistent — rejected.
+    auto result = GrammarSchema::loadFromText(wrapNumberStyle(R"JSON({
+        "decimal": true,
+        "trailingFraction": true,
+        "emitKind": { "integer": "IntLiteral", "float": "FloatLiteral" }
+      })JSON"));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidNumberStyle));
+}
+
+TEST(GrammarSchema, ExponentObjectUnknownKeyRejectedAtBothSites) {
+    // Audit fold (FC1c2): the shared exponent parser's unknown-key
+    // reject needs a red lever at BOTH call sites — a `signOptionl`
+    // typo must fail loud whether it sits in the TOP-LEVEL exponent
+    // or a prefix's float.exponent (silently defaulting signOptional
+    // is the knob-that-lies).
+    auto top = GrammarSchema::loadFromText(wrapNumberStyle(R"JSON({
+        "decimal": true,
+        "exponent": { "letters": ["e"], "signOptionl": true },
+        "emitKind": { "integer": "IntLiteral", "float": "FloatLiteral" }
+      })JSON"));
+    ASSERT_FALSE(top.has_value());
+    EXPECT_TRUE(hasDiagCode(top.error(), DiagnosticCode::C_InvalidNumberStyle));
+
+    auto pfx = GrammarSchema::loadFromText(wrapNumberStyle(R"JSON({
+        "decimal": true,
+        "integerPrefixes": [
+          { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F",
+            "float": { "exponent": { "letters": ["p"], "signOptionl": true } } }
+        ],
+        "fractionPoint": ".",
+        "emitKind": { "integer": "IntLiteral", "float": "FloatLiteral" }
+      })JSON"));
+    ASSERT_FALSE(pfx.has_value());
+    EXPECT_TRUE(hasDiagCode(pfx.error(), DiagnosticCode::C_InvalidNumberStyle));
+}
+
+TEST(GrammarSchema, PrefixFloatEmptyExponentDigitsRejected) {
+    auto result = GrammarSchema::loadFromText(wrapNumberStyle(R"JSON({
+        "decimal": true,
+        "integerPrefixes": [
+          { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F",
+            "float": { "exponent": { "letters": ["p"] },
+                       "exponentDigits": "" } }
+        ],
+        "fractionPoint": ".",
+        "emitKind": { "integer": "IntLiteral", "float": "FloatLiteral" }
+      })JSON"));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidNumberStyle));
+}
+
 // F3: tsql-subset declares typeExtensions[] for parameterized types
 // (VARCHAR(N) — Integer parameter). Verify the shipped config carries
 // the registration so a future grammar-level update can wire the

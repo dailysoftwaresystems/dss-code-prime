@@ -148,6 +148,36 @@ void parseVariantTemplate(json const& v, std::size_t opIdx, std::size_t vi,
             }
         }
     }
+    // FC2 Part B (SSE float backend): mandatory legacy-prefix bytes
+    // (F2/F3/66 — the SSE opcode-form selectors). Same shape +
+    // validation rigor as `opcode` above; emitted BEFORE the REX
+    // prefix by the x86-variable walker. validate() rejects the
+    // field on a fixed32 variant.
+    if (t.contains("mandatoryPrefix")) {
+        auto const& mp = t.at("mandatoryPrefix");
+        if (!mp.is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/opcodes/{}/encoding/variants/{}/template/mandatoryPrefix", opIdx, vi),
+                      "'mandatoryPrefix' must be an array of byte integers");
+        } else {
+            for (auto const& bn : mp) {
+                if (!bn.is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/opcodes/{}/encoding/variants/{}/template/mandatoryPrefix", opIdx, vi),
+                              "every mandatoryPrefix entry must be an integer in [0, 255]");
+                    continue;
+                }
+                std::int64_t const bv = bn.get<std::int64_t>();
+                if (bv < 0 || bv > 255) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/opcodes/{}/encoding/variants/{}/template/mandatoryPrefix", opIdx, vi),
+                              std::format("mandatoryPrefix byte {} out of range [0, 255]", bv));
+                    continue;
+                }
+                tmpl.mandatoryPrefix.push_back(static_cast<std::uint8_t>(bv));
+            }
+        }
+    }
     if (t.contains("modrmRegExt")) {
         auto const path = std::format("/opcodes/{}/encoding/variants/{}/template/modrmRegExt", opIdx, vi);
         if (!t.at("modrmRegExt").is_number_integer()) {
@@ -1036,10 +1066,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // discipline (closed 2026-06-04 elsewhere): a typo
                 // like `"inpts": [...]` would silently leave inputs
                 // empty + slip through to a misleading "empty block"
-                // reject. Allowlist the 3 known sub-keys + emit per
+                // reject. Allowlist the known sub-keys + emit per
                 // unknown key.
-                static constexpr std::array<std::string_view, 3>
-                    kKnownKeys{"inputs", "outputs", "clobbered"};
+                static constexpr std::array<std::string_view, 5>
+                    kKnownKeys{"inputs", "outputs", "clobbered",
+                               "inputRoles", "outputRoles"};
                 for (auto it = ir.begin(); it != ir.end(); ++it) {
                     bool known = false;
                     for (auto const& k : kKnownKeys) {
@@ -1051,7 +1082,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                               i, it.key()),
                                   std::format("unknown key '{}' — allowed "
                                               "keys are 'inputs', 'outputs', "
-                                              "'clobbered' (typo discriminator)",
+                                              "'clobbered', 'inputRoles', "
+                                              "'outputRoles' (typo "
+                                              "discriminator)",
                                               it.key()));
                     }
                 }
@@ -1083,6 +1116,40 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 readRegArray("inputs",    irc.inputNames);
                 readRegArray("outputs",   irc.outputNames);
                 readRegArray("clobbered", irc.clobberedNames);
+                // Role maps (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-
+                // CONTRACT): each is an OBJECT of role → register
+                // name. Shape-only here; role-vocabulary, membership
+                // (role's register ∈ the positional array), and
+                // name→ordinal resolution happen in the post-register
+                // resolution block with the other cross-field checks.
+                auto readRoleMap =
+                    [&](char const* field,
+                        std::vector<std::pair<std::string, std::string>>& out) {
+                    if (!ir.contains(field)) return;
+                    auto const& obj = ir.at(field);
+                    if (!obj.is_object()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/opcodes/{}/implicitRegisters/{}",
+                                              i, field),
+                                  "must be an object mapping role names to "
+                                  "register-name strings");
+                        return;
+                    }
+                    for (auto it = obj.begin(); it != obj.end(); ++it) {
+                        if (!it.value().is_string()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("/opcodes/{}/implicitRegisters/{}/{}",
+                                                  i, field, it.key()),
+                                      "role value must be a register-name "
+                                      "string");
+                            continue;
+                        }
+                        out.emplace_back(it.key(),
+                                         it.value().get<std::string>());
+                    }
+                };
+                readRoleMap("inputRoles",  irc.inputRoleNames);
+                readRoleMap("outputRoles", irc.outputRoleNames);
                 info.implicitRegisters = std::move(irc);
             }
         }
@@ -1158,6 +1225,66 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     continue;  // skip push_back so vector & index stay in sync
                 }
                 data.registers.push_back(std::move(info));
+            }
+        }
+    }
+
+    // ── registerClassOps (FC2 Part B — optional) ───────────────────
+    // Per-register-class move/load/store mnemonic table. A class with
+    // no row resolves to the universal defaults iff it is GPR (see
+    // TargetSchema::regClassOpOpcode); a declared row may omit slots
+    // (consumers fail loud on an omitted slot — trigger discipline).
+    if (doc.contains("registerClassOps")) {
+        if (!doc.at("registerClassOps").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/registerClassOps",
+                      "'registerClassOps' must be an array");
+        } else {
+            auto const& rows = doc.at("registerClassOps");
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                auto const& r = rows[i];
+                if (!r.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/registerClassOps/{}", i),
+                              "registerClassOps entry must be an object");
+                    continue;
+                }
+                if (!r.contains("class") || !r.at("class").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("/registerClassOps/{}/class", i),
+                              "missing or non-string 'class'");
+                    continue;
+                }
+                auto const cls =
+                    targetRegClassFromName(r.at("class").get<std::string>());
+                if (!cls.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/registerClassOps/{}/class", i),
+                              "expected 'gpr' / 'fpr' / 'vr' / 'flags'");
+                    continue;
+                }
+                auto& row = data.registerClassOps[static_cast<std::size_t>(*cls)];
+                if (row.declared) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/registerClassOps/{}/class", i),
+                              std::format("duplicate registerClassOps row for "
+                                          "class '{}'",
+                                          targetRegClassName(*cls)));
+                    continue;
+                }
+                row.declared = true;
+                auto readOp = [&](char const* field, std::string& out) {
+                    if (!r.contains(field)) return;
+                    if (!r.at(field).is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/registerClassOps/{}/{}", i, field),
+                                  "must be a mnemonic string");
+                        return;
+                    }
+                    out = r.at(field).get<std::string>();
+                };
+                readOp("move",  row.move);
+                readOp("load",  row.load);
+                readOp("store", row.store);
             }
         }
     }
@@ -1447,6 +1574,85 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                       ir.outputNames[k]));
             }
         }
+
+        // Role-map resolution + validation (D-CSUBSET-MOD-OP-CODEGEN-
+        // OUTPUT-INDEX-CONTRACT, 2026-06-10). Three rejects per role:
+        //   1. unknown role name (typo discriminator — the lowering
+        //      queries a registered vocabulary; "remaindr" must fail
+        //      at LOAD, not surface as a missing-role at lowering);
+        //   2. the role's register must appear in the corresponding
+        //      POSITIONAL array (a role naming a register the op does
+        //      not declare as an implicit input/output is internally
+        //      inconsistent);
+        //   3. the register name must resolve through the target's
+        //      register table (same rule as the positional arrays).
+        // The registered vocabulary grows as new projection shapes
+        // arrive (a fail-loud reject here forces the deliberate
+        // extension rather than a silent free-form string).
+        static constexpr std::array<std::string_view, 3>
+            kKnownImplicitRegisterRoles{"dividend", "quotient", "remainder"};
+        auto resolveRoles =
+            [&](std::vector<std::pair<std::string, std::string>> const& roles,
+                std::vector<std::pair<std::string, std::uint16_t>>& resolved,
+                std::vector<std::string> const& memberNames,
+                char const* field) {
+            resolved.clear();
+            for (auto const& [role, regName] : roles) {
+                bool knownRole = false;
+                for (auto const& k : kKnownImplicitRegisterRoles) {
+                    if (role == k) { knownRole = true; break; }
+                }
+                if (!knownRole) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format(
+                                  "/opcodes/{}/implicitRegisters/{}/{}",
+                                  opIdx, field, role),
+                              std::format("opcode '{}': unknown implicit-"
+                                          "register role '{}' — registered "
+                                          "roles are 'dividend', 'quotient', "
+                                          "'remainder' (typo discriminator; "
+                                          "extend the registered vocabulary "
+                                          "for a new projection shape)",
+                                          info.mnemonic, role));
+                    continue;
+                }
+                bool member = false;
+                for (auto const& n : memberNames) {
+                    if (n == regName) { member = true; break; }
+                }
+                if (!member) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format(
+                                  "/opcodes/{}/implicitRegisters/{}/{}",
+                                  opIdx, field, role),
+                              std::format("opcode '{}': role '{}' names "
+                                          "register '{}' which is not "
+                                          "declared in the corresponding "
+                                          "positional array (a projection "
+                                          "role must tag a register the op "
+                                          "actually declares)",
+                                          info.mnemonic, role, regName));
+                    continue;
+                }
+                auto it = data.registerIndex.find(regName);
+                if (it == data.registerIndex.end()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format(
+                                  "/opcodes/{}/implicitRegisters/{}/{}",
+                                  opIdx, field, role),
+                              std::format("opcode '{}': role '{}' names "
+                                          "unknown register '{}'",
+                                          info.mnemonic, role, regName));
+                    continue;
+                }
+                resolved.emplace_back(
+                    role, static_cast<std::uint16_t>(it->second));
+            }
+        };
+        resolveRoles(ir.inputRoleNames,  ir.inputRoleOrdinals,
+                     ir.inputNames,  "inputRoles");
+        resolveRoles(ir.outputRoleNames, ir.outputRoleOrdinals,
+                     ir.outputNames, "outputRoles");
     }
 
     // ── Cross-field invariants (validate after per-field parse) ───

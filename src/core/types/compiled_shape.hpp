@@ -128,6 +128,19 @@ struct CompiledRule {
     bool                       isExpr = false;
     RuleId                     exprAtom{};
     std::int32_t               exprMinPrecedence = 0;
+
+    // Type-name commit guard (`commitRequiresTypeName` on the shape body;
+    // FC2 cast-expression disambiguation). When valid, names the child rule
+    // occupying this rule's TYPE position: a structurally-successful
+    // speculative probe of this rule COMMITS only after the parser's
+    // generic type-name triage over that child's subtree (a lone
+    // `identifierToken` leaf consults the binder sketch / the
+    // operator-table follower test; any other form — keyword base,
+    // struct-tag, pointer star, const — commits unconditionally because it
+    // cannot be an expression). Invalid (the default) ⇒ no guard; the
+    // probe commits on structural success exactly as before. Config-
+    // sourced — the engine never hardcodes which rule is a "cast".
+    RuleId                     typeNameCommitRule{};
 };
 
 } // namespace dss::detail

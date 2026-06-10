@@ -191,16 +191,221 @@ TEST(Tokenizer, BareENotConsumedAsExponentWhenNoDigitFollows) {
 }
 
 TEST(Tokenizer, MemberAccessDotIsNotPartOfFloat) {
-    // `a.b` must NOT be consumed as one float-like token. The `.` is
-    // only fractional when it follows a digit AND a digit follows. Here
-    // `a` starts a word.
+    // `a.foo` member access: the dot after a WORD never enters the
+    // numeric scanner — three tokens. (FC1 cycle 2 rewrote this
+    // test's input: it previously pinned `3.foo` → `3`+`.`+`foo`,
+    // the pre-C23 digit-after-dot-only rule that c-subset's new
+    // `trailingFraction` opt-in replaces.)
+    auto h      = loadCSubset("a.foo");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 3u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "a");
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), ".");
+    EXPECT_EQ(textOf(*h.src, result.tokens[2]), "foo");
+}
+
+TEST(Tokenizer, TrailingFractionMakesDigitsDotOneFloat) {
+    // FC1 cycle 2 (`trailingFraction: true` in c-subset — C23
+    // 6.4.4.2 fractional-constant `digit-sequence .`): `3.` is ONE
+    // float — and the float-suffix maximal-munch then takes the `f`,
+    // so `3.foo` lexes as the float `3.f` + the word `oo`. (Real C
+    // absorbs `3.foo` into one ill-formed pp-number; either way the
+    // downstream parse diagnoses the adjacency loudly.)
     auto h      = loadCSubset("3.foo");
     auto result = lex(h);
-    // Expected: IntLiteral("3"), Punctuation("."), Word("foo") — exactly 3.
-    ASSERT_EQ(result.tokens.size(), 3u);
+    ASSERT_EQ(result.tokens.size(), 2u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "3.f");
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "oo");
+
+    // The pure trailing-dot form (whitespace-delimited, no suffix
+    // ambiguity): exactly `3.`.
+    auto h2      = loadCSubset("3. ;");
+    auto result2 = lex(h2);
+    ASSERT_GE(result2.tokens.size(), 1u);
+    EXPECT_EQ(result2.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
+    EXPECT_EQ(textOf(*h2.src, result2.tokens[0]), "3.");
+}
+
+// ─── FC1 cycle 2 (2026-06-10): C23 hex-float literals ──────────────────────
+// The 0x/0X prefixes declare a `float` continuation (letters p/P,
+// decimal exponent digits). C23 6.4.4.2: optional fraction with digits
+// on at least ONE side of the point + a REQUIRED binary-exponent-part.
+
+namespace {
+// One-FloatLiteral-token assertion helper for the valid hex-float forms.
+void expectOneFloat(std::string_view src) {
+    auto h      = loadCSubset(std::string{src});
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u) << "input: " << src;
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral)
+        << "input: " << src;
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), src);
+    EXPECT_TRUE(result.diags.empty()) << "input: " << src;
+}
+// One-malformed-token assertion helper: tokens[0] spans `expectedSpan`,
+// exactly one P_MalformedNumber (the tail may re-lex into more tokens).
+void expectMalformedHead(std::string_view src, std::string_view expectedSpan) {
+    auto h      = loadCSubset(std::string{src});
+    auto result = lex(h);
+    ASSERT_GE(result.tokens.size(), 1u) << "input: " << src;
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), expectedSpan)
+        << "input: " << src;
+    std::size_t malformed = 0;
+    for (auto const& d : result.diags) {
+        if (d.code == DiagnosticCode::P_MalformedNumber) ++malformed;
+    }
+    EXPECT_EQ(malformed, 1u) << "input: " << src;
+}
+}  // namespace
+
+TEST(Tokenizer, HexFloatLexesAsOneFloatToken) {
+    expectOneFloat("0x1.8p3");
+}
+
+TEST(Tokenizer, HexFloatWithoutFractionLexes) {
+    expectOneFloat("0x1p3");
+}
+
+TEST(Tokenizer, HexFloatLeadingFractionLexes) {
+    // C23: hexadecimal-fractional-constant `. hex-digits` — the
+    // fraction point directly after the prefix (the entry gate
+    // admits it because 0x declares a float continuation).
+    expectOneFloat("0x.8p1");
+}
+
+TEST(Tokenizer, HexFloatTrailingDotLexes) {
+    // C23: `hex-digits .` (empty fraction) is valid WITH the exponent.
+    expectOneFloat("0x1.p3");
+}
+
+TEST(Tokenizer, HexFloatNegativeExponentLexes) {
+    expectOneFloat("0x1p-2");
+}
+
+TEST(Tokenizer, HexFloatSeparatorsSuffixAndFDigitLex) {
+    // 'f' here is a MANTISSA DIGIT (1.ff), the separator sits between
+    // digits, and the trailing 'f' is the float SUFFIX — three
+    // different meanings of the same letter in one literal.
+    expectOneFloat("0x1.f'fp3f");
+}
+
+TEST(Tokenizer, HexFloatUppercaseFormLexes) {
+    expectOneFloat("0X1.8P3");
+}
+
+TEST(Tokenizer, HexFloatWithoutExponentIsMalformed) {
+    // The binary-exponent-part is REQUIRED (C23) — once the fraction
+    // commits the float, a missing exponent is ONE loud malformed
+    // token, never a silent `0x1` + `.8` split.
+    expectMalformedHead("0x1.8", "0x1.8");
+}
+
+TEST(Tokenizer, HexFloatDanglingExponentLetterIsMalformed) {
+    expectMalformedHead("0x1.8p", "0x1.8p");
+}
+
+TEST(Tokenizer, HexFloatDanglingExponentSignIsMalformed) {
+    expectMalformedHead("0x1.8p+", "0x1.8p+");
+}
+
+TEST(Tokenizer, HexPrefixDotWithoutDigitsIsMalformedPrefix) {
+    // `0x.p3` has no digit on EITHER side of the point — the fraction
+    // never commits, so the prefix arm falls out as the malformed
+    // `0x` (the same loud shape as `0x'ff`); the tail re-lexes.
+    expectMalformedHead("0x.p3", "0x");
+}
+
+TEST(Tokenizer, HexIntegerWithTrailingFDigitStaysInteger) {
+    // No fraction, no exponent letter → the float continuation never
+    // engages; `f` is just a hex digit.
+    auto h      = loadCSubset("0x1f");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
-    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "3");
-    EXPECT_EQ(textOf(*h.src, result.tokens[2]), "foo");
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0x1f");
+    EXPECT_TRUE(result.diags.empty());
+}
+
+TEST(Tokenizer, BinaryPrefixTrailingFIsIntegerPlusWord) {
+    // The prefix arm deliberately does NOT inherit the decimal arm's
+    // f-suffix INT→FLOAT promotion: in a prefix digit class the
+    // suffix letters can BE digits, so `0b1f` is the integer `0b1`
+    // followed by the word `f` — never a float (strtod would parse
+    // "0b1" as 0 and silently zero the value).
+    auto h      = loadCSubset("0b1f");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 2u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0b1");
+    EXPECT_EQ(result.tokens[1].coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "f");
+}
+
+// ─── FC1 cycle 2: C23 decimal fractional-constant edge forms ───────────────
+// (`trailingFraction` + `leadingFraction`, both opt-in, c-subset = true.)
+
+TEST(Tokenizer, TrailingFractionWithExponentAndSuffixLex) {
+    expectOneFloat("1.");
+    expectOneFloat("1.e3");
+    expectOneFloat("1.f");
+}
+
+TEST(Tokenizer, LeadingFractionLexes) {
+    expectOneFloat(".5");
+    expectOneFloat(".5e2");
+    expectOneFloat(".5f");
+}
+
+TEST(Tokenizer, FractionFlagsDefaultFalseKeepsSplitLexing) {
+    // Audit fold (FC1c2): the knobs' FALSE direction must be a
+    // BEHAVIOR pin, not just load-validation coupling — the audit
+    // demonstrated that dropping the scanner's
+    // trailingFraction/leadingFraction guards left the whole suite
+    // green. tsql-subset is a SHIPPED config that declares
+    // fractionPoint but NOT the flags: `1.` must stay the integer
+    // `1` + a separate dot, and `.5` must stay a dot + the integer
+    // `5`. Red-on-disable: ignore either knob in scanNumber/dispatch
+    // and these exact-text pins flip.
+    auto loaded = GrammarSchema::loadShipped("tsql-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    {
+        auto src = SourceBuffer::fromString("1.", "<tsql>");
+        Tokenizer tk{src, schema};
+        auto [stream, _] = std::move(tk).tokenize();
+        std::vector<Token> tokens;
+        while (!stream.isAtEnd()) tokens.push_back(stream.advance());
+        ASSERT_GE(tokens.size(), 2u);
+        EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::IntLiteral);
+        EXPECT_EQ(textOf(*src, tokens[0]), "1");
+        EXPECT_EQ(textOf(*src, tokens[1]), ".");
+    }
+    {
+        auto src = SourceBuffer::fromString(".5", "<tsql>");
+        Tokenizer tk{src, schema};
+        auto [stream, _] = std::move(tk).tokenize();
+        std::vector<Token> tokens;
+        while (!stream.isAtEnd()) tokens.push_back(stream.advance());
+        ASSERT_GE(tokens.size(), 2u);
+        EXPECT_NE(tokens[0].coreKind, CoreTokenKind::FloatLiteral);
+        EXPECT_EQ(textOf(*src, tokens[0]), ".");
+        EXPECT_EQ(tokens[1].coreKind, CoreTokenKind::IntLiteral);
+        EXPECT_EQ(textOf(*src, tokens[1]), "5");
+    }
+}
+
+TEST(Tokenizer, LoneDotIsNotANumber) {
+    // The leading-fraction dispatch admits `.` ONLY when a decimal
+    // digit follows — a bare dot (or `.foo`) stays the language's
+    // member-access dot.
+    auto h      = loadCSubset(".foo");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 2u);
+    EXPECT_NE(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), ".");
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "foo");
 }
 
 TEST(Tokenizer, HexLiteralLexedAsOneIntToken) {
@@ -212,20 +417,22 @@ TEST(Tokenizer, HexLiteralLexedAsOneIntToken) {
     EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0xff");
 }
 
-TEST(Tokenizer, HexLiteralWithUnderscoreSeparators) {
-    auto h      = loadCSubset("0xDEAD_BEEF");
+TEST(Tokenizer, HexLiteralWithApostropheSeparators) {
+    // FC1 (2026-06-10): c-subset's digitSeparator flipped `_` → `'`
+    // (the C23 separator — `_` was never C).
+    auto h      = loadCSubset("0xDEAD'BEEF");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
-    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0xDEAD_BEEF");
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0xDEAD'BEEF");
 }
 
 TEST(Tokenizer, BinaryLiteralLexedAsOneIntToken) {
-    auto h      = loadCSubset("0b1010_0101");
+    auto h      = loadCSubset("0b1010'0101");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
-    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0b1010_0101");
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0b1010'0101");
 }
 
 TEST(Tokenizer, OctalLiteralLexedAsOneIntToken) {
@@ -377,40 +584,63 @@ TEST(Tokenizer, BareOctalPrefixAtEofIsMalformed) {
     EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_MalformedNumber);
 }
 
-TEST(Tokenizer, HexPrefixFollowedByUnderscoreOnlyEmitsMalformedDiagnostic) {
-    // `0x_` has no actual hex digits — only the underscore that the
-    // base-prefix branch accepts as a body char. The tokenizer still
-    // emits a single IntLiteral spanning `0x_` (so the source span is
-    // covered) but flags it with P_MalformedNumber for the downstream
-    // value parser. Companion: `0b_`, `0o_` behave identically.
-    auto h      = loadCSubset("0x_");
+TEST(Tokenizer, HexPrefixFollowedBySeparatorOnlyEmitsMalformedDiagnostic) {
+    // FC1 rewrite (2026-06-10): the pre-FC1 form used `0x_` (the old
+    // `_` separator). With c-subset's separator now `'` (C23) and the
+    // flanked-by-digits rule, `0x'` enters the hex-prefix arm (the
+    // entry check admits a separator after the prefix so the typo is
+    // DIAGNOSED rather than split into `0` + identifier), finds no
+    // digit body, and emits a malformed `0x` IntLiteral. The dangling
+    // `'` re-enters the dispatch as a char-literal start, so only the
+    // first token + the malformed count are pinned. (`0x_` itself now
+    // lexes as `0` + identifier `x_` — `_` is no longer special.)
+    auto h      = loadCSubset("0x'");
     auto result = lex(h);
-    ASSERT_EQ(result.tokens.size(), 1u);
+    ASSERT_GE(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
-    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0x_");
-    ASSERT_EQ(result.diags.size(), 1u);
-    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_MalformedNumber);
-    EXPECT_EQ(result.diags[0].severity, DiagnosticSeverity::Error);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0x");
+    std::size_t malformedCount = 0;
+    for (auto const& d : result.diags) {
+        if (d.code == DiagnosticCode::P_MalformedNumber) ++malformedCount;
+    }
+    EXPECT_EQ(malformedCount, 1u);
 }
 
-TEST(Tokenizer, BinaryPrefixFollowedByUnderscoreOnlyIsMalformed) {
-    auto h      = loadCSubset("0b___");
+TEST(Tokenizer, BinaryPrefixWithoutDigitsIsMalformed) {
+    // FC1 rewrite (2026-06-10): the pre-FC1 form of this test
+    // (`0b___`) relied on the OLD unconditional separator consume —
+    // separators are now flanked-by-digits (C23 6.4.4.1), so a
+    // separator-only body no longer extends the token. The intent —
+    // a multi-char prefix with no digit body is ONE malformed
+    // IntLiteral — is pinned via the EOF-after-prefix form.
+    auto h      = loadCSubset("0b");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
-    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0b___");
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0b");
     ASSERT_EQ(result.diags.size(), 1u);
     EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_MalformedNumber);
 }
 
-TEST(Tokenizer, ValidHexWithLeadingUnderscoreThenDigitIsAccepted) {
-    // `0x_ff` is well-formed: the underscore is a digit-separator and
-    // `ff` provides actual hex digits. No P_MalformedNumber.
-    auto h      = loadCSubset("0x_ff");
+TEST(Tokenizer, HexPrefixFollowedBySeparatorIsMalformedPerC23) {
+    // FC1 INVERSION (2026-06-10) of the pre-FC1
+    // `ValidHexWithLeadingUnderscoreThenDigitIsAccepted`: C23
+    // 6.4.4.1 requires every digit separator to be flanked by
+    // digits, so `0x'ff` is ill-formed — the prefix arm stops at the
+    // leading separator and `0x` surfaces as a malformed IntLiteral
+    // (exactly one P_MalformedNumber). The tail `'ff` re-enters the
+    // dispatch as a char-literal start, so only the FIRST token +
+    // the malformed-count are pinned here (the tail's char-literal
+    // diagnostics are its own feature's concern).
+    auto h      = loadCSubset("0x'ff");
     auto result = lex(h);
-    ASSERT_EQ(result.tokens.size(), 1u);
+    ASSERT_GE(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
-    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0x_ff");
-    EXPECT_TRUE(result.diags.empty());
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0x");
+    std::size_t malformedCount = 0;
+    for (auto const& d : result.diags) {
+        if (d.code == DiagnosticCode::P_MalformedNumber) ++malformedCount;
+    }
+    EXPECT_EQ(malformedCount, 1u);
 }
 
 TEST(Tokenizer, ZeroFollowedByLetterPinsSchemaKindAsIntLiteral) {
@@ -1623,8 +1853,12 @@ constexpr std::string_view kGenericNumSchema = R"JSON({
   "numberStyle": {
     "decimal":         true,
     "integerPrefixes": [
-      { "prefix": "$",  "radix": 16, "digits": "0-9a-fA-F" },
-      { "prefix": "%",  "radix": 2,  "digits": "01"        }
+      { "prefix": "$",  "radix": 16, "digits": "0-9a-fA-F",
+        "float": { "exponent": { "letters": ["^"], "signOptional": true },
+                   "exponentDigits": "01" } },
+      { "prefix": "%",  "radix": 2,  "digits": "01",
+        "float": { "exponent": { "letters": ["@"], "signOptional": false },
+                   "exponentDigits": "0-7" } }
     ],
     "exponent":        { "letters": ["^"], "signOptional": false },
     "fractionPoint":   ".",
@@ -1680,6 +1914,116 @@ TEST(Tokenizer, GenericNumberStyleApostropheSeparator) {
     ASSERT_EQ(tokens.size(), 1u);
     EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::IntLiteral);
     EXPECT_EQ(textOf(*src, tokens[0]), "1'000'000");
+}
+
+TEST(Tokenizer, GenericSeparatorTrailingIsNotConsumed) {
+    // FC1 between-digits rule (C23 6.4.4.1, applied universally to
+    // any schema-declared separator): a TRAILING separator is not
+    // part of the number. Pre-FC1 the scanner consumed it
+    // unconditionally — `1'000'` lexed as ONE token swallowing the
+    // final quote (red-on-disable lever: revert the flanked-by-
+    // digits guard and tokens[0] becomes "1'000'"). The synthetic
+    // non-C schema proves the rule is engine-universal, not a
+    // c-subset special case.
+    auto loaded = GrammarSchema::loadFromText(kGenericNumSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("1'000'", "<gen>");
+    Tokenizer tk{src, schema};
+    auto [stream, _] = std::move(tk).tokenize();
+    std::vector<Token> tokens;
+    while (!stream.isAtEnd()) tokens.push_back(stream.advance());
+    ASSERT_GE(tokens.size(), 1u);
+    EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*src, tokens[0]), "1'000");
+}
+
+TEST(Tokenizer, GenericSeparatorMustBeFlankedByDigits) {
+    // FC1: a DOUBLED separator ends the number at the last digit —
+    // `1''2` is two-sided ill-formed per C23, so the number is just
+    // "1" (pre-FC1 the loose scanner produced one "1''2" token).
+    auto loaded = GrammarSchema::loadFromText(kGenericNumSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("1''2", "<gen>");
+    Tokenizer tk{src, schema};
+    auto [stream, _] = std::move(tk).tokenize();
+    std::vector<Token> tokens;
+    while (!stream.isAtEnd()) tokens.push_back(stream.advance());
+    ASSERT_GE(tokens.size(), 1u);
+    EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*src, tokens[0]), "1");
+}
+
+// ─── FC1 cycle 2: prefix-float genericity pins ─────────────────────────────
+// The synthetic schema's `$` prefix declares a float continuation with
+// the NON-C letter `^` and BINARY exponent digits ("01"); the `%`
+// prefix uses `@` with sign-NOT-optional and octal exponent digits. If
+// any of `p`/`.`-after-`0x`/decimal-exponent-digits were hardcoded in
+// the engine, these would tokenize wrong.
+
+namespace {
+[[nodiscard]] std::vector<Token>
+lexGeneric(std::string_view text, std::shared_ptr<SourceBuffer>& srcOut) {
+    auto loaded = GrammarSchema::loadFromText(kGenericNumSchema);
+    if (!loaded.has_value()) {
+        ADD_FAILURE() << "kGenericNumSchema must load";
+        return {};
+    }
+    auto schema = *loaded;
+    srcOut      = SourceBuffer::fromString(std::string{text}, "<gen>");
+    Tokenizer tk{srcOut, schema};
+    auto [stream, _] = std::move(tk).tokenize();
+    std::vector<Token> tokens;
+    while (!stream.isAtEnd()) tokens.push_back(stream.advance());
+    return tokens;
+}
+}  // namespace
+
+TEST(Tokenizer, GenericPrefixFloatLexesWithCustomLetterAndDigits) {
+    std::shared_ptr<SourceBuffer> src;
+    auto tokens = lexGeneric("$1.8^11", src);
+    ASSERT_EQ(tokens.size(), 1u);
+    EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::FloatLiteral);
+    EXPECT_EQ(textOf(*src, tokens[0]), "$1.8^11");
+}
+
+TEST(Tokenizer, GenericPrefixFloatExponentDigitsClassIsHonored) {
+    // `2` is NOT in the `$` prefix's exponentDigits class ("01") —
+    // the letter commits the float, the digit run can't start, the
+    // span is ONE malformed token. The knob-that-lies guard for
+    // `exponentDigits`: a hardcoded "0-9" would happily accept it.
+    std::shared_ptr<SourceBuffer> src;
+    auto tokens = lexGeneric("$1.8^2", src);
+    ASSERT_GE(tokens.size(), 1u);
+    EXPECT_EQ(textOf(*src, tokens[0]), "$1.8^");
+}
+
+TEST(Tokenizer, GenericPrefixFloatExponentIsRequired) {
+    // Engine rule (no knob until a language needs one): a committed
+    // prefix-float without its exponent is malformed.
+    std::shared_ptr<SourceBuffer> src;
+    auto tokens = lexGeneric("$1.8", src);
+    ASSERT_GE(tokens.size(), 1u);
+    EXPECT_EQ(textOf(*src, tokens[0]), "$1.8");
+    EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::FloatLiteral);
+}
+
+TEST(Tokenizer, GenericPrefixFloatSignNotOptionalIsCommittedMalformed) {
+    // `%`'s float declares signOptional=false: `@+1` does NOT accept
+    // the sign, the committed float dies loudly at `%1.1@` (this
+    // DIVERGES from the decimal exponent's documented
+    // leave-the-letter split — a prefix-float has no valid split to
+    // fall back to; see NumberPrefixFloat's doc).
+    std::shared_ptr<SourceBuffer> src;
+    auto tokens = lexGeneric("%1.1@+1", src);
+    ASSERT_GE(tokens.size(), 1u);
+    EXPECT_EQ(textOf(*src, tokens[0]), "%1.1@");
+
+    auto tokens2 = lexGeneric("%1.1@7", src);
+    ASSERT_EQ(tokens2.size(), 1u);
+    EXPECT_EQ(tokens2[0].coreKind, CoreTokenKind::FloatLiteral);
+    EXPECT_EQ(textOf(*src, tokens2[0]), "%1.1@7");
 }
 
 TEST(Tokenizer, GenericNumberStyleFloatSuffixPromotesKind) {

@@ -395,13 +395,37 @@ compileAndRunArm(fs::path const& exampleDir,
     SCOPED_TRACE(std::string{"arm="} + armLabel);
     ArmResult armResult;
     ScratchDir scratch{Location::InsideRepo, "examples"};
-    // Copy EVERY source file into the scratch dir (one file for the single-CU form, N for
-    // a multi-CU example). The first source names the artifact stem.
+    // Mirror the EXAMPLE DIR's file neighborhood into the scratch dir
+    // (every regular file except the manifest) — not just the declared
+    // sources. The CLI-subprocess runner (integrated_tests) compiles IN
+    // the example dir, where a quote include resolves against the
+    // includer's directory; the in-process scratch must offer the same
+    // neighbor files or an include-bearing example (e.g.
+    // include_typedef_cast's myint.h) false-fails here only. The entry
+    // files passed to the driver stay exactly `m.sources`. CONTRACT: the
+    // mirror is the IMMEDIATE dir only (no subdirectories) — an example
+    // whose includes live in a subdir needs this loop made recursive
+    // (recreating relative paths) in the same change.
+    for (auto const& entry : fs::directory_iterator(exampleDir)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().filename() == "expected.json") continue;
+        fs::copy_file(entry.path(),
+                      scratch.path() / entry.path().filename(),
+                      fs::copy_options::overwrite_existing);
+    }
+    // Every DECLARED source must have been among the copied files — a
+    // manifest typo fails loud here, not as a confusing driver error.
     std::vector<std::string> srcPaths;
     srcPaths.reserve(m.sources.size());
     for (auto const& s : m.sources) {
         auto const sp = scratch.path() / s;
-        fs::copy_file(exampleDir / s, sp, fs::copy_options::overwrite_existing);
+        if (!fs::exists(sp)) {
+            ADD_FAILURE() << "manifest source '" << s
+                          << "' not found in example dir "
+                          << exampleDir.generic_string();
+            armResult.status = ArmStatus::Poisoned;
+            return armResult;
+        }
         srcPaths.push_back(sp.generic_string());
     }
     scratch.useAsCwd();

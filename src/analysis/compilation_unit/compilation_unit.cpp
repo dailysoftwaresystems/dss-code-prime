@@ -63,13 +63,15 @@ CompilationUnit::CompilationUnit(PrivateTag,
                                  std::vector<Tree>                    trees,
                                  DiagnosticReporter                   driverDiagnostics,
                                  std::vector<CrossTreeRef>            crossRefs,
-                                 std::vector<std::filesystem::path>   shippedLibDescriptors)
+                                 std::vector<std::filesystem::path>   shippedLibDescriptors,
+                                 std::uint32_t                        typeNameReparseCount)
     : id_(id)
     , schema_(std::move(schema))
     , trees_(std::move(trees))
     , driverDiagnostics_(std::move(driverDiagnostics))
     , crossRefs_(std::move(crossRefs))
-    , shippedLibDescriptors_(std::move(shippedLibDescriptors)) {}
+    , shippedLibDescriptors_(std::move(shippedLibDescriptors))
+    , typeNameReparseCount_(typeNameReparseCount) {}
 
 CompilationUnit::~CompilationUnit()                                            = default;
 CompilationUnit::CompilationUnit(CompilationUnit&&) noexcept                   = default;
@@ -157,6 +159,10 @@ void UnitBuilder::addTree(Tree&& tree) {
         cuFatal("UnitBuilder::addTree called after finish()");
     }
     trees_.push_back(std::move(tree));
+    // FC2: keep the parse-sidecar vector index-parallel by construction.
+    // An externally-built tree has no parse sidecar (empty candidates,
+    // no source/schema handle) — it is never oracle-reparsed.
+    sidecars_.emplace_back();
 }
 
 TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
@@ -190,8 +196,17 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
     // downstream per-tree semantic + lowering dispatch.
     Tokenizer tk{src, schema};
     auto [stream, lexDiags] = std::move(tk).tokenize();
-    Parser p{src, std::move(schema), std::move(stream), {}, std::move(lexDiags)};
-    addTree(std::move(p).parse().tree);
+    Parser p{src, schema, std::move(stream), {}, std::move(lexDiags)};
+    ParseResult result = std::move(p).parse();
+    addTree(std::move(result.tree));
+    // FC2: fill the sidecar addTree just pushed — the parse's ambiguous
+    // type-name candidates + exported global type names (the finish()-time
+    // oracle's inputs) and the handles a one-shot reparse needs.
+    auto& sidecar           = sidecars_.back();
+    sidecar.candidates      = std::move(result.typeNameCandidates);
+    sidecar.globalTypeNames = std::move(result.globalTypeNames);
+    sidecar.source          = std::move(src);
+    sidecar.schema          = std::move(schema);
     return trees_.back().id();
 }
 
@@ -386,6 +401,115 @@ CompilationUnit UnitBuilder::finish() && {
         chooseResolver(schema)->resolve(context);
     }
 
+    // ── FC2 type-name oracle + conditional reparse ────────────────────────
+    //
+    // Premise: an `#include`d header's typedefs are invisible to the
+    // INCLUDER's parse (each file parses alone; trees merge post-parse via
+    // crossRefs), so `(MyT)-x` with MyT from a header froze as the value
+    // reading and recorded an AmbiguousTypeNameCandidate. Here — after the
+    // resolvers loaded every include target, while `trees_` is still
+    // mutable — the oracle resolves each candidate against the UNION of
+    // every tree's exported global TYPE names (each parse's binder sketch
+    // already harvested its own; nested includes are covered because the
+    // union spans ALL trees in the CU). A tree with ≥1 resolved candidate
+    // is re-tokenized + re-parsed ONCE with the resolved names seeded into
+    // the binder sketch's global scope, and REPLACED in place. The second
+    // parse's diagnostics replace the first's wholesale (the Tree owns its
+    // diagnostic stream — no double-report). Candidates the oracle cannot
+    // resolve keep the value reading (semantic diagnoses misuse — fail
+    // loud, correct C behavior). Single round by design: candidates that
+    // EMERGE on a reparse are not re-processed.
+    //
+    // Languages with no binder declarations record no candidates → this
+    // whole block is a no-op scan (zero cost, zero behavior).
+    std::uint32_t typeNameReparseCount = 0;
+    {
+        bool anyCandidates = false;
+        for (auto const& sc : sidecars_) {
+            if (!sc.candidates.empty()) { anyCandidates = true; break; }
+        }
+        if (anyCandidates) {
+            std::unordered_set<std::string> oracle;
+            for (auto const& sc : sidecars_) {
+                for (auto const& n : sc.globalTypeNames) oracle.insert(n);
+            }
+            // `sidecars_` is index-parallel to `trees_` by construction
+            // (addTree appends both) — fatal if that invariant ever broke.
+            if (sidecars_.size() != trees_.size()) {
+                cuFatal("UnitBuilder::finish: parse-sidecar vector out of "
+                        "sync with trees");
+            }
+            for (std::size_t i = 0; i < trees_.size(); ++i) {
+                auto& sc = sidecars_[i];
+                if (sc.candidates.empty()) continue;
+                std::vector<std::string>        seeds;
+                std::unordered_set<std::string> seen;
+                for (auto const& cand : sc.candidates) {
+                    if (!oracle.contains(cand.name)) continue;
+                    if (seen.insert(cand.name).second) {
+                        seeds.push_back(cand.name);
+                    }
+                }
+                if (seeds.empty()) continue;   // unresolved → value reading stands
+                if (!sc.source || !sc.schema) {
+                    // Candidates exist but the tree was injected via the
+                    // raw addTree path (no source/schema handle) — we
+                    // cannot reparse what we did not parse. Unreachable
+                    // for builder-parsed trees; fail loud over silently
+                    // dropping a resolvable cross-file type.
+                    cuFatal("UnitBuilder::finish: type-name candidates on "
+                            "a tree with no reparse handles");
+                }
+                Tokenizer tk{sc.source, sc.schema};
+                auto [stream, lexDiags] = std::move(tk).tokenize();
+                ParserConfig cfg;
+                cfg.seedGlobalTypeNames = std::move(seeds);
+                Parser p{sc.source, sc.schema, std::move(stream),
+                         std::move(cfg), std::move(lexDiags)};
+                ParseResult result = std::move(p).parse();
+                trees_[i]          = std::move(result.tree);
+                sc.candidates      = std::move(result.typeNameCandidates);
+                sc.globalTypeNames = std::move(result.globalTypeNames);
+                ++typeNameReparseCount;
+            }
+            if (typeNameReparseCount > 0) {
+                // A reparsed tree carries a NEW TreeId (and fresh NodeIds),
+                // so every crossRefs edge built above is potentially stale.
+                // Re-run the resolvers over the FINAL tree set into fresh
+                // outputs. The first pass's driver diagnostics + descriptor
+                // paths remain authoritative (they are path-keyed, not
+                // tree-id-keyed); the re-resolve writes into scratch sinks
+                // so nothing double-reports. Inputs are identical (every
+                // include target is already loaded; loadAndAdd_ dedups by
+                // canonical path), so the edge SET is the same — only the
+                // ids are refreshed.
+                crossRefs.clear();
+                DiagnosticReporter scratchDiags{
+                    DiagnosticReporter::Config{.dedupWindow = 0}};
+                std::vector<std::filesystem::path> scratchDescriptors;
+                ResolutionContext recontext{
+                    trees_,
+                    scratchDiags,
+                    includeDirs_,
+                    systemDirs_,
+                    [this](std::filesystem::path const& path, bool& ok,
+                           std::shared_ptr<GrammarSchema const> schema) {
+                        return loadAndAdd_(path, ok, std::move(schema));
+                    },
+                    crossRefs,
+                    scratchDescriptors,
+                };
+                resolvedSchemaIds.clear();
+                for (auto const& schema : schemas_) {
+                    if (!resolvedSchemaIds.insert(schema->schemaId().v).second) {
+                        continue;
+                    }
+                    chooseResolver(schema)->resolve(recontext);
+                }
+            }
+        }
+    }
+
     finished_ = true;
     return CompilationUnit{
         CompilationUnit::PrivateTag{},
@@ -395,6 +519,7 @@ CompilationUnit UnitBuilder::finish() && {
         std::move(driverDiagnostics_),
         std::move(crossRefs),
         std::move(shippedLibDescriptors),
+        typeNameReparseCount,
     };
 }
 

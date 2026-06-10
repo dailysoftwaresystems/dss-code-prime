@@ -614,7 +614,11 @@ Every `expr` shape now declares the three Pratt-walker wrapper rule names the en
 "numberStyle": {
   "decimal":         true,             // permit bare decimal digits
   "integerPrefixes": [                 // optional; empty = decimal only
-    { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F" },
+    { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F",
+      "float": {                       // optional (FC1c2): prefix-float continuation
+        "exponent": { "letters": ["p", "P"], "signOptional": true },
+        "exponentDigits": "0-9"        // default "0-9" — C hex-float exponents are DECIMAL
+      } },
     { "prefix": "0b", "radix": 2,  "digits": "01" },
     { "prefix": "0o", "radix": 8,  "digits": "0-7" }
   ],
@@ -623,7 +627,9 @@ Every `expr` shape now declares the three Pratt-walker wrapper rule names the en
     "signOptional": true
   },
   "fractionPoint":   ".",              // optional; absent = no float literal
-  "digitSeparator":  "_",              // optional; absent = no separators
+  "trailingFraction": true,            // optional (FC1c2, default false): `1.` is a float
+  "leadingFraction":  true,            // optional (FC1c2, default false): `.5` is a float
+  "digitSeparator":  "'",              // optional; absent = no separators
   "integerSuffixes": ["u","U","l","L","ll","LL","ul","UL","ull","ULL"],
   "floatSuffixes":   ["f","F","d","D"],
   "emitKind": {                        // which token kinds the scanner emits
@@ -634,13 +640,16 @@ Every `expr` shape now declares the three Pratt-walker wrapper rule names the en
 ```
 
 - `decimal` (bool, default `false`) — permit bare digits at start of a number.
-- `integerPrefixes[*]` — `{ prefix, radix, digits }`. The scanner walks prefixes in declaration order; the first whose `digits` class accepts the byte after the prefix wins. `radix` ∈ [2, 36]. `digits` is a character class string supporting `a-z` ranges (e.g. `"0-9a-fA-F"`).
-- `exponent` — `{ letters, signOptional }`. `letters[*]` are single ASCII characters; the scanner accepts any one of them as the exponent introducer. `signOptional` defaults to `true`. **Semantics**: `signOptional: true` means a `+` or `-` MAY appear between the exponent letter and digits (`1e+3`, `1e-3`, `1e3` all accepted — the C-style default). `signOptional: false` means NO sign is permitted there — `1e+3` tokenizes as `1` + identifier-or-token `e` + `+` + `3`, NOT as one float. The name does NOT mean "sign required"; that mode is intentionally not modeled.
+- `integerPrefixes[*]` — `{ prefix, radix, digits, float? }`. The scanner walks prefixes in declaration order; the first whose `digits` class accepts the byte after the prefix wins. `radix` ∈ [2, 36]. `digits` is a character class string supporting `a-z` ranges (e.g. `"0-9a-fA-F"`).
+- `integerPrefixes[*].float` — optional **prefix-float continuation** (FC1 cycle 2 — C23 hex-floats `0x1.8p3`). The prefix may continue past its integer digit run into an optional fraction (the language's `fractionPoint` + the PREFIX's digit class, digits required on at least ONE side of the point — `0x1.p3` and `0x.8p3` are valid, `0x.p3` is not) followed by a **required** exponent: one of `float.exponent.letters` + an optional sign (per `float.exponent.signOptional`) + ≥1 digit from `float.exponentDigits` (its OWN class — C hex-float exponents are decimal while the mantissa is hex). Separators are flanked-by-digits in every run. Once the continuation **commits** (a fraction or an exponent letter was consumed) and cannot complete, the whole span is ONE malformed token + `P_MalformedNumber` — never a silent split. Only `floatSuffixes` apply to a completed prefix-float; the decimal arm's f-suffix INT→FLOAT *promotion* deliberately does **not** apply in the prefix arm (suffix letters can BE digits there: `0x1f` is an integer, `0b1f` is `0b1` + a word). The loader rejects an exponent letter that lands inside the prefix's digit class (the digit run would consume it first — a silently-dead config) and unknown keys in the `float` block. An `exponentRequired: false` knob is intentionally not modeled until a language consumes it.
+- `exponent` — `{ letters, signOptional }`. `letters[*]` are single ASCII characters; the scanner accepts any one of them as the exponent introducer. `signOptional` defaults to `true`. **Semantics**: `signOptional: true` means a `+` or `-` MAY appear between the exponent letter and digits (`1e+3`, `1e-3`, `1e3` all accepted — the C-style default). `signOptional: false` means NO sign is permitted there — `1e+3` tokenizes as `1` + identifier-or-token `e` + `+` + `3`, NOT as one float. The name does NOT mean "sign required"; that mode is intentionally not modeled. **Note the divergence in the prefix-float context**: a prefix-float exponent letter that cannot complete yields the loud committed-malformed token (above), not the decimal split — a prefix-float has no valid split to fall back to.
 - `fractionPoint` — single ASCII char (typically `.`). When set AND followed by a digit, the scanner promotes the literal to float.
-- `digitSeparator` — single ASCII char. Accepted (and consumed silently) between digits.
-- `integerSuffixes` / `floatSuffixes` — string arrays; the scanner longest-matches against them after the number body. A float-suffix match promotes the kind.
+- `trailingFraction` (bool, default `false`; FC1 cycle 2) — `digit-sequence .` (C23 `1.`) lexes as ONE float. Off, `1.` splits into the integer + the dot token — the right default for range-operator languages (`1..5`). Requires `fractionPoint`.
+- `leadingFraction` (bool, default `false`; FC1 cycle 2) — `. digit-sequence` (C23 `.5`) lexes as ONE float; the number-entry dispatch admits the fraction point ONLY when the next byte is a decimal digit (a bare `.` / `.foo` stays the language's dot token). Requires `fractionPoint`.
+- `digitSeparator` — single ASCII char. Consumed only **between digits** (C23 6.4.4.1 flanked-by-digits, FC1): a leading, trailing, or doubled separator ends the number at the last digit.
+- `integerSuffixes` / `floatSuffixes` — string arrays; the scanner longest-matches against them after the number body. A float-suffix match promotes the kind (decimal arm only — see the prefix-float note above).
 - `emitKind.integer` — required; names the token kind the scanner emits for integer literals.
-- `emitKind.float` — required IFF any float-producing facet is declared (`exponent` / `fractionPoint` / non-empty `floatSuffixes`).
+- `emitKind.float` — required IFF any float-producing facet is declared (`exponent` / `fractionPoint` / non-empty `floatSuffixes` / any prefix `float` block / `trailingFraction` / `leadingFraction`).
 
 Languages with no numeric literals omit the block entirely. Configs that reference `IntLiteral`/`FloatLiteral` in any shape but declare no `numberStyle` fail to load (`C_MissingNumberStyle`).
 
@@ -651,7 +660,8 @@ Languages with no numeric literals omit the block entirely. Configs that referen
 | `C_MissingWrapperRules` | An `expr` shape was declared without a complete `wrapperRules` block, or one of `binary`/`unary`/`postfix` is missing/empty/non-string. Names declared here cannot collide with top-level `shapes`. |
 | `C_MissingNumberStyle` | The language declared `IntLiteral`/`FloatLiteral` in any shape but omitted the `numberStyle` block entirely. |
 | `C_MissingField` on `numberStyle/...` | A required sub-field is absent or empty (e.g. `emitKind`, `emitKind.integer`, a prefix's `prefix`/`radix`/`digits`). |
-| `C_InvalidNumberStyle` | The block is present but malformed: wrong JSON type, `radix` outside `[2, 36]`, `fractionPoint`/`digitSeparator` not single-char, non-bool `signOptional`, etc. |
+| `C_InvalidNumberStyle` | The block is present but malformed: wrong JSON type, `radix` outside `[2, 36]`, `fractionPoint`/`digitSeparator` not single-char, non-bool `signOptional`, an unknown key in a prefix's `float` block, an empty `float.exponentDigits`, a float exponent letter inside the prefix's digit class (a silently-dead config), or `trailingFraction`/`leadingFraction` without `fractionPoint`. |
+| `C_MissingField` on `.../float/exponent` | A prefix declared a `float` block without its required `exponent` sub-object (a prefix-float can never complete without one). |
 | `C_UnknownToken` on `numberStyle/emitKind/*` | The named token kind isn't declared anywhere (built-in or `tokens`). |
 
 ### 11.6 `artifactProfiles` — supported output shapes (plan 06 AP1)
@@ -680,6 +690,16 @@ An **optional** top-level array naming the **artifact profiles** a language can 
 | `C_UnknownArtifactProfile` | An entry isn't in the registered set, OR `artifactProfiles` isn't an array, OR an entry isn't a string. Use one of `cli`/`gui`/`lib`/`staticlib`/`script`/`sproc`/`transpile`/`shader`/`hdl`. |
 | `C_ConflictingField` on `artifactProfiles` | The same profile is listed twice; remove the duplicate (the load hard-fails until you do). |
 
+### 11.7 Cast expressions — `commitRequiresTypeName`, `semantics.casts`, `hirLowering.castRule` (v0.0.2 FC2)
+
+Three coupled surfaces let a language declare a C-style cast `(type)expr` whose type position admits a **bare identifier** (a typedef name) — the classically ambiguous form (`(a)-b` is a subtraction when `a` is a value, a cast of `-b` when `a` names a type):
+
+- **`commitRequiresTypeName`** (shape-body field, on the cast rule): names the child position holding the type subtree. When the rule is tried as a **speculative** alternative and that subtree's type base is a *lone identifier* (no keyword/tag/star/const — those forms are structurally unambiguous), the parser commits the branch only per its triage: the identifier is **sketch-known as a type** in scope → commit; sketch-known as a **value** (shadowing-aware) → roll back to the value reading; **unknown** → commit only if the follower token cannot continue a value reading (derived from the operator table, never a token list), else roll back and record an ambiguous-candidate for the post-include oracle (one whole-file reparse with the merged trees' exported type names seeded). The **binder sketch** feeding this is built from the language's existing `semantics.declarations` rows (`kind: "type"` vs `"variable"` + the `name` child position) and `semantics.scopes` — one declaration, two consumers; a language with no declarations gets an inert sketch. Requires `semantics.identifierToken` (load-rejected otherwise).
+- **`semantics.casts`** (array of `{rule, typeChild, operandChild}`): pass 2 resolves the type child like any type node (typedefs included), stamps it and the cast node with the **target type**, and validates explicit-castability (scalar↔scalar incl. float↔int, pointer↔pointer, pointer↔integer; struct/union values, `void`, float↔pointer reject with `S_InvalidCast`).
+- **`hirLowering.castRule`**: the HIR lowering arm — the stamped target type + the lowered operand become an explicit `Cast` node (the compound-literal stamped-type-probe precedent).
+
+c-subset declares `castExpr` = `[ParenOpen, castTypeRef, ParenClose, castOperand]` as a speculative `operand` alternative, with `castOperand` a second `expr`-entry rule at `minPrecedence` 90 so the cast binds at unary tier (`(int)a + b` casts only `a`; postfix binds inside the operand).
+
 ---
 
 ## 12. Shipped-library FFI descriptor
@@ -690,7 +710,7 @@ An **optional** top-level array naming the **artifact profiles** a language can 
 
 A shipped system library — libc / `msvcrt.dll`, `kernel32`, `libSystem`, … — exports symbols (`puts`, `malloc`, `GetStdHandle`) that programs call without ever defining them. To call one in C you `#include <stdio.h>` and the header carries the prototype; you never re-declare `puts` yourself.
 
-DSS Code Prime ships those prototypes **once**, language-neutrally, as a JSON descriptor under `src/dss-config/shippedLibs/<platform>/<lib>.json`. A program does an angle/system include (`#include <stdio.h>`, or whatever import form the source language declares) and the symbols become visible to the call — with **no inline `extern` re-declaration** in the program. Because the descriptor is neutral JSON (not per-language source), one `stdio.json` serves c-subset and any other language that imports it; a second language reuses the same descriptors with zero engine change.
+DSS Code Prime ships those prototypes **once**, language-neutrally, as a JSON descriptor under `src/dss-config/shippedLibs/<lib>.json` (one neutral set — per-target library names resolve via the per-format `library` map, §12.5). A program does an angle/system include (`#include <stdio.h>`, or whatever import form the source language declares) and the symbols become visible to the call — with **no inline `extern` re-declaration** in the program. Because the descriptor is neutral JSON (not per-language source), one `stdio.json` serves c-subset and any other language that imports it; a second language reuses the same descriptors with zero engine change.
 
 The reader is `dss::ffi::readShippedLibDescriptor` ([`src/ffi/shipped_lib_descriptor.hpp`](../src/ffi/shipped_lib_descriptor.hpp)). It is a pure function of `(path, interner, typeReg, reporter)` — it branches on no source language, no CPU target, no object format. Every type it builds is interned through the caller's `TypeInterner`.
 
@@ -732,7 +752,7 @@ The shipped `stdio.json` (`src/dss-config/shippedLibs/windows-x86_64/stdio.json`
 How a `#include <stdio.h>` ends up as a resolved call to `puts`:
 
 1. **Angle/system include.** The source language declares the angle/system include form via its `imports` block's `systemPathToken` ([§11.1](#111-imports--config-driven-import-resolution)). The angle form `#include <stdio.h>` is the **system** form (distinct from the quote form's local-source search).
-2. **Map to a descriptor.** The import resolver maps the requested header to `<stem>.json` — `<stdio.h>` (or `<stdio>`) becomes `stdio.json` — and searches the `shippedLibDirs` system search path (the per-language analogue of C's `/usr/include`, declared in `SemanticConfig.shippedLibDirs`, e.g. `shippedLibs/windows-x86_64`). A hit records the resolved descriptor path on the compilation unit; unlike a quote include it is **not** parsed as a source Tree and produces no `CrossTreeRef`.
+2. **Map to a descriptor.** The import resolver maps the requested header to `<stem>.json` — `<stdio.h>` (or `<stdio>`) becomes `stdio.json` — and searches the `shippedLibDirs` system search path (the per-language analogue of C's `/usr/include`, declared in `SemanticConfig.shippedLibDirs`, e.g. the neutral `shippedLibs` root). A hit records the resolved descriptor path on the compilation unit; unlike a quote include it is **not** parsed as a source Tree and produces no `CrossTreeRef`.
 3. **Inject into scope.** The semantic phase reads each recorded descriptor via `readShippedLibDescriptor`, decoding every `signature` into the CU's interner and injecting the symbols (as extern functions / globals) into the semantic scope — so the program's call to `puts` resolves to a declared symbol.
 4. **FFI synthesis → linker import.** The decoded externs flow through the FFI synthesis path (synthesizing the HIR extern records) and on to the linker as library imports, with the owning library taken from `library` (or the language's `externLibraryByFormat` fallback).
 
@@ -749,4 +769,4 @@ The reader never returns a partial result — if **any** diagnostic is emitted d
 
 ### 12.5 Platform note
 
-The descriptor directory is named **per-platform** (`windows-x86_64`), and the language's `shippedLibDirs` names that exact platform subdirectory. Three platform surfaces are shipped and validated to decode (`windows-x86_64`, `linux-x86_64`, `macos-arm64`) — the latter two differ from Windows on the `long`-width ABI (LP64 vs. LLP64; see the shippedLibs README). Automatic platform selection — picking the directory from the active target's triple — is **deferred** (anchor `D-FFI-SHIPPED-LIB-PLATFORM-SELECT`); for now each shipped dir names its platform explicitly, the language config points at `windows-x86_64`, and the other two are staged for the selector.
+Descriptors are **language-neutral AND platform-neutral** (Model 3, v0.0.2): one descriptor set under the neutral `shippedLibs/` root serves every platform — the per-symbol `library` field is a **per-object-format map** (`{"pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "libSystem.B.dylib"}`) resolved per-target at compile time via `objectFormatKindName`, with the language's `externLibraryByFormat` as the fallback for a missing key (an *unknown* format key fails loud). The earlier per-platform directory layout (`windows-x86_64/` etc.) and its automatic-selection deferral (`D-FFI-SHIPPED-LIB-PLATFORM-SELECT`) were **dissolved by Model 3** — the directory carries no platform name and `shippedLibDirs` points at the neutral root. ABI-divergent signature widths (LP64 vs. LLP64 `long`) remain a descriptor-content concern; see the shippedLibs README and anchor `D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH`.

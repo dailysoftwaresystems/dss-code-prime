@@ -4,6 +4,7 @@
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
 
+#include <array>
 #include <format>
 #include <optional>
 #include <unordered_map>
@@ -15,27 +16,40 @@ namespace {
 
 using dss::report;
 
-// Per-pass shared cache for "the mov opcode in this schema". Looked
-// up once; reused for every implicit move emitted.
+// Per-pass shared cache for "the register-copy opcode in this schema",
+// resolved PER REGISTER CLASS (FC2 Part B — the registerClassOps
+// table). The implicit 2-address copy must use the destination's
+// class-correct move (x86_64: GPR `mov`, FPR `movaps`) — a GPR mov
+// against an FPR ordinal assembles to valid-looking-but-wrong bytes.
 struct PassState {
     TargetSchema const& schema;
-    std::optional<std::uint16_t> movOpcode;
+    // One lazily-resolved cell per LirRegClass ordinal; the inner
+    // optional<optional> distinguishes "not yet looked up" from
+    // "looked up, class has no move".
+    std::array<std::optional<std::optional<std::uint16_t>>, 5> movByClass{};
 
     [[nodiscard]] std::optional<std::uint16_t>
-    resolveMov(DiagnosticReporter& reporter) {
-        if (movOpcode.has_value()) return movOpcode;
-        auto const op = schema.opcodeByMnemonic("mov");
-        if (!op.has_value()) {
-            report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
-                   DiagnosticSeverity::Error,
-                   std::format("2-address legalize: target schema '{}' "
-                               "lacks a 'mov' opcode required to "
-                               "synthesize the implicit register copy",
-                               schema.name()));
-            return std::nullopt;
+    resolveMov(LirRegClass cls, DiagnosticReporter& reporter) {
+        auto const c = static_cast<std::size_t>(cls);
+        if (c >= movByClass.size()) return std::nullopt;
+        if (!movByClass[c].has_value()) {
+            movByClass[c] = schema.regClassOpOpcode(
+                static_cast<TargetRegClass>(c), RegClassOp::Move);
+            if (!movByClass[c]->has_value()) {
+                report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                       DiagnosticSeverity::Error,
+                       std::format("2-address legalize: target schema '{}' "
+                                   "declares no 'move' operation for "
+                                   "register class '{}' (registerClassOps) "
+                                   "— cannot synthesize the implicit "
+                                   "register copy; a GPR mov against this "
+                                   "class would silently mis-encode",
+                                   schema.name(),
+                                   targetRegClassName(
+                                       static_cast<TargetRegClass>(c))));
+            }
         }
-        movOpcode = *op;
-        return movOpcode;
+        return *movByClass[c];
     }
 };
 
@@ -127,7 +141,8 @@ legalizeTwoAddress(Lir const&          src,
                     && newOps[0].reg != result_reg;
 
                 if (needsLegalize) {
-                    auto const movOp = state.resolveMov(reporter);
+                    auto const movOp =
+                        state.resolveMov(result_reg.regClass(), reporter);
                     if (!movOp.has_value()) {
                         // Convergence-fix A: cannot synthesize the
                         // implicit `mov` (schema lacks `mov`). The

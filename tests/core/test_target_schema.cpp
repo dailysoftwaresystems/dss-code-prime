@@ -312,6 +312,131 @@ TEST(TargetSchema, ImplicitRegistersValidDeclarationLoads) {
     EXPECT_EQ(ir.clobberedOrdinals[1], *rdxOrd);
 }
 
+// ─── FC1 (V2-4.X, 2026-06-10): role-tagged projection maps ─────────────────
+// (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT closure substrate.)
+
+TEST(TargetSchema, ImplicitRegisterRolesValidDeclarationLoadsAndResolves) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"fakediv","result":"value",
+               "implicitRegisters":{
+                 "inputs":["rax","rdx"],
+                 "outputs":["rax","rdx"],
+                 "clobbered":["rax","rdx"],
+                 "inputRoles":  {"dividend":"rax"},
+                 "outputRoles": {"quotient":"rax","remainder":"rdx"}
+               }}
+            ],
+            "registers":[
+              {"name":"rax","class":"gpr","widthBytes":8},
+              {"name":"rdx","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_TRUE(r.has_value()) << "valid role maps must load";
+    auto const& sch = **r;
+    auto const op = sch.opcodeByMnemonic("fakediv");
+    ASSERT_TRUE(op.has_value());
+    auto const* info = sch.opcodeInfo(*op);
+    ASSERT_NE(info, nullptr);
+    ASSERT_TRUE(info->implicitRegisters.has_value());
+    auto const& ir = *info->implicitRegisters;
+    auto const raxOrd = sch.registerByName("rax");
+    auto const rdxOrd = sch.registerByName("rdx");
+    ASSERT_TRUE(raxOrd.has_value() && rdxOrd.has_value());
+    // The consumer-facing lookup helpers resolve role → ordinal.
+    auto const dividend  = ir.inputOrdinalForRole("dividend");
+    auto const quotient  = ir.outputOrdinalForRole("quotient");
+    auto const remainder = ir.outputOrdinalForRole("remainder");
+    ASSERT_TRUE(dividend.has_value());
+    ASSERT_TRUE(quotient.has_value());
+    ASSERT_TRUE(remainder.has_value());
+    EXPECT_EQ(*dividend,  *raxOrd);
+    EXPECT_EQ(*quotient,  *raxOrd);
+    EXPECT_EQ(*remainder, *rdxOrd);
+    // An undeclared role resolves to nothing (the lowering fail-louds
+    // at its query site).
+    EXPECT_FALSE(ir.outputOrdinalForRole("dividend").has_value());
+    EXPECT_FALSE(ir.inputOrdinalForRole("quotient").has_value());
+}
+
+// An UNREGISTERED role name ("remaindr" typo) must fail at LOAD —
+// the lowering queries a registered vocabulary, so the typo would
+// otherwise surface only as a confusing missing-role diagnostic at
+// the first divide lowering.
+TEST(TargetSchema, ImplicitRegisterRoleUnknownRoleNameRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"fakediv","result":"value",
+               "implicitRegisters":{
+                 "outputs":["rdx"],
+                 "clobbered":["rdx"],
+                 "outputRoles": {"remaindr":"rdx"}
+               }}
+            ],
+            "registers":[
+              {"name":"rdx","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "an unknown role name must be rejected at load (typo "
+           "discriminator — registered roles are dividend/quotient/"
+           "remainder).";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// A role naming a register that is NOT in the corresponding
+// positional array is internally inconsistent → load reject.
+TEST(TargetSchema, ImplicitRegisterRoleRegisterNotInPositionalArrayRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"fakediv","result":"value",
+               "implicitRegisters":{
+                 "outputs":["rax"],
+                 "clobbered":["rax"],
+                 "outputRoles": {"remainder":"rdx"}
+               }}
+            ],
+            "registers":[
+              {"name":"rax","class":"gpr","widthBytes":8},
+              {"name":"rdx","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "a projection role must tag a register the op actually "
+           "declares in the positional array.";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// The unknown-sub-key typo discriminator covers the NEW keys too:
+// `outputRolez` must be rejected, not silently ignored (which would
+// leave the lowering fail-louding on a 'missing' role the author
+// believes is declared).
+TEST(TargetSchema, ImplicitRegistersUnknownRoleMapKeyRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"fakediv","result":"value",
+               "implicitRegisters":{
+                 "outputs":["rdx"],
+                 "clobbered":["rdx"],
+                 "outputRolez": {"remainder":"rdx"}
+               }}
+            ],
+            "registers":[
+              {"name":"rdx","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
 // D-TARGET-IMPLICIT-REGISTER-CONSTRAINT outputs ⊆ clobbered invariant
 // (cycle 10r 7-agent review fold F1 CRITICAL 9/10, 2026-06-04). A
 // schema declaring `outputs:[rax]` without `clobbered:[rax]` must

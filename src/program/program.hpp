@@ -40,7 +40,7 @@ public:
     /// Entry point for the CLI. Parses arguments and dispatches compilation.
     int run(int argc, char* argv[]);
 
-    /// Compile a project file (.dsp). `reporterConfig` threads
+    /// Compile a project file (.dss-project.json). `reporterConfig` threads
     /// `--warnings-as-errors` + `--suppress=<code>` through every tier.
     /// (LK10 cycle 3 post-fold #2: overload pair collapsed to single
     /// signature with default — code-simplifier REQUIRED.)

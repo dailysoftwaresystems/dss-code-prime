@@ -25,14 +25,17 @@
 #include "mir/mir_literal_pool.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "mutate_target_schema.hpp"
 #include "synthetic_fn.hpp"
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
 #include <array>
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -282,8 +285,24 @@ TEST(MirToLir, SignedDivisionLowersToCqoPlusIDiv) {
     EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, idivIdx - 2)), *movOp)
         << "cqo must be preceded by `mov rax, dividend`.";
     ASSERT_LT(idivIdx + 1, lir.blockInstCount(bb));
-    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, idivIdx + 1)), *movOp)
+    LirInstId const divCapture = lir.blockInstAt(bb, idivIdx + 1);
+    EXPECT_EQ(lir.instOpcode(divCapture), *movOp)
         << "idiv_op must be followed by `mov result, rax`.";
+    // FC1 (2026-06-10) role-contract symmetry: SDiv must capture the
+    // QUOTIENT register (rax, role 'quotient') — the mirror of the
+    // SMod rdx assert below. Before this assert, a quotient↔remainder
+    // role flip in the JSON left this test green (only the SMod pin
+    // went red); now BOTH directions of the flip are pinned.
+    {
+        auto const ops = L.lir.lir.instOperands(divCapture);
+        ASSERT_EQ(ops.size(), 1u);
+        ASSERT_EQ(ops[0].kind, LirOperandKind::Reg);
+        ASSERT_TRUE(ops[0].reg.isPhysical);
+        auto const rax = L.target->registerByName("rax");
+        ASSERT_TRUE(rax.has_value());
+        EXPECT_EQ(ops[0].reg.id, static_cast<std::uint32_t>(*rax))
+            << "SDiv must capture rax (role 'quotient'), never rdx.";
+    }
 }
 
 // FLAG 1 discrimination test (10r, 2026-06-04): a hand-built MIR
@@ -354,6 +373,358 @@ TEST(MirToLir, UnsignedDivisionLowersToXorPlusDivNotCqoIDiv) {
            "mis-sign-interpret dividends ≥ INT_MAX (CRITICAL "
            "discriminator for FLAG 1 of cycle 10q's silent-"
            "miscompile guard, preserved through 10r split).";
+}
+
+// ─── FC1 (V2-4.X, 2026-06-10): SMod/UMod lowering + the role contract ──────
+
+namespace {
+
+// Hand-built single-function MIR `fn(i32, i32) -> i32 { return OP(a, b); }`
+// — the UDiv-test pattern (c-subset has no unsigned / the arm64 target has
+// no c-subset front-end dependency here, so hand-built MIR exercises the
+// lowering arm directly on any target schema).
+[[nodiscard]] Mir buildBinFnMir(MirOpcode op, TypeInterner& interner) {
+    TypeId const i32 = interner.primitive(TypeKind::I32);
+    TypeId const params[] = {i32, i32};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const a = mb.addArg(0, i32);
+    MirInstId const b = mb.addArg(1, i32);
+    MirInstId const ops[] = {a, b};
+    MirInstId const r = mb.addInst(op, ops, i32);
+    mb.addReturn(r);
+    return std::move(mb).finish();
+}
+
+// The physical register an inst's single Reg operand names, or nullopt
+// (used to pin WHICH implicit output the capture mov reads).
+[[nodiscard]] std::optional<std::uint32_t>
+singlePhysRegOperand(Lir const& lir, LirInstId inst) {
+    auto const ops = lir.instOperands(inst);
+    if (ops.size() != 1 || ops[0].kind != LirOperandKind::Reg) {
+        return std::nullopt;
+    }
+    if (!ops[0].reg.isPhysical) return std::nullopt;
+    return ops[0].reg.id;
+}
+
+}  // namespace
+
+// D-CSUBSET-MOD-OP-CODEGEN closure: `%` lowers through the SAME
+// cqo+idiv_op pair as `/` but captures the REMAINDER (RDX, via the
+// `outputRoles` role "remainder") instead of the quotient (RAX). The
+// capture-register assertion is the OUTPUT-INDEX-CONTRACT's teeth: a
+// quotient/remainder flip (the silent-miscompile class the role map
+// kills) makes this test red.
+TEST(MirToLir, SignedModuloLowersToCqoIdivWithRemainderCapture) {
+    auto L = lowerCSubsetToLir("int m(int a, int b) { return a % b; }");
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "LIR lowering: " << (L.lirReporter.all().empty()
+            ? "" : L.lirReporter.all()[0].actual);
+
+    Lir const& lir = L.lir.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const cqoOp  = L.target->opcodeByMnemonic("cqo");
+    auto const idivOp = L.target->opcodeByMnemonic("idiv_op");
+    auto const movOp  = L.target->opcodeByMnemonic("mov");
+    ASSERT_TRUE(cqoOp.has_value());
+    ASSERT_TRUE(idivOp.has_value());
+    ASSERT_TRUE(movOp.has_value());
+    std::uint32_t idivIdx = lir.blockInstCount(bb);
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == *idivOp) {
+            idivIdx = i;
+            break;
+        }
+    }
+    ASSERT_LT(idivIdx, lir.blockInstCount(bb))
+        << "MIR SMod must lower through LIR idiv_op (the x86 remainder "
+           "lives in the SAME divide instruction as the quotient).";
+    ASSERT_GE(idivIdx, 2u);
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, idivIdx - 1)), *cqoOp)
+        << "SMod's idiv_op must be preceded by `cqo` (signed pair — "
+           "FLAG 1: never xor_rdx_zero).";
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, idivIdx - 2)), *movOp);
+    ASSERT_LT(idivIdx + 1, lir.blockInstCount(bb));
+    LirInstId const capture = lir.blockInstAt(bb, idivIdx + 1);
+    EXPECT_EQ(lir.instOpcode(capture), *movOp)
+        << "idiv_op must be followed by the remainder-capture mov.";
+
+    auto const rdx = L.target->registerByName("rdx");
+    auto const rax = L.target->registerByName("rax");
+    ASSERT_TRUE(rdx.has_value());
+    ASSERT_TRUE(rax.has_value());
+    auto const captureSrc = singlePhysRegOperand(lir, capture);
+    ASSERT_TRUE(captureSrc.has_value())
+        << "the capture mov must read a PHYSICAL register operand.";
+    EXPECT_EQ(*captureSrc, static_cast<std::uint32_t>(*rdx))
+        << "SMod must capture the REMAINDER register (rdx, role "
+           "'remainder') — capturing rax would silently return the "
+           "quotient (the exact miscompile class "
+           "D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT names).";
+    EXPECT_NE(*captureSrc, static_cast<std::uint32_t>(*rax))
+        << "SMod capture must NOT read rax (the quotient).";
+}
+
+// FLAG-1 mirror for the unsigned remainder (hand-built MIR — unsigned
+// is source-unreachable until FC3 lands the width/signedness types):
+// UMod routes through xor_rdx_zero + div_op, NEVER cqo/idiv_op, and
+// captures RDX.
+TEST(MirToLir, UnsignedModuloLowersToXorDivWithRemainderCaptureNotCqoIdiv) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildBinFnMir(MirOpcode::UMod, interner);
+
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    Lir const& lir = lirR.lir;
+
+    auto const xorRdxOp = (*target)->opcodeByMnemonic("xor_rdx_zero");
+    auto const divOp    = (*target)->opcodeByMnemonic("div_op");
+    auto const cqoOp    = (*target)->opcodeByMnemonic("cqo");
+    auto const idivOp   = (*target)->opcodeByMnemonic("idiv_op");
+    auto const movOp    = (*target)->opcodeByMnemonic("mov");
+    ASSERT_TRUE(xorRdxOp.has_value() && divOp.has_value()
+                && cqoOp.has_value() && idivOp.has_value()
+                && movOp.has_value());
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    std::uint32_t divIdx = lir.blockInstCount(bb);
+    bool foundCqo = false;
+    bool foundIdiv = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const op = lir.instOpcode(lir.blockInstAt(bb, i));
+        if (op == *divOp)  divIdx = i;
+        if (op == *cqoOp)  foundCqo = true;
+        if (op == *idivOp) foundIdiv = true;
+    }
+    ASSERT_LT(divIdx, lir.blockInstCount(bb))
+        << "MIR UMod must lower through `div_op`.";
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, divIdx - 1)), *xorRdxOp)
+        << "UMod's div_op must be preceded by xor_rdx_zero (zero-extend).";
+    EXPECT_FALSE(foundCqo)
+        << "UMod MUST NOT emit `cqo` — FLAG 1 sign-interpretation guard.";
+    EXPECT_FALSE(foundIdiv)
+        << "UMod MUST NOT emit `idiv_op` — FLAG 1 guard.";
+    ASSERT_LT(divIdx + 1, lir.blockInstCount(bb));
+    LirInstId const capture = lir.blockInstAt(bb, divIdx + 1);
+    auto const rdx = (*target)->registerByName("rdx");
+    ASSERT_TRUE(rdx.has_value());
+    auto const captureSrc = singlePhysRegOperand(lir, capture);
+    ASSERT_TRUE(captureSrc.has_value());
+    EXPECT_EQ(*captureSrc, static_cast<std::uint32_t>(*rdx))
+        << "UMod must capture rdx (role 'remainder').";
+}
+
+// D-MIR-TO-LIR-DIV-SEQUENCE-AGNOSTIC closure, Rule 1: a target that
+// declares a NATIVE result-bearing `sdiv` (arm64 SDIV Xd,Xn,Xm) gets
+// exactly ONE LIR op for MIR SDiv — no mov-pin, no pre-op, no
+// implicit-register machinery. The SAME lowering arm that emits the
+// x86 4-op pair shape selects this by capability probing (no arch
+// identity anywhere).
+TEST(MirToLir, Arm64SignedDivisionLowersToSingleNativeSdiv) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildBinFnMir(MirOpcode::SDiv, interner);
+
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = lirR.lir;
+
+    auto const sdivOp = (*target)->opcodeByMnemonic("sdiv");
+    auto const argOp  = (*target)->opcodeByMnemonic("arg");
+    ASSERT_TRUE(sdivOp.has_value());
+    ASSERT_TRUE(argOp.has_value());
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    // EXACT shape: arg, arg, sdiv, ret — 4 LIR insts, no extra movs.
+    ASSERT_EQ(lir.blockInstCount(bb), 4u)
+        << "arm64 SDiv must be ONE native op (arg, arg, sdiv, ret) — "
+           "extra instructions mean the x86 implicit-pair shape leaked "
+           "onto a native-divide target.";
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 0)), *argOp);
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 1)), *argOp);
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 2)), *sdivOp);
+}
+
+// Rule 3 (the generic remainder expansion): arm64 has no hardware
+// remainder, so MIR SMod expands to the target-blind arithmetic
+// identity rem = n − (n/d)·d over the DECLARED verbs: sdiv, mul, sub
+// — exactly three value-bearing ops, in that order.
+TEST(MirToLir, Arm64SignedModuloExpandsToSdivMulSub) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildBinFnMir(MirOpcode::SMod, interner);
+
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = lirR.lir;
+
+    auto const sdivOp = (*target)->opcodeByMnemonic("sdiv");
+    auto const mulOp  = (*target)->opcodeByMnemonic("mul");
+    auto const subOp  = (*target)->opcodeByMnemonic("sub");
+    ASSERT_TRUE(sdivOp.has_value() && mulOp.has_value() && subOp.has_value());
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    // EXACT shape: arg, arg, sdiv, mul, sub, ret — 6 LIR insts.
+    ASSERT_EQ(lir.blockInstCount(bb), 6u)
+        << "arm64 SMod must expand to exactly sdiv+mul+sub.";
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 2)), *sdivOp)
+        << "expansion step 1: q = sdiv(n, d).";
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 3)), *mulOp)
+        << "expansion step 2: t = mul(q, d).";
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 4)), *subOp)
+        << "expansion step 3: r = sub(n, t).";
+
+    // Operand wiring (the identity's correctness): mul reads (sdiv, b);
+    // sub reads (a, mul). A transposed sub (t − n instead of n − t)
+    // would negate every remainder.
+    LirInstId const sdivInst = lir.blockInstAt(bb, 2);
+    LirInstId const mulInst  = lir.blockInstAt(bb, 3);
+    LirInstId const subInst  = lir.blockInstAt(bb, 4);
+    auto const aReg    = lir.instResult(lir.blockInstAt(bb, 0));
+    auto const sdivReg = lir.instResult(sdivInst);
+    auto const mulReg  = lir.instResult(mulInst);
+    auto const mulOps  = lir.instOperands(mulInst);
+    ASSERT_EQ(mulOps.size(), 2u);
+    EXPECT_EQ(mulOps[0].reg, sdivReg)
+        << "mul's first operand must be the sdiv quotient.";
+    auto const subOps = lir.instOperands(subInst);
+    ASSERT_EQ(subOps.size(), 2u);
+    EXPECT_EQ(subOps[0].reg, aReg)
+        << "sub's first operand must be the DIVIDEND (n − q·d, not "
+           "q·d − n — a transpose negates every remainder).";
+    EXPECT_EQ(subOps[1].reg, mulReg)
+        << "sub's second operand must be the mul product.";
+}
+
+// FLAG-1 mirror inside the expansion: arm64 UMod must expand via
+// `udiv` (unsigned), never `sdiv`.
+TEST(MirToLir, Arm64UnsignedModuloExpandsViaUdivNotSdiv) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildBinFnMir(MirOpcode::UMod, interner);
+
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    Lir const& lir = lirR.lir;
+
+    auto const sdivOp = (*target)->opcodeByMnemonic("sdiv");
+    auto const udivOp = (*target)->opcodeByMnemonic("udiv");
+    ASSERT_TRUE(sdivOp.has_value() && udivOp.has_value());
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool foundSdiv = false;
+    bool foundUdiv = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const op = lir.instOpcode(lir.blockInstAt(bb, i));
+        if (op == *sdivOp) foundSdiv = true;
+        if (op == *udivOp) foundUdiv = true;
+    }
+    EXPECT_TRUE(foundUdiv)
+        << "UMod's expansion must divide via `udiv`.";
+    EXPECT_FALSE(foundSdiv)
+        << "UMod MUST NOT divide via `sdiv` — sign misinterpretation "
+           "of high-bit dividends (FLAG 1, expansion arm).";
+}
+
+namespace {
+
+// Strip ONE role map off `idiv_op` in the shipped x86_64 schema (the
+// cycle-10k in-memory mutation substrate). The lever for the two
+// red-on-disable tests below — stripping must NOT fail the loader
+// (the role maps are optional; cqo/xor_rdx_zero never declare them),
+// only the LOWERING.
+[[nodiscard]] std::shared_ptr<TargetSchema>
+loadX64WithIdivRoleMapStripped(char const* mapKey) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [&](nlohmann::json& doc) {
+            for (auto& op : doc.at("opcodes")) {
+                if (op.value("mnemonic", "") == "idiv_op") {
+                    op.at("implicitRegisters").erase(mapKey);
+                }
+            }
+        });
+    if (!mutated.has_value()) {
+        ADD_FAILURE() << "role maps are OPTIONAL at load — stripping '"
+                      << mapKey << "' must not fail the loader: "
+                      << (mutated.error().empty()
+                              ? "" : mutated.error()[0].message);
+        return nullptr;
+    }
+    return *mutated;
+}
+
+}  // namespace
+
+// RED-ON-DISABLE lever for the role contract: strip `outputRoles`
+// from idiv_op (a mutated schema) → the SDiv lowering must FAIL LOUD
+// (L_RequiredLirOpcodeMissing naming the missing role), never fall
+// back to positional indexing. This is the proof the projection
+// actually READS the role map.
+TEST(MirToLir, MissingOutputRolesFailsLoudOnDivLowering) {
+    auto mutated = loadX64WithIdivRoleMapStripped("outputRoles");
+    ASSERT_NE(mutated, nullptr);
+
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildBinFnMir(MirOpcode::SDiv, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, *mutated, interner, rep, noExterns);
+    EXPECT_FALSE(lirR.ok)
+        << "an idiv_op without outputRoles must FAIL the div lowering "
+           "(the projection reads BY ROLE — no positional fallback).";
+    bool sawRoleDiag = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_RequiredLirOpcodeMissing
+            && d.actual.find("quotient") != std::string::npos
+            && d.actual.find("outputRoles") != std::string::npos) {
+            sawRoleDiag = true;
+        }
+    }
+    EXPECT_TRUE(sawRoleDiag)
+        << "the fail-loud diagnostic must name the missing role "
+           "('quotient') and the map ('outputRoles').";
+}
+
+// The inputRoles twin (plan-lock MUST-FIX 1 — the dividend pin is the
+// SAME silent-reorder class as the output projection): strip
+// `inputRoles` → fail loud naming 'dividend'.
+TEST(MirToLir, MissingInputRolesFailsLoudOnDivLowering) {
+    auto mutated = loadX64WithIdivRoleMapStripped("inputRoles");
+    ASSERT_NE(mutated, nullptr);
+
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildBinFnMir(MirOpcode::SDiv, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, *mutated, interner, rep, noExterns);
+    EXPECT_FALSE(lirR.ok);
+    bool sawRoleDiag = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_RequiredLirOpcodeMissing
+            && d.actual.find("dividend") != std::string::npos
+            && d.actual.find("inputRoles") != std::string::npos) {
+            sawRoleDiag = true;
+        }
+    }
+    EXPECT_TRUE(sawRoleDiag)
+        << "the fail-loud diagnostic must name the missing role "
+           "('dividend') and the map ('inputRoles').";
 }
 
 // Cycle 3a wide-literal coverage (>INT32_MAX) is deferred to cycle 3b's
@@ -1245,13 +1616,24 @@ TEST(MirToLir, PhiResolutionUsesFprClassForFloatPhi) {
     mb.beginBlock(entry);
     ::dss::MirInstId const cond = mb.addArg(0, boolT);
     mb.addCondBr(cond, thenB, elseB);
-    mb.beginBlock(thenB);
+    // FC2 Part B: F64 constants reach MIR as promoted rodata globals
+    // (GlobalAddr + Load — the HIR→MIR promotion shape); a raw F64
+    // `Const` is now a loud MIR→LIR error. Build the phi inputs the
+    // promoted way.
+    auto const ptrF64 = interner.pointer(f64);
     ::dss::MirLiteralValue lvOne;  lvOne.value  = 1.0;  lvOne.core  = ::dss::TypeKind::F64;
-    ::dss::MirInstId const constOne = mb.addConst(lvOne, f64);
+    ::dss::MirLiteralValue lvTwo;  lvTwo.value  = 2.0;  lvTwo.core  = ::dss::TypeKind::F64;
+    (void)mb.addGlobal(f64, ::dss::SymbolId{500}, mb.literalPoolAdd(lvOne));
+    (void)mb.addGlobal(f64, ::dss::SymbolId{501}, mb.literalPoolAdd(lvTwo));
+    mb.beginBlock(thenB);
+    ::dss::MirInstId const addrOne = mb.addGlobalAddr(::dss::SymbolId{500}, ptrF64);
+    std::array<::dss::MirInstId, 1> loadOneOps{addrOne};
+    ::dss::MirInstId const constOne = mb.addInst(::dss::MirOpcode::Load, loadOneOps, f64);
     mb.addBr(join);
     mb.beginBlock(elseB);
-    ::dss::MirLiteralValue lvTwo;  lvTwo.value  = 2.0;  lvTwo.core  = ::dss::TypeKind::F64;
-    ::dss::MirInstId const constTwo = mb.addConst(lvTwo, f64);
+    ::dss::MirInstId const addrTwo = mb.addGlobalAddr(::dss::SymbolId{501}, ptrF64);
+    std::array<::dss::MirInstId, 1> loadTwoOps{addrTwo};
+    ::dss::MirInstId const constTwo = mb.addInst(::dss::MirOpcode::Load, loadTwoOps, f64);
     mb.addBr(join);
     mb.beginBlock(join);
     ::dss::MirInstId const phi = mb.addPhi(f64);
@@ -1318,11 +1700,15 @@ TEST(MirToLir, WideLiteralStringRoutesThroughLiteralPool) {
     EXPECT_EQ(*asStr, "hello world");
 }
 
-TEST(MirToLir, WideLiteralDoubleRoutesThroughFprLiteralPool) {
-    // Cycle 3d enabled double-literal lowering: F64 MIR Const flows
-    // through the LirLiteralPool with an FPR-class result register
-    // (the cycle-3c stub previously fail-loud-deferred this case
-    // because no FPR-class machinery existed). Pin the result is FPR.
+TEST(MirToLir, FprConstAtMirToLirFailsLoudPointingAtPromotion) {
+    // FC2 Part B retired the cycle-3d F64→LirLiteralPool route: it was
+    // a DEAD END (no encoding variant consumes a LiteralIndex operand
+    // → A_NoMatchingEncodingVariant at assemble time, after regalloc
+    // had already burned an FPR). F64 constants are now promoted at
+    // HIR→MIR to anonymous rodata globals (GlobalAddr + Load). A raw
+    // F64 `Const` reaching MIR→LIR — hand-built MIR, or a future
+    // producer that forgets the promotion — must FAIL LOUD naming the
+    // contract, never silently re-enter the pool dead-end.
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto const& sch = **target;
@@ -1343,32 +1729,220 @@ TEST(MirToLir, WideLiteralDoubleRoutesThroughFprLiteralPool) {
 
     ::dss::DiagnosticReporter rep;
     auto const result = ::dss::lowerToLir(m, sch, interner, rep);
-    ASSERT_TRUE(result.ok)
-        << "F64 literal must lower cleanly via FPR-class + LirLiteralPool";
-
-    // The pool must contain the double, and the mov's result must be
-    // FPR-class (regClassForType maps F64 → FPR).
-    ::dss::Lir const& lir = result.lir;
-    ASSERT_EQ(lir.literalPool().size(), 1u);
-    auto const* asDbl = std::get_if<double>(&lir.literalValue(0).value);
-    ASSERT_NE(asDbl, nullptr);
-    EXPECT_DOUBLE_EQ(*asDbl, 3.14);
-
-    auto const movOp = *sch.opcodeByMnemonic("mov");
-    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
-    bool foundFprMov = false;
-    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
-        LirInstId const inst = lir.blockInstAt(entry, i);
-        if (lir.instOpcode(inst) != movOp) continue;
-        auto const ops = lir.instOperands(inst);
-        if (ops.size() == 1 && ops[0].kind == LirOperandKind::LiteralIndex) {
-            EXPECT_EQ(lir.instResult(inst).regClass(), LirRegClass::FPR)
-                << "double literal must materialize into an FPR-class vreg";
-            foundFprMov = true;
-            break;
+    EXPECT_FALSE(result.ok)
+        << "an F64 Const at MIR→LIR must fail loud (the LiteralIndex "
+           "route is a dead end; promotion happens at HIR→MIR)";
+    bool sawPromotionDiag = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode
+            && d.actual.find("promoted to anonymous rodata globals")
+                   != std::string::npos) {
+            sawPromotionDiag = true;
         }
     }
-    EXPECT_TRUE(foundFprMov);
+    EXPECT_TRUE(sawPromotionDiag)
+        << "the diagnostic must point the producer at the HIR→MIR "
+           "promotion contract";
+}
+
+// FC2 Part B width gate (D-TARGET-ENCODING-WIDTH-GUARD): with the F64
+// addsd encoding live, a non-F64 float FAdd would otherwise SILENTLY
+// match the F2 0F 58 variant (the guard has no width discriminator)
+// and run double-width arithmetic on F32 values. Pin the fail-loud.
+TEST(MirToLir, F32FAddFailsLoudUntilWidthDiscriminatedEncodings) {
+    std::array<::dss::TypeKind, 2> paramKinds{
+        ::dss::TypeKind::F32, ::dss::TypeKind::F32};
+    auto syn = ::dss::test_support::buildSyntheticFn(
+        paramKinds, ::dss::TypeKind::F32,
+        [](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+           std::span<::dss::TypeId const> params, ::dss::TypeId retT) {
+            ::dss::MirInstId const a = mb.addArg(0, params[0]);
+            ::dss::MirInstId const b = mb.addArg(1, params[1]);
+            ::dss::MirInstId const ops[] = {a, b};
+            ::dss::MirInstId const r =
+                mb.addInst(::dss::MirOpcode::FAdd, ops, retT);
+            mb.addReturn(r);
+        });
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    EXPECT_FALSE(result.ok)
+        << "F32 FAdd must fail loud — lowering it would silently select "
+           "the F64 addsd encoding";
+    bool sawWidthDiag = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode
+            && d.actual.find("D-TARGET-ENCODING-WIDTH-GUARD")
+                   != std::string::npos) {
+            sawWidthDiag = true;
+        }
+    }
+    EXPECT_TRUE(sawWidthDiag)
+        << "the width-gate diagnostic must name "
+           "D-TARGET-ENCODING-WIDTH-GUARD";
+}
+
+// Shared MIR shape for the FPR-store pair below: f(f64 v, f64* p)
+// { Store v -> p; return 0; }. The stored VALUE is FPR-class, so the
+// store mnemonic must resolve through the class table.
+namespace {
+[[nodiscard]] std::pair<::dss::Mir, ::dss::TypeInterner>
+buildF64StoreMir() {
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f64  = interner.primitive(::dss::TypeKind::F64);
+    auto const ptrT = interner.pointer(f64);
+    auto const i32  = interner.primitive(::dss::TypeKind::I32);
+    ::dss::TypeId const params[] = {f64, ptrT};
+    auto const sig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb =
+        mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const v = mb.addArg(0, f64);
+    ::dss::MirInstId const p = mb.addArg(1, ptrT);
+    ::dss::MirInstId const storeOps[] = {v, p};
+    (void)mb.addInst(::dss::MirOpcode::Store, storeOps, ::dss::InvalidType);
+    ::dss::MirLiteralValue zero; zero.value = std::int64_t{0};
+    zero.core = ::dss::TypeKind::I32;
+    mb.addReturn(mb.addConst(zero, i32));
+    return {std::move(mb).finish(), std::move(interner)};
+}
+} // namespace
+
+// FC2 PE-float closure (2026-06-10): the shipped x86_64 schema now
+// DECLARES the fpr store (movsd_store, F2 0F 11 /r — landed with its
+// first consumer, the ms_x64 callee-saved-xmm prologue spill). A MIR
+// Store of an F64 value must lower through THAT mnemonic — never the
+// GPR `store` (which would 8-byte-GPR-write the XMM ordinal —
+// valid-looking, silently wrong bytes).
+TEST(MirToLir, FprStoreLowersViaDeclaredMovsdStore) {
+    auto [m, interner] = buildF64StoreMir();
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    auto const movsdStoreOp = (*target)->opcodeByMnemonic("movsd_store");
+    auto const gprStoreOp   = (*target)->opcodeByMnemonic("store");
+    ASSERT_TRUE(movsdStoreOp.has_value());
+    ASSERT_TRUE(gprStoreOp.has_value());
+    ::dss::Lir const& lir = result.lir;
+    ::dss::LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool foundMovsdStore = false;
+    bool foundGprStore   = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const op = lir.instOpcode(lir.blockInstAt(bb, i));
+        if (op == *movsdStoreOp) foundMovsdStore = true;
+        if (op == *gprStoreOp)   foundGprStore   = true;
+    }
+    EXPECT_TRUE(foundMovsdStore)
+        << "the F64 Store must lower to the fpr class's declared "
+           "store mnemonic (movsd_store)";
+    EXPECT_FALSE(foundGprStore)
+        << "the F64 Store must NOT emit the GPR `store` — that form "
+           "would silently mis-encode the XMM ordinal";
+}
+
+// FC2 Part B (registerClassOps) fail-loud lever, PRESERVED after the
+// shipped schema gained its fpr store: erase the row's "store" key
+// (the StrippedClassOpsTable pattern) → MIR Store of an F64 value
+// must FAIL LOUD naming the class+op, never fall back to the GPR
+// `store`. This is the same lever the pre-consumer shipped schema
+// exercised by omission.
+TEST(MirToLir, FprStoreFailsLoudWithoutDeclaredStoreOp) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            doc["registerClassOps"][0].erase("store");
+        });
+    ASSERT_TRUE(mutated.has_value())
+        << "a registerClassOps row with no 'store' slot is legal at "
+           "load (trigger discipline) — only the consumer fails";
+
+    auto [m, interner] = buildF64StoreMir();
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, **mutated, interner, rep);
+    EXPECT_FALSE(result.ok);
+    bool sawClassDiag = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_RequiredLirOpcodeMissing
+            && d.actual.find("'store'") != std::string::npos
+            && d.actual.find("'fpr'") != std::string::npos) {
+            sawClassDiag = true;
+        }
+    }
+    EXPECT_TRUE(sawClassDiag)
+        << "the diagnostic must name the class ('fpr') and the op "
+           "('store') so the schema author knows what to declare";
+}
+
+// RED-ON-DISABLE lever for the class table being READ: strip the
+// registerClassOps section from the shipped x86_64 schema → an F64
+// load (FPR-class) must fail loud naming 'load'/'fpr' (the table is
+// the ONLY source of the fpr load mnemonic; without it the lowering
+// must never silently use the GPR `load`).
+TEST(MirToLir, StrippedClassOpsTableFailsLoudOnFprLoad) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) { doc.erase("registerClassOps"); });
+    ASSERT_TRUE(mutated.has_value())
+        << "registerClassOps is OPTIONAL at load — stripping it must "
+           "not fail the loader, only the FPR lowering";
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f64  = interner.primitive(::dss::TypeKind::F64);
+    auto const ptrT = interner.pointer(f64);
+    ::dss::TypeId const params[] = {ptrT};
+    auto const sig = interner.fnSig(params, f64, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb =
+        mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const p = mb.addArg(0, ptrT);
+    ::dss::MirInstId const loadOps[] = {p};
+    ::dss::MirInstId const v =
+        mb.addInst(::dss::MirOpcode::Load, loadOps, f64);
+    mb.addReturn(v);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, **mutated, interner, rep);
+    EXPECT_FALSE(result.ok);
+    bool sawClassDiag = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_RequiredLirOpcodeMissing
+            && d.actual.find("'load'") != std::string::npos
+            && d.actual.find("'fpr'") != std::string::npos) {
+            sawClassDiag = true;
+        }
+    }
+    EXPECT_TRUE(sawClassDiag);
+}
+
+// The FPToSI twin: cvttsd2si consumes an F64 SOURCE; an F32 source
+// must fail loud rather than convert 4 garbage upper bytes.
+TEST(MirToLir, F32FpToSiSourceFailsLoudUntilWidthDiscriminatedEncodings) {
+    std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::F32};
+    auto syn = ::dss::test_support::buildSyntheticFn(
+        paramKinds, ::dss::TypeKind::I32,
+        [](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+           std::span<::dss::TypeId const> params, ::dss::TypeId retT) {
+            ::dss::MirInstId const a = mb.addArg(0, params[0]);
+            ::dss::MirInstId const ops[] = {a};
+            ::dss::MirInstId const r =
+                mb.addInst(::dss::MirOpcode::FPToSI, ops, retT);
+            mb.addReturn(r);
+        });
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    EXPECT_FALSE(result.ok)
+        << "F32-source FPToSI must fail loud — lowering it would "
+           "silently select the F64 cvttsd2si encoding";
 }
 
 // ─── cycle 3e: Calls + Aggregates + LirVerifier ─────────────────────────

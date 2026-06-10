@@ -46,6 +46,7 @@ build-wsl/
 # Ad-hoc out-of-source build dirs (e.g. build-rel / build-dbg used for
 # timed before/after measurements and per-config canary builds).
 build-*/
+tmp_probe/
 !scripts/build/
 
 # CTest leftover when ctest is invoked from the repo root (e.g. inside

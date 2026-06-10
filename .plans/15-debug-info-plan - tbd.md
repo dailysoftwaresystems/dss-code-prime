@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1 acceptance includes "step through line numbers"; locals reserved post-v1. |
-| Predecessors  | ⏳ [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) (byte-offset stability). ⏳ [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) (section placement). |
+| Predecessors  | ✅ [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) (byte-offset stability — AS1–AS6 closed 2026-05-29). ✅ [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) (section placement — LK1–LK10 closed 2026-05-30). |
 | Successors    | [`16-codesign-publish-plan`](./16-codesign-publish-plan%20-%20tbd.md) codesigns include debug sections. |
 | Scope         | **Bounded.** DB1–DB12. v1: line numbers via DWARF + PDB; locals (variable lifetimes) post-v1. CFI / unwind in v1 (required for crash + profilers). |
 

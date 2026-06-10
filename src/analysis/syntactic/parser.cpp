@@ -17,6 +17,8 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -149,6 +151,16 @@ struct Parser::Impl {
     // diagnostic).
     SchemaWalker walker;
 
+    // FC2 binder sketch — the parser-side scoped name→kind(type|value)
+    // map fed by `semantics.declarations` + `semantics.scopes` (the SAME
+    // vocabulary the semantic analyzer consumes; ONE declaration, two
+    // consumers). Consulted by the speculative type-name commit triage
+    // (`typeNameCommitApproved_`); recorded into at binder-rule frame
+    // close (`closeFrameOnce`). Inert (`!enabled()`) for languages with
+    // no declarations — toy/tsql pay nothing. Snapshot/restored across
+    // speculation exactly like the other four state machines.
+    BinderSketch sketch;
+
     // Forward-progress watchdog state (carried across iterations).
     SchemaCursor lastCursor{};
     std::size_t  lastTokPos = 0;
@@ -217,11 +229,13 @@ struct Parser::Impl {
             cfg.recoveryStrategy,
             cfg.maxSyncScanTokens,
             nullptr,
+            std::move(cfg.seedGlobalTypeNames),
           }
         , identifierKind(schema->schemaTokens().find("Identifier"))
         , errorKind(schema->schemaTokens().find("Error"))
         , bodyDefaultTokenKinds(&schema->bodyDefaultTokenKinds())
         , walker(schema)
+        , sketch(*schema)
         , prattWalker(std::move(cfg.prattWalker)) {}
 
     // Default Pratt walker has friend access to drive the parser's
@@ -432,10 +446,246 @@ struct Parser::Impl {
     void closeFrameOnce() noexcept {
         if (frames.empty()) return;
         const RuleId rule = builder->currentRule();
+        // FC2 binder sketch: extract the declared name BEFORE the frame
+        // closes (its direct children are still in the builder's pending
+        // staging area), but RECORD it after any scope this rule itself
+        // owns has closed — a scope-opening declaration (e.g. a struct)
+        // binds its NAME in the ENCLOSING scope, while its members were
+        // bound into its own scope as their frames closed earlier.
+        std::optional<std::pair<std::string, bool>> binderName;
+        if (sketch.enabled()) {
+            if (auto const* decl = sketch.binderFor(rule)) {
+                binderName = extractBinderName_(*decl);
+            }
+        }
         walker.leaveRule(SourceSpan::empty(0), rule);
         frames.back().close();
         frames.pop_back();
         if (!frameRules.empty()) frameRules.pop_back();
+        if (sketch.enabled()) {
+            if (sketch.isScopeRule(rule)) sketch.closeScope();
+            if (binderName.has_value()) {
+                sketch.record(std::move(binderName->first),
+                              binderName->second);
+            }
+        }
+    }
+
+    // ── FC2 binder-sketch name extraction ───────────────────────────────
+    //
+    // Mirrors the semantic analyzer's declRoleChildren + extractNameNode
+    // convention (visible non-EmptySpace children; optional specifier-
+    // prefix strip; positional name child; Self single-wrapper descend /
+    // LastIdentifier DFS) — but reads the BUILDER's in-progress arena at
+    // frame-close time instead of a frozen Tree. ONE config declaration
+    // (`semantics.declarations`), two consumers.
+
+    // Resolve the name-bearing leaf below `node` per `mode`.
+    //   Self           — descend single-visible-child wrappers to the leaf.
+    //   LastIdentifier — DFS; the LAST identifierToken leaf wins.
+    [[nodiscard]] NodeId resolveNameNode_(NodeId node,
+                                          NameMatchMode mode) const {
+        if (mode == NameMatchMode::Self) {
+            while (builder->nodeKind(node) == NodeKind::Internal) {
+                NodeId      only{};
+                std::size_t count = 0;
+                for (NodeId c : builder->nodeChildren(node)) {
+                    if (isEmptySpace(builder->nodeFlags(c))) continue;
+                    only = c;
+                    if (++count > 1) break;
+                }
+                if (count != 1) return node;   // 0 or many → stop here
+                node = only;
+            }
+            return node;
+        }
+        // LastIdentifier — track the latest identifier in source order.
+        NodeId              found{};
+        std::vector<NodeId> stack{node};
+        while (!stack.empty()) {
+            const NodeId cur = stack.back();
+            stack.pop_back();
+            if (builder->nodeKind(cur) == NodeKind::Token
+                && builder->nodeTokenKind(cur).v == identifierKind.v) {
+                found = cur;
+            }
+            const auto cs = builder->nodeChildren(cur);
+            for (auto it = cs.rbegin(); it != cs.rend(); ++it) {
+                if (!isEmptySpace(builder->nodeFlags(*it))) {
+                    stack.push_back(*it);
+                }
+            }
+        }
+        return found;
+    }
+
+    // Extract (name, isType) from the ABOUT-TO-CLOSE top frame — a
+    // binder rule per the sketch's view. The frame's direct children are
+    // its pending staging range; everything BELOW the top level is
+    // already closed (children ranges finalized), so descent is safe.
+    // Returns nullopt when the name child is structurally absent or not
+    // a plain identifier leaf (e.g. an errored declaration) — the sketch
+    // then simply has no entry and the name reads as Unknown, the safe
+    // direction (semantic analysis remains the authority).
+    [[nodiscard]] std::optional<std::pair<std::string, bool>>
+    extractBinderName_(BinderSketch::BinderDecl const& decl) const {
+        std::vector<NodeId> kids;
+        for (NodeId c : builder->currentFramePendingChildren()) {
+            if (!isEmptySpace(builder->nodeFlags(c))) kids.push_back(c);
+        }
+        // Specifier-prefix strip (mirrors semantic's declRoleChildren) —
+        // positional indices stay stable whether or not specifiers
+        // (`static`, `__attribute__((...))`) are present.
+        if (decl.specifierPrefixRule.valid() && !kids.empty()
+            && builder->nodeKind(kids.front()) == NodeKind::Internal
+            && builder->nodeRule(kids.front()).v
+                   == decl.specifierPrefixRule.v) {
+            kids.erase(kids.begin());
+        }
+        if (decl.nameChild >= kids.size()) return std::nullopt;
+        const NodeId nameNode =
+            resolveNameNode_(kids[decl.nameChild], decl.nameMatch);
+        if (!nameNode.valid()
+            || builder->nodeKind(nameNode) != NodeKind::Token
+            || builder->nodeTokenKind(nameNode).v != identifierKind.v) {
+            return std::nullopt;
+        }
+        return std::make_pair(
+            std::string{src->slice(builder->nodeSpan(nameNode))},
+            decl.isType);
+    }
+
+    // ── FC2 type-name commit triage ─────────────────────────────────────
+
+    // Collect non-trivia LEAF nodes under `node` (pre-order), stopping
+    // once `out.size() > cap` — the triage only ever distinguishes
+    // "exactly one" from "more". Error/Missing leaves count as content
+    // (a non-identifier form → rule-1 commit; semantic diagnoses).
+    void collectLeavesBelow_(NodeId node, std::vector<NodeId>& out,
+                             std::size_t cap) const {
+        if (out.size() > cap) return;
+        const NodeKind k = builder->nodeKind(node);
+        if (k != NodeKind::Internal) {
+            if (!isEmptySpace(builder->nodeFlags(node))) out.push_back(node);
+            return;
+        }
+        for (NodeId c : builder->nodeChildren(node)) {
+            if (isEmptySpace(builder->nodeFlags(c))) continue;
+            collectLeavesBelow_(c, out, cap);
+            if (out.size() > cap) return;
+        }
+    }
+
+    // Decide whether a STRUCTURALLY-successful speculative probe of a
+    // `commitRequiresTypeName`-guarded branch may COMMIT. Generic — the
+    // guarded rule, its type child, the identifier token, the binder
+    // vocabulary, and the operator table are all config-sourced.
+    //
+    //   (1) type child is NOT a lone identifier (keyword base, struct
+    //       tag, pointer star, const, …) → COMMIT: those forms cannot
+    //       be expressions, so no value reading competes.
+    //   (2) lone identifier the sketch knows as a TYPE → COMMIT.
+    //   (3) lone identifier the sketch knows as a VALUE → ROLLBACK
+    //       (the value reading is the meaning; shadowing-aware).
+    //   (4) lone identifier the sketch has NO entry for → COMMIT iff
+    //       the token after the type position (the first token of the
+    //       following operand subtree) could NOT continue a value
+    //       reading — i.e. it is not an infix/postfix/ternary operator
+    //       per the operator table. Ternary is included beyond the
+    //       plan's "binary/postfix" wording because `(a) ? b : c` is a
+    //       continuable value reading too; the test is "could the
+    //       parenthesized value parse keep going", derived ENTIRELY
+    //       from the operator table — never a hardcoded token list.
+    //       When it IS an operator: ROLLBACK to the value reading and
+    //       hand an AmbiguousTypeNameCandidate out via `outCandidate`
+    //       for the compilation unit's cross-file oracle (one-shot
+    //       seeded reparse). The CALLER records it after the probe's
+    //       rollback so it survives (the probe restore would otherwise
+    //       erase it with the rest of the sketch delta).
+    //
+    // Returning false lets the caller's SpeculationProbe restore all
+    // five machines; the alt's next candidate branch then parses the
+    // value reading.
+    [[nodiscard]] bool typeNameCommitApproved_(
+        RuleId branch, RuleId typeRule,
+        std::optional<AmbiguousTypeNameCandidate>& outCandidate) {
+        // The just-built branch subtree is the parent frame's newest
+        // pending child (the branch frame closed inside the probe loop).
+        const auto pending = builder->currentFramePendingChildren();
+        if (pending.empty()) return false;   // cannot verify → rollback
+        const NodeId branchNode = pending.back();
+        if (builder->nodeKind(branchNode) != NodeKind::Internal
+            || builder->nodeRule(branchNode).v != branch.v) {
+            return false;   // not the branch subtree — refuse to guess
+        }
+
+        // Locate the type child + the first INTERNAL sibling after it
+        // (the operand subtree; the token(s) between are the closer).
+        NodeId typeChild{};
+        NodeId operandSibling{};
+        for (NodeId c : builder->nodeChildren(branchNode)) {
+            if (isEmptySpace(builder->nodeFlags(c))) continue;
+            if (!typeChild.valid()) {
+                if (builder->nodeKind(c) == NodeKind::Internal
+                    && builder->nodeRule(c).v == typeRule.v) {
+                    typeChild = c;
+                }
+                continue;
+            }
+            if (builder->nodeKind(c) == NodeKind::Internal) {
+                operandSibling = c;
+                break;
+            }
+        }
+        if (!typeChild.valid()) {
+            // The guard names a rule that did not materialize in the
+            // built subtree — a schema-authoring inconsistency. Refuse
+            // the commit (the alt's other branches still get their
+            // shot); never guess a type parse we cannot inspect.
+            return false;
+        }
+
+        // Rule 1 — not a lone identifier → commit.
+        std::vector<NodeId> typeLeaves;
+        collectLeavesBelow_(typeChild, typeLeaves, /*cap=*/1);
+        if (typeLeaves.size() != 1
+            || builder->nodeKind(typeLeaves[0]) != NodeKind::Token
+            || builder->nodeTokenKind(typeLeaves[0]).v != identifierKind.v) {
+            return true;
+        }
+
+        // Rules 2 + 3 — the sketch knows the name.
+        const SourceSpan nameSpan = builder->nodeSpan(typeLeaves[0]);
+        const std::string_view name = src->slice(nameSpan);
+        switch (sketch.lookup(name)) {
+        case BinderSketch::NameKind::Type:    return true;
+        case BinderSketch::NameKind::Value:   return false;
+        case BinderSketch::NameKind::Unknown: break;
+        }
+
+        // Rule 4 — unknown name: follower-operator test.
+        SchemaTokenId followerKind{};
+        if (operandSibling.valid()) {
+            std::vector<NodeId> fl;
+            collectLeavesBelow_(operandSibling, fl, /*cap=*/0);
+            if (!fl.empty()
+                && builder->nodeKind(fl[0]) == NodeKind::Token) {
+                followerKind = builder->nodeTokenKind(fl[0]);
+            }
+        }
+        auto const& ops = schema->operatorTable();
+        const bool followerIsOperator = followerKind.valid()
+            && (ops.lookup(followerKind, OperatorArity::Infix).has_value()
+                || ops.lookup(followerKind, OperatorArity::Postfix).has_value()
+                || ops.lookup(followerKind, OperatorArity::Ternary).has_value());
+        if (!followerIsOperator) {
+            return true;   // value reading could not continue → commit
+        }
+        outCandidate = AmbiguousTypeNameCandidate{
+            .name = std::string{name},
+            .span = nameSpan,
+        };
+        return false;
     }
 
     [[nodiscard]] bool isAtSourceEnd() const noexcept {
@@ -526,7 +776,13 @@ struct Parser::Impl {
                   impl.walker.lookahead() > 0
                       ? impl.walker.lookahead() * 16u
                       : 64u))
-            , stepRecoveredBefore_(impl.stepRecovered_) {
+            , stepRecoveredBefore_(impl.stepRecovered_)
+            // FC2: the binder sketch is the FIFTH machine a probe
+            // touches (binder-rule frames closing inside the branch
+            // record bindings; the type-name triage records
+            // candidates). A rolled-back probe must leak neither —
+            // same discipline as diagsEmitted / stepRecovered_.
+            , sketchSnap_(impl.sketch.snapshot()) {
             ++impl_.speculationDepth;
         }
 
@@ -559,6 +815,7 @@ struct Parser::Impl {
                 impl_.tokens.restore(bookmark_);
                 impl_.diagsEmitted = diagsBefore_;
                 impl_.stepRecovered_ = stepRecoveredBefore_;
+                impl_.sketch.restore(std::move(sketchSnap_));
             }
             --impl_.speculationDepth;
         }
@@ -611,6 +868,7 @@ struct Parser::Impl {
         bool                                   desyncedBefore_;
         std::size_t                            budget_;
         bool                                   stepRecoveredBefore_;
+        BinderSketch::Snapshot                 sketchSnap_;
         bool                                   committed_ = false;
     };
 
@@ -669,6 +927,14 @@ struct Parser::Impl {
         frames.push_back(std::move(guard));
         frameRules.push_back(rule);
         walker.enterRule(rule);
+        // FC2 binder sketch: a `semantics.scopes` rule's frame is a
+        // lexical scope — the SAME rule-driven scope model the semantic
+        // analyzer builds, mirrored parser-side. (Probe rollback pops
+        // frames without closeFrameOnce; the sketch snapshot restore
+        // covers those opens wholesale.)
+        if (sketch.enabled() && sketch.isScopeRule(rule)) {
+            sketch.openScope();
+        }
     }
 
     // Advance over `peek` as an operator token: push to builder, step
@@ -701,6 +967,12 @@ struct Parser::Impl {
         std::optional<SchemaWalker::Snapshot>  walkerSnap;
         std::size_t                            frameDepth;
         std::size_t                            diagsBefore;
+        // FC2: the binder sketch rolls back with the other machines.
+        // c-subset declarations never nest inside expressions, but the
+        // contract is engine-generic (a language with let-expressions
+        // would bind inside a replayed primary) — restoring here keeps
+        // the rollback-replay sound for any grammar.
+        BinderSketch::Snapshot                 sketchSnap;
     };
 
     [[nodiscard]] WalkerSnapshot snapForWalker() {
@@ -710,6 +982,7 @@ struct Parser::Impl {
             walker.snapshot(),
             frames.size(),
             diagsEmitted,
+            sketch.snapshot(),
         };
     }
 
@@ -729,6 +1002,7 @@ struct Parser::Impl {
         builder->rollback(std::move(*s.builderCp));
         tokens.restore(s.tokenBookmark);
         diagsEmitted = s.diagsBefore;
+        sketch.restore(std::move(s.sketchSnap));
     }
 
     // Commit the snapshot's builder Checkpoint so its dtor doesn't
@@ -768,6 +1042,20 @@ struct Parser::Impl {
             return false;
         }
 
+        // FC2: an ambiguous type-name candidate produced by the commit
+        // triage must SURVIVE the rollback of its own probe (the
+        // rolled-back value reading is the chosen parse; the candidate
+        // is the oracle's input for the cross-file second chance). The
+        // probe's RAII restore covers the sketch — so the triage hands
+        // the candidate OUT and it is recorded after the probe
+        // destructs, into the restored sketch. An ENCLOSING probe that
+        // later rolls back erases it correctly (the winning parse
+        // re-encounters and re-records the site), and the Pratt
+        // walker's rollback-replay re-records it on each replay —
+        // convergent to exactly the surviving parse's candidates.
+        std::optional<AmbiguousTypeNameCandidate> rolledBackCandidate;
+
+        const bool committed = [&]() -> bool {
         SpeculationProbe probe{*this};
 
         openExprFrame(branch);
@@ -801,8 +1089,28 @@ struct Parser::Impl {
             if (probe.isDesynced())  return false;
         }
 
+        // FC2 type-name commit guard: a `commitRequiresTypeName`-marked
+        // branch commits only per the generic triage (lone-identifier
+        // type names need binder-sketch / follower evidence; every other
+        // type form commits). Returning false lets the probe's RAII
+        // restore roll the branch back and the caller try the alt's
+        // next candidate — the value reading.
+        if (const RuleId typeRule = schema->typeNameCommitRule(branch);
+            typeRule.valid()) {
+            if (!typeNameCommitApproved_(branch, typeRule,
+                                         rolledBackCandidate)) {
+                return false;
+            }
+        }
+
         probe.commit();
         return true;
+        }();   // probe destructs here — rollback restored the sketch
+
+        if (!committed && rolledBackCandidate.has_value()) {
+            sketch.recordCandidate(std::move(*rolledBackCandidate));
+        }
+        return committed;
     }
 
     // ── one dispatch iteration ─────────────────────────────────────
@@ -1253,6 +1561,14 @@ ParseResult Parser::parse() && {
         fatal("dss::Parser::parse: schema has no root rule");
     }
 
+    // FC2: seed cross-file type names into the binder sketch's global
+    // scope BEFORE any frame opens — the compilation-unit oracle's
+    // channel for the one-shot ambiguous-candidate reparse.
+    for (auto& seed : I.config.seedGlobalTypeNames) {
+        I.sketch.seedGlobalType(std::move(seed));
+    }
+    I.config.seedGlobalTypeNames.clear();
+
     I.openExprFrame(rootRule);
 
     I.lastCursor = I.walker.cursor();
@@ -1277,7 +1593,15 @@ ParseResult Parser::parse() && {
         I.closeFrameOnce();
     }
 
-    return ParseResult{std::move(*I.builder).finish()};
+    // FC2 sidecars: the ambiguous type-name sites this parse rolled
+    // back on (the CU oracle's input) + the global-scope TYPE names it
+    // bound (the oracle's harvest surface). Both empty for binder-less
+    // languages.
+    return ParseResult{
+        .tree               = std::move(*I.builder).finish(),
+        .typeNameCandidates = I.sketch.takeCandidates(),
+        .globalTypeNames    = I.sketch.globalTypeNames(),
+    };
 }
 
 // ── DefaultPrattWalker ──────────────────────────────────────────────────

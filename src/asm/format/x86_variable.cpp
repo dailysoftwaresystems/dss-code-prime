@@ -568,7 +568,15 @@ bool encode(Lir const&                  lir,
     }
 
     // ── Emit bytes in canonical x86 order ─────────────────────────
-    // 1) Legacy prefixes (none for this cycle).
+    // 1) Legacy prefixes: the variant's declared mandatory-prefix
+    //    bytes (FC2 Part B — SSE F2/F3/66 opcode-form selectors).
+    //    MUST precede the REX prefix: x86 decode treats a mandatory
+    //    prefix after REX as a plain legacy prefix that does NOT
+    //    select the SSE opcode form (the instruction would decode
+    //    as a different opcode). Empty for every non-SSE template.
+    for (auto b : selected->tmpl.mandatoryPrefix) {
+        out.push_back(b);
+    }
     // 2) REX prefix: emit iff W, R, or B is set. The 4 bits compose
     //    `0x40 | (W<<3) | (R<<2) | (X<<1) | B`. X is reserved here
     //    (SIB.index high bit) — joins when memory addressing modes

@@ -22,9 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <cerrno>
 #include <cstdint>
-#include <cstdlib>
 #include <format>
 #include <limits>
 #include <optional>
@@ -61,24 +59,12 @@ namespace {
 // engine's BinaryOp branch. A new comparison-shaped op (e.g. `Spaceship`)
 // would otherwise need updates in all three sites.
 
-// decodeInteger lives in core/types/number_decode.hpp — shared with the
-// semantic phase so a literal's text is interpreted identically everywhere.
-
-[[nodiscard]] double decodeFloat(std::string_view text, NumberStyle const* ns, bool& ok) {
-    std::string s;
-    s.reserve(text.size());
-    char const sep = (ns && ns->digitSeparator) ? *ns->digitSeparator : '\0';
-    for (char c : text) {
-        if (sep != '\0' && c == sep) continue;
-        if (c == 'f' || c == 'F') continue;  // float suffix
-        s += c;
-    }
-    errno = 0;
-    char* end = nullptr;
-    double const d = std::strtod(s.c_str(), &end);
-    ok = (end != s.c_str()) && errno != ERANGE;   // parsed something, in range
-    return d;
-}
+// decodeInteger + decodeFloat live in core/types/number_decode.hpp —
+// shared so a literal's text is interpreted identically everywhere.
+// (FC1 cycle 2, 2026-06-10: decodeFloat was hoisted from here; its old
+// local body stripped EVERY 'f'/'F' char — a hardcoded C-ism that
+// value-corrupted hex-float mantissas like `0x1.fp3`. The shared one
+// strips only a trailing DECLARED suffix.)
 
 [[nodiscard]] bool isSignedCore(TypeKind k) noexcept {
     switch (k) {
@@ -701,18 +687,24 @@ struct Lowerer {
 
     E lowerOperand(NodeId node) {
         // operand = Identifier | <literal token> | <char/string literal>
-        //         | ( expression ) | compoundLiteralExpr | ...
+        //         | ( expression ) | compoundLiteralExpr | castExpr | ...
         if (auto lit = tryLowerLeafLiteral(node)) return *lit;
         // D5.3 cycle 1b.3: compound literal `(T){...}` as an expression.
         // Detected BEFORE the generic internal-child descent because
         // its shape is `(T){...}` — lowerExpr's rule dispatch doesn't
         // recognize compoundLiteralExpr; route it through the dedicated
         // lowering that resolves the type-ref + lowers the brace child.
+        // FC2: the explicit cast `(T)expr` routes the same way (its type
+        // child must NOT be lowered as an expression).
         for (NodeId c : visible(node)) {
             if (tree().kind(c) != NodeKind::Internal) continue;
             if (cfg.compoundLiteralRule.valid()
              && tree().rule(c).v == cfg.compoundLiteralRule.v) {
                 return lowerCompoundLiteral(c);
+            }
+            if (cfg.castRule.valid()
+             && tree().rule(c).v == cfg.castRule.v) {
+                return lowerCast(c);
             }
         }
         for (NodeId c : visible(node)) {
@@ -1767,6 +1759,42 @@ struct Lowerer {
         }
         HirNodeId const agg = lowerBraceInit(braceN, type);
         return {track(agg, clNode), type};
+    }
+
+    // FC2: explicit cast `(T)expr` (`hirLowering.castRule`). The grammar
+    // parses `castExpr = ParenOpen typeRef ParenClose operandExpr`; the
+    // FIRST internal child is the type-ref (its target type comes from
+    // the semantic phase's per-node stamp — same probe as the compound
+    // literal above), the SECOND is the operand expression. Lowers to a
+    // core `HirKind::Cast` with EXPLICIT flags (HirFlags::None — NOT
+    // Synthetic, which marks compiler-inserted coercions; an explicit
+    // cast is programmer-written source). The semantic phase already
+    // validated the (target, operand) pair against the explicit-cast
+    // matrix (S_InvalidCast), so an unlowerable pair never reaches the
+    // MIR mapCast lattice. Fail-loud on a missing stamp or child — a
+    // castRule subtree the analyzer didn't type is a phase-ordering bug,
+    // not a recoverable shape.
+    [[nodiscard]] E lowerCast(NodeId castNode) {
+        NodeId typeRefN{}, operandN{};
+        for (NodeId c : visible(castNode)) {
+            if (isToken(c)) continue;
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (!typeRefN.valid())       typeRefN = c;
+            else if (!operandN.valid()) { operandN = c; break; }
+        }
+        if (!typeRefN.valid() || !operandN.valid()) {
+            return exprError(castNode,
+                "cast expression is missing its type-ref or operand");
+        }
+        TypeId const target = resolveStampedTypeBelow(typeRefN);
+        if (!target.valid()) {
+            return exprError(castNode,
+                "cast type-ref did not resolve to a type");
+        }
+        E const operand = lowerExpr(operandN);
+        HirNodeId const cast =
+            builder.makeCast(operand.id, target, HirFlags::None);
+        return {track(cast, castNode), target};
     }
 
     // D5.3 cycle 1b.2: resolve an `designatedIndex` CST `[i]` to an

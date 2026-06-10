@@ -136,6 +136,16 @@ enum class MnemonicSlot : std::uint8_t {
     // shadow space AND wrong call opcode. Same schema opcode the
     // trampoline emitter uses for ExitProcess.
     CallIndirectViaExtern,
+    // FC1 (V2-4.X full-C, 2026-06-10): NATIVE result-bearing division /
+    // remainder verbs — Rule 1 of the capability-driven div/mod
+    // realization (closes D-MIR-TO-LIR-DIV-SEQUENCE-AGNOSTIC). A target
+    // that declares one of these mnemonics as a `result: value` opcode
+    // gets a single 3-address LIR op (arm64 SDIV/UDIV; a future RISC-V
+    // DIV/DIVU/REM/REMU hits all four). A target without them falls
+    // back to the implicit-register pair (x86 cqo+idiv_op /
+    // xor_rdx_zero+div_op) or — remainder only — the generic
+    // rem = n − (n/d)·d expansion over div + mul + sub.
+    SDivNative, UDivNative, SModNative, UModNative,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -213,6 +223,10 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::Call,           "call"},
     {MnemonicSlot::IntrinsicCall,  "intrinsic_call"},
     {MnemonicSlot::CallIndirectViaExtern, "call_indirect_via_extern"},
+    {MnemonicSlot::SDivNative,    "sdiv"},
+    {MnemonicSlot::UDivNative,    "udiv"},
+    {MnemonicSlot::SModNative,    "smod"},
+    {MnemonicSlot::UModNative,    "umod"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -240,6 +254,16 @@ struct Lowerer {
     // nullopt when the target schema omits it), `cache_[i].missingReported`
     // gates the one-shot diagnostic.
     std::array<MnemonicCache, kMnemonicCount> cache_;
+
+    // FC2 Part B: per-(register-class, op) opcode handles resolved from
+    // the target's `registerClassOps[]` table (with the GPR universal
+    // defaults — see TargetSchema::regClassOpOpcode). `nullopt` = the
+    // class has no such operation; consumers fail loud at the use site
+    // (a class/op combination a module never emits must not fail the
+    // whole lowering at construction). Generalizes the lowerBitcast
+    // class-dispatch pattern to EVERY mov/load/store emission.
+    std::array<std::array<std::optional<std::uint16_t>, kRegClassOpCount>, 5>
+        classOpCache_{};
 
     // Per-function state. Cleared at the top of `lowerFunction`.
     MirAttribute<LirReg>            valueToReg;
@@ -318,6 +342,17 @@ struct Lowerer {
             cache_[i].id       = target.opcodeByMnemonic(r.mnemonic);
         }
 
+        // FC2 Part B: resolve the per-class move/load/store handles
+        // once (mirrors the mnemonic cache). Unresolvable cells stay
+        // nullopt — diagnosed at the emitting site, not here.
+        for (std::size_t c = 0; c < classOpCache_.size(); ++c) {
+            for (std::size_t o = 0; o < kRegClassOpCount; ++o) {
+                classOpCache_[c][o] = target.regClassOpOpcode(
+                    static_cast<TargetRegClass>(c),
+                    static_cast<RegClassOp>(o));
+            }
+        }
+
         // D-FFI-EXTERN-CALL-DISPATCH (was D-LK10-ENTRY-ML7-FRAME-BIAS-
         // UNIFY 2nd-order audit fold): fail loud UPFRONT at construction
         // if the module declares extern imports but the active object
@@ -381,6 +416,35 @@ struct Lowerer {
         return cache_[static_cast<std::size_t>(s)].id;
     }
 
+    // FC2 Part B: the opcode that performs `op` on a value of register
+    // class `cls` (the registerClassOps resolution). GPR resolves to
+    // the universal mov/load/store; a class with no declared operation
+    // returns nullopt — callers MUST route through
+    // `reportMissingClassOp` rather than falling back to the GPR
+    // handle (the silent class-blind miscompile this table kills).
+    [[nodiscard]] std::optional<std::uint16_t>
+    classOp(LirRegClass cls, RegClassOp op) const {
+        auto const c = static_cast<std::size_t>(cls);
+        if (c >= classOpCache_.size()) return std::nullopt;
+        return classOpCache_[c][static_cast<std::size_t>(op)];
+    }
+
+    void reportMissingClassOp(LirRegClass cls, RegClassOp op,
+                              std::string_view context) {
+        dss::report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+            DiagnosticSeverity::Error,
+            std::format(
+                "target '{}' declares no '{}' operation for register "
+                "class '{}' (required for lowering {}) — declare it in "
+                "the target's `registerClassOps[]` (the universal "
+                "mov/load/store bindings cover only the GPR class); "
+                "falling back to the GPR instruction forms would "
+                "silently mis-encode",
+                target.name(), regClassOpName(op),
+                targetRegClassName(static_cast<TargetRegClass>(cls)),
+                context));
+    }
+
     // Map a MIR `TypeId` to the LIR register class that holds its
     // values. F16/F32/F64/F128 → FPR; Vector/Matrix → VR (SIMD);
     // integer/bool/pointer → GPR; default for aggregates (Struct/
@@ -403,6 +467,40 @@ struct Lowerer {
 
     [[nodiscard]] LirRegClass regClassFor(MirInstId id) const {
         return regClassForType(mir.instType(id));
+    }
+
+    // FC2 Part B width gate (D-TARGET-ENCODING-WIDTH-GUARD): encoding
+    // variant guards carry NO operand-width discriminator, so once the
+    // F64 SSE rows exist (addsd / cvttsd2si / movsd_load), a non-F64
+    // float op lowered through the same mnemonics would SILENTLY
+    // encode the 8-byte double instruction forms against narrower
+    // values — a miscompile, not a diagnostic. This is the only tier
+    // where MIR types are still visible (post-regalloc LIR carries
+    // register CLASSES, not widths), so the gate lives here: any
+    // FPR-class type flowing into an F64-encoded mnemonic must BE
+    // F64. Returns true (no-op) for non-FPR types. Applied exactly
+    // where F64 encodings exist this cycle (FAdd, FPToSI source,
+    // FPR-class Load); the still-encoding-less float ops keep their
+    // assemble-tier A_NoEncodingDeclared fail-loud and gain this gate
+    // alongside their encodings.
+    [[nodiscard]] bool requireF64Width(MirInstId id, TypeId ty,
+                                       std::string_view context) {
+        if (!ty.valid()) return true;  // upstream diagnosed the type hole
+        if (regClassForType(ty) != LirRegClass::FPR) return true;
+        if (interner.kind(ty) == TypeKind::F64) return true;
+        dss::report(reporter,
+            DiagnosticCode::L_UnsupportedLoweringForOpcode,
+            DiagnosticSeverity::Error,
+            std::format(
+                "{}: float TypeKind ordinal {} is not lowerable to "
+                "target '{}' — only F64 has scalar float encodings this "
+                "cycle; proceeding would silently select the F64 "
+                "(double-width) instruction forms "
+                "(D-TARGET-ENCODING-WIDTH-GUARD)",
+                context, static_cast<unsigned>(interner.kind(ty)),
+                target.name()));
+        poisonValue(id);
+        return false;
     }
 
     // ── diagnostics ──────────────────────────────────────────────────
@@ -480,8 +578,10 @@ struct Lowerer {
             case MirOpcode::Add:    return lowerBinaryOp(id, MnemonicSlot::Add);
             case MirOpcode::Sub:    return lowerBinaryOp(id, MnemonicSlot::Sub);
             case MirOpcode::Mul:    return lowerBinaryOp(id, MnemonicSlot::Mul);
-            case MirOpcode::SDiv:   return lowerDiv(id, kSDivPair);
-            case MirOpcode::UDiv:   return lowerDiv(id, kUDivPair);
+            case MirOpcode::SDiv:   return lowerDivLike(id, /*isSigned=*/true,  /*wantRemainder=*/false);
+            case MirOpcode::UDiv:   return lowerDivLike(id, /*isSigned=*/false, /*wantRemainder=*/false);
+            case MirOpcode::SMod:   return lowerDivLike(id, /*isSigned=*/true,  /*wantRemainder=*/true);
+            case MirOpcode::UMod:   return lowerDivLike(id, /*isSigned=*/false, /*wantRemainder=*/true);
             case MirOpcode::ICmpEq: case MirOpcode::ICmpNe:
             case MirOpcode::ICmpSlt: case MirOpcode::ICmpSle:
             case MirOpcode::ICmpSgt: case MirOpcode::ICmpSge:
@@ -526,7 +626,11 @@ struct Lowerer {
             case MirOpcode::Not:    return lowerUnaryOp(id, MnemonicSlot::Not);
             case MirOpcode::Neg:    return lowerUnaryOp(id, MnemonicSlot::Neg);
             // ── cycle 3d float arithmetic (FPR-class result) ───────
-            case MirOpcode::FAdd:   return lowerBinaryOp(id, MnemonicSlot::FAdd);
+            case MirOpcode::FAdd:
+                // FC2 Part B: fadd carries the F64 addsd encoding —
+                // gate the width before the class-blind lowering.
+                if (!requireF64Width(id, mir.instType(id), "MIR FAdd")) return;
+                return lowerBinaryOp(id, MnemonicSlot::FAdd);
             case MirOpcode::FSub:   return lowerBinaryOp(id, MnemonicSlot::FSub);
             case MirOpcode::FMul:   return lowerBinaryOp(id, MnemonicSlot::FMul);
             case MirOpcode::FDiv:   return lowerBinaryOp(id, MnemonicSlot::FDiv);
@@ -534,7 +638,18 @@ struct Lowerer {
             // ── cycle 3d float casts (the 6 conversion variants) ───
             case MirOpcode::FPTrunc: return lowerCast(id, MnemonicSlot::FpCvt,   "MIR FPTrunc");
             case MirOpcode::FPExt:   return lowerCast(id, MnemonicSlot::FpCvt,   "MIR FPExt");
-            case MirOpcode::FPToSI:  return lowerCast(id, MnemonicSlot::FpToSi,  "MIR FPToSI");
+            case MirOpcode::FPToSI: {
+                // FC2 Part B: fp_to_si carries the F64 cvttsd2si
+                // encoding — the SOURCE operand's float width is the
+                // encoded one (the result is integer/GPR).
+                auto const convOps = mir.instOperands(id);
+                if (convOps.size() == 1
+                    && !requireF64Width(id, mir.instType(convOps[0]),
+                                        "MIR FPToSI (source)")) {
+                    return;
+                }
+                return lowerCast(id, MnemonicSlot::FpToSi,  "MIR FPToSI");
+            }
             case MirOpcode::FPToUI:  return lowerCast(id, MnemonicSlot::FpToUi,  "MIR FPToUI");
             case MirOpcode::SIToFP:  return lowerCast(id, MnemonicSlot::SiToFp,  "MIR SIToFP");
             case MirOpcode::UIToFP:  return lowerCast(id, MnemonicSlot::UiToFp,  "MIR UIToFP");
@@ -565,14 +680,23 @@ struct Lowerer {
         defineValue(id, result);
     }
 
-    // Emit a single-operand `mov` and define the result vreg. Shared
-    // tail of `lowerConst`'s narrow + wide paths (the only difference
-    // between them is the operand-kind in `op`). Returns the result reg
-    // so callers can chain.
+    // Emit a single-operand class-correct register write and define the
+    // result vreg. Shared tail of `lowerConst`'s narrow + wide paths
+    // (the only difference between them is the operand-kind in `op`).
+    // FC2 Part B: the mnemonic comes from the per-register-class table
+    // (GPR → the universal `mov`; FPR → the class's declared move, e.g.
+    // x86_64 movaps) — a GPR mov against an FPR ordinal mis-encodes.
+    // Returns the result reg so callers can chain.
     LirReg emitMovToFresh(MirInstId id, LirOperand op, LirRegClass cls) {
+        auto const movOp = classOp(cls, RegClassOp::Move);
+        if (!movOp.has_value()) {
+            reportMissingClassOp(cls, RegClassOp::Move, "MIR value copy");
+            poisonValue(id);
+            return valueToReg.get(id);
+        }
         LirReg const result = lir.newVReg(cls);
         std::array<LirOperand, 1> ops{op};
-        emitInst(*opcode(MnemonicSlot::Mov), result, ops);
+        emitInst(*movOp, result, ops);
         defineValue(id, result);
         return result;
     }
@@ -623,18 +747,42 @@ struct Lowerer {
         // ── wide-literal path: route through LirLiteralPool ──
         //
         // Routing: int32-fits → ImmInt (above); int64/uint64/string →
-        // pool with GPR-class result; double → pool with FPR-class
-        // result (cycle 3d enabled FPR consumption + the cross-class
-        // movq path for downstream Bitcast); monostate / aggregate →
+        // pool with GPR-class result; monostate / aggregate →
         // unsupported + poison so dependent uses surface ONE root-cause
         // diagnostic rather than a cascade of "used before definition".
+        //
+        // FC2 Part B (F64 constant materialization): float (FPR-class)
+        // constants must NOT reach MIR→LIR as `Const` — HIR→MIR
+        // promotes F64 literals to anonymous rodata globals
+        // (GlobalAddr + Load, the string-literal shape). The prior
+        // double→LiteralPool route was a DEAD END: no encoding variant
+        // consumes a LiteralIndex operand, so every FPR literal hit
+        // A_NoMatchingEncodingVariant at assemble time. Fail loud HERE
+        // (where the contract is visible) on EITHER signal — a double
+        // variant arm, or an FPR-class result type (catches a non-
+        // double literal hand-typed F64). Non-F64 float widths have
+        // no promotion either (D-TARGET-ENCODING-WIDTH-GUARD).
+        LirRegClass resultCls = regClassFor(id);
+        if (std::holds_alternative<double>(lit.value)
+            || resultCls == LirRegClass::FPR) {
+            dss::report(reporter,
+                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "MIR Const %{} is a float (FPR-class) literal at "
+                    "MIR→LIR — float constants must be promoted to "
+                    "anonymous rodata globals (GlobalAddr + Load) at "
+                    "HIR→MIR; the LirLiteralPool LiteralIndex route has "
+                    "no encoder path (FC2 Part B; non-F64 widths: "
+                    "D-TARGET-ENCODING-WIDTH-GUARD)", id.v));
+            poisonValue(id);
+            return;
+        }
         LirLiteralValue lirLit;
         lirLit.core = lit.core;
-        LirRegClass resultCls = regClassFor(id);
         bool unsupportedVariant = false;
         if (auto const* i = std::get_if<std::int64_t>(&lit.value))       lirLit.value = *i;
         else if (auto const* u = std::get_if<std::uint64_t>(&lit.value)) lirLit.value = *u;
-        else if (auto const* d = std::get_if<double>(&lit.value))        lirLit.value = *d;
         else if (auto const* s = std::get_if<std::string>(&lit.value))   lirLit.value = *s;
         else {
             // monostate (malformed-source recovery), aggregate (cycle
@@ -665,10 +813,6 @@ struct Lowerer {
     }
 
     void lowerLoad(MirInstId id) {
-        if (!opcode(MnemonicSlot::Load).has_value()) {
-            reportMissingOpcode(MnemonicSlot::Load, "MIR Load");
-            return;
-        }
         auto const operands = mir.instOperands(id);
         if (operands.size() != 1) { reportUnsupported(MirOpcode::Load, id); return; }
         std::optional<LirReg> const base = regForValue(operands[0]);
@@ -676,33 +820,53 @@ struct Lowerer {
         // Cycle 3d FPR-class plumbing closure: a Load of an F64 must
         // produce an FPR-class result, not GPR. Closes the silent-
         // failure-hunter HIGH finding from cycle 3d's review.
-        LirReg const result = lir.newVReg(regClassFor(id));
+        // FC2 Part B: an FPR-class load selects the F64 movsd_load
+        // mnemonic (8-byte read) via registerClassOps — gate the
+        // width so an F32 load can't silently read 8 bytes.
+        if (!requireF64Width(id, mir.instType(id), "MIR Load")) return;
+        // FC2 Part B: the load mnemonic follows the RESULT's register
+        // class (registerClassOps — GPR `load`, FPR e.g. movsd_load).
+        LirRegClass const cls = regClassFor(id);
+        auto const loadOp = classOp(cls, RegClassOp::Load);
+        if (!loadOp.has_value()) {
+            reportMissingClassOp(cls, RegClassOp::Load, "MIR Load");
+            poisonValue(id);
+            return;
+        }
+        LirReg const result = lir.newVReg(cls);
         std::array<LirOperand, 3> ops{
             LirOperand::makeReg(*base),
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        emitInst(*opcode(MnemonicSlot::Load), result, ops);
+        emitInst(*loadOp, result, ops);
         defineValue(id, result);
     }
 
     void lowerStore(MirInstId id) {
-        if (!opcode(MnemonicSlot::Store).has_value()) {
-            reportMissingOpcode(MnemonicSlot::Store, "MIR Store");
-            return;
-        }
         auto const operands = mir.instOperands(id);
         if (operands.size() != 2) { reportUnsupported(MirOpcode::Store, id); return; }
         std::optional<LirReg> const value = regForValue(operands[0]);
         std::optional<LirReg> const base  = regForValue(operands[1]);
         if (!value.has_value() || !base.has_value()) return;
+        // FC2 Part B: the store mnemonic follows the stored VALUE's
+        // register class (x86_64 fpr → movsd_store since the PE-float
+        // closure, 2026-06-10). A class with no declared store fails
+        // loud here instead of silently GPR-storing 8 bytes of XMM
+        // ordinal.
+        LirRegClass const cls = value->regClass();
+        auto const storeOp = classOp(cls, RegClassOp::Store);
+        if (!storeOp.has_value()) {
+            reportMissingClassOp(cls, RegClassOp::Store, "MIR Store");
+            return;
+        }
         std::array<LirOperand, 4> ops{
             LirOperand::makeReg(*value),
             LirOperand::makeReg(*base),
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        emitInst(*opcode(MnemonicSlot::Store), InvalidLirReg, ops);
+        emitInst(*storeOp, InvalidLirReg, ops);
     }
 
     void lowerGep(MirInstId id) {
@@ -779,17 +943,31 @@ struct Lowerer {
         if (!src.has_value()) return;
         LirRegClass const srcCls = src->regClass();
         LirRegClass const dstCls = regClassFor(id);
-        MnemonicSlot const slot =
-            (srcCls == dstCls) ? MnemonicSlot::Mov : MnemonicSlot::MovqXClass;
-        char const* const ctx =
-            (srcCls == dstCls) ? "MIR Bitcast (same-class)" : "MIR Bitcast (cross-class)";
-        if (!opcode(slot).has_value()) {
-            reportMissingOpcode(slot, ctx);
-            return;
+        // FC2 Part B: the same-class arm now routes through the
+        // per-register-class move table (this function WAS the
+        // class-dispatch pattern the table generalizes) — an FPR↔FPR
+        // bitcast copies via the class's move (x86_64 movaps), never
+        // the GPR mov. Cross-class keeps the dedicated movq_xclass.
+        std::optional<std::uint16_t> copyOp;
+        if (srcCls == dstCls) {
+            copyOp = classOp(dstCls, RegClassOp::Move);
+            if (!copyOp.has_value()) {
+                reportMissingClassOp(dstCls, RegClassOp::Move,
+                                     "MIR Bitcast (same-class)");
+                poisonValue(id);
+                return;
+            }
+        } else {
+            if (!opcode(MnemonicSlot::MovqXClass).has_value()) {
+                reportMissingOpcode(MnemonicSlot::MovqXClass,
+                                    "MIR Bitcast (cross-class)");
+                return;
+            }
+            copyOp = opcode(MnemonicSlot::MovqXClass);
         }
         LirReg const result = lir.newVReg(dstCls);
         std::array<LirOperand, 1> ops{LirOperand::makeReg(*src)};
-        emitInst(*opcode(slot), result, ops);
+        emitInst(*copyOp, result, ops);
         defineValue(id, result);
     }
 
@@ -1078,20 +1256,26 @@ struct Lowerer {
                 return;
             }
         }
-        // Degenerate first-field path: emit `load` from base.
-        if (!opcode(MnemonicSlot::Load).has_value()) {
-            reportMissingOpcode(MnemonicSlot::Load, "MIR ExtractValue");
-            return;
-        }
+        // Degenerate first-field path: emit `load` from base. FC2
+        // Part B: class-routed like lowerLoad (an F64 first field
+        // would otherwise GPR-load into an FPR vreg).
         std::optional<LirReg> const base = regForValue(operands[0]);
         if (!base.has_value()) return;
-        LirReg const result = lir.newVReg(regClassFor(id));
+        if (!requireF64Width(id, mir.instType(id), "MIR ExtractValue")) return;
+        LirRegClass const cls = regClassFor(id);
+        auto const loadOp = classOp(cls, RegClassOp::Load);
+        if (!loadOp.has_value()) {
+            reportMissingClassOp(cls, RegClassOp::Load, "MIR ExtractValue");
+            poisonValue(id);
+            return;
+        }
+        LirReg const result = lir.newVReg(cls);
         std::array<LirOperand, 3> ops{
             LirOperand::makeReg(*base),
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        emitInst(*opcode(MnemonicSlot::Load), result, ops);
+        emitInst(*loadOp, result, ops);
         defineValue(id, result);
     }
 
@@ -1111,20 +1295,25 @@ struct Lowerer {
                 return;
             }
         }
-        if (!opcode(MnemonicSlot::Store).has_value()) {
-            reportMissingOpcode(MnemonicSlot::Store, "MIR InsertValue");
-            return;
-        }
         std::optional<LirReg> const base  = regForValue(operands[0]);
         std::optional<LirReg> const value = regForValue(operands[1]);
         if (!base.has_value() || !value.has_value()) return;
+        // FC2 Part B: class-routed like lowerStore — the stored
+        // VALUE's class picks the mnemonic; a class without a
+        // declared store fails loud.
+        LirRegClass const cls = value->regClass();
+        auto const storeOp = classOp(cls, RegClassOp::Store);
+        if (!storeOp.has_value()) {
+            reportMissingClassOp(cls, RegClassOp::Store, "MIR InsertValue");
+            return;
+        }
         std::array<LirOperand, 4> ops{
             LirOperand::makeReg(*value),
             LirOperand::makeReg(*base),
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        emitInst(*opcode(MnemonicSlot::Store), InvalidLirReg, ops);
+        emitInst(*storeOp, InvalidLirReg, ops);
         // The result of InsertValue is conceptually the modified
         // aggregate. In the memory-flattening model the aggregate IS
         // the base pointer; reuse it as the result. ML6's promote-to-
@@ -1165,29 +1354,64 @@ struct Lowerer {
     void lowerBinaryOp(MirInstId id, MnemonicSlot slot) { lowerNAryOp<2>(id, slot); }
     void lowerUnaryOp (MirInstId id, MnemonicSlot slot) { lowerNAryOp<1>(id, slot); }
 
-    // ── cycle 10r: MIR SDiv/UDiv lowering (D-CSUBSET-DIVISION-OP-CODEGEN) ──
+    // ── FC1 (V2-4.X): capability-driven MIR SDiv/UDiv/SMod/UMod lowering ──
+    // (cycle 10r D-CSUBSET-DIVISION-OP-CODEGEN substrate, generalized
+    //  2026-06-10 to close D-CSUBSET-MOD-OP-CODEGEN +
+    //  D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT +
+    //  D-MIR-TO-LIR-DIV-SEQUENCE-AGNOSTIC)
     //
-    // x86 division is structurally 4-LIR-inst on this target because:
-    //   1. The CORE op (IDIV /7 or DIV /6) has implicit-register
-    //      semantics: reads RDX:RAX, writes RDX:RAX, clobbers RDX.
-    //   2. A PRE op must zero/sign-extend RAX into RDX before the
-    //      core: CQO (signed sign-extend) or XOR RDX,RDX (unsigned
-    //      zero-extend).
-    //   3. Both PRE and CORE declare `result: none` — outputs live
-    //      in implicit physical registers, not encoding slots.
-    //   4. The SSA result vreg is created by a follow-up `mov` from
-    //      RAX (quotient).
+    // ONE arm serves all four division-family MIR opcodes on every
+    // target, selecting the realization from the target's DECLARED
+    // OPCODE VOCABULARY (mnemonic-presence probing — the sanctioned
+    // pattern `lea`/`call` already use; never an arch identity):
     //
-    // Sequence emitted (x86 today):
-    //   mov rax_phys, dividend_vreg     ; pin dividend to RAX
-    //   {cqo,xor_rdx_zero}              ; pre op (no operands, no result)
-    //   {idiv_op,div_op} divisor_vreg   ; core op (no result)
-    //   mov result_vreg, rax_phys       ; capture quotient
+    //   Rule 1 — NATIVE: the target declares a `result: value` opcode
+    //     under the verb's own mnemonic ("sdiv"/"udiv"/"smod"/"umod")
+    //     → ONE 3-address LIR op. (arm64 SDIV/UDIV; a future RISC-V
+    //     DIV/DIVU/REM/REMU hits all four.) A `result: none`
+    //     declaration under these mnemonics is a schema
+    //     misdeclaration → fail loud, never a silent fall-through to
+    //     another realization the author did not intend.
     //
-    // **Cycle 10r split rationale** — cycle 10q packaged CQO+IDIV
-    // into a single compound op with opcode bytes `[0x48, 0x99,
-    // 0x48, 0xF7]`. The encoder auto-emits ONE REX prefix at the
-    // start (e.g. `0x41` for REX.B when the divisor is in R14);
+    //   Rule 2 — IMPLICIT-REGISTER PAIR: the target declares the
+    //     pre/core pair (x86: cqo+idiv_op signed; xor_rdx_zero+div_op
+    //     unsigned) → the 4-LIR-op sequence in `emitImplicitPairDiv`;
+    //     the SSA result is captured from the implicit output
+    //     selected BY ROLE ("quotient" for div, "remainder" for mod)
+    //     via the core op's `outputRoles` declaration — never by
+    //     positional index (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-
+    //     CONTRACT: a JSON reorder of `outputs` can no longer
+    //     silently flip a quotient capture into a remainder capture).
+    //     The dividend pin likewise resolves via `inputRoles` role
+    //     "dividend". A HALF-declared pair (pre without core or vice
+    //     versa) is a misconfiguration → fail loud naming the absent
+    //     half — it does NOT silently fall through to rule 3.
+    //
+    //   Rule 3 — EXPANSION (remainder only): no native rem and no
+    //     pair, but a div realization (rule 1/2) plus the universal
+    //     `mul` + `sub` verbs exist → the target-blind arithmetic
+    //     identity   rem = n − (n / d) · d   (arm64 SMod/UMod:
+    //     sdiv/udiv + mul + sub = 3 LIR ops). C truncated-remainder
+    //     semantics hold by construction — the identity IS C23
+    //     6.5.5's definition of % over truncated /. A fused MSUB
+    //     realization (2 ops) is a peephole-quality refinement,
+    //     pinned D-LIR-MOD-MSUB-FUSION (needs an `Ra` encoding slot
+    //     kind the fixed32 vocabulary does not have).
+    //
+    //   Else → fail loud (no division realization declared).
+    //
+    // The previously sketched alternative — one result-bearing LIR op
+    // whose result vreg the REGALLOC pins to the implicit output
+    // register — was rejected at the FC1 plan-lock: no regalloc
+    // pre-coloring mechanism exists (call results use an explicit
+    // post-regalloc mov in `materializeOneFunc`), and building one
+    // for a perf-only delta would speculatively erect the deferred
+    // D-ML7-2.5 substrate.
+    //
+    // **Cycle 10r split rationale** (preserved) — cycle 10q packaged
+    // CQO+IDIV into a single compound op with opcode bytes `[0x48,
+    // 0x99, 0x48, 0xF7]`. The encoder auto-emits ONE REX prefix at
+    // the start (e.g. `0x41` for REX.B when the divisor is in R14);
     // the embedded second `0x48` (REX.W only) then SUPERSEDED the
     // auto-REX prefix, losing REX.B. The IDIV operand decodes as
     // `modrm.rm low 3 bits` = 6 = RSI (without REX.B) instead of
@@ -1195,43 +1419,12 @@ struct Lowerer {
     // Splitting into two opcodes lets each instruction's REX be
     // auto-computed correctly with its operand's high bit.
     //
-    // FLAG 1 (silent-miscompile guard, 2026-06-04, preserved through
-    // 10r split): SDiv routes pre=cqo + core=idiv_op; UDiv routes
-    // pre=xor_rdx_zero + core=div_op. Routing UDiv through idiv would
-    // mis-sign-interpret any dividend ≥ INT_MAX as negative — silent
-    // miscompile.
-    //
-    // FLAG 2 anchor (sequence agnosticism, 2026-06-04): the 4-LIR-
-    // op shape is x86-specific. ARM64's direct `SDIV Xd, Xn, Xm` is
-    // a single inst with SSA result and no implicit registers — a
-    // future ARM64 target.json would map the four slots to its
-    // ARM SDIV/UDIV opcodes (pre slots possibly absent / no-op);
-    // the MIR→LIR Div arm would then need to detect "result: value
-    // vs result: none" + branch accordingly. Anchored
-    // D-MIR-TO-LIR-DIV-SEQUENCE-AGNOSTIC for the closure when the
-    // 2nd target lands.
-    //
-    // Physical-RAX resolution: the dividend-input + quotient-output
-    // ordinals are read from the CORE op's `implicitRegisters`
-    // declaration — NOT hardcoded `rax`. This keeps the lowering
-    // target-blind at the lir-emit tier; the target.json declares
-    // which physical register plays the dividend / quotient role.
-    void lowerDiv(MirInstId id, DivSlotPair pair) {
-        auto const preOp = opcode(pair.pre);
-        if (!preOp.has_value()) {
-            reportMissingOpcode(pair.pre, mirOpcodeName(mir.instOpcode(id)));
-            return;
-        }
-        auto const coreOp = opcode(pair.core);
-        if (!coreOp.has_value()) {
-            reportMissingOpcode(pair.core, mirOpcodeName(mir.instOpcode(id)));
-            return;
-        }
-        auto const movOp = opcode(MnemonicSlot::Mov);
-        if (!movOp.has_value()) {
-            reportMissingOpcode(MnemonicSlot::Mov, "MIR Div (capture)");
-            return;
-        }
+    // FLAG 1 (silent-miscompile guard, 2026-06-04, preserved): SDiv/
+    // SMod route pre=cqo + core=idiv_op; UDiv/UMod route
+    // pre=xor_rdx_zero + core=div_op. Routing the unsigned ops
+    // through idiv would mis-sign-interpret any dividend ≥ INT_MAX
+    // as negative — silent miscompile.
+    void lowerDivLike(MirInstId id, bool isSigned, bool wantRemainder) {
         auto const operands = mir.instOperands(id);
         if (operands.size() != 2) {
             reportUnsupported(mir.instOpcode(id), id);
@@ -1240,80 +1433,175 @@ struct Lowerer {
         std::optional<LirReg> const dividend = regForValue(operands[0]);
         std::optional<LirReg> const divisor  = regForValue(operands[1]);
         if (!dividend.has_value() || !divisor.has_value()) return;
+        auto const result =
+            emitDivLikeValue(id, isSigned, wantRemainder, *dividend, *divisor);
+        if (!result.has_value()) return;  // diagnostic already emitted
+        defineValue(id, *result);
+    }
 
+    // Emits the LIR realization of one division-family value and
+    // returns the vreg holding the requested quotient/remainder
+    // (nullopt = no realization available / misdeclared; diagnostic
+    // already emitted). Split from `lowerDivLike` so rule 3's
+    // expansion can realize its inner DIVISION through the same
+    // rule-1/2 probing without re-running operand validation or
+    // defining the MIR value twice.
+    [[nodiscard]] std::optional<LirReg> emitDivLikeValue(
+            MirInstId id, bool isSigned, bool wantRemainder,
+            LirReg dividend, LirReg divisor) {
+        // Rule 1 — native result-bearing opcode under the verb's mnemonic.
+        MnemonicSlot const nativeSlot = wantRemainder
+            ? (isSigned ? MnemonicSlot::SModNative : MnemonicSlot::UModNative)
+            : (isSigned ? MnemonicSlot::SDivNative : MnemonicSlot::UDivNative);
+        if (auto const nativeOp = opcode(nativeSlot); nativeOp.has_value()) {
+            auto const* ni = target.opcodeInfo(*nativeOp);
+            if (ni == nullptr || ni->result != TargetResultRule::Value) {
+                reportUnsupported(mir.instOpcode(id), id);
+                return std::nullopt;
+            }
+            LirReg const result = lir.newVReg(regClassFor(id));
+            std::array<LirOperand, 2> const ops{
+                LirOperand::makeReg(dividend), LirOperand::makeReg(divisor)};
+            emitInst(*nativeOp, result, ops);
+            return result;
+        }
+        // Rule 2 — implicit-register pre/core pair.
+        DivSlotPair const pair = isSigned ? kSDivPair : kUDivPair;
+        auto const preOp  = opcode(pair.pre);
+        auto const coreOp = opcode(pair.core);
+        if (preOp.has_value() || coreOp.has_value()) {
+            if (!preOp.has_value()) {
+                reportMissingOpcode(pair.pre,
+                                    mirOpcodeName(mir.instOpcode(id)));
+                return std::nullopt;
+            }
+            if (!coreOp.has_value()) {
+                reportMissingOpcode(pair.core,
+                                    mirOpcodeName(mir.instOpcode(id)));
+                return std::nullopt;
+            }
+            return emitImplicitPairDiv(id, *preOp, *coreOp, wantRemainder,
+                                       dividend, divisor);
+        }
+        // Rule 3 — generic remainder expansion over div + mul + sub.
+        if (wantRemainder) {
+            auto const quotient = emitDivLikeValue(
+                id, isSigned, /*wantRemainder=*/false, dividend, divisor);
+            if (!quotient.has_value()) return std::nullopt;
+            auto const mulOp = opcode(MnemonicSlot::Mul);
+            if (!mulOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Mul,
+                                    mirOpcodeName(mir.instOpcode(id)));
+                return std::nullopt;
+            }
+            auto const subOp = opcode(MnemonicSlot::Sub);
+            if (!subOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Sub,
+                                    mirOpcodeName(mir.instOpcode(id)));
+                return std::nullopt;
+            }
+            LirReg const product = lir.newVReg(regClassFor(id));
+            std::array<LirOperand, 2> const mulOps{
+                LirOperand::makeReg(*quotient), LirOperand::makeReg(divisor)};
+            emitInst(*mulOp, product, mulOps);
+            LirReg const remainder = lir.newVReg(regClassFor(id));
+            std::array<LirOperand, 2> const subOps{
+                LirOperand::makeReg(dividend), LirOperand::makeReg(product)};
+            emitInst(*subOp, remainder, subOps);
+            return remainder;
+        }
+        // No realization for a plain division: report the native verb
+        // mnemonic as the canonical missing capability.
+        reportMissingOpcode(nativeSlot, mirOpcodeName(mir.instOpcode(id)));
+        return std::nullopt;
+    }
+
+    // Rule 2 body — the implicit-register pre/core sequence:
+    //   mov  <dividend-role>_phys, dividend_vreg   ; pin dividend
+    //   PRE                                        ; cqo / xor_rdx_zero
+    //   CORE divisor_vreg                          ; idiv_op / div_op
+    //   mov  result_vreg, <capture-role>_phys      ; quotient/remainder
+    [[nodiscard]] std::optional<LirReg> emitImplicitPairDiv(
+            MirInstId id, std::uint16_t preOpId, std::uint16_t coreOpId,
+            bool wantRemainder, LirReg dividend, LirReg divisor) {
+        auto const movOp = opcode(MnemonicSlot::Mov);
+        if (!movOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::Mov, "MIR Div/Mod (capture)");
+            return std::nullopt;
+        }
         // 7-agent review fold F2 (silent-failure 8/10, 2026-06-04):
         // validate that BOTH the pre AND core op carry implicit-
-        // register declarations. Pre-fold only the core was checked,
-        // leaving the pre silently un-validated. If a future JSON
-        // edit drops `implicitRegisters` from `cqo` or `xor_rdx_zero`,
-        // regalloc's `collectImplicitClobberPositions` skips that
-        // position with no diagnostic — divisor vreg could land in
-        // RDX, get zeroed by xor, idiv would divide by zero. Fail
-        // loud at the lowering tier captures the misconfiguration
-        // BEFORE regalloc silently mis-allocates.
-        auto const* preInfo = target.opcodeInfo(*preOp);
+        // register declarations. If a future JSON edit drops
+        // `implicitRegisters` from `cqo` or `xor_rdx_zero`, regalloc's
+        // `collectImplicitClobberPositions` skips that position with
+        // no diagnostic — divisor vreg could land in RDX, get zeroed
+        // by xor, idiv would divide by zero. Fail loud at the lowering
+        // tier captures the misconfiguration BEFORE regalloc silently
+        // mis-allocates.
+        auto const* preInfo = target.opcodeInfo(preOpId);
         if (preInfo == nullptr
          || !preInfo->implicitRegisters.has_value()
          || preInfo->implicitRegisters->clobberedOrdinals.empty()) {
             reportUnsupported(mir.instOpcode(id), id);
-            return;
+            return std::nullopt;
         }
-        // Read implicit-input + implicit-output ordinals from the
-        // CORE op's schema declaration — config-driven (no
-        // hardcoded "rax"). The core op declares that the FIRST
-        // implicit-input is the dividend register; the first
-        // implicit-output is the quotient register. For x86_64 both
-        // resolve to RAX; for a future ARM64 mapping they'd be N/A.
-        auto const* coreInfo = target.opcodeInfo(*coreOp);
+        auto const* coreInfo = target.opcodeInfo(coreOpId);
         if (coreInfo == nullptr
-         || !coreInfo->implicitRegisters.has_value()
-         || coreInfo->implicitRegisters->inputOrdinals.empty()
-         || coreInfo->implicitRegisters->outputOrdinals.empty()) {
-            // Without the implicit-register declaration, the lowering
-            // cannot determine the dividend/quotient physical
-            // registers. This indicates a target.json misconfiguration
-            // (divide core opcode declared without implicitRegisters).
-            // Fail loud rather than emit code that silently mis-pins.
+         || !coreInfo->implicitRegisters.has_value()) {
             reportUnsupported(mir.instOpcode(id), id);
-            return;
+            return std::nullopt;
         }
-        std::uint16_t const dividendOrdinal =
-            coreInfo->implicitRegisters->inputOrdinals[0];
-        std::uint16_t const quotientOrdinal =
-            coreInfo->implicitRegisters->outputOrdinals[0];
+        // Role-based register resolution (D-CSUBSET-MOD-OP-CODEGEN-
+        // OUTPUT-INDEX-CONTRACT): the dividend pin and the captured
+        // output are looked up BY ROLE from the core op's
+        // inputRoles/outputRoles declarations — positional indexing
+        // is gone from this projection path. An op missing the
+        // required role is a misconfiguration → fail loud.
+        auto const& coreIr = *coreInfo->implicitRegisters;
+        auto const dividendOrdinal = coreIr.inputOrdinalForRole("dividend");
+        if (!dividendOrdinal.has_value()) {
+            reportMissingImplicitRole(coreOpId, "inputRoles", "dividend", id);
+            return std::nullopt;
+        }
+        char const* const captureRole =
+            wantRemainder ? "remainder" : "quotient";
+        auto const captureOrdinal = coreIr.outputOrdinalForRole(captureRole);
+        if (!captureOrdinal.has_value()) {
+            reportMissingImplicitRole(coreOpId, "outputRoles", captureRole,
+                                      id);
+            return std::nullopt;
+        }
         // 7-agent fold F1 (HIGH, 2026-06-04): read register CLASS
-        // from the schema's register table (NOT hardcoded GPR). The
-        // dividend/quotient ordinals were already config-driven; the
-        // CLASS must be too. A hypothetical future target whose
-        // dividend lives in an FPR-class register would silently
-        // misallocate if this hardcoded `LirRegClass::GPR`.
-        // `static_cast<LirRegClass>(TargetRegClass)` is sound — the
-        // two enums are statically asserted identical-shape at
+        // from the schema's register table (NOT hardcoded GPR). A
+        // hypothetical future target whose dividend lives in an
+        // FPR-class register would silently misallocate if this
+        // hardcoded `LirRegClass::GPR`. The cast is sound — the two
+        // enums are statically asserted identical-shape at
         // `lir_reg.hpp:96-100`.
-        auto const* dividendRegInfo = target.registerInfo(dividendOrdinal);
-        auto const* quotientRegInfo = target.registerInfo(quotientOrdinal);
-        if (dividendRegInfo == nullptr || quotientRegInfo == nullptr) {
+        auto const* dividendRegInfo = target.registerInfo(*dividendOrdinal);
+        auto const* captureRegInfo  = target.registerInfo(*captureOrdinal);
+        if (dividendRegInfo == nullptr || captureRegInfo == nullptr) {
             reportUnsupported(mir.instOpcode(id), id);
-            return;
+            return std::nullopt;
         }
         LirRegClass const dividendCls =
             static_cast<LirRegClass>(dividendRegInfo->regClass);
-        LirRegClass const quotientCls =
-            static_cast<LirRegClass>(quotientRegInfo->regClass);
-        LirReg const raxPhys =
-            makePhysicalReg(dividendOrdinal, dividendCls);
+        LirRegClass const captureCls =
+            static_cast<LirRegClass>(captureRegInfo->regClass);
+        LirReg const dividendPhys =
+            makePhysicalReg(*dividendOrdinal, dividendCls);
 
-        // 1. Pin dividend into RAX_phys (or equivalent).
+        // 1. Pin dividend into the role-declared register.
         std::array<LirOperand, 1> const movInOps{
-            LirOperand::makeReg(*dividend)};
-        emitInst(*movOp, raxPhys, movInOps);
+            LirOperand::makeReg(dividend)};
+        emitInst(*movOp, dividendPhys, movInOps);
 
         // 2. Emit PRE op (CQO / XOR RDX,RDX). Zero operands, no
         //    SSA result. The op declares its own implicit-input/
         //    output/clobber set (RAX → RDX for CQO; RDX clobber for
         //    XOR). Regalloc reads each PRE op's implicit-register
         //    declaration independently — no extra coupling required.
-        emitInst(*preOp, InvalidLirReg, std::span<LirOperand const>{});
+        emitInst(preOpId, InvalidLirReg, std::span<LirOperand const>{});
 
         // 3. Emit CORE op (IDIV /7 or DIV /6). One operand (divisor
         //    in modrm.rm), no SSA result; the op declares
@@ -1322,21 +1610,35 @@ struct Lowerer {
         //    the schema and excludes the clobbered regs from any
         //    range that COVERS this position.
         std::array<LirOperand, 1> const divOps{
-            LirOperand::makeReg(*divisor)};
-        emitInst(*coreOp, InvalidLirReg, divOps);
+            LirOperand::makeReg(divisor)};
+        emitInst(coreOpId, InvalidLirReg, divOps);
 
-        // 4. Capture quotient from RAX_phys into a fresh SSA result.
-        // SMod/UMod would project outputOrdinals[1] (remainder) here
-        // — anchored D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT
-        // for the role-tagged implicit-register declaration that
-        // makes the index intent explicit.
+        // 4. Capture the role-selected output (quotient for div,
+        //    remainder for mod) into a fresh SSA result.
         LirReg const result = lir.newVReg(regClassFor(id));
-        LirReg const quotPhys =
-            makePhysicalReg(quotientOrdinal, quotientCls);
+        LirReg const capturePhys =
+            makePhysicalReg(*captureOrdinal, captureCls);
         std::array<LirOperand, 1> const captureOps{
-            LirOperand::makeReg(quotPhys)};
+            LirOperand::makeReg(capturePhys)};
         emitInst(*movOp, result, captureOps);
-        defineValue(id, result);
+        return result;
+    }
+
+    void reportMissingImplicitRole(std::uint16_t opId, char const* mapName,
+                                   char const* role, MirInstId at) {
+        auto const* info = target.opcodeInfo(opId);
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::L_RequiredLirOpcodeMissing;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "target '{}': opcode '{}' declares no '{}' role in "
+            "implicitRegisters.{} — required to lower MIR '{}' (inst {}); "
+            "the div/mod projection resolves registers BY ROLE, never by "
+            "positional index (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-"
+            "CONTRACT)",
+            target.name(), info != nullptr ? info->mnemonic : "?",
+            role, mapName, mirOpcodeName(mir.instOpcode(at)), at.v);
+        reporter.report(std::move(d));
     }
 
     // MIR ICmp{Eq,Ne,Slt,...} → LIR `cmp` + `setcc(cond)` pair. Naive
@@ -1424,10 +1726,6 @@ struct Lowerer {
     //    is SKIPPED so a poisoned tmp does not silently propagate
     //  - phi without an incoming for this predecessor → loud
     void emitPhiMovesForEdge(MirBlockId currentMir, MirBlockId successorMir) {
-        if (!opcode(MnemonicSlot::Mov).has_value()) {
-            reportMissingOpcode(MnemonicSlot::Mov, "MIR Phi edge");
-            return;
-        }
         // Collect (phiReg, incomingReg) pairs for this edge.
         struct Pair { LirReg phi; LirReg incoming; };
         std::vector<Pair> pairs;
@@ -1487,18 +1785,29 @@ struct Lowerer {
         // (which equals the incoming's, since SSA guarantees same-
         // typed flow on each edge). An F64 phi must use FPR-class
         // temps so the parallel-copy chain stays consistent.
+        // FC2 Part B: each copy's mnemonic follows the pair's class
+        // via the registerClassOps table (FPR pairs copy via movaps,
+        // never the GPR mov).
         std::vector<LirReg> temps;
         temps.reserve(pairs.size());
         for (auto const& p : pairs) {
+            auto const movOp = classOp(p.phi.regClass(), RegClassOp::Move);
+            if (!movOp.has_value()) {
+                reportMissingClassOp(p.phi.regClass(), RegClassOp::Move,
+                                     "MIR Phi edge");
+                return;
+            }
             LirReg const tmp = lir.newVReg(p.phi.regClass());
             std::array<LirOperand, 1> ops{LirOperand::makeReg(p.incoming)};
-            emitInst(*opcode(MnemonicSlot::Mov), tmp, ops);
+            emitInst(*movOp, tmp, ops);
             temps.push_back(tmp);
         }
         // Step 2: write each phi-result from its captured temp.
         for (std::size_t k = 0; k < pairs.size(); ++k) {
+            auto const movOp = classOp(pairs[k].phi.regClass(), RegClassOp::Move);
+            if (!movOp.has_value()) return;  // diagnosed in step 1
             std::array<LirOperand, 1> ops{LirOperand::makeReg(temps[k])};
-            emitInst(*opcode(MnemonicSlot::Mov), pairs[k].phi, ops);
+            emitInst(*movOp, pairs[k].phi, ops);
         }
     }
 

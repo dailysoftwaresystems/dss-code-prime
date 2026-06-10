@@ -15,6 +15,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -299,6 +300,52 @@ struct DSS_EXPORT TargetRegisterInfo {
     // Hardware encoding (e.g. ModR/M ordinal on x86) — opaque to the
     // substrate; AS1 assembler reads this directly to emit machine code.
     std::uint16_t  hwEncoding = 0;
+};
+
+// FC2 Part B (per-register-class operation table): the three universal
+// register-data-movement ROLES every lowering pass emits on a value of
+// some register class. Distinct from a mnemonic: a single x86 mnemonic
+// vocabulary covers GPRs ("mov"/"load"/"store") but the FPR class needs
+// DIFFERENT instructions (movaps / movsd) — a GPR mov against an XMM
+// hwEncoding assembles to valid-looking-but-wrong bytes (the silent
+// class-blind miscompile this table kills).
+enum class RegClassOp : std::uint8_t {
+    Move  = 0,  // register→register copy within the class
+    Load  = 1,  // register ← [memory]
+    Store = 2,  // [memory] ← register
+};
+inline constexpr std::size_t kRegClassOpCount = 3;
+
+[[nodiscard]] constexpr std::string_view regClassOpName(RegClassOp op) noexcept {
+    switch (op) {
+        case RegClassOp::Move:  return "move";
+        case RegClassOp::Load:  return "load";
+        case RegClassOp::Store: return "store";
+    }
+    return "?";
+}
+
+// One register class's declared operation mnemonics (the JSON
+// `registerClassOps[]` row). An EMPTY string means "not declared" —
+// an op consulted on a declared row with an empty slot fails loud at
+// the consumer (e.g. x86_64's fpr declares move+load but NO store
+// until a real FPR-store consumer exists — trigger discipline; a
+// silent fallback to the GPR "store" would 8-byte-GPR-write an XMM
+// ordinal).
+struct DSS_EXPORT TargetRegisterClassOps {
+    bool        declared = false;  // a JSON row exists for this class
+    std::string move;
+    std::string load;
+    std::string store;
+
+    [[nodiscard]] std::string_view nameFor(RegClassOp op) const noexcept {
+        switch (op) {
+            case RegClassOp::Move:  return move;
+            case RegClassOp::Load:  return load;
+            case RegClassOp::Store: return store;
+        }
+        return {};
+    }
 };
 
 // One calling convention. A target may declare multiple (SysV AMD64,
@@ -866,6 +913,16 @@ struct DSS_EXPORT TargetEncodingTemplate {
     // the walker emits a REX prefix byte (0x40 base + bits). Only
     // meaningful for the `x86-variable` shape.
     bool rexW = false;
+
+    // FC2 Part B (SSE float backend): mandatory legacy-prefix bytes
+    // emitted BEFORE the REX prefix (the x86 decode contract: a
+    // mandatory prefix like F2/F3/66 that selects an SSE opcode
+    // form must precede REX, or the prefix is not part of the
+    // opcode selection). Empty = no prefix (every pre-FC2 opcode).
+    // Only meaningful for the `x86-variable` shape — validate()
+    // rejects it on a fixed32 variant (mirrors the opcodeBytes /
+    // modrmRegExt fixed32 rejection).
+    std::vector<std::uint8_t> mandatoryPrefix;
 
     // Fixed opcode bytes (e.g. `[0x03]` for `add r64, r/m64`; `[0x0F,
     // 0xAF]` for `imul r64, r/m64`). Non-empty for any non-`None`
@@ -1483,6 +1540,45 @@ struct DSS_EXPORT ImplicitRegisterConstraint {
     std::vector<std::uint16_t> inputOrdinals;
     std::vector<std::uint16_t> outputOrdinals;
     std::vector<std::uint16_t> clobberedOrdinals;
+
+    // Role-tagged projection contract (D-CSUBSET-MOD-OP-CODEGEN-
+    // OUTPUT-INDEX-CONTRACT closure, 2026-06-10). Optional JSON
+    // objects `inputRoles` / `outputRoles` map a ROLE name (from the
+    // loader's registered role vocabulary — "dividend", "quotient",
+    // "remainder") to a register name that must ALSO appear in the
+    // corresponding positional array. The MIR→LIR div/mod lowering
+    // reads its pinned/captured registers BY ROLE, never by
+    // positional index — so a JSON reorder of `outputs` can no
+    // longer silently flip a quotient capture into a remainder
+    // capture (the silent-miscompile class the anchor named). The
+    // positional arrays REMAIN the regalloc/invariant surface
+    // (outputs ⊆ clobbered; forbidden-set construction); ops whose
+    // implicit registers are never projected by the lowering (cqo,
+    // xor_rdx_zero) simply omit the role maps.
+    std::vector<std::pair<std::string, std::string>> inputRoleNames;
+    std::vector<std::pair<std::string, std::string>> outputRoleNames;
+
+    // Validator-populated {role, ordinal} pairs — only successfully
+    // resolved roles appear (a role whose register fails resolution
+    // is diagnosed at load and omitted here, so consumers see the
+    // failure as a missing role, fail-loud at the query site).
+    std::vector<std::pair<std::string, std::uint16_t>> inputRoleOrdinals;
+    std::vector<std::pair<std::string, std::uint16_t>> outputRoleOrdinals;
+
+    [[nodiscard]] std::optional<std::uint16_t>
+    inputOrdinalForRole(std::string_view role) const noexcept {
+        for (auto const& [r, ord] : inputRoleOrdinals) {
+            if (r == role) return ord;
+        }
+        return std::nullopt;
+    }
+    [[nodiscard]] std::optional<std::uint16_t>
+    outputOrdinalForRole(std::string_view role) const noexcept {
+        for (auto const& [r, ord] : outputRoleOrdinals) {
+            if (r == role) return ord;
+        }
+        return std::nullopt;
+    }
 };
 
 // One row per opcode; index in the vector IS the opcode's numeric
@@ -1594,6 +1690,18 @@ struct DSS_EXPORT TargetSchemaData {
     // valid until ML6 regalloc requires the section.
     std::vector<TargetRegisterInfo> registers;
     substrate::TransparentStringMap<std::uint16_t> registerIndex;
+
+    // FC2 Part B: per-register-class move/load/store mnemonic table
+    // (the JSON `registerClassOps[]` section), indexed by the
+    // TargetRegClass ordinal. A class WITHOUT a row resolves to the
+    // universal default bindings ("mov"/"load"/"store") iff it is the
+    // substrate's default class (GPR — the class every existing
+    // lowering pass assumed); any OTHER row-less class resolves to
+    // nothing so the consumer fails loud instead of silently emitting
+    // the GPR instruction forms against a foreign register file.
+    // validate() guarantees every DECLARED mnemonic resolves to an
+    // opcode row. arm64 (no table, no fpr registers) is untouched.
+    std::array<TargetRegisterClassOps, 5> registerClassOps{};
 
     // Calling conventions (cycle 2b). Same optional-for-now discipline
     // as `registers` — ML7 callconv lowering will require ≥1 entry.
@@ -1753,6 +1861,39 @@ public:
         auto it = d_.registerIndex.find(name);
         if (it == d_.registerIndex.end()) return std::nullopt;
         return it->second;
+    }
+
+    // FC2 Part B: resolve the opcode handle that performs `op` on a
+    // value of register class `cls` (the per-register-class operation
+    // table — `registerClassOps[]` in the target JSON). Resolution:
+    //   * class has a declared row + the row names this op → that
+    //     mnemonic's opcode (validate() guarantees it resolves; the
+    //     optional still guards a hand-built schema);
+    //   * class has a declared row but the row OMITS this op →
+    //     nullopt — the CALLER fails loud naming class+op (e.g. an
+    //     FPR store with no declared store mnemonic must never fall
+    //     back to the GPR `store` encoding);
+    //   * class has NO row: GPR (the substrate default class — what
+    //     every pre-FC2 lowering pass emitted unconditionally) → the
+    //     universal "mov"/"load"/"store" bindings; any other class →
+    //     nullopt (fail loud at the caller).
+    [[nodiscard]] std::optional<std::uint16_t> regClassOpOpcode(
+            TargetRegClass cls, RegClassOp op) const noexcept {
+        auto const idx = static_cast<std::size_t>(cls);
+        if (idx >= d_.registerClassOps.size()) return std::nullopt;
+        auto const& row = d_.registerClassOps[idx];
+        if (row.declared) {
+            auto const name = row.nameFor(op);
+            if (name.empty()) return std::nullopt;
+            return opcodeByMnemonic(name);
+        }
+        if (cls != TargetRegClass::GPR) return std::nullopt;
+        switch (op) {
+            case RegClassOp::Move:  return opcodeByMnemonic("mov");
+            case RegClassOp::Load:  return opcodeByMnemonic("load");
+            case RegClassOp::Store: return opcodeByMnemonic("store");
+        }
+        return std::nullopt;
     }
 
     // ── Calling conventions (cycle 2b) ──────────────────────────

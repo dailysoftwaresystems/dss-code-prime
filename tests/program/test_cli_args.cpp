@@ -187,11 +187,11 @@ TEST(CliArgs, DirectoryDefaultIsRecursive) {
 // ── Project mode ─────────────────────────────────────────────
 
 TEST(CliArgs, ProjectModeAccepted) {
-    Argv a{"dss-code-prime", "--project", "myproj.dsp"};
+    Argv a{"dss-code-prime", "--project", "myproj.dss-project.json"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
     ASSERT_TRUE(r->projectPath.has_value());
-    EXPECT_EQ(*r->projectPath, "myproj.dsp");
+    EXPECT_EQ(*r->projectPath, "myproj.dss-project.json");
 }
 
 // ── Mutually-exclusive modes ─────────────────────────────────

@@ -472,41 +472,16 @@ void emitFrameAddr(LirBuilder& b, std::uint16_t leaOp, LirReg result,
     b.addInst(leaOp, result, ops);
 }
 
-void emitPrologue(LirBuilder& b, FrameLayout const& layout,
-                  LirReg sp, std::uint16_t subOp, std::uint16_t storeOp) {
-    emitSpAdjust(b, subOp, sp, layout.totalFrameSize);
-    // D-ML7-2.2 audit-fold (2026-06-02 silent-failure CRITICAL C1):
-    // saved regs sit at [SP + savedRegAreaOffset() + i*slotSize),
-    // NOT [SP + i*slotSize). The new outgoing-args area pushes saved
-    // regs upward by `outgoingArgAreaSize` bytes. Pre-fold the
-    // emitter wrote saved regs into the outgoing-area memory,
-    // silently corrupting outgoing stack args (and reading garbage
-    // back at the epilogue).
-    std::uint32_t const base = layout.savedRegAreaOffset();
-    for (std::size_t i = 0; i < layout.savedRegs.size(); ++i) {
-        // saved reg carries its own class (set by collectUsedCalleeSaved
-        // via schema.registerInfo) — FPR callee-saves (MS-x64 xmm6..15)
-        // store with FPR-class encoding rather than being silently
-        // mis-classified as GPR.
-        emitFrameStore(b, storeOp, layout.savedRegs[i], sp,
-                       static_cast<std::int32_t>(base + i * layout.slotSize));
-    }
-}
-
-void emitEpilogue(LirBuilder& b, FrameLayout const& layout,
-                  LirReg sp, std::uint16_t addOp, std::uint16_t loadOp) {
-    // Reverse the prologue: load saved regs FIRST, then restore SP.
-    // Same savedRegAreaOffset() bias as the prologue (mirrored
-    // reads — silent miscompile if these diverge).
-    std::uint32_t const base = layout.savedRegAreaOffset();
-    for (std::size_t i = 0; i < layout.savedRegs.size(); ++i) {
-        emitFrameLoad(b, loadOp, layout.savedRegs[i], sp,
-                      static_cast<std::int32_t>(base + i * layout.slotSize));
-    }
-    emitSpAdjust(b, addOp, sp, layout.totalFrameSize);
-}
+// (emitPrologue / emitEpilogue moved below `classOpHandle` — FC2
+// Part B made the saved-reg store/load mnemonics class-resolved.)
 
 struct OpcodeHandles {
+    // FC2 Part B: `mov`/`load`/`store` are no longer EMITTED through
+    // these handles — every emission site resolves the class-correct
+    // opcode via `classOpHandle` (registerClassOps). The three fields
+    // stay in the required-resolve table as the load-time existence
+    // gate: a target schema lacking the universal GPR bindings fails
+    // ONCE here instead of per-instruction downstream.
     std::uint16_t mov;
     std::uint16_t add;
     std::uint16_t sub;
@@ -534,6 +509,83 @@ struct OpcodeHandles {
     std::uint16_t alloca_;
     std::uint16_t lea;
 };
+
+// FC2 Part B: resolve the class-correct opcode for a register-data-
+// movement role (the registerClassOps table; GPR → the universal
+// mov/load/store bindings). Mirrors the MIR→LIR consumer's fail-loud:
+// silently emitting the GPR handle against an FPR ordinal assembles
+// valid-looking-but-WRONG bytes (e.g. `mov` on an XMM hwEncoding).
+[[nodiscard]] std::optional<std::uint16_t>
+classOpHandle(TargetSchema const&  schema,
+              LirRegClass          cls,
+              RegClassOp           op,
+              std::string_view     contextLabel,
+              DiagnosticReporter&  reporter) {
+    auto const handle = schema.regClassOpOpcode(
+        static_cast<TargetRegClass>(static_cast<std::uint8_t>(cls)), op);
+    if (!handle.has_value()) {
+        report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+               DiagnosticSeverity::Error,
+               std::format("{}: target schema declares no '{}' operation "
+                           "for register class '{}' — declare it in "
+                           "`registerClassOps[]`; emitting the GPR "
+                           "instruction form would silently mis-encode",
+                           contextLabel, regClassOpName(op),
+                           targetRegClassName(static_cast<TargetRegClass>(
+                               static_cast<std::uint8_t>(cls)))));
+    }
+    return handle;
+}
+
+void emitPrologue(LirBuilder& b, FrameLayout const& layout,
+                  TargetSchema const& schema, LirReg sp,
+                  std::uint16_t subOp, DiagnosticReporter& reporter,
+                  bool& ok) {
+    emitSpAdjust(b, subOp, sp, layout.totalFrameSize);
+    // D-ML7-2.2 audit-fold (2026-06-02 silent-failure CRITICAL C1):
+    // saved regs sit at [SP + savedRegAreaOffset() + i*slotSize),
+    // NOT [SP + i*slotSize). The new outgoing-args area pushes saved
+    // regs upward by `outgoingArgAreaSize` bytes. Pre-fold the
+    // emitter wrote saved regs into the outgoing-area memory,
+    // silently corrupting outgoing stack args (and reading garbage
+    // back at the epilogue).
+    std::uint32_t const base = layout.savedRegAreaOffset();
+    for (std::size_t i = 0; i < layout.savedRegs.size(); ++i) {
+        // saved reg carries its own class (set by collectUsedCalleeSaved
+        // via schema.registerInfo) — FPR callee-saves (MS-x64 xmm6..15)
+        // store with FPR-class encoding rather than being silently
+        // mis-classified as GPR. FC2 Part B: the store MNEMONIC also
+        // resolves per class (registerClassOps) — fail loud when the
+        // class declares none.
+        auto const storeOp = classOpHandle(
+            schema, layout.savedRegs[i].regClass(), RegClassOp::Store,
+            "callconv: prologue saved-reg store", reporter);
+        if (!storeOp.has_value()) { ok = false; return; }
+        emitFrameStore(b, *storeOp, layout.savedRegs[i], sp,
+                       static_cast<std::int32_t>(base + i * layout.slotSize));
+    }
+    ok = true;
+}
+
+void emitEpilogue(LirBuilder& b, FrameLayout const& layout,
+                  TargetSchema const& schema, LirReg sp,
+                  std::uint16_t addOp, DiagnosticReporter& reporter,
+                  bool& ok) {
+    // Reverse the prologue: load saved regs FIRST, then restore SP.
+    // Same savedRegAreaOffset() bias as the prologue (mirrored
+    // reads — silent miscompile if these diverge).
+    std::uint32_t const base = layout.savedRegAreaOffset();
+    for (std::size_t i = 0; i < layout.savedRegs.size(); ++i) {
+        auto const loadOp = classOpHandle(
+            schema, layout.savedRegs[i].regClass(), RegClassOp::Load,
+            "callconv: epilogue saved-reg load", reporter);
+        if (!loadOp.has_value()) { ok = false; return; }
+        emitFrameLoad(b, *loadOp, layout.savedRegs[i], sp,
+                      static_cast<std::int32_t>(base + i * layout.slotSize));
+    }
+    emitSpAdjust(b, addOp, sp, layout.totalFrameSize);
+    ok = true;
+}
 
 // Resolve a cc register-name reference to a typed `LirReg`. Returns
 // nullopt + a loud diagnostic if the name doesn't exist in the
@@ -802,7 +854,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
         b.beginBlock(dstBlock);
 
         if (bi == 0) {
-            emitPrologue(b, outLayout, sp, h.sub, h.store);
+            bool prologueOk = false;
+            emitPrologue(b, outLayout, schema, sp, h.sub, reporter,
+                         prologueOk);
+            if (!prologueOk) return false;
         }
 
         std::uint32_t const instN = src.blockInstCount(srcBlock);
@@ -869,12 +924,18 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 std::uint32_t const poolSize = cc.slotAligned
                     ? slotAlignedPoolSize : classPoolSize;
                 if (payload < poolSize) {
-                    // Register-resident: existing path.
+                    // Register-resident: existing path. FC2 Part B:
+                    // the copy mnemonic follows the param's class
+                    // (FPR args move via movaps, not the GPR mov).
                     auto const argSrc =
                         argPassingReg(schema, cc, payload, cls,
                                       "materializeOneFunc: arg", reporter);
                     if (!argSrc.has_value()) return false;
-                    maybeMov(b, h.mov, result, *argSrc);
+                    auto const argMov = classOpHandle(
+                        schema, cls, RegClassOp::Move,
+                        "materializeOneFunc: arg copy", reporter);
+                    if (!argMov.has_value()) return false;
+                    maybeMov(b, *argMov, result, *argSrc);
                 } else {
                     // Stack-resident: read from caller's outgoing area.
                     // Offset within outgoing area = shadowSpaceBytes +
@@ -890,7 +951,12 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         + static_cast<std::uint32_t>(cc.callPushBytes)
                         + static_cast<std::uint32_t>(cc.shadowSpaceBytes)
                         + overflowIdx * outLayout.outgoingSlotSize);
-                    emitFrameLoad(b, h.load, result, sp, offset);
+                    auto const argLoad = classOpHandle(
+                        schema, cls, RegClassOp::Load,
+                        "materializeOneFunc: stack-resident arg load",
+                        reporter);
+                    if (!argLoad.has_value()) return false;
+                    emitFrameLoad(b, *argLoad, result, sp, offset);
                 }
                 continue;
             }
@@ -1143,11 +1209,25 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // fn's SP-post-prologue (the outgoing-args area sits
                 // at [SP+0..outgoingArgAreaSize)).
                 for (auto const& s : stackStores) {
-                    emitFrameStore(b, h.store, s.src, sp, s.offset);
+                    // FC2 Part B: stack-arg stores resolve the store
+                    // mnemonic from the VALUE's class.
+                    auto const stkStore = classOpHandle(
+                        schema, s.src.regClass(), RegClassOp::Store,
+                        "materializeOneFunc: call stack-arg store",
+                        reporter);
+                    if (!stkStore.has_value()) return false;
+                    emitFrameStore(b, *stkStore, s.src, sp, s.offset);
                 }
-                // Cycle-free — emit register moves in order.
+                // Cycle-free — emit register moves in order. FC2
+                // Part B: each move's mnemonic follows its class
+                // (FPR arg-passing moves use movaps).
                 for (auto const& m : argMoves) {
-                    maybeMov(b, h.mov, m.dest, m.src);
+                    auto const argMov = classOpHandle(
+                        schema, m.dest.regClass(), RegClassOp::Move,
+                        "materializeOneFunc: call arg-passing move",
+                        reporter);
+                    if (!argMov.has_value()) return false;
+                    maybeMov(b, *argMov, m.dest, m.src);
                 }
                 // D-LANG-VARIADIC (step 13.4): when the call is
                 // variadic AND the cc declares a vector-arg count
@@ -1200,10 +1280,20 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         cc.variadicVectorCountReg->ordinal,
                         static_cast<LirRegClass>(
                             static_cast<std::uint8_t>(regInfo->regClass)));
+                    // FC2 Part B: class-routed like every other move
+                    // (the countReg is GPR on every shipped ABI; a
+                    // hypothetical FPR countReg resolves its class's
+                    // move and the imm operand then fails loud at
+                    // encode — no silent GPR fallback either way).
+                    auto const countMov = classOpHandle(
+                        schema, countReg.regClass(), RegClassOp::Move,
+                        "materializeOneFunc: variadic count-reg set",
+                        reporter);
+                    if (!countMov.has_value()) return false;
                     std::array<LirOperand, 1> immOps{
                         LirOperand::makeImmInt32(
                             static_cast<std::int32_t>(vectorArgsInVararg))};
-                    b.addInst(h.mov, countReg, immOps);
+                    b.addInst(*countMov, countReg, immOps);
                 }
                 // Emit the call instruction. Pass through the input
                 // opcode (h.call OR h.callIndirectViaExtern) so the
@@ -1228,17 +1318,29 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         returnReg(schema, cc, result.regClass(),
                                   "materializeOneFunc: call", reporter);
                     if (!retReg.has_value()) return false;
-                    maybeMov(b, h.mov, result, *retReg);
+                    // FC2 Part B: FPR returns copy via the class move.
+                    auto const retMov = classOpHandle(
+                        schema, result.regClass(), RegClassOp::Move,
+                        "materializeOneFunc: call-result move", reporter);
+                    if (!retMov.has_value()) return false;
+                    maybeMov(b, *retMov, result, *retReg);
                 }
                 continue;
             }
 
-            // Materialize frame_load / frame_store.
+            // Materialize frame_load / frame_store. FC2 Part B: spill
+            // reloads/stores resolve their mnemonic from the spilled
+            // value's register class — an FPR spill must never round-
+            // trip through the GPR mov (silent 8-byte mis-encode).
             if (op == h.frameLoad) {
                 LirSpillSlot const slot{payload};
                 std::int32_t const offset = static_cast<std::int32_t>(
                     outLayout.spillAreaOffset() + (slot.v - 1u) * slotSize);
-                emitFrameLoad(b, h.load, result, sp, offset);
+                auto const spillLoad = classOpHandle(
+                    schema, result.regClass(), RegClassOp::Load,
+                    "materializeOneFunc: spill reload", reporter);
+                if (!spillLoad.has_value()) return false;
+                emitFrameLoad(b, *spillLoad, result, sp, offset);
                 continue;
             }
             if (op == h.frameStore) {
@@ -1252,7 +1354,11 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                        "malformed operand list", inst.v));
                     return false;
                 }
-                emitFrameStore(b, h.store, ops[0].reg, sp, offset);
+                auto const spillStore = classOpHandle(
+                    schema, ops[0].reg.regClass(), RegClassOp::Store,
+                    "materializeOneFunc: spill store", reporter);
+                if (!spillStore.has_value()) return false;
+                emitFrameStore(b, *spillStore, ops[0].reg, sp, offset);
                 continue;
             }
 
@@ -1295,13 +1401,22 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                             returnReg(schema, cc, valReg.regClass(),
                                       "materializeOneFunc: ret", reporter);
                         if (!retReg.has_value()) return false;
-                        maybeMov(b, h.mov, *retReg, valReg);
+                        // FC2 Part B: FPR return values move via the
+                        // class's declared move (movaps), never GPR mov.
+                        auto const retMov = classOpHandle(
+                            schema, valReg.regClass(), RegClassOp::Move,
+                            "materializeOneFunc: ret-value move", reporter);
+                        if (!retMov.has_value()) return false;
+                        maybeMov(b, *retMov, *retReg, valReg);
                         // Strip the operand from the ret — the
                         // value is now in the cc's return reg.
                         newOps.clear();
                     }
                     // Emit epilogue BEFORE the return.
-                    emitEpilogue(b, outLayout, sp, h.add, h.load);
+                    bool epilogueOk = false;
+                    emitEpilogue(b, outLayout, schema, sp, h.add, reporter,
+                                 epilogueOk);
+                    if (!epilogueOk) return false;
                 }
                 if (!lir_pass_util::emitTerminator(b, op, info, succs, newOps,
                                                    payload, src.instFlags(inst),

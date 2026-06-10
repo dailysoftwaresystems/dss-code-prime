@@ -11,3 +11,6 @@ dss_add_test(NAME lir/test_lir_regalloc  SOURCES test_lir_regalloc.cpp)
 dss_add_test(NAME lir/test_lir_rewrite   SOURCES test_lir_rewrite.cpp)
 dss_add_test(NAME lir/test_lir_text      SOURCES test_lir_text.cpp)
 dss_add_test(NAME lir/test_mir_to_lir    SOURCES test_mir_to_lir.cpp)
+# FC1 (V2-4.X): the role-contract red-on-disable levers strip
+# inputRoles/outputRoles off idiv_op via mutate_target_schema.hpp.
+target_link_libraries(dss_lir_test_mir_to_lir PRIVATE nlohmann_json::nlohmann_json)

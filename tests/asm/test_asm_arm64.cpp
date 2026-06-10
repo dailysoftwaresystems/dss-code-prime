@@ -15,7 +15,17 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "core/types/type_lattice/type_interner.hpp"
 #include "lir/lir.hpp"
+#include "lir/lir_2addr_legalize.hpp"
+#include "lir/lir_callconv.hpp"
+#include "lir/lir_liveness.hpp"
+#include "lir/lir_regalloc.hpp"
+#include "lir/lir_rewrite.hpp"
+#include "lir/lowering/mir_to_lir.hpp"
+#include "mir/mir.hpp"
+#include "mir/mir_node.hpp"
+#include "mir/mir_opcode.hpp"
 
 #include <gtest/gtest.h>
 
@@ -286,6 +296,124 @@ TEST(Arm64Encoder, ZextEncodesOrrW) {
     EXPECT_EQ(bytes[1], 0x03);
     EXPECT_EQ(bytes[2], 0x01);
     EXPECT_EQ(bytes[3], 0x2A);
+}
+
+// ── FC1 (V2-4.X): NEG — surfaced by the modulo corpus' negatives ───
+
+TEST(Arm64Encoder, NegEncodesSubFromXzr) {
+    // neg X0, X1 = SUB X0, XZR, X1:
+    //   base 0xCB0003E0 (SUB shifted-reg 0xCB000000 | Rn=XZR=31<<5)
+    //   | Rm = X1 (enc 1) << 16 → 0x00010000
+    //   = 0xCB0103E0 — LE bytes: E0 03 01 CB.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const negOp = (*s)->opcodeByMnemonic("neg");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(negOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const nops[] = { LirOperand::makeReg(x1) };
+    (void)b.addInst(*negOp, x0, nops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE0);
+    EXPECT_EQ(bytes[1], 0x03);
+    EXPECT_EQ(bytes[2], 0x01);
+    EXPECT_EQ(bytes[3], 0xCB);
+}
+
+// ── FC1 (V2-4.X): SDIV/UDIV — the Rule-1 native divide opcodes ─────
+// (D-MIR-TO-LIR-DIV-SEQUENCE-AGNOSTIC closure: arm64's divide is one
+// result-bearing 3-address instruction, no implicit RDX:RAX dance.)
+
+TEST(Arm64Encoder, SdivEncodesDataProc2Source) {
+    // sdiv X0, X1, X2 — data-processing (2 source), sf=1:
+    //   base 0x9AC00C00 (sf=1 | S=0 | 11010110 | opcode 000011)
+    //   | Rm = X2 (enc 2)  << 16 → 0x00020000
+    //   | Rn = X1 (enc 1)  << 5  → 0x00000020
+    //   | Rd = X0 (enc 0)        → 0
+    //   = 0x9AC20C20 — LE bytes: 20 0C C2 9A.
+    // Hand-verified against the ARM ARM (C6.2.281 SDIV).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const sdivOp = (*s)->opcodeByMnemonic("sdiv");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(sdivOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x2{static_cast<std::uint32_t>(*(*s)->registerByName("x2")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const dops[] = { LirOperand::makeReg(x1),
+                                LirOperand::makeReg(x2) };
+    (void)b.addInst(*sdivOp, x0, dops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0x0C);
+    EXPECT_EQ(bytes[2], 0xC2);
+    EXPECT_EQ(bytes[3], 0x9A);
+}
+
+TEST(Arm64Encoder, UdivEncodesDataProc2SourceHighRegs) {
+    // udiv X3, X4, X14 — UDIV's opcode field is 000010 (bit 11:10 =
+    // 10 vs SDIV's 11; a flipped bit here silently turns every
+    // unsigned divide into a signed one):
+    //   base 0x9AC00800
+    //   | Rm = X14 (enc 14) << 16 → 0x000E0000
+    //   | Rn = X4  (enc 4)  << 5  → 0x00000080
+    //   | Rd = X3  (enc 3)        → 0x00000003
+    //   = 0x9ACE0883 — LE bytes: 83 08 CE 9A.
+    // X14 covers a >7 register encoding (5-bit field, no x86-style
+    // REX pitfalls, but pins the full-width Rm window).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const udivOp = (*s)->opcodeByMnemonic("udiv");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(udivOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x3 {static_cast<std::uint32_t>(*(*s)->registerByName("x3")),  1, cls};
+    LirReg const x4 {static_cast<std::uint32_t>(*(*s)->registerByName("x4")),  1, cls};
+    LirReg const x14{static_cast<std::uint32_t>(*(*s)->registerByName("x14")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const dops[] = { LirOperand::makeReg(x4),
+                                LirOperand::makeReg(x14) };
+    (void)b.addInst(*udivOp, x3, dops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x83);
+    EXPECT_EQ(bytes[1], 0x08);
+    EXPECT_EQ(bytes[2], 0xCE);
+    EXPECT_EQ(bytes[3], 0x9A);
 }
 
 // ── fixed32 walker — `mov Xd, #imm16` (MOVZ) — D-LK10-ENTRY-ARM64 ──
@@ -976,4 +1104,473 @@ TEST(EncodingValidate, MultiWordRejectsExtraResultSlotsWithoutResultSlot) {
     })";
     EXPECT_FALSE(TargetSchema::loadFromText(kJson, "x.json").has_value())
         << "'extraResultSlots' without a 'resultSlot' must be rejected";
+}
+
+// ── D-ARM64-FLOAT-SUBSTRATE: FPR (F64) byte-pins ──────────────────
+//
+// The arm64 float substrate is DECLARATION-ONLY (config rows in
+// arm64.target.json — zero engine change); these pins lock the five
+// new fixed32 words, each hand-derived from the ARM ARM and
+// cross-checked against the base+slot composition:
+//   * fadd     FADD Dd, Dn, Dm   — base 0x1E602800 (ftype=01 double)
+//   * fp_to_si FCVTZS Xd, Dn     — base 0x9E780000 (sf=1, rmode=11)
+//   * fmov     FMOV Dd, Dn       — base 0x1E604000 (1-source, Rn)
+//   * fldur    LDUR Dt,[Xn,#s9]  — base 0xFC400000 (GPR LDUR | V=1)
+//   * fstur    STUR Dt,[Xn,#s9]  — base 0xFC000000 (GPR STUR | V=1)
+// The D-register hwEncodings ride the SAME 5-bit Rd/Rn/Rm/Rt windows
+// the GPR pins already lock; the high-register pin (d31/d8/d15)
+// proves the field placement across the full 5-bit width.
+
+namespace {
+[[nodiscard]] LirReg fpr(TargetSchema const& s, std::string_view name) {
+    return makePhysicalReg(
+        static_cast<std::uint32_t>(*s.registerByName(name)), LirRegClass::FPR);
+}
+} // namespace
+
+TEST(Arm64Encoder, FaddEncodesScalarDouble) {
+    // fadd d0, d1, d2 — FP data-processing (2 source), double:
+    //   base 0x1E602800
+    //   | Rm = d2 (enc 2) << 16 → 0x00020000
+    //   | Rn = d1 (enc 1) << 5  → 0x00000020
+    //   | Rd = d0 (enc 0)       → 0
+    //   = 0x1E622820 — LE bytes: 20 28 62 1E.
+    // Hand-verified against the ARM ARM (C7.2 FADD scalar, ftype=01).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const faddOp = (*s)->opcodeByMnemonic("fadd");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(faddOp.has_value() && retOp.has_value());
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(fpr(**s, "d1")),
+                               LirOperand::makeReg(fpr(**s, "d2")) };
+    (void)b.addInst(*faddOp, fpr(**s, "d0"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0x28);
+    EXPECT_EQ(bytes[2], 0x62);
+    EXPECT_EQ(bytes[3], 0x1E);
+}
+
+TEST(Arm64Encoder, FaddHighRegistersPinFiveBitFields) {
+    // fadd d31, d8, d15 — every operand off the low-register fast
+    // path, proving each 5-bit window's full width + placement
+    // (d31 = 0b11111 fills Rd; d8/d15 sit in Rn/Rm):
+    //   base 0x1E602800
+    //   | Rm = d15 (enc 15) << 16 → 0x000F0000
+    //   | Rn = d8  (enc 8)  << 5  → 0x00000100
+    //   | Rd = d31 (enc 31)       → 0x0000001F
+    //   = 0x1E6F291F — LE bytes: 1F 29 6F 1E.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const faddOp = (*s)->opcodeByMnemonic("fadd");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(faddOp.has_value() && retOp.has_value());
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(fpr(**s, "d8")),
+                               LirOperand::makeReg(fpr(**s, "d15")) };
+    (void)b.addInst(*faddOp, fpr(**s, "d31"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x1F);
+    EXPECT_EQ(bytes[1], 0x29);
+    EXPECT_EQ(bytes[2], 0x6F);
+    EXPECT_EQ(bytes[3], 0x1E);
+}
+
+TEST(Arm64Encoder, FcvtzsEncodesDoubleToX0) {
+    // fp_to_si x0, d1 → FCVTZS X0, D1 (sf=1, ftype=01, rmode=11
+    // toward-zero — the C truncation semantics):
+    //   base 0x9E780000
+    //   | Rn = d1 (enc 1) << 5 → 0x00000020
+    //   | Rd = x0 (enc 0)      → 0
+    //   = 0x9E780020 — LE bytes: 20 00 78 9E.
+    // The result register is GPR-class, the source FPR-class — the
+    // 5-bit slots are class-blind hwEncodings (the cvttsd2si
+    // reg/rm-role analog).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const cvtOp = (*s)->opcodeByMnemonic("fp_to_si");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(cvtOp.has_value() && retOp.has_value());
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(fpr(**s, "d1")) };
+    (void)b.addInst(*cvtOp, gpr(**s, "x0"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0x78);
+    EXPECT_EQ(bytes[3], 0x9E);
+}
+
+TEST(Arm64Encoder, FmovEncodesRegisterDouble) {
+    // fmov d0, d1 — FP data-processing (1 source): the single source
+    // rides Rn (bits 5..9), NOT Rm — the GPR mov's ORR alias puts its
+    // source at Rm (bits 16..20), so a copy-paste of that wire would
+    // move the wrong field:
+    //   base 0x1E604000 | Rn = d1 (enc 1) << 5 → 0x1E604020.
+    //   LE bytes: 20 40 60 1E.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const fmovOp = (*s)->opcodeByMnemonic("fmov");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(fmovOp.has_value() && retOp.has_value());
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(fpr(**s, "d1")) };
+    (void)b.addInst(*fmovOp, fpr(**s, "d0"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0x40);
+    EXPECT_EQ(bytes[2], 0x60);
+    EXPECT_EQ(bytes[3], 0x1E);
+}
+
+TEST(Arm64Encoder, FldurEncodes) {
+    // fldur d2, [x3, #16] → LDUR D2, [X3, #16] (SIMD&FP 64-bit,
+    // unscaled — the GPR LDUR word with V=1 at bit 26):
+    //   base 0xFC400000
+    //   | Imm9 = 16 << 12 → 0x00010000
+    //   | Rn = x3 (3) << 5 → 0x00000060
+    //   | Rt = d2 (2)      → 0x00000002
+    //   = 0xFC410062 — LE bytes: 62 00 41 FC.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const ldOp  = (*s)->opcodeByMnemonic("fldur");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(ldOp.has_value() && retOp.has_value());
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x3")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(16)
+    };
+    (void)b.addInst(*ldOp, fpr(**s, "d2"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x62);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0x41);
+    EXPECT_EQ(bytes[3], 0xFC);
+}
+
+TEST(Arm64Encoder, FsturEncodesNegativeImm9) {
+    // fstur d4, [x5, #-8] → STUR D4, [X5, #-8] — the SIGNED 9-bit
+    // window: -8 two's-complements to 0x1F8 in the 9-bit field
+    // (bits 12..20), the negative half the positive-offset pins
+    // never reach:
+    //   base 0xFC000000
+    //   | Imm9 = 0x1F8 << 12 → 0x001F8000
+    //   | Rn = x5 (5) << 5   → 0x000000A0
+    //   | Rt = d4 (4)        → 0x00000004
+    //   = 0xFC1F80A4 — LE bytes: A4 80 1F FC.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const stOp  = (*s)->opcodeByMnemonic("fstur");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(stOp.has_value() && retOp.has_value());
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(fpr(**s, "d4")),
+        LirOperand::makeReg(gpr(**s, "x5")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(-8)
+    };
+    (void)b.addInst(*stOp, InvalidLirReg, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xA4);
+    EXPECT_EQ(bytes[1], 0x80);
+    EXPECT_EQ(bytes[2], 0x1F);
+    EXPECT_EQ(bytes[3], 0xFC);
+}
+
+// ── D-ARM64-FLOAT-SUBSTRATE: the FULL pipeline (the SSE-test mirror) ──
+
+namespace {
+
+// Decode the emitted byte stream as little-endian 32-bit words —
+// sound on arm64 where every instruction is one 4-byte word (no
+// variable-length scan needed).
+[[nodiscard]] std::vector<std::uint32_t>
+wordsOf(std::vector<std::uint8_t> const& bytes) {
+    std::vector<std::uint32_t> ws;
+    ws.reserve(bytes.size() / 4);
+    for (std::size_t i = 0; i + 3 < bytes.size(); i += 4) {
+        ws.push_back(static_cast<std::uint32_t>(bytes[i])
+                     | (static_cast<std::uint32_t>(bytes[i + 1]) << 8)
+                     | (static_cast<std::uint32_t>(bytes[i + 2]) << 16)
+                     | (static_cast<std::uint32_t>(bytes[i + 3]) << 24));
+    }
+    return ws;
+}
+
+// True iff any word matches `want` under `mask` (mask = the encoding's
+// fixed bits; the cleared bits are the register/immediate fields the
+// regalloc picks).
+[[nodiscard]] bool containsWordMasked(std::vector<std::uint32_t> const& ws,
+                                      std::uint32_t mask,
+                                      std::uint32_t want) {
+    for (auto const w : ws) {
+        if ((w & mask) == want) return true;
+    }
+    return false;
+}
+
+// Fixed-bit masks for the FPR words (clear exactly the wired fields):
+//   FADD   clears Rm[20:16] Rn[9:5] Rd[4:0]          → 0xFFE0FC00
+//   FCVTZS clears Rn[9:5] Rd[4:0]                    → 0xFFFFFC00
+//   FMOV   clears Rn[9:5] Rd[4:0]                    → 0xFFFFFC00
+//   LDUR/STUR clear imm9[20:12] Rn[9:5] Rt[4:0]      → 0xFFE00C00
+inline constexpr std::uint32_t kFaddMask   = 0xFFE0FC00u;
+inline constexpr std::uint32_t kFaddBase   = 0x1E602800u;
+inline constexpr std::uint32_t kFcvtzsMask = 0xFFFFFC00u;
+inline constexpr std::uint32_t kFcvtzsBase = 0x9E780000u;
+inline constexpr std::uint32_t kFmovMask   = 0xFFFFFC00u;
+inline constexpr std::uint32_t kFmovBase   = 0x1E604000u;
+inline constexpr std::uint32_t kFpMemMask  = 0xFFE00C00u;
+inline constexpr std::uint32_t kFldurBase  = 0xFC400000u;
+inline constexpr std::uint32_t kFsturBase  = 0xFC000000u;
+
+void dumpDiagnostics(DiagnosticReporter const& rep) {
+    for (auto const& d : rep.all()) {
+        ADD_FAILURE() << "diagnostic: " << d.actual;
+    }
+}
+
+struct PipelineOut {
+    DiagnosticReporter        rep;
+    std::vector<std::uint8_t> bytes;
+    std::vector<Relocation>   relocs;
+    bool                      ok = false;
+};
+
+// Drive hand-built MIR through the REAL pipeline: MIR→LIR → liveness
+// → regalloc → rewrite → 2-addr legalize → callconv → assemble (the
+// exact stage order of compile_pipeline.cpp's lowerMirModuleToAssembly
+// — the same shape as test_asm_x86_sse.cpp's runFullPipeline).
+// `ccIndex` selects the calling convention by the schema's declared
+// order (arm64.target.json: 0 = aapcs64, 1 = apple_arm64).
+void runFullPipeline(Mir& mir, TypeInterner const& interner,
+                     TargetSchema const& target, PipelineOut& out,
+                     std::uint16_t ccIndex = 0) {
+    auto lir = lowerToLir(mir, target, interner, out.rep);
+    ASSERT_TRUE(lir.ok) << "MIR->LIR failed";
+    auto const liveness = analyzeLiveness(lir.lir);
+    auto const alloc = allocateRegisters(lir.lir, target, liveness,
+                                         ccIndex, out.rep);
+    ASSERT_TRUE(alloc.ok()) << "regalloc failed";
+    auto rewritten = rewriteWithAllocation(lir.lir, target, alloc, out.rep);
+    ASSERT_TRUE(rewritten.ok) << "rewrite failed";
+    auto legal = legalizeTwoAddress(rewritten.lir, target, out.rep);
+    ASSERT_TRUE(legal.ok()) << "2-addr legalize failed";
+    auto cc = materializeCallingConvention(legal.lir, target, alloc, out.rep);
+    ASSERT_TRUE(cc.ok()) << "callconv failed";
+    std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    auto assembled = assemble(cc.lir, target, lirToMir, out.rep);
+    ASSERT_TRUE(assembled.ok()) << "assemble failed";
+    ASSERT_EQ(assembled.functions.size(), 1u);
+    out.bytes  = assembled.functions[0].bytes;
+    out.relocs = assembled.functions[0].relocations;
+    out.ok = true;
+}
+
+}  // namespace
+
+TEST(Arm64Fpr, FullPipelineDoubleAddToIntEncodesFaddAndFcvtzs) {
+    // MIR: i32 f(f64 a, f64 b) { return FPToSI(FAdd(a, b)); } —
+    // through the FULL real pipeline under aapcs64, down to arm64
+    // machine code with ZERO diagnostics. Beyond the FADD/FCVTZS
+    // presence, this pins the three declaration-driven consumers:
+    //   * the AAPCS64 d-register ARG PATH: the two `arg` ops
+    //     materialize as FMOV copies READING d0 and d1 (cc.argFprs)
+    //     — asserted via the FMOV words' Rn fields;
+    //   * the fpr `move` row (those copies ARE fmov, not the GPR
+    //     ORR-alias mov against a D hwEncoding);
+    //   * the fpr `store`/`load` rows: AAPCS64 declares d8-d15
+    //     callee-saved + the regalloc allocates callee-saved FIRST,
+    //     so the FPR vregs land in d-regs the prologue must FSTUR-
+    //     spill and the epilogue FLDUR-reload (the exact shape that
+    //     surfaced movsd_store on ms_x64).
+    // RED-on-disable lever: strip the arm64 registerClassOps fpr row
+    // → classOpHandle fails loud (L_RequiredLirOpcodeMissing, "no
+    // 'move' operation for register class 'fpr'") at the arg copy
+    // and this test cannot even reach assemble.
+    TypeInterner interner{CompilationUnitId{1}};
+    auto const f64 = interner.primitive(TypeKind::F64);
+    auto const i32 = interner.primitive(TypeKind::I32);
+    TypeId const params[] = {f64, f64};
+    auto const sig = interner.fnSig(params, i32, CallConv::CcAAPCS64);
+    MirBuilder mb;
+    mb.addFunction(sig, SymbolId{1});
+    MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    MirInstId const a = mb.addArg(0, f64);
+    MirInstId const b = mb.addArg(1, f64);
+    MirInstId const addOps[] = {a, b};
+    MirInstId const s = mb.addInst(MirOpcode::FAdd, addOps, f64);
+    MirInstId const cvtOps[] = {s};
+    MirInstId const r = mb.addInst(MirOpcode::FPToSI, cvtOps, i32);
+    mb.addReturn(r);
+    Mir mir = std::move(mb).finish();
+
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    PipelineOut out;
+    runFullPipeline(mir, interner, **target, out);
+    ASSERT_TRUE(out.ok);
+    EXPECT_EQ(out.rep.errorCount(), 0u);
+    if (out.rep.errorCount() != 0u) dumpDiagnostics(out.rep);
+
+    auto const ws = wordsOf(out.bytes);
+    EXPECT_TRUE(containsWordMasked(ws, kFaddMask, kFaddBase))
+        << "encoded function must contain FADD Dd, Dn, Dm";
+    EXPECT_TRUE(containsWordMasked(ws, kFcvtzsMask, kFcvtzsBase))
+        << "encoded function must contain FCVTZS Xd, Dn";
+
+    // The AAPCS64 d-register arg path: FMOV copies reading d0 (arg 0)
+    // and d1 (arg 1). Rn (the FMOV source) sits at bits 5..9.
+    bool sawArgFromD0 = false;
+    bool sawArgFromD1 = false;
+    for (auto const w : ws) {
+        if ((w & kFmovMask) != kFmovBase) continue;
+        std::uint32_t const rn = (w >> 5) & 0x1Fu;
+        if (rn == 0u) sawArgFromD0 = true;
+        if (rn == 1u) sawArgFromD1 = true;
+    }
+    EXPECT_TRUE(sawArgFromD0)
+        << "aapcs64 arg 0 must materialize as an FMOV reading d0";
+    EXPECT_TRUE(sawArgFromD1)
+        << "aapcs64 arg 1 must materialize as an FMOV reading d1";
+
+    // Callee-saved d-reg discipline (d8-d15 + callee-saved-first
+    // regalloc): the prologue spills via FSTUR, the epilogue reloads
+    // via FLDUR — the fpr store/load rows' first in-pipeline consumer.
+    EXPECT_TRUE(containsWordMasked(ws, kFpMemMask, kFsturBase))
+        << "prologue must spill the callee-saved d-reg via STUR(D)";
+    EXPECT_TRUE(containsWordMasked(ws, kFpMemMask, kFldurBase))
+        << "epilogue must reload the callee-saved d-reg via LDUR(D)";
+}
+
+TEST(Arm64Fpr, FullPipelineDoublePlusRodataConstEncodesLeaFldurFadd) {
+    // The float_cast corpus shape, host-independent: i32 f(f64 a)
+    // { return FPToSI(a + 0.25); } with 0.25 in the HIR→MIR PROMOTED
+    // form — an anonymous F64 rodata global + GlobalAddr + Load (what
+    // the front-end emits for every float literal). Mirrors the x86
+    // FullPipelineDoublePlusRodataConstEncodesLeaMovsdAddsd pin. On
+    // arm64 the address materializes via the lea ADRP+ADD pair (TWO
+    // relocations to the promoted symbol) and the F64 value loads via
+    // the fpr class's `load` row → FLDUR. RED-on-disable: strip the
+    // fpr registerClassOps row → MIR Load fails loud ("no 'load'
+    // operation for register class 'fpr'").
+    TypeInterner interner{CompilationUnitId{1}};
+    auto const f64    = interner.primitive(TypeKind::F64);
+    auto const ptrF64 = interner.pointer(f64);
+    auto const i32    = interner.primitive(TypeKind::I32);
+    TypeId const params[] = {f64};
+    auto const sig = interner.fnSig(params, i32, CallConv::CcAAPCS64);
+    MirBuilder mb;
+    MirLiteralValue quarter; quarter.value = 0.25;
+    quarter.core = TypeKind::F64;
+    mb.addFunction(sig, SymbolId{1});
+    (void)mb.addGlobal(f64, SymbolId{500}, mb.literalPoolAdd(quarter));
+    MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    MirInstId const a = mb.addArg(0, f64);
+    MirInstId const addr = mb.addGlobalAddr(SymbolId{500}, ptrF64);
+    MirInstId const loadOps[] = {addr};
+    MirInstId const c = mb.addInst(MirOpcode::Load, loadOps, f64);
+    MirInstId const addOps[] = {a, c};
+    MirInstId const s = mb.addInst(MirOpcode::FAdd, addOps, f64);
+    MirInstId const cvtOps[] = {s};
+    MirInstId const r = mb.addInst(MirOpcode::FPToSI, cvtOps, i32);
+    mb.addReturn(r);
+    Mir mir = std::move(mb).finish();
+
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    PipelineOut out;
+    runFullPipeline(mir, interner, **target, out);
+    ASSERT_TRUE(out.ok);
+    EXPECT_EQ(out.rep.errorCount(), 0u)
+        << "the global+load shape must encode end-to-end (a missing "
+           "fpr 'load' row fails loud here)";
+    if (out.rep.errorCount() != 0u) dumpDiagnostics(out.rep);
+
+    auto const ws = wordsOf(out.bytes);
+    EXPECT_TRUE(containsWordMasked(ws, kFpMemMask, kFldurBase))
+        << "must contain the FPR LDUR(D) load of the rodata constant";
+    EXPECT_TRUE(containsWordMasked(ws, kFaddMask, kFaddBase))
+        << "must contain FADD";
+    EXPECT_TRUE(containsWordMasked(ws, kFcvtzsMask, kFcvtzsBase))
+        << "must contain FCVTZS";
+
+    // The lea ADRP+ADD materialization emits exactly TWO relocations,
+    // both targeting the promoted global's symbol (the arm64 parallel
+    // of the x86 single rel32 assert).
+    ASSERT_EQ(out.relocs.size(), 2u);
+    auto const* adrp = (*target)->relocationByName("adr_prel_pg_hi21");
+    auto const* add  = (*target)->relocationByName("add_abs_lo12_nc");
+    ASSERT_NE(adrp, nullptr);
+    ASSERT_NE(add, nullptr);
+    EXPECT_EQ(out.relocs[0].target, SymbolId{500});
+    EXPECT_EQ(out.relocs[0].kind, adrp->kind);
+    EXPECT_EQ(out.relocs[1].target, SymbolId{500});
+    EXPECT_EQ(out.relocs[1].kind, add->kind);
 }

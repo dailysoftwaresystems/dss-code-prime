@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 
 // D-CSUBSET-LOCAL-INT-CODEGEN-NEGATIVE-PIN substrate (cycle 10k,
 // 2026-06-04): test-tier helper that loads a shipped target schema,
@@ -43,6 +44,65 @@
 
 namespace dss::test_support {
 
+namespace detail {
+
+// Shared load+parse half of the two mutation entry points below.
+// Returns the parsed shipped JSON document, or the failure envelope.
+[[nodiscard]] inline LoadResult<nlohmann::json>
+parseShippedTargetJson(std::string_view targetName) {
+    auto pathR = findShippedConfig(
+        ShippedConfigLocator{targetName, "targets", ".target.json",
+                             "target", DiagnosticCode::C_InvalidTargetName});
+    if (!pathR.has_value()) {
+        return std::unexpected(std::move(pathR).error());
+    }
+
+    std::ifstream in{*pathR};
+    if (!in.is_open()) {
+        return std::unexpected(std::vector<ConfigDiagnostic>{
+            {DiagnosticCode::C_MissingField, DiagnosticSeverity::Error,
+             pathR->string(), "parseShippedTargetJson: cannot open "
+                              "shipped target JSON"}});
+    }
+    std::ostringstream buf;
+    buf << in.rdbuf();
+
+    try {
+        return nlohmann::json::parse(buf.str());
+    } catch (nlohmann::json::parse_error const& e) {
+        return std::unexpected(std::vector<ConfigDiagnostic>{
+            {DiagnosticCode::C_InvalidSemantics, DiagnosticSeverity::Error,
+             pathR->string(),
+             std::string{"parseShippedTargetJson: JSON parse error in "
+                         "shipped schema: "} + e.what()}});
+    }
+}
+
+}  // namespace detail
+
+// Generalized in-memory schema mutation (FC1 V2-4.X, 2026-06-10):
+// load the shipped target JSON, hand the parsed document to `mutate`
+// (any in-place transform), re-construct a `TargetSchema` from the
+// mutated text. The remove-mnemonics helper below is the common
+// special case; tests needing finer-grained surgery (e.g. stripping
+// ONE sub-key off one opcode's `implicitRegisters` to exercise a
+// lowering fail-loud arm) pass a lambda instead of authoring a
+// parallel broken JSON file (which would rot against the shipped
+// one — the cycle-10k rationale above applies unchanged).
+template <typename MutateFn>
+[[nodiscard]] inline LoadResult<std::shared_ptr<TargetSchema>>
+mutateShippedTargetSchemaDoc(std::string_view targetName,
+                             MutateFn&& mutate) {
+    auto docR = detail::parseShippedTargetJson(targetName);
+    if (!docR.has_value()) {
+        return std::unexpected(std::move(docR).error());
+    }
+    nlohmann::json doc = *std::move(docR);
+    std::forward<MutateFn>(mutate)(doc);
+    return TargetSchema::loadFromText(doc.dump(),
+        std::string{"<mutated "} + std::string{targetName} + ">");
+}
+
 // Load the shipped target schema for `targetName`, parse its JSON,
 // remove every opcode row whose `mnemonic` field matches any entry
 // in `removeMnemonics`, and re-construct a `TargetSchema` from the
@@ -60,34 +120,6 @@ mutateShippedTargetSchemaJson(
     std::string_view targetName,
     std::initializer_list<std::string_view> removeMnemonics) {
 
-    auto pathR = findShippedConfig(
-        ShippedConfigLocator{targetName, "targets", ".target.json",
-                             "target", DiagnosticCode::C_InvalidTargetName});
-    if (!pathR.has_value()) {
-        return std::unexpected(std::move(pathR).error());
-    }
-
-    std::ifstream in{*pathR};
-    if (!in.is_open()) {
-        return std::unexpected(std::vector<ConfigDiagnostic>{
-            {DiagnosticCode::C_MissingField, DiagnosticSeverity::Error,
-             pathR->string(), "mutateShippedTargetSchemaJson: cannot "
-                              "open shipped target JSON"}});
-    }
-    std::ostringstream buf;
-    buf << in.rdbuf();
-
-    nlohmann::json doc;
-    try {
-        doc = nlohmann::json::parse(buf.str());
-    } catch (nlohmann::json::parse_error const& e) {
-        return std::unexpected(std::vector<ConfigDiagnostic>{
-            {DiagnosticCode::C_InvalidSemantics, DiagnosticSeverity::Error,
-             pathR->string(),
-             std::string{"mutateShippedTargetSchemaJson: JSON parse "
-                         "error in shipped schema: "} + e.what()}});
-    }
-
     // Build the removal set (string_view → string copies for stable
     // storage during the erase walk).
     std::unordered_set<std::string> drop;
@@ -99,22 +131,24 @@ mutateShippedTargetSchemaJson(
     // Strip matching opcode rows. Silently tolerant: an entry not
     // present in the JSON is a vacuous removal — caller's intent
     // ("ensure this mnemonic is absent") is satisfied.
-    if (doc.contains("opcodes") && doc["opcodes"].is_array()) {
-        auto& opcodes = doc["opcodes"];
-        opcodes.erase(
-            std::remove_if(
-                opcodes.begin(), opcodes.end(),
-                [&drop](nlohmann::json const& entry) {
-                    auto it = entry.find("mnemonic");
-                    if (it == entry.end() || !it->is_string()) return false;
-                    return drop.contains(it->get<std::string>());
-                }),
-            opcodes.end());
-    }
-
-    std::string const mutatedText = doc.dump();
-    return TargetSchema::loadFromText(mutatedText,
-        std::string{"<mutated "} + std::string{targetName} + ">");
+    return mutateShippedTargetSchemaDoc(targetName,
+        [&drop](nlohmann::json& doc) {
+            if (!doc.contains("opcodes") || !doc["opcodes"].is_array()) {
+                return;
+            }
+            auto& opcodes = doc["opcodes"];
+            opcodes.erase(
+                std::remove_if(
+                    opcodes.begin(), opcodes.end(),
+                    [&drop](nlohmann::json const& entry) {
+                        auto it = entry.find("mnemonic");
+                        if (it == entry.end() || !it->is_string()) {
+                            return false;
+                        }
+                        return drop.contains(it->get<std::string>());
+                    }),
+                opcodes.end());
+        });
 }
 
 } // namespace dss::test_support

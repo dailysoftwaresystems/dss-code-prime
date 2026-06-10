@@ -161,6 +161,18 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                      "length limit)",
                                      o.mnemonic, vi, v.tmpl.opcodeBytes.size()));
                 }
+                // FC2 Part B: the 15-byte architectural cap counts
+                // prefixes too — a mandatoryPrefix + opcode pair that
+                // alone exceeds it can never encode.
+                if (v.tmpl.mandatoryPrefix.size() + v.tmpl.opcodeBytes.size() > 15) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/template/mandatoryPrefix", i, vi),
+                         std::format("opcode '{}' variant {}: 'mandatoryPrefix' "
+                                     "({} bytes) plus 'opcode' ({} bytes) "
+                                     "exceeds 15 (x86 instruction length limit)",
+                                     o.mnemonic, vi,
+                                     v.tmpl.mandatoryPrefix.size(),
+                                     v.tmpl.opcodeBytes.size()));
+                }
             } else if (o.encoding.shape == TargetEncodingShape::Fixed32) {
                 // fixed32 mirror: opcodeBytes / modrmRegExt are
                 // never meaningful; declaring them on a fixed32
@@ -177,6 +189,17 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                          std::format("opcode '{}' variant {}: 'modrmRegExt' "
                                      "declared on a fixed32 variant — "
                                      "fixed32 has no ModR/M byte",
+                                     o.mnemonic, vi));
+                }
+                // FC2 Part B: legacy prefixes are an x86-variable-only
+                // concept — a fixed-word ISA has no prefix bytes.
+                // Silent ignore would let a misauthored row believe
+                // its prefix is emitted.
+                if (!v.tmpl.mandatoryPrefix.empty()) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/template/mandatoryPrefix", i, vi),
+                         std::format("opcode '{}' variant {}: 'mandatoryPrefix' "
+                                     "declared on a fixed32 variant — "
+                                     "fixed32 has no legacy-prefix bytes",
                                      o.mnemonic, vi));
                 }
             }
@@ -849,6 +872,32 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 break;  // one cycle finding per validate() — caller fixes & retries
             }
         }
+    }
+
+    // ── registerClassOps (FC2 Part B) ───────────────────────────
+    // Every DECLARED per-class mnemonic must resolve to an opcode row
+    // — a typo here would otherwise surface per-instruction at the
+    // consumer (`regClassOpOpcode` returning nullopt looks identical
+    // to "op not declared"); load-time is the one place the mistake
+    // is distinguishable from trigger-disciplined omission.
+    for (std::size_t ci = 0; ci < registerClassOps.size(); ++ci) {
+        auto const& row = registerClassOps[ci];
+        if (!row.declared) continue;
+        auto const clsName =
+            targetRegClassName(static_cast<TargetRegClass>(ci));
+        auto checkOp = [&](char const* field, std::string const& name) {
+            if (name.empty()) return;  // omitted op — consumer fails loud
+            if (mnemonicIndex.find(name) == mnemonicIndex.end()) {
+                fail(std::format("/registerClassOps/{}/{}", clsName, field),
+                     std::format("registerClassOps class '{}': '{}' "
+                                 "mnemonic '{}' does not resolve to any "
+                                 "opcode row",
+                                 clsName, field, name));
+            }
+        };
+        checkOp("move",  row.move);
+        checkOp("load",  row.load);
+        checkOp("store", row.store);
     }
 
     // ── Relocation taxonomy (AS1 §2.6) ──────────────────────────

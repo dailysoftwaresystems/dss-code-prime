@@ -13,13 +13,16 @@
 // Locked decisions L1-L6 + deferrals D1-D8 live in
 // `.plans/08-compilation-unit-plan - tbd.md` §2.5.
 
+#include "analysis/syntactic/binder_sketch.hpp"   // AmbiguousTypeNameCandidate (FC2 sidecar)
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/tree.hpp"
 
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -61,7 +64,8 @@ public:
                     std::vector<Tree>                    trees,
                     DiagnosticReporter                   driverDiagnostics,
                     std::vector<CrossTreeRef>            crossRefs,
-                    std::vector<std::filesystem::path>   shippedLibDescriptors);
+                    std::vector<std::filesystem::path>   shippedLibDescriptors,
+                    std::uint32_t                        typeNameReparseCount = 0);
 
     ~CompilationUnit();  // out-of-line; mirrors Tree's discipline.
 
@@ -120,6 +124,15 @@ public:
     // `TreeBuilder::nextTreeId()`.
     [[nodiscard]] static CompilationUnitId nextId() noexcept;
 
+    // FC2 observability: how many trees the type-name oracle REPARSED
+    // during finish() (cross-file ambiguous-cast resolution). 0 when no
+    // tree recorded a resolvable AmbiguousTypeNameCandidate — the pin
+    // that the reparse pass costs nothing on candidate-free builds.
+    // Pure observability, NOT a behavior knob.
+    [[nodiscard]] std::uint32_t typeNameReparseCount() const noexcept {
+        return typeNameReparseCount_;
+    }
+
 private:
     CompilationUnitId                    id_;
     std::shared_ptr<GrammarSchema const> schema_;
@@ -127,6 +140,7 @@ private:
     DiagnosticReporter                   driverDiagnostics_;
     std::vector<CrossTreeRef>            crossRefs_;
     std::vector<std::filesystem::path>   shippedLibDescriptors_;  // FF11 neutral-JSON descriptor paths
+    std::uint32_t                        typeNameReparseCount_ = 0;  // FC2 oracle observability
 };
 
 // Single-use builder for CompilationUnit. Non-copyable + non-movable, same
@@ -233,6 +247,20 @@ private:
     [[nodiscard]] std::shared_ptr<GrammarSchema const>
     schemaForPath_(std::filesystem::path const& path) const;
 
+    // FC2: per-tree parse sidecar, index-parallel to `trees_` (alignment
+    // is by construction: addTree appends an EMPTY sidecar; parseAndAdd_
+    // then fills the back one). Carries each parse's ambiguous type-name
+    // candidates + exported global type names (the oracle's inputs) and
+    // the source/schema handles a one-shot reparse needs. An externally
+    // built tree pushed via addTree keeps the empty sidecar — it is
+    // never reparsed (no candidates, no source handle).
+    struct TreeParseSidecar {
+        std::vector<AmbiguousTypeNameCandidate> candidates;
+        std::vector<std::string>                globalTypeNames;
+        std::shared_ptr<SourceBuffer>           source;   // null for addTree trees
+        std::shared_ptr<GrammarSchema const>    schema;   // null for addTree trees
+    };
+
     CompilationUnitId                    id_;
     std::shared_ptr<GrammarSchema const> schema_;        // primary (= schemas_[0])
     std::vector<std::shared_ptr<GrammarSchema const>> schemas_;  // registry, by extension
@@ -244,6 +272,7 @@ private:
     std::unordered_map<std::string, std::size_t> pathToTreeIndex_;
     std::vector<std::filesystem::path>   includeDirs_;
     std::vector<std::filesystem::path>   systemDirs_;   // FF11 angle-include search path
+    std::vector<TreeParseSidecar>        sidecars_;     // FC2; parallel to trees_
     bool                                 finished_ = false;
 };
 

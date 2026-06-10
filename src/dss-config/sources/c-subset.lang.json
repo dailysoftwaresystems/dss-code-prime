@@ -42,6 +42,8 @@
     }
   },
 
+  "$fc2CastExprComment": "FC2 Part A: C-style cast `(type)expr` (castExpr/castTypeRef/castTypeBase/castOperand shapes). castExpr shares the `( ... )` opener with compoundLiteralExpr/parenExpr inside the speculative operand alt; the probe disambiguates structurally (a brace-init follows the compound literal's `)`, an expression follows the cast's). `commitRequiresTypeName` names the type-position child rule: a structurally-successful probe COMMITS only per the parser's GENERIC type-name triage — (1) a type that is NOT a lone Identifier (keyword/struct-tag/star/const present) always commits, those forms cannot be expressions; (2) a lone Identifier the binder sketch knows as a TYPE commits; (3) one it knows as a VALUE rolls back to the value reading (shadowing-aware); (4) an UNKNOWN lone Identifier commits iff the token after the type's closer is NOT an infix/postfix/ternary operator per the operator table (the value reading could not continue), else rolls back AND records an AmbiguousTypeNameCandidate for the compilation-unit oracle's one-shot reparse (cross-file typedefs). castTypeRef duplicates typeRefAllowingStruct PLUS a bare-Identifier base (typedef names in cast position) — deliberately NOT added to typeRefAllowingStruct itself, which would inject the C decl-vs-expr statement ambiguity (`T x;` vs `a * b;`) into varDecl/param/structField; that generalization stays anchored separately. castOperand is a second expr-entry rule re-entering the Pratt walker at PREFIX precedence (90): the cast operand binds prefix + postfix operators but NOT binary/ternary ones, giving C-correct `(int)a + b` == ((int)a)+b, `(int)x[2]` == (int)(x[2]), `-(int)x`, and `(int)(long)x` chains. Same wrapper vocabulary as `expression` (wrapper rule names are per-schema; the loader dedups).",
+
   "$ff11AngleIncludeComment": "FF11 angle-include lexing. `#` pushes the line-scoped `include-directive` mode (popAtNewline:true -> the frame auto-pops at the next newline, so a malformed `#include` with no header -- or any directive -- never leaks `<`-as-header-opener into the following line; C preprocessor directives are line-oriented). That mode inherits the top-level token map (tokens:default) so `include`, `\"...\"`, and identifiers all lex normally; the ONLY override is `<`, which there OPENS a header path (replaceMode -> header-body, stringStyle.endsAt `>`) instead of meaning LtOp. The override-first longest-match rule (language-config-spec section 9.6) means `<` wins at length 1 and the global `<<`/`<=` are deliberately suppressed inside a directive -- correct, since `#include <<x>>` is not valid C. The `header-body` mode mirrors the `string` body: a coalesced `HeaderPath` token captures the raw path bytes between `<` and the closing `>` (which pops the frame back to main); escapeKind:none -- header paths have no escapes. The quote form keeps the global `\"`->StringStart->string body unchanged (additive: both `#include <h>` and `#include \"h\"` work). The resolver reads the raw path slice (a filename, not a decoded string) for both forms, and picks the search path by which token kind it finds under the directive (imports.pathToken=StringStart -> self-dir+includeDirs; imports.systemPathToken=HeaderStart -> shippedLibDirs).",
 
   "tokens": {
@@ -89,6 +91,7 @@
     "-":  [{ "kind": "MinusOp"  }],
     "*":  [{ "kind": "StarOp"   }],
     "/":  [{ "kind": "SlashOp"  }],
+    "%":  [{ "kind": "PercentOp" }],
     "!":  [{ "kind": "BangOp"   }],
     "?":  [{ "kind": "QuestionOp" }],
 
@@ -140,7 +143,7 @@
       { "precedence": 55, "associativity": "left",                       "operators": ["<", ">", "<=", ">="]                   },
       { "precedence": 60, "associativity": "left",                       "operators": ["<<", ">>"]                             },
       { "precedence": 65, "associativity": "left",                       "operators": ["+", "-"]                               },
-      { "precedence": 70, "associativity": "left",                       "operators": ["*", "/"]                               },
+      { "precedence": 70, "associativity": "left",                       "operators": ["*", "/", "%"]                          },
       { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-", "*", "&"]                },
       { "precedence": 95,                            "arity": "postfix",  "operators": ["++", "--"]                            },
       { "precedence": 100,                           "arity": "postfix",  "operators": ["("], "endsAt": ")", "bodyRule": "argList" },
@@ -153,8 +156,12 @@
   "numberStyle": {
     "decimal": true,
     "integerPrefixes": [
-      { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F" },
-      { "prefix": "0X", "radix": 16, "digits": "0-9a-fA-F" },
+      { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F",
+        "float": { "exponent": { "letters": ["p", "P"], "signOptional": true },
+                   "exponentDigits": "0-9" } },
+      { "prefix": "0X", "radix": 16, "digits": "0-9a-fA-F",
+        "float": { "exponent": { "letters": ["p", "P"], "signOptional": true },
+                   "exponentDigits": "0-9" } },
       { "prefix": "0b", "radix": 2,  "digits": "01"        },
       { "prefix": "0B", "radix": 2,  "digits": "01"        },
       { "prefix": "0o", "radix": 8,  "digits": "0-7"       },
@@ -163,7 +170,9 @@
     ],
     "exponent":         { "letters": ["e", "E"], "signOptional": true },
     "fractionPoint":    ".",
-    "digitSeparator":   "_",
+    "trailingFraction": true,
+    "leadingFraction":  true,
+    "digitSeparator":   "'",
     "integerSuffixes":  ["u", "U", "l", "L", "ll", "LL", "ul", "UL", "lu", "LU",
                           "ull", "ULL", "llu", "LLU"],
     "floatSuffixes":    ["f", "F"],
@@ -542,16 +551,49 @@
         "stringLiteralExpr",
         "charLiteralExpr",
         "compoundLiteralExpr",
+        "castExpr",
         "parenExpr"
       ],
       "speculative": true,
-      "lookahead": 8
+      "$lookaheadComment": "FC2 Part A: raised 8 -> 64. The speculation budget is lookahead*16 tokens per probe (parser SpeculationProbe); a castExpr probe must consume the ENTIRE cast operand expression before its frame closes, so the old 128-token budget was a correctness cliff for casts of long expressions (and for large compound-literal brace inits). 64 -> 1024-token probe budget.",
+      "lookahead": 64
     },
 
     "parenExpr": { "sequence": [ "ParenOpen", "expression", "ParenClose" ] },
 
     "compoundLiteralExpr": {
       "sequence": [ "ParenOpen", "typeRefAllowingStruct", "ParenClose", "braceInitList" ]
+    },
+
+    "castExpr": {
+      "sequence": [ "ParenOpen", "castTypeRef", "ParenClose", "castOperand" ],
+      "commitRequiresTypeName": "castTypeRef"
+    },
+
+    "castTypeBase": {
+      "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "Identifier", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
+    },
+
+    "castTypeRef": {
+      "sequence": [
+        { "optional": "ConstKeyword" },
+        "castTypeBase",
+        { "repeat": "StarOp" },
+        { "optional": "ConstKeyword" }
+      ]
+    },
+
+    "castOperand": {
+      "expr": {
+        "atom": "operand",
+        "minPrecedence": 90,
+        "wrapperRules": {
+          "binary":  "binaryExpr",
+          "unary":   "unaryExpr",
+          "postfix": "postfixExpr",
+          "ternary": "ternaryExpr"
+        }
+      }
     },
 
     "braceInitList": {
@@ -694,6 +736,10 @@
       { "rule": "postfixExpr", "callee": 0, "args": 2,
         "operatorToken": "ParenOpen" }
     ],
+    "$castsComment": "FC2: explicit C cast `(T)expr`. typeChild/operandChild are visible-child indices into castExpr = [ '(' , castTypeRef , ')' , castOperand ]. Pass 2 resolves+stamps the type child (typedefs incl. cross-tree-injected ones resolve through the standard type-position resolver), stamps the cast node's RESULT type, and validates the pair against the explicit-cast matrix (scalar<->scalar incl. float<->int, ptr<->ptr, ptr<->int; struct values / void / arrays -> S_InvalidCast).",
+    "casts": [
+      { "rule": "castExpr", "typeChild": 1, "operandChild": 3 }
+    ],
     "returnRules": [
       { "rule": "returnStmt", "value": 1 }
     ],
@@ -745,6 +791,7 @@
     "designatedFieldRule": "designatedField",
     "designatedIndexRule": "designatedIndex",
     "compoundLiteralRule": "compoundLiteralExpr",
+    "castRule":            "castExpr",
 
     "globalsConstEval": { "allowFloat": true },
 
@@ -754,6 +801,7 @@
       { "token": "MinusOp",  "target": "Sub"    },
       { "token": "StarOp",   "target": "Mul"    },
       { "token": "SlashOp",  "target": "Div"    },
+      { "token": "PercentOp","target": "Rem"    },
       { "token": "EqEqOp",   "target": "Eq"     },
       { "token": "NotEqOp",  "target": "Ne"     },
       { "token": "LtOp",     "target": "Lt"     },

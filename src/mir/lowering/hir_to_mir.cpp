@@ -312,6 +312,39 @@ struct Lowerer {
                 // and emit a Const instruction.
                 std::uint32_t const idx = hir.payload(node);
                 HirLiteralValue const& src = literals.at(idx);
+                // FC2 Part B (F64 constant materialization): an F64
+                // float literal in a function body lowers the way
+                // STRING literals do (the D-LK4-RODATA-PRODUCER-STRING
+                // shape below) — mint an anonymous module global whose
+                // constant-init carries the value, then GlobalAddr +
+                // Load. Register machines have no float-immediate
+                // instruction form; the prior `Const` route dead-ended
+                // in the LirLiteralPool (no encoding variant consumes
+                // a LiteralIndex operand). Per-occurrence global, no
+                // dedup — mirrors the string path exactly. Non-F64
+                // float widths fall through to `addConst` and fail
+                // loud at MIR→LIR (D-TARGET-ENCODING-WIDTH-GUARD —
+                // promoting them here would silently pair them with
+                // the F64-width load/arithmetic encodings).
+                if (std::holds_alternative<double>(src.value)
+                    && t.valid() && interner.kind(t) == TypeKind::F64) {
+                    SymbolId const sym = mintSyntheticGlobalSymbol();
+                    if (!sym.valid()) {
+                        unsupported(node,
+                            "float-literal promotion failed: synthetic "
+                            "SymbolId space exhausted (UINT32_MAX "
+                            "wraparound) — same guard as the string-"
+                            "literal minter.");
+                        return InvalidMirInst;
+                    }
+                    std::uint32_t const mirLitIdx =
+                        mir.literalPoolAdd(toMirLiteral(src));
+                    (void)mir.addGlobal(t, sym, mirLitIdx);
+                    TypeId const ptrTy = interner.pointer(t);
+                    MirInstId const addr = mir.addGlobalAddr(sym, ptrTy);
+                    std::array<MirInstId, 1> ops{addr};
+                    return mir.addInst(MirOpcode::Load, ops, t);
+                }
                 return mir.addConst(toMirLiteral(src), t);
             }
             case HirKind::Ref: {

@@ -361,6 +361,12 @@ std::int32_t GrammarSchema::exprMinPrecedence(RuleId rule) const noexcept {
     return it->second.exprMinPrecedence;
 }
 
+RuleId GrammarSchema::typeNameCommitRule(RuleId rule) const noexcept {
+    auto it = d_.compiledRules.find(rule.v);
+    if (it == d_.compiledRules.end()) return RuleId{};
+    return it->second.typeNameCommitRule;
+}
+
 ExprWrapperRules GrammarSchema::exprWrapperRules(RuleId rule) const noexcept {
     auto it = d_.exprWrapperRules.find(rule.v);
     if (it == d_.exprWrapperRules.end()) return ExprWrapperRules{};

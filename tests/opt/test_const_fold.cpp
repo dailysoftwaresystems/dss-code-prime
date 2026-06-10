@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 
 using namespace dss;
 
@@ -181,6 +182,115 @@ TEST(ConstFold, DefersDivByZeroToRuntime) {
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.instructionsFolded, 0u);
     auto const ret = inspectReturnOperand(br.mir);
+    EXPECT_FALSE(ret.isConst);
+    EXPECT_EQ(ret.op, MirOpcode::SDiv);
+}
+
+// ─── FC1 (V2-4.X, 2026-06-10): SMod folding + the INT64_MIN/-1 guard ───────
+
+namespace {
+
+// Build `fn() -> i32/i64 { return OP(Const a, Const b); }` for the
+// SMod/SDiv fold tests below.
+[[nodiscard]] Mir buildConstBinOp(TypeInterner& interner, MirOpcode op,
+                                  TypeKind core, std::int64_t a,
+                                  std::int64_t b) {
+    TypeId const ty    = interner.primitive(core);
+    TypeId const fnSig = interner.fnSig({}, ty, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirLiteralValue va; va.value = a; va.core = core;
+    MirLiteralValue vb; vb.value = b; vb.core = core;
+    MirInstId const ops[] = {mb.addConst(va, ty), mb.addConst(vb, ty)};
+    mb.addReturn(mb.addInst(op, ops, ty));
+    return std::move(mb).finish();
+}
+
+}  // namespace
+
+// SMod folds with C TRUNCATED-remainder semantics (C23 6.5.5: the
+// sign follows the DIVIDEND; (a/b)*b + a%b == a with / truncating
+// toward zero). A floored-division remainder ((-7)%2 == +1) here
+// would be a silent cross-semantics miscompile.
+TEST(ConstFold, SModFoldsTruncatedRemainderSemantics) {
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildConstBinOp(interner, MirOpcode::SMod,
+                                  TypeKind::I32, -7, 2);
+        DiagnosticReporter rep;
+        auto const r = opt::passes::runConstFold(mir, interner, rep);
+        EXPECT_TRUE(r.ok);
+        EXPECT_EQ(r.instructionsFolded, 1u);
+        auto const ret = inspectReturnOperand(mir);
+        ASSERT_TRUE(ret.isConst);
+        EXPECT_EQ(ret.constValue, -1)
+            << "(-7) % 2 must be -1 (truncated; floored gives +1).";
+    }
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildConstBinOp(interner, MirOpcode::SMod,
+                                  TypeKind::I32, 7, -2);
+        DiagnosticReporter rep;
+        auto const r = opt::passes::runConstFold(mir, interner, rep);
+        EXPECT_TRUE(r.ok);
+        EXPECT_EQ(r.instructionsFolded, 1u);
+        auto const ret = inspectReturnOperand(mir);
+        ASSERT_TRUE(ret.isConst);
+        EXPECT_EQ(ret.constValue, 1)
+            << "7 % (-2) must be +1 (truncated; floored gives -1).";
+    }
+}
+
+// SMod-by-zero defers to runtime exactly like SDiv-by-zero (folding
+// would erase the trap the unoptimized path has).
+TEST(ConstFold, SModByZeroDefersToRuntime) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildConstBinOp(interner, MirOpcode::SMod,
+                              TypeKind::I32, 7, 0);
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runConstFold(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsFolded, 0u);
+    auto const ret = inspectReturnOperand(mir);
+    EXPECT_FALSE(ret.isConst);
+    EXPECT_EQ(ret.op, MirOpcode::SMod);
+}
+
+// INT64_MIN % -1 must NOT fold (FC1, the new const_eval_arith guard):
+// it is C UB (6.5.5p6 — a/b is unrepresentable so a%b is undefined)
+// AND, without the guard, the COMPILER ITSELF would execute
+// `INT64_MIN % -1` on the host — signed-overflow UB that the
+// linux-clang UBSan CI leg traps. The op stays live; the TARGET
+// defines the runtime outcome (x86 idiv #DE; arm64 sdiv wraps).
+TEST(ConstFold, SModIntMinByMinusOneNotFolded) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildConstBinOp(interner, MirOpcode::SMod, TypeKind::I64,
+                              std::numeric_limits<std::int64_t>::min(), -1);
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runConstFold(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsFolded, 0u)
+        << "folding INT64_MIN % -1 is host UB (UBSan-visible) and "
+           "erases the target-defined runtime behavior.";
+    auto const ret = inspectReturnOperand(mir);
+    EXPECT_FALSE(ret.isConst);
+    EXPECT_EQ(ret.op, MirOpcode::SMod);
+}
+
+// The SDiv twin — the guard fixes a PRE-EXISTING latent host-UB bug
+// in the Div arm (it folded `av / bv` with only a bv==0 check;
+// INT64_MIN / -1 overflows int64 inside the compiler).
+TEST(ConstFold, SDivIntMinByMinusOneNotFolded) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildConstBinOp(interner, MirOpcode::SDiv, TypeKind::I64,
+                              std::numeric_limits<std::int64_t>::min(), -1);
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runConstFold(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsFolded, 0u);
+    auto const ret = inspectReturnOperand(mir);
     EXPECT_FALSE(ret.isConst);
     EXPECT_EQ(ret.op, MirOpcode::SDiv);
 }

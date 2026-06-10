@@ -189,6 +189,53 @@ namespace detail::type_rules {
     return false;
 }
 
+// FC2 explicit-cast legality (`(T)expr`). DELIBERATELY wider than
+// `isAssignable` — an explicit cast is the programmer overriding the
+// implicit-conversion rules — but still bounded by what the MIR cast
+// lattice (`mapCast` in hir_to_mir.cpp) can lower and what C allows for
+// the shipped type surface:
+//
+//   * scalar ↔ scalar — every (signed/unsigned int, Char, Byte, Bool,
+//     float) pair, INCLUDING the float→int / int→float conversions the
+//     implicit rules reject (mapCast: Trunc/SExt/ZExt/Bitcast/FPTrunc/
+//     FPExt/SIToFP/UIToFP/FPToSI/FPToUI).
+//   * Ptr ↔ Ptr — any object-pointer pair (mapCast: Bitcast).
+//   * Ptr ↔ integer — C's implementation-defined round-trip (mapCast:
+//     PtrToInt / IntToPtr). Float↔Ptr stays ILLEGAL (C constraint).
+//   * InvalidType on either side → allowed (cascade suppression, same
+//     posture as isAssignable).
+//
+// Everything else is false → the analyzer emits S_InvalidCast. Notably
+// REJECTED (fail loud, never miscompile): struct/union VALUES (C forbids
+// casts to composite types), `void` on either side (mapCast has no void
+// arm; a value-discarding `(void)x` statement-cast is future surface),
+// and Array-typed operands (decay-inside-cast, e.g. `(char*)"s"`, is a
+// pinned follow-up — the implicit decay path exists but the explicit-
+// cast lowering does not reuse it yet).
+[[nodiscard]] inline bool isExplicitCastable(TypeInterner const& interner,
+                                             TypeId target,
+                                             TypeId operand) noexcept {
+    if (!target.valid() || !operand.valid()) return true;   // cascade suppression
+    auto const tk = interner.kind(target);
+    auto const ok = interner.kind(operand);
+    // Mirrors mapCast's isInt: every integral scalar the MIR lattice
+    // casts between (incl. Bool/Char/Byte — C casts these freely).
+    auto const isCastableInt = [](TypeKind k) noexcept {
+        using namespace detail::type_rules;
+        return signedIntRank(k) != 0 || unsignedIntRank(k) != 0
+            || k == TypeKind::Char || k == TypeKind::Byte
+            || k == TypeKind::Bool;
+    };
+    auto const isCastableScalar = [&](TypeKind k) noexcept {
+        return isCastableInt(k) || detail::type_rules::floatRank(k) != 0;
+    };
+    if (isCastableScalar(tk) && isCastableScalar(ok)) return true;
+    if (tk == TypeKind::Ptr && ok == TypeKind::Ptr)   return true;
+    if (tk == TypeKind::Ptr && isCastableInt(ok))     return true;
+    if (isCastableInt(tk) && ok == TypeKind::Ptr)     return true;
+    return false;
+}
+
 // Best common type for binary arithmetic. Returns the wider operand
 // when both live in the same widening lattice; InvalidType otherwise.
 // InvalidType passes through (cascade suppression).
