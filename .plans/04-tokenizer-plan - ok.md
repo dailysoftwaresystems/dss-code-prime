@@ -6,7 +6,7 @@
 >
 > **TZ3 review done.** 5-agent review (`code`, `simplify`, `tests`, `errors`, `types`) ran against the TZ3 diff, 13 actionable items triaged + addressed in this branch's review-fix round 1. All 29 suites pass (625 cases / 100%). See the TZ3 row below for the full per-item breakdown.
 >
-> **Next action: open the parser phase (#7).** `00-compiler-implementation-plan - tbd.md` §8 row 7 (`analysis-syntactic`) is `🔵 next`. The schema-driven cursor is in place, the tokenizer is feeding live tokens, the builder synthesizes meanings for built-in kinds and skips off-grammar body chars — what's missing is the actual parser driver that consumes a `TokenStream` and drives `TreeBuilder::open`/`pushToken`/`Checkpoint` from the compiled shape graph.
+> **Next action (as recorded at plan close): open the parser phase (#7) — ✅ since done** ([`05-parser-plan`](./05-parser-plan%20-%20ok.md) shipped + closed). `00-compiler-implementation-plan - tbd.md` §8 row 7 (`analysis-syntactic`) was `🔵 next` at the time, since ✅. The schema-driven cursor is in place, the tokenizer is feeding live tokens, the builder synthesizes meanings for built-in kinds and skips off-grammar body chars — what's missing is the actual parser driver that consumes a `TokenStream` and drives `TreeBuilder::open`/`pushToken`/`Checkpoint` from the compiled shape graph.
 
 ## 0. Status (snapshot)
 

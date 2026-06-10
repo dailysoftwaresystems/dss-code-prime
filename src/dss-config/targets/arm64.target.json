@@ -569,6 +569,117 @@
           }
         ]
       }
+    },
+    {
+      "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): FADD Dd, Dn, Dm — scalar double, FP data-processing (2 source). Base 0x1E602800 = 0 0 0 11110 [31:24] | ftype=01 double [23:22] | 1 [21] | Rm [20:16] | opcode 001010 FADD [15:10] | Rn [9:5] | Rd [4:0] (ARM ARM C7.2.*). 3-operand NATIVE like sdiv — deliberately NO requires2Address (x86's fadd carries it for ADDSD's 2-address shape; declaring it here would force a pointless extra fmov through the legalize pass). MIR FAdd is the producer; its requireF64Width gate keeps this row F64-only — the F32 form (ftype=00, base 0x1E202800) lands with an F32 consumer (D-TARGET-ENCODING-WIDTH-GUARD).",
+      "mnemonic":      "fadd",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg"] },
+            "template":   { "fixedWord": 509618176 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): FCVTZS Xd, Dn — double to signed 64-bit integer, round toward zero (FP→integer conversion). Base 0x9E780000 = sf=1 [31] | 00 | 11110 [28:24] | ftype=01 double [23:22] | 1 [21] | rmode=11 toward-zero [20:19] | opcode=000 FCVTZS [18:16] | 000000 [15:10] | Rn [9:5] | Rd [4:0]. The result is GPR-class via the MIR integer type (regClassFor) — rd carries the X destination, the rn wire the D source; the 5-bit slots are class-blind hwEncodings, exactly the GPR-dest/FPR-src split x86's cvttsd2si makes through modrm.reg/modrm.rm. MIR FPToSI is the producer; its requireF64Width source gate keeps this F64-only.",
+      "mnemonic":      "fp_to_si",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"] },
+            "template":   { "fixedWord": 2658664448 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): FMOV Dd, Dn — FP register-register move, double. Base 0x1E604000 = 0 0 0 11110 [31:24] | ftype=01 [23:22] | 1 [21] | opc=000000 FMOV [20:15] | 10000 [14:10] | Rn [9:5] | Rd [4:0] (FP data-processing 1 source — the single source rides Rn, NOT Rm; contrast the GPR mov's ORR alias whose source is Rm). Bound to the fpr class's `move` slot in registerClassOps[] — consumed by MIR value/phi copies and the callconv arg/return moves whenever the register class is FPR (the arm64 analog of x86's movaps role; a D-form copy moves the full 64-bit view, no upper-lane-merge hazard to dodge).",
+      "mnemonic":      "fmov",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"] },
+            "template":   { "fixedWord": 509624320 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): FPR memory LOAD — LDUR Dt, [Xn, #simm9] (SIMD&FP 64-bit, unscaled). Fixed word 0xFC400000 = the GPR LDUR 0xF8400000 with V=1 (bit 26): size=11 [31:30] | 111 [29:27] | V=1 [26] | 00 [25:24] | opc=01 load [23:22] | 0 [21] | imm9 [20:12] | 00 [11:10] | Rn [9:5] | Rt [4:0]. Operand layout mirrors the GPR `load` row exactly (shared LIR load form [base_reg, MemBase(scale=1), MemOffset(disp)] + result): result→Rt (rd), base→Rn, MemOffset→Imm9 (signed -256..255), MemBase carries no bits (membase.noscale). Bound to the fpr class's `load` slot in registerClassOps[] — the callconv epilogue saved-d-reg reload, stack-resident F64 args, and MIR Load of an F64 rodata global (the literal-materialization path) all resolve here. F64-only: the F32 S-form (size=10, 0xBC400000) lands with an F32 consumer.",
+      "mnemonic":      "fldur",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template":   { "fixedWord": 4232052736 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm9"           }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): FPR memory STORE — STUR Dt, [Xn, #simm9] (SIMD&FP 64-bit, unscaled). Fixed word 0xFC000000 = the GPR STUR 0xF8000000 with V=1 (bit 26); opc=00 store. Operand layout mirrors the GPR `store` row exactly (shared LIR store form [value_reg, base_reg, MemBase(scale=1), MemOffset(disp)], no result): value→Rt (rd wire), base→Rn, MemOffset→Imm9 (signed). Bound to the fpr class's `store` slot in registerClassOps[] — the callconv prologue saved-d-reg spill is the first consumer (AAPCS64 declares d8-d15 callee-saved + regalloc prefers callee-saved, so the FIRST FPR vreg in any function needs this store — the exact shape that surfaced x86's movsd_store on ms_x64).",
+      "mnemonic":      "fstur",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "template": { "fixedWord": 4227858432 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm9"           }
+            ]
+          }
+        ]
+      }
     }
   ],
   "$condCodeEncodingComment": "D-AS3-COND-CODE-ARM64 (mirror of x86's table): per-cond-code nibble for the AArch64 B.cond instruction's bits [3:0]. Numeric values are the AArch64 condition codes (ARM ARM C1.2.4): EQ=0, NE=1, CS/HS=2, CC/LO=3, HI=8, LS=9, GE=10(0xA), LT=11(0xB), GT=12(0xC), LE=13(0xD). Signed comparisons map slt→LT(0xB)=11, sle→LE(0xD)=13, sgt→GT(0xC)=12, sge→GE(0xA)=10; unsigned map ult→CC/LO=3, ule→LS=9, ugt→HI=8, uge→CS/HS=2. The encoder ORs this nibble into word 0 bits 0..3 of the jcc macro (vs x86's low 4 bits of the opcode byte — same field-position abstraction, different ISA placement). 10-arm coverage matches the substrate's TargetCondCode enum exactly.",
@@ -584,7 +695,7 @@
     "ugt": 8,
     "uge": 2
   },
-  "$registersComment": "AAPCS64 general-purpose registers x0..x30 + zero-register XZR (encoded as 31 in source operands; uses register's hwEncoding). Stack pointer `sp` is also encoded as 31 but in the SP-slot context — hwEncoding=31 with class GPR is shared between XZR and SP at the byte level. NEON/FP regs v0..v31 use the same 5-bit field but in a separate class. Cycle-3 declares enough registers for AAPCS64 callconv + the encoded mov/ret/brk subset.",
+  "$registersComment": "AAPCS64 general-purpose registers x0..x30 + zero-register XZR (encoded as 31 in source operands; uses register's hwEncoding). Stack pointer `sp` is also encoded as 31 but in the SP-slot context — hwEncoding=31 with class GPR is shared between XZR and SP at the byte level. D-ARM64-FLOAT-SUBSTRATE (2026-06-10): the SIMD&FP file is declared as d0..d31 (class fpr) — the V registers' 64-bit D views, sharing the same 5-bit field encoding.",
   "registers": [
     { "name": "x0",  "class": "gpr", "widthBytes": 8, "hwEncoding": 0 },
     { "name": "x1",  "class": "gpr", "widthBytes": 8, "hwEncoding": 1 },
@@ -619,18 +730,61 @@
     { "name": "x30", "class": "gpr", "widthBytes": 8, "hwEncoding": 30 },
     { "name": "xzr", "class": "gpr", "widthBytes": 8, "hwEncoding": 31 },
     { "$comment": "Stack pointer shares hwEncoding=31 with XZR at the byte level (the context determines which: SP-using addressing modes vs ZR-encoding instructions). The substrate treats them as distinct names with distinct ordinals; the JSON-side ordinal is what matters for the cc lookup.",
-      "name": "sp",  "class": "gpr", "widthBytes": 8, "hwEncoding": 31 }
+      "name": "sp",  "class": "gpr", "widthBytes": 8, "hwEncoding": 31 },
+
+    { "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): the V-register file's 64-bit D views, class fpr — F64-only this cycle, exactly like x86_64 (which declares only F64 SSE encodings); the MIR→LIR requireF64Width guards keep F32 fail-loud. widthBytes=8 is the D view, NOT the full 128-bit V register — the q/v views (and their subOf aliasing) are the future F128/SIMD cycle's work. hwEncoding = the 5-bit register number every SIMD&FP instruction form shares.",
+      "name": "d0",  "class": "fpr", "widthBytes": 8, "hwEncoding": 0 },
+    { "name": "d1",  "class": "fpr", "widthBytes": 8, "hwEncoding": 1 },
+    { "name": "d2",  "class": "fpr", "widthBytes": 8, "hwEncoding": 2 },
+    { "name": "d3",  "class": "fpr", "widthBytes": 8, "hwEncoding": 3 },
+    { "name": "d4",  "class": "fpr", "widthBytes": 8, "hwEncoding": 4 },
+    { "name": "d5",  "class": "fpr", "widthBytes": 8, "hwEncoding": 5 },
+    { "name": "d6",  "class": "fpr", "widthBytes": 8, "hwEncoding": 6 },
+    { "name": "d7",  "class": "fpr", "widthBytes": 8, "hwEncoding": 7 },
+    { "name": "d8",  "class": "fpr", "widthBytes": 8, "hwEncoding": 8 },
+    { "name": "d9",  "class": "fpr", "widthBytes": 8, "hwEncoding": 9 },
+    { "name": "d10", "class": "fpr", "widthBytes": 8, "hwEncoding": 10 },
+    { "name": "d11", "class": "fpr", "widthBytes": 8, "hwEncoding": 11 },
+    { "name": "d12", "class": "fpr", "widthBytes": 8, "hwEncoding": 12 },
+    { "name": "d13", "class": "fpr", "widthBytes": 8, "hwEncoding": 13 },
+    { "name": "d14", "class": "fpr", "widthBytes": 8, "hwEncoding": 14 },
+    { "name": "d15", "class": "fpr", "widthBytes": 8, "hwEncoding": 15 },
+    { "name": "d16", "class": "fpr", "widthBytes": 8, "hwEncoding": 16 },
+    { "name": "d17", "class": "fpr", "widthBytes": 8, "hwEncoding": 17 },
+    { "name": "d18", "class": "fpr", "widthBytes": 8, "hwEncoding": 18 },
+    { "name": "d19", "class": "fpr", "widthBytes": 8, "hwEncoding": 19 },
+    { "name": "d20", "class": "fpr", "widthBytes": 8, "hwEncoding": 20 },
+    { "name": "d21", "class": "fpr", "widthBytes": 8, "hwEncoding": 21 },
+    { "name": "d22", "class": "fpr", "widthBytes": 8, "hwEncoding": 22 },
+    { "name": "d23", "class": "fpr", "widthBytes": 8, "hwEncoding": 23 },
+    { "name": "d24", "class": "fpr", "widthBytes": 8, "hwEncoding": 24 },
+    { "name": "d25", "class": "fpr", "widthBytes": 8, "hwEncoding": 25 },
+    { "name": "d26", "class": "fpr", "widthBytes": 8, "hwEncoding": 26 },
+    { "name": "d27", "class": "fpr", "widthBytes": 8, "hwEncoding": 27 },
+    { "name": "d28", "class": "fpr", "widthBytes": 8, "hwEncoding": 28 },
+    { "name": "d29", "class": "fpr", "widthBytes": 8, "hwEncoding": 29 },
+    { "name": "d30", "class": "fpr", "widthBytes": 8, "hwEncoding": 30 },
+    { "name": "d31", "class": "fpr", "widthBytes": 8, "hwEncoding": 31 }
   ],
-  "$callingConventionsComment": "AAPCS64 (https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst). Integer args: x0..x7. FP args: v0..v7 — omitted in cycle-3 (no FP support yet at the asm-tier). Caller-saved: x0..x18 (incl. x16/x17 = IP0/IP1; PLT-clobberable). Callee-saved: x19..x28 + x29 (frame ptr) + x30 (link reg).",
+  "$registerClassOpsComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): per-register-class move/load/store mnemonics — the same FC2 Part B table x86_64 declares. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (L_RequiredLirOpcodeMissing), because the class-blind alternative is a silent miscompile (a GPR ORR/LDUR against a D-register hwEncoding assembles to valid-looking words that move the WRONG register file). fpr: move=FMOV(D), load=LDUR(D), store=STUR(D).",
+  "registerClassOps": [
+    { "class": "fpr", "move": "fmov", "load": "fldur", "store": "fstur" }
+  ],
+  "$callingConventionsComment": "AAPCS64 (https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst). Integer args: x0..x7. FP args: d0..d7 (D-ARM64-FLOAT-SUBSTRATE 2026-06-10 — declared with the FPR substrate). Caller-saved: x0..x18 (incl. x16/x17 = IP0/IP1; PLT-clobberable) + v0-v7/v16-v31 in their d views. Callee-saved: x19..x28 + x29 (frame ptr) + x30 (link reg) + v8-v15 low 64 bits (d8..d15).",
   "callingConventions": [
     {
       "name":             "aapcs64",
       "argGprs":          ["x0","x1","x2","x3","x4","x5","x6","x7"],
-      "argFprs":          [],
+      "argFprs":          ["d0","d1","d2","d3","d4","d5","d6","d7"],
       "returnGprs":       ["x0","x1"],
-      "returnFprs":       [],
-      "callerSaved":      ["x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x18"],
-      "calleeSaved":      ["x19","x20","x21","x22","x23","x24","x25","x26","x27","x28","x29"],
+      "returnFprs":       ["d0"],
+      "$callerSavedFprComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): AAPCS64 §6.1.2 — v0-v7 (args/results) and v16-v31 are caller-saved; declared here in their d views. Being listed in callerSaved is what keeps the regalloc honest about them: an allocatable register NOT in callerSaved is treated as call-safe (lir_regalloc buildFreeLists), so omitting these while argFprs makes them allocatable would let a float live across a call sit unsaved in a volatile d-register — the same reason x86_64's sysv row lists all sixteen xmm registers here.",
+      "callerSaved":      ["x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x18",
+                           "d0","d1","d2","d3","d4","d5","d6","d7",
+                           "d16","d17","d18","d19","d20","d21","d22","d23","d24","d25","d26","d27","d28","d29","d30","d31"],
+      "$calleeSavedFprComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): AAPCS64 §6.1.2 — v8-v15 must be preserved by a callee ONLY in their LOW 64 BITS; the top 64 bits are caller's responsibility everywhere. The d8..d15 rows are therefore EXACTLY the preserved contract for F64 (the prologue's D-form STUR saves precisely the bits the ABI guarantees — the same low-64-only shape as Win64's xmm6-15/MOVSD). CAVEAT for a future F128/SIMD cycle: a Q/V-register value live across a call must NOT rely on these rows — the callee preserves only the low half; re-examine when q/v views land.",
+      "calleeSaved":      ["x19","x20","x21","x22","x23","x24","x25","x26","x27","x28","x29",
+                           "d8","d9","d10","d11","d12","d13","d14","d15"],
       "linkRegister":     "x30",
       "stackPointer":     "sp",
       "stackAlignment":   16,
@@ -645,11 +799,15 @@
       "$comment": "apple_arm64 — Apple's ARM64 ABI for Apple platforms (developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms). The ABI catalog (abi_catalog.cpp) maps (arm64, MachO) → CcApple → \"apple_arm64\"; shipping this row CLOSES D-FF3-5 (trigger: 'apple_arm64 cc row ships in arm64.target.json') and is what lets `resolveAbi` + the entry trampoline resolve a Mach-O-ARM64 cc. The general-purpose REGISTER vocabulary is IDENTICAL to AAPCS64 — integer args x0..x7, returns x0/x1, callee-saved x19..x28+x29, link x30, sp, 16-byte stack alignment, bias 0 (BL writes LR, no push). The Apple ABI's documented DIVERGENCES from AAPCS64 are NOT register-assignment differences: (1) variadic args are ALWAYS passed on the stack (vs AAPCS64's register-then-stack) and (2) a different indirect-result-location rule. Neither is modeled at today's scalar-only asm tier (variadic support is gated at D-FFI-DESCRIPTOR-VARIADIC-SIGNATURE), so for the scalar register-passing this row carries the same fields as aapcs64; a SEPARATE named row keeps the ABI identity explicit and correct, so when variadic/indirect-result lands it is updated HERE, not by silently reusing aapcs64. The always-stack variadic rule + indirect-result-location divergence are pinned at D-FF3-APPLE-ARM64-ABI-DIVERGENCE (they land WITH the proper CcApple field set when the trigger fires — a variadic OR struct-return call on arm64-Apple — not as a silent aapcs64 reuse; distinct from D-FF3-4, which is the Microsoft CcMSARM64 split).",
       "name":             "apple_arm64",
       "argGprs":          ["x0","x1","x2","x3","x4","x5","x6","x7"],
-      "argFprs":          [],
+      "argFprs":          ["d0","d1","d2","d3","d4","d5","d6","d7"],
       "returnGprs":       ["x0","x1"],
-      "returnFprs":       [],
-      "callerSaved":      ["x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x18"],
-      "calleeSaved":      ["x19","x20","x21","x22","x23","x24","x25","x26","x27","x28","x29"],
+      "returnFprs":       ["d0"],
+      "$fprComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): the SIMD&FP register vocabulary is IDENTICAL to AAPCS64 (Apple's documented divergences are variadic/indirect-result rules, not register assignment): args d0..d7, return d0, v0-v7/v16-v31 caller-saved, v8-v15 callee-saved in their LOW 64 BITS only (d8..d15 — same F128/SIMD-cycle caveat as the aapcs64 row's $calleeSavedFprComment).",
+      "callerSaved":      ["x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x18",
+                           "d0","d1","d2","d3","d4","d5","d6","d7",
+                           "d16","d17","d18","d19","d20","d21","d22","d23","d24","d25","d26","d27","d28","d29","d30","d31"],
+      "calleeSaved":      ["x19","x20","x21","x22","x23","x24","x25","x26","x27","x28","x29",
+                           "d8","d9","d10","d11","d12","d13","d14","d15"],
       "linkRegister":     "x30",
       "stackPointer":     "sp",
       "stackAlignment":   16,

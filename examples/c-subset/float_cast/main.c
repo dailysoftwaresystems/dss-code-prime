@@ -29,15 +29,21 @@
 // so the FAdd + FPToSI (x86_64: ADDSD + CVTTSD2SI over RIP-relative
 // .rodata F64 globals) execute at runtime on every arm.
 //
-// Arms: x86_64 PE (windows) + x86_64 ELF (linux). The PE arm was
-// initially BLOCKED fail-loud: under ms_x64 (callee-saved xmm6-15 +
-// the regalloc's callee-saved-first policy) the prologue needs an FPR
+// Arms: x86_64 PE (windows) + x86_64 ELF (linux) + arm64 ELF (linux,
+// qemu-aarch64) + arm64 Mach-O (darwin). The PE arm was initially
+// BLOCKED fail-loud: under ms_x64 (callee-saved xmm6-15 + the
+// regalloc's callee-saved-first policy) the prologue needs an FPR
 // saved-reg STORE, and the x86_64 registerClassOps declared no
 // 'store' for class fpr -> L_RequiredLirOpcodeMissing (lir_callconv
 // classOpHandle). Closed 2026-06-10 by declaring `movsd_store`
 // (F2 0F 11 /r) + the fpr store row — this PE arm is the consumer
 // that triggered it, and the FIRST float-value runtime witness on
-// Windows. arm64 has no FPR substrate at all. No darwin:
+// Windows. The arm64 arms landed with D-ARM64-FLOAT-SUBSTRATE
+// (2026-06-10): d0..d31 fpr registers + AAPCS64/apple_arm64 FPR
+// pools + FADD/FCVTZS/FMOV/LDUR(D)/STUR(D) encodings + the fpr
+// registerClassOps row — declaration-only, zero engine change
+// (x86_64: ADDSD + CVTTSD2SI; arm64: FADD + FCVTZS over the same
+// promoted rodata F64 globals). No x86_64 darwin:
 // macho64-x86_64-darwin-exec ships no processExit/cli profile.
 int hexPart() { return (int)(0x1.8p3 + 0.25); }
 

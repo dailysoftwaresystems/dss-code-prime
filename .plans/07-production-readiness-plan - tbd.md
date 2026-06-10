@@ -15,7 +15,7 @@
 
 | | |
 |---|---|
-| Status        | 🔵 **opened.** v1 production target: end-to-end binaries for 3 shipped languages on 3 OS × 2 arch. No deliverables shipped against this plan yet — current state is "frontend infrastructure done, backend infrastructure largely unborn." |
+| Status        | 🔵 **opened.** v1 production target: end-to-end binaries for 3 shipped languages on 3 OS × 2 arch. No dedicated arc has run against this plan — its `G-*` gates are consumed/closed incrementally by the owning cycles (e.g. G-110/G-111 ✅ in plan 08; §5 G-50x cited through the assembler/linker arcs). *(The original at-open note "backend infrastructure largely unborn" is long superseded: as of v0.0.2 the in-tree assembler + hermetic linker are complete and c-subset binaries RUN on 3 OSes × 2 arches — see plan-00 §0.)* |
 | Predecessors  | ✅ core-types (T0–T12); ✅ schema-expressiveness v1 + v2 (PR0–PR8); ✅ substrate hardening (SH1–SH4); ✅ tokenizer (TZ1–TZ3 + review-fix r1). |
 | Successors    | None — this plan IS the v1 bar. Post-v1 candidates (LSP, incremental parsing, PGO, additional architectures) are tracked in §9. |
 

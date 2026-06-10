@@ -2,7 +2,7 @@
 
 A **universal, configurable compiler** written in C++. Define any source language via JSON configuration, compile to any target ISA via JSON configuration — all through a single engine.
 
-> **Status** — Frontend (lexer / parser / semantic / HIR) is complete. MIR + LIR closed end-to-end (HIR→MIR lowering, register allocation, calling-convention lowering, full IR text round-trip). **In-tree assembler complete end-to-end** (AS1–AS6 landed 2026-05-29) — x86_64 + ARM64 byte encoding via shape-keyed walkers, round-trip oracle disassembler, relocation taxonomy, source-map stamping. **In-tree linker complete end-to-end** (LK1–LK10 landed 2026-05-30) — `ObjectFormatSchema` + format-blind engine + per-format writers for ELF / PE / Mach-O / WASM (skeleton) / SPIR-V (skeleton), executable image paths (ET_EXEC / .exe / MH_EXECUTE), dynamic linking (PE IAT / ELF GOT+PLT / Mach-O LC_DYLD_INFO_ONLY), codesign placeholders (LK7), file emission (`linker::writeImage`) + driver pipeline wiring (`Program::compileFiles` / `compileDirectory`). **v0.0.2 — the toolchain now produces RUNNING binaries on 3 OSes × 2 arches** (Windows-PE / Linux-ELF / macOS-Mach-O × x86_64 + ARM64, runtime-verified on every native CI leg): a c-subset `#include <stdio.h>` + `puts("hello")` program prints to stdout + exits cleanly on linux-x86_64, linux-arm64, and macОS-arm64 (Apple Silicon). **`artifactProfile` landed** — AP1 (language-config schema + loader), AP2 (`.dss-project.json` project-config loader + driver language-profile gate), AP3 (profile↔format compatibility gate). See `.plans/00-compiler-implementation-plan - tbd.md` for the live status snapshot.
+> **Status** — Frontend (lexer / parser / semantic / HIR) is complete. MIR + LIR closed end-to-end (HIR→MIR lowering, register allocation, calling-convention lowering, full IR text round-trip). **In-tree assembler complete end-to-end** (AS1–AS6 landed 2026-05-29) — x86_64 + ARM64 byte encoding via shape-keyed walkers, round-trip oracle disassembler, relocation taxonomy, source-map stamping. **In-tree linker complete end-to-end** (LK1–LK10 landed 2026-05-30) — `ObjectFormatSchema` + format-blind engine + per-format writers for ELF / PE / Mach-O / WASM (skeleton) / SPIR-V (skeleton), executable image paths (ET_EXEC / .exe / MH_EXECUTE), dynamic linking (PE IAT / ELF GOT+PLT / Mach-O LC_DYLD_INFO_ONLY), codesign placeholders (LK7), file emission (`linker::writeImage`) + driver pipeline wiring (`Program::compileFiles` / `compileDirectory`). **v0.0.2 — the toolchain now produces RUNNING binaries on 3 OSes × 2 arches** (Windows-PE / Linux-ELF / macOS-Mach-O × x86_64 + ARM64, runtime-verified on every native CI leg): a c-subset `#include <stdio.h>` + `puts("hello")` program prints to stdout + exits cleanly on linux-x86_64, linux-arm64, and macOS-arm64 (Apple Silicon). **`artifactProfile` complete (AP1–AP4)** — AP1 (language-config schema + loader), AP2 (`.dss-project.json` project-config loader + driver language-profile gate), AP3 (profile↔format compatibility gate), AP4 (per-language onboarding matrix + `docs/project-config-spec.md`). **Positioned CLI diagnostics landed (V2-4)** — DSS's own renderer (no clang/LLVM) prints `--> file:line:col` + source line + caret, strict-asserted by golden-diagnostic + corpus harnesses. **The c-subset → full C23 upgrade arc (V2-4.X) is in flight** — binary `%`, C23 float-literal forms (hex-floats, `1.`/`.5`), and full C-style casts (incl. typedef-name resolution) + the first float runtime witnesses have landed. See `.plans/00-compiler-implementation-plan - tbd.md` for the live status snapshot.
 
 ## Key Features
 
@@ -40,41 +40,34 @@ The pipeline is **fully config-driven** end-to-end: the engine has zero per-lang
 
 The compiler exposes a **program API** with three input modes:
 
-### Project File (`.dsp`)
+### Project File (`.dss-project.json`)
 
-A self-contained JSON project definition:
+A self-contained JSON project definition (full spec: [`docs/project-config-spec.md`](./docs/project-config-spec.md)):
 
 ```jsonc
 {
-  "project": { "name": "MyApp", "version": "1.0.0" },
-  "source": {
-    "language": "ExampleLang",
-    "include": ["src/"],
-    "exclude": ["src/tests/"]
-  },
-  "targets": [
-    { "os": "linux",   "arch": "x86_64" },
-    { "os": "windows", "arch": "x86_64" },
-    { "os": "web",     "arch": "wasm"   }
-  ],
-  "output": { "directory": "build/" }
+  "language":        "c-subset",
+  "artifactProfile": "cli",
+  "targets":         ["x86_64:elf64-x86_64-linux-exec", "x86_64:pe64-x86_64-windows-exec"],
+  "sources":         ["src/main.c"],
+  "output":          "dist/myprog"
 }
 ```
 
 ```bash
-dss-code-prime --project myapp.dsp
+dss-code-prime --project myapp.dss-project.json
 ```
 
 ### File List
 
 ```bash
-dss-code-prime --files src/main.exl src/utils.exl --lang ExampleLang --target linux-x86_64 --target web-wasm
+dss-code-prime --compile src/main.c src/utils.c --language c-subset --target x86_64:elf64-x86_64-linux-exec --target x86_64:pe64-x86_64-windows-exec
 ```
 
 ### Directory Scan
 
 ```bash
-dss-code-prime --dir ./src/ --lang ExampleLang --target linux-x86_64
+dss-code-prime --dir ./src/ --language c-subset --target x86_64:elf64-x86_64-linux-exec
 ```
 
 The compiler scans the directory recursively for files matching the language's configured extensions.
