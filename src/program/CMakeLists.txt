@@ -5,6 +5,7 @@ add_library(program OBJECT
     cli_args.cpp
     input_resolver.cpp
     cross_validate_target_format.cpp
+    project_config.cpp
 )
 
 target_include_directories(program PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
@@ -20,3 +21,9 @@ target_compile_definitions(program PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 # dss-code-prime-lib by the top-level lib target, which already aggregates
 # every backend.
 target_link_libraries(program PUBLIC core lsp ffi ffi_abi opt)
+
+# `project_config.cpp` parses the `.dss-project.json` project file with
+# nlohmann/json. `core` links it PRIVATE, so the include path does NOT
+# propagate transitively — `program` needs its own (PRIVATE: only this
+# OBJECT lib's own sources use it; no usage requirement to re-export).
+target_link_libraries(program PRIVATE nlohmann_json::nlohmann_json)

@@ -155,6 +155,16 @@ struct Parser::Impl {
     std::size_t  lastDepth  = 0;
     bool         firstIteration = true;
 
+    // True iff the PREVIOUS dispatch step performed a recovery (panic scan
+    // or missing-rule synthesis). Lets `synthesizeMissingRule` SUPPRESS its
+    // diagnostic when it fires immediately after another recovery — i.e. when
+    // a stop-point is reached while still resyncing the SAME broken region, so
+    // one structural error yields one diagnostic (the file-level cascade-bound
+    // quality bar) rather than a fresh "missing X" at every resync horizon.
+    // Captured + restored across speculative probes (like `diagsEmitted`), so
+    // a rolled-back probe cannot leave it stale.
+    bool         stepRecovered_ = false;
+
     // Diagnostic-emission counter. Incremented by `emitDiag`; lets
     // the speculation sub-loop detect "branch dispatch emitted a
     // diagnostic" without builder-side introspection. Rollback
@@ -305,6 +315,20 @@ struct Parser::Impl {
         return false;
     }
 
+    // A token is a recovery "stop-point" when it belongs to an ENCLOSING
+    // context: it is a schema-declared `syncTokens` member, or it is in the
+    // FOLLOW set of the nearest enclosing compiled rule. This is exactly the
+    // condition `panicRecover` uses to STOP its forward scan — lifted into a
+    // named predicate so the scan loop and the missing-production branch in
+    // `recoverAt` share ONE definition of "stop-point" (no second copy of
+    // the rule). Grammar-driven: `syncTokens` + FOLLOW sets are config /
+    // schema data, never a hardcoded token or language identity.
+    [[nodiscard]] bool isStopPoint(SchemaTokenId kind) const noexcept {
+        const auto sync = schema->syncTokens();
+        if (std::ranges::find(sync, kind) != sync.end()) return true;
+        return followContains(kind);
+    }
+
     // Panic-mode recovery: insert an Error leaf at the bad token,
     // then scan forward until peek is a stopping point:
     //   - EOF — always stops
@@ -329,7 +353,6 @@ struct Parser::Impl {
             return 1;
         }
 
-        const auto sync = schema->syncTokens();
         std::size_t consumed = 1;
         while (consumed < config.maxSyncScanTokens) {
             Token const& peek = tokens.peek();
@@ -342,8 +365,7 @@ struct Parser::Impl {
             }
             const SchemaTokenId kind =
                 effectiveKind(peek, identifierKind, errorKind);
-            if (std::ranges::find(sync, kind) != sync.end()) break;
-            if (followContains(kind)) break;
+            if (isStopPoint(kind)) break;
             (void)tokens.advance();
             ++consumed;
         }
@@ -360,7 +382,51 @@ struct Parser::Impl {
                           std::span<SchemaTokenId const> expected) {
         emitParserError(code, peek.span, renderActual(peek), expected);
         (void)panicRecover();
+        stepRecovered_ = true;
         return StepOutcome::Continue;
+    }
+
+    // Recover a MISSING required RULE: the dispatch needs to descend into
+    // `rule` but `peek` can't start it, `rule` isn't nullable, AND `peek` is
+    // a STOP-POINT (a sync token or in an enclosing open frame's FOLLOW) — so
+    // `peek` belongs to an enclosing context, NOT to `rule`. Panic-consuming
+    // it (the `recoverAt` else-path) would SWALLOW a token the enclosing
+    // grammar still needs — e.g. the statement terminator `;`, or a block
+    // closer `}` whose `closesScope` must fire to balance the scope stack.
+    // (That swallow is the `int x = ;` bug: with the `initValue` rule absent,
+    // panic recovery consumed the block's `}` via `tokens.advance()` instead
+    // of `pushToken`, so the scope never closed → "scope stack non-empty at
+    // finish" + a Missing-node cascade.)
+    //
+    // The fix synthesizes `rule` as an EMPTY error subtree (open it, attach an
+    // Error leaf, close it). Opening+closing the rule advances the PARENT's
+    // schema cursor PAST this RuleLeaf slot (the same mechanism the nullable-
+    // skip below uses), leaving the parent frame open to consume `peek` at its
+    // next slot — so `varDeclHead` proceeds to its `EndStatement` and eats the
+    // `;`, and the block later eats and scope-closes its `}`. `peek` is NOT
+    // consumed.
+    //
+    // `emitDiagnostic` is false when this synthesis fires WHILE already
+    // resyncing (the prior step recovered) — the broken region was already
+    // diagnosed, so re-reporting "missing X" at every resync horizon would
+    // violate the one-diagnostic-per-broken-region bar. The Error leaf is
+    // still attached (HasError propagates), so the region stays marked errored
+    // even when the diagnostic text is suppressed.
+    //
+    // Scoped narrowly (required RuleLeaf miss at a stop-point, non-speculative)
+    // so the garbage path — a non-stop-point bad token, e.g. a stray `@` in an
+    // expression — keeps its existing panic-scan-and-resync behavior untouched.
+    void synthesizeMissingRule(RuleId rule, Token const& peek,
+                               std::span<SchemaTokenId const> firstSet,
+                               bool emitDiagnostic) {
+        if (emitDiagnostic) {
+            emitParserError(DiagnosticCode::P_NoAlternativeMatched,
+                            peek.span, renderActual(peek), firstSet);
+        }
+        openExprFrame(rule);
+        builder->pushErrorNode(peek.span);
+        closeFrameOnce();
+        stepRecovered_ = true;
     }
 
     void closeFrameOnce() noexcept {
@@ -459,7 +525,8 @@ struct Parser::Impl {
             , budget_(static_cast<std::size_t>(
                   impl.walker.lookahead() > 0
                       ? impl.walker.lookahead() * 16u
-                      : 64u)) {
+                      : 64u))
+            , stepRecoveredBefore_(impl.stepRecovered_) {
             ++impl_.speculationDepth;
         }
 
@@ -491,6 +558,7 @@ struct Parser::Impl {
                 impl_.builder->rollback(std::move(*cp_));
                 impl_.tokens.restore(bookmark_);
                 impl_.diagsEmitted = diagsBefore_;
+                impl_.stepRecovered_ = stepRecoveredBefore_;
             }
             --impl_.speculationDepth;
         }
@@ -542,6 +610,7 @@ struct Parser::Impl {
         std::size_t                            probeStartPos_;
         bool                                   desyncedBefore_;
         std::size_t                            budget_;
+        bool                                   stepRecoveredBefore_;
         bool                                   committed_ = false;
     };
 
@@ -739,6 +808,14 @@ struct Parser::Impl {
     // ── one dispatch iteration ─────────────────────────────────────
 
     [[nodiscard]] StepOutcome stepOnce() {
+        // Snapshot whether the PREVIOUS step recovered, then clear it: any
+        // step that recovers (panic scan / missing-rule synthesis) re-sets it
+        // before returning. `synthesizeMissingRule` reads this snapshot to
+        // suppress a redundant diagnostic when it fires while still resyncing
+        // the same broken region.
+        const bool prevStepRecovered = stepRecovered_;
+        stepRecovered_ = false;
+
         // Termination at root: `canEndSource` returns true only at
         // the root rule's nullable-tail end position; combined with
         // Eof on the input, we're done.
@@ -935,6 +1012,17 @@ struct Parser::Impl {
                 return StepOutcome::Continue;
             }
 
+            // Required rule `nextRule` can't start here. If `peek` is a
+            // stop-point it belongs to an enclosing context (the statement
+            // terminator / block closer) — synthesize the missing rule and
+            // let the parent consume `peek`, instead of panic-consuming a
+            // token the enclosing grammar needs (the `int x = ;` scope-
+            // imbalance fix). Non-stop-point garbage keeps the panic path.
+            if (speculationDepth == 0 && isStopPoint(tokKind)) {
+                synthesizeMissingRule(nextRule, peek, firstSet,
+                                      /*emitDiagnostic=*/!prevStepRecovered);
+                return StepOutcome::Continue;
+            }
             return recoverAt(DiagnosticCode::P_NoAlternativeMatched,
                              peek, firstSet);
         }

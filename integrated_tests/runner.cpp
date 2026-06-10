@@ -35,6 +35,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>  // std::istreambuf_iterator (do not rely on a transitive include)
 #include <string>
 #include <vector>
 
@@ -166,6 +167,15 @@ struct ExampleTarget {
     std::string              emulator;
 };
 
+// V2-4 Part C (D-DIAG-CLI-POSITION-RENDER-AND-ASSERT): one declared
+// expected diagnostic for an EXPECT-ERROR example. Mirrors the in-process
+// examples_runner so BOTH corpus harnesses accept the same manifests.
+struct ExpectedDiagnostic {
+    std::string   code;
+    std::uint32_t line = 0;
+    std::uint32_t col  = 0;
+};
+
 struct ExampleManifest {
     std::string                language;
     // Multi-CU (CU6): "sources":[...] makes each file its OWN CompilationUnit; the CLI's
@@ -178,6 +188,10 @@ struct ExampleManifest {
     bool                       multiCu = false;
     std::int64_t               exitCode = 0;
     std::vector<ExampleTarget> targets;
+    // V2-4 Part C: NON-EMPTY ⇒ EXPECT-ERROR example. The CLI must REJECT
+    // the malformed source (non-zero exit) and emit each diagnostic's
+    // positioned `:line:col` (the Part A renderer) on stderr.
+    std::vector<ExpectedDiagnostic> expectDiagnostics;
 };
 
 [[nodiscard]] bool readManifest(fs::path const& path, ExampleManifest& out) {
@@ -218,12 +232,44 @@ struct ExampleManifest {
                   << path.generic_string() << "\n";
         return false;
     }
-    if (!j.contains("exitCode") || !j.at("exitCode").is_number_integer()) {
-        std::cerr << "  missing integer 'exitCode' in "
+    // V2-4 Part C: expect-error diagnostics (parsed first — their presence
+    // relaxes the exitCode requirement, since no binary is produced/run).
+    if (j.contains("expectDiagnostics")) {
+        if (!j.at("expectDiagnostics").is_array() || j.at("expectDiagnostics").empty()) {
+            std::cerr << "  'expectDiagnostics' must be a non-empty array in "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+        for (auto const& d : j.at("expectDiagnostics")) {
+            if (!d.is_object()
+                || !d.contains("code") || !d.at("code").is_string()
+                || !d.contains("line") || !d.at("line").is_number_unsigned()
+                || !d.contains("col")  || !d.at("col").is_number_unsigned()) {
+                std::cerr << "  each expectDiagnostics entry needs string 'code'"
+                             " + unsigned 'line' + unsigned 'col' in "
+                          << path.generic_string() << "\n";
+                return false;
+            }
+            ExpectedDiagnostic ed;
+            ed.code = d.at("code").get<std::string>();
+            ed.line = d.at("line").get<std::uint32_t>();
+            ed.col  = d.at("col").get<std::uint32_t>();
+            out.expectDiagnostics.push_back(std::move(ed));
+        }
+    }
+    if (j.contains("exitCode")) {
+        if (!j.at("exitCode").is_number_integer()) {
+            std::cerr << "  'exitCode' must be an integer in "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+        out.exitCode = j.at("exitCode").get<std::int64_t>();
+    } else if (out.expectDiagnostics.empty()) {
+        std::cerr << "  missing integer 'exitCode' (required unless"
+                     " 'expectDiagnostics' is present) in "
                   << path.generic_string() << "\n";
         return false;
     }
-    out.exitCode = j.at("exitCode").get<std::int64_t>();
     if (!j.contains("targets") || !j.at("targets").is_array()) {
         std::cerr << "  missing 'targets' array in "
                   << path.generic_string() << "\n";
@@ -379,6 +425,65 @@ void runExampleViaCli(std::string const& compiler,
           exitMatches);
 }
 
+// V2-4 Part C: drive an EXPECT-ERROR example through the CLI SUBPROCESS.
+// The malformed source MUST be REJECTED (non-zero exit) and the CLI's
+// positioned renderer (Part A) MUST print each diagnostic's `:line:col`
+// on stderr. The front-end error is target-independent, so the first
+// declared target's spec drives the compile (no runOn host gate needed —
+// nothing is spawned). The CODE is asserted by name in the in-process
+// examples_runner; here we pin the format-stable positioned coordinate.
+void runErrorExampleViaCli(std::string const& compiler,
+                           fs::path const&    exampleDir,
+                           fs::path const&    outputBase,
+                           ExampleManifest const& m) {
+    auto const exampleName = exampleDir.filename().generic_string();
+    if (m.targets.empty()) {
+        check(exampleName + ": expect-error example declares a target spec", false);
+        return;
+    }
+    auto const& spec = m.targets.front().spec;
+
+    auto const specDir = [&]() {
+        std::string s = spec;
+        for (auto& c : s) if (c == ':') c = '_';
+        return s;
+    }();
+    auto const outDir = outputBase / "ex" / exampleName / specDir;
+    fs::create_directories(outDir);
+
+    std::string compileArgs;
+    for (auto const& s : m.sources) {
+        compileArgs += " " + quote((exampleDir / s).string());
+    }
+    auto const cliLog = outDir / "cli.log";
+    std::string cmd = quote(compiler)
+        + " --compile"   + compileArgs
+        + " --language " + m.language
+        + " --target "   + spec
+        + " --output "   + quote(outDir.string())
+        + " > " + quote(cliLog.string()) + " 2>&1";
+    int const sysRc = std::system(shellWrap(cmd).c_str());
+
+    // The CLI MUST reject the malformed source (a successful compile of a
+    // known-bad source is a real regression).
+    check(exampleName + ": CLI rejects malformed source (rc != 0)",
+          sysRc != 0,
+          "rc=" + std::to_string(sysRc) + ", cli log: "
+          + cliLog.generic_string());
+
+    std::ifstream f(cliLog.string());
+    std::string const body((std::istreambuf_iterator<char>(f)),
+                           std::istreambuf_iterator<char>());
+    for (auto const& e : m.expectDiagnostics) {
+        std::string const posn = ":" + std::to_string(e.line)
+                               + ":" + std::to_string(e.col);
+        check(exampleName + ": CLI emits positioned diagnostic " + e.code
+              + " at " + posn,
+              body.find(posn) != std::string::npos,
+              "cli.log lacks '" + posn + "':\n" + body);
+    }
+}
+
 void runAllExamples(std::string const& compiler,
                     fs::path const&    examplesRoot,
                     fs::path const&    outputBase) {
@@ -418,7 +523,14 @@ void runAllExamples(std::string const& compiler,
             ++failures;
             continue;
         }
-        runExampleViaCli(compiler, mp.parent_path(), outputBase, m);
+        // V2-4 Part C: an expectDiagnostics manifest asserts a rejected
+        // compile + positioned CLI diagnostics; otherwise the standard
+        // compile + run path.
+        if (m.expectDiagnostics.empty()) {
+            runExampleViaCli(compiler, mp.parent_path(), outputBase, m);
+        } else {
+            runErrorExampleViaCli(compiler, mp.parent_path(), outputBase, m);
+        }
     }
     std::cout << "\n";
 }

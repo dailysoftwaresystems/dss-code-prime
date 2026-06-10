@@ -17,6 +17,8 @@
 #include "tokenizer/token_stream.hpp"
 #include "tokenizer/tokenizer.hpp"
 
+#include "golden_file.hpp"   // hoisted: findCorpusRoot / goldenRefreshRequested / checkGoldenText
+
 #include <gtest/gtest.h>
 
 #include <cstdlib>
@@ -34,33 +36,13 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// Walk up from the running test binary's working directory looking
-// for the `tests/corpus/` tree. The CI / local-dev cwd is the build
-// directory, which is somewhere under the repo root — same pattern
-// `GrammarSchema::loadShipped` uses to find shipped configs.
-[[nodiscard]] fs::path findCorpusRoot() {
-    fs::path cwd = fs::current_path();
-    for (int hops = 0; hops < 8; ++hops) {
-        const auto candidate = cwd / "tests" / "corpus";
-        if (fs::is_directory(candidate)) return candidate;
-        if (!cwd.has_parent_path() || cwd == cwd.parent_path()) break;
-        cwd = cwd.parent_path();
-    }
-    ADD_FAILURE() << "could not locate tests/corpus/ from cwd "
-                  << fs::current_path().string();
-    std::abort();
-}
-
-[[nodiscard]] std::string readFile(fs::path const& path) {
-    std::ifstream in{path, std::ios::binary};
-    if (!in) {
-        ADD_FAILURE() << "cannot open " << path.string();
-        std::abort();
-    }
-    std::ostringstream buf;
-    buf << in.rdbuf();
-    return std::move(buf).str();
-}
+// The corpus-root walk + golden refresh/compare are shared with the
+// golden-DIAGNOSTIC harness (test_diagnostic_corpus.cpp) — hoisted to
+// `tests/test_support/golden_file.hpp` so the refresh discipline + CRLF
+// compare live in one place.
+using dss::test_support::findCorpusRoot;
+using dss::test_support::readFile;
+using dss::test_support::checkGoldenText;
 
 // Render the parsed tree as the structural fingerprint the golden
 // file captures. AST mode (skip `EmptySpace` trivia) keeps the golden
@@ -86,80 +68,12 @@ namespace {
     return out;
 }
 
-// Parse the `DSS_REFRESH_GOLDENS` env var. The intent is "set to `1`
-// to refresh"; we explicitly REJECT other values (including `0` and
-// `false`) rather than treat them as truthy. Loose `getenv != nullptr`
-// semantics would let a stale or accidentally-exported `=0` silently
-// overwrite goldens and skip the byte-compare across every corpus
-// test — a CI footgun this guard exists to prevent.
-[[nodiscard]] bool goldenRefreshRequested() {
-    const char* raw = std::getenv("DSS_REFRESH_GOLDENS");
-    if (raw == nullptr) return false;
-    const std::string_view v{raw};
-    if (v == "1" || v == "true" || v == "TRUE" || v == "yes") return true;
-    if (v.empty() || v == "0" || v == "false" || v == "FALSE" || v == "no") {
-        return false;
-    }
-    ADD_FAILURE() << "DSS_REFRESH_GOLDENS has unexpected value '" << v
-                  << "' — use '1' to refresh, unset (or '0') otherwise. "
-                     "Refusing to interpret to avoid silently masking "
-                     "drift.";
-    std::abort();
-}
-
-// Golden-file comparison. Each corpus file gets a sibling `.tree`
-// capturing the expected `prettyPrintTree(tree)`. To regenerate after
-// an intentional grammar change, set the env var
-// `DSS_REFRESH_GOLDENS=1` and re-run ctest — the helper rewrites the
-// golden in place and skips the byte-compare. Missing golden = fail
-// (better to error loudly than silently skip pinning on a new corpus
-// addition that forgot the companion file).
+// Golden-file comparison: each corpus file gets a sibling `.tree`
+// capturing `prettyPrintTree(tree)`. Delegates to the shared refresh /
+// CRLF-normalized compare (golden_file.hpp). Regenerate after an
+// intentional grammar change via `DSS_REFRESH_GOLDENS=1 ctest`.
 void checkGoldenTree(Tree const& t, fs::path const& goldenPath) {
-    const std::string actual = prettyPrintTree(t);
-    if (goldenRefreshRequested()) {
-        std::ofstream out{goldenPath, std::ios::binary};
-        if (!out.is_open()) {
-            ADD_FAILURE() << "cannot open golden file for write: "
-                          << goldenPath.string();
-            return;
-        }
-        out << actual;
-        out.flush();
-        if (!out.good()) {
-            ADD_FAILURE() << "write to golden file failed (disk full / "
-                          << "quota?): " << goldenPath.string();
-            return;
-        }
-        // Refreshing always emits a loud test failure so a CI run that
-        // accidentally has the env var set can never be a passing
-        // build — refresh is a developer action, not a CI mode.
-        ADD_FAILURE() << "Refreshed " << goldenPath.string()
-                      << " — this is a developer-only operation; the "
-                         "test fails by design when refreshed so CI "
-                         "with DSS_REFRESH_GOLDENS=1 cannot mask drift.";
-        return;
-    }
-    if (!fs::exists(goldenPath)) {
-        ADD_FAILURE() << "missing golden file " << goldenPath.string()
-                      << " — generate it once via "
-                         "`DSS_REFRESH_GOLDENS=1 ctest`";
-        return;
-    }
-    std::ifstream in{goldenPath, std::ios::binary};
-    if (!in.is_open()) {
-        ADD_FAILURE() << "cannot open golden file for read "
-                         "(permission / sharing violation?): "
-                      << goldenPath.string();
-        return;
-    }
-    std::ostringstream buf;
-    buf << in.rdbuf();
-    std::string expected = std::move(buf).str();
-    std::erase(expected, '\r');   // CRLF→LF: compare is line-ending agnostic (Windows autocrlf)
-    EXPECT_EQ(actual, expected)
-        << "tree shape diverged from " << goldenPath.filename().string()
-        << " — if the change is intentional, re-run with "
-           "`DSS_REFRESH_GOLDENS=1` to update the golden";
+    checkGoldenText(prettyPrintTree(t), goldenPath);
 }
 
 // Parse one corpus file end-to-end and assert no error diagnostics.

@@ -17,6 +17,13 @@ tests/corpus/** text eol=lf
 # tests pass.
 src/dss-config/** text eol=lf
 
+# Curated runnable-corpus sources (examples/<lang>/<name>/). The V2-4 Part C
+# expect-error harness asserts diagnostic POSITIONS (line:col) resolved from
+# these source bytes, so pin LF: a Windows `core.autocrlf` checkout that
+# injected CR would shift byte offsets between the compiler's read and the
+# runner's source read, mis-resolving the asserted line:col.
+examples/** text eol=lf
+
 # `.dsshir` HIR text-format goldens — emitted with LF by `emitHir` and compared
 # byte-exact by the HIR text + lowering golden tests (test_hir_text.cpp,
 # test_hir_lowering_*.cpp). Without this a Windows `core.autocrlf` checkout

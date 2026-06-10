@@ -26,6 +26,8 @@
 
   "$supportedDataSectionsComment": "D-LK2-RODATA closure: PE-Exec walker emits `.rdata` from `AssembledModule.dataItems` items with `section=Rodata`. The linker's pre-walker gate (linker.cpp) consults this set per-item — `Data` and `Bss` remain anchored under D-LK4-RODATA-PRODUCER. Cross-format agnosticism: ELF and Mach-O exec formats will declare their own row when D-LK1-RODATA / D-LK3-RODATA close; zero linker source changes.",
   "supportedDataSections": ["rodata"],
+  "$artifactProfilesComment": "Profiles this format SERVES (plan 06 AP3) — a runnable console executable ⇒ cli (the format-side twin of the language's artifactProfiles[]; driver fails loud D_ArtifactProfileFormatMismatch on a profile not in this set). A `gui` profile (IMAGE_SUBSYSTEM_WINDOWS_GUI) would be added when gui codegen lands — same format, profile-selected subsystem/entry, zero gate-code change.",
+  "artifactProfiles": ["cli"],
 
   "pe": {
     "$comment": "IMAGE_FILE_HEADER identity. machine = IMAGE_FILE_MACHINE_AMD64 (0x8664). characteristics = IMAGE_FILE_EXECUTABLE_IMAGE (0x0002) | IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) = 0x0022. type = exec.",

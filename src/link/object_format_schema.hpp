@@ -748,6 +748,30 @@ struct DSS_EXPORT ObjectFormatData {
     // .obj symbol tables, not via this capability gate).
     std::vector<DataSectionKind> supportedDataSections;
 
+    // The artifact profiles this format SERVES — i.e. produces a real
+    // artifact for (plan 06 AP3). The format-side symmetric twin of the
+    // LANGUAGE's `artifactProfiles[]` (AP1, on GrammarSchemaData): AP1
+    // declares which profiles a language SUPPORTS; this declares which
+    // profiles a format PRODUCES. The driver enforces
+    // `project.artifactProfile ∈ format.artifactProfiles` and fails loud
+    // (`D_ArtifactProfileFormatMismatch`) otherwise — so a `cli` project
+    // pointed at a shared-library format, or a `lib` pointed at an exec
+    // format, is rejected at config-load time, not deep in codegen.
+    //
+    // Empty by default ⇒ the format serves NO profile (fail-CLOSED,
+    // consistent with the language-side empty-set reject): a relocatable
+    // `.o`/`.obj` format leaves it empty until a `staticlib` archiver
+    // ships; only the 5 executable formats declare `["cli"]` today (gui
+    // deferred — no gui codegen). A format may only claim a profile it can
+    // ACTUALLY emit (declaring an unproducible profile is itself the
+    // "nonsense" the gate exists to prevent). Each entry is validated at
+    // load against the shared registered vocabulary
+    // (`isRegisteredArtifactProfile`, core/types/artifact_profile.hpp).
+    // Schema-declared, NOT enumerated in C++ — a new format opts in by
+    // dropping `"artifactProfiles": [...]` into its JSON; the gate is a
+    // generic set-membership, never an `if (profile == "...")` branch.
+    std::vector<std::string> artifactProfiles;
+
     // Cross-field invariants:
     //   * relocations: kind != 0, kind unique cross-row, name unique
     //     + non-empty, nativeId != 0 when relocations are non-empty.
@@ -889,6 +913,14 @@ public:
     [[nodiscard]] std::span<DataSectionKind const>
     supportedDataSections() const noexcept {
         return d_.supportedDataSections;
+    }
+
+    // The artifact profiles this format SERVES (plan 06 AP3). Empty ⇒
+    // serves none (fail-closed). The driver checks the project's profile
+    // against this set via the shared `artifactProfileSupported` predicate.
+    [[nodiscard]] std::span<std::string const>
+    artifactProfiles() const noexcept {
+        return d_.artifactProfiles;
     }
 
     // ── Loaders ───────────────────────────────────────────────

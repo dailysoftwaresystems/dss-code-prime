@@ -56,7 +56,7 @@ The §1–§7 sections below enumerate **127 distinct gaps** (numbered for cross
 | G-112 | Preprocessor for full C (not c-subset). | n/a | **Explicitly out of v1.** c-subset omits the preprocessor by design. Full C99 is post-v1. |
 | G-113 | T-SQL `GO` batch separator, `BEGIN ... END` blocks, cursors, `TRY/CATCH`. | tsql-subset.lang.json | Out of v1 if PA4 corpus doesn't need them; otherwise extend tsql-subset (mechanism exists — pure shape work per v2-gap-catalog §6 "Residual T-SQL gaps"). |
 | G-114 | ✅ Error recovery quality benchmark. PA3 ✅ — bar set to "every error produces an actionable message; recovery continues without cascading beyond 3× the original error count" (pinned by `ParserRecovery.SingleErrorCascadeBoundedAtThreeX`). Real-world stress is PA4's job to validate. | `tests/analysis/syntactic/test_parser_recovery.cpp` | parser-plan PA3 ✅ |
-| G-115 | ✅ Diagnostic UX end-to-end. PA3 closed the CLI-side renderer (`DiagnosticReporter::format()`, clang-style line/col/caret + multi-char `^^^` underline). PA5a closed the LSP-side translation (`src/lsp/diagnostic_translator.{hpp,cpp}` — UTF-8 byte spans → LSP `Diagnostic` with UTF-16 columns + severity mapping + composed message + code-name). Real editor sessions consume `textDocument/publishDiagnostics` via the PA5a server. | `tests/core/test_diagnostic_reporter.cpp` + `tests/lsp/test_diagnostic_translator.cpp` | parser-plan PA3 + PA5a ✅; driver-side CLI wiring still pending |
+| G-115 | ✅ Diagnostic UX end-to-end. PA3 built the renderer (`DiagnosticReporter::format()`, DSS's own positioned line/col/caret + multi-char `^^^` underline; NO clang/LLVM). PA5a closed the LSP-side translation (`src/lsp/diagnostic_translator.{hpp,cpp}` — UTF-8 byte spans → LSP `Diagnostic` with UTF-16 columns + severity mapping + composed message + code-name). **Driver-side CLI wiring DONE 2026-06-09 (V2-4 Part A)** — `drainDiagnosticsToStderr` now renders positioned context for buffer-bearing diagnostics. Real editor sessions consume `textDocument/publishDiagnostics` via the PA5a server. | `tests/core/test_diagnostic_reporter.cpp` + `tests/lsp/test_diagnostic_translator.cpp` + `tests/program/test_compile_pipeline.cpp` (Part A e2e) | parser-plan PA3 + PA5a ✅; driver-side CLI wiring ✅ V2-4 Part A |
 | G-118 | ✅ **Numeric-literal `flagsApplied` channel** is in place — the tokenizer routes per-kind flags through the schema's mechanism. Tracked closed as a consequence of 08.55's numberStyle plumbing. | `src/tokenizer/tokenizer.cpp` | Resolved alongside G-109. |
 
 ---
@@ -214,7 +214,7 @@ This is the **largest single chunk of work** in v1.
 | G-605 | Build caching. If sources haven't changed, don't re-tokenize/parse/lower. | Post-v1. v1 = always full rebuild. |
 | G-606 | Deterministic output. Same input → same byte-identical binary. | v1 acceptance. Required for reproducible-build workflows. |
 | G-607 | Multi-file compilation orchestration — which files compile in which order, dependency tracking. | Depends on G-110. v1 picks a simple strategy (single-tree per input file; link at the end). |
-| G-608 | Diagnostic-rendering layer in the driver. Renders `tree.diagnostics()` as clang-style display. | Driver-level, not parser-level. parser-plan PA3 produces the data; the driver renders it. |
+| G-608 | 🟢 **partial — driver positioned rendering wired 2026-06-09 (V2-4 Part A).** The driver `drainDiagnosticsToStderr` routes buffer-bearing diagnostics through DSS's own `DiagnosticReporter::format()` (`--> file:line:col` + source line + `^` caret; NO clang/LLVM) via a `BufferRegistry` built from the CUs; buffer-less driver `D_*` stay code-only. Remaining: V2-4 B (P_*/S_* position assertions) + C (corpus expectError). | Driver-level, not parser-level. parser-plan PA3 produces the data; the driver renders it. |
 | G-609 | Exit code conventions. 0 = success, 1 = source error (P_*/C_*/S_*/I_* diagnostics), 2 = driver error (D_* diagnostics), 3 = internal compiler error. | Codify in driver. |
 
 ---
@@ -434,7 +434,7 @@ A PR titled "v1 — production-ready" is accepted when **every** item below is c
 - [ ] `script` and `sproc` profiles produce valid output for tsql-subset on every host.
 - [ ] CI matrix runs on all 6 target combos + ASan/UBSan on Linux Clang.
 - [ ] Compile-then-run integration tests pass on every CI runner.
-- [ ] Diagnostic UX renders clang-quality output for every `P_*`/`S_*`/`H_*`/`I_*`/`L_*`/`K_*`/`F_*`/`A_*`/`B_*`/`G_*` namespace.
+- [ ] Diagnostic UX renders positioned source-context output (`file:line:col` + caret; DSS's own renderer, NO clang/LLVM) for every `P_*`/`S_*`/`H_*`/`I_*`/`L_*`/`K_*`/`F_*`/`A_*`/`B_*`/`G_*` namespace. (V2-4 Part A wired the driver path for buffer-bearing diagnostics 2026-06-09; B+C complete the assertion coverage.)
 - [ ] Compile time for a 500-LOC c-subset program is < 1 second on a modern laptop.
 - [ ] Generated binary perf is within 2× of `gcc -O0` for the c-subset corpus.
 - [ ] `docs/{language,project,architecture,contributing}.md` are current.

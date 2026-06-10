@@ -549,6 +549,69 @@ TEST(Program_CompileFiles, StderrIncludesTargetContextPrefixOnPerTargetError) {
            "got stderr:\n" << stderrOut;
 }
 
+// ── Plan 06 V2-4 Part A: positioned source-context diagnostics ──────
+// The driver drain now routes a buffer-bearing diagnostic (parser /
+// semantic, with a span into real source) through DSS's OWN renderer
+// (`DiagnosticReporter::format` — hand-written over our SourceBuffer /
+// SourceSpan; NO clang / LLVM dependency): `--> file:line:col` + the
+// source line + a `^` caret. The BufferRegistry that resolves the
+// diagnostic's BufferId is built in `runCusToTargets` from the CUs'
+// trees. Buffer-LESS driver `D_*` diagnostics keep the code-only line.
+
+// A malformed-source compile prints the positioned context + caret at
+// the exact offending column. RED-on-disable: revert
+// `drainDiagnosticsToStderr` to the old code-only loop (drop the
+// `format()` branch) and the `-->` / `bad.c:2:12` / `^` assertions all
+// go red — this is the cycle's effectiveness lever.
+TEST(Program_CompileFiles, MalformedSourceRendersPositionedCaret) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    // Illegal character '@' at line 2, column 12 (after `return `).
+    auto const src = writeCSubsetSource(
+        scratch.path(), "bad.c", "int main() {\n    return @;\n}\n");
+    scratch.useAsCwd();
+    Program prog;
+    testing::internal::CaptureStderr();
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+    auto const err = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(rc, 0) << "malformed source must fail the build";
+    // `--> <file>:<line>:<col>` header at the exact position of '@'. The
+    // parser stamps the span; format() resolves it via the registry.
+    EXPECT_NE(err.find("bad.c:2:12"), std::string::npos)
+        << "expected positioned header '<file>:2:12'; got:\n" << err;
+    EXPECT_NE(err.find("-->"), std::string::npos)
+        << "expected a '-->' source-location header; got:\n" << err;
+    EXPECT_NE(err.find('^'), std::string::npos)
+        << "expected a '^' caret underline; got:\n" << err;
+    // The source line is echoed (the positioned context the renderer adds).
+    EXPECT_NE(err.find("return @"), std::string::npos)
+        << "expected the offending source line echoed; got:\n" << err;
+}
+
+// A buffer-LESS driver-tier diagnostic (no source span) stays on the
+// code-only path: NO bogus `--> <unknown-buffer>` line, NO caret, and
+// the human-readable SYMBOLIC code name (not the numeric band). Pins
+// the per-diagnostic routing split. Empty targets → D_InvalidTargetSpec
+// is emitted buffer-less, before any CU/source is touched.
+TEST(Program_CompileFiles, BufferlessDriverDiagnosticStaysCodeOnly) {
+    Program prog;
+    testing::internal::CaptureStderr();
+    int const rc = prog.compileFiles({"unused.c"}, "c-subset", /*targets*/ {});
+    auto const err = testing::internal::GetCapturedStderr();
+
+    EXPECT_EQ(rc, 1);
+    EXPECT_NE(err.find("[D_InvalidTargetSpec]"), std::string::npos)
+        << "a buffer-less driver diagnostic must render the code-only line "
+           "with the SYMBOLIC code name; got:\n" << err;
+    EXPECT_EQ(err.find("-->"), std::string::npos)
+        << "a buffer-less diagnostic must NOT print a source-location line; "
+           "got:\n" << err;
+    EXPECT_EQ(err.find("<unknown-buffer"), std::string::npos)
+        << "a buffer-less diagnostic must NOT print '<unknown-buffer>'; "
+           "got:\n" << err;
+}
+
 // D-CAP-MARKER-MULTI-TARGET-E2E-PIN close (e4508b9 → next 2026-06-01):
 // the prior anchor was reserved because `D_TargetMachineCodeMismatch`
 // joined `kUnsuppressableCodes` and bypasses all cap/dedup gates —
@@ -651,25 +714,36 @@ TEST(Program_CompileFiles, NoCapMarkerWhenDiagnosticsBudgetExceedsErrorCount) {
         << "both per-target schema-load failures must surface in rep";
 }
 
-// ── compileProject: plan 06 fail-loud stub ────────────────────
+// ── compileProject: plan 06 AP2 (project-config loader + profile gate) ──
+// (Was the `D_PlanNotLanded` stub pre-AP2; the stub is gone — these now
+// pin the real loader's fail-loud surface. Deeper AP2 wiring — the
+// profile-enforcement gate against a real `.dss-project.json` — is pinned
+// in `tests/program/test_project_config.cpp`.)
 
-TEST(Program_CompileProject, FailsLoudPlanNotLanded) {
+TEST(Program_CompileProject, FailsLoudMissingProjectFile) {
     Program prog;
-    EXPECT_EQ(prog.compileProject("any.dsp"), 1);
+    DiagnosticReporter rep;
+    // A nonexistent project-config path fails loud with D_FileNotFound
+    // (loadProjectConfig's open-failure arm), not the removed
+    // D_PlanNotLanded stub.
+    EXPECT_EQ(prog.compileProject("does-not-exist.dss-project.json", rep), 1);
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::D_FileNotFound), 1u);
 }
 
-// H2 behavioral pin (silent-failure audit post-fold #2): even with
-// --suppress=D_PlanNotLanded, compileProject + transpile must return
-// non-zero. The suppress hides the stderr message but MUST NOT
-// absorb the "the operation didn't happen" signal into a silent
-// success exit. Without this, build systems downstream of
-// dss-code-prime treat exit 0 as "transpile happened" and consume
-// nonexistent outputs.
-TEST(Program_CompileProject, SuppressedPlanNotLandedStillReturnsNonZero) {
+// H2 behavioral pin (silent-failure audit post-fold #2), re-aimed at a
+// code compileProject ACTUALLY emits: even with the fail-loud code
+// suppressed, compileProject must return non-zero. The suppress hides
+// the stderr message but MUST NOT absorb the "the operation didn't
+// happen" signal into a silent success exit — compileProject returns 1
+// on the failure path explicitly, not via `errorCount() == 0 ? 0 : 1`.
+// Without this, build systems downstream treat exit 0 as "build
+// happened" and consume nonexistent outputs.
+TEST(Program_CompileProject, SuppressedFailLoudStillReturnsNonZero) {
     Program prog;
     DiagnosticReporter::Config cfg;
-    cfg.policy.suppress.insert(DiagnosticCode::D_PlanNotLanded);
-    EXPECT_EQ(prog.compileProject("any.dsp", cfg), 1);
+    cfg.policy.suppress.insert(DiagnosticCode::D_FileNotFound);
+    EXPECT_EQ(prog.compileProject("does-not-exist.dss-project.json", cfg), 1);
 }
 
 TEST(Program_Transpile, FailsLoudPlanNotLanded) {

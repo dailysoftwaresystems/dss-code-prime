@@ -19,7 +19,9 @@
 
 #include <gtest/gtest.h>
 
+#include <string>
 #include <string_view>
+#include <vector>
 
 using namespace dss;
 
@@ -572,4 +574,85 @@ TEST(LK10EntrySliceB, ExitMechanismEnumRoundTrip) {
     EXPECT_EQ(exitMechanismFromName("by-name-import"),
               std::optional{ExitMechanism::ByNameImport});
     EXPECT_FALSE(exitMechanismFromName("bogus").has_value());
+}
+
+// ── AP3: object-format `artifactProfiles[]` (which profiles a format SERVES) ──
+
+namespace {
+// A minimal loadable ELF format with a custom `artifactProfiles` array spliced
+// in. Mirrors the cross-validate test's makeElfFormat shape.
+std::string elfWithArtifactProfiles(std::string_view profilesArrayJson) {
+    return std::string{R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"synth-elf","kind":"elf"},
+      "elf": {"class":"elf64","data":"lsb","machine":62},
+      "artifactProfiles": )"} + std::string{profilesArrayJson} + R"(
+    })";
+}
+bool sawCodeOFS(auto const& diags, DiagnosticCode c) {
+    for (auto const& d : diags) if (d.code == c) return true;
+    return false;
+}
+} // namespace
+
+TEST(ObjectFormatArtifactProfiles, ParsesDeclaredSet) {
+    auto r = ObjectFormatSchema::loadFromText(
+        elfWithArtifactProfiles(R"(["cli", "lib"])"));
+    ASSERT_TRUE(r.has_value());
+    auto const served = (*r)->artifactProfiles();
+    ASSERT_EQ(served.size(), 2u);
+    EXPECT_EQ(served[0], "cli");
+    EXPECT_EQ(served[1], "lib");
+}
+
+TEST(ObjectFormatArtifactProfiles, AbsentIsEmptyServesNothing) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"synth-elf","kind":"elf"},
+      "elf": {"class":"elf64","data":"lsb","machine":62}
+    })");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE((*r)->artifactProfiles().empty());
+}
+
+// RED-on-disable for the shared-vocab validation (MUST-FIX 2): a typo'd
+// profile name a format declares must fail loud at load — disable the
+// `isRegisteredArtifactProfile` check and this load would (wrongly) succeed.
+TEST(ObjectFormatArtifactProfiles, UnregisteredProfileRejected) {
+    auto r = ObjectFormatSchema::loadFromText(
+        elfWithArtifactProfiles(R"(["clii"])"));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(sawCodeOFS(r.error(),
+                           DiagnosticCode::C_UnknownArtifactProfile));
+}
+
+TEST(ObjectFormatArtifactProfiles, DuplicateProfileRejected) {
+    auto r = ObjectFormatSchema::loadFromText(
+        elfWithArtifactProfiles(R"(["cli", "cli"])"));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(sawCodeOFS(r.error(), DiagnosticCode::C_ConflictingField));
+}
+
+TEST(ObjectFormatArtifactProfiles, NonArrayRejected) {
+    auto r = ObjectFormatSchema::loadFromText(
+        elfWithArtifactProfiles(R"("cli")"));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(sawCodeOFS(r.error(),
+                           DiagnosticCode::C_UnknownArtifactProfile));
+}
+
+// Integration with the SHIPPED formats: the 4 runnable exec formats serve
+// `cli`; the relocatable `.o` format serves nothing (fail-closed).
+TEST(ObjectFormatArtifactProfiles, ShippedExecFormatServesCli) {
+    auto r = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(r.has_value());
+    auto const served = (*r)->artifactProfiles();
+    ASSERT_EQ(served.size(), 1u);
+    EXPECT_EQ(served[0], "cli");
+}
+
+TEST(ObjectFormatArtifactProfiles, ShippedRelocatableFormatServesNothing) {
+    auto r = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE((*r)->artifactProfiles().empty());
 }

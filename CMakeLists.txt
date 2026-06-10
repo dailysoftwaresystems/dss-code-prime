@@ -74,6 +74,54 @@ if(DSS_BUILD_TESTS)
     FetchContent_MakeAvailable(googletest)
 endif()
 
+# ── Precompiled headers (build-time only — D-CI-WINDOWS-MSVC-BUILD-TIME-CEILING) ──
+# The windows-msvc-release CI leg re-parses the same heavy, templated STL
+# headers (<format>, <unordered_map>, <vector>, …) in every one of the ~280
+# translation units. On the 2-core CI runner that repeated parse dominates the
+# cold build and pushed the leg past its 45-minute ceiling. Precompiling this
+# stable STL set ONCE and reusing it removes the repeated parse.
+#
+# This is a PURE build-time optimization — every TU still sees the same headers
+# in the same order, so NO emitted code changes (single-CU byte-identity holds).
+# The list is deliberately STL-ONLY (no project headers) so that (a) editing our
+# own code never invalidates the PCH — incremental dev builds stay fast — and
+# (b) the PCH can never mask a missing project-header include. `DSS_PCH_HEADERS`
+# is consumed by src/ (one shared producer, reused across the object libs) and
+# tests/ (a second shared producer, reused across the test executables).
+set(DSS_PCH_HEADERS
+    <algorithm>
+    <array>
+    <cstddef>
+    <cstdint>
+    <expected>
+    <filesystem>
+    <format>
+    <functional>
+    <limits>
+    <memory>
+    <optional>
+    <span>
+    <string>
+    <string_view>
+    <type_traits>
+    <unordered_map>
+    <unordered_set>
+    <utility>
+    <variant>
+    <vector>)
+
+# Debug-build canary: compile PCH-free in Debug so the one Debug CI leg
+# (linux-clang-asan, a single-config Ninja build with CMAKE_BUILD_TYPE=Debug)
+# proves every TU's #includes are self-sufficient. A TU that silently leaned on
+# a PCH-provided header would compile on the PCH Release legs but FAIL here —
+# turning the classic "PCH masks a missing include" trap into a hard CI error
+# rather than a latent portability bug. (Multi-config local generators leave
+# CMAKE_BUILD_TYPE empty, so PCH stays on there; the seam is the single-config
+# Debug CI leg, which is exactly where we want the PCH-free proof to run.)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
+endif()
+
 add_subdirectory(src)
 
 if(DSS_BUILD_TESTS)

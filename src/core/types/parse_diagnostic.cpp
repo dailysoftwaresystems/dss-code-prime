@@ -168,6 +168,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_TargetMachineCodeMismatch:    return "D_TargetMachineCodeMismatch";
         case DiagnosticCode::D_TargetAbiModelMismatch:       return "D_TargetAbiModelMismatch";
         case DiagnosticCode::D_TargetAbiModelUnsupportedByDriver: return "D_TargetAbiModelUnsupportedByDriver";
+        case DiagnosticCode::D_ArtifactProfileNotSupported:  return "D_ArtifactProfileNotSupported";
+        case DiagnosticCode::D_ArtifactProfileFormatMismatch: return "D_ArtifactProfileFormatMismatch";
 
         case DiagnosticCode::F_FileOpenFailed:               return "F_FileOpenFailed";
         case DiagnosticCode::F_FileEmpty:                    return "F_FileEmpty";

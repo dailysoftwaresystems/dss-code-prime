@@ -17,6 +17,7 @@
 #include "program/compile_pipeline.hpp"
 #include "program/cross_validate_target_format.hpp"
 #include "program/input_resolver.hpp"
+#include "program/project_config.hpp"
 #include "program/target_spec.hpp"
 
 #include <algorithm>
@@ -79,13 +80,47 @@ namespace {
 // fold the prefix lives in its own field (excluded from dedup hash)
 // and every render path must spell out the inclusion. LSP
 // `composeMessage` performs the symmetric prepend.
-void drainDiagnosticsToStderr(DiagnosticReporter const& rep) {
+// Render the reporter's diagnostics to stderr (plan 06 V2-4 Part A).
+//
+// Per-diagnostic routing — the agnostic split is on whether the
+// diagnostic carries a source buffer, NOT on any language/target/format:
+//   * buffer-VALID (parser/semantic errors, span into real source) →
+//     DSS's OWN positioned renderer `DiagnosticReporter::format(d, bufs)`:
+//     `--> file:line:col` + the source line + a `^` caret + related-
+//     location notes. (No clang/LLVM: this is hand-written DSS code over
+//     our SourceBuffer/SourceSpan; `bufs` resolves BufferId → buffer.)
+//   * buffer-LESS (driver-tier `D_*` emitted via `emitDriver`, default
+//     `BufferId{}`, no span) → the established code-only one-liner. These
+//     have no source location to point at; routing them through the
+//     positioned renderer would print a bogus `<unknown-buffer:0>` line
+//     and a spurious `got ` prefix for driver prose.
+//
+// `bufs` is built by the driver from the compiled CUs' source buffers
+// (see `runCusToTargets`). Pre-parse error sites (no CUs yet) pass an
+// empty registry — their diagnostics are all buffer-less, so the split
+// keeps them on the code-only path regardless.
+void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
+                              BufferRegistry const&     bufs) {
     for (auto const& d : rep.all()) {
-        std::cerr << severityName(d.severity)
-                  << "[" << diagnosticCodeName(d.code) << "] "
-                  << d.contextPrefix
-                  << d.actual << '\n';
+        if (d.buffer.valid()) {
+            std::cerr << rep.format(d, bufs);
+        } else {
+            std::cerr << severityName(d.severity)
+                      << "[" << diagnosticCodeName(d.code) << "] "
+                      << d.contextPrefix
+                      << d.actual << '\n';
+        }
     }
+}
+
+// Overload for the pre-parse / buffer-less call sites (empty registry):
+// every diagnostic at those sites is driver-tier (buffer-less), so this
+// renders them code-only via the routing above. Keeps the 13 early-error
+// sites a one-token change while the 2 post-parse sites (in
+// `runCusToTargets`, which owns the CUs) pass the real registry.
+void drainDiagnosticsToStderr(DiagnosticReporter const& rep) {
+    static BufferRegistry const kEmpty;
+    drainDiagnosticsToStderr(rep, kEmpty);
 }
 
 // Emit a driver-tier D_* diagnostic. Wraps `dss::report` so all
@@ -412,15 +447,31 @@ int runCusToTargets(std::span<CompilationUnit const>            cus,
     // Drain each CU's driver-tier + per-Tree diagnostics (D_FileNotFound, parser/lexer
     // errors) into the run-wide reporter. Without this drain, a missing source file
     // produces rc=1 with ZERO stderr — the substrate silent-failure archetype.
+    // Build the BufferRegistry (BufferId -> source buffer) from the CUs' trees
+    // alongside the diagnostic drain, so positioned rendering can resolve each
+    // parser/semantic diagnostic's `buffer` to its source (plan 06 V2-4 Part A).
+    // `add` keys on the buffer's own id (the same id the parser stamped onto
+    // `ParseDiagnostic.buffer`), so the registry resolves by construction;
+    // duplicate ids (a header shared across trees) are idempotent.
+    BufferRegistry bufs;
     for (auto const& cu : cus) {
         copyDiagnostics(cu.driverDiagnostics(), rep);
         for (auto const& tree : cu.trees()) {
             copyDiagnostics(tree.diagnostics(), rep);
+            // Defense-in-depth: every driver-produced tree has a non-null
+            // source (the UnitBuilder early-returns before pushing a tree
+            // when `SourceBuffer::fromFile` fails), so this is non-null on
+            // the real path. Guard anyway — `BufferRegistry::add` THROWS on
+            // null, and a future tree-producer (or a hand-built test tree)
+            // must not abort the diagnostic drain.
+            if (auto src = tree.sourceShared()) {
+                bufs.add(std::move(src));
+            }
         }
     }
     // If parsing already failed, the per-target loop would only produce derivative noise.
     if (rep.hasErrors()) {
-        drainDiagnosticsToStderr(rep);
+        drainDiagnosticsToStderr(rep, bufs);
         return 1;
     }
 
@@ -445,7 +496,7 @@ int runCusToTargets(std::span<CompilationUnit const>            cus,
         if (!ok || scratch.hasErrors()) exitCode = 1;
     }
 
-    drainDiagnosticsToStderr(rep);
+    drainDiagnosticsToStderr(rep, bufs);
     return exitCode;
 }
 
@@ -504,9 +555,11 @@ int Program::run(int argc, char* argv[]) {
         // unit) is deliberately NOT a CLI surface: no language's file model concatenates
         // translation units, so there is no source-agnostic CLI spelling for it; a future
         // explicit opt-in flag can route to `compileFiles` when a real consumer needs it.
-        // The `size() > 1` test keys on translation-unit COUNT, not on any language / CPU /
-        // format identity — the standing agnosticism veto is held.
-        return args.sourceFiles.size() > 1
+        // The route keys on translation-unit COUNT, not on any language / CPU /
+        // format identity — the standing agnosticism veto is held. `routesToMultiUnit`
+        // (program.hpp) is the single source of truth for the threshold, shared with
+        // `compileProject` (plan 06 AP2) so the two dispatch sites never drift.
+        return routesToMultiUnit(args.sourceFiles.size())
             ? compileUnits(args.sourceFiles, args.languageName, args.targets, cfg)
             : compileFiles(args.sourceFiles, args.languageName, args.targets, cfg);
     }
@@ -525,29 +578,97 @@ int Program::compileProject(
     const std::string& projectFilePath,
     DiagnosticReporter::Config const& reporterConfig
 ) {
-    // Plan 06 (.dsp parser + artifact profile) is unstarted; cycle 2
-    // anchors the fail-loud surface so a caller passing a project
-    // path gets a structural diagnostic rather than silent success
-    // and a zero-byte target dir. Policy-aware overload (H2 fold):
-    // `--warnings-as-errors` + `--suppress=<code>` apply here too —
-    // a user who explicitly suppresses `D_PlanNotLanded` gets the
-    // diagnostic dropped before stderr, not silently ignored.
+    // Thin wrapper around the rep-injection overload (mirrors
+    // `compileFiles`). `reporterConfig` threads `--warnings-as-errors`
+    // + `--suppress=<code>` through every tier; the rep-taking overload
+    // lets tests inspect the emitted code after return.
     DiagnosticReporter rep{reporterConfig};
-    emitDriver(rep, DiagnosticCode::D_PlanNotLanded,
-               "compileProject: .dsp project-file parsing is not "
-               "yet implemented — plan 06 (artifact profile) owns "
-               "the .dsp schema. Path: '" + projectFilePath + "'.");
-    drainDiagnosticsToStderr(rep);
-    // Unconditional non-zero exit — `D_PlanNotLanded` signals "the
-    // requested operation cannot be performed by this build", a hard
-    // capability gap that `--suppress` MUST NOT absorb into a silent
-    // success exit. (silent-failure audit post-fold #2: H2's
-    // `errorCount() == 0 ? 0 : 1` allowed `--suppress=D_PlanNotLanded`
-    // to exit 0 with zero-byte output, exactly the silent-failure
-    // class the fold was meant to close.) The user's `--suppress`
-    // still hides the message via the policy applied at emit time;
-    // it just no longer hides the exit code.
-    return 1;
+    return compileProject(projectFilePath, rep);
+}
+
+int Program::compileProject(
+    const std::string& projectFilePath,
+    DiagnosticReporter&             rep
+) {
+    // Plan 06 artifactProfile gates: load the `.dss-project.json`, then
+    // enforce the requested `artifactProfile` through TWO generic set-
+    // membership gates before delegating to the existing compile path —
+    // AP2 = the LANGUAGE gate (profile ∈ AP1's
+    // `GrammarSchema::artifactProfiles()` → D_ArtifactProfileNotSupported);
+    // AP3 = the per-target FORMAT gate (profile ∈ the object format's
+    // served set → D_ArtifactProfileFormatMismatch). Threading the
+    // resolved profile onward to CODEGEN (entry-symbol / subsystem /
+    // extension) is deferred — NOT to a fixed AP slice but to the first
+    // non-format-redundant profile consumer (e.g. gui), since no shipped
+    // profile's codegen differs from what its (target:format) already
+    // encodes; building it now would be a dead knob (D-AP2-COMPILATION-CONTEXT).
+    auto pcOpt = loadProjectConfig(fs::path{projectFilePath}, rep);
+    if (!pcOpt.has_value()) {
+        // loadProjectConfig already emitted the structural diagnostic
+        // (D_FileNotFound / C_MalformedJson / C_MissingField).
+        drainDiagnosticsToStderr(rep);
+        return 1;
+    }
+    ProjectConfig const& pc = *pcOpt;
+
+    // Load the language grammar to read its declared `artifactProfiles`.
+    // The delegated `compileFiles`/`compileUnits` re-loads it by name;
+    // the redundant load is benign for a project-build entry point and
+    // keeps the delegate signatures unchanged (no pre-loaded-grammar
+    // overload to add this cycle).
+    auto grammarR = GrammarSchema::loadShipped(pc.language);
+    if (!grammarR.has_value()) {
+        forwardConfigDiagnostics(grammarR.error(), rep);
+        emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                   "language schema '" + pc.language
+                   + "' could not be loaded — check that "
+                     "src/dss-config/sources/" + pc.language
+                   + ".lang.json exists and parses cleanly.");
+        drainDiagnosticsToStderr(rep);
+        return 1;
+    }
+    auto grammar = *grammarR;
+
+    // AP2 driver gate: the requested profile must be ∈ the language's
+    // declared set. Empty set ⇒ reject (fail-closed). One predicate, no
+    // per-profile-name branch — the agnosticism veto holds.
+    if (!enforceArtifactProfile(grammar->artifactProfiles(),
+                                pc.artifactProfile, pc.language, rep)) {
+        drainDiagnosticsToStderr(rep);
+        return 1;
+    }
+
+    // AP3 driver gate: the requested profile must be SERVED by EACH target's
+    // object format (`project.artifactProfile ∈ format.artifactProfiles()`).
+    // Symmetric with the language gate above — the same generic predicate,
+    // no per-profile-name / format-identity branch. A spec that doesn't
+    // parse, or a format that doesn't load, is SKIPPED here (the delegated
+    // compile emits the precise D_InvalidTargetSpec / D_SchemaLoadFailed —
+    // no duplication); such a target still fails the whole build downstream,
+    // so nothing slips past silently. The format is re-loaded by the build
+    // (the same benign redundancy as the grammar above).
+    for (auto const& spec : pc.targets) {
+        auto parsed = TargetSpec::parse(spec);
+        if (!parsed.has_value()) continue;           // delegate → D_InvalidTargetSpec
+        auto fmtR = ObjectFormatSchema::loadShipped(parsed->formatName);
+        if (!fmtR.has_value()) continue;             // delegate → D_SchemaLoadFailed
+        if (!enforceArtifactProfileFormat((*fmtR)->artifactProfiles(),
+                                          pc.artifactProfile,
+                                          parsed->formatName, rep)) {
+            drainDiagnosticsToStderr(rep);
+            return 1;
+        }
+    }
+
+    // Route by source COUNT via the shared `routesToMultiUnit` threshold
+    // (identical to the CLI dispatcher): >1 source ⇒ N independent CUs
+    // the linker merges (`compileUnits`, `cc a.c b.c` semantics); ≤1 ⇒
+    // the single-CU path (`compileFiles`). The delegate validates each
+    // `<targetName>:<formatName>` spec (D_InvalidTargetSpec) and drains
+    // `rep` at its end (runCusToTargets), so we do NOT drain here.
+    return routesToMultiUnit(pc.sources.size())
+        ? compileUnits(pc.sources, pc.language, pc.targets, rep)
+        : compileFiles(pc.sources, pc.language, pc.targets, rep);
 }
 
 int Program::transpile(

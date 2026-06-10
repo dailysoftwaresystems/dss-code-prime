@@ -318,6 +318,37 @@ enum class DiagnosticCode : std::uint16_t {
     //   Distinct from `D_PlanNotLanded` (pending-arrival surface).
     //   (post-fold #6 silent-failure C2 fix.)
     D_TargetAbiModelUnsupportedByDriver = 0xD00F,
+    // D_ArtifactProfileNotSupported (plan 06 AP2): a project config
+    //   (`.dss-project.json`) requested an `artifactProfile` the
+    //   selected language does not declare in its `artifactProfiles[]`
+    //   set (grammar schema, AP1). Two sub-cases share this one code
+    //   (one logical failure — "the requested profile is not in the
+    //   supported set"; the message discriminates):
+    //     * the language declares a non-empty set that excludes the
+    //       requested profile (e.g. c-subset declares {cli,lib,
+    //       staticlib} and the project asks for "gui");
+    //     * the language declares NO profiles at all (empty set) — a
+    //       fail-CLOSED reject, aligning with §2.1's trajectory toward
+    //       making `artifactProfiles[]` required (a language must
+    //       declare ≥1 profile to be project-buildable).
+    //   The check belongs at project-load time (plan 06 §1) so the
+    //   failure surfaces here, not "deep in codegen". AP3/AP4 own the
+    //   downstream consumption (CompilationContext + codegen).
+    D_ArtifactProfileNotSupported = 0xD010,
+    // D_ArtifactProfileFormatMismatch (plan 06 AP3): a project config's
+    //   `artifactProfile` is not SERVED by the chosen object format —
+    //   i.e. the profile is not in that format's declared
+    //   `artifactProfiles[]` set (the format-side symmetric twin of AP1's
+    //   language-side set). Example: a `cli` project pointed at a
+    //   shared-library format, or a `lib` project pointed at an executable
+    //   format, or any profile pointed at a format that declares no served
+    //   profiles (e.g. a relocatable `.o` format — fail-CLOSED). Distinct
+    //   from `D_ArtifactProfileNotSupported` (0xD010): that is
+    //   "the LANGUAGE doesn't declare this profile" (fix the `.lang.json`);
+    //   this is "the chosen FORMAT doesn't produce this profile" (fix the
+    //   target/format, or ship the backend that emits it). Remediation-
+    //   distinct → distinct code.
+    D_ArtifactProfileFormatMismatch = 0xD011,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──
