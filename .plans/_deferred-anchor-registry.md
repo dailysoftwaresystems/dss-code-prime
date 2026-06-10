@@ -14,6 +14,21 @@
 > The guard makes the system enforce the discipline — same shape as the
 > agnosticism veto + the `CallConv` static_assert.
 >
+> **V2-4.X / full-C ownership (2026-06-10):** the C-language-feature deferral
+> CLUSTER — division/mod codegen (`D-CSUBSET-DIVISION-OP-CODEGEN`,
+> `D-CSUBSET-MOD-OP-CODEGEN`, …), primitive widths
+> (`D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH`), linkage/visibility syntax
+> (`D-CSUBSET-LINKAGE-VISIBILITY-SYNTAX`, `D-DECL-PREFIX-STRIP-SHARED-HELPER`),
+> rodata aggregates (`D-LK4-RODATA-PRODUCER-NONSTRING-ARRAY`), implicit main
+> return (`D-LK10-ENTRY-MAIN-IMPLICIT-RETURN`), variadic + multi-format FFI
+> (`D-FFI-DESCRIPTOR-VARIADIC-SIGNATURE`, `D-FFI-EXTERN-CALL-DISPATCH`), the
+> apple-arm64 ABI divergence (`D-FF3-APPLE-ARM64-ABI-DIVERGENCE`), and peers —
+> is now OWNED by **stepper V2-4.X / [`23-full-c-plan`](./23-full-c-plan%20-%20tbd.md)**
+> (c-subset → full C23). Each closes inside the relevant FC phase (see the plan
+> §3.1). New full-C exotic-tail exclusions land as `D-FULLC-*` rows as clusters
+> ship. Individual rows are NOT rewritten here yet (the plan is the live map
+> until a cycle actually closes the anchor).
+>
 > **Schema (one row per anchor)**:
 > ```
 > | Anchor | Trigger | Closing work | Cross-refs |
