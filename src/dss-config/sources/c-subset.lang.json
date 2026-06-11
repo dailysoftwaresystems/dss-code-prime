@@ -188,6 +188,15 @@
     { "word": "int",     "kind": "IntKeyword"     },
     { "word": "long",    "kind": "LongKeyword"    },
     { "word": "char",    "kind": "CharKeyword"    },
+    { "word": "short",    "kind": "ShortKeyword"      },
+    { "word": "unsigned", "kind": "UnsignedKeyword"   },
+    { "word": "signed",   "kind": "SignedKeyword"     },
+    { "word": "bool",     "kind": "BoolKeyword"       },
+    { "word": "_Bool",    "kind": "LegacyBoolKeyword" },
+    { "word": "true",     "kind": "TrueKeyword"       },
+    { "word": "false",    "kind": "FalseKeyword"      },
+    { "word": "float",    "kind": "FloatKeyword"      },
+    { "word": "double",   "kind": "DoubleKeyword"     },
     { "word": "const",   "kind": "ConstKeyword"   },
     { "word": "typedef", "kind": "TypedefKeyword" },
     { "word": "struct",  "kind": "StructKeyword"  },
@@ -381,7 +390,15 @@
       ]
     },
 
-    "typeBase": { "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "Identifier" ] },
+    "typeSpecifierSeq": {
+      "$comment": "FC3 c1: C 6.7.2 type-specifier run — one-or-more specifier KEYWORDS in any order (`unsigned long long int` == `long long unsigned int` == `long unsigned long`). The inner alt is INLINE (no named wrapper rule) so the matched keyword TOKENS land as typeSpecifierSeq's DIRECT children — the semantic engine's multiset arm requires all-token children. Which multisets are VALID (and what core each resolves to, per data model) is the semantics.typeSpecifiers table; invalid combos (`unsigned float`, `short long`) parse fine here and reject SEMANTICALLY by absence from the table (S_InvalidTypeSpecifierCombination). The seq SUBSUMES the former single-token Void/Int/Long/Char alts (a one-keyword run). Keyword-led, so castExpr's commitRequiresTypeName triage rule 1 (not-a-lone-identifier) always commits a seq-led cast type.",
+      "sequence": [
+        { "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "ShortKeyword", "UnsignedKeyword", "SignedKeyword", "BoolKeyword", "LegacyBoolKeyword", "FloatKeyword", "DoubleKeyword" ] },
+        { "repeat": { "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "ShortKeyword", "UnsignedKeyword", "SignedKeyword", "BoolKeyword", "LegacyBoolKeyword", "FloatKeyword", "DoubleKeyword" ] } }
+      ]
+    },
+
+    "typeBase": { "alt": [ "typeSpecifierSeq", "Identifier" ] },
 
     "typeRef": {
       "sequence": [
@@ -393,7 +410,7 @@
     },
 
     "typeBaseAllowingStruct": {
-      "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
+      "alt": [ "typeSpecifierSeq", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
     },
 
     "typeRefAllowingStruct": {
@@ -548,6 +565,8 @@
         "Identifier",
         "IntLiteral",
         "FloatLiteral",
+        "TrueKeyword",
+        "FalseKeyword",
         "stringLiteralExpr",
         "charLiteralExpr",
         "compoundLiteralExpr",
@@ -571,7 +590,7 @@
     },
 
     "castTypeBase": {
-      "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "Identifier", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
+      "alt": [ "typeSpecifierSeq", "Identifier", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
     },
 
     "castTypeRef": {
@@ -745,16 +764,84 @@
     ],
     "loopRules": [ "whileStmt", "forStmt", "doStmt", "switchStmt" ],
     "loopControls": [ { "rule": "breakStmt" }, { "rule": "continueStmt" } ],
+    "$builtinTypesComment": "FC3 c1: the TEXT-keyed type-name table (typedef-style positions + the load-time fallback for single-word ladder/promotion names). The KEYWORD grammar path resolves through semantics.typeSpecifiers below (the C 6.7.2 multiset table) — both tables declare the SAME widths, and `long` carries the LLP64 override on BOTH so the two paths can never disagree (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH).",
     "builtinTypes": [
-      { "name": "int",  "core": "I32"  },
-      { "name": "long", "core": "I64"  },
-      { "name": "char", "core": "Char" },
-      { "name": "void", "core": "Void" }
+      { "name": "int",    "core": "I32"  },
+      { "name": "long",   "core": "I64", "coreByDataModel": { "LLP64": "I32" } },
+      { "name": "char",   "core": "Char" },
+      { "name": "void",   "core": "Void" },
+      { "name": "bool",   "core": "Bool" },
+      { "name": "float",  "core": "F32"  },
+      { "name": "double", "core": "F64"  }
     ],
+    "$typeSpecifiersComment": "FC3 c1: every VALID C type-specifier multiset (C 6.7.2 6) over the shipped keyword surface; combinations are ORDER-FREE (the engine canonicalizes by sorting token kinds; `long long` = LongKeyword twice). Invalid combos (`unsigned float`, `short long`, `long double`) reject by ABSENCE -> S_InvalidTypeSpecifierCombination. `long`-bearing rows carry the LLP64 (Windows) 32-bit override; `long long` stays 64-bit everywhere. NO `long double` row: F128/long-double is an FC3+ exclusion (rejects by absence).",
+    "typeSpecifiers": [
+      { "tokens": ["VoidKeyword"],                                              "core": "Void" },
+      { "tokens": ["CharKeyword"],                                              "core": "Char" },
+      { "tokens": ["SignedKeyword", "CharKeyword"],                             "core": "I8"   },
+      { "tokens": ["UnsignedKeyword", "CharKeyword"],                           "core": "U8"   },
+      { "tokens": ["ShortKeyword"],                                             "core": "I16"  },
+      { "tokens": ["ShortKeyword", "IntKeyword"],                               "core": "I16"  },
+      { "tokens": ["SignedKeyword", "ShortKeyword"],                            "core": "I16"  },
+      { "tokens": ["SignedKeyword", "ShortKeyword", "IntKeyword"],              "core": "I16"  },
+      { "tokens": ["UnsignedKeyword", "ShortKeyword"],                          "core": "U16"  },
+      { "tokens": ["UnsignedKeyword", "ShortKeyword", "IntKeyword"],            "core": "U16"  },
+      { "tokens": ["IntKeyword"],                                               "core": "I32"  },
+      { "tokens": ["SignedKeyword"],                                            "core": "I32"  },
+      { "tokens": ["SignedKeyword", "IntKeyword"],                              "core": "I32"  },
+      { "tokens": ["UnsignedKeyword"],                                          "core": "U32"  },
+      { "tokens": ["UnsignedKeyword", "IntKeyword"],                            "core": "U32"  },
+      { "tokens": ["LongKeyword"],                                              "core": "I64", "coreByDataModel": { "LLP64": "I32" } },
+      { "tokens": ["LongKeyword", "IntKeyword"],                                "core": "I64", "coreByDataModel": { "LLP64": "I32" } },
+      { "tokens": ["SignedKeyword", "LongKeyword"],                             "core": "I64", "coreByDataModel": { "LLP64": "I32" } },
+      { "tokens": ["SignedKeyword", "LongKeyword", "IntKeyword"],               "core": "I64", "coreByDataModel": { "LLP64": "I32" } },
+      { "tokens": ["UnsignedKeyword", "LongKeyword"],                           "core": "U64", "coreByDataModel": { "LLP64": "U32" } },
+      { "tokens": ["UnsignedKeyword", "LongKeyword", "IntKeyword"],             "core": "U64", "coreByDataModel": { "LLP64": "U32" } },
+      { "tokens": ["LongKeyword", "LongKeyword"],                               "core": "I64"  },
+      { "tokens": ["LongKeyword", "LongKeyword", "IntKeyword"],                 "core": "I64"  },
+      { "tokens": ["SignedKeyword", "LongKeyword", "LongKeyword"],              "core": "I64"  },
+      { "tokens": ["SignedKeyword", "LongKeyword", "LongKeyword", "IntKeyword"],"core": "I64"  },
+      { "tokens": ["UnsignedKeyword", "LongKeyword", "LongKeyword"],            "core": "U64"  },
+      { "tokens": ["UnsignedKeyword", "LongKeyword", "LongKeyword", "IntKeyword"], "core": "U64" },
+      { "tokens": ["BoolKeyword"],                                              "core": "Bool" },
+      { "tokens": ["LegacyBoolKeyword"],                                        "core": "Bool" },
+      { "tokens": ["FloatKeyword"],                                             "core": "F32"  },
+      { "tokens": ["DoubleKeyword"],                                            "core": "F64"  }
+    ],
+    "$literalTypesComment": "FC3 c1: IntLiteral's I32 is the BASE core; the integerLiteralTyping ladder below refines the width by magnitude/suffix/radix per C 6.4.4.1. FloatLiteral stays F64 INCLUDING the `f`-suffixed form (`1.5f` types F64 this cycle — the f->F32 literal typing rides the F32 arithmetic surface, anchored D-CSUBSET-F32-CODEGEN; silently flipping it now would pair F32 typing with fail-loud-only codegen for zero benefit). true/false are C23 keyword literals: type Bool with config-declared FIXED values (1/0) — the engine never decodes their text as a number.",
     "literalTypes": [
       { "literal": "IntLiteral",   "core": "I32" },
-      { "literal": "FloatLiteral", "core": "F64" }
-    ]
+      { "literal": "FloatLiteral", "core": "F64" },
+      { "literal": "TrueKeyword",  "core": "Bool", "value": 1 },
+      { "literal": "FalseKeyword", "core": "Bool", "value": 0 }
+    ],
+    "$integerLiteralTypingComment": "FC3 c1: C 6.4.4.1 EXACTLY — the FIRST candidate (per suffix-group x radix-class) whose range holds the decoded magnitude is the literal's type. `decimal` = no declared numberStyle prefix matched; `nondecimal` (hex/octal/binary) adds the unsigned candidates per the C table. Type names resolve through typeSpecifiers/builtinTypes at LOAD time, so LLP64's 32-bit `long` falls out of the data-model select (2147483648 is `long` on LP64 but `long long` on LLP64). Suffix GROUPS list the exact numberStyle.integerSuffixes spellings they cover; the loader cross-checks every declared suffix is covered exactly once. A magnitude beyond the last candidate -> S_IntegerLiteralTooLarge.",
+    "integerLiteralTyping": [
+      { "suffixes": [],
+        "decimal":    ["int", "long", "long long"],
+        "nondecimal": ["int", "unsigned int", "long", "unsigned long", "long long", "unsigned long long"] },
+      { "suffixes": ["u", "U"],
+        "decimal":    ["unsigned int", "unsigned long", "unsigned long long"],
+        "nondecimal": ["unsigned int", "unsigned long", "unsigned long long"] },
+      { "suffixes": ["l", "L"],
+        "decimal":    ["long", "long long"],
+        "nondecimal": ["long", "unsigned long", "long long", "unsigned long long"] },
+      { "suffixes": ["ul", "UL", "lu", "LU"],
+        "decimal":    ["unsigned long", "unsigned long long"],
+        "nondecimal": ["unsigned long", "unsigned long long"] },
+      { "suffixes": ["ll", "LL"],
+        "decimal":    ["long long"],
+        "nondecimal": ["long long", "unsigned long long"] },
+      { "suffixes": ["ull", "ULL", "llu", "LLU"],
+        "decimal":    ["unsigned long long"],
+        "nondecimal": ["unsigned long long"] }
+    ],
+    "$arithmeticConversionsComment": "FC3 c1: C 6.3.1.8 usual arithmetic conversions, declared (the engine algorithm in analysis/semantic/type_rules.hpp is closed-verb config-driven; languages WITHOUT this block keep the legacy commonType path). integerPromotion: operands below `int`'s rank promote to int; `alsoPromote` pulls char/bool (outside the width-rank lattice) into promotion WITHOUT the engine hardcoding C's view of char. mixedSignedness `rank-prefer-unsigned`: unsigned rank >= signed rank -> the unsigned type, else the (strictly wider) signed type. promoteComparisons: comparisons convert operands to the common type (so -1 > 0ul compares as U64 -> true) and still yield Bool.",
+    "arithmeticConversions": {
+      "integerPromotion": { "minRankType": "int", "alsoPromote": ["char", "bool"] },
+      "mixedSignedness": "rank-prefer-unsigned",
+      "promoteComparisons": true
+    }
   },
 
   "hirLowering": {

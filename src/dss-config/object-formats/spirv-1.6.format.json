@@ -7,5 +7,8 @@
     "name": "spirv-1.6",
     "version": "1.6",
     "kind": "spirv"
-  }
+  },
+
+  "$dataModelComment": "FC3 c1: 32-bit data model (int 32, long 32, ptr 32) -- DECLARED-ONLY: the semantic consumer fails loud (S_UnsupportedDataModel) when an ILP32 format is actually selected, so no untested width path runs. REQUIRED closed-enum field like every format.",
+  "dataModel": "ILP32"
 }

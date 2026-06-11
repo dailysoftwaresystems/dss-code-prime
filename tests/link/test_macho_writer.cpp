@@ -296,6 +296,7 @@ TEST(MachOWriter, NonMachOFormatKindEmitsK_NoMatchingObjectFormat) {
 TEST(MachOFormatJson, ZeroCputypeRejectedByValidate) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"bad-macho","kind":"macho"},
       "macho": { "cputype": 0, "filetype": 1 }
     })");
@@ -307,6 +308,7 @@ TEST(MachOFormatJson, ZeroCputypeRejectedByValidate) {
 TEST(MachOFormatJson, EmptySegmentRejectedByValidate) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"bad-macho-seg","kind":"macho"},
       "macho": { "cputype": 16777223, "filetype": 1 },
       "sections":[{"kind":"text","name":"__text","type":0,"flags":0,"addrAlign":4,"entrySize":0}]
@@ -319,6 +321,7 @@ TEST(MachOFormatJson, EmptySegmentRejectedByValidate) {
 TEST(ElfFormatJson, SegmentFieldRejectedOnElfSection) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"bad-elf","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62 },
       "sections":[{"kind":"text","name":".text","segment":"__TEXT","type":1,"flags":6,"addrAlign":16,"entrySize":0}]
@@ -336,6 +339,7 @@ TEST(MachOFormatJson, NonZeroVirtualAddressRejectedOnMhObject) {
     // a future MachO-row edit can't silently no-op.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"bad-macho-va","kind":"macho"},
       "macho": { "cputype": 16777223, "filetype": 1 },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":4,"entrySize":0,"virtualAddress":4198400}]
@@ -605,6 +609,7 @@ TEST(MachOExecWriter, ExternTargetFailsLoudAsUndefined) {
 TEST(MachOExecFormatJsonValidate, ObjWithImageBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"obj-with-image","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": 1, "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld", "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
@@ -621,6 +626,7 @@ TEST(MachOExecFormatJsonValidate, ObjWithBindNowFalseRejected) {
     // LK6 cycle 2c post-fold review.)
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"obj-with-bindnow-false","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": 1, "flags": 0 },
       "image": { "bindNow": false },
@@ -632,6 +638,7 @@ TEST(MachOExecFormatJsonValidate, ObjWithBindNowFalseRejected) {
 TEST(MachOExecFormatJsonValidate, ExecMissingLoadDylibsRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"exec-no-dylibs","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld" },
@@ -647,6 +654,7 @@ TEST(MachOExecFormatJsonValidate, DylibFiletypeRejected) {
     // rejected by validate() until LK6 dynamic linking lands.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"a-dylib","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
@@ -660,6 +668,7 @@ TEST(MachOExecFormatJsonValidate, SectionVaBelowPageZeroRejected) {
     // underflows.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"underflow","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld", "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
@@ -671,6 +680,7 @@ TEST(MachOExecFormatJsonValidate, SectionVaBelowPageZeroRejected) {
 TEST(MachOExecFormatJsonValidate, MissingDylinkerPathRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"no-dyld","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
@@ -934,6 +944,7 @@ TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-lazy-pending","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
@@ -985,6 +996,7 @@ TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
 TEST(MachOExecFormatJson, UseChainedFixupsDefaultsToFalse) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-cfx-default","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -1003,6 +1015,7 @@ TEST(MachOExecFormatJson, UseChainedFixupsDefaultsToFalse) {
 TEST(MachOExecFormatJson, UseChainedFixupsAcceptsTrue) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-cfx-on","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -1022,6 +1035,7 @@ TEST(MachOExecFormatJson, UseChainedFixupsAcceptsTrue) {
 TEST(MachOExecFormatJson, UseChainedFixupsRejectsNonBoolean) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-cfx-bad","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -1055,6 +1069,7 @@ namespace {
 loadChainedFixupsExecFormat() {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-cfx-integration","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
@@ -1425,6 +1440,7 @@ TEST(MachOExecWriter, ChainedFixupsSizeofcmdsDelta) {
     // Legacy fixture (useChainedFixups absent → defaults to false).
     auto fmtLegacy = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-legacy-for-delta","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
@@ -1645,6 +1661,7 @@ TEST(MachOExecWriter, ChainedFixupsNameOffsetOverflowFailsLoud) {
 TEST(MachOExecFormatJson, BindNowDefaultsToTrue) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-bindnow-default","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -1667,6 +1684,7 @@ TEST(MachOExecFormatJson, PageZeroSizeMustBePowerOfTwo) {
     // — LK6 cycle 2c post-fold review.)
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-bad-pagezero","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -1788,6 +1806,7 @@ TEST(MachOExecWriter, TextSegmentFilesizeCoversStubsEnd) {
 TEST(MachOExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-bindnow-wrong","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -1811,6 +1830,7 @@ TEST(MachOExecWriter, MultipleExternsInTwoLibrariesEmitTwoLcLoadDylibRefs) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-two-libs","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },

@@ -109,6 +109,7 @@ makeSyscallElfExecFormat() {
     // x86_64 Linux exit_group=231 via SYSCALL (0x0F 0x05) in rax.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth-elf-syscall-x64", "version": "0.1", "kind": "elf" },
       "entryPoint": "",
       "externCallDispatch": "direct-plt",
@@ -138,6 +139,7 @@ makeSyscallElfExecFormatArm64() {
     // AArch64 Linux exit_group=94 via SVC #0 (0xD4000001) in x8.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth-elf-syscall-arm64", "version": "0.1", "kind": "elf" },
       "entryPoint": "",
       "externCallDispatch": "direct-plt",

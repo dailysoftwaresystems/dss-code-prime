@@ -2,10 +2,13 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "analysis/semantic/type_rules.hpp"      // FC3 c1: usualArithmeticCommonType / resolveArithmeticRules
+#include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/char_decode.hpp"
 #include "core/types/hir_lowering_config.hpp"
+#include "core/types/integer_literal_ladder.hpp" // FC3 c1: the C 6.4.4.1 ladder (shared with the semantic tier)
 #include "core/types/object_format_kind.hpp"     // kObjectFormatKindTable (per-format library-map keys)
 #include "core/types/number_decode.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -179,7 +182,32 @@ struct Lowerer {
     std::unordered_map<std::uint32_t, std::size_t> binOp_, unOp_, postOp_;  // SchemaTokenId.v → idx
     std::unordered_map<std::uint32_t, TypeId>      litType_;     // SchemaTokenId.v → core TypeId
     std::unordered_map<std::uint32_t, TypeKind>    litCore_;     // SchemaTokenId.v → TypeKind
+    // FC3 c1: keyword literals' config-declared fixed VALUES (`true` →
+    // 1). `lowerLiteral` uses the value directly instead of decoding the
+    // token text as a number (decodeInteger("true") would silently
+    // yield 0). Sparse — only rows declaring `value`.
+    std::unordered_map<std::uint32_t, std::int64_t> litFixed_;   // SchemaTokenId.v → value
     std::unordered_map<std::uint32_t, bool>        deferred_;    // RuleId.v of explicitly-deferred rules
+
+    // FC3 c1: the analysis-time data model, read OFF THE MODEL (the
+    // `analyze()` parameter travels on the SemanticModel) so this tier
+    // can never run under a different model than the semantic tier.
+    DataModel dataModel_ = DataModel::Lp64;
+    // FC3 c1: the language's usual-arithmetic-conversion rules resolved
+    // for `dataModel_`. nullopt (no `arithmeticConversions` block) keeps
+    // every combine site on the legacy `TypeInterner::commonType` path
+    // EXACTLY (toy / tsql — pinned by their typing-unchanged tests).
+    std::optional<ResolvedArithmeticRules> arith_;
+
+    // The common arithmetic type at a binary / ternary / compound-assign
+    // combine site: the config-driven C 6.3.1.8 engine when the language
+    // declares the block, else the legacy interner rule.
+    [[nodiscard]] TypeId commonArithType(TypeId a, TypeId b) {
+        if (arith_.has_value()) {
+            return usualArithmeticCommonType(interner, a, b, *arith_);
+        }
+        return interner.commonType(a, b);
+    }
 
     // The enclosing function's declared return type, threaded into `lowerReturn`
     // so a `return expr;` whose `expr.type` differs from the declared type
@@ -398,6 +426,14 @@ struct Lowerer {
         for (auto const& lt : sem.literalTypes) {
             litType_.emplace(lt.literal.v, interner.primitive(lt.core));
             litCore_.emplace(lt.literal.v, lt.core);
+            if (lt.fixedValue.has_value()) {
+                litFixed_.emplace(lt.literal.v, *lt.fixedValue);
+            }
+        }
+        // FC3 c1: data model + resolved UAC rules (see the member docs).
+        dataModel_ = m.dataModel();
+        if (sem.arithmeticConversions.has_value()) {
+            arith_ = resolveArithmeticRules(*sem.arithmeticConversions, dataModel_);
         }
         for (RuleId r : cfg.deferredRules) deferred_.emplace(r.v, true);
         // HR10: register every declared extension kind up front, so a rule mapped
@@ -1115,20 +1151,49 @@ struct Lowerer {
     }
 
     E lowerLiteral(NodeId operandNode, NodeId tokenNode, SchemaTokenId tk, TypeId type) {
-        TypeKind const core = litCore_.at(tk.v);
+        TypeKind core = litCore_.at(tk.v);
         std::string_view const text = tree().text(tokenNode);
         HirLiteralValue val;          // value defaults to monostate (= undecodable)
-        val.core = core;
         bool ok = true;
-        if (isFloatCore(core)) {
+        // FC3 c1: keyword literals (`true` / `false`) carry their
+        // config-declared fixed VALUE — never decoded from the token
+        // text (decodeInteger("true") would silently yield 0).
+        if (auto fixedIt = litFixed_.find(tk.v); fixedIt != litFixed_.end()) {
+            if (isSignedCore(core)) val.value = fixedIt->second;
+            else val.value = static_cast<std::uint64_t>(fixedIt->second);
+        } else if (isFloatCore(core)) {
             double const d = decodeFloat(text, numberStyle, ok);
             if (ok) val.value = d;
         } else if (auto iv = decodeInteger(text, numberStyle)) {
-            if (isSignedCore(core)) val.value = static_cast<std::int64_t>(*iv);
-            else                    val.value = *iv;
+            // FC3 c1: the integer-literal ladder (C 6.4.4.1) — the SAME
+            // shared algorithm the semantic tier ran in pass 2 (plan-lock
+            // C-2: both tiers type the literal; one implementation, two
+            // call sites), refining the static `literalTypes` core by
+            // magnitude / suffix-class / radix-class under the model.
+            if (!sem.integerLiteralTyping.empty() && numberStyle != nullptr
+                && numberStyle->emitKind.integer.valid()
+                && tk == numberStyle->emitKind.integer) {
+                auto const r = typeIntegerLiteral(
+                    text, numberStyle, sem.integerLiteralTyping, dataModel_, *iv);
+                if (r.status == IntegerLadderStatus::Typed) {
+                    core = r.kind;
+                    type = interner.primitive(core);
+                } else {
+                    // TooLarge / NoRule: the semantic tier already
+                    // diagnosed (S_IntegerLiteralTooLarge / loader
+                    // invariant) on the production path; direct-API
+                    // lowering stays loud through the arm below.
+                    ok = false;
+                }
+            }
+            if (ok) {
+                if (isSignedCore(core)) val.value = static_cast<std::int64_t>(*iv);
+                else                    val.value = *iv;
+            }
         } else {
             ok = false;             // integer overflow
         }
+        val.core = core;
         if (!ok)
             unsupported(tokenNode, std::format("literal '{}' is out of range / undecodable", text));
         std::uint32_t const idx = literals.add(val);
@@ -1155,13 +1220,46 @@ struct Lowerer {
             unsupported(anchor, std::format("binary target '{}' is not a core binary operator", e.target));
             return {errorNode(anchor), InvalidType};
         }
+        // FC3 c1 shifts under the `arithmeticConversions` block: C 6.5.7
+        // — each operand integer-promotes INDEPENDENTLY and the result
+        // type is the PROMOTED LEFT operand only (the count's type never
+        // contributes; `i64 << u32` is I64, `u32 >> 1` is U32 → LShr).
+        // The count is ALSO coerced to the compute type so both register
+        // operands share a width (value-preserving for any in-range
+        // count; an out-of-range count is UB in C). Block-less languages
+        // keep the legacy both-coerce-to-common path below EXACTLY.
+        if (arith_.has_value()
+            && (*op == HirOpKind::Shl || *op == HirOpKind::Shr)) {
+            TypeId const lp = integerPromotedType(interner, lhs.type, *arith_);
+            E lc = lhs, rc = rhs;
+            if (lp.valid()) {
+                lc = coerce(lhs, lp);
+                rc = coerce(rhs, lp);
+            }
+            TypeId const result =
+                lp.valid() ? lp : (lhs.type.valid() ? lhs.type : rhs.type);
+            return {track(builder.addParent(HirKind::BinaryOp,
+                                            std::array{lc.id, rc.id},
+                                            result, encodeOp(*op)), anchor),
+                    result};
+        }
         // C99 usual arithmetic conversions: both operands coerce to their
         // common type before the op. The result type is that common type
-        // (or Bool for comparisons). `commonType` returns InvalidType for
-        // non-arithmetic operand pairs — fall back to the prior "first
-        // valid type wins" rule so non-arithmetic Refs (e.g. pointer +
-        // pointer comparisons) still lower without losing structure.
-        TypeId const common = interner.commonType(lhs.type, rhs.type);
+        // (or Bool for comparisons). The common type comes from the
+        // language's `arithmeticConversions` block when declared (the
+        // config-driven C 6.3.1.8 engine — FC3 c1), else the legacy
+        // `TypeInterner::commonType` (toy/tsql — pinned byte-identical).
+        // Either returns InvalidType for non-arithmetic operand pairs —
+        // fall back to the prior "first valid type wins" rule so
+        // non-arithmetic Refs (e.g. pointer + pointer comparisons) still
+        // lower without losing structure.
+        TypeId common = commonArithType(lhs.type, rhs.type);
+        // `promoteComparisons: false` (config) keeps comparison operands
+        // at their raw types — no conversion is materialized.
+        if (arith_.has_value() && !arith_->promoteComparisons
+            && isComparison(*op)) {
+            common = InvalidType;
+        }
         E lc = lhs, rc = rhs;
         if (common.valid()) {
             lc = coerce(lhs, common);
@@ -1281,8 +1379,10 @@ struct Lowerer {
         E thenE = lowerExpr(operands[1]);
         E elseE = lowerExpr(operands[2]);
         // Coerce both arms to their common type (C99 conditional-expression
-        // type-balance rule). Falls back to the type-attribute-or-then.
-        TypeId const common = interner.commonType(thenE.type, elseE.type);
+        // type-balance rule — the config-driven UAC engine when the
+        // language declares the block; FC3 c1). Falls back to the
+        // type-attribute-or-then.
+        TypeId const common = commonArithType(thenE.type, elseE.type);
         if (common.valid()) {
             thenE = coerce(thenE, common);
             elseE = coerce(elseE, common);
@@ -2407,9 +2507,10 @@ struct Lowerer {
         // T is the type of `a`, and OP is computed at the COMMON type of a
         // and b (so a narrower-than-int operand is integer-promoted first).
         // Implement that exactly: read lhs, coerce both to common, OP, then
-        // narrow result back to lhs's type for the store.
+        // narrow result back to lhs's type for the store. (FC3 c1: the
+        // common type comes from the language's UAC block when declared.)
         HirNodeId const lhsRead = lvRead(*lv);
-        TypeId const common = interner.commonType(lv->type, rhs.type);
+        TypeId const common = commonArithType(lv->type, rhs.type);
         E lhsE{lhsRead, lv->type};
         E rhsE = rhs;
         TypeId const opType = common.valid() ? common : lv->type;

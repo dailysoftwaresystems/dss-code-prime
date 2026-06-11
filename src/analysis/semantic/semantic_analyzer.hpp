@@ -3,6 +3,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "core/export.hpp"
+#include "core/types/data_model.hpp"
 
 #include <memory>
 
@@ -19,7 +20,26 @@
 
 namespace dss {
 
+// FC3 c1: `dataModel` is the ACTIVE FORMAT's declared width triple
+// (plan 23 — the format schema's REQUIRED `dataModel` field), threaded
+// by the driver (`buildCuMir` passes `format.dataModel()`); semantic
+// analysis is per-(CU × target) so the model is always in scope there.
+// It drives every `coreByDataModel` override (builtinTypes /
+// typeSpecifiers), the integer-literal ladder, and the shipped-lib
+// descriptor `signatureByDataModel` resolution. The returned
+// SemanticModel CARRIES the model (`SemanticModel::dataModel()`) so the
+// HIR lowering reads the SAME value by construction — the two tiers can
+// never diverge.
+//
+// The default (LP64) serves DIRECT-API callers (unit tests, LSP):
+// LP64 is the identity model for every shipped config (each row's BASE
+// `core` is its LP64 value; overrides key the other models), so a
+// default-call analyzes exactly as the pre-FC3 signature did. The
+// format JSON itself has NO default — a missing `dataModel` there is a
+// load reject. ILP32 is declared-only: selecting it fails loud
+// (S_UnsupportedDataModel) rather than running an untested width path.
 [[nodiscard]] DSS_EXPORT SemanticModel
-analyze(std::shared_ptr<CompilationUnit const> cu);
+analyze(std::shared_ptr<CompilationUnit const> cu,
+        DataModel dataModel = DataModel::Lp64);
 
 } // namespace dss

@@ -561,6 +561,8 @@ TEST(ContextualKeywords, CSubsetIntDeclEmitsNoContextualResolution) {
         {
             auto ty = b.open(schema->rules().find("typeRef"));
             auto tb = b.open(schema->rules().find("typeBase"));
+            // FC3 c1: typeBase routes keywords through typeSpecifierSeq.
+            auto ts = b.open(schema->rules().find("typeSpecifierSeq"));
             b.pushToken(tokAt(*src, "int", CoreTokenKind::Word));
         }
         b.pushToken(tokAt(*src, "x", CoreTokenKind::Word));

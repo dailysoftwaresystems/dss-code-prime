@@ -2609,3 +2609,120 @@ TEST(MirToLir, WhileLoopLowersWithBackEdge) {
         EXPECT_TRUE(L.target->isTerminator(lir.instOpcode(lir.blockTerminator(bb))));
     }
 }
+
+// ── FC3 c1: D-CSUBSET-32BIT-ALU-FORMS width gate ────────────────────────
+//
+// The shipped integer ALU/div/shift/compare encodings compute 64-bit
+// wide; a type whose semantics C DEFINES at a narrower width (unsigned
+// wraparound) must FAIL LOUD at MIR→LIR — the only tier where MIR types
+// are still visible — rather than silently compute 64-wide. I32 (signed
+// overflow is UB → 64-wide is conforming) and I64/U64 stay allowed.
+
+namespace {
+
+// Hand-build `fn(k, k) -> k { return a OP b; }` and lower it.
+struct GuardProbe {
+    ::dss::DiagnosticReporter rep;
+    bool ok = false;
+};
+
+[[nodiscard]] GuardProbe lowerBinaryProbe(::dss::TypeKind k,
+                                          ::dss::MirOpcode op) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const ty = interner.primitive(k);
+    std::array<::dss::TypeId, 2> params{ty, ty};
+    auto const fnSig = interner.fnSig(params, ty, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb =
+        mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const a = mb.addArg(0, ty);
+    ::dss::MirInstId const b = mb.addArg(1, ty);
+    std::array<::dss::MirInstId, 2> ops{a, b};
+    ::dss::MirInstId const r = mb.addInst(op, ops, ty);
+    mb.addReturn(r);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto const result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok = result.ok;
+    return probe;
+}
+
+[[nodiscard]] bool sawAnchor(::dss::DiagnosticReporter const& rep,
+                             std::string_view anchor) {
+    for (auto const& d : rep.all()) {
+        if (d.actual.find(anchor) != std::string::npos) return true;
+    }
+    return false;
+}
+
+} // namespace
+
+TEST(MirToLir, U32AddFailsLoudCitingNativeWidthGuard) {
+    auto probe = lowerBinaryProbe(::dss::TypeKind::U32, ::dss::MirOpcode::Add);
+    EXPECT_FALSE(probe.ok)
+        << "U32 add must NOT lower — 64-wide compute would silently break "
+           "the type's DEFINED wraparound";
+    EXPECT_TRUE(sawAnchor(probe.rep, "D-CSUBSET-32BIT-ALU-FORMS"))
+        << "the diagnostic must cite the staging anchor";
+}
+
+TEST(MirToLir, U16DivAndI16MulAlsoGate) {
+    EXPECT_FALSE(lowerBinaryProbe(::dss::TypeKind::U16,
+                                  ::dss::MirOpcode::UDiv).ok);
+    EXPECT_FALSE(lowerBinaryProbe(::dss::TypeKind::I16,
+                                  ::dss::MirOpcode::Mul).ok);
+}
+
+TEST(MirToLir, U32CompareOperandsGate) {
+    // The compare RESULT is Bool — the gate keys on the OPERANDS' type.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const u32  = interner.primitive(::dss::TypeKind::U32);
+    auto const b1   = interner.primitive(::dss::TypeKind::Bool);
+    std::array<::dss::TypeId, 2> params{u32, u32};
+    auto const fnSig = interner.fnSig(params, b1, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb =
+        mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const a = mb.addArg(0, u32);
+    ::dss::MirInstId const b = mb.addArg(1, u32);
+    std::array<::dss::MirInstId, 2> ops{a, b};
+    ::dss::MirInstId const r =
+        mb.addInst(::dss::MirOpcode::ICmpUgt, ops, b1);
+    mb.addReturn(r);
+    ::dss::Mir m = std::move(mb).finish();
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, **target, interner, rep);
+    EXPECT_FALSE(result.ok);
+    EXPECT_TRUE(sawAnchor(rep, "D-CSUBSET-32BIT-ALU-FORMS"));
+}
+
+TEST(MirToLir, NativeWidthsStayAllowedThroughTheGate) {
+    // U64 unsigned compute IS native-width (defined wraparound holds in
+    // 64-bit registers) and I32 signed rides the signed-overflow-is-UB
+    // exemption — the existing corpus' status quo. The gate must not
+    // overfire on either.
+    EXPECT_TRUE(lowerBinaryProbe(::dss::TypeKind::U64,
+                                 ::dss::MirOpcode::Add).ok);
+    EXPECT_TRUE(lowerBinaryProbe(::dss::TypeKind::I32,
+                                 ::dss::MirOpcode::Add).ok);
+    EXPECT_TRUE(lowerBinaryProbe(::dss::TypeKind::I64,
+                                 ::dss::MirOpcode::Mul).ok);
+}
+
+TEST(MirToLir, F32AddFailsLoudViaTheF64WidthGuard) {
+    // FC3 c1 P6: `float` now TYPES as F32 at the front end; its codegen
+    // stays fail-loud (only F64 has scalar float encodings) — an F32
+    // arithmetic program must REJECT, never silently compute F64
+    // (D-TARGET-ENCODING-WIDTH-GUARD / D-CSUBSET-F32-CODEGEN).
+    auto probe = lowerBinaryProbe(::dss::TypeKind::F32, ::dss::MirOpcode::FAdd);
+    EXPECT_FALSE(probe.ok);
+    EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+}

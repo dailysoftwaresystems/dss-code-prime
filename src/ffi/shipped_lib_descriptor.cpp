@@ -1,5 +1,6 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 
+#include "core/types/data_model.hpp"             // dataModelFromName (signatureByDataModel keys)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/object_format_kind.hpp"     // objectFormatKindFromName (library-map key vocabulary)
 #include "core/types/parse_diagnostic.hpp"
@@ -79,7 +80,8 @@ std::optional<ShippedLibDescriptor>
 readShippedLibDescriptor(std::filesystem::path const& path,
                          TypeInterner&                interner,
                          TypeRegistry&                typeReg,
-                         DiagnosticReporter&          reporter) {
+                         DiagnosticReporter&          reporter,
+                         DataModel                    dataModel) {
     std::size_t const errBefore = reporter.errorCount();
 
     // (0) Read the file. A missing/unreadable descriptor is malformed-shaped
@@ -276,16 +278,77 @@ readShippedLibDescriptor(std::filesystem::path const& path,
             linkage = *l;
         }
 
+        // FC3 c1: optional per-data-model signature override
+        // (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH closure for the
+        // LP64-merged libc symbols — fseek/ftell/atol/strtol/strtoul/
+        // labs carry the C `long`, whose width is the FORMAT's data
+        // model, not one signature). Shape mirrors the Model-3
+        // per-format `library` map: the BASE `signature` is the
+        // LP64-correct text; `signatureByDataModel` keys data-model
+        // names ("LLP64"/"ILP32") to replacement type texts. The
+        // ACTIVE model's entry (when present) becomes the effective
+        // signature; EVERY declared override must parse (a malformed
+        // override under a model not currently selected would
+        // otherwise lurk until that model is first compiled). Unknown
+        // model keys fail loud (closed vocabulary).
+        std::string effectiveSigText = sigText;
+        bool overridesOk = true;
+        if (sym.contains("signatureByDataModel")) {
+            if (!sym.at("signatureByDataModel").is_object()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": 'signatureByDataModel' must be an "
+                                              "object mapping data-model names to "
+                                              "signature strings");
+                continue;
+            }
+            for (auto const& kv : sym.at("signatureByDataModel").items()) {
+                auto const dm = dataModelFromName(kv.key());
+                if (!dm) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                        + ": 'signatureByDataModel' has unknown data-model key '"
+                        + kv.key() + "' (expected one of \"LP64\"/\"LLP64\"/\"ILP32\")");
+                    overridesOk = false;
+                    continue;
+                }
+                if (!kv.value().is_string()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                        + ": 'signatureByDataModel." + kv.key()
+                        + "' must be a signature string");
+                    overridesOk = false;
+                    continue;
+                }
+                std::string const ovText = kv.value().get<std::string>();
+                TypeId const ovSig =
+                    parseTypeFromText(ovText, interner, typeReg, reporter);
+                if (!ovSig.valid() || ovSig == InvalidType) {
+                    dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                                DiagnosticSeverity::Error,
+                                "shipped-lib descriptor " + at + ": symbol '" + name
+                                    + "' has a 'signatureByDataModel." + kv.key()
+                                    + "' that failed to decode as a type ('" + ovText
+                                    + "') — refusing a descriptor whose override "
+                                      "would fail when that data model is selected");
+                    overridesOk = false;
+                    continue;
+                }
+                if (*dm == dataModel) effectiveSigText = ovText;
+            }
+        }
+        if (!overridesOk) continue;
+
         // Reject unknown per-symbol keys (closed key set).
         (void)rejectUnknownKeys(reporter, sym, "symbols[" + std::to_string(idx - 1) + "]",
-                                {"name", "signature", "kind", "linkage"});
+                                {"name", "signature", "signatureByDataModel",
+                                 "kind", "linkage"});
 
         // Decode the signature via the ONE type-text decoder. A decode failure
         // is the CRITICAL fail-loud: F_ShippedLibUnsupportedType, and the
         // symbol is NEVER appended with InvalidType (it is dropped from `out`,
-        // and the whole read fails via the errorCount delta below).
-        TypeId const sig = parseTypeFromText(sigText, interner, typeReg, reporter);
-        if (!sig.valid() || sig == InvalidType) {
+        // and the whole read fails via the errorCount delta below). The BASE
+        // text is decoded even when an override is active (both must be
+        // valid); the EFFECTIVE signature is the active model's.
+        TypeId const baseSig = parseTypeFromText(sigText, interner, typeReg, reporter);
+        if (!baseSig.valid() || baseSig == InvalidType) {
             dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                         DiagnosticSeverity::Error,
                         "shipped-lib descriptor " + at + ": symbol '" + name
@@ -293,6 +356,13 @@ readShippedLibDescriptor(std::filesystem::path const& path,
                               "type ('" + sigText + "') — refusing to synthesize "
                               "an extern with an unresolved signature");
             continue;
+        }
+        TypeId sig = baseSig;
+        if (effectiveSigText != sigText) {
+            sig = parseTypeFromText(effectiveSigText, interner, typeReg, reporter);
+            // Already validated above; a second-parse failure here would be
+            // interner drift — covered by the errorCount delta either way.
+            if (!sig.valid() || sig == InvalidType) continue;
         }
 
         out.symbols.push_back(ShippedSymbol{std::move(name), sig, kind, linkage});

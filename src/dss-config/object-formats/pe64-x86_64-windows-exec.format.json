@@ -9,6 +9,9 @@
     "kind": "pe"
   },
 
+  "$dataModelComment": "FC3 c1: 64-bit Windows is LLP64 (int 32, long 32, long long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I32 here, the literal ladder + descriptor signatureByDataModel resolve their LLP64 arms. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
+  "dataModel": "LLP64",
+
   "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention — same as LK1 ELF ET_EXEC). Real-name resolution closes with D-LK1-1 (HIR→LIR symbol-name thread). D-LK10-ENTRY Slice C (CLOSED 2026-06-02, commit 1a0b414): the linker prepends a synthetic `_start` trampoline as module.functions[0]; the schema's empty entryPoint resolves to functions[0] = the trampoline, which then calls the USER fn (the post-prepend functions[1+]). See plan 14 §2.13 — Stage 1 closed.",
   "entryPoint": "",
   "$externCallDispatchComment": "PE resolves imports through the IAT: the linker points each extern symbol's VA at an .idata POINTER slot, and the call site dereferences it (x86_64 FF 15 disp32 = call [RIP+disp32]). D-FFI-EXTERN-CALL-DISPATCH.",

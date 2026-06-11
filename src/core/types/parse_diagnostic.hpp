@@ -240,6 +240,25 @@ enum class DiagnosticCode : std::uint16_t {
     // S_TypeMismatch (implicit-conversion failures) so tooling can route
     // on the explicit-cast shape.
     S_InvalidCast                 = 0xE010,
+    // FC3 c1: a type-specifier keyword multiset (e.g. C's `unsigned long
+    // int`) with NO matching row in the language's `typeSpecifiers` table.
+    // C's invalid combinations (`unsigned float`, `short long`) reject by
+    // ABSENCE from the declared table — the engine never hardcodes which
+    // combos are legal; the message carries the offending source text.
+    S_InvalidTypeSpecifierCombination = 0xE011,
+    // FC3 c1: an integer literal whose decoded magnitude exceeds the RANGE
+    // of every candidate type in the language's `integerLiteralTyping`
+    // ladder for its (suffix-class × radix-class) — e.g. a decimal literal
+    // above LLONG_MAX in C. Distinct from the decode-tier overflow (a
+    // value that doesn't fit the 64-bit accumulator at all, reported by
+    // the lowering as out-of-range): this is "decodable, but no declared
+    // type can hold it".
+    S_IntegerLiteralTooLarge      = 0xE012,
+    // FC3 c1: the active object format declares a `dataModel` the semantic
+    // tier has no exercised width path for (ILP32 is declared-only on the
+    // wasm/spirv skeleton formats). Fail loud at analysis rather than
+    // silently typing `long`/pointers with untested widths.
+    S_UnsupportedDataModel        = 0xE013,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

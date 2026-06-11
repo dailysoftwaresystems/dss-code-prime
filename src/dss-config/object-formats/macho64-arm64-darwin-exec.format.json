@@ -9,6 +9,9 @@
     "kind": "macho"
   },
 
+  "$dataModelComment": "FC3 c1: 64-bit linux/darwin are LP64 (int 32, long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I64 here. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
+  "dataModel": "LP64",
+
   "$entryPointComment": "Empty defaults to module.functions[0] (cycle-2 convention). LC_MAIN.entryoff is computed as (entry_function_offset_in_.text) — relative to the __TEXT segment start.",
   "entryPoint": "",
   "$externCallDispatchComment": "DIRECT-PLT. Mach-O points each extern symbol's VA at its __stubs STUB (code) — `symbolVa[extern] = stubVa` in macho.cpp — and the stub does the __got indirection internally (ARM64: ADRP x16, page → LDR x16,[x16,#lo12] → BR x16). The call site is therefore a PLAIN DIRECT call (ARM64 `BL imm26`, R_*/ARM64_RELOC_BRANCH26) to the stub, NOT a deref-the-stub-as-pointer. This is the SAME direct-plt model ELF uses; it matches what the trampoline + MIR→LIR `lowerCall` emit (both via `externCallUsesIndirectShape`). ARM64 has no `call_indirect_via_extern` opcode, so direct-plt is also the only lowerable shape. D-FFI-EXTERN-CALL-DISPATCH.",

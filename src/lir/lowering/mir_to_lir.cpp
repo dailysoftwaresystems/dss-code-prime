@@ -503,6 +503,95 @@ struct Lowerer {
         return false;
     }
 
+    // FC3 c1 width gate (D-CSUBSET-32BIT-ALU-FORMS): the integer ALU /
+    // div / shift / compare encodings this backend ships are 64-bit-wide
+    // (REX.W x86 forms / X-register arm64 forms). Computing a type whose
+    // semantics C DEFINES at a narrower width through them would be a
+    // silent MISCOMPILE, not a diagnostic:
+    //   * U8/U16/U32 — unsigned wraparound is DEFINED (0xFFFFFFFFu + 1u
+    //     must be 0); 64-wide compute produces 0x100000000.
+    //   * I8/I16     — same defined-wraparound concern via the
+    //     conversion semantics at their width.
+    //   * I128/U128  — WIDER than the registers; 64-wide compute would
+    //     silently truncate.
+    //   * Bool/Char/Byte — never reach an ALU op in a post-promotion
+    //     language (the UAC block promotes them to the int floor); an
+    //     appearance here means a language without promotion is doing
+    //     sub-int compute — same fail-loud.
+    //   * I32 SIGNED stays ALLOWED: signed overflow is UB in C, so the
+    //     64-wide forms are conforming for every DEFINED I32 program
+    //     (the existing corpus' status quo). I64/U64/Ptr are native.
+    // COMPARISONS gate on their OPERANDS' type (the result is Bool);
+    // Bool-typed compare operands stay allowed — the `!x` lowering's
+    // `ICmpEq(x, 0)` over Bool is width-exact for 0/1 values.
+    // The 32-bit-significant ALU forms (r32 operands) are the c2
+    // upgrade that lifts this gate per-width; until then every gated
+    // appearance fails loud here — the only tier where MIR types are
+    // still visible. Trunc needs no arm: x86 declares `trunc` with NO
+    // encoding and arm64 declares none at all, so any Trunc reaching
+    // codegen already fails loud (A_NoEncodingDeclared /
+    // L_RequiredLirOpcodeMissing).
+    [[nodiscard]] bool requireNativeIntWidth(MirInstId id, MirOpcode op) {
+        auto const gatedKind = [](TypeKind k) noexcept {
+            switch (k) {
+                case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
+                case TypeKind::I8:  case TypeKind::I16:
+                case TypeKind::I128: case TypeKind::U128:
+                case TypeKind::Char: case TypeKind::Byte:
+                    return true;
+                default:
+                    return false;
+            }
+        };
+        auto const fail = [&](TypeId ty, std::string_view what) {
+            dss::report(reporter,
+                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "{}: integer TypeKind ordinal {} has no native-width "
+                    "ALU forms on target '{}' this cycle — the shipped "
+                    "integer encodings compute 64-bit-wide, which would "
+                    "silently violate the type's defined wraparound/"
+                    "comparison semantics (D-CSUBSET-32BIT-ALU-FORMS)",
+                    what, static_cast<unsigned>(interner.kind(ty)),
+                    target.name()));
+            poisonValue(id);
+            return false;
+        };
+        switch (op) {
+            case MirOpcode::Add: case MirOpcode::Sub: case MirOpcode::Mul:
+            case MirOpcode::SDiv: case MirOpcode::UDiv:
+            case MirOpcode::SMod: case MirOpcode::UMod:
+            case MirOpcode::And: case MirOpcode::Or: case MirOpcode::Xor:
+            case MirOpcode::Shl: case MirOpcode::LShr: case MirOpcode::AShr:
+            case MirOpcode::Neg: case MirOpcode::Not: {
+                TypeId const ty = mir.instType(id);
+                // Bool ALU compute is gated too (unreachable post-
+                // promotion; reaching it = sub-int compute).
+                if (ty.valid() && (gatedKind(interner.kind(ty))
+                                   || interner.kind(ty) == TypeKind::Bool)) {
+                    return fail(ty, mirOpcodeName(op));
+                }
+                return true;
+            }
+            case MirOpcode::ICmpEq:  case MirOpcode::ICmpNe:
+            case MirOpcode::ICmpSlt: case MirOpcode::ICmpSle:
+            case MirOpcode::ICmpSgt: case MirOpcode::ICmpSge:
+            case MirOpcode::ICmpUlt: case MirOpcode::ICmpUle:
+            case MirOpcode::ICmpUgt: case MirOpcode::ICmpUge: {
+                for (MirInstId const operand : mir.instOperands(id)) {
+                    TypeId const ty = mir.instType(operand);
+                    if (ty.valid() && gatedKind(interner.kind(ty))) {
+                        return fail(ty, "ICmp operand");
+                    }
+                }
+                return true;
+            }
+            default:
+                return true;
+        }
+    }
+
     // ── diagnostics ──────────────────────────────────────────────────
 
     void reportMissingOpcode(MnemonicSlot slot, std::string_view context) {
@@ -572,6 +661,9 @@ struct Lowerer {
     void lowerInst(MirInstId id) {
         currentMir = id;
         MirOpcode const op = mir.instOpcode(id);
+        // FC3 c1: sub-native integer compute fails loud BEFORE any arm
+        // (D-CSUBSET-32BIT-ALU-FORMS — see requireNativeIntWidth).
+        if (!requireNativeIntWidth(id, op)) return;
         switch (op) {
             case MirOpcode::Arg:    return lowerArg(id);
             case MirOpcode::Const:  return lowerConst(id);

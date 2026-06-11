@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/data_model.hpp"   // DataModel (signatureByDataModel resolution)
 #include "core/types/strong_ids.hpp"   // TypeId
 
 #include <cstdint>
@@ -149,11 +150,22 @@ struct DSS_EXPORT ShippedLibDescriptor {
 //
 // On success the returned descriptor is fully populated and every symbol's
 // `signature` is a valid TypeId in `interner`.
+// FC3 c1 `dataModel`: the ACTIVE format's width triple (threaded from
+// `analyze()`, which is per-(CU × target)). A symbol MAY carry a
+// `signatureByDataModel` object ({"LLP64": "fn(...) -> i32", …} — the
+// Model-3 `library`-map shape) whose entry for the active model REPLACES
+// the base `signature` (the base text is the LP64-correct form). Every
+// declared override must parse — a malformed override fails the read
+// even when its model is not the active one (it would otherwise lurk
+// until that model's first compile). Unknown model keys fail loud.
+// Defaulted for direct-API/unit callers (LP64 = the base-signature
+// identity); the semantic analyzer always passes its threaded model.
 [[nodiscard]] DSS_EXPORT std::optional<ShippedLibDescriptor>
 readShippedLibDescriptor(std::filesystem::path const& path,
                          TypeInterner&                interner,
                          TypeRegistry&                typeReg,
-                         DiagnosticReporter&          reporter);
+                         DiagnosticReporter&          reporter,
+                         DataModel                    dataModel = DataModel::Lp64);
 
 } // namespace ffi
 } // namespace dss

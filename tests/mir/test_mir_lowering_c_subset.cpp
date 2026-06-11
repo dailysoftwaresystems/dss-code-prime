@@ -1730,3 +1730,156 @@ TEST(MirLoweringCSubset, BodyF64LiteralPromotesToAnonymousGlobalPlusLoad) {
     EXPECT_EQ(nF64Load, 2u);
     EXPECT_EQ(nFAdd, 1u);
 }
+
+// ── FC3 c1: UAC materialization pins (plan 23) ──────────────────────────
+//
+// The `arithmeticConversions` block drives the HIR combine sites; these
+// pins assert the MIR consequences: implicit conversions exist as REAL
+// cast instructions and the signedness routing sees the COMMON type.
+
+namespace {
+
+// Count instructions of `op` across the whole module.
+[[nodiscard]] std::size_t countOp(::dss::Mir const& m, ::dss::MirOpcode op) {
+    std::size_t n = 0;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        auto const fn = m.funcAt(f);
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            auto const bb = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(bb); ++i) {
+                if (m.instOpcode(m.blockInstAt(bb, i)) == op) ++n;
+            }
+        }
+    }
+    return n;
+}
+
+// The instType TypeKind of the FIRST instruction of `op` (Void if none).
+[[nodiscard]] ::dss::TypeKind firstOpTypeKind(Lowered const& L,
+                                              ::dss::MirOpcode op) {
+    auto const& m = L.mir.mir;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        auto const fn = m.funcAt(f);
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            auto const bb = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(bb); ++i) {
+                auto const inst = m.blockInstAt(bb, i);
+                if (m.instOpcode(inst) == op) {
+                    auto const ty = m.instType(inst);
+                    return ty.valid()
+                        ? L.model.lattice().interner().kind(ty)
+                        : ::dss::TypeKind::Void;
+                }
+            }
+        }
+    }
+    return ::dss::TypeKind::Void;
+}
+
+} // namespace
+
+// `long > unsigned long` (same width, mixed signedness): C 6.3.1.8 says
+// the UNSIGNED type wins — the compare must be ICmpUgt over U64 with the
+// signed operand converted by an EXPLICIT cast (same-width I64→U64 is a
+// Bitcast). RED-on-disable: breaking the mixed-signedness verb (or the
+// comparison promotion) routes this through ICmpSgt — asserted absent.
+TEST(MirLoweringCSubset, MixedSignCompareLowersUnsignedWithExplicitCast) {
+    auto L = lowerCSubset(
+        "int cmp(long s, unsigned long u) { if (s > u) { return 1; } "
+        "return 0; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(countOp(m, MirOpcode::ICmpUgt), 1u)
+        << "mixed I64/U64 compare must route UNSIGNED (C 6.3.1.8)";
+    EXPECT_EQ(countOp(m, MirOpcode::ICmpSgt), 0u)
+        << "a signed compare here is the UAC-disabled miscompile shape";
+    EXPECT_EQ(countOp(m, MirOpcode::Bitcast), 1u)
+        << "the I64 operand's conversion to U64 must be a REAL cast inst";
+}
+
+// `char + 1` promotes char to int (the `alsoPromote` config row): the
+// Add computes at I32 and the char operand is widened by a REAL SExt.
+TEST(MirLoweringCSubset, CharPlusIntPromotesToI32WithSExt) {
+    auto L = lowerCSubset("int f(char c) { return c + 1; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    EXPECT_EQ(firstOpTypeKind(L, MirOpcode::Add), TypeKind::I32);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::SExt), 1u)
+        << "char (signed, sub-int) widens to the promotion floor by SExt";
+}
+
+// `short + short` integer-promotes BOTH operands to int (value-
+// preserving); the Add computes at I32, never at I16.
+TEST(MirLoweringCSubset, ShortPlusShortPromotesToI32) {
+    auto L = lowerCSubset("int f(short a, short b) { return a + b; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    EXPECT_EQ(firstOpTypeKind(L, MirOpcode::Add), TypeKind::I32);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::SExt), 2u);
+}
+
+// Mixed I32 + U64: the wider unsigned type wins; the I32 operand
+// sign-extends (its own value semantics) into the U64 compute.
+TEST(MirLoweringCSubset, MixedI32U64AddComputesU64) {
+    auto L = lowerCSubset(
+        "unsigned long long f(int a, unsigned long long b) "
+        "{ return a + b; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    EXPECT_EQ(firstOpTypeKind(L, MirOpcode::Add), TypeKind::U64);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::SExt), 1u);
+}
+
+// Shifts under the block follow C 6.5.7: the result type is the PROMOTED
+// LEFT operand — `u64 >> int` stays U64 (LShr, not AShr) and the int
+// count does NOT widen the result.
+//
+// NOTE (pre-existing heuristic, surfaced by FC3's mixed-operand shifts):
+// `return v >> n;` would spuriously S_ReturnTypeMismatch — the semantic
+// tier's `subtreeType` descends an INFIX wrapper to a LEAF (DFS reaches
+// the rightmost `n`, I32) because pass 2 has no binary-expression typing
+// arm yet (D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS, full closure
+// pending). Heterogeneous-operand expressions in checked positions bind
+// through a local until that closure.
+TEST(MirLoweringCSubset, ShiftResultIsPromotedLeftOperand) {
+    auto L = lowerCSubset(
+        "unsigned long long f(unsigned long long v, int n) "
+        "{ unsigned long long r; r = v >> n; return r; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    EXPECT_EQ(firstOpTypeKind(L, MirOpcode::LShr), TypeKind::U64);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::AShr), 0u)
+        << "an unsigned left operand must never route arithmetic-shift";
+}
+
+// `true`/`false` keyword literals carry their config-declared FIXED
+// values (1/0) — never a decode of the keyword text (which would be 0
+// for both). The function pair returns 1 and 0 via the literals.
+TEST(MirLoweringCSubset, BoolKeywordLiteralsCarryFixedValues) {
+    auto L = lowerCSubset(
+        "bool t() { return true; }\n"
+        "bool f() { return false; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+    bool sawTrue = false;
+    bool sawFalse = false;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        auto const fn = m.funcAt(f);
+        auto const bb = m.funcEntry(fn);
+        for (std::uint32_t i = 0; i < m.blockInstCount(bb); ++i) {
+            auto const inst = m.blockInstAt(bb, i);
+            if (m.instOpcode(inst) != MirOpcode::Const) continue;
+            auto const& lit = m.literalValue(m.instPayload(inst));
+            if (auto const* v = std::get_if<std::int64_t>(&lit.value)) {
+                if (*v == 1) sawTrue = true;
+                if (*v == 0) sawFalse = true;
+            }
+        }
+    }
+    EXPECT_TRUE(sawTrue)  << "true must lower as the fixed value 1";
+    EXPECT_TRUE(sawFalse) << "false must lower as the fixed value 0";
+}

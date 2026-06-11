@@ -367,6 +367,7 @@ TEST(MachOArm64Exit, IndirectSlotDispatchOnMachOFailsLoud) {
     // the stub on every cputype).
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-indirect-bad","kind":"macho"},
       "entryPoint": "",
       "externCallDispatch": "indirect-slot",
@@ -562,6 +563,7 @@ TEST(MachOArm64Exit, SegmentPageSizeNonPowerOfTwoFailsLoud) {
     // power of two; alignUp() would corrupt the layout. Must reject.
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-badpage","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },
@@ -597,6 +599,7 @@ TEST(MachOArm64Exit, SegmentPageSizeNonPowerOfTwoFailsLoud) {
 TEST(MachOArm64Exit, TextVaNotCongruentTo16KPageFailsLoud) {
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-badva","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },

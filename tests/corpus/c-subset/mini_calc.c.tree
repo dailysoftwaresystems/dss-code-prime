@@ -4,7 +4,8 @@ rule:root
       tok:"extern"
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"printf"
       rule:externTail
         rule:externFuncTail
@@ -13,7 +14,8 @@ rule:root
             rule:param
               rule:typeRefAllowingStruct
                 rule:typeBaseAllowingStruct
-                  tok:"int"
+                  rule:typeSpecifierSeq
+                    tok:"int"
               tok:"fmt"
           tok:")"
           tok:";"
@@ -21,7 +23,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"g_iter_count"
       rule:topLevelDeclTail
         rule:varDeclTail
@@ -35,7 +38,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"g_buffer"
       rule:topLevelDeclTail
         rule:varDeclTail
@@ -50,7 +54,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"g_pending"
       rule:topLevelDeclTail
         rule:varDeclTail
@@ -62,7 +67,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"square"
       rule:topLevelDeclTail
         rule:funcDefTail
@@ -72,7 +78,8 @@ rule:root
               rule:param
                 rule:typeRefAllowingStruct
                   rule:typeBaseAllowingStruct
-                    tok:"int"
+                    rule:typeSpecifierSeq
+                      tok:"int"
                 tok:"x"
             tok:")"
           rule:block
@@ -93,7 +100,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"add"
       rule:topLevelDeclTail
         rule:funcDefTail
@@ -103,14 +111,16 @@ rule:root
               rule:param
                 rule:typeRefAllowingStruct
                   rule:typeBaseAllowingStruct
-                    tok:"int"
+                    rule:typeSpecifierSeq
+                      tok:"int"
                 tok:"a"
               tok:","
               rule:paramOrEllipsis
                 rule:param
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"b"
             tok:")"
           rule:block
@@ -131,7 +141,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"max3"
       rule:topLevelDeclTail
         rule:funcDefTail
@@ -141,21 +152,24 @@ rule:root
               rule:param
                 rule:typeRefAllowingStruct
                   rule:typeBaseAllowingStruct
-                    tok:"int"
+                    rule:typeSpecifierSeq
+                      tok:"int"
                 tok:"a"
               tok:","
               rule:paramOrEllipsis
                 rule:param
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"b"
               tok:","
               rule:paramOrEllipsis
                 rule:param
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"c"
             tok:")"
           rule:block
@@ -241,7 +255,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"sum_array"
       rule:topLevelDeclTail
         rule:funcDefTail
@@ -251,14 +266,16 @@ rule:root
               rule:param
                 rule:typeRefAllowingStruct
                   rule:typeBaseAllowingStruct
-                    tok:"int"
+                    rule:typeSpecifierSeq
+                      tok:"int"
                 tok:"arr"
               tok:","
               rule:paramOrEllipsis
                 rule:param
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"len"
             tok:")"
           rule:block
@@ -268,7 +285,8 @@ rule:root
                 rule:varDeclHead
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"total"
                   tok:"="
                   rule:initValue
@@ -281,7 +299,8 @@ rule:root
                 rule:varDeclHead
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"i"
                   tok:"="
                   rule:initValue
@@ -345,7 +364,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"fact"
       rule:topLevelDeclTail
         rule:funcDefTail
@@ -355,7 +375,8 @@ rule:root
               rule:param
                 rule:typeRefAllowingStruct
                   rule:typeBaseAllowingStruct
-                    tok:"int"
+                    rule:typeSpecifierSeq
+                      tok:"int"
                 tok:"n"
             tok:")"
           rule:block
@@ -410,7 +431,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"fib"
       rule:topLevelDeclTail
         rule:funcDefTail
@@ -420,7 +442,8 @@ rule:root
               rule:param
                 rule:typeRefAllowingStruct
                   rule:typeBaseAllowingStruct
-                    tok:"int"
+                    rule:typeSpecifierSeq
+                      tok:"int"
                 tok:"n"
             tok:")"
           rule:block
@@ -486,7 +509,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"abs_int"
       rule:topLevelDeclTail
         rule:funcDefTail
@@ -496,7 +520,8 @@ rule:root
               rule:param
                 rule:typeRefAllowingStruct
                   rule:typeBaseAllowingStruct
-                    tok:"int"
+                    rule:typeSpecifierSeq
+                      tok:"int"
                 tok:"x"
             tok:")"
           rule:block
@@ -538,7 +563,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"bit_count"
       rule:topLevelDeclTail
         rule:funcDefTail
@@ -548,7 +574,8 @@ rule:root
               rule:param
                 rule:typeRefAllowingStruct
                   rule:typeBaseAllowingStruct
-                    tok:"int"
+                    rule:typeSpecifierSeq
+                      tok:"int"
                 tok:"value"
             tok:")"
           rule:block
@@ -558,7 +585,8 @@ rule:root
                 rule:varDeclHead
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"count"
                   tok:"="
                   rule:initValue
@@ -571,7 +599,8 @@ rule:root
                 rule:varDeclHead
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"v"
                   tok:"="
                   rule:initValue
@@ -660,7 +689,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"load_indirect"
       rule:topLevelDeclTail
         rule:funcDefTail
@@ -670,7 +700,8 @@ rule:root
               rule:param
                 rule:typeRefAllowingStruct
                   rule:typeBaseAllowingStruct
-                    tok:"int"
+                    rule:typeSpecifierSeq
+                      tok:"int"
                 tok:"ptr"
             tok:")"
           rule:block
@@ -689,7 +720,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"min"
       rule:topLevelDeclTail
         rule:funcDefTail
@@ -699,14 +731,16 @@ rule:root
               rule:param
                 rule:typeRefAllowingStruct
                   rule:typeBaseAllowingStruct
-                    tok:"int"
+                    rule:typeSpecifierSeq
+                      tok:"int"
                 tok:"a"
               tok:","
               rule:paramOrEllipsis
                 rule:param
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"b"
             tok:")"
           rule:block
@@ -746,7 +780,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"clamp"
       rule:topLevelDeclTail
         rule:funcDefTail
@@ -756,21 +791,24 @@ rule:root
               rule:param
                 rule:typeRefAllowingStruct
                   rule:typeBaseAllowingStruct
-                    tok:"int"
+                    rule:typeSpecifierSeq
+                      tok:"int"
                 tok:"x"
               tok:","
               rule:paramOrEllipsis
                 rule:param
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"lo"
               tok:","
               rule:paramOrEllipsis
                 rule:param
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"hi"
             tok:")"
           rule:block
@@ -813,7 +851,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"saturating_add"
       rule:topLevelDeclTail
         rule:funcDefTail
@@ -823,21 +862,24 @@ rule:root
               rule:param
                 rule:typeRefAllowingStruct
                   rule:typeBaseAllowingStruct
-                    tok:"int"
+                    rule:typeSpecifierSeq
+                      tok:"int"
                 tok:"a"
               tok:","
               rule:paramOrEllipsis
                 rule:param
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"b"
               tok:","
               rule:paramOrEllipsis
                 rule:param
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"limit"
             tok:")"
           rule:block
@@ -847,7 +889,8 @@ rule:root
                 rule:varDeclHead
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"s"
                   tok:"="
                   rule:initValue
@@ -921,7 +964,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"compose_calc"
       rule:topLevelDeclTail
         rule:funcDefTail
@@ -931,21 +975,24 @@ rule:root
               rule:param
                 rule:typeRefAllowingStruct
                   rule:typeBaseAllowingStruct
-                    tok:"int"
+                    rule:typeSpecifierSeq
+                      tok:"int"
                 tok:"a"
               tok:","
               rule:paramOrEllipsis
                 rule:param
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"b"
               tok:","
               rule:paramOrEllipsis
                 rule:param
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"c"
             tok:")"
           rule:block
@@ -955,7 +1002,8 @@ rule:root
                 rule:varDeclHead
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"t1"
                   tok:"="
                   rule:initValue
@@ -986,7 +1034,8 @@ rule:root
                 rule:varDeclHead
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"t2"
                   tok:"="
                   rule:initValue
@@ -1017,7 +1066,8 @@ rule:root
                 rule:varDeclHead
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"t3"
                   tok:"="
                   rule:initValue
@@ -1052,7 +1102,8 @@ rule:root
     rule:topLevelDecl
       rule:typeRef
         rule:typeBase
-          tok:"int"
+          rule:typeSpecifierSeq
+            tok:"int"
       tok:"main"
       rule:topLevelDeclTail
         rule:funcDefTail
@@ -1066,7 +1117,8 @@ rule:root
                 rule:varDeclHead
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"arr"
                 tok:";"
             rule:statement
@@ -1074,7 +1126,8 @@ rule:root
                 rule:varDeclHead
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"local_buf"
                   rule:arrayDeclSuffix
                     tok:"["
@@ -1088,7 +1141,8 @@ rule:root
                 rule:varDeclHead
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"sum"
                   tok:"="
                   rule:initValue
@@ -1128,7 +1182,8 @@ rule:root
                 rule:varDeclHead
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"m"
                   tok:"="
                   rule:initValue
@@ -1170,7 +1225,8 @@ rule:root
                 rule:varDeclHead
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"c"
                   tok:"="
                   rule:initValue
@@ -1198,7 +1254,8 @@ rule:root
                 rule:varDeclHead
                   rule:typeRefAllowingStruct
                     rule:typeBaseAllowingStruct
-                      tok:"int"
+                      rule:typeSpecifierSeq
+                        tok:"int"
                   tok:"s"
                   tok:"="
                   rule:initValue

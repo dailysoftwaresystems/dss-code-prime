@@ -82,6 +82,7 @@ namespace {
                                              unsigned pageSize = 4096) {
     return std::string(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-cs-adhoc","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
@@ -298,6 +299,7 @@ namespace {
 [[nodiscard]] std::string codeSignSchemaRaw(char const* csBody) {
     return std::string(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-cs-bad","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -384,6 +386,7 @@ TEST(MachOAdHocCodeSign, ObjectFiletypeWithCodeSignatureFailsLoud) {
     // MH_EXECUTE image; a MH_OBJECT carrying it is a config error.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-obj-with-cs","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "object", "flags": 0 },
       "image": { "codeSignature": { "kind": "adhoc", "hashAlgorithm": "sha256", "identifier": "x" } },

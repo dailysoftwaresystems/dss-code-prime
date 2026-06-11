@@ -259,6 +259,155 @@ namespace detail::type_rules {
     return InvalidType;
 }
 
+// ── FC3 c1: config-driven usual arithmetic conversions (C 6.3.1.8) ──────
+//
+// The `arithmeticConversions` SemanticConfig block, RESOLVED for the
+// active DataModel (the load-resolved `DataModelTypeRef`s collapse to
+// concrete TypeKinds here, once per (schema × dataModel)). Consumed by
+// the CST→HIR combine sites (binary / ternary / compound-assign): a
+// language WITH the block runs `usualArithmeticCommonType` below; a
+// language WITHOUT it keeps the legacy `TypeInterner::commonType`
+// EXACTLY (toy/tsql — pinned by their typing-unchanged tests). The
+// engine never hardcodes C's view of int/char/bool — the promotion
+// floor, the extra promoted kinds, and the mixed-signedness verb are all
+// declared by the language and validated fail-loud at load.
+struct ResolvedArithmeticRules {
+    TypeKind              minRank = TypeKind::I32;  // promotion floor kind
+    std::vector<TypeKind> alsoPromote;              // out-of-lattice promoted kinds
+    MixedSignednessRule   mixedSignedness = MixedSignednessRule::RankPreferUnsigned;
+    bool                  promoteComparisons = true;
+};
+
+[[nodiscard]] inline ResolvedArithmeticRules
+resolveArithmeticRules(ArithmeticConversions const& cfg, DataModel dm) {
+    ResolvedArithmeticRules out;
+    out.minRank = cfg.minRankType.resolveCore(dm);
+    out.alsoPromote.reserve(cfg.alsoPromote.size());
+    for (auto const& p : cfg.alsoPromote) out.alsoPromote.push_back(p.resolveCore(dm));
+    out.mixedSignedness    = cfg.mixedSignedness;
+    out.promoteComparisons = cfg.promoteComparisons;
+    return out;
+}
+
+namespace detail::type_rules {
+
+// Width rank of any core integer kind (signed or unsigned): 1..5 for
+// 8..128 bits; 0 = outside the integer rank lattice.
+[[nodiscard]] inline constexpr int intWidthRank(TypeKind k) noexcept {
+    int const s = signedIntRank(k);
+    return s != 0 ? s : unsignedIntRank(k);
+}
+
+// Inverse mapper: the canonical kind at (width rank, signedness).
+[[nodiscard]] inline constexpr TypeKind kindAtRank(int rank, bool isSigned) noexcept {
+    switch (rank) {
+        case 1: return isSigned ? TypeKind::I8   : TypeKind::U8;
+        case 2: return isSigned ? TypeKind::I16  : TypeKind::U16;
+        case 3: return isSigned ? TypeKind::I32  : TypeKind::U32;
+        case 4: return isSigned ? TypeKind::I64  : TypeKind::U64;
+        case 5: return isSigned ? TypeKind::I128 : TypeKind::U128;
+        default: return TypeKind::Void;
+    }
+}
+
+// Integer promotion (C 6.3.1.8 step 1, parameterized): a kind in the
+// rules' `alsoPromote` set, or one whose width rank is BELOW the floor's,
+// promotes to the floor kind (value-preserving: every promoted kind's
+// range fits the floor — C's Bool/Char/I8..U16 all fit int). Kinds at or
+// above the floor — and kinds outside the lattice that the language did
+// NOT list (pointers, structs, floats) — pass through unchanged.
+[[nodiscard]] inline TypeKind
+promoteIntegerKind(TypeKind k, ResolvedArithmeticRules const& rules) noexcept {
+    for (TypeKind p : rules.alsoPromote) {
+        if (p == k) return rules.minRank;
+    }
+    int const r     = intWidthRank(k);
+    int const floor = intWidthRank(rules.minRank);
+    if (r != 0 && r < floor) return rules.minRank;
+    return k;
+}
+
+} // namespace detail::type_rules
+
+// The C 6.3.1.8 common type of two operands under the language's
+// declared rules — the config-driven sibling of
+// `TypeInterner::commonType` (which keeps serving block-less languages
+// byte-identically). Returns InvalidType for non-arithmetic pairs (the
+// caller falls back to its structural rule, exactly the commonType
+// contract). Algorithm:
+//   1. float hierarchy: if either operand is float, BOTH must be
+//      arithmetic; the result is the wider float (int converts to the
+//      float side).
+//   2. integer promotion per `promoteIntegerKind` (floor + alsoPromote).
+//   3. same kind → it; same signedness → wider rank; mixed signedness
+//      per the closed verb. `rank-prefer-unsigned` (C): unsigned rank ≥
+//      signed rank → the unsigned kind at its rank; else the signed kind
+//      (a strictly-wider power-of-two signed type represents the whole
+//      unsigned range, so C's third branch — "the unsigned counterpart
+//      of the signed type" — is unreachable over width-distinct core
+//      kinds; it exists only for same-width different-rank ABO types).
+[[nodiscard]] inline TypeId
+usualArithmeticCommonType(TypeInterner& interner, TypeId a, TypeId b,
+                          ResolvedArithmeticRules const& rules) {
+    if (!a.valid() || !b.valid()) return InvalidType;
+    using namespace detail::type_rules;
+    TypeKind const ka = interner.kind(a);
+    TypeKind const kb = interner.kind(b);
+    auto const isArith = [&](TypeKind k) noexcept {
+        if (floatRank(k) != 0 || intWidthRank(k) != 0) return true;
+        for (TypeKind p : rules.alsoPromote) {
+            if (p == k) return true;
+        }
+        return false;
+    };
+    int const fa = floatRank(ka);
+    int const fb = floatRank(kb);
+    if (fa != 0 || fb != 0) {
+        if (!isArith(ka) || !isArith(kb)) return InvalidType;
+        if (fa != 0 && fb != 0) return fa >= fb ? a : b;
+        return fa != 0 ? a : b;
+    }
+    TypeKind const pa = promoteIntegerKind(ka, rules);
+    TypeKind const pb = promoteIntegerKind(kb, rules);
+    int const ra = intWidthRank(pa);
+    int const rb = intWidthRank(pb);
+    if (ra == 0 || rb == 0) return InvalidType;   // not arithmetic
+    if (pa == pb) return interner.primitive(pa);
+    bool const sa = signedIntRank(pa) != 0;
+    bool const sb = signedIntRank(pb) != 0;
+    if (sa == sb) {
+        return interner.primitive(kindAtRank(ra >= rb ? ra : rb, sa));
+    }
+    // Mixed signedness — closed verb (loader rejects unknown spellings,
+    // so this switch is exhaustive over the declared vocabulary).
+    switch (rules.mixedSignedness) {
+        case MixedSignednessRule::RankPreferUnsigned: {
+            int const  uRank = sa ? rb : ra;
+            int const  sRank = sa ? ra : rb;
+            if (uRank >= sRank) {
+                return interner.primitive(kindAtRank(uRank, /*isSigned=*/false));
+            }
+            return interner.primitive(kindAtRank(sRank, /*isSigned=*/true));
+        }
+    }
+    return InvalidType;
+}
+
+// One operand's integer promotion as a TypeId (C 6.5.7: a SHIFT's result
+// type is the PROMOTED LEFT operand — the count's type never
+// contributes). Non-arithmetic and float operands pass through.
+[[nodiscard]] inline TypeId
+integerPromotedType(TypeInterner& interner, TypeId t,
+                    ResolvedArithmeticRules const& rules) {
+    if (!t.valid()) return t;
+    using namespace detail::type_rules;
+    TypeKind const k = interner.kind(t);
+    if (floatRank(k) != 0) return t;
+    TypeKind const p = promoteIntegerKind(k, rules);
+    if (p == k) return t;
+    return interner.primitive(p);
+}
+
 // Compile-time sanity: the rank functions are pure (constexpr) and the
 // widening order matches the documented chain.
 static_assert(detail::type_rules::signedIntRank(TypeKind::I8) == 1);

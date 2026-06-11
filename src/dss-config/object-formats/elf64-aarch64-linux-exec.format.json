@@ -9,6 +9,9 @@
     "kind": "elf"
   },
 
+  "$dataModelComment": "FC3 c1: 64-bit linux/darwin are LP64 (int 32, long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I64 here. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
+  "dataModel": "LP64",
+
   "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention). Once D-LK1-1 closes (real symbol-name thread through HIR→LIR→AssembledFunction), this field will name the entry symbol and the walker will resolve it by name.",
   "entryPoint": "",
   "$externCallDispatchComment": "ELF resolves imports through the PLT: the linker synthesizes a 16-byte ARM64 PLT stub per extern (ADRP+LDR+BR+NOP through the GOT slot) and points the extern symbol's VA at the STUB, so the call site is a PLAIN DIRECT call (BL imm26 to the stub, R_AARCH64_CALL26). No inline ADRP+LDR+BLR macro-op is needed at the call site -- the stub does the GOT indirection. D-FFI-EXTERN-CALL-DISPATCH.",
