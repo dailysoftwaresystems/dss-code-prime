@@ -14,10 +14,16 @@
 // manifest — the c1 datamodel_long_width / _llp64 split discipline.)
 //
 // The `x + one` sum mixes `int` into `unsigned long`, so the SAME line
-// also witnesses the divergent UAC conversion: under LLP64 the int
-// converts by same-width Bitcast; under LP64 it SIGN-EXTENDS
-// (I32 -> I64 SExt = x86 movsxd / arm64 SXTW — the c2-new arm64
-// opcode's end-to-end consumer).
+// also EXERCISES the divergent UAC conversion (LLP64 same-width
+// Bitcast; LP64 I32 -> I64 SExt = x86 movsxd / arm64 SXTW — the
+// c2-new arm64 opcode's end-to-end consumer). HONEST REACH
+// (audit-residue sweep c2, D-AUDIT-WITNESS-STRENGTHENING): the
+// instruction EXECUTES on every LP64 run, but the converted operand
+// is 1, where SExt == ZExt — the conversion DIRECTION is runtime-
+// invisible here; it is MIR/asm-pinned (the c2 threading pins). What
+// this example RUNTIME-witnesses is the WIDTH divergence above. A
+// sign-extension runtime witness (negative converted operand) belongs
+// to a future conversions example.
 //
 // **Width red-on-disable (the runtime lever)**: force the width axis
 // to 64 (or strip the 32-bit add variants) and the LLP64 arm computes

@@ -25,5 +25,8 @@
       "runOn": ["darwin"],
       "emulator": ""
     }
+  ],
+  "optimizedPipelines": [
+    { "label": "constfold-only", "passes": ["ConstFold"] }
   ]
 }

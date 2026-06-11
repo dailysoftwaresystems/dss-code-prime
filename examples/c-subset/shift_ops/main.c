@@ -18,8 +18,15 @@
 //           peephole).
 //
 // Discriminators baked into the arithmetic:
-//   * `(0 - 64) >> 4` MUST be -4 (arithmetic/sign-fill). A
-//     logical-shift misroute yields a huge positive -> exit wrong.
+//   * `(0 - 64) >> 4` MUST be -4 (arithmetic/sign-fill). HONEST REACH
+//     (audit-residue sweep c2, D-AUDIT-WITNESS-STRENGTHENING): a
+//     logical-shift misroute yields 0x0FFFFFFC — huge positive, but
+//     its ADDITIVE delta vs -4 is exactly 2^28 ≡ 0 mod 256, so the
+//     SUM-routed exit aliases back to 42 under POSIX WEXITSTATUS;
+//     this term discriminates on Windows (full 32-bit exit) only.
+//     The every-leg runtime guarantee is the BRANCH-observed
+//     sar_branch() arm below; the encodings themselves are byte-
+//     pinned at the asm tier.
 //   * `u >> (n + 5)` over unsigned MUST zero-fill at 32 bits.
 //   * swapped operand wiring (count<->value) or a count-pin landing
 //     on the wrong register derails every term.
@@ -72,6 +79,26 @@ int pressured(int x, int n) {               // called as pressured(5, 3)
              + a9 - 111;                    // 40+5+3+105-111 = 42
 }
 
+// BRANCH-observed SAR witness (audit-residue sweep c2,
+// D-AUDIT-WITNESS-STRENGTHENING): collapses the SAR-vs-SHR divergence
+// into a SIGN TEST instead of an additive delta, so it discriminates
+// on EVERY leg (the shifty() sum-term aliases mod 256 — above).
+// x = -64 and n = 3 arrive as runtime args (fold-resistant):
+//   arithmetic  x >> n = -8           -> negative -> 42-path
+//   logical SHR/LSRV   = 0x1FFFFFF8   -> positive -> exit 7
+// The nested probe repeats the test on the imm8-count form
+// (C1 /7 ib; arm64 materialized count): -64 >> 4 = -4 vs 0x0FFFFFFC.
+// 42 vs 7 (delta 35 ≢ 0 mod 256) survives WEXITSTATUS on every leg.
+int sar_branch(int x, int n) {              // called as sar_branch(0 - 64, 3)
+    if ((x >> n) < 0) {                     // variable-count SAR (D3 /7 CL; ASRV)
+        if ((x >> 4) < 0) {                 // imm8-count SAR (C1 /7 ib)
+            return 42;
+        }
+    }
+    return 7;
+}
+
 int main() {
-    return shifty(5, 3) + pressured(5, 3) - 42;  // 42+42-42 = 42
+    return shifty(5, 3) + pressured(5, 3) + sar_branch(0 - 64, 3)
+             - 84;                          // 42+42+42-84 = 42
 }

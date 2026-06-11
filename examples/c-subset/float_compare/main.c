@@ -17,12 +17,21 @@
 // the call sites in main) — an intraprocedural pass never sees a
 // comparable constant pair, and MIR ConstFold is int-only today.
 //
-// The sum discriminates each predicate independently:
+// The sum's observations:
 //   lt(1.5,2.5)=1  lt(2.5,1.5)=0  gt(2.5,1.5)=1  ge(2.5,2.5)=1
 //   le(1.5,2.5)=1  eq(2.5,2.5)=1  ne(1.5,2.5)=1  eq(1.5,2.5)=0
-// total = 6 → exit 42; ANY wrong predicate shifts the sum (a flipped
-// branch adds/drops exactly one unit; the +100 tail separates "wrong
-// count" from "happened to be 6").
+// total = 6 → exit 42 (the +100 tail separates "wrong count" from
+// "happened to be 6"). HONEST REACH (audit-residue sweep c2,
+// D-AUDIT-WITNESS-STRENGTHENING): the sum catches SOME misroutes,
+// not all — a POLARITY INVERSION of a predicate observed with both
+// outcomes here (lt, eq) flips both of its calls and is SUM-NEUTRAL,
+// and an adjacent-predicate slip (e.g. lt→le) is invisible without
+// an equal-operand probe on that slot. The EXHAUSTIVE per-predicate
+// guarantee is the 56-cell truth-table pin (7 predicates × 4 operand
+// outcomes × 2 targets vs an independent SDM/ARM-ARM flag simulator,
+// tests/lir/test_fcmp_lowering.cpp); what THIS corpus witnesses
+// end-to-end is the branch plumbing of both realization families on
+// live hardware.
 int lt(double a, double b) { if (a < b)  return 1; return 0; }
 int gt(double a, double b) { if (a > b)  return 1; return 0; }
 int ge(double a, double b) { if (a >= b) return 1; return 0; }

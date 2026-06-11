@@ -22,15 +22,26 @@
 //   narrow(41.75)     = 41.75f          (CVTSD2SS)
 //   (int)(41.75f + 0.25f) = (int)42.0f  = 42  (ADDSS + CVTTSS2SI)
 //
-// A width mix-up is value-visible: computing the chain at the wrong
-// precision cannot round these exact values away, but selecting the
-// WRONG conversion direction (the fpcvt source-width axis) swaps
-// widen/narrow and the chain type-breaks at the callconv boundary —
-// while a movss/movsd width slip on the 4-byte rodata items reads
-// the neighboring item's bytes into the high half (the value stays
-// correct only because consumers read the low 4 bytes; the
-// boundary-fault hazard is the reason the width axis exists — pinned
-// at the byte tier, witnessed here as plumbing).
+// HONEST REACH of the exact chain (audit-residue sweep c2,
+// D-AUDIT-WITNESS-STRENGTHENING): BECAUSE every value is exact in
+// both binary32 and binary64, computing the whole chain at the wrong
+// precision (an all-F64 misinterpretation — a broken width axis)
+// would still exit 42 — the chain witnesses the PLUMBING (loads,
+// conversions, callconv), not the precision. The PRECISION witness is
+// the round_away() arm below: 2^24 + 1 is the first integer binary32
+// cannot represent, so under a true ADDSS/FADD-S the +1.0f rounds
+// away (round-to-nearest-even -> 16777216.0f) and the result EQUALS
+// big, while a double-precision add holds 16777217.0 exactly and the
+// equality flips -> exit 7 (42 vs 7, delta 35, WEXITSTATUS-safe).
+// The 16777216.0f literal rides the F32 rodata materialization path
+// (float literals are never inline int32 consts), and the F32 `==`
+// rides the width-32 fcmp variants (UCOMISS / FCMP Sn,Sm).
+// Selecting the WRONG conversion direction (the fpcvt source-width
+// axis) still type-breaks the chain at the callconv boundary, and a
+// movss/movsd width slip on the 4-byte rodata items reads the
+// neighboring item's bytes into the high half (the boundary-fault
+// hazard is the reason the width axis exists — pinned at the byte
+// tier).
 //
 // Fold-resistance: float operands arrive as FUNCTION PARAMETERS;
 // MIR ConstFold is int-only today, and the cast result crosses a
@@ -41,9 +52,19 @@ double widen(float f) { return f + 0.5; }
 
 float narrow(double d) { return (float)d; }
 
+// The binary32 ROUNDING discriminator: big + 1.0f at single precision
+// rounds the +1 away (ties-to-even at the 2^24 representability
+// edge); at double precision it does not. The operand arrives as a
+// FUNCTION PARAMETER (fold-resistant, like every arm above).
+float round_away(float big) { return big + 1.0f; }
+
 int main() {
     float s = add(40.25f, 1.0f);
     double w = widen(s);
     float n = narrow(w);
-    return (int)(n + 0.25f);
+    float big = 16777216.0f;                 // 2^24, exact in binary32
+    if (round_away(big) == big) {            // true ONLY at binary32
+        return (int)(n + 0.25f);             // the exact-chain 42
+    }
+    return 7;                                // double-precision add leaked in
 }
