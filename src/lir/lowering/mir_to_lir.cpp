@@ -545,10 +545,13 @@ struct Lowerer {
     //     32-to-64 zero-extend realization (`mov r32,r32`, already
     //     declared) lands with its first consumer
     //     (D-CSUBSET-ZEXT-32-TO-64).
-    // Shifts/bitwise: Shl/LShr/AShr (all widths) and x86 And/Or/Xor/
-    // Not have NO encodings at all — they pass this TYPE gate at
-    // 32/64 and fail loud at the assembler (A_NoEncodingDeclared),
-    // the pre-existing width-independent wall.
+    // Shifts (FC3.5 sweep-c1): Shl/LShr/AShr are now ENCODED at both
+    // widths (x86 D3/C1 CL+imm8 forms via the implicit-count "count"
+    // role contract; arm64 LSLV/LSRV/ASRV X+W forms) — they pass this
+    // TYPE gate at 32/64 and lower through `lowerShift`. Bitwise: x86
+    // And/Or/Xor/Not still have NO encodings — they pass the gate and
+    // fail loud at the assembler (A_NoEncodingDeclared), the
+    // pre-existing width-independent wall.
     [[nodiscard]] bool requireNativeIntWidth(MirInstId id, MirOpcode op) {
         auto const gatedKind = [](TypeKind k) noexcept {
             switch (k) {
@@ -651,16 +654,30 @@ struct Lowerer {
                 return true;
             }
             case MirOpcode::ZExt: {
-                // Source-width gate: the shipped zext reads a BYTE
-                // source on x86 (movzx r64, r/m8) — only the Bool
-                // 0/1 producer is realized.
+                // Source-width gate (FC3.5 sweep-c1 widened —
+                // D-CSUBSET-ZEXT-32-TO-64 closed): TWO source shapes
+                // are realized, discriminated by the SOURCE type's
+                // width on the LIR inst (see the ZExt dispatch arm):
+                //   * Bool — the byte widener (x86 movzx r64, r/m8;
+                //     arm64 W-ORR mov over a 0/1 register);
+                //   * U32  — the 32-to-64 zero-extend (x86
+                //     `mov r32, r32` width-32 form, auto-zero-
+                //     extending; arm64 the SAME W-ORR word — a
+                //     W-register write zeroes the upper 32 bits).
+                // An I32 source stays REJECTED: C's I32→wider
+                // conversion sign-extends (mapCast routes it to SExt);
+                // a ZExt-from-I32 reaching here is a lowering bug, not
+                // a missing realization. U8/U16/Char sources through
+                // the x86 byte-form would read one byte of a wider
+                // value — fail loud until their forms are encoded.
                 auto const operands = mir.instOperands(id);
                 if (!operands.empty()) {
                     TypeId const ty = mir.instType(operands[0]);
                     if (ty.valid()
-                        && interner.kind(ty) != TypeKind::Bool) {
+                        && interner.kind(ty) != TypeKind::Bool
+                        && interner.kind(ty) != TypeKind::U32) {
                         return failConv(ty, "ZExt source",
-                                        "the Bool-source form");
+                                        "the Bool- and U32-source forms");
                     }
                 }
                 return true;
@@ -800,7 +817,26 @@ struct Lowerer {
             case MirOpcode::Gep:    return lowerGep(id);
             case MirOpcode::Trunc:  return lowerCast(id, MnemonicSlot::Trunc, "MIR Trunc");
             case MirOpcode::SExt:   return lowerCast(id, MnemonicSlot::SExt,  "MIR SExt");
-            case MirOpcode::ZExt:   return lowerCast(id, MnemonicSlot::ZExt,  "MIR ZExt");
+            case MirOpcode::ZExt: {
+                // FC3.5 sweep-c1 (D-CSUBSET-ZEXT-32-TO-64): zext is
+                // the ONE conversion whose encoded form is selected by
+                // the SOURCE type's width, not the result's (the
+                // result is always the 64-bit register) — a Bool
+                // source keeps the width-default byte widener (x86
+                // movzx r64, r/m8), a U32 source selects the width-32
+                // variant (x86 `mov r32, r32`, whose 32-bit register
+                // write zero-extends; routing a U32 through the byte
+                // form would silently read ONE byte). The width axis
+                // rides the same LirInst flag the ALU tier uses; the
+                // requireNativeIntWidth ZExt arm has already walled
+                // off every other source kind.
+                auto const zextOps = mir.instOperands(id);
+                std::uint8_t const srcWidthFlags = (zextOps.size() == 1)
+                    ? widthFlagsForType(mir.instType(zextOps[0]))
+                    : 0;
+                return lowerCast(id, MnemonicSlot::ZExt, "MIR ZExt",
+                                 srcWidthFlags);
+            }
             case MirOpcode::Bitcast:    return lowerBitcast(id);
             case MirOpcode::IntToPtr:
             case MirOpcode::PtrToInt:
@@ -811,9 +847,12 @@ struct Lowerer {
             case MirOpcode::And:    return lowerBinaryOp(id, MnemonicSlot::And);
             case MirOpcode::Or:     return lowerBinaryOp(id, MnemonicSlot::Or);
             case MirOpcode::Xor:    return lowerBinaryOp(id, MnemonicSlot::Xor);
-            case MirOpcode::Shl:    return lowerBinaryOp(id, MnemonicSlot::Shl);
-            case MirOpcode::LShr:   return lowerBinaryOp(id, MnemonicSlot::ShrL);
-            case MirOpcode::AShr:   return lowerBinaryOp(id, MnemonicSlot::ShrA);
+            // FC3.5 sweep-c1: shifts route through the capability-
+            // driven realization (immediate-count / implicit-count
+            // register / native 3-address — see lowerShift).
+            case MirOpcode::Shl:    return lowerShift(id, MnemonicSlot::Shl);
+            case MirOpcode::LShr:   return lowerShift(id, MnemonicSlot::ShrL);
+            case MirOpcode::AShr:   return lowerShift(id, MnemonicSlot::ShrA);
             case MirOpcode::Not:    return lowerUnaryOp(id, MnemonicSlot::Not);
             case MirOpcode::Neg:    return lowerUnaryOp(id, MnemonicSlot::Neg);
             // ── cycle 3d float arithmetic (FPR-class result) ───────
@@ -1144,9 +1183,12 @@ struct Lowerer {
     // otherwise). Cycle 3d's float casts (FpCvt/FpToSi/FpToUi/SiToFp/
     // UiToFp) all land here. Delegates to the shared lowerNAryOp; the
     // `context` argument is now redundant with `mirOpcodeName` and
-    // dropped (simplifier review).
-    void lowerCast(MirInstId id, MnemonicSlot slot, std::string_view /*context*/) {
-        lowerNAryOp<1>(id, slot);
+    // dropped (simplifier review). FC3.5: optional `widthOverride`
+    // threads a non-result width key (ZExt's SOURCE width — see the
+    // dispatch arm; D-CSUBSET-ZEXT-32-TO-64).
+    void lowerCast(MirInstId id, MnemonicSlot slot, std::string_view /*context*/,
+                   std::optional<std::uint8_t> widthOverride = std::nullopt) {
+        lowerNAryOp<1>(id, slot, widthOverride);
     }
 
     // Bitcast lowering — closes the cycle-3c-anchored hazard 3 review
@@ -1550,7 +1592,8 @@ struct Lowerer {
     // → newVReg(regClassFor(id)) → addInst → defineValue). Per the
     // cycle-3d simplifier review.
     template <std::size_t Arity>
-    void lowerNAryOp(MirInstId id, MnemonicSlot slot) {
+    void lowerNAryOp(MirInstId id, MnemonicSlot slot,
+                     std::optional<std::uint8_t> widthOverride = std::nullopt) {
         auto const op = opcode(slot);
         if (!op.has_value()) {
             reportMissingOpcode(slot, mirOpcodeName(mir.instOpcode(id)));
@@ -1575,13 +1618,195 @@ struct Lowerer {
         // Width-invariant ops (floats, conversions with inherent
         // widths, Bool) map to the 64-bit default and keep matching
         // their width-absent variants byte-identically.
+        // FC3.5 sweep-c1: `widthOverride` serves the one conversion
+        // whose encoded form keys on a NON-result width — ZExt's
+        // source (D-CSUBSET-ZEXT-32-TO-64). Every other caller leaves
+        // it unset and keeps the result-type rule byte-identically.
         emitInst(*op, result, ops, /*payload=*/0,
-                 widthFlagsForType(mir.instType(id)));
+                 widthOverride.has_value()
+                     ? *widthOverride
+                     : widthFlagsForType(mir.instType(id)));
         defineValue(id, result);
     }
 
     void lowerBinaryOp(MirInstId id, MnemonicSlot slot) { lowerNAryOp<2>(id, slot); }
     void lowerUnaryOp (MirInstId id, MnemonicSlot slot) { lowerNAryOp<1>(id, slot); }
+
+    // ── FC3.5 sweep-c1: capability-driven MIR Shl/LShr/AShr lowering ──
+    // (closes the D-CSUBSET-32BIT-ALU-FORMS shifts residue)
+    //
+    // ONE arm serves all three shift MIR opcodes on every target,
+    // selecting the realization from the opcode's DECLARED capability
+    // (the FC1 div/mod probing pattern — never an arch identity):
+    //
+    //   Rule 1 — IMMEDIATE COUNT: the count operand is a MIR integer
+    //     Const whose value fits the imm8 byte AND the opcode declares
+    //     a [reg, imm] encoding variant → emit the 2-operand
+    //     (value, imm) form (x86 `SHL/SHR/SAR r/m, imm8` = C1 /4 /5
+    //     /7 ib). A target without an imm variant (arm64 — the
+    //     LSL-imm UBFM aliases are a deliberate peephole deferral)
+    //     skips this rule; the materialized const vreg feeds rule 2/3
+    //     like any operand.
+    //
+    //   Rule 2 — IMPLICIT-COUNT REGISTER: the opcode declares
+    //     `implicitRegisters` → the count lives in a fixed register
+    //     the core op reads implicitly (x86: CL — there is no
+    //     3-address reg-count shift). The register is resolved BY
+    //     ROLE ("count") from `inputRoles` — the FC1 idiv "dividend"
+    //     contract; a declaration missing the role is a
+    //     misconfiguration → fail loud, never positional. Sequence:
+    //       mov  <count-role>_phys, count_vreg   ; pin the count
+    //       SHIFT result_vreg, value_vreg        ; requires2Address
+    //                                            ; legalize makes
+    //                                            ; result == value
+    //     Regalloc keeps live ranges out of the count register across
+    //     the shift via the same covered-position implicit-clobber
+    //     exclusion the div pair uses (the opcode declares the count
+    //     register clobbered: the REALIZATION's pin-mov destroys its
+    //     prior value).
+    //
+    //   Rule 3 — NATIVE 3-ADDRESS: no implicitRegisters → the target
+    //     shifts by a plain register operand (arm64 LSLV/LSRV/ASRV
+    //     Xd, Xn, Xm; a future RISC-V SLL/SRL/SRA likewise) → the
+    //     generic 2-operand lowering.
+    //
+    // C semantics note (C23 6.5.7p3): shift counts >= the promoted
+    // left operand's width (or negative) are UNDEFINED — no masking
+    // is emitted; both ISAs mask in hardware (x86 count & 63/& 31
+    // incl. the imm8 form; arm64 LSLV/LSRV/ASRV use Xm mod 64 /
+    // Wm mod 32), so a UB count yields the hardware's masked result
+    // rather than a trap. The width axis keys on the RESULT type
+    // (= C's promoted LEFT operand, the shift's UAC rule) — the
+    // COUNT's own width is irrelevant to the encoding (CL reads one
+    // byte; the V-forms read the low bits of Xm/Wm).
+    bool isShiftCountImm8(MirInstId countId,
+                          std::optional<std::int32_t>& out) const {
+        if (mir.instOpcode(countId) != MirOpcode::Const) return false;
+        MirLiteralValue const& lit =
+            mir.literalValue(mir.constLiteralIndex(countId));
+        std::int64_t v = 0;
+        if (auto const* i = std::get_if<std::int64_t>(&lit.value)) {
+            v = *i;
+        } else if (auto const* u = std::get_if<std::uint64_t>(&lit.value)) {
+            if (*u > 255u) return false;
+            v = static_cast<std::int64_t>(*u);
+        } else {
+            return false;
+        }
+        if (v < 0 || v > 255) return false;
+        out = static_cast<std::int32_t>(v);
+        return true;
+    }
+
+    // Does the opcode declare ANY [Reg, ImmInt]-guarded encoding
+    // variant? Capability probe for the immediate-count form —
+    // config-driven (reads the schema's declared variants), no
+    // arch identity.
+    [[nodiscard]] static bool
+    declaresRegImmVariant(TargetOpcodeInfo const& info) noexcept {
+        for (auto const& v : info.encoding.variants) {
+            if (v.operandKinds.size() == 2
+                && v.operandKinds[0] == OperandKindFilter::Reg
+                && v.operandKinds[1] == OperandKindFilter::ImmInt) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void lowerShift(MirInstId id, MnemonicSlot slot) {
+        auto const op = opcode(slot);
+        if (!op.has_value()) {
+            reportMissingOpcode(slot, mirOpcodeName(mir.instOpcode(id)));
+            return;
+        }
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 2) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return;
+        }
+        auto const* info = target.opcodeInfo(*op);
+        if (info == nullptr) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return;
+        }
+        std::optional<LirReg> const value = regForValue(operands[0]);
+        if (!value.has_value()) return;
+        // The width axis keys on the RESULT type (C's promoted left
+        // operand — shifts do NOT unify with the count's type).
+        std::uint8_t const widthFlags = widthFlagsForType(mir.instType(id));
+
+        // Rule 1 — immediate count.
+        std::optional<std::int32_t> imm;
+        if (isShiftCountImm8(operands[1], imm)
+            && declaresRegImmVariant(*info)) {
+            LirReg const result = lir.newVReg(regClassFor(id));
+            std::array<LirOperand, 2> const ops{
+                LirOperand::makeReg(*value),
+                LirOperand::makeImmInt32(*imm)};
+            emitInst(*op, result, ops, /*payload=*/0, widthFlags);
+            defineValue(id, result);
+            return;
+        }
+
+        std::optional<LirReg> const count = regForValue(operands[1]);
+        if (!count.has_value()) return;
+
+        // Rule 2 — implicit-count register (resolved BY ROLE).
+        if (info->implicitRegisters.has_value()) {
+            auto const& ir = *info->implicitRegisters;
+            auto const countOrdinal = ir.inputOrdinalForRole("count");
+            if (!countOrdinal.has_value()) {
+                reportMissingImplicitRole(*op, "inputRoles", "count", id);
+                return;
+            }
+            auto const movOp = opcode(MnemonicSlot::Mov);
+            if (!movOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Mov,
+                                    "MIR shift (count pin)");
+                return;
+            }
+            // Register class from the schema's register table — the
+            // F1 div-lowering rule (never hardcoded GPR).
+            auto const* countRegInfo = target.registerInfo(*countOrdinal);
+            if (countRegInfo == nullptr) {
+                reportUnsupported(mir.instOpcode(id), id);
+                return;
+            }
+            LirReg const countPhys = makePhysicalReg(
+                *countOrdinal,
+                static_cast<LirRegClass>(countRegInfo->regClass));
+            // 1. Pin the count into the role-declared register
+            //    (64-bit full copy — the core reads only the low
+            //    byte/bits it needs; mirrors the div dividend pin).
+            std::array<LirOperand, 1> const pinOps{
+                LirOperand::makeReg(*count)};
+            emitInst(*movOp, countPhys, pinOps);
+            // 2. The core shift: ONE explicit operand (the value;
+            //    requires2Address legalize copies it into the result
+            //    so the r/m operand IS the destination). Regalloc
+            //    reads the implicit-register declaration and protects
+            //    the count register with TWO rules: covering OPERAND
+            //    ranges are excluded (covered-position rule), and the
+            //    RESULT vreg is excluded too (result-def rule —
+            //    required because the legalize's `mov result, value`
+            //    lands BEFORE this op; result==count would clobber
+            //    the pin under pressure).
+            LirReg const result = lir.newVReg(regClassFor(id));
+            std::array<LirOperand, 1> const shiftOps{
+                LirOperand::makeReg(*value)};
+            emitInst(*op, result, shiftOps, /*payload=*/0, widthFlags);
+            defineValue(id, result);
+            return;
+        }
+
+        // Rule 3 — native 3-address (count as a plain reg operand).
+        LirReg const result = lir.newVReg(regClassFor(id));
+        std::array<LirOperand, 2> const ops{
+            LirOperand::makeReg(*value), LirOperand::makeReg(*count)};
+        emitInst(*op, result, ops, /*payload=*/0, widthFlags);
+        defineValue(id, result);
+    }
 
     // ── FC1 (V2-4.X): capability-driven MIR SDiv/UDiv/SMod/UMod lowering ──
     // (cycle 10r D-CSUBSET-DIVISION-OP-CODEGEN substrate, generalized

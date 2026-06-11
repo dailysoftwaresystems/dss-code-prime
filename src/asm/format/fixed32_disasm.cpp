@@ -46,6 +46,7 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmReg:
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
+        case EncodingSlotKind::Imm8:
         case EncodingSlotKind::Disp32:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:

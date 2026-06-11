@@ -806,11 +806,22 @@ enum class EncodingSlotKind : std::uint8_t {
     // D-CSUBSET-LONG-BRANCH). `isSymbolBearingSlot` returns FALSE (no
     // relocationKind — resolved intra-function, not at link time).
     Imm19 = 20,
+    // FC3.5 sweep-c1 (shifts end-to-end): the x86 8-bit immediate
+    // slot — ONE byte appended after ModR/M (and SIB when present),
+    // before any imm32 bytes. First consumer: the constant-count
+    // shift forms `SHL/SHR/SAR r/m, imm8` (C1 /4 /5 /7 ib per the
+    // Intel SDM). The walker range-checks the wired value to [0,255]
+    // fail-loud (never silently truncates a wider immediate to one
+    // byte). The variant GUARD vocabulary is unchanged — the operand
+    // KIND filter stays `"imm32"` (= the LirOperandKind::ImmInt
+    // discriminator; the historical width-labeled name); the SLOT
+    // decides the emitted width.
+    Imm8 = 21,
     // Future fixed32 slots (paired with their consumer cycle):
     //   ImmShift / Sf-flag / scaled LDR imm12 / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 21> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 22> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -832,6 +843,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 21> kEncodingSlotKindTable{{{
     { EncodingSlotKind::Imm12,         "imm12"          },
     { EncodingSlotKind::SymbolPatchMarker, "sym.patch"   },
     { EncodingSlotKind::Imm19,         "imm19"          },
+    { EncodingSlotKind::Imm8,          "imm8"           },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -850,7 +862,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 21,
+static_assert(kEncodingSlotKindCount == 22,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -868,6 +880,7 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmReg:
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
+        case EncodingSlotKind::Imm8:
         case EncodingSlotKind::Disp32:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
@@ -1054,6 +1067,7 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmReg:
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
+        case EncodingSlotKind::Imm8:
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:

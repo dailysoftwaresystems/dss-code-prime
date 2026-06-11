@@ -602,14 +602,18 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         // the same exclusion.
         // Exclusion buffer holds the union of (a) requires2Address
         // operand[1..N] clobber-prevention + (b) cycle-10q implicit-
-        // register clobbers from crossed opcodes (e.g., x86 idiv's
-        // RDX). Size 8 = 4 (existing 2-addr headroom) + 4 (current
-        // max implicit-clobber set on any one op; idiv/div clobber 1
-        // each, future mul-1-op clobbers 1, future shift-by-CL
-        // clobbers 0). A schema row that pushes the union past 8
-        // fails loud via `regallocFatal` in
-        // `implicitClobbersCrossedBy` (D-OPT-REGALLOC-EXCLUSION-
-        // BUFFER anchored there).
+        // register clobbers from COVERED opcodes (e.g., x86 idiv's
+        // RDX) + (c) the FC3.5 result-def rule below: the DEFINING
+        // op's own implicit (inputs ∪ clobbered) set when it is
+        // requires2Address (x86 shift-by-CL's RCX). Today's worst
+        // case: (a) ≤ 1 (2-operand binops; shifts carry 1 explicit
+        // operand → 0), (b) ≤ 3 distinct ordinals across the shipped
+        // schemas (RAX/RDX from the div family + RCX from shifts,
+        // dedup'd), (c) ⊆ {RCX} and dedups into the same vocabulary
+        // — union ≤ 4, comfortably under 8. A schema row that pushes
+        // the union past 8 fails loud via `regallocFatal` in
+        // `implicitClobbersCrossedBy` / the result-def arm below
+        // (D-OPT-REGALLOC-EXCLUSION-BUFFER anchored there).
         std::array<std::uint16_t, 8> excludedStorage{};
         std::size_t excludedCount = 0;
         if (LirInstId const producingInst =
@@ -682,6 +686,58 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
                             a.physReg().id);
                     }
                     excludedStorage[excludedCount++] = ord;
+                }
+                // FC3.5 sweep-c1 CRITICAL fix (2026-06-11): the
+                // RESULT of a requires2Address op that ALSO declares
+                // implicit input/clobbered registers must avoid those
+                // registers. The 2-addr legalize materializes
+                // `mov result, ops[0]` BEFORE the op, so the result's
+                // physical register becomes a live conduit for ops[0]
+                // ACROSS the op's implicit-register read — result ==
+                // implicit-input means that mov destroys the pinned
+                // value (x86 shift-by-CL: lowerShift emits `mov rcx,
+                // count`, then the legalize's `mov result(=rcx),
+                // value` overwrites the count → the shift computes
+                // value << (value & 63) instead of value << count;
+                // SILENT miscompile under register pressure). The
+                // covered-position exclusion below CANNOT catch this:
+                // the result's range STARTS at the op's LATE slot
+                // (lir_liveness firstDef = latePos) while the
+                // implicit-clobber entry sits at the EARLY slot, so
+                // `c.position < r.start` skips it. Generic over the
+                // DECLARED implicitRegisters (inputs ∪ clobbered —
+                // the same union collectImplicitClobberPositions
+                // forbids for covering operands); any future
+                // requires2Address op with implicit registers is
+                // covered by construction — no shift/RCX identity.
+                // The div family never enters this arm (idiv_op/
+                // div_op declare `result: none`; their SSA result is
+                // captured by a separate post-op mov, so result ==
+                // RAX is benign there).
+                if (info->implicitRegisters.has_value()) {
+                    auto const& ir = *info->implicitRegisters;
+                    auto addForbidden = [&](std::uint16_t ord) {
+                        for (std::size_t k = 0; k < excludedCount; ++k) {
+                            if (excludedStorage[k] == ord) return;
+                        }
+                        if (excludedCount >= excludedStorage.size()) {
+                            regallocFatal(
+                                "result-def implicit-register + 2-addr "
+                                "exclusion union exceeds fixed "
+                                "exclusion buffer size — extend "
+                                "excludedStorage in lir_regalloc.cpp "
+                                "OR re-shape the schema so the high-"
+                                "pressure case lands differently "
+                                "(D-OPT-REGALLOC-EXCLUSION-BUFFER)");
+                        }
+                        excludedStorage[excludedCount++] = ord;
+                    };
+                    for (auto const o : ir.inputOrdinals) {
+                        addForbidden(o);
+                    }
+                    for (auto const o : ir.clobberedOrdinals) {
+                        addForbidden(o);
+                    }
                 }
             }
         }

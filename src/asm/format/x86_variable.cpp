@@ -103,6 +103,11 @@ struct EncodingState {
     // to 0, silently coupling to wroteSibIndex).
     std::optional<std::uint8_t> sibScaleExp;
     std::vector<std::int32_t>     imm32s;        // immediate values to append (LE 4B each)
+    // FC3.5 sweep-c1: 1-byte immediates (the shift-count ib of
+    // C1 /4 /5 /7). Emitted BEFORE imm32s — today no instruction
+    // carries both; an ENTER-style imm16+imm8 shape would need
+    // wiring-order-preserving emission when it lands.
+    std::vector<std::uint8_t>     imm8s;
     std::optional<PendingRelocSlot> disp32;      // symbol-relative 32-bit slot (cycle 4)
     // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): pending
     // intra-function block-relative branch targets. Each entry
@@ -210,6 +215,7 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
             st.rexX      = (hwEnc & 0x8u) != 0u;
             return true;
         case EncodingSlotKind::Imm32:
+        case EncodingSlotKind::Imm8:
         case EncodingSlotKind::Disp32Mem:
         case EncodingSlotKind::RipRelDisp32:
         case EncodingSlotKind::CondCodeNibble:
@@ -288,6 +294,29 @@ wireImm32(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
         return false;
     }
     st.imm32s.push_back(v);
+    return true;
+}
+
+// FC3.5 sweep-c1 (shifts): stash an ImmInt operand's value for a
+// 1-byte immediate slot (`SHL/SHR/SAR r/m, imm8` — C1 /4 /5 /7 ib).
+// RANGE-CHECKED [0, 255] fail-loud: silently truncating a wider
+// immediate to one byte would emit a valid-looking instruction with a
+// wrong count. (The MIR→LIR shift lowering only selects the imm form
+// for counts it verified fit; this is the defense-in-depth half.)
+[[nodiscard]] bool
+wireImm8(EncodingState& st, std::int32_t v,
+         std::string_view mnemonic, DiagnosticReporter& reporter) {
+    if (v < 0 || v > 255) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': immediate {} does not fit the "
+                           "imm8 slot (0..255) — the lowering must "
+                           "route out-of-range counts through the "
+                           "register form",
+                           mnemonic, v));
+        return false;
+    }
+    st.imm8s.push_back(static_cast<std::uint8_t>(v));
     return true;
 }
 
@@ -456,8 +485,16 @@ bool encode(Lir const&                  lir,
                 return false;
             }
         } else if (srcOp.kind == LirOperandKind::ImmInt) {
-            if (!wireImm32(st, wire.slotKind, srcOp.immInt32,
-                            info->mnemonic, reporter)) {
+            // Slot decides the emitted width: Imm8 (the shift-count
+            // ib) emits ONE byte; everything else goes through the
+            // Imm32 path (which rejects non-Imm32 slots loudly).
+            if (wire.slotKind == EncodingSlotKind::Imm8) {
+                if (!wireImm8(st, srcOp.immInt32,
+                              info->mnemonic, reporter)) {
+                    return false;
+                }
+            } else if (!wireImm32(st, wire.slotKind, srcOp.immInt32,
+                                  info->mnemonic, reporter)) {
                 return false;
             }
         } else if (srcOp.kind == LirOperandKind::MemBase) {
@@ -768,7 +805,12 @@ bool encode(Lir const&                  lir,
         return false;
     }
 
-    // 7) Immediates: append in slot-wiring order.
+    // 7) Immediates: append in slot-wiring order — imm8 bytes first
+    //    (the shift-count ib; no shipped instruction carries both an
+    //    imm8 AND an imm32), then the 4-byte immediates.
+    for (auto v : st.imm8s) {
+        out.push_back(v);
+    }
     for (auto v : st.imm32s) {
         asm_byte_emit::appendImm32LE(out, v);
     }

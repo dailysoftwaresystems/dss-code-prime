@@ -513,6 +513,10 @@ TEST(MirLoweringCSubset, LogicalAndShortCircuitsWithPhi) {
     EXPECT_EQ(m.instOpcode(m.blockTerminator(entry)), MirOpcode::CondBr);
     auto succs = m.blockSuccessors(entry);
     ASSERT_EQ(succs.size(), 2u);
+    // rhsBB (the true-edge target) is the diamond's conditional ARM —
+    // FC3.5 sweep-c1 marks it IfThen so the verifier's IfThen↔IfJoin
+    // count pairing holds (the one-armed-if shape; chip task_bd58aa3d).
+    EXPECT_EQ(m.blockMarker(succs[0]), StructCfMarker::IfThen);
     // joinBB is the second successor (the false-edge / short-circuit target).
     MirBlockId const joinBB = succs[1];
     EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::IfJoin);
@@ -534,6 +538,55 @@ TEST(MirLoweringCSubset, LogicalOrShortCircuitsWithPhi) {
     MirBlockId const joinBB = succs[0];
     EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::IfJoin);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(joinBB, 0)), MirOpcode::Phi);
+    // rhsBB sits on the FALSE edge for `||` — still the conditional
+    // arm of the diamond, still IfThen (the marker pairs counts; it
+    // carries no edge polarity).
+    EXPECT_EQ(m.blockMarker(succs[1]), StructCfMarker::IfThen);
+}
+
+// FC3.5 sweep-c1 (chip task_bd58aa3d): `&&`/`||` AS AN IF-CONDITION.
+// Pre-fix, LogicalAnd/Or minted an IfJoin with a `Linear` rhs arm, so
+// `if (a < 2 && a < 3)` counted IfThen 1 vs IfJoin 2 and the verifier
+// rejected the function (I_StructCfMismatch) — the LOWERING was the
+// bug, not the verifier (the count pairing is the structural guard).
+// This is the red-on-revert lever: flip rhsBB back to Linear and the
+// verifier diagnostic returns.
+TEST(MirLoweringCSubset, IfConditionWithLogicalOpsVerifiesClean) {
+    auto L = lowerCSubset(
+        "int pick(int a) {\n"
+        "  if (a < 2 && a < 3) { return 40; }\n"
+        "  if (a > 90 || a > 80) { return 41; }\n"
+        "  if (a > 8 && (a < 12 || a > 100)) { return 42; }\n"
+        "  return 7;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+    DiagnosticReporter vrep;
+    MirVerifier v{L.mir.mir};
+    EXPECT_TRUE(v.verify(vrep))
+        << "logical ops in if-conditions must verify clean: "
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+    for (auto const& d : vrep.all()) {
+        EXPECT_NE(d.code, DiagnosticCode::I_StructCfMismatch)
+            << d.actual;
+    }
+}
+
+// The value-position uses must stay verifier-clean too (`return a&&b;`
+// has NO IfStmt to balance against — the arm marker is what pairs the
+// short-circuit join).
+TEST(MirLoweringCSubset, LogicalOpsAsValuesVerifyClean) {
+    auto L = lowerCSubset(
+        "int and2(int a, int b) { return a && b; }\n"
+        "int or2(int a, int b) { return a || b; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    DiagnosticReporter vrep;
+    MirVerifier v{L.mir.mir};
+    EXPECT_TRUE(v.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
 }
 
 // ─── ML2 cycle 2: control flow ─────────────────────────────────────────────
@@ -764,6 +817,101 @@ TEST(MirLoweringCSubset, ForLoopLowersWithUpdateOnBackEdge) {
     EXPECT_EQ(m.blockMarker(update), StructCfMarker::LoopLatch);
     EXPECT_EQ(m.instOpcode(m.blockTerminator(update)), MirOpcode::Br);
     EXPECT_EQ(m.blockSuccessors(update)[0], header);
+}
+
+// FC3.5 sweep-c1 (chip task_20b1224d): the CONVENTIONAL C for-loop —
+// the update clause is an ASSIGNMENT (`i = i - 1`), which cst_to_hir
+// lowers to an AssignStmt, not an expression. Pre-fix, ForStmt routed
+// the update through `lowerExpr`, which fail-louded with "HIR
+// expression kind ordinal 19 [AssignStmt] not yet supported"; the
+// statement-shaped clause now routes through `lowerStmt` (the same
+// path the init clause always took). The update block must hold the
+// Store back into `i`'s slot and branch to the header.
+TEST(MirLoweringCSubset, ForLoopWithAssignmentUpdateLowers) {
+    auto L = lowerCSubset(
+        "int f(int i) {\n"
+        "  int acc = 0;\n"
+        "  for (i = 9; i; i = i - 1) {\n"
+        "    acc = acc + 1;\n"
+        "  }\n"
+        "  return acc;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    // Find the LoopLatch (update) block: it must contain a Store (the
+    // `i = i - 1` write-back) and terminate with Br(header).
+    bool sawLatchStore = false;
+    for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+        MirBlockId const b = m.funcBlockAt(fn, bi);
+        if (m.blockMarker(b) != StructCfMarker::LoopLatch) continue;
+        for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+            if (m.instOpcode(m.blockInstAt(b, ii)) == MirOpcode::Store) {
+                sawLatchStore = true;
+            }
+        }
+        EXPECT_EQ(m.instOpcode(m.blockTerminator(b)), MirOpcode::Br);
+    }
+    EXPECT_TRUE(sawLatchStore)
+        << "the assignment update must lower to a Store in the latch";
+    // The whole function verifies clean (loop pairing intact).
+    DiagnosticReporter vrep;
+    MirVerifier v{m};
+    EXPECT_TRUE(v.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+}
+
+// Compound-assign + postfix inc/dec updates desugar to AssignStmt in
+// cst_to_hir (`lowerCompoundAssign` / `lowerIncDecStmt`) and ride the
+// same statement path. The grammar admits ALL of `+=`/`-=`/`*=`/`/=`/
+// `%=`/`&=`/`|=`/`^=`/`<<=`/`>>=` plus postfix `++`/`--`; pin one
+// compound (`-=`) and one postfix (`++`) — the others share the
+// single desugar site.
+TEST(MirLoweringCSubset, ForLoopCompoundAndIncDecUpdatesLower) {
+    auto L = lowerCSubset(
+        "int f(int n) {\n"
+        "  int acc = 0;\n"
+        "  for (n = 6; n; n -= 1) { acc = acc + 1; }\n"
+        "  for (int j = 0; j < 3; j++) { acc = acc + 1; }\n"
+        "  return acc;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+            ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+    DiagnosticReporter vrep;
+    MirVerifier v{L.mir.mir};
+    EXPECT_TRUE(v.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+}
+
+// A bare-EXPRESSION init clause (`for (f(); ...)`) is the symmetric
+// shape on the INIT side — cst_to_hir emits the unwrapped expression
+// and the same for-clause dispatch admits it (pre-fix, the init path
+// routed through lowerStmt whose default arm rejected expressions).
+TEST(MirLoweringCSubset, ForLoopWithBareExpressionInitLowers) {
+    auto L = lowerCSubset(
+        "int g(int x) { return x + 1; }\n"
+        "int f(int n) {\n"
+        "  int acc = 0;\n"
+        "  for (g(n); acc < 2; acc = acc + 1) { }\n"
+        "  return acc;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+    DiagnosticReporter vrep;
+    MirVerifier v{L.mir.mir};
+    EXPECT_TRUE(v.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
 }
 
 // Logical `!x` lowers as `cmp eq operand, 0` → Bool. Returning it from an

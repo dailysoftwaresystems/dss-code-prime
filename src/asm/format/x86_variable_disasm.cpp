@@ -35,6 +35,9 @@ struct DisasmState {
     std::uint8_t modRmRm3  = 0;
     std::int32_t imm32     = 0;
     bool         hasImm32  = false;
+    // FC3.5 sweep-c1: the 1-byte immediate (shift-count ib).
+    std::uint8_t imm8      = 0;
+    bool         hasImm8   = false;
     bool         hasDisp32 = false;
     // Re-composed hwEncodings (low 3 bits + REX high bit).
     std::uint8_t modRmRegFull() const noexcept {
@@ -173,6 +176,17 @@ disassemble(TargetSchema const&            schema,
                 state->imm32 = readImm32LE(bytes, cursor);
                 state->hasImm32 = true;
                 cursor += 4;
+            } else if (w.slotKind == EncodingSlotKind::Imm8) {
+                // FC3.5: the 1-byte shift-count ib — emitted right
+                // after ModR/M (the encoder appends imm8s before any
+                // imm32s; shipped variants carry at most one imm).
+                if (cursor + 1 > bytes.size()) {
+                    state = std::nullopt;
+                    break;
+                }
+                state->imm8 = bytes[cursor];
+                state->hasImm8 = true;
+                cursor += 1;
             } else if (w.slotKind == EncodingSlotKind::Disp32) {
                 if (cursor + 4 > bytes.size()) {
                     state = std::nullopt;
@@ -222,6 +236,10 @@ disassemble(TargetSchema const&            schema,
                 case EncodingSlotKind::Imm32:
                     return state->hasImm32
                         ? std::optional<std::int64_t>{state->imm32}
+                        : std::nullopt;
+                case EncodingSlotKind::Imm8:
+                    return state->hasImm8
+                        ? std::optional<std::int64_t>{state->imm8}
                         : std::nullopt;
                 case EncodingSlotKind::Disp32:
                     // Symbol-bearing slot: encoder writes ZEROS at

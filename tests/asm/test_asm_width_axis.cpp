@@ -460,6 +460,54 @@ TEST(WidthAxisArm64, CmpWFormAndNegWForm) {
     }
 }
 
+// FC3.5 sweep-c1: the arm64 CMP-immediate alias — SUBS XZR, Xn, #imm12
+// (ARM ARM C6.2.395 add/subtract-immediate; sf|1|1|100010|sh=0|imm12|
+// Rn|11111). FIRST consumer is the MIR→LIR non-fused CondBr arm's
+// `cmp cond, #0` over a PHI-produced Bool (`&&`/`||` results used as
+// conditions can't fuse) — the gap was masked until the short-circuit
+// marker fix let logical-op conditions reach arm64 codegen.
+TEST(WidthAxisArm64, CmpImmediateXAndWForms) {
+    auto schema = loadArm();
+    ASSERT_NE(schema, nullptr);
+    auto const x1 = gpr(*schema, "x1");
+    {
+        // CMP X1, #0 = 0xF100003F (Rn=1 → bits 5..9; imm12=0).
+        DiagnosticReporter rep;
+        auto bytes = buildAndAssembleArm(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(x1),
+                                      LirOperand::makeImmInt32(0)};
+            (void)b.addInst(*schema->opcodeByMnemonic("cmp"),
+                            InvalidLirReg, ops);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_EQ(firstInstWord(bytes), 0xF100003Fu);
+    }
+    {
+        // CMP X1, #7 — imm12 lands at bits 10..21: 7<<10 = 0x1C00.
+        DiagnosticReporter rep;
+        auto bytes = buildAndAssembleArm(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(x1),
+                                      LirOperand::makeImmInt32(7)};
+            (void)b.addInst(*schema->opcodeByMnemonic("cmp"),
+                            InvalidLirReg, ops);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_EQ(firstInstWord(bytes), 0xF1001C3Fu);
+    }
+    {
+        // CMP W1, #0 = 0x7100003F (the X-form word with sf cleared).
+        DiagnosticReporter rep;
+        auto bytes = buildAndAssembleArm(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(x1),
+                                      LirOperand::makeImmInt32(0)};
+            (void)b.addInst(*schema->opcodeByMnemonic("cmp"),
+                            InvalidLirReg, ops, /*payload=*/0, kW32);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_EQ(firstInstWord(bytes), 0x7100003Fu);
+    }
+}
+
 TEST(WidthAxisArm64, SxtwAndTruncWords) {
     auto schema = loadArm();
     ASSERT_NE(schema, nullptr);
@@ -490,7 +538,296 @@ TEST(WidthAxisArm64, SxtwAndTruncWords) {
     }
 }
 
+// ── FC3.5 sweep-c1: SHIFT encodings (the D-CSUBSET-32BIT-ALU-FORMS
+//    shifts residue) — Intel SDM SAL/SAR/SHL/SHR + ARM ARM LSLV/LSRV/
+//    ASRV, byte-pinned per variant. ──────────────────────────────────
+
+TEST(WidthAxisX86, ShiftClFormsBothWidthsAndHighReg) {
+    // Variable-count forms: D3 /4 (shl), /5 (shr), /7 (sar). The
+    // count is the IMPLICIT CL register — one explicit r/m operand.
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const rax = gpr(*schema, "rax");
+    auto const r8  = gpr(*schema, "r8");
+    struct Case { char const* mnemonic; std::uint8_t modrm; };
+    for (Case const c : {Case{"shl",  0xE0},     // /4 → reg=100
+                         Case{"shr_l", 0xE8},    // /5 → reg=101
+                         Case{"shr_a", 0xF8}}) { // /7 → reg=111
+        {
+            // 64-bit: REX.W D3 /digit.
+            DiagnosticReporter rep;
+            auto bytes = buildLegalizeAssemble(*schema, rep,
+                                               [&](LirBuilder& b) {
+                LirOperand const ops[] = {LirOperand::makeReg(rax)};
+                (void)b.addInst(*schema->opcodeByMnemonic(c.mnemonic),
+                                rax, ops);
+            });
+            EXPECT_EQ(rep.errorCount(), 0u) << c.mnemonic;
+            expectPrefix(bytes, {0x48, 0xD3, c.modrm});
+        }
+        {
+            // 32-bit: D3 /digit without REX.W.
+            DiagnosticReporter rep;
+            auto bytes = buildLegalizeAssemble(*schema, rep,
+                                               [&](LirBuilder& b) {
+                LirOperand const ops[] = {LirOperand::makeReg(rax)};
+                (void)b.addInst(*schema->opcodeByMnemonic(c.mnemonic),
+                                rax, ops, /*payload=*/0, kW32);
+            });
+            EXPECT_EQ(rep.errorCount(), 0u) << c.mnemonic;
+            expectPrefix(bytes, {0xD3, c.modrm});
+        }
+    }
+    {
+        // REX-without-W: shl r8d, cl → 0x41 D3 E0 (B extension, W=0).
+        DiagnosticReporter rep;
+        auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(r8)};
+            (void)b.addInst(*schema->opcodeByMnemonic("shl"), r8, ops,
+                            /*payload=*/0, kW32);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        expectPrefix(bytes, {0x41, 0xD3, 0xE0});
+    }
+}
+
+TEST(WidthAxisX86, ShiftImm8FormsBothWidths) {
+    // Constant-count forms: C1 /digit ib — the count is ONE byte
+    // after ModR/M (the NEW Imm8 slot's first consumer).
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const rax = gpr(*schema, "rax");
+    struct Case { char const* mnemonic; std::uint8_t modrm; };
+    for (Case const c : {Case{"shl",  0xE0},
+                         Case{"shr_l", 0xE8},
+                         Case{"shr_a", 0xF8}}) {
+        {
+            // 64-bit: REX.W C1 /digit ib (count 5).
+            DiagnosticReporter rep;
+            auto bytes = buildLegalizeAssemble(*schema, rep,
+                                               [&](LirBuilder& b) {
+                LirOperand const ops[] = {LirOperand::makeReg(rax),
+                                          LirOperand::makeImmInt32(5)};
+                (void)b.addInst(*schema->opcodeByMnemonic(c.mnemonic),
+                                rax, ops);
+            });
+            EXPECT_EQ(rep.errorCount(), 0u) << c.mnemonic;
+            expectPrefix(bytes, {0x48, 0xC1, c.modrm, 0x05});
+        }
+        {
+            // 32-bit: C1 /digit ib without REX.W (count 2).
+            DiagnosticReporter rep;
+            auto bytes = buildLegalizeAssemble(*schema, rep,
+                                               [&](LirBuilder& b) {
+                LirOperand const ops[] = {LirOperand::makeReg(rax),
+                                          LirOperand::makeImmInt32(2)};
+                (void)b.addInst(*schema->opcodeByMnemonic(c.mnemonic),
+                                rax, ops, /*payload=*/0, kW32);
+            });
+            EXPECT_EQ(rep.errorCount(), 0u) << c.mnemonic;
+            expectPrefix(bytes, {0xC1, c.modrm, 0x02});
+        }
+    }
+}
+
+TEST(WidthAxisX86, ShiftImm8OutOfRangeFailsLoudNeverTruncates) {
+    // Defense-in-depth: a value that doesn't fit one byte must fail
+    // loud at the walker (the lowering routes such counts through the
+    // CL form; this pins the walker's own guard).
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const rax = gpr(*schema, "rax");
+    DiagnosticReporter rep;
+    (void)buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(rax),
+                                  LirOperand::makeImmInt32(300)};
+        (void)b.addInst(*schema->opcodeByMnemonic("shl"), rax, ops);
+    });
+    EXPECT_GT(rep.errorCount(), 0u);
+    bool sawRangeReject = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_NoMatchingEncodingVariant
+            && d.actual.find("imm8") != std::string::npos) {
+            sawRangeReject = true;
+        }
+    }
+    EXPECT_TRUE(sawRangeReject);
+}
+
+TEST(WidthAxisArm64, ShiftVariableWordsXAndWForms) {
+    // LSLV/LSRV/ASRV Xd, Xn, Xm — data-processing (2 source), opcode
+    // field 001000/001001/001010. W-forms = the X word with sf (bit
+    // 31) cleared. Derived from the ARM ARM (C6.2.215/217/21), with
+    // d0=x0, n=x1, m=x2 → | 2<<16 | 1<<5 | 0.
+    auto schema = loadArm();
+    ASSERT_NE(schema, nullptr);
+    auto const x0 = gpr(*schema, "x0");
+    auto const x1 = gpr(*schema, "x1");
+    auto const x2 = gpr(*schema, "x2");
+    struct Case { char const* mnemonic; std::uint32_t xWord; };
+    for (Case const c : {Case{"shl",   0x9AC22020u},   // LSLV
+                         Case{"shr_l", 0x9AC22420u},   // LSRV
+                         Case{"shr_a", 0x9AC22820u}}) {// ASRV
+        {
+            DiagnosticReporter rep;
+            auto bytes = buildAndAssembleArm(*schema, rep,
+                                             [&](LirBuilder& b) {
+                LirOperand const ops[] = {LirOperand::makeReg(x1),
+                                          LirOperand::makeReg(x2)};
+                (void)b.addInst(*schema->opcodeByMnemonic(c.mnemonic),
+                                x0, ops);
+            });
+            EXPECT_EQ(rep.errorCount(), 0u) << c.mnemonic;
+            EXPECT_EQ(firstInstWord(bytes), c.xWord) << c.mnemonic;
+        }
+        {
+            DiagnosticReporter rep;
+            auto bytes = buildAndAssembleArm(*schema, rep,
+                                             [&](LirBuilder& b) {
+                LirOperand const ops[] = {LirOperand::makeReg(x1),
+                                          LirOperand::makeReg(x2)};
+                (void)b.addInst(*schema->opcodeByMnemonic(c.mnemonic),
+                                x0, ops, /*payload=*/0, kW32);
+            });
+            EXPECT_EQ(rep.errorCount(), 0u) << c.mnemonic;
+            EXPECT_EQ(firstInstWord(bytes), c.xWord & ~0x80000000u)
+                << c.mnemonic;
+        }
+    }
+}
+
+// RED-ON-DISABLE: strip the x86 shift encodings entirely → a shift
+// inst must FAIL LOUD at the assembler (A_NoEncodingDeclared — the
+// exact pre-FC3.5 wall this cycle removed), proving the encodings are
+// the load-bearing piece, not some fallback.
+TEST(WidthAxisX86, StrippedShiftEncodingFailsLoud) {
+    auto mutated = test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            for (auto& op : doc["opcodes"]) {
+                if (op.value("mnemonic", "") != "shl") continue;
+                op.erase("encoding");
+            }
+        });
+    ASSERT_TRUE(mutated.has_value());
+    auto const& schema = **mutated;
+    auto const rax = gpr(schema, "rax");
+    DiagnosticReporter rep;
+    (void)buildLegalizeAssemble(schema, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(rax)};
+        (void)b.addInst(*schema.opcodeByMnemonic("shl"), rax, ops);
+    });
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a shift with no declared encoding must NOT assemble";
+    bool sawNoEncoding = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_NoEncodingDeclared) {
+            sawNoEncoding = true;
+        }
+    }
+    EXPECT_TRUE(sawNoEncoding);
+}
+
+// ── FC3.5 sweep-c1: the zext SOURCE-width forms (D-CSUBSET-ZEXT-32-TO-64) ──
+
+TEST(WidthAxisX86, ZextWidth32EmitsMovR32AndDefaultKeepsMovzx) {
+    // The zext mnemonic's width axis keys on the SOURCE type (threaded
+    // by the MIR→LIR ZExt arm): width 32 (U32 source) = mov r32, r/m32
+    // (0x8B /r, no REX.W — the 32-bit register write zero-extends);
+    // width-default (Bool source / lowerICmp's setcc widener) = the
+    // movzx byte form REX.W 0F B6 /r, byte-identical to pre-FC3.5.
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const rax = gpr(*schema, "rax");
+    auto const rcx = gpr(*schema, "rcx");
+    {
+        DiagnosticReporter rep;
+        auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(rcx)};
+            (void)b.addInst(*schema->opcodeByMnemonic("zext"), rax, ops,
+                            /*payload=*/0, kW32);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        // mov eax, ecx — 8B /r, ModRM = 11_000_001 = 0xC1, no REX.
+        expectPrefix(bytes, {0x8B, 0xC1});
+    }
+    {
+        DiagnosticReporter rep;
+        auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(rcx)};
+            (void)b.addInst(*schema->opcodeByMnemonic("zext"), rax, ops);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        // movzx rax, cl — REX.W 0F B6 /r (unchanged byte shape).
+        expectPrefix(bytes, {0x48, 0x0F, 0xB6, 0xC1});
+    }
+}
+
+TEST(WidthAxisArm64, ZextIsWidthInvariantOneWordServesBothSources) {
+    // arm64's zext = ORR Wd, WZR, Wm — the W-register write zeroes
+    // bits 63:32 for ANY 32-bit source value, so the SAME word is the
+    // correct realization for both the Bool 0/1 widener and the
+    // U32→U64 zero-extend. The variant is deliberately width-ABSENT
+    // (match-any; the xor_rdx_zero precedent) — pin both widths
+    // emitting the identical word.
+    auto schema = loadArm();
+    ASSERT_NE(schema, nullptr);
+    auto const x0 = gpr(*schema, "x0");
+    auto const x1 = gpr(*schema, "x1");
+    for (std::uint8_t const flags : {std::uint8_t{0}, kW32}) {
+        DiagnosticReporter rep;
+        auto bytes = buildAndAssembleArm(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(x1)};
+            (void)b.addInst(*schema->opcodeByMnemonic("zext"), x0, ops,
+                            /*payload=*/0, flags);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u) << unsigned(flags);
+        EXPECT_EQ(firstInstWord(bytes), 0x2A0103E0u) << unsigned(flags);
+    }
+}
+
 // ── red-on-disable: a stripped 32-bit variant fails loud ──────────────
+
+TEST(WidthAxisX86, StrippedZextWidth32VariantFailsLoudNeverFallsBack) {
+    // Strip the width-32 zext variant (the U32→U64 mov form): a
+    // width-32 zext inst must FAIL LOUD at the matcher — silently
+    // matching the byte-movzx form would read ONE byte of the U32
+    // (the exact miscompile D-CSUBSET-ZEXT-32-TO-64's gate existed to
+    // prevent). Proves both variants are width-KEYED, no match-any.
+    auto mutated = test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            for (auto& op : doc["opcodes"]) {
+                if (op.value("mnemonic", "") != "zext") continue;
+                auto& variants = op["encoding"]["variants"];
+                variants.erase(
+                    std::remove_if(
+                        variants.begin(), variants.end(),
+                        [](nlohmann::json const& v) {
+                            return v.contains("guard")
+                                && v["guard"].value("width", 0) == 32;
+                        }),
+                    variants.end());
+            }
+        });
+    ASSERT_TRUE(mutated.has_value());
+    auto const& schema = **mutated;
+    auto const rax = gpr(schema, "rax");
+    auto const rcx = gpr(schema, "rcx");
+    DiagnosticReporter rep;
+    (void)buildLegalizeAssemble(schema, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(rcx)};
+        (void)b.addInst(*schema.opcodeByMnemonic("zext"), rax, ops,
+                        /*payload=*/0, kW32);
+    });
+    EXPECT_GT(rep.errorCount(), 0u);
+    bool sawNoVariantAtWidth32 = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_NoMatchingEncodingVariant
+            && d.actual.find("width 32") != std::string::npos) {
+            sawNoVariantAtWidth32 = true;
+        }
+    }
+    EXPECT_TRUE(sawNoVariantAtWidth32);
+}
 
 TEST(WidthAxisX86, StrippedThirtyTwoBitVariantFailsLoudNeverFallsBack) {
     // Strip the width-32 reg-reg `add` variant from the shipped JSON

@@ -1609,8 +1609,14 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // The registered vocabulary grows as new projection shapes
         // arrive (a fail-loud reject here forces the deliberate
         // extension rather than a silent free-form string).
-        static constexpr std::array<std::string_view, 3>
-            kKnownImplicitRegisterRoles{"dividend", "quotient", "remainder"};
+        // FC3.5 sweep-c1 added "count" — the shift-count input of the
+        // implicit-count shift realization (x86 SHL/SHR/SAR read the
+        // count from CL; the MIR→LIR shift lowering pins the count
+        // vreg into the role-declared register exactly like the div
+        // lowering's "dividend" pin).
+        static constexpr std::array<std::string_view, 4>
+            kKnownImplicitRegisterRoles{"dividend", "quotient", "remainder",
+                                        "count"};
         auto resolveRoles =
             [&](std::vector<std::pair<std::string, std::string>> const& roles,
                 std::vector<std::pair<std::string, std::uint16_t>>& resolved,
@@ -1630,9 +1636,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                               std::format("opcode '{}': unknown implicit-"
                                           "register role '{}' — registered "
                                           "roles are 'dividend', 'quotient', "
-                                          "'remainder' (typo discriminator; "
-                                          "extend the registered vocabulary "
-                                          "for a new projection shape)",
+                                          "'remainder', 'count' (typo "
+                                          "discriminator; extend the "
+                                          "registered vocabulary for a new "
+                                          "projection shape)",
                                           info.mnemonic, role));
                     continue;
                 }

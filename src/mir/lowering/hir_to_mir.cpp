@@ -593,7 +593,20 @@ struct Lowerer {
                 MirInstId const lhs = lowerExpr(kids[0]);
                 if (!lhs.valid()) return InvalidMirInst;
                 MirBlockId const lhsPred = mir.currentlyOpenBlock();
-                MirBlockId const rhsBB   = mir.createBlock(StructCfMarker::Linear);
+                // FC3.5 sweep-c1 (chip task_bd58aa3d): the rhs block is
+                // the CONDITIONAL ARM of this one-armed diamond — mark
+                // it IfThen, exactly like IfStmt's else-less shape
+                // (CondBr(cond, arm, join)). The previous `Linear`
+                // marker left the IfJoin UNPAIRED, so any function
+                // mixing `&&`/`||` with an `if`/ternary tripped the
+                // verifier's count-pairing invariant (IfThen-count !=
+                // IfJoin-count → I_StructCfMismatch; `if (a < 2 &&
+                // a < 3)` = IfThen 1 vs IfJoin 2). For OR the arm sits
+                // on the FALSE edge — the marker means "the diamond's
+                // single conditional arm", not an edge polarity (the
+                // verifier pairs counts; Ternary set the value-level-
+                // diamond precedent for the If-family markers).
+                MirBlockId const rhsBB   = mir.createBlock(StructCfMarker::IfThen);
                 MirBlockId const joinBB  = mir.createBlock(StructCfMarker::IfJoin);
                 // AND: lhs true → rhs, lhs false → join (short-circuit).
                 // OR:  lhs true → join (short-circuit), lhs false → rhs.
@@ -1232,6 +1245,33 @@ struct Lowerer {
         }
     }
 
+    // FC3.5 sweep-c1 (chip task_20b1224d): lower one `for` header
+    // clause (init or update). cst_to_hir's `lowerForClause` emits one
+    // of exactly three shapes:
+    //   * `VarDecl`    — a declaration init (`for (int i = 0; ...)`);
+    //   * `AssignStmt` — an assignment, INCLUDING every compound
+    //     assign (`+=`/`-=`/.../`<<=`/`>>=`) and postfix `++`/`--`,
+    //     which `lowerCompoundAssign`/`lowerIncDecStmt` desugar to
+    //     AssignStmt before MIR ever sees them;
+    //   * a BARE expression evaluated for its side effects (the value
+    //     is discarded — cst_to_hir deliberately does NOT wrap for-
+    //     clause expressions in ExprStmt).
+    // Routing the whole clause through `lowerExpr` was the bug:
+    // `for (i = 9; i; i = i - 1)`'s update is an AssignStmt, and the
+    // expression dispatch fails loud with "HIR expression kind ordinal
+    // 19 [AssignStmt] not yet supported". Statement-shaped clauses go
+    // through `lowerStmt`; anything else stays an expression (its
+    // default arm still fail-louds on a genuinely unloweable kind).
+    bool lowerForClauseNode(HirNodeId node) {
+        switch (hir.kind(node)) {
+            case HirKind::VarDecl:
+            case HirKind::AssignStmt:
+                return lowerStmt(node);
+            default:
+                return lowerExpr(node).valid();
+        }
+    }
+
     // Lower a single HIR statement in the currently-open MIR block.
     // Returns true on success, false on a hard error (caller bails).
     bool lowerStmt(HirNodeId node) {
@@ -1472,7 +1512,7 @@ struct Lowerer {
                 HirNodeId const bodyN = hir.loopBody(node);
 
                 if (initN.has_value()) {
-                    if (!lowerStmt(*initN)) {
+                    if (!lowerForClauseNode(*initN)) {
                         if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                         return false;
                     }
@@ -1518,10 +1558,7 @@ struct Lowerer {
 
                 if (updateN.has_value()) {
                     mir.beginBlock(update);
-                    // The update is an expression evaluated for its side
-                    // effects (the value is discarded), same shape as ExprStmt.
-                    MirInstId const u = lowerExpr(*updateN);
-                    if (!u.valid()) {
+                    if (!lowerForClauseNode(*updateN)) {
                         if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                         sealCreatedAsUnreachable(exit);
                         return false;

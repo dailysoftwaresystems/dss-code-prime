@@ -25,6 +25,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -460,6 +461,130 @@ TEST(LirRegAlloc, DivisorVregExcludesImplicitClobberSet) {
            "extend phase) BEFORE IDIV reads it — divide by "
            "sign-extension-of-RAX = divide by zero trap for "
            "positive dividends.";
+}
+
+// ── FC3.5 sweep-c1 CRITICAL miscompile fix pin (2026-06-11) ────────
+// The implicit-CL shift lowering (mir_to_lir lowerShift Rule 2) emits
+// `mov rcx, count` (the role pin) + `shl result, value`
+// (requires2Address). The post-regalloc 2-addr legalize inserts
+// `mov result, value` BEFORE the shift. If the allocator assigns the
+// RESULT vreg to RCX, that mov destroys the pinned count — the shift
+// computes `value << (value & 63)` instead of `value << count`.
+// SILENT MISCOMPILE, reachable only under register pressure:
+//   * the covered-position exclusion (implicitClobbersCrossedBy)
+//     skips it — the result's range STARTS at the shift's LATE slot
+//     (liveness firstDef = pos+1) while the clobber entry sits at the
+//     EARLY slot (`c.position < r.start` → continue);
+//   * the 2-addr operand exclusion covers explicit operands [1..N]
+//     only — the count is IMPLICIT, not an operand.
+// The fix: the result of a requires2Address op with declared
+// implicitRegisters also excludes (inputs ∪ clobbered) — generic over
+// the schema declaration, no shift/RCX identity in src/.
+//
+// THE PIN MUST BE PRESSURED (registry row
+// D-LIR-REGALLOC-PRESSURED-IMPLICIT-CLOBBER-PIN documents that
+// unpressured pins pass even with the exclusion disabled — the
+// natural linear-scan pick only reaches RCX once the free pool is
+// nearly drained; on SysV the caller-saved LIFO hands out
+// r11..r8, rdi, rsi, rdx BEFORE rcx, with rax last). We sweep the
+// live-value count so at least one iteration drains the pool to
+// exactly the {rcx, rax} tail at the shift result's allocation —
+// disabling the result-def exclusion in lir_regalloc.cpp flips this
+// test RED (result lands on rcx); the sweep keeps the pin firing
+// across small allocation-order drifts.
+TEST(LirRegAlloc, PressuredShiftResultExcludesImplicitInputAndClobberSet) {
+    bool sawShiftShapedInst    = false;
+    bool sawPhysAssignedResult = false;
+
+    for (int nLive = 10; nLive <= 16; ++nLive) {
+        // f keeps x, n AND every a_i live ACROSS the variable-count
+        // shift (all are read after it), so nothing expires at the
+        // shift result's allocation point and the pool is drained.
+        std::string src = "int f(int x, int n) {\n";
+        for (int i = 0; i < nLive; ++i) {
+            src += "    int a" + std::to_string(i) + " = x + "
+                 + std::to_string(i + 1) + ";\n";
+        }
+        src += "    int s = x << n;\n";
+        src += "    return s + x + n";
+        for (int i = 0; i < nLive; ++i) {
+            src += " + a" + std::to_string(i);
+        }
+        src += ";\n}\n";
+
+        auto lowered = lowerCSubsetToLir(src);
+        ASSERT_TRUE(lowered.lir.ok) << "nLive=" << nLive;
+        LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
+        DiagnosticReporter regallocRep;
+        // ccIndex 0 = sysv_amd64 (the reviewer's probe convention).
+        LirAllocation const out = allocateRegisters(
+            lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0,
+            regallocRep);
+        ASSERT_TRUE(out.ok()) << "nLive=" << nLive;
+        ASSERT_EQ(out.perFunc.size(), 1u);
+        auto const& alloc = out.perFunc[0];
+        Lir const& lir    = lowered.lir.lir;
+
+        // Scan EVERY instruction whose opcode declares BOTH
+        // requires2Address AND implicitRegisters (the hazardous
+        // shape) — agnostic discovery, no mnemonic list.
+        std::size_t const funcCount = lir.moduleFuncCount();
+        for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
+            LirFuncId const fn = lir.funcAt(fi);
+            std::uint32_t const blockCount = lir.funcBlockCount(fn);
+            for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+                LirBlockId const blk = lir.funcBlockAt(fn, bi);
+                std::uint32_t const instCount = lir.blockInstCount(blk);
+                for (std::uint32_t ii = 0; ii < instCount; ++ii) {
+                    LirInstId const inst = lir.blockInstAt(blk, ii);
+                    auto const* info =
+                        lowered.target->opcodeInfo(lir.instOpcode(inst));
+                    if (info == nullptr || !info->requires2Address
+                        || !info->implicitRegisters.has_value()) {
+                        continue;
+                    }
+                    sawShiftShapedInst = true;
+                    LirReg const res = lir.instResult(inst);
+                    if (!res.valid() || res.isPhysical) continue;
+                    auto const* a = alloc.forVReg(res.id);
+                    if (a == nullptr || a->isSpilled()) continue;
+                    sawPhysAssignedResult = true;
+                    auto const ord = static_cast<std::uint16_t>(
+                        a->physReg().id);
+                    auto const& ir = *info->implicitRegisters;
+                    for (auto const f : ir.inputOrdinals) {
+                        EXPECT_NE(ord, f)
+                            << "nLive=" << nLive << ": "
+                            << info->mnemonic
+                            << " result allocated to its IMPLICIT-"
+                               "INPUT register (ordinal " << f
+                            << ") — the 2-addr legalize's `mov "
+                               "result, value` would overwrite the "
+                               "role-pinned value before the op "
+                               "reads it (shift-by-CL count clobber "
+                               "= silent miscompile).";
+                    }
+                    for (auto const f : ir.clobberedOrdinals) {
+                        EXPECT_NE(ord, f)
+                            << "nLive=" << nLive << ": "
+                            << info->mnemonic
+                            << " result allocated to an implicit-"
+                               "CLOBBERED register (ordinal " << f
+                            << ").";
+                    }
+                }
+            }
+        }
+    }
+    // Non-vacuity guards: the sweep must actually exercise the
+    // hazardous shape, and at least one result must be register-
+    // allocated (an all-spilled sweep would assert nothing).
+    EXPECT_TRUE(sawShiftShapedInst)
+        << "sweep produced no requires2Address+implicitRegisters "
+           "instruction — the corpus shape regressed";
+    EXPECT_TRUE(sawPhysAssignedResult)
+        << "no shift result was register-allocated anywhere in the "
+           "sweep — the pin would be vacuous";
 }
 
 TEST(LirRegAlloc, CrossCallRangesLandInCalleeSavedOrSpill) {

@@ -710,7 +710,7 @@
       }
     },
     {
-      "$comment": "D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold, code-reviewer C2): zero-extend the low BYTE of a register to a full r64. Encoding `REX.W 0F B6 /r` — movzx r64, r/m8. ModR/M.reg = result (dest, 64-bit); ModR/M.rm = operand[0] (src, low-byte). REX.W=true serves double duty: (a) sets dest to r64, (b) forces REX prefix presence so the SRC low-byte access uses the spl/bpl/sil/dil aliasing (proper 8-bit access of r4..r7) instead of the legacy ah/ch/dh/bh high-byte alias. The natural consumer is the setcc → zext pair lowered by `lowerICmp`, but it is also reused by MIR ZExt for arbitrary boolean-typed → int widening.",
+      "$comment": "D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold, code-reviewer C2): zero-extend the low BYTE of a register to a full r64. Encoding `REX.W 0F B6 /r` — movzx r64, r/m8. ModR/M.reg = result (dest, 64-bit); ModR/M.rm = operand[0] (src, low-byte). REX.W=true serves double duty: (a) sets dest to r64, (b) forces REX prefix presence so the SRC low-byte access uses the spl/bpl/sil/dil aliasing (proper 8-bit access of r4..r7) instead of the legacy ah/ch/dh/bh high-byte alias. The natural consumer is the setcc → zext pair lowered by `lowerICmp`, but it is also reused by MIR ZExt for boolean-typed → int widening. FC3.5 sweep-c1 (D-CSUBSET-ZEXT-32-TO-64): the mnemonic now carries TWO width-keyed forms selected by the SOURCE type's width on the LIR inst (the MIR→LIR ZExt arm threads it): width 64 (the Bool/byte default — flags=0) keeps this movzx byte-widener byte-identically; width 32 (a U32 source) selects `mov r32, r32` below — a 32-bit register write zero-extends to the full r64 (Intel SDM MOV: 32-bit operands auto-zero the upper dword), which IS the U32→U64 conversion. Routing a U32 through the byte form would silently read ONE byte. Both variants are width-KEYED (no width-absent match-any), so an unforeseen width fails loud at the matcher instead of silently picking a wrong-width form.",
       "mnemonic":      "zext",
       "result":        "value",
       "hasSideEffects": false,
@@ -722,12 +722,19 @@
         "format": "x86-variable",
         "variants": [
           {
-            "guard":    { "operandKinds": ["reg"] },
+            "guard":    { "operandKinds": ["reg"], "width": 64 },
             "template": { "rexW": true, "opcode": [15, 182] },
             "resultSlot": "modrm.reg",
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
+          },
+          {
+            "$comment": "FC3.5: zext-from-U32 — mov r32, r/m32 (0x8B /r WITHOUT REX.W; the SAME bytes the `trunc` opcode emits, because the ISA operation is identical: a 32-bit register write zeroes bits 63:32). Two mnemonics deliberately share the encoding — each conversion polices its own inherent (source, dest) pair at the MIR→LIR gate.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "opcode": [139] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           }
         ]
       }
@@ -770,22 +777,140 @@
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
-      "$comment": "Logical left shift. Same opcode shape as add/sub.",
+      "$comment": "FC3.5 sweep-c1 (D-CSUBSET-32BIT-ALU-FORMS shifts residue): logical left shift — FIRST real encodings. Intel SDM SHL: the VARIABLE-count form `SHL r/m64, CL` = REX.W D3 /4 (the count is the IMPLICIT CL register — x86 has no 3-address reg-count shift); the CONSTANT-count form `SHL r/m64, imm8` = REX.W C1 /4 ib; 32-bit siblings = the same opcodes WITHOUT REX.W per the FC3-c2 width axis (a 32-bit shift auto-zero-extends its destination). Hardware masks the count to the operand width (& 63 / & 31, SDM Vol. 2B SAL/SAR/SHL/SHR) — C declares counts >= width UB (C23 6.5.7p3), so no extra masking is emitted; whatever the hardware does to a UB count is conforming. 2-address: the r/m operand IS the destination (requires2Address legalize inserts the copy). implicitRegisters (the FC1 idiv role-contract pattern): inputs=[rcx] (the core reads CL), inputRoles={count: rcx} — the MIR->LIR shift lowering pins the count vreg BY ROLE, never by name; clobbered=[rcx] expresses that the REALIZATION's count-pin mov destroys RCX's prior value across the sequence (regalloc's covered-position exclusion keeps live ranges out of RCX across the shift — the same mechanism that keeps div operands out of RAX/RDX). The exclusion is conservatively also active at imm-form positions (the constraint is per-OPCODE; costs one register of pressure there, never correctness). The lowering selects the imm8 variant when the count is a MIR Const in [0,255] AND a [reg,imm] variant is declared; otherwise the CL pair.",
       "mnemonic": "shl", "result": "value",
-      "minOperands": 2, "maxOperands": 2,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "requires2Address": true,
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "implicitRegisters": {
+        "inputs":     ["rcx"],
+        "clobbered":  ["rcx"],
+        "inputRoles": { "count": "rcx" }
+      },
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "SHL r/m64, CL — REX.W D3 /4. ONE explicit operand (the value/destination); CL is implicit.",
+            "guard":    { "operandKinds": ["reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [211], "modrmRegExt": 4 },
+            "wires":    [ { "index": 0, "slotKind": "modrm.rm" } ]
+          },
+          {
+            "$comment": "SHL r/m32, CL — D3 /4 without REX.W.",
+            "guard":    { "operandKinds": ["reg"], "width": 32 },
+            "template": { "opcode": [211], "modrmRegExt": 4 },
+            "wires":    [ { "index": 0, "slotKind": "modrm.rm" } ]
+          },
+          {
+            "$comment": "SHL r/m64, imm8 — REX.W C1 /4 ib.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 64 },
+            "template": { "rexW": true, "opcode": [193], "modrmRegExt": 4 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm8" }
+            ]
+          },
+          {
+            "$comment": "SHL r/m32, imm8 — C1 /4 ib without REX.W.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 32 },
+            "template": { "opcode": [193], "modrmRegExt": 4 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm8" }
+            ]
+          }
+        ]
+      }
     },
     {
-      "$comment": "Logical right shift (LShr). AS1 emits x86_64 `shr`.",
+      "$comment": "FC3.5 sweep-c1: LOGICAL right shift (MIR LShr — unsigned operands; zero-fill). Intel SDM SHR: /5 digit on the same D3 (CL) / C1 (imm8) opcodes as shl. Same implicit-count role contract + width axis + UB-above-width note as shl.",
       "mnemonic": "shr_l", "result": "value",
-      "minOperands": 2, "maxOperands": 2,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "requires2Address": true,
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "implicitRegisters": {
+        "inputs":     ["rcx"],
+        "clobbered":  ["rcx"],
+        "inputRoles": { "count": "rcx" }
+      },
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [211], "modrmRegExt": 5 },
+            "wires":    [ { "index": 0, "slotKind": "modrm.rm" } ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg"], "width": 32 },
+            "template": { "opcode": [211], "modrmRegExt": 5 },
+            "wires":    [ { "index": 0, "slotKind": "modrm.rm" } ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 64 },
+            "template": { "rexW": true, "opcode": [193], "modrmRegExt": 5 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm8" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 32 },
+            "template": { "opcode": [193], "modrmRegExt": 5 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm8" }
+            ]
+          }
+        ]
+      }
     },
     {
-      "$comment": "Arithmetic right shift (AShr). AS1 emits x86_64 `sar`.",
+      "$comment": "FC3.5 sweep-c1: ARITHMETIC right shift (MIR AShr — signed operands; sign-fill). Intel SDM SAR: /7 digit on the same D3 (CL) / C1 (imm8) opcodes. Same implicit-count role contract + width axis + UB-above-width note as shl. C 6.5.7p5 leaves negative-operand >> implementation-defined; DSS defines it as SAR (sign-fill) on every target.",
       "mnemonic": "shr_a", "result": "value",
-      "minOperands": 2, "maxOperands": 2,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "requires2Address": true,
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "implicitRegisters": {
+        "inputs":     ["rcx"],
+        "clobbered":  ["rcx"],
+        "inputRoles": { "count": "rcx" }
+      },
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [211], "modrmRegExt": 7 },
+            "wires":    [ { "index": 0, "slotKind": "modrm.rm" } ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg"], "width": 32 },
+            "template": { "opcode": [211], "modrmRegExt": 7 },
+            "wires":    [ { "index": 0, "slotKind": "modrm.rm" } ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 64 },
+            "template": { "rexW": true, "opcode": [193], "modrmRegExt": 7 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm8" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 32 },
+            "template": { "opcode": [193], "modrmRegExt": 7 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm8" }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "Bitwise NOT — 1-operand. AS1 emits x86_64 `not`.",
