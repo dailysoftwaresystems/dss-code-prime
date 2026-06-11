@@ -8,6 +8,10 @@ dss_add_test(NAME lir/test_lir_callconv  SOURCES test_lir_callconv.cpp)
 # NEGATIVE-PIN).
 target_link_libraries(dss_lir_test_lir_callconv PRIVATE nlohmann_json::nlohmann_json)
 dss_add_test(NAME lir/test_lir_regalloc  SOURCES test_lir_regalloc.cpp)
+# D-OPT-REGALLOC-EXCLUSION-BUFFER closure (2026-06-11): the >8-ordinal
+# exclusion-union growth pins mutate idiv_op/shl implicitRegisters via
+# mutate_target_schema.hpp.
+target_link_libraries(dss_lir_test_lir_regalloc PRIVATE nlohmann_json::nlohmann_json)
 dss_add_test(NAME lir/test_lir_rewrite   SOURCES test_lir_rewrite.cpp)
 dss_add_test(NAME lir/test_lir_text      SOURCES test_lir_text.cpp)
 dss_add_test(NAME lir/test_mir_to_lir    SOURCES test_mir_to_lir.cpp)

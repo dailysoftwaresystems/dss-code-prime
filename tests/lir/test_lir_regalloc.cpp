@@ -19,9 +19,11 @@
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "mutate_target_schema.hpp"
 #include "synthetic_fn.hpp"
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
 #include <array>
 #include <cstdint>
@@ -53,6 +55,56 @@ void expectAllocationInvariants(LirFuncAllocation const& alloc) {
             EXPECT_EQ(phys.regClass(), a.vreg.regClass());
         }
     }
+}
+
+// One implicit-register-bearing opcode occurrence on the liveness
+// position scale (early slot of the N-th instruction in
+// `flow.blockOrder` walk order = 2*N) — the same scan the allocator's
+// `collectImplicitClobberPositions` performs. `forbidden` is the
+// declared (inputs ∪ clobbered) union, dedup'd: every live range that
+// COVERS the position (range.start <= position < range.end) is
+// exposed to the op's implicit reads/writes mid-op, so the allocator
+// must keep it off these ordinals (the covered-position exclusion).
+// Agnostic discovery: driven by the schema declaration; no mnemonic
+// list.
+struct ImplicitOpOccurrence {
+    std::uint32_t              position;
+    std::vector<std::uint16_t> forbidden;
+    std::string                mnemonic;
+};
+
+[[nodiscard]] std::vector<ImplicitOpOccurrence>
+collectImplicitOpOccurrences(Lir const& lir, TargetSchema const& schema,
+                             LirFuncLiveness const& flow) {
+    std::vector<ImplicitOpOccurrence> out;
+    std::uint32_t pos = 0;
+    for (auto const& b : flow.blockOrder) {
+        std::uint32_t const n = lir.blockInstCount(b);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const inst = lir.blockInstAt(b, i);
+            auto const* info = schema.opcodeInfo(lir.instOpcode(inst));
+            if (info != nullptr && info->implicitRegisters.has_value()) {
+                auto const& ir = *info->implicitRegisters;
+                std::vector<std::uint16_t> forbidden;
+                forbidden.reserve(ir.inputOrdinals.size()
+                                  + ir.clobberedOrdinals.size());
+                for (auto const o : ir.inputOrdinals) forbidden.push_back(o);
+                for (auto const o : ir.clobberedOrdinals) {
+                    bool dup = false;
+                    for (auto const e : forbidden) {
+                        if (e == o) { dup = true; break; }
+                    }
+                    if (!dup) forbidden.push_back(o);
+                }
+                if (!forbidden.empty()) {
+                    out.push_back({pos, std::move(forbidden),
+                                   std::string{info->mnemonic}});
+                }
+            }
+            pos += 2u;
+        }
+    }
+    return out;
 }
 
 } // namespace
@@ -585,6 +637,326 @@ TEST(LirRegAlloc, PressuredShiftResultExcludesImplicitInputAndClobberSet) {
     EXPECT_TRUE(sawPhysAssignedResult)
         << "no shift result was register-allocated anywhere in the "
            "sweep — the pin would be vacuous";
+}
+
+// ── D-LIR-REGALLOC-PRESSURED-IMPLICIT-CLOBBER-PIN closure ──────────
+// (2026-06-11). The DIV sibling of the pressured shift pin above.
+// The unpressured `DivisorVregExcludesImplicitClobberSet` passes EVEN
+// WITH the covered-position exclusion disabled — with R3..R13 free,
+// the linear scan picks R14 for the divisor naturally and never
+// reaches the {rax, rdx} tail of the free-list pop order (callee-
+// saved r15..r12, rbp, rbx first, then caller-saved r11..r8, rdi,
+// rsi, rdx, rcx, rax LIFO). This sweep drains the pool: x, n AND
+// every a_i stay live ACROSS the div compound realization (x86:
+// cqo + idiv_op, each declaring implicitRegisters), so at the upper
+// sweep points the allocator's natural pick for a covering range
+// REACHES rdx/rax — only the covered-position exclusion
+// (`implicitClobbersCrossedBy` in lir_regalloc.cpp) keeps them off.
+//
+// The rule UNDER TEST: every vreg whose range COVERS an implicit-
+// register op's position (range.start <= pos < range.end — the
+// divisor and every live-across local) must avoid that op's declared
+// (inputs ∪ clobbered) ordinals. Mid-op clobber semantics, NOT the
+// call-style "consumed at early slot is safe" rule: CQO destroys RDX
+// BEFORE IDIV reads its operand, and the dividend pin `mov rax, ...`
+// overwrites RAX BEFORE the op reads any covering value parked there.
+// The div family's RESULT is immune by construction (idiv_op/cqo
+// declare `result: none`; the quotient is captured by a separate
+// post-op mov) — so unlike the shift sibling, the assertion here is
+// over COVERING ranges, not the defining result.
+//
+// **Red-on-disable (demonstrated 2026-06-11 + restored)**: comment
+// out the `implicitClobbersCrossedBy(r, implicitClobbers,
+// excludedScratch)` consultation in lir_regalloc.cpp's
+// allocateOneFunc → covering ranges land on rdx/rax at the drained
+// sweep points → this pin goes RED (and the pressured corpus arm
+// `examples/c-subset/division/` exits wrong). Agnostic: discovery
+// probes the schema's declared implicitRegisters; no mnemonic list,
+// no register names in the assertion.
+TEST(LirRegAlloc, PressuredDivCoveringVregsExcludeImplicitInputAndClobberSet) {
+    bool sawImplicitOp               = false;
+    bool sawPhysAssignedCoveringRange = false;
+
+    for (int nLive = 10; nLive <= 16; ++nLive) {
+        // f keeps x, n AND every a_i live ACROSS the division (all
+        // are read after it), so nothing expires at the div ops'
+        // positions and the pool is drained toward the forbidden
+        // tail.
+        std::string src = "int f(int x, int n) {\n";
+        for (int i = 0; i < nLive; ++i) {
+            src += "    int a" + std::to_string(i) + " = x + "
+                 + std::to_string(i + 1) + ";\n";
+        }
+        src += "    int q = x / n;\n";
+        src += "    return q + x + n";
+        for (int i = 0; i < nLive; ++i) {
+            src += " + a" + std::to_string(i);
+        }
+        src += ";\n}\n";
+
+        auto lowered = lowerCSubsetToLir(src);
+        ASSERT_TRUE(lowered.lir.ok) << "nLive=" << nLive;
+        LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
+        DiagnosticReporter regallocRep;
+        // ccIndex 0 = sysv_amd64 (matches the shift sibling).
+        LirAllocation const out = allocateRegisters(
+            lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0,
+            regallocRep);
+        ASSERT_TRUE(out.ok()) << "nLive=" << nLive;
+        ASSERT_EQ(out.perFunc.size(), 1u);
+        ASSERT_EQ(lv.perFunc.size(), 1u);
+        auto const& alloc = out.perFunc[0];
+        auto const& flow  = lv.perFunc[0];
+        Lir const& lir    = lowered.lir.lir;
+
+        auto const occurrences = collectImplicitOpOccurrences(
+            lir, *lowered.target, flow);
+        if (!occurrences.empty()) sawImplicitOp = true;
+
+        for (auto const& occ : occurrences) {
+            for (auto const& rng : flow.ranges) {
+                // Covered-position semantics — the rule under test.
+                if (rng.start > occ.position) continue;
+                if (occ.position >= rng.end) continue;
+                auto const* a = alloc.forVReg(rng.vreg.id);
+                if (a == nullptr || a->isSpilled()) continue;
+                sawPhysAssignedCoveringRange = true;
+                auto const ord =
+                    static_cast<std::uint16_t>(a->physReg().id);
+                for (auto const f : occ.forbidden) {
+                    EXPECT_NE(ord, f)
+                        << "nLive=" << nLive << ": vreg "
+                        << rng.vreg.id << " (range [" << rng.start
+                        << ", " << rng.end << ")) covering "
+                        << occ.mnemonic << " at position "
+                        << occ.position
+                        << " was allocated to that op's implicit "
+                           "(input ∪ clobbered) ordinal " << f
+                        << " — the op destroys/overwrites the "
+                           "register mid-op (silent miscompile; "
+                           "x86 CQO writes RDX before IDIV reads, "
+                           "the dividend pin writes RAX before the "
+                           "compound op reads).";
+                }
+            }
+        }
+    }
+    // Non-vacuity guards (mirrors the shift sibling): the sweep must
+    // actually contain the implicit-register shape, and at least one
+    // covering range must be register-allocated.
+    EXPECT_TRUE(sawImplicitOp)
+        << "sweep produced no implicitRegisters-declaring instruction "
+           "— the div lowering shape regressed";
+    EXPECT_TRUE(sawPhysAssignedCoveringRange)
+        << "no range covering an implicit-register op was register-"
+           "allocated anywhere in the sweep — the pin would be "
+           "vacuous";
+}
+
+// ── D-OPT-REGALLOC-EXCLUSION-BUFFER closure pins (2026-06-11) ──────
+// The exclusion scratch in allocateOneFunc was a fixed
+// std::array<uint16_t, 8>; a schema whose per-range (inputs ∪
+// clobbered ∪ 2-addr-operand) union exceeded 8 tripped regallocFatal
+// (process abort). The schema loader places NO cap on
+// `implicitRegisters` list sizes (bounded only by the target's
+// register table), so the fixed cap was not total. The buffer is now
+// growable: allocation must SUCCEED for any declared union size with
+// EVERY declared ordinal excluded.
+//
+// Two pins, one per former fatal site:
+//   1. the covered-position consumer (`implicitClobbersCrossedBy`) —
+//      mutated idiv_op declaring a 14-register clobber set;
+//   2. the result-def arm (requires2Address + implicitRegisters) —
+//      mutated shl declaring a 14-register clobber set.
+// Both use the established in-memory schema-mutation substrate
+// (tests/test_support/mutate_target_schema.hpp); register names live
+// only in the mutation lambdas (test DATA), the assertions read the
+// declared ordinals back generically.
+//
+// **Red-on-recap (demonstrated 2026-06-11 + restored)**: temporarily
+// re-adding a cap (`if (excludedScratch.size() > 8)
+// excludedScratch.resize(8);` before the span in allocateOneFunc —
+// i.e. the old buffer size as a silent truncation) flips BOTH pins
+// RED: the first-popped callee-saved ordinals (r15…) sit at the TAIL
+// of the declared lists, so the truncated exclusion lets the
+// allocator hand them straight to the covering/result vreg, and the
+// EXPECT_NE over the declared union catches the dropped ordinals.
+// The old fataling code is strictly worse than that truncation (it
+// aborted the process), so these pins cover the regression class
+// from both directions: silent truncation AND reintroduced cap.
+TEST(LirRegAlloc, ExclusionUnionBeyondFixedBufferAllocatesAndExcludesAll) {
+    // Mutate idiv_op: 14-register clobbered list (every sysv-
+    // allocatable GPR except rbp). inputs/outputs/roles stay
+    // untouched, so the loader invariants (outputs ⊆ clobbered,
+    // roles ∈ arrays) and the div lowering's role pins hold.
+    // Union (inputs ∪ clobbered) = 14 > 8 = the old fixed cap.
+    auto mutated = test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            for (auto& op : doc["opcodes"]) {
+                if (op.value("mnemonic", "") == "idiv_op") {
+                    op["implicitRegisters"]["clobbered"] =
+                        {"rax", "rdx", "rcx", "rsi", "rdi", "r8", "r9",
+                         "r10", "r11", "rbx", "r12", "r13", "r14",
+                         "r15"};
+                }
+            }
+        });
+    ASSERT_TRUE(mutated.has_value())
+        << "mutated x86_64 schema failed to load";
+
+    auto lowered = lowerCSubsetToLir(
+        "int q(int a, int b) { return a / b; }\n", *mutated);
+    ASSERT_TRUE(lowered.lir.ok);
+    LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
+    DiagnosticReporter regallocRep;
+    LirAllocation const out = allocateRegisters(
+        lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0,
+        regallocRep);
+    // The headline of the closure: the old fixed-buffer code ABORTED
+    // here (regallocFatal in implicitClobbersCrossedBy as soon as a
+    // covering range's union passed 8). Allocation must now succeed.
+    ASSERT_TRUE(out.ok())
+        << ">8-ordinal implicit union must allocate cleanly — the "
+           "exclusion buffer is growable";
+    ASSERT_EQ(out.perFunc.size(), 1u);
+    ASSERT_EQ(lv.perFunc.size(), 1u);
+    auto const& alloc = out.perFunc[0];
+    auto const& flow  = lv.perFunc[0];
+    expectAllocationInvariants(alloc);
+
+    auto const occurrences = collectImplicitOpOccurrences(
+        lowered.lir.lir, *lowered.target, flow);
+    bool sawBeyondFixedCapUnion       = false;
+    bool sawPhysAssignedCoveringRange = false;
+    for (auto const& occ : occurrences) {
+        if (occ.forbidden.size() > 8u) sawBeyondFixedCapUnion = true;
+        for (auto const& rng : flow.ranges) {
+            if (rng.start > occ.position) continue;
+            if (occ.position >= rng.end) continue;
+            auto const* a = alloc.forVReg(rng.vreg.id);
+            if (a == nullptr || a->isSpilled()) continue;
+            sawPhysAssignedCoveringRange = true;
+            auto const ord =
+                static_cast<std::uint16_t>(a->physReg().id);
+            for (auto const f : occ.forbidden) {
+                EXPECT_NE(ord, f)
+                    << "vreg " << rng.vreg.id << " covering "
+                    << occ.mnemonic << " at position " << occ.position
+                    << " landed on declared implicit ordinal " << f
+                    << " — every declared ordinal (including the 9th+"
+                       " beyond the old fixed cap) must be excluded";
+            }
+        }
+    }
+    // Non-vacuity: the >8 union must actually be present (otherwise
+    // the growth path was never exercised), and at least one covering
+    // range must be phys-assigned (the divisor lands on the one
+    // non-forbidden GPR; an all-spilled outcome would assert
+    // nothing).
+    EXPECT_TRUE(sawBeyondFixedCapUnion)
+        << "mutated schema produced no >8-ordinal union — the growth "
+           "path was not exercised";
+    EXPECT_TRUE(sawPhysAssignedCoveringRange)
+        << "no covering range was register-allocated — the exclusion "
+           "assertion would be vacuous";
+}
+
+TEST(LirRegAlloc, ResultDefExclusionUnionBeyondFixedBufferAllocatesAndExcludesAll) {
+    // Mutate shl: 14-register clobbered list (rcx stays first — the
+    // count role's register must remain declared; inputs/inputRoles
+    // untouched). Union (inputs ∪ clobbered) = 14 > 8. This drives
+    // the RESULT-DEF arm in allocateOneFunc (requires2Address +
+    // implicitRegisters → the result excludes the implicit union),
+    // whose old fixed-buffer addForbidden fataled past 8.
+    auto mutated = test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            for (auto& op : doc["opcodes"]) {
+                if (op.value("mnemonic", "") == "shl") {
+                    op["implicitRegisters"]["clobbered"] =
+                        {"rcx", "rax", "rdx", "rsi", "rdi", "r8", "r9",
+                         "r10", "r11", "rbx", "r12", "r13", "r14",
+                         "r15"};
+                }
+            }
+        });
+    ASSERT_TRUE(mutated.has_value())
+        << "mutated x86_64 schema failed to load";
+
+    auto lowered = lowerCSubsetToLir(
+        "int f(int x, int n) { return x << n; }\n", *mutated);
+    ASSERT_TRUE(lowered.lir.ok);
+    LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
+    DiagnosticReporter regallocRep;
+    LirAllocation const out = allocateRegisters(
+        lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0,
+        regallocRep);
+    ASSERT_TRUE(out.ok())
+        << ">8-ordinal result-def implicit union must allocate "
+           "cleanly — the exclusion buffer is growable";
+    ASSERT_EQ(out.perFunc.size(), 1u);
+    auto const& alloc = out.perFunc[0];
+    expectAllocationInvariants(alloc);
+
+    // The shift sibling's discovery: every requires2Address +
+    // implicitRegisters instruction's RESULT must avoid the declared
+    // (inputs ∪ clobbered) union — here 14 ordinals deep.
+    Lir const& lir = lowered.lir.lir;
+    bool sawResultDefShape       = false;
+    bool sawPhysAssignedResult   = false;
+    bool sawBeyondFixedCapUnion  = false;
+    std::size_t const funcCount = lir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        std::uint32_t const blockCount = lir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+            LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            std::uint32_t const instCount = lir.blockInstCount(blk);
+            for (std::uint32_t ii = 0; ii < instCount; ++ii) {
+                LirInstId const inst = lir.blockInstAt(blk, ii);
+                auto const* info =
+                    lowered.target->opcodeInfo(lir.instOpcode(inst));
+                if (info == nullptr || !info->requires2Address
+                    || !info->implicitRegisters.has_value()) {
+                    continue;
+                }
+                sawResultDefShape = true;
+                auto const& ir = *info->implicitRegisters;
+                if (ir.inputOrdinals.size()
+                        + ir.clobberedOrdinals.size() > 8u) {
+                    sawBeyondFixedCapUnion = true;
+                }
+                LirReg const res = lir.instResult(inst);
+                if (!res.valid() || res.isPhysical) continue;
+                auto const* a = alloc.forVReg(res.id);
+                if (a == nullptr || a->isSpilled()) continue;
+                sawPhysAssignedResult = true;
+                auto const ord = static_cast<std::uint16_t>(
+                    a->physReg().id);
+                for (auto const f : ir.inputOrdinals) {
+                    EXPECT_NE(ord, f)
+                        << info->mnemonic << " result on declared "
+                           "implicit-input ordinal " << f;
+                }
+                for (auto const f : ir.clobberedOrdinals) {
+                    EXPECT_NE(ord, f)
+                        << info->mnemonic << " result on declared "
+                           "implicit-clobbered ordinal " << f
+                        << " — every declared ordinal (including the "
+                           "9th+ beyond the old fixed cap) must be "
+                           "excluded";
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(sawResultDefShape)
+        << "no requires2Address+implicitRegisters instruction — the "
+           "shift lowering shape regressed";
+    EXPECT_TRUE(sawBeyondFixedCapUnion)
+        << "mutated schema produced no >8-ordinal union — the growth "
+           "path was not exercised";
+    EXPECT_TRUE(sawPhysAssignedResult)
+        << "the shift result was not register-allocated — the "
+           "exclusion assertion would be vacuous";
 }
 
 TEST(LirRegAlloc, CrossCallRangesLandInCalleeSavedOrSpill) {

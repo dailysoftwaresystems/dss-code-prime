@@ -36,13 +36,14 @@ struct LoweredLir {
     MirToLirResult                   lir;
 };
 
-// `targetName` defaults to "x86_64" (the historic behavior — every
-// pre-existing caller is unaffected). A test that needs the lowering
-// against a different target's calling convention (e.g. ARM64's
-// AAPCS64 link-register frame discipline) passes the target name
-// explicitly; the whole lower->LIR pipeline is target-parameterized.
+// Schema-injected overload (D-OPT-REGALLOC-EXCLUSION-BUFFER closure,
+// 2026-06-11): a test exercising substrate behavior against a
+// MUTATED target schema (the tests/test_support/mutate_target_schema
+// substrate) hands the pre-built schema in directly; the c-subset →
+// HIR → MIR half of the pipeline is target-independent, so only the
+// MIR→LIR step consumes it.
 [[nodiscard]] inline LoweredLir
-lowerCSubsetToLir(std::string src, std::string targetName = "x86_64") {
+lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
     UnitBuilder builder{*loaded};
@@ -57,18 +58,32 @@ lowerCSubsetToLir(std::string src, std::string targetName = "x86_64") {
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg);
+    if (target == nullptr) {
+        ADD_FAILURE() << "lowerCSubsetToLir: null target schema";
+        std::abort();
+    }
+    DiagnosticReporter lirReporter;
+    MirToLirResult lir = lowerToLir(mir.mir, *target,
+                                    model.lattice().interner(),
+                                    lirReporter);
+    return LoweredLir{std::move(model), std::move(hir), std::move(hirReporter),
+                      std::move(mir), std::move(mirReporter), std::move(target),
+                      std::move(lirReporter), std::move(lir)};
+}
+
+// `targetName` defaults to "x86_64" (the historic behavior — every
+// pre-existing caller is unaffected). A test that needs the lowering
+// against a different target's calling convention (e.g. ARM64's
+// AAPCS64 link-register frame discipline) passes the target name
+// explicitly; the whole lower->LIR pipeline is target-parameterized.
+[[nodiscard]] inline LoweredLir
+lowerCSubsetToLir(std::string src, std::string targetName = "x86_64") {
     auto target = TargetSchema::loadShipped(targetName);
     if (!target) {
         ADD_FAILURE() << "loadShipped(" << targetName << ") failed";
         std::abort();
     }
-    DiagnosticReporter lirReporter;
-    MirToLirResult lir = lowerToLir(mir.mir, **target,
-                                    model.lattice().interner(),
-                                    lirReporter);
-    return LoweredLir{std::move(model), std::move(hir), std::move(hirReporter),
-                      std::move(mir), std::move(mirReporter), std::move(*target),
-                      std::move(lirReporter), std::move(lir)};
+    return lowerCSubsetToLir(std::move(src), std::move(*target));
 }
 
 } // namespace dss::test_support
