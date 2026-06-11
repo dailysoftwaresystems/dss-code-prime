@@ -98,6 +98,9 @@ struct SchemaIndexes {
     std::unordered_map<std::uint32_t, std::vector<std::size_t>> assignByRule;
     std::unordered_map<std::uint32_t, std::size_t> callByRule;
     std::unordered_map<std::uint32_t, std::size_t> castByRule;      // FC2 explicit casts
+    // FC3.5 sweep-c3: compound-literal type stamping
+    // (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF)
+    std::unordered_map<std::uint32_t, std::size_t> compoundLiteralByRule;
     std::unordered_map<std::uint32_t, std::size_t> returnByRule;   // GAP A
     std::unordered_map<std::uint32_t, bool>        loopByRule;      // GAP C loop contexts
     std::unordered_map<std::uint32_t, bool>        loopControlByRule; // GAP C break/continue
@@ -439,6 +442,9 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
     }
     for (std::size_t i = 0; i < cfg.castRules.size(); ++i) {
         idx.castByRule[cfg.castRules[i].rule.v] = i;
+    }
+    for (std::size_t i = 0; i < cfg.compoundLiteralRules.size(); ++i) {
+        idx.compoundLiteralByRule[cfg.compoundLiteralRules[i].rule.v] = i;
     }
     for (std::size_t i = 0; i < cfg.returnRules.size(); ++i) {
         idx.returnByRule[cfg.returnRules[i].rule.v] = i;
@@ -1515,7 +1521,14 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     s.nodeToType.set(node, target);
                     TypeId const operandTy =
                         subtreeType(s, tree, operandNode);
+                    // FC3.5 sweep-c3 (D-CSUBSET-CAST-VOID-DISCARD): the
+                    // `(void)expr` discard idiom is legal for EVERY
+                    // operand type (C 6.5.4p2 / 6.3.2.2) — checked
+                    // BEFORE the castability matrix, whose entries must
+                    // all be mapCast-lowerable (the discard emits no
+                    // Cast node at all; see lowerCast).
                     if (operandTy.valid()
+                        && !isVoidDiscardCast(s.lattice.interner(), target)
                         && !isExplicitCastable(s.lattice.interner(),
                                                target, operandTy)) {
                         ParseDiagnostic d;
@@ -1530,6 +1543,38 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 // target invalid ⇒ resolveTypeNode already emitted
                 // S_UnknownType (fail loud); the cast node stays
                 // untyped and enclosing checks cascade-suppress.
+            }
+        }
+
+        // FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF):
+        // compound-literal typing (`semantics.compoundLiterals`). The
+        // type-position child resolves through the SAME resolver the
+        // cast block above uses (builtins + pointer stars + struct
+        // refs + typedef aliases); the resolved type is stamped on
+        // BOTH the type child (the HIR lowering's
+        // `resolveStampedTypeBelow` probe) and the node itself (the
+        // literal's RESULT type for enclosing checks). NO cast-matrix
+        // validation — a compound literal is C 6.5.2.5 postfix
+        // syntax, not a conversion; per-element legality lives in the
+        // HIR brace-init lowering. Pre-sweep only struct-ref type
+        // children resolved (via the struct-name machinery); builtin
+        // keywords and typedef names stamped NOTHING and the HIR
+        // lowering fail-louded on every scalar compound literal.
+        auto clIt = s.idx().compoundLiteralByRule.find(rule.v);
+        if (clIt != s.idx().compoundLiteralByRule.end()) {
+            auto const& clRule = cfg.compoundLiteralRules[clIt->second];
+            auto kids = visibleChildren(tree, node);
+            if (clRule.typeChild < kids.size()) {
+                NodeId const typeNode = kids[clRule.typeChild];
+                TypeId const target =
+                    resolveTypeNode(s, cfg, tree, typeNode, here);
+                if (target.valid()) {
+                    s.nodeToType.set(typeNode, target);
+                    s.nodeToType.set(node, target);
+                }
+                // target invalid ⇒ resolveTypeNode already emitted
+                // S_UnknownType (fail loud); the literal stays untyped
+                // and enclosing checks cascade-suppress.
             }
         }
 

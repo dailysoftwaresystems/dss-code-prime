@@ -849,11 +849,20 @@ enum class EncodingSlotKind : std::uint8_t {
     // discriminator; the historical width-labeled name); the SLOT
     // decides the emitted width.
     Imm8 = 21,
+    // FC3.5 sweep-c3 (D-LIR-MOD-MSUB-FUSION): the fixed32 THIRD source-
+    // register field at bits 10..14 — AArch64's `Ra` (the addend /
+    // minuend register of the multiply-accumulate family: MADD/MSUB/
+    // SMADDL/UMSUBL all carry Rm[20:16] | o0[15] | Ra[14:10] | Rn[9:5]
+    // | Rd[4:0]). First consumer: the arm64 `msub` opcode (MSUB Xd,
+    // Xn, Xm, Xa = Xa − Xn·Xm), the fused realization of rule 3's
+    // remainder expansion rem = n − (n/d)·d. NOT symbol-bearing; a
+    // plain 5-bit register window exactly like Rd/Rn/Rm.
+    Ra = 22,
     // Future fixed32 slots (paired with their consumer cycle):
     //   ImmShift / Sf-flag / scaled LDR imm12 / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 22> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 23> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -876,6 +885,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 22> kEncodingSlotKindTable{{{
     { EncodingSlotKind::SymbolPatchMarker, "sym.patch"   },
     { EncodingSlotKind::Imm19,         "imm19"          },
     { EncodingSlotKind::Imm8,          "imm8"           },
+    { EncodingSlotKind::Ra,            "ra"             },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -894,7 +904,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 22,
+static_assert(kEncodingSlotKindCount == 23,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -925,6 +935,7 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:
+        case EncodingSlotKind::Ra:
         case EncodingSlotKind::Imm26:
         case EncodingSlotKind::Imm16:
         case EncodingSlotKind::Imm9:
@@ -1103,6 +1114,7 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:
+        case EncodingSlotKind::Ra:
         case EncodingSlotKind::Imm16:
         case EncodingSlotKind::Imm9:
         case EncodingSlotKind::MemBaseNoScale:

@@ -2006,7 +2006,30 @@ struct Lowerer {
             return exprError(castNode,
                 "cast type-ref did not resolve to a type");
         }
-        E const operand = lowerExpr(operandN);
+        E operand = lowerExpr(operandN);
+        // FC3.5 sweep-c3 (D-CSUBSET-CAST-VOID-DISCARD): `(void)expr`
+        // is C's evaluate-and-discard idiom (6.3.2.2) — the operand
+        // lowers for its effects and NO Cast node wraps it (mapCast
+        // has no void arm by design; the discard is an expression-
+        // statement effect, not a conversion). The void result type
+        // makes any enclosing VALUE use a loud type mismatch.
+        if (interner.kind(target) == TypeKind::Void) {
+            return {operand.id, target};
+        }
+        // FC3.5 sweep-c3 (D-CSUBSET-CAST-ARRAY-DECAY): per C 6.3.2.1p3
+        // the cast operand undergoes array-to-pointer decay BEFORE the
+        // cast applies — `(char*)"str"` decays the Array<Char> literal
+        // to Ptr<Char> first. Reuse `coerce`'s implicit-decay arm (the
+        // SAME synthetic Cast mapCast already materializes via
+        // GlobalAddr), then the explicit cast operates on the decayed
+        // pointer (same-type → identity Bitcast; cross-type → the
+        // standard Ptr↔Ptr / Ptr↔int arms).
+        if (interner.kind(operand.type) == TypeKind::Array) {
+            auto const elems = interner.operands(operand.type);
+            if (!elems.empty()) {
+                operand = coerce(operand, interner.pointer(elems[0]));
+            }
+        }
         HirNodeId const cast =
             builder.makeCast(operand.id, target, HirFlags::None);
         return {track(cast, castNode), target};

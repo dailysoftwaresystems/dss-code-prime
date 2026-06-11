@@ -581,7 +581,9 @@
     "parenExpr": { "sequence": [ "ParenOpen", "expression", "ParenClose" ] },
 
     "compoundLiteralExpr": {
-      "sequence": [ "ParenOpen", "typeRefAllowingStruct", "ParenClose", "braceInitList" ]
+      "$comment": "FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF): the type position is castTypeRef (typedef-admitting via its bare-Identifier base alt) with the SAME commitRequiresTypeName binder triage castExpr uses. The `{` follower makes most forms unambiguous (triage case 4: BlockOpen is not a continuable value-reading operator -> COMMIT for unknown names); a KNOWN-value identifier `(a){...}` rolls back to the value reading, whose `(a)` parenExpr then hits the orphan `{` -> LOUD parse error (C says the form is invalid anyway).",
+      "sequence": [ "ParenOpen", "castTypeRef", "ParenClose", "braceInitList" ],
+      "commitRequiresTypeName": "castTypeRef"
     },
 
     "castExpr": {
@@ -758,6 +760,10 @@
     "$castsComment": "FC2: explicit C cast `(T)expr`. typeChild/operandChild are visible-child indices into castExpr = [ '(' , castTypeRef , ')' , castOperand ]. Pass 2 resolves+stamps the type child (typedefs incl. cross-tree-injected ones resolve through the standard type-position resolver), stamps the cast node's RESULT type, and validates the pair against the explicit-cast matrix (scalar<->scalar incl. float<->int, ptr<->ptr, ptr<->int; struct values / void / arrays -> S_InvalidCast).",
     "casts": [
       { "rule": "castExpr", "typeChild": 1, "operandChild": 3 }
+    ],
+    "$compoundLiteralsComment": "FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF): the compound-literal type position resolves + stamps through the SAME type-position resolver casts use (typedefs included). typeChild is the visible-child index into compoundLiteralExpr = [ '(' , castTypeRef , ')' , braceInitList ]. NO operandChild / cast-matrix validation — a compound literal is C 6.5.2.5 postfix syntax, not a conversion.",
+    "compoundLiterals": [
+      { "rule": "compoundLiteralExpr", "typeChild": 1 }
     ],
     "returnRules": [
       { "rule": "returnStmt", "value": 1 }

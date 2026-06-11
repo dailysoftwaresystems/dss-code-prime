@@ -207,17 +207,29 @@ namespace detail::type_rules {
 //
 // Everything else is false → the analyzer emits S_InvalidCast. Notably
 // REJECTED (fail loud, never miscompile): struct/union VALUES (C forbids
-// casts to composite types), `void` on either side (mapCast has no void
-// arm; a value-discarding `(void)x` statement-cast is future surface),
-// and Array-typed operands (decay-inside-cast, e.g. `(char*)"s"`, is a
-// pinned follow-up — the implicit decay path exists but the explicit-
-// cast lowering does not reuse it yet).
+// casts to composite types), `void` as the OPERAND (a void value cannot
+// convert to anything; the `(void)expr` DISCARD direction — void as the
+// TARGET — is admitted separately by `isVoidDiscardCast` below, FC3.5
+// sweep-c3), and Array-typed TARGETS (C 6.5.4 forbids casts to array
+// types).
+//
+// ARRAY-TYPED OPERANDS decay first (D-CSUBSET-CAST-ARRAY-DECAY ✅
+// FC3.5 sweep-c3): per C 6.3.2.1p3 the cast operand undergoes the
+// array-to-pointer conversion BEFORE the cast applies, so
+// `(char*)"str"` is Ptr↔Ptr legality-wise (and `(long)arr` is the
+// Ptr→integer round-trip). The legality view simply re-kinds the
+// operand as Ptr; the HIR lowering (`lowerCast`) emits the SAME
+// synthetic decay Cast the implicit path uses, so the value side
+// always sees pointer-typed input.
 [[nodiscard]] inline bool isExplicitCastable(TypeInterner const& interner,
                                              TypeId target,
                                              TypeId operand) noexcept {
     if (!target.valid() || !operand.valid()) return true;   // cascade suppression
     auto const tk = interner.kind(target);
-    auto const ok = interner.kind(operand);
+    auto const ok0 = interner.kind(operand);
+    // C 6.3.2.1p3 array-to-pointer decay on the OPERAND side only —
+    // an Array TARGET stays rejected below (no arm admits it).
+    auto const ok = (ok0 == TypeKind::Array) ? TypeKind::Ptr : ok0;
     // Mirrors mapCast's isInt: every integral scalar the MIR lattice
     // casts between (incl. Bool/Char/Byte — C casts these freely).
     auto const isCastableInt = [](TypeKind k) noexcept {
@@ -234,6 +246,22 @@ namespace detail::type_rules {
     if (tk == TypeKind::Ptr && isCastableInt(ok))     return true;
     if (isCastableInt(tk) && ok == TypeKind::Ptr)     return true;
     return false;
+}
+
+// FC3.5 sweep-c3 (D-CSUBSET-CAST-VOID-DISCARD): the C discard idiom
+// `(void)expr` — C 6.5.4p2 exempts a void TARGET from the scalar-
+// operand constraint and C 6.3.2.2 defines the semantics as evaluate-
+// and-discard. ANY operand type (scalar, pointer, array, struct, even
+// void itself) is admissible. Kept SEPARATE from `isExplicitCastable`
+// deliberately: everything that matrix admits must be lowerable by
+// MIR's `mapCast`, while a void discard produces NO Cast node at all —
+// `lowerCast` (cst_to_hir.cpp) lowers the operand for its side effects
+// and discards the value (an expression-statement effect). The
+// analyzer's cast-legality site checks this FIRST; a void target never
+// reaches the matrix.
+[[nodiscard]] inline bool isVoidDiscardCast(TypeInterner const& interner,
+                                            TypeId target) noexcept {
+    return target.valid() && interner.kind(target) == TypeKind::Void;
 }
 
 // Best common type for binary arithmetic. Returns the wider operand

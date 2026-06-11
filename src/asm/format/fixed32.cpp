@@ -48,6 +48,10 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Rd:    return SlotBitWindow{ 0,  5 };
         case EncodingSlotKind::Rn:    return SlotBitWindow{ 5,  5 };
         case EncodingSlotKind::Rm:    return SlotBitWindow{ 16, 5 };
+        // Ra (D-LIR-MOD-MSUB-FUSION): the multiply-accumulate family's
+        // third source register at bits 10..14 (MADD/MSUB Xd, Xn, Xm,
+        // Xa). A plain 5-bit register window like Rd/Rn/Rm.
+        case EncodingSlotKind::Ra:    return SlotBitWindow{ 10, 5 };
         // Imm26 (ARM64 branch displacement, e.g. `bl imm26`) — the
         // operand value at bits 0..25 of the fixed word. Cycle-4
         // scope: source is always a `SymbolRef`; the wire emits a

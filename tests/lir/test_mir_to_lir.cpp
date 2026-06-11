@@ -560,7 +560,13 @@ TEST(MirToLir, Arm64SignedDivisionLowersToSingleNativeSdiv) {
 // remainder, so MIR SMod expands to the target-blind arithmetic
 // identity rem = n − (n/d)·d over the DECLARED verbs: sdiv, mul, sub
 // — exactly three value-bearing ops, in that order.
-TEST(MirToLir, Arm64SignedModuloExpandsToSdivMulSub) {
+// D-LIR-MOD-MSUB-FUSION (FC3.5 sweep-c3): arm64 SMod now realizes the
+// rem = n − (n/d)·d identity via the FUSED msub (rule 3 preference a)
+// — sdiv + msub = 2 compute ops, the shape production compilers emit.
+// RED-on-disable lever: disabling the msub preference (or stripping
+// the `msub` declaration — see the fallback pin below) returns the
+// 3-op mul+sub expansion → the count + opcode asserts here go RED.
+TEST(MirToLir, Arm64SignedModuloFusesToSdivMsub) {
     TypeInterner interner{CompilationUnitId{1}};
     Mir mir = buildBinFnMir(MirOpcode::SMod, interner);
 
@@ -574,13 +580,293 @@ TEST(MirToLir, Arm64SignedModuloExpandsToSdivMulSub) {
     Lir const& lir = lirR.lir;
 
     auto const sdivOp = (*target)->opcodeByMnemonic("sdiv");
+    auto const msubOp = (*target)->opcodeByMnemonic("msub");
+    ASSERT_TRUE(sdivOp.has_value() && msubOp.has_value());
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    // EXACT shape: arg, arg, sdiv, msub, ret — 5 LIR insts (was 6
+    // pre-fusion: arg, arg, sdiv, mul, sub, ret).
+    ASSERT_EQ(lir.blockInstCount(bb), 5u)
+        << "arm64 SMod must fuse to exactly sdiv+msub.";
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 2)), *sdivOp)
+        << "fusion step 1: q = sdiv(n, d).";
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 3)), *msubOp)
+        << "fusion step 2: r = msub(q, d, n) = n − q·d.";
+
+    // Operand wiring (the identity's correctness): msub reads
+    // (quotient, divisor, dividend) — wired rn/rm/ra so the encoded
+    // MSUB computes Ra − Rn·Rm = n − q·d. Any transposition either
+    // negates every remainder (n, q·d swap) or computes garbage.
+    LirInstId const sdivInst = lir.blockInstAt(bb, 2);
+    LirInstId const msubInst = lir.blockInstAt(bb, 3);
+    auto const aReg    = lir.instResult(lir.blockInstAt(bb, 0));
+    auto const bReg    = lir.instResult(lir.blockInstAt(bb, 1));
+    auto const sdivReg = lir.instResult(sdivInst);
+    auto const msubOps = lir.instOperands(msubInst);
+    ASSERT_EQ(msubOps.size(), 3u);
+    EXPECT_EQ(msubOps[0].reg, sdivReg)
+        << "msub operand 0 (→ Rn) must be the sdiv quotient.";
+    EXPECT_EQ(msubOps[1].reg, bReg)
+        << "msub operand 1 (→ Rm) must be the divisor.";
+    EXPECT_EQ(msubOps[2].reg, aReg)
+        << "msub operand 2 (→ Ra) must be the DIVIDEND (r = n − q·d; "
+           "a transposed Ra would negate or corrupt every remainder).";
+}
+
+// ── D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (FC3.5 sweep-c3) ──────────────
+// The MOVZ+MOVK wide-immediate ladder. Hand-built `fn() -> T { return
+// <const>; }` MIR drives `lowerConst`'s inline path on each target.
+
+namespace {
+
+// Hand-built single-function MIR `fn() -> i64 { return CONST; }`.
+[[nodiscard]] Mir buildConstFnMir(std::int64_t value, TypeKind kind,
+                                  TypeInterner& interner) {
+    TypeId const ty = interner.primitive(kind);
+    auto const fnSig = interner.fnSig(std::span<TypeId const>{}, ty,
+                                      CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirLiteralValue lit;
+    lit.value = value;
+    lit.core  = kind;
+    MirInstId const c = mb.addConst(lit, ty);
+    mb.addReturn(c);
+    return std::move(mb).finish();
+}
+
+struct ConstChain {
+    std::vector<std::uint16_t> opcodes;   // block opcode sequence
+    std::vector<std::int32_t>  immValues; // each inst's ImmInt operand (or skip)
+};
+
+[[nodiscard]] ConstChain lowerConstChain(std::int64_t value, TypeKind kind,
+                                         char const* targetName) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildConstFnMir(value, kind, interner);
+    auto target = TargetSchema::loadShipped(targetName);
+    EXPECT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    EXPECT_TRUE(lirR.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    ConstChain out;
+    Lir const& lir = lirR.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        LirInstId const inst = lir.blockInstAt(bb, i);
+        out.opcodes.push_back(lir.instOpcode(inst));
+        std::int32_t imm = 0;
+        for (auto const& op : lir.instOperands(inst)) {
+            if (op.kind == LirOperandKind::ImmInt) imm = op.immInt32;
+        }
+        out.immValues.push_back(imm);
+    }
+    return out;
+}
+
+}  // namespace
+
+// 196608 = 0x30000: chunk0 = 0, chunk1 = 3 — exactly mov #0 +
+// movk_lsl16 #3 (+ ret). RED-on-disable lever: with the ladder off the
+// lowering emits ONE mov #196608 that fail-louds at encode; at THIS
+// tier the chain shape vanishes → count/opcode asserts RED.
+TEST(MirToLir, Arm64WideConstSplitsIntoMovzMovkChain) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp  = (*target)->opcodeByMnemonic("mov");
+    auto const mk16   = (*target)->opcodeByMnemonic("movk_lsl16");
+    ASSERT_TRUE(movOp.has_value() && mk16.has_value());
+
+    auto const chain = lowerConstChain(196608, TypeKind::I64, "arm64");
+    // mov #0, movk_lsl16 #3, ret — exactly 3 insts.
+    ASSERT_EQ(chain.opcodes.size(), 3u)
+        << "0x30000 must lower as a 2-op MOVZ+MOVK ladder";
+    EXPECT_EQ(chain.opcodes[0], *movOp);
+    EXPECT_EQ(chain.immValues[0], 0)
+        << "chunk 0 (lo16) of 0x30000 is ZERO";
+    EXPECT_EQ(chain.opcodes[1], *mk16);
+    EXPECT_EQ(chain.immValues[1], 3)
+        << "chunk 1 (bits 31:16) of 0x30000 is 3";
+}
+
+// A NEGATIVE width-64 constant is the SIGN-EXTENDED pattern — the
+// full 4-op ladder (chunk0 + three 0xFFFF-filled high chunks). -2 =
+// 0xFFFF_FFFF_FFFF_FFFE.
+TEST(MirToLir, Arm64NegativeConstEmitsFullFourOpLadder) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp = (*target)->opcodeByMnemonic("mov");
+    auto const mk16  = (*target)->opcodeByMnemonic("movk_lsl16");
+    auto const mk32  = (*target)->opcodeByMnemonic("movk_lsl32");
+    auto const mk48  = (*target)->opcodeByMnemonic("movk_lsl48");
+    ASSERT_TRUE(movOp.has_value() && mk16.has_value()
+             && mk32.has_value() && mk48.has_value());
+
+    auto const chain = lowerConstChain(-2, TypeKind::I64, "arm64");
+    ASSERT_EQ(chain.opcodes.size(), 5u)
+        << "-2 must lower as the full 4-op ladder (sign-extended "
+           "pattern) + ret";
+    EXPECT_EQ(chain.opcodes[0], *movOp);
+    EXPECT_EQ(chain.immValues[0], 0xFFFE);
+    EXPECT_EQ(chain.opcodes[1], *mk16);
+    EXPECT_EQ(chain.immValues[1], 0xFFFF);
+    EXPECT_EQ(chain.opcodes[2], *mk32);
+    EXPECT_EQ(chain.immValues[2], 0xFFFF);
+    EXPECT_EQ(chain.opcodes[3], *mk48);
+    EXPECT_EQ(chain.immValues[3], 0xFFFF);
+}
+
+// imm16-window constants keep the single MOVZ byte-identically — the
+// ladder must NOT fire below the ceiling.
+TEST(MirToLir, Arm64NarrowConstKeepsSingleMov) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp = (*target)->opcodeByMnemonic("mov");
+    ASSERT_TRUE(movOp.has_value());
+    auto const chain = lowerConstChain(0x2345, TypeKind::I64, "arm64");
+    ASSERT_EQ(chain.opcodes.size(), 2u)
+        << "0x2345 fits MOVZ — single mov + ret, no ladder";
+    EXPECT_EQ(chain.opcodes[0], *movOp);
+    EXPECT_EQ(chain.immValues[0], 0x2345);
+}
+
+// A width-32 (U32-typed) wide constant emits AT MOST the 2-chunk
+// ladder — chunks 2/3 do not exist at 32-bit width (the MOVZ seed
+// zeroes the whole register; the W-write semantics need no high
+// chunks). 0xFFFFFFFF = chunks FFFF/FFFF.
+TEST(MirToLir, Arm64Width32WideConstEmitsTwoChunkLadderOnly) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp = (*target)->opcodeByMnemonic("mov");
+    auto const mk16  = (*target)->opcodeByMnemonic("movk_lsl16");
+    ASSERT_TRUE(movOp.has_value() && mk16.has_value());
+    auto const chain = lowerConstChain(
+        static_cast<std::int64_t>(0xFFFFFFFFll), TypeKind::U32, "arm64");
+    ASSERT_EQ(chain.opcodes.size(), 3u)
+        << "U32 0xFFFFFFFF = mov #0xFFFF + movk_lsl16 #0xFFFF + ret — "
+           "no chunk-2/3 movk at 32-bit width";
+    EXPECT_EQ(chain.opcodes[0], *movOp);
+    EXPECT_EQ(chain.immValues[0], 0xFFFF);
+    EXPECT_EQ(chain.opcodes[1], *mk16);
+    EXPECT_EQ(chain.immValues[1], 0xFFFF);
+}
+
+// The CAPABILITY boundary: x86_64 declares no movk family — its mov
+// imm32 form swallows the whole inline range in ONE inst, and the
+// ladder must never fire (probe-by-mnemonic, zero `if (arch)`).
+TEST(MirToLir, X64WideConstKeepsSingleMovNoLadder) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp = (*target)->opcodeByMnemonic("mov");
+    ASSERT_TRUE(movOp.has_value());
+    EXPECT_FALSE((*target)->opcodeByMnemonic("movk_lsl16").has_value())
+        << "precondition: x86_64 must not declare the arm64 movk family";
+    auto const chain = lowerConstChain(196608, TypeKind::I64, "x86_64");
+    ASSERT_EQ(chain.opcodes.size(), 2u)
+        << "x86 keeps the single mov r, imm32 — the ladder is a "
+           "capability of movk-declaring targets only";
+    EXPECT_EQ(chain.opcodes[0], *movOp);
+    EXPECT_EQ(chain.immValues[0], 196608);
+}
+
+// D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD, the CAPABILITY boundary: arm64's
+// FPR load (`fldur`) declares NO [symbol] encoding variant — its
+// address materialization is the 2-word ADRP+ADD lea macro, and a
+// symbol-relative LDR fold is a DIFFERENT encoding shape (deliberately
+// out of scope; see the registry row). The fold predicate must
+// therefore NOT fire on arm64: the single-use GlobalAddr keeps its
+// lea and the load keeps the [base] form. This is the agnosticism pin
+// — the fold is mnemonic-capability-driven, never `if (x86)`.
+TEST(MirToLir, Arm64GlobalAddrLoadKeepsLeaPlusBaseFormLoad) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto const f64    = interner.primitive(TypeKind::F64);
+    auto const ptrF64 = interner.pointer(f64);
+    auto const sig = interner.fnSig(std::span<TypeId const>{}, f64,
+                                    CallConv::CcSysV);
+    MirBuilder mb;
+    MirLiteralValue quarter; quarter.value = 0.25;
+    quarter.core = TypeKind::F64;
+    mb.addFunction(sig, SymbolId{1});
+    (void)mb.addGlobal(f64, SymbolId{500}, mb.literalPoolAdd(quarter));
+    MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    MirInstId const addr = mb.addGlobalAddr(SymbolId{500}, ptrF64);
+    MirInstId const loadOps[] = {addr};
+    MirInstId const c = mb.addInst(MirOpcode::Load, loadOps, f64);
+    mb.addReturn(c);
+    Mir mir = std::move(mb).finish();
+
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = lirR.lir;
+
+    auto const leaOp   = (*target)->opcodeByMnemonic("lea");
+    auto const fldurOp = (*target)->opcodeByMnemonic("fldur");
+    ASSERT_TRUE(leaOp.has_value() && fldurOp.has_value());
+    LirBlockId const bbL = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool sawLea = false;
+    bool sawBaseFormLoad = false;
+    bool sawSymbolLoad = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bbL); ++i) {
+        LirInstId const inst = lir.blockInstAt(bbL, i);
+        auto const op = lir.instOpcode(inst);
+        if (op == *leaOp) sawLea = true;
+        if (op == *fldurOp) {
+            auto const ops = lir.instOperands(inst);
+            ASSERT_FALSE(ops.empty());
+            if (ops[0].kind == LirOperandKind::Reg) sawBaseFormLoad = true;
+            if (ops[0].kind == LirOperandKind::SymbolRef) sawSymbolLoad = true;
+        }
+    }
+    EXPECT_TRUE(sawLea)
+        << "arm64 must KEEP the lea (ADRP+ADD) — fldur declares no "
+           "[symbol] variant, so the riprel fold must not fire";
+    EXPECT_TRUE(sawBaseFormLoad)
+        << "the fldur must read through the lea-produced base register";
+    EXPECT_FALSE(sawSymbolLoad)
+        << "no symbol-operand fldur may be emitted — the assembler has "
+           "no encoding for it (the fold would be a guaranteed "
+           "A_NoMatchingEncodingVariant)";
+}
+
+// The generic mul+sub expansion is the FALLBACK for targets without a
+// fused multiply-subtract — and no shipped target reaches it any more
+// (x86 realizes remainders at rule 2; arm64 declares msub). This pin
+// keeps the fallback alive and correct under the msub-stripped arm64
+// schema (the cycle-10k mutation substrate): a regression that breaks
+// the expansion (or silently swallows a missing msub) goes RED here.
+TEST(MirToLir, Arm64ModuloWithoutMsubFallsBackToSdivMulSub) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildBinFnMir(MirOpcode::SMod, interner);
+
+    auto target = dss::test_support::mutateShippedTargetSchemaJson(
+        "arm64", {"msub"});
+    ASSERT_TRUE(target.has_value())
+        << "stripping msub must not fail the loader (an optional "
+           "capability, not a required verb)";
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = lirR.lir;
+
+    auto const sdivOp = (*target)->opcodeByMnemonic("sdiv");
     auto const mulOp  = (*target)->opcodeByMnemonic("mul");
     auto const subOp  = (*target)->opcodeByMnemonic("sub");
     ASSERT_TRUE(sdivOp.has_value() && mulOp.has_value() && subOp.has_value());
     LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
-    // EXACT shape: arg, arg, sdiv, mul, sub, ret — 6 LIR insts.
+    // EXACT pre-fusion shape: arg, arg, sdiv, mul, sub, ret — 6 insts.
     ASSERT_EQ(lir.blockInstCount(bb), 6u)
-        << "arm64 SMod must expand to exactly sdiv+mul+sub.";
+        << "without msub, SMod must expand to exactly sdiv+mul+sub.";
     EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 2)), *sdivOp)
         << "expansion step 1: q = sdiv(n, d).";
     EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 3)), *mulOp)

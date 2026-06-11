@@ -24,6 +24,9 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Rd:    return SlotBitWindow{ 0,  5 };
         case EncodingSlotKind::Rn:    return SlotBitWindow{ 5,  5 };
         case EncodingSlotKind::Rm:    return SlotBitWindow{ 16, 5 };
+        // Ra (D-LIR-MOD-MSUB-FUSION): multiply-accumulate third source
+        // at bits 10..14 — decoded for the msub round-trip.
+        case EncodingSlotKind::Ra:    return SlotBitWindow{ 10, 5 };
         case EncodingSlotKind::Imm26: return SlotBitWindow{ 0,  26 };
         // D-LK10-ENTRY-ARM64: MOVZ Imm16 at bits 5..20. NOT
         // symbol-bearing — extracted as a normal value (the Imm26
@@ -32,7 +35,8 @@ windowFor(EncodingSlotKind s) noexcept {
         // Every remaining slot decodes to nullopt. This is an
         // intentionally PARTIAL mirror of `fixed32::windowFor`: the
         // round-trip decoder only needs the register/immediate windows
-        // the shipped fixed32 opcodes actually use (Rd/Rn/Rm/Imm26/Imm16).
+        // the shipped fixed32 opcodes actually use (Rd/Rn/Rm/Ra/Imm26/
+        // Imm16).
         //   * x86-variable slots (ModRm*, Imm32, Disp32*, SibIndex,
         //     RipRelDisp32, CondCodeNibble, BlockRel32, MemBaseScale)
         //     never appear on a fixed32 variant — validate() rejects

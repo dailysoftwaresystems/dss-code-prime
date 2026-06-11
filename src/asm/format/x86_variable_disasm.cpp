@@ -253,6 +253,7 @@ disassemble(TargetSchema const&            schema,
                 case EncodingSlotKind::Rd:
                 case EncodingSlotKind::Rn:
                 case EncodingSlotKind::Rm:
+                case EncodingSlotKind::Ra:
                 case EncodingSlotKind::Imm26:
                     // fixed32 slots. Validate-time rules reject
                     // cross-shape variants, but if a future variant

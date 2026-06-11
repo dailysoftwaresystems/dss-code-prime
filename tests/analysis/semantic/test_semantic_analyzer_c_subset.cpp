@@ -1561,3 +1561,127 @@ TEST(SemanticAnalyzerCSubset, FloatToPointerCastRejected) {
     });
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 1u);
 }
+
+// D-CSUBSET-CAST-ARRAY-DECAY (FC3.5 sweep-c3): the cast OPERAND
+// undergoes array-to-pointer decay BEFORE the legality check (C
+// 6.3.2.1p3) — `(char*)"abc"` is Ptr↔Ptr after decay and `(long)"xy"`
+// is decay + the Ptr→integer round-trip. Pre-sweep BOTH fired
+// S_InvalidCast (the matrix saw Array(Char) raw).
+TEST(SemanticAnalyzerCSubset, CastOfStringLiteralDecaysAndIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() {\n"
+        "  char* p = (char*)\"abc\";\n"
+        "  long bits = (long)\"xy\";\n"
+        "  (void)p;\n"
+        "  return (int)(bits - bits);\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 0u)
+        << "(char*)\"abc\" and (long)\"xy\" must decay-then-cast, "
+           "never S_InvalidCast";
+}
+
+// D-CSUBSET-CAST-VOID-DISCARD (FC3.5 sweep-c3): `(void)expr` admits
+// EVERY operand type — scalar, pointer, struct VALUE (the type the
+// castability matrix rejects hardest), parenthesized arithmetic — per
+// C 6.5.4p2 / 6.3.2.2. Zero S_InvalidCast; nothing else errors either
+// (the discard also serves the idiom's suppress-unused purpose: no
+// unused-result diagnostic may be introduced that fires on it).
+TEST(SemanticAnalyzerCSubset, VoidDiscardCastAcceptsAllOperandTypes) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int x; };\n"
+        "int main() {\n"
+        "  struct S s;\n"
+        "  double d = 1.5;\n"
+        "  int* p = (int*)0;\n"
+        "  (void)s;\n"
+        "  (void)d;\n"
+        "  (void)p;\n"
+        "  (void)(1 + 2);\n"
+        "  return 0;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 0u)
+        << "(void)x must admit every operand type (C 6.5.4p2)";
+}
+
+// The DISCARD direction is the only legal void cast: a void VALUE as a
+// cast operand stays rejected (C has no void→T conversion; mapCast has
+// no arm). `(int)(void)x` — the inner discard types void, the outer
+// cast must fire S_InvalidCast exactly once.
+TEST(SemanticAnalyzerCSubset, CastFromVoidValueStaysRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() { int x = 1; return (int)(void)x; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 1u)
+        << "void -> int must stay rejected; only the (void)expr DISCARD "
+           "direction is legal";
+}
+
+// D-CSUBSET-COMPOUND-LITERAL-TYPEDEF (FC3.5 sweep-c3): `(MyT){...}`
+// with a typedef name — the compound-literal type position now rides
+// `castTypeRef` (bare-Identifier base) + the SAME commitRequiresTypeName
+// binder triage castExpr uses, and the NEW `semantics.compoundLiterals`
+// stamping resolves the typedef through the standard type-position
+// resolver. Pre-sweep the bare identifier could not even PARSE in
+// compound-literal type position (typeBaseAllowingStruct has no
+// Identifier alt). Zero diagnostics: the typedef'd struct type flows
+// into the literal and the enclosing declaration's assignability
+// (struct P == MyP via alias interning).
+TEST(SemanticAnalyzerCSubset, TypedefCompoundLiteralResolvesAndTypes) {
+    auto model = analyzeShipped("c-subset", {
+        "struct P { int x; int y; };\n"
+        "typedef struct P MyP;\n"
+        "int main() { struct P p = (MyP){40, 2}; return p.x; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "(MyP){...} must resolve the typedef in compound-literal "
+           "type position";
+}
+
+// The commit triage's case-4 arm: an UNKNOWN identifier followed by
+// `{` commits as a compound literal (BlockOpen cannot continue a value
+// reading) and then fails LOUD at semantic — S_UnknownType, exactly
+// once, at the type position. Never a silent value reinterpretation.
+TEST(SemanticAnalyzerCSubset, CompoundLiteralUnknownTypeNameFiresUnknownType) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() { (zzz){1}; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "(zzz){...} must commit via the `{` follower and fail loud "
+           "at type resolution";
+}
+
+// The commit triage's case-3 arm: a KNOWN-VALUE identifier in the type
+// position rolls the compound-literal reading BACK (the value reading
+// is the meaning); `(a)` then parses as parenExpr and the orphan `{`
+// is a LOUD PARSE error — C says `(a){...}` is invalid, and it must
+// never be silently mis-parsed as either reading. Parse diagnostics
+// live on the TREE (not the semantic model), so this pin reads the
+// tree reporters directly.
+TEST(SemanticAnalyzerCSubset, CompoundLiteralValueIdentifierIsLoudError) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { int a = 1; (a){2}; return a; }\n",
+    });
+    bool sawParseError = false;
+    for (auto const& t : cu->trees()) {
+        for (auto const& d : t.diagnostics().all()) {
+            if (d.severity == DiagnosticSeverity::Error) {
+                sawParseError = true;
+            }
+        }
+    }
+    EXPECT_TRUE(sawParseError)
+        << "(a){...} with a VALUE identifier must fail LOUD at parse "
+           "(C 6.5.2.5 requires a type name; the triage rolls back to "
+           "the value reading whose orphan `{` cannot parse)";
+}

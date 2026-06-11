@@ -50,12 +50,84 @@
             ]
           },
           {
-            "$comment": "MOVZ Xd, #imm16 — move a 16-bit UNSIGNED immediate (zeroing the rest of the register; hw shift = 0). Fixed word 0xD2800000 (sf=1, opc=10, fixed bits 100101, hw=00). The Imm16 slot writes imm16 at bits 5..20; Rd at bits 0..4. Selected by the `imm32` operand-kind guard (the engine's immediate-operand filter — the SLOT is 16-bit, MOVZ-specific). The entry trampoline uses this to load the exit-syscall number into x8 (D-LK10-ENTRY-ARM64). A value wider than 16 bits fails loud (A_ImmediateOperandOutOfRange) — MOVZ+MOVK / shifted-MOVZ materialization is a future cycle.",
+            "$comment": "MOVZ Xd, #imm16 — move a 16-bit UNSIGNED immediate (zeroing the rest of the register; hw shift = 0). Fixed word 0xD2800000 (sf=1, opc=10, fixed bits 100101, hw=00). The Imm16 slot writes imm16 at bits 5..20; Rd at bits 0..4. Selected by the `imm32` operand-kind guard (the engine's immediate-operand filter — the SLOT is 16-bit, MOVZ-specific). The entry trampoline uses this to load the exit-syscall number into x8 (D-LK10-ENTRY-ARM64). A value wider than the 16-bit slot STILL fails loud at encode (A_ImmediateOperandOutOfRange) — but the MIR->LIR const materialization now splits wide inline constants into the MOVZ + MOVK ladder BEFORE encode when the movk_lsl* family below is declared (D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE, FC3.5 sweep-c3), so the encoder ceiling backstops hand-built LIR only.",
             "guard":      { "operandKinds": ["imm32"] },
             "template":   { "fixedWord": 3531603968 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "imm16" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC3.5 sweep-c3 (D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE): MOVK Xd, #imm16, LSL #16 — keep-other-bits 16-bit insert at bits 31:16. ARM ARM C6.2.227: sf [31] | opc=11 [30:29] | 100101 [28:23] | hw [22:21] | imm16 [20:5] | Rd [4:0]; X-base 0xF2800000, hw=01 -> 0xF2A00000. The MIR->LIR const materialization emits the MINIMAL ladder: MOVZ #chunk0 (zeroing all 64 bits) + one MOVK per NONZERO higher 16-bit chunk — selected by constant magnitude at the LOWERING (an operand's VALUE cannot guard encoding variants), capability-probed by mnemonic presence (x86's imm32 mov form never consults this family). requires2Address: the ISA reads Xd's other bits — the LIR shape is result==operand[0] (the accumulating register), wire index 0 lands in Rd (the 2-addr dest-wire satisfies the result-placement validate rule). ONE deliberately width-ABSENT X-form variant: the ladder is seeded by MOVZ (which zeroes bits 63:32), so the X-MOVK is value-correct for width-32 constants too (chunks 2/3 are never emitted at width 32) — the W-ORR zext / xor_rdx_zero width-invariance precedent.",
+      "mnemonic":      "movk_lsl16",
+      "result":        "value",
+      "hasSideEffects": false,
+      "requires2Address": true,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "imm32"] },
+            "template":   { "fixedWord": 4070572032 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"    },
+              { "index": 1, "slotKind": "imm16" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "MOVK Xd, #imm16, LSL #32 — hw=10 -> 0xF2C00000 (X-only: sf=0 reserves hw>=10). Chunk 2 of the wide-immediate ladder; emitted only for width-64 constants whose bits 47:32 are nonzero (sign-extended negative int32 patterns).",
+      "mnemonic":      "movk_lsl32",
+      "result":        "value",
+      "hasSideEffects": false,
+      "requires2Address": true,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "imm32"] },
+            "template":   { "fixedWord": 4072669184 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"    },
+              { "index": 1, "slotKind": "imm16" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "MOVK Xd, #imm16, LSL #48 — hw=11 -> 0xF2E00000 (X-only). Chunk 3 of the wide-immediate ladder.",
+      "mnemonic":      "movk_lsl48",
+      "result":        "value",
+      "hasSideEffects": false,
+      "requires2Address": true,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "imm32"] },
+            "template":   { "fixedWord": 4074766336 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"    },
+              { "index": 1, "slotKind": "imm16" }
             ]
           }
         ]
@@ -244,7 +316,7 @@
       }
     },
     {
-      "$comment": "FC1 V2-4.X (2026-06-10): SDIV Xd, Xn, Xm — data-processing (2 source), sf=1. Base = 0x9AC00C00 (sf=1 | S=0 | 11010110 | Rm[20:16] | opcode 000011[15:10] | Rn[9:5] | Rd[4:0]). The MIR→LIR div lowering's Rule-1 NATIVE realization: result-bearing 3-address op, no implicit registers, no pre-op (contrast x86 cqo+idiv_op). ARM64 SDIV never traps — divide-by-zero yields 0 and INT_MIN/-1 wraps (A-profile), so the C-UB divide cases are non-trapping on this target. SMod has no hardware instruction: the lowering expands rem = n - (n/d)*d via sdiv+mul+sub (a fused MSUB realization is pinned D-LIR-MOD-MSUB-FUSION).",
+      "$comment": "FC1 V2-4.X (2026-06-10): SDIV Xd, Xn, Xm — data-processing (2 source), sf=1. Base = 0x9AC00C00 (sf=1 | S=0 | 11010110 | Rm[20:16] | opcode 000011[15:10] | Rn[9:5] | Rd[4:0]). The MIR→LIR div lowering's Rule-1 NATIVE realization: result-bearing 3-address op, no implicit registers, no pre-op (contrast x86 cqo+idiv_op). ARM64 SDIV never traps — divide-by-zero yields 0 and INT_MIN/-1 wraps (A-profile), so the C-UB divide cases are non-trapping on this target. SMod has no hardware instruction: the lowering realizes rem = n - (n/d)*d via sdiv + the fused `msub` (D-LIR-MOD-MSUB-FUSION ✅ closed FC3.5 sweep-c3; the generic mul+sub expansion remains the fallback for targets without a fused op).",
       "mnemonic":      "sdiv",
       "result":        "value",
       "minOperands":   2,
@@ -300,6 +372,39 @@
             "wires":      [
               { "index": 0, "slotKind": "rn" },
               { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC3.5 sweep-c3 (D-LIR-MOD-MSUB-FUSION): MSUB Xd, Xn, Xm, Xa = Xa − Xn·Xm — data-processing (3 source), ARM ARM C6.2.230: sf [31] | 00 [30:29] | 11011 [28:24] | 000 [23:21] | Rm [20:16] | o0=1 sub [15] | Ra [14:10] | Rn [9:5] | Rd [4:0]. X-base = 0x9B000000 | (1<<15) = 0x9B008000 (the MADD base the `mul` alias builds on, with o0=1). The MIR→LIR rule-3 remainder expansion PREFERS this fused form when declared: msub r, q, d, n = n − q·d in ONE instruction (operand 0 = quotient → rn, operand 1 = divisor → rm, operand 2 = dividend → ra), replacing the generic mul+sub pair. First consumer of the fixed32 `ra` slot (bits 10..14).",
+      "mnemonic":      "msub",
+      "result":        "value",
+      "minOperands":   3,
+      "maxOperands":   3,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 2600501248 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" },
+              { "index": 2, "slotKind": "ra" }
+            ]
+          },
+          {
+            "$comment": "MSUB Wd, Wn, Wm, Wa — 0x1B008000 (the X-form 0x9B008000 with sf=0; the W result IS the C 32-bit remainder mod 2^32).",
+            "guard":      { "operandKinds": ["reg", "reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 453017600 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" },
+              { "index": 2, "slotKind": "ra" }
             ]
           }
         ]

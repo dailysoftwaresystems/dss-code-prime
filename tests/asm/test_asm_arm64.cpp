@@ -416,6 +416,169 @@ TEST(Arm64Encoder, UdivEncodesDataProc2SourceHighRegs) {
     EXPECT_EQ(bytes[3], 0x9A);
 }
 
+// ── FC3.5 sweep-c3: MSUB — D-LIR-MOD-MSUB-FUSION (the fixed32 `ra`
+// slot's first consumer; rule 3's fused remainder realization) ─────
+
+TEST(Arm64Encoder, MsubEncodesDataProc3Source) {
+    // msub X0, X1, X2, X3 = X3 − X1·X2 — data-processing (3 source),
+    // ARM ARM C6.2.230:
+    //   base 0x9B008000 (sf=1 | 00 | 11011 | 000 | o0=1 sub)
+    //   | Rm = X2 (enc 2) << 16 → 0x00020000
+    //   | Ra = X3 (enc 3) << 10 → 0x00000C00
+    //   | Rn = X1 (enc 1) << 5  → 0x00000020
+    //   | Rd = X0 (enc 0)       → 0
+    //   = 0x9B028C20 — LE bytes: 20 8C 02 9B.
+    // A wrong Ra window (e.g. the bits 10..14 field drifting) corrupts
+    // the minuend register — every remainder silently wrong.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const msubOp = (*s)->opcodeByMnemonic("msub");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(msubOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x2{static_cast<std::uint32_t>(*(*s)->registerByName("x2")), 1, cls};
+    LirReg const x3{static_cast<std::uint32_t>(*(*s)->registerByName("x3")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const mops[] = { LirOperand::makeReg(x1),
+                                LirOperand::makeReg(x2),
+                                LirOperand::makeReg(x3) };
+    (void)b.addInst(*msubOp, x0, mops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0x8C);
+    EXPECT_EQ(bytes[2], 0x02);
+    EXPECT_EQ(bytes[3], 0x9B);
+}
+
+TEST(Arm64Encoder, MsubWFormEncodesHighRegs) {
+    // msub W3, W4, W14, W21 — the sf=0 W-form (0x1B008000) with HIGH
+    // register encodings exercising the full 5-bit Rm (14) and Ra (21
+    // = 0b10101, both window edges) fields:
+    //   0x1B008000 | (14<<16) | (21<<10) | (4<<5) | 3 = 0x1B0ED483
+    //   — LE bytes: 83 D4 0E 1B.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const msubOp = (*s)->opcodeByMnemonic("msub");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(msubOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x3 {static_cast<std::uint32_t>(*(*s)->registerByName("x3")),  1, cls};
+    LirReg const x4 {static_cast<std::uint32_t>(*(*s)->registerByName("x4")),  1, cls};
+    LirReg const x14{static_cast<std::uint32_t>(*(*s)->registerByName("x14")), 1, cls};
+    LirReg const x21{static_cast<std::uint32_t>(*(*s)->registerByName("x21")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const mops[] = { LirOperand::makeReg(x4),
+                                LirOperand::makeReg(x14),
+                                LirOperand::makeReg(x21) };
+    (void)b.addInst(*msubOp, x3, mops, /*payload=*/0, kLirInstFlagWidth32);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x83);
+    EXPECT_EQ(bytes[1], 0xD4);
+    EXPECT_EQ(bytes[2], 0x0E);
+    EXPECT_EQ(bytes[3], 0x1B);
+}
+
+// ── FC3.5 sweep-c3: MOVK ladder — D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE ─
+// MOVK Xd, #imm16, LSL #n (ARM ARM C6.2.227): sf=1 | opc=11 | 100101 |
+// hw | imm16 | Rd. X-base 0xF2800000; hw=01/10/11 → LSL 16/32/48.
+
+TEST(Arm64Encoder, MovkLsl16EncodesHwField01) {
+    // movk x5, #0xABCD, LSL #16 → 0xF2A00000 | (0xABCD<<5) | 5
+    //   = 0xF2B579A5 — LE: A5 79 B5 F2.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const mkOp  = (*s)->opcodeByMnemonic("movk_lsl16");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(mkOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x5{static_cast<std::uint32_t>(*(*s)->registerByName("x5")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(x5),
+                               LirOperand::makeImmInt32(0xABCD) };
+    (void)b.addInst(*mkOp, x5, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xA5);
+    EXPECT_EQ(bytes[1], 0x79);
+    EXPECT_EQ(bytes[2], 0xB5);
+    EXPECT_EQ(bytes[3], 0xF2);
+}
+
+TEST(Arm64Encoder, MovkLsl32And48EncodeHwFields10And11) {
+    // movk x9, #0xFFFF, LSL #32 → 0xF2C00000 | (0xFFFF<<5) | 9
+    //   = 0xF2DFFFE9 — LE: E9 FF DF F2.
+    // movk x21, #0x1234, LSL #48 → 0xF2E00000 | (0x1234<<5) | 21
+    //   = 0xF2E24695 — LE: 95 46 E2 F2 (x21 = a >15 register encoding
+    //   exercising the full Rd window under the hw=11 form).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const mk32Op = (*s)->opcodeByMnemonic("movk_lsl32");
+    auto const mk48Op = (*s)->opcodeByMnemonic("movk_lsl48");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(mk32Op.has_value() && mk48Op.has_value()
+             && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x9 {static_cast<std::uint32_t>(*(*s)->registerByName("x9")),  1, cls};
+    LirReg const x21{static_cast<std::uint32_t>(*(*s)->registerByName("x21")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops32[] = { LirOperand::makeReg(x9),
+                                 LirOperand::makeImmInt32(0xFFFF) };
+    (void)b.addInst(*mk32Op, x9, ops32);
+    LirOperand const ops48[] = { LirOperand::makeReg(x21),
+                                 LirOperand::makeImmInt32(0x1234) };
+    (void)b.addInst(*mk48Op, x21, ops48);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0xE9);
+    EXPECT_EQ(bytes[1], 0xFF);
+    EXPECT_EQ(bytes[2], 0xDF);
+    EXPECT_EQ(bytes[3], 0xF2);
+    EXPECT_EQ(bytes[4], 0x95);
+    EXPECT_EQ(bytes[5], 0x46);
+    EXPECT_EQ(bytes[6], 0xE2);
+    EXPECT_EQ(bytes[7], 0xF2);
+}
+
 // ── fixed32 walker — `mov Xd, #imm16` (MOVZ) — D-LK10-ENTRY-ARM64 ──
 
 TEST(Arm64Encoder, MovImm16EncodesMOVZ) {

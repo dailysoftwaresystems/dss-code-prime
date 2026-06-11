@@ -393,6 +393,28 @@ struct DSS_EXPORT CastRule {
     std::string   ruleName;           // source spelling, for diagnostics
 };
 
+// FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF): a compound
+// literal expression (`(T){...}` in C-family syntax). Pass 2 resolves
+// the TYPE-position subtree at visible child `typeChild` via the SAME
+// standard type-position resolver casts use (builtins + pointer stars
+// + struct refs + typedef aliases) and stamps the resolved type on
+// BOTH the type child (the HIR lowering's `resolveStampedTypeBelow`
+// probe) and the node itself (the literal's RESULT type for enclosing
+// checks). Deliberately a SEPARATE vocabulary from `CastRule`: a
+// compound literal is C 6.5.2.5 postfix syntax, NOT a conversion — no
+// operand child exists and the explicit-cast matrix must never run
+// against the brace-init (the per-element checks live in the HIR
+// brace-init lowering, contextually typed by the stamped type).
+// Pre-sweep only struct-ref type children worked (the struct-name
+// resolution stamped them as a side effect); builtin keywords and
+// typedef names in compound-literal position resolved to NOTHING and
+// the HIR lowering fail-louded.
+struct DSS_EXPORT CompoundLiteralRule {
+    RuleId        rule{};
+    std::uint32_t typeChild = 0;      // visible-child index of the type subtree
+    std::string   ruleName;           // source spelling, for diagnostics
+};
+
 // Identifier-use recognition. The named rule (whose RuleId the loader
 // resolves) is a "reference site": when Pass 2 sees a node with this
 // rule, it extracts the identifier text per `nameMatch` and does a
@@ -700,6 +722,9 @@ struct DSS_EXPORT SemanticConfig {
     std::vector<AssignmentRule>     assignments;       // SE4 const-correctness
     std::vector<CallRule>           callRules;         // SE6 call checking
     std::vector<CastRule>           castRules;         // FC2 explicit casts
+    // FC3.5 sweep-c3: compound-literal type-position stamping rules
+    // (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF). See CompoundLiteralRule.
+    std::vector<CompoundLiteralRule> compoundLiteralRules;
     std::vector<BuiltinFunctionMapping> builtinFunctions;  // SE6 builtins
     std::vector<ReturnRule>         returnRules;       // GAP A return-type checking
     // Rules that establish a break/continue-valid context (while/for/do/

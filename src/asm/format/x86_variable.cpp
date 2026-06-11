@@ -245,6 +245,7 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:
+        case EncodingSlotKind::Ra:
         case EncodingSlotKind::Imm26:
         case EncodingSlotKind::Imm16:
         case EncodingSlotKind::Imm9:

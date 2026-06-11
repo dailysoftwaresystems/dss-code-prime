@@ -5527,6 +5527,55 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── compoundLiterals (FC3.5 sweep-c3,
+            //    D-CSUBSET-COMPOUND-LITERAL-TYPEDEF) ──
+            // `{ rule, typeChild }` — the compound-literal expression
+            // shape; Pass 2 resolves + stamps the type child through the
+            // standard type-position resolver (typedefs included). NO
+            // operandChild and NO cast-matrix validation — a compound
+            // literal is postfix syntax, not a conversion.
+            if (sem.contains("compoundLiterals")) {
+                json const& arr = sem.at("compoundLiterals");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/compoundLiterals",
+                              "'semantics.compoundLiterals' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path =
+                            std::format("/semantics/compoundLiterals/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'compoundLiterals' entry must be "
+                                      "an object");
+                            continue;
+                        }
+                        if (!entry.contains("rule") || !entry.at("rule").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/rule",
+                                      "'rule' is required and must be a string");
+                            continue;
+                        }
+                        CompoundLiteralRule rule;
+                        rule.ruleName = entry.at("rule").get<std::string>();
+                        if (!data.rules->contains(rule.ruleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path + "/rule",
+                                      std::format("'compoundLiterals[{}].rule' "
+                                                  "references unknown shape '{}'",
+                                                  i, rule.ruleName));
+                            continue;
+                        }
+                        rule.rule = data.rules->find(rule.ruleName);
+
+                        bool ok = true;
+                        readReqIndex(entry, "typeChild", path, rule.typeChild, ok);
+                        if (!ok) continue;
+
+                        cfg.compoundLiteralRules.push_back(std::move(rule));
+                    }
+                }
+            }
+
             // ── builtinFunctions (SE6) ──
             // A named function the engine interns + binds into a CU-wide
             // builtins scope. `params` is an array of core-kind names;

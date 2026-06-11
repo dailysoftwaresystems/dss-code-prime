@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <variant>
@@ -153,6 +154,23 @@ enum class MnemonicSlot : std::uint8_t {
     // The width axis on the variants discriminates F64/F32 exactly
     // like the integer 64/32 split.
     FCmp,
+    // FC3.5 sweep-c3 (D-LIR-MOD-MSUB-FUSION): fused multiply-subtract —
+    // msub r, q, d, n  =  n − q·d  (arm64 MSUB Xd,Xn,Xm,Xa = Xa−Xn·Xm).
+    // Rule 3 of the div/mod realization PREFERS a declared `msub` over
+    // the generic mul+sub remainder expansion (2-op modulo). Probe-by-
+    // mnemonic like every other capability; targets without it keep the
+    // expansion unchanged.
+    MSub,
+    // FC3.5 sweep-c3 (D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE): the keep-
+    // other-bits 16-bit immediate inserts at bit positions 16/32/48
+    // (arm64 MOVK Xd,#imm16,LSL #n). `lowerConst` splits a wide inline
+    // constant into the minimal MOVZ + MOVK ladder when these are
+    // declared — selection by constant MAGNITUDE lives in the lowering
+    // (an operand's value cannot guard encoding variants); a target
+    // without the family (x86: its mov imm32 form swallows the whole
+    // inline range) keeps the single-mov materialization byte-
+    // identically.
+    MovkLsl16, MovkLsl32, MovkLsl48,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -235,6 +253,10 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::SModNative,    "smod"},
     {MnemonicSlot::UModNative,    "umod"},
     {MnemonicSlot::FCmp,          "fcmp"},
+    {MnemonicSlot::MSub,          "msub"},
+    {MnemonicSlot::MovkLsl16,     "movk_lsl16"},
+    {MnemonicSlot::MovkLsl32,     "movk_lsl32"},
+    {MnemonicSlot::MovkLsl48,     "movk_lsl48"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -370,6 +392,25 @@ struct Lowerer {
     // Per-function state. Cleared at the top of `lowerFunction`.
     MirAttribute<LirReg>            valueToReg;
     MirBlockAttribute<LirBlockId>   mirBlockToLirBlock;
+
+    // D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD (FC3.5 sweep-c3): per-function
+    // MIR value-use census — value id → (use count, last user). Built
+    // by `computeValueUses` over EVERY instruction's `instOperands`
+    // PLUS every Phi's `phiIncomings` (phi incoming values live
+    // OUTSIDE instOperands; missing them would under-count a phi-read
+    // GlobalAddr and fold away a lea the phi still needs — a silent
+    // miscompile). Consumed by the GlobalAddr+Load riprel fold's
+    // single-use analysis. When count == 1, `user` IS the single user.
+    struct MirUseEntry { std::uint32_t count = 0; MirInstId user{}; };
+    std::unordered_map<std::uint32_t, MirUseEntry> mirValueUses_;
+    // GlobalAddr insts whose lea emission was elided because their
+    // single use is a riprel-foldable Load (see
+    // `globalAddrRiprelFoldsIntoLoad`). `lowerLoad` consults this to
+    // emit the SymbolRef load form instead of reading a (never-
+    // defined) address vreg. Any OTHER consumer reaching a folded
+    // value via `regForValue` fails loud on the undefined vreg —
+    // a disagreement between the two fold sites can never be silent.
+    std::unordered_set<std::uint32_t> foldedGlobalAddrs_;
 
     // Module-tier (NOT per-function) reverse-mapping LirInstId.v →
     // MirInstId. Grows as the lowerer emits LIR insts (slot 0 is the
@@ -1123,6 +1164,83 @@ struct Lowerer {
         valueToReg.set(id, placeholder);
     }
 
+    // D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (FC3.5 sweep-c3): materialize
+    // an inline (int32-carried) integer constant.
+    //
+    //   * Single-chunk values (every 16-bit chunk above chunk 0 is
+    //     zero) emit the ONE mov-imm byte-identically to the pre-sweep
+    //     path — x86's `mov r, imm32` and arm64's MOVZ both cover
+    //     them.
+    //   * Wider values: when the target declares the MOVK ladder
+    //     (`movk_lsl16/32/48` — probed by mnemonic presence, the
+    //     sanctioned capability pattern), emit the MINIMAL chain:
+    //     mov #chunk0 (arm64: MOVZ, zeroing the whole register) + one
+    //     `movk_lslN` per NONZERO higher chunk, each a 2-address
+    //     result==operand[0] insert into the SAME vreg. Selection by
+    //     MAGNITUDE lives here in the lowering — an operand's VALUE
+    //     cannot guard encoding variants.
+    //   * Without the ladder (x86): the single mov keeps the whole
+    //     value — its imm32 form swallows the full inline range, so
+    //     nothing changes. A fixed32 target with a 16-bit mov-imm
+    //     window and NO declared ladder keeps today's encode-time
+    //     fail-loud (A_ImmediateOperandOutOfRange) — the ladder is
+    //     ALL-OR-NOTHING per needed chunk; a half-declared family
+    //     never silently emits a partial constant.
+    //
+    // The effective bit pattern: width-32 constants are the raw low
+    // 32 bits (the 32-bit write zero-extends — chunks 2/3 never
+    // exist); width-64 constants are the SIGN-EXTENDED 64-bit pattern
+    // (the x86 `mov r64, imm32` semantics every consumer was lowered
+    // against) — a negative constant therefore emits the full 4-op
+    // ladder (chunk0 + 0xFFFF-filled high chunks). A 2-op MOVN-seeded
+    // chain is a deliberate non-goal this cycle (peephole-class).
+    void materializeInlineIntConst(MirInstId id, std::int32_t imm32,
+                                   std::uint8_t widthFlags) {
+        bool const is32 = lirInstWidthBits(widthFlags) == 32;
+        std::uint64_t const pattern = is32
+            ? static_cast<std::uint64_t>(static_cast<std::uint32_t>(imm32))
+            : static_cast<std::uint64_t>(static_cast<std::int64_t>(imm32));
+        std::array<std::uint16_t, 4> chunks{};
+        for (std::size_t k = 0; k < 4; ++k) {
+            chunks[k] = static_cast<std::uint16_t>(pattern >> (16 * k));
+        }
+        std::size_t const nChunks = is32 ? 2 : 4;
+        bool needsChain = false;
+        for (std::size_t k = 1; k < nChunks; ++k) {
+            if (chunks[k] != 0) { needsChain = true; break; }
+        }
+        // The ladder slots, positionally chunk index 1..3.
+        static constexpr std::array<MnemonicSlot, 3> kMovkSlots{
+            MnemonicSlot::MovkLsl16, MnemonicSlot::MovkLsl32,
+            MnemonicSlot::MovkLsl48};
+        bool ladderDeclared = needsChain;
+        for (std::size_t k = 1; k < nChunks && ladderDeclared; ++k) {
+            if (chunks[k] != 0
+                && !opcode(kMovkSlots[k - 1]).has_value()) {
+                ladderDeclared = false;
+            }
+        }
+        if (!needsChain || !ladderDeclared) {
+            emitMovToFresh(id, LirOperand::makeImmInt32(imm32),
+                           LirRegClass::GPR, widthFlags);
+            return;
+        }
+        LirReg const r = emitMovToFresh(
+            id,
+            LirOperand::makeImmInt32(
+                static_cast<std::int32_t>(chunks[0])),
+            LirRegClass::GPR, widthFlags);
+        for (std::size_t k = 1; k < nChunks; ++k) {
+            if (chunks[k] == 0) continue;
+            std::array<LirOperand, 2> const movkOps{
+                LirOperand::makeReg(r),
+                LirOperand::makeImmInt32(
+                    static_cast<std::int32_t>(chunks[k]))};
+            emitInst(*opcode(kMovkSlots[k - 1]), r, movkOps,
+                     /*payload=*/0, widthFlags);
+        }
+    }
+
     void lowerConst(MirInstId id) {
         if (!opcode(MnemonicSlot::Mov).has_value()) {
             reportMissingOpcode(MnemonicSlot::Mov, "MIR Const");
@@ -1180,8 +1298,13 @@ struct Lowerer {
             // declared MIR type since the immediate IS an integer.
             // (Bool literals are also routed here as 0/1 at the
             // 64-bit default width.)
-            emitMovToFresh(id, LirOperand::makeImmInt32(imm32),
-                           LirRegClass::GPR, constWidthFlags);
+            //
+            // D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (FC3.5 sweep-c3): when
+            // the value does not fit the single mov-imm form's
+            // immediate window on a MOVK-declaring target, the
+            // materialization splits into the minimal MOVZ + MOVK
+            // ladder instead (see the helper).
+            materializeInlineIntConst(id, imm32, constWidthFlags);
             return;
         }
 
@@ -1256,6 +1379,37 @@ struct Lowerer {
     void lowerLoad(MirInstId id) {
         auto const operands = mir.instOperands(id);
         if (operands.size() != 1) { reportUnsupported(MirOpcode::Load, id); return; }
+        // D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD (FC3.5 sweep-c3): the
+        // address comes from a single-use GlobalAddr whose lea was
+        // elided (see `lowerGlobalAddr`) — emit the load's declared
+        // symbol-relative form directly: ONE `movsd/movss xmm,
+        // [rip+sym]` instead of the lea + [base] pair. The width gate
+        // and class/width selection below are the SAME as the generic
+        // path; only the operand shape differs ([SymbolRef] vs
+        // [base, MemBase, MemOffset]).
+        if (foldedGlobalAddrs_.contains(operands[0].v)) {
+            if (!requireEncodedFloatWidth(id, mir.instType(id), "MIR Load"))
+                return;
+            LirRegClass const cls = regClassFor(id);
+            auto const loadOp = classOp(cls, RegClassOp::Load);
+            if (!loadOp.has_value()) {
+                // Unreachable under the fold predicate (it probed this
+                // class-op); fail loud like the generic path if a
+                // future edit breaks the agreement.
+                reportMissingClassOp(cls, RegClassOp::Load, "MIR Load");
+                poisonValue(id);
+                return;
+            }
+            std::uint8_t const loadWidthFlags = (cls == LirRegClass::FPR)
+                ? widthFlagsForType(mir.instType(id))
+                : 0;
+            SymbolId const sym = mir.globalAddrSymbol(operands[0]);
+            LirReg const result = lir.newVReg(cls);
+            std::array<LirOperand, 1> ops{LirOperand::makeSymbolRef(sym.v)};
+            emitInst(*loadOp, result, ops, /*payload=*/0, loadWidthFlags);
+            defineValue(id, result);
+            return;
+        }
         std::optional<LirReg> const base = regForValue(operands[0]);
         if (!base.has_value()) return;
         // Cycle 3d FPR-class plumbing closure: a Load of an F64 must
@@ -1460,7 +1614,66 @@ struct Lowerer {
     // address, loading from a global, etc.) were blocked by the
     // missing `mov` SymbolRef variant pre-D-LK4-RODATA-PRODUCER;
     // the LEA-RIP-rel variant unblocks them.
+    // D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD (FC3.5 sweep-c3): true iff
+    // `gaId`'s value has EXACTLY ONE MIR use, that use is a Load whose
+    // sole (address) operand is this value, and the load's result-
+    // class load mnemonic declares a single-SymbolRef-operand encoding
+    // variant at the load's effective width. When true, the lea+load
+    // pair folds to ONE symbol-relative load (x86: `movsd/movss
+    // xmm, [rip+sym]` — the FC2 riprel variants' first pipeline
+    // consumer). CAPABILITY-DRIVEN, never per-arch: a mnemonic without
+    // a declared [symbol] variant (x86 GPR `load`; arm64 `fldur` —
+    // arm64's lea is the 2-word ADRP+ADD macro, so a riprel-LDR fold
+    // is a different encoding shape, deliberately out of scope) keeps
+    // the generic pair byte-identically. Both fold sites
+    // (`lowerGlobalAddr` skip-lea + `lowerLoad` symbol-form emit)
+    // consult this ONE predicate via the `foldedGlobalAddrs_` set, so
+    // they can never disagree; a stale set entry surfaces as a loud
+    // undefined-vreg failure in `regForValue`, never a silent wrong
+    // address.
+    [[nodiscard]] bool globalAddrRiprelFoldsIntoLoad(MirInstId gaId) {
+        auto const it = mirValueUses_.find(gaId.v);
+        if (it == mirValueUses_.end() || it->second.count != 1) {
+            return false;  // zero or multiple users — keep the lea
+        }
+        MirInstId const user = it->second.user;
+        if (mir.instOpcode(user) != MirOpcode::Load) return false;
+        auto const userOps = mir.instOperands(user);
+        if (userOps.size() != 1 || userOps[0].v != gaId.v) return false;
+        // Probe the load's class-op mnemonic for a [symbol] variant at
+        // the load's width (the same class/width selection lowerLoad
+        // makes — GPR loads are width-default 64; FPR loads carry the
+        // loaded type's width so the F64/F32 riprel forms key apart).
+        LirRegClass const cls = regClassFor(user);
+        auto const loadOp = classOp(cls, RegClassOp::Load);
+        if (!loadOp.has_value()) return false;  // lowerLoad fails loud
+        auto const* info = target.opcodeInfo(*loadOp);
+        if (info == nullptr) return false;
+        std::uint8_t const loadWidthFlags = (cls == LirRegClass::FPR)
+            ? widthFlagsForType(mir.instType(user))
+            : 0;
+        std::uint8_t const widthBits = lirInstWidthBits(loadWidthFlags);
+        for (auto const& v : info->encoding.variants) {
+            if (v.operandKinds.size() == 1
+                && v.operandKinds[0] == OperandKindFilter::SymbolRef
+                && (v.guardWidthBits == 0 || v.guardWidthBits == widthBits)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void lowerGlobalAddr(MirInstId id) {
+        // D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD: when the sole consumer is
+        // a load whose mnemonic declares the symbol-relative variant,
+        // emit NO lea here — `lowerLoad` folds the symbol straight
+        // into the load (lea+load pair → ONE riprel load). The
+        // single-use guarantee means no other consumer can miss the
+        // (never-defined) address vreg.
+        if (globalAddrRiprelFoldsIntoLoad(id)) {
+            foldedGlobalAddrs_.insert(id.v);
+            return;
+        }
         if (!opcode(MnemonicSlot::Lea).has_value()) {
             reportMissingOpcode(MnemonicSlot::Lea, "MIR GlobalAddr");
             return;
@@ -2045,15 +2258,18 @@ struct Lowerer {
     //     half — it does NOT silently fall through to rule 3.
     //
     //   Rule 3 — EXPANSION (remainder only): no native rem and no
-    //     pair, but a div realization (rule 1/2) plus the universal
-    //     `mul` + `sub` verbs exist → the target-blind arithmetic
-    //     identity   rem = n − (n / d) · d   (arm64 SMod/UMod:
-    //     sdiv/udiv + mul + sub = 3 LIR ops). C truncated-remainder
-    //     semantics hold by construction — the identity IS C23
-    //     6.5.5's definition of % over truncated /. A fused MSUB
-    //     realization (2 ops) is a peephole-quality refinement,
-    //     pinned D-LIR-MOD-MSUB-FUSION (needs an `Ra` encoding slot
-    //     kind the fixed32 vocabulary does not have).
+    //     pair, but a div realization (rule 1/2) exists → the
+    //     target-blind arithmetic identity  rem = n − (n / d) · d.
+    //     C truncated-remainder semantics hold by construction — the
+    //     identity IS C23 6.5.5's definition of % over truncated /.
+    //     The subtract half is capability-driven in PREFERENCE order
+    //     (D-LIR-MOD-MSUB-FUSION ✅ FC3.5 sweep-c3):
+    //       (a) a declared fused `msub` (arm64 MSUB Xd,Xn,Xm,Xa =
+    //           Xa − Xn·Xm) → msub r, q, d, n — ONE op (2-op modulo,
+    //           what production compilers emit);
+    //       (b) else the universal `mul` + `sub` pair (3-op modulo).
+    //     A declared-but-result-less `msub` is a misdeclaration →
+    //     fail loud, never a silent fall-through to (b).
     //
     //   Else → fail loud (no division realization declared).
     //
@@ -2149,11 +2365,41 @@ struct Lowerer {
             return emitImplicitPairDiv(id, *preOp, *coreOp, wantRemainder,
                                        dividend, divisor);
         }
-        // Rule 3 — generic remainder expansion over div + mul + sub.
+        // Rule 3 — remainder via the identity rem = n − (n/d)·d over a
+        // rule-1/2 division.
         if (wantRemainder) {
             auto const quotient = emitDivLikeValue(
                 id, isSigned, /*wantRemainder=*/false, dividend, divisor);
             if (!quotient.has_value()) return std::nullopt;
+            // (a) Fused multiply-subtract when the target declares one
+            // (D-LIR-MOD-MSUB-FUSION): msub r, q, d, n = n − q·d in ONE
+            // instruction. Probed by mnemonic presence — the sanctioned
+            // capability pattern; x86 never reaches rule 3 (its rule-2
+            // pair realizes the remainder), so this fires for fixed32-
+            // class targets that declare `msub` (arm64) and any future
+            // ISA with a fused form. A target without `msub` keeps the
+            // (b) mul+sub expansion below byte-identically.
+            if (auto const msubOp = opcode(MnemonicSlot::MSub);
+                msubOp.has_value()) {
+                auto const* mi = target.opcodeInfo(*msubOp);
+                if (mi == nullptr || mi->result != TargetResultRule::Value) {
+                    // Misdeclared fused op (no value result) — fail loud
+                    // like rule 1's native-verb misdeclaration; falling
+                    // through to mul+sub would silently mask the broken
+                    // declaration.
+                    reportUnsupported(mir.instOpcode(id), id);
+                    return std::nullopt;
+                }
+                LirReg const remainder = lir.newVReg(regClassFor(id));
+                std::array<LirOperand, 3> const msubOps{
+                    LirOperand::makeReg(*quotient),
+                    LirOperand::makeReg(divisor),
+                    LirOperand::makeReg(dividend)};
+                emitInst(*msubOp, remainder, msubOps, /*payload=*/0,
+                         widthFlags);
+                return remainder;
+            }
+            // (b) Generic expansion over the universal mul + sub verbs.
             auto const mulOp = opcode(MnemonicSlot::Mul);
             if (!mulOp.has_value()) {
                 reportMissingOpcode(MnemonicSlot::Mul,
@@ -3090,9 +3336,45 @@ struct Lowerer {
         }
     }
 
+    // D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD: per-function MIR value-use
+    // census. ONE pass over every block's instructions counting each
+    // operand-position read, PLUS every Phi's incoming values (stored
+    // outside `instOperands` — see `mirValueUses_`'s member comment
+    // for the miscompile this guards). Switch case values are
+    // MirInstId refs to Const insts and ride instOperands like the
+    // scrutinee — the plain operand walk counts them.
+    void computeValueUses(MirFuncId mf) {
+        mirValueUses_.clear();
+        foldedGlobalAddrs_.clear();
+        std::uint32_t const blockCount = mir.funcBlockCount(mf);
+        for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+            MirBlockId const mb = mir.funcBlockAt(mf, bi);
+            std::uint32_t const n = mir.blockInstCount(mb);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                MirInstId const inst = mir.blockInstAt(mb, i);
+                // Phi operands live in `phiIncomings` EXCLUSIVELY —
+                // `instOperands` on a Phi is a Mir fail-loud.
+                if (mir.instOpcode(inst) == MirOpcode::Phi) {
+                    for (MirPhiIncoming const& inc : mir.phiIncomings(inst)) {
+                        auto& e = mirValueUses_[inc.value.v];
+                        ++e.count;
+                        e.user = inst;
+                    }
+                    continue;
+                }
+                for (auto const& op : mir.instOperands(inst)) {
+                    auto& e = mirValueUses_[op.v];
+                    ++e.count;
+                    e.user = inst;
+                }
+            }
+        }
+    }
+
     void lowerFunction(MirFuncId mf) {
         valueToReg.clear();
         mirBlockToLirBlock.clear();
+        computeValueUses(mf);
         lir.addFunction(mir.funcSymbol(mf));
 
         // Pre-pass 1: pre-allocate LIR blocks (1:1 with MIR blocks).

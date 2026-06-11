@@ -308,6 +308,125 @@ TEST(HirLoweringCSubset, NullPointerConstantEmitsCastInCallArg) {
     EXPECT_EQ(ti.kind(elem[0]), TypeKind::Void);
 }
 
+// D-CSUBSET-CAST-ARRAY-DECAY (FC3.5 sweep-c3): the explicit cast of a
+// string literal lowers THROUGH the synthetic array-to-pointer decay
+// (C 6.3.2.1p3): `(long)"xy"` is Cast(I64 ← Cast(Ptr<Char> ←
+// Array<Char>)) — the inner decay is the SAME synthetic Cast the
+// implicit path emits (mapCast materializes the rodata global +
+// GlobalAddr), the outer Cast is the programmer's PtrToInt. Without
+// the decay the MIR mapCast would see Array directly (no arm — fail).
+TEST(HirLoweringCSubset, ExplicitCastOfStringLiteralLowersViaDecay) {
+    SemanticModel model = analyzeCSubset(
+        "int main() { return (int)(long)\"xy\"; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto const& ti = model.lattice().interner();
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_GE(decls.size(), 1u);
+    HirNodeId const mainBody = res->hir.functionBody(decls.back());
+    auto const stmts = res->hir.children(mainBody);
+    ASSERT_GE(stmts.size(), 1u);
+    HirNodeId const ret = stmts.back();
+    HirNodeId const outer = *res->hir.returnValue(ret);
+    // (int) ← (long) ← decay(Ptr<Char>) ← "xy"
+    ASSERT_EQ(res->hir.kind(outer), HirKind::Cast);
+    EXPECT_EQ(ti.kind(res->hir.typeId(outer)), TypeKind::I32);
+    auto const outerKids = res->hir.children(outer);
+    ASSERT_EQ(outerKids.size(), 1u);
+    HirNodeId const longCast = outerKids[0];
+    ASSERT_EQ(res->hir.kind(longCast), HirKind::Cast);
+    EXPECT_EQ(ti.kind(res->hir.typeId(longCast)), TypeKind::I64);
+    auto const longKids = res->hir.children(longCast);
+    ASSERT_EQ(longKids.size(), 1u);
+    HirNodeId const decay = longKids[0];
+    ASSERT_EQ(res->hir.kind(decay), HirKind::Cast)
+        << "the cast operand must pass through the synthetic "
+           "array-to-pointer decay Cast (C 6.3.2.1p3) — mapCast has "
+           "no Array→int arm";
+    TypeId const decayTy = res->hir.typeId(decay);
+    ASSERT_EQ(ti.kind(decayTy), TypeKind::Ptr)
+        << "the decay result must be Ptr<Char>";
+    auto const decayElem = ti.operands(decayTy);
+    ASSERT_FALSE(decayElem.empty());
+    EXPECT_EQ(ti.kind(decayElem[0]), TypeKind::Char);
+}
+
+// D-CSUBSET-COMPOUND-LITERAL-TYPEDEF (FC3.5 sweep-c3): a typedef'd
+// STRUCT compound literal lowers through HIR cleanly — the semantic
+// stamping (semantics.compoundLiterals) resolved `MyP` so
+// `resolveStampedTypeBelow` finds the struct type and `lowerBraceInit`
+// builds the aggregate. HONEST TIER NOTE: this pins the
+// parse+semantic+HIR tiers; struct VALUES do not reach LIR codegen yet
+// (the aggregate MIR ops are a pre-existing '<deferred>' lowering
+// gap), so no runtime corpus arm exists for compound literals.
+TEST(HirLoweringCSubset, TypedefStructCompoundLiteralLowersTyped) {
+    SemanticModel model = analyzeCSubset(
+        "struct P { int x; int y; };\n"
+        "typedef struct P MyP;\n"
+        "int main() { struct P p = (MyP){40, 2}; return p.x; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok)
+        << "typedef'd compound literal must lower through HIR: "
+        << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// SCALAR compound literals — `(int){42}`, valid C 6.5.2.5p9 — now
+// resolve their TYPE (the semantic stamping admits them) but the HIR
+// brace-init lowering is aggregate-only by design: the scalar shape
+// stays a deliberate FAIL-LOUD ("brace-init target type must be
+// struct, union, or array"), never a silent misparse. Lifting the
+// scalar restriction is brace-init-lowering work, distinct from this
+// anchor's typedef-admission scope.
+TEST(HirLoweringCSubset, ScalarCompoundLiteralStaysAggregateOnlyFailLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int main() { int x = (int){42}; return x; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "the semantic tier must admit + type the scalar compound "
+           "literal (the stamp resolves)";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "scalar compound literals are aggregate-gated at the HIR "
+           "brace-init lowering today — this must stay LOUD until the "
+           "scalar arm lands";
+}
+
+// D-CSUBSET-CAST-VOID-DISCARD (FC3.5 sweep-c3): `(void)f()` lowers as
+// evaluate-operand-discard — the expression statement's node IS the
+// Call itself, with NO Cast wrapping it (mapCast has no void arm by
+// design; the discard is a statement effect, not a conversion). The
+// operand's presence in the lowered tree is the evaluation guarantee.
+TEST(HirLoweringCSubset, VoidDiscardCastLowersOperandWithoutCastNode) {
+    SemanticModel model = analyzeCSubset(
+        "extern int f();\n"
+        "int main() { (void)f(); return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_GE(decls.size(), 2u);
+    HirNodeId const mainBody = res->hir.functionBody(decls.back());
+    auto const stmts = res->hir.children(mainBody);
+    ASSERT_GE(stmts.size(), 2u);
+    HirNodeId const exprStmt = stmts[0];
+    HirNodeId const inner = res->hir.exprStmtExpr(exprStmt);
+    ASSERT_EQ(res->hir.kind(inner), HirKind::Call)
+        << "(void)f() must lower to the bare Call (operand evaluated "
+           "for effects) — NO Cast node may wrap it (mapCast has no "
+           "void arm; a Cast here would fail-loud downstream)";
+}
+
 // D5.1: a `struct Foo { int x; int y; };` declaration lowers to a HIR
 // `TypeDecl` whose `typeId` is the composed `structType("Foo", {I32, I32})`.
 TEST(HirLoweringCSubset, StructDeclarationLowersToTypeDecl) {
