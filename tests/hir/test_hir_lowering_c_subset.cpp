@@ -870,10 +870,13 @@ TEST(HirLoweringCSubset, IfConditionAlreadyBoolStaysUncasted) {
 }
 
 TEST(HirLoweringCSubset, TernaryLowersToTernaryNode) {
-    // `cond ? a : b` lowers to a HIR Ternary [cond, then, else]. With HR's
-    // implicit-coercion pass, the cond is wrapped in `Cast(_, Bool)` when
-    // its source type is non-Bool — matches the CondBr-expects-Bool
-    // discipline at the MIR boundary.
+    // `cond ? a : b` lowers to a HIR Ternary [cond, then, else]. A
+    // non-Bool ARITHMETIC cond takes the truthiness test: a synthetic
+    // `BinaryOp Ne(cond, 0-of-cond's-type)` typed Bool (C99 6.5.15p4
+    // "compares unequal to 0") — NOT a `Cast(_, Bool)`, whose MIR
+    // lowering (Trunc) would keep only the low bit (`x = 2` would
+    // select the WRONG arm). Pins the coerceCondition shape at the
+    // ternary site.
     SemanticModel model = analyzeCSubset("int f(int x) { return x ? 1 : 2; }");
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
@@ -885,13 +888,61 @@ TEST(HirLoweringCSubset, TernaryLowersToTernaryNode) {
     ASSERT_EQ(res->hir.kind(tern), HirKind::Ternary);
     auto kids = res->hir.children(tern);
     ASSERT_EQ(kids.size(), 3u);
-    // cond is now `Cast(Ref(x), Bool)` after the implicit-coercion pass.
-    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Cast);
-    auto castKids = res->hir.children(kids[0]);
-    ASSERT_EQ(castKids.size(), 1u);
-    EXPECT_EQ(res->hir.kind(castKids[0]), HirKind::Ref);   // cond's operand: x
+    // cond is `Ne(Ref(x), Literal 0)` typed Bool after coerceCondition.
+    ASSERT_EQ(res->hir.kind(kids[0]), HirKind::BinaryOp)
+        << "non-Bool ternary cond must lower as a truthiness comparison, "
+           "not a Cast";
+    ASSERT_TRUE(isCoreOp(res->hir.payload(kids[0])));
+    EXPECT_EQ(decodeCoreOp(res->hir.payload(kids[0])), HirOpKind::Ne);
+    EXPECT_EQ(model.lattice().interner().kind(res->hir.typeId(kids[0])),
+              TypeKind::Bool);
+    auto neKids = res->hir.children(kids[0]);
+    ASSERT_EQ(neKids.size(), 2u);
+    EXPECT_EQ(res->hir.kind(neKids[0]), HirKind::Ref);     // cond operand: x
+    ASSERT_EQ(res->hir.kind(neKids[1]), HirKind::Literal); // synthetic 0
+    // The synthetic zero keeps the cond's OWN type (I32) — no promotion
+    // is needed for an unequal-to-zero test — and its pool value is 0.
+    EXPECT_EQ(model.lattice().interner().kind(res->hir.typeId(neKids[1])),
+              TypeKind::I32);
+    auto zeroLit = res->literalPool.at(res->hir.payload(neKids[1]));
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(zeroLit.value));
+    EXPECT_EQ(std::get<std::int64_t>(zeroLit.value), 0);
     EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Literal);   // then: 1
     EXPECT_EQ(res->hir.kind(kids[2]), HirKind::Literal);   // else: 2
+}
+
+// LogicalAnd/Or operands are CONDITION positions (C99 6.5.13p3/6.5.14p3:
+// each operand "compares unequal to 0"). A non-Bool int operand must take
+// the same truthiness `Ne(operand, 0)` wrap as an if/while condition —
+// pinned at HIR tier because the MIR tier's LogicalAnd lowering currently
+// trips an unrelated pre-existing StructCf marker mismatch (orthogonal:
+// it reproduces with genuine Bool comparison operands too).
+TEST(HirLoweringCSubset, LogicalAndIntOperandsTakeTruthinessNe) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int x, int y) { return x && y ? 1 : 2; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId ret  = res->hir.children(body)[0];
+    HirNodeId tern = *res->hir.returnValue(ret);
+    ASSERT_EQ(res->hir.kind(tern), HirKind::Ternary);
+    // The ternary cond is the LogicalAnd itself — already Bool, so
+    // coerceCondition adds NO extra node on top of it.
+    HirNodeId land = res->hir.children(tern)[0];
+    ASSERT_EQ(res->hir.kind(land), HirKind::LogicalAnd)
+        << "Bool-typed LogicalAnd cond must NOT be re-wrapped";
+    auto ops = res->hir.children(land);
+    ASSERT_EQ(ops.size(), 2u);
+    for (std::size_t i = 0; i < 2; ++i) {
+        ASSERT_EQ(res->hir.kind(ops[i]), HirKind::BinaryOp)
+            << "int operand " << i << " of && must take the truthiness Ne";
+        ASSERT_TRUE(isCoreOp(res->hir.payload(ops[i])));
+        EXPECT_EQ(decodeCoreOp(res->hir.payload(ops[i])), HirOpKind::Ne);
+        EXPECT_EQ(model.lattice().interner().kind(res->hir.typeId(ops[i])),
+                  TypeKind::Bool);
+    }
 }
 
 TEST(HirLoweringCSubset, PointerDerefAndAddressOfLower) {

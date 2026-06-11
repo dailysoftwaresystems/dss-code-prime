@@ -80,6 +80,22 @@ namespace {
     return k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64 || k == TypeKind::F128;
 }
 
+// Arithmetic-kind predicate — the implicit-conversion surface (ints +
+// floats + the int-adjacent Char/Byte/Bool scalars). Shared by `coerce`
+// (which conversion pairs may materialize a Cast) and `coerceCondition`
+// (which condition types take the `!= 0` truthiness test; Bool is
+// early-outed there before this is consulted). A SHAPE predicate over
+// TypeKind — never language identity.
+[[nodiscard]] bool isArithmeticCore(TypeKind k) noexcept {
+    return k == TypeKind::Bool || k == TypeKind::Char || k == TypeKind::Byte
+        || k == TypeKind::I8   || k == TypeKind::I16  || k == TypeKind::I32
+        || k == TypeKind::I64  || k == TypeKind::I128
+        || k == TypeKind::U8   || k == TypeKind::U16  || k == TypeKind::U32
+        || k == TypeKind::U64  || k == TypeKind::U128
+        || k == TypeKind::F16  || k == TypeKind::F32
+        || k == TypeKind::F64  || k == TypeKind::F128;
+}
+
 // Full-width-integer return predicate for D-LK10-ENTRY-MAIN-IMPLICIT-
 // RETURN. Restricted to I32+ / U32+ because the SysV AMD64 + MS x64
 // ABIs do NOT zero-extend sub-32-bit integer returns to the full GPR
@@ -380,17 +396,9 @@ struct Lowerer {
         }
         // Pointers, structs, FnSig are not coerced implicitly; let the
         // caller decide whether the mismatch is a diagnostic. Arithmetic
-        // (int + float kinds) is the implicit-conversion surface.
-        auto isArithmetic = [](TypeKind k) noexcept {
-            return k == TypeKind::Bool || k == TypeKind::Char || k == TypeKind::Byte
-                || k == TypeKind::I8   || k == TypeKind::I16  || k == TypeKind::I32
-                || k == TypeKind::I64  || k == TypeKind::I128
-                || k == TypeKind::U8   || k == TypeKind::U16  || k == TypeKind::U32
-                || k == TypeKind::U64  || k == TypeKind::U128
-                || k == TypeKind::F16  || k == TypeKind::F32
-                || k == TypeKind::F64  || k == TypeKind::F128;
-        };
-        if (!isArithmetic(ck) || !isArithmetic(tk)) return child;
+        // (int + float kinds — file-scope `isArithmeticCore`) is the
+        // implicit-conversion surface.
+        if (!isArithmeticCore(ck) || !isArithmeticCore(tk)) return child;
         HirNodeId const cast = builder.makeCast(child.id, target, HirFlags::Synthetic);
         // Alias the synthetic Cast to its operand's pending span entry so
         // diagnostics anchored at the Cast locate to real source. The
@@ -403,6 +411,82 @@ struct Lowerer {
             }
         }
         return E{cast, target};
+    }
+
+    // Truthiness at CONDITION positions (`if`/`while`/`do-while`/`for`
+    // conditions, the ternary cond, LogicalAnd/Or operands): a non-Bool
+    // scalar condition tests `!= 0` (C99 6.8.4.1p2/6.8.5p4 "compares
+    // unequal to 0"; 6.5.13/6.5.14/6.5.15 for the operand forms), NOT a
+    // value-truncating Cast-to-Bool — `if (2)` is TRUE under truthiness,
+    // while `Cast → MIR Trunc(2 → Bool)` keeps only the low bit (false).
+    // Builds the SAME compare-against-typed-zero shape `hir_to_mir`
+    // already lowers `HirOpKind::Not` to (ICmpEq there; the binary `Ne`
+    // here routes via `mapBinaryOp` → ICmpNe for integer kinds — Ne is
+    // signedness-irrelevant — and FCmpOne for float kinds).
+    //
+    // Dispatch is a TypeKind SHAPE predicate — never language identity:
+    //  - invalid type, or already Bool → UNCHANGED (a comparison already
+    //    yields Bool: zero extra nodes; invalid passes through exactly
+    //    like `coerce`).
+    //  - arithmetic non-Bool (int kinds, float kinds, Char, Byte) →
+    //    synthetic `BinaryOp Ne(cond, zero-of-cond's-own-type)` typed
+    //    Bool. The zero keeps the cond's type (no promotion is needed
+    //    for an unequal-to-zero test), minted by `synthZeroOrError`'s
+    //    scalar arm.
+    //  - Ptr, when the active language admits integer-zero null-pointer
+    //    constants (`pointerConversions.nullPointerConstantFromIntegerZero`)
+    //    → `Ne(cond, Cast(0 → cond's Ptr type))` — the 13.3 null-pointer-
+    //    constant node shape the semantic-admitted `coerce` arm builds
+    //    for a source-level zero in pointer context ("scalar" in C
+    //    6.8.4.1 includes pointers). Languages without the rule keep the
+    //    pass-through below.
+    //  - everything else (Struct, Array, Enum, FnSig, Void, …) →
+    //    UNCHANGED: exactly the prior coerce(_, Bool) pass-through for
+    //    non-arithmetic kinds; the MIR verifier's CondBr-expects-Bool
+    //    check remains the loud gate.
+    //
+    // Replaced `coerce(cond, boolType())` at every condition site
+    // (2026-06-11): for an I32 cond that emitted `Cast(I32 → Bool)`
+    // which MIR's `mapCast` lowers as `Trunc` — semantically wrong for
+    // truthiness conditions (`if (2)` would have been false; every
+    // reachable case was caught by the FC3-c2 conversion-width gate, so
+    // nothing miscompiled silently).
+    [[nodiscard]] E coerceCondition(E cond, NodeId anchor) {
+        if (!cond.type.valid()) return cond;
+        TypeKind const ck = interner.kind(cond.type);
+        if (ck == TypeKind::Bool) return cond;
+        if (isArithmeticCore(ck)) {
+            HirNodeId const zero = synthZeroOrError(anchor, cond.type);
+            return {track(builder.addParent(HirKind::BinaryOp,
+                                            std::array{cond.id, zero},
+                                            boolType(),
+                                            encodeOp(HirOpKind::Ne)),
+                          anchor),
+                    boolType()};
+        }
+        if (ck == TypeKind::Ptr
+            && sem.pointerConversions.nullPointerConstantFromIntegerZero) {
+            // Null-pointer constant: Cast(Literal 0 : I32 → cond's Ptr
+            // type), both Synthetic — the exact shape the 13.3 coerce
+            // arm materializes for a semantic-admitted source-level
+            // integer zero in pointer context; MIR's `mapCast` routes
+            // it as IntToPtr.
+            HirLiteralValue v;
+            v.core  = TypeKind::I32;
+            v.value = std::int64_t{0};
+            HirNodeId const zeroLit = builder.makeLiteral(
+                interner.primitive(TypeKind::I32), literals.add(v),
+                HirFlags::Synthetic);
+            HirNodeId const nullPtr = builder.makeCast(
+                zeroLit, cond.type, HirFlags::Synthetic);
+            return {track(builder.addParent(HirKind::BinaryOp,
+                                            std::array{cond.id, nullPtr},
+                                            boolType(),
+                                            encodeOp(HirOpKind::Ne)),
+                          anchor),
+                    boolType()};
+        }
+        return cond;
     }
 
     Lowerer(SemanticModel& m, HirLoweringConfig const& c, SemanticConfig const& s,
@@ -1207,10 +1291,13 @@ struct Lowerer {
     // type) stay identical. Does NOT handle `Assign` (an expression-position
     // store) — that is Pratt-only and resolved by the caller before this point.
     E combineBinary(NodeId anchor, HirOperatorEntry const& e, E lhs, E rhs) {
-        // LogicalAnd/Or: operands coerce to Bool (short-circuit semantics).
+        // LogicalAnd/Or: operands are CONDITION positions (short-circuit
+        // semantics) — each non-Bool scalar operand takes the truthiness
+        // `Ne(operand, 0)` test (C99 6.5.13p3 / 6.5.14p3 "compares
+        // unequal to 0"), never a value-truncating Cast.
         if (e.target == "LogicalAnd" || e.target == "LogicalOr") {
-            E const lb = coerce(lhs, boolType());
-            E const rb = coerce(rhs, boolType());
+            E const lb = coerceCondition(lhs, anchor);
+            E const rb = coerceCondition(rhs, anchor);
             if (e.target == "LogicalAnd")
                 return {track(builder.makeLogicalAnd(lb.id, rb.id, boolType()), anchor), boolType()};
             return {track(builder.makeLogicalOr(lb.id, rb.id, boolType()), anchor), boolType()};
@@ -1373,9 +1460,10 @@ struct Lowerer {
             return {errorNode(node), InvalidType};
         }
         E cond = lowerExpr(operands[0]);
-        // Coerce cond to Bool (C99 + LLVM-style i1 discipline at the
-        // CondBr / Ternary boundary).
-        cond = coerce(cond, boolType());
+        // Truthiness at the Ternary boundary: a non-Bool scalar cond
+        // becomes `Ne(cond, 0)` (C99 6.5.15p4 "compares unequal to 0"),
+        // keeping the CondBr-expects-Bool discipline at MIR.
+        cond = coerceCondition(cond, operands[0]);
         E thenE = lowerExpr(operands[1]);
         E elseE = lowerExpr(operands[2]);
         // Coerce both arms to their common type (C99 conditional-expression
@@ -2614,7 +2702,7 @@ struct Lowerer {
             Role const role = classify(c);
             if (role == Role::Expr && !cond) {
                 E const condE = lowerExpr(c);
-                cond = coerce(condE, boolType()).id;
+                cond = coerceCondition(condE, c).id;
             }
             else if (role == Role::Stmt)     bodies.push_back(lowerStmt(c));
         }
@@ -2633,7 +2721,7 @@ struct Lowerer {
             Role const role = classify(c);
             if (role == Role::Expr && !cond) {
                 E const condE = lowerExpr(c);
-                cond = coerce(condE, boolType()).id;
+                cond = coerceCondition(condE, c).id;
             }
             else if (role == Role::Stmt && !body) body = lowerStmt(c);
         }
@@ -2664,7 +2752,7 @@ struct Lowerer {
             if (s == 0)      init   = lowerForClause(c);
             else if (s == 1) {
                 E const condE = lowerExpr(c);
-                cond = coerce(condE, boolType()).id;
+                cond = coerceCondition(condE, c).id;
             }
             else if (s == 2) update = lowerForClause(c);
         }

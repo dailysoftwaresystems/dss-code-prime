@@ -1832,6 +1832,175 @@ TEST(MirLoweringCSubset, MixedI32U64AddComputesU64) {
     EXPECT_EQ(countOp(L.mir.mir, MirOpcode::SExt), 1u);
 }
 
+// ── Condition truthiness pins (C99 "compares unequal to 0") ─────────────
+//
+// A non-Bool ARITHMETIC condition at EVERY condition site (if / while /
+// do-while / for / ternary — and a call-result feeding one) lowers as
+// `ICmpNe(cond, 0-of-cond's-type)`, NEVER as the value-truncating
+// `Cast → Trunc(cond → Bool)` (low-bit truncation would make `if (2)`
+// FALSE). The `countOp(Trunc) == 0` half of each pin is the RED-on-
+// disable lever: reverting any site in cst_to_hir.cpp to the old
+// `coerce(cond, boolType())` re-materializes the Trunc and drops the
+// ICmpNe.
+
+namespace {
+
+// TypeKind of operand `idx` of the FIRST instruction of `op` across the
+// whole module (Void if no such instruction / operand).
+[[nodiscard]] ::dss::TypeKind firstOperandKindOf(Lowered const& L,
+                                                 ::dss::MirOpcode op,
+                                                 std::size_t idx) {
+    auto const& m = L.mir.mir;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        auto const fn = m.funcAt(f);
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            auto const bb = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(bb); ++i) {
+                auto const inst = m.blockInstAt(bb, i);
+                if (m.instOpcode(inst) != op) continue;
+                auto const ops = m.instOperands(inst);
+                if (idx >= ops.size()) return ::dss::TypeKind::Void;
+                auto const ty = m.instType(ops[idx]);
+                return ty.valid()
+                    ? L.model.lattice().interner().kind(ty)
+                    : ::dss::TypeKind::Void;
+            }
+        }
+    }
+    return ::dss::TypeKind::Void;
+}
+
+// Shared three-sided truthiness assertion: exactly one ICmpNe, zero
+// Trunc (the old wrong shape), upstream + MIR clean.
+void expectTruthinessNe(Lowered const& L, char const* site) {
+    ASSERT_FALSE(L.model.hasErrors()) << site;
+    ASSERT_TRUE(L.hir->ok) << site << ": "
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok) << site << ": "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::ICmpNe), 1u)
+        << site << ": a non-Bool arithmetic condition must lower as the "
+           "truthiness `!= 0` compare";
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::Trunc), 0u)
+        << site << ": the old Cast-to-Bool shape (Trunc keeps only the "
+           "low bit — `if (2)` would be false) must NOT appear";
+}
+
+} // namespace
+
+TEST(MirLoweringCSubset, BareIntIfConditionLowersAsICmpNeNotTrunc) {
+    auto L = lowerCSubset("int main() { if (2) return 42; return 7; }");
+    expectTruthinessNe(L, "if");
+    // The synthetic zero keeps the condition's own type: I32 vs I32.
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 0), TypeKind::I32);
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 1), TypeKind::I32);
+}
+
+TEST(MirLoweringCSubset, BareIntWhileConditionLowersAsICmpNeNotTrunc) {
+    auto L = lowerCSubset(
+        "int f(int n) { while (n) { n = n - 1; } return n; }");
+    expectTruthinessNe(L, "while");
+}
+
+TEST(MirLoweringCSubset, BareIntDoWhileConditionLowersAsICmpNeNotTrunc) {
+    auto L = lowerCSubset(
+        "int f(int n) { do { n = n - 1; } while (n); return n; }");
+    expectTruthinessNe(L, "do-while");
+}
+
+TEST(MirLoweringCSubset, BareIntForConditionLowersAsICmpNeNotTrunc) {
+    // The update clause is EMPTY (decrement in the body): every
+    // statement-shaped update (`n = n - 1`, `n -= 1`, `n--`) lowers at
+    // HIR as an AssignStmt, and ForStmt's MIR lowering routes the update
+    // through lowerExpr — which does not handle AssignStmt (the init
+    // clause goes through lowerStmt and is fine). A PRE-EXISTING,
+    // condition-UNRELATED gap; this pin exercises only the for-COND
+    // truthiness site. (Runtime-witnessed: an empty-update for with a
+    // bare int cond compiles + exits clean on PE x86_64.)
+    auto L = lowerCSubset(
+        "int f(int n) { for (n = 3; n; ) { n = n - 1; } return n; }");
+    expectTruthinessNe(L, "for");
+}
+
+TEST(MirLoweringCSubset, BareIntTernaryConditionLowersAsICmpNeNotTrunc) {
+    auto L = lowerCSubset("int f(int c) { return c ? 1 : 2; }");
+    expectTruthinessNe(L, "ternary");
+}
+
+TEST(MirLoweringCSubset, CallResultIfConditionLowersAsICmpNeNotTrunc) {
+    auto L = lowerCSubset(
+        "int two() { return 2; }\n"
+        "int main() { if (two()) return 42; return 7; }\n");
+    expectTruthinessNe(L, "if(call)");
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::Call), 1u);
+}
+
+// A condition that is ALREADY Bool (a comparison) gets NO truthiness
+// wrap: exactly ONE comparison total — the source-level `<` — and no
+// double-Ne re-test of its Bool result.
+TEST(MirLoweringCSubset, BoolIfConditionKeepsExactlyOneComparison) {
+    auto L = lowerCSubset(
+        "int f(int a, int b) { if (a < b) return 1; return 0; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::ICmpSlt), 1u);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::ICmpNe), 0u)
+        << "a Bool condition must NOT be re-wrapped in a truthiness Ne";
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::Trunc), 0u);
+}
+
+// Float condition: truthiness is `!= 0.0` → FCmpOne over the cond's own
+// float type (C99 6.8.4.1 over scalars), NOT the old Cast shape whose
+// mapCast routed float→Bool as FPToUI (value-WRONG: FPToUI(0.5) == 0
+// would make `if (0.5)` false). FCmp has no LIR lowering yet, so the
+// runtime tier stays fail-loud — but at the RIGHT shape, pinned here.
+TEST(MirLoweringCSubset, FloatIfConditionLowersAsFCmpOneNotFpToUi) {
+    auto L = lowerCSubset(
+        "int f(double d) { if (d) return 1; return 0; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::FCmpOne), 1u)
+        << "float truthiness must be the ordered `!= 0.0` compare";
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::FCmpOne, 1), TypeKind::F64)
+        << "the synthetic float zero keeps the cond's own type";
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::FPToUI), 0u)
+        << "the old Cast(F64→Bool) shape routed FPToUI — value-wrong";
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::Trunc), 0u);
+}
+
+// Char condition: Char is C-scalar arithmetic — same `!= 0` test against
+// a Char-typed zero (no promotion is needed for an unequal-to-zero
+// test). Char-width ALU forms are still gated at LIR (D-CSUBSET-32BIT-
+// ALU-FORMS) so the runtime tier stays fail-loud at the right shape.
+TEST(MirLoweringCSubset, CharIfConditionLowersAsICmpNeTypedZero) {
+    auto L = lowerCSubset(
+        "int f(char c) { if (c) return 1; return 0; }");
+    expectTruthinessNe(L, "if(char)");
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 0), TypeKind::Char);
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 1), TypeKind::Char);
+}
+
+// Pointer condition: `if (p)` tests `p != null-pointer-constant` when
+// the language admits integer-zero null-pointer constants (c-subset
+// does). The constant materializes through the 13.3 substrate shape —
+// Cast(0:I32 → Ptr) = MIR IntToPtr — and the compare is ICmpNe over
+// pointer operands. (Runtime-witnessed: PE x86_64 `if (p)` exits 42.)
+TEST(MirLoweringCSubset, PointerIfConditionLowersAsICmpNeAgainstNullConstant) {
+    auto L = lowerCSubset(
+        "int main() { int x; x = 5; int* p; p = &x; "
+        "if (p) return 42; return 7; }");
+    expectTruthinessNe(L, "if(ptr)");
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::IntToPtr), 1u)
+        << "the null-pointer constant must materialize as the 13.3 "
+           "Cast(int 0 → Ptr) shape";
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 0), TypeKind::Ptr);
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 1), TypeKind::Ptr);
+}
+
 // Shifts under the block follow C 6.5.7: the result type is the PROMOTED
 // LEFT operand — `u64 >> int` stays U64 (LShr, not AShr) and the int
 // count does NOT widen the result.

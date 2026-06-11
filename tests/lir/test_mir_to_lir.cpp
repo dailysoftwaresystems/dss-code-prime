@@ -960,17 +960,16 @@ TEST(MirToLir, TernaryProducesPhiResolutionMoves) {
     // each predecessor BEFORE its terminator, writing the per-arm value
     // into the phi's pre-allocated vreg.
     //
-    // Note: the condition path may use MIR Cast (HR's implicit bool
-    // coercion), which cycle 3b does NOT yet lower — so `L.lir.ok` may
-    // be false. The Phi resolution itself runs INDEPENDENTLY of the
-    // condition path's Cast failure (pre-allocation + edge-mov emission
-    // happen in their own pass). The test pins the move shape, not the
-    // overall lowering success.
+    // The non-Bool int condition lowers as the truthiness ICmpNe(c, 0)
+    // (cst_to_hir's coerceCondition — it used to be a Cast the LIR tier
+    // could not lower), which the CondBr fusion machinery handles — so
+    // the WHOLE function now lowers cleanly and `L.lir.ok` is required.
     auto L = lowerCSubsetToLir(
         "int f(int c) { return c ? 1 : 2; }");
     assertUpstreamClean(L);
-    // Don't require L.lir.ok — Cast on the condition may surface
-    // L_UnsupportedLoweringForOpcode without preventing Phi resolution.
+    ASSERT_TRUE(L.lir.ok)
+        << "ternary with a bare int cond must lower end-to-end (the "
+           "truthiness ICmpNe is CondBr-fusable)";
 
     auto const& sch = *L.target;
     auto const movOp = *sch.opcodeByMnemonic("mov");
