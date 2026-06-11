@@ -108,10 +108,11 @@
       "minOperands":   2,
       "maxOperands":   2,
       "encoding": {
+        "$comment": "FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): the reg-reg shape is width-keyed 64/32 — the W-form is the SAME shifted-register ADD word with sf (bit 31) CLEARED (ARM ARM C6.2.5: a W-register write zeroes the upper 32 bits of the X register, the C-defined unsigned-int wraparound for free). The imm12 shape stays width:64-only — its sole producer is the callconv sp-adjust (Ptr-width); a width-32 add-imm inst would match NOTHING and fail loud rather than silently compute with a 64-bit carry.",
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg", "reg"] },
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
             "template":   { "fixedWord": 2332033024 },
             "resultSlot": "rd",
             "wires":      [
@@ -120,8 +121,18 @@
             ]
           },
           {
+            "$comment": "ADD Wd, Wn, Wm — 0x0B000000 (the X-form 0x8B000000 with sf=0).",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 184549376 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
             "$comment": "ADD Xd, Xn, #imm12 (immediate). Fixed word 0x91000000 (sf=1, op=0 add, S=0, sh=0). imm12 at bits 10..21 via the Imm12 slot; Rd 0..4, Rn 5..9. Used by the callconv prologue/epilogue stack adjust (`add sp, sp, #frame`). 2-operand LIR form [reg, imm]: operand 0 → Rn (also the dest via resultSlot), operand 1 → Imm12. Range 0..4095.",
-            "guard":      { "operandKinds": ["reg", "imm32"] },
+            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64 },
             "template":   { "fixedWord": 2432696320 },
             "resultSlot": "rd",
             "wires":      [
@@ -141,7 +152,7 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg", "reg"] },
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
             "template":   { "fixedWord": 3405774848 },
             "resultSlot": "rd",
             "wires":      [
@@ -150,8 +161,18 @@
             ]
           },
           {
-            "$comment": "SUB Xd, Xn, #imm12 (immediate). Fixed word 0xD1000000 (sf=1, op=1 sub, S=0, sh=0). imm12 at bits 10..21; Rd 0..4, Rn 5..9. Used by the callconv prologue stack adjust (`sub sp, sp, #frame`). Same 2-operand [reg, imm] LIR form as ADD-immediate.",
-            "guard":      { "operandKinds": ["reg", "imm32"] },
+            "$comment": "FC3 c2: SUB Wd, Wn, Wm — 0x4B000000 (the X-form 0xCB000000 with sf=0).",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 1258291200 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "SUB Xd, Xn, #imm12 (immediate). Fixed word 0xD1000000 (sf=1, op=1 sub, S=0, sh=0). imm12 at bits 10..21; Rd 0..4, Rn 5..9. Used by the callconv prologue stack adjust (`sub sp, sp, #frame`). Same 2-operand [reg, imm] LIR form as ADD-immediate. FC3 c2: width:64-only like add's imm12 shape (sole producer is the Ptr-width sp-adjust; a width-32 sub-imm fails loud).",
+            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64 },
             "template":   { "fixedWord": 3506438144 },
             "resultSlot": "rd",
             "wires":      [
@@ -172,8 +193,18 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg", "reg"] },
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
             "template":   { "fixedWord": 2600500224 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FC3 c2: MUL Wd, Wn, Wm = MADD Wd, Wn, Wm, WZR — 0x1B007C00 (the X-form 0x9B007C00 with sf=0; the W product IS the C unsigned-int product mod 2^32).",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 453016576 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" },
@@ -193,8 +224,17 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg"] },
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 3405775840 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FC3 c2: NEG Wd, Wm = SUB Wd, WZR, Wm — 0x4B0003E0 (the X-form 0xCB0003E0 with sf=0).",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 1258292192 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rm" }
@@ -213,8 +253,18 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg", "reg"] },
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
             "template":   { "fixedWord": 2596277248 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FC3 c2: SDIV Wd, Wn, Wm — 0x1AC00C00 (the X-form 0x9AC00C00 with sf=0; ARM ARM C6.2.250 data-processing 2-source).",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 448793600 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" },
@@ -234,8 +284,18 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg", "reg"] },
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
             "template":   { "fixedWord": 2596276224 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FC3 c2: UDIV Wd, Wn, Wm — 0x1AC00800 (the X-form 0x9AC00800 with sf=0).",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 448792576 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" },
@@ -340,6 +400,52 @@
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"] },
+            "template":   { "fixedWord": 704644064 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): NEW opcode — sign-extend a 32-bit value to 64-bit. AArch64 `SXTW Xd, Wn` = the SBFM alias `SBFM Xd, Xn, #0, #31`: word 0x93407C00 = sf=1 [31] | opc=00 [30:29] | 100110 [28:23] | N=1 [22] | immr=000000 [21:16] | imms=011111 [15:10] | Rn [9:5] | Rd [4:0] (ARM ARM C6.2.263 SXTW / C6.2.234 SBFM). Mirrors x86_64's `sext` (movsxd r64, r/m32) LIR shape: result=value, ONE reg operand on the Rn slot. The MIR→LIR SExt gate admits I32 sources only — exactly this form's inherent width. First consumer: the LP64 `int` → `unsigned long` UAC conversion in the datamodel_runtime_width corpus.",
+      "mnemonic":      "sext",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"] },
+            "template":   { "fixedWord": 2470476800 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): NEW opcode — truncate a 64-bit value to 32 bits. AArch64 `MOV Wd, Wm` = `ORR Wd, WZR, Wm` (0x2A0003E0 — sf=0, Rn=WZR baked; the SAME word the `zext` opcode uses, because the ISA-level operation is identical: a W-register write zeroes the upper 32 bits). Two mnemonics deliberately exist over one word — each conversion mnemonic carries its INHERENT width pair (trunc: 64→32 mod-2^32, C's conversion semantics; zext: Bool/byte→64) and the MIR→LIR gates police each independently. The variant is WIDTH-KEYED 32 like x86's trunc: a Trunc to 16/8 bits reaching the assembler matches NOTHING and fails loud.",
+      "mnemonic":      "trunc",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "fixedWord": 704644064 },
             "resultSlot": "rd",
             "wires":      [
@@ -513,8 +619,17 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":    { "operandKinds": ["reg", "reg"] },
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
             "template": { "fixedWord": 3942645791 },
+            "wires":    [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FC3 c2: CMP Wn, Wm = SUBS WZR, Wn, Wm — 0x6B00001F (the X-form 0xEB00001F with sf=0). A U32 compare MUST read 32 bits — a bitcast-from-negative operand carries sign-extended upper bits the X-form would misread.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "fixedWord": 1795162143 },
             "wires":    [
               { "index": 0, "slotKind": "rn" },
               { "index": 1, "slotKind": "rm" }

@@ -503,38 +503,56 @@ struct Lowerer {
         return false;
     }
 
-    // FC3 c1 width gate (D-CSUBSET-32BIT-ALU-FORMS): the integer ALU /
-    // div / shift / compare encodings this backend ships are 64-bit-wide
-    // (REX.W x86 forms / X-register arm64 forms). Computing a type whose
-    // semantics C DEFINES at a narrower width through them would be a
-    // silent MISCOMPILE, not a diagnostic:
-    //   * U8/U16/U32 — unsigned wraparound is DEFINED (0xFFFFFFFFu + 1u
-    //     must be 0); 64-wide compute produces 0x100000000.
-    //   * I8/I16     — same defined-wraparound concern via the
-    //     conversion semantics at their width.
+    // FC3 width gate (D-CSUBSET-32BIT-ALU-FORMS — c1 erected it, c2
+    // NARROWED it): the integer ALU / div / compare tier now ships TWO
+    // encoded widths — 64-bit (REX.W x86 / X-register arm64, the
+    // substrate default) and 32-bit (no-REX.W x86 forms, auto-zero-
+    // extending / arm64 W-forms, sf=0) selected by the width axis
+    // (`kLirInstFlagWidth32` on LirInst.flags ↔ the variant guards'
+    // `width` key). I32/U32 therefore COMPUTE AT 32 BITS — true C
+    // `int`/`unsigned int` semantics including the DEFINED unsigned
+    // wraparound (0xFFFFFFFFu + 1u == 0). Still GATED loudly (a
+    // narrower width whose semantics C DEFINES but no encoded form
+    // exists would be a silent miscompile, not a diagnostic):
+    //   * U8/U16/I8/I16 — defined wraparound/conversion semantics at
+    //     8/16 bits; no 8/16-bit ALU forms are encoded (a later FC
+    //     extends the width axis — the loader already rejects guard
+    //     widths outside {32, 64}).
     //   * I128/U128  — WIDER than the registers; 64-wide compute would
     //     silently truncate.
     //   * Bool/Char/Byte — never reach an ALU op in a post-promotion
     //     language (the UAC block promotes them to the int floor); an
     //     appearance here means a language without promotion is doing
     //     sub-int compute — same fail-loud.
-    //   * I32 SIGNED stays ALLOWED: signed overflow is UB in C, so the
-    //     64-wide forms are conforming for every DEFINED I32 program
-    //     (the existing corpus' status quo). I64/U64/Ptr are native.
     // COMPARISONS gate on their OPERANDS' type (the result is Bool);
     // Bool-typed compare operands stay allowed — the `!x` lowering's
     // `ICmpEq(x, 0)` over Bool is width-exact for 0/1 values.
-    // The 32-bit-significant ALU forms (r32 operands) are the c2
-    // upgrade that lifts this gate per-width; until then every gated
-    // appearance fails loud here — the only tier where MIR types are
-    // still visible. Trunc needs no arm: x86 declares `trunc` with NO
-    // encoding and arm64 declares none at all, so any Trunc reaching
-    // codegen already fails loud (A_NoEncodingDeclared /
-    // L_RequiredLirOpcodeMissing).
+    // CONVERSIONS (c2): each conversion mnemonic has an INHERENT
+    // (source, dest) width pair, so the gate walls off the shapes
+    // with no realization rather than letting first-match pick a
+    // wrong-width encoding:
+    //   * Trunc — realized for 32-bit results only (x86 `mov r32,r32`
+    //     zero-extends = C's mod-2^32 conversion; arm64 W-form ORR
+    //     mov). 16/8/Bool results stay fail-loud here AND at the
+    //     assembler (the trunc variants carry `width: 32`, so a
+    //     non-32 trunc inst matches nothing — belt and suspenders).
+    //   * SExt — realized for I32 sources only (x86 movsxd r64,r/m32;
+    //     arm64 SXTW). An I8/I16/Char source would silently read a
+    //     32-bit register window.
+    //   * ZExt — realized for Bool sources only (x86 movzx r64,r/m8;
+    //     arm64 W-form ORR over a 0/1 register). A U32 source through
+    //     the x86 byte-form would silently read ONE byte — the
+    //     32-to-64 zero-extend realization (`mov r32,r32`, already
+    //     declared) lands with its first consumer
+    //     (D-CSUBSET-ZEXT-32-TO-64).
+    // Shifts/bitwise: Shl/LShr/AShr (all widths) and x86 And/Or/Xor/
+    // Not have NO encodings at all — they pass this TYPE gate at
+    // 32/64 and fail loud at the assembler (A_NoEncodingDeclared),
+    // the pre-existing width-independent wall.
     [[nodiscard]] bool requireNativeIntWidth(MirInstId id, MirOpcode op) {
         auto const gatedKind = [](TypeKind k) noexcept {
             switch (k) {
-                case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
+                case TypeKind::U8:  case TypeKind::U16:
                 case TypeKind::I8:  case TypeKind::I16:
                 case TypeKind::I128: case TypeKind::U128:
                 case TypeKind::Char: case TypeKind::Byte:
@@ -550,11 +568,28 @@ struct Lowerer {
                 std::format(
                     "{}: integer TypeKind ordinal {} has no native-width "
                     "ALU forms on target '{}' this cycle — the shipped "
-                    "integer encodings compute 64-bit-wide, which would "
-                    "silently violate the type's defined wraparound/"
+                    "integer encodings compute 64- or 32-bit-wide, which "
+                    "would silently violate the type's defined wraparound/"
                     "comparison semantics (D-CSUBSET-32BIT-ALU-FORMS)",
                     what, static_cast<unsigned>(interner.kind(ty)),
                     target.name()));
+            poisonValue(id);
+            return false;
+        };
+        // Conversion-shape reject: the mnemonic's inherent width pair
+        // has no realization for this (source/result) kind.
+        auto const failConv = [&](TypeId ty, std::string_view what,
+                                  std::string_view realized) {
+            dss::report(reporter,
+                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "{}: TypeKind ordinal {} has no encoded conversion "
+                    "form on target '{}' this cycle — only {} is realized; "
+                    "first-match would otherwise pick a wrong-width "
+                    "encoding (D-CSUBSET-32BIT-ALU-FORMS)",
+                    what, static_cast<unsigned>(interner.kind(ty)),
+                    target.name(), realized));
             poisonValue(id);
             return false;
         };
@@ -587,8 +622,72 @@ struct Lowerer {
                 }
                 return true;
             }
+            case MirOpcode::Trunc: {
+                // Result-width gate: only 32-bit results are realized
+                // (I64-result Trunc cannot arise — its source would be
+                // a gated I128).
+                TypeId const ty = mir.instType(id);
+                if (ty.valid()) {
+                    TypeKind const k = interner.kind(ty);
+                    if (k != TypeKind::I32 && k != TypeKind::U32) {
+                        return failConv(ty, "Trunc result",
+                                        "the 32-bit result form");
+                    }
+                }
+                return true;
+            }
+            case MirOpcode::SExt: {
+                // Source-width gate: movsxd / SXTW read a 32-bit
+                // source window.
+                auto const operands = mir.instOperands(id);
+                if (!operands.empty()) {
+                    TypeId const ty = mir.instType(operands[0]);
+                    if (ty.valid()
+                        && interner.kind(ty) != TypeKind::I32) {
+                        return failConv(ty, "SExt source",
+                                        "the I32-source form");
+                    }
+                }
+                return true;
+            }
+            case MirOpcode::ZExt: {
+                // Source-width gate: the shipped zext reads a BYTE
+                // source on x86 (movzx r64, r/m8) — only the Bool
+                // 0/1 producer is realized.
+                auto const operands = mir.instOperands(id);
+                if (!operands.empty()) {
+                    TypeId const ty = mir.instType(operands[0]);
+                    if (ty.valid()
+                        && interner.kind(ty) != TypeKind::Bool) {
+                        return failConv(ty, "ZExt source",
+                                        "the Bool-source form");
+                    }
+                }
+                return true;
+            }
             default:
                 return true;
+        }
+    }
+
+    // FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): the LIR width flag for a MIR
+    // type — the SINGLE point where TypeKind becomes the width axis.
+    // I32/U32 compute at 32 bits (true C int semantics; x86 32-bit ops
+    // auto-zero-extend, arm64 W-forms clear the upper word); everything
+    // else stays at the 64-bit substrate default (I64/U64/Ptr native;
+    // Bool/byte ops are width-invariant at 64; the gated kinds never
+    // reach an emission site). Applied at the COMPUTE tier only — ALU,
+    // div family, compares, trunc; plumbing movs / loads / stores /
+    // spills stay 64-bit full-width (value-correct: every 32-bit-typed
+    // CONSUMER reads only the low 32 bits of its operand registers, and
+    // widening happens only through the explicit conversion mnemonics).
+    [[nodiscard]] std::uint8_t widthFlagsForType(TypeId ty) const {
+        if (!ty.valid()) return 0;
+        switch (interner.kind(ty)) {
+            case TypeKind::I32: case TypeKind::U32:
+                return kLirInstFlagWidth32;
+            default:
+                return 0;
         }
     }
 
@@ -778,8 +877,12 @@ struct Lowerer {
     // FC2 Part B: the mnemonic comes from the per-register-class table
     // (GPR → the universal `mov`; FPR → the class's declared move, e.g.
     // x86_64 movaps) — a GPR mov against an FPR ordinal mis-encodes.
+    // FC3 c2: optional width `flags` (lowerConst threads the const's
+    // type width so a 32-bit-typed immediate selects the EXACT 32-bit
+    // mov-imm form; every other caller's copy stays width-default).
     // Returns the result reg so callers can chain.
-    LirReg emitMovToFresh(MirInstId id, LirOperand op, LirRegClass cls) {
+    LirReg emitMovToFresh(MirInstId id, LirOperand op, LirRegClass cls,
+                          std::uint8_t flags = 0) {
         auto const movOp = classOp(cls, RegClassOp::Move);
         if (!movOp.has_value()) {
             reportMissingClassOp(cls, RegClassOp::Move, "MIR value copy");
@@ -788,7 +891,7 @@ struct Lowerer {
         }
         LirReg const result = lir.newVReg(cls);
         std::array<LirOperand, 1> ops{op};
-        emitInst(*movOp, result, ops);
+        emitInst(*movOp, result, ops, /*payload=*/0, flags);
         defineValue(id, result);
         return result;
     }
@@ -810,6 +913,20 @@ struct Lowerer {
         std::uint32_t const litIdx = mir.constLiteralIndex(id);
         MirLiteralValue const& lit = mir.literalValue(litIdx);
 
+        // FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): a 32-bit-TYPED constant
+        // (I32/U32) materializes through the width-32 mov-imm form —
+        // the EXACT (non-sign-extending) 32-bit immediate write whose
+        // zero-extension makes the producer upper-bit-clean. This also
+        // WIDENS the inline range for 32-typed constants to the full
+        // [INT32_MIN, UINT32_MAX]: an `unsigned int` 0xFFFFFFFF (e.g.
+        // minted by ConstFold folding the u32_wraparound chain) IS a
+        // 4-byte immediate by construction — routing it to the
+        // LiteralPool dead end (no encoder consumes LiteralIndex) was
+        // a 64-bit-era artifact of the int32-signed range check.
+        std::uint8_t const constWidthFlags =
+            widthFlagsForType(mir.instType(id));
+        bool const is32Typed = constWidthFlags != 0;
+
         // ── narrow integer path: inline ImmInt32 ──
         std::int32_t imm32 = 0;
         bool fits = false;
@@ -818,10 +935,22 @@ struct Lowerer {
              && *i <= std::numeric_limits<std::int32_t>::max()) {
                 imm32 = static_cast<std::int32_t>(*i);
                 fits  = true;
+            } else if (is32Typed && *i >= 0
+                       && *i <= std::numeric_limits<std::uint32_t>::max()) {
+                // U32-range value carried in the int64 arm: the low 32
+                // bits ARE the value (the width-32 form writes them raw).
+                imm32 = static_cast<std::int32_t>(
+                    static_cast<std::uint32_t>(*i));
+                fits  = true;
             }
         } else if (auto const* u = std::get_if<std::uint64_t>(&lit.value)) {
-            if (*u <= static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
-                imm32 = static_cast<std::int32_t>(*u);
+            std::uint64_t const cap = is32Typed
+                ? std::numeric_limits<std::uint32_t>::max()
+                : static_cast<std::uint64_t>(
+                      std::numeric_limits<std::int32_t>::max());
+            if (*u <= cap) {
+                imm32 = static_cast<std::int32_t>(
+                    static_cast<std::uint32_t>(*u));
                 fits  = true;
             }
         } else if (auto const* b = std::get_if<bool>(&lit.value)) {
@@ -831,8 +960,10 @@ struct Lowerer {
         if (fits) {
             // Narrow integer literal — GPR-class regardless of the
             // declared MIR type since the immediate IS an integer.
-            // (Bool literals are also routed here as 0/1.)
-            emitMovToFresh(id, LirOperand::makeImmInt32(imm32), LirRegClass::GPR);
+            // (Bool literals are also routed here as 0/1 at the
+            // 64-bit default width.)
+            emitMovToFresh(id, LirOperand::makeImmInt32(imm32),
+                           LirRegClass::GPR, constWidthFlags);
             return;
         }
 
@@ -1439,7 +1570,13 @@ struct Lowerer {
         // Result reg class follows the MIR result type — FPR for float
         // ops, VR for vector ops, GPR otherwise.
         LirReg const result = lir.newVReg(regClassFor(id));
-        emitInst(*op, result, ops);
+        // FC3 c2: the RESULT type's width selects the encoded form
+        // (I32/U32 → the 32-bit variants; D-CSUBSET-32BIT-ALU-FORMS).
+        // Width-invariant ops (floats, conversions with inherent
+        // widths, Bool) map to the 64-bit default and keep matching
+        // their width-absent variants byte-identically.
+        emitInst(*op, result, ops, /*payload=*/0,
+                 widthFlagsForType(mir.instType(id)));
         defineValue(id, result);
     }
 
@@ -1545,6 +1682,15 @@ struct Lowerer {
         MnemonicSlot const nativeSlot = wantRemainder
             ? (isSigned ? MnemonicSlot::SModNative : MnemonicSlot::UModNative)
             : (isSigned ? MnemonicSlot::SDivNative : MnemonicSlot::UDivNative);
+        // FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): every COMPUTE op of the
+        // realization (native div / pre+core pair / the mul+sub of the
+        // remainder expansion) carries the MIR value's width so the
+        // encoder picks the matching forms (I32/U32 → CDQ + 32-bit
+        // idiv/div on x86, W-form sdiv/udiv/mul/sub on arm64). The
+        // dividend-pin and capture MOVs stay 64-bit full-width copies
+        // (value-correct: the 32-bit core op reads/writes only the low
+        // 32 bits it defines).
+        std::uint8_t const widthFlags = widthFlagsForType(mir.instType(id));
         if (auto const nativeOp = opcode(nativeSlot); nativeOp.has_value()) {
             auto const* ni = target.opcodeInfo(*nativeOp);
             if (ni == nullptr || ni->result != TargetResultRule::Value) {
@@ -1554,7 +1700,7 @@ struct Lowerer {
             LirReg const result = lir.newVReg(regClassFor(id));
             std::array<LirOperand, 2> const ops{
                 LirOperand::makeReg(dividend), LirOperand::makeReg(divisor)};
-            emitInst(*nativeOp, result, ops);
+            emitInst(*nativeOp, result, ops, /*payload=*/0, widthFlags);
             return result;
         }
         // Rule 2 — implicit-register pre/core pair.
@@ -1595,11 +1741,11 @@ struct Lowerer {
             LirReg const product = lir.newVReg(regClassFor(id));
             std::array<LirOperand, 2> const mulOps{
                 LirOperand::makeReg(*quotient), LirOperand::makeReg(divisor)};
-            emitInst(*mulOp, product, mulOps);
+            emitInst(*mulOp, product, mulOps, /*payload=*/0, widthFlags);
             LirReg const remainder = lir.newVReg(regClassFor(id));
             std::array<LirOperand, 2> const subOps{
                 LirOperand::makeReg(dividend), LirOperand::makeReg(product)};
-            emitInst(*subOp, remainder, subOps);
+            emitInst(*subOp, remainder, subOps, /*payload=*/0, widthFlags);
             return remainder;
         }
         // No realization for a plain division: report the native verb
@@ -1683,6 +1829,13 @@ struct Lowerer {
         LirReg const dividendPhys =
             makePhysicalReg(*dividendOrdinal, dividendCls);
 
+        // FC3 c2: the PRE and CORE ops carry the value's width — for
+        // I32/U32 the pair selects the 32-bit forms (x86: CDQ [99, the
+        // no-REX.W cqo sibling] + 32-bit F7 /7 idiv / /6 div). The
+        // pin/capture movs stay 64-bit (full-register copies).
+        std::uint8_t const pairWidthFlags =
+            widthFlagsForType(mir.instType(id));
+
         // 1. Pin dividend into the role-declared register.
         std::array<LirOperand, 1> const movInOps{
             LirOperand::makeReg(dividend)};
@@ -1693,7 +1846,8 @@ struct Lowerer {
         //    output/clobber set (RAX → RDX for CQO; RDX clobber for
         //    XOR). Regalloc reads each PRE op's implicit-register
         //    declaration independently — no extra coupling required.
-        emitInst(preOpId, InvalidLirReg, std::span<LirOperand const>{});
+        emitInst(preOpId, InvalidLirReg, std::span<LirOperand const>{},
+                 /*payload=*/0, pairWidthFlags);
 
         // 3. Emit CORE op (IDIV /7 or DIV /6). One operand (divisor
         //    in modrm.rm), no SSA result; the op declares
@@ -1703,7 +1857,8 @@ struct Lowerer {
         //    range that COVERS this position.
         std::array<LirOperand, 1> const divOps{
             LirOperand::makeReg(divisor)};
-        emitInst(coreOpId, InvalidLirReg, divOps);
+        emitInst(coreOpId, InvalidLirReg, divOps,
+                 /*payload=*/0, pairWidthFlags);
 
         // 4. Capture the role-selected output (quotient for div,
         //    remainder for mod) into a fresh SSA result.
@@ -1762,8 +1917,13 @@ struct Lowerer {
         // cmp + setcc as paired instructions; the substrate guarantees no
         // value-producing inst sits between them (cycle 3a fallback-seal
         // + cycle 3b ICmp-immediately-followed-by-setcc).
+        // FC3 c2: the compare width follows the OPERANDS' type (the
+        // result is Bool) — post-UAC both operands carry the same
+        // type, so operand 0 is authoritative. A U32/I32 compare
+        // selects the 32-bit cmp form (D-CSUBSET-32BIT-ALU-FORMS).
         std::array<LirOperand, 2> cmpOps{LirOperand::makeReg(*a), LirOperand::makeReg(*b)};
-        emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
+        emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps,
+                 /*payload=*/0, widthFlagsForType(mir.instType(operands[0])));
 
         // D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold,
         // code-reviewer C2): emit setcc into a separate "byte" vreg,
@@ -2037,14 +2197,24 @@ struct Lowerer {
             if (!a.has_value() || !b.has_value()) return false;
             std::array<LirOperand, 2> cmpOps{
                 LirOperand::makeReg(*a), LirOperand::makeReg(*b)};
-            emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
+            // FC3 c2: the fused compare's width follows the ICmp
+            // OPERANDS' type — the same rule as lowerICmp's cmp
+            // (D-CSUBSET-32BIT-ALU-FORMS).
+            emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps,
+                     /*payload=*/0,
+                     widthFlagsForType(mir.instType(icmpOperands[0])));
             jccCond = *fusedCc;
         } else {
             std::optional<LirReg> const cond = regForValue(operands[0]);
             if (!cond.has_value()) return false;
             std::array<LirOperand, 2> cmpOps{
                 LirOperand::makeReg(*cond), LirOperand::makeImmInt32(0)};
-            emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
+            // The non-fused arm's cond is a Bool/byte producer (its
+            // own producer zero-extended it) — width follows its type
+            // (Bool → the 64-bit default; the imm-form cmp variants).
+            emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps,
+                     /*payload=*/0,
+                     widthFlagsForType(mir.instType(operands[0])));
             jccCond = TargetCondCode::Ne;
         }
         // Pass both successors as BlockRef operands. jcc remains
@@ -2139,7 +2309,11 @@ struct Lowerer {
             }
             std::array<LirOperand, 2> cmpOps{
                 LirOperand::makeReg(*discrim), LirOperand::makeReg(*caseConst)};
-            emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
+            // FC3 c2: the cascade compares follow the DISCRIMINANT's
+            // type width (D-CSUBSET-32BIT-ALU-FORMS).
+            emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps,
+                     /*payload=*/0,
+                     widthFlagsForType(mir.instType(operands[0])));
 
             // First-iteration pre-jcc pin: the open block must still
             // be `switchHeader` after the compare emits and before

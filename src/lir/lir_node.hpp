@@ -19,6 +19,31 @@ namespace dss {
 // vocabulary tier (compile-time enum, not JSON-driven). LIR pulls it
 // in via target_schema.hpp's include.
 
+// FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): `LirInst.flags` bit 0 is the
+// operation-WIDTH discriminator the encoding-variant guards match on.
+//   0 (default) = 64-bit — every pre-FC3 instruction and all
+//                 hand-built test LIR (back-compat by construction).
+//   1           = 32-bit — set by MIR→LIR lowering when the MIR
+//                 instruction's type is I32/U32 (ALU/div/compare/
+//                 trunc tiers; plumbing movs/loads/stores stay 64).
+// The width rides `flags` (not a new POD field) deliberately: every
+// existing flags-copying rewrite pass (lir_2addr_legalize, the
+// regalloc rewriter, lir_callconv materialize) and the `.dsslir`
+// text round-trip ("payload=N flags=M" is mandatory-emitted) carry
+// it forward with ZERO changes — a width dropped at any rebuild
+// would silently re-select the 64-bit forms (a miscompile), so the
+// carrier that survives by construction is the safe one. Future
+// 16/8-bit forms extend this to a 2-bit field; the JSON loader
+// already rejects any guard width outside {32, 64}.
+inline constexpr std::uint8_t kLirInstFlagWidth32 = 0x01;
+
+// The instruction's operation width in bits, derived from its flags.
+[[nodiscard]] constexpr std::uint8_t
+lirInstWidthBits(std::uint8_t flags) noexcept {
+    return (flags & kLirInstFlagWidth32) != 0 ? std::uint8_t{32}
+                                              : std::uint8_t{64};
+}
+
 // Operand variant tag carried on each entry of the LIR operand pool.
 // LIR operands are heterogeneous (registers / immediates / memory
 // addressing modes); the kind discriminator picks the right field

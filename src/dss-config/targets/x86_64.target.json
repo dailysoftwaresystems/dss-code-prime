@@ -29,7 +29,7 @@
       "maxSuccessors": 0
     },
     {
-      "$comment": "2-operand-shape mov: destination = result vreg, source = operands[0]. AS2 cycle 2 wires this to two encoding variants: REX.W 0x8B /r (mov r64, r64) when source is a register; REX.W 0xC7 /0 imm32 (mov r/m64, imm32 sign-extended to 64-bit) when source is an immediate.",
+      "$comment": "2-operand-shape mov: destination = result vreg, source = operands[0]. AS2 cycle 2 wires this to two encoding variants: REX.W 0x8B /r (mov r64, r64) when source is a register; REX.W 0xC7 /0 imm32 (mov r/m64, imm32 SIGN-extended to 64-bit) when source is an immediate. FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): both shapes gain explicit `width` keys + 32-bit siblings (same opcodes WITHOUT REX.W, Intel SDM Vol. 2B MOV) — a 32-bit register write auto-zero-extends to the full 64-bit register, and the 32-bit imm32 form is EXACT (not sign-extending), the difference that matters for an `unsigned int` 0xFFFFFFFF. Plumbing movs (phi/copy/capture/spill) are emitted width-default (64) — full-register copies are value-correct for every type.",
       "mnemonic":      "mov",
       "result":        "value",
       "hasSideEffects": false,
@@ -41,14 +41,28 @@
         "format": "x86-variable",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg"] },
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "rexW": true, "opcode": [139] },
             "resultSlot": "modrm.reg",
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
-            "guard":      { "operandKinds": ["imm32"] },
+            "$comment": "mov r32, r32 — 0x8B /r without REX.W (zero-extends to r64).",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "opcode": [139] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["imm32"], "width": 64 },
             "template":   { "rexW": true, "opcode": [199], "modrmRegExt": 0 },
+            "resultSlot": "modrm.rm",
+            "wires":      [{ "index": 0, "slotKind": "imm32" }]
+          },
+          {
+            "$comment": "mov r/m32, imm32 — 0xC7 /0 without REX.W: writes the EXACT 32-bit immediate + zero upper (the 64-bit form sign-extends).",
+            "guard":      { "operandKinds": ["imm32"], "width": 32 },
+            "template":   { "opcode": [199], "modrmRegExt": 0 },
             "resultSlot": "modrm.rm",
             "wires":      [{ "index": 0, "slotKind": "imm32" }]
           }
@@ -66,11 +80,11 @@
       "minSuccessors": 0,
       "maxSuccessors": 0,
       "encoding": {
-        "$comment": "2-address shape: `operands[0]` IS the destination after `lir_2addr_legalize` ensures result==operands[0]. So no resultSlot — the wire for operands[0] handles the destination placement (its hwEncoding goes into ModR/M.rm). validate() rule G has a `requires2Address` exception for exactly this shape.",
+        "$comment": "2-address shape: `operands[0]` IS the destination after `lir_2addr_legalize` ensures result==operands[0]. So no resultSlot — the wire for operands[0] handles the destination placement (its hwEncoding goes into ModR/M.rm). validate() rule G has a `requires2Address` exception for exactly this shape. FC3 c2: width-keyed 64/32 pairs — the 32-bit forms are the SAME opcodes without REX.W (Intel SDM ADD), computing mod-2^32 with auto-zero-extension (the C-defined `unsigned int` wraparound).",
         "format": "x86-variable",
         "variants": [
           {
-            "guard":    { "operandKinds": ["reg", "reg"] },
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
             "template": { "rexW": true, "opcode": [1] },
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" },
@@ -78,9 +92,27 @@
             ]
           },
           {
+            "$comment": "add r/m32, r32 — 0x01 /r without REX.W (32-bit add, zero-extends).",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "opcode": [1] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
             "$comment": "add reg-imm32 — REX.W 0x81 /0 imm32 (ADD r/m64, imm32). Used by ML7 epilogue's `add rsp, N` stack-frame teardown. 2-address shape: operands[0] is dest, imm32 is immediate. modrmRegExt=0 fills ModR/M.reg with the opcode-extension digit (/0 for ADD).",
-            "guard":    { "operandKinds": ["reg", "imm32"] },
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 64 },
             "template": { "rexW": true, "opcode": [129], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "$comment": "add r/m32, imm32 — 0x81 /0 without REX.W.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 32 },
+            "template": { "opcode": [129], "modrmRegExt": 0 },
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" },
               { "index": 1, "slotKind": "imm32" }
@@ -103,7 +135,7 @@
         "format": "x86-variable",
         "variants": [
           {
-            "guard":    { "operandKinds": ["reg", "reg"] },
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
             "template": { "rexW": true, "opcode": [41] },
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" },
@@ -111,9 +143,27 @@
             ]
           },
           {
+            "$comment": "FC3 c2: sub r/m32, r32 — 0x29 /r without REX.W.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "opcode": [41] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
             "$comment": "sub reg-imm32 — REX.W 0x81 /5 imm32 (SUB r/m64, imm32). Used by ML7 prologue's `sub rsp, N` stack-frame setup. 2-address shape (operands[0] is dest, imm32 is immediate). modrmRegExt=5 fills ModR/M.reg with the opcode-extension digit (/5 for SUB).",
-            "guard":    { "operandKinds": ["reg", "imm32"] },
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 64 },
             "template": { "rexW": true, "opcode": [129], "modrmRegExt": 5 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "$comment": "FC3 c2: sub r/m32, imm32 — 0x81 /5 without REX.W.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 32 },
+            "template": { "opcode": [129], "modrmRegExt": 5 },
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" },
               { "index": 1, "slotKind": "imm32" }
@@ -136,8 +186,17 @@
         "format": "x86-variable",
         "variants": [
           {
-            "guard":    { "operandKinds": ["reg", "reg"] },
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
             "template": { "rexW": true, "opcode": [15, 175] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "FC3 c2: imul r32, r/m32 — 0F AF /r without REX.W (32-bit multiply, low half, zero-extends; the C-defined unsigned-int product mod 2^32).",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "opcode": [15, 175] },
             "wires":    [
               { "index": 0, "slotKind": "modrm.reg" },
               { "index": 1, "slotKind": "modrm.rm" }
@@ -164,8 +223,13 @@
         "format": "x86-variable",
         "variants": [
           {
-            "guard":    { "operandKinds": [] },
+            "guard":    { "operandKinds": [], "width": 64 },
             "template": { "rexW": true, "opcode": [153] }
+          },
+          {
+            "$comment": "FC3 c2: the 32-bit sibling is CDQ — the SAME 0x99 opcode WITHOUT REX.W (Intel SDM CWD/CDQ/CQO: operand size selects which) — sign-extends EAX into EDX:EAX, the pre-divide setup the 32-bit IDIV consumes. The MIR→LIR div lowering threads ONE width through the pre+core pair so they always agree.",
+            "guard":    { "operandKinds": [], "width": 32 },
+            "template": { "opcode": [153] }
           }
         ]
       }
@@ -190,8 +254,16 @@
         "format": "x86-variable",
         "variants": [
           {
-            "guard":    { "operandKinds": ["reg"] },
+            "guard":    { "operandKinds": ["reg"], "width": 64 },
             "template": { "rexW": true, "opcode": [247], "modrmRegExt": 7 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "FC3 c2: idiv r/m32 — 0xF7 /7 without REX.W (divides EDX:EAX, quotient EAX / remainder EDX, both zero-extending into the full registers). Pairs with the width-32 cqo sibling (CDQ).",
+            "guard":    { "operandKinds": ["reg"], "width": 32 },
+            "template": { "opcode": [247], "modrmRegExt": 7 },
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -216,6 +288,7 @@
         "format": "x86-variable",
         "variants": [
           {
+            "$comment": "FC3 c2: deliberately WIDTH-ABSENT (match-any). XOR EDX,EDX is ALREADY a 32-bit op that zeroes the full RDX — the same bytes are the correct unsigned-divide pre-op at BOTH widths (the 32-bit DIV reads only EDX of it).",
             "guard":    { "operandKinds": [] },
             "template": { "opcode": [49, 210] }
           }
@@ -242,8 +315,16 @@
         "format": "x86-variable",
         "variants": [
           {
-            "guard":    { "operandKinds": ["reg"] },
+            "guard":    { "operandKinds": ["reg"], "width": 64 },
             "template": { "rexW": true, "opcode": [247], "modrmRegExt": 6 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "FC3 c2: div r/m32 — 0xF7 /6 without REX.W (unsigned 32-bit divide of EDX:EAX; quotient EAX zero-extends).",
+            "guard":    { "operandKinds": ["reg"], "width": 32 },
+            "template": { "opcode": [247], "modrmRegExt": 6 },
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -264,7 +345,7 @@
         "format": "x86-variable",
         "variants": [
           {
-            "guard":    { "operandKinds": ["reg", "reg"] },
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
             "template": { "rexW": true, "opcode": [57] },
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" },
@@ -272,8 +353,26 @@
             ]
           },
           {
-            "guard":    { "operandKinds": ["reg", "imm32"] },
+            "$comment": "FC3 c2: cmp r/m32, r32 — 0x39 /r without REX.W. A U32 compare MUST read 32 bits: a bitcast-from-negative-int operand carries sign-extended upper bits a 64-wide compare would misread.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "opcode": [57] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 64 },
             "template": { "rexW": true, "opcode": [129], "modrmRegExt": 7 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "$comment": "FC3 c2: cmp r/m32, imm32 — 0x81 /7 without REX.W (the lowerCondBr nonzero-test on a 32-bit-typed condition).",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 32 },
+            "template": { "opcode": [129], "modrmRegExt": 7 },
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" },
               { "index": 1, "slotKind": "imm32" }
@@ -634,14 +733,25 @@
       }
     },
     {
-      "$comment": "Truncate integer (cycle 3c cast lowering for MIR Trunc). Operands: [src_reg]. AS1 emits mov of the low N bits (effectively a no-op on x86_64 since registers alias subregs).",
+      "$comment": "Truncate integer (cycle 3c cast lowering for MIR Trunc). Operands: [src_reg]. FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): FIRST real encoding — the 32-bit-result form is `mov r32, r/m32` (0x8B /r WITHOUT REX.W): a 32-bit register write zero-extends to the full r64, which IS C's value mod 2^32 conversion (C23 6.3.1.3 for unsigned; the same bit pattern for the int window). The variant is deliberately WIDTH-KEYED 32: a Trunc to 16/8 bits (gated at MIR→LIR requireNativeIntWidth) that somehow reached the assembler would match NOTHING and fail loud (A_NoMatchingEncodingVariant) instead of silently emitting a 32-bit mov — belt + suspenders.",
       "mnemonic":      "trunc",
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   1,
       "maxOperands":   1,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "opcode": [139] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
     },
     {
       "$comment": "Bitwise AND. Cycle 3d bitwise wave — same shape as add/sub/mul. AS1 emits x86_64 `and`.",
@@ -693,8 +803,16 @@
         "format": "x86-variable",
         "variants": [
           {
-            "guard":    { "operandKinds": ["reg"] },
+            "guard":    { "operandKinds": ["reg"], "width": 64 },
             "template": { "rexW": true, "opcode": [247], "modrmRegExt": 3 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "FC3 c2: neg r/m32 — 0xF7 /3 without REX.W (32-bit two's-complement, zero-extends).",
+            "guard":    { "operandKinds": ["reg"], "width": 32 },
+            "template": { "opcode": [247], "modrmRegExt": 3 },
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]

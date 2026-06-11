@@ -1162,6 +1162,19 @@ struct DSS_EXPORT ResultSlotExtra {
 
 struct DSS_EXPORT TargetEncodingVariant {
     std::vector<OperandKindFilter>     operandKinds;
+    // FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): optional WIDTH discriminator
+    // on the guard — the JSON key `guard.width`. 0 = absent = the
+    // variant matches an instruction of ANY width (every pre-FC3
+    // variant; width-invariant ops like loads/stores/branches keep
+    // this). 32/64 = the variant matches ONLY an instruction whose
+    // `lirInstWidthBits(flags)` equals it (the 32-bit no-REX.W x86
+    // forms / arm64 W-forms vs their 64-bit siblings — same mnemonic,
+    // same operand shape, different encoded width). The loader
+    // rejects any other value; validate() rejects two same-kind
+    // variants with the same width AND the ambiguous mix of a
+    // width-keyed variant with a width-absent same-kind sibling
+    // (first-match dispatch would silently shadow one of them).
+    std::uint8_t                       guardWidthBits = 0;
     TargetEncodingTemplate             tmpl;
     // Where the instruction's RESULT register goes (when the inst
     // has a result). Nullopt for value-less instructions (e.g.

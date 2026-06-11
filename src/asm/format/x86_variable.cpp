@@ -397,10 +397,13 @@ bool encode(Lir const&                  lir,
     auto const instOps = lir.instOperands(inst);
     LirReg const result = lir.instResult(inst);
 
-    // Find the first variant whose guard matches the operand kinds.
+    // Find the first variant whose guard matches the operand kinds AND
+    // the instruction's operation width (FC3 c2 width axis —
+    // D-CSUBSET-32BIT-ALU-FORMS; width-absent variants match any).
+    std::uint8_t const instWidth = lirInstWidthBits(lir.instFlags(inst));
     TargetEncodingVariant const* selected = nullptr;
     for (auto const& v : info->encoding.variants) {
-        if (operandsMatchGuard(instOps, v.operandKinds)) {
+        if (walker_util::variantMatchesInst(instOps, instWidth, v)) {
             selected = &v;
             break;
         }
@@ -409,9 +412,9 @@ bool encode(Lir const&                  lir,
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                DiagnosticSeverity::Error,
                std::format("opcode '{}': no encoding variant matches "
-                           "this instruction's operand kinds (declared "
-                           "variants: {})",
-                           info->mnemonic,
+                           "this instruction's operand kinds at width "
+                           "{} (declared variants: {})",
+                           info->mnemonic, instWidth,
                            info->encoding.variants.size()));
         return false;
     }

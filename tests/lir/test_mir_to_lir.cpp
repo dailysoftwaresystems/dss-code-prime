@@ -1514,7 +1514,12 @@ INSTANTIATE_TEST_SUITE_P(
         // Integer casts (cycle 3c) — all GPR result.
         CastCase{::dss::MirOpcode::Trunc,    "trunc", ::dss::TypeKind::I64, ::dss::TypeKind::I32, LirRegClass::GPR},
         CastCase{::dss::MirOpcode::SExt,     "sext",  ::dss::TypeKind::I32, ::dss::TypeKind::I64, LirRegClass::GPR},
-        CastCase{::dss::MirOpcode::ZExt,     "zext",  ::dss::TypeKind::I32, ::dss::TypeKind::I64, LirRegClass::GPR},
+        // FC3 c2: the zext mnemonic's inherent shape is the Bool 0/1
+        // byte source (x86 movzx r64, r/m8). An I32/U32 source would
+        // silently read ONE BYTE — gated at requireNativeIntWidth
+        // (see ZExtFromU32SourceStaysGated), and mapCast never mints
+        // an I32-source ZExt (signed widening is SExt).
+        CastCase{::dss::MirOpcode::ZExt,     "zext",  ::dss::TypeKind::Bool, ::dss::TypeKind::I64, LirRegClass::GPR},
         CastCase{::dss::MirOpcode::IntToPtr, "mov",   ::dss::TypeKind::I64, ::dss::TypeKind::Ptr, LirRegClass::GPR},
         CastCase{::dss::MirOpcode::PtrToInt, "mov",   ::dss::TypeKind::Ptr, ::dss::TypeKind::I64, LirRegClass::GPR},
         // Bitcast same-class is mov; different test (BitcastCrossClass)
@@ -2610,19 +2615,22 @@ TEST(MirToLir, WhileLoopLowersWithBackEdge) {
     }
 }
 
-// ── FC3 c1: D-CSUBSET-32BIT-ALU-FORMS width gate ────────────────────────
+// ── FC3 width gate + width axis (D-CSUBSET-32BIT-ALU-FORMS) ─────────────
 //
-// The shipped integer ALU/div/shift/compare encodings compute 64-bit
-// wide; a type whose semantics C DEFINES at a narrower width (unsigned
-// wraparound) must FAIL LOUD at MIR→LIR — the only tier where MIR types
-// are still visible — rather than silently compute 64-wide. I32 (signed
-// overflow is UB → 64-wide is conforming) and I64/U64 stay allowed.
+// c1 erected the gate (every shipped integer encoding was 64-bit-wide;
+// narrower DEFINED semantics failed loud). c2 ships the 32-bit forms +
+// the width axis: I32/U32 now LOWER, carrying `kLirInstFlagWidth32` on
+// the LIR instruction so the encoder picks the 32-bit variants. The
+// still-unencoded widths (8/16/128-bit + Bool-ALU) stay gated, and the
+// conversion mnemonics gate the (source/result) shapes they do not
+// realize.
 
 namespace {
 
 // Hand-build `fn(k, k) -> k { return a OP b; }` and lower it.
 struct GuardProbe {
     ::dss::DiagnosticReporter rep;
+    ::dss::Lir                lir;
     bool ok = false;
 };
 
@@ -2646,8 +2654,9 @@ struct GuardProbe {
     mb.addReturn(r);
     ::dss::Mir m = std::move(mb).finish();
     GuardProbe probe;
-    auto const result = ::dss::lowerToLir(m, **target, interner, probe.rep);
-    probe.ok = result.ok;
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
     return probe;
 }
 
@@ -2659,15 +2668,77 @@ struct GuardProbe {
     return false;
 }
 
+// Collect the LIR width (in bits) of every instruction whose mnemonic
+// matches, across the whole module. Empty = mnemonic never emitted.
+[[nodiscard]] std::vector<unsigned>
+widthsOfMnemonic(::dss::Lir const& lir, ::dss::TargetSchema const& sch,
+                 std::string_view mnemonic) {
+    std::vector<unsigned> out;
+    for (std::uint32_t f = 0; f < lir.moduleFuncCount(); ++f) {
+        auto const fn = lir.funcAt(f);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            auto const bb = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < lir.blockInstCount(bb); ++ii) {
+                auto const inst  = lir.blockInstAt(bb, ii);
+                auto const* info = sch.opcodeInfo(lir.instOpcode(inst));
+                if (info != nullptr && info->mnemonic == mnemonic) {
+                    out.push_back(::dss::lirInstWidthBits(
+                        lir.instFlags(inst)));
+                }
+            }
+        }
+    }
+    return out;
+}
+
 } // namespace
 
-TEST(MirToLir, U32AddFailsLoudCitingNativeWidthGuard) {
+TEST(MirToLir, U32AddLowersCarryingTheThirtyTwoBitWidthFlag) {
+    // c2 FLIP of the c1 gate test `U32AddFailsLoudCitingNativeWidthGuard`:
+    // U32 arithmetic now lowers, and the add instruction must carry the
+    // 32-bit width flag — the lever the encoder's variant guards match
+    // on. Width-perturbation red-on-disable: force `widthFlagsForType`
+    // to 0 and this pin goes RED (and the u32_wraparound corpus exit
+    // flips 42→7 — defined wraparound computed 64-wide).
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
     auto probe = lowerBinaryProbe(::dss::TypeKind::U32, ::dss::MirOpcode::Add);
-    EXPECT_FALSE(probe.ok)
-        << "U32 add must NOT lower — 64-wide compute would silently break "
-           "the type's DEFINED wraparound";
-    EXPECT_TRUE(sawAnchor(probe.rep, "D-CSUBSET-32BIT-ALU-FORMS"))
-        << "the diagnostic must cite the staging anchor";
+    EXPECT_TRUE(probe.ok)
+        << "U32 add must lower — c2 shipped the 32-bit ALU forms";
+    auto const widths = widthsOfMnemonic(probe.lir, **target, "add");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 32u)
+        << "the U32 add must carry kLirInstFlagWidth32 so the encoder "
+           "selects the 32-bit (no-REX.W) variant";
+}
+
+TEST(MirToLir, I64AddKeepsTheSixtyFourBitDefaultWidth) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto probe = lowerBinaryProbe(::dss::TypeKind::I64, ::dss::MirOpcode::Add);
+    EXPECT_TRUE(probe.ok);
+    auto const widths = widthsOfMnemonic(probe.lir, **target, "add");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 64u)
+        << "64-bit-typed code must keep the default width (back-compat: "
+           "it matches the pre-existing width-keyed 64 variants)";
+}
+
+TEST(MirToLir, I32SignedDivisionThreadsWidthThroughPreAndCoreOps) {
+    // The implicit-register pair must select the 32-bit forms COHERENTLY:
+    // an I32 SDiv lowers pre=cqo (encoding CDQ at width 32) + core=
+    // idiv_op (32-bit F7 /7) — a 64-bit CQO paired with a 32-bit IDIV
+    // (or vice versa) would sign-extend the WRONG register half.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto probe = lowerBinaryProbe(::dss::TypeKind::I32, ::dss::MirOpcode::SDiv);
+    EXPECT_TRUE(probe.ok);
+    auto const preWidths  = widthsOfMnemonic(probe.lir, **target, "cqo");
+    auto const coreWidths = widthsOfMnemonic(probe.lir, **target, "idiv_op");
+    ASSERT_EQ(preWidths.size(), 1u);
+    ASSERT_EQ(coreWidths.size(), 1u);
+    EXPECT_EQ(preWidths[0], 32u);
+    EXPECT_EQ(coreWidths[0], 32u);
 }
 
 TEST(MirToLir, U16DivAndI16MulAlsoGate) {
@@ -2677,8 +2748,11 @@ TEST(MirToLir, U16DivAndI16MulAlsoGate) {
                                   ::dss::MirOpcode::Mul).ok);
 }
 
-TEST(MirToLir, U32CompareOperandsGate) {
-    // The compare RESULT is Bool — the gate keys on the OPERANDS' type.
+TEST(MirToLir, U32CompareLowersWithThirtyTwoBitCmpWidth) {
+    // c2 FLIP of the c1 gate test `U32CompareOperandsGate`: a U32
+    // compare now lowers, and the `cmp` instruction's width follows
+    // the OPERANDS' type (the result is Bool — width 64 would read
+    // the sign-garbage upper bits of a bitcast-from-negative operand).
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
@@ -2699,9 +2773,137 @@ TEST(MirToLir, U32CompareOperandsGate) {
     mb.addReturn(r);
     ::dss::Mir m = std::move(mb).finish();
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, **target, interner, rep);
-    EXPECT_FALSE(result.ok);
-    EXPECT_TRUE(sawAnchor(rep, "D-CSUBSET-32BIT-ALU-FORMS"));
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    EXPECT_TRUE(result.ok);
+    auto const widths = widthsOfMnemonic(result.lir, **target, "cmp");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 32u);
+    // The Bool-producing setcc/zext pair stays width-default.
+    auto const zextWidths = widthsOfMnemonic(result.lir, **target, "zext");
+    ASSERT_EQ(zextWidths.size(), 1u);
+    EXPECT_EQ(zextWidths[0], 64u);
+}
+
+// ── FC3 c2: conversion-shape gates ──────────────────────────────────────
+// Each conversion mnemonic has an INHERENT (source, dest) width pair;
+// the shapes with no realization must fail loud at MIR→LIR, never let
+// first-match pick a wrong-width encoding.
+
+namespace {
+
+// Hand-build `fn(src) -> dst { return (dst)a; }` with the given cast
+// opcode and lower it.
+[[nodiscard]] GuardProbe lowerCastProbe(::dss::MirOpcode castOp,
+                                        ::dss::TypeKind src,
+                                        ::dss::TypeKind dst) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const srcTy = interner.primitive(src);
+    auto const dstTy = interner.primitive(dst);
+    std::array<::dss::TypeId, 1> params{srcTy};
+    auto const fnSig = interner.fnSig(params, dstTy, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb =
+        mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const a = mb.addArg(0, srcTy);
+    std::array<::dss::MirInstId, 1> ops{a};
+    ::dss::MirInstId const r = mb.addInst(castOp, ops, dstTy);
+    mb.addReturn(r);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+
+} // namespace
+
+TEST(MirToLir, TruncToThirtyTwoLowersCarryingWidthFlag) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto probe = lowerCastProbe(::dss::MirOpcode::Trunc,
+                                ::dss::TypeKind::I64, ::dss::TypeKind::U32);
+    EXPECT_TRUE(probe.ok)
+        << "Trunc to a 32-bit result is realized (x86 mov r32,r32 = "
+           "C's mod-2^32 conversion)";
+    auto const widths = widthsOfMnemonic(probe.lir, **target, "trunc");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 32u)
+        << "the trunc inst must carry the 32-bit width — its encoding "
+           "variant is width-keyed so non-32 trunc matches nothing";
+}
+
+TEST(MirToLir, TruncToSixteenAndEightStayGated) {
+    auto p16 = lowerCastProbe(::dss::MirOpcode::Trunc,
+                              ::dss::TypeKind::I64, ::dss::TypeKind::I16);
+    EXPECT_FALSE(p16.ok);
+    EXPECT_TRUE(sawAnchor(p16.rep, "D-CSUBSET-32BIT-ALU-FORMS"));
+    EXPECT_FALSE(lowerCastProbe(::dss::MirOpcode::Trunc,
+                                ::dss::TypeKind::I64,
+                                ::dss::TypeKind::U8).ok);
+}
+
+TEST(MirToLir, ZExtFromU32SourceStaysGated) {
+    // The shipped zext is the Bool/byte form (x86 movzx r64, r/m8);
+    // a U32 source through it would silently read ONE byte. The
+    // 32-to-64 zero-extend realization lands with its first consumer.
+    auto probe = lowerCastProbe(::dss::MirOpcode::ZExt,
+                                ::dss::TypeKind::U32, ::dss::TypeKind::U64);
+    EXPECT_FALSE(probe.ok);
+    EXPECT_TRUE(sawAnchor(probe.rep, "D-CSUBSET-32BIT-ALU-FORMS"));
+}
+
+TEST(MirToLir, SExtFromI16SourceStaysGatedButI32Lowers) {
+    // movsxd / SXTW read a 32-bit source window — only I32 sources
+    // are realized.
+    auto p16 = lowerCastProbe(::dss::MirOpcode::SExt,
+                              ::dss::TypeKind::I16, ::dss::TypeKind::I64);
+    EXPECT_FALSE(p16.ok);
+    EXPECT_TRUE(sawAnchor(p16.rep, "D-CSUBSET-32BIT-ALU-FORMS"));
+    EXPECT_TRUE(lowerCastProbe(::dss::MirOpcode::SExt,
+                               ::dss::TypeKind::I32,
+                               ::dss::TypeKind::I64).ok);
+}
+
+TEST(MirToLir, CSubsetSourceTypesThreadWidthToLirFlags) {
+    // SOURCE-tier width-threading pin: the c-subset front end's
+    // `unsigned int`/`int` (32-bit) vs `long long` (64-bit) typing
+    // must arrive at the LIR width flag — composing with the byte
+    // pins (tests/asm/test_asm_width_axis.cpp: flag → bytes) and the
+    // runtime corpus (u32_wraparound: program → exit), this covers
+    // source → bytes end-to-end.
+    {
+        auto L = lowerCSubsetToLir(
+            "unsigned int f(unsigned int a, unsigned int b) "
+            "{ return a + b; }");
+        assertUpstreamClean(L);
+        auto const w = widthsOfMnemonic(L.lir.lir, *L.target, "add");
+        ASSERT_EQ(w.size(), 1u);
+        EXPECT_EQ(w[0], 32u);
+    }
+    {
+        // Plain `int` now ALSO computes at 32 bits — true C int
+        // semantics (the c1 64-wide exemption was conforming via
+        // signed-overflow UB; the 32-bit forms are exact).
+        auto L = lowerCSubsetToLir(
+            "int g(int a, int b) { return a + b; }");
+        assertUpstreamClean(L);
+        auto const w = widthsOfMnemonic(L.lir.lir, *L.target, "add");
+        ASSERT_EQ(w.size(), 1u);
+        EXPECT_EQ(w[0], 32u);
+    }
+    {
+        auto L = lowerCSubsetToLir(
+            "long long h(long long a, long long b) { return a + b; }");
+        assertUpstreamClean(L);
+        auto const w = widthsOfMnemonic(L.lir.lir, *L.target, "add");
+        ASSERT_EQ(w.size(), 1u);
+        EXPECT_EQ(w[0], 64u);
+    }
 }
 
 TEST(MirToLir, NativeWidthsStayAllowedThroughTheGate) {
