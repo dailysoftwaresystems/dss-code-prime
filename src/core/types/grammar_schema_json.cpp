@@ -5004,6 +5004,167 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── FC3.5 sweep-c2: floatLiteralTyping (C 6.4.4.2 suffix map) ──
+            // The integer ladder's float sibling — suffix-keyed only
+            // (no magnitude/radix machinery). Same load-time
+            // resolution + the same coverage cross-checks against
+            // `numberStyle.floatSuffixes`.
+            if (sem.contains("floatLiteralTyping")) {
+                json const& arr = sem.at("floatLiteralTyping");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/floatLiteralTyping",
+                              "'semantics.floatLiteralTyping' must be an array");
+                } else {
+                    // Is the resolved ref a FLOAT kind under every data
+                    // model? (A float-typing rule naming an integer/void
+                    // type is a config error.)
+                    auto const isFloatKindName =
+                        [](DataModelTypeRef const& r) -> bool {
+                        auto const isFlt = [](TypeKind k) noexcept {
+                            return k == TypeKind::F16 || k == TypeKind::F32
+                                || k == TypeKind::F64 || k == TypeKind::F128;
+                        };
+                        if (!isFlt(r.core)) return false;
+                        for (auto const& [_, k] : r.coreByDataModel) {
+                            if (!isFlt(k)) return false;
+                        }
+                        return true;
+                    };
+                    bool rowsOk = true;
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path =
+                            std::format("/semantics/floatLiteralTyping/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'floatLiteralTyping' entry must be "
+                                      "an object");
+                            rowsOk = false;
+                            continue;
+                        }
+                        for (auto const& [key, _] : entry.items()) {
+                            if (key != "suffixes" && key != "type"
+                                && key.rfind("$", 0) != 0) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/" + key,
+                                          std::format("unknown 'floatLiteralTyping' "
+                                                      "field '{}' — expected 'suffixes' "
+                                                      "or 'type'", key));
+                                rowsOk = false;
+                            }
+                        }
+                        FloatLiteralTypingRule rule;
+                        if (!entry.contains("suffixes")
+                            || !entry.at("suffixes").is_array()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      path + "/suffixes",
+                                      "'suffixes' is required and must be an array "
+                                      "(empty = the unsuffixed rule)");
+                            rowsOk = false;
+                            continue;
+                        }
+                        bool entryOk = true;
+                        for (auto const& s : entry.at("suffixes")) {
+                            if (!s.is_string() || s.get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/suffixes",
+                                          "each 'suffixes' entry must be a non-empty "
+                                          "string");
+                                entryOk = false;
+                                break;
+                            }
+                            rule.suffixes.push_back(s.get<std::string>());
+                        }
+                        if (!entryOk) { rowsOk = false; continue; }
+                        if (!entry.contains("type")
+                            || !entry.at("type").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      path + "/type",
+                                      "'type' is required and must be a type-name "
+                                      "string");
+                            rowsOk = false;
+                            continue;
+                        }
+                        if (!resolveTypeName(entry.at("type").get<std::string>(),
+                                             path + "/type", rule.type)) {
+                            rowsOk = false;
+                            continue;
+                        }
+                        if (!isFloatKindName(rule.type)) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      path + "/type",
+                                      std::format("float-typing rule type '{}' must "
+                                                  "resolve to a float kind under "
+                                                  "every data model",
+                                                  entry.at("type").get<std::string>()));
+                            rowsOk = false;
+                            continue;
+                        }
+                        cfg.floatLiteralTyping.push_back(std::move(rule));
+                    }
+                    // Cross-checks (mirror the integer ladder's): exactly
+                    // one unsuffixed rule; every declared
+                    // numberStyle.floatSuffixes spelling covered exactly
+                    // once; no rule naming a suffix the lexer doesn't
+                    // admit.
+                    if (rowsOk && !cfg.floatLiteralTyping.empty()) {
+                        std::unordered_map<std::string, std::size_t> claims;
+                        std::size_t unsuffixedRules = 0;
+                        for (auto const& r : cfg.floatLiteralTyping) {
+                            if (r.suffixes.empty()) ++unsuffixedRules;
+                            for (auto const& s : r.suffixes) ++claims[s];
+                        }
+                        if (unsuffixedRules != 1) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/floatLiteralTyping",
+                                      std::format("'floatLiteralTyping' must declare "
+                                                  "exactly one unsuffixed rule (empty "
+                                                  "'suffixes'); found {}",
+                                                  unsuffixedRules));
+                        }
+                        std::vector<std::string> const* declared =
+                            data.numberStyle.has_value()
+                                ? &data.numberStyle->floatSuffixes
+                                : nullptr;
+                        for (auto const& [sfx, count] : claims) {
+                            if (count > 1) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/floatLiteralTyping",
+                                          std::format("suffix '{}' is claimed by {} "
+                                                      "'floatLiteralTyping' rules — "
+                                                      "selection would be ambiguous",
+                                                      sfx, count));
+                            }
+                            bool const lexerKnows = declared != nullptr
+                                && std::find(declared->begin(), declared->end(), sfx)
+                                       != declared->end();
+                            if (!lexerKnows) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/floatLiteralTyping",
+                                          std::format("suffix '{}' is not declared in "
+                                                      "'numberStyle.floatSuffixes' — "
+                                                      "the rule could never match", sfx));
+                            }
+                        }
+                        if (declared != nullptr) {
+                            for (auto const& sfx : *declared) {
+                                if (!claims.contains(sfx)) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              "/semantics/floatLiteralTyping",
+                                              std::format("'numberStyle.floatSuffixes' "
+                                                          "declares '{}' but no "
+                                                          "'floatLiteralTyping' rule "
+                                                          "covers it — the lexer would "
+                                                          "admit a literal the typing "
+                                                          "map cannot type", sfx));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // ── FC3 c1: arithmeticConversions (C 6.3.1.8 parameters) ───
             if (sem.contains("arithmeticConversions")) {
                 json const& obj = sem.at("arithmeticConversions");

@@ -187,19 +187,51 @@ enum class TargetCondCode : std::uint8_t {
     Ule = 7,  // unsigned <=
     Ugt = 8,  // unsigned >
     Uge = 9,  // unsigned >=
+    // FC3.5 sweep-c2 (FCmp LIR lowering — D-COND-FLOAT-NAN-TRUTHINESS-
+    // FCMP adjudication): FLOAT condition codes over the flags an FP
+    // compare instruction sets (x86 UCOMISD/UCOMISS → ZF/PF/CF; arm64
+    // FCMP → NZCV). These are SEPARATE entries from the integer codes
+    // because the (predicate → ISA condition) mapping diverges per
+    // target: arm64 float `>` is GT (the SIGNED nibble — FCMP's NZCV
+    // makes N=V mean ordered-ge), while x86 float `>` is `a` (the
+    // UNSIGNED nibble — UCOMI sets CF like an unsigned compare).
+    // Reusing the integer entries would silently encode HI on arm64
+    // (TRUE on unordered — a NaN miscompile). Declared per-target in
+    // `condCodeEncoding`; the float arms are OPTIONAL — an undeclared
+    // float code means the target realizes that predicate by the
+    // universal two-setcc COMPOSITION (see mir_to_lir's
+    // `floatCmpPlan`), and the encoder fails loud if a single-cc
+    // setcc/jcc reaches it anyway.
+    Fogt = 10,  // float ordered >   (false on unordered)
+    Foge = 11,  // float ordered >=  (false on unordered)
+    Foeq = 12,  // float ordered ==  (false on unordered)
+    Fone = 13,  // float ordered !=  (false on unordered)
+    Fune = 14,  // float unordered-or-unequal != (TRUE on unordered — C 6.5.9)
+    Fuo  = 15,  // unordered (NaN operand): x86 PF=1 / arm64 VS
+    Ford = 16,  // ordered (no NaN):        x86 PF=0 / arm64 VC
 };
 
-inline constexpr EnumNameTable<TargetCondCode, 10> kTargetCondCodeTable{{{
-    { TargetCondCode::Eq,  "eq"  },
-    { TargetCondCode::Ne,  "ne"  },
-    { TargetCondCode::Slt, "slt" },
-    { TargetCondCode::Sle, "sle" },
-    { TargetCondCode::Sgt, "sgt" },
-    { TargetCondCode::Sge, "sge" },
-    { TargetCondCode::Ult, "ult" },
-    { TargetCondCode::Ule, "ule" },
-    { TargetCondCode::Ugt, "ugt" },
-    { TargetCondCode::Uge, "uge" },
+inline constexpr std::size_t kTargetCondCodeCount = 17;
+
+inline constexpr EnumNameTable<TargetCondCode, kTargetCondCodeCount>
+kTargetCondCodeTable{{{
+    { TargetCondCode::Eq,   "eq"   },
+    { TargetCondCode::Ne,   "ne"   },
+    { TargetCondCode::Slt,  "slt"  },
+    { TargetCondCode::Sle,  "sle"  },
+    { TargetCondCode::Sgt,  "sgt"  },
+    { TargetCondCode::Sge,  "sge"  },
+    { TargetCondCode::Ult,  "ult"  },
+    { TargetCondCode::Ule,  "ule"  },
+    { TargetCondCode::Ugt,  "ugt"  },
+    { TargetCondCode::Uge,  "uge"  },
+    { TargetCondCode::Fogt, "fogt" },
+    { TargetCondCode::Foge, "foge" },
+    { TargetCondCode::Foeq, "foeq" },
+    { TargetCondCode::Fone, "fone" },
+    { TargetCondCode::Fune, "fune" },
+    { TargetCondCode::Fuo,  "fuo"  },
+    { TargetCondCode::Ford, "ford" },
 }}};
 
 [[nodiscard]] constexpr std::string_view targetCondCodeName(TargetCondCode c) noexcept {
@@ -1737,16 +1769,23 @@ struct DSS_EXPORT TargetSchemaData {
 
     // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03):
     // per-target mapping from abstract `TargetCondCode` (substrate-tier
-    // 10-arm enum: Eq/Ne/Slt/Sle/Sgt/Sge/Ult/Ule/Ugt/Uge) to a numeric
-    // encoding used by the ISA's conditional opcodes. x86_64 uses the
-    // low 4 bits of the setcc/jcc opcode byte: Eq=4, Ne=5, Slt=12,
-    // Sle=14, Sgt=15, Sge=13, Ult=2, Ule=6, Ugt=7, Uge=3. ARM64 uses
-    // the same low-4-bits position but a different numeric mapping in
-    // bits 0..3 of the 32-bit B.cc instruction word. Empty means the
-    // target has no cond-code-bearing opcodes (declarative-only
-    // targets). When populated, MUST contain exactly 10 entries
-    // indexed by `(uint8_t)TargetCondCode` — validate() enforces.
-    std::array<std::uint8_t, 10> condCodeEncoding{};
+    // enum: 10 integer arms Eq/Ne/Slt/Sle/Sgt/Sge/Ult/Ule/Ugt/Uge + the
+    // FC3.5-c2 float arms) to a numeric encoding used by the ISA's
+    // conditional opcodes. x86_64 uses the low 4 bits of the setcc/jcc
+    // opcode byte: Eq=4, Ne=5, Slt=12, Sle=14, Sgt=15, Sge=13, Ult=2,
+    // Ule=6, Ugt=7, Uge=3. ARM64 uses the same low-4-bits position but
+    // a different numeric mapping in bits 0..3 of the 32-bit B.cc
+    // instruction word. Empty means the target has no cond-code-bearing
+    // opcodes (declarative-only targets). When populated, MUST contain
+    // all 10 INTEGER entries indexed by `(uint8_t)TargetCondCode`; the
+    // FLOAT arms (fogt/foge/foeq/fone/fune/fuo/ford) are OPTIONAL —
+    // `condCodeDeclared` records which entries the JSON actually
+    // declared, and `condCodeEncoding()` returns nullopt for an
+    // undeclared one (the MIR→LIR FCmp lowering reads that as "this
+    // target realizes the predicate via the two-setcc composition";
+    // the encoder fails loud if a single-cc inst reaches it anyway).
+    std::array<std::uint8_t, kTargetCondCodeCount> condCodeEncoding{};
+    std::array<bool, kTargetCondCodeCount>         condCodeDeclared{};
     // Companion bit: `true` once `condCodeEncoding` has been populated
     // from the JSON (any value, including all-zero, is legal — the
     // distinction is "is this table loaded vs. default-initialized").
@@ -1944,15 +1983,23 @@ public:
 
     // ── Cond-code encoding (D-CSUBSET-WHILE-LOOP-SUBSTRATE) ──────
     // Returns the target's numeric encoding for `cond`, or `nullopt`
-    // when this target hasn't declared a `condCodeEncoding` table.
+    // when this target hasn't declared a `condCodeEncoding` table OR
+    // hasn't declared THIS entry (the float arms are per-entry
+    // optional — FC3.5 sweep-c2; an undeclared float cond means the
+    // MIR→LIR FCmp lowering must use the two-setcc composition).
     // The encoder for cond-code-bearing opcodes (setcc / jcc on x86;
-    // B.cc on ARM64) gates on this — a missing table fails loud
-    // (A_NoCondCodeEncoding) rather than silently OR'ing zero into
-    // the opcode byte (which would map every condition to `eq`).
+    // B.cc / CSET on ARM64) gates on this — a missing table/entry
+    // fails loud (A_NoCondCodeEncoding) rather than silently OR'ing
+    // zero into the opcode byte (which would map every condition to
+    // `eq`). The bounds check guards a corrupt payload cast: an
+    // out-of-enum payload reads as undeclared, never out-of-bounds.
     [[nodiscard]] std::optional<std::uint8_t> condCodeEncoding(
             TargetCondCode cond) const noexcept {
         if (!d_.condCodeEncodingLoaded) return std::nullopt;
-        return d_.condCodeEncoding[static_cast<std::uint8_t>(cond)];
+        auto const idx = static_cast<std::size_t>(cond);
+        if (idx >= d_.condCodeEncoding.size()) return std::nullopt;
+        if (!d_.condCodeDeclared[idx]) return std::nullopt;
+        return d_.condCodeEncoding[idx];
     }
     [[nodiscard]] bool condCodeEncodingLoaded() const noexcept {
         return d_.condCodeEncodingLoaded;

@@ -761,15 +761,64 @@
       }
     },
     {
-      "$comment": "Bitwise AND. Cycle 3d bitwise wave — same shape as add/sub/mul. AS1 emits x86_64 `and`.",
+      "$comment": "Bitwise AND. FC3.5 sweep-c2: FIRST encodings — AND r/m64, r64 = REX.W 21 /r and the no-REX.W 32-bit sibling (Intel SDM AND; the same 64/32 width-keyed reg-reg pair as add/sub). First consumer: the composed-FCmp materialization (x86 Oeq = sete ∧ setnp — lowerFCmp folds the two setcc+zext halves with `and`). Also makes source-level `&` live at both widths; xor/not stay un-encoded (the pre-existing assembler wall).",
       "mnemonic": "and", "result": "value",
+      "hasSideEffects": false,
+      "requires2Address": true,
       "minOperands": 2, "maxOperands": 2,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [33] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "and r/m32, r32 — 0x21 /r without REX.W (32-bit, zero-extends).",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "opcode": [33] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          }
+        ]
+      }
     },
     {
+      "$comment": "Bitwise OR. FC3.5 sweep-c2: FIRST encodings — OR r/m64, r64 = REX.W 09 /r + the 32-bit sibling (Intel SDM OR). First consumer: the composed-FCmp Une materialization (setne ∨ setp).",
       "mnemonic": "or",  "result": "value",
+      "hasSideEffects": false,
+      "requires2Address": true,
       "minOperands": 2, "maxOperands": 2,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [9] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "or r/m32, r32 — 0x09 /r without REX.W (32-bit, zero-extends).",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "opcode": [9] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          }
+        ]
+      }
     },
     {
       "mnemonic": "xor", "result": "value",
@@ -946,7 +995,7 @@
       }
     },
     {
-      "$comment": "Float arithmetic (cycle 3d FPR wave). FC2 Part B: ADDSD xmm1, xmm2 — F2 0F 58 /r (scalar double add). Mandatory prefix F2 selects the scalar-double form and is emitted BEFORE the auto-REX (xmm8-15 operands set REX.R/REX.B with rexW=false). 2-address like `mul`: dest goes to ModR/M.reg (op[0] IS the destination after lir_2addr_legalize), source-2 to ModR/M.rm. F64-WIDTH ONLY: the variant guard has no width discriminator (D-TARGET-ENCODING-WIDTH-GUARD), so MIR→LIR fail-louds non-F64 FAdd before it could silently match this addsd row (addss F3 0F 58 lands when an F32 consumer exists).",
+      "$comment": "Float arithmetic (cycle 3d FPR wave). FC2 Part B: ADDSD xmm1, xmm2 — F2 0F 58 /r (scalar double add). Mandatory prefix F2 selects the scalar-double form and is emitted BEFORE the auto-REX (xmm8-15 operands set REX.R/REX.B with rexW=false). 2-address like `mul`: dest goes to ModR/M.reg (op[0] IS the destination after lir_2addr_legalize), source-2 to ModR/M.rm. FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN): the F32 sibling ADDSS xmm1, xmm2 = F3 0F 58 /r (Intel SDM ADDSS — same opcode bytes, the F3 scalar-single mandatory prefix) rides the width axis: the F64 variant is now width-KEYED 64, the F32 one 32 (an F32-typed MIR FAdd carries kLirInstFlagWidth32 via widthFlagsForType).",
       "mnemonic": "fadd", "result": "value",
       "requires2Address": true,
       "minOperands": 2, "maxOperands": 2,
@@ -955,8 +1004,17 @@
         "format": "x86-variable",
         "variants": [
           {
-            "guard":    { "operandKinds": ["reg", "reg"] },
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
             "template": { "mandatoryPrefix": [242], "opcode": [15, 88] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "FC3.5: ADDSS xmm1, xmm2 — F3 0F 58 /r (scalar single).",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "mandatoryPrefix": [243], "opcode": [15, 88] },
             "wires":    [
               { "index": 0, "slotKind": "modrm.reg" },
               { "index": 1, "slotKind": "modrm.rm" }
@@ -976,9 +1034,62 @@
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
+      "$comment": "FC3.5 sweep-c2: float divide — DIVSD xmm1, xmm2 = F2 0F 5E /r (scalar double) / DIVSS = F3 0F 5E /r (scalar single), Intel SDM DIVSD/DIVSS. Same 2-address dest=ModR/M.reg shape as fadd (division is non-commutative: op[0] IS the dividend/destination after lir_2addr_legalize, op[1] the divisor in ModR/M.rm). First consumer: NaN construction (0.0/0.0) for the D-COND-FLOAT-NAN-TRUTHINESS-FCMP corpus witnesses — this also closes the fdiv encoding stub.",
       "mnemonic": "fdiv", "result": "value",
+      "requires2Address": true,
       "minOperands": 2, "maxOperands": 2,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template": { "mandatoryPrefix": [242], "opcode": [15, 94] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "FC3.5: DIVSS xmm1, xmm2 — F3 0F 5E /r (scalar single).",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "mandatoryPrefix": [243], "opcode": [15, 94] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC3.5 sweep-c2 (FCmp LIR lowering): float compare writing FLAGS, no register result — the float sibling of `cmp`. UCOMISD xmm1, xmm2 = 66 0F 2E /r (scalar double) / UCOMISS xmm1, xmm2 = NP 0F 2E /r (scalar single — NO prefix; an F3 here would be an invalid encoding), Intel SDM UCOMISD/UCOMISS. Quiet (non-signaling on QNaN) compare: sets ZF/PF/CF — unordered → ZF=PF=CF=1, greater → all 0, less → CF=1, equal → ZF=1 (the truth table the float condCodeEncoding arms below realize; full derivation at mir_to_lir floatCmpPlan). ModRM roles: ModR/M.reg = operand[0] (the LEFT side of the predicate), ModR/M.rm = operand[1] — NOTE this is the RM-form direction, the MIRROR of the integer cmp's 0x39 MR-form wiring; the LIR-level convention (op[0] = left) is identical. Annex-F note: C's relational operators are SIGNALING comparisons (COMISD raises Invalid on quiet NaN); DSS does not model the FP environment (no fenv access), so the quiet UCOMI forms serve all predicates — the comparison RESULTS are identical, only the unmodeled FE_INVALID flag differs.",
+      "mnemonic": "fcmp", "result": "none",
+      "hasSideEffects": false,
+      "minOperands": 2, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template": { "mandatoryPrefix": [102], "opcode": [15, 46] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "FC3.5: UCOMISS xmm1, xmm2 — NP 0F 2E /r (no mandatory prefix).",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "opcode": [15, 46] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "Float unary negate. AS1 emits xorps reg, [.LC0_signbit] OR subss zero, reg — the abstract opcode hides this.",
@@ -987,13 +1098,32 @@
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
-      "$comment": "Float-to-float precision change (FPTrunc f64→f32, FPExt f32→f64). AS1 emits cvtsd2ss / cvtss2sd.",
+      "$comment": "Float-to-float precision change (FPTrunc f64→f32, FPExt f32→f64). FC3.5 sweep-c2: encoded — CVTSD2SS xmm1, xmm2 = F2 0F 5A /r (double→single) and CVTSS2SD xmm1, xmm2 = F3 0F 5A /r (single→double), Intel SDM CVTSD2SS/CVTSS2SD: SAME opcode bytes, the mandatory prefix names the SOURCE width. The width axis therefore keys on the SOURCE: the MIR→LIR FPTrunc/FPExt arm threads a widthOverride from the source operand's type (the result-width default would select exactly the WRONG sibling — FPTrunc's F32 result would pick the F3 widen). ModR/M.reg = the xmm destination (resultSlot), ModR/M.rm = the xmm source.",
       "mnemonic": "fpcvt", "result": "value",
       "minOperands": 1, "maxOperands": 1,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "F64 source → CVTSD2SS (narrow to single).",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [242], "opcode": [15, 90] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "F32 source → CVTSS2SD (widen to double).",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [243], "opcode": [15, 90] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
     },
     {
-      "$comment": "Float-to-signed-integer conversion (FPToSI). FC2 Part B: CVTTSD2SI r64, xmm — F2 REX.W 0F 2C /r (truncating scalar-double → signed 64-bit). Operand roles per Intel SDM: ModR/M.reg = the GPR DESTINATION (resultSlot), ModR/M.rm = the xmm SOURCE. REX.W widens the destination to r64 (the sign-extended result also serves i32 results — the backend's i32-in-r64 convention). F64-SOURCE ONLY: cvttss2si (F3) lands when an F32 consumer exists (D-TARGET-ENCODING-WIDTH-GUARD); MIR→LIR fail-louds a non-F64 source before it could silently match this row.",
+      "$comment": "Float-to-signed-integer conversion (FPToSI). FC2 Part B: CVTTSD2SI r64, xmm — F2 REX.W 0F 2C /r (truncating scalar-double → signed 64-bit). Operand roles per Intel SDM: ModR/M.reg = the GPR DESTINATION (resultSlot), ModR/M.rm = the xmm SOURCE. REX.W widens the destination to r64 (the sign-extended result also serves i32 results — the backend's i32-in-r64 convention). FC3.5 sweep-c2: the F32-source sibling CVTTSS2SI r64, xmm = F3 REX.W 0F 2C /r (Intel SDM CVTTSS2SI — REX.W stays: the destination is still the 64-bit GPR). The width axis keys on the SOURCE float width (the MIR→LIR FPToSI arm threads a widthOverride from the source operand's type; the result-width default — an I32 result → 32 — would mis-key the source axis).",
       "mnemonic": "fp_to_si", "result": "value",
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0,
@@ -1001,8 +1131,15 @@
         "format": "x86-variable",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg"] },
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "mandatoryPrefix": [242], "rexW": true, "opcode": [15, 44] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "FC3.5: CVTTSS2SI r64, xmm — F3 REX.W 0F 2C /r (truncating scalar-single → signed 64-bit).",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [243], "rexW": true, "opcode": [15, 44] },
             "resultSlot": "modrm.reg",
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           }
@@ -1076,10 +1213,11 @@
       "minOperands": 1, "maxOperands": 3,
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
+        "$comment": "FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN): width-keyed pairs — MOVSD xmm, m64 = F2 0F 10 (8-byte read, width 64) vs MOVSS xmm, m32 = F3 0F 10 (4-byte read, width 32; Intel SDM MOVSS). The MIR→LIR lowerLoad threads the loaded type's width for FPR-class results: an 8-byte movsd read of a 4-byte F32 rodata item would read past the item (potential fault at a section edge) — the width axis makes the access width type-exact. Both operandKinds shapes carry the pair (the loader's keyed/absent-mix rule).",
         "format": "x86-variable",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
             "template":   { "mandatoryPrefix": [242], "opcode": [15, 16] },
             "resultSlot": "modrm.reg",
             "wires":      [
@@ -1089,8 +1227,28 @@
             ]
           },
           {
-            "guard":      { "operandKinds": ["symbol"] },
+            "$comment": "FC3.5: MOVSS xmm, m32 — F3 0F 10 /r (4-byte load).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "template":   { "mandatoryPrefix": [243], "opcode": [15, 16] },
+            "resultSlot": "modrm.reg",
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["symbol"], "width": 64 },
             "template":   { "mandatoryPrefix": [242], "opcode": [15, 16] },
+            "resultSlot": "modrm.reg",
+            "wires":      [
+              { "index": 0, "slotKind": "riprel.disp32", "relocationKind": "rel32" }
+            ]
+          },
+          {
+            "$comment": "FC3.5: the RIP-relative MOVSS form (F3 0F 10 05 rel32) — the F32 mirror of the F64 riprel variant (consumed end-to-end when the GlobalAddr+Load fold peephole lands; byte-pinned now).",
+            "guard":      { "operandKinds": ["symbol"], "width": 32 },
+            "template":   { "mandatoryPrefix": [243], "opcode": [15, 16] },
             "resultSlot": "modrm.reg",
             "wires":      [
               { "index": 0, "slotKind": "riprel.disp32", "relocationKind": "rel32" }
@@ -1106,11 +1264,23 @@
       "minOperands": 4, "maxOperands": 4,
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
+        "$comment": "FC3.5 sweep-c2: width-keyed pair — MOVSD m64, xmm (F2, width 64) vs MOVSS m32, xmm (F3 0F 11, width 32; Intel SDM MOVSS). lowerStore threads the stored VALUE's type width for FPR-class stores (type-exact access width); the regalloc spill path stays width-default 64 over 8-byte slots (value-preserving for both float widths — the F32 value is the low 4 bytes either way).",
         "format": "x86-variable",
         "variants": [
           {
-            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "template": { "mandatoryPrefix": [242], "opcode": [15, 17] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "FC3.5: MOVSS m32, xmm — F3 0F 11 /r (4-byte store).",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "mandatoryPrefix": [243], "opcode": [15, 17] },
             "wires":    [
               { "index": 0, "slotKind": "modrm.reg"     },
               { "index": 1, "slotKind": "modrm.rm.mem"  },
@@ -1212,7 +1382,8 @@
       "slotAligned": true
     }
   ],
-  "$condCodeEncodingComment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): per-cond-code nibble mapping for x86 setcc / jcc opcodes. The encoder OR's this nibble into the LOW 4 BITS of the LAST opcode byte: setcc emits `0F 9x` (where x = cc nibble); jcc emits `0F 8x rel32`. Numeric values from Intel SDM Vol. 1 Appendix B (condition code encoding table). 10-arm coverage matches the substrate's `TargetCondCode` enum exactly. ARM64 will declare its own table mapping into bits 0..3 of the B.cc instruction word — different numeric values, same field-position abstraction (D-AS3-COND-CODE-ARM64 anchor).",
+  "$condCodeEncodingComment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): per-cond-code nibble mapping for x86 setcc / jcc opcodes. The encoder OR's this nibble into the LOW 4 BITS of the LAST opcode byte: setcc emits `0F 9x` (where x = cc nibble); jcc emits `0F 8x rel32`. Numeric values from Intel SDM Vol. 1 Appendix B (condition code encoding table). The 10 integer arms are REQUIRED; the FC3.5 float arms (next comment) are per-entry optional. ARM64 declares its own table mapping into bits 0..3 of the B.cc instruction word — different numeric values, same field-position abstraction (D-AS3-COND-CODE-ARM64 anchor).",
+  "$condCodeEncodingFloatComment": "FC3.5 sweep-c2 (FCmp lowering — D-COND-FLOAT-NAN-TRUTHINESS-FCMP): float condition arms over the UCOMISD/UCOMISS flag truth table (Intel SDM: unordered → ZF=PF=CF=1; greater → all 0; less → CF=1; equal → ZF=1). fogt = `a` (CF=0∧ZF=0, nibble 7 — false on unordered); foge = `ae` (CF=0, nibble 3); fone = `ne` (ZF=0, nibble 5 — false on BOTH equal and unordered, so plain setne IS ordered-ne on x86); fuo = `p` (PF=1, nibble 0xA — after UCOMI the parity flag IS the unordered predicate); ford = `np` (nibble 0xB). foeq/fune are deliberately ABSENT: sete is TRUE on unordered (ZF conflation) — no single x86 cc realizes them; their absence signals the MIR→LIR composed realization (Oeq = sete∧setnp, Une = setne∨setp). Olt/Ole need no entries — the lowering swap-canonicalizes them to fogt/foge.",
   "condCodeEncoding": {
     "eq":  4,
     "ne":  5,
@@ -1223,7 +1394,12 @@
     "ult": 2,
     "ule": 6,
     "ugt": 7,
-    "uge": 3
+    "uge": 3,
+    "fogt": 7,
+    "foge": 3,
+    "fone": 5,
+    "fuo": 10,
+    "ford": 11
   },
   "$relocationsComment": "Relocation taxonomy (plan 13 AS4 + plan 14 LK6 cycle 1 + D-LK6-1 closure 2026-06-01). Opaque uint32 `kind` tags the assembler stamps onto each emitted Relocation; the linker reads via TargetSchema::relocationInfo(kind). `formula` is a CLOSED-ENUM DISCRIMINATOR (load-bearing — see RelocFormulaKind in target_schema.hpp): 'linear' (S + A + (pcRel ? -P : 0) + addendBias; widthBytes LE), or one of the bit-shift variants ('aarch64_call26' / 'aarch64_adr_prel_pg_hi21' / 'aarch64_add_abs_lo12'). For 'linear', the structured fields (pcRelative + addendBias + widthBytes) parameterize the formula. Tag values are arbitrary per-target — only the NAME round-trips with format.json cross-reference.",
   "relocations": [

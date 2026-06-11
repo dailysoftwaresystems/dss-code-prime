@@ -532,6 +532,36 @@ struct DSS_EXPORT IntegerLiteralTypingRule {
     std::vector<DataModelTypeRef> nondecimal;
 };
 
+// ── FC3.5 sweep-c2: float-literal typing (`semantics.floatLiteralTyping`) ──
+//
+// C 6.4.4.2: a floating constant's type is keyed by its SUFFIX alone
+// (no magnitude ladder — an unsuffixed constant is `double`, `f`/`F`
+// is `float`). One rule per suffix GROUP, mirroring
+// `IntegerLiteralTypingRule`'s shape minus the radix/range machinery:
+//
+//   * `suffixes` — the EXACT spellings (as declared in
+//     `numberStyle.floatSuffixes`) this rule covers; the EMPTY list is
+//     the unsuffixed rule. The engine longest-matches the raw token
+//     tail against the numberStyle float-suffix list, then selects the
+//     rule whose `suffixes` contains the matched spelling.
+//   * `type` — ONE type name resolved at load through the same
+//     typeSpecifiers/builtinTypes path the integer ladder candidates
+//     use (a dataModel-aware ref, though C's float widths are
+//     model-invariant).
+//
+// The loader cross-checks mirror the integer ladder's: every
+// numberStyle float suffix covered exactly once, exactly one
+// unsuffixed rule, no suffix the lexer doesn't admit (dead config),
+// and every type resolving to a FLOAT kind under every data model.
+// Languages WITHOUT the block keep the `literalTypes` token-kind core
+// exactly (toy / tsql — pinned). (D-CSUBSET-F32-CODEGEN closure: this
+// block is what flips c-subset's `1.5f` from the interim F64 pin to
+// its C-correct F32.)
+struct DSS_EXPORT FloatLiteralTypingRule {
+    std::vector<std::string> suffixes;  // exact spellings; empty = unsuffixed
+    DataModelTypeRef         type;
+};
+
 // ── FC3 c1: usual arithmetic conversions (`semantics.arithmeticConversions`) ──
 //
 // Parameterizes the C 6.3.1.8 binary-operand conversion algorithm the
@@ -659,6 +689,10 @@ struct DSS_EXPORT SemanticConfig {
     // `literalTypes` token-kind map types integer literals exactly as
     // before (toy / tsql — pinned). See IntegerLiteralTypingRule above.
     std::vector<IntegerLiteralTypingRule> integerLiteralTyping;
+    // FC3.5 sweep-c2: float-literal suffix typing (C 6.4.4.2). Empty ⇒
+    // the `literalTypes` token-kind core types float literals exactly
+    // as before (toy / tsql — pinned). See FloatLiteralTypingRule.
+    std::vector<FloatLiteralTypingRule>   floatLiteralTyping;
     // FC3 c1: usual-arithmetic-conversions parameter block (C 6.3.1.8).
     // nullopt ⇒ the legacy `TypeInterner::commonType` behavior at every
     // HIR combine site (toy / tsql — pinned). See ArithmeticConversions.

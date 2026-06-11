@@ -191,16 +191,20 @@ bool encode(Lir const&                  lir,
     // `condCodeEncoding` table — a missing table would silently OR zero
     // (= TargetCondCode::Eq's nibble on x86, but ARM64's EQ is also 0) and
     // EVERY conditional branch would resolve as `b.eq`. Same payload
-    // range-gate as x86 (0..9 = the 10-arm TargetCondCode enum).
+    // range-gate as x86 (the full TargetCondCode enum incl. the FC3.5
+    // float arms; an undeclared float ENTRY also fails loud — the
+    // composed-FCmp lowering must never reach a single-cc inst here).
     if (selected->tmpl.condCodeFromPayload) {
         auto const condValue = lir.instPayload(inst);
-        if (condValue > 9u) {
+        if (condValue >= kTargetCondCodeCount) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': cond-code payload {} is out of "
-                               "range [0..9] for TargetCondCode "
-                               "(eq/ne/slt/sle/sgt/sge/ult/ule/ugt/uge)",
-                               info->mnemonic, condValue));
+                               "range [0..{}] for TargetCondCode "
+                               "(eq/ne/slt/sle/sgt/sge/ult/ule/ugt/uge + "
+                               "fogt/foge/foeq/fone/fune/fuo/ford)",
+                               info->mnemonic, condValue,
+                               kTargetCondCodeCount - 1));
             return false;
         }
         auto const condNibble = schema.condCodeEncoding(
@@ -210,8 +214,11 @@ bool encode(Lir const&                  lir,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': variant declares "
                                "condCodeFromPayload but target schema '{}' "
-                               "has no `condCodeEncoding` table",
-                               info->mnemonic, schema.name()));
+                               "declares no `condCodeEncoding` entry for "
+                               "cond '{}'",
+                               info->mnemonic, schema.name(),
+                               targetCondCodeName(static_cast<TargetCondCode>(
+                                   condValue))));
             return false;
         }
         // Place the 4-bit cond nibble at the template's declared bit

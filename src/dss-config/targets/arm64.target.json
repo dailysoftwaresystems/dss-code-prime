@@ -795,7 +795,7 @@
       }
     },
     {
-      "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): FADD Dd, Dn, Dm — scalar double, FP data-processing (2 source). Base 0x1E602800 = 0 0 0 11110 [31:24] | ftype=01 double [23:22] | 1 [21] | Rm [20:16] | opcode 001010 FADD [15:10] | Rn [9:5] | Rd [4:0] (ARM ARM C7.2.*). 3-operand NATIVE like sdiv — deliberately NO requires2Address (x86's fadd carries it for ADDSD's 2-address shape; declaring it here would force a pointless extra fmov through the legalize pass). MIR FAdd is the producer; its requireF64Width gate keeps this row F64-only — the F32 form (ftype=00, base 0x1E202800) lands with an F32 consumer (D-TARGET-ENCODING-WIDTH-GUARD).",
+      "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): FADD Dd, Dn, Dm — scalar double, FP data-processing (2 source). Base 0x1E602800 = 0 0 0 11110 [31:24] | ftype=01 double [23:22] | 1 [21] | Rm [20:16] | opcode 001010 FADD [15:10] | Rn [9:5] | Rd [4:0] (ARM ARM C7.2.*). 3-operand NATIVE like sdiv — deliberately NO requires2Address (x86's fadd carries it for ADDSD's 2-address shape; declaring it here would force a pointless extra fmov through the legalize pass). FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN): the F32 sibling FADD Sd, Sn, Sm (ftype=00 → base 0x1E202800) rides the width axis — D-form keyed 64, S-form keyed 32.",
       "mnemonic":      "fadd",
       "result":        "value",
       "minOperands":   2,
@@ -804,8 +804,18 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg", "reg"] },
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
             "template":   { "fixedWord": 509618176 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FC3.5: FADD Sd, Sn, Sm — ftype=00 single, base 0x1E202800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 505423872 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" },
@@ -816,8 +826,71 @@
       }
     },
     {
-      "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): FCVTZS Xd, Dn — double to signed 64-bit integer, round toward zero (FP→integer conversion). Base 0x9E780000 = sf=1 [31] | 00 | 11110 [28:24] | ftype=01 double [23:22] | 1 [21] | rmode=11 toward-zero [20:19] | opcode=000 FCVTZS [18:16] | 000000 [15:10] | Rn [9:5] | Rd [4:0]. The result is GPR-class via the MIR integer type (regClassFor) — rd carries the X destination, the rn wire the D source; the 5-bit slots are class-blind hwEncodings, exactly the GPR-dest/FPR-src split x86's cvttsd2si makes through modrm.reg/modrm.rm. MIR FPToSI is the producer; its requireF64Width source gate keeps this F64-only.",
-      "mnemonic":      "fp_to_si",
+      "$comment": "FC3.5 sweep-c2: FDIV Dd, Dn, Dm — scalar double divide, FP data-processing (2 source), opcode 000110 at [15:10]: base 0x1E601800 (ftype=01); F32 sibling FDIV Sd, Sn, Sm = 0x1E201800 (ftype=00) — ARM ARM C7.2 FDIV (scalar). 3-operand NATIVE (no requires2Address). First consumer: NaN construction (0.0/0.0) for the D-COND-FLOAT-NAN-TRUTHINESS-FCMP corpus witnesses; closes the fdiv stub on this target.",
+      "mnemonic":      "fdiv",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 509614080 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FC3.5: FDIV Sd, Sn, Sm — ftype=00 single, base 0x1E201800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 505419776 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC3.5 sweep-c2 (FCmp LIR lowering): FCMP Dn, Dm — floating-point compare writing NZCV, no register result (the float sibling of `cmp`). Base 0x1E602000 = 000 11110 [31:24] | ftype=01 [23:22] | 1 [21] | Rm [20:16] | op=00 [15:14] | 1000 [13:10] | Rn [9:5] | opcode2=00000 [4:0] (ARM ARM C7.2 FCMP; opcode2 bit4=1 would be FCMPE, the signaling form — DSS does not model the FP environment, so the quiet FCMP serves all predicates; the NZCV comparison RESULTS are identical). F32 sibling FCMP Sn, Sm = 0x1E202000 (ftype=00). NZCV outcomes: equal → Z=1(C=1); less → N=1; greater → C=1; unordered → C=1,V=1 — the truth table the float condCodeEncoding arms below realize (full derivation at mir_to_lir floatCmpPlan).",
+      "mnemonic":      "fcmp",
+      "result":        "none",
+      "hasSideEffects": false,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template": { "fixedWord": 509616128 },
+            "wires":    [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FC3.5: FCMP Sn, Sm — ftype=00 single, base 0x1E202000.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "fixedWord": 505421824 },
+            "wires":    [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC3.5 sweep-c2: float↔float precision change for MIR FPTrunc/FPExt — FCVT (scalar): 000 11110 [31:24] | type [23:22] = SOURCE type | 1 [21] | 0001 [20:17] | opc [16:15] = DEST type | 10000 [14:10] | Rn [9:5] | Rd [4:0] (ARM ARM C7.2 FCVT). The width axis keys on the SOURCE (the MIR→LIR FPTrunc/FPExt arm threads a widthOverride from the source operand's type — the result-width default would select exactly the WRONG direction): F32 source → FCVT Dd, Sn (type=00, opc=01 → 0x1E22C000, the FPExt widen); F64 source → FCVT Sd, Dn (type=01, opc=00 → 0x1E624000, the FPTrunc narrow).",
+      "mnemonic":      "fpcvt",
       "result":        "value",
       "minOperands":   1,
       "maxOperands":   1,
@@ -825,8 +898,18 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg"] },
-            "template":   { "fixedWord": 2658664448 },
+            "$comment": "F64 source → FCVT Sd, Dn (narrow to single).",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 509755392 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "F32 source → FCVT Dd, Sn (widen to double).",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505593856 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }
@@ -836,7 +919,36 @@
       }
     },
     {
-      "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): FMOV Dd, Dn — FP register-register move, double. Base 0x1E604000 = 0 0 0 11110 [31:24] | ftype=01 [23:22] | 1 [21] | opc=000000 FMOV [20:15] | 10000 [14:10] | Rn [9:5] | Rd [4:0] (FP data-processing 1 source — the single source rides Rn, NOT Rm; contrast the GPR mov's ORR alias whose source is Rm). Bound to the fpr class's `move` slot in registerClassOps[] — consumed by MIR value/phi copies and the callconv arg/return moves whenever the register class is FPR (the arm64 analog of x86's movaps role; a D-form copy moves the full 64-bit view, no upper-lane-merge hazard to dodge).",
+      "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): FCVTZS Xd, Dn — double to signed 64-bit integer, round toward zero (FP→integer conversion). Base 0x9E780000 = sf=1 [31] | 00 | 11110 [28:24] | ftype=01 double [23:22] | 1 [21] | rmode=11 toward-zero [20:19] | opcode=000 FCVTZS [18:16] | 000000 [15:10] | Rn [9:5] | Rd [4:0]. The result is GPR-class via the MIR integer type (regClassFor) — rd carries the X destination, the rn wire the D source; the 5-bit slots are class-blind hwEncodings, exactly the GPR-dest/FPR-src split x86's cvttsd2si makes through modrm.reg/modrm.rm. MIR FPToSI is the producer. FC3.5 sweep-c2: the F32-source sibling FCVTZS Xd, Sn (ftype=00 → 0x9E380000) rides the SOURCE-width axis (the FPToSI arm threads the source's width — the X destination is unchanged).",
+      "mnemonic":      "fp_to_si",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2658664448 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FC3.5: FCVTZS Xd, Sn — ftype=00 single source, base 0x9E380000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 2654470144 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): FMOV Dd, Dn — FP register-register move, double. Base 0x1E604000 = 0 0 0 11110 [31:24] | ftype=01 [23:22] | 1 [21] | opc=000000 FMOV [20:15] | 10000 [14:10] | Rn [9:5] | Rd [4:0] (FP data-processing 1 source — the single source rides Rn, NOT Rm; contrast the GPR mov's ORR alias whose source is Rm). Bound to the fpr class's `move` slot in registerClassOps[] — consumed by MIR value/phi copies and the callconv arg/return moves whenever the register class is FPR (the arm64 analog of x86's movaps role; a D-form copy moves the full 64-bit view, no upper-lane-merge hazard to dodge). FC3.5 sweep-c2 adjudication: register COPIES stay width-BLIND (variant deliberately width-absent, match-any) — the D-form move preserves an F32 value exactly (it lives in the low 4 bytes; S[n] is the low half of D[n]), the same reasoning as x86's full-register MOVAPS serving both widths. Only memory accesses (fldur/fstur) are width-exact.",
       "mnemonic":      "fmov",
       "result":        "value",
       "minOperands":   1,
@@ -865,11 +977,23 @@
       "minSuccessors": 0,
       "maxSuccessors": 0,
       "encoding": {
+        "$comment": "FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN): width-keyed pair — LDUR Dt (8-byte, 0xFC400000, width 64) vs LDUR St (4-byte, size=10 → 0xBC400000, width 32; ARM ARM C7.2 LDUR SIMD&FP). lowerLoad threads the loaded type's width for FPR-class results: an 8-byte D-load of a 4-byte F32 rodata item would read past the item.",
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
             "template":   { "fixedWord": 4232052736 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm9"           }
+            ]
+          },
+          {
+            "$comment": "FC3.5: LDUR St, [Xn, #simm9] — size=10 single, base 0xBC400000 (4-byte load).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "template":   { "fixedWord": 3158310912 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn"             },
@@ -890,11 +1014,23 @@
       "minSuccessors": 0,
       "maxSuccessors": 0,
       "encoding": {
+        "$comment": "FC3.5 sweep-c2: width-keyed pair — STUR Dt (8-byte, width 64) vs STUR St (4-byte, 0xBC000000, width 32). lowerStore threads the stored VALUE's type width for FPR-class stores; the regalloc spill path stays width-default 64 over 8-byte slots (value-preserving for both float widths).",
         "format":   "fixed32",
         "variants": [
           {
-            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "template": { "fixedWord": 4227858432 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm9"           }
+            ]
+          },
+          {
+            "$comment": "FC3.5: STUR St, [Xn, #simm9] — size=10 single, base 0xBC000000 (4-byte store).",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "fixedWord": 3154116608 },
             "wires":    [
               { "index": 0, "slotKind": "rd"             },
               { "index": 1, "slotKind": "rn"             },
@@ -906,7 +1042,8 @@
       }
     }
   ],
-  "$condCodeEncodingComment": "D-AS3-COND-CODE-ARM64 (mirror of x86's table): per-cond-code nibble for the AArch64 B.cond instruction's bits [3:0]. Numeric values are the AArch64 condition codes (ARM ARM C1.2.4): EQ=0, NE=1, CS/HS=2, CC/LO=3, HI=8, LS=9, GE=10(0xA), LT=11(0xB), GT=12(0xC), LE=13(0xD). Signed comparisons map slt→LT(0xB)=11, sle→LE(0xD)=13, sgt→GT(0xC)=12, sge→GE(0xA)=10; unsigned map ult→CC/LO=3, ule→LS=9, ugt→HI=8, uge→CS/HS=2. The encoder ORs this nibble into word 0 bits 0..3 of the jcc macro (vs x86's low 4 bits of the opcode byte — same field-position abstraction, different ISA placement). 10-arm coverage matches the substrate's TargetCondCode enum exactly.",
+  "$condCodeEncodingComment": "D-AS3-COND-CODE-ARM64 (mirror of x86's table): per-cond-code nibble for the AArch64 B.cond instruction's bits [3:0]. Numeric values are the AArch64 condition codes (ARM ARM C1.2.4): EQ=0, NE=1, CS/HS=2, CC/LO=3, HI=8, LS=9, GE=10(0xA), LT=11(0xB), GT=12(0xC), LE=13(0xD). Signed comparisons map slt→LT(0xB)=11, sle→LE(0xD)=13, sgt→GT(0xC)=12, sge→GE(0xA)=10; unsigned map ult→CC/LO=3, ule→LS=9, ugt→HI=8, uge→CS/HS=2. The encoder ORs this nibble into word 0 bits 0..3 of the jcc macro (vs x86's low 4 bits of the opcode byte — same field-position abstraction, different ISA placement). The 10 integer arms are REQUIRED; the FC3.5 float arms (next comment) are per-entry optional.",
+  "$condCodeEncodingFloatComment": "FC3.5 sweep-c2 (FCmp lowering — D-COND-FLOAT-NAN-TRUTHINESS-FCMP): float condition arms over the FCMP NZCV truth table (ARM ARM: equal → Z=1,C=1; less → N=1; greater → C=1; unordered → C=1,V=1). fogt = GT (Z=0∧N=V, 0xC — unordered has N=0≠V=1 → false ✓; NOTE the integer-ugt HI=8 would be TRUE on unordered, a NaN miscompile — this is why float codes are separate); foge = GE (N=V, 0xA); foeq = EQ (Z=1, 0 — unordered Z=0 → false ✓); fune = NE (Z=0, 1 — TRUE on unordered, exactly C 6.5.9 `!=`); fuo = VS (V=1, 6 — after FCMP the overflow flag IS the unordered predicate); ford = VC (7). fone is deliberately ABSENT: NE is true on unordered, and no single AArch64 cond is `ordered ∧ unequal` — its absence signals the composed realization (One = cset-NE ∧ cset-VC), the mirror of x86's foeq/fune absence. Olt/Ole need no entries — the lowering swap-canonicalizes them to fogt/foge (MI/LS would also realize them directly; the swap keeps ONE target-blind rule).",
   "condCodeEncoding": {
     "eq":  0,
     "ne":  1,
@@ -917,7 +1054,13 @@
     "ult": 3,
     "ule": 9,
     "ugt": 8,
-    "uge": 2
+    "uge": 2,
+    "fogt": 12,
+    "foge": 10,
+    "foeq": 0,
+    "fune": 1,
+    "fuo": 6,
+    "ford": 7
   },
   "$registersComment": "AAPCS64 general-purpose registers x0..x30 + zero-register XZR (encoded as 31 in source operands; uses register's hwEncoding). Stack pointer `sp` is also encoded as 31 but in the SP-slot context — hwEncoding=31 with class GPR is shared between XZR and SP at the byte level. D-ARM64-FLOAT-SUBSTRATE (2026-06-10): the SIMD&FP file is declared as d0..d31 (class fpr) — the V registers' 64-bit D views, sharing the same 5-bit field encoding.",
   "registers": [
@@ -956,7 +1099,7 @@
     { "$comment": "Stack pointer shares hwEncoding=31 with XZR at the byte level (the context determines which: SP-using addressing modes vs ZR-encoding instructions). The substrate treats them as distinct names with distinct ordinals; the JSON-side ordinal is what matters for the cc lookup.",
       "name": "sp",  "class": "gpr", "widthBytes": 8, "hwEncoding": 31 },
 
-    { "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): the V-register file's 64-bit D views, class fpr — F64-only this cycle, exactly like x86_64 (which declares only F64 SSE encodings); the MIR→LIR requireF64Width guards keep F32 fail-loud. widthBytes=8 is the D view, NOT the full 128-bit V register — the q/v views (and their subOf aliasing) are the future F128/SIMD cycle's work. hwEncoding = the 5-bit register number every SIMD&FP instruction form shares.",
+    { "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): the V-register file's 64-bit D views, class fpr. FC3.5 sweep-c2: F32 values live in the S views (the low 32 bits of the same registers) — the width axis on the instruction VARIANTS selects D vs S forms; the register declarations stay the D views (the 5-bit hwEncoding is shared by every view, and copies/spills move the containing D view, value-preserving for F32). widthBytes=8 is the D view, NOT the full 128-bit V register — the q/v views (and their subOf aliasing) are the future F128/SIMD cycle's work. hwEncoding = the 5-bit register number every SIMD&FP instruction form shares.",
       "name": "d0",  "class": "fpr", "widthBytes": 8, "hwEncoding": 0 },
     { "name": "d1",  "class": "fpr", "widthBytes": 8, "hwEncoding": 1 },
     { "name": "d2",  "class": "fpr", "widthBytes": 8, "hwEncoding": 2 },

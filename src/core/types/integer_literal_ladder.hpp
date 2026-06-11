@@ -7,6 +7,7 @@
 #include "core/types/type_lattice/core_type.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 
@@ -130,6 +131,35 @@ typeIntegerLiteral(std::string_view rawText,
         }
     }
     return {IntegerLadderStatus::TooLarge, TypeKind::Void};
+}
+
+// ── FC3.5 sweep-c2: the float-literal typing rule (C 6.4.4.2) ────────────
+//
+// The float sibling of `typeIntegerLiteral`, shared by the SAME two
+// tiers (semantic pass-2 + CST→HIR lowerLiteral) so they can never
+// drift. Far simpler than the integer ladder: a floating constant's
+// type is keyed by its SUFFIX alone — no magnitude ranges, no radix
+// classes (C 6.4.4.2: unsuffixed → double, f/F → float). Returns
+// nullopt when no rule covers the matched suffix — loader-prevented
+// for shipped configs (every numberStyle float suffix must be covered
+// + an unsuffixed rule must exist); a miss is substrate drift the
+// caller surfaces fail-loud, never silently the literalTypes base.
+[[nodiscard]] inline std::optional<TypeKind>
+typeFloatLiteral(std::string_view rawText,
+                 NumberStyle const* ns,
+                 std::span<FloatLiteralTypingRule const> rules,
+                 DataModel dm) {
+    std::string_view const suffix = matchFloatSuffix(rawText, ns);
+    for (auto const& r : rules) {
+        if (suffix.empty()) {
+            if (r.suffixes.empty()) return r.type.resolveCore(dm);
+            continue;
+        }
+        for (auto const& s : r.suffixes) {
+            if (s == suffix) return r.type.resolveCore(dm);
+        }
+    }
+    return std::nullopt;
 }
 
 } // namespace dss

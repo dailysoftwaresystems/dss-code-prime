@@ -808,12 +808,17 @@
       { "tokens": ["FloatKeyword"],                                             "core": "F32"  },
       { "tokens": ["DoubleKeyword"],                                            "core": "F64"  }
     ],
-    "$literalTypesComment": "FC3 c1: IntLiteral's I32 is the BASE core; the integerLiteralTyping ladder below refines the width by magnitude/suffix/radix per C 6.4.4.1. FloatLiteral stays F64 INCLUDING the `f`-suffixed form (`1.5f` types F64 this cycle — the f->F32 literal typing rides the F32 arithmetic surface, anchored D-CSUBSET-F32-CODEGEN; silently flipping it now would pair F32 typing with fail-loud-only codegen for zero benefit). true/false are C23 keyword literals: type Bool with config-declared FIXED values (1/0) — the engine never decodes their text as a number.",
+    "$literalTypesComment": "FC3 c1: IntLiteral's I32 is the BASE core; the integerLiteralTyping ladder below refines the width by magnitude/suffix/radix per C 6.4.4.1. FloatLiteral's F64 is the BASE core; the floatLiteralTyping suffix map below refines it per C 6.4.4.2 (FC3.5 sweep-c2 / D-CSUBSET-F32-CODEGEN closure: `1.5f` now types F32 — the F32 arithmetic surface shipped, so the typing flip pairs with real codegen). true/false are C23 keyword literals: type Bool with config-declared FIXED values (1/0) — the engine never decodes their text as a number.",
     "literalTypes": [
       { "literal": "IntLiteral",   "core": "I32" },
       { "literal": "FloatLiteral", "core": "F64" },
       { "literal": "TrueKeyword",  "core": "Bool", "value": 1 },
       { "literal": "FalseKeyword", "core": "Bool", "value": 0 }
+    ],
+    "$floatLiteralTypingComment": "FC3.5 sweep-c2: C 6.4.4.2 — a floating constant's type is keyed by its SUFFIX alone (unsuffixed -> double, f/F -> float). Type names resolve through typeSpecifiers/builtinTypes at LOAD time like the integer ladder's candidates. The loader cross-checks every numberStyle.floatSuffixes spelling is covered exactly once + an unsuffixed rule exists. C's l/L long-double suffix is NOT declared in floatSuffixes (pre-existing FC1c2 note) — long double lands with its own width story, not here.",
+    "floatLiteralTyping": [
+      { "suffixes": [],         "type": "double" },
+      { "suffixes": ["f", "F"], "type": "float"  }
     ],
     "$integerLiteralTypingComment": "FC3 c1: C 6.4.4.1 EXACTLY — the FIRST candidate (per suffix-group x radix-class) whose range holds the decoded magnitude is the literal's type. `decimal` = no declared numberStyle prefix matched; `nondecimal` (hex/octal/binary) adds the unsigned candidates per the C table. Type names resolve through typeSpecifiers/builtinTypes at LOAD time, so LLP64's 32-bit `long` falls out of the data-model select (2147483648 is `long` on LP64 but `long long` on LLP64). Suffix GROUPS list the exact numberStyle.integerSuffixes spellings they cover; the loader cross-checks every declared suffix is covered exactly once. A magnitude beyond the last candidate -> S_IntegerLiteralTooLarge.",
     "integerLiteralTyping": [

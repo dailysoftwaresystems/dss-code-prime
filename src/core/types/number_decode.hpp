@@ -62,6 +62,18 @@ matchIntegerSuffix(std::string_view text, NumberStyle const* ns) {
     return detail::matchTrailingSuffix(text, ns->integerSuffixes);
 }
 
+// FC3.5 sweep-c2: the float sibling — the declared float suffix
+// spelling a float literal's raw text carries (longest tail match
+// against `ns->floatSuffixes`), or the empty view for an unsuffixed
+// literal / null style. `typeFloatLiteral` keys its rule selection on
+// the EXACT matched spelling (the same match `decodeFloat`'s suffix
+// strip performs, so typing and decode can never disagree).
+[[nodiscard]] inline std::string_view
+matchFloatSuffix(std::string_view text, NumberStyle const* ns) {
+    if (ns == nullptr) return {};
+    return detail::matchTrailingSuffix(text, ns->floatSuffixes);
+}
+
 // FC3 c1: true iff the literal's text (suffix + separators stripped —
 // the SAME normalization `decodeInteger` applies) starts with a declared
 // `integerPrefixes` prefix. This is the ladder's radix-CLASS test: C

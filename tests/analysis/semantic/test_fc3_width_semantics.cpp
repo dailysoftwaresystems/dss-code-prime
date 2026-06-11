@@ -301,13 +301,98 @@ TEST(Fc3WidthSemantics, LiteralBeyondEveryCandidateFailsLoud) {
                         DiagnosticCode::S_IntegerLiteralTooLarge), 1u);
 }
 
-TEST(Fc3WidthSemantics, FloatSuffixedLiteralStaysF64ThisCycle) {
-    // `1.5f` deliberately types F64 in c1 (the f→F32 literal typing
-    // rides the F32 arithmetic surface — D-CSUBSET-F32-CODEGEN); pin the
-    // current behavior so a future flip is a CONSCIOUS config change.
-    auto m = analyzeCSubset("int main() { double d; d = 1.5f; return 0; }\n");
-    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
-    EXPECT_FALSE(m.hasErrors());
+TEST(Fc3WidthSemantics, FloatSuffixedLiteralTypesF32) {
+    // FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN closed): `1.5f` now types
+    // F32 per C 6.4.4.2 — the `floatLiteralTyping` suffix map's flip
+    // of the interim c1 F64 pin (the F32 arithmetic surface shipped
+    // alongside, so the typing pairs with real codegen). Pin the
+    // EXACT type through assignability: `float` param accepts `1.5f`
+    // cleanly; an F32 value also implicitly WIDENS into a `double`
+    // param (C float→double conversion — same-direction float
+    // widening) so the discriminating probe is the REVERSE: an
+    // UNSUFFIXED `1.5` (F64) into a `float` param must MISMATCH
+    // (narrowing — assignability admits only widening), while `1.5f`
+    // into `float` is clean. That asymmetry proves the suffix
+    // selected F32, not merely "something float".
+    auto cleanF32 = analyzeCSubset(
+        "int take(float v) { return 0; }\n"
+        "int main() { int r; r = take(1.5f); return 0; }\n");
+    EXPECT_EQ(countCode(cleanF32.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "1.5f must pass cleanly into a float param (types F32)";
+    EXPECT_FALSE(cleanF32.hasErrors());
+    auto widen = analyzeCSubset(
+        "int take(double v) { return 0; }\n"
+        "int main() { int r; r = take(1.5f); return 0; }\n");
+    EXPECT_EQ(countCode(widen.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "F32 widens implicitly into a double param";
+    auto narrow = analyzeCSubset(
+        "int take(float v) { return 0; }\n"
+        "int main() { int r; r = take(1.5); return 0; }\n");
+    EXPECT_EQ(countCode(narrow.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "unsuffixed 1.5 stays F64 — narrowing into float must "
+           "mismatch, proving the suffix (not the base core) typed "
+           "1.5f";
+}
+
+// ── FC3.5 sweep-c2: floatLiteralTyping loader validation ────────────────
+// (Mirrors the integerLiteralTyping cross-checks: suffix coverage,
+// exactly-one-unsuffixed, lexer-known suffixes, float-kind types.)
+
+TEST(Fc3WidthSemantics, FloatTypingUncoveredSuffixRejectsAtLoad) {
+    // Remove the f/F rule: numberStyle.floatSuffixes still declares
+    // them → the lexer would admit a literal the typing map cannot
+    // type. Must reject at LOAD, never silently fall back.
+    auto doc = loadShippedCSubsetJson();
+    auto& rules = doc["semantics"]["floatLiteralTyping"];
+    rules.erase(
+        std::remove_if(rules.begin(), rules.end(),
+                       [](nlohmann::json const& r) {
+                           return r.contains("suffixes")
+                               && !r["suffixes"].empty();
+                       }),
+        rules.end());
+    EXPECT_FALSE(schemaLoads(doc));
+}
+
+TEST(Fc3WidthSemantics, FloatTypingUnknownSuffixRejectsAtLoad) {
+    // A rule naming a suffix the lexer does not admit is dead config.
+    auto doc = loadShippedCSubsetJson();
+    doc["semantics"]["floatLiteralTyping"].push_back(
+        {{"suffixes", {"q"}}, {"type", "double"}});
+    EXPECT_FALSE(schemaLoads(doc));
+}
+
+TEST(Fc3WidthSemantics, FloatTypingNonFloatTypeRejectsAtLoad) {
+    auto doc = loadShippedCSubsetJson();
+    for (auto& r : doc["semantics"]["floatLiteralTyping"]) {
+        if (r.contains("suffixes") && r["suffixes"].empty()) {
+            r["type"] = "int";
+        }
+    }
+    EXPECT_FALSE(schemaLoads(doc));
+}
+
+TEST(Fc3WidthSemantics, FloatTypingMissingUnsuffixedRuleRejectsAtLoad) {
+    auto doc = loadShippedCSubsetJson();
+    auto& rules = doc["semantics"]["floatLiteralTyping"];
+    rules.erase(
+        std::remove_if(rules.begin(), rules.end(),
+                       [](nlohmann::json const& r) {
+                           return r.contains("suffixes")
+                               && r["suffixes"].empty();
+                       }),
+        rules.end());
+    EXPECT_FALSE(schemaLoads(doc));
+}
+
+TEST(Fc3WidthSemantics, FloatTypingDuplicateSuffixClaimRejectsAtLoad) {
+    auto doc = loadShippedCSubsetJson();
+    doc["semantics"]["floatLiteralTyping"].push_back(
+        {{"suffixes", {"f"}}, {"type", "double"}});
+    EXPECT_FALSE(schemaLoads(doc));
 }
 
 // ── toy / tsql: typing-unchanged pins ───────────────────────────────────

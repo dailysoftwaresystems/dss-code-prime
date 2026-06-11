@@ -1370,6 +1370,33 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     return;
                 }
             }
+            // FC3.5 sweep-c2: float-literal suffix typing (C 6.4.4.2).
+            // When the language declares `floatLiteralTyping` AND this
+            // token is the numberStyle's FLOAT literal kind, the
+            // suffix selects the type (c-subset: `1.5f` → F32, `1.5`
+            // → F64) — the SAME shared rule the CST→HIR tier runs.
+            // Languages without the block keep the token-kind map
+            // exactly (toy / tsql — pinned).
+            if (!cfg.floatLiteralTyping.empty()
+                && s.idx().numberStyle != nullptr
+                && s.idx().numberStyle->emitKind.floating.valid()
+                && tk == s.idx().numberStyle->emitKind.floating) {
+                auto const fk = typeFloatLiteral(
+                    tree.text(node), s.idx().numberStyle,
+                    cfg.floatLiteralTyping, s.dataModel);
+                if (!fk.has_value()) {
+                    // Loader invariant: every numberStyle float suffix
+                    // is covered and an unsuffixed rule exists. A miss
+                    // here is substrate drift — fail loud, never
+                    // silently keep the base core.
+                    std::fputs("dss::analyze fatal: float literal "
+                               "matched no floatLiteralTyping rule "
+                               "(loader cross-check invariant "
+                               "violated)\n", stderr);
+                    std::abort();
+                }
+                litTy = s.lattice.interner().primitive(*fk);
+            }
             s.nodeToType.set(node, litTy);
         }
     }

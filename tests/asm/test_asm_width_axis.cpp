@@ -877,6 +877,540 @@ TEST(WidthAxisX86, StrippedThirtyTwoBitVariantFailsLoudNeverFallsBack) {
     EXPECT_TRUE(sawNoVariantAtWidth32);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// FC3.5 sweep-c2: the FLOAT arm of the width axis
+// (D-CSUBSET-F32-CODEGEN + D-COND-FLOAT-NAN-TRUTHINESS-FCMP).
+//
+// Every new encoding byte-pinned against the manuals:
+//   x86_64 (Intel SDM Vol. 2): ADDSS = F3 0F 58 /r; DIVSD = F2 0F 5E
+//   /r; DIVSS = F3 0F 5E /r; CVTTSS2SI r64 = F3 REX.W 0F 2C /r;
+//   CVTSD2SS = F2 0F 5A /r; CVTSS2SD = F3 0F 5A /r; UCOMISD = 66 0F
+//   2E /r; UCOMISS = NP 0F 2E /r (no prefix!); MOVSS = F3 0F 10/11;
+//   AND = REX.W 21 /r (+32-bit sibling); OR = REX.W 09 /r; the parity
+//   setcc nibbles SETP=0F 9A / SETNP=0F 9B (SDM Vol. 1 App. B).
+//   arm64 (ARM ARM C7.2): FADD-S 0x1E202800; FDIV-D 0x1E601800 /
+//   FDIV-S 0x1E201800; FCMP-D 0x1E602000 / FCMP-S 0x1E202000 (quiet —
+//   opcode2 bit4=0; FCMPE would be +0x10); FCVT D←S 0x1E22C000 / S←D
+//   0x1E624000; FCVTZS-from-S 0x9E380000; LDUR-S 0xBC400000 / STUR-S
+//   0xBC000000; CSET float conds (nibble INVERTED at bits 12..15 per
+//   the CSINC alias).
+// ═══════════════════════════════════════════════════════════════════════
+
+namespace {
+// NOTE: built via makePhysicalReg — the aggregate-init shape the
+// file's `gpr()` helper uses ({ord, 1, cls}) sets LirReg's BITFIELD
+// order {id, classKind, isPhysical}, which is only accidentally
+// correct for GPR (classKind=1 == GPR, isPhysical=(GPR)1); for FPR it
+// would silently build a class-GPR NON-physical reg.
+[[nodiscard]] LirReg fprReg(TargetSchema const& s, std::string_view name) {
+    auto const ord = s.registerByName(name);
+    EXPECT_TRUE(ord.has_value()) << name;
+    return makePhysicalReg(static_cast<std::uint32_t>(ord.value_or(0)),
+                           LirRegClass::FPR);
+}
+} // namespace
+
+TEST(FloatWidthAxisX86, AddssEmits_F3_0F_58_AndAddsdKeeps_F2) {
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const xmm0 = fprReg(*schema, "xmm0");
+    auto const xmm1 = fprReg(*schema, "xmm1");
+    DiagnosticReporter rep;
+    auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(xmm0),
+                                  LirOperand::makeReg(xmm1)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fadd"), xmm0, ops,
+                        /*payload=*/0, kW32);
+    });
+    EXPECT_EQ(rep.errorCount(), 0u);
+    expectPrefix(bytes, {0xF3, 0x0F, 0x58, 0xC1});
+    // Back-compat contrast: width-default keeps the F2 ADDSD bytes.
+    DiagnosticReporter rep64;
+    auto bytes64 = buildLegalizeAssemble(*schema, rep64, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(xmm0),
+                                  LirOperand::makeReg(xmm1)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fadd"), xmm0, ops);
+    });
+    EXPECT_EQ(rep64.errorCount(), 0u);
+    expectPrefix(bytes64, {0xF2, 0x0F, 0x58, 0xC1});
+}
+
+TEST(FloatWidthAxisX86, DivsdAndDivssEmit_0F_5E_WidthPrefixed) {
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const xmm0 = fprReg(*schema, "xmm0");
+    auto const xmm1 = fprReg(*schema, "xmm1");
+    DiagnosticReporter rep;
+    auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(xmm0),
+                                  LirOperand::makeReg(xmm1)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fdiv"), xmm0, ops);
+    });
+    EXPECT_EQ(rep.errorCount(), 0u);
+    expectPrefix(bytes, {0xF2, 0x0F, 0x5E, 0xC1});  // DIVSD xmm0, xmm1
+    DiagnosticReporter rep32;
+    auto bytes32 = buildLegalizeAssemble(*schema, rep32, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(xmm0),
+                                  LirOperand::makeReg(xmm1)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fdiv"), xmm0, ops,
+                        /*payload=*/0, kW32);
+    });
+    EXPECT_EQ(rep32.errorCount(), 0u);
+    expectPrefix(bytes32, {0xF3, 0x0F, 0x5E, 0xC1});  // DIVSS xmm0, xmm1
+}
+
+TEST(FloatWidthAxisX86, Cvttss2siEmits_F3_RexW_0F_2C) {
+    // fp_to_si width-32 = the F32-SOURCE form; REX.W stays (the
+    // destination is the 64-bit GPR). Prefix precedes REX (the FC2
+    // mandatory-prefix order pin).
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const rax  = gpr(*schema, "rax");
+    auto const xmm0 = fprReg(*schema, "xmm0");
+    DiagnosticReporter rep;
+    auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(xmm0)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fp_to_si"), rax, ops,
+                        /*payload=*/0, kW32);
+    });
+    EXPECT_EQ(rep.errorCount(), 0u);
+    expectPrefix(bytes, {0xF3, 0x48, 0x0F, 0x2C, 0xC0});
+}
+
+TEST(FloatWidthAxisX86, FpcvtKeysOnSourceWidth_5A_BothDirections) {
+    // fpcvt width-64 (F64 source) = CVTSD2SS (narrow); width-32 (F32
+    // source) = CVTSS2SD (widen). The SOURCE-width axis: picking the
+    // result width instead would swap the two directions.
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const xmm0 = fprReg(*schema, "xmm0");
+    auto const xmm1 = fprReg(*schema, "xmm1");
+    DiagnosticReporter repN;
+    auto narrow = buildLegalizeAssemble(*schema, repN, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(xmm1)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fpcvt"), xmm0, ops);
+    });
+    EXPECT_EQ(repN.errorCount(), 0u);
+    expectPrefix(narrow, {0xF2, 0x0F, 0x5A, 0xC1});  // CVTSD2SS
+    DiagnosticReporter repW;
+    auto widen = buildLegalizeAssemble(*schema, repW, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(xmm1)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fpcvt"), xmm0, ops,
+                        /*payload=*/0, kW32);
+    });
+    EXPECT_EQ(repW.errorCount(), 0u);
+    expectPrefix(widen, {0xF3, 0x0F, 0x5A, 0xC1});   // CVTSS2SD
+}
+
+TEST(FloatWidthAxisX86, UcomisdAndUcomissEmit_0F_2E) {
+    // UCOMISD = 66 0F 2E (the 66 mandatory prefix); UCOMISS = NP 0F 2E
+    // — NO prefix at all (an F3 here would be an invalid encoding).
+    // ModRM roles: op[0] (the predicate's LEFT side) = reg, op[1] = rm
+    // — the RM-form direction (the integer cmp's 0x39 is MR-form; the
+    // LIR-level convention op[0]=left is identical).
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const xmm0 = fprReg(*schema, "xmm0");
+    auto const xmm1 = fprReg(*schema, "xmm1");
+    DiagnosticReporter rep;
+    auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(xmm0),
+                                  LirOperand::makeReg(xmm1)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fcmp"), InvalidLirReg,
+                        ops);
+    });
+    EXPECT_EQ(rep.errorCount(), 0u);
+    expectPrefix(bytes, {0x66, 0x0F, 0x2E, 0xC1});
+    DiagnosticReporter rep32;
+    auto bytes32 = buildLegalizeAssemble(*schema, rep32, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(xmm0),
+                                  LirOperand::makeReg(xmm1)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fcmp"), InvalidLirReg,
+                        ops, /*payload=*/0, kW32);
+    });
+    EXPECT_EQ(rep32.errorCount(), 0u);
+    expectPrefix(bytes32, {0x0F, 0x2E, 0xC1});
+}
+
+TEST(FloatWidthAxisX86, MovssLoadStoreAndRiprelEmit_F3_0F_10_11) {
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const rax  = gpr(*schema, "rax");
+    auto const xmm1 = fprReg(*schema, "xmm1");
+    // movss xmm1, [rax + 8] — F3 0F 10, ModR/M mod=10 reg=1 rm=0 →
+    // 0x88, disp32 = 08 00 00 00.
+    DiagnosticReporter repL;
+    auto load = buildLegalizeAssemble(*schema, repL, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(rax),
+                                  LirOperand::makeMemBase(1),
+                                  LirOperand::makeMemOffset(8)};
+        (void)b.addInst(*schema->opcodeByMnemonic("movsd_load"), xmm1, ops,
+                        /*payload=*/0, kW32);
+    });
+    EXPECT_EQ(repL.errorCount(), 0u);
+    expectPrefix(load, {0xF3, 0x0F, 0x10, 0x88, 0x08, 0x00, 0x00, 0x00});
+    // movss [rax + 8], xmm1 — F3 0F 11, same ModRM roles.
+    DiagnosticReporter repS;
+    auto store = buildLegalizeAssemble(*schema, repS, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(xmm1),
+                                  LirOperand::makeReg(rax),
+                                  LirOperand::makeMemBase(1),
+                                  LirOperand::makeMemOffset(8)};
+        (void)b.addInst(*schema->opcodeByMnemonic("movsd_store"),
+                        InvalidLirReg, ops, /*payload=*/0, kW32);
+    });
+    EXPECT_EQ(repS.errorCount(), 0u);
+    expectPrefix(store, {0xF3, 0x0F, 0x11, 0x88, 0x08, 0x00, 0x00, 0x00});
+    // The width-default contrast: the SAME loads keep F2 (movsd 8-byte).
+    DiagnosticReporter repL64;
+    auto load64 = buildLegalizeAssemble(*schema, repL64, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(rax),
+                                  LirOperand::makeMemBase(1),
+                                  LirOperand::makeMemOffset(8)};
+        (void)b.addInst(*schema->opcodeByMnemonic("movsd_load"), xmm1, ops);
+    });
+    EXPECT_EQ(repL64.errorCount(), 0u);
+    expectPrefix(load64, {0xF2, 0x0F, 0x10, 0x88, 0x08, 0x00, 0x00, 0x00});
+    // The RIP-relative MOVSS form: F3 0F 10 05 <rel32> + one rel32
+    // relocation at the placeholder (the F32 mirror of the F64 riprel
+    // variant).
+    LirBuilder b{*schema};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const symOps[] = {LirOperand::makeSymbolRef(7)};
+    (void)b.addInst(*schema->opcodeByMnemonic("movsd_load"), xmm1, symOps,
+                    /*payload=*/0, kW32);
+    (void)b.addReturn(*schema->opcodeByMnemonic("ret"), {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter repR;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    auto r = assemble(lir, *schema, lirToMir, repR);
+    EXPECT_EQ(repR.errorCount(), 0u);
+    ASSERT_EQ(r.functions.size(), 1u);
+    auto const& fn = r.functions[0];
+    expectPrefix(fn.bytes, {0xF3, 0x0F, 0x10, 0x0D});
+    ASSERT_EQ(fn.relocations.size(), 1u);
+    EXPECT_EQ(fn.relocations[0].offset, 4u);
+}
+
+TEST(FloatWidthAxisX86, AndOrEmit_21_09_BothWidths) {
+    // The composed-FCmp combiner substrate: AND r/m64, r64 = REX.W 21
+    // /r; OR = REX.W 09 /r; the no-REX.W 32-bit siblings per the
+    // established width pairs (Intel SDM AND/OR).
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const rax = gpr(*schema, "rax");
+    auto const rcx = gpr(*schema, "rcx");
+    auto const pin = [&](char const* mnemonic, std::uint8_t opByte) {
+        DiagnosticReporter rep64;
+        auto b64 = buildLegalizeAssemble(*schema, rep64, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(rax),
+                                      LirOperand::makeReg(rcx)};
+            (void)b.addInst(*schema->opcodeByMnemonic(mnemonic), rax, ops);
+        });
+        EXPECT_EQ(rep64.errorCount(), 0u) << mnemonic;
+        expectPrefix(b64, {0x48, opByte, 0xC8});
+        DiagnosticReporter rep32;
+        auto b32 = buildLegalizeAssemble(*schema, rep32, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(rax),
+                                      LirOperand::makeReg(rcx)};
+            (void)b.addInst(*schema->opcodeByMnemonic(mnemonic), rax, ops,
+                            /*payload=*/0, kW32);
+        });
+        EXPECT_EQ(rep32.errorCount(), 0u) << mnemonic;
+        expectPrefix(b32, {opByte, 0xC8});
+    };
+    pin("and", 0x21);
+    pin("or", 0x09);
+}
+
+TEST(FloatWidthAxisX86, FloatCondCodeSetccNibblesMatchTheSdm) {
+    // The float condCodeEncoding arms drive the SAME setcc low-nibble
+    // OR mechanism: fogt→seta (0F 97), foge→setae (0F 93), fone→setne
+    // (0F 95), fuo→setp (0F 9A), ford→setnp (0F 9B). forceRexPrefix
+    // emits the plain 0x40 REX; result rax → ModRM 0xC0.
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const rax = gpr(*schema, "rax");
+    auto const pin = [&](TargetCondCode cc, std::uint8_t opByte) {
+        DiagnosticReporter rep;
+        auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+            (void)b.addInst(*schema->opcodeByMnemonic("setcc"), rax, {},
+                            static_cast<std::uint32_t>(cc));
+        });
+        EXPECT_EQ(rep.errorCount(), 0u)
+            << "cc " << targetCondCodeName(cc);
+        expectPrefix(bytes, {0x40, 0x0F, opByte, 0xC0});
+    };
+    pin(TargetCondCode::Fogt, 0x97);
+    pin(TargetCondCode::Foge, 0x93);
+    pin(TargetCondCode::Fone, 0x95);
+    pin(TargetCondCode::Fuo,  0x9A);
+    pin(TargetCondCode::Ford, 0x9B);
+}
+
+TEST(FloatWidthAxisX86, UndeclaredFoeqSetccFailsLoud) {
+    // x86 deliberately declares NO foeq nibble (sete is TRUE on
+    // unordered — the composed realization is the only correct one).
+    // A single-cc setcc reaching the encoder with the undeclared cond
+    // must FAIL LOUD naming it, never OR a stale nibble.
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const rax = gpr(*schema, "rax");
+    DiagnosticReporter rep;
+    (void)buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+        (void)b.addInst(*schema->opcodeByMnemonic("setcc"), rax, {},
+                        static_cast<std::uint32_t>(TargetCondCode::Foeq));
+    });
+    EXPECT_GT(rep.errorCount(), 0u);
+    bool saw = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_NoMatchingEncodingVariant
+            && d.actual.find("foeq") != std::string::npos) {
+            saw = true;
+        }
+    }
+    EXPECT_TRUE(saw);
+}
+
+TEST(FloatWidthAxisX86, StrippedAddssVariantFailsLoudNeverFallsBackToF2) {
+    // THE float strip-variant red-on-disable (the permanent in-suite
+    // pin, D-CSUBSET-F32-CODEGEN): remove the width-32 ADDSS variant →
+    // a width-32 fadd must FAIL LOUD at the matcher naming width 32 —
+    // silently matching the F2 ADDSD sibling would compute F32 values
+    // double-width (the exact miscompile the width axis kills).
+    auto mutated = test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            for (auto& op : doc["opcodes"]) {
+                if (op.value("mnemonic", "") != "fadd") continue;
+                auto& variants = op["encoding"]["variants"];
+                variants.erase(
+                    std::remove_if(
+                        variants.begin(), variants.end(),
+                        [](nlohmann::json const& v) {
+                            return v.contains("guard")
+                                && v["guard"].value("width", 0) == 32;
+                        }),
+                    variants.end());
+            }
+        });
+    ASSERT_TRUE(mutated.has_value());
+    auto const& schema = **mutated;
+    auto const xmm0 = fprReg(schema, "xmm0");
+    auto const xmm1 = fprReg(schema, "xmm1");
+    DiagnosticReporter rep;
+    (void)buildLegalizeAssemble(schema, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(xmm0),
+                                  LirOperand::makeReg(xmm1)};
+        (void)b.addInst(*schema.opcodeByMnemonic("fadd"), xmm0, ops,
+                        /*payload=*/0, kW32);
+    });
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a width-32 fadd with no ADDSS variant must NOT encode";
+    bool sawNoVariantAtWidth32 = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_NoMatchingEncodingVariant
+            && d.actual.find("width 32") != std::string::npos) {
+            sawNoVariantAtWidth32 = true;
+        }
+    }
+    EXPECT_TRUE(sawNoVariantAtWidth32);
+}
+
+// ── arm64: the float S-forms + FCMP/FDIV/FCVT + CSET float conds ──────
+
+TEST(FloatWidthAxisArm64, FaddSFormClearsFtypeTo00) {
+    // fadd width-32 d0, d1, d2 → FADD S0, S1, S2: base 0x1E202800
+    // | Rm=2<<16 | Rn=1<<5 | Rd=0 = 0x1E222820 (LE 20 28 22 1E).
+    auto schema = loadArm();
+    ASSERT_NE(schema, nullptr);
+    auto const d0 = fprReg(*schema, "d0");
+    auto const d1 = fprReg(*schema, "d1");
+    auto const d2 = fprReg(*schema, "d2");
+    DiagnosticReporter rep;
+    auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(d1),
+                                  LirOperand::makeReg(d2)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fadd"), d0, ops,
+                        /*payload=*/0, kW32);
+    });
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(firstInstWord(bytes), 0x1E222820u);
+    // Width-default contrast: the D-form word is unchanged.
+    DiagnosticReporter rep64;
+    auto bytes64 = buildLegalizeAssemble(*schema, rep64, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(d1),
+                                  LirOperand::makeReg(d2)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fadd"), d0, ops);
+    });
+    EXPECT_EQ(rep64.errorCount(), 0u);
+    EXPECT_EQ(firstInstWord(bytes64), 0x1E622820u);
+}
+
+TEST(FloatWidthAxisArm64, FdivDAndSForms) {
+    // FDIV D0, D1, D2 = 0x1E601800 | 2<<16 | 1<<5 = 0x1E621820;
+    // FDIV S0, S1, S2 = 0x1E201800 | ... = 0x1E221820.
+    auto schema = loadArm();
+    ASSERT_NE(schema, nullptr);
+    auto const d0 = fprReg(*schema, "d0");
+    auto const d1 = fprReg(*schema, "d1");
+    auto const d2 = fprReg(*schema, "d2");
+    DiagnosticReporter rep;
+    auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(d1),
+                                  LirOperand::makeReg(d2)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fdiv"), d0, ops);
+    });
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(firstInstWord(bytes), 0x1E621820u);
+    DiagnosticReporter rep32;
+    auto bytes32 = buildLegalizeAssemble(*schema, rep32, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(d1),
+                                  LirOperand::makeReg(d2)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fdiv"), d0, ops,
+                        /*payload=*/0, kW32);
+    });
+    EXPECT_EQ(rep32.errorCount(), 0u);
+    EXPECT_EQ(firstInstWord(bytes32), 0x1E221820u);
+}
+
+TEST(FloatWidthAxisArm64, FcmpQuietDAndSForms) {
+    // FCMP D1, D2 = 0x1E602000 | Rm=2<<16 | Rn=1<<5 = 0x1E622020
+    // (opcode2 bits [4:0] = 00000 — the QUIET form; bit 4 set would
+    // be FCMPE). S-form: 0x1E222020.
+    auto schema = loadArm();
+    ASSERT_NE(schema, nullptr);
+    auto const d1 = fprReg(*schema, "d1");
+    auto const d2 = fprReg(*schema, "d2");
+    DiagnosticReporter rep;
+    auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(d1),
+                                  LirOperand::makeReg(d2)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fcmp"), InvalidLirReg,
+                        ops);
+    });
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(firstInstWord(bytes), 0x1E622020u);
+    DiagnosticReporter rep32;
+    auto bytes32 = buildLegalizeAssemble(*schema, rep32, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(d1),
+                                  LirOperand::makeReg(d2)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fcmp"), InvalidLirReg,
+                        ops, /*payload=*/0, kW32);
+    });
+    EXPECT_EQ(rep32.errorCount(), 0u);
+    EXPECT_EQ(firstInstWord(bytes32), 0x1E222020u);
+}
+
+TEST(FloatWidthAxisArm64, FcvtKeysOnSourceWidthBothDirections) {
+    // fpcvt width-64 (F64 source) = FCVT S0, D1 (narrow): 0x1E624000 |
+    // 1<<5 = 0x1E624020; width-32 (F32 source) = FCVT D0, S1 (widen):
+    // 0x1E22C000 | 1<<5 = 0x1E22C020.
+    auto schema = loadArm();
+    ASSERT_NE(schema, nullptr);
+    auto const d0 = fprReg(*schema, "d0");
+    auto const d1 = fprReg(*schema, "d1");
+    DiagnosticReporter repN;
+    auto narrow = buildLegalizeAssemble(*schema, repN, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(d1)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fpcvt"), d0, ops);
+    });
+    EXPECT_EQ(repN.errorCount(), 0u);
+    EXPECT_EQ(firstInstWord(narrow), 0x1E624020u);
+    DiagnosticReporter repW;
+    auto widen = buildLegalizeAssemble(*schema, repW, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(d1)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fpcvt"), d0, ops,
+                        /*payload=*/0, kW32);
+    });
+    EXPECT_EQ(repW.errorCount(), 0u);
+    EXPECT_EQ(firstInstWord(widen), 0x1E22C020u);
+}
+
+TEST(FloatWidthAxisArm64, FcvtzsFromSForm) {
+    // fp_to_si width-32 x0, d1 → FCVTZS X0, S1 (ftype=00):
+    // 0x9E380000 | 1<<5 = 0x9E380020. The width-default D-source form
+    // stays 0x9E780020.
+    auto schema = loadArm();
+    ASSERT_NE(schema, nullptr);
+    auto const x0 = gpr(*schema, "x0");
+    auto const d1 = fprReg(*schema, "d1");
+    DiagnosticReporter rep;
+    auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(d1)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fp_to_si"), x0, ops,
+                        /*payload=*/0, kW32);
+    });
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(firstInstWord(bytes), 0x9E380020u);
+    DiagnosticReporter rep64;
+    auto bytes64 = buildLegalizeAssemble(*schema, rep64, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(d1)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fp_to_si"), x0, ops);
+    });
+    EXPECT_EQ(rep64.errorCount(), 0u);
+    EXPECT_EQ(firstInstWord(bytes64), 0x9E780020u);
+}
+
+TEST(FloatWidthAxisArm64, LdurSturSFormsAreFourByteAccesses) {
+    // LDUR S1, [X0, #8] = 0xBC400000 | 8<<12 | 0<<5 | 1 = 0xBC408001;
+    // STUR S1, [X0, #8] = 0xBC000000 | ... = 0xBC008001. The size=10
+    // S-forms read/write exactly 4 bytes — the type-exact access width
+    // for F32 rodata items.
+    auto schema = loadArm();
+    ASSERT_NE(schema, nullptr);
+    auto const x0 = gpr(*schema, "x0");
+    auto const d1 = fprReg(*schema, "d1");
+    DiagnosticReporter repL;
+    auto load = buildLegalizeAssemble(*schema, repL, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(x0),
+                                  LirOperand::makeMemBase(1),
+                                  LirOperand::makeMemOffset(8)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fldur"), d1, ops,
+                        /*payload=*/0, kW32);
+    });
+    EXPECT_EQ(repL.errorCount(), 0u);
+    EXPECT_EQ(firstInstWord(load), 0xBC408001u);
+    DiagnosticReporter repS;
+    auto store = buildLegalizeAssemble(*schema, repS, [&](LirBuilder& b) {
+        LirOperand const ops[] = {LirOperand::makeReg(d1),
+                                  LirOperand::makeReg(x0),
+                                  LirOperand::makeMemBase(1),
+                                  LirOperand::makeMemOffset(8)};
+        (void)b.addInst(*schema->opcodeByMnemonic("fstur"), InvalidLirReg,
+                        ops, /*payload=*/0, kW32);
+    });
+    EXPECT_EQ(repS.errorCount(), 0u);
+    EXPECT_EQ(firstInstWord(store), 0xBC008001u);
+}
+
+TEST(FloatWidthAxisArm64, CsetFloatCondsInvertNibbleAtBit12) {
+    // CSET Xd, cond = CSINC Xd, XZR, XZR, invert(cond): base
+    // 0x9A9F07E0 | (invert(nibble) << 12) | Rd. Float conds: fogt =
+    // GT(0xC)→0xD; foge = GE(0xA)→0xB; foeq = EQ(0)→1; fune =
+    // NE(1)→0; fuo = VS(6)→7; ford = VC(7)→6 (the ^1 inversion pairs
+    // each condition with its complement).
+    auto schema = loadArm();
+    ASSERT_NE(schema, nullptr);
+    auto const x0 = gpr(*schema, "x0");
+    auto const pin = [&](TargetCondCode cc, std::uint32_t word) {
+        DiagnosticReporter rep;
+        auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+            (void)b.addInst(*schema->opcodeByMnemonic("setcc"), x0, {},
+                            static_cast<std::uint32_t>(cc));
+        });
+        EXPECT_EQ(rep.errorCount(), 0u) << targetCondCodeName(cc);
+        EXPECT_EQ(firstInstWord(bytes), word) << targetCondCodeName(cc);
+    };
+    pin(TargetCondCode::Fogt, 0x9A9FD7E0u);  // cset x0, gt
+    pin(TargetCondCode::Foge, 0x9A9FB7E0u);  // cset x0, ge
+    pin(TargetCondCode::Foeq, 0x9A9F17E0u);  // cset x0, eq
+    pin(TargetCondCode::Fune, 0x9A9F07E0u);  // cset x0, ne
+    pin(TargetCondCode::Fuo,  0x9A9F77E0u);  // cset x0, vs
+    pin(TargetCondCode::Ford, 0x9A9F67E0u);  // cset x0, vc
+}
+
 // ── loader validation: the width vocabulary is closed ─────────────────
 
 TEST(WidthAxisLoader, GuardWidthSixteenIsRejected) {

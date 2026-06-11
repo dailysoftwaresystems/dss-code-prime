@@ -1979,11 +1979,13 @@ TEST(MirToLir, FprConstAtMirToLirFailsLoudPointingAtPromotion) {
            "promotion contract";
 }
 
-// FC2 Part B width gate (D-TARGET-ENCODING-WIDTH-GUARD): with the F64
-// addsd encoding live, a non-F64 float FAdd would otherwise SILENTLY
-// match the F2 0F 58 variant (the guard has no width discriminator)
-// and run double-width arithmetic on F32 values. Pin the fail-loud.
-TEST(MirToLir, F32FAddFailsLoudUntilWidthDiscriminatedEncodings) {
+// FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN closed): an F32 FAdd now
+// LOWERS — the fadd inst must carry the width-32 flag so the
+// assembler's variant matcher selects ADDSS (F3 0F 58), never the F64
+// ADDSD sibling. The width AXIS is the discrimination pin: a dropped
+// F32→width-32 mapping would re-select the 64-bit default and the
+// width-keyed F2 variant — double-width arithmetic on F32 values.
+TEST(MirToLir, F32FAddLowersWithWidth32Flag) {
     std::array<::dss::TypeKind, 2> paramKinds{
         ::dss::TypeKind::F32, ::dss::TypeKind::F32};
     auto syn = ::dss::test_support::buildSyntheticFn(
@@ -2001,9 +2003,53 @@ TEST(MirToLir, F32FAddFailsLoudUntilWidthDiscriminatedEncodings) {
     ASSERT_TRUE(target.has_value());
     ::dss::DiagnosticReporter rep;
     auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    auto const faddOp = (*target)->opcodeByMnemonic("fadd");
+    ASSERT_TRUE(faddOp.has_value());
+    bool sawWidth32Fadd = false;
+    for (std::uint32_t f = 0; f < result.lir.moduleFuncCount(); ++f) {
+        auto const fn = result.lir.funcAt(f);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            auto const bb = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < result.lir.blockInstCount(bb); ++ii) {
+                auto const id = result.lir.blockInstAt(bb, ii);
+                if (result.lir.instOpcode(id) != *faddOp) continue;
+                EXPECT_EQ(::dss::lirInstWidthBits(result.lir.instFlags(id)),
+                          32u)
+                    << "an F32 FAdd must carry the width-32 flag (ADDSS, "
+                       "never the F64 ADDSD sibling)";
+                sawWidth32Fadd = true;
+            }
+        }
+    }
+    EXPECT_TRUE(sawWidth32Fadd) << "expected a width-32 fadd inst";
+}
+
+// The F16/F128 wall stays: no scalar encodings exist at ANY width for
+// them, and first-match would otherwise pick a wrong-width form
+// (D-TARGET-ENCODING-WIDTH-GUARD). F16 FAdd must still fail loud.
+TEST(MirToLir, F16FAddStillFailsLoudViaTheWidthGuard) {
+    std::array<::dss::TypeKind, 2> paramKinds{
+        ::dss::TypeKind::F16, ::dss::TypeKind::F16};
+    auto syn = ::dss::test_support::buildSyntheticFn(
+        paramKinds, ::dss::TypeKind::F16,
+        [](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+           std::span<::dss::TypeId const> params, ::dss::TypeId retT) {
+            ::dss::MirInstId const a = mb.addArg(0, params[0]);
+            ::dss::MirInstId const b = mb.addArg(1, params[1]);
+            ::dss::MirInstId const ops[] = {a, b};
+            ::dss::MirInstId const r =
+                mb.addInst(::dss::MirOpcode::FAdd, ops, retT);
+            mb.addReturn(r);
+        });
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
     EXPECT_FALSE(result.ok)
-        << "F32 FAdd must fail loud — lowering it would silently select "
-           "the F64 addsd encoding";
+        << "F16 FAdd must fail loud — no scalar encodings at any width";
     bool sawWidthDiag = false;
     for (auto const& d : rep.all()) {
         if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode
@@ -2156,9 +2202,13 @@ TEST(MirToLir, StrippedClassOpsTableFailsLoudOnFprLoad) {
     EXPECT_TRUE(sawClassDiag);
 }
 
-// The FPToSI twin: cvttsd2si consumes an F64 SOURCE; an F32 source
-// must fail loud rather than convert 4 garbage upper bytes.
-TEST(MirToLir, F32FpToSiSourceFailsLoudUntilWidthDiscriminatedEncodings) {
+// The FPToSI twin (FC3.5 re-pin — D-CSUBSET-F32-CODEGEN closed): an
+// F32-source FPToSI now LOWERS, and the fp_to_si inst must carry the
+// SOURCE's width-32 flag (the variant axis keys on the source float
+// width — CVTTSS2SI F3 vs CVTTSD2SI F2 — while the RESULT-width
+// default would have mis-keyed an I32 result as 32 even for an F64
+// source; the override is the pinned behavior).
+TEST(MirToLir, F32FpToSiSourceLowersWithSourceWidth32Flag) {
     std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::F32};
     auto syn = ::dss::test_support::buildSyntheticFn(
         paramKinds, ::dss::TypeKind::I32,
@@ -2174,9 +2224,71 @@ TEST(MirToLir, F32FpToSiSourceFailsLoudUntilWidthDiscriminatedEncodings) {
     ASSERT_TRUE(target.has_value());
     ::dss::DiagnosticReporter rep;
     auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
-    EXPECT_FALSE(result.ok)
-        << "F32-source FPToSI must fail loud — lowering it would "
-           "silently select the F64 cvttsd2si encoding";
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    auto const fpToSiOp = (*target)->opcodeByMnemonic("fp_to_si");
+    ASSERT_TRUE(fpToSiOp.has_value());
+    bool saw = false;
+    for (std::uint32_t f = 0; f < result.lir.moduleFuncCount(); ++f) {
+        auto const fn = result.lir.funcAt(f);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            auto const bb = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < result.lir.blockInstCount(bb); ++ii) {
+                auto const id = result.lir.blockInstAt(bb, ii);
+                if (result.lir.instOpcode(id) != *fpToSiOp) continue;
+                EXPECT_EQ(::dss::lirInstWidthBits(result.lir.instFlags(id)),
+                          32u)
+                    << "F32-source fp_to_si must carry the SOURCE width";
+                saw = true;
+            }
+        }
+    }
+    EXPECT_TRUE(saw) << "expected an fp_to_si inst";
+}
+
+// The mirror discrimination pin: an F64-source FPToSI with an I32
+// RESULT must carry width-64 (the SOURCE axis) — the result-type
+// default (I32 → 32) would silently select the F3 CVTTSS2SI form and
+// convert an F64 as a single. This is the exact mis-key the
+// widthOverride threading exists to prevent.
+TEST(MirToLir, F64FpToSiWithI32ResultKeepsSourceWidth64) {
+    std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::F64};
+    auto syn = ::dss::test_support::buildSyntheticFn(
+        paramKinds, ::dss::TypeKind::I32,
+        [](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+           std::span<::dss::TypeId const> params, ::dss::TypeId retT) {
+            ::dss::MirInstId const a = mb.addArg(0, params[0]);
+            ::dss::MirInstId const ops[] = {a};
+            ::dss::MirInstId const r =
+                mb.addInst(::dss::MirOpcode::FPToSI, ops, retT);
+            mb.addReturn(r);
+        });
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    auto const fpToSiOp = (*target)->opcodeByMnemonic("fp_to_si");
+    ASSERT_TRUE(fpToSiOp.has_value());
+    bool saw = false;
+    for (std::uint32_t f = 0; f < result.lir.moduleFuncCount(); ++f) {
+        auto const fn = result.lir.funcAt(f);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            auto const bb = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < result.lir.blockInstCount(bb); ++ii) {
+                auto const id = result.lir.blockInstAt(bb, ii);
+                if (result.lir.instOpcode(id) != *fpToSiOp) continue;
+                EXPECT_EQ(::dss::lirInstWidthBits(result.lir.instFlags(id)),
+                          64u)
+                    << "F64-source fp_to_si must carry width-64 even with "
+                       "an I32 result — the source axis, never the result "
+                       "type";
+                saw = true;
+            }
+        }
+    }
+    EXPECT_TRUE(saw) << "expected an fp_to_si inst";
 }
 
 // ─── cycle 3e: Calls + Aggregates + LirVerifier ─────────────────────────
@@ -3199,12 +3311,26 @@ TEST(MirToLir, NativeWidthsStayAllowedThroughTheGate) {
                                  ::dss::MirOpcode::Mul).ok);
 }
 
-TEST(MirToLir, F32AddFailsLoudViaTheF64WidthGuard) {
-    // FC3 c1 P6: `float` now TYPES as F32 at the front end; its codegen
-    // stays fail-loud (only F64 has scalar float encodings) — an F32
-    // arithmetic program must REJECT, never silently compute F64
-    // (D-TARGET-ENCODING-WIDTH-GUARD / D-CSUBSET-F32-CODEGEN).
-    auto probe = lowerBinaryProbe(::dss::TypeKind::F32, ::dss::MirOpcode::FAdd);
-    EXPECT_FALSE(probe.ok);
-    EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+TEST(MirToLir, F32AddLowersAndExoticFloatWidthsStayWalled) {
+    // FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN CLOSED): F32 arithmetic now
+    // LOWERS through the width axis (ADDSS / arm64 FADD-S). The wall
+    // narrows to the genuinely-unencoded widths: F16/F128 must still
+    // REJECT via the width guard, never first-match a wrong-width form
+    // (D-TARGET-ENCODING-WIDTH-GUARD).
+    EXPECT_TRUE(lowerBinaryProbe(::dss::TypeKind::F32,
+                                 ::dss::MirOpcode::FAdd).ok);
+    EXPECT_TRUE(lowerBinaryProbe(::dss::TypeKind::F64,
+                                 ::dss::MirOpcode::FDiv).ok)
+        << "fdiv gained DIVSD — the NaN-construction path";
+    EXPECT_TRUE(lowerBinaryProbe(::dss::TypeKind::F32,
+                                 ::dss::MirOpcode::FDiv).ok)
+        << "fdiv gained DIVSS";
+    auto probe16 = lowerBinaryProbe(::dss::TypeKind::F16,
+                                    ::dss::MirOpcode::FAdd);
+    EXPECT_FALSE(probe16.ok);
+    EXPECT_TRUE(sawAnchor(probe16.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+    auto probe128 = lowerBinaryProbe(::dss::TypeKind::F128,
+                                     ::dss::MirOpcode::FDiv);
+    EXPECT_FALSE(probe128.ok);
+    EXPECT_TRUE(sawAnchor(probe128.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
 }

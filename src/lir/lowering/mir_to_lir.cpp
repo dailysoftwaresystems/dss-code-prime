@@ -146,6 +146,13 @@ enum class MnemonicSlot : std::uint8_t {
     // xor_rdx_zero+div_op) or — remainder only — the generic
     // rem = n − (n/d)·d expansion over div + mul + sub.
     SDivNative, UDivNative, SModNative, UModNative,
+    // FC3.5 sweep-c2 (FCmp LIR lowering — D-COND-FLOAT-NAN-TRUTHINESS-
+    // FCMP): float compare writing FLAGS, no register result — the
+    // float sibling of `cmp`. x86_64 binds UCOMISD (66 0F 2E, width
+    // 64) / UCOMISS (0F 2E, width 32); arm64 binds FCMP D/S forms.
+    // The width axis on the variants discriminates F64/F32 exactly
+    // like the integer 64/32 split.
+    FCmp,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -227,6 +234,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::UDivNative,    "udiv"},
     {MnemonicSlot::SModNative,    "smod"},
     {MnemonicSlot::UModNative,    "umod"},
+    {MnemonicSlot::FCmp,          "fcmp"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -239,6 +247,100 @@ static_assert(kMnemonicRows.size() == kMnemonicCount,
 static_assert(kMnemonicRowsAligned(),
     "MnemonicSlot rows out of order — kMnemonicRows[i].slot must equal "
     "MnemonicSlot(i) for every i (cycle-3d swap-silent-corruption hazard).");
+
+// ── FC3.5 sweep-c2: MIR FCmp → target-condition realization plan ─────
+//
+// THE CORRECTNESS CRUX (D-COND-FLOAT-NAN-TRUTHINESS-FCMP): a float
+// compare has FOUR outcomes — less / equal / greater / UNORDERED (a
+// NaN operand) — and every Ordered predicate must be FALSE on
+// unordered while Une must be TRUE (C 6.5.9: NaN != x holds). The
+// flag patterns (derived instruction-by-instruction, pinned by the
+// FloatCmpPredicateTruthTable test):
+//
+//   x86 UCOMISD/UCOMISS (Intel SDM Vol. 2A "UCOMISD"):
+//     unordered → ZF=1 PF=1 CF=1;  a>b → all 0;
+//     a<b → CF=1 only;             a==b → ZF=1 only.
+//     seta  (cc 7) = CF=0∧ZF=0 → exactly Ogt (false on unordered).
+//     setae (cc 3) = CF=0      → exactly Oge (false on unordered).
+//     setb  (cc 2) = CF=1      → TRUE on unordered — NEVER usable
+//                                for an ordered less-than; hence the
+//                                SWAP canonicalization below.
+//     sete  (cc 4) = ZF=1      → true on unordered too → Oeq needs
+//                                the ∧-ordered composition.
+//     setne (cc 5) = ZF=0      → false on unordered AND false on
+//                                equal → exactly One as a SINGLE cc.
+//     setp/setnp (cc A/B) = PF — after UCOMI, PF=1 IS "unordered":
+//                                the universal Fuo/Ford conditions.
+//
+//   arm64 FCMP (ARM ARM C7.2 FCMP; condition table C1.2.4):
+//     a==b → Z=1(C=1);  a<b → N=1;  a>b → C=1;  unordered → C=1,V=1.
+//     EQ (0) = Z=1   → exactly Foeq (unordered has Z=0).
+//     NE (1) = Z=0   → TRUE on unordered → exactly Fune (C's !=) and
+//                      therefore NOT usable as One — the mirror of
+//                      the x86 asymmetry (there setne IS One).
+//     GT (C) = Z=0∧N=V → exactly Ogt (unordered: N=0≠V=1 → false).
+//     GE (A) = N=V     → exactly Oge (same V=1 disambiguation).
+//     HI (8) = C=1∧Z=0 → TRUE on unordered — the integer-ugt nibble
+//                        is a NaN miscompile for floats; this is WHY
+//                        the float codes are separate enum entries.
+//     VS/VC (6/7) = V — after FCMP, V=1 IS "unordered": Fuo/Ford.
+//
+// CANONICALIZATION: Olt(a,b) ≡ Ogt(b,a) and Ole(a,b) ≡ Oge(b,a) hold
+// EXACTLY under IEEE 754 (including the unordered outcome — both
+// sides false), so the lowering swaps the fcmp operands and reuses
+// Fogt/Foge. This is the classic x86 shape (no ordered-below setcc
+// exists) and is harmless-correct on arm64 (MI would also work; the
+// swap keeps ONE target-blind rule).
+//
+// COMPOSITIONS (universal, used when the target declares no single
+// nibble for the predicate — the capability signal is the ABSENCE of
+// the `condCodeEncoding` float entry):
+//     Foeq = Eq ∧ Ford      Fone = Ne ∧ Ford      Fune = Ne ∨ Fuo
+// Each is flag-exact on BOTH targets (the Ford/Fuo conjunct
+// disambiguates the unordered case whichever way the equality flag
+// conflates it); the shipped configs declare singles where the ISA
+// has them — x86: fogt/foge/fone singles, foeq/fune composed;
+// arm64: fogt/foge/foeq/fune singles, fone composed.
+//
+// The unordered-relational predicates (Ueq/Ult/Ule/Ugt/Uge) have NO
+// C-subset producer (C's <,<=,>,>= are the ordered forms; == is Oeq;
+// != is Une) and stay fail-loud-unsupported — returning nullopt here
+// routes them to reportUnsupported, never a silent wrong-parity cc.
+struct FloatCmpComposition {
+    TargetCondCode partA;    // the flag-exact equality half (Eq / Ne)
+    TargetCondCode partB;    // Ford (∧-ordered) or Fuo (∨-unordered)
+    MnemonicSlot   combine;  // MnemonicSlot::And or ::Or
+};
+struct FloatCmpPlan {
+    bool           swapOperands = false;
+    TargetCondCode single{};   // the preferred single condition code
+    std::optional<FloatCmpComposition> composition;  // fallback shape
+};
+[[nodiscard]] std::optional<FloatCmpPlan> floatCmpPlan(MirOpcode op) noexcept {
+    using CC = TargetCondCode;
+    switch (op) {
+        case MirOpcode::FCmpOgt:
+            return FloatCmpPlan{false, CC::Fogt, std::nullopt};
+        case MirOpcode::FCmpOge:
+            return FloatCmpPlan{false, CC::Foge, std::nullopt};
+        case MirOpcode::FCmpOlt:   // a<b ≡ b>a (exact, incl. unordered)
+            return FloatCmpPlan{true,  CC::Fogt, std::nullopt};
+        case MirOpcode::FCmpOle:   // a<=b ≡ b>=a (exact, incl. unordered)
+            return FloatCmpPlan{true,  CC::Foge, std::nullopt};
+        case MirOpcode::FCmpOeq:
+            return FloatCmpPlan{false, CC::Foeq,
+                FloatCmpComposition{CC::Eq, CC::Ford, MnemonicSlot::And}};
+        case MirOpcode::FCmpOne:
+            return FloatCmpPlan{false, CC::Fone,
+                FloatCmpComposition{CC::Ne, CC::Ford, MnemonicSlot::And}};
+        case MirOpcode::FCmpUne:
+            return FloatCmpPlan{false, CC::Fune,
+                FloatCmpComposition{CC::Ne, CC::Fuo, MnemonicSlot::Or}};
+        default:
+            return std::nullopt;   // Ueq/Ult/Ule/Ugt/Uge: no producer,
+                                   // fail loud at the dispatch arm
+    }
+}
 
 // One transient lowerer per `lowerToLir` call. Holds the per-pass state
 // the dispatcher methods read/write. Mirrors `Lowerer` in `hir_to_mir.cpp`.
@@ -469,36 +571,41 @@ struct Lowerer {
         return regClassForType(mir.instType(id));
     }
 
-    // FC2 Part B width gate (D-TARGET-ENCODING-WIDTH-GUARD): encoding
-    // variant guards carry NO operand-width discriminator, so once the
-    // F64 SSE rows exist (addsd / cvttsd2si / movsd_load), a non-F64
-    // float op lowered through the same mnemonics would SILENTLY
-    // encode the 8-byte double instruction forms against narrower
-    // values — a miscompile, not a diagnostic. This is the only tier
-    // where MIR types are still visible (post-regalloc LIR carries
-    // register CLASSES, not widths), so the gate lives here: any
-    // FPR-class type flowing into an F64-encoded mnemonic must BE
-    // F64. Returns true (no-op) for non-FPR types. Applied exactly
-    // where F64 encodings exist this cycle (FAdd, FPToSI source,
-    // FPR-class Load); the still-encoding-less float ops keep their
-    // assemble-tier A_NoEncodingDeclared fail-loud and gain this gate
-    // alongside their encodings.
-    [[nodiscard]] bool requireF64Width(MirInstId id, TypeId ty,
-                                       std::string_view context) {
+    // FC2 Part B width gate (D-TARGET-ENCODING-WIDTH-GUARD), WIDENED by
+    // FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN closure): the scalar float
+    // tier now ships TWO encoded widths — F64 (the FC2 substrate: F2-
+    // prefixed SSE / arm64 D-forms) and F32 (F3-prefixed SSE scalar-
+    // single / arm64 S-forms) — selected by the SAME width axis the
+    // integer 64/32 split rides (`kLirInstFlagWidth32` ↔ the variant
+    // guards' `width` key; `widthFlagsForType` maps F32 → 32). This is
+    // the only tier where MIR types are still visible (post-regalloc
+    // LIR carries register CLASSES, not widths), so the gate lives
+    // here: any FPR-class type flowing into a width-keyed float
+    // mnemonic must be one of the ENCODED widths. F16/F128 stay
+    // fail-loud (no encodings at any width — first-match could
+    // otherwise pick a wrong-width form). Returns true (no-op) for
+    // non-FPR types. Applied exactly where float encodings exist
+    // (FAdd, FDiv, FCmp operands, FPToSI source, FPTrunc/FPExt
+    // source+result, FPR-class Load); the still-encoding-less float
+    // ops (FSub/FMul/FNeg) keep their assemble-tier
+    // A_NoEncodingDeclared fail-loud and gain this gate alongside
+    // their encodings.
+    [[nodiscard]] bool requireEncodedFloatWidth(MirInstId id, TypeId ty,
+                                                std::string_view context) {
         if (!ty.valid()) return true;  // upstream diagnosed the type hole
         if (regClassForType(ty) != LirRegClass::FPR) return true;
-        if (interner.kind(ty) == TypeKind::F64) return true;
+        TypeKind const k = interner.kind(ty);
+        if (k == TypeKind::F64 || k == TypeKind::F32) return true;
         dss::report(reporter,
             DiagnosticCode::L_UnsupportedLoweringForOpcode,
             DiagnosticSeverity::Error,
             std::format(
                 "{}: float TypeKind ordinal {} is not lowerable to "
-                "target '{}' — only F64 has scalar float encodings this "
-                "cycle; proceeding would silently select the F64 "
-                "(double-width) instruction forms "
+                "target '{}' — only F64 and F32 have scalar float "
+                "encodings this cycle; proceeding would silently select "
+                "a wrong-width instruction form "
                 "(D-TARGET-ENCODING-WIDTH-GUARD)",
-                context, static_cast<unsigned>(interner.kind(ty)),
-                target.name()));
+                context, static_cast<unsigned>(k), target.name()));
         poisonValue(id);
         return false;
     }
@@ -690,18 +797,29 @@ struct Lowerer {
     // FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): the LIR width flag for a MIR
     // type — the SINGLE point where TypeKind becomes the width axis.
     // I32/U32 compute at 32 bits (true C int semantics; x86 32-bit ops
-    // auto-zero-extend, arm64 W-forms clear the upper word); everything
-    // else stays at the 64-bit substrate default (I64/U64/Ptr native;
-    // Bool/byte ops are width-invariant at 64; the gated kinds never
-    // reach an emission site). Applied at the COMPUTE tier only — ALU,
-    // div family, compares, trunc; plumbing movs / loads / stores /
-    // spills stay 64-bit full-width (value-correct: every 32-bit-typed
+    // auto-zero-extend, arm64 W-forms clear the upper word); FC3.5
+    // sweep-c2 adds F32 → 32 (D-CSUBSET-F32-CODEGEN: the F3-prefixed
+    // SSE scalar-single forms / arm64 S-forms ride the SAME axis — an
+    // F32-typed float op selects the width-32 variants of fadd / fdiv
+    // / fcmp / fp_to_si / movsd_load / fldur …). Everything else stays
+    // at the 64-bit substrate default (I64/U64/F64/Ptr native; Bool/
+    // byte ops are width-invariant at 64; the gated kinds never reach
+    // an emission site). Applied at the COMPUTE tier + FPR-class
+    // memory ops — integer plumbing movs / loads / stores / spills
+    // stay 64-bit full-width (value-correct: every 32-bit-typed
     // CONSUMER reads only the low 32 bits of its operand registers, and
-    // widening happens only through the explicit conversion mnemonics).
+    // widening happens only through the explicit conversion mnemonics),
+    // but an FPR LOAD/STORE must be width-exact: an 8-byte movsd read
+    // of a 4-byte F32 rodata item would read past the item (see
+    // lowerLoad/lowerStore). FPR-class register COPIES stay width-
+    // blind by design (x86 movaps / arm64 fmov-D copy the containing
+    // register; the low 4 bytes — the F32 value — ride along), and
+    // regalloc spill/reload uses the width-default 8-byte forms over
+    // 8-byte slots (value-preserving for both float widths).
     [[nodiscard]] std::uint8_t widthFlagsForType(TypeId ty) const {
         if (!ty.valid()) return 0;
         switch (interner.kind(ty)) {
-            case TypeKind::I32: case TypeKind::U32:
+            case TypeKind::I32: case TypeKind::U32: case TypeKind::F32:
                 return kLirInstFlagWidth32;
             default:
                 return 0;
@@ -810,6 +928,19 @@ struct Lowerer {
                 }
                 return lowerICmp(id, *cc);
             }
+            // ── FC3.5 sweep-c2: float comparisons ──────────────────
+            // The 7 C-reachable predicates (Oeq/One/Olt/Ole/Ogt/Oge +
+            // Une) lower via the capability-driven plan; the 5
+            // unordered-relational predicates (Ueq/Ult/Ule/Ugt/Uge)
+            // have NO C producer and fail loud through the nullopt
+            // plan — never a silent wrong-parity condition.
+            case MirOpcode::FCmpOeq: case MirOpcode::FCmpOne:
+            case MirOpcode::FCmpOlt: case MirOpcode::FCmpOle:
+            case MirOpcode::FCmpOgt: case MirOpcode::FCmpOge:
+            case MirOpcode::FCmpUeq: case MirOpcode::FCmpUne:
+            case MirOpcode::FCmpUlt: case MirOpcode::FCmpUle:
+            case MirOpcode::FCmpUgt: case MirOpcode::FCmpUge:
+                return lowerFCmp(id);
             case MirOpcode::Phi:    return;  // pre-pass-allocated; no body emission
             case MirOpcode::Alloca: return lowerAlloca(id);
             case MirOpcode::Load:   return lowerLoad(id);
@@ -857,28 +988,76 @@ struct Lowerer {
             case MirOpcode::Neg:    return lowerUnaryOp(id, MnemonicSlot::Neg);
             // ── cycle 3d float arithmetic (FPR-class result) ───────
             case MirOpcode::FAdd:
-                // FC2 Part B: fadd carries the F64 addsd encoding —
-                // gate the width before the class-blind lowering.
-                if (!requireF64Width(id, mir.instType(id), "MIR FAdd")) return;
+                // FC2 Part B / FC3.5 c2: fadd carries the F64 addsd +
+                // F32 addss encodings, width-axis-selected — gate the
+                // width before the class-blind lowering (the result
+                // type IS the operands' type post-UAC, so the default
+                // result-width key is the right axis).
+                if (!requireEncodedFloatWidth(id, mir.instType(id),
+                                              "MIR FAdd")) return;
                 return lowerBinaryOp(id, MnemonicSlot::FAdd);
             case MirOpcode::FSub:   return lowerBinaryOp(id, MnemonicSlot::FSub);
             case MirOpcode::FMul:   return lowerBinaryOp(id, MnemonicSlot::FMul);
-            case MirOpcode::FDiv:   return lowerBinaryOp(id, MnemonicSlot::FDiv);
+            case MirOpcode::FDiv:
+                // FC3.5 sweep-c2: fdiv gains its first encodings
+                // (DIVSD/DIVSS, arm64 FDIV D/S) — the NaN-construction
+                // path (0.0/0.0). Same gate+axis as FAdd.
+                if (!requireEncodedFloatWidth(id, mir.instType(id),
+                                              "MIR FDiv")) return;
+                return lowerBinaryOp(id, MnemonicSlot::FDiv);
             case MirOpcode::FNeg:   return lowerUnaryOp(id, MnemonicSlot::FNeg);
             // ── cycle 3d float casts (the 6 conversion variants) ───
-            case MirOpcode::FPTrunc: return lowerCast(id, MnemonicSlot::FpCvt,   "MIR FPTrunc");
-            case MirOpcode::FPExt:   return lowerCast(id, MnemonicSlot::FpCvt,   "MIR FPExt");
-            case MirOpcode::FPToSI: {
-                // FC2 Part B: fp_to_si carries the F64 cvttsd2si
-                // encoding — the SOURCE operand's float width is the
-                // encoded one (the result is integer/GPR).
-                auto const convOps = mir.instOperands(id);
-                if (convOps.size() == 1
-                    && !requireF64Width(id, mir.instType(convOps[0]),
-                                        "MIR FPToSI (source)")) {
+            case MirOpcode::FPTrunc:
+            case MirOpcode::FPExt: {
+                // FC3.5 sweep-c2: fpcvt gains the F64↔F32 encodings
+                // (x86 CVTSD2SS F2 0F 5A / CVTSS2SD F3 0F 5A; arm64
+                // FCVT S↔D). ONE mnemonic, SOURCE-width-keyed
+                // variants: FPExt's F32 source selects the width-32
+                // form (cvtss2sd — widen), FPTrunc's F64 source the
+                // width-64 form (cvtsd2ss — narrow); the result-width
+                // default would pick exactly the WRONG sibling, so
+                // this is the second consumer of the ZExt-style
+                // widthOverride. Gate BOTH ends: an F16/F128 source
+                // or result has no encoded conversion at any width.
+                auto const cvtOps = mir.instOperands(id);
+                if (!requireEncodedFloatWidth(id, mir.instType(id),
+                        op == MirOpcode::FPExt ? "MIR FPExt (result)"
+                                               : "MIR FPTrunc (result)")) {
                     return;
                 }
-                return lowerCast(id, MnemonicSlot::FpToSi,  "MIR FPToSI");
+                if (cvtOps.size() == 1
+                    && !requireEncodedFloatWidth(id, mir.instType(cvtOps[0]),
+                            op == MirOpcode::FPExt ? "MIR FPExt (source)"
+                                                   : "MIR FPTrunc (source)")) {
+                    return;
+                }
+                std::uint8_t const cvtSrcWidth = (cvtOps.size() == 1)
+                    ? widthFlagsForType(mir.instType(cvtOps[0]))
+                    : 0;
+                return lowerCast(id, MnemonicSlot::FpCvt,
+                                 op == MirOpcode::FPExt ? "MIR FPExt"
+                                                        : "MIR FPTrunc",
+                                 cvtSrcWidth);
+            }
+            case MirOpcode::FPToSI: {
+                // FC2 Part B / FC3.5 c2: fp_to_si carries the F64
+                // cvttsd2si + F32 cvttss2si encodings — the SOURCE
+                // operand's float width is the encoded axis (the
+                // result is integer/GPR and stays the 64-bit form;
+                // its low 32 bits serve I32 results). The result-
+                // width default (an I32 result → width-32) would
+                // mis-key the SOURCE axis, so thread the override.
+                auto const convOps = mir.instOperands(id);
+                if (convOps.size() == 1
+                    && !requireEncodedFloatWidth(id, mir.instType(convOps[0]),
+                                                 "MIR FPToSI (source)")) {
+                    return;
+                }
+                std::uint8_t const fpsiSrcWidth = (convOps.size() == 1)
+                    ? widthFlagsForType(mir.instType(convOps[0]))
+                    : 0;
+                return lowerCast(id, MnemonicSlot::FpToSi, "MIR FPToSI",
+                                 fpsiSrcWidth);
             }
             case MirOpcode::FPToUI:  return lowerCast(id, MnemonicSlot::FpToUi,  "MIR FPToUI");
             case MirOpcode::SIToFP:  return lowerCast(id, MnemonicSlot::SiToFp,  "MIR SIToFP");
@@ -1082,10 +1261,15 @@ struct Lowerer {
         // Cycle 3d FPR-class plumbing closure: a Load of an F64 must
         // produce an FPR-class result, not GPR. Closes the silent-
         // failure-hunter HIGH finding from cycle 3d's review.
-        // FC2 Part B: an FPR-class load selects the F64 movsd_load
-        // mnemonic (8-byte read) via registerClassOps — gate the
-        // width so an F32 load can't silently read 8 bytes.
-        if (!requireF64Width(id, mir.instType(id), "MIR Load")) return;
+        // FC2 Part B / FC3.5 c2: an FPR-class load selects the
+        // movsd_load/fldur mnemonic via registerClassOps and the WIDTH
+        // axis picks the F64 (8-byte) vs F32 (4-byte movss / LDUR-S)
+        // variant — the access width must be TYPE-EXACT for FPR loads
+        // (an 8-byte read of a 4-byte F32 rodata item reads past the
+        // item; potential fault at a section edge). Integer/GPR loads
+        // keep the width-default full-slot read (their loaded values
+        // are consumed low-bits-only). The gate walls off F16/F128.
+        if (!requireEncodedFloatWidth(id, mir.instType(id), "MIR Load")) return;
         // FC2 Part B: the load mnemonic follows the RESULT's register
         // class (registerClassOps — GPR `load`, FPR e.g. movsd_load).
         LirRegClass const cls = regClassFor(id);
@@ -1095,13 +1279,16 @@ struct Lowerer {
             poisonValue(id);
             return;
         }
+        std::uint8_t const loadWidthFlags = (cls == LirRegClass::FPR)
+            ? widthFlagsForType(mir.instType(id))
+            : 0;
         LirReg const result = lir.newVReg(cls);
         std::array<LirOperand, 3> ops{
             LirOperand::makeReg(*base),
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        emitInst(*loadOp, result, ops);
+        emitInst(*loadOp, result, ops, /*payload=*/0, loadWidthFlags);
         defineValue(id, result);
     }
 
@@ -1115,20 +1302,26 @@ struct Lowerer {
         // register class (x86_64 fpr → movsd_store since the PE-float
         // closure, 2026-06-10). A class with no declared store fails
         // loud here instead of silently GPR-storing 8 bytes of XMM
-        // ordinal.
+        // ordinal. FC3.5 c2: FPR-class stores are width-exact like
+        // loads — the stored value's TYPE width picks the F64/F32
+        // variant (movsd vs movss / STUR-D vs STUR-S).
         LirRegClass const cls = value->regClass();
         auto const storeOp = classOp(cls, RegClassOp::Store);
         if (!storeOp.has_value()) {
             reportMissingClassOp(cls, RegClassOp::Store, "MIR Store");
             return;
         }
+        std::uint8_t const storeWidthFlags = (cls == LirRegClass::FPR)
+            ? widthFlagsForType(mir.instType(operands[0]))
+            : 0;
         std::array<LirOperand, 4> ops{
             LirOperand::makeReg(*value),
             LirOperand::makeReg(*base),
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        emitInst(*storeOp, InvalidLirReg, ops);
+        emitInst(*storeOp, InvalidLirReg, ops, /*payload=*/0,
+                 storeWidthFlags);
     }
 
     void lowerGep(MirInstId id) {
@@ -1526,7 +1719,8 @@ struct Lowerer {
         // would otherwise GPR-load into an FPR vreg).
         std::optional<LirReg> const base = regForValue(operands[0]);
         if (!base.has_value()) return;
-        if (!requireF64Width(id, mir.instType(id), "MIR ExtractValue")) return;
+        if (!requireEncodedFloatWidth(id, mir.instType(id),
+                                      "MIR ExtractValue")) return;
         LirRegClass const cls = regClassFor(id);
         auto const loadOp = classOp(cls, RegClassOp::Load);
         if (!loadOp.has_value()) {
@@ -1534,13 +1728,17 @@ struct Lowerer {
             poisonValue(id);
             return;
         }
+        // FC3.5 c2: FPR width-exact like lowerLoad.
+        std::uint8_t const extWidthFlags = (cls == LirRegClass::FPR)
+            ? widthFlagsForType(mir.instType(id))
+            : 0;
         LirReg const result = lir.newVReg(cls);
         std::array<LirOperand, 3> ops{
             LirOperand::makeReg(*base),
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        emitInst(*loadOp, result, ops);
+        emitInst(*loadOp, result, ops, /*payload=*/0, extWidthFlags);
         defineValue(id, result);
     }
 
@@ -1565,20 +1763,25 @@ struct Lowerer {
         if (!base.has_value() || !value.has_value()) return;
         // FC2 Part B: class-routed like lowerStore — the stored
         // VALUE's class picks the mnemonic; a class without a
-        // declared store fails loud.
+        // declared store fails loud. FC3.5 c2: FPR width-exact like
+        // lowerStore (the stored value's type width).
         LirRegClass const cls = value->regClass();
         auto const storeOp = classOp(cls, RegClassOp::Store);
         if (!storeOp.has_value()) {
             reportMissingClassOp(cls, RegClassOp::Store, "MIR InsertValue");
             return;
         }
+        std::uint8_t const insWidthFlags = (cls == LirRegClass::FPR)
+            ? widthFlagsForType(mir.instType(operands[1]))
+            : 0;
         std::array<LirOperand, 4> ops{
             LirOperand::makeReg(*value),
             LirOperand::makeReg(*base),
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        emitInst(*storeOp, InvalidLirReg, ops);
+        emitInst(*storeOp, InvalidLirReg, ops, /*payload=*/0,
+                 insWidthFlags);
         // The result of InsertValue is conceptually the modified
         // aggregate. In the memory-flattening model the aggregate IS
         // the base pointer; reuse it as the result. ML6's promote-to-
@@ -2174,6 +2377,167 @@ struct Lowerer {
         defineValue(id, result);
     }
 
+    // ── FC3.5 sweep-c2: MIR FCmp lowering ────────────────────────────
+    //
+    // Shape (mirrors lowerICmp's cmp+setcc+zext): emit the float
+    // compare (`fcmp` — UCOMISD/UCOMISS on x86, FCMP D/S on arm64;
+    // width-axis-selected by the OPERANDS' float type), then
+    // materialize the predicate from the flags by the capability-
+    // driven plan (`floatCmpPlan` — see its derivation comment):
+    //
+    //  * single-cc (the target declares the predicate's float nibble
+    //    in `condCodeEncoding`): ONE setcc(cc) + zext — identical to
+    //    the integer tail.
+    //  * composed (nibble undeclared — x86 Oeq/Une, arm64 One): TWO
+    //    setcc+zext pairs over the flag-exact halves (the integer
+    //    Eq/Ne nibble + the Ford/Fuo parity/overflow nibble) folded
+    //    by `and`/`or`. FLAGS survive the interleaved insts: setcc /
+    //    movzx (x86) and CSINC / ORR-mov (arm64) do not write flags,
+    //    and any regalloc spill movs between them don't either — the
+    //    second setcc still reads the fcmp's flags.
+    //
+    // Operand-swap canonicalization (Olt/Ole → swapped Fogt/Foge) is
+    // part of the plan; the swap is exact under IEEE 754 including
+    // the unordered outcome (both sides false).
+    void lowerFCmp(MirInstId id) {
+        MirOpcode const op = mir.instOpcode(id);
+        auto const plan = floatCmpPlan(op);
+        if (!plan.has_value()) {
+            // Ueq/Ult/Ule/Ugt/Uge — no C producer, no realization.
+            reportUnsupported(op, id);
+            poisonValue(id);
+            return;
+        }
+        if (!opcode(MnemonicSlot::FCmp).has_value()) {
+            reportMissingOpcode(MnemonicSlot::FCmp, "MIR FCmp");
+            poisonValue(id);
+            return;
+        }
+        if (!opcode(MnemonicSlot::Setcc).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Setcc, "MIR FCmp");
+            poisonValue(id);
+            return;
+        }
+        if (!opcode(MnemonicSlot::ZExt).has_value()) {
+            reportMissingOpcode(MnemonicSlot::ZExt, "MIR FCmp");
+            poisonValue(id);
+            return;
+        }
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 2) {
+            reportUnsupported(op, id);
+            poisonValue(id);
+            return;
+        }
+        // Gate + width: the compare's encoded width follows the
+        // OPERANDS' float type (the result is Bool); post-UAC both
+        // operands carry the same type, so operand 0 is authoritative
+        // (the lowerICmp rule).
+        if (!requireEncodedFloatWidth(id, mir.instType(operands[0]),
+                                      "MIR FCmp operand")) {
+            return;
+        }
+        if (!emitFloatCompare(id, *plan, operands)) {
+            poisonValue(id);
+            return;
+        }
+        // Materialize per the plan: single setcc when the target
+        // declares the nibble; else the composed two-setcc shape.
+        if (target.condCodeEncoding(plan->single).has_value()) {
+            LirReg const b8 = lir.newVReg(LirRegClass::GPR);
+            emitInst(*opcode(MnemonicSlot::Setcc), b8,
+                     std::span<LirOperand const>{},
+                     /*payload=*/static_cast<std::uint32_t>(plan->single));
+            LirReg const result = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 1> zextOps{LirOperand::makeReg(b8)};
+            emitInst(*opcode(MnemonicSlot::ZExt), result, zextOps);
+            defineValue(id, result);
+            return;
+        }
+        if (!plan->composition.has_value()) {
+            // A required-single predicate (Ogt/Oge family) whose
+            // nibble the target does not declare: no composed
+            // fallback exists — fail loud naming the missing entry.
+            dss::report(reporter,
+                DiagnosticCode::L_RequiredLirOpcodeMissing,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "MIR→LIR: target '{}' declares no `condCodeEncoding` "
+                    "entry for float condition '{}' (required to lower "
+                    "MIR '{}') and the predicate has no composed "
+                    "realization — declare the nibble in the target "
+                    "schema (FC3.5 FCmp lowering)",
+                    target.name(), targetCondCodeName(plan->single),
+                    mirOpcodeName(op)));
+            poisonValue(id);
+            return;
+        }
+        FloatCmpComposition const& comp = *plan->composition;
+        if (!target.condCodeEncoding(comp.partA).has_value()
+            || !target.condCodeEncoding(comp.partB).has_value()) {
+            dss::report(reporter,
+                DiagnosticCode::L_RequiredLirOpcodeMissing,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "MIR→LIR: target '{}' declares neither a single "
+                    "`condCodeEncoding` entry for float condition '{}' "
+                    "nor both composition ingredients '{}' + '{}' "
+                    "(required to lower MIR '{}') — declare one of the "
+                    "two realizations (FC3.5 FCmp lowering)",
+                    target.name(), targetCondCodeName(plan->single),
+                    targetCondCodeName(comp.partA),
+                    targetCondCodeName(comp.partB), mirOpcodeName(op)));
+            poisonValue(id);
+            return;
+        }
+        auto const combineOp = opcode(comp.combine);
+        if (!combineOp.has_value()) {
+            reportMissingOpcode(comp.combine, "MIR FCmp (composed)");
+            poisonValue(id);
+            return;
+        }
+        auto const setccZext = [&](TargetCondCode cc) -> LirReg {
+            LirReg const b8 = lir.newVReg(LirRegClass::GPR);
+            emitInst(*opcode(MnemonicSlot::Setcc), b8,
+                     std::span<LirOperand const>{},
+                     /*payload=*/static_cast<std::uint32_t>(cc));
+            LirReg const wide = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 1> ops{LirOperand::makeReg(b8)};
+            emitInst(*opcode(MnemonicSlot::ZExt), wide, ops);
+            return wide;
+        };
+        LirReg const a = setccZext(comp.partA);
+        LirReg const b = setccZext(comp.partB);
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 2> combineOps{
+            LirOperand::makeReg(a), LirOperand::makeReg(b)};
+        emitInst(*combineOp, result, combineOps);
+        defineValue(id, result);
+    }
+
+    // Emit the `fcmp` flag-writing compare for `id` per the plan's
+    // operand order. Shared by lowerFCmp (materialization — which
+    // poisons `id` on false) and lowerCondBr's fused single-cc branch
+    // path (which must NOT poison: the FCmp value was already defined
+    // by its own lowering). Returns false when an operand vreg is
+    // missing (already diagnosed by regForValue).
+    bool emitFloatCompare(MirInstId id, FloatCmpPlan const& plan,
+                          std::span<MirInstId const> operands) {
+        std::optional<LirReg> const a = regForValue(operands[0]);
+        std::optional<LirReg> const b = regForValue(operands[1]);
+        if (!a.has_value() || !b.has_value()) {
+            return false;
+        }
+        LirReg const lhs = plan.swapOperands ? *b : *a;
+        LirReg const rhs = plan.swapOperands ? *a : *b;
+        std::array<LirOperand, 2> cmpOps{
+            LirOperand::makeReg(lhs), LirOperand::makeReg(rhs)};
+        emitInst(*opcode(MnemonicSlot::FCmp), InvalidLirReg, cmpOps,
+                 /*payload=*/0,
+                 widthFlagsForType(mir.instType(operands[0])));
+        return true;
+    }
+
     // ── terminator + phi resolution ──────────────────────────────────
 
     // Emit the phi-edge moves for one (predecessor, successor) edge.
@@ -2410,8 +2774,36 @@ struct Lowerer {
         MirInstId const condInst = operands[0];
         MirOpcode const condOp   = mir.instOpcode(condInst);
         auto const fusedCc       = condCodeForICmp(condOp);
+        // FC3.5 sweep-c2: FCmp+CondBr fusion — ONLY for predicates the
+        // target realizes as a SINGLE declared condition code (the
+        // capability check below). A composed predicate (x86 Oeq/Une,
+        // arm64 One) takes the non-fused arm: lowerFCmp already
+        // materialized the composed Bool, and the cmp-against-0 + jne
+        // path branches on it — correct, just not fused (a jcc-pair /
+        // flag-forwarding fusion for composed float conditions is an
+        // optimizer peephole, deliberately NOT done here).
+        auto const floatPlan = floatCmpPlan(condOp);
+        bool const fuseFloat =
+            floatPlan.has_value()
+            && opcode(MnemonicSlot::FCmp).has_value()
+            && target.condCodeEncoding(floatPlan->single).has_value();
         TargetCondCode jccCond;
-        if (fusedCc.has_value()) {
+        if (fuseFloat) {
+            auto const fcmpOperands = mir.instOperands(condInst);
+            if (fcmpOperands.size() != 2) {
+                reportUnsupported(condOp, condInst);
+                return false;
+            }
+            if (!requireEncodedFloatWidth(condInst,
+                                          mir.instType(fcmpOperands[0]),
+                                          "MIR FCmp operand (fused)")) {
+                return false;
+            }
+            if (!emitFloatCompare(condInst, *floatPlan, fcmpOperands)) {
+                return false;
+            }
+            jccCond = floatPlan->single;
+        } else if (fusedCc.has_value()) {
             auto const icmpOperands = mir.instOperands(condInst);
             if (icmpOperands.size() != 2) {
                 reportUnsupported(condOp, condInst);

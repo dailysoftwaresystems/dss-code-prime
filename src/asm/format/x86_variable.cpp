@@ -657,13 +657,16 @@ bool encode(Lir const&                  lir,
     }
     if (selected->tmpl.condCodeFromPayload) {
         auto const condValue = lir.instPayload(inst);
-        if (condValue > 9u) {
+        if (condValue >= kTargetCondCodeCount) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': cond-code payload {} is "
-                               "out of range [0..9] for TargetCondCode "
-                               "(eq/ne/slt/sle/sgt/sge/ult/ule/ugt/uge)",
-                               info->mnemonic, condValue));
+                               "out of range [0..{}] for TargetCondCode "
+                               "(eq/ne/slt/sle/sgt/sge/ult/ule/ugt/uge + "
+                               "the float codes fogt/foge/foeq/fone/"
+                               "fune/fuo/ford)",
+                               info->mnemonic, condValue,
+                               kTargetCondCodeCount - 1));
             return false;
         }
         auto const condNibble = schema.condCodeEncoding(
@@ -673,8 +676,14 @@ bool encode(Lir const&                  lir,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': variant declares "
                                "condCodeFromPayload but target schema "
-                               "'{}' has no `condCodeEncoding` table",
-                               info->mnemonic, schema.name()));
+                               "'{}' declares no `condCodeEncoding` "
+                               "entry for cond '{}' (the float arms "
+                               "are per-entry optional — an undeclared "
+                               "one must lower via the composed-FCmp "
+                               "shape, never reach a single-cc inst)",
+                               info->mnemonic, schema.name(),
+                               targetCondCodeName(static_cast<TargetCondCode>(
+                                   condValue))));
             return false;
         }
         for (std::size_t i = 0; i + 1 < selected->tmpl.opcodeBytes.size(); ++i) {

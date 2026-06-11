@@ -422,7 +422,11 @@ struct Lowerer {
     // Builds the SAME compare-against-typed-zero shape `hir_to_mir`
     // already lowers `HirOpKind::Not` to (ICmpEq there; the binary `Ne`
     // here routes via `mapBinaryOp` → ICmpNe for integer kinds — Ne is
-    // signedness-irrelevant — and FCmpOne for float kinds).
+    // signedness-irrelevant — and FCmpUNE for float kinds: the
+    // UNORDERED-or-unequal predicate, TRUE on NaN, so `if (NaN)` is
+    // true exactly as C requires — NaN compares unequal to 0.0; the
+    // FC3.5 D-COND-FLOAT-NAN-TRUTHINESS-FCMP adjudication, flipped
+    // from the interim FCmpOne when FCmp gained its LIR lowering).
     //
     // Dispatch is a TypeKind SHAPE predicate — never language identity:
     //  - invalid type, or already Bool → UNCHANGED (a comparison already
@@ -1246,8 +1250,31 @@ struct Lowerer {
             if (isSignedCore(core)) val.value = fixedIt->second;
             else val.value = static_cast<std::uint64_t>(fixedIt->second);
         } else if (isFloatCore(core)) {
-            double const d = decodeFloat(text, numberStyle, ok);
-            if (ok) val.value = d;
+            // FC3.5 sweep-c2: float-literal suffix typing (C 6.4.4.2)
+            // — the SAME shared rule the semantic tier ran in pass 2
+            // (one implementation, two call sites — the integer
+            // ladder's discipline): `1.5f` refines the literalTypes
+            // F64 base to F32. Languages without the block keep the
+            // base core exactly (toy / tsql — pinned).
+            if (!sem.floatLiteralTyping.empty() && numberStyle != nullptr
+                && numberStyle->emitKind.floating.valid()
+                && tk == numberStyle->emitKind.floating) {
+                auto const fk = typeFloatLiteral(
+                    text, numberStyle, sem.floatLiteralTyping, dataModel_);
+                if (fk.has_value()) {
+                    core = *fk;
+                    type = interner.primitive(core);
+                } else {
+                    // Loader invariant violated (uncovered suffix) —
+                    // stay loud through the arm below, mirroring the
+                    // integer ladder's NoRule handling.
+                    ok = false;
+                }
+            }
+            if (ok) {
+                double const d = decodeFloat(text, numberStyle, ok);
+                if (ok) val.value = d;
+            }
         } else if (auto iv = decodeInteger(text, numberStyle)) {
             // FC3 c1: the integer-literal ladder (C 6.4.4.1) — the SAME
             // shared algorithm the semantic tier ran in pass 2 (plan-lock

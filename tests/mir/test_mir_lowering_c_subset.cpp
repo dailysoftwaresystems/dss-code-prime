@@ -2099,21 +2099,31 @@ TEST(MirLoweringCSubset, BoolIfConditionKeepsExactlyOneComparison) {
     EXPECT_EQ(countOp(L.mir.mir, MirOpcode::Trunc), 0u);
 }
 
-// Float condition: truthiness is `!= 0.0` → FCmpOne over the cond's own
+// Float condition: truthiness is `!= 0.0` → FCmpUNE over the cond's own
 // float type (C99 6.8.4.1 over scalars), NOT the old Cast shape whose
 // mapCast routed float→Bool as FPToUI (value-WRONG: FPToUI(0.5) == 0
-// would make `if (0.5)` false). FCmp has no LIR lowering yet, so the
-// runtime tier stays fail-loud — but at the RIGHT shape, pinned here.
-TEST(MirLoweringCSubset, FloatIfConditionLowersAsFCmpOneNotFpToUi) {
+// would make `if (0.5)` false). FC3.5 sweep-c2 — the
+// D-COND-FLOAT-NAN-TRUTHINESS-FCMP adjudication: the predicate is the
+// UNORDERED-or-unequal Une (per C 6.5.9, `!=` on NaN is TRUE, so
+// `if (NaN)` is true — NaN compares unequal to 0.0). The interim
+// FCmpOne (ordered-ne — FALSE on NaN) would have made `if (NaN)`
+// silently false once FCmp gained its LIR lowering; this pin is the
+// red-on-disable lever for the Ne→Une mapping (flipping mapBinaryOp
+// back to FCmpOne turns it red).
+TEST(MirLoweringCSubset, FloatIfConditionLowersAsFCmpUneNotFpToUi) {
     auto L = lowerCSubset(
         "int f(double d) { if (d) return 1; return 0; }");
     ASSERT_FALSE(L.model.hasErrors());
     ASSERT_TRUE(L.hir->ok);
     ASSERT_TRUE(L.mir.ok)
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
-    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::FCmpOne), 1u)
-        << "float truthiness must be the ordered `!= 0.0` compare";
-    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::FCmpOne, 1), TypeKind::F64)
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::FCmpUne), 1u)
+        << "float truthiness must be the UNORDERED `!= 0.0` compare "
+           "(true on NaN — C 6.5.9)";
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::FCmpOne), 0u)
+        << "ordered-ne would make `if (NaN)` false — the exact "
+           "D-COND-FLOAT-NAN-TRUTHINESS-FCMP miscompile";
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::FCmpUne, 1), TypeKind::F64)
         << "the synthetic float zero keeps the cond's own type";
     EXPECT_EQ(countOp(L.mir.mir, MirOpcode::FPToUI), 0u)
         << "the old Cast(F64→Bool) shape routed FPToUI — value-wrong";
