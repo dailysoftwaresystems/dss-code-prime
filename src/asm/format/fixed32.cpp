@@ -48,6 +48,10 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Rd:    return SlotBitWindow{ 0,  5 };
         case EncodingSlotKind::Rn:    return SlotBitWindow{ 5,  5 };
         case EncodingSlotKind::Rm:    return SlotBitWindow{ 16, 5 };
+        // Ra (D-LIR-MOD-MSUB-FUSION): the multiply-accumulate family's
+        // third source register at bits 10..14 (MADD/MSUB Xd, Xn, Xm,
+        // Xa). A plain 5-bit register window like Rd/Rn/Rm.
+        case EncodingSlotKind::Ra:    return SlotBitWindow{ 10, 5 };
         // Imm26 (ARM64 branch displacement, e.g. `bl imm26`) — the
         // operand value at bits 0..25 of the fixed word. Cycle-4
         // scope: source is always a `SymbolRef`; the wire emits a
@@ -98,6 +102,7 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmReg:
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
+        case EncodingSlotKind::Imm8:
         case EncodingSlotKind::Disp32:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
@@ -146,10 +151,15 @@ bool encode(Lir const&                  lir,
     auto const instOps    = lir.instOperands(inst);
     LirReg const result = lir.instResult(inst);
 
-    // First-match variant selection.
+    // First-match variant selection over (operandKinds, width) — the
+    // FC3 c2 width axis (D-CSUBSET-32BIT-ALU-FORMS) is format-agnostic:
+    // the fixed32 walker consults the SAME shared matcher as
+    // x86_variable (arm64 W-forms = width:32 variants whose fixedWord
+    // clears bit 31; width-absent variants match any width).
+    std::uint8_t const instWidth = lirInstWidthBits(lir.instFlags(inst));
     TargetEncodingVariant const* selected = nullptr;
     for (auto const& v : info->encoding.variants) {
-        if (operandsMatchGuard(instOps, v.operandKinds)) {
+        if (walker_util::variantMatchesInst(instOps, instWidth, v)) {
             selected = &v;
             break;
         }
@@ -158,9 +168,9 @@ bool encode(Lir const&                  lir,
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                DiagnosticSeverity::Error,
                std::format("opcode '{}': no encoding variant matches "
-                           "this instruction's operand kinds (declared "
-                           "variants: {})",
-                           info->mnemonic,
+                           "this instruction's operand kinds at width "
+                           "{} (declared variants: {})",
+                           info->mnemonic, instWidth,
                            info->encoding.variants.size()));
         return false;
     }
@@ -185,16 +195,20 @@ bool encode(Lir const&                  lir,
     // `condCodeEncoding` table — a missing table would silently OR zero
     // (= TargetCondCode::Eq's nibble on x86, but ARM64's EQ is also 0) and
     // EVERY conditional branch would resolve as `b.eq`. Same payload
-    // range-gate as x86 (0..9 = the 10-arm TargetCondCode enum).
+    // range-gate as x86 (the full TargetCondCode enum incl. the FC3.5
+    // float arms; an undeclared float ENTRY also fails loud — the
+    // composed-FCmp lowering must never reach a single-cc inst here).
     if (selected->tmpl.condCodeFromPayload) {
         auto const condValue = lir.instPayload(inst);
-        if (condValue > 9u) {
+        if (condValue >= kTargetCondCodeCount) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': cond-code payload {} is out of "
-                               "range [0..9] for TargetCondCode "
-                               "(eq/ne/slt/sle/sgt/sge/ult/ule/ugt/uge)",
-                               info->mnemonic, condValue));
+                               "range [0..{}] for TargetCondCode "
+                               "(eq/ne/slt/sle/sgt/sge/ult/ule/ugt/uge + "
+                               "fogt/foge/foeq/fone/fune/fuo/ford)",
+                               info->mnemonic, condValue,
+                               kTargetCondCodeCount - 1));
             return false;
         }
         auto const condNibble = schema.condCodeEncoding(
@@ -204,8 +218,11 @@ bool encode(Lir const&                  lir,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': variant declares "
                                "condCodeFromPayload but target schema '{}' "
-                               "has no `condCodeEncoding` table",
-                               info->mnemonic, schema.name()));
+                               "declares no `condCodeEncoding` entry for "
+                               "cond '{}'",
+                               info->mnemonic, schema.name(),
+                               targetCondCodeName(static_cast<TargetCondCode>(
+                                   condValue))));
             return false;
         }
         // Place the 4-bit cond nibble at the template's declared bit

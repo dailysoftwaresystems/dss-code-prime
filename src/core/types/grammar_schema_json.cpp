@@ -9,6 +9,7 @@
 #include "core/types/scope_kind.hpp"
 #include "core/types/tree_node.hpp"
 #include "core/types/artifact_profile.hpp"     // kRegisteredArtifactProfiles / isRegisteredArtifactProfile (shared with the object-format loader, AP3)
+#include "core/types/data_model.hpp"           // dataModelFromName (FC3 c1 coreByDataModel keys)
 #include "core/types/object_format_kind.hpp"  // objectFormatKindFromName
 #include "core/types/symbol_attrs.hpp"         // symbolBindingFromName / symbolVisibilityFromName
 
@@ -3309,6 +3310,60 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 return std::nullopt;
             };
 
+            // FC3 c1: the optional `coreByDataModel` sub-object
+            // ({"LLP64": "I32", …}) shared by `builtinTypes` and
+            // `typeSpecifiers` rows. Closed keys: every key must be a
+            // registered DataModel name and every value a core TypeKind —
+            // a typo'd model name would otherwise silently never override
+            // and bake the base width under that model (the exact
+            // knob-that-lies the unknown-key discipline exists to
+            // prevent). Returns false when anything was rejected.
+            auto const readCoreByDataModel =
+                [&](json const& entry, std::string const& path,
+                    std::unordered_map<DataModel, TypeKind>& out) -> bool {
+                if (!entry.contains("coreByDataModel")) return true;
+                auto const& obj = entry.at("coreByDataModel");
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              path + "/coreByDataModel",
+                              "'coreByDataModel' must be an object mapping "
+                              "data-model names to core TypeKinds");
+                    return false;
+                }
+                bool ok = true;
+                for (auto const& [key, val] : obj.items()) {
+                    auto const dm = dataModelFromName(key);
+                    if (!dm) {
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  path + "/coreByDataModel/" + key,
+                                  std::format("unknown data model '{}' (expected "
+                                              "one of 'LP64', 'LLP64', 'ILP32')",
+                                              key));
+                        ok = false;
+                        continue;
+                    }
+                    if (!val.is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  path + "/coreByDataModel/" + key,
+                                  "data-model override must be a core "
+                                  "TypeKind name string");
+                        ok = false;
+                        continue;
+                    }
+                    auto const core = parseCore(val.get<std::string>());
+                    if (!core) {
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  path + "/coreByDataModel/" + key,
+                                  std::format("unknown core TypeKind '{}'",
+                                              val.get<std::string>()));
+                        ok = false;
+                        continue;
+                    }
+                    out.emplace(*dm, *core);
+                }
+                return ok;
+            };
+
             auto const parseKind = [](std::string_view name) -> std::optional<DeclarationKind> {
                 if (name == "variable") return DeclarationKind::Variable;
                 if (name == "function") return DeclarationKind::Function;
@@ -4383,6 +4438,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                       "'typeExtensions'", i, extName));
                                 continue;
                             }
+                            // FC3 c1: an extension type has no core width
+                            // to vary — coreByDataModel on an extension
+                            // row is a config contradiction.
+                            if (entry.contains("coreByDataModel")) {
+                                coll.emit(DiagnosticCode::C_ConflictingField,
+                                          path + "/coreByDataModel",
+                                          "'coreByDataModel' cannot be combined "
+                                          "with 'extension' (extension types "
+                                          "have no data-model-dependent core)");
+                                continue;
+                            }
                             m.extension = std::move(extName);
                             cfg.builtinTypes.push_back(std::move(m));
                             continue;
@@ -4401,6 +4467,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             continue;
                         }
                         m.core = *k;
+                        // FC3 c1: optional per-data-model width override
+                        // (c-subset: long → I64 base, LLP64 → I32).
+                        if (!readCoreByDataModel(entry, path, m.coreByDataModel)) {
+                            continue;
+                        }
                         cfg.builtinTypes.push_back(std::move(m));
                     }
                 }
@@ -4515,8 +4586,747 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             continue;
                         }
                         m.core = *k;
+                        // FC3 c1: optional fixed VALUE for keyword
+                        // literals (`true` → 1). The HIR lowering uses it
+                        // instead of decoding the token text as a number.
+                        if (entry.contains("value")) {
+                            if (!entry.at("value").is_number_integer()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/value",
+                                          "'value' must be an integer");
+                                continue;
+                            }
+                            m.fixedValue = entry.at("value").get<std::int64_t>();
+                        }
                         cfg.literalTypes.push_back(std::move(m));
                     }
+                }
+            }
+
+            // ── FC3 c1: typeSpecifiers (C 6.7.2 keyword multisets) ─────
+            //
+            // Rows: { "tokens": ["UnsignedKeyword","LongKeyword"],
+            //         "core": "U64", "coreByDataModel": {"LLP64": "U32"} }.
+            // The multiset key is canonicalized by SORTING the resolved
+            // token kinds (duplicates legal — `long long` is LongKeyword
+            // twice). Rejected loudly: unknown token-kind names, unknown
+            // cores/model keys (above), EMPTY token lists, and a multiset
+            // already declared by an earlier row (two rows claiming
+            // `unsigned long` would make resolution order-dependent).
+            if (sem.contains("typeSpecifiers")) {
+                json const& arr = sem.at("typeSpecifiers");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/typeSpecifiers",
+                              "'semantics.typeSpecifiers' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path =
+                            std::format("/semantics/typeSpecifiers/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'typeSpecifiers' entry must be an object");
+                            continue;
+                        }
+                        for (auto const& [key, _] : entry.items()) {
+                            if (key != "tokens" && key != "core"
+                                && key != "coreByDataModel"
+                                && key.rfind("$", 0) != 0) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/" + key,
+                                          std::format("unknown 'typeSpecifiers' field "
+                                                      "'{}' — expected 'tokens', 'core', "
+                                                      "or 'coreByDataModel'", key));
+                            }
+                        }
+                        if (!entry.contains("tokens") || !entry.at("tokens").is_array()
+                            || entry.at("tokens").empty()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/tokens",
+                                      "'tokens' is required and must be a non-empty "
+                                      "array of token-kind names");
+                            continue;
+                        }
+                        if (!entry.contains("core") || !entry.at("core").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/core",
+                                      "'core' is required and must be a string");
+                            continue;
+                        }
+                        TypeSpecifierRule rule;
+                        bool tokensOk = true;
+                        for (auto const& t : entry.at("tokens")) {
+                            if (!t.is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/tokens",
+                                          "each 'tokens' entry must be a token-kind "
+                                          "name string");
+                                tokensOk = false;
+                                break;
+                            }
+                            auto const name = t.get<std::string>();
+                            if (!data.schemaTokens->contains(name)) {
+                                coll.emit(DiagnosticCode::C_UnknownToken,
+                                          path + "/tokens",
+                                          std::format("'typeSpecifiers[{}].tokens' "
+                                                      "references unknown token kind "
+                                                      "'{}'", i, name));
+                                tokensOk = false;
+                                break;
+                            }
+                            rule.tokens.push_back(data.schemaTokens->find(name));
+                            rule.tokenNames.push_back(name);
+                        }
+                        if (!tokensOk) continue;
+                        auto const k = parseCore(entry.at("core").get<std::string>());
+                        if (!k) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path + "/core",
+                                      std::format("unknown core TypeKind '{}'",
+                                                  entry.at("core").get<std::string>()));
+                            continue;
+                        }
+                        rule.core = *k;
+                        if (!readCoreByDataModel(entry, path, rule.coreByDataModel)) {
+                            continue;
+                        }
+                        // Canonicalize: sort the (kind, name) pairs by kind id
+                        // so lookup is order-free (C's specifier multiset).
+                        {
+                            std::vector<std::size_t> order(rule.tokens.size());
+                            for (std::size_t n = 0; n < order.size(); ++n) order[n] = n;
+                            std::sort(order.begin(), order.end(),
+                                      [&](std::size_t a, std::size_t b) {
+                                          return rule.tokens[a].v < rule.tokens[b].v;
+                                      });
+                            std::vector<SchemaTokenId> st;
+                            std::vector<std::string>   sn;
+                            st.reserve(order.size());
+                            sn.reserve(order.size());
+                            for (std::size_t n : order) {
+                                st.push_back(rule.tokens[n]);
+                                sn.push_back(rule.tokenNames[n]);
+                            }
+                            rule.tokens     = std::move(st);
+                            rule.tokenNames = std::move(sn);
+                        }
+                        // Duplicate-multiset reject (order-dependent
+                        // resolution would silently shadow the later row).
+                        bool dup = false;
+                        for (auto const& prior : cfg.typeSpecifiers) {
+                            if (prior.tokens.size() != rule.tokens.size()) continue;
+                            bool same = true;
+                            for (std::size_t n = 0; n < prior.tokens.size(); ++n) {
+                                if (prior.tokens[n].v != rule.tokens[n].v) {
+                                    same = false;
+                                    break;
+                                }
+                            }
+                            if (same) { dup = true; break; }
+                        }
+                        if (dup) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      std::format("'typeSpecifiers[{}]' re-declares a "
+                                                  "token multiset already declared by an "
+                                                  "earlier row", i));
+                            continue;
+                        }
+                        cfg.typeSpecifiers.push_back(std::move(rule));
+                    }
+                }
+            }
+
+            // ── FC3 c1: dataModel-aware TYPE-NAME resolution ───────────
+            //
+            // `integerLiteralTyping` candidates and the
+            // `arithmeticConversions` promotion names are SOURCE
+            // spellings ("int", "unsigned long"). Resolve each ONCE at
+            // load: split on spaces, map each word through the keyword
+            // lexeme table to its token kind, and look the sorted
+            // multiset up in `typeSpecifiers`; a single word that misses
+            // falls back to a `builtinTypes` text match (toy-style
+            // languages with no specifier table). Unresolvable → reject
+            // (C_InvalidSemantics) so a typo can never silently no-op.
+            auto const resolveTypeName =
+                [&](std::string const& name, std::string const& path,
+                    DataModelTypeRef& out) -> bool {
+                out.name = name;
+                // Split on single spaces (the JSON spelling convention).
+                std::vector<std::string> words;
+                {
+                    std::size_t pos = 0;
+                    while (pos < name.size()) {
+                        std::size_t const sp = name.find(' ', pos);
+                        if (sp == std::string::npos) {
+                            words.push_back(name.substr(pos));
+                            break;
+                        }
+                        if (sp > pos) words.push_back(name.substr(pos, sp - pos));
+                        pos = sp + 1;
+                    }
+                }
+                if (words.empty()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                              "type name must be non-empty");
+                    return false;
+                }
+                // Try the typeSpecifiers multiset (each word must be a
+                // declared keyword lexeme with exactly one meaning).
+                if (!cfg.typeSpecifiers.empty()) {
+                    std::vector<SchemaTokenId> kinds;
+                    bool allWordsKnown = true;
+                    for (auto const& w : words) {
+                        auto const it = data.lexemeTable.find(w);
+                        if (it == data.lexemeTable.end()
+                            || it->second.size() != 1) {
+                            allWordsKnown = false;
+                            break;
+                        }
+                        kinds.push_back(it->second.front().id);
+                    }
+                    if (allWordsKnown) {
+                        std::sort(kinds.begin(), kinds.end(),
+                                  [](SchemaTokenId a, SchemaTokenId b) {
+                                      return a.v < b.v;
+                                  });
+                        for (auto const& row : cfg.typeSpecifiers) {
+                            if (row.tokens.size() != kinds.size()) continue;
+                            bool same = true;
+                            for (std::size_t n = 0; n < kinds.size(); ++n) {
+                                if (row.tokens[n].v != kinds[n].v) {
+                                    same = false;
+                                    break;
+                                }
+                            }
+                            if (same) {
+                                out.core            = row.core;
+                                out.coreByDataModel = row.coreByDataModel;
+                                return true;
+                            }
+                        }
+                    }
+                }
+                // Single-word fallback: builtinTypes text match (core
+                // rows only — extension types have no width semantics).
+                if (words.size() == 1) {
+                    for (auto const& bt : cfg.builtinTypes) {
+                        if (bt.name == words.front() && !bt.extension.has_value()) {
+                            out.core            = bt.core;
+                            out.coreByDataModel = bt.coreByDataModel;
+                            return true;
+                        }
+                    }
+                }
+                coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                          std::format("type name '{}' resolves to no "
+                                      "'typeSpecifiers' multiset and no "
+                                      "'builtinTypes' entry", name));
+                return false;
+            };
+
+            // Is the resolved ref an INTEGER kind under EVERY data model
+            // it can take? (The ladder + promotion floor are integer
+            // machinery; a float/void name there is a config error.)
+            auto const isIntegerKindName =
+                [](DataModelTypeRef const& r) -> bool {
+                auto const isInt = [](TypeKind k) noexcept {
+                    return k == TypeKind::I8 || k == TypeKind::I16
+                        || k == TypeKind::I32 || k == TypeKind::I64
+                        || k == TypeKind::I128
+                        || k == TypeKind::U8 || k == TypeKind::U16
+                        || k == TypeKind::U32 || k == TypeKind::U64
+                        || k == TypeKind::U128;
+                };
+                if (!isInt(r.core)) return false;
+                for (auto const& [_, k] : r.coreByDataModel) {
+                    if (!isInt(k)) return false;
+                }
+                return true;
+            };
+
+            // ── FC3 c1: integerLiteralTyping (C 6.4.4.1 ladder) ────────
+            if (sem.contains("integerLiteralTyping")) {
+                json const& arr = sem.at("integerLiteralTyping");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/integerLiteralTyping",
+                              "'semantics.integerLiteralTyping' must be an array");
+                } else {
+                    bool rowsOk = true;
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path =
+                            std::format("/semantics/integerLiteralTyping/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'integerLiteralTyping' entry must be "
+                                      "an object");
+                            rowsOk = false;
+                            continue;
+                        }
+                        for (auto const& [key, _] : entry.items()) {
+                            if (key != "suffixes" && key != "decimal"
+                                && key != "nondecimal"
+                                && key.rfind("$", 0) != 0) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/" + key,
+                                          std::format("unknown 'integerLiteralTyping' "
+                                                      "field '{}' — expected 'suffixes', "
+                                                      "'decimal', or 'nondecimal'", key));
+                                rowsOk = false;
+                            }
+                        }
+                        IntegerLiteralTypingRule rule;
+                        if (!entry.contains("suffixes")
+                            || !entry.at("suffixes").is_array()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      path + "/suffixes",
+                                      "'suffixes' is required and must be an array "
+                                      "(empty = the unsuffixed rule)");
+                            rowsOk = false;
+                            continue;
+                        }
+                        bool entryOk = true;
+                        for (auto const& s : entry.at("suffixes")) {
+                            if (!s.is_string() || s.get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/suffixes",
+                                          "each 'suffixes' entry must be a non-empty "
+                                          "string");
+                                entryOk = false;
+                                break;
+                            }
+                            rule.suffixes.push_back(s.get<std::string>());
+                        }
+                        if (!entryOk) { rowsOk = false; continue; }
+                        auto const readCandidates =
+                            [&](char const* key,
+                                std::vector<DataModelTypeRef>& out) -> bool {
+                            if (!entry.contains(key) || !entry.at(key).is_array()
+                                || entry.at(key).empty()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/" + key,
+                                          std::format("'{}' is required and must be a "
+                                                      "non-empty array of type names",
+                                                      key));
+                                return false;
+                            }
+                            for (auto const& nm : entry.at(key)) {
+                                if (!nm.is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/" + key,
+                                              "each candidate must be a type-name "
+                                              "string");
+                                    return false;
+                                }
+                                DataModelTypeRef ref;
+                                if (!resolveTypeName(nm.get<std::string>(),
+                                                     path + "/" + key, ref)) {
+                                    return false;
+                                }
+                                if (!isIntegerKindName(ref)) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/" + key,
+                                              std::format("ladder candidate '{}' must "
+                                                          "resolve to an integer kind "
+                                                          "under every data model",
+                                                          nm.get<std::string>()));
+                                    return false;
+                                }
+                                out.push_back(std::move(ref));
+                            }
+                            return true;
+                        };
+                        if (!readCandidates("decimal", rule.decimal)
+                            || !readCandidates("nondecimal", rule.nondecimal)) {
+                            rowsOk = false;
+                            continue;
+                        }
+                        cfg.integerLiteralTyping.push_back(std::move(rule));
+                    }
+                    // Cross-checks over the loaded rows: every declared
+                    // numberStyle suffix must be covered EXACTLY once, an
+                    // unsuffixed rule must exist, and no rule may name a
+                    // suffix the lexer does not admit (dead config) or one
+                    // another rule already claimed (ambiguous selection).
+                    if (rowsOk && !cfg.integerLiteralTyping.empty()) {
+                        std::unordered_map<std::string, std::size_t> claims;
+                        std::size_t unsuffixedRules = 0;
+                        for (auto const& r : cfg.integerLiteralTyping) {
+                            if (r.suffixes.empty()) ++unsuffixedRules;
+                            for (auto const& s : r.suffixes) ++claims[s];
+                        }
+                        if (unsuffixedRules != 1) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/integerLiteralTyping",
+                                      std::format("'integerLiteralTyping' must declare "
+                                                  "exactly one unsuffixed rule (empty "
+                                                  "'suffixes'); found {}",
+                                                  unsuffixedRules));
+                        }
+                        std::vector<std::string> const* declared =
+                            data.numberStyle.has_value()
+                                ? &data.numberStyle->integerSuffixes
+                                : nullptr;
+                        for (auto const& [sfx, count] : claims) {
+                            if (count > 1) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/integerLiteralTyping",
+                                          std::format("suffix '{}' is claimed by {} "
+                                                      "'integerLiteralTyping' rules — "
+                                                      "selection would be ambiguous",
+                                                      sfx, count));
+                            }
+                            bool const lexerKnows = declared != nullptr
+                                && std::find(declared->begin(), declared->end(), sfx)
+                                       != declared->end();
+                            if (!lexerKnows) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/integerLiteralTyping",
+                                          std::format("suffix '{}' is not declared in "
+                                                      "'numberStyle.integerSuffixes' — "
+                                                      "the rule could never match", sfx));
+                            }
+                        }
+                        if (declared != nullptr) {
+                            for (auto const& sfx : *declared) {
+                                if (!claims.contains(sfx)) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              "/semantics/integerLiteralTyping",
+                                              std::format("'numberStyle.integerSuffixes' "
+                                                          "declares '{}' but no "
+                                                          "'integerLiteralTyping' rule "
+                                                          "covers it — the lexer would "
+                                                          "admit a literal the ladder "
+                                                          "cannot type", sfx));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── FC3.5 sweep-c2: floatLiteralTyping (C 6.4.4.2 suffix map) ──
+            // The integer ladder's float sibling — suffix-keyed only
+            // (no magnitude/radix machinery). Same load-time
+            // resolution + the same coverage cross-checks against
+            // `numberStyle.floatSuffixes`.
+            if (sem.contains("floatLiteralTyping")) {
+                json const& arr = sem.at("floatLiteralTyping");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/floatLiteralTyping",
+                              "'semantics.floatLiteralTyping' must be an array");
+                } else {
+                    // Is the resolved ref a FLOAT kind under every data
+                    // model? (A float-typing rule naming an integer/void
+                    // type is a config error.)
+                    auto const isFloatKindName =
+                        [](DataModelTypeRef const& r) -> bool {
+                        auto const isFlt = [](TypeKind k) noexcept {
+                            return k == TypeKind::F16 || k == TypeKind::F32
+                                || k == TypeKind::F64 || k == TypeKind::F128;
+                        };
+                        if (!isFlt(r.core)) return false;
+                        for (auto const& [_, k] : r.coreByDataModel) {
+                            if (!isFlt(k)) return false;
+                        }
+                        return true;
+                    };
+                    bool rowsOk = true;
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path =
+                            std::format("/semantics/floatLiteralTyping/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'floatLiteralTyping' entry must be "
+                                      "an object");
+                            rowsOk = false;
+                            continue;
+                        }
+                        for (auto const& [key, _] : entry.items()) {
+                            if (key != "suffixes" && key != "type"
+                                && key.rfind("$", 0) != 0) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/" + key,
+                                          std::format("unknown 'floatLiteralTyping' "
+                                                      "field '{}' — expected 'suffixes' "
+                                                      "or 'type'", key));
+                                rowsOk = false;
+                            }
+                        }
+                        FloatLiteralTypingRule rule;
+                        if (!entry.contains("suffixes")
+                            || !entry.at("suffixes").is_array()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      path + "/suffixes",
+                                      "'suffixes' is required and must be an array "
+                                      "(empty = the unsuffixed rule)");
+                            rowsOk = false;
+                            continue;
+                        }
+                        bool entryOk = true;
+                        for (auto const& s : entry.at("suffixes")) {
+                            if (!s.is_string() || s.get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/suffixes",
+                                          "each 'suffixes' entry must be a non-empty "
+                                          "string");
+                                entryOk = false;
+                                break;
+                            }
+                            rule.suffixes.push_back(s.get<std::string>());
+                        }
+                        if (!entryOk) { rowsOk = false; continue; }
+                        if (!entry.contains("type")
+                            || !entry.at("type").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      path + "/type",
+                                      "'type' is required and must be a type-name "
+                                      "string");
+                            rowsOk = false;
+                            continue;
+                        }
+                        if (!resolveTypeName(entry.at("type").get<std::string>(),
+                                             path + "/type", rule.type)) {
+                            rowsOk = false;
+                            continue;
+                        }
+                        if (!isFloatKindName(rule.type)) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      path + "/type",
+                                      std::format("float-typing rule type '{}' must "
+                                                  "resolve to a float kind under "
+                                                  "every data model",
+                                                  entry.at("type").get<std::string>()));
+                            rowsOk = false;
+                            continue;
+                        }
+                        cfg.floatLiteralTyping.push_back(std::move(rule));
+                    }
+                    // Cross-checks (mirror the integer ladder's): exactly
+                    // one unsuffixed rule; every declared
+                    // numberStyle.floatSuffixes spelling covered exactly
+                    // once; no rule naming a suffix the lexer doesn't
+                    // admit.
+                    if (rowsOk && !cfg.floatLiteralTyping.empty()) {
+                        std::unordered_map<std::string, std::size_t> claims;
+                        std::size_t unsuffixedRules = 0;
+                        for (auto const& r : cfg.floatLiteralTyping) {
+                            if (r.suffixes.empty()) ++unsuffixedRules;
+                            for (auto const& s : r.suffixes) ++claims[s];
+                        }
+                        if (unsuffixedRules != 1) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/floatLiteralTyping",
+                                      std::format("'floatLiteralTyping' must declare "
+                                                  "exactly one unsuffixed rule (empty "
+                                                  "'suffixes'); found {}",
+                                                  unsuffixedRules));
+                        }
+                        std::vector<std::string> const* declared =
+                            data.numberStyle.has_value()
+                                ? &data.numberStyle->floatSuffixes
+                                : nullptr;
+                        for (auto const& [sfx, count] : claims) {
+                            if (count > 1) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/floatLiteralTyping",
+                                          std::format("suffix '{}' is claimed by {} "
+                                                      "'floatLiteralTyping' rules — "
+                                                      "selection would be ambiguous",
+                                                      sfx, count));
+                            }
+                            bool const lexerKnows = declared != nullptr
+                                && std::find(declared->begin(), declared->end(), sfx)
+                                       != declared->end();
+                            if (!lexerKnows) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/floatLiteralTyping",
+                                          std::format("suffix '{}' is not declared in "
+                                                      "'numberStyle.floatSuffixes' — "
+                                                      "the rule could never match", sfx));
+                            }
+                        }
+                        if (declared != nullptr) {
+                            for (auto const& sfx : *declared) {
+                                if (!claims.contains(sfx)) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              "/semantics/floatLiteralTyping",
+                                              std::format("'numberStyle.floatSuffixes' "
+                                                          "declares '{}' but no "
+                                                          "'floatLiteralTyping' rule "
+                                                          "covers it — the lexer would "
+                                                          "admit a literal the typing "
+                                                          "map cannot type", sfx));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── FC3 c1: arithmeticConversions (C 6.3.1.8 parameters) ───
+            if (sem.contains("arithmeticConversions")) {
+                json const& obj = sem.at("arithmeticConversions");
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/arithmeticConversions",
+                              "'arithmeticConversions' must be an object");
+                } else {
+                    bool ok = true;
+                    for (auto const& [key, _] : obj.items()) {
+                        if (key != "integerPromotion" && key != "mixedSignedness"
+                            && key != "promoteComparisons"
+                            && key.rfind("$", 0) != 0) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/arithmeticConversions/" + key,
+                                      std::format("unknown 'arithmeticConversions' "
+                                                  "field '{}' — expected "
+                                                  "'integerPromotion', "
+                                                  "'mixedSignedness', or "
+                                                  "'promoteComparisons'", key));
+                            ok = false;
+                        }
+                    }
+                    ArithmeticConversions ac;
+                    if (!obj.contains("integerPromotion")
+                        || !obj.at("integerPromotion").is_object()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/arithmeticConversions/integerPromotion",
+                                  "'integerPromotion' is required and must be an "
+                                  "object with 'minRankType'");
+                        ok = false;
+                    } else {
+                        json const& ip = obj.at("integerPromotion");
+                        for (auto const& [key, _] : ip.items()) {
+                            if (key != "minRankType" && key != "alsoPromote"
+                                && key.rfind("$", 0) != 0) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/arithmeticConversions/"
+                                          "integerPromotion/" + key,
+                                          std::format("unknown 'integerPromotion' "
+                                                      "field '{}' — expected "
+                                                      "'minRankType' or 'alsoPromote'",
+                                                      key));
+                                ok = false;
+                            }
+                        }
+                        if (!ip.contains("minRankType")
+                            || !ip.at("minRankType").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      "/semantics/arithmeticConversions/"
+                                      "integerPromotion/minRankType",
+                                      "'minRankType' is required and must be a "
+                                      "type-name string");
+                            ok = false;
+                        } else if (!resolveTypeName(
+                                       ip.at("minRankType").get<std::string>(),
+                                       "/semantics/arithmeticConversions/"
+                                       "integerPromotion/minRankType",
+                                       ac.minRankType)) {
+                            ok = false;
+                        } else if (!isIntegerKindName(ac.minRankType)) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/arithmeticConversions/"
+                                      "integerPromotion/minRankType",
+                                      "'minRankType' must resolve to an integer "
+                                      "kind under every data model");
+                            ok = false;
+                        }
+                        if (ip.contains("alsoPromote")) {
+                            if (!ip.at("alsoPromote").is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/arithmeticConversions/"
+                                          "integerPromotion/alsoPromote",
+                                          "'alsoPromote' must be an array of "
+                                          "type names");
+                                ok = false;
+                            } else {
+                                for (auto const& nm : ip.at("alsoPromote")) {
+                                    if (!nm.is_string()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  "/semantics/arithmeticConversions/"
+                                                  "integerPromotion/alsoPromote",
+                                                  "each 'alsoPromote' entry must be a "
+                                                  "type-name string");
+                                        ok = false;
+                                        continue;
+                                    }
+                                    DataModelTypeRef ref;
+                                    if (!resolveTypeName(
+                                            nm.get<std::string>(),
+                                            "/semantics/arithmeticConversions/"
+                                            "integerPromotion/alsoPromote", ref)) {
+                                        ok = false;
+                                        continue;
+                                    }
+                                    // The promotion SOURCES may be outside the
+                                    // integer rank lattice (that is the point:
+                                    // Bool/Char join promotion) but a float /
+                                    // void source is meaningless.
+                                    auto const promotable = [](TypeKind k) noexcept {
+                                        return k != TypeKind::Void
+                                            && k != TypeKind::F16 && k != TypeKind::F32
+                                            && k != TypeKind::F64 && k != TypeKind::F128;
+                                    };
+                                    bool good = promotable(ref.core);
+                                    for (auto const& [_, k2] : ref.coreByDataModel) {
+                                        if (!promotable(k2)) good = false;
+                                    }
+                                    if (!good) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  "/semantics/arithmeticConversions/"
+                                                  "integerPromotion/alsoPromote",
+                                                  std::format("'{}' cannot join integer "
+                                                              "promotion (float/void "
+                                                              "kind)",
+                                                              nm.get<std::string>()));
+                                        ok = false;
+                                        continue;
+                                    }
+                                    ac.alsoPromote.push_back(std::move(ref));
+                                }
+                            }
+                        }
+                    }
+                    if (!obj.contains("mixedSignedness")
+                        || !obj.at("mixedSignedness").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/arithmeticConversions/mixedSignedness",
+                                  "'mixedSignedness' is required and must be a "
+                                  "string (closed verb)");
+                        ok = false;
+                    } else {
+                        auto const verb =
+                            obj.at("mixedSignedness").get<std::string>();
+                        if (verb == "rank-prefer-unsigned") {
+                            ac.mixedSignedness =
+                                MixedSignednessRule::RankPreferUnsigned;
+                        } else {
+                            // CLOSED verb — an unknown spelling must never
+                            // silently fall back to a default polarity.
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/arithmeticConversions/"
+                                      "mixedSignedness",
+                                      std::format("unknown 'mixedSignedness' verb "
+                                                  "'{}' — expected "
+                                                  "'rank-prefer-unsigned'", verb));
+                            ok = false;
+                        }
+                    }
+                    if (obj.contains("promoteComparisons")) {
+                        if (!obj.at("promoteComparisons").is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/arithmeticConversions/"
+                                      "promoteComparisons",
+                                      "'promoteComparisons' must be a boolean");
+                            ok = false;
+                        } else {
+                            ac.promoteComparisons =
+                                obj.at("promoteComparisons").get<bool>();
+                        }
+                    }
+                    if (ok) cfg.arithmeticConversions = std::move(ac);
                 }
             }
 
@@ -4713,6 +5523,55 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         if (!ok) continue;
 
                         cfg.castRules.push_back(std::move(rule));
+                    }
+                }
+            }
+
+            // ── compoundLiterals (FC3.5 sweep-c3,
+            //    D-CSUBSET-COMPOUND-LITERAL-TYPEDEF) ──
+            // `{ rule, typeChild }` — the compound-literal expression
+            // shape; Pass 2 resolves + stamps the type child through the
+            // standard type-position resolver (typedefs included). NO
+            // operandChild and NO cast-matrix validation — a compound
+            // literal is postfix syntax, not a conversion.
+            if (sem.contains("compoundLiterals")) {
+                json const& arr = sem.at("compoundLiterals");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/compoundLiterals",
+                              "'semantics.compoundLiterals' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path =
+                            std::format("/semantics/compoundLiterals/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'compoundLiterals' entry must be "
+                                      "an object");
+                            continue;
+                        }
+                        if (!entry.contains("rule") || !entry.at("rule").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/rule",
+                                      "'rule' is required and must be a string");
+                            continue;
+                        }
+                        CompoundLiteralRule rule;
+                        rule.ruleName = entry.at("rule").get<std::string>();
+                        if (!data.rules->contains(rule.ruleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path + "/rule",
+                                      std::format("'compoundLiterals[{}].rule' "
+                                                  "references unknown shape '{}'",
+                                                  i, rule.ruleName));
+                            continue;
+                        }
+                        rule.rule = data.rules->find(rule.ruleName);
+
+                        bool ok = true;
+                        readReqIndex(entry, "typeChild", path, rule.typeChild, ok);
+                        if (!ok) continue;
+
+                        cfg.compoundLiteralRules.push_back(std::move(rule));
                     }
                 }
             }

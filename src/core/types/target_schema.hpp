@@ -187,19 +187,51 @@ enum class TargetCondCode : std::uint8_t {
     Ule = 7,  // unsigned <=
     Ugt = 8,  // unsigned >
     Uge = 9,  // unsigned >=
+    // FC3.5 sweep-c2 (FCmp LIR lowering — D-COND-FLOAT-NAN-TRUTHINESS-
+    // FCMP adjudication): FLOAT condition codes over the flags an FP
+    // compare instruction sets (x86 UCOMISD/UCOMISS → ZF/PF/CF; arm64
+    // FCMP → NZCV). These are SEPARATE entries from the integer codes
+    // because the (predicate → ISA condition) mapping diverges per
+    // target: arm64 float `>` is GT (the SIGNED nibble — FCMP's NZCV
+    // makes N=V mean ordered-ge), while x86 float `>` is `a` (the
+    // UNSIGNED nibble — UCOMI sets CF like an unsigned compare).
+    // Reusing the integer entries would silently encode HI on arm64
+    // (TRUE on unordered — a NaN miscompile). Declared per-target in
+    // `condCodeEncoding`; the float arms are OPTIONAL — an undeclared
+    // float code means the target realizes that predicate by the
+    // universal two-setcc COMPOSITION (see mir_to_lir's
+    // `floatCmpPlan`), and the encoder fails loud if a single-cc
+    // setcc/jcc reaches it anyway.
+    Fogt = 10,  // float ordered >   (false on unordered)
+    Foge = 11,  // float ordered >=  (false on unordered)
+    Foeq = 12,  // float ordered ==  (false on unordered)
+    Fone = 13,  // float ordered !=  (false on unordered)
+    Fune = 14,  // float unordered-or-unequal != (TRUE on unordered — C 6.5.9)
+    Fuo  = 15,  // unordered (NaN operand): x86 PF=1 / arm64 VS
+    Ford = 16,  // ordered (no NaN):        x86 PF=0 / arm64 VC
 };
 
-inline constexpr EnumNameTable<TargetCondCode, 10> kTargetCondCodeTable{{{
-    { TargetCondCode::Eq,  "eq"  },
-    { TargetCondCode::Ne,  "ne"  },
-    { TargetCondCode::Slt, "slt" },
-    { TargetCondCode::Sle, "sle" },
-    { TargetCondCode::Sgt, "sgt" },
-    { TargetCondCode::Sge, "sge" },
-    { TargetCondCode::Ult, "ult" },
-    { TargetCondCode::Ule, "ule" },
-    { TargetCondCode::Ugt, "ugt" },
-    { TargetCondCode::Uge, "uge" },
+inline constexpr std::size_t kTargetCondCodeCount = 17;
+
+inline constexpr EnumNameTable<TargetCondCode, kTargetCondCodeCount>
+kTargetCondCodeTable{{{
+    { TargetCondCode::Eq,   "eq"   },
+    { TargetCondCode::Ne,   "ne"   },
+    { TargetCondCode::Slt,  "slt"  },
+    { TargetCondCode::Sle,  "sle"  },
+    { TargetCondCode::Sgt,  "sgt"  },
+    { TargetCondCode::Sge,  "sge"  },
+    { TargetCondCode::Ult,  "ult"  },
+    { TargetCondCode::Ule,  "ule"  },
+    { TargetCondCode::Ugt,  "ugt"  },
+    { TargetCondCode::Uge,  "uge"  },
+    { TargetCondCode::Fogt, "fogt" },
+    { TargetCondCode::Foge, "foge" },
+    { TargetCondCode::Foeq, "foeq" },
+    { TargetCondCode::Fone, "fone" },
+    { TargetCondCode::Fune, "fune" },
+    { TargetCondCode::Fuo,  "fuo"  },
+    { TargetCondCode::Ford, "ford" },
 }}};
 
 [[nodiscard]] constexpr std::string_view targetCondCodeName(TargetCondCode c) noexcept {
@@ -806,11 +838,31 @@ enum class EncodingSlotKind : std::uint8_t {
     // D-CSUBSET-LONG-BRANCH). `isSymbolBearingSlot` returns FALSE (no
     // relocationKind — resolved intra-function, not at link time).
     Imm19 = 20,
+    // FC3.5 sweep-c1 (shifts end-to-end): the x86 8-bit immediate
+    // slot — ONE byte appended after ModR/M (and SIB when present),
+    // before any imm32 bytes. First consumer: the constant-count
+    // shift forms `SHL/SHR/SAR r/m, imm8` (C1 /4 /5 /7 ib per the
+    // Intel SDM). The walker range-checks the wired value to [0,255]
+    // fail-loud (never silently truncates a wider immediate to one
+    // byte). The variant GUARD vocabulary is unchanged — the operand
+    // KIND filter stays `"imm32"` (= the LirOperandKind::ImmInt
+    // discriminator; the historical width-labeled name); the SLOT
+    // decides the emitted width.
+    Imm8 = 21,
+    // FC3.5 sweep-c3 (D-LIR-MOD-MSUB-FUSION): the fixed32 THIRD source-
+    // register field at bits 10..14 — AArch64's `Ra` (the addend /
+    // minuend register of the multiply-accumulate family: MADD/MSUB/
+    // SMADDL/UMSUBL all carry Rm[20:16] | o0[15] | Ra[14:10] | Rn[9:5]
+    // | Rd[4:0]). First consumer: the arm64 `msub` opcode (MSUB Xd,
+    // Xn, Xm, Xa = Xa − Xn·Xm), the fused realization of rule 3's
+    // remainder expansion rem = n − (n/d)·d. NOT symbol-bearing; a
+    // plain 5-bit register window exactly like Rd/Rn/Rm.
+    Ra = 22,
     // Future fixed32 slots (paired with their consumer cycle):
     //   ImmShift / Sf-flag / scaled LDR imm12 / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 21> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 23> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -832,6 +884,8 @@ inline constexpr EnumNameTable<EncodingSlotKind, 21> kEncodingSlotKindTable{{{
     { EncodingSlotKind::Imm12,         "imm12"          },
     { EncodingSlotKind::SymbolPatchMarker, "sym.patch"   },
     { EncodingSlotKind::Imm19,         "imm19"          },
+    { EncodingSlotKind::Imm8,          "imm8"           },
+    { EncodingSlotKind::Ra,            "ra"             },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -850,7 +904,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 21,
+static_assert(kEncodingSlotKindCount == 23,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -868,6 +922,7 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmReg:
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
+        case EncodingSlotKind::Imm8:
         case EncodingSlotKind::Disp32:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
@@ -880,6 +935,7 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:
+        case EncodingSlotKind::Ra:
         case EncodingSlotKind::Imm26:
         case EncodingSlotKind::Imm16:
         case EncodingSlotKind::Imm9:
@@ -1054,9 +1110,11 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmReg:
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
+        case EncodingSlotKind::Imm8:
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:
+        case EncodingSlotKind::Ra:
         case EncodingSlotKind::Imm16:
         case EncodingSlotKind::Imm9:
         case EncodingSlotKind::MemBaseNoScale:
@@ -1162,6 +1220,19 @@ struct DSS_EXPORT ResultSlotExtra {
 
 struct DSS_EXPORT TargetEncodingVariant {
     std::vector<OperandKindFilter>     operandKinds;
+    // FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): optional WIDTH discriminator
+    // on the guard — the JSON key `guard.width`. 0 = absent = the
+    // variant matches an instruction of ANY width (every pre-FC3
+    // variant; width-invariant ops like loads/stores/branches keep
+    // this). 32/64 = the variant matches ONLY an instruction whose
+    // `lirInstWidthBits(flags)` equals it (the 32-bit no-REX.W x86
+    // forms / arm64 W-forms vs their 64-bit siblings — same mnemonic,
+    // same operand shape, different encoded width). The loader
+    // rejects any other value; validate() rejects two same-kind
+    // variants with the same width AND the ambiguous mix of a
+    // width-keyed variant with a width-absent same-kind sibling
+    // (first-match dispatch would silently shadow one of them).
+    std::uint8_t                       guardWidthBits = 0;
     TargetEncodingTemplate             tmpl;
     // Where the instruction's RESULT register goes (when the inst
     // has a result). Nullopt for value-less instructions (e.g.
@@ -1710,16 +1781,23 @@ struct DSS_EXPORT TargetSchemaData {
 
     // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03):
     // per-target mapping from abstract `TargetCondCode` (substrate-tier
-    // 10-arm enum: Eq/Ne/Slt/Sle/Sgt/Sge/Ult/Ule/Ugt/Uge) to a numeric
-    // encoding used by the ISA's conditional opcodes. x86_64 uses the
-    // low 4 bits of the setcc/jcc opcode byte: Eq=4, Ne=5, Slt=12,
-    // Sle=14, Sgt=15, Sge=13, Ult=2, Ule=6, Ugt=7, Uge=3. ARM64 uses
-    // the same low-4-bits position but a different numeric mapping in
-    // bits 0..3 of the 32-bit B.cc instruction word. Empty means the
-    // target has no cond-code-bearing opcodes (declarative-only
-    // targets). When populated, MUST contain exactly 10 entries
-    // indexed by `(uint8_t)TargetCondCode` — validate() enforces.
-    std::array<std::uint8_t, 10> condCodeEncoding{};
+    // enum: 10 integer arms Eq/Ne/Slt/Sle/Sgt/Sge/Ult/Ule/Ugt/Uge + the
+    // FC3.5-c2 float arms) to a numeric encoding used by the ISA's
+    // conditional opcodes. x86_64 uses the low 4 bits of the setcc/jcc
+    // opcode byte: Eq=4, Ne=5, Slt=12, Sle=14, Sgt=15, Sge=13, Ult=2,
+    // Ule=6, Ugt=7, Uge=3. ARM64 uses the same low-4-bits position but
+    // a different numeric mapping in bits 0..3 of the 32-bit B.cc
+    // instruction word. Empty means the target has no cond-code-bearing
+    // opcodes (declarative-only targets). When populated, MUST contain
+    // all 10 INTEGER entries indexed by `(uint8_t)TargetCondCode`; the
+    // FLOAT arms (fogt/foge/foeq/fone/fune/fuo/ford) are OPTIONAL —
+    // `condCodeDeclared` records which entries the JSON actually
+    // declared, and `condCodeEncoding()` returns nullopt for an
+    // undeclared one (the MIR→LIR FCmp lowering reads that as "this
+    // target realizes the predicate via the two-setcc composition";
+    // the encoder fails loud if a single-cc inst reaches it anyway).
+    std::array<std::uint8_t, kTargetCondCodeCount> condCodeEncoding{};
+    std::array<bool, kTargetCondCodeCount>         condCodeDeclared{};
     // Companion bit: `true` once `condCodeEncoding` has been populated
     // from the JSON (any value, including all-zero, is legal — the
     // distinction is "is this table loaded vs. default-initialized").
@@ -1917,15 +1995,23 @@ public:
 
     // ── Cond-code encoding (D-CSUBSET-WHILE-LOOP-SUBSTRATE) ──────
     // Returns the target's numeric encoding for `cond`, or `nullopt`
-    // when this target hasn't declared a `condCodeEncoding` table.
+    // when this target hasn't declared a `condCodeEncoding` table OR
+    // hasn't declared THIS entry (the float arms are per-entry
+    // optional — FC3.5 sweep-c2; an undeclared float cond means the
+    // MIR→LIR FCmp lowering must use the two-setcc composition).
     // The encoder for cond-code-bearing opcodes (setcc / jcc on x86;
-    // B.cc on ARM64) gates on this — a missing table fails loud
-    // (A_NoCondCodeEncoding) rather than silently OR'ing zero into
-    // the opcode byte (which would map every condition to `eq`).
+    // B.cc / CSET on ARM64) gates on this — a missing table/entry
+    // fails loud (A_NoCondCodeEncoding) rather than silently OR'ing
+    // zero into the opcode byte (which would map every condition to
+    // `eq`). The bounds check guards a corrupt payload cast: an
+    // out-of-enum payload reads as undeclared, never out-of-bounds.
     [[nodiscard]] std::optional<std::uint8_t> condCodeEncoding(
             TargetCondCode cond) const noexcept {
         if (!d_.condCodeEncodingLoaded) return std::nullopt;
-        return d_.condCodeEncoding[static_cast<std::uint8_t>(cond)];
+        auto const idx = static_cast<std::size_t>(cond);
+        if (idx >= d_.condCodeEncoding.size()) return std::nullopt;
+        if (!d_.condCodeDeclared[idx]) return std::nullopt;
+        return d_.condCodeEncoding[idx];
     }
     [[nodiscard]] bool condCodeEncodingLoaded() const noexcept {
         return d_.condCodeEncodingLoaded;

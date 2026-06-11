@@ -325,6 +325,40 @@ TEST(ConstFold, WrapsI32OnAddOverflow) {
         << "i32 wrap: 0x7FFFFFFF + 1 must wrap to INT32_MIN";
 }
 
+TEST(ConstFold, WrapsU32OnAddOverflowToZero) {
+    // FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): the U32 sibling of the I32
+    // wrap pin — 0xFFFFFFFFu + 1u is C-DEFINED to be 0 (modulo-2^32).
+    // This is the FOLDED shape of the u32_wraparound corpus' witness;
+    // a 64-wide fold would produce 0x100000000 and the optimized arm
+    // would diverge from the runtime 32-bit add. (The corpus example
+    // itself carries no constfold arm — the folded 0xFFFFFFFF constant
+    // hits arm64's pre-existing MOVZ-imm16 wide-immediate wall — so
+    // this unit pin carries the fold-width contract.)
+    TypeInterner interner{CompilationUnitId{1}};
+    BuildResult br;
+    auto const u32 = interner.primitive(TypeKind::U32);
+    br.fnSig = interner.fnSig({}, u32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(br.fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirLiteralValue va; va.value = std::int64_t{0xFFFFFFFF}; va.core = TypeKind::U32;
+    MirLiteralValue vb; vb.value = std::int64_t{1};          vb.core = TypeKind::U32;
+    MirInstId const ops[] = {mb.addConst(va, u32), mb.addConst(vb, u32)};
+    mb.addReturn(mb.addInst(MirOpcode::Add, ops, u32));
+    br.mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runConstFold(br.mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsFolded, 1u);
+    auto const ret = inspectReturnOperand(br.mir);
+    ASSERT_TRUE(ret.isConst);
+    EXPECT_EQ(ret.constValue, std::int64_t{0})
+        << "u32 wrap: 0xFFFFFFFF + 1 must wrap to 0 (defined "
+           "unsigned wraparound)";
+}
+
 // G3: nested folding. `Add(Mul(2, 3), 7)` must fold to `Const 13` in
 // a SINGLE pass — the Mul folds to a Const that the constCache
 // resolves so the Add also folds. Regression target: a constCache

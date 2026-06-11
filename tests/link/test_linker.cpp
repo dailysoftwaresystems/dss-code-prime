@@ -56,6 +56,7 @@ namespace {
 // `test_elf_writer.cpp`).
 constexpr std::string_view kFormatMatchingX86_64 = R"({
   "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
   "format": {"name": "test-elf", "kind": "elf"},
   "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
   "sections": [
@@ -78,6 +79,7 @@ constexpr std::string_view kFormatMatchingX86_64 = R"({
 // declared so the ELF walker doesn't pollute the diagnostic count.
 constexpr std::string_view kFormatMissingReloc = R"({
   "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
   "format": {"name": "test-elf-bare", "kind": "elf"},
   "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
   "sections": [

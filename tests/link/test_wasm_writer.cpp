@@ -51,6 +51,7 @@ TEST(WasmFormatJson, WasmKindWithElfBlockRejected) {
     // the LK8 cross-kind guard. Now rejected at load.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"wasm-with-elf-block","kind":"wasm"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel" }
     })");
@@ -60,6 +61,7 @@ TEST(WasmFormatJson, WasmKindWithElfBlockRejected) {
 TEST(WasmFormatJson, WasmKindWithPeBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"wasm-with-pe-block","kind":"wasm"},
       "pe": { "machine": 34404, "type": "obj" }
     })");
@@ -69,6 +71,7 @@ TEST(WasmFormatJson, WasmKindWithPeBlockRejected) {
 TEST(WasmFormatJson, WasmKindWithMachoBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"wasm-with-macho-block","kind":"wasm"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "object", "flags": 0 }
     })");
@@ -82,6 +85,7 @@ TEST(WasmFormatJson, WasmKindWithUniversalFieldRejected) {
     // be silently ignored by the walker. Validate-reject at load.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"wasm-with-relocations","kind":"wasm"},
       "relocations": [{"name":"R_X86_64_PC32","kind":1,"nativeId":2}]
     })");
@@ -95,6 +99,7 @@ TEST(ObjectFormatJsonCrossKind, ElfKindWithPeBlockRejected) {
     // a rule fails fast.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"elf-with-pe-block","kind":"elf"},
       "pe": { "machine": 34404, "type": "obj" }
     })");
@@ -104,6 +109,7 @@ TEST(ObjectFormatJsonCrossKind, ElfKindWithPeBlockRejected) {
 TEST(ObjectFormatJsonCrossKind, PeKindWithMachoBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"pe-with-macho-block","kind":"pe"},
       "pe": { "machine": 34404, "type": "obj" },
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "object", "flags": 0 }
@@ -117,6 +123,7 @@ TEST(ObjectFormatJsonCrossKind, MachoKindWithOptionalHeaderBlockRejected) {
     // the 5 rules are unreachable.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-with-pe-oh-block","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "object", "flags": 0 },
       "optionalHeader": { "magic": 523 }

@@ -21,12 +21,15 @@ namespace dss {
 
 namespace detail {
 
-// Strip exactly ONE longest-matching declared suffix from the END of
-// the text. Never strips mid-text: in a hex-float `0x1.fp3` the 'f'
-// is a MANTISSA DIGIT, and in a base-36 integer a suffix letter can
-// be a digit — only the trailing position is unambiguous.
+// The ONE longest-matching declared suffix at the END of the text (the
+// matched spelling, or the empty view when none matches). Never matches
+// mid-text: in a hex-float `0x1.fp3` the 'f' is a MANTISSA DIGIT, and in
+// a base-36 integer a suffix letter can be a digit — only the trailing
+// position is unambiguous. Shared by the strip below AND the FC3 c1
+// integer-literal ladder (which classifies the literal by WHICH declared
+// suffix spelling matched) so the two can never disagree on the match.
 [[nodiscard]] inline std::string_view
-stripTrailingSuffix(std::string_view text,
+matchTrailingSuffix(std::string_view text,
                     std::vector<std::string> const& suffixes) {
     std::size_t best = 0;
     for (auto const& sfx : suffixes) {
@@ -35,11 +38,67 @@ stripTrailingSuffix(std::string_view text,
             best = sfx.size();
         }
     }
-    text.remove_suffix(best);
+    return text.substr(text.size() - best);
+}
+
+// Strip exactly ONE longest-matching declared suffix from the END of
+// the text (via the shared matcher above).
+[[nodiscard]] inline std::string_view
+stripTrailingSuffix(std::string_view text,
+                    std::vector<std::string> const& suffixes) {
+    text.remove_suffix(matchTrailingSuffix(text, suffixes).size());
     return text;
 }
 
 }  // namespace detail
+
+// FC3 c1: the declared integer suffix spelling an integer literal's raw
+// text carries (longest tail match against `ns->integerSuffixes`), or the
+// empty view for an unsuffixed literal / null style. The integer-literal
+// ladder keys its rule selection on the EXACT matched spelling.
+[[nodiscard]] inline std::string_view
+matchIntegerSuffix(std::string_view text, NumberStyle const* ns) {
+    if (ns == nullptr) return {};
+    return detail::matchTrailingSuffix(text, ns->integerSuffixes);
+}
+
+// FC3.5 sweep-c2: the float sibling — the declared float suffix
+// spelling a float literal's raw text carries (longest tail match
+// against `ns->floatSuffixes`), or the empty view for an unsuffixed
+// literal / null style. `typeFloatLiteral` keys its rule selection on
+// the EXACT matched spelling (the same match `decodeFloat`'s suffix
+// strip performs, so typing and decode can never disagree).
+[[nodiscard]] inline std::string_view
+matchFloatSuffix(std::string_view text, NumberStyle const* ns) {
+    if (ns == nullptr) return {};
+    return detail::matchTrailingSuffix(text, ns->floatSuffixes);
+}
+
+// FC3 c1: true iff the literal's text (suffix + separators stripped —
+// the SAME normalization `decodeInteger` applies) starts with a declared
+// `integerPrefixes` prefix. This is the ladder's radix-CLASS test: C
+// 6.4.4.1 gives octal/hex ("nondecimal") constants extra unsigned
+// candidates. Mirrors `decodeInteger`'s longest-prefix scan exactly so
+// the class and the decoded value can never disagree about the radix.
+[[nodiscard]] inline bool
+integerLiteralIsPrefixed(std::string_view text, NumberStyle const* ns) {
+    if (ns == nullptr) return false;
+    text = detail::stripTrailingSuffix(text, ns->integerSuffixes);
+    std::string s;
+    s.reserve(text.size());
+    char const sep = ns->digitSeparator ? *ns->digitSeparator : '\0';
+    for (char c : text) {
+        if (sep != '\0' && c == sep) continue;
+        s += c;
+    }
+    for (auto const& p : ns->integerPrefixes) {
+        if (s.size() >= p.prefix.size()
+            && std::string_view{s}.substr(0, p.prefix.size()) == p.prefix) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // Decode an integer literal's text per the language's NumberStyle:
 // strip ONE trailing declared integer suffix, strip digit separators,

@@ -361,6 +361,53 @@ TEST(TargetSchema, ImplicitRegisterRolesValidDeclarationLoadsAndResolves) {
     EXPECT_FALSE(ir.inputOrdinalForRole("quotient").has_value());
 }
 
+// FC3.5 sweep-c1: "count" joined the registered role vocabulary — the
+// shift-count input of the implicit-count shift realization (x86 SHL/
+// SHR/SAR read CL; the MIR→LIR shift lowering pins the count vreg by
+// this role). A declaration must load + resolve; the SHIPPED x86_64
+// schema must actually declare it on all three shift opcodes.
+TEST(TargetSchema, ImplicitRegisterCountRoleLoadsAndShipsOnX64Shifts) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"fakeshift","result":"value",
+               "implicitRegisters":{
+                 "inputs":["rcx"],
+                 "clobbered":["rcx"],
+                 "inputRoles": {"count":"rcx"}
+               }}
+            ],
+            "registers":[
+              {"name":"rcx","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_TRUE(r.has_value()) << "the count role must be registered";
+    auto const op = (*r)->opcodeByMnemonic("fakeshift");
+    ASSERT_TRUE(op.has_value());
+    auto const* info = (*r)->opcodeInfo(*op);
+    ASSERT_NE(info, nullptr);
+    ASSERT_TRUE(info->implicitRegisters.has_value());
+    EXPECT_TRUE(info->implicitRegisters
+                    ->inputOrdinalForRole("count").has_value());
+
+    auto shipped = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(shipped.has_value());
+    auto const rcxOrd = (*shipped)->registerByName("rcx");
+    ASSERT_TRUE(rcxOrd.has_value());
+    for (auto const* mn : {"shl", "shr_l", "shr_a"}) {
+        auto const sop = (*shipped)->opcodeByMnemonic(mn);
+        ASSERT_TRUE(sop.has_value()) << mn;
+        auto const* sinfo = (*shipped)->opcodeInfo(*sop);
+        ASSERT_NE(sinfo, nullptr) << mn;
+        ASSERT_TRUE(sinfo->implicitRegisters.has_value()) << mn;
+        auto const ord =
+            sinfo->implicitRegisters->inputOrdinalForRole("count");
+        ASSERT_TRUE(ord.has_value()) << mn;
+        EXPECT_EQ(*ord, *rcxOrd) << mn;
+    }
+}
+
 // An UNREGISTERED role name ("remaindr" typo) must fail at LOAD —
 // the lowering queries a registered vocabulary, so the typo would
 // otherwise surface only as a confusing missing-role diagnostic at
@@ -708,15 +755,20 @@ TEST(TargetSchema, ShippedX86_64ImplicitRegistersConsumerCount) {
     // dropping `xor_rdx_zero` at position 2 and adding `shl_cl` at
     // the end fails with a misleading "got div_op" at index 2). Use
     // a sorted set compare so "which one disappeared" reads cleanly.
-    ASSERT_EQ(mnemonicsWithConstraint.size(), 4u)
-        << "expected exactly 4 implicit-register-bearing opcodes "
+    // FC3.5 sweep-c1: the anticipated "shift-by-CL" consumers landed —
+    // shl/shr_l/shr_a each declare the implicit-count contract
+    // (inputs=[rcx], inputRoles={count: rcx}).
+    ASSERT_EQ(mnemonicsWithConstraint.size(), 7u)
+        << "expected exactly 7 implicit-register-bearing opcodes "
            "(cqo + idiv_op + xor_rdx_zero + div_op from cycle 10r "
-           "split); update this count when a new consumer lands.";
+           "split; shl + shr_l + shr_a from FC3.5 shifts); update "
+           "this count when a new consumer lands.";
     std::set<std::string> const observedSet(
         mnemonicsWithConstraint.begin(),
         mnemonicsWithConstraint.end());
     std::set<std::string> const expectedSet{
-        "cqo", "idiv_op", "xor_rdx_zero", "div_op"};
+        "cqo", "idiv_op", "xor_rdx_zero", "div_op",
+        "shl", "shr_l", "shr_a"};
     EXPECT_EQ(observedSet, expectedSet);
 
     // FLAG 1 discrimination: the four ops carry DIFFERENT implicit-

@@ -510,6 +510,36 @@ namespace {
     return false;
 }
 
+// D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD: like containsSseOp but ALSO pins
+// the ModR/M addressing MODE — `modrmMask`-selected bits of the byte
+// after the opcode must equal `modrmBits`. The riprel form is mod=00
+// rm=101 with any xmm reg → (modrm & 0xC7) == 0x05; the [base+disp32]
+// form is mod=10 → (modrm & 0xC0) == 0x80.
+[[nodiscard]] bool containsSseOpModRm(std::vector<std::uint8_t> const& bytes,
+                                      std::uint8_t prefix, std::uint8_t op2,
+                                      std::uint8_t modrmMask,
+                                      std::uint8_t modrmBits) {
+    for (std::size_t i = 0; i + 3 < bytes.size(); ++i) {
+        if (bytes[i] != prefix) continue;
+        std::size_t j = i + 1;
+        if ((bytes[j] & 0xF0u) == 0x40u) ++j;  // optional REX
+        if (j + 2 < bytes.size() && bytes[j] == 0x0F && bytes[j + 1] == op2
+            && (bytes[j + 2] & modrmMask) == modrmBits) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True iff the byte stream contains an x86 LEA (REX.W 0x8D — the only
+// LEA shape DSS emits today: `lea r64, [rip+sym]` / `[base+disp]`).
+[[nodiscard]] bool containsLea(std::vector<std::uint8_t> const& bytes) {
+    for (std::size_t i = 0; i + 1 < bytes.size(); ++i) {
+        if ((bytes[i] & 0xF8u) == 0x48u && bytes[i + 1] == 0x8D) return true;
+    }
+    return false;
+}
+
 struct PipelineOut {
     DiagnosticReporter        rep;
     std::vector<std::uint8_t> bytes;
@@ -586,14 +616,17 @@ TEST(X86Sse, FullPipelineDoubleAddToIntEncodesAddsdAndCvttsdsi) {
         << "encoded function must contain CVTTSD2SI (F2 REX.W 0F 2C)";
 }
 
-TEST(X86Sse, FullPipelineDoublePlusRodataConstEncodesLeaMovsdAddsd) {
-    // The FC2 Part-B3 end-to-end: i32 f(f64 a) { return FPToSI(a + 0.25); }
-    // with 0.25 in the HIR->MIR PROMOTED shape — an anonymous F64
-    // rodata global + GlobalAddr + Load (what the front-end emits).
-    // Must encode with ZERO diagnostics (the retired LiteralIndex
-    // route fired A_NoMatchingEncodingVariant here) and contain the
-    // MOVSD load (F2 0F 10) + ADDSD + CVTTSD2SI + ONE rel32
-    // relocation to the promoted global (from lea [rip + sym]).
+TEST(X86Sse, FullPipelineDoublePlusRodataConstFoldsToRipRelMovsd) {
+    // The FC2 Part-B3 shape — i32 f(f64 a) { return FPToSI(a + 0.25); }
+    // with 0.25 in the HIR->MIR PROMOTED form (anonymous F64 rodata
+    // global + GlobalAddr + Load) — now lands the
+    // D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD (FC3.5 sweep-c3): the
+    // GlobalAddr is SINGLE-USE (this load), movsd_load declares the
+    // [symbol] riprel variant, so the lea+load pair folds to ONE
+    // `movsd xmm, [rip+sym]` (F2 [REX] 0F 10 05 rel32 — the FC2
+    // riprel byte-pin's variant finally consumed by the pipeline).
+    // RED-on-disable lever: disable the fold → the lea returns and
+    // the riprel ModR/M (mod=00 rm=101) vanishes → both pins RED.
     TypeInterner interner{CompilationUnitId{1}};
     auto const f64    = interner.primitive(TypeKind::F64);
     auto const ptrF64 = interner.pointer(f64);
@@ -629,19 +662,81 @@ TEST(X86Sse, FullPipelineDoublePlusRodataConstEncodesLeaMovsdAddsd) {
            "failure mode)";
     if (out.rep.errorCount() != 0u) dumpDiagnostics(out.rep);
 
-    EXPECT_TRUE(containsSseOp(out.bytes, 0xF2, 0x10))
-        << "must contain the MOVSD load (F2 [REX] 0F 10)";
+    EXPECT_TRUE(containsSseOpModRm(out.bytes, 0xF2, 0x10, 0xC7, 0x05))
+        << "the fold must emit the RIP-relative MOVSD (F2 [REX] 0F 10 "
+           "<modrm mod=00 rm=101>) — the lea+load pair folded to ONE "
+           "riprel load";
+    EXPECT_FALSE(containsLea(out.bytes))
+        << "the single-use GlobalAddr's lea must be ELIDED by the fold "
+           "(no REX.W 8D anywhere in the function)";
     EXPECT_TRUE(containsSseOp(out.bytes, 0xF2, 0x58))
         << "must contain ADDSD";
     EXPECT_TRUE(containsSseOp(out.bytes, 0xF2, 0x2C))
         << "must contain CVTTSD2SI";
-    // The lea [rip + sym] address materialization emits the one
-    // rel32 relocation targeting the promoted global's symbol.
+    // Exactly ONE rel32 relocation to the promoted global — now
+    // emitted by the movsd_load riprel wire (pre-fold it came from
+    // the lea; the fold preserves the reloc count and target).
     ASSERT_EQ(out.relocs.size(), 1u);
     EXPECT_EQ(out.relocs[0].target, SymbolId{500});
     auto const rel32 = (*target)->relocationByName("rel32");
     ASSERT_NE(rel32, nullptr);
     EXPECT_EQ(out.relocs[0].kind, rel32->kind);
+}
+
+TEST(X86Sse, FullPipelineRodataConstTwoLoadsKeepsLeaPlusBaseForm) {
+    // NOT-single-use guard (D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD's
+    // conservative arm): the SAME promoted-global shape but the
+    // GlobalAddr address feeds TWO loads — the fold must NOT fire
+    // (folding would orphan the second consumer's address). The lea
+    // stays, both loads keep the [base+disp32] form (mod=10), and the
+    // riprel ModR/M never appears.
+    TypeInterner interner{CompilationUnitId{1}};
+    auto const f64    = interner.primitive(TypeKind::F64);
+    auto const ptrF64 = interner.pointer(f64);
+    auto const i32    = interner.primitive(TypeKind::I32);
+    TypeId const params[] = {f64};
+    auto const sig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    MirLiteralValue quarter; quarter.value = 0.25;
+    quarter.core = TypeKind::F64;
+    mb.addFunction(sig, SymbolId{1});
+    (void)mb.addGlobal(f64, SymbolId{500}, mb.literalPoolAdd(quarter));
+    MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    MirInstId const a = mb.addArg(0, f64);
+    MirInstId const addr = mb.addGlobalAddr(SymbolId{500}, ptrF64);
+    MirInstId const loadOps[] = {addr};
+    MirInstId const c1 = mb.addInst(MirOpcode::Load, loadOps, f64);
+    MirInstId const c2 = mb.addInst(MirOpcode::Load, loadOps, f64);
+    MirInstId const add1Ops[] = {a, c1};
+    MirInstId const s1 = mb.addInst(MirOpcode::FAdd, add1Ops, f64);
+    MirInstId const add2Ops[] = {s1, c2};
+    MirInstId const s2 = mb.addInst(MirOpcode::FAdd, add2Ops, f64);
+    MirInstId const cvtOps[] = {s2};
+    MirInstId const r = mb.addInst(MirOpcode::FPToSI, cvtOps, i32);
+    mb.addReturn(r);
+    Mir mir = std::move(mb).finish();
+
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    PipelineOut out;
+    runFullPipeline(mir, interner, **target, out);
+    ASSERT_TRUE(out.ok);
+    EXPECT_EQ(out.rep.errorCount(), 0u);
+    if (out.rep.errorCount() != 0u) dumpDiagnostics(out.rep);
+
+    EXPECT_TRUE(containsLea(out.bytes))
+        << "a TWO-consumer GlobalAddr must keep its lea (the fold is "
+           "single-use only)";
+    EXPECT_TRUE(containsSseOpModRm(out.bytes, 0xF2, 0x10, 0xC0, 0x80))
+        << "the loads must keep the [base+disp32] form (ModR/M mod=10)";
+    EXPECT_FALSE(containsSseOpModRm(out.bytes, 0xF2, 0x10, 0xC7, 0x05))
+        << "no riprel MOVSD may appear when the address has two "
+           "consumers";
+    // Exactly ONE rel32 relocation — the lea's; the base-form loads
+    // emit none.
+    ASSERT_EQ(out.relocs.size(), 1u);
+    EXPECT_EQ(out.relocs[0].target, SymbolId{500});
 }
 
 TEST(X86Sse, FullPipelineMsX64FprPrologueSpillsViaMovsdStore) {

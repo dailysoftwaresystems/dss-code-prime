@@ -84,6 +84,26 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
                   "'guard' must be an object");
         return;
     }
+    // FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): optional `width` key — the
+    // operation-width discriminator. Absent = the variant matches an
+    // instruction of ANY width (every pre-FC3 variant). Only 32 and 64
+    // are encodable this cycle (the 16/8-bit forms are a later FC);
+    // any other value is a load-time reject, never a silent
+    // match-nothing variant.
+    if (g.contains("width")) {
+        auto const& w = g.at("width");
+        if (!w.is_number_integer()
+            || (w.get<std::int64_t>() != 32 && w.get<std::int64_t>() != 64)) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/opcodes/{}/encoding/variants/{}/guard/width", opIdx, vi),
+                      "'width' must be the integer 32 or 64 "
+                      "(the shipped operation-width vocabulary; "
+                      "D-CSUBSET-32BIT-ALU-FORMS)");
+        } else {
+            variant.guardWidthBits =
+                static_cast<std::uint8_t>(w.get<std::int64_t>());
+        }
+    }
     if (!g.contains("operandKinds")) return;
     auto const& oks = g.at("operandKinds");
     if (!oks.is_array()) {
@@ -838,10 +858,19 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                       "must be an object mapping cond-code name → "
                       "integer encoding");
         } else {
-            constexpr std::array<std::string_view, 10> kCondNames{
+            // The full TargetCondCode name set: the 10 INTEGER codes
+            // (REQUIRED when the table is declared — pre-FC3.5 rule
+            // unchanged) + the 7 FLOAT codes (OPTIONAL per entry —
+            // FC3.5 sweep-c2: an undeclared float code is the
+            // capability signal that the target realizes that FCmp
+            // predicate via the two-setcc composition instead of a
+            // single native condition; see mir_to_lir floatCmpPlan).
+            constexpr std::array<std::string_view, 17> kCondNames{
                 "eq", "ne", "slt", "sle", "sgt", "sge",
-                "ult", "ule", "ugt", "uge"};
-            std::array<bool, 10> seen{};
+                "ult", "ule", "ugt", "uge",
+                "fogt", "foge", "foeq", "fone", "fune", "fuo", "ford"};
+            constexpr std::size_t kRequiredCount = 10;
+            std::array<bool, 17> seen{};
             for (auto it = cc.begin(); it != cc.end(); ++it) {
                 auto const& key = it.key();
                 std::size_t idx = kCondNames.size();
@@ -853,7 +882,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                               std::format("/condCodeEncoding/{}", key),
                               std::format("unknown cond-code key '{}' "
                                           "(expected one of eq/ne/slt/sle/"
-                                          "sgt/sge/ult/ule/ugt/uge)", key));
+                                          "sgt/sge/ult/ule/ugt/uge or the "
+                                          "float codes fogt/foge/foeq/"
+                                          "fone/fune/fuo/ford)", key));
                     continue;
                 }
                 if (!it.value().is_number_integer()) {
@@ -873,10 +904,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     continue;
                 }
                 data.condCodeEncoding[idx] = static_cast<std::uint8_t>(v);
+                data.condCodeDeclared[idx] = true;
                 seen[idx] = true;
             }
             std::vector<std::string_view> missing;
-            for (std::size_t i = 0; i < kCondNames.size(); ++i) {
+            for (std::size_t i = 0; i < kRequiredCount; ++i) {
                 if (!seen[i]) missing.push_back(kCondNames[i]);
             }
             if (!missing.empty()) {
@@ -889,9 +921,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                           "/condCodeEncoding",
                           std::format("missing cond-code(s) {} — when "
                                       "the table is declared, ALL 10 "
-                                      "entries must be present so the "
-                                      "encoder cannot silently default "
-                                      "to 0 for an absent code", list));
+                                      "integer entries must be present "
+                                      "so the encoder cannot silently "
+                                      "default to 0 for an absent code "
+                                      "(the float codes are optional — "
+                                      "absence selects the composed "
+                                      "FCmp realization)", list));
             } else {
                 data.condCodeEncodingLoaded = true;
             }
@@ -1589,8 +1624,14 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // The registered vocabulary grows as new projection shapes
         // arrive (a fail-loud reject here forces the deliberate
         // extension rather than a silent free-form string).
-        static constexpr std::array<std::string_view, 3>
-            kKnownImplicitRegisterRoles{"dividend", "quotient", "remainder"};
+        // FC3.5 sweep-c1 added "count" — the shift-count input of the
+        // implicit-count shift realization (x86 SHL/SHR/SAR read the
+        // count from CL; the MIR→LIR shift lowering pins the count
+        // vreg into the role-declared register exactly like the div
+        // lowering's "dividend" pin).
+        static constexpr std::array<std::string_view, 4>
+            kKnownImplicitRegisterRoles{"dividend", "quotient", "remainder",
+                                        "count"};
         auto resolveRoles =
             [&](std::vector<std::pair<std::string, std::string>> const& roles,
                 std::vector<std::pair<std::string, std::uint16_t>>& resolved,
@@ -1610,9 +1651,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                               std::format("opcode '{}': unknown implicit-"
                                           "register role '{}' — registered "
                                           "roles are 'dividend', 'quotient', "
-                                          "'remainder' (typo discriminator; "
-                                          "extend the registered vocabulary "
-                                          "for a new projection shape)",
+                                          "'remainder', 'count' (typo "
+                                          "discriminator; extend the "
+                                          "registered vocabulary for a new "
+                                          "projection shape)",
                                           info.mnemonic, role));
                     continue;
                 }

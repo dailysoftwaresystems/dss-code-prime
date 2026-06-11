@@ -513,6 +513,10 @@ TEST(MirLoweringCSubset, LogicalAndShortCircuitsWithPhi) {
     EXPECT_EQ(m.instOpcode(m.blockTerminator(entry)), MirOpcode::CondBr);
     auto succs = m.blockSuccessors(entry);
     ASSERT_EQ(succs.size(), 2u);
+    // rhsBB (the true-edge target) is the diamond's conditional ARM —
+    // FC3.5 sweep-c1 marks it IfThen so the verifier's IfThen↔IfJoin
+    // count pairing holds (the one-armed-if shape; chip task_bd58aa3d).
+    EXPECT_EQ(m.blockMarker(succs[0]), StructCfMarker::IfThen);
     // joinBB is the second successor (the false-edge / short-circuit target).
     MirBlockId const joinBB = succs[1];
     EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::IfJoin);
@@ -534,6 +538,55 @@ TEST(MirLoweringCSubset, LogicalOrShortCircuitsWithPhi) {
     MirBlockId const joinBB = succs[0];
     EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::IfJoin);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(joinBB, 0)), MirOpcode::Phi);
+    // rhsBB sits on the FALSE edge for `||` — still the conditional
+    // arm of the diamond, still IfThen (the marker pairs counts; it
+    // carries no edge polarity).
+    EXPECT_EQ(m.blockMarker(succs[1]), StructCfMarker::IfThen);
+}
+
+// FC3.5 sweep-c1 (chip task_bd58aa3d): `&&`/`||` AS AN IF-CONDITION.
+// Pre-fix, LogicalAnd/Or minted an IfJoin with a `Linear` rhs arm, so
+// `if (a < 2 && a < 3)` counted IfThen 1 vs IfJoin 2 and the verifier
+// rejected the function (I_StructCfMismatch) — the LOWERING was the
+// bug, not the verifier (the count pairing is the structural guard).
+// This is the red-on-revert lever: flip rhsBB back to Linear and the
+// verifier diagnostic returns.
+TEST(MirLoweringCSubset, IfConditionWithLogicalOpsVerifiesClean) {
+    auto L = lowerCSubset(
+        "int pick(int a) {\n"
+        "  if (a < 2 && a < 3) { return 40; }\n"
+        "  if (a > 90 || a > 80) { return 41; }\n"
+        "  if (a > 8 && (a < 12 || a > 100)) { return 42; }\n"
+        "  return 7;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+    DiagnosticReporter vrep;
+    MirVerifier v{L.mir.mir};
+    EXPECT_TRUE(v.verify(vrep))
+        << "logical ops in if-conditions must verify clean: "
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+    for (auto const& d : vrep.all()) {
+        EXPECT_NE(d.code, DiagnosticCode::I_StructCfMismatch)
+            << d.actual;
+    }
+}
+
+// The value-position uses must stay verifier-clean too (`return a&&b;`
+// has NO IfStmt to balance against — the arm marker is what pairs the
+// short-circuit join).
+TEST(MirLoweringCSubset, LogicalOpsAsValuesVerifyClean) {
+    auto L = lowerCSubset(
+        "int and2(int a, int b) { return a && b; }\n"
+        "int or2(int a, int b) { return a || b; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    DiagnosticReporter vrep;
+    MirVerifier v{L.mir.mir};
+    EXPECT_TRUE(v.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
 }
 
 // ─── ML2 cycle 2: control flow ─────────────────────────────────────────────
@@ -764,6 +817,101 @@ TEST(MirLoweringCSubset, ForLoopLowersWithUpdateOnBackEdge) {
     EXPECT_EQ(m.blockMarker(update), StructCfMarker::LoopLatch);
     EXPECT_EQ(m.instOpcode(m.blockTerminator(update)), MirOpcode::Br);
     EXPECT_EQ(m.blockSuccessors(update)[0], header);
+}
+
+// FC3.5 sweep-c1 (chip task_20b1224d): the CONVENTIONAL C for-loop —
+// the update clause is an ASSIGNMENT (`i = i - 1`), which cst_to_hir
+// lowers to an AssignStmt, not an expression. Pre-fix, ForStmt routed
+// the update through `lowerExpr`, which fail-louded with "HIR
+// expression kind ordinal 19 [AssignStmt] not yet supported"; the
+// statement-shaped clause now routes through `lowerStmt` (the same
+// path the init clause always took). The update block must hold the
+// Store back into `i`'s slot and branch to the header.
+TEST(MirLoweringCSubset, ForLoopWithAssignmentUpdateLowers) {
+    auto L = lowerCSubset(
+        "int f(int i) {\n"
+        "  int acc = 0;\n"
+        "  for (i = 9; i; i = i - 1) {\n"
+        "    acc = acc + 1;\n"
+        "  }\n"
+        "  return acc;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    // Find the LoopLatch (update) block: it must contain a Store (the
+    // `i = i - 1` write-back) and terminate with Br(header).
+    bool sawLatchStore = false;
+    for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+        MirBlockId const b = m.funcBlockAt(fn, bi);
+        if (m.blockMarker(b) != StructCfMarker::LoopLatch) continue;
+        for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+            if (m.instOpcode(m.blockInstAt(b, ii)) == MirOpcode::Store) {
+                sawLatchStore = true;
+            }
+        }
+        EXPECT_EQ(m.instOpcode(m.blockTerminator(b)), MirOpcode::Br);
+    }
+    EXPECT_TRUE(sawLatchStore)
+        << "the assignment update must lower to a Store in the latch";
+    // The whole function verifies clean (loop pairing intact).
+    DiagnosticReporter vrep;
+    MirVerifier v{m};
+    EXPECT_TRUE(v.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+}
+
+// Compound-assign + postfix inc/dec updates desugar to AssignStmt in
+// cst_to_hir (`lowerCompoundAssign` / `lowerIncDecStmt`) and ride the
+// same statement path. The grammar admits ALL of `+=`/`-=`/`*=`/`/=`/
+// `%=`/`&=`/`|=`/`^=`/`<<=`/`>>=` plus postfix `++`/`--`; pin one
+// compound (`-=`) and one postfix (`++`) — the others share the
+// single desugar site.
+TEST(MirLoweringCSubset, ForLoopCompoundAndIncDecUpdatesLower) {
+    auto L = lowerCSubset(
+        "int f(int n) {\n"
+        "  int acc = 0;\n"
+        "  for (n = 6; n; n -= 1) { acc = acc + 1; }\n"
+        "  for (int j = 0; j < 3; j++) { acc = acc + 1; }\n"
+        "  return acc;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+            ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+    DiagnosticReporter vrep;
+    MirVerifier v{L.mir.mir};
+    EXPECT_TRUE(v.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+}
+
+// A bare-EXPRESSION init clause (`for (f(); ...)`) is the symmetric
+// shape on the INIT side — cst_to_hir emits the unwrapped expression
+// and the same for-clause dispatch admits it (pre-fix, the init path
+// routed through lowerStmt whose default arm rejected expressions).
+TEST(MirLoweringCSubset, ForLoopWithBareExpressionInitLowers) {
+    auto L = lowerCSubset(
+        "int g(int x) { return x + 1; }\n"
+        "int f(int n) {\n"
+        "  int acc = 0;\n"
+        "  for (g(n); acc < 2; acc = acc + 1) { }\n"
+        "  return acc;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+    DiagnosticReporter vrep;
+    MirVerifier v{L.mir.mir};
+    EXPECT_TRUE(v.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
 }
 
 // Logical `!x` lowers as `cmp eq operand, 0` → Bool. Returning it from an
@@ -1729,4 +1877,336 @@ TEST(MirLoweringCSubset, BodyF64LiteralPromotesToAnonymousGlobalPlusLoad) {
     EXPECT_EQ(nGlobalAddr, 2u);
     EXPECT_EQ(nF64Load, 2u);
     EXPECT_EQ(nFAdd, 1u);
+}
+
+// ── FC3 c1: UAC materialization pins (plan 23) ──────────────────────────
+//
+// The `arithmeticConversions` block drives the HIR combine sites; these
+// pins assert the MIR consequences: implicit conversions exist as REAL
+// cast instructions and the signedness routing sees the COMMON type.
+
+namespace {
+
+// Count instructions of `op` across the whole module.
+[[nodiscard]] std::size_t countOp(::dss::Mir const& m, ::dss::MirOpcode op) {
+    std::size_t n = 0;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        auto const fn = m.funcAt(f);
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            auto const bb = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(bb); ++i) {
+                if (m.instOpcode(m.blockInstAt(bb, i)) == op) ++n;
+            }
+        }
+    }
+    return n;
+}
+
+// The instType TypeKind of the FIRST instruction of `op` (Void if none).
+[[nodiscard]] ::dss::TypeKind firstOpTypeKind(Lowered const& L,
+                                              ::dss::MirOpcode op) {
+    auto const& m = L.mir.mir;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        auto const fn = m.funcAt(f);
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            auto const bb = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(bb); ++i) {
+                auto const inst = m.blockInstAt(bb, i);
+                if (m.instOpcode(inst) == op) {
+                    auto const ty = m.instType(inst);
+                    return ty.valid()
+                        ? L.model.lattice().interner().kind(ty)
+                        : ::dss::TypeKind::Void;
+                }
+            }
+        }
+    }
+    return ::dss::TypeKind::Void;
+}
+
+} // namespace
+
+// `long > unsigned long` (same width, mixed signedness): C 6.3.1.8 says
+// the UNSIGNED type wins — the compare must be ICmpUgt over U64 with the
+// signed operand converted by an EXPLICIT cast (same-width I64→U64 is a
+// Bitcast). RED-on-disable: breaking the mixed-signedness verb (or the
+// comparison promotion) routes this through ICmpSgt — asserted absent.
+TEST(MirLoweringCSubset, MixedSignCompareLowersUnsignedWithExplicitCast) {
+    auto L = lowerCSubset(
+        "int cmp(long s, unsigned long u) { if (s > u) { return 1; } "
+        "return 0; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(countOp(m, MirOpcode::ICmpUgt), 1u)
+        << "mixed I64/U64 compare must route UNSIGNED (C 6.3.1.8)";
+    EXPECT_EQ(countOp(m, MirOpcode::ICmpSgt), 0u)
+        << "a signed compare here is the UAC-disabled miscompile shape";
+    EXPECT_EQ(countOp(m, MirOpcode::Bitcast), 1u)
+        << "the I64 operand's conversion to U64 must be a REAL cast inst";
+}
+
+// `char + 1` promotes char to int (the `alsoPromote` config row): the
+// Add computes at I32 and the char operand is widened by a REAL SExt.
+TEST(MirLoweringCSubset, CharPlusIntPromotesToI32WithSExt) {
+    auto L = lowerCSubset("int f(char c) { return c + 1; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    EXPECT_EQ(firstOpTypeKind(L, MirOpcode::Add), TypeKind::I32);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::SExt), 1u)
+        << "char (signed, sub-int) widens to the promotion floor by SExt";
+}
+
+// `short + short` integer-promotes BOTH operands to int (value-
+// preserving); the Add computes at I32, never at I16.
+TEST(MirLoweringCSubset, ShortPlusShortPromotesToI32) {
+    auto L = lowerCSubset("int f(short a, short b) { return a + b; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    EXPECT_EQ(firstOpTypeKind(L, MirOpcode::Add), TypeKind::I32);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::SExt), 2u);
+}
+
+// Mixed I32 + U64: the wider unsigned type wins; the I32 operand
+// sign-extends (its own value semantics) into the U64 compute.
+TEST(MirLoweringCSubset, MixedI32U64AddComputesU64) {
+    auto L = lowerCSubset(
+        "unsigned long long f(int a, unsigned long long b) "
+        "{ return a + b; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    EXPECT_EQ(firstOpTypeKind(L, MirOpcode::Add), TypeKind::U64);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::SExt), 1u);
+}
+
+// ── Condition truthiness pins (C99 "compares unequal to 0") ─────────────
+//
+// A non-Bool ARITHMETIC condition at EVERY condition site (if / while /
+// do-while / for / ternary — and a call-result feeding one) lowers as
+// `ICmpNe(cond, 0-of-cond's-type)`, NEVER as the value-truncating
+// `Cast → Trunc(cond → Bool)` (low-bit truncation would make `if (2)`
+// FALSE). The `countOp(Trunc) == 0` half of each pin is the RED-on-
+// disable lever: reverting any site in cst_to_hir.cpp to the old
+// `coerce(cond, boolType())` re-materializes the Trunc and drops the
+// ICmpNe.
+
+namespace {
+
+// TypeKind of operand `idx` of the FIRST instruction of `op` across the
+// whole module (Void if no such instruction / operand).
+[[nodiscard]] ::dss::TypeKind firstOperandKindOf(Lowered const& L,
+                                                 ::dss::MirOpcode op,
+                                                 std::size_t idx) {
+    auto const& m = L.mir.mir;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        auto const fn = m.funcAt(f);
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            auto const bb = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(bb); ++i) {
+                auto const inst = m.blockInstAt(bb, i);
+                if (m.instOpcode(inst) != op) continue;
+                auto const ops = m.instOperands(inst);
+                if (idx >= ops.size()) return ::dss::TypeKind::Void;
+                auto const ty = m.instType(ops[idx]);
+                return ty.valid()
+                    ? L.model.lattice().interner().kind(ty)
+                    : ::dss::TypeKind::Void;
+            }
+        }
+    }
+    return ::dss::TypeKind::Void;
+}
+
+// Shared three-sided truthiness assertion: exactly one ICmpNe, zero
+// Trunc (the old wrong shape), upstream + MIR clean.
+void expectTruthinessNe(Lowered const& L, char const* site) {
+    ASSERT_FALSE(L.model.hasErrors()) << site;
+    ASSERT_TRUE(L.hir->ok) << site << ": "
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok) << site << ": "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::ICmpNe), 1u)
+        << site << ": a non-Bool arithmetic condition must lower as the "
+           "truthiness `!= 0` compare";
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::Trunc), 0u)
+        << site << ": the old Cast-to-Bool shape (Trunc keeps only the "
+           "low bit — `if (2)` would be false) must NOT appear";
+}
+
+} // namespace
+
+TEST(MirLoweringCSubset, BareIntIfConditionLowersAsICmpNeNotTrunc) {
+    auto L = lowerCSubset("int main() { if (2) return 42; return 7; }");
+    expectTruthinessNe(L, "if");
+    // The synthetic zero keeps the condition's own type: I32 vs I32.
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 0), TypeKind::I32);
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 1), TypeKind::I32);
+}
+
+TEST(MirLoweringCSubset, BareIntWhileConditionLowersAsICmpNeNotTrunc) {
+    auto L = lowerCSubset(
+        "int f(int n) { while (n) { n = n - 1; } return n; }");
+    expectTruthinessNe(L, "while");
+}
+
+TEST(MirLoweringCSubset, BareIntDoWhileConditionLowersAsICmpNeNotTrunc) {
+    auto L = lowerCSubset(
+        "int f(int n) { do { n = n - 1; } while (n); return n; }");
+    expectTruthinessNe(L, "do-while");
+}
+
+TEST(MirLoweringCSubset, BareIntForConditionLowersAsICmpNeNotTrunc) {
+    // The update clause is EMPTY (decrement in the body): every
+    // statement-shaped update (`n = n - 1`, `n -= 1`, `n--`) lowers at
+    // HIR as an AssignStmt, and ForStmt's MIR lowering routes the update
+    // through lowerExpr — which does not handle AssignStmt (the init
+    // clause goes through lowerStmt and is fine). A PRE-EXISTING,
+    // condition-UNRELATED gap; this pin exercises only the for-COND
+    // truthiness site. (Runtime-witnessed: an empty-update for with a
+    // bare int cond compiles + exits clean on PE x86_64.)
+    auto L = lowerCSubset(
+        "int f(int n) { for (n = 3; n; ) { n = n - 1; } return n; }");
+    expectTruthinessNe(L, "for");
+}
+
+TEST(MirLoweringCSubset, BareIntTernaryConditionLowersAsICmpNeNotTrunc) {
+    auto L = lowerCSubset("int f(int c) { return c ? 1 : 2; }");
+    expectTruthinessNe(L, "ternary");
+}
+
+TEST(MirLoweringCSubset, CallResultIfConditionLowersAsICmpNeNotTrunc) {
+    auto L = lowerCSubset(
+        "int two() { return 2; }\n"
+        "int main() { if (two()) return 42; return 7; }\n");
+    expectTruthinessNe(L, "if(call)");
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::Call), 1u);
+}
+
+// A condition that is ALREADY Bool (a comparison) gets NO truthiness
+// wrap: exactly ONE comparison total — the source-level `<` — and no
+// double-Ne re-test of its Bool result.
+TEST(MirLoweringCSubset, BoolIfConditionKeepsExactlyOneComparison) {
+    auto L = lowerCSubset(
+        "int f(int a, int b) { if (a < b) return 1; return 0; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::ICmpSlt), 1u);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::ICmpNe), 0u)
+        << "a Bool condition must NOT be re-wrapped in a truthiness Ne";
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::Trunc), 0u);
+}
+
+// Float condition: truthiness is `!= 0.0` → FCmpUNE over the cond's own
+// float type (C99 6.8.4.1 over scalars), NOT the old Cast shape whose
+// mapCast routed float→Bool as FPToUI (value-WRONG: FPToUI(0.5) == 0
+// would make `if (0.5)` false). FC3.5 sweep-c2 — the
+// D-COND-FLOAT-NAN-TRUTHINESS-FCMP adjudication: the predicate is the
+// UNORDERED-or-unequal Une (per C 6.5.9, `!=` on NaN is TRUE, so
+// `if (NaN)` is true — NaN compares unequal to 0.0). The interim
+// FCmpOne (ordered-ne — FALSE on NaN) would have made `if (NaN)`
+// silently false once FCmp gained its LIR lowering; this pin is the
+// red-on-disable lever for the Ne→Une mapping (flipping mapBinaryOp
+// back to FCmpOne turns it red).
+TEST(MirLoweringCSubset, FloatIfConditionLowersAsFCmpUneNotFpToUi) {
+    auto L = lowerCSubset(
+        "int f(double d) { if (d) return 1; return 0; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::FCmpUne), 1u)
+        << "float truthiness must be the UNORDERED `!= 0.0` compare "
+           "(true on NaN — C 6.5.9)";
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::FCmpOne), 0u)
+        << "ordered-ne would make `if (NaN)` false — the exact "
+           "D-COND-FLOAT-NAN-TRUTHINESS-FCMP miscompile";
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::FCmpUne, 1), TypeKind::F64)
+        << "the synthetic float zero keeps the cond's own type";
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::FPToUI), 0u)
+        << "the old Cast(F64→Bool) shape routed FPToUI — value-wrong";
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::Trunc), 0u);
+}
+
+// Char condition: Char is C-scalar arithmetic — same `!= 0` test against
+// a Char-typed zero (no promotion is needed for an unequal-to-zero
+// test). Char-width ALU forms are still gated at LIR (D-CSUBSET-32BIT-
+// ALU-FORMS) so the runtime tier stays fail-loud at the right shape.
+TEST(MirLoweringCSubset, CharIfConditionLowersAsICmpNeTypedZero) {
+    auto L = lowerCSubset(
+        "int f(char c) { if (c) return 1; return 0; }");
+    expectTruthinessNe(L, "if(char)");
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 0), TypeKind::Char);
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 1), TypeKind::Char);
+}
+
+// Pointer condition: `if (p)` tests `p != null-pointer-constant` when
+// the language admits integer-zero null-pointer constants (c-subset
+// does). The constant materializes through the 13.3 substrate shape —
+// Cast(0:I32 → Ptr) = MIR IntToPtr — and the compare is ICmpNe over
+// pointer operands. (Runtime-witnessed: PE x86_64 `if (p)` exits 42.)
+TEST(MirLoweringCSubset, PointerIfConditionLowersAsICmpNeAgainstNullConstant) {
+    auto L = lowerCSubset(
+        "int main() { int x; x = 5; int* p; p = &x; "
+        "if (p) return 42; return 7; }");
+    expectTruthinessNe(L, "if(ptr)");
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::IntToPtr), 1u)
+        << "the null-pointer constant must materialize as the 13.3 "
+           "Cast(int 0 → Ptr) shape";
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 0), TypeKind::Ptr);
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 1), TypeKind::Ptr);
+}
+
+// Shifts under the block follow C 6.5.7: the result type is the PROMOTED
+// LEFT operand — `u64 >> int` stays U64 (LShr, not AShr) and the int
+// count does NOT widen the result.
+//
+// NOTE (pre-existing heuristic, surfaced by FC3's mixed-operand shifts):
+// `return v >> n;` would spuriously S_ReturnTypeMismatch — the semantic
+// tier's `subtreeType` descends an INFIX wrapper to a LEAF (DFS reaches
+// the rightmost `n`, I32) because pass 2 has no binary-expression typing
+// arm yet (D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS, full closure
+// pending). Heterogeneous-operand expressions in checked positions bind
+// through a local until that closure.
+TEST(MirLoweringCSubset, ShiftResultIsPromotedLeftOperand) {
+    auto L = lowerCSubset(
+        "unsigned long long f(unsigned long long v, int n) "
+        "{ unsigned long long r; r = v >> n; return r; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    EXPECT_EQ(firstOpTypeKind(L, MirOpcode::LShr), TypeKind::U64);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::AShr), 0u)
+        << "an unsigned left operand must never route arithmetic-shift";
+}
+
+// `true`/`false` keyword literals carry their config-declared FIXED
+// values (1/0) — never a decode of the keyword text (which would be 0
+// for both). The function pair returns 1 and 0 via the literals.
+TEST(MirLoweringCSubset, BoolKeywordLiteralsCarryFixedValues) {
+    auto L = lowerCSubset(
+        "bool t() { return true; }\n"
+        "bool f() { return false; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+    bool sawTrue = false;
+    bool sawFalse = false;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        auto const fn = m.funcAt(f);
+        auto const bb = m.funcEntry(fn);
+        for (std::uint32_t i = 0; i < m.blockInstCount(bb); ++i) {
+            auto const inst = m.blockInstAt(bb, i);
+            if (m.instOpcode(inst) != MirOpcode::Const) continue;
+            auto const& lit = m.literalValue(m.instPayload(inst));
+            if (auto const* v = std::get_if<std::int64_t>(&lit.value)) {
+                if (*v == 1) sawTrue = true;
+                if (*v == 0) sawFalse = true;
+            }
+        }
+    }
+    EXPECT_TRUE(sawTrue)  << "true must lower as the fixed value 1";
+    EXPECT_TRUE(sawFalse) << "false must lower as the fixed value 0";
 }

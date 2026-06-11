@@ -21,6 +21,12 @@ dss_add_test(NAME analysis/semantic/test_semantic_analyzer_tsql
 dss_add_test(NAME analysis/semantic/test_semantic_analyzer_genericity
              SOURCES test_semantic_analyzer_genericity.cpp)
 
+# FC3 c1: width/signedness front-end semantics (typeSpecifiers multiset
+# table, dataModel threading, the integer-literal ladder, descriptor
+# signatureByDataModel, loader fail-louds, toy/tsql typing pins).
+dss_add_test(NAME analysis/semantic/test_fc3_width_semantics
+             SOURCES test_fc3_width_semantics.cpp)
+
 # All semantic e2e tests share `semantic_test_fixture.hpp`. Add tests/
 # (NOT the repo root — its `VERSION` file shadows the C++ standard
 # `<version>` header on case-insensitive filesystems and breaks
@@ -33,3 +39,8 @@ target_include_directories(dss_analysis_semantic_test_semantic_analyzer_tsql
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_include_directories(dss_analysis_semantic_test_semantic_analyzer_genericity
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+target_include_directories(dss_analysis_semantic_test_fc3_width_semantics
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+# The FC3 suite perturbs the SHIPPED c-subset JSON — it needs nlohmann.
+target_link_libraries(dss_analysis_semantic_test_fc3_width_semantics
+                      PRIVATE nlohmann_json::nlohmann_json)

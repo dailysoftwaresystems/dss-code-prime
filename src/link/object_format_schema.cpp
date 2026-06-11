@@ -67,6 +67,18 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "declare one of 'elf' / 'pe' / 'macho' / 'wasm' / 'spirv'");
     }
 
+    // FC3 c1: the data model is REQUIRED (the loader rejects a missing
+    // or unknown `dataModel` upstream; this arm catches a HAND-BUILT
+    // ObjectFormatData that never set it — the zero default is the
+    // invalid sentinel, never a silent width choice).
+    if (dataModelName(dataModel).empty()) {
+        fail("/dataModel",
+             "missing required 'dataModel' — every object format must "
+             "declare its C-family width triple ('LP64', 'LLP64', or "
+             "'ILP32'); a silent default would bake wrong primitive "
+             "widths");
+    }
+
     // Cross-row reloc uniqueness + non-empty-name + non-zero-kind:
     // shared substrate with TargetSchema so the two sides of plan
     // 13 §2.6's reloc-taxonomy unifier are validated identically.

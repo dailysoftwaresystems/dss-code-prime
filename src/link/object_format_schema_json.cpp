@@ -206,6 +206,37 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
+    // ── FC3 c1: `dataModel` — REQUIRED on EVERY format ──────────────
+    //
+    // The per-OS C-family width triple ("LP64" / "LLP64" / "ILP32").
+    // Closed enum + required: a missing field or unknown spelling is a
+    // LOAD reject — a silent default would bake wrong `long` widths
+    // into every compile for the format (the knob-that-lies failure the
+    // unknown-key discipline exists to prevent). Required on wasm /
+    // spirv skeletons too (ILP32, declared-only — the semantic consumer
+    // fails loud when an ILP32 format is actually selected).
+    if (!doc.contains("dataModel")) {
+        coll.emit(DiagnosticCode::C_MissingField, "/dataModel",
+                  "missing required 'dataModel' — every object format "
+                  "must declare its C-family width triple ('LP64', "
+                  "'LLP64', or 'ILP32'); a silent default would bake "
+                  "wrong primitive widths");
+    } else if (!doc.at("dataModel").is_string()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, "/dataModel",
+                  "'dataModel' must be a string ('LP64', 'LLP64', or "
+                  "'ILP32')");
+    } else {
+        auto const s = doc.at("dataModel").get<std::string>();
+        auto const dm = dataModelFromName(s);
+        if (!dm) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/dataModel",
+                      std::format("unknown dataModel '{}' — expected one "
+                                  "of 'LP64', 'LLP64', 'ILP32'", s));
+        } else {
+            data.dataModel = *dm;
+        }
+    }
+
     // Top-level `entryPoint` — universal entry-symbol name for
     // executable artifacts (e.g. "_start" / "main" / Mach-O's
     // LC_MAIN target). Empty for relocatable artifacts. The walker

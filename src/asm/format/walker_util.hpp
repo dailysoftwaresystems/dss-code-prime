@@ -118,6 +118,26 @@ operandsMatchGuard(std::span<LirOperand const>          instOps,
     return true;
 }
 
+// Full variant-guard match: operand kinds AND the FC3 c2 width axis
+// (D-CSUBSET-32BIT-ALU-FORMS). `instWidthBits` is the instruction's
+// operation width (`lirInstWidthBits(lir.instFlags(inst))` — 64 for
+// every pre-FC3 / hand-built instruction). A variant with
+// `guardWidthBits == 0` (no `width` key in the JSON) matches ANY
+// width — full back-compat for every pre-existing variant; a
+// width-keyed variant matches only its declared width (the 32-bit
+// no-REX.W x86 forms / arm64 W-forms vs their 64-bit siblings).
+// Shared by BOTH walkers (x86_variable + fixed32) — the width axis
+// is format-agnostic by construction.
+[[nodiscard]] inline bool
+variantMatchesInst(std::span<LirOperand const>  instOps,
+                   std::uint8_t                 instWidthBits,
+                   TargetEncodingVariant const& v) noexcept {
+    if (v.guardWidthBits != 0 && v.guardWidthBits != instWidthBits) {
+        return false;
+    }
+    return operandsMatchGuard(instOps, v.operandKinds);
+}
+
 // Read 4 little-endian bytes as a uint32. Caller guarantees the
 // 4-byte window is in bounds.
 [[nodiscard]] inline std::uint32_t

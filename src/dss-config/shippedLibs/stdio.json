@@ -1,7 +1,7 @@
 {
   "header": "stdio.h",
   "standard": "c89",
-  "$comment": "Model 3 (2026-06-09): PLATFORM-NEUTRAL descriptor. `library` is a per-object-format map; the active target's format selects its runtime image at compile_pipeline resolution. The `fseek` offset (param[1]) and `ftell` result are the C `long` type, encoded here in the LP64 (i64) form correct for the runnable elf/macho targets. The Windows LLP64 (i32) form for these 2 is latently deferred — UNEXERCISED by any corpus/test — and tracked by D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH.",
+  "$comment": "Model 3 (2026-06-09): PLATFORM-NEUTRAL descriptor. `library` is a per-object-format map; the active target's format selects its runtime image at compile_pipeline resolution. The `fseek` offset (param[1]) and `ftell` result are the C `long` type, encoded here in the LP64 (i64) form correct for the runnable elf/macho targets. FC3 c1: the Windows LLP64 (i32) form for these 2 is now declared per-symbol via signatureByDataModel (the active format dataModel selects it; D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH).",
   "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "symbols": [
     { "name": "puts",     "signature": "fn(ptr<char>) -> i32",            "kind": "function", "linkage": "external" },
@@ -18,8 +18,8 @@
     { "name": "fclose",   "signature": "fn(ptr<struct \"FILE\" {}>) -> i32", "kind": "function", "linkage": "external" },
     { "name": "fread",    "signature": "fn(ptr<void>, u64, u64, ptr<struct \"FILE\" {}>) -> u64", "kind": "function", "linkage": "external" },
     { "name": "fwrite",   "signature": "fn(ptr<void>, u64, u64, ptr<struct \"FILE\" {}>) -> u64", "kind": "function", "linkage": "external" },
-    { "name": "fseek",    "signature": "fn(ptr<struct \"FILE\" {}>, i64, i32) -> i32", "kind": "function", "linkage": "external" },
-    { "name": "ftell",    "signature": "fn(ptr<struct \"FILE\" {}>) -> i64", "kind": "function", "linkage": "external" },
+    { "name": "fseek",    "signature": "fn(ptr<struct \"FILE\" {}>, i64, i32) -> i32", "signatureByDataModel": { "LLP64": "fn(ptr<struct \"FILE\" {}>, i32, i32) -> i32" }, "kind": "function", "linkage": "external" },
+    { "name": "ftell",    "signature": "fn(ptr<struct \"FILE\" {}>) -> i64", "signatureByDataModel": { "LLP64": "fn(ptr<struct \"FILE\" {}>) -> i32" }, "kind": "function", "linkage": "external" },
     { "name": "rewind",   "signature": "fn(ptr<struct \"FILE\" {}>) -> void", "kind": "function", "linkage": "external" },
     { "name": "feof",     "signature": "fn(ptr<struct \"FILE\" {}>) -> i32", "kind": "function", "linkage": "external" },
     { "name": "ferror",   "signature": "fn(ptr<struct \"FILE\" {}>) -> i32", "kind": "function", "linkage": "external" },

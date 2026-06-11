@@ -308,6 +308,125 @@ TEST(HirLoweringCSubset, NullPointerConstantEmitsCastInCallArg) {
     EXPECT_EQ(ti.kind(elem[0]), TypeKind::Void);
 }
 
+// D-CSUBSET-CAST-ARRAY-DECAY (FC3.5 sweep-c3): the explicit cast of a
+// string literal lowers THROUGH the synthetic array-to-pointer decay
+// (C 6.3.2.1p3): `(long)"xy"` is Cast(I64 ← Cast(Ptr<Char> ←
+// Array<Char>)) — the inner decay is the SAME synthetic Cast the
+// implicit path emits (mapCast materializes the rodata global +
+// GlobalAddr), the outer Cast is the programmer's PtrToInt. Without
+// the decay the MIR mapCast would see Array directly (no arm — fail).
+TEST(HirLoweringCSubset, ExplicitCastOfStringLiteralLowersViaDecay) {
+    SemanticModel model = analyzeCSubset(
+        "int main() { return (int)(long)\"xy\"; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto const& ti = model.lattice().interner();
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_GE(decls.size(), 1u);
+    HirNodeId const mainBody = res->hir.functionBody(decls.back());
+    auto const stmts = res->hir.children(mainBody);
+    ASSERT_GE(stmts.size(), 1u);
+    HirNodeId const ret = stmts.back();
+    HirNodeId const outer = *res->hir.returnValue(ret);
+    // (int) ← (long) ← decay(Ptr<Char>) ← "xy"
+    ASSERT_EQ(res->hir.kind(outer), HirKind::Cast);
+    EXPECT_EQ(ti.kind(res->hir.typeId(outer)), TypeKind::I32);
+    auto const outerKids = res->hir.children(outer);
+    ASSERT_EQ(outerKids.size(), 1u);
+    HirNodeId const longCast = outerKids[0];
+    ASSERT_EQ(res->hir.kind(longCast), HirKind::Cast);
+    EXPECT_EQ(ti.kind(res->hir.typeId(longCast)), TypeKind::I64);
+    auto const longKids = res->hir.children(longCast);
+    ASSERT_EQ(longKids.size(), 1u);
+    HirNodeId const decay = longKids[0];
+    ASSERT_EQ(res->hir.kind(decay), HirKind::Cast)
+        << "the cast operand must pass through the synthetic "
+           "array-to-pointer decay Cast (C 6.3.2.1p3) — mapCast has "
+           "no Array→int arm";
+    TypeId const decayTy = res->hir.typeId(decay);
+    ASSERT_EQ(ti.kind(decayTy), TypeKind::Ptr)
+        << "the decay result must be Ptr<Char>";
+    auto const decayElem = ti.operands(decayTy);
+    ASSERT_FALSE(decayElem.empty());
+    EXPECT_EQ(ti.kind(decayElem[0]), TypeKind::Char);
+}
+
+// D-CSUBSET-COMPOUND-LITERAL-TYPEDEF (FC3.5 sweep-c3): a typedef'd
+// STRUCT compound literal lowers through HIR cleanly — the semantic
+// stamping (semantics.compoundLiterals) resolved `MyP` so
+// `resolveStampedTypeBelow` finds the struct type and `lowerBraceInit`
+// builds the aggregate. HONEST TIER NOTE: this pins the
+// parse+semantic+HIR tiers; struct VALUES do not reach LIR codegen yet
+// (the aggregate MIR ops are a pre-existing '<deferred>' lowering
+// gap), so no runtime corpus arm exists for compound literals.
+TEST(HirLoweringCSubset, TypedefStructCompoundLiteralLowersTyped) {
+    SemanticModel model = analyzeCSubset(
+        "struct P { int x; int y; };\n"
+        "typedef struct P MyP;\n"
+        "int main() { struct P p = (MyP){40, 2}; return p.x; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok)
+        << "typedef'd compound literal must lower through HIR: "
+        << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// SCALAR compound literals — `(int){42}`, valid C 6.5.2.5p9 — now
+// resolve their TYPE (the semantic stamping admits them) but the HIR
+// brace-init lowering is aggregate-only by design: the scalar shape
+// stays a deliberate FAIL-LOUD ("brace-init target type must be
+// struct, union, or array"), never a silent misparse. Lifting the
+// scalar restriction is brace-init-lowering work, distinct from this
+// anchor's typedef-admission scope.
+TEST(HirLoweringCSubset, ScalarCompoundLiteralStaysAggregateOnlyFailLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int main() { int x = (int){42}; return x; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "the semantic tier must admit + type the scalar compound "
+           "literal (the stamp resolves)";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "scalar compound literals are aggregate-gated at the HIR "
+           "brace-init lowering today — this must stay LOUD until the "
+           "scalar arm lands";
+}
+
+// D-CSUBSET-CAST-VOID-DISCARD (FC3.5 sweep-c3): `(void)f()` lowers as
+// evaluate-operand-discard — the expression statement's node IS the
+// Call itself, with NO Cast wrapping it (mapCast has no void arm by
+// design; the discard is a statement effect, not a conversion). The
+// operand's presence in the lowered tree is the evaluation guarantee.
+TEST(HirLoweringCSubset, VoidDiscardCastLowersOperandWithoutCastNode) {
+    SemanticModel model = analyzeCSubset(
+        "extern int f();\n"
+        "int main() { (void)f(); return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_GE(decls.size(), 2u);
+    HirNodeId const mainBody = res->hir.functionBody(decls.back());
+    auto const stmts = res->hir.children(mainBody);
+    ASSERT_GE(stmts.size(), 2u);
+    HirNodeId const exprStmt = stmts[0];
+    HirNodeId const inner = res->hir.exprStmtExpr(exprStmt);
+    ASSERT_EQ(res->hir.kind(inner), HirKind::Call)
+        << "(void)f() must lower to the bare Call (operand evaluated "
+           "for effects) — NO Cast node may wrap it (mapCast has no "
+           "void arm; a Cast here would fail-loud downstream)";
+}
+
 // D5.1: a `struct Foo { int x; int y; };` declaration lowers to a HIR
 // `TypeDecl` whose `typeId` is the composed `structType("Foo", {I32, I32})`.
 TEST(HirLoweringCSubset, StructDeclarationLowersToTypeDecl) {
@@ -870,10 +989,13 @@ TEST(HirLoweringCSubset, IfConditionAlreadyBoolStaysUncasted) {
 }
 
 TEST(HirLoweringCSubset, TernaryLowersToTernaryNode) {
-    // `cond ? a : b` lowers to a HIR Ternary [cond, then, else]. With HR's
-    // implicit-coercion pass, the cond is wrapped in `Cast(_, Bool)` when
-    // its source type is non-Bool — matches the CondBr-expects-Bool
-    // discipline at the MIR boundary.
+    // `cond ? a : b` lowers to a HIR Ternary [cond, then, else]. A
+    // non-Bool ARITHMETIC cond takes the truthiness test: a synthetic
+    // `BinaryOp Ne(cond, 0-of-cond's-type)` typed Bool (C99 6.5.15p4
+    // "compares unequal to 0") — NOT a `Cast(_, Bool)`, whose MIR
+    // lowering (Trunc) would keep only the low bit (`x = 2` would
+    // select the WRONG arm). Pins the coerceCondition shape at the
+    // ternary site.
     SemanticModel model = analyzeCSubset("int f(int x) { return x ? 1 : 2; }");
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
@@ -885,13 +1007,61 @@ TEST(HirLoweringCSubset, TernaryLowersToTernaryNode) {
     ASSERT_EQ(res->hir.kind(tern), HirKind::Ternary);
     auto kids = res->hir.children(tern);
     ASSERT_EQ(kids.size(), 3u);
-    // cond is now `Cast(Ref(x), Bool)` after the implicit-coercion pass.
-    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Cast);
-    auto castKids = res->hir.children(kids[0]);
-    ASSERT_EQ(castKids.size(), 1u);
-    EXPECT_EQ(res->hir.kind(castKids[0]), HirKind::Ref);   // cond's operand: x
+    // cond is `Ne(Ref(x), Literal 0)` typed Bool after coerceCondition.
+    ASSERT_EQ(res->hir.kind(kids[0]), HirKind::BinaryOp)
+        << "non-Bool ternary cond must lower as a truthiness comparison, "
+           "not a Cast";
+    ASSERT_TRUE(isCoreOp(res->hir.payload(kids[0])));
+    EXPECT_EQ(decodeCoreOp(res->hir.payload(kids[0])), HirOpKind::Ne);
+    EXPECT_EQ(model.lattice().interner().kind(res->hir.typeId(kids[0])),
+              TypeKind::Bool);
+    auto neKids = res->hir.children(kids[0]);
+    ASSERT_EQ(neKids.size(), 2u);
+    EXPECT_EQ(res->hir.kind(neKids[0]), HirKind::Ref);     // cond operand: x
+    ASSERT_EQ(res->hir.kind(neKids[1]), HirKind::Literal); // synthetic 0
+    // The synthetic zero keeps the cond's OWN type (I32) — no promotion
+    // is needed for an unequal-to-zero test — and its pool value is 0.
+    EXPECT_EQ(model.lattice().interner().kind(res->hir.typeId(neKids[1])),
+              TypeKind::I32);
+    auto zeroLit = res->literalPool.at(res->hir.payload(neKids[1]));
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(zeroLit.value));
+    EXPECT_EQ(std::get<std::int64_t>(zeroLit.value), 0);
     EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Literal);   // then: 1
     EXPECT_EQ(res->hir.kind(kids[2]), HirKind::Literal);   // else: 2
+}
+
+// LogicalAnd/Or operands are CONDITION positions (C99 6.5.13p3/6.5.14p3:
+// each operand "compares unequal to 0"). A non-Bool int operand must take
+// the same truthiness `Ne(operand, 0)` wrap as an if/while condition —
+// pinned at HIR tier because the MIR tier's LogicalAnd lowering currently
+// trips an unrelated pre-existing StructCf marker mismatch (orthogonal:
+// it reproduces with genuine Bool comparison operands too).
+TEST(HirLoweringCSubset, LogicalAndIntOperandsTakeTruthinessNe) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int x, int y) { return x && y ? 1 : 2; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId ret  = res->hir.children(body)[0];
+    HirNodeId tern = *res->hir.returnValue(ret);
+    ASSERT_EQ(res->hir.kind(tern), HirKind::Ternary);
+    // The ternary cond is the LogicalAnd itself — already Bool, so
+    // coerceCondition adds NO extra node on top of it.
+    HirNodeId land = res->hir.children(tern)[0];
+    ASSERT_EQ(res->hir.kind(land), HirKind::LogicalAnd)
+        << "Bool-typed LogicalAnd cond must NOT be re-wrapped";
+    auto ops = res->hir.children(land);
+    ASSERT_EQ(ops.size(), 2u);
+    for (std::size_t i = 0; i < 2; ++i) {
+        ASSERT_EQ(res->hir.kind(ops[i]), HirKind::BinaryOp)
+            << "int operand " << i << " of && must take the truthiness Ne";
+        ASSERT_TRUE(isCoreOp(res->hir.payload(ops[i])));
+        EXPECT_EQ(decodeCoreOp(res->hir.payload(ops[i])), HirOpKind::Ne);
+        EXPECT_EQ(model.lattice().interner().kind(res->hir.typeId(ops[i])),
+                  TypeKind::Bool);
+    }
 }
 
 TEST(HirLoweringCSubset, PointerDerefAndAddressOfLower) {

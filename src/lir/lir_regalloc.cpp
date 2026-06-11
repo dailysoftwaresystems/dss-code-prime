@@ -246,13 +246,20 @@ collectImplicitClobberPositions(Lir const& lir, TargetSchema const& schema,
 // The fix: use "covers position P" semantics — exclude clobbers
 // from any range with `r.start <= pos < r.end`. Captures both
 // (a) ranges crossing past, AND (b) ranges with use-at-pos.
-template <std::size_t N>
-[[nodiscard]] std::size_t
+//
+// Appends into the caller's growable exclusion scratch
+// (D-OPT-REGALLOC-EXCLUSION-BUFFER closure, 2026-06-11): the prior
+// fixed `std::array<uint16_t, 8>` + `regallocFatal` overflow arm is
+// gone — the schema loader places NO cap on `implicitRegisters`
+// list sizes (bounded only by the target's register table, which is
+// itself unbounded), so only a growable buffer makes the exclusion
+// contract TOTAL over every loadable schema. Removing the fail-loud
+// arm is sound precisely because the replacement cannot lose an
+// ordinal: `push_back` grows; nothing truncates.
+void
 implicitClobbersCrossedBy(LirLiveRange const& r,
                           std::vector<ImplicitClobberAt> const& clobbers,
-                          std::array<std::uint16_t, N>& out,
-                          std::size_t outAlreadyFilled) {
-    std::size_t filled = outAlreadyFilled;
+                          std::vector<std::uint16_t>& out) {
     for (auto const& c : clobbers) {
         if (c.position < r.start) continue;
         if (c.position >= r.end) continue;
@@ -262,22 +269,13 @@ implicitClobbersCrossedBy(LirLiveRange const& r,
             // multiple implicit-clobber positions may repeat the
             // same ordinal).
             bool already = false;
-            for (std::size_t k = 0; k < filled; ++k) {
-                if (out[k] == ord) { already = true; break; }
+            for (std::uint16_t const e : out) {
+                if (e == ord) { already = true; break; }
             }
             if (already) continue;
-            if (filled >= out.size()) {
-                regallocFatal(
-                    "implicit-clobber + 2-addr exclusion union "
-                    "exceeds fixed exclusion buffer size — extend "
-                    "excludedStorage in lir_regalloc.cpp OR re-shape "
-                    "the schema so the high-pressure case lands "
-                    "differently (D-OPT-REGALLOC-EXCLUSION-BUFFER)");
-            }
-            out[filled++] = ord;
+            out.push_back(ord);
         }
     }
-    return filled;
 }
 
 struct ActiveEntry {
@@ -554,6 +552,20 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
     std::vector<ActiveEntry> active;
     active.reserve(flow.ranges.size());
 
+    // Exclusion scratch, hoisted out of the range loop
+    // (D-OPT-REGALLOC-EXCLUSION-BUFFER closure, 2026-06-11). Holds
+    // the per-range union of (a) requires2Address operand[1..N]
+    // clobber-prevention + (b) implicit-register clobbers from
+    // opcodes the range COVERS + (c) the result-def implicit
+    // (inputs ∪ clobbered) set. `clear()` keeps capacity, so the
+    // loop is allocation-free after the high-water mark — and the
+    // buffer GROWS for any declared union size (the schema loader
+    // places no cap on `implicitRegisters` lists, so the prior
+    // fixed array<uint16_t, 8> + its two regallocFatal overflow
+    // arms were not total; push_back can never truncate the
+    // exclusion contract).
+    std::vector<std::uint16_t> excludedScratch;
+
     SpillStats spills;
     // Slots start at 1; slot 0 is the LirSpillSlot invalid sentinel.
     std::uint32_t nextSlotV = 1;
@@ -600,18 +612,21 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         // Universal across commutativity: the bug fires for both
         // commutative and non-commutative 2-addr ops; both want
         // the same exclusion.
-        // Exclusion buffer holds the union of (a) requires2Address
-        // operand[1..N] clobber-prevention + (b) cycle-10q implicit-
-        // register clobbers from crossed opcodes (e.g., x86 idiv's
-        // RDX). Size 8 = 4 (existing 2-addr headroom) + 4 (current
-        // max implicit-clobber set on any one op; idiv/div clobber 1
-        // each, future mul-1-op clobbers 1, future shift-by-CL
-        // clobbers 0). A schema row that pushes the union past 8
-        // fails loud via `regallocFatal` in
-        // `implicitClobbersCrossedBy` (D-OPT-REGALLOC-EXCLUSION-
-        // BUFFER anchored there).
-        std::array<std::uint16_t, 8> excludedStorage{};
-        std::size_t excludedCount = 0;
+        // The exclusion scratch (hoisted above) holds the union of
+        // (a) requires2Address operand[1..N] clobber-prevention +
+        // (b) cycle-10q implicit-register clobbers from COVERED
+        // opcodes (e.g., x86 idiv's RDX) + (c) the FC3.5 result-def
+        // rule below: the DEFINING op's own implicit (inputs ∪
+        // clobbered) set when it is requires2Address (x86
+        // shift-by-CL's RCX). Today's worst case across the shipped
+        // schemas: (a) ≤ 1 + (b) ≤ 3 distinct + (c) ⊆ {RCX},
+        // dedup'd — union ≤ 4. The buffer is GROWABLE
+        // (D-OPT-REGALLOC-EXCLUSION-BUFFER ✅ CLOSED 2026-06-11):
+        // a schema declaring a union of ANY size allocates correctly
+        // with every declared ordinal excluded — the prior fixed
+        // array<uint16_t, 8> tripped regallocFatal past 8, which
+        // was not total (the loader caps nothing).
+        excludedScratch.clear();
         if (LirInstId const producingInst =
                 (r.start < flow.positionToInst.size())
                     ? flow.positionToInst[r.start]
@@ -632,27 +647,15 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
             if (info != nullptr && info->requires2Address
                 && lir.instResult(producingInst) == r.vreg) {
                 auto const ops = lir.instOperands(producingInst);
-                // HIGH-2 silent-failure fold (2026-06-02): fail
-                // loud BEFORE the loop instead of silently
-                // truncating mid-loop when a future N-ary
-                // `requires2Address` op exceeds the fixed-size
-                // exclusion buffer. Today's 2-operand binops
-                // produce exactly 1 excluded entry (4× headroom);
-                // a future schema row with 5+ source operands at
-                // indices ≥1 would silently regress the clobber-
-                // prevention contract under the prior loop-guard
-                // shape. Hard-abort + clear message names the
-                // path for the schema author.
-                if (ops.size() > excludedStorage.size() + 1u) {
-                    regallocFatal(
-                        "requires2Address opcode has more source "
-                        "operands than the 2-addr exclusion buffer "
-                        "can hold — extend excludedStorage in "
-                        "lir_regalloc.cpp OR re-shape the schema "
-                        "so the high-arity case is encoded as a "
-                        "non-2-addr opcode (D-CSUBSET-BINOP-RIGHT-"
-                        "CLOBBER buffer overflow)");
-                }
+                // The 2026-06-02 HIGH-2 fixed-buffer overflow
+                // pre-check (`ops.size() > excludedStorage.size()
+                // + 1`) is gone with the growable scratch
+                // (D-OPT-REGALLOC-EXCLUSION-BUFFER closure): an
+                // N-ary requires2Address op of ANY arity now has
+                // every operand[1..N] ordinal excluded — push_back
+                // cannot truncate, so the fail-loud arm's job
+                // (never silently drop an exclusion) is satisfied
+                // by construction.
                 // Skip operand[0] (legitimate coalesce target).
                 for (std::size_t k = 1; k < ops.size(); ++k) {
                     if (ops[k].kind != LirOperandKind::Reg) continue;
@@ -681,7 +684,55 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
                         ord = static_cast<std::uint16_t>(
                             a.physReg().id);
                     }
-                    excludedStorage[excludedCount++] = ord;
+                    excludedScratch.push_back(ord);
+                }
+                // FC3.5 sweep-c1 CRITICAL fix (2026-06-11): the
+                // RESULT of a requires2Address op that ALSO declares
+                // implicit input/clobbered registers must avoid those
+                // registers. The 2-addr legalize materializes
+                // `mov result, ops[0]` BEFORE the op, so the result's
+                // physical register becomes a live conduit for ops[0]
+                // ACROSS the op's implicit-register read — result ==
+                // implicit-input means that mov destroys the pinned
+                // value (x86 shift-by-CL: lowerShift emits `mov rcx,
+                // count`, then the legalize's `mov result(=rcx),
+                // value` overwrites the count → the shift computes
+                // value << (value & 63) instead of value << count;
+                // SILENT miscompile under register pressure). The
+                // covered-position exclusion below CANNOT catch this:
+                // the result's range STARTS at the op's LATE slot
+                // (lir_liveness firstDef = latePos) while the
+                // implicit-clobber entry sits at the EARLY slot, so
+                // `c.position < r.start` skips it. Generic over the
+                // DECLARED implicitRegisters (inputs ∪ clobbered —
+                // the same union collectImplicitClobberPositions
+                // forbids for covering operands); any future
+                // requires2Address op with implicit registers is
+                // covered by construction — no shift/RCX identity.
+                // The div family never enters this arm (idiv_op/
+                // div_op declare `result: none`; their SSA result is
+                // captured by a separate post-op mov, so result ==
+                // RAX is benign there).
+                if (info->implicitRegisters.has_value()) {
+                    auto const& ir = *info->implicitRegisters;
+                    // Dedup'd append; the growable scratch makes
+                    // this total for any declared union size — the
+                    // prior fixed-buffer regallocFatal arm is gone
+                    // (D-OPT-REGALLOC-EXCLUSION-BUFFER closure;
+                    // removal is sound because push_back can never
+                    // drop a declared ordinal).
+                    auto addForbidden = [&](std::uint16_t ord) {
+                        for (std::uint16_t const e : excludedScratch) {
+                            if (e == ord) return;
+                        }
+                        excludedScratch.push_back(ord);
+                    };
+                    for (auto const o : ir.inputOrdinals) {
+                        addForbidden(o);
+                    }
+                    for (auto const o : ir.clobberedOrdinals) {
+                        addForbidden(o);
+                    }
                 }
             }
         }
@@ -689,11 +740,10 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         // opcode this range crosses (cycle 10q substrate consumer).
         // Universal across CPUs — driven entirely by the per-opcode
         // schema declaration; no `if (opcode == idiv)` branch.
-        excludedCount = implicitClobbersCrossedBy(
-            r, implicitClobbers, excludedStorage, excludedCount);
+        implicitClobbersCrossedBy(r, implicitClobbers, excludedScratch);
 
         std::span<std::uint16_t const> const excluded{
-            excludedStorage.data(), excludedCount};
+            excludedScratch.data(), excludedScratch.size()};
 
         if (auto pick = tryAllocateExcluding(free, cls, crossesCall, excluded);
             pick.has_value()) {

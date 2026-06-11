@@ -68,6 +68,7 @@ makeTrivialModule(std::uint32_t funcSymV = 1) {
 TEST(MachOCodeSignPlaceholder, NonMultipleOfEightRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-bad-cs","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -86,6 +87,7 @@ TEST(MachOCodeSignPlaceholder, NonMultipleOfEightRejectedAtLoad) {
 TEST(MachOCodeSignPlaceholder, ZeroAcceptedAsDisabled) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-no-cs","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -106,6 +108,7 @@ TEST(MachOCodeSignPlaceholder, ObjectFiletypeRejectsCodeSigField) {
     // placeholder is meaningful only on executable images.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-obj-with-cs","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "object", "flags": 0 },
       "image": { "codeSignatureSize": 4096 },
@@ -126,6 +129,7 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsNonZeroCodeSigSize) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-cs-static","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
@@ -166,6 +170,7 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsTakesPrecedenceOverBindNow) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-cs+lazy-no-externs","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
@@ -212,6 +217,7 @@ TEST(MachOCodeSignPlaceholder, DynamicPathEmitsLcCodeSignatureWithZeroReservatio
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"macho-cs-dyn","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
@@ -320,6 +326,7 @@ TEST(MachOCodeSignPlaceholder, ZeroSizeOmitsLcCodeSignature) {
 TEST(PeCertPlaceholder, NonMultipleOfEightRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"pe-bad-cert","kind":"pe"},
       "pe": { "machine": 34404, "type": "exec" },
       "optionalHeader": {
@@ -347,6 +354,7 @@ TEST(PeCertPlaceholder, ObjFormatRejectsCertField) {
     // PE .obj must not declare attributeCertReserveSize.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"pe-obj-with-cert","kind":"pe"},
       "pe": { "machine": 34404, "type": "obj" },
       "optionalHeader": { "attributeCertReserveSize": 1024 },
@@ -362,6 +370,7 @@ TEST(PeCertPlaceholder, WalkerEmitsSecurityDirAndZeroReservation) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"pe-with-cert","kind":"pe"},
       "entryPoint": "",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
@@ -422,6 +431,7 @@ TEST(PeExecFormatJsonValidate,
     // silently produce a non-executable binary.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"pe-no-exec-bit","kind":"pe"},
       "pe": { "machine": 34404, "characteristics": 0, "type": "exec" },
       "optionalHeader": {
@@ -450,6 +460,7 @@ TEST(PeCertPlaceholder, CertTableLandsAfterIdataWhenImportsPresent) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"pe-imports-with-cert","kind":"pe"},
       "entryPoint": "",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },

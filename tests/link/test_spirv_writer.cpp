@@ -71,6 +71,7 @@ TEST(SpirvFormatJson, SpirvKindWithElfBlockRejected) {
     // schema with a stray `elf` block is rejected at load.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"spirv-with-elf-block","kind":"spirv"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel" }
     })");
@@ -83,6 +84,7 @@ TEST(SpirvFormatJson, SpirvKindWithUniversalFieldRejected) {
     // so a top-level `relocations[]` would be silently dropped.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"spirv-with-relocations","kind":"spirv"},
       "relocations": [{"name":"R_X86_64_PC32","kind":1,"nativeId":2}]
     })");

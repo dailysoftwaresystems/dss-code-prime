@@ -103,6 +103,11 @@ struct EncodingState {
     // to 0, silently coupling to wroteSibIndex).
     std::optional<std::uint8_t> sibScaleExp;
     std::vector<std::int32_t>     imm32s;        // immediate values to append (LE 4B each)
+    // FC3.5 sweep-c1: 1-byte immediates (the shift-count ib of
+    // C1 /4 /5 /7). Emitted BEFORE imm32s — today no instruction
+    // carries both; an ENTER-style imm16+imm8 shape would need
+    // wiring-order-preserving emission when it lands.
+    std::vector<std::uint8_t>     imm8s;
     std::optional<PendingRelocSlot> disp32;      // symbol-relative 32-bit slot (cycle 4)
     // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): pending
     // intra-function block-relative branch targets. Each entry
@@ -210,6 +215,7 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
             st.rexX      = (hwEnc & 0x8u) != 0u;
             return true;
         case EncodingSlotKind::Imm32:
+        case EncodingSlotKind::Imm8:
         case EncodingSlotKind::Disp32Mem:
         case EncodingSlotKind::RipRelDisp32:
         case EncodingSlotKind::CondCodeNibble:
@@ -239,6 +245,7 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:
+        case EncodingSlotKind::Ra:
         case EncodingSlotKind::Imm26:
         case EncodingSlotKind::Imm16:
         case EncodingSlotKind::Imm9:
@@ -288,6 +295,29 @@ wireImm32(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
         return false;
     }
     st.imm32s.push_back(v);
+    return true;
+}
+
+// FC3.5 sweep-c1 (shifts): stash an ImmInt operand's value for a
+// 1-byte immediate slot (`SHL/SHR/SAR r/m, imm8` — C1 /4 /5 /7 ib).
+// RANGE-CHECKED [0, 255] fail-loud: silently truncating a wider
+// immediate to one byte would emit a valid-looking instruction with a
+// wrong count. (The MIR→LIR shift lowering only selects the imm form
+// for counts it verified fit; this is the defense-in-depth half.)
+[[nodiscard]] bool
+wireImm8(EncodingState& st, std::int32_t v,
+         std::string_view mnemonic, DiagnosticReporter& reporter) {
+    if (v < 0 || v > 255) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': immediate {} does not fit the "
+                           "imm8 slot (0..255) — the lowering must "
+                           "route out-of-range counts through the "
+                           "register form",
+                           mnemonic, v));
+        return false;
+    }
+    st.imm8s.push_back(static_cast<std::uint8_t>(v));
     return true;
 }
 
@@ -397,10 +427,13 @@ bool encode(Lir const&                  lir,
     auto const instOps = lir.instOperands(inst);
     LirReg const result = lir.instResult(inst);
 
-    // Find the first variant whose guard matches the operand kinds.
+    // Find the first variant whose guard matches the operand kinds AND
+    // the instruction's operation width (FC3 c2 width axis —
+    // D-CSUBSET-32BIT-ALU-FORMS; width-absent variants match any).
+    std::uint8_t const instWidth = lirInstWidthBits(lir.instFlags(inst));
     TargetEncodingVariant const* selected = nullptr;
     for (auto const& v : info->encoding.variants) {
-        if (operandsMatchGuard(instOps, v.operandKinds)) {
+        if (walker_util::variantMatchesInst(instOps, instWidth, v)) {
             selected = &v;
             break;
         }
@@ -409,9 +442,9 @@ bool encode(Lir const&                  lir,
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                DiagnosticSeverity::Error,
                std::format("opcode '{}': no encoding variant matches "
-                           "this instruction's operand kinds (declared "
-                           "variants: {})",
-                           info->mnemonic,
+                           "this instruction's operand kinds at width "
+                           "{} (declared variants: {})",
+                           info->mnemonic, instWidth,
                            info->encoding.variants.size()));
         return false;
     }
@@ -453,8 +486,16 @@ bool encode(Lir const&                  lir,
                 return false;
             }
         } else if (srcOp.kind == LirOperandKind::ImmInt) {
-            if (!wireImm32(st, wire.slotKind, srcOp.immInt32,
-                            info->mnemonic, reporter)) {
+            // Slot decides the emitted width: Imm8 (the shift-count
+            // ib) emits ONE byte; everything else goes through the
+            // Imm32 path (which rejects non-Imm32 slots loudly).
+            if (wire.slotKind == EncodingSlotKind::Imm8) {
+                if (!wireImm8(st, srcOp.immInt32,
+                              info->mnemonic, reporter)) {
+                    return false;
+                }
+            } else if (!wireImm32(st, wire.slotKind, srcOp.immInt32,
+                                  info->mnemonic, reporter)) {
                 return false;
             }
         } else if (srcOp.kind == LirOperandKind::MemBase) {
@@ -617,13 +658,16 @@ bool encode(Lir const&                  lir,
     }
     if (selected->tmpl.condCodeFromPayload) {
         auto const condValue = lir.instPayload(inst);
-        if (condValue > 9u) {
+        if (condValue >= kTargetCondCodeCount) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': cond-code payload {} is "
-                               "out of range [0..9] for TargetCondCode "
-                               "(eq/ne/slt/sle/sgt/sge/ult/ule/ugt/uge)",
-                               info->mnemonic, condValue));
+                               "out of range [0..{}] for TargetCondCode "
+                               "(eq/ne/slt/sle/sgt/sge/ult/ule/ugt/uge + "
+                               "the float codes fogt/foge/foeq/fone/"
+                               "fune/fuo/ford)",
+                               info->mnemonic, condValue,
+                               kTargetCondCodeCount - 1));
             return false;
         }
         auto const condNibble = schema.condCodeEncoding(
@@ -633,8 +677,14 @@ bool encode(Lir const&                  lir,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': variant declares "
                                "condCodeFromPayload but target schema "
-                               "'{}' has no `condCodeEncoding` table",
-                               info->mnemonic, schema.name()));
+                               "'{}' declares no `condCodeEncoding` "
+                               "entry for cond '{}' (the float arms "
+                               "are per-entry optional — an undeclared "
+                               "one must lower via the composed-FCmp "
+                               "shape, never reach a single-cc inst)",
+                               info->mnemonic, schema.name(),
+                               targetCondCodeName(static_cast<TargetCondCode>(
+                                   condValue))));
             return false;
         }
         for (std::size_t i = 0; i + 1 < selected->tmpl.opcodeBytes.size(); ++i) {
@@ -765,7 +815,12 @@ bool encode(Lir const&                  lir,
         return false;
     }
 
-    // 7) Immediates: append in slot-wiring order.
+    // 7) Immediates: append in slot-wiring order — imm8 bytes first
+    //    (the shift-count ib; no shipped instruction carries both an
+    //    imm8 AND an imm32), then the 4-byte immediates.
+    for (auto v : st.imm8s) {
+        out.push_back(v);
+    }
     for (auto v : st.imm32s) {
         asm_byte_emit::appendImm32LE(out, v);
     }

@@ -88,6 +88,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::S_NonConstantEnumeratorValue: return "S_NonConstantEnumeratorValue";
         case DiagnosticCode::S_ArrayLengthOutOfRange:    return "S_ArrayLengthOutOfRange";
         case DiagnosticCode::S_InvalidCast:              return "S_InvalidCast";
+        case DiagnosticCode::S_InvalidTypeSpecifierCombination:
+            return "S_InvalidTypeSpecifierCombination";
+        case DiagnosticCode::S_IntegerLiteralTooLarge:   return "S_IntegerLiteralTooLarge";
+        case DiagnosticCode::S_UnsupportedDataModel:     return "S_UnsupportedDataModel";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

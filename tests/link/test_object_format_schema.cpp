@@ -81,6 +81,7 @@ TEST(ObjectFormatSchemaEnum, SymbolVisibilityNameRoundTrip) {
 namespace {
 constexpr std::string_view kElfMinimal = R"({
   "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
   "format": {
     "name": "elf64-x86_64-linux",
     "version": "1.0",
@@ -132,13 +133,15 @@ TEST(ObjectFormatSchemaLoader, WrongVersionRejected) {
 
 TEST(ObjectFormatSchemaLoader, UnknownKindRejected) {
     auto r = ObjectFormatSchema::loadFromText(
-        R"({"dssObjectFormatVersion":1,"format":{"name":"x","kind":"notafmt"}})");
+        R"({"dssObjectFormatVersion":1,
+  "dataModel": "LP64","format":{"name":"x","kind":"notafmt"}})");
     ASSERT_FALSE(r.has_value());
 }
 
 TEST(ObjectFormatSchemaLoader, DuplicateRelocationNameRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"x","kind":"elf"},
       "relocations":[
         {"name":"R_FOO","kind":1},
@@ -151,6 +154,7 @@ TEST(ObjectFormatSchemaLoader, DuplicateRelocationNameRejected) {
 TEST(ObjectFormatSchemaLoader, ZeroKindRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"x","kind":"elf"},
       "relocations":[{"name":"R_BAD","kind":0}]
     })");
@@ -160,6 +164,7 @@ TEST(ObjectFormatSchemaLoader, ZeroKindRejected) {
 TEST(ObjectFormatSchemaLoader, DuplicateRelocationKindRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"x","kind":"elf"},
       "relocations":[
         {"name":"R_A","kind":7},
@@ -176,6 +181,7 @@ TEST(ObjectFormatSchemaLoader, UnknownSentinelKindRejectedByValidate) {
     // real format declaration.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"x","kind":"unknown"},
       "relocations":[]
     })");
@@ -185,6 +191,7 @@ TEST(ObjectFormatSchemaLoader, UnknownSentinelKindRejectedByValidate) {
 TEST(ObjectFormatSchemaLoader, RelocationsNotArrayRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"x","kind":"elf"},
       "relocations": "oops"
     })");
@@ -337,6 +344,7 @@ TEST(LK10EntrySliceB, EntryCallingConventionResolvesAgainstTarget) {
 TEST(LK10EntrySliceB, ProcessExitWithoutEntryCcRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "processExit": {
@@ -354,6 +362,7 @@ TEST(LK10EntrySliceB, ProcessExitWithoutEntryCcRejected) {
 TEST(LK10EntrySliceB, EntryCcWithoutProcessExitRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64"
@@ -366,6 +375,7 @@ TEST(LK10EntrySliceB, EntryCcWithoutProcessExitRejected) {
 TEST(LK10EntrySliceB, UnknownMechanismRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -379,6 +389,7 @@ TEST(LK10EntrySliceB, UnknownMechanismRejected) {
 TEST(LK10EntrySliceB, SyscallArmMissingNumberRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -395,6 +406,7 @@ TEST(LK10EntrySliceB, SyscallArmMissingNumberRejected) {
 TEST(LK10EntrySliceB, ByNameImportArmMissingLibraryRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth", "version": "0.1", "kind": "pe" },
       "pe": { "machine": 34404, "characteristics": 34 },
       "entryCallingConvention": "ms_x64",
@@ -410,6 +422,7 @@ TEST(LK10EntrySliceB, ByNameImportArmMissingLibraryRejected) {
 TEST(LK10EntrySliceB, OpcodeByteOutOfRangeRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -432,6 +445,7 @@ TEST(LK10EntrySliceB, OpcodeByteOutOfRangeRejected) {
 TEST(LK10EntrySliceB, MechanismNoneStringRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -445,6 +459,7 @@ TEST(LK10EntrySliceB, MechanismNoneStringRejected) {
 TEST(LK10EntrySliceB, MechanismKeyOmittedRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -458,6 +473,7 @@ TEST(LK10EntrySliceB, MechanismKeyOmittedRejected) {
 TEST(LK10EntrySliceB, SyscallArmMissingNumGprRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -474,6 +490,7 @@ TEST(LK10EntrySliceB, SyscallArmMissingNumGprRejected) {
 TEST(LK10EntrySliceB, SyscallOpcodeBytesEmptyArrayRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -491,6 +508,7 @@ TEST(LK10EntrySliceB, SyscallOpcodeBytesEmptyArrayRejected) {
 TEST(LK10EntrySliceB, ByNameImportArmMissingMangledNameRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth", "version": "0.1", "kind": "pe" },
       "pe": { "machine": 34404, "characteristics": 34 },
       "entryCallingConvention": "ms_x64",
@@ -508,6 +526,7 @@ TEST(LK10EntrySliceB, ByNameImportArmMissingMangledNameRejected) {
 TEST(LK10EntrySliceB, ProcessExitOnRelocatableFormatRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth-obj", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62,
                "type": "rel" },
@@ -528,6 +547,7 @@ TEST(LK10EntrySliceB, ProcessExitOnRelocatableFormatRejected) {
 TEST(LK10EntrySliceB, EntryCcLeadingWhitespaceRejected) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": " sysv_amd64",
@@ -547,6 +567,7 @@ TEST(LK10EntrySliceB, EntryCcLeadingWhitespaceRejected) {
 TEST(LK10EntrySliceB, WasmFormatRejectsProcessExit) {
     expectRejected(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": { "name": "synth-wasm", "version": "0.1", "kind": "wasm" },
       "processExit": { "mechanism": "syscall" }
     })", "WASM format must reject `processExit` — no trampoline "
@@ -584,6 +605,7 @@ namespace {
 std::string elfWithArtifactProfiles(std::string_view profilesArrayJson) {
     return std::string{R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"synth-elf","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
       "artifactProfiles": )"} + std::string{profilesArrayJson} + R"(
@@ -608,6 +630,7 @@ TEST(ObjectFormatArtifactProfiles, ParsesDeclaredSet) {
 TEST(ObjectFormatArtifactProfiles, AbsentIsEmptyServesNothing) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"synth-elf","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62}
     })");

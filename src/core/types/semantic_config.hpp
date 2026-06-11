@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/data_model.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 
@@ -392,6 +393,28 @@ struct DSS_EXPORT CastRule {
     std::string   ruleName;           // source spelling, for diagnostics
 };
 
+// FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF): a compound
+// literal expression (`(T){...}` in C-family syntax). Pass 2 resolves
+// the TYPE-position subtree at visible child `typeChild` via the SAME
+// standard type-position resolver casts use (builtins + pointer stars
+// + struct refs + typedef aliases) and stamps the resolved type on
+// BOTH the type child (the HIR lowering's `resolveStampedTypeBelow`
+// probe) and the node itself (the literal's RESULT type for enclosing
+// checks). Deliberately a SEPARATE vocabulary from `CastRule`: a
+// compound literal is C 6.5.2.5 postfix syntax, NOT a conversion — no
+// operand child exists and the explicit-cast matrix must never run
+// against the brace-init (the per-element checks live in the HIR
+// brace-init lowering, contextually typed by the stamped type).
+// Pre-sweep only struct-ref type children worked (the struct-name
+// resolution stamped them as a side effect); builtin keywords and
+// typedef names in compound-literal position resolved to NOTHING and
+// the HIR lowering fail-louded.
+struct DSS_EXPORT CompoundLiteralRule {
+    RuleId        rule{};
+    std::uint32_t typeChild = 0;      // visible-child index of the type subtree
+    std::string   ruleName;           // source spelling, for diagnostics
+};
+
 // Identifier-use recognition. The named rule (whose RuleId the loader
 // resolves) is a "reference site": when Pass 2 sees a node with this
 // rule, it extracts the identifier text per `nameMatch` and does a
@@ -431,6 +454,167 @@ struct DSS_EXPORT BuiltinTypeMapping {
     std::string                name;       // user-visible name in source (e.g. "int")
     TypeKind                   core = TypeKind::Void;
     std::optional<std::string> extension;  // language-qualified extension name, when set
+    // FC3 c1 (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH): per-data-model
+    // core override. `core` is the BASE mapping; a key for the ACTIVE
+    // format's `DataModel` replaces it (c-subset: long → I64, LLP64 → I32).
+    // Loader rejects unknown data-model keys + non-core values; mutually
+    // exclusive with `extension` (an extension type has no width to vary).
+    std::unordered_map<DataModel, TypeKind> coreByDataModel;
+    // The mapping's effective core under the active data model.
+    [[nodiscard]] TypeKind resolveCore(DataModel dm) const {
+        if (auto it = coreByDataModel.find(dm); it != coreByDataModel.end()) {
+            return it->second;
+        }
+        return core;
+    }
+};
+
+// ── FC3 c1: type-specifier multiset table (`semantics.typeSpecifiers`) ──
+//
+// C 6.7.2 declares type specifiers as an order-free MULTISET: `unsigned
+// long long int` ≡ `long long unsigned int` ≡ `long unsigned long`. A
+// language whose grammar produces a specifier-keyword run in type
+// position (c-subset's `typeSpecifierSeq`) declares here which multisets
+// are valid and what core type each resolves to. The ENGINE collects the
+// run's keyword token KINDS, canonicalizes (sorts) them, and looks the
+// multiset up — an undeclared combination (`unsigned float`, `short
+// long`) fails loud with S_InvalidTypeSpecifierCombination, by ABSENCE
+// from the table, never by a hardcoded legality matrix.
+//
+// `tokens` is the loader-SORTED token-kind multiset key (sorted by
+// SchemaTokenId.v; duplicates legal — C's `long long` is the LongKeyword
+// kind twice). `coreByDataModel` mirrors BuiltinTypeMapping's override
+// (LLP64 long → I32). The loader rejects: duplicate multisets across
+// rows, unknown token-kind names, unknown core names, unknown data-model
+// keys, and empty token lists.
+struct DSS_EXPORT TypeSpecifierRule {
+    std::vector<SchemaTokenId> tokens;       // SORTED multiset key
+    std::vector<std::string>   tokenNames;   // source spellings, for diagnostics
+    TypeKind                   core = TypeKind::Void;
+    std::unordered_map<DataModel, TypeKind> coreByDataModel;
+    [[nodiscard]] TypeKind resolveCore(DataModel dm) const {
+        if (auto it = coreByDataModel.find(dm); it != coreByDataModel.end()) {
+            return it->second;
+        }
+        return core;
+    }
+};
+
+// ── FC3 c1: a LOAD-RESOLVED dataModel-aware type-name reference ──
+//
+// Several config blocks (`integerLiteralTyping` candidates,
+// `arithmeticConversions.integerPromotion`) name types by their SOURCE
+// spelling ("int", "unsigned long"). The loader resolves each name ONCE
+// at load time — through the `typeSpecifiers` table (splitting the name
+// on spaces and mapping each word through the schema's keyword table to
+// its token kind) with `builtinTypes` as the single-word text fallback —
+// and stores the resolved (core, coreByDataModel) pair here. An
+// unresolvable name is a LOAD reject (C_InvalidSemantics), so runtime
+// consumers only ever apply the trivial data-model select.
+struct DSS_EXPORT DataModelTypeRef {
+    std::string name;                        // source spelling, for diagnostics
+    TypeKind    core = TypeKind::Void;
+    std::unordered_map<DataModel, TypeKind> coreByDataModel;
+    [[nodiscard]] TypeKind resolveCore(DataModel dm) const {
+        if (auto it = coreByDataModel.find(dm); it != coreByDataModel.end()) {
+            return it->second;
+        }
+        return core;
+    }
+};
+
+// ── FC3 c1: integer-literal typing ladder (`semantics.integerLiteralTyping`) ──
+//
+// C 6.4.4.1: an integer constant's type is the FIRST of an ordered
+// candidate list (keyed by its suffix and whether it is decimal) whose
+// range can represent the value. One rule per suffix GROUP:
+//
+//   * `suffixes` — the EXACT suffix spellings (as declared in
+//     `numberStyle.integerSuffixes`) this rule covers; the EMPTY list is
+//     the unsuffixed rule. The engine longest-matches the raw token
+//     tail against the numberStyle suffix list (the same match
+//     `decodeInteger`'s strip performs), then selects the rule whose
+//     `suffixes` contains the matched spelling. The loader cross-checks
+//     that EVERY numberStyle suffix appears in exactly one rule (a
+//     suffix the lexer admits but the ladder cannot type would be a
+//     silent config hole) and that an unsuffixed rule exists.
+//   * `decimal` / `nondecimal` — ordered candidate lists for the two
+//     radix classes (nondecimal = any literal whose text matched a
+//     declared `numberStyle.integerPrefixes` prefix; C gives hex/octal
+//     constants the extra unsigned candidates). Names are load-resolved
+//     (`DataModelTypeRef`) so LLP64's 32-bit `long` falls out of the
+//     data-model select. Loader rejects empty lists + non-integer cores.
+//
+// A magnitude exceeding the LAST candidate's range fails loud
+// (S_IntegerLiteralTooLarge). Languages WITHOUT this block keep the
+// `literalTypes` token-kind map exactly (toy / tsql — pinned).
+struct DSS_EXPORT IntegerLiteralTypingRule {
+    std::vector<std::string>      suffixes;   // exact spellings; empty = unsuffixed
+    std::vector<DataModelTypeRef> decimal;
+    std::vector<DataModelTypeRef> nondecimal;
+};
+
+// ── FC3.5 sweep-c2: float-literal typing (`semantics.floatLiteralTyping`) ──
+//
+// C 6.4.4.2: a floating constant's type is keyed by its SUFFIX alone
+// (no magnitude ladder — an unsuffixed constant is `double`, `f`/`F`
+// is `float`). One rule per suffix GROUP, mirroring
+// `IntegerLiteralTypingRule`'s shape minus the radix/range machinery:
+//
+//   * `suffixes` — the EXACT spellings (as declared in
+//     `numberStyle.floatSuffixes`) this rule covers; the EMPTY list is
+//     the unsuffixed rule. The engine longest-matches the raw token
+//     tail against the numberStyle float-suffix list, then selects the
+//     rule whose `suffixes` contains the matched spelling.
+//   * `type` — ONE type name resolved at load through the same
+//     typeSpecifiers/builtinTypes path the integer ladder candidates
+//     use (a dataModel-aware ref, though C's float widths are
+//     model-invariant).
+//
+// The loader cross-checks mirror the integer ladder's: every
+// numberStyle float suffix covered exactly once, exactly one
+// unsuffixed rule, no suffix the lexer doesn't admit (dead config),
+// and every type resolving to a FLOAT kind under every data model.
+// Languages WITHOUT the block keep the `literalTypes` token-kind core
+// exactly (toy / tsql — pinned). (D-CSUBSET-F32-CODEGEN closure: this
+// block is what flips c-subset's `1.5f` from the interim F64 pin to
+// its C-correct F32.)
+struct DSS_EXPORT FloatLiteralTypingRule {
+    std::vector<std::string> suffixes;  // exact spellings; empty = unsuffixed
+    DataModelTypeRef         type;
+};
+
+// ── FC3 c1: usual arithmetic conversions (`semantics.arithmeticConversions`) ──
+//
+// Parameterizes the C 6.3.1.8 binary-operand conversion algorithm the
+// HIR lowering applies at every binary / ternary / compound-assign
+// combine site (see `usualArithmeticCommonType` in
+// `analysis/semantic/type_rules.hpp`). Languages WITHOUT the block keep
+// the legacy `TypeInterner::commonType` path EXACTLY (toy/tsql — pinned).
+//
+//   * `integerPromotion.minRankType` — operands of integer rank BELOW
+//     this type's rank promote to it before the conversion (C: `int`).
+//   * `integerPromotion.alsoPromote` — type names OUTSIDE the integer
+//     rank lattice that join promotion (c-subset: "char", "bool" — C
+//     promotes both to int; the engine never hardcodes C's view of
+//     char). Resolved per data model like every other name here.
+//   * `mixedSignedness` — closed verb for the cross-signedness rule.
+//     `rank-prefer-unsigned` (C): unsigned rank ≥ signed rank → the
+//     unsigned type; else the signed type (which, at strictly higher
+//     width-rank, represents the whole unsigned range). The loader
+//     rejects unknown verbs — a typo can never silently no-op.
+//   * `promoteComparisons` — when true (C), comparison operands run the
+//     same conversion (so `-1 > 0ul` compares as U64); the result stays
+//     Bool. When false, comparisons keep their raw operand types.
+enum class MixedSignednessRule : std::uint8_t {
+    RankPreferUnsigned = 1,   // C 6.3.1.8
+};
+
+struct DSS_EXPORT ArithmeticConversions {
+    DataModelTypeRef              minRankType;          // e.g. "int"
+    std::vector<DataModelTypeRef> alsoPromote;          // e.g. ["char", "bool"]
+    MixedSignednessRule mixedSignedness = MixedSignednessRule::RankPreferUnsigned;
+    bool                promoteComparisons = true;
 };
 
 // Type-expression constructors. When a type-position subtree matches
@@ -496,6 +680,13 @@ struct DSS_EXPORT LiteralTypeMapping {
     SchemaTokenId   literal{};
     TypeKind        core = TypeKind::Void;
     std::string     literalName;   // source-text name retained for diags
+    // FC3 c1: KEYWORD literals (C23 `true` / `false`). When set, the HIR
+    // lowering uses this value directly instead of decoding the token's
+    // TEXT as a number — `decodeInteger("true")` would otherwise silently
+    // produce 0 (no leading digits). Declared per-row so any language can
+    // map a keyword token to a fixed-value literal of any core (`true` →
+    // Bool 1, a future `nil` → Ptr 0, …) with zero engine vocabulary.
+    std::optional<std::int64_t> fixedValue;
 };
 
 // The full `semantics` block. Every facet is optional; absent ⇒ that
@@ -509,11 +700,31 @@ struct DSS_EXPORT SemanticConfig {
     std::vector<MemberAccessRule>   memberAccesses;
     std::vector<ScopeRule>          scopes;        // rules that open a fresh lexical scope
     std::vector<BuiltinTypeMapping> builtinTypes;
+    // FC3 c1: type-specifier keyword-multiset table (C 6.7.2 `unsigned
+    // long long int` ≡ `long long unsigned int`). Empty ⇒ the language
+    // has no specifier-run type syntax (toy / tsql) and type-position
+    // resolution is untouched. See TypeSpecifierRule above.
+    std::vector<TypeSpecifierRule>  typeSpecifiers;
     std::vector<TypeShapeRule>      typeShapes;
     std::vector<LiteralTypeMapping> literalTypes;
+    // FC3 c1: the integer-literal typing ladder (C 6.4.4.1). Empty ⇒ the
+    // `literalTypes` token-kind map types integer literals exactly as
+    // before (toy / tsql — pinned). See IntegerLiteralTypingRule above.
+    std::vector<IntegerLiteralTypingRule> integerLiteralTyping;
+    // FC3.5 sweep-c2: float-literal suffix typing (C 6.4.4.2). Empty ⇒
+    // the `literalTypes` token-kind core types float literals exactly
+    // as before (toy / tsql — pinned). See FloatLiteralTypingRule.
+    std::vector<FloatLiteralTypingRule>   floatLiteralTyping;
+    // FC3 c1: usual-arithmetic-conversions parameter block (C 6.3.1.8).
+    // nullopt ⇒ the legacy `TypeInterner::commonType` behavior at every
+    // HIR combine site (toy / tsql — pinned). See ArithmeticConversions.
+    std::optional<ArithmeticConversions>  arithmeticConversions;
     std::vector<AssignmentRule>     assignments;       // SE4 const-correctness
     std::vector<CallRule>           callRules;         // SE6 call checking
     std::vector<CastRule>           castRules;         // FC2 explicit casts
+    // FC3.5 sweep-c3: compound-literal type-position stamping rules
+    // (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF). See CompoundLiteralRule.
+    std::vector<CompoundLiteralRule> compoundLiteralRules;
     std::vector<BuiltinFunctionMapping> builtinFunctions;  // SE6 builtins
     std::vector<ReturnRule>         returnRules;       // GAP A return-type checking
     // Rules that establish a break/continue-valid context (while/for/do/

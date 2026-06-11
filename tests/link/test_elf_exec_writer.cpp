@@ -120,6 +120,7 @@ TEST(ElfExecFormatJson, ShippedFileLoadsCleanlyWithExecFields) {
 TEST(ElfExecFormatJson, InterpreterTypeCheckRejectsNonString) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"bad-interp","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": 42 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -135,6 +136,7 @@ TEST(ElfExecFormatJson, EmptyInterpreterStringRejectedAtLoad) {
     // empty); explicit empty is not.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"empty-interp","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -149,6 +151,7 @@ TEST(ElfRelFormatJson, InterpreterOnRelFormatRejectedAtLoad) {
     // ET_REL/virtualAddress!=0 reject.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"rel-with-interp","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel", "interpreter": "/lib64/ld-linux-x86-64.so.2" }
     })");
@@ -164,6 +167,7 @@ TEST(ElfRelFormatJson, BindNowFalseOnRelFormatRejectedAtLoad) {
     // review.)
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"rel-with-bindnow-false","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel", "bindNow": false }
     })");
@@ -179,6 +183,7 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterCitesSubstrateGap) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"exec-no-interp","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -388,6 +393,7 @@ TEST(ElfExecWriter, ExternImportsOnRiscVMachineFailsLoudCitingFutureWork) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"riscv-exec","kind":"elf"},
       "elf": {
         "class":"elf64", "data":"lsb", "machine": 243, "type":"exec",
@@ -670,6 +676,7 @@ TEST(ElfExecWriter, EntryPointHonoredOnDynamicPath) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"exec-entry-named","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "entryPoint": "sym_42",
@@ -701,6 +708,7 @@ TEST(ElfExecWriter, UnknownEntryPointOnDynamicPathFailsLoud) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"exec-bad-entry","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "entryPoint": "sym_99",
@@ -768,6 +776,7 @@ TEST(ElfExecWriter, ExternImportsProduceDynamicImage) {
 TEST(ElfExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"bindnow-wrong-type","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": "true" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -778,6 +787,7 @@ TEST(ElfExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
 TEST(ElfExecFormatJson, BindNowDefaultsToTrue) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"bindnow-default","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -791,6 +801,7 @@ TEST(ElfExecWriter, BindNowFalseFailsLoudCitingDLK611) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"elf-lazy-pending","kind":"elf"},
       "entryPoint": "",
       "elf": {
@@ -1341,6 +1352,7 @@ TEST(ElfExecWriter, ZeroFunctionModuleFailLoud) {
 TEST(ElfExecFormatJson, ExecWithZeroVirtualAddressRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"bad-exec","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
@@ -1356,6 +1368,7 @@ TEST(ElfExecFormatJson, ExecWithoutPageAlignRejected) {
     // 4096, so the value cannot be hardcoded in the walker.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"no-page-align","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -1366,6 +1379,7 @@ TEST(ElfExecFormatJson, ExecWithoutPageAlignRejected) {
 TEST(ElfExecFormatJson, PageAlignMustBePowerOfTwo) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"odd-page-align","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 3000 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -1376,6 +1390,7 @@ TEST(ElfExecFormatJson, PageAlignMustBePowerOfTwo) {
 TEST(ElfRelFormatJson, RelWithNonZeroVirtualAddressRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"bad-rel","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -1386,6 +1401,7 @@ TEST(ElfRelFormatJson, RelWithNonZeroVirtualAddressRejected) {
 TEST(ElfFormatJson, UnknownTypeStringRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"bad-type","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"executable" }
     })");
@@ -1411,6 +1427,7 @@ TEST(ElfExecWriter, EntryPointResolvesSecondFunctionByName) {
     // (the shipped file has entryPoint=""; we override).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"forge-exec","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_42",
@@ -1448,6 +1465,7 @@ TEST(ElfExecWriter, UnknownEntryPointFailsLoud) {
     ASSERT_TRUE(target.has_value());
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"bad-entry","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_99",
@@ -1525,6 +1543,7 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterFailsLoud) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
       "format": {"name":"exec-no-interp","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]

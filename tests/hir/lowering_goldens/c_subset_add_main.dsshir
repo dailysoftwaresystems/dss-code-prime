@@ -17,7 +17,7 @@ module "CSubset" {
   function %4 : fn() -> i32 {
     block {
       var %5 : i32 = call : i32 (ref %1 : fn(i32, i32) -> i32, lit int 1 : i32, lit int 2 : i32)
-      if (cast [syn] : bool (ref %5 : i32))
+      if (binop Ne : bool (ref %5 : i32, lit [syn] int 0 : i32))
         block {
           assign ref %5 : i32 = binop Add : i32 (ref %5 : i32, lit int 1 : i32)
         }

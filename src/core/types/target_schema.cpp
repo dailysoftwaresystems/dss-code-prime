@@ -628,18 +628,39 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         }
 
         // ── Convergence-fix D: overlapping variant guards ─────────
-        // Two variants with identical `operandKinds` would first-match
-        // silently win — the second is unreachable.
+        // Two variants with identical `operandKinds` AND the same
+        // `guard.width` would first-match silently win — the second is
+        // unreachable. FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS) extends the
+        // identity to the (operandKinds, width) pair AND rejects the
+        // AMBIGUOUS MIX: a width-absent (match-any) variant alongside a
+        // width-keyed same-kind sibling. The match-any variant either
+        // shadows the keyed one (if first) or silently absorbs the
+        // widths the keyed one does NOT declare (if last) — both are
+        // config bugs; the author must key EVERY same-kind sibling
+        // once any of them is width-discriminated.
         for (std::size_t a = 0; a < o.encoding.variants.size(); ++a) {
             for (std::size_t b = a + 1; b < o.encoding.variants.size(); ++b) {
-                if (o.encoding.variants[a].operandKinds
-                    == o.encoding.variants[b].operandKinds) {
+                auto const& va = o.encoding.variants[a];
+                auto const& vb = o.encoding.variants[b];
+                if (va.operandKinds != vb.operandKinds) continue;
+                if (va.guardWidthBits == vb.guardWidthBits) {
                     fail(std::format("/opcodes/{}/encoding/variants/{}", i, b),
                          std::format("opcode '{}': variant {} has the "
-                                     "same `operandKinds` as variant "
-                                     "{} — first-match dispatch makes "
-                                     "variant {} unreachable",
+                                     "same `operandKinds` and `width` as "
+                                     "variant {} — first-match dispatch "
+                                     "makes variant {} unreachable",
                                      o.mnemonic, b, a, b));
+                } else if (va.guardWidthBits == 0
+                           || vb.guardWidthBits == 0) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}", i, b),
+                         std::format("opcode '{}': variants {} and {} "
+                                     "share `operandKinds` but mix a "
+                                     "width-keyed guard with a width-"
+                                     "absent (match-any) one — key every "
+                                     "same-kind sibling once any is "
+                                     "width-discriminated "
+                                     "(D-CSUBSET-32BIT-ALU-FORMS)",
+                                     o.mnemonic, a, b));
                 }
             }
         }

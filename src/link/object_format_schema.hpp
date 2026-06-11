@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/substrate/transparent_string_hash.hpp"
+#include "core/types/data_model.hpp"          // DataModel (FC3 c1 — the per-OS width triple)
 #include "core/types/grammar_schema.hpp"      // ConfigDiagnostic + LoadResult
 #include "core/types/object_format_kind.hpp"  // ObjectFormatKind + kObjectFormatKindTable
 #include "core/types/section_kind.hpp"        // SectionKind + kSectionKindTable
@@ -635,6 +636,22 @@ struct DSS_EXPORT ObjectFormatData {
     std::string          version;
     ObjectFormatKind     kind = ObjectFormatKind::Elf;
 
+    // ── FC3 c1: the data model (per-OS C-family width triple) ─────
+    //
+    // REQUIRED top-level `"dataModel"` field ("LP64" / "LLP64" /
+    // "ILP32" — closed enum, loader fails loud on missing OR unknown;
+    // a silent default would bake wrong `long` widths into every
+    // semantic analysis run for the format). The OS lives on the
+    // FORMAT schema (pe64-*-windows vs elf64-*-linux share a CPU
+    // target), so the width contract does too. Consumed by the driver
+    // (`buildCuMir` threads it into `analyze()`) — the per-language
+    // `coreByDataModel` overrides, the integer-literal ladder, and the
+    // shipped-lib descriptor `signatureByDataModel` all resolve
+    // against it. The zero default is the INVALID sentinel: a
+    // hand-built ObjectFormatData that never set it is rejected by
+    // validate() (the loader path always sets it or fails).
+    DataModel            dataModel{};
+
     // Relocations row — same shape as `TargetSchema::relocations[]`
     // so the reloc-taxonomy unifier (plan 13 §2.6) is symmetric.
     std::vector<ObjectFormatRelocationInfo> relocations;
@@ -797,6 +814,10 @@ public:
     [[nodiscard]] std::string_view     name()    const noexcept { return d_.name; }
     [[nodiscard]] std::string_view     version() const noexcept { return d_.version; }
     [[nodiscard]] ObjectFormatKind     kind()    const noexcept { return d_.kind; }
+    // FC3 c1: the format's declared data model (LP64 / LLP64 / ILP32).
+    // Always a valid member for a loader-produced schema (the field is
+    // REQUIRED + closed-enum at load).
+    [[nodiscard]] DataModel            dataModel() const noexcept { return d_.dataModel; }
 
     // Relocation accessors — symmetric with TargetSchema's. The
     // linker calls `relocationByKind(kind)` to find which

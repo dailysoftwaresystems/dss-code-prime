@@ -48,6 +48,8 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
         {
             auto ty = b.open(h.schema->rules().find("typeRef"));
             auto tb = b.open(h.schema->rules().find("typeBase"));
+            // FC3 c1: typeBase routes keywords through typeSpecifierSeq.
+            auto ts = b.open(h.schema->rules().find("typeSpecifierSeq"));
             b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
@@ -76,7 +78,8 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
         "    rule:topLevelDecl\n"
         "      rule:typeRef\n"
         "        rule:typeBase\n"
-        "          tok:\"int\"\n"
+        "          rule:typeSpecifierSeq\n"
+        "            tok:\"int\"\n"
         "      tok:\"x\"\n"
         "      rule:topLevelDeclTail\n"
         "        rule:varDeclTail\n"
@@ -105,6 +108,8 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
         {
             auto ty = b.open(h.schema->rules().find("typeRef"));
             auto tb = b.open(h.schema->rules().find("typeBase"));
+            // FC3 c1: typeBase routes keywords through typeSpecifierSeq.
+            auto ts = b.open(h.schema->rules().find("typeSpecifierSeq"));
             b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
@@ -119,6 +124,7 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
                 auto p  = b.open(h.schema->rules().find("param"));
                 auto ty = b.open(h.schema->rules().find("typeRef"));
                 auto tb = b.open(h.schema->rules().find("typeBase"));
+                auto ts = b.open(h.schema->rules().find("typeSpecifierSeq"));
                 b.pushToken(h.stream.advance());
             }
             pushNext(b, h.stream);
@@ -178,7 +184,8 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
         "    rule:topLevelDecl\n"
         "      rule:typeRef\n"
         "        rule:typeBase\n"
-        "          tok:\"int\"\n"
+        "          rule:typeSpecifierSeq\n"
+        "            tok:\"int\"\n"
         "      tok:\"main\"\n"
         "      rule:topLevelDeclTail\n"
         "        rule:funcDefTail\n"
@@ -188,7 +195,8 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
         "              rule:param\n"
         "                rule:typeRef\n"
         "                  rule:typeBase\n"
-        "                    tok:\"void\"\n"
+        "                    rule:typeSpecifierSeq\n"
+        "                      tok:\"void\"\n"
         "            tok:\")\"\n"
         "          rule:block\n"
         "            tok:\"{\"\n"

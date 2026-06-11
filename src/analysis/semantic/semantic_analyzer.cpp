@@ -5,8 +5,10 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/symbol_table.hpp"
 #include "analysis/semantic/type_rules.hpp"
+#include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/integer_literal_ladder.hpp"
 #include "core/types/number_decode.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -96,13 +98,28 @@ struct SchemaIndexes {
     std::unordered_map<std::uint32_t, std::vector<std::size_t>> assignByRule;
     std::unordered_map<std::uint32_t, std::size_t> callByRule;
     std::unordered_map<std::uint32_t, std::size_t> castByRule;      // FC2 explicit casts
+    // FC3.5 sweep-c3: compound-literal type stamping
+    // (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF)
+    std::unordered_map<std::uint32_t, std::size_t> compoundLiteralByRule;
     std::unordered_map<std::uint32_t, std::size_t> returnByRule;   // GAP A
     std::unordered_map<std::uint32_t, bool>        loopByRule;      // GAP C loop contexts
     std::unordered_map<std::uint32_t, bool>        loopControlByRule; // GAP C break/continue
-    // Built-in type name → TypeId (interned once per schema, into the CU lattice).
+    // Built-in type name → TypeId (interned once per schema, into the CU
+    // lattice; FC3 c1 — the per-row `coreByDataModel` override for the
+    // ACTIVE data model is applied here, so every consumer below sees
+    // the model-correct width).
     std::unordered_map<std::string, TypeId>        builtinTypeIds;
     // Literal token-kind → TypeId.
     std::unordered_map<std::uint32_t, TypeId>      literalTypeIds;
+    // FC3 c1: type-specifier multiset resolution (C 6.7.2). The
+    // VOCABULARY is every token kind appearing in any `typeSpecifiers`
+    // row — `resolveTypeNode` treats an Internal node whose visible
+    // children are ALL vocabulary tokens as a specifier run. The SETS
+    // map keys the canonical (sorted, comma-joined kind-id) multiset to
+    // its interned TypeId (data model already applied). Empty for
+    // languages without the table (toy / tsql) — the arm never fires.
+    std::unordered_set<std::uint32_t>              typeSpecifierVocabulary;
+    std::unordered_map<std::string, TypeId>        typeSpecifierSets;
 };
 
 // One transient per `analyze()` call. Consumed into the returned model.
@@ -118,6 +135,11 @@ struct EngineState {
     SymbolTable                symbols;
     UnitAttribute<SymbolId>    nodeToSymbol;
     UnitAttribute<TypeId>      nodeToType;
+    // FC3 c1: the analysis-time data model (`analyze()`'s parameter —
+    // the active format's width triple). Read by `buildIndexes` (the
+    // `coreByDataModel` overrides), the integer-literal ladder, and the
+    // shipped-lib descriptor reader. Set ONCE before any index is built.
+    DataModel                  dataModel = DataModel::Lp64;
     // HR11: per-schema index bundles, keyed by SchemaId.v; `active_` is the
     // bundle for the tree currently being processed (set via `activate`).
     std::unordered_map<std::uint32_t, SchemaIndexes> schemaIndexes;
@@ -421,6 +443,9 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
     for (std::size_t i = 0; i < cfg.castRules.size(); ++i) {
         idx.castByRule[cfg.castRules[i].rule.v] = i;
     }
+    for (std::size_t i = 0; i < cfg.compoundLiteralRules.size(); ++i) {
+        idx.compoundLiteralByRule[cfg.compoundLiteralRules[i].rule.v] = i;
+    }
     for (std::size_t i = 0; i < cfg.returnRules.size(); ++i) {
         idx.returnByRule[cfg.returnRules[i].rule.v] = i;
     }
@@ -453,10 +478,27 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
                 s.lattice.interner().extension(*kindId, *bt.extension, {});
             continue;
         }
-        idx.builtinTypeIds[bt.name] = s.lattice.interner().primitive(bt.core);
+        // FC3 c1: the ACTIVE data model's override (if declared) wins —
+        // c-subset's `long` is I64 base / I32 under LLP64.
+        idx.builtinTypeIds[bt.name] =
+            s.lattice.interner().primitive(bt.resolveCore(s.dataModel));
     }
     for (auto const& lt : cfg.literalTypes) {
         idx.literalTypeIds[lt.literal.v] = s.lattice.interner().primitive(lt.core);
+    }
+    // FC3 c1: type-specifier multiset table (C 6.7.2). Vocabulary = every
+    // token kind any row names; sets = canonical sorted-kind key → the
+    // interned TypeId under the ACTIVE data model. The loader already
+    // sorted each row's `tokens` and rejected duplicate multisets.
+    for (auto const& ts : cfg.typeSpecifiers) {
+        std::string key;
+        for (auto const& t : ts.tokens) {
+            idx.typeSpecifierVocabulary.insert(t.v);
+            key += std::to_string(t.v);
+            key += ',';
+        }
+        idx.typeSpecifierSets[std::move(key)] =
+            s.lattice.interner().primitive(ts.resolveCore(s.dataModel));
     }
 }
 
@@ -467,9 +509,18 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
 // with a valid type yields that aliased type (SE5 typedef resolution).
 // Emits `S_UnknownType` when no matching mapping was found in the
 // subtree's leaf.
+//
+// FC3 c1: `specifierDiagnosed` threads the "an invalid type-specifier
+// COMBINATION was already reported inside this resolution" fact up the
+// recursion so the outer-level miss arm does not pile a generic
+// S_UnknownType on top of the precise S_InvalidTypeSpecifierCombination
+// (one definitive diagnostic per bad type, the house one-diag bar).
+// The public wrapper below owns the flag; external callers are
+// signature-unchanged.
 [[nodiscard]] TypeId
-resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-                NodeId node, ScopeId scope, bool emitOnMiss = true) {
+resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                    NodeId node, ScopeId scope, bool emitOnMiss,
+                    bool& specifierDiagnosed) {
     if (!node.valid()) return InvalidType;
     auto const k = tree.kind(node);
     if (k == NodeKind::Internal) {
@@ -489,8 +540,8 @@ resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 s.reporter.report(std::move(d));
                 return InvalidType;
             }
-            TypeId inner = resolveTypeNode(s, cfg, tree, kids[shape.operandChild],
-                                           scope, emitOnMiss);
+            TypeId inner = resolveTypeNodeImpl(s, cfg, tree, kids[shape.operandChild],
+                                               scope, emitOnMiss, specifierDiagnosed);
             switch (shape.constructor) {
                 case TypeConstructor::Pointer:
                     return s.lattice.interner().pointer(inner);
@@ -504,6 +555,55 @@ resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     return s.lattice.interner().slice(inner);
             }
             return InvalidType;
+        }
+        // FC3 c1: type-specifier keyword run (C 6.7.2 — `unsigned long
+        // long int` in any order). An Internal node whose visible
+        // children are ALL tokens of the language's declared specifier
+        // VOCABULARY resolves by canonical (sorted) multiset lookup in
+        // the `typeSpecifiers` table. An undeclared combination
+        // (`unsigned float`, `short long`) fails loud HERE — it is a
+        // definitive semantic reject (the run is structurally a
+        // specifier set; no alternative resolution exists), so the
+        // diagnostic fires regardless of `emitOnMiss` (which only
+        // suppresses the "maybe another child resolves" miss path).
+        // Languages without the table have an empty vocabulary — the
+        // arm never fires and resolution is byte-identical to pre-FC3.
+        if (!s.idx().typeSpecifierSets.empty()) {
+            auto specKids = visibleChildren(tree, node);
+            bool allSpecifierTokens = !specKids.empty();
+            std::vector<std::uint32_t> kinds;
+            kinds.reserve(specKids.size());
+            for (auto child : specKids) {
+                if (tree.kind(child) == NodeKind::Token
+                    && s.idx().typeSpecifierVocabulary.contains(
+                           tree.tokenKind(child).v)) {
+                    kinds.push_back(tree.tokenKind(child).v);
+                    continue;
+                }
+                allSpecifierTokens = false;
+                break;
+            }
+            if (allSpecifierTokens) {
+                std::sort(kinds.begin(), kinds.end());
+                std::string key;
+                for (auto kv : kinds) {
+                    key += std::to_string(kv);
+                    key += ',';
+                }
+                auto setIt = s.idx().typeSpecifierSets.find(key);
+                if (setIt != s.idx().typeSpecifierSets.end()) {
+                    return setIt->second;
+                }
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_InvalidTypeSpecifierCombination;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(node);
+                d.actual   = std::string{tree.text(node)};
+                s.reporter.report(std::move(d));
+                specifierDiagnosed = true;   // outer S_UnknownType suppressed
+                return InvalidType;
+            }
         }
         auto kids = visibleChildren(tree, node);
         // SE-pointers (G5): count `pointerToken` children at THIS node (C
@@ -520,7 +620,9 @@ resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 continue;
             }
             if (!inner.valid()) {
-                auto t = resolveTypeNode(s, cfg, tree, child, scope, /*emitOnMiss=*/false);
+                auto t = resolveTypeNodeImpl(s, cfg, tree, child, scope,
+                                             /*emitOnMiss=*/false,
+                                             specifierDiagnosed);
                 if (t.valid()) inner = t;
             }
         }
@@ -529,7 +631,7 @@ resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 inner = s.lattice.interner().pointer(inner);
             return inner;
         }
-        if (emitOnMiss) {
+        if (emitOnMiss && !specifierDiagnosed) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::S_UnknownType;
             d.severity = DiagnosticSeverity::Error;
@@ -559,6 +661,17 @@ resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         return InvalidType;
     }
     return InvalidType;
+}
+
+// The public type-position resolver — every external call site uses this
+// signature; the wrapper owns the FC3 c1 specifier-diagnosed flag (see
+// resolveTypeNodeImpl).
+[[nodiscard]] TypeId
+resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                NodeId node, ScopeId scope, bool emitOnMiss = true) {
+    bool specifierDiagnosed = false;
+    return resolveTypeNodeImpl(s, cfg, tree, node, scope, emitOnMiss,
+                               specifierDiagnosed);
 }
 
 // True for the core integer kinds (signed + unsigned). Array lengths must be
@@ -1207,7 +1320,90 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         auto tk = tree.tokenKind(node);
         auto litIt = s.idx().literalTypeIds.find(tk.v);
         if (litIt != s.idx().literalTypeIds.end()) {
-            s.nodeToType.set(node, litIt->second);
+            TypeId litTy = litIt->second;
+            // FC3 c1: the integer-literal ladder (C 6.4.4.1). When the
+            // language declares `integerLiteralTyping` AND this token is
+            // the numberStyle's INTEGER literal kind, the literal's type
+            // is the first (suffix-class × radix-class) candidate whose
+            // range fits the decoded magnitude — overriding the
+            // `literalTypes` base core. Languages without the block (or
+            // other literal kinds — float, bool keywords) keep the
+            // token-kind map exactly (toy / tsql — pinned).
+            if (!cfg.integerLiteralTyping.empty()
+                && s.idx().numberStyle != nullptr
+                && s.idx().numberStyle->emitKind.integer.valid()
+                && tk == s.idx().numberStyle->emitKind.integer) {
+                auto const text = tree.text(node);
+                auto const magnitude = decodeInteger(text, s.idx().numberStyle);
+                bool fits = magnitude.has_value();
+                if (fits) {
+                    auto const r = typeIntegerLiteral(
+                        text, s.idx().numberStyle, cfg.integerLiteralTyping,
+                        s.dataModel, *magnitude);
+                    switch (r.status) {
+                        case IntegerLadderStatus::Typed:
+                            litTy = s.lattice.interner().primitive(r.kind);
+                            break;
+                        case IntegerLadderStatus::TooLarge:
+                            fits = false;
+                            break;
+                        case IntegerLadderStatus::NoRule:
+                            // Loader invariant: every numberStyle suffix is
+                            // covered by exactly one rule and an unsuffixed
+                            // rule exists. A miss here is substrate drift —
+                            // fail loud, never silently keep the base core.
+                            std::fputs("dss::analyze fatal: integer literal "
+                                       "matched no integerLiteralTyping rule "
+                                       "(loader cross-check invariant "
+                                       "violated)\n", stderr);
+                            std::abort();
+                    }
+                }
+                if (!fits) {
+                    // Decode-tier overflow (> the u64 accumulator) and
+                    // ladder exhaustion (decodable but beyond the last
+                    // candidate's range) are the same user-facing fact:
+                    // no declared type can hold this literal.
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_IntegerLiteralTooLarge;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(node);
+                    d.actual   = std::string{text};
+                    s.reporter.report(std::move(d));
+                    // Leave the node untyped (cascade suppression
+                    // downstream; the error already fails the compile).
+                    return;
+                }
+            }
+            // FC3.5 sweep-c2: float-literal suffix typing (C 6.4.4.2).
+            // When the language declares `floatLiteralTyping` AND this
+            // token is the numberStyle's FLOAT literal kind, the
+            // suffix selects the type (c-subset: `1.5f` → F32, `1.5`
+            // → F64) — the SAME shared rule the CST→HIR tier runs.
+            // Languages without the block keep the token-kind map
+            // exactly (toy / tsql — pinned).
+            if (!cfg.floatLiteralTyping.empty()
+                && s.idx().numberStyle != nullptr
+                && s.idx().numberStyle->emitKind.floating.valid()
+                && tk == s.idx().numberStyle->emitKind.floating) {
+                auto const fk = typeFloatLiteral(
+                    tree.text(node), s.idx().numberStyle,
+                    cfg.floatLiteralTyping, s.dataModel);
+                if (!fk.has_value()) {
+                    // Loader invariant: every numberStyle float suffix
+                    // is covered and an unsuffixed rule exists. A miss
+                    // here is substrate drift — fail loud, never
+                    // silently keep the base core.
+                    std::fputs("dss::analyze fatal: float literal "
+                               "matched no floatLiteralTyping rule "
+                               "(loader cross-check invariant "
+                               "violated)\n", stderr);
+                    std::abort();
+                }
+                litTy = s.lattice.interner().primitive(*fk);
+            }
+            s.nodeToType.set(node, litTy);
         }
     }
 
@@ -1325,7 +1521,14 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     s.nodeToType.set(node, target);
                     TypeId const operandTy =
                         subtreeType(s, tree, operandNode);
+                    // FC3.5 sweep-c3 (D-CSUBSET-CAST-VOID-DISCARD): the
+                    // `(void)expr` discard idiom is legal for EVERY
+                    // operand type (C 6.5.4p2 / 6.3.2.2) — checked
+                    // BEFORE the castability matrix, whose entries must
+                    // all be mapCast-lowerable (the discard emits no
+                    // Cast node at all; see lowerCast).
                     if (operandTy.valid()
+                        && !isVoidDiscardCast(s.lattice.interner(), target)
                         && !isExplicitCastable(s.lattice.interner(),
                                                target, operandTy)) {
                         ParseDiagnostic d;
@@ -1340,6 +1543,38 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 // target invalid ⇒ resolveTypeNode already emitted
                 // S_UnknownType (fail loud); the cast node stays
                 // untyped and enclosing checks cascade-suppress.
+            }
+        }
+
+        // FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF):
+        // compound-literal typing (`semantics.compoundLiterals`). The
+        // type-position child resolves through the SAME resolver the
+        // cast block above uses (builtins + pointer stars + struct
+        // refs + typedef aliases); the resolved type is stamped on
+        // BOTH the type child (the HIR lowering's
+        // `resolveStampedTypeBelow` probe) and the node itself (the
+        // literal's RESULT type for enclosing checks). NO cast-matrix
+        // validation — a compound literal is C 6.5.2.5 postfix
+        // syntax, not a conversion; per-element legality lives in the
+        // HIR brace-init lowering. Pre-sweep only struct-ref type
+        // children resolved (via the struct-name machinery); builtin
+        // keywords and typedef names stamped NOTHING and the HIR
+        // lowering fail-louded on every scalar compound literal.
+        auto clIt = s.idx().compoundLiteralByRule.find(rule.v);
+        if (clIt != s.idx().compoundLiteralByRule.end()) {
+            auto const& clRule = cfg.compoundLiteralRules[clIt->second];
+            auto kids = visibleChildren(tree, node);
+            if (clRule.typeChild < kids.size()) {
+                NodeId const typeNode = kids[clRule.typeChild];
+                TypeId const target =
+                    resolveTypeNode(s, cfg, tree, typeNode, here);
+                if (target.valid()) {
+                    s.nodeToType.set(typeNode, target);
+                    s.nodeToType.set(node, target);
+                }
+                // target invalid ⇒ resolveTypeNode already emitted
+                // S_UnknownType (fail loud); the literal stays untyped
+                // and enclosing checks cascade-suppress.
             }
         }
 
@@ -2178,12 +2413,34 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 
 } // namespace
 
-SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
+SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
+                      DataModel dataModel) {
     if (!cu) {
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();
     }
     EngineState s{*cu};
+    s.dataModel = dataModel;
+
+    // FC3 c1: ILP32 is DECLARED-ONLY (the wasm/spirv skeleton formats
+    // carry it for honesty) — no exercised 32-bit width path exists, so
+    // selecting it fails loud rather than silently typing `long` /
+    // pointers with untested widths. Positioned at the first tree's
+    // root (the analysis covers the whole CU); analysis continues under
+    // the collect-all discipline, but the error fails the compile.
+    if (dataModel == DataModel::Ilp32) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_UnsupportedDataModel;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::string{dataModelName(dataModel)};
+        for (Tree const& tree : cu->trees()) {
+            if (!tree.root().valid()) continue;
+            d.buffer = tree.source().id();
+            d.span   = tree.span(tree.root());
+            break;
+        }
+        s.reporter.report(std::move(d));
+    }
 
     // HR11: build one index bundle per DISTINCT schema in the CU (keyed by
     // SchemaId), each with its type extensions registered into the shared CU
@@ -2414,7 +2671,8 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
             // nothing is injected in that case (the pipeline then aborts on the
             // reporter error delta — never a silent partial import).
             auto desc = ffi::readShippedLibDescriptor(
-                descPath, s.lattice.interner(), s.lattice.registry(), s.reporter);
+                descPath, s.lattice.interner(), s.lattice.registry(), s.reporter,
+                s.dataModel);
             if (!desc) continue;
 
             for (auto const& sym : desc->symbols) {
@@ -2503,6 +2761,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
         std::move(s.usesBySymbol),
         std::move(s.compositeScopeByType),
         std::move(shippedExterns),
+        dataModel,
     };
 }
 

@@ -3,6 +3,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/compilation_unit/unit_attribute.hpp"
 #include "core/export.hpp"
+#include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/source_span.hpp"
@@ -136,7 +137,8 @@ public:
                   DiagnosticReporter                     diagnostics,
                   std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
-                  std::vector<ShippedExternSymbol>       shippedExterns) noexcept
+                  std::vector<ShippedExternSymbol>       shippedExterns,
+                  DataModel                              dataModel) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
           scopes_(std::move(scopes)),
@@ -146,7 +148,8 @@ public:
           diagnostics_(std::move(diagnostics)),
           usesBySymbol_(std::move(usesBySymbol)),
           compositeScopeByType_(std::move(compositeScopeByType)),
-          shippedExterns_(std::move(shippedExterns)) {}
+          shippedExterns_(std::move(shippedExterns)),
+          dataModel_(dataModel) {}
 
     SemanticModel(SemanticModel const&)            = delete;
     SemanticModel& operator=(SemanticModel const&) = delete;
@@ -211,6 +214,12 @@ public:
         return shippedExterns_;
     }
 
+    // FC3 c1: the data model this analysis ran under (`analyze()`'s
+    // parameter — the active format's declared width triple). The HIR
+    // lowering reads THIS (never a second parameter), so the two tiers'
+    // ladder / UAC resolutions agree by construction.
+    [[nodiscard]] DataModel dataModel() const noexcept { return dataModel_; }
+
 private:
     std::shared_ptr<CompilationUnit const> cu_;
     TypeLattice                            lattice_;
@@ -229,6 +238,8 @@ private:
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the
     // CST→HIR lowerer.
     std::vector<ShippedExternSymbol>                       shippedExterns_;
+    // FC3 c1: the analysis-time data model (see `dataModel()`).
+    DataModel                                              dataModel_ = DataModel::Lp64;
 };
 
 // Pin move-only / non-copyable at compile time so a future refactor

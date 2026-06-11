@@ -560,7 +560,13 @@ TEST(MirToLir, Arm64SignedDivisionLowersToSingleNativeSdiv) {
 // remainder, so MIR SMod expands to the target-blind arithmetic
 // identity rem = n − (n/d)·d over the DECLARED verbs: sdiv, mul, sub
 // — exactly three value-bearing ops, in that order.
-TEST(MirToLir, Arm64SignedModuloExpandsToSdivMulSub) {
+// D-LIR-MOD-MSUB-FUSION (FC3.5 sweep-c3): arm64 SMod now realizes the
+// rem = n − (n/d)·d identity via the FUSED msub (rule 3 preference a)
+// — sdiv + msub = 2 compute ops, the shape production compilers emit.
+// RED-on-disable lever: disabling the msub preference (or stripping
+// the `msub` declaration — see the fallback pin below) returns the
+// 3-op mul+sub expansion → the count + opcode asserts here go RED.
+TEST(MirToLir, Arm64SignedModuloFusesToSdivMsub) {
     TypeInterner interner{CompilationUnitId{1}};
     Mir mir = buildBinFnMir(MirOpcode::SMod, interner);
 
@@ -574,13 +580,293 @@ TEST(MirToLir, Arm64SignedModuloExpandsToSdivMulSub) {
     Lir const& lir = lirR.lir;
 
     auto const sdivOp = (*target)->opcodeByMnemonic("sdiv");
+    auto const msubOp = (*target)->opcodeByMnemonic("msub");
+    ASSERT_TRUE(sdivOp.has_value() && msubOp.has_value());
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    // EXACT shape: arg, arg, sdiv, msub, ret — 5 LIR insts (was 6
+    // pre-fusion: arg, arg, sdiv, mul, sub, ret).
+    ASSERT_EQ(lir.blockInstCount(bb), 5u)
+        << "arm64 SMod must fuse to exactly sdiv+msub.";
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 2)), *sdivOp)
+        << "fusion step 1: q = sdiv(n, d).";
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 3)), *msubOp)
+        << "fusion step 2: r = msub(q, d, n) = n − q·d.";
+
+    // Operand wiring (the identity's correctness): msub reads
+    // (quotient, divisor, dividend) — wired rn/rm/ra so the encoded
+    // MSUB computes Ra − Rn·Rm = n − q·d. Any transposition either
+    // negates every remainder (n, q·d swap) or computes garbage.
+    LirInstId const sdivInst = lir.blockInstAt(bb, 2);
+    LirInstId const msubInst = lir.blockInstAt(bb, 3);
+    auto const aReg    = lir.instResult(lir.blockInstAt(bb, 0));
+    auto const bReg    = lir.instResult(lir.blockInstAt(bb, 1));
+    auto const sdivReg = lir.instResult(sdivInst);
+    auto const msubOps = lir.instOperands(msubInst);
+    ASSERT_EQ(msubOps.size(), 3u);
+    EXPECT_EQ(msubOps[0].reg, sdivReg)
+        << "msub operand 0 (→ Rn) must be the sdiv quotient.";
+    EXPECT_EQ(msubOps[1].reg, bReg)
+        << "msub operand 1 (→ Rm) must be the divisor.";
+    EXPECT_EQ(msubOps[2].reg, aReg)
+        << "msub operand 2 (→ Ra) must be the DIVIDEND (r = n − q·d; "
+           "a transposed Ra would negate or corrupt every remainder).";
+}
+
+// ── D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (FC3.5 sweep-c3) ──────────────
+// The MOVZ+MOVK wide-immediate ladder. Hand-built `fn() -> T { return
+// <const>; }` MIR drives `lowerConst`'s inline path on each target.
+
+namespace {
+
+// Hand-built single-function MIR `fn() -> i64 { return CONST; }`.
+[[nodiscard]] Mir buildConstFnMir(std::int64_t value, TypeKind kind,
+                                  TypeInterner& interner) {
+    TypeId const ty = interner.primitive(kind);
+    auto const fnSig = interner.fnSig(std::span<TypeId const>{}, ty,
+                                      CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirLiteralValue lit;
+    lit.value = value;
+    lit.core  = kind;
+    MirInstId const c = mb.addConst(lit, ty);
+    mb.addReturn(c);
+    return std::move(mb).finish();
+}
+
+struct ConstChain {
+    std::vector<std::uint16_t> opcodes;   // block opcode sequence
+    std::vector<std::int32_t>  immValues; // each inst's ImmInt operand (or skip)
+};
+
+[[nodiscard]] ConstChain lowerConstChain(std::int64_t value, TypeKind kind,
+                                         char const* targetName) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildConstFnMir(value, kind, interner);
+    auto target = TargetSchema::loadShipped(targetName);
+    EXPECT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    EXPECT_TRUE(lirR.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    ConstChain out;
+    Lir const& lir = lirR.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        LirInstId const inst = lir.blockInstAt(bb, i);
+        out.opcodes.push_back(lir.instOpcode(inst));
+        std::int32_t imm = 0;
+        for (auto const& op : lir.instOperands(inst)) {
+            if (op.kind == LirOperandKind::ImmInt) imm = op.immInt32;
+        }
+        out.immValues.push_back(imm);
+    }
+    return out;
+}
+
+}  // namespace
+
+// 196608 = 0x30000: chunk0 = 0, chunk1 = 3 — exactly mov #0 +
+// movk_lsl16 #3 (+ ret). RED-on-disable lever: with the ladder off the
+// lowering emits ONE mov #196608 that fail-louds at encode; at THIS
+// tier the chain shape vanishes → count/opcode asserts RED.
+TEST(MirToLir, Arm64WideConstSplitsIntoMovzMovkChain) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp  = (*target)->opcodeByMnemonic("mov");
+    auto const mk16   = (*target)->opcodeByMnemonic("movk_lsl16");
+    ASSERT_TRUE(movOp.has_value() && mk16.has_value());
+
+    auto const chain = lowerConstChain(196608, TypeKind::I64, "arm64");
+    // mov #0, movk_lsl16 #3, ret — exactly 3 insts.
+    ASSERT_EQ(chain.opcodes.size(), 3u)
+        << "0x30000 must lower as a 2-op MOVZ+MOVK ladder";
+    EXPECT_EQ(chain.opcodes[0], *movOp);
+    EXPECT_EQ(chain.immValues[0], 0)
+        << "chunk 0 (lo16) of 0x30000 is ZERO";
+    EXPECT_EQ(chain.opcodes[1], *mk16);
+    EXPECT_EQ(chain.immValues[1], 3)
+        << "chunk 1 (bits 31:16) of 0x30000 is 3";
+}
+
+// A NEGATIVE width-64 constant is the SIGN-EXTENDED pattern — the
+// full 4-op ladder (chunk0 + three 0xFFFF-filled high chunks). -2 =
+// 0xFFFF_FFFF_FFFF_FFFE.
+TEST(MirToLir, Arm64NegativeConstEmitsFullFourOpLadder) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp = (*target)->opcodeByMnemonic("mov");
+    auto const mk16  = (*target)->opcodeByMnemonic("movk_lsl16");
+    auto const mk32  = (*target)->opcodeByMnemonic("movk_lsl32");
+    auto const mk48  = (*target)->opcodeByMnemonic("movk_lsl48");
+    ASSERT_TRUE(movOp.has_value() && mk16.has_value()
+             && mk32.has_value() && mk48.has_value());
+
+    auto const chain = lowerConstChain(-2, TypeKind::I64, "arm64");
+    ASSERT_EQ(chain.opcodes.size(), 5u)
+        << "-2 must lower as the full 4-op ladder (sign-extended "
+           "pattern) + ret";
+    EXPECT_EQ(chain.opcodes[0], *movOp);
+    EXPECT_EQ(chain.immValues[0], 0xFFFE);
+    EXPECT_EQ(chain.opcodes[1], *mk16);
+    EXPECT_EQ(chain.immValues[1], 0xFFFF);
+    EXPECT_EQ(chain.opcodes[2], *mk32);
+    EXPECT_EQ(chain.immValues[2], 0xFFFF);
+    EXPECT_EQ(chain.opcodes[3], *mk48);
+    EXPECT_EQ(chain.immValues[3], 0xFFFF);
+}
+
+// imm16-window constants keep the single MOVZ byte-identically — the
+// ladder must NOT fire below the ceiling.
+TEST(MirToLir, Arm64NarrowConstKeepsSingleMov) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp = (*target)->opcodeByMnemonic("mov");
+    ASSERT_TRUE(movOp.has_value());
+    auto const chain = lowerConstChain(0x2345, TypeKind::I64, "arm64");
+    ASSERT_EQ(chain.opcodes.size(), 2u)
+        << "0x2345 fits MOVZ — single mov + ret, no ladder";
+    EXPECT_EQ(chain.opcodes[0], *movOp);
+    EXPECT_EQ(chain.immValues[0], 0x2345);
+}
+
+// A width-32 (U32-typed) wide constant emits AT MOST the 2-chunk
+// ladder — chunks 2/3 do not exist at 32-bit width (the MOVZ seed
+// zeroes the whole register; the W-write semantics need no high
+// chunks). 0xFFFFFFFF = chunks FFFF/FFFF.
+TEST(MirToLir, Arm64Width32WideConstEmitsTwoChunkLadderOnly) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp = (*target)->opcodeByMnemonic("mov");
+    auto const mk16  = (*target)->opcodeByMnemonic("movk_lsl16");
+    ASSERT_TRUE(movOp.has_value() && mk16.has_value());
+    auto const chain = lowerConstChain(
+        static_cast<std::int64_t>(0xFFFFFFFFll), TypeKind::U32, "arm64");
+    ASSERT_EQ(chain.opcodes.size(), 3u)
+        << "U32 0xFFFFFFFF = mov #0xFFFF + movk_lsl16 #0xFFFF + ret — "
+           "no chunk-2/3 movk at 32-bit width";
+    EXPECT_EQ(chain.opcodes[0], *movOp);
+    EXPECT_EQ(chain.immValues[0], 0xFFFF);
+    EXPECT_EQ(chain.opcodes[1], *mk16);
+    EXPECT_EQ(chain.immValues[1], 0xFFFF);
+}
+
+// The CAPABILITY boundary: x86_64 declares no movk family — its mov
+// imm32 form swallows the whole inline range in ONE inst, and the
+// ladder must never fire (probe-by-mnemonic, zero `if (arch)`).
+TEST(MirToLir, X64WideConstKeepsSingleMovNoLadder) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp = (*target)->opcodeByMnemonic("mov");
+    ASSERT_TRUE(movOp.has_value());
+    EXPECT_FALSE((*target)->opcodeByMnemonic("movk_lsl16").has_value())
+        << "precondition: x86_64 must not declare the arm64 movk family";
+    auto const chain = lowerConstChain(196608, TypeKind::I64, "x86_64");
+    ASSERT_EQ(chain.opcodes.size(), 2u)
+        << "x86 keeps the single mov r, imm32 — the ladder is a "
+           "capability of movk-declaring targets only";
+    EXPECT_EQ(chain.opcodes[0], *movOp);
+    EXPECT_EQ(chain.immValues[0], 196608);
+}
+
+// D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD, the CAPABILITY boundary: arm64's
+// FPR load (`fldur`) declares NO [symbol] encoding variant — its
+// address materialization is the 2-word ADRP+ADD lea macro, and a
+// symbol-relative LDR fold is a DIFFERENT encoding shape (deliberately
+// out of scope; see the registry row). The fold predicate must
+// therefore NOT fire on arm64: the single-use GlobalAddr keeps its
+// lea and the load keeps the [base] form. This is the agnosticism pin
+// — the fold is mnemonic-capability-driven, never `if (x86)`.
+TEST(MirToLir, Arm64GlobalAddrLoadKeepsLeaPlusBaseFormLoad) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto const f64    = interner.primitive(TypeKind::F64);
+    auto const ptrF64 = interner.pointer(f64);
+    auto const sig = interner.fnSig(std::span<TypeId const>{}, f64,
+                                    CallConv::CcSysV);
+    MirBuilder mb;
+    MirLiteralValue quarter; quarter.value = 0.25;
+    quarter.core = TypeKind::F64;
+    mb.addFunction(sig, SymbolId{1});
+    (void)mb.addGlobal(f64, SymbolId{500}, mb.literalPoolAdd(quarter));
+    MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    MirInstId const addr = mb.addGlobalAddr(SymbolId{500}, ptrF64);
+    MirInstId const loadOps[] = {addr};
+    MirInstId const c = mb.addInst(MirOpcode::Load, loadOps, f64);
+    mb.addReturn(c);
+    Mir mir = std::move(mb).finish();
+
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = lirR.lir;
+
+    auto const leaOp   = (*target)->opcodeByMnemonic("lea");
+    auto const fldurOp = (*target)->opcodeByMnemonic("fldur");
+    ASSERT_TRUE(leaOp.has_value() && fldurOp.has_value());
+    LirBlockId const bbL = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool sawLea = false;
+    bool sawBaseFormLoad = false;
+    bool sawSymbolLoad = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bbL); ++i) {
+        LirInstId const inst = lir.blockInstAt(bbL, i);
+        auto const op = lir.instOpcode(inst);
+        if (op == *leaOp) sawLea = true;
+        if (op == *fldurOp) {
+            auto const ops = lir.instOperands(inst);
+            ASSERT_FALSE(ops.empty());
+            if (ops[0].kind == LirOperandKind::Reg) sawBaseFormLoad = true;
+            if (ops[0].kind == LirOperandKind::SymbolRef) sawSymbolLoad = true;
+        }
+    }
+    EXPECT_TRUE(sawLea)
+        << "arm64 must KEEP the lea (ADRP+ADD) — fldur declares no "
+           "[symbol] variant, so the riprel fold must not fire";
+    EXPECT_TRUE(sawBaseFormLoad)
+        << "the fldur must read through the lea-produced base register";
+    EXPECT_FALSE(sawSymbolLoad)
+        << "no symbol-operand fldur may be emitted — the assembler has "
+           "no encoding for it (the fold would be a guaranteed "
+           "A_NoMatchingEncodingVariant)";
+}
+
+// The generic mul+sub expansion is the FALLBACK for targets without a
+// fused multiply-subtract — and no shipped target reaches it any more
+// (x86 realizes remainders at rule 2; arm64 declares msub). This pin
+// keeps the fallback alive and correct under the msub-stripped arm64
+// schema (the cycle-10k mutation substrate): a regression that breaks
+// the expansion (or silently swallows a missing msub) goes RED here.
+TEST(MirToLir, Arm64ModuloWithoutMsubFallsBackToSdivMulSub) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildBinFnMir(MirOpcode::SMod, interner);
+
+    auto target = dss::test_support::mutateShippedTargetSchemaJson(
+        "arm64", {"msub"});
+    ASSERT_TRUE(target.has_value())
+        << "stripping msub must not fail the loader (an optional "
+           "capability, not a required verb)";
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = lirR.lir;
+
+    auto const sdivOp = (*target)->opcodeByMnemonic("sdiv");
     auto const mulOp  = (*target)->opcodeByMnemonic("mul");
     auto const subOp  = (*target)->opcodeByMnemonic("sub");
     ASSERT_TRUE(sdivOp.has_value() && mulOp.has_value() && subOp.has_value());
     LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
-    // EXACT shape: arg, arg, sdiv, mul, sub, ret — 6 LIR insts.
+    // EXACT pre-fusion shape: arg, arg, sdiv, mul, sub, ret — 6 insts.
     ASSERT_EQ(lir.blockInstCount(bb), 6u)
-        << "arm64 SMod must expand to exactly sdiv+mul+sub.";
+        << "without msub, SMod must expand to exactly sdiv+mul+sub.";
     EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 2)), *sdivOp)
         << "expansion step 1: q = sdiv(n, d).";
     EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 3)), *mulOp)
@@ -725,6 +1011,234 @@ TEST(MirToLir, MissingInputRolesFailsLoudOnDivLowering) {
     EXPECT_TRUE(sawRoleDiag)
         << "the fail-loud diagnostic must name the missing role "
            "('dividend') and the map ('inputRoles').";
+}
+
+// ── FC3.5 sweep-c1: capability-driven shift lowering ────────────────────
+// (the D-CSUBSET-32BIT-ALU-FORMS shifts residue — x86 implicit-CL
+//  "count" role contract / imm8 constant form / arm64 native LSLV.)
+
+namespace {
+
+// Self-contained probe result for the shift-lowering pins (the later
+// FC3-section `GuardProbe` is declared further down this TU; a
+// distinct name keeps the anonymous namespace ODR-clean).
+struct ShiftProbe {
+    ::dss::DiagnosticReporter rep;
+    ::dss::Lir                lir;
+    bool ok = false;
+};
+
+// Hand-build `fn(a, b) -> a OP b` (variable count) or
+// `fn(a) -> a OP <countConst>` and lower against `schema`.
+[[nodiscard]] ShiftProbe lowerShiftProbe(
+        std::shared_ptr<::dss::TargetSchema> const& schema,
+        ::dss::MirOpcode op, ::dss::TypeKind k,
+        std::optional<std::int64_t> countConst = std::nullopt) {
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const ty = interner.primitive(k);
+    ShiftProbe probe;
+    if (schema == nullptr) { return probe; }
+    ::dss::MirBuilder mb;
+    if (countConst.has_value()) {
+        std::array<::dss::TypeId, 1> params{ty};
+        mb.addFunction(interner.fnSig(params, ty, ::dss::CallConv::CcSysV),
+                       ::dss::SymbolId{1});
+        auto const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+        mb.beginBlock(bb);
+        auto const a = mb.addArg(0, ty);
+        auto const c = mb.addConst(
+            ::dss::MirLiteralValue{*countConst, ::dss::TypeKind::I64}, ty);
+        std::array<::dss::MirInstId, 2> ops{a, c};
+        mb.addReturn(mb.addInst(op, ops, ty));
+    } else {
+        std::array<::dss::TypeId, 2> params{ty, ty};
+        mb.addFunction(interner.fnSig(params, ty, ::dss::CallConv::CcSysV),
+                       ::dss::SymbolId{1});
+        auto const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+        mb.beginBlock(bb);
+        auto const a = mb.addArg(0, ty);
+        auto const b = mb.addArg(1, ty);
+        std::array<::dss::MirInstId, 2> ops{a, b};
+        mb.addReturn(mb.addInst(op, ops, ty));
+    }
+    ::dss::Mir m = std::move(mb).finish();
+    auto result = ::dss::lowerToLir(m, *schema, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+
+struct ShiftInstShape {
+    std::size_t operandCount = 0;
+    bool        op1IsImm     = false;
+    std::int32_t imm         = -1;
+};
+
+// Find the first inst with `mnemonic`; also report whether any mov
+// writes a PHYSICAL register of `physOrdinal` (the count pin).
+[[nodiscard]] std::optional<ShiftInstShape>
+findShiftShape(::dss::Lir const& lir, ::dss::TargetSchema const& sch,
+               std::string_view mnemonic, std::uint16_t physOrdinal,
+               bool& sawPinToPhys) {
+    sawPinToPhys = false;
+    std::optional<ShiftInstShape> shape;
+    for (std::uint32_t f = 0; f < lir.moduleFuncCount(); ++f) {
+        auto const fn = lir.funcAt(f);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            auto const bb = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < lir.blockInstCount(bb); ++ii) {
+                auto const inst  = lir.blockInstAt(bb, ii);
+                auto const* info = sch.opcodeInfo(lir.instOpcode(inst));
+                if (info == nullptr) continue;
+                auto const result = lir.instResult(inst);
+                if (info->mnemonic == "mov" && result.valid()
+                    && result.isPhysical != 0
+                    && result.id == physOrdinal) {
+                    sawPinToPhys = true;
+                }
+                if (info->mnemonic == mnemonic && !shape.has_value()) {
+                    auto const ops = lir.instOperands(inst);
+                    ShiftInstShape s;
+                    s.operandCount = ops.size();
+                    if (ops.size() == 2
+                        && ops[1].kind == ::dss::LirOperandKind::ImmInt) {
+                        s.op1IsImm = true;
+                        s.imm = ops[1].immInt32;
+                    }
+                    shape = s;
+                }
+            }
+        }
+    }
+    return shape;
+}
+
+} // namespace
+
+TEST(MirToLir, VariableShiftOnX64PinsCountByRoleAndEmitsOneOperandCore) {
+    // x86 has no 3-address reg-count shift — the count must reach CL.
+    // The lowering pins the count vreg into the ROLE-declared register
+    // (mov rcx_phys, count) and emits the core with ONE explicit
+    // operand (the value; requires2Address makes it the destination).
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const rcxOrd = (*target)->registerByName("rcx");
+    ASSERT_TRUE(rcxOrd.has_value());
+    for (auto const& [op, mn] : {
+             std::pair{::dss::MirOpcode::Shl,  "shl"},
+             std::pair{::dss::MirOpcode::LShr, "shr_l"},
+             std::pair{::dss::MirOpcode::AShr, "shr_a"}}) {
+        auto probe = lowerShiftProbe(*target, op,
+                                     op == ::dss::MirOpcode::LShr
+                                         ? ::dss::TypeKind::U64
+                                         : ::dss::TypeKind::I64);
+        EXPECT_TRUE(probe.ok) << mn << ": "
+            << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+        bool sawPin = false;
+        auto const shape =
+            findShiftShape(probe.lir, **target, mn, *rcxOrd, sawPin);
+        ASSERT_TRUE(shape.has_value()) << mn;
+        EXPECT_EQ(shape->operandCount, 1u)
+            << mn << ": the CL core carries ONE explicit operand";
+        EXPECT_TRUE(sawPin)
+            << mn << ": the count must be pinned into the role-declared "
+                      "register (mov rcx_phys, count)";
+    }
+}
+
+TEST(MirToLir, ConstantCountShiftOnX64SelectsTheImm8Form) {
+    // A MIR-Const count in [0,255] + a declared [reg,imm] variant →
+    // the imm8 form: TWO operands, op1 an ImmInt, NO rcx pin.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const rcxOrd = (*target)->registerByName("rcx");
+    ASSERT_TRUE(rcxOrd.has_value());
+    auto probe = lowerShiftProbe(*target, ::dss::MirOpcode::Shl,
+                                 ::dss::TypeKind::I64,
+                                 /*countConst=*/3);
+    EXPECT_TRUE(probe.ok)
+        << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+    bool sawPin = false;
+    auto const shape =
+        findShiftShape(probe.lir, **target, "shl", *rcxOrd, sawPin);
+    ASSERT_TRUE(shape.has_value());
+    EXPECT_EQ(shape->operandCount, 2u);
+    EXPECT_TRUE(shape->op1IsImm);
+    EXPECT_EQ(shape->imm, 3);
+    EXPECT_FALSE(sawPin)
+        << "an immediate-count shift needs no CL pin";
+}
+
+TEST(MirToLir, OutOfImm8RangeConstantCountFallsBackToTheClForm) {
+    // A 300 count is C-UB (>= width) but must still ENCODE — the imm8
+    // byte can't hold it, so the lowering falls back to the CL form
+    // (hardware masks; never a silent truncation to one byte).
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const rcxOrd = (*target)->registerByName("rcx");
+    ASSERT_TRUE(rcxOrd.has_value());
+    auto probe = lowerShiftProbe(*target, ::dss::MirOpcode::Shl,
+                                 ::dss::TypeKind::I64,
+                                 /*countConst=*/300);
+    EXPECT_TRUE(probe.ok);
+    bool sawPin = false;
+    auto const shape =
+        findShiftShape(probe.lir, **target, "shl", *rcxOrd, sawPin);
+    ASSERT_TRUE(shape.has_value());
+    EXPECT_EQ(shape->operandCount, 1u);
+    EXPECT_TRUE(sawPin);
+}
+
+TEST(MirToLir, VariableShiftOnArm64UsesTheNativeThreeAddressForm) {
+    // arm64 declares NO implicitRegisters on its shifts (LSLV/LSRV/
+    // ASRV are 3-address) → the generic reg,reg form, no pin mov.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto probe = lowerShiftProbe(*target, ::dss::MirOpcode::Shl,
+                                 ::dss::TypeKind::I64);
+    EXPECT_TRUE(probe.ok)
+        << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+    bool sawPin = false;  // probe ordinal irrelevant on arm64; use 0xFFFF
+    auto const shape =
+        findShiftShape(probe.lir, **target, "shl", 0xFFFF, sawPin);
+    ASSERT_TRUE(shape.has_value());
+    EXPECT_EQ(shape->operandCount, 2u)
+        << "native 3-address: value + count as plain reg operands";
+    EXPECT_FALSE(shape->op1IsImm);
+}
+
+// RED-ON-DISABLE lever for the count-role contract (the FC1
+// MissingInputRolesFailsLoud twin): strip `inputRoles` from the
+// shipped shl — the lowering must FAIL LOUD naming the missing role,
+// never fall back to a positional or name-based register guess.
+TEST(MirToLir, MissingCountRoleFailsLoudOnShiftLowering) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            for (auto& op : doc.at("opcodes")) {
+                if (op.value("mnemonic", "") == "shl") {
+                    op.at("implicitRegisters").erase("inputRoles");
+                }
+            }
+        });
+    ASSERT_TRUE(mutated.has_value())
+        << "role maps are OPTIONAL at load — stripping must only fail "
+           "the LOWERING";
+    auto probe = lowerShiftProbe(*mutated, ::dss::MirOpcode::Shl,
+                                 ::dss::TypeKind::I64);
+    EXPECT_FALSE(probe.ok)
+        << "a shl with implicitRegisters but no count role must FAIL "
+           "the shift lowering";
+    bool sawRoleDiag = false;
+    for (auto const& d : probe.rep.all()) {
+        if (d.code == DiagnosticCode::L_RequiredLirOpcodeMissing
+            && d.actual.find("count") != std::string::npos
+            && d.actual.find("inputRoles") != std::string::npos) {
+            sawRoleDiag = true;
+        }
+    }
+    EXPECT_TRUE(sawRoleDiag)
+        << "the fail-loud diagnostic must name the missing role "
+           "('count') and the map ('inputRoles').";
 }
 
 // Cycle 3a wide-literal coverage (>INT32_MAX) is deferred to cycle 3b's
@@ -960,17 +1474,16 @@ TEST(MirToLir, TernaryProducesPhiResolutionMoves) {
     // each predecessor BEFORE its terminator, writing the per-arm value
     // into the phi's pre-allocated vreg.
     //
-    // Note: the condition path may use MIR Cast (HR's implicit bool
-    // coercion), which cycle 3b does NOT yet lower — so `L.lir.ok` may
-    // be false. The Phi resolution itself runs INDEPENDENTLY of the
-    // condition path's Cast failure (pre-allocation + edge-mov emission
-    // happen in their own pass). The test pins the move shape, not the
-    // overall lowering success.
+    // The non-Bool int condition lowers as the truthiness ICmpNe(c, 0)
+    // (cst_to_hir's coerceCondition — it used to be a Cast the LIR tier
+    // could not lower), which the CondBr fusion machinery handles — so
+    // the WHOLE function now lowers cleanly and `L.lir.ok` is required.
     auto L = lowerCSubsetToLir(
         "int f(int c) { return c ? 1 : 2; }");
     assertUpstreamClean(L);
-    // Don't require L.lir.ok — Cast on the condition may surface
-    // L_UnsupportedLoweringForOpcode without preventing Phi resolution.
+    ASSERT_TRUE(L.lir.ok)
+        << "ternary with a bare int cond must lower end-to-end (the "
+           "truthiness ICmpNe is CondBr-fusable)";
 
     auto const& sch = *L.target;
     auto const movOp = *sch.opcodeByMnemonic("mov");
@@ -1514,7 +2027,14 @@ INSTANTIATE_TEST_SUITE_P(
         // Integer casts (cycle 3c) — all GPR result.
         CastCase{::dss::MirOpcode::Trunc,    "trunc", ::dss::TypeKind::I64, ::dss::TypeKind::I32, LirRegClass::GPR},
         CastCase{::dss::MirOpcode::SExt,     "sext",  ::dss::TypeKind::I32, ::dss::TypeKind::I64, LirRegClass::GPR},
-        CastCase{::dss::MirOpcode::ZExt,     "zext",  ::dss::TypeKind::I32, ::dss::TypeKind::I64, LirRegClass::GPR},
+        // FC3 c2 → FC3.5: the zext mnemonic carries TWO width-keyed
+        // forms — the Bool 0/1 byte source (x86 movzx r64, r/m8,
+        // width-default) and the U32 source (mov r32,r32, width 32;
+        // D-CSUBSET-ZEXT-32-TO-64 — see
+        // ZExtFromU32SourceLowersCarryingSourceWidth). Narrower
+        // sources stay gated at requireNativeIntWidth, and mapCast
+        // never mints an I32-source ZExt (signed widening is SExt).
+        CastCase{::dss::MirOpcode::ZExt,     "zext",  ::dss::TypeKind::Bool, ::dss::TypeKind::I64, LirRegClass::GPR},
         CastCase{::dss::MirOpcode::IntToPtr, "mov",   ::dss::TypeKind::I64, ::dss::TypeKind::Ptr, LirRegClass::GPR},
         CastCase{::dss::MirOpcode::PtrToInt, "mov",   ::dss::TypeKind::Ptr, ::dss::TypeKind::I64, LirRegClass::GPR},
         // Bitcast same-class is mov; different test (BitcastCrossClass)
@@ -1745,11 +2265,13 @@ TEST(MirToLir, FprConstAtMirToLirFailsLoudPointingAtPromotion) {
            "promotion contract";
 }
 
-// FC2 Part B width gate (D-TARGET-ENCODING-WIDTH-GUARD): with the F64
-// addsd encoding live, a non-F64 float FAdd would otherwise SILENTLY
-// match the F2 0F 58 variant (the guard has no width discriminator)
-// and run double-width arithmetic on F32 values. Pin the fail-loud.
-TEST(MirToLir, F32FAddFailsLoudUntilWidthDiscriminatedEncodings) {
+// FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN closed): an F32 FAdd now
+// LOWERS — the fadd inst must carry the width-32 flag so the
+// assembler's variant matcher selects ADDSS (F3 0F 58), never the F64
+// ADDSD sibling. The width AXIS is the discrimination pin: a dropped
+// F32→width-32 mapping would re-select the 64-bit default and the
+// width-keyed F2 variant — double-width arithmetic on F32 values.
+TEST(MirToLir, F32FAddLowersWithWidth32Flag) {
     std::array<::dss::TypeKind, 2> paramKinds{
         ::dss::TypeKind::F32, ::dss::TypeKind::F32};
     auto syn = ::dss::test_support::buildSyntheticFn(
@@ -1767,9 +2289,53 @@ TEST(MirToLir, F32FAddFailsLoudUntilWidthDiscriminatedEncodings) {
     ASSERT_TRUE(target.has_value());
     ::dss::DiagnosticReporter rep;
     auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    auto const faddOp = (*target)->opcodeByMnemonic("fadd");
+    ASSERT_TRUE(faddOp.has_value());
+    bool sawWidth32Fadd = false;
+    for (std::uint32_t f = 0; f < result.lir.moduleFuncCount(); ++f) {
+        auto const fn = result.lir.funcAt(f);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            auto const bb = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < result.lir.blockInstCount(bb); ++ii) {
+                auto const id = result.lir.blockInstAt(bb, ii);
+                if (result.lir.instOpcode(id) != *faddOp) continue;
+                EXPECT_EQ(::dss::lirInstWidthBits(result.lir.instFlags(id)),
+                          32u)
+                    << "an F32 FAdd must carry the width-32 flag (ADDSS, "
+                       "never the F64 ADDSD sibling)";
+                sawWidth32Fadd = true;
+            }
+        }
+    }
+    EXPECT_TRUE(sawWidth32Fadd) << "expected a width-32 fadd inst";
+}
+
+// The F16/F128 wall stays: no scalar encodings exist at ANY width for
+// them, and first-match would otherwise pick a wrong-width form
+// (D-TARGET-ENCODING-WIDTH-GUARD). F16 FAdd must still fail loud.
+TEST(MirToLir, F16FAddStillFailsLoudViaTheWidthGuard) {
+    std::array<::dss::TypeKind, 2> paramKinds{
+        ::dss::TypeKind::F16, ::dss::TypeKind::F16};
+    auto syn = ::dss::test_support::buildSyntheticFn(
+        paramKinds, ::dss::TypeKind::F16,
+        [](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+           std::span<::dss::TypeId const> params, ::dss::TypeId retT) {
+            ::dss::MirInstId const a = mb.addArg(0, params[0]);
+            ::dss::MirInstId const b = mb.addArg(1, params[1]);
+            ::dss::MirInstId const ops[] = {a, b};
+            ::dss::MirInstId const r =
+                mb.addInst(::dss::MirOpcode::FAdd, ops, retT);
+            mb.addReturn(r);
+        });
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
     EXPECT_FALSE(result.ok)
-        << "F32 FAdd must fail loud — lowering it would silently select "
-           "the F64 addsd encoding";
+        << "F16 FAdd must fail loud — no scalar encodings at any width";
     bool sawWidthDiag = false;
     for (auto const& d : rep.all()) {
         if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode
@@ -1922,9 +2488,13 @@ TEST(MirToLir, StrippedClassOpsTableFailsLoudOnFprLoad) {
     EXPECT_TRUE(sawClassDiag);
 }
 
-// The FPToSI twin: cvttsd2si consumes an F64 SOURCE; an F32 source
-// must fail loud rather than convert 4 garbage upper bytes.
-TEST(MirToLir, F32FpToSiSourceFailsLoudUntilWidthDiscriminatedEncodings) {
+// The FPToSI twin (FC3.5 re-pin — D-CSUBSET-F32-CODEGEN closed): an
+// F32-source FPToSI now LOWERS, and the fp_to_si inst must carry the
+// SOURCE's width-32 flag (the variant axis keys on the source float
+// width — CVTTSS2SI F3 vs CVTTSD2SI F2 — while the RESULT-width
+// default would have mis-keyed an I32 result as 32 even for an F64
+// source; the override is the pinned behavior).
+TEST(MirToLir, F32FpToSiSourceLowersWithSourceWidth32Flag) {
     std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::F32};
     auto syn = ::dss::test_support::buildSyntheticFn(
         paramKinds, ::dss::TypeKind::I32,
@@ -1940,9 +2510,71 @@ TEST(MirToLir, F32FpToSiSourceFailsLoudUntilWidthDiscriminatedEncodings) {
     ASSERT_TRUE(target.has_value());
     ::dss::DiagnosticReporter rep;
     auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
-    EXPECT_FALSE(result.ok)
-        << "F32-source FPToSI must fail loud — lowering it would "
-           "silently select the F64 cvttsd2si encoding";
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    auto const fpToSiOp = (*target)->opcodeByMnemonic("fp_to_si");
+    ASSERT_TRUE(fpToSiOp.has_value());
+    bool saw = false;
+    for (std::uint32_t f = 0; f < result.lir.moduleFuncCount(); ++f) {
+        auto const fn = result.lir.funcAt(f);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            auto const bb = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < result.lir.blockInstCount(bb); ++ii) {
+                auto const id = result.lir.blockInstAt(bb, ii);
+                if (result.lir.instOpcode(id) != *fpToSiOp) continue;
+                EXPECT_EQ(::dss::lirInstWidthBits(result.lir.instFlags(id)),
+                          32u)
+                    << "F32-source fp_to_si must carry the SOURCE width";
+                saw = true;
+            }
+        }
+    }
+    EXPECT_TRUE(saw) << "expected an fp_to_si inst";
+}
+
+// The mirror discrimination pin: an F64-source FPToSI with an I32
+// RESULT must carry width-64 (the SOURCE axis) — the result-type
+// default (I32 → 32) would silently select the F3 CVTTSS2SI form and
+// convert an F64 as a single. This is the exact mis-key the
+// widthOverride threading exists to prevent.
+TEST(MirToLir, F64FpToSiWithI32ResultKeepsSourceWidth64) {
+    std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::F64};
+    auto syn = ::dss::test_support::buildSyntheticFn(
+        paramKinds, ::dss::TypeKind::I32,
+        [](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+           std::span<::dss::TypeId const> params, ::dss::TypeId retT) {
+            ::dss::MirInstId const a = mb.addArg(0, params[0]);
+            ::dss::MirInstId const ops[] = {a};
+            ::dss::MirInstId const r =
+                mb.addInst(::dss::MirOpcode::FPToSI, ops, retT);
+            mb.addReturn(r);
+        });
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    auto const fpToSiOp = (*target)->opcodeByMnemonic("fp_to_si");
+    ASSERT_TRUE(fpToSiOp.has_value());
+    bool saw = false;
+    for (std::uint32_t f = 0; f < result.lir.moduleFuncCount(); ++f) {
+        auto const fn = result.lir.funcAt(f);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            auto const bb = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < result.lir.blockInstCount(bb); ++ii) {
+                auto const id = result.lir.blockInstAt(bb, ii);
+                if (result.lir.instOpcode(id) != *fpToSiOp) continue;
+                EXPECT_EQ(::dss::lirInstWidthBits(result.lir.instFlags(id)),
+                          64u)
+                    << "F64-source fp_to_si must carry width-64 even with "
+                       "an I32 result — the source axis, never the result "
+                       "type";
+                saw = true;
+            }
+        }
+    }
+    EXPECT_TRUE(saw) << "expected an fp_to_si inst";
 }
 
 // ─── cycle 3e: Calls + Aggregates + LirVerifier ─────────────────────────
@@ -2608,4 +3240,515 @@ TEST(MirToLir, WhileLoopLowersWithBackEdge) {
         LirBlockId const bb = lir.funcBlockAt(fn, b);
         EXPECT_TRUE(L.target->isTerminator(lir.instOpcode(lir.blockTerminator(bb))));
     }
+}
+
+// ── FC3 width gate + width axis (D-CSUBSET-32BIT-ALU-FORMS) ─────────────
+//
+// c1 erected the gate (every shipped integer encoding was 64-bit-wide;
+// narrower DEFINED semantics failed loud). c2 ships the 32-bit forms +
+// the width axis: I32/U32 now LOWER, carrying `kLirInstFlagWidth32` on
+// the LIR instruction so the encoder picks the 32-bit variants. The
+// still-unencoded widths (8/16/128-bit + Bool-ALU) stay gated, and the
+// conversion mnemonics gate the (source/result) shapes they do not
+// realize.
+
+namespace {
+
+// Hand-build `fn(k, k) -> k { return a OP b; }` and lower it.
+struct GuardProbe {
+    ::dss::DiagnosticReporter rep;
+    ::dss::Lir                lir;
+    bool ok = false;
+};
+
+[[nodiscard]] GuardProbe lowerBinaryProbe(::dss::TypeKind k,
+                                          ::dss::MirOpcode op) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const ty = interner.primitive(k);
+    std::array<::dss::TypeId, 2> params{ty, ty};
+    auto const fnSig = interner.fnSig(params, ty, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb =
+        mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const a = mb.addArg(0, ty);
+    ::dss::MirInstId const b = mb.addArg(1, ty);
+    std::array<::dss::MirInstId, 2> ops{a, b};
+    ::dss::MirInstId const r = mb.addInst(op, ops, ty);
+    mb.addReturn(r);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+
+[[nodiscard]] bool sawAnchor(::dss::DiagnosticReporter const& rep,
+                             std::string_view anchor) {
+    for (auto const& d : rep.all()) {
+        if (d.actual.find(anchor) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// Collect the LIR width (in bits) of every instruction whose mnemonic
+// matches, across the whole module. Empty = mnemonic never emitted.
+[[nodiscard]] std::vector<unsigned>
+widthsOfMnemonic(::dss::Lir const& lir, ::dss::TargetSchema const& sch,
+                 std::string_view mnemonic) {
+    std::vector<unsigned> out;
+    for (std::uint32_t f = 0; f < lir.moduleFuncCount(); ++f) {
+        auto const fn = lir.funcAt(f);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            auto const bb = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < lir.blockInstCount(bb); ++ii) {
+                auto const inst  = lir.blockInstAt(bb, ii);
+                auto const* info = sch.opcodeInfo(lir.instOpcode(inst));
+                if (info != nullptr && info->mnemonic == mnemonic) {
+                    out.push_back(::dss::lirInstWidthBits(
+                        lir.instFlags(inst)));
+                }
+            }
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(MirToLir, U32AddLowersCarryingTheThirtyTwoBitWidthFlag) {
+    // c2 FLIP of the c1 gate test `U32AddFailsLoudCitingNativeWidthGuard`:
+    // U32 arithmetic now lowers, and the add instruction must carry the
+    // 32-bit width flag — the lever the encoder's variant guards match
+    // on. Width-perturbation red-on-disable: force `widthFlagsForType`
+    // to 0 and this pin goes RED (and the u32_wraparound corpus exit
+    // flips 42→7 — defined wraparound computed 64-wide).
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto probe = lowerBinaryProbe(::dss::TypeKind::U32, ::dss::MirOpcode::Add);
+    EXPECT_TRUE(probe.ok)
+        << "U32 add must lower — c2 shipped the 32-bit ALU forms";
+    auto const widths = widthsOfMnemonic(probe.lir, **target, "add");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 32u)
+        << "the U32 add must carry kLirInstFlagWidth32 so the encoder "
+           "selects the 32-bit (no-REX.W) variant";
+}
+
+TEST(MirToLir, I64AddKeepsTheSixtyFourBitDefaultWidth) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto probe = lowerBinaryProbe(::dss::TypeKind::I64, ::dss::MirOpcode::Add);
+    EXPECT_TRUE(probe.ok);
+    auto const widths = widthsOfMnemonic(probe.lir, **target, "add");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 64u)
+        << "64-bit-typed code must keep the default width (back-compat: "
+           "it matches the pre-existing width-keyed 64 variants)";
+}
+
+TEST(MirToLir, I32SignedDivisionThreadsWidthThroughPreAndCoreOps) {
+    // The implicit-register pair must select the 32-bit forms COHERENTLY:
+    // an I32 SDiv lowers pre=cqo (encoding CDQ at width 32) + core=
+    // idiv_op (32-bit F7 /7) — a 64-bit CQO paired with a 32-bit IDIV
+    // (or vice versa) would sign-extend the WRONG register half.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto probe = lowerBinaryProbe(::dss::TypeKind::I32, ::dss::MirOpcode::SDiv);
+    EXPECT_TRUE(probe.ok);
+    auto const preWidths  = widthsOfMnemonic(probe.lir, **target, "cqo");
+    auto const coreWidths = widthsOfMnemonic(probe.lir, **target, "idiv_op");
+    ASSERT_EQ(preWidths.size(), 1u);
+    ASSERT_EQ(coreWidths.size(), 1u);
+    EXPECT_EQ(preWidths[0], 32u);
+    EXPECT_EQ(coreWidths[0], 32u);
+}
+
+TEST(MirToLir, U16DivAndI16MulAlsoGate) {
+    EXPECT_FALSE(lowerBinaryProbe(::dss::TypeKind::U16,
+                                  ::dss::MirOpcode::UDiv).ok);
+    EXPECT_FALSE(lowerBinaryProbe(::dss::TypeKind::I16,
+                                  ::dss::MirOpcode::Mul).ok);
+}
+
+TEST(MirToLir, U32CompareLowersWithThirtyTwoBitCmpWidth) {
+    // c2 FLIP of the c1 gate test `U32CompareOperandsGate`: a U32
+    // compare now lowers, and the `cmp` instruction's width follows
+    // the OPERANDS' type (the result is Bool — width 64 would read
+    // the sign-garbage upper bits of a bitcast-from-negative operand).
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const u32  = interner.primitive(::dss::TypeKind::U32);
+    auto const b1   = interner.primitive(::dss::TypeKind::Bool);
+    std::array<::dss::TypeId, 2> params{u32, u32};
+    auto const fnSig = interner.fnSig(params, b1, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb =
+        mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const a = mb.addArg(0, u32);
+    ::dss::MirInstId const b = mb.addArg(1, u32);
+    std::array<::dss::MirInstId, 2> ops{a, b};
+    ::dss::MirInstId const r =
+        mb.addInst(::dss::MirOpcode::ICmpUgt, ops, b1);
+    mb.addReturn(r);
+    ::dss::Mir m = std::move(mb).finish();
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    EXPECT_TRUE(result.ok);
+    auto const widths = widthsOfMnemonic(result.lir, **target, "cmp");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 32u);
+    // The Bool-producing setcc/zext pair stays width-default.
+    auto const zextWidths = widthsOfMnemonic(result.lir, **target, "zext");
+    ASSERT_EQ(zextWidths.size(), 1u);
+    EXPECT_EQ(zextWidths[0], 64u);
+}
+
+// ── audit-residue sweep c1: the FUSED ICmp+CondBr cmp width pin ─────────
+// D-AUDIT-FUSED-CMP-WIDTH-PIN: lowerCondBr's ICmp-fusion arm emits its
+// OWN `cmp lhs, rhs` (immediately before the jcc) — a SEPARATE emit
+// site from lowerICmp's value-path cmp (which the U32Compare… pin
+// above covers). The fused cmp's width must follow the ICmp OPERANDS'
+// type, the same FC3-c2 rule. Because the 32-bit producers zero the
+// upper 32 bits (x86 no-REX.W auto-zero-extend / arm64 W-forms), a
+// width-64 regression at that ONE site silently mis-branches every
+// `int x = a - b; if (x < 0)` (a cmp64 reads 0x00000000FFFFFFxx as
+// POSITIVE) while the value-path width pins stay green — the highest-
+// traffic compare shape in C. Runtime witness:
+// examples/c-subset/fused_negative_compare (42 ↔ 7 exit divergence).
+// The shape below makes the CondBr the ICmpSlt's ONLY consumer, so the
+// fusion precondition holds; the jcc payload carrying Slt (not the
+// non-fused arm's Ne) PROVES the fusion arm actually fired.
+
+namespace {
+
+struct FusedCmpShape {
+    bool          lowered    = false;  // lowerToLir ok
+    bool          shapeFound = false;  // entry block ends `cmp ; jcc`
+    unsigned      fusedCmpWidthBits = 0;
+    std::uint32_t jccPayload = 0;
+};
+
+// f(k a, k b) { if (a < b) return 7; return 9; } — ICmpSlt's only
+// consumer is the CondBr (the fusion precondition; mirrors the FCmp
+// fusion tests' buildFcmpBranchFn with integer operands).
+[[nodiscard]] FusedCmpShape
+lowerFusedSltShape(std::string_view targetName, ::dss::TypeKind k) {
+    FusedCmpShape out;
+    auto target = ::dss::TargetSchema::loadShipped(targetName);
+    if (!target.has_value()) {
+        ADD_FAILURE() << "loadShipped(" << targetName << ") failed";
+        return out;
+    }
+    std::array<::dss::TypeKind, 2> paramKinds{k, k};
+    auto syn = test_support::buildSyntheticFn(
+        paramKinds, ::dss::TypeKind::I32,
+        [&](::dss::MirBuilder& mb, ::dss::TypeInterner& in,
+            std::span<::dss::TypeId const> params, ::dss::TypeId retT) {
+            ::dss::MirInstId const a = mb.addArg(0, params[0]);
+            ::dss::MirInstId const b = mb.addArg(1, params[1]);
+            std::array<::dss::MirInstId, 2> ops{a, b};
+            ::dss::MirInstId const c = mb.addInst(
+                ::dss::MirOpcode::ICmpSlt, ops,
+                in.primitive(::dss::TypeKind::Bool));
+            ::dss::MirBlockId const thenB =
+                mb.createBlock(::dss::StructCfMarker::IfThen);
+            ::dss::MirBlockId const elseB =
+                mb.createBlock(::dss::StructCfMarker::IfElse);
+            mb.addCondBr(c, thenB, elseB);
+            ::dss::MirLiteralValue v7;
+            v7.value = static_cast<std::int64_t>(7);
+            v7.core  = ::dss::TypeKind::I32;
+            mb.beginBlock(thenB);
+            mb.addReturn(mb.addConst(v7, retT));
+            ::dss::MirLiteralValue v9;
+            v9.value = static_cast<std::int64_t>(9);
+            v9.core  = ::dss::TypeKind::I32;
+            mb.beginBlock(elseB);
+            mb.addReturn(mb.addConst(v9, retT));
+        });
+    ::dss::DiagnosticReporter rep;
+    auto const result =
+        ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    if (!result.ok) return out;
+    out.lowered = true;
+    auto const& sch = **target;
+    ::dss::Lir const& lir = result.lir;
+    auto const jccOp = sch.opcodeByMnemonic("jcc");
+    auto const cmpOp = sch.opcodeByMnemonic("cmp");
+    if (!jccOp.has_value() || !cmpOp.has_value()) return out;
+    ::dss::LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        ::dss::LirInstId const inst = lir.blockInstAt(entry, i);
+        if (lir.instOpcode(inst) != *jccOp) continue;
+        // The fused cmp is emitted IMMEDIATELY before the jcc (phi-edge
+        // moves precede it; none exist in this shape).
+        if (i == 0) return out;
+        ::dss::LirInstId const prev = lir.blockInstAt(entry, i - 1);
+        if (lir.instOpcode(prev) != *cmpOp) return out;
+        out.shapeFound        = true;
+        out.fusedCmpWidthBits =
+            ::dss::lirInstWidthBits(lir.instFlags(prev));
+        out.jccPayload        = lir.instPayload(inst);
+        return out;
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(MirToLir, FusedI32CompareCondBrCmpCarriesThirtyTwoBitWidth) {
+    // The width-threading site is TARGET-BLIND (shared lowering), so
+    // pin both shipped targets — each schema's cmp carries width-keyed
+    // variants (x86 no-REX.W 39 / arm64 SUBS W-form 0x6B00001F) that
+    // the assembler selects from this flag.
+    for (auto const* targetName : {"x86_64", "arm64"}) {
+        SCOPED_TRACE(targetName);
+        auto const s = lowerFusedSltShape(targetName, ::dss::TypeKind::I32);
+        ASSERT_TRUE(s.lowered);
+        ASSERT_TRUE(s.shapeFound)
+            << "entry block must end `cmp ; jcc` — the fused shape";
+        EXPECT_EQ(s.jccPayload,
+                  static_cast<std::uint32_t>(::dss::TargetCondCode::Slt))
+            << "jcc payload must be the ICmpSlt cc — proves the FUSION "
+               "arm fired (the non-fused arm carries Ne)";
+        EXPECT_EQ(s.fusedCmpWidthBits, 32u)
+            << "the FUSED cmp over I32 operands must read 32 bits — "
+               "width-64 here reads zero-extended upper bits and calls "
+               "a negative int positive (D-AUDIT-FUSED-CMP-WIDTH-PIN)";
+    }
+}
+
+TEST(MirToLir, FusedI64CompareCondBrCmpKeepsSixtyFourBitWidth) {
+    // The I64 contrast pin: native-width operands must keep the
+    // 64-bit default (flags 0) — guards against over-rotating the fix
+    // into a blanket width-32.
+    for (auto const* targetName : {"x86_64", "arm64"}) {
+        SCOPED_TRACE(targetName);
+        auto const s = lowerFusedSltShape(targetName, ::dss::TypeKind::I64);
+        ASSERT_TRUE(s.lowered);
+        ASSERT_TRUE(s.shapeFound)
+            << "entry block must end `cmp ; jcc` — the fused shape";
+        EXPECT_EQ(s.jccPayload,
+                  static_cast<std::uint32_t>(::dss::TargetCondCode::Slt));
+        EXPECT_EQ(s.fusedCmpWidthBits, 64u)
+            << "I64-operand fused cmp must stay width-64";
+    }
+}
+
+// ── FC3 c2: conversion-shape gates ──────────────────────────────────────
+// Each conversion mnemonic has an INHERENT (source, dest) width pair;
+// the shapes with no realization must fail loud at MIR→LIR, never let
+// first-match pick a wrong-width encoding.
+
+namespace {
+
+// Hand-build `fn(src) -> dst { return (dst)a; }` with the given cast
+// opcode and lower it.
+[[nodiscard]] GuardProbe lowerCastProbe(::dss::MirOpcode castOp,
+                                        ::dss::TypeKind src,
+                                        ::dss::TypeKind dst) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const srcTy = interner.primitive(src);
+    auto const dstTy = interner.primitive(dst);
+    std::array<::dss::TypeId, 1> params{srcTy};
+    auto const fnSig = interner.fnSig(params, dstTy, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb =
+        mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const a = mb.addArg(0, srcTy);
+    std::array<::dss::MirInstId, 1> ops{a};
+    ::dss::MirInstId const r = mb.addInst(castOp, ops, dstTy);
+    mb.addReturn(r);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+
+} // namespace
+
+TEST(MirToLir, TruncToThirtyTwoLowersCarryingWidthFlag) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto probe = lowerCastProbe(::dss::MirOpcode::Trunc,
+                                ::dss::TypeKind::I64, ::dss::TypeKind::U32);
+    EXPECT_TRUE(probe.ok)
+        << "Trunc to a 32-bit result is realized (x86 mov r32,r32 = "
+           "C's mod-2^32 conversion)";
+    auto const widths = widthsOfMnemonic(probe.lir, **target, "trunc");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 32u)
+        << "the trunc inst must carry the 32-bit width — its encoding "
+           "variant is width-keyed so non-32 trunc matches nothing";
+}
+
+TEST(MirToLir, TruncToSixteenAndEightStayGated) {
+    auto p16 = lowerCastProbe(::dss::MirOpcode::Trunc,
+                              ::dss::TypeKind::I64, ::dss::TypeKind::I16);
+    EXPECT_FALSE(p16.ok);
+    EXPECT_TRUE(sawAnchor(p16.rep, "D-CSUBSET-32BIT-ALU-FORMS"));
+    EXPECT_FALSE(lowerCastProbe(::dss::MirOpcode::Trunc,
+                                ::dss::TypeKind::I64,
+                                ::dss::TypeKind::U8).ok);
+}
+
+TEST(MirToLir, ZExtFromU32SourceLowersCarryingSourceWidth) {
+    // FC3.5 sweep-c1 FLIP of `ZExtFromU32SourceStaysGated`
+    // (D-CSUBSET-ZEXT-32-TO-64 closed): the U32→U64 zero-extend is now
+    // realized — the ZExt arm threads the SOURCE type's width onto the
+    // LIR inst so the encoder picks the width-32 form (x86 `mov r32,
+    // r32`, auto-zero-extending) instead of the Bool byte-widener
+    // (movzx r64, r/m8 — which would silently read ONE byte of the
+    // U32). Red-on-disable: revert the source-width threading in the
+    // ZExt dispatch arm and this width pin goes RED (the inst falls
+    // back to the result-type rule = width 64).
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto probe = lowerCastProbe(::dss::MirOpcode::ZExt,
+                                ::dss::TypeKind::U32, ::dss::TypeKind::U64);
+    EXPECT_TRUE(probe.ok)
+        << "ZExt from U32 is realized (x86 mov r32,r32 width-32 form): "
+        << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+    auto const widths = widthsOfMnemonic(probe.lir, **target, "zext");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 32u)
+        << "the U32-source zext must carry the SOURCE width (32) — "
+           "the encoding variants are width-keyed";
+}
+
+TEST(MirToLir, ZExtFromBoolKeepsTheDefaultWidthAndNarrowSourcesStayGated) {
+    // The Bool 0/1 source keeps the width-default byte widener
+    // (existing consumers — lowerICmp's setcc→zext pair — must stay
+    // byte-identical), and the still-unencoded narrow sources keep
+    // failing loud.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto boolProbe = lowerCastProbe(::dss::MirOpcode::ZExt,
+                                    ::dss::TypeKind::Bool,
+                                    ::dss::TypeKind::I64);
+    EXPECT_TRUE(boolProbe.ok);
+    auto const widths = widthsOfMnemonic(boolProbe.lir, **target, "zext");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 64u)
+        << "Bool-source zext keeps the 64-default (movzx byte form)";
+    auto u16Probe = lowerCastProbe(::dss::MirOpcode::ZExt,
+                                   ::dss::TypeKind::U16,
+                                   ::dss::TypeKind::U64);
+    EXPECT_FALSE(u16Probe.ok);
+    EXPECT_TRUE(sawAnchor(u16Probe.rep, "D-CSUBSET-32BIT-ALU-FORMS"));
+}
+
+TEST(MirToLir, SExtFromI16SourceStaysGatedButI32Lowers) {
+    // movsxd / SXTW read a 32-bit source window — only I32 sources
+    // are realized.
+    auto p16 = lowerCastProbe(::dss::MirOpcode::SExt,
+                              ::dss::TypeKind::I16, ::dss::TypeKind::I64);
+    EXPECT_FALSE(p16.ok);
+    EXPECT_TRUE(sawAnchor(p16.rep, "D-CSUBSET-32BIT-ALU-FORMS"));
+    EXPECT_TRUE(lowerCastProbe(::dss::MirOpcode::SExt,
+                               ::dss::TypeKind::I32,
+                               ::dss::TypeKind::I64).ok);
+}
+
+TEST(MirToLir, CSubsetSourceTypesThreadWidthToLirFlags) {
+    // SOURCE-tier width-threading pin: the c-subset front end's
+    // `unsigned int`/`int` (32-bit) vs `long long` (64-bit) typing
+    // must arrive at the LIR width flag — composing with the byte
+    // pins (tests/asm/test_asm_width_axis.cpp: flag → bytes) and the
+    // runtime corpus (u32_wraparound: program → exit), this covers
+    // source → bytes end-to-end.
+    {
+        auto L = lowerCSubsetToLir(
+            "unsigned int f(unsigned int a, unsigned int b) "
+            "{ return a + b; }");
+        assertUpstreamClean(L);
+        auto const w = widthsOfMnemonic(L.lir.lir, *L.target, "add");
+        ASSERT_EQ(w.size(), 1u);
+        EXPECT_EQ(w[0], 32u);
+    }
+    {
+        // Plain `int` now ALSO computes at 32 bits — true C int
+        // semantics (the c1 64-wide exemption was conforming via
+        // signed-overflow UB; the 32-bit forms are exact).
+        auto L = lowerCSubsetToLir(
+            "int g(int a, int b) { return a + b; }");
+        assertUpstreamClean(L);
+        auto const w = widthsOfMnemonic(L.lir.lir, *L.target, "add");
+        ASSERT_EQ(w.size(), 1u);
+        EXPECT_EQ(w[0], 32u);
+    }
+    {
+        auto L = lowerCSubsetToLir(
+            "long long h(long long a, long long b) { return a + b; }");
+        assertUpstreamClean(L);
+        auto const w = widthsOfMnemonic(L.lir.lir, *L.target, "add");
+        ASSERT_EQ(w.size(), 1u);
+        EXPECT_EQ(w[0], 64u);
+    }
+    {
+        // FC3.5 (D-CSUBSET-ZEXT-32-TO-64): the C-source widening
+        // conversion `unsigned int` → `unsigned long long` mints a
+        // ZExt whose LIR width is the SOURCE's 32 — the front-end
+        // composition of ZExtFromU32SourceLowersCarryingSourceWidth.
+        auto L = lowerCSubsetToLir(
+            "unsigned long long w(unsigned int a) "
+            "{ return (unsigned long long)a; }");
+        assertUpstreamClean(L);
+        auto const w = widthsOfMnemonic(L.lir.lir, *L.target, "zext");
+        ASSERT_EQ(w.size(), 1u);
+        EXPECT_EQ(w[0], 32u)
+            << "the U32→U64 widening's zext must carry the source "
+               "width so the encoder picks mov r32,r32 over movzx";
+    }
+}
+
+TEST(MirToLir, NativeWidthsStayAllowedThroughTheGate) {
+    // U64 unsigned compute IS native-width (defined wraparound holds in
+    // 64-bit registers) and I32 signed rides the signed-overflow-is-UB
+    // exemption — the existing corpus' status quo. The gate must not
+    // overfire on either.
+    EXPECT_TRUE(lowerBinaryProbe(::dss::TypeKind::U64,
+                                 ::dss::MirOpcode::Add).ok);
+    EXPECT_TRUE(lowerBinaryProbe(::dss::TypeKind::I32,
+                                 ::dss::MirOpcode::Add).ok);
+    EXPECT_TRUE(lowerBinaryProbe(::dss::TypeKind::I64,
+                                 ::dss::MirOpcode::Mul).ok);
+}
+
+TEST(MirToLir, F32AddLowersAndExoticFloatWidthsStayWalled) {
+    // FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN CLOSED): F32 arithmetic now
+    // LOWERS through the width axis (ADDSS / arm64 FADD-S). The wall
+    // narrows to the genuinely-unencoded widths: F16/F128 must still
+    // REJECT via the width guard, never first-match a wrong-width form
+    // (D-TARGET-ENCODING-WIDTH-GUARD).
+    EXPECT_TRUE(lowerBinaryProbe(::dss::TypeKind::F32,
+                                 ::dss::MirOpcode::FAdd).ok);
+    EXPECT_TRUE(lowerBinaryProbe(::dss::TypeKind::F64,
+                                 ::dss::MirOpcode::FDiv).ok)
+        << "fdiv gained DIVSD — the NaN-construction path";
+    EXPECT_TRUE(lowerBinaryProbe(::dss::TypeKind::F32,
+                                 ::dss::MirOpcode::FDiv).ok)
+        << "fdiv gained DIVSS";
+    auto probe16 = lowerBinaryProbe(::dss::TypeKind::F16,
+                                    ::dss::MirOpcode::FAdd);
+    EXPECT_FALSE(probe16.ok);
+    EXPECT_TRUE(sawAnchor(probe16.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+    auto probe128 = lowerBinaryProbe(::dss::TypeKind::F128,
+                                     ::dss::MirOpcode::FDiv);
+    EXPECT_FALSE(probe128.ok);
+    EXPECT_TRUE(sawAnchor(probe128.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
 }

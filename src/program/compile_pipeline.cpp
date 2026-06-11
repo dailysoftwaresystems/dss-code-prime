@@ -136,7 +136,13 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
     //    `copyDiagnostics` helper to eliminate the inline-drain
     //    duplicate.)
     auto const semEntry = reporter.errorCount();
-    auto model = analyze(std::move(borrowed));
+    // FC3 c1: thread the FORMAT's declared data model (its REQUIRED
+    // `dataModel` field) into the per-(CU × target) analysis — the
+    // single source for every width-dependent resolution downstream
+    // (builtinTypes/typeSpecifiers `coreByDataModel`, the integer-
+    // literal ladder, descriptor `signatureByDataModel`). The HIR
+    // lowering reads the SAME value back off the SemanticModel.
+    auto model = analyze(std::move(borrowed), format.dataModel());
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
         return std::nullopt;

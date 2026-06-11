@@ -207,17 +207,29 @@ namespace detail::type_rules {
 //
 // Everything else is false → the analyzer emits S_InvalidCast. Notably
 // REJECTED (fail loud, never miscompile): struct/union VALUES (C forbids
-// casts to composite types), `void` on either side (mapCast has no void
-// arm; a value-discarding `(void)x` statement-cast is future surface),
-// and Array-typed operands (decay-inside-cast, e.g. `(char*)"s"`, is a
-// pinned follow-up — the implicit decay path exists but the explicit-
-// cast lowering does not reuse it yet).
+// casts to composite types), `void` as the OPERAND (a void value cannot
+// convert to anything; the `(void)expr` DISCARD direction — void as the
+// TARGET — is admitted separately by `isVoidDiscardCast` below, FC3.5
+// sweep-c3), and Array-typed TARGETS (C 6.5.4 forbids casts to array
+// types).
+//
+// ARRAY-TYPED OPERANDS decay first (D-CSUBSET-CAST-ARRAY-DECAY ✅
+// FC3.5 sweep-c3): per C 6.3.2.1p3 the cast operand undergoes the
+// array-to-pointer conversion BEFORE the cast applies, so
+// `(char*)"str"` is Ptr↔Ptr legality-wise (and `(long)arr` is the
+// Ptr→integer round-trip). The legality view simply re-kinds the
+// operand as Ptr; the HIR lowering (`lowerCast`) emits the SAME
+// synthetic decay Cast the implicit path uses, so the value side
+// always sees pointer-typed input.
 [[nodiscard]] inline bool isExplicitCastable(TypeInterner const& interner,
                                              TypeId target,
                                              TypeId operand) noexcept {
     if (!target.valid() || !operand.valid()) return true;   // cascade suppression
     auto const tk = interner.kind(target);
-    auto const ok = interner.kind(operand);
+    auto const ok0 = interner.kind(operand);
+    // C 6.3.2.1p3 array-to-pointer decay on the OPERAND side only —
+    // an Array TARGET stays rejected below (no arm admits it).
+    auto const ok = (ok0 == TypeKind::Array) ? TypeKind::Ptr : ok0;
     // Mirrors mapCast's isInt: every integral scalar the MIR lattice
     // casts between (incl. Bool/Char/Byte — C casts these freely).
     auto const isCastableInt = [](TypeKind k) noexcept {
@@ -234,6 +246,22 @@ namespace detail::type_rules {
     if (tk == TypeKind::Ptr && isCastableInt(ok))     return true;
     if (isCastableInt(tk) && ok == TypeKind::Ptr)     return true;
     return false;
+}
+
+// FC3.5 sweep-c3 (D-CSUBSET-CAST-VOID-DISCARD): the C discard idiom
+// `(void)expr` — C 6.5.4p2 exempts a void TARGET from the scalar-
+// operand constraint and C 6.3.2.2 defines the semantics as evaluate-
+// and-discard. ANY operand type (scalar, pointer, array, struct, even
+// void itself) is admissible. Kept SEPARATE from `isExplicitCastable`
+// deliberately: everything that matrix admits must be lowerable by
+// MIR's `mapCast`, while a void discard produces NO Cast node at all —
+// `lowerCast` (cst_to_hir.cpp) lowers the operand for its side effects
+// and discards the value (an expression-statement effect). The
+// analyzer's cast-legality site checks this FIRST; a void target never
+// reaches the matrix.
+[[nodiscard]] inline bool isVoidDiscardCast(TypeInterner const& interner,
+                                            TypeId target) noexcept {
+    return target.valid() && interner.kind(target) == TypeKind::Void;
 }
 
 // Best common type for binary arithmetic. Returns the wider operand
@@ -257,6 +285,155 @@ namespace detail::type_rules {
         return floatRank(ak) >= floatRank(bk) ? a : b;
     }
     return InvalidType;
+}
+
+// ── FC3 c1: config-driven usual arithmetic conversions (C 6.3.1.8) ──────
+//
+// The `arithmeticConversions` SemanticConfig block, RESOLVED for the
+// active DataModel (the load-resolved `DataModelTypeRef`s collapse to
+// concrete TypeKinds here, once per (schema × dataModel)). Consumed by
+// the CST→HIR combine sites (binary / ternary / compound-assign): a
+// language WITH the block runs `usualArithmeticCommonType` below; a
+// language WITHOUT it keeps the legacy `TypeInterner::commonType`
+// EXACTLY (toy/tsql — pinned by their typing-unchanged tests). The
+// engine never hardcodes C's view of int/char/bool — the promotion
+// floor, the extra promoted kinds, and the mixed-signedness verb are all
+// declared by the language and validated fail-loud at load.
+struct ResolvedArithmeticRules {
+    TypeKind              minRank = TypeKind::I32;  // promotion floor kind
+    std::vector<TypeKind> alsoPromote;              // out-of-lattice promoted kinds
+    MixedSignednessRule   mixedSignedness = MixedSignednessRule::RankPreferUnsigned;
+    bool                  promoteComparisons = true;
+};
+
+[[nodiscard]] inline ResolvedArithmeticRules
+resolveArithmeticRules(ArithmeticConversions const& cfg, DataModel dm) {
+    ResolvedArithmeticRules out;
+    out.minRank = cfg.minRankType.resolveCore(dm);
+    out.alsoPromote.reserve(cfg.alsoPromote.size());
+    for (auto const& p : cfg.alsoPromote) out.alsoPromote.push_back(p.resolveCore(dm));
+    out.mixedSignedness    = cfg.mixedSignedness;
+    out.promoteComparisons = cfg.promoteComparisons;
+    return out;
+}
+
+namespace detail::type_rules {
+
+// Width rank of any core integer kind (signed or unsigned): 1..5 for
+// 8..128 bits; 0 = outside the integer rank lattice.
+[[nodiscard]] inline constexpr int intWidthRank(TypeKind k) noexcept {
+    int const s = signedIntRank(k);
+    return s != 0 ? s : unsignedIntRank(k);
+}
+
+// Inverse mapper: the canonical kind at (width rank, signedness).
+[[nodiscard]] inline constexpr TypeKind kindAtRank(int rank, bool isSigned) noexcept {
+    switch (rank) {
+        case 1: return isSigned ? TypeKind::I8   : TypeKind::U8;
+        case 2: return isSigned ? TypeKind::I16  : TypeKind::U16;
+        case 3: return isSigned ? TypeKind::I32  : TypeKind::U32;
+        case 4: return isSigned ? TypeKind::I64  : TypeKind::U64;
+        case 5: return isSigned ? TypeKind::I128 : TypeKind::U128;
+        default: return TypeKind::Void;
+    }
+}
+
+// Integer promotion (C 6.3.1.8 step 1, parameterized): a kind in the
+// rules' `alsoPromote` set, or one whose width rank is BELOW the floor's,
+// promotes to the floor kind (value-preserving: every promoted kind's
+// range fits the floor — C's Bool/Char/I8..U16 all fit int). Kinds at or
+// above the floor — and kinds outside the lattice that the language did
+// NOT list (pointers, structs, floats) — pass through unchanged.
+[[nodiscard]] inline TypeKind
+promoteIntegerKind(TypeKind k, ResolvedArithmeticRules const& rules) noexcept {
+    for (TypeKind p : rules.alsoPromote) {
+        if (p == k) return rules.minRank;
+    }
+    int const r     = intWidthRank(k);
+    int const floor = intWidthRank(rules.minRank);
+    if (r != 0 && r < floor) return rules.minRank;
+    return k;
+}
+
+} // namespace detail::type_rules
+
+// The C 6.3.1.8 common type of two operands under the language's
+// declared rules — the config-driven sibling of
+// `TypeInterner::commonType` (which keeps serving block-less languages
+// byte-identically). Returns InvalidType for non-arithmetic pairs (the
+// caller falls back to its structural rule, exactly the commonType
+// contract). Algorithm:
+//   1. float hierarchy: if either operand is float, BOTH must be
+//      arithmetic; the result is the wider float (int converts to the
+//      float side).
+//   2. integer promotion per `promoteIntegerKind` (floor + alsoPromote).
+//   3. same kind → it; same signedness → wider rank; mixed signedness
+//      per the closed verb. `rank-prefer-unsigned` (C): unsigned rank ≥
+//      signed rank → the unsigned kind at its rank; else the signed kind
+//      (a strictly-wider power-of-two signed type represents the whole
+//      unsigned range, so C's third branch — "the unsigned counterpart
+//      of the signed type" — is unreachable over width-distinct core
+//      kinds; it exists only for same-width different-rank ABO types).
+[[nodiscard]] inline TypeId
+usualArithmeticCommonType(TypeInterner& interner, TypeId a, TypeId b,
+                          ResolvedArithmeticRules const& rules) {
+    if (!a.valid() || !b.valid()) return InvalidType;
+    using namespace detail::type_rules;
+    TypeKind const ka = interner.kind(a);
+    TypeKind const kb = interner.kind(b);
+    auto const isArith = [&](TypeKind k) noexcept {
+        if (floatRank(k) != 0 || intWidthRank(k) != 0) return true;
+        for (TypeKind p : rules.alsoPromote) {
+            if (p == k) return true;
+        }
+        return false;
+    };
+    int const fa = floatRank(ka);
+    int const fb = floatRank(kb);
+    if (fa != 0 || fb != 0) {
+        if (!isArith(ka) || !isArith(kb)) return InvalidType;
+        if (fa != 0 && fb != 0) return fa >= fb ? a : b;
+        return fa != 0 ? a : b;
+    }
+    TypeKind const pa = promoteIntegerKind(ka, rules);
+    TypeKind const pb = promoteIntegerKind(kb, rules);
+    int const ra = intWidthRank(pa);
+    int const rb = intWidthRank(pb);
+    if (ra == 0 || rb == 0) return InvalidType;   // not arithmetic
+    if (pa == pb) return interner.primitive(pa);
+    bool const sa = signedIntRank(pa) != 0;
+    bool const sb = signedIntRank(pb) != 0;
+    if (sa == sb) {
+        return interner.primitive(kindAtRank(ra >= rb ? ra : rb, sa));
+    }
+    // Mixed signedness — closed verb (loader rejects unknown spellings,
+    // so this switch is exhaustive over the declared vocabulary).
+    switch (rules.mixedSignedness) {
+        case MixedSignednessRule::RankPreferUnsigned: {
+            int const  uRank = sa ? rb : ra;
+            int const  sRank = sa ? ra : rb;
+            if (uRank >= sRank) {
+                return interner.primitive(kindAtRank(uRank, /*isSigned=*/false));
+            }
+            return interner.primitive(kindAtRank(sRank, /*isSigned=*/true));
+        }
+    }
+    return InvalidType;
+}
+
+// One operand's integer promotion as a TypeId (C 6.5.7: a SHIFT's result
+// type is the PROMOTED LEFT operand — the count's type never
+// contributes). Non-arithmetic and float operands pass through.
+[[nodiscard]] inline TypeId
+integerPromotedType(TypeInterner& interner, TypeId t,
+                    ResolvedArithmeticRules const& rules) {
+    if (!t.valid()) return t;
+    using namespace detail::type_rules;
+    TypeKind const k = interner.kind(t);
+    if (floatRank(k) != 0) return t;
+    TypeKind const p = promoteIntegerKind(k, rules);
+    if (p == k) return t;
+    return interner.primitive(p);
 }
 
 // Compile-time sanity: the rank functions are pure (constexpr) and the

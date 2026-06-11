@@ -9,6 +9,9 @@
     "kind": "pe"
   },
 
+  "$dataModelComment": "FC3 c1: 64-bit Windows is LLP64 (int 32, long 32, long long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I32 here, the literal ladder + descriptor signatureByDataModel resolve their LLP64 arms. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
+  "dataModel": "LLP64",
+
   "pe": {
     "$comment": "IMAGE_FILE_HEADER identity. machine = IMAGE_FILE_MACHINE_AMD64 (0x8664). characteristics = 0 — relocatable .obj carries no file-level flags (link.exe sets image-level flags when producing the .exe/.dll).",
     "machine": 34404,
