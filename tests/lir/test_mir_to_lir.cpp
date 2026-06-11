@@ -3411,6 +3411,138 @@ TEST(MirToLir, U32CompareLowersWithThirtyTwoBitCmpWidth) {
     EXPECT_EQ(zextWidths[0], 64u);
 }
 
+// ── audit-residue sweep c1: the FUSED ICmp+CondBr cmp width pin ─────────
+// D-AUDIT-FUSED-CMP-WIDTH-PIN: lowerCondBr's ICmp-fusion arm emits its
+// OWN `cmp lhs, rhs` (immediately before the jcc) — a SEPARATE emit
+// site from lowerICmp's value-path cmp (which the U32Compare… pin
+// above covers). The fused cmp's width must follow the ICmp OPERANDS'
+// type, the same FC3-c2 rule. Because the 32-bit producers zero the
+// upper 32 bits (x86 no-REX.W auto-zero-extend / arm64 W-forms), a
+// width-64 regression at that ONE site silently mis-branches every
+// `int x = a - b; if (x < 0)` (a cmp64 reads 0x00000000FFFFFFxx as
+// POSITIVE) while the value-path width pins stay green — the highest-
+// traffic compare shape in C. Runtime witness:
+// examples/c-subset/fused_negative_compare (42 ↔ 7 exit divergence).
+// The shape below makes the CondBr the ICmpSlt's ONLY consumer, so the
+// fusion precondition holds; the jcc payload carrying Slt (not the
+// non-fused arm's Ne) PROVES the fusion arm actually fired.
+
+namespace {
+
+struct FusedCmpShape {
+    bool          lowered    = false;  // lowerToLir ok
+    bool          shapeFound = false;  // entry block ends `cmp ; jcc`
+    unsigned      fusedCmpWidthBits = 0;
+    std::uint32_t jccPayload = 0;
+};
+
+// f(k a, k b) { if (a < b) return 7; return 9; } — ICmpSlt's only
+// consumer is the CondBr (the fusion precondition; mirrors the FCmp
+// fusion tests' buildFcmpBranchFn with integer operands).
+[[nodiscard]] FusedCmpShape
+lowerFusedSltShape(std::string_view targetName, ::dss::TypeKind k) {
+    FusedCmpShape out;
+    auto target = ::dss::TargetSchema::loadShipped(targetName);
+    if (!target.has_value()) {
+        ADD_FAILURE() << "loadShipped(" << targetName << ") failed";
+        return out;
+    }
+    std::array<::dss::TypeKind, 2> paramKinds{k, k};
+    auto syn = test_support::buildSyntheticFn(
+        paramKinds, ::dss::TypeKind::I32,
+        [&](::dss::MirBuilder& mb, ::dss::TypeInterner& in,
+            std::span<::dss::TypeId const> params, ::dss::TypeId retT) {
+            ::dss::MirInstId const a = mb.addArg(0, params[0]);
+            ::dss::MirInstId const b = mb.addArg(1, params[1]);
+            std::array<::dss::MirInstId, 2> ops{a, b};
+            ::dss::MirInstId const c = mb.addInst(
+                ::dss::MirOpcode::ICmpSlt, ops,
+                in.primitive(::dss::TypeKind::Bool));
+            ::dss::MirBlockId const thenB =
+                mb.createBlock(::dss::StructCfMarker::IfThen);
+            ::dss::MirBlockId const elseB =
+                mb.createBlock(::dss::StructCfMarker::IfElse);
+            mb.addCondBr(c, thenB, elseB);
+            ::dss::MirLiteralValue v7;
+            v7.value = static_cast<std::int64_t>(7);
+            v7.core  = ::dss::TypeKind::I32;
+            mb.beginBlock(thenB);
+            mb.addReturn(mb.addConst(v7, retT));
+            ::dss::MirLiteralValue v9;
+            v9.value = static_cast<std::int64_t>(9);
+            v9.core  = ::dss::TypeKind::I32;
+            mb.beginBlock(elseB);
+            mb.addReturn(mb.addConst(v9, retT));
+        });
+    ::dss::DiagnosticReporter rep;
+    auto const result =
+        ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    if (!result.ok) return out;
+    out.lowered = true;
+    auto const& sch = **target;
+    ::dss::Lir const& lir = result.lir;
+    auto const jccOp = sch.opcodeByMnemonic("jcc");
+    auto const cmpOp = sch.opcodeByMnemonic("cmp");
+    if (!jccOp.has_value() || !cmpOp.has_value()) return out;
+    ::dss::LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        ::dss::LirInstId const inst = lir.blockInstAt(entry, i);
+        if (lir.instOpcode(inst) != *jccOp) continue;
+        // The fused cmp is emitted IMMEDIATELY before the jcc (phi-edge
+        // moves precede it; none exist in this shape).
+        if (i == 0) return out;
+        ::dss::LirInstId const prev = lir.blockInstAt(entry, i - 1);
+        if (lir.instOpcode(prev) != *cmpOp) return out;
+        out.shapeFound        = true;
+        out.fusedCmpWidthBits =
+            ::dss::lirInstWidthBits(lir.instFlags(prev));
+        out.jccPayload        = lir.instPayload(inst);
+        return out;
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(MirToLir, FusedI32CompareCondBrCmpCarriesThirtyTwoBitWidth) {
+    // The width-threading site is TARGET-BLIND (shared lowering), so
+    // pin both shipped targets — each schema's cmp carries width-keyed
+    // variants (x86 no-REX.W 39 / arm64 SUBS W-form 0x6B00001F) that
+    // the assembler selects from this flag.
+    for (auto const* targetName : {"x86_64", "arm64"}) {
+        SCOPED_TRACE(targetName);
+        auto const s = lowerFusedSltShape(targetName, ::dss::TypeKind::I32);
+        ASSERT_TRUE(s.lowered);
+        ASSERT_TRUE(s.shapeFound)
+            << "entry block must end `cmp ; jcc` — the fused shape";
+        EXPECT_EQ(s.jccPayload,
+                  static_cast<std::uint32_t>(::dss::TargetCondCode::Slt))
+            << "jcc payload must be the ICmpSlt cc — proves the FUSION "
+               "arm fired (the non-fused arm carries Ne)";
+        EXPECT_EQ(s.fusedCmpWidthBits, 32u)
+            << "the FUSED cmp over I32 operands must read 32 bits — "
+               "width-64 here reads zero-extended upper bits and calls "
+               "a negative int positive (D-AUDIT-FUSED-CMP-WIDTH-PIN)";
+    }
+}
+
+TEST(MirToLir, FusedI64CompareCondBrCmpKeepsSixtyFourBitWidth) {
+    // The I64 contrast pin: native-width operands must keep the
+    // 64-bit default (flags 0) — guards against over-rotating the fix
+    // into a blanket width-32.
+    for (auto const* targetName : {"x86_64", "arm64"}) {
+        SCOPED_TRACE(targetName);
+        auto const s = lowerFusedSltShape(targetName, ::dss::TypeKind::I64);
+        ASSERT_TRUE(s.lowered);
+        ASSERT_TRUE(s.shapeFound)
+            << "entry block must end `cmp ; jcc` — the fused shape";
+        EXPECT_EQ(s.jccPayload,
+                  static_cast<std::uint32_t>(::dss::TargetCondCode::Slt));
+        EXPECT_EQ(s.fusedCmpWidthBits, 64u)
+            << "I64-operand fused cmp must stay width-64";
+    }
+}
+
 // ── FC3 c2: conversion-shape gates ──────────────────────────────────────
 // Each conversion mnemonic has an INHERENT (source, dest) width pair;
 // the shapes with no realization must fail loud at MIR→LIR, never let

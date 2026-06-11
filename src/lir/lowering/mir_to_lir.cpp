@@ -696,10 +696,19 @@ struct Lowerer {
     // Shifts (FC3.5 sweep-c1): Shl/LShr/AShr are now ENCODED at both
     // widths (x86 D3/C1 CL+imm8 forms via the implicit-count "count"
     // role contract; arm64 LSLV/LSRV/ASRV X+W forms) — they pass this
-    // TYPE gate at 32/64 and lower through `lowerShift`. Bitwise: x86
-    // And/Or/Xor/Not still have NO encodings — they pass the gate and
-    // fail loud at the assembler (A_NoEncodingDeclared), the
-    // pre-existing width-independent wall.
+    // TYPE gate at 32/64 and lower through `lowerShift`. Bitwise
+    // (audit-residue sweep c1, D-AUDIT-BITWISE-UNWALL-WITNESS): And/Or
+    // are ENCODED end-to-end on BOTH targets (x86 21/09 reg-reg at
+    // widths 64+32 since FC3.5 sweep-c2 — added for the composed-FCmp
+    // materialization, which also un-walled source-level `&`/`|`;
+    // arm64 AND/ORR X-form, width-absent variants) — witnessed by
+    // examples/c-subset/bitwise_and_or. The REMAINING walls, per
+    // target: x86 declares xor/not WITHOUT encodings (they pass this
+    // gate, lower, and fail loud at the assembler —
+    // A_NoEncodingDeclared); arm64 ENCODES xor (EOR) but declares no
+    // `not` mnemonic at all (Not fails loud at lowering,
+    // L_RequiredLirOpcodeMissing). So Xor walls on x86 only; Not walls
+    // on both targets, at different tiers.
     [[nodiscard]] bool requireNativeIntWidth(MirInstId id, MirOpcode op) {
         auto const gatedKind = [](TypeKind k) noexcept {
             switch (k) {
@@ -3062,7 +3071,12 @@ struct Lowerer {
                 LirOperand::makeReg(*a), LirOperand::makeReg(*b)};
             // FC3 c2: the fused compare's width follows the ICmp
             // OPERANDS' type — the same rule as lowerICmp's cmp
-            // (D-CSUBSET-32BIT-ALU-FORMS).
+            // (D-CSUBSET-32BIT-ALU-FORMS). Pinned (audit-residue sweep
+            // c1, D-AUDIT-FUSED-CMP-WIDTH-PIN): the Fused{I32,I64}…
+            // width pins in tests/lir/test_mir_to_lir.cpp + the
+            // examples/c-subset/fused_negative_compare runtime witness
+            // (width-64 here flips its exit 42 → 7: a zero-extended
+            // negative I32 reads as positive).
             emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps,
                      /*payload=*/0,
                      widthFlagsForType(mir.instType(icmpOperands[0])));
