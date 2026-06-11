@@ -1,5 +1,6 @@
 #include "hir/cst_const_eval.hpp"
 
+#include "core/types/decl_prefix_strip.hpp"   // declRoleChildren (shared specifier-prefix strip)
 #include "core/types/grammar_schema.hpp"
 #include "core/types/hir_lowering_config.hpp"
 #include "core/types/semantic_config.hpp"
@@ -346,21 +347,16 @@ std::optional<NodeId>
 findInitExprInDecl(Tree const& tree, DeclarationRule const& decl,
                    NodeId declRuleNode) {
     if (!declRuleNode.valid()) return std::nullopt;
-    std::vector<NodeId> kids;
-    for (auto const& child : tree.children(declRuleNode)) {
-        if (!isEmptySpace(tree.flags(child))) kids.push_back(child);
-    }
-    // D-DECL-SPECIFIER-PREFIX-SUBSTRATE: strip a leading declaration-specifier
-    // prefix so both the positional `initChild` path and the role-fallback loop
-    // below resolve against the same prefix-free child numbering the analyzer's
-    // `declRoleChildren` uses — otherwise a `static`/`__attribute__` prefix node
-    // shifts initChild AND (being a non-skip-listed Internal child) would be
-    // wrongly returned as the init by the fallback. Mirrors `declRoleChildren`.
-    if (decl.specifierPrefixRule.has_value() && !kids.empty()
-        && tree.kind(kids.front()) == NodeKind::Internal
-        && tree.rule(kids.front()) == *decl.specifierPrefixRule) {
-        kids.erase(kids.begin());
-    }
+    // D-DECL-SPECIFIER-PREFIX-SUBSTRATE: role children = visible children with
+    // a leading declaration-specifier prefix stripped — the SHARED
+    // `declRoleChildren` (core/types/decl_prefix_strip.hpp,
+    // D-DECL-PREFIX-STRIP-SHARED-HELPER) — so both the positional `initChild`
+    // path and the role-fallback loop below resolve against the same
+    // prefix-free child numbering the analyzer minted symbols against.
+    // Otherwise a `static`/`__attribute__` prefix node shifts initChild AND
+    // (being a non-skip-listed Internal child) would be wrongly returned as
+    // the init by the fallback.
+    auto kids = declRoleChildren(tree, declRuleNode, decl);
     // Explicit positional `initChild` wins when configured.
     if (decl.initChild.has_value()) {
         if (*decl.initChild >= kids.size()) return std::nullopt;

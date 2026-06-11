@@ -6,6 +6,7 @@
 #include "analysis/semantic/symbol_table.hpp"
 #include "analysis/semantic/type_rules.hpp"
 #include "core/types/data_model.hpp"
+#include "core/types/decl_prefix_strip.hpp"   // declRoleChildren / descendVisibleDecl / specifierPrefixChild
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/integer_literal_ladder.hpp"
@@ -212,45 +213,12 @@ descendVisible(Tree const& tree, NodeId start,
     return cur;
 }
 
-// D-DECL-SPECIFIER-PREFIX-SUBSTRATE (2026-06-04): a declaration's "role
-// children" — its visible children with a leading declaration-specifier prefix
-// stripped, when the rule declares a `specifierPrefixRule` AND that rule is the
-// first visible child. Positional name/type/params/body/kindByChild indices
-// resolve against THESE, so they stay stable whether or not specifiers
-// (`static`, `__attribute__((...))`) are present. With no prefix
-// declared/present this is exactly `visibleChildren` — the no-op that keeps
-// every shipped declaration (none declare a prefix today) unchanged.
-[[nodiscard]] std::vector<NodeId>
-declRoleChildren(Tree const& tree, NodeId node, DeclarationRule const& decl) {
-    auto kids = visibleChildren(tree, node);
-    if (decl.specifierPrefixRule.has_value() && !kids.empty()
-        && tree.kind(kids.front()) == NodeKind::Internal
-        && tree.rule(kids.front()) == *decl.specifierPrefixRule) {
-        kids.erase(kids.begin());
-    }
-    return kids;
-}
-
-// `descendVisible` whose FIRST path step indexes into the declaration's
-// role-children (specifier-prefix stripped); later steps descend via the
-// ordinary `visibleChildren`. Lets a `kindByChild` childPath be authored
-// against the same prefix-free numbering as name/type/etc.
-[[nodiscard]] NodeId
-descendVisibleDecl(Tree const& tree, NodeId start,
-                   std::vector<std::uint32_t> const& path,
-                   DeclarationRule const& decl) {
-    if (path.empty()) return start;
-    auto roleKids = declRoleChildren(tree, start, decl);
-    if (path.front() >= roleKids.size()) return {};
-    NodeId cur = roleKids[path.front()];
-    for (std::size_t i = 1; i < path.size(); ++i) {
-        if (!cur.valid()) return {};
-        auto kids = visibleChildren(tree, cur);
-        if (path[i] >= kids.size()) return {};
-        cur = kids[path[i]];
-    }
-    return cur;
-}
+// D-DECL-SPECIFIER-PREFIX-SUBSTRATE: `declRoleChildren` (a declaration's
+// visible children with a leading specifier prefix stripped — what positional
+// name/type/params/body/kindByChild indices resolve against) and
+// `descendVisibleDecl` (strip-aware first step, raw later steps) come from the
+// SHARED `core/types/decl_prefix_strip.hpp` (D-DECL-PREFIX-STRIP-SHARED-HELPER
+// — one source of truth across the analyzer, cst_const_eval, and CST→HIR).
 
 // Forward declarations (these helpers are referenced by the passes
 // before their definitions appear). `CallRule` comes from

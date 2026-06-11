@@ -709,19 +709,25 @@ struct Parser::Impl {
     }
 
     // Enumerate candidate branch rules at the current speculative
-    // AltChoice: rule ids `r` for which both
+    // AltChoice: the alt's RuleLeaf branches `r` (depth-first through
+    // nested AltChoice positions) for which both
     //   (1) `FIRST(r)` contains the upcoming token's effective kind, AND
     //   (2) `routeToRuleLeaf(walker.cursor(), r)` is valid (the alt
     //       structurally allows descending into r).
-    // O(rules) per AltChoice miss; acceptable for current grammar sizes.
+    //
+    // CONTRACT: speculative candidates probe in DECLARED grammar order
+    // — author-controlled, never interner/name order. The list comes
+    // from the AltChoice's compiled branch table (JSON-array order via
+    // `altRuleBranches`); sourcing it from the rule interner instead
+    // (the pre-FC4 behavior) made probe priority an accident of rule
+    // NAMING — interner ids are assigned in alphabetical key order —
+    // silently overriding the author's declared branch order whenever
+    // two branches structurally accept the same input.
     [[nodiscard]] std::vector<RuleId>
     candidateBranches(SchemaTokenId tokKind) const {
         std::vector<RuleId> out;
-        const auto& interner = schema->rules();
-        // Skip `RuleId{0}` — the invalid-sentinel slot — and iterate
-        // real rules `[1, interner.size())`.
-        for (std::uint32_t r = 1; r < interner.size(); ++r) {
-            const RuleId candidate{r};
+        for (RuleId const candidate
+             : schema->altRuleBranches(walker.cursor())) {
             const auto firstSet = schema->firstSetOf(candidate);
             if (firstSet.empty()) continue;
             if (std::ranges::find(firstSet, tokKind) == firstSet.end()) continue;
@@ -1440,16 +1446,17 @@ struct Parser::Impl {
                 return StepOutcome::Continue;
             }
 
-            // AltChoice → RuleLeaf branch route. The schema's
-            // public API doesn't enumerate an AltChoice's branch
-            // RuleIds, so we linear-scan the rule interner for a
-            // candidate whose FIRST contains tokKind and for which
-            // `routeToRuleLeaf` accepts from the current cursor.
-            // O(rules) per AltChoice miss; acceptable for current
-            // grammar sizes.
-            const auto& interner = schema->rules();
-            for (std::uint32_t r = 1; r < interner.size(); ++r) {
-                const RuleId candidate{r};
+            // AltChoice → RuleLeaf branch route, candidates sourced
+            // from the alt's compiled branch table in DECLARED grammar
+            // order (same contract as `candidateBranches`: speculative
+            // candidates probe in DECLARED grammar order — author-
+            // controlled, never interner/name order). Non-speculative
+            // alts are loader-checked for FIRST-set overlap
+            // (C_AmbiguousAlternatives), so at most one branch admits
+            // `tokKind` here; declared order keeps the tie-break
+            // uniform with the speculative path regardless.
+            for (RuleId const candidate
+                 : schema->altRuleBranches(walker.cursor())) {
                 const auto firstSet = schema->firstSetOf(candidate);
                 if (firstSet.empty()) continue;
                 if (std::ranges::find(firstSet, tokKind) == firstSet.end()) continue;

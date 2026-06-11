@@ -213,6 +213,49 @@ SchemaCursor GrammarSchema::routeToRuleLeaf(SchemaCursor parentCur,
     return SchemaCursor{};
 }
 
+std::vector<RuleId> GrammarSchema::altRuleBranches(SchemaCursor cur) const noexcept {
+    std::vector<RuleId> out;
+    if (!cur.valid()) return out;
+    auto it = d_.compiledRules.find(cur.rule().v);
+    if (it == d_.compiledRules.end()) return out;
+    auto const& positions = it->second.positions;
+
+    // Depth-first over AltChoice branch edges, in stored (= declared
+    // JSON-array) order — the exact traversal `routeToRuleLeaf` uses,
+    // so a rule appears here iff `routeToRuleLeaf(cur, rule)` would
+    // find it. `visitedPos` guards positional cycles (a `repeat`'s
+    // tie-the-knot loop entry can be reachable from its own branch
+    // subtree when the repeated body is nullable); `routeToRuleLeaf`
+    // never revisits in loadable grammars, and pruning a revisit
+    // cannot drop a rule — every reachable RuleLeaf is collected on
+    // the first visit of its position. Counts are tiny (branch fan-
+    // out per alt), so linear membership scans beat set machinery.
+    std::vector<std::uint32_t> visitedPos;
+    auto walk = [&](auto&& self, std::uint32_t posId) -> void {
+        if (posId >= positions.size()) return;
+        for (auto const seen : visitedPos) {
+            if (seen == posId) return;
+        }
+        visitedPos.push_back(posId);
+        auto const& p = positions[posId];
+        if (p.slotKind() == SlotKind::RuleLeaf) {
+            const RuleId r = p.ruleId();
+            for (auto const existing : out) {
+                if (existing.v == r.v) return;   // first occurrence wins
+            }
+            out.push_back(r);
+            return;
+        }
+        if (p.slotKind() == SlotKind::AltChoice) {
+            for (auto bid : p.branches()) self(self, bid);
+        }
+        // TokenLeaf / End: not a rule branch — token routing goes
+        // through `advance`.
+    };
+    walk(walk, cur.posId());
+    return out;
+}
+
 SchemaCursor GrammarSchema::advance(SchemaCursor cur, SchemaTokenId tok) const noexcept {
     auto it = d_.compiledRules.find(cur.rule().v);
     if (it == d_.compiledRules.end()) return SchemaCursor{};

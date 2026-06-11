@@ -4,6 +4,7 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/type_rules.hpp"      // FC3 c1: usualArithmeticCommonType / resolveArithmeticRules
 #include "core/types/data_model.hpp"
+#include "core/types/decl_prefix_strip.hpp"     // declRoleChildren / descendVisibleDecl / specifierPrefixChild
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/char_decode.hpp"
@@ -582,48 +583,16 @@ struct Lowerer {
 
     // ── declaration-specifier prefix (D-DECL-SPECIFIER-PREFIX-SUBSTRATE consumer)
     // The c-subset's `static`/`__attribute__` prefix rides as an OPTIONAL leading
-    // child of a declaration. These helpers mirror the semantic analyzer's
-    // `declRoleChildren`/`descendVisibleDecl` so CST→HIR resolves the same
-    // prefix-free positional indices the analyzer minted symbols against — without
-    // the strip, a leading prefix shifts name/type/params/body/kindByChild by one
-    // (silent wrong-child). The prefix subtree stays reachable for `linkageFrom`.
-    // NOTE (D-DECL-PREFIX-STRIP-SHARED-HELPER): this is the 3rd file-local copy of
-    // the strip guard (analyzer + cst_const_eval + here) — a shared helper is
-    // pinned for extraction.
+    // child of a declaration. CST→HIR resolves positional declaration children
+    // via the SHARED strip-aware helpers in `core/types/decl_prefix_strip.hpp`
+    // (`declRoleChildren` / `descendVisibleDecl` / `specifierPrefixChild` —
+    // D-DECL-PREFIX-STRIP-SHARED-HELPER: one source of truth with the semantic
+    // analyzer and cst_const_eval), so lowering sees the same prefix-free
+    // positional indices the analyzer minted symbols against — without the
+    // strip, a leading prefix shifts name/type/params/body/kindByChild by one
+    // (silent wrong-child). The prefix subtree stays reachable for `linkageFrom`
+    // via `specifierPrefixChild`.
 
-    // The declaration's specifier-prefix subtree, or invalid if none/not-first.
-    [[nodiscard]] NodeId specifierPrefix(NodeId node, DeclarationRule const& decl) const {
-        if (!decl.specifierPrefixRule.has_value()) return {};
-        auto vis = visible(node);
-        if (!vis.empty() && tree().kind(vis.front()) == NodeKind::Internal
-            && tree().rule(vis.front()) == *decl.specifierPrefixRule)
-            return vis.front();
-        return {};
-    }
-    // Visible children with a leading specifier prefix stripped — the list the
-    // positional name/type/params/body indices resolve against.
-    [[nodiscard]] std::vector<NodeId> declVisible(NodeId node, DeclarationRule const& decl) const {
-        auto vis = visible(node);
-        if (specifierPrefix(node, decl).valid()) vis.erase(vis.begin());
-        return vis;
-    }
-    // `descend` whose FIRST step resolves against the prefix-stripped children
-    // (start IS the declaration); deeper steps use ordinary `visible` (past any
-    // prefix). Mirrors the analyzer's `descendVisibleDecl`.
-    [[nodiscard]] NodeId descendDecl(NodeId start, std::vector<std::uint32_t> const& path,
-                                     DeclarationRule const& decl) {
-        if (path.empty()) return start;
-        auto vis = declVisible(start, decl);
-        if (path.front() >= vis.size()) return {};
-        NodeId cur = vis[path.front()];
-        for (std::size_t i = 1; i < path.size(); ++i) {
-            if (!cur.valid()) return {};
-            auto v = visible(cur);
-            if (path[i] >= v.size()) return {};
-            cur = v[path[i]];
-        }
-        return cur;
-    }
     // Fold the linkage effects of every specifier token in `prefixNode` onto a
     // LinkageAttr, per the declaration's `linkageSpecifiers` facet (token SOURCE
     // TEXT → effect). A token whose KIND is in `linkageSpecifierIgnoredKinds` (the
@@ -2879,7 +2848,13 @@ struct Lowerer {
                                        "(the lattice has no Array type yet)");
         auto it = declMap_.find(tree().rule(node).v);
         DeclarationRule const* decl = (it != declMap_.end()) ? &sem.declarations[it->second] : nullptr;
-        auto vis = visible(node);
+        // STRIP-AWARE on purpose (D-DECL-PREFIX-STRIP-SHARED-HELPER closure
+        // fix): this used raw `visible(node)` — a latent wrong-child shift the
+        // day a VarDecl-dispatch rule gains a `specifierPrefix` (no shipped one
+        // does today, so this is behavior-preserving now and load-bearing when
+        // local declarations gain specifiers). No DeclarationRule ⇒ no prefix
+        // possible ⇒ raw visible children.
+        auto vis = decl ? declRoleChildren(tree(), node, *decl) : visible(node);
         SymbolId sym{};
         TypeId type = InvalidType;
         if (decl && decl->nameChild && *decl->nameChild < vis.size()) {
@@ -2918,7 +2893,10 @@ struct Lowerer {
     HirNodeId lowerTypeDecl(NodeId node) {
         auto it = declMap_.find(tree().rule(node).v);
         DeclarationRule const* decl = (it != declMap_.end()) ? &sem.declarations[it->second] : nullptr;
-        auto vis = visible(node);
+        // Strip-aware for the same reason as `lowerVarLike` above: no shipped
+        // type-decl rule declares a `specifierPrefix` today (behavior-
+        // preserving), but a prefixed one must not shift `nameChild`.
+        auto vis = decl ? declRoleChildren(tree(), node, *decl) : visible(node);
         SymbolId sym{};
         TypeId type = InvalidType;
         if (decl && decl->nameChild && *decl->nameChild < vis.size()) {
@@ -2934,7 +2912,7 @@ struct Lowerer {
         auto it = declMap_.find(tree().rule(node).v);
         if (it == declMap_.end()) { unsupported(node, "top-level decl has no semantics rule"); return errorNode(node); }
         DeclarationRule const& decl = sem.declarations[it->second];
-        auto vis = declVisible(node, decl);
+        auto vis = declRoleChildren(tree(), node, decl);
         SymbolId sym{};
         TypeId type = InvalidType;
         if (decl.nameChild && *decl.nameChild < vis.size()) {
@@ -2944,11 +2922,13 @@ struct Lowerer {
         // D-CSUBSET-LINKAGE-SPECIFIERS: linkage from the (optional) specifier
         // prefix, attached below to the lowered Function/Global node and threaded
         // to MIR for DCE protection.
-        LinkageAttr const linkAttr = linkageFrom(specifierPrefix(node, decl), decl);
+        LinkageAttr const linkAttr =
+            linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
         // Function iff the kindByChild discriminator matches funcDefTail.
         NodeId discNode{};
         if (decl.kindByChild) {
-            discNode = descendDecl(node, decl.kindByChild->childPath, decl);
+            discNode = descendVisibleDecl(tree(), node,
+                                          decl.kindByChild->childPath, decl);
             if (discNode.valid() && tree().kind(discNode) == NodeKind::Internal
                 && tree().rule(discNode).v == decl.kindByChild->whenRule.v) {
                 return lowerFunction(node, sym, type, decl, *decl.kindByChild, discNode, linkAttr);
@@ -2960,7 +2940,7 @@ struct Lowerer {
                                        "(the lattice has no Array type yet)");
         std::optional<HirNodeId> init;
         RuleId const skip = arraySuffixSkipRule(decl);
-        for (NodeId c : descendantsForInit(node, skip)) if (isExprNode(c)) {
+        for (NodeId c : descendantsForInit(node, skip, &decl)) if (isExprNode(c)) {
             // Coerce the initializer to the declared variable type — the same
             // discipline `lowerVarLike` applies for local VarDecls. Without
             // this, a module global declared `int g = 1.7 + 2.5;` lands with
@@ -3049,14 +3029,15 @@ struct Lowerer {
         auto it = declMap_.find(tree().rule(node).v);
         if (it == declMap_.end()) return reportedError(node, "function decl has no semantics rule");
         DeclarationRule const& decl = sem.declarations[it->second];
-        auto vis = declVisible(node, decl);
+        auto vis = declRoleChildren(tree(), node, decl);
         SymbolId sym{};
         TypeId sig = InvalidType;
         if (decl.nameChild && *decl.nameChild < vis.size()) {
             sym = model.symbolAt(vis[*decl.nameChild]);
             if (auto const* rec = model.recordFor(sym)) sig = rec->type;
         }
-        LinkageAttr const linkAttr = linkageFrom(specifierPrefix(node, decl), decl);
+        LinkageAttr const linkAttr =
+            linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
         std::vector<HirNodeId> params;
         if (decl.paramsChild && *decl.paramsChild < vis.size())
             collectParams(vis[*decl.paramsChild], params);
@@ -3085,7 +3066,7 @@ struct Lowerer {
         auto it = declMap_.find(tree().rule(node).v);
         if (it == declMap_.end()) return reportedError(node, "extern decl has no semantics rule");
         DeclarationRule const& decl = sem.declarations[it->second];
-        auto vis = declVisible(node, decl);
+        auto vis = declRoleChildren(tree(), node, decl);
         SymbolId sym{};
         TypeId type = InvalidType;
         if (decl.nameChild && *decl.nameChild < vis.size()) {
@@ -3104,7 +3085,11 @@ struct Lowerer {
         // the override string body.
         auto extractLibraryOverride = [&]() -> std::string {
             if (!decl.kindByChild) return {};
-            NodeId disc = descend(node, decl.kindByChild->childPath);
+            // Strip-aware: `childPath` is authored against the declaration's
+            // prefix-free numbering (D-DECL-PREFIX-STRIP-SHARED-HELPER). A
+            // no-op today — externDecl declares no specifierPrefix.
+            NodeId disc = descendVisibleDecl(tree(), node,
+                                             decl.kindByChild->childPath, decl);
             if (!disc.valid() || tree().kind(disc) != NodeKind::Internal) {
                 return {};
             }
@@ -3165,10 +3150,11 @@ struct Lowerer {
             // Gate 1): route the extern arm through the SAME linkageFrom chokepoint
             // as lowerTopLevel/lowerFunctionDecl, so specifier validation is
             // by-construction for EVERY decl-lowering arm, not a hand-picked subset.
-            // A no-op today (externDecl declares no specifierPrefix → specifierPrefix
-            // returns invalid → linkageFrom early-returns); structural for the day an
-            // extern gains specifiers.
-            recordLinkage(h, linkageFrom(specifierPrefix(node, decl), decl));
+            // A no-op today (externDecl declares no specifierPrefix →
+            // specifierPrefixChild returns invalid → linkageFrom early-returns);
+            // structural for the day an extern gains specifiers.
+            recordLinkage(h, linkageFrom(specifierPrefixChild(tree(), node, decl),
+                                         decl));
             auto const* rec = model.recordFor(sym);
             // Model 3: the source `"libname"` override is format-independent →
             // project it under every object-format key so the compile-pipeline
@@ -3178,7 +3164,11 @@ struct Lowerer {
                                    uniformLibraryMap(extractLibraryOverride())});
         };
         if (decl.kindByChild) {
-            NodeId disc = descend(node, decl.kindByChild->childPath);
+            // Strip-aware: `childPath` is authored against the declaration's
+            // prefix-free numbering (D-DECL-PREFIX-STRIP-SHARED-HELPER). A
+            // no-op today — externDecl declares no specifierPrefix.
+            NodeId disc = descendVisibleDecl(tree(), node,
+                                             decl.kindByChild->childPath, decl);
             if (disc.valid() && tree().kind(disc) == NodeKind::Internal
                 && tree().rule(disc).v == decl.kindByChild->whenRule.v) {
                 std::vector<HirNodeId> params;
@@ -3229,7 +3219,9 @@ struct Lowerer {
                   "extern shape can be lowered safely");
             return errorNode(node);
         }
-        NodeId const varDeclTail = descend(node, decl.kindByChild->childPath);
+        // Strip-aware for the same reason as the two `disc` probes above.
+        NodeId const varDeclTail =
+            descendVisibleDecl(tree(), node, decl.kindByChild->childPath, decl);
         if (!varDeclTail.valid()
             || tree().kind(varDeclTail) != NodeKind::Internal) {
             // Post-fold #12 D-FF2-MSG-JARGON: user-facing message
@@ -3292,10 +3284,19 @@ struct Lowerer {
 
     // Direct children to scan for a global's initializer expression. A subtree
     // rooted at `skipRule` (the array-declarator suffix) is pruned so a global
-    // array's `[N]` length is never mistaken for the initializer.
-    [[nodiscard]] std::vector<NodeId> descendantsForInit(NodeId node, RuleId skipRule = {}) {
+    // array's `[N]` length is never mistaken for the initializer. When `decl`
+    // is supplied the walk seeds from the declaration's ROLE children
+    // (specifier prefix stripped — D-DECL-PREFIX-STRIP-SHARED-HELPER), so an
+    // expr-shaped specifier argument (e.g. a future
+    // `__attribute__((aligned(8)))`) can never be mistaken for the global's
+    // initializer. A no-op for every shipped prefix today (c-subset's
+    // specifiers contain no expr-rule nodes).
+    [[nodiscard]] std::vector<NodeId>
+    descendantsForInit(NodeId node, RuleId skipRule = {},
+                       DeclarationRule const* decl = nullptr) {
         std::vector<NodeId> out;
-        std::vector<NodeId> stack = visible(node);
+        std::vector<NodeId> stack =
+            decl ? declRoleChildren(tree(), node, *decl) : visible(node);
         while (!stack.empty()) {
             NodeId c = stack.back(); stack.pop_back();
             if (skipRule.valid() && tree().kind(c) == NodeKind::Internal

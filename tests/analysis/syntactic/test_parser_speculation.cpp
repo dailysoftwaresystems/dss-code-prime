@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 using namespace dss;
 
@@ -358,4 +359,116 @@ TEST(ParserSpeculation, EmptyInputSkipsSpeculativeRepeat) {
     EXPECT_EQ(countCode(t.diagnostics().all(),
                         DiagnosticCode::P_BacktrackFailed), 0u)
         << "skipping a nullable repeat must not trip speculation";
+}
+
+// ── DECLARED-order speculative probing (the FC4 enabler) ──────────────
+//
+// Speculative candidates probe in DECLARED grammar order — author-
+// controlled, never interner/name order. Rule-interner ids are assigned
+// by iterating the JSON `shapes` OBJECT (alphabetical key order on
+// nlohmann::json), so an interner-sourced candidate scan makes probe
+// priority an accident of rule NAMING. The two rules below have
+// IDENTICAL bodies — both structurally succeed on `A B ;` — and are
+// DECLARED in the REVERSE of alphabetical order (`zetaFirst` before
+// `alphaSecond`), so the committed branch is a pure probe-ORDER
+// witness:
+//   - declared order (the contract):    zetaFirst probes first → wins;
+//   - interner order (the old accident): alphaSecond interns before
+//     zetaFirst, probes first, and wins — this test goes RED on any
+//     revert to interner-sourced candidate enumeration.
+constexpr std::string_view kDeclaredOrderSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "DeclOrder", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "A":  [{ "kind": "AKind" }],
+    "B":  [{ "kind": "BKind" }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "shapes": {
+    "root":        { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":        { "alt": ["zetaFirst", "alphaSecond"], "speculative": true, "lookahead": 3 },
+    "zetaFirst":   { "sequence": ["AKind", "BKind", "Semi"] },
+    "alphaSecond": { "sequence": ["AKind", "BKind", "Semi"] }
+  }
+})JSON";
+
+TEST(ParserSpeculation, ProbeOrderIsDeclaredOrderNotInternerOrder) {
+    auto loaded = GrammarSchema::loadFromText(kDeclaredOrderSchema);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.has_value() ? "" : loaded.error()[0].message);
+
+    // Schema-tier half of the pin: the alt's branch enumeration itself
+    // must report [zetaFirst, alphaSecond] — declared, not alphabetical.
+    {
+        auto const& schema = **loaded;
+        const RuleId stmt = schema.rules().find("stmt");
+        ASSERT_TRUE(stmt.valid());
+        const SchemaCursor altCur = schema.enterRule(stmt);
+        ASSERT_EQ(schema.slotKind(altCur), SlotKind::AltChoice);
+        ASSERT_TRUE(schema.isSpeculativeAlt(altCur));
+        const auto branches = schema.altRuleBranches(altCur);
+        ASSERT_EQ(branches.size(), 2u);
+        EXPECT_EQ(schema.rules().name(branches[0]), "zetaFirst");
+        EXPECT_EQ(schema.rules().name(branches[1]), "alphaSecond");
+    }
+
+    // Parser-tier half: the DECLARED-first branch must be the one that
+    // commits when both branches structurally succeed.
+    auto src = SourceBuffer::fromString("A B ;", "<declorder>");
+    Tokenizer tk{src, *loaded};
+    auto [stream, _] = std::move(tk).tokenize();
+    Parser p{src, *loaded, std::move(stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(t, "zetaFirst"), 1u)
+        << "the DECLARED-first branch must win the probe";
+    EXPECT_EQ(countNodesByRule(t, "alphaSecond"), 0u)
+        << "the alphabetically-first branch winning means candidates "
+           "were sourced from the rule interner (name order), not the "
+           "alt's declared branch list";
+}
+
+TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
+    // FC2 order-preservation pin over the SHIPPED c-subset grammar:
+    // `operand`'s speculative alt declares its RULE branches as
+    // [stringLiteralExpr, charLiteralExpr, compoundLiteralExpr,
+    // castExpr, parenExpr] (the alt's leading entries are token-leaf
+    // branches — Identifier / IntLiteral / FloatLiteral / TrueKeyword /
+    // FalseKeyword — which route via `advance`, not the probe loop, and
+    // so are deliberately absent here). The schema API must report the
+    // rule branches in EXACTLY that declared array order; a regression
+    // to interner order would instead yield the alphabetical
+    // [castExpr, charLiteralExpr, compoundLiteralExpr, parenExpr,
+    // stringLiteralExpr] — silently re-prioritizing castExpr ahead of
+    // compoundLiteralExpr for every `(`-led operand probe.
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto const& schema = **loaded;
+
+    const RuleId operand = schema.rules().find("operand");
+    ASSERT_TRUE(operand.valid()) << "c-subset must declare an `operand` rule";
+    const SchemaCursor altCur = schema.enterRule(operand);
+    ASSERT_EQ(schema.slotKind(altCur), SlotKind::AltChoice)
+        << "`operand`'s body must compile to an AltChoice entry position";
+    ASSERT_TRUE(schema.isSpeculativeAlt(altCur));
+
+    std::vector<std::string> names;
+    for (RuleId const r : schema.altRuleBranches(altCur)) {
+        names.emplace_back(schema.rules().name(r));
+    }
+    const std::vector<std::string> declared{
+        "stringLiteralExpr",
+        "charLiteralExpr",
+        "compoundLiteralExpr",
+        "castExpr",
+        "parenExpr",
+    };
+    EXPECT_EQ(names, declared)
+        << "operand's speculative rule branches must surface in the "
+           "JSON-array order declared in c-subset.lang.json";
 }
