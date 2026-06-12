@@ -513,6 +513,28 @@ TEST(X86VariableEncoder, DivOpR15EmitsREX_B_49_F7_F7_LowBitsAllOnes) {
     expectDivBytes("div_op", "r15", {0x49, 0xF7, 0xF7});
 }
 
+// ── FC4 c2: indirect call `call <reg>` — 0xFF /2 ────────────────────
+// The `call` row's ["reg"] encoding variant (the direct ["symbol"]
+// variant emits E8 rel32). NO REX.W: FF /2 defaults to 64-bit operand
+// size in long mode — a spurious REX.W (0x48) here would still decode,
+// but pinning its ABSENCE keeps the variant exactly the canonical
+// form. Same /digit machinery as idiv /7 / div /6 above; the helper
+// reuse is deliberate (single-reg-operand byte-pin shape).
+
+TEST(X86VariableEncoder, CallRaxEmitsFF_D0) {
+    // CALL r/m64 with callee in RAX: 0xFF /2 with
+    // ModR/M = mod=11 reg=/2=010 rm=rax(000) = 0xD0. NO REX byte
+    // (no W, B=0 for rax). 2 bytes total.
+    expectDivBytes("call", "rax", {0xFF, 0xD0});
+}
+
+TEST(X86VariableEncoder, CallR10EmitsREX_B_41_FF_D2) {
+    // CALL r/m64 with callee in R10: REX.B (0x41 — B from the high
+    // ordinal bit, NO W) + 0xFF /2 with
+    // ModR/M = mod=11 reg=/2=010 rm=(10&7)=010 = 0xD2. 3 bytes.
+    expectDivBytes("call", "r10", {0x41, 0xFF, 0xD2});
+}
+
 // ── Variant-guard mismatch — A_NoMatchingEncodingVariant ─────────────
 
 TEST(X86VariableEncoder, NoMatchingVariantFiresLoudDiagnostic_KindMismatch) {

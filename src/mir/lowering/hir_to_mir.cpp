@@ -932,8 +932,8 @@ struct Lowerer {
                 // The function's code address is its GlobalAddr, typed
                 // Ptr<FnSig> (what an `int (*fp)(int) = &helper;` init
                 // stores/compares). Mirrors the rvalue Ref arm's
-                // function case; calls THROUGH the pointer stay gated
-                // (S_IndirectCallNotSupported is stage 2b's wall).
+                // function case; calls THROUGH the pointer lower via
+                // the indirect call-reg path (FC4 c2).
                 TypeId const declared = hir.typeId(node);
                 if (!declared.valid()) {
                     unsupported(node, std::format(

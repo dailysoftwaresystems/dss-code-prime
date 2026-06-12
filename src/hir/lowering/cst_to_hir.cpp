@@ -1040,6 +1040,28 @@ struct Lowerer {
         return exprError(node, "SQL operand has no recognizable form");
     }
 
+    // Shared callee-signature resolution (FC4 c2, plan-lock MUST-FIX 3):
+    // a callee expression carries either the FnSig directly (a direct /
+    // paren-wrapped designator) or `Ptr<FnSig>` (a function-pointer
+    // value — the canonical c-subset fn-ptr type). Unwrap ONE pointer
+    // level, mirroring hir_verifier.cpp's checkCallArguments. Feeds
+    // BOTH call arms' param COERCION + inferred result type — without
+    // it, indirect-call arguments would silently skip coercion (the
+    // width/signedness miscompile class). InvalidType when the callee
+    // type is neither shape (opaque/extension callee — the verifier
+    // owns arity rules there).
+    [[nodiscard]] TypeId calleeSigOf(TypeId t) const {
+        if (!t.valid()) return InvalidType;
+        if (interner.kind(t) == TypeKind::FnSig) return t;
+        if (interner.kind(t) == TypeKind::Ptr) {
+            auto const ops = interner.operands(t);
+            if (!ops.empty() && interner.kind(ops[0]) == TypeKind::FnSig) {
+                return ops[0];
+            }
+        }
+        return InvalidType;
+    }
+
     // SQL `f(args)` → a core Call (callee Ref + lowered argument expressions),
     // reusing the semantics `callRules` callee/args child positions.
     E lowerSqlCall(NodeId callNode) {
@@ -1063,8 +1085,11 @@ struct Lowerer {
             return exprError(callNode, "call has no callee child");
         }
         std::vector<HirNodeId> args;
-        // If the callee's typeId is a FnSig, coerce each arg to its declared
-        // param type. Variadic / unknown signatures pass through unchanged
+        // If the callee resolves to a signature — a FnSig designator OR
+        // a `Ptr<FnSig>` function-pointer value (FC4 c2: `calleeSigOf`
+        // unwraps one level so indirect-call args coerce exactly like
+        // direct-call args) — coerce each arg to its declared param
+        // type. Variadic / unknown signatures pass through unchanged
         // (the verifier owns the arity-vs-FnSig rule).
         //
         // M2 silent-failure fix (3-agent root-cause analysis, 2026-06-02):
@@ -1075,9 +1100,10 @@ struct Lowerer {
         // (e.g., `interner.pointer()` / `interner.array()` during a
         // nested arg lowering), silently dangling the span. Same
         // pattern applied at lowerPostfix's call arm.
+        TypeId const calleeSig = calleeSigOf(calleeTy);
         std::vector<TypeId> paramTypes;
-        if (calleeTy.valid() && interner.kind(calleeTy) == TypeKind::FnSig) {
-            auto const paramSpan = interner.fnParams(calleeTy);
+        if (calleeSig.valid()) {
+            auto const paramSpan = interner.fnParams(calleeSig);
             paramTypes.assign(paramSpan.begin(), paramSpan.end());
         }
         std::size_t argIdx = 0;
@@ -1107,8 +1133,9 @@ struct Lowerer {
                 ++argIdx;
             }
         }
-        TypeId const result = (calleeTy.valid() && interner.kind(calleeTy) == TypeKind::FnSig)
-                            ? interner.fnResult(calleeTy) : typeAtOr(callNode, InvalidType);
+        TypeId const result = calleeSig.valid()
+                            ? interner.fnResult(calleeSig)
+                            : typeAtOr(callNode, InvalidType);
         return {track(builder.makeCall(callee, args, result), callNode), result};
     }
 
@@ -1496,6 +1523,27 @@ struct Lowerer {
             return {track(builder.makeAddressOf(operand.id, result), node), result};
         }
         if (e.target == "Deref") {
+            // FC4 c2 — C 6.5.3.2p4 designator decay as a lattice law:
+            // `*` applied to a function pointer yields the function
+            // DESIGNATOR, which (outside sizeof/&) immediately decays
+            // back to the pointer — the deref is the IDENTITY. Return
+            // the operand UNCHANGED (no Deref node): covers
+            // `(*fp)(40)` and the recursive `(***fp)(x)` (each level
+            // folds), and `(*helper)(40)` (operand's own type is the
+            // FnSig designator). WITHOUT this fold a Deref node would
+            // lower to a memory LOAD THROUGH the code pointer —
+            // executing the callee's first 8 instruction bytes as an
+            // address: silent garbage. Lattice-kind-driven only.
+            if (operand.type.valid()) {
+                TypeKind const opk = interner.kind(operand.type);
+                if (opk == TypeKind::FnSig) return operand;
+                if (opk == TypeKind::Ptr
+                    && !interner.operands(operand.type).empty()
+                    && interner.kind(interner.operands(operand.type)[0])
+                           == TypeKind::FnSig) {
+                    return operand;
+                }
+            }
             TypeId result = InvalidType;
             if (operand.type.valid() && interner.kind(operand.type) == TypeKind::Ptr)
                 result = interner.operands(operand.type)[0];
@@ -1585,9 +1633,14 @@ struct Lowerer {
         E base = lowerExpr(baseN);
         if (e.target == "Call") {
             std::vector<HirNodeId> args;
-            // Coerce each arg to its FnSig param type (when the callee's
-            // signature is known). Same discipline as the lowerFlatExpr's
-            // call arm above — single source of truth for arg-coercion.
+            // Coerce each arg to its declared param type when the
+            // callee's signature is known — a FnSig designator OR a
+            // `Ptr<FnSig>` function-pointer value (FC4 c2:
+            // `calleeSigOf` unwraps one level so INDIRECT-call args
+            // coerce exactly like direct-call args; skipping coercion
+            // here would be the width/signedness miscompile class).
+            // Same discipline as lowerSqlCall — single source of truth
+            // for arg-coercion.
             //
             // M2 silent-failure fix (3-agent root-cause analysis,
             // 2026-06-02): `interner.fnParams()` returns a span into
@@ -1601,9 +1654,10 @@ struct Lowerer {
             // interner growth. Cost: one small heap allocation per
             // call site; rare alternative is a `std::array`-backed
             // small-buffer for ≤8-param calls (most calls).
+            TypeId const calleeSig = calleeSigOf(base.type);
             std::vector<TypeId> paramTypes;
-            if (base.type.valid() && interner.kind(base.type) == TypeKind::FnSig) {
-                auto const paramSpan = interner.fnParams(base.type);
+            if (calleeSig.valid()) {
+                auto const paramSpan = interner.fnParams(calleeSig);
                 paramTypes.assign(paramSpan.begin(), paramSpan.end());
             }
             std::size_t argIdx = 0;
@@ -1617,10 +1671,10 @@ struct Lowerer {
                 ++argIdx;
             }
             // Prefer the semantic phase's resolved call type (it types call nodes);
-            // fall back to the callee FnSig's result.
+            // fall back to the callee signature's result (direct FnSig
+            // or unwrapped Ptr<FnSig> — FC4 c2).
             TypeId inferred = InvalidType;
-            if (base.type.valid() && interner.kind(base.type) == TypeKind::FnSig)
-                inferred = interner.fnResult(base.type);
+            if (calleeSig.valid()) inferred = interner.fnResult(calleeSig);
             TypeId const result = typeAtOr(node, inferred);
             return {track(builder.makeCall(base.id, args, result), node), result};
         }

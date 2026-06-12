@@ -1005,28 +1005,34 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 continue;
             }
 
-            // ML7 cycle 2: materialize virtual `call` op into the
-            // explicit ABI sequence.
+            // ML7 cycle 2 (+ FC4 c2 indirect): materialize virtual
+            // `call` op into the explicit ABI sequence.
             //
             // Input shape (post-regalloc): `result?, call callee, arg0,
             // arg1, ...` — operands are [callee, arg0..argN-1] where
-            // callee is a SymbolRef (direct call) and each arg is a
-            // physical register holding the value at the call site.
+            // callee is a SymbolRef (direct call) OR a physical Reg
+            // (indirect call through a function-pointer value — FC4
+            // c2), and each arg is a physical register holding the
+            // value at the call site. (mir_to_lir keeps the callee at
+            // ops[0] in BOTH shapes: it folds a GlobalAddr callee into
+            // a SymbolRef and passes any other callee value through as
+            // its Reg — `firstArgIdx = calleeIsGlobalAddr ? 1 : 0`.)
             //
-            // Output shape:
+            // Output shape (IDENTICAL planning for both callee kinds —
+            // arg moves, stack-arg stores, hazard detection, variadic
+            // count-reg, result capture are all shared):
             //   mov destArgReg_0, arg0   (per cc.argGprs/argFprs by class)
             //   mov destArgReg_1, arg1
             //   ...
-            //   call <callee_symbol>     (only the symbol operand —
-            //                             matches the existing
-            //                             x86-variable encoding variant
-            //                             guard `["symbol"]`)
+            //   call <callee_symbol>     (single-operand form; matches
+            //     | call <callee_reg>     the schema's per-callee-kind
+            //                             encoding variant guards
+            //                             `["symbol"]` / `["reg"]`)
             //   mov result, returnReg    (only if result is non-void;
             //                             returnReg picked from
             //                             cc.returnGprs[0] / returnFprs[0]
             //                             by result class)
             //
-            // Indirect calls (`call <reg>`) are anchored at D-ML7-2.4.
             // Move-graph cycles (when regalloc pins src args to dest
             // arg-passing regs in a way that produces a cycle —
             // e.g. arg0 in argGprs[1], arg1 in argGprs[0] would need
@@ -1042,9 +1048,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             // detection scan uses — single source of truth.
             // Mnemonic-equality match (`op == h.call || op ==
             // h.callIndirectViaExtern`) was the prior shape; it would
-            // silently miss a 3rd call-shaped opcode (e.g. a future
-            // `call_indirect_reg` for function-pointer support
-            // anchored at D-ML7-2.4) — the silent-failure audit pin.
+            // silently miss a 3rd call-shaped opcode — the silent-
+            // failure audit pin. (The indirect form itself landed as a
+            // VARIANT of `call`, not a 3rd opcode, exactly so this
+            // sharing holds by construction.)
             if (info != nullptr && info->isCall) {
                 if (ops.empty()) {
                     report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
@@ -1055,14 +1062,33 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     return false;
                 }
                 LirOperand const calleeOp = ops[0];
-                if (calleeOp.kind != LirOperandKind::SymbolRef) {
+                bool const calleeIsSymbol =
+                    calleeOp.kind == LirOperandKind::SymbolRef;
+                bool const calleeIsReg =
+                    calleeOp.kind == LirOperandKind::Reg;
+                if (!calleeIsSymbol && !calleeIsReg) {
+                    // Fail-loud TOTALITY backstop: a callee operand
+                    // kind the materializer does not understand is an
+                    // upstream lowering bug — never guess. The code
+                    // stays ALIVE for the residual kinds even though
+                    // the Reg (indirect) form is now encoded (FC4 c2).
                     report(reporter,
                            DiagnosticCode::L_IndirectCallUnsupported,
                            DiagnosticSeverity::Error,
                            std::format("callconv: call inst {}'s callee "
-                                       "operand is not a SymbolRef — indirect "
-                                       "calls are anchored at D-ML7-2.4",
+                                       "operand kind is neither SymbolRef "
+                                       "(direct) nor Reg (indirect) — "
+                                       "unsupported callee shape",
                                        inst.v));
+                    return false;
+                }
+                if (calleeIsReg && calleeOp.reg.isPhysical == 0) {
+                    report(reporter,
+                           DiagnosticCode::L_VirtualRegInPostRegalloc,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: call inst {}'s Reg "
+                                       "callee is not a physical reg "
+                                       "after regalloc", inst.v));
                     return false;
                 }
                 // Plan the move-to-arg-register sequence (and any
@@ -1198,6 +1224,68 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         }
                     }
                 }
+                // FC4 c2 indirect-callee backstop (the red-on-disable
+                // lever for the regalloc-tier rules): a Reg callee that
+                // regalloc parked in one of THIS call's arg-passing
+                // destination registers (or in the cc's variadic
+                // vector-count register on a variadic call) would be
+                // OVERWRITTEN by the moves emitted below, and the call
+                // would jump THROUGH AN ARGUMENT VALUE — silent
+                // garbage. Two upstream rules make this unreachable:
+                // the allocator excludes argGprs ∪ argFprs (+ countReg)
+                // from any indirect-callee range (lir_regalloc.cpp),
+                // and the spill-reload scratch filter keeps a SPILLED
+                // callee's reload scratch out of the same set
+                // (lir_rewrite.cpp). This check converts any future
+                // regression of either rule into a loud compile error.
+                // Same-reg moves are skipped: `maybeMov` emits nothing
+                // for dest == src, so they cannot clobber.
+                if (calleeIsReg) {
+                    for (std::size_t i = 0; i < argMoves.size(); ++i) {
+                        if (argMoves[i].dest.id == argMoves[i].src.id) {
+                            continue;  // no mov emitted — no clobber
+                        }
+                        if (argMoves[i].dest.id == calleeOp.reg.id) {
+                            report(reporter,
+                                   DiagnosticCode::
+                                       L_IndirectCalleeClobberedByArgSetup,
+                                   DiagnosticSeverity::Error,
+                                   std::format(
+                                       "callconv: call inst {}'s Reg callee "
+                                       "(reg #{}) is the destination of its "
+                                       "own arg-passing move {} — the move "
+                                       "would overwrite the callee before "
+                                       "the call consumes it (the regalloc "
+                                       "indirect-callee arg-reg exclusion / "
+                                       "spill-reload scratch filter "
+                                       "invariant was violated upstream)",
+                                       inst.v,
+                                       static_cast<unsigned>(calleeOp.reg.id),
+                                       i));
+                            return false;
+                        }
+                    }
+                    if (::dss::call_payload::isVariadic(payload)
+                        && cc.variadicVectorCountReg.has_value()
+                        && cc.variadicVectorCountReg->ordinal
+                               == calleeOp.reg.id) {
+                        report(reporter,
+                               DiagnosticCode::
+                                   L_IndirectCalleeClobberedByArgSetup,
+                               DiagnosticSeverity::Error,
+                               std::format(
+                                   "callconv: variadic call inst {}'s Reg "
+                                   "callee (reg #{}) is the cc's variadic "
+                                   "vector-count register — the count-reg "
+                                   "set below would overwrite the callee "
+                                   "before the call consumes it (regalloc "
+                                   "indirect-callee exclusion invariant "
+                                   "violated upstream)",
+                                   inst.v,
+                                   static_cast<unsigned>(calleeOp.reg.id)));
+                        return false;
+                    }
+                }
                 // D-ML7-2.2 (closed 2026-06-02): emit stack-arg
                 // stores FIRST, before any register move. The
                 // stack-store reads its src reg; if a later register
@@ -1236,10 +1324,16 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // docblock in target_schema.hpp). Emitted AFTER
                 // arg-passing moves + stack-arg stores: the cc's
                 // countReg (e.g. SysV `rax`) is NOT in the arg-
-                // passing GPR pool, but a future indirect-call
-                // shape or parallel-copy serializer could use it
-                // as a scratch — emitting last guarantees no later
-                // code reads or writes it before the call consumes it.
+                // passing GPR pool, but an indirect-call callee or
+                // a parallel-copy serializer could use it as a
+                // scratch — emitting last guarantees no later code
+                // reads or writes it before the call consumes it.
+                // (This comment PREDICTED the FC4 c2 indirect-call
+                // collision: a variadic indirect call's Reg callee
+                // must also avoid the countReg — the regalloc
+                // exclusion handles it, and the
+                // L_IndirectCalleeClobberedByArgSetup backstop above
+                // converts any regression into a loud error.)
                 if (::dss::call_payload::isVariadic(payload)
                     && cc.variadicVectorCountReg.has_value()) {
                     std::uint32_t const fixedCount =
@@ -1297,9 +1391,11 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 }
                 // Emit the call instruction. Pass through the input
                 // opcode (h.call OR h.callIndirectViaExtern) so the
-                // assembler picks the right encoding. Single-symbol
-                // operand form for both (matches each schema variant
-                // guard `["symbol"]`).
+                // assembler picks the right encoding. Single-operand
+                // form for every shape: a SymbolRef callee matches the
+                // schema variant guard `["symbol"]` (direct E8 / BL /
+                // FF 15-via-extern), a Reg callee matches `["reg"]`
+                // (indirect FF /2 / BLR — FC4 c2).
                 std::array<LirOperand, 1> callOps{calleeOp};
                 b.addInst(op, InvalidLirReg, callOps,
                           payload, src.instFlags(inst));

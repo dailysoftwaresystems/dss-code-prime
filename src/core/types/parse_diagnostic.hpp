@@ -268,14 +268,17 @@ enum class DiagnosticCode : std::uint16_t {
     // per-language config (the engine only honors the declared token→code
     // pair; nothing here hardcodes the word "volatile").
     S_VolatileNotSupported        = 0xE014,
-    // FC4 c1 (defined now, wired by the c-subset stage): a call through a
-    // function-pointer VALUE — an indirect call. Declarators can TYPE
-    // `int (*fp)(int)`, but the call path only encodes direct symbol
-    // calls (D-ML7-2.4 owns the indirect-call encoding); a language gates
-    // the indirect-call shape to this code so the unsupported form fails
-    // loud at semantic analysis instead of surfacing as the LIR tier's
-    // late L_IndirectCallUnsupported.
-    S_IndirectCallNotSupported    = 0xE015,
+    // S_IndirectCallNotSupported: RETIRED 2026-06-12 (FC4 c2). The
+    // indirect-call encoding landed end-to-end (semantic Ptr<FnSig>
+    // unwrap → HIR deref-decay + arg coercion → LIR call-reg
+    // materialization + the regalloc callee/arg-reg exclusion rule →
+    // x86 FF /2 + arm64 BLR encoding variants), so the semantic wall
+    // this code gated is gone: a Ptr<FnSig> callee now routes through
+    // the SAME result-stamp + arity + per-arg checking as a direct
+    // call. Both emit sites removed. The number is kept reserved (NOT
+    // renumbered) so historical diagnostics remain decodeable —
+    // 0xC034 precedent.
+    S_IndirectCallNotSupported    = 0xE015,  // RETIRED — see comment
     // FC4 c1 stage 2a: C 6.7.6.3p10 — a `(void)` parameter list declares
     // zero parameters; a NAMED void parameter (`int f(void x)`) or void
     // mixed with other parameters (`int f(void, int)`) is ill-formed.
@@ -632,14 +635,29 @@ enum class DiagnosticCode : std::uint16_t {
     //   such a cycle — second mov reads a clobbered source. v1 detects
     //   loud; D-ML7-2.3 anchors the proper parallel-copy resolution.
     // L_IndirectCallUnsupported: the LIR `call` instruction's callee
-    //   operand is not a `SymbolRef`. v1 only encodes direct calls
-    //   (the schema's encoding variant guard is `["symbol"]`); indirect
-    //   calls need a new schema variant + the materializer must emit
-    //   `call <reg>` instead of `call <sym>`. Anchor: D-ML7-2.4.
+    //   operand is neither a `SymbolRef` (direct call) nor a `Reg`
+    //   (indirect call through a register — FC4 c2 landed that
+    //   encoding: schema `call` variant guard `["reg"]`, x86 FF /2 /
+    //   arm64 BLR). Any OTHER operand kind in callee position is a
+    //   lowering bug upstream — fail-loud totality, the code stays
+    //   ALIVE as the residual-kind backstop.
+    // L_IndirectCalleeClobberedByArgSetup (FC4 c2): an indirect call's
+    //   post-regalloc callee REGISTER is also the destination of one
+    //   of that same call's arg-passing moves (or the cc's variadic
+    //   vector-count register on a variadic call). The materializer
+    //   emits those moves BETWEEN the callee's definition and the
+    //   `call <reg>` — the callee would be overwritten and the call
+    //   would jump THROUGH AN ARGUMENT VALUE (silent garbage jump).
+    //   The regalloc-tier rules (the indirect-callee arg-reg exclusion
+    //   in lir_regalloc.cpp + the spill-reload scratch filter in
+    //   lir_rewrite.cpp) make this unreachable; this code is the
+    //   BACKSTOP that converts any future regression of either rule
+    //   from a silent garbage jump into a loud compile error.
     L_StackPassedArgUnsupported    = 0xB007,
     L_CcRegLookupFailed            = 0xB008,
     L_MoveCycleUnsupported         = 0xB009,
     L_IndirectCallUnsupported      = 0xB00A,
+    L_IndirectCalleeClobberedByArgSetup = 0xB00B,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //

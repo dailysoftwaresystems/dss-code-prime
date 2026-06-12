@@ -662,7 +662,7 @@
       "maxSuccessors": 0
     },
     {
-      "$comment": "Direct call to a symbol — AArch64 `BL imm26` (branch-with-link). Declared under the engine's GENERIC `call` verb (NOT the ISA spelling 'bl'), the same convention every other opcode in this file already follows (`mov`=ORR-alias, `add`=ADD, `xor`=EOR, `or`=ORR): the target's mnemonics ARE the engine's verb vocabulary; the real ISA mnemonic lives in this comment. This is what lets the format-blind trampoline emitter (`opcodeByMnemonic(\"call\")`) and the MIR→LIR `MnemonicSlot::Call` resolve the direct call on ANY target. Fixed-word base = 0x94000000 (opcode bits 26..31 = 0b100101). Imm26 wire at bits 0..25 emits a call26 relocation; the bits are left at 0 (linker patches at link time).",
+      "$comment": "Direct AND indirect call, one mnemonic with per-callee-kind variants (FC4 c2). Direct call to a symbol — AArch64 `BL imm26` (branch-with-link); indirect call through a register — AArch64 `BLR Xn` (branch-with-link-to-register). Declared under the engine's GENERIC `call` verb (NOT the ISA spellings 'bl'/'blr'), the same convention every other opcode in this file already follows (`mov`=ORR-alias, `add`=ADD, `xor`=EOR, `or`=ORR): the target's mnemonics ARE the engine's verb vocabulary; the real ISA mnemonics live in this comment. This is what lets the format-blind trampoline emitter (`opcodeByMnemonic(\"call\")`) and the MIR→LIR `MnemonicSlot::Call` resolve the call on ANY target — and keeping BLR a VARIANT (not a second opcode) keeps isCall / functionHasCalls / caller-saved-clobber semantics shared by construction. BL fixed-word base = 0x94000000 (opcode bits 26..31 = 0b100101); imm26 wire at bits 0..25 emits a call26 relocation, bits left at 0 (linker patches at link time). BLR fixed-word base = 0xD63F0000 with the callee register in the Rn slot (bits 5..9): BLR X9 = 0xD63F0120.",
       "mnemonic":         "call",
       "result":           "none",
       "hasSideEffects":   true,
@@ -677,6 +677,14 @@
             "template": { "fixedWord": 2483027968 },
             "wires":    [
               { "index": 0, "slotKind": "imm26", "relocationKind": "call26" }
+            ]
+          },
+          {
+            "$comment": "FC4 c2: BLR Xn — 0xD63F0000 | Rn<<5 (indirect call through a register). fixedWord 3594452992 = 0xD63F0000; sanity precedent: the shipped ret row's 0xD65F03C0 = 3596551104 (RET X30, same D6 family).",
+            "guard":    { "operandKinds": ["reg"] },
+            "template": { "fixedWord": 3594452992 },
+            "wires":    [
+              { "index": 0, "slotKind": "rn" }
             ]
           }
         ]

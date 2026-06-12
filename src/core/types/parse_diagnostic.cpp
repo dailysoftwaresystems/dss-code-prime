@@ -147,6 +147,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::L_CcRegLookupFailed:            return "L_CcRegLookupFailed";
         case DiagnosticCode::L_MoveCycleUnsupported:         return "L_MoveCycleUnsupported";
         case DiagnosticCode::L_IndirectCallUnsupported:      return "L_IndirectCallUnsupported";
+        case DiagnosticCode::L_IndirectCalleeClobberedByArgSetup: return "L_IndirectCalleeClobberedByArgSetup";
         case DiagnosticCode::R_NoCallingConventions:          return "R_NoCallingConventions";
         case DiagnosticCode::R_CallingConventionLookupFailed: return "R_CallingConventionLookupFailed";
         case DiagnosticCode::R_VRegHasNoClass:                return "R_VRegHasNoClass";

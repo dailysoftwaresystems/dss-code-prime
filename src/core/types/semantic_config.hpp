@@ -1005,9 +1005,10 @@ struct DSS_EXPORT SemanticConfig {
     //     extends this struct.
     //   * `D-LANG-VOIDPTR-FN-CONVERT`: `void* ↔ fn-pointer` is
     //     technically UB in standard C even though every compiler
-    //     permits it. When function-pointer types land (D-ML7-2.4),
-    //     another `allowVoidPtrFnConvert: bool` opt-in extends this
-    //     struct.
+    //     permits it. Function-pointer types landed (FC4: Ptr<FnSig>
+    //     declarators + indirect calls); when the first language
+    //     needs the conversion, another `allowVoidPtrFnConvert: bool`
+    //     opt-in extends this struct.
     //   * `D-LANG-VOIDPTR-PREDICATE-GATE` (type-design analyst,
     //     step 13.2 audit fold): if a future language needs
     //     per-element-type predicates ("only T* → void* when T ∈

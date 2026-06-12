@@ -9,8 +9,8 @@ namespace {
 
 // D-FF2-UNSUPP closed-table. Sorted by phase letter (D / F / H / I / K
 // / L / R / A) + numeric value within each phase for at-a-glance
-// audit. The linear scan via `std::ranges::find` is O(N) on N=53
-// members — still faster than hash lookup at this size + needs no
+// audit. The linear scan via `std::ranges::find` is O(N) over the
+// table — still faster than hash lookup at this size + needs no
 // static-init dance.
 //
 // Membership rule: a code is unsuppressable when its surface is a
@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 61> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 62> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -164,7 +164,7 @@ constexpr std::array<DiagnosticCode, 61> kUnsuppressableCodes{{
 
     // L_* LIR verifier / lowering band — structural invariants
     // (cannot reach assembler-tier codegen without violating
-    // downstream contracts). All 10 codes fire from arms that gate
+    // downstream contracts). All 11 codes fire from arms that gate
     // the producer's ok() / return value. Suppressing any → silent
     // miscompile through the LIR layer.
     //
@@ -175,6 +175,11 @@ constexpr std::array<DiagnosticCode, 61> kUnsuppressableCodes{{
     // every coverage-gap deferral. Was omitted in post-fold #12 →
     // `--suppress=L_UnsupportedLoweringForOpcode` silently re-opened
     // the MIR→LIR miscompile surface for unrecognized opcodes.
+    //
+    // L_IndirectCalleeClobberedByArgSetup (FC4 c2): the backstop for
+    // the indirect-callee regalloc rules — suppressing it would turn
+    // a callee-clobbered-by-arg-setup regression back into a SILENT
+    // garbage jump through an argument value.
     DiagnosticCode::L_UnsupportedLoweringForOpcode,
     DiagnosticCode::L_RequiredLirOpcodeMissing,
     DiagnosticCode::L_VirtualRegInPostRegalloc,
@@ -183,6 +188,7 @@ constexpr std::array<DiagnosticCode, 61> kUnsuppressableCodes{{
     DiagnosticCode::L_InvalidSpillSlotSentinel,
     DiagnosticCode::L_MoveCycleUnsupported,
     DiagnosticCode::L_IndirectCallUnsupported,
+    DiagnosticCode::L_IndirectCalleeClobberedByArgSetup,
     DiagnosticCode::L_StackPassedArgUnsupported,
     DiagnosticCode::L_CcRegLookupFailed,
 

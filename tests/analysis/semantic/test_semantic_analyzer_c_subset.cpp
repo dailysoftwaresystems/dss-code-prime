@@ -1885,47 +1885,77 @@ TEST(SemanticAnalyzerCSubset, UnknownStarUnknownStaysExpressionWithUndeclared) {
     EXPECT_TRUE(sawU) << "`u` must carry a positioned S_UndeclaredIdentifier";
 }
 
-// ── FC4 c1 stage 2b: the indirect-call wall (W1) ────────────────────────
-// D-CSUBSET-FNPTR-INDIRECT-CALL — the four callee triage arms.
+// ── FC4 c2: indirect calls TYPE-CHECK like direct calls ─────────────────
+// D-CSUBSET-FNPTR-INDIRECT-CALL closed — the c1 walls flipped to
+// positive signature checking: a Ptr<FnSig> callee (bare identifier,
+// cast expression, paren/deref form) unwraps to its FnSig and runs the
+// SAME result-stamp + arity + per-arg path as a direct symbol call.
 
-// (a) bare-identifier callee typed Ptr<FnSig> -> S_IndirectCallNotSupported
-// (NOT S_NotCallable: the value IS callable in C; the gap is the backend
-// call-via-register encoding, D-ML7-2.4), positioned on the callee.
-TEST(SemanticAnalyzerCSubset, BareFnPtrIdentifierCallFiresIndirectGate) {
-    auto cu = buildShippedUnit("c-subset", {
+// (a) bare-identifier callee typed Ptr<FnSig> — clean when the args
+// match, exactly one S_ArgCountMismatch on wrong arity, S_TypeMismatch
+// on a wrong arg type. (c1 predecessor: BareFnPtrIdentifierCallFires
+// IndirectGate pinned the S_IndirectCallNotSupported wall.)
+TEST(SemanticAnalyzerCSubset, BareFnPtrCallTypesAndChecks) {
+    // Clean: fp(3) against int(*)(int).
+    auto clean = analyzeShipped("c-subset", {
         "int helper(int v) { return v; }\n"
         "int main() { int (*fp)(int) = &helper; return fp(3); }\n",
     });
-    assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
-    ASSERT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_IndirectCallNotSupported), 1u);
-    EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_NotCallable), 0u)
-        << "a fn-ptr callee must NOT be miscoded as not-callable";
-    for (auto const& d : model.diagnostics().all()) {
-        if (d.code != DiagnosticCode::S_IndirectCallNotSupported) continue;
-        EXPECT_EQ(cu->trees()[0].source().slice(d.span), "fp");
-    }
+    EXPECT_FALSE(clean.hasErrors())
+        << "a well-typed indirect call must be CLEAN (the c1 wall is "
+           "retired)";
+
+    // Arity: fp(1, 2) against int(*)(int) -> exactly 1 S_ArgCountMismatch.
+    auto arity = analyzeShipped("c-subset", {
+        "int helper(int v) { return v; }\n"
+        "int main() { int (*fp)(int) = &helper; return fp(1, 2); }\n",
+    });
+    EXPECT_EQ(countCode(arity.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 1u)
+        << "indirect calls must get the SAME arity checking as direct";
+    EXPECT_EQ(countCode(arity.diagnostics(),
+                        DiagnosticCode::S_NotCallable), 0u);
+
+    // Arg type: passing a pointer where the FnSig declares int.
+    auto badArg = analyzeShipped("c-subset", {
+        "int helper(int v) { return v; }\n"
+        "int main() {\n"
+        "    int (*fp)(int) = &helper;\n"
+        "    int x = 1;\n"
+        "    int *p = &x;\n"
+        "    return fp(p);\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(badArg.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "indirect calls must get the SAME per-arg checking as direct";
 }
 
 // (b) non-identifier callee whose STAMPED type is Ptr<FnSig> (the cast
-// form `((H)fp)(3)`) -> the same wall. Pre-gate this died as an opaque
-// HIR-tier unsupported-construct error.
-TEST(SemanticAnalyzerCSubset, CastFnPtrCalleeFiresIndirectGate) {
-    auto model = analyzeShipped("c-subset", {
+// form `((H)fp)(3)`) — clean, plus the arity-error sibling. (c1
+// predecessor: CastFnPtrCalleeFiresIndirectGate pinned the wall.)
+TEST(SemanticAnalyzerCSubset, CastFnPtrCalleeTypesAndChecks) {
+    auto clean = analyzeShipped("c-subset", {
         "int helper(int v) { return v; }\n"
         "typedef int (*H)(int);\n"
         "int main() { int (*fp)(int) = &helper; return ((H)fp)(3); }\n",
     });
-    EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_IndirectCallNotSupported), 1u);
-    EXPECT_EQ(countCode(model.diagnostics(),
+    EXPECT_FALSE(clean.hasErrors());
+
+    auto arity = analyzeShipped("c-subset", {
+        "int helper(int v) { return v; }\n"
+        "typedef int (*H)(int);\n"
+        "int main() { int (*fp)(int) = &helper; return ((H)fp)(1, 2); }\n",
+    });
+    EXPECT_EQ(countCode(arity.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 1u);
+    EXPECT_EQ(countCode(arity.diagnostics(),
                         DiagnosticCode::S_NotCallable), 0u);
 }
 
 // (b) non-identifier callee whose stamped type is provably NOT callable
-// (`((int)x)(3)` — castExpr stamped I32) -> S_NotCallable.
+// (`((int)x)(3)` — castExpr stamped I32) -> S_NotCallable. UNCHANGED by
+// FC4 c2: the triage's other-valid-type arm.
 TEST(SemanticAnalyzerCSubset, CastNonCallableCalleeFiresNotCallable) {
     auto model = analyzeShipped("c-subset", {
         "int main() { int x = 1; return ((int)x)(3); }\n",
@@ -1933,14 +1963,17 @@ TEST(SemanticAnalyzerCSubset, CastNonCallableCalleeFiresNotCallable) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NotCallable), 1u);
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_IndirectCallNotSupported), 0u);
+                        DiagnosticCode::S_ArgCountMismatch), 0u);
 }
 
 // The paren-wrapped DIRECT designator `(helper)(40)` stays CLEAN — it is
 // a direct call (C 6.5.1p5: parentheses preserve the designator) and is
-// RUNTIME-PROVEN end-to-end (exit-42 CLI probe, 2026-06-11). The gate's
-// stamped-FnSig arm deliberately stays silent so this form keeps
-// compiling; this pin enforces that decision.
+// RUNTIME-PROVEN end-to-end (exit-42 CLI probe, 2026-06-11). FC4 c2
+// UPGRADE: the callee peel lands on `helper`'s FnSig and runs the full
+// signature check — so the form is no longer silently admitted, it is
+// POSITIVELY checked: `(helper)(1, 2)` now fires exactly one
+// S_ArgCountMismatch (no double-emission with any other path — the
+// plan-lock MUST-FIX 8 pin).
 TEST(SemanticAnalyzerCSubset, ParenWrappedDirectCalleeStaysClean) {
     auto model = analyzeShipped("c-subset", {
         "int helper(int v) { return v + 2; }\n"
@@ -1948,27 +1981,56 @@ TEST(SemanticAnalyzerCSubset, ParenWrappedDirectCalleeStaysClean) {
     });
     EXPECT_FALSE(model.hasErrors());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_IndirectCallNotSupported), 0u);
-    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotCallable), 0u);
+
+    // FC4 c2: wrong arity through the paren-wrapped designator is now
+    // CAUGHT (c1 deliberately admitted it silently) — and exactly ONCE.
+    auto arity = analyzeShipped("c-subset", {
+        "int helper(int v) { return v + 2; }\n"
+        "int main() { return (helper)(1, 2); }\n",
+    });
+    EXPECT_EQ(countCode(arity.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 1u)
+        << "exactly one emission — the peel path must not double-report "
+           "with the bare-identifier/refByRule paths";
+    EXPECT_EQ(countCode(arity.diagnostics(),
                         DiagnosticCode::S_NotCallable), 0u);
 }
 
-// HONEST TIER for `(*fp)(3)`: the deref wrapper is UNSTAMPED at the
-// semantic tier (subtreeType stops at prefix-operator wrappers — there
-// is no deref-typing arm yet), so the gate conservatively stays SILENT
-// here (do not invent types). The form still fails LOUD downstream at
-// the LIR tier: callconv's L_IndirectCallUnsupported (pinned by
-// tests/lir/test_lir_callconv.cpp RegCalleeCallFailsLoud — the D-ML7-2.4
-// wall). When a deref-typing arm lands and stamps `(*fp)` as FnSig, the
-// stamped-FnSig triage arm must be revisited (see checkCall's comment).
-TEST(SemanticAnalyzerCSubset, DerefFnPtrCalleeStaysSemanticallySilent) {
-    auto model = analyzeShipped("c-subset", {
+// `(*fp)(3)` / `(*helper)(40)` — the deref-designator forms. FC4 c2:
+// the callee peel folds `*` on a function pointer / function designator
+// (C 6.5.3.2p4 — deref is the identity for call purposes, the
+// designator decays right back), lands on the designator, and runs the
+// full signature check: clean when well-typed, exactly one
+// S_ArgCountMismatch on wrong arity. (c1 predecessor:
+// DerefFnPtrCalleeStaysSemanticallySilent pinned the conservative
+// silent tier, with the LIR-tier L_IndirectCallUnsupported as the
+// downstream wall — both retired by the end-to-end encoding.)
+TEST(SemanticAnalyzerCSubset, DerefFnPtrCalleeTypesAndChecks) {
+    auto clean = analyzeShipped("c-subset", {
         "int helper(int v) { return v; }\n"
         "int main() { int (*fp)(int) = &helper; return (*fp)(3); }\n",
     });
-    EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_IndirectCallNotSupported), 0u)
-        << "unstamped deref callee: the semantic tier must not guess";
-    EXPECT_EQ(countCode(model.diagnostics(),
+    EXPECT_FALSE(clean.hasErrors())
+        << "(*fp)(3) is a well-typed indirect call — must be clean";
+
+    auto arity = analyzeShipped("c-subset", {
+        "int helper(int v) { return v; }\n"
+        "int main() { int (*fp)(int) = &helper; return (*fp)(1, 2); }\n",
+    });
+    EXPECT_EQ(countCode(arity.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 1u)
+        << "the deref peel must feed the SAME arity check";
+    EXPECT_EQ(countCode(arity.diagnostics(),
                         DiagnosticCode::S_NotCallable), 0u);
+
+    // Deref of the bare DESIGNATOR (`(*helper)(40)` — operand's own
+    // type is the FnSig, no pointer involved): C idiom, stays clean.
+    auto derefDesignator = analyzeShipped("c-subset", {
+        "int helper(int v) { return v + 2; }\n"
+        "int main() { return (*helper)(40); }\n",
+    });
+    EXPECT_FALSE(derefDesignator.hasErrors())
+        << "deref of a function designator decays right back (C "
+           "6.5.3.2p4) — must be clean";
 }

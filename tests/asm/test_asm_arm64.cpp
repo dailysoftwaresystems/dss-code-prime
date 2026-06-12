@@ -104,6 +104,50 @@ TEST(Arm64Encoder, RetEncodesD65F03C0) {
     EXPECT_EQ(bytes[3], 0xD6);
 }
 
+// ── FC4 c2: indirect call `BLR Xn` — 0xD63F0000 | Rn<<5 ────────────
+// The `call` row's ["reg"] encoding variant (the direct ["symbol"]
+// variant emits BL imm26 + a call26 relocation). Callee register in
+// the Rn slot (bits 5..9), exactly like sdiv/udiv's Rn wiring.
+
+TEST(Arm64Encoder, BlrX9EncodesD63F0120) {
+    // BLR X9 = 0xD63F0000 | (9 << 5) = 0xD63F0120.
+    // LE bytes: 20 01 3F D6.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const callOp = (*s)->opcodeByMnemonic("call");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(callOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+    auto const x9 = (*s)->registerByName("x9");
+    ASSERT_TRUE(x9.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const r_x9{static_cast<std::uint32_t>(*x9), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(r_x9) };
+    (void)b.addInst(*callOp, InvalidLirReg, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);  // BLR + RET
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0x01);
+    EXPECT_EQ(bytes[2], 0x3F);
+    EXPECT_EQ(bytes[3], 0xD6);
+    // The trailing RET (C0 03 5F D6) confirms the BLR did not bleed
+    // into the next word.
+    EXPECT_EQ(bytes[4], 0xC0);
+    EXPECT_EQ(bytes[5], 0x03);
+    EXPECT_EQ(bytes[6], 0x5F);
+    EXPECT_EQ(bytes[7], 0xD6);
+}
+
 TEST(Arm64Encoder, UnreachableEncodesD4200000) {
     auto s = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(s.has_value());
