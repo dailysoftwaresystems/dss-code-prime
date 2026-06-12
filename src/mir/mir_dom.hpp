@@ -50,6 +50,39 @@ struct MirDomTree {
 // not resolve" diagnostic, not a wrong-blame "not dominated."
 enum class MirDomResult : std::uint8_t { Dominates, DoesNot, GaveUp };
 
+// Per-block POST-dominator state (the reverse-graph sibling of
+// `MirDomTree`), computed per function over a VIRTUAL exit node so
+// multi-exit functions have a single reverse-graph root. Arrays are
+// sized `mir.blockCount() + 1`; the extra slot IS the virtual exit.
+//
+// `ipdom[b.v]` is THREE-valued:
+//   - a REAL block slot: the immediate post-dominator (the join every
+//     path from `b` to function exit passes through);
+//   - the VIRTUAL slot (`virtualExitSlot()`): paths from `b` diverge
+//     to DISTINCT exits — there is no real join (e.g. the head of a
+//     both-arms-return if);
+//   - INVALID (`!valid()`): `b` is reverse-unreachable — no path from
+//     `b` reaches any exit (an infinite-loop region, e.g. `for(;;)`
+//     with no break).
+//
+// WARNING: the virtual-exit id `MirBlockId{blockCount, tag}` is a
+// synthetic slot, NOT an arena element — passing it to any
+// `Mir::block*` accessor ABORTS (arena bounds guard). Compare against
+// `virtualExitSlot()` / use `isVirtualExit()`; never dereference.
+struct MirPostDomTree {
+    std::vector<MirBlockId>   ipdom;
+    std::vector<std::uint8_t> gaveUp;
+    // The synthetic exit's slot value (== blockCount() of the module
+    // the tree was computed over). Stored, not recomputed, so a tree
+    // outlives intermediate module rebuilds without ambiguity.
+    std::uint32_t virtualExit = 0;
+
+    [[nodiscard]] std::uint32_t virtualExitSlot() const noexcept { return virtualExit; }
+    [[nodiscard]] bool isVirtualExit(MirBlockId b) const noexcept {
+        return b.valid() && b.v == virtualExit;
+    }
+};
+
 // Natural-loop forest: every back-edge (u → v) where v dominates u
 // induces a natural loop with header `v`. The loop's body is `v`
 // itself plus every block from which `u` is reachable in the
@@ -93,6 +126,26 @@ computeMirDomTree(Mir const&                                  mir,
 // Does `a` dominate `b`? Tri-state — `GaveUp` on iteration-cap overflow.
 [[nodiscard]] DSS_EXPORT MirDomResult
 mirDominatesBlock(MirBlockId a, MirBlockId b, MirDomTree const& dom);
+
+// Post-dominator tree for ONE function — the same Cooper-Harvey-
+// Kennedy core as `computeMirDomTree` run over the REVERSE graph with
+// a virtual exit (see `MirPostDomTree`):
+//   - reverse-predecessors of a block = its forward successors;
+//   - the virtual node's reverse-successors = every Return/Unreachable-
+//     terminated block of the function that is forward-REACHABLE from
+//     the function entry (unreachable exits don't define the join
+//     structure of live code);
+//   - the traversal order is reverse-RPO from the virtual node.
+// Consumed by `deriveStructCfMarkers` (mir_struct_markers.hpp) for
+// if/switch join derivation.
+[[nodiscard]] DSS_EXPORT MirPostDomTree
+computeMirPostDomTree(Mir const& mir, MirFuncId f);
+
+// Does `a` post-dominate `b`? Tri-state sibling of `mirDominatesBlock`.
+// `a` may be the virtual-exit id (`MirBlockId{postdom.virtualExitSlot(),
+// tag}`) — it post-dominates every reverse-reachable block.
+[[nodiscard]] DSS_EXPORT MirDomResult
+mirPostDominatesBlock(MirBlockId a, MirBlockId b, MirPostDomTree const& postdom);
 
 // Dominance frontier: for each block `b`, the set of blocks `n` such
 // that `b` dominates a predecessor of `n` but does NOT strictly

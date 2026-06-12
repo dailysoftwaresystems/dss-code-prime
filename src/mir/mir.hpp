@@ -133,6 +133,17 @@ public:
 
     // ── block accessors ──
     [[nodiscard]] StructCfMarker blockMarker(MirBlockId id) const { return blockArena_.at(id).marker; }
+    // Narrow METADATA-ONLY mutation — the single exception to "MIR is
+    // immutable once frozen". A `StructCfMarker` is verification metadata
+    // DERIVED from the CFG (mir_struct_markers.hpp), not structure: every
+    // producer (HIR→MIR lowering, CFG-mutating optimizer passes, the
+    // cross-CU merge) re-stamps markers from the canonical derivation
+    // AFTER `MirBuilder::finish()`, which requires a frozen-module setter.
+    // Structural immutability (instruction/block/successor ranges, pools)
+    // is untouched — only the marker byte may change through this.
+    void setBlockMarker(MirBlockId id, StructCfMarker m) {
+        blockArena_.mutableAt(id).marker = m;
+    }
     [[nodiscard]] std::uint32_t  blockInstCount(MirBlockId id) const {
         return blockArena_.at(id).instCount;
     }

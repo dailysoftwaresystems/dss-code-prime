@@ -2,7 +2,7 @@
 
 // MIR-tier SimplifyCFG: minimal-scope CFG simplification.
 //
-// **Scope (OPT5+ c2)**:
+// **Scope**:
 //   1. **Branch-folding**: `CondBr(Const(true|false), T, F)` collapses
 //      to `Br(T|F)`. The folded-out arm becomes unreachable → the
 //      subsequent DCE pass elides its blocks. This is the high-value
@@ -14,15 +14,17 @@
 //      (conservative — avoids Phi-incoming fan-out) is elided.
 //      Predecessor terminators that branched to B are redirected to
 //      S directly via the new `redirectBlockTarget` hook.
+//   3. **Block-merge** (D-OPT5-BLOCK-MERGE): a straight-line (P, B)
+//      pair — P ends Br(B), B's only pred is P, B non-entry, no Phi,
+//      instCount > 1 — merges into one block. The gate is pure
+//      CFG-legality; markers play no role in admission.
 //
-// **OUT-OF-SCOPE for c2** (anchored):
-//   - General block-merge (B has 1 pred + P has B as only succ).
-//     Phi-incoming fix-up requires the predecessor-fan-out algorithm
-//     this cycle's empty-block-only scope deliberately avoids.
-//   - StructCfMarker re-derivation. Branch-folding + empty-block
-//     elision PRESERVE the surviving blocks' markers (we never
-//     change a block's structural role; we only drop blocks). Marker
-//     re-derivation activates when block-merge lands (D-OPT4-1).
+// **StructCfMarker discipline (D-OPT4-1, closed)**: markers are NOT
+// maintained through the rebuild — after `finish()` the pass re-stamps
+// every block from the canonical CFG derivation
+// (`rederiveStructCfMarkers`, mir_struct_markers.hpp). This subsumed
+// the cycle-9 "non-Linear wins" repair and the c3-era both-non-Linear
+// merge refusal (D-OPT4-1-NON-LINEAR-MARKER-MERGE).
 //
 // **Mechanism**: SimplifyCFG uses two new `MirRebuildPolicy` hooks:
 //   - `tryRewriteTerminator(op, oldId, dst, rewrite, blockMap)`:

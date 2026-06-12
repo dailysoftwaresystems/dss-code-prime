@@ -189,9 +189,15 @@ public:
 
     // Phase 3: per-phi-incoming filter. Default = accept everything.
     // DCE: skip incomings whose pred isn't in the (RPO-reachable)
-    // blockMap. ConstFold: identity (all preds reachable).
+    // blockMap. SimplifyCFG: skip incomings whose CFG EDGE the
+    // branch-fold abandoned — `oldPhiBlock` (the OLD id of the block
+    // owning the phi) makes the hook an EDGE-level filter
+    // (pred → phi-owner), which a block-level pred check cannot
+    // express: a folded CondBr's block stays live, only its edge into
+    // the not-taken target dies. ConstFold: identity (all preds
+    // reachable, no edges removed).
     [[nodiscard]] virtual bool acceptPhiIncoming(
-        MirPhiIncoming const& /*inc*/,
+        MirPhiIncoming const& /*inc*/, MirBlockId /*oldPhiBlock*/,
         std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) {
         return true;
     }

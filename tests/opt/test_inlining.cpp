@@ -382,14 +382,14 @@ TEST(Inlining, MultiBlockLeafCalleeIsInlined) {
     MirBuilder mb;
 
     // pick (SymbolId 50): entry → CondBr to two blocks that each return.
-    // Markers: entry=EntryBlock; the two return blocks=ExitBlock (each
-    // terminates in Return). This keeps the un-inlined `pick` verifier-
-    // valid (no orphan IfThen/IfElse without an IfJoin) — the inliner
-    // re-derives the CLONED blocks to Linear regardless.
+    // Markers are derivation-consistent (both arms return → ipdom is the
+    // virtual exit → IfThen/IfElse, no join) so the un-inlined `pick`
+    // is verifier-valid; the post-inline re-derivation re-stamps every
+    // block from the spliced CFG regardless.
     mb.addFunction(fnSig, SymbolId{50});
     MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const fThen  = mb.createBlock(StructCfMarker::ExitBlock);
-    MirBlockId const fElse  = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const fThen  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const fElse  = mb.createBlock(StructCfMarker::IfElse);
     mb.beginBlock(fEntry);
     MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
     MirInstId const cond = mb.addConst(tru, boolT);
@@ -552,12 +552,13 @@ TEST(Inlining, MultiBlockNonLeafCalleeIsInlined) {
         mb.beginBlock(hEntry);
         mb.addReturn(mb.addConst(i32Lit(11), i32));
         // g (SymbolId 50): multi-block; then-arm CALLS h → NON-LEAF (now
-        // admitted). Balanced markers (entry=EntryBlock, return arms=
-        // ExitBlock) so g stays verifier-valid whether or not h is inlined.
+        // admitted). Derivation-consistent markers (both arms return →
+        // IfThen/IfElse around the virtual exit) so g stays verifier-
+        // valid whether or not h is inlined.
         mb.addFunction(fnSig, SymbolId{50});
         MirBlockId const gEntry = mb.createBlock(StructCfMarker::EntryBlock);
-        MirBlockId const gThen  = mb.createBlock(StructCfMarker::ExitBlock);
-        MirBlockId const gElse  = mb.createBlock(StructCfMarker::ExitBlock);
+        MirBlockId const gThen  = mb.createBlock(StructCfMarker::IfThen);
+        MirBlockId const gElse  = mb.createBlock(StructCfMarker::IfElse);
         mb.beginBlock(gEntry);
         MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
         MirInstId const gcond = mb.addConst(tru, boolT);
@@ -638,13 +639,14 @@ TEST(Inlining, NonReturningLeafCalleeIsNotInlined) {
     MirBuilder mb;
 
     // loopForever (SymbolId 50): entry block branches to L; L ends in
-    // Unreachable. Two blocks, leaf, NO Return on any path. Markers:
-    // entry=EntryBlock; L=ExitBlock terminating in Unreachable (the
-    // verifier explicitly allows an ExitBlock to end in Unreachable), so
-    // the un-inlined callee is itself verifier-valid.
+    // Unreachable. Two blocks, leaf, NO Return on any path. Markers
+    // are derivation-consistent (EntryBlock + Linear — a straight line;
+    // ExitBlock is a dormant marker the equality verifier would reject
+    // on a reachable block), so the un-inlined callee module is itself
+    // verifier-valid.
     mb.addFunction(fnSig, SymbolId{50});
     MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const fLoop  = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const fLoop  = mb.createBlock(StructCfMarker::Linear);
     mb.beginBlock(fEntry);
     mb.addBr(fLoop);
     mb.beginBlock(fLoop);
@@ -1007,11 +1009,12 @@ TEST(Inlining, MultiBlockIntrinsicCalleeIsInlined) {
     MirBuilder mb;
 
     // f (SymbolId 55): entry → Br B1; B1 computes an IntrinsicCall and
-    // returns it. Markers: entry=EntryBlock, B1=ExitBlock so the un-
-    // inlined f is verifier-valid; the inliner re-derives clones to Linear.
+    // returns it. Derivation-consistent markers (a straight line —
+    // EntryBlock + Linear) so the un-inlined f is verifier-valid; the
+    // post-inline re-derivation re-stamps the spliced result anyway.
     mb.addFunction(fnSig, SymbolId{55});
     MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const fB1    = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const fB1    = mb.createBlock(StructCfMarker::Linear);
     mb.beginBlock(fEntry);
     mb.addBr(fB1);
     mb.beginBlock(fB1);
@@ -1232,11 +1235,12 @@ TEST(Inlining, MixedSingleAndMultiBlockLeavesBothInlined) {
     mb.addReturn(mb.addConst(i32Lit(3), i32));
 
     // m (SymbolId 50): multi-block leaf, two return paths (early-return
-    // shape; balanced markers so the un-inlined m is verifier-valid).
+    // shape; derivation-consistent markers — both arms return →
+    // IfThen/IfElse — so the un-inlined m is verifier-valid).
     mb.addFunction(fnSig, SymbolId{50});
     MirBlockId const mEntryB = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const mThen   = mb.createBlock(StructCfMarker::ExitBlock);
-    MirBlockId const mAfter  = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const mThen   = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const mAfter  = mb.createBlock(StructCfMarker::IfElse);
     mb.beginBlock(mEntryB);
     MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
     MirInstId const mcond = mb.addConst(tru, boolT);
@@ -1307,12 +1311,13 @@ TEST(Inlining, MultiBlockSingleReturnLeafElidesMergePhi) {
     MirBuilder mb;
 
     // f (SymbolId 50): entry branches to B1; B1 returns 7. Two blocks,
-    // leaf, NO Phi, exactly ONE Return. Markers: entry=EntryBlock;
-    // B1=ExitBlock (terminates in Return) so the un-inlined f is itself
-    // verifier-valid. The inliner re-derives the CLONED blocks to Linear.
+    // leaf, NO Phi, exactly ONE Return. Derivation-consistent markers
+    // (a straight line — EntryBlock + Linear) so the un-inlined f is
+    // itself verifier-valid; the post-inline re-derivation re-stamps
+    // the spliced result.
     mb.addFunction(fnSig, SymbolId{50});
     MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const fB1    = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const fB1    = mb.createBlock(StructCfMarker::Linear);
     mb.beginBlock(fEntry);
     mb.addBr(fB1);
     mb.beginBlock(fB1);
@@ -1439,12 +1444,12 @@ TEST(Inlining, MultiBlockVoidLeafIsInlined) {
 
     // g (SymbolId 80): VOID multi-block leaf. entry branches to B1; B1
     // holds a real (non-terminator) body inst — a Const the splice must
-    // clone — then a bare void Return (no value). Markers: entry=Entry,
-    // B1=ExitBlock terminating in a (void) Return → un-inlined g valid.
+    // clone — then a bare void Return (no value). Derivation-consistent
+    // markers (straight line — EntryBlock + Linear) → un-inlined g valid.
     mb.addFunction(voidSig, SymbolId{80}, SymbolBinding::Global,
                    SymbolVisibility::Default);
     MirBlockId const gEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const gB1    = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const gB1    = mb.createBlock(StructCfMarker::Linear);
     mb.beginBlock(gEntry);
     mb.addBr(gB1);
     mb.beginBlock(gB1);

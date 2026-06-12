@@ -194,11 +194,14 @@ TEST(MirVerifier, EntryBlockMarkerNotAtSlot0EmitsDiag) {
     EXPECT_GE(countCode(r, DiagnosticCode::I_EntryBlockNotFirst), 1u);
 }
 
-// ── negative: StructCfMarker pairing ────────────────────────────────────────
+// ── negative: StructCfMarker equality (stored == derived) ───────────────────
 
-// An ExitBlock that terminates in something other than Return /
-// Unreachable fails I_StructCfMismatch.
-TEST(MirVerifier, ExitBlockTerminatingInBrEmitsStructCfMismatch) {
+// A reachable block stamped with the DORMANT `ExitBlock` marker fails
+// the equality check: no derivation rule ever produces ExitBlock, so
+// stored(ExitBlock) != derived(Linear). EXACTLY one mismatch, and the
+// diagnostic names BOTH markers (the equality-model successor of the
+// old "ExitBlock must terminate in Return/Unreachable" rule).
+TEST(MirVerifier, DormantExitBlockMarkerEmitsStructCfMismatch) {
     MirBuilder b;
     MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
     (void)f;
@@ -207,33 +210,52 @@ TEST(MirVerifier, ExitBlockTerminatingInBrEmitsStructCfMismatch) {
     b.beginBlock(entry);
     b.addBr(exit);
     b.beginBlock(exit);
-    b.addBr(exit);  // Self-loop branch — NOT Return/Unreachable.
-    Mir m = std::move(b).finish();
-
-    DiagnosticReporter r;
-    MirVerifier v{m};
-    EXPECT_FALSE(v.verify(r));
-    EXPECT_GE(countCode(r, DiagnosticCode::I_StructCfMismatch), 1u);
-}
-
-// IfThen without IfJoin fails I_StructCfMismatch.
-TEST(MirVerifier, IfThenWithoutIfJoinEmitsStructCfMismatch) {
-    MirBuilder b;
-    MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
-    (void)f;
-    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const thenB = b.createBlock(StructCfMarker::IfThen);
-    b.beginBlock(entry);
-    MirInstId const c1 = b.addConst(intLit(1), kBool);
-    b.addCondBr(c1, thenB, thenB);
-    b.beginBlock(thenB);
     b.addReturn();
     Mir m = std::move(b).finish();
 
     DiagnosticReporter r;
     MirVerifier v{m};
     EXPECT_FALSE(v.verify(r));
-    EXPECT_GE(countCode(r, DiagnosticCode::I_StructCfMismatch), 1u);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StructCfMismatch), 1u)
+        << "exactly ONE block is mis-marked -> exactly one mismatch";
+    bool namesBothMarkers = false;
+    for (auto const& d : r.all()) {
+        if (d.code != DiagnosticCode::I_StructCfMismatch) continue;
+        if (d.actual.find("ExitBlock") != std::string::npos
+            && d.actual.find("Linear") != std::string::npos) {
+            namesBothMarkers = true;
+        }
+    }
+    EXPECT_TRUE(namesBothMarkers)
+        << "the mismatch diagnostic must name stored (ExitBlock) AND "
+           "derived (Linear)";
+}
+
+// A then-arm stamped `Linear` where the CFG derives `IfThen` fails the
+// equality check (the equality-model successor of the old IfThen/IfJoin
+// count-pairing rule — under-marking is now just as loud as
+// over-marking).
+TEST(MirVerifier, MisstampedThenArmEmitsStructCfMismatch) {
+    MirBuilder b;
+    MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
+    (void)f;
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const thenB = b.createBlock(StructCfMarker::Linear);  // should be IfThen
+    MirBlockId const joinB = b.createBlock(StructCfMarker::IfJoin);
+    b.beginBlock(entry);
+    MirInstId const c1 = b.addConst(intLit(1), kBool);
+    b.addCondBr(c1, thenB, joinB);  // if-no-else: false edge = join
+    b.beginBlock(thenB);
+    b.addBr(joinB);
+    b.beginBlock(joinB);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StructCfMismatch), 1u)
+        << "only the then-arm is mis-marked (join correctly IfJoin)";
 }
 
 // ── negative: phi predecessor ───────────────────────────────────────────────
@@ -442,15 +464,18 @@ TEST(MirVerifier, OrphanBlockEmitsUnreachable) {
     EXPECT_GE(countCode(r, DiagnosticCode::I_UnreachableBlock), 1u);
 }
 
-// Count-based marker pairing: two IfThen + one IfJoin fails
-// I_StructCfMismatch (was a silent-pass with the presence-only check).
-TEST(MirVerifier, TwoIfThenOneIfJoinEmitsStructCfMismatch) {
+// Wrong arm POLARITY: the false-edge arm of a diamond stamped IfThen
+// fails equality — the derivation is edge-polarity-faithful (succs[1]
+// derives IfElse). The equality-model successor of the old "two IfThen
+// + one IfJoin count mismatch" rule: the same fixture, but the
+// diagnosis is now per-block and names the actual disagreement.
+TEST(MirVerifier, WrongArmPolarityEmitsStructCfMismatch) {
     MirBuilder b;
     MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
     (void)f;
     MirBlockId const entry  = b.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const then1  = b.createBlock(StructCfMarker::IfThen);
-    MirBlockId const then2  = b.createBlock(StructCfMarker::IfThen);
+    MirBlockId const then2  = b.createBlock(StructCfMarker::IfThen);  // false edge → should be IfElse
     MirBlockId const join   = b.createBlock(StructCfMarker::IfJoin);
     b.beginBlock(entry);
     MirInstId const c1 = b.addConst(intLit(1), kBool);
@@ -463,16 +488,21 @@ TEST(MirVerifier, TwoIfThenOneIfJoinEmitsStructCfMismatch) {
     DiagnosticReporter r;
     MirVerifier v{m};
     EXPECT_FALSE(v.verify(r));
-    EXPECT_GE(countCode(r, DiagnosticCode::I_StructCfMismatch), 1u);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StructCfMismatch), 1u)
+        << "only then2 disagrees with the derivation (stored IfThen, "
+           "derived IfElse)";
 }
 
-// IfElse without IfJoin: count check catches it.
-TEST(MirVerifier, IfElseWithoutIfJoinEmitsStructCfMismatch) {
+// A degenerate CondBr whose BOTH arms target the same block: the target
+// is the immediate post-dominator, so it derives IfJoin — a stored
+// IfElse fails equality (the successor of the old "IfElse without
+// IfJoin" count rule).
+TEST(MirVerifier, BothArmsSameTargetDerivesIfJoinNotIfElse) {
     MirBuilder b;
     MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
     (void)f;
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const elseB = b.createBlock(StructCfMarker::IfElse);
+    MirBlockId const elseB = b.createBlock(StructCfMarker::IfElse);  // derives IfJoin
     b.beginBlock(entry);
     MirInstId const c1 = b.addConst(intLit(1), kBool);
     b.addCondBr(c1, elseB, elseB);
@@ -482,27 +512,27 @@ TEST(MirVerifier, IfElseWithoutIfJoinEmitsStructCfMismatch) {
     DiagnosticReporter r;
     MirVerifier v{m};
     EXPECT_FALSE(v.verify(r));
-    EXPECT_GE(countCode(r, DiagnosticCode::I_StructCfMismatch), 1u);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StructCfMismatch), 1u);
 }
 
-// LoopHeader with no back-edge predecessor (no pred dominated by the
-// header) fails I_StructCfMismatch. Closes the gap the LoopLatch≤
-// LoopHeader relaxation left: presence-only count check accepts
-// `nLoopLatch == 0`, so the back-edge invariant has to be enforced
-// via dominance.
+// LoopHeader with no back-edge predecessor fails equality: the
+// derivation only claims LoopHeader for an actual back-edge target, so
+// the stale stamp mismatches (stored LoopHeader, derived Linear). Same
+// fail-loud intent as the old dominance-based back-edge rule — the
+// equality model subsumes it (a `while(1){break;}`-class degenerate
+// loop is the production shape: the PRODUCER's rederive normalizes the
+// stamp, and a producer that forgets to rederive is caught HERE).
 TEST(MirVerifier, LoopHeaderWithoutBackEdgeEmitsStructCfMismatch) {
     MirBuilder b;
     MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
     (void)f;
     MirBlockId const entry  = b.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const header = b.createBlock(StructCfMarker::LoopHeader);
-    MirBlockId const exit   = b.createBlock(StructCfMarker::LoopExit);
+    MirBlockId const exit   = b.createBlock(StructCfMarker::Linear);
     b.beginBlock(entry);
     b.addBr(header);
     b.beginBlock(header);
-    // Branch straight to exit — NO back-edge. The header has only
-    // one predecessor (entry), and `header` does NOT dominate
-    // `entry`, so the back-edge check fires.
+    // Branch straight to exit — NO back-edge; `header` derives Linear.
     b.addBr(exit);
     b.beginBlock(exit);
     b.addReturn();
@@ -511,7 +541,8 @@ TEST(MirVerifier, LoopHeaderWithoutBackEdgeEmitsStructCfMismatch) {
     DiagnosticReporter r;
     MirVerifier v{m};
     EXPECT_FALSE(v.verify(r));
-    EXPECT_GE(countCode(r, DiagnosticCode::I_StructCfMismatch), 1u);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_StructCfMismatch), 1u)
+        << "only the stale LoopHeader stamp disagrees with the derivation";
 }
 
 // Without an interner: type-gated rules are skipped — even a malformed

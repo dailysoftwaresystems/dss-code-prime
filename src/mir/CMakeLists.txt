@@ -2,6 +2,7 @@ add_library(mir OBJECT
     mir.cpp
     mir_dom.cpp
     mir_literal_pool.cpp
+    mir_struct_markers.cpp
     mir_text.cpp
     mir_verifier.cpp
 )

@@ -177,7 +177,7 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     for (auto const& dp : deferredPhis) {
         std::size_t kept = 0;
         for (auto const& inc : src_.phiIncomings(dp.oldPhi)) {
-            if (!policy_.acceptPhiIncoming(inc, blockMap_)) continue;
+            if (!policy_.acceptPhiIncoming(inc, dp.oldBlock, blockMap_)) continue;
             MirBlockId const redirectedPred =
                 policy_.redirectBlockTarget(inc.pred);
             auto const predIt = blockMap_.find(redirectedPred.v);

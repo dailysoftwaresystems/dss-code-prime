@@ -6,6 +6,7 @@
 #include "mir/mir_cfg.hpp"   // shared mirReversePostOrder
 #include "mir/mir_dom.hpp"   // shared computeMirDomTree + mirBuildPredecessors
 #include "mir/mir_opcode.hpp"
+#include "mir/mir_struct_markers.hpp"  // deriveStructCfMarkers + structCfMarkerName
 
 #include <format>
 #include <unordered_set>
@@ -68,8 +69,10 @@ bool MirVerifier::verify(DiagnosticReporter& reporter) const {
     checkStructuralInvariants(reporter);
     checkEntryBlocks(reporter);
     checkBlockTermination(reporter);
-    checkStructCfMarkers(reporter);
     checkPhiIncomings(reporter);
+    // StructCfMarker equality lives INSIDE checkDomination — the
+    // derivation needs the same per-function preds/RPO/dom the
+    // use-dom-def scan computes, so they share one computation.
     checkDomination(reporter);
     checkTypeInvariants(reporter);
     if (reporter.hitCap()) return false;
@@ -187,82 +190,6 @@ void MirVerifier::checkBlockTermination(DiagnosticReporter& reporter) const {
     });
 }
 
-void MirVerifier::checkStructCfMarkers(DiagnosticReporter& reporter) const {
-    // Marker pairing — count-based. Strict count-equality catches a
-    // pairing-mismatch the presence-only check would miss (two IfThen
-    // blocks + one IfJoin should diagnose; one IfElse with no IfJoin
-    // should diagnose). Full structural nesting validity needs the
-    // dom tree, but count parity is the load-bearing structural
-    // invariant ML2 emits + downstream passes assume.
-    for (std::uint32_t fi = 0; fi < mir_.moduleFuncCount(); ++fi) {
-        MirFuncId const f = mir_.funcAt(fi);
-        std::uint32_t const nBlocks = mir_.funcBlockCount(f);
-        std::uint32_t nIfThen = 0, nIfElse = 0, nIfJoin = 0;
-        std::uint32_t nLoopHeader = 0, nLoopLatch = 0, nLoopExit = 0;
-        for (std::uint32_t bi = 0; bi < nBlocks; ++bi) {
-            MirBlockId const b = mir_.funcBlockAt(f, bi);
-            StructCfMarker const m = mir_.blockMarker(b);
-            if (m == StructCfMarker::ExitBlock) {
-                std::uint32_t const n = mir_.blockInstCount(b);
-                if (n > 0) {
-                    MirOpcode const op = mir_.instOpcode(mir_.blockInstAt(b, n - 1));
-                    if (op != MirOpcode::Return && op != MirOpcode::Unreachable) {
-                        reportBlock(reporter, DiagnosticCode::I_StructCfMismatch, b,
-                            std::format("ExitBlock terminates in {}; expected "
-                                        "Return or Unreachable",
-                                opcodeInfo(op).mnemonic));
-                    }
-                }
-            }
-            switch (m) {
-                case StructCfMarker::IfThen:     ++nIfThen; break;
-                case StructCfMarker::IfElse:     ++nIfElse; break;
-                case StructCfMarker::IfJoin:     ++nIfJoin; break;
-                case StructCfMarker::LoopHeader: ++nLoopHeader; break;
-                case StructCfMarker::LoopLatch:  ++nLoopLatch; break;
-                case StructCfMarker::LoopExit:   ++nLoopExit; break;
-                default: break;
-            }
-        }
-        // If: IfThen-count == IfJoin-count (each then-arm joins);
-        // IfElse-count ≤ IfJoin-count (else is optional). An orphan
-        // IfElse without IfJoin is a violation; multiple IfElse
-        // without IfJoin is a violation.
-        if (nIfThen != nIfJoin) {
-            reportFunc(reporter, DiagnosticCode::I_StructCfMismatch, f,
-                std::format("IfThen-count {} != IfJoin-count {} (each then-arm "
-                            "must have a join block)",
-                    nIfThen, nIfJoin));
-        }
-        if (nIfElse > nIfJoin) {
-            reportFunc(reporter, DiagnosticCode::I_StructCfMismatch, f,
-                std::format("IfElse-count {} > IfJoin-count {} (each else-arm "
-                            "must be paired with a join)",
-                    nIfElse, nIfJoin));
-        }
-        // Loop: LoopHeader-count == LoopExit-count (each loop has an
-        // exit); LoopLatch-count == LoopHeader-count (each loop has
-        // a back-edge source).
-        if (nLoopHeader != nLoopExit) {
-            reportFunc(reporter, DiagnosticCode::I_StructCfMismatch, f,
-                std::format("LoopHeader-count {} != LoopExit-count {}",
-                    nLoopHeader, nLoopExit));
-        }
-        // LoopLatch is OPTIONAL — ML2's while-loop lowering marks the
-        // back-edge source as `Linear`, not LoopLatch (the marker is
-        // emitted only when a dedicated continue-target block exists,
-        // as in do-while). Strict-equality would over-flag valid ML2
-        // output. The weaker `>` check still catches a LoopLatch
-        // without a header.
-        if (nLoopLatch > nLoopHeader) {
-            reportFunc(reporter, DiagnosticCode::I_StructCfMismatch, f,
-                std::format("LoopLatch-count {} > LoopHeader-count {} (latch "
-                            "block without an enclosing loop header)",
-                    nLoopLatch, nLoopHeader));
-        }
-    }
-}
-
 void MirVerifier::checkPhiIncomings(DiagnosticReporter& reporter) const {
     auto preds = mirBuildPredecessors(mir_);
     forEachInst(mir_, [&](MirInstId id) {
@@ -338,25 +265,34 @@ void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
                         f.v));
             }
         }
-        // Loop-back-edge check: each `LoopHeader` block must have at
-        // least one predecessor it dominates (the back-edge source).
-        // This catches the case where `LoopLatch` is absent (ML2 marks
-        // while-loop back-edges as `Linear`, so we can't count latches)
-        // but no back-edge actually exists at all — a malformed loop.
-        for (MirBlockId const b : rpo) {
-            if (mir_.blockMarker(b) != StructCfMarker::LoopHeader) continue;
-            bool hasBackEdge = false;
-            for (MirBlockId const p : preds[b.v]) {
-                if (mirDominatesBlock(b, p, domState) == MirDomResult::Dominates) {
-                    hasBackEdge = true;
-                    break;
+        // StructCfMarker equality (the derivation model, D-OPT4-1): the
+        // verifier RECOMPUTES the canonical derivation independently —
+        // never trusting a producer-supplied vector — and requires
+        // stored == derived for every REACHABLE block. PLACEMENT
+        // PRINCIPLE: producers rederive at their own sites (lowering /
+        // SimplifyCfg / inliner / merge call rederiveStructCfMarkers
+        // after finish()); a central rederive-before-verify here would
+        // make this equality tautological. Unreachable blocks are
+        // skipped — I_UnreachableBlock (above) owns them. This subsumed
+        // the old count-parity switch, the ExitBlock-terminator rule,
+        // and the LoopHeader-back-edge rule (a no-back-edge "header" now
+        // simply derives non-LoopHeader).
+        // Sharing: the derivation reuses THIS function's preds/rpo/dom
+        // (one computation per function per verify; the post-dominator
+        // tree is the only addition, built inside the derivation).
+        {
+            auto const derived = deriveStructCfMarkers(mir_, f, preds, rpo, domState);
+            for (MirBlockId const b : rpo) {
+                StructCfMarker const stored = mir_.blockMarker(b);
+                if (b.v >= derived.size()) continue;  // defensive — derived is blockCount-sized
+                if (stored != derived[b.v]) {
+                    reportBlock(reporter, DiagnosticCode::I_StructCfMismatch, b,
+                        std::format("stored marker {} != derived marker {} "
+                                    "(markers must equal the canonical CFG "
+                                    "derivation - mir_struct_markers.hpp)",
+                            structCfMarkerName(stored),
+                            structCfMarkerName(derived[b.v])));
                 }
-            }
-            if (!hasBackEdge) {
-                reportBlock(reporter, DiagnosticCode::I_StructCfMismatch, b,
-                    "LoopHeader has no back-edge predecessor (no predecessor "
-                    "of this block is dominated by it — the loop has no "
-                    "back-edge source)");
             }
         }
         // Use-dom-def scan over reachable blocks.

@@ -4,6 +4,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "hir/const_eval.hpp"
 #include "hir/hir_op.hpp"
+#include "mir/mir_struct_markers.hpp"
 
 #include <array>
 #include <format>
@@ -2324,6 +2325,16 @@ HirToMirResult lowerToMir(Hir const&               hir,
     lwr.lower();
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();
+    // Canonical-marker stamping (D-OPT4-1): the creation-time
+    // `createBlock(StructCfMarker::X)` stamps above are creation-time
+    // DEFAULTS documenting lowering intent; the canonical CFG-derived
+    // markers are stamped here as the FINAL step, module-wide. This is
+    // what makes degenerate shapes verify: `while(1){break;}` lowers
+    // with a LoopHeader stamp, but the break removed the back-edge —
+    // the derivation normalizes the header to its actual role instead
+    // of the verifier rejecting the program (the pre-derivation
+    // behavior). See mir_struct_markers.hpp for the placement principle.
+    rederiveStructCfMarkers(result.mir);
     result.externImports = std::move(lwr.externImports);
     result.ok = (reporter.errorCount() == errorsBefore);
     return result;

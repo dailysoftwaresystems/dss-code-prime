@@ -6,6 +6,7 @@
 #include "link/symbol_kind.hpp"        // LinkedSymbolKey
 #include "mir/mir_cfg.hpp"             // mirReversePostOrder
 #include "mir/mir_opcode.hpp"
+#include "mir/mir_struct_markers.hpp"  // rederiveStructCfMarkers (post-merge stamp)
 #include "mir/mir_verifier.hpp"
 
 #include <algorithm>
@@ -656,6 +657,12 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     }
 
     Mir merged = std::move(builder).finish();
+
+    // Canonical-marker stamping (D-OPT4-1): clones copy markers verbatim
+    // and per-function CFGs are unchanged by the merge, so this is a
+    // uniformity re-stamp — it keeps the equality verifier below green
+    // BY CONSTRUCTION even when an input CU carried stale stamps.
+    rederiveStructCfMarkers(merged);
 
     // ── verify the merged module before returning (the engine's verify-after-
     // every-transform discipline). A non-verifying merge is a build break, never

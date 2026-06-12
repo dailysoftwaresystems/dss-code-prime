@@ -5,6 +5,7 @@
 #include "mir/mir_cfg.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "mir/mir_struct_markers.hpp"
 #include "opt/analysis/call_graph_scc.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
@@ -558,16 +559,16 @@ private:
 // and caller Phi incomings redirect their `pred` through it.
 //
 // StructCfMarker: the cloned callee blocks + every continuation block
-// are re-derived to `Linear` (the SimplifyCfg cycle-9 marker re-
-// derivation precedent). Re-deriving is the clean choice — a clone of
-// the callee's `EntryBlock` would violate the verifier's "exactly one
-// EntryBlock == funcBlockAt(f,0)" rule, a clone of an `ExitBlock` whose
-// Return became a `Br` would violate "ExitBlock terminates in
-// Return/Unreachable", and transplanting the callee's If/Loop marker
-// COUNTS would pollute the caller's marker-parity checks. `Linear`
-// contributes to zero parity counts and to neither special rule, so
-// the post-splice CFG verifies. The caller's OWN block markers are
-// preserved unchanged (the caller's structure is untouched).
+// are CREATED `Linear`, and the caller's blocks are created with their
+// source markers — but both are creation-time defaults only. After the
+// rebuild, `runInlining` re-stamps EVERY block from the canonical CFG
+// derivation (`rederiveStructCfMarkers`, mir_struct_markers.hpp), so an
+// inlined callee's loop headers RE-EMERGE as `LoopHeader` in the caller
+// (the splice preserves the back-edges, and the derivation reads them)
+// and an inlined if-diamond re-derives IfThen/IfElse/IfJoin around the
+// caller's post-dominator structure. The verifier checks stored ==
+// derived per reachable block, which the final stamping satisfies by
+// construction.
 //
 // SSA: callee blocks are emitted in RPO from the callee entry (a valid
 // def-before-use order for a Phi-free SSA body — every def dominates
@@ -1089,6 +1090,11 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
 
     result.callsInlined = callsInlined;
     mir = std::move(builder).finish();
+    // Canonical-marker stamping (D-OPT4-1): the splice changed the
+    // caller's CFG (split blocks, cloned callee bodies). Markers are
+    // re-derived from the NEW shape — inlined loop headers re-emerge
+    // as LoopHeader; continuation blocks take their actual role.
+    rederiveStructCfMarkers(mir);
     result.ok = true;
     return result;
 }

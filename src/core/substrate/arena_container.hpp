@@ -60,6 +60,20 @@ public:
         return nodes_[id.v];
     }
 
+    // Mutable element access — the narrow METADATA-ONLY escape hatch to the
+    // frozen-arena rule. The structural contract is unchanged: ranges /
+    // offsets that other slots index into (instStart, succStart, blockStart,
+    // pool offsets, …) MUST NOT change through this reference — that would
+    // silently corrupt sibling ranges the freeze validated. Sanctioned for
+    // per-element metadata fields only; the one current consumer is
+    // `Mir::setBlockMarker` (StructCfMarker re-derivation — markers are
+    // CFG-derived verification metadata, not structure; see
+    // mir/mir_struct_markers.hpp). Same bounds + cross-arena guard as `at`.
+    [[nodiscard]] Pod& mutableAt(Id id) {
+        detail::arena::validateElement<ArenaNames<Id, Tag>>(id, tag_, nodes_.size());
+        return nodes_[id.v];
+    }
+
 private:
     std::vector<Pod> nodes_;
     Tag              tag_;

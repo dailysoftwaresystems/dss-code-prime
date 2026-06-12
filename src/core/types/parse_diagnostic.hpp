@@ -573,9 +573,11 @@ enum class DiagnosticCode : std::uint16_t {
     // every extension type must have been resolved to a core lattice
     // kind at the HIR→MIR boundary. Interner-gated.
     I_ExtensionTypeInMir      = 0xA00A,
-    // StructCfMarker pairing — IfThen has matching IfElse/IfJoin;
-    // LoopHeader has matching LoopLatch/LoopExit; ExitBlock terminates
-    // in Return/Unreachable.
+    // A reachable block's stored StructCfMarker differs from the
+    // canonical CFG derivation (`deriveStructCfMarkers`,
+    // mir/mir_struct_markers.hpp) — the verifier recomputes the
+    // derivation independently and requires stored == derived per
+    // reachable block; the diagnostic names both markers.
     I_StructCfMismatch        = 0xA00B,
     // A block in a function is not reachable from the function's
     // entry block. Orphan CFG islands are a structural invariant

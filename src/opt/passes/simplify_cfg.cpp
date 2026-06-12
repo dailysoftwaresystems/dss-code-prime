@@ -4,6 +4,7 @@
 #include "mir/mir_dom.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "mir/mir_struct_markers.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 #include "opt/passes/path_compress.hpp"
 
@@ -12,6 +13,7 @@
 #include <cstdlib>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dss::opt::passes {
@@ -82,44 +84,26 @@ public:
         return it->second;
     }
 
-    // Block-merge marker re-derivation: when a merge head's source
-    // marker is Linear but the absorb chain includes a non-Linear
-    // marker, override the rebuilt block's marker so the structural
-    // role is preserved. The c3 gate restricts merges to "at least
-    // one side is Linear" so at most ONE non-Linear marker exists in
-    // any absorb chain — pick it. (Both-non-Linear merges are
-    // anchored as D-OPT4-1-NON-LINEAR-MARKER-MERGE for a future
-    // cycle where the marker semantics require a CFG-shape-driven
-    // re-derivation rather than the simple "non-Linear wins" rule.)
-    void onBlockBegin(MirBlockId oldB, MirBlockId newB,
-                      MirBuilder& dst,
-                      std::unordered_map<std::uint32_t, MirInstId>& /*rewrite*/,
-                      std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) override {
-        StructCfMarker const headMarker = src_.blockMarker(oldB);
-        if (headMarker != StructCfMarker::Linear) return;  // already non-Linear
-        // Walk the absorb chain to find a non-Linear marker.
-        MirBlockId cur = oldB;
-        std::uint32_t cap = static_cast<std::uint32_t>(absorbMap_.size()) + 1;
-        while (cap-- > 0) {
-            auto it = absorbMap_.find(cur);
-            if (it == absorbMap_.end()) return;
-            cur = it->second;
-            StructCfMarker const cm = src_.blockMarker(cur);
-            if (cm != StructCfMarker::Linear) {
-                dst.setBlockMarker(newB, cm);
-                return;
-            }
-        }
-        // Cap exhausted = cycle in absorb chain. Should be structurally
-        // impossible (the 1-pred-of-tail + non-entry-of-tail gates
-        // prevent P→B→P shapes; unreachable cycles are excluded from
-        // RPO before analyze). Fail loud so a future regression that
-        // admits a cycle surfaces here rather than silently returning.
-        std::fprintf(stderr,
-            "dss::opt::passes::SimplifyCfg fatal: onBlockBegin absorb-"
-            "chain walk exceeded cap from oldB v=%u — cycle in "
-            "absorbMap_ (substrate-contract violation).\n", oldB.v);
-        std::abort();
+    // No `onBlockBegin` marker repair: markers are NOT maintained
+    // through the rebuild — `runSimplifyCfg` re-stamps every block
+    // from the canonical CFG derivation (`rederiveStructCfMarkers`)
+    // after `finish()`, which subsumed the cycle-9 "non-Linear wins"
+    // absorb-chain walk and its ≤1-non-Linear-per-chain admission
+    // gate (D-OPT4-1-NON-LINEAR-MARKER-MERGE closure).
+
+    // Branch-fold phi hygiene: folding `CondBr(b, T, F)` → `Br(taken)`
+    // removes the b → abandoned CFG edge while b itself STAYS LIVE, so
+    // a phi in the abandoned target naming b as a pred would go stale
+    // (I_PhiPredNotInCfg — the unreachable-pred cleanup never fires for
+    // a live pred). Drop exactly those (pred == b, owner == abandoned)
+    // incomings. A phi left with ZERO incomings still hits the
+    // rebuilder's fail-loud `onZeroPhiIncomings` (a 1-pred phi-bearing
+    // block whose only edge was folded away) — loud, never silent.
+    [[nodiscard]] bool acceptPhiIncoming(
+        MirPhiIncoming const& inc, MirBlockId oldPhiBlock,
+        std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) override {
+        return abandonedPhiEdges_.find(edgeKey_(inc.pred.v, oldPhiBlock.v))
+            == abandonedPhiEdges_.end();
     }
 
     [[nodiscard]] std::optional<MirInstId>
@@ -151,7 +135,7 @@ public:
         jumpThreadMap_.clear();
         absorbMap_.clear();
         absorbedToHead_.clear();
-        chainNonLinearMarker_.clear();
+        abandonedPhiEdges_.clear();
     }
 
     // Branch-folding emits a Br whose new id is structurally
@@ -186,17 +170,21 @@ private:
     //     merges resolve directly to the head. The KEY-SET of this
     //     map IS the "absorbed block" elision set (single source of
     //     truth — `selectBlocks` queries it directly).
-    //   - `chainNonLinearMarker_[H]`: per-chain-head record of "this
-    //     chain already contains a non-Linear marker." Used to
-    //     reject admission of a pair whose addition would push the
-    //     chain past the conservative "≤1 non-Linear per chain"
-    //     invariant (the marker re-derivation rule that c3 ships).
-    //     Multiple non-Linear markers in one chain anchor as
-    //     D-OPT4-1-NON-LINEAR-MARKER-MERGE for full CFG-shape-driven
-    //     marker re-derivation.
+    // Markers play NO role in merge admission: the post-rebuild
+    // `rederiveStructCfMarkers` re-stamps every block from the CFG
+    // (D-OPT4-1-NON-LINEAR-MARKER-MERGE closed — the c3-era ≤1-non-
+    // Linear-per-chain bookkeeping and its admission gate are gone).
     std::unordered_map<MirBlockId, MirBlockId> absorbMap_;
     std::unordered_map<MirBlockId, MirBlockId> absorbedToHead_;
-    std::unordered_map<MirBlockId, StructCfMarker> chainNonLinearMarker_;
+    // CFG edges (foldingBlock → abandonedTarget) removed by branch-
+    // folding, keyed (pred << 32 | owner). `acceptPhiIncoming` drops a
+    // phi incoming that travels a dead edge (see the override's doc).
+    std::unordered_set<std::uint64_t> abandonedPhiEdges_;
+
+    [[nodiscard]] static std::uint64_t edgeKey_(std::uint32_t pred,
+                                                std::uint32_t owner) noexcept {
+        return (static_cast<std::uint64_t>(pred) << 32) | owner;
+    }
 
     std::size_t branchesFolded_     = 0;
     std::size_t blocksJumpThreaded_ = 0;
@@ -258,12 +246,12 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn) {
     //   - B's instCount > 1 (a 1-inst Br-only B is the trampoline
     //     case handled by `jumpThreadMap_` above — block-merge
     //     defers to that).
-    //   - At least one of {P.marker, B.marker} is Linear (conservative
-    //     marker re-derivation; non-Linear-on-both is anchored as
-    //     D-OPT4-1-NON-LINEAR-MARKER-MERGE pending a CFG-shape-driven
-    //     marker repair).
     //   - Neither P nor B is in `jumpThreadMap_` (they'd be elided
     //     anyway; block-merge is exclusive with jump-thread elision).
+    // Markers are NOT a gate: both-non-Linear (P, B) pairs merge —
+    // the post-rebuild canonical re-derivation stamps the merged
+    // block's actual structural role (D-OPT4-1-NON-LINEAR-MARKER-
+    // MERGE closed). The remaining conditions are pure CFG-legality.
     auto const preds = mirBuildPredecessors(src_);
     auto isCandidateForMerge = [&](MirBlockId P, MirBlockId B) -> bool {
         if (B.v == entry.v) return false;
@@ -278,21 +266,14 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn) {
                 return false;
             }
         }
-        // Marker gate (c3 conservative).
-        StructCfMarker const pm = src_.blockMarker(P);
-        StructCfMarker const bm = src_.blockMarker(B);
-        if (pm != StructCfMarker::Linear && bm != StructCfMarker::Linear) {
-            return false;
-        }
         return true;
     };
     // Process pairs in RPO order, incrementally admitting them into
-    // absorbMap_ + absorbedToHead_. This lets us track the
-    // per-chain non-Linear marker count + reject any pair whose
-    // admission would push a chain past the "≤1 non-Linear per
-    // chain" invariant the c3 marker re-derivation depends on.
-    // RPO order admits the outer-most pair first; each subsequent
-    // admission extends an existing chain or starts a new one.
+    // absorbMap_ + absorbedToHead_. RPO order admits the outer-most
+    // pair first; each subsequent admission extends an existing chain
+    // or starts a new one. (The c3-era per-chain non-Linear marker
+    // bookkeeping is gone — the post-rebuild canonical re-derivation
+    // owns markers; admission is pure CFG-legality.)
     for (MirBlockId const P : rpo) {
         std::uint32_t const n = src_.blockInstCount(P);
         if (n == 0) continue;
@@ -313,25 +294,9 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn) {
         if (auto it = absorbedToHead_.find(P); it != absorbedToHead_.end()) {
             head = it->second;
         }
-        // Chain non-Linear invariant check. If the chain already has
-        // a non-Linear marker AND B's marker is also non-Linear, this
-        // admission would silently lose marker info. Reject.
-        StructCfMarker const bMarker = src_.blockMarker(B);
-        if (bMarker != StructCfMarker::Linear) {
-            auto it = chainNonLinearMarker_.find(head);
-            if (it != chainNonLinearMarker_.end()) continue;
-            // Also check head's own marker (the chain starts there;
-            // no entry exists yet for a fresh chain).
-            if (src_.blockMarker(head) != StructCfMarker::Linear) continue;
-        }
         // Admit.
         absorbMap_[P] = B;
         absorbedToHead_[B] = head;
-        if (bMarker != StructCfMarker::Linear) {
-            chainNonLinearMarker_[head] = bMarker;
-        } else if (src_.blockMarker(head) != StructCfMarker::Linear) {
-            chainNonLinearMarker_[head] = src_.blockMarker(head);
-        }
     }
     // Disjointness invariant: a block elided by trampoline jump-thread
     // must NOT also appear as an absorbed block — the two redirect
@@ -402,14 +367,26 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn) {
         if (asInt == nullptr) continue;
         bool const taken = (*asInt != 0);
         // `blockSuccessors` returns CondBr arms in (ifTrue, ifFalse)
-        // order — Mir::blockSuccessors contract (see `mir.hpp:131`
-        // "CondBr → [ifTrue, ifFalse]"). Reversing this contract
+        // order — the Mir::blockSuccessors contract ("CondBr →
+        // [ifTrue, ifFalse]", mir.hpp). Reversing this contract
         // would silently flip every branch-fold; the
         // `CondBrTrueFoldsToThenArm` + `CondBrFalseFoldsToElseArm`
         // pair pins both polarities at the test layer.
         auto const succs = src_.blockSuccessors(b);
         if (succs.size() != 2) continue;
         MirBlockId const rawTgt = taken ? succs[0] : succs[1];
+        // Phi hygiene: the NOT-taken raw arm's CFG edge (b → abandoned)
+        // dies with the fold; record it so `acceptPhiIncoming` drops
+        // the abandoned target's incoming-from-b (b stays live — the
+        // unreachable-pred cleanup can never catch this). A CondBr
+        // whose both arms name the SAME block keeps its single edge
+        // alive → nothing to record. The RAW target is the right key:
+        // a jump-threaded abandoned arm's FINAL target has no phis
+        // (the trampoline gate requires a phi-free target).
+        MirBlockId const rawAbandoned = taken ? succs[1] : succs[0];
+        if (rawAbandoned.v != rawTgt.v) {
+            abandonedPhiEdges_.insert(edgeKey_(b.v, rawAbandoned.v));
+        }
         // Chase jump-thread but NOT absorb: an absorbed block has
         // exactly 1 pred (its absorb head) by the merge gate, and
         // that pred is the head itself — no third block can have a
@@ -450,6 +427,10 @@ SimplifyCfgResult runSimplifyCfg(Mir& mir, TypeInterner const& /*interner*/,
     result.blocksJumpThreaded = policy.blocksJumpThreaded();
     result.blocksMerged       = policy.blocksMerged();
     mir = std::move(builder).finish();
+    // Canonical-marker stamping (D-OPT4-1): SimplifyCfg mutates the CFG
+    // (fold/thread/merge), so every surviving block's structural role is
+    // re-derived from the NEW shape — no incremental marker repair.
+    rederiveStructCfMarkers(mir);
     result.ok = true;
     return result;
 }
