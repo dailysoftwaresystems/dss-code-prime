@@ -549,10 +549,11 @@ TEST(ParserCastExpr, BinderlessLanguageHasEmptySidecars) {
 // A candidate recorded inside an ENCLOSING probe that itself rolls back
 // must not leak twice: `((q)-x)` probes parenExpr around the inner
 // ambiguous site; the inner candidate is recorded, the outer parenExpr
-// probe COMMITS, and the Pratt walker's rollback-replay re-parses the
-// region — the net result must be EXACTLY ONE candidate for `q`, not a
-// duplicate per replay/probe. (This pins the snapshot/restore +
-// record-after-rollback interplay; a leak would double-count.)
+// probe COMMITS, and the Pratt walker climbs the surrounding chain
+// (wrap-in-place — the primary is never re-parsed) — the net result
+// must be EXACTLY ONE candidate for `q`, not a duplicate per probe.
+// (This pins the probe snapshot/restore + record-after-rollback
+// interplay; a leak would double-count.)
 TEST(ParserCastExpr, NestedProbesYieldExactlyOneCandidate) {
     auto r = parseCSubset("int main() { return ((q)-x); }");
     ASSERT_FALSE(r.tree.diagnostics().hasErrors());
@@ -560,10 +561,10 @@ TEST(ParserCastExpr, NestedProbesYieldExactlyOneCandidate) {
     EXPECT_EQ(r.typeNameCandidates[0].name, "q");
 }
 
-// Same hygiene across a climb replay: `(q)-x-y` forces the Pratt walker
-// to roll back and replay the `(q)` primary while building the nested
-// binary shape — still exactly one candidate.
-TEST(ParserCastExpr, ClimbReplayDoesNotDuplicateCandidates) {
+// Same hygiene across a climb chain: `(q)-x-y` builds two binary wraps
+// above the `(q)` primary (wrap-in-place — the ambiguous site is
+// parsed exactly once) — still exactly one candidate.
+TEST(ParserCastExpr, ClimbChainDoesNotDuplicateCandidates) {
     auto r = parseCSubset("int main() { return (q)-x-y; }");
     ASSERT_FALSE(r.tree.diagnostics().hasErrors());
     ASSERT_EQ(r.typeNameCandidates.size(), 1u);

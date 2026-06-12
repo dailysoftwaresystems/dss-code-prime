@@ -1,0 +1,33 @@
+{
+  "$comment": "Same-precedence chain associativity, runtime-argument operands (nothing const-foldable: every chain operand is a function parameter or call result, so the LEFT shape must survive codegen, not just const-eval). LEFT-assoc: sub_add=(50-10)+2=42, div_div=(100/5)/2=10, sub_sub=(20-6)-4=10, main=((42-10)-10)+20=42. The old RIGHT-recursive mis-shape evaluates sub_add=50-(10+2)=38, div_div=100/(5/2)=50, sub_sub=20-(6-4)=18, main=38-(50-(18+20))=26 — a loudly different exit (26 vs 42), mod-256-safe. The `sub_add (50, ...)` call is deliberately SPACED: a postfix operator preceded by trivia used to wrap the whitespace leaf instead of the callee (H0001 at HIR lowering); this example is its runtime witness across all targets.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}

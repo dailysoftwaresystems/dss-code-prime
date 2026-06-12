@@ -11,6 +11,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "hir/const_eval.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_intrinsic_registry.hpp"
 #include "hir/hir_text.hpp"
@@ -18,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -25,6 +27,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 using namespace dss;
@@ -915,6 +918,32 @@ TEST(HirLoweringCSubset, GlobalArrayLowersToArrayTypeWithNoInit) {
     ASSERT_EQ(ti.kind(ty), TypeKind::Array);
     EXPECT_EQ(ti.scalars(ty)[0], 10);
     EXPECT_FALSE(res->hir.globalInit(g).has_value()) << "the `[10]` length must not become an initializer";
+}
+
+TEST(HirLoweringCSubset, GlobalInitConstEvalIsLeftAssociative) {
+    // `int g = 10 - 3 + 1;` — the parse tree is now STRUCTURALLY
+    // left-associative, and const-eval follows the tree: (10-3)+1 = 8.
+    // The right-recursive mis-shape would fold 10-(3+1) = 6. This pins
+    // the full source→parse→semantic→HIR→const-eval pipeline (the
+    // hand-built Rig tests in test_const_eval.cpp can't see parser
+    // shape bugs).
+    SemanticModel model =
+        analyzeCSubset("int g = 10 - 3 + 1;\nint main() { return 0; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId g = res->hir.moduleDecls(res->hir.root())[0];
+    ASSERT_EQ(res->hir.kind(g), HirKind::Global);
+    auto const init = res->hir.globalInit(g);
+    ASSERT_TRUE(init.has_value());
+    auto cer = evaluateConstant(res->hir, model.lattice().interner(),
+                                res->literalPool, *init);
+    ASSERT_TRUE(cer.value.has_value())
+        << "the global initializer chain must const-fold";
+    EXPECT_EQ(std::get<std::int64_t>(cer.value->value), 8)
+        << "10 - 3 + 1 must evaluate LEFT-associatively: (10-3)+1 = 8";
 }
 
 TEST(HirLoweringCSubset, NonConstantArrayLengthFailsLoud) {

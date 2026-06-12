@@ -53,8 +53,8 @@ struct DSS_EXPORT AmbiguousTypeNameCandidate {
 //   * Closed-scope bindings are RETAINED (marked dead via scope-id
 //     liveness) rather than truncated, so a Snapshot is four integers +
 //     a depth-sized stack copy and restore is pure truncation — the
-//     speculation-rollback contract (SpeculationProbe / WalkerSnapshot)
-//     stays O(depth) per probe.
+//     speculation-rollback contract (SpeculationProbe) stays O(depth)
+//     per probe.
 //
 // KNOWN SHALLOWNESS (by design — the sketch only needs to be right
 // about TYPE-vs-VALUE for names it has SEEN; everything else routes to
@@ -133,10 +133,10 @@ public:
 
     // ── speculation safety ──
     // Captured/restored exactly like the parser's other four state
-    // machines (SpeculationProbe / WalkerSnapshot): bindings +
-    // candidates are append-only between snapshots so restore is
-    // truncate-to-count; the live-scope stack is small (lexical depth)
-    // so a full copy is cheap.
+    // machines (SpeculationProbe): bindings + candidates are
+    // append-only between snapshots so restore is truncate-to-count;
+    // the live-scope stack is small (lexical depth) so a full copy is
+    // cheap.
     struct Snapshot {
         std::size_t                bindingCount   = 0;
         std::size_t                candidateCount = 0;

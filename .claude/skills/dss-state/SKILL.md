@@ -77,8 +77,8 @@ matter: declare-then-assign (init-at-decl has its own probe), and never use Bool
 node .claude/skills/dss-state/driver.mjs --quick
 ```
 
-Expect: a `battery of 104` funnel line, the category table, and exit 0. (`--strict` currently
-exits 1 — the known `ptr_swap_through` miscompile below is still open.)
+Expect: a `battery of 104` funnel line, the category table, and exit 0. (`--strict` also
+exits 0 since 2026-06-12 — the `ptr_swap_through` miscompile is FIXED, see below.)
 
 ## Gotchas
 
@@ -96,10 +96,12 @@ exits 1 — the known `ptr_swap_through` miscompile below is still open.)
 - **Git velocity is squash-blind**: PRs squash to one main commit, hiding per-cycle commits.
   The plan board is the primary velocity source; the `^v0.0.2` commit count is shown only as
   a floor.
-- **Known real miscompile (compiler, not driver)**: a two-pointer-param swap
-  (`t=*a; *a=*b; *b=t;`) compiles rc=0 but returns the wrong value (exit 34 ≠ 42), on both
-  `void` and `int`-returning variants — while single-pointer writeback (`*p = 42` through a
-  callee) is correct. Until fixed, `ptr_swap_through` legitimately shows under MISCOMPILES.
+- **The `ptr_swap_through` miscompile is FIXED (2026-06-12)**: the probe's exit-34 was NOT a
+  pointer bug — the swap compiled perfectly; `return x - y + 4;` parsed RIGHT-associative
+  (`x - (y + 4)`) because same-precedence infix chains nested rightward in the Pratt walker
+  (`D-PARSE-INFIX-ASSOCIATIVITY-STRUCTURAL` ✅, registry). The probe now passes, MISCOMPILES
+  is empty, and `--strict` exits 0. Lesson for probe triage: a miscompile probe's NAME frames
+  a hypothesis (pointers) — the disassembly, not the name, localizes the defect.
 - **PowerShell quirk while probing by hand**: piping the CLI through `Select-Object -First N`
   can kill it before it exits — `$LASTEXITCODE` comes back empty. The driver is unaffected
   (Node captures properly); just don't trust `rc=` after a truncated pipe.

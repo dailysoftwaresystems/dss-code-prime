@@ -295,7 +295,7 @@ Each group declares one or more `kinds` (token-kind names) sharing a precedence 
 |---|---|---|
 | `precedence` | yes | Integer; higher binds tighter. |
 | `arity` | no | `"Prefix"`, `"Infix"`, or `"Postfix"`. Defaults to `Infix`. |
-| `associativity` | no | `"Left"`, `"Right"`, or `"None"`. Defaults to `None`. |
+| `associativity` | no | `"Left"`, `"Right"`, or `"None"`. Defaults to `None`. **Structural semantics (consumed by the Pratt walker, 2026-06-12):** an infix chain at the same precedence nests LEFT for `Left` AND `None` (the tree is structurally associative; `None` ≡ left), and nests RIGHT for `Right` (e.g. assignment chains). The walker parses the RHS at `prec+1` (Left/None) vs `prec` (Right). |
 | `kinds` | yes | Array of token-kind names declared in `tokens`. |
 
 **New diagnostic code:** `C_InvalidPrecedenceTable` — malformed `operators` block, duplicate `(kind, arity)` keys, or non-integer precedence.

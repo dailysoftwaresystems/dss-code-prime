@@ -150,6 +150,278 @@ TEST(ParserCSubsetSmoke, FunctionBodyExpressionIsPrecedenceCorrect) {
     EXPECT_EQ(prettyPrintSubtree(t, expr), expected);
 }
 
+// `a * b + c` — the tighter `*` chain sits as the LEFT child of `+`.
+// Complements the `a + b * c` pin above so BOTH mixed-precedence
+// orientations are exact-shape pinned (unchanged by the wrap-in-place
+// associativity fix).
+TEST(ParserCSubsetSmoke, TightLhsMulThenAddNestsMulOnLeft) {
+    auto h = loadAndTokenize("int main() { a * b + c; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    const std::string_view expected =
+        "rule:expression\n"
+        "  rule:binaryExpr\n"
+        "    rule:binaryExpr\n"
+        "      rule:operand\n"
+        "        tok:\"a\"\n"
+        "      tok:\"*\"\n"
+        "      rule:operand\n"
+        "        tok:\"b\"\n"
+        "    tok:\"+\"\n"
+        "    rule:operand\n"
+        "      tok:\"c\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), expected);
+}
+
+// `a - b + c` — SAME-precedence chain (c-subset declares `+`/`-` in one
+// LEFT group) must nest LEFT: `(a - b) + c`. This is the exact shape
+// whose right-recursive mis-nesting silently miscompiled `10 - 3 + 1`
+// to 6 (instead of 8) before the wrap-in-place fix.
+TEST(ParserCSubsetSmoke, SamePrecSubAddChainNestsLeftward) {
+    auto h = loadAndTokenize("int main() { a - b + c; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    const std::string_view expected =
+        "rule:expression\n"
+        "  rule:binaryExpr\n"
+        "    rule:binaryExpr\n"
+        "      rule:operand\n"
+        "        tok:\"a\"\n"
+        "      tok:\"-\"\n"
+        "      rule:operand\n"
+        "        tok:\"b\"\n"
+        "    tok:\"+\"\n"
+        "    rule:operand\n"
+        "      tok:\"c\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), expected);
+}
+
+// `a / b / c` — division chain nests LEFT: `(a / b) / c`. (100/5/2 must
+// be 10, not 100/(5/2) = 50.)
+TEST(ParserCSubsetSmoke, DivisionChainNestsLeftward) {
+    auto h = loadAndTokenize("int main() { a / b / c; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    const std::string_view expected =
+        "rule:expression\n"
+        "  rule:binaryExpr\n"
+        "    rule:binaryExpr\n"
+        "      rule:operand\n"
+        "        tok:\"a\"\n"
+        "      tok:\"/\"\n"
+        "      rule:operand\n"
+        "        tok:\"b\"\n"
+        "    tok:\"/\"\n"
+        "    rule:operand\n"
+        "      tok:\"c\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), expected);
+}
+
+// `a = b = c` — assignment is declared RIGHT-assoc and must still nest
+// RIGHT: `a = (b = c)`. Regression guard for the rhsMin selection
+// (right ops keep recursing at their own precedence).
+TEST(ParserCSubsetSmoke, AssignmentChainNestsRightward) {
+    auto h = loadAndTokenize("int main() { a = b = c; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    const std::string_view expected =
+        "rule:expression\n"
+        "  rule:binaryExpr\n"
+        "    rule:operand\n"
+        "      tok:\"a\"\n"
+        "    tok:\"=\"\n"
+        "    rule:binaryExpr\n"
+        "      rule:operand\n"
+        "        tok:\"b\"\n"
+        "      tok:\"=\"\n"
+        "      rule:operand\n"
+        "        tok:\"c\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), expected);
+}
+
+// `a ? b : c ? d : e` — exact right-chained ternary shape: the inner
+// ternary is the OUTER's else child (`a ? b : (c ? d : e)`).
+TEST(ParserCSubsetSmoke, TernaryChainExactRightNestedShape) {
+    auto h = loadAndTokenize("int main() { a ? b : c ? d : e; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    const std::string_view expected =
+        "rule:expression\n"
+        "  rule:ternaryExpr\n"
+        "    rule:operand\n"
+        "      tok:\"a\"\n"
+        "    tok:\"?\"\n"
+        "    rule:operand\n"
+        "      tok:\"b\"\n"
+        "    tok:\":\"\n"
+        "    rule:ternaryExpr\n"
+        "      rule:operand\n"
+        "        tok:\"c\"\n"
+        "      tok:\"?\"\n"
+        "      rule:operand\n"
+        "        tok:\"d\"\n"
+        "      tok:\":\"\n"
+        "      rule:operand\n"
+        "        tok:\"e\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), expected);
+}
+
+// `f(a) + g(b)` — postfix-infix mix: both calls wrap their callees,
+// the `+` wraps the FIRST call as its left child. Exercises the
+// postfix-then-infix climb hand-off (the old design rolled the postfix
+// wrap back and replayed it inside the binary frame; wrap-in-place
+// adopts it directly).
+TEST(ParserCSubsetSmoke, CallPlusCallMixesPostfixAndInfix) {
+    auto h = loadAndTokenize("int main() { f(a) + g(b); }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    const std::string_view expected =
+        "rule:expression\n"
+        "  rule:binaryExpr\n"
+        "    rule:postfixExpr\n"
+        "      rule:operand\n"
+        "        tok:\"f\"\n"
+        "      tok:\"(\"\n"
+        "      rule:argList\n"
+        "        rule:expression\n"
+        "          rule:operand\n"
+        "            tok:\"a\"\n"
+        "      tok:\")\"\n"
+        "    tok:\"+\"\n"
+        "    rule:postfixExpr\n"
+        "      rule:operand\n"
+        "        tok:\"g\"\n"
+        "      tok:\"(\"\n"
+        "      rule:argList\n"
+        "        rule:expression\n"
+        "          rule:operand\n"
+        "            tok:\"b\"\n"
+        "      tok:\")\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), expected);
+}
+
+// ── trivia hold-then-place pins ─────────────────────────────────────────
+//
+// A SPACE between the callee and the call opener (`f (40)`) used to
+// make the climb's trivia push land in the open frame BEFORE the wrap
+// decision, so `wrapLastChildInFrame` wrapped the whitespace leaf
+// instead of the callee — the call lowered to garbage HIR (H0001).
+// The climb now HOLDS the trivia run, wraps the real subtree, then
+// places the trivia inside the wrapper before the operator token.
+TEST(ParserCSubsetSmoke, SpacedCallWrapsCalleeNotWhitespace) {
+    auto h = loadAndTokenize("int main() { return f (40) + 2; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    // AST-mode print (trivia hidden): the callee `f` must be INSIDE the
+    // postfixExpr, and the postfixExpr inside the binaryExpr.
+    const std::string_view expected =
+        "rule:expression\n"
+        "  rule:binaryExpr\n"
+        "    rule:postfixExpr\n"
+        "      rule:operand\n"
+        "        tok:\"f\"\n"
+        "      tok:\"(\"\n"
+        "      rule:argList\n"
+        "        rule:expression\n"
+        "          rule:operand\n"
+        "            tok:\"40\"\n"
+        "      tok:\")\"\n"
+        "    tok:\"+\"\n"
+        "    rule:operand\n"
+        "      tok:\"2\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), expected);
+}
+
+// Comment-as-trivia inside a chain: `a /*x*/ + b` must parse clean and
+// the CST leaf stream must reproduce the source byte-for-byte (the
+// held trivia run is re-placed without loss or reordering).
+TEST(ParserCSubsetSmoke, CommentTriviaInChainKeepsLeafOrder) {
+    const std::string source = "int main() { a /*x*/ + b; }";
+    auto h = loadAndTokenize(source);
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "binaryExpr"));
+
+    std::string rebuilt;
+    walkPreOrder(TreeCursor{t, t.root(), CursorMode::Cst},
+                 [&](TreeCursor const& c) {
+        const auto id = c.current();
+        if (t.kind(id) != NodeKind::Internal) rebuilt += t.text(id);
+    });
+    EXPECT_EQ(rebuilt, source);
+}
+
+// Spaced ternary: extra spaces around `?` and `:` must not perturb the
+// mixfix shape (the ternary arm holds-then-places trivia like infix).
+TEST(ParserCSubsetSmoke, SpacedTernaryShapeMatchesCompactForm) {
+    auto h = loadAndTokenize("int main() { a  ?  b  :  c ; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    const std::string_view expected =
+        "rule:expression\n"
+        "  rule:ternaryExpr\n"
+        "    rule:operand\n"
+        "      tok:\"a\"\n"
+        "    tok:\"?\"\n"
+        "    rule:operand\n"
+        "      tok:\"b\"\n"
+        "    tok:\":\"\n"
+        "    rule:operand\n"
+        "      tok:\"c\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), expected);
+}
+
 TEST(ParserCSubsetSmoke, TernaryParsesAsMixfix) {
     auto h = loadAndTokenize("int main() { a ? b : c; }");
     Parser p{h.src, h.schema, std::move(h.stream)};
@@ -334,10 +606,10 @@ TEST(ParserCSubsetSmoke, ArrayIndexBodyClimbsPrecedence) {
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
-    // The right-recursive `binaryExpr[i, +, binaryExpr[j, *, k]]`
-    // shape is the visible signal that operator climb ran inside the
-    // brackets — `*` (prec 70) binds tighter than `+` (prec 65), so
-    // `j * k` nests under the `+` RHS.
+    // The nested `binaryExpr[i, +, binaryExpr[j, *, k]]` shape is the
+    // visible signal that operator climb ran inside the brackets —
+    // `*` (prec 70) binds tighter than `+` (prec 65), so `j * k`
+    // nests under the `+` RHS (precedence nesting, not associativity).
     constexpr std::string_view kExpected =
         "rule:expression\n"
         "  rule:postfixExpr\n"
@@ -689,11 +961,11 @@ TEST(ParserCSubsetSmoke, ArrayDeclWithInitializerExpressionParses) {
     EXPECT_EQ(prettyPrintSubtree(t, suffix), kExpected);
 }
 
-// Postfix chains are left-recursive: `f(a)[i]` binds as `(f(a))[i]` —
-// the `[i]` postfix wraps the result of `f(a)`. The walker's postfix
-// branch uses `wrapLastChildExprFrame` (vs the rollback-replay used
-// by infix), so the previous wrap becomes the first child of the
-// next wrap directly, with no intermediate `operand` layer.
+// Postfix chains nest left: `f(a)[i]` binds as `(f(a))[i]` — the `[i]`
+// postfix wraps the result of `f(a)`. Every climb arm uses
+// `wrapLastChildExprFrame`, so the previous wrap becomes the first
+// child of the next wrap directly, with no intermediate `operand`
+// layer.
 TEST(ParserCSubsetSmoke, PostfixChainNestsLeftToRight) {
     auto h = loadAndTokenize("int main() { f(a)[i]; }");
     Parser p{h.src, h.schema, std::move(h.stream)};
@@ -1095,11 +1367,12 @@ TEST(ParserCSubsetSmoke, AutoInferenceFormIsALoudParseError) {
 // `MyT x = <expr> ;` swallow — while staying inside 4096.
 //
 // Shape note: the initializer is WIDE (many flat call arguments), not a
-// long `1 + 1 + ...` binary CHAIN — the Pratt walker counts each chain
-// continuation against ParserConfig::maxExpressionDepth (256, the
-// C++-call-stack watchdog), so a 600-term chain trips THAT orthogonal
-// guard first. Each call argument parses as a fresh shallow expression,
-// keeping depth ~constant while the TOKEN count stresses the budget.
+// long `1 + 1 + ...` binary CHAIN — a left-assoc chain now builds
+// ITERATIVELY (wrap-in-place; it no longer counts against
+// ParserConfig::maxExpressionDepth), so a wide argument list is the
+// shape that stresses the TOKEN budget specifically: each call argument
+// parses as a fresh shallow expression, keeping depth ~constant while
+// the token count grows.
 TEST(ParserCSubsetSmoke, LongInitializerRidesTheStatementProbeBudget) {
     std::string src = "typedef int MyT;\nint main() { MyT x = f(1";
     for (int i = 0; i < 599; ++i) src += ", 1";

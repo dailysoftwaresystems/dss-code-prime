@@ -20,6 +20,8 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
@@ -73,9 +75,10 @@ constexpr std::string_view kInfixSchema = R"JSON({
   }
 })JSON";
 
-// Inline schema with a single postfix operator `?`. C-subset doesn't
-// ship any postfix ops yet (PA4 will add `++`/`--`/`()`/`[]`), so we
-// need a dedicated schema to pin postfix behavior here.
+// Inline schema with a single postfix operator `?`. C-subset ships its
+// own postfix ops (`++ -- ( [ . ->`), but this minimal grammar pins
+// the SIMPLE single-token postfix arm in isolation (c-subset's are
+// grouped/follower forms wrapped in surrounding declaration syntax).
 constexpr std::string_view kPostfixSchema = R"JSON({
   "dssSchemaVersion": 4,
   "language": { "name": "PrattPostfix", "version": "0.1.0" },
@@ -241,13 +244,11 @@ TEST(PrattWalker, TightLhsThenLooseOperatorWrapsLhsInBinaryExpr) {
 }
 
 // Same-precedence left-assoc operator chain `a + b + c;` — the tree
-// shape is right-recursive (each `+` recurses for the right side at
-// equal precedence), which is the documented PA2 design. Left-vs-right
-// associativity is encoded in the operator table, not the tree's
-// structural nesting; a downstream semantic pass reads
-// `operatorTable().lookup(+, Infix)->associativity` to know how to
-// interpret the chain.
-TEST(PrattWalker, SamePrecLeftAssocChainIsRightRecursive) {
+// nests LEFT, structurally: `(a + b) + c`. The walker consumes the
+// operator table's declared associativity when picking the RHS climb
+// floor (`prec + 1` for left), so the chain wraps iteratively and the
+// nesting IS the evaluation order — no downstream pass re-derives it.
+TEST(PrattWalker, SamePrecLeftAssocChainNestsLeftward) {
     Tree t = parse(kInfixSchema, "a + b + c;");
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors());
@@ -257,15 +258,42 @@ TEST(PrattWalker, SamePrecLeftAssocChainIsRightRecursive) {
         "  rule:stmt\n"
         "    rule:expression\n"
         "      rule:binaryExpr\n"
-        "        rule:operand\n"
-        "          tok:\"a\"\n"
-        "        tok:\"+\"\n"
         "        rule:binaryExpr\n"
         "          rule:operand\n"
-        "            tok:\"b\"\n"
+        "            tok:\"a\"\n"
         "          tok:\"+\"\n"
         "          rule:operand\n"
-        "            tok:\"c\"\n"
+        "            tok:\"b\"\n"
+        "        tok:\"+\"\n"
+        "        rule:operand\n"
+        "          tok:\"c\"\n"
+        "    tok:\";\"\n";
+    EXPECT_EQ(prettyPrint(t), expected);
+}
+
+// Mixed SAME-precedence left-assoc ops `a - b + c;` (kInfixSchema puts
+// `-` and `+` in one prec-65 left group, like C) — `(a - b) + c`. The
+// shape that miscompiled under the right-recursive design (10-3+1 = 6
+// instead of 8).
+TEST(PrattWalker, MixedSamePrecLeftAssocOpsNestLeftward) {
+    Tree t = parse(kInfixSchema, "a - b + c;");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const std::string_view expected =
+        "rule:root\n"
+        "  rule:stmt\n"
+        "    rule:expression\n"
+        "      rule:binaryExpr\n"
+        "        rule:binaryExpr\n"
+        "          rule:operand\n"
+        "            tok:\"a\"\n"
+        "          tok:\"-\"\n"
+        "          rule:operand\n"
+        "            tok:\"b\"\n"
+        "        tok:\"+\"\n"
+        "        rule:operand\n"
+        "          tok:\"c\"\n"
         "    tok:\";\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
 }
@@ -293,6 +321,119 @@ TEST(PrattWalker, RightAssocChainNestsRightward) {
         "            tok:\"c\"\n"
         "    tok:\";\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
+}
+
+// Schema that OMITS `associativity` on an infix group. The loader
+// defaults the field to `OperatorAssoc::None`; the walker's contract
+// is that None behaves structurally LEFT (rhsMin = prec + 1) — an
+// omitted declaration must never silently produce right-recursive
+// nesting. (The postfix schemas above also omit it, but associativity
+// is moot for postfix — this is the INFIX omission pin.)
+namespace {
+constexpr std::string_view kOmittedAssocSchema = R"JSON({
+  "dssSchemaVersion": 4,
+  "language": { "name": "PrattNoAssoc", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "+":  [{ "kind": "PlusOp" }],
+    ";":  [{ "kind": "Semi"   }]
+  },
+  "operators": {
+    "groups": [
+      { "precedence": 65, "operators": ["+"] }
+    ]
+  },
+  "shapes": {
+    "root":       { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":       { "sequence": ["expression", "Semi"] },
+    "expression": {
+      "expr": {
+        "atom": "operand",
+        "wrapperRules": {
+          "binary":  "binaryExpr",
+          "unary":   "unaryExpr",
+          "postfix": "postfixExpr"
+        }
+      }
+    },
+    "operand":    { "alt": ["Identifier"] }
+  }
+})JSON";
+} // namespace
+
+TEST(PrattWalker, OmittedAssociativityDefaultsToStructurallyLeft) {
+    Tree t = parse(kOmittedAssocSchema, "a + b + c;");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const std::string_view expected =
+        "rule:root\n"
+        "  rule:stmt\n"
+        "    rule:expression\n"
+        "      rule:binaryExpr\n"
+        "        rule:binaryExpr\n"
+        "          rule:operand\n"
+        "            tok:\"a\"\n"
+        "          tok:\"+\"\n"
+        "          rule:operand\n"
+        "            tok:\"b\"\n"
+        "        tok:\"+\"\n"
+        "        rule:operand\n"
+        "          tok:\"c\"\n"
+        "    tok:\";\"\n";
+    EXPECT_EQ(prettyPrint(t), expected);
+}
+
+// Long LEFT-assoc chain far beyond maxExpressionDepth (default 256):
+// 2000 `+` continuations. The wrap-in-place climb is ITERATIVE for
+// left chains — depth stays O(1) per op and the parse is clean. (The
+// right-assoc counterpart deliberately still aborts — see the
+// PrattWalkerDeath test below.)
+TEST(PrattWalker, LongLeftAssocChainParsesIteratively) {
+    std::string src = "a";
+    for (int i = 0; i < 2000; ++i) src += " + b";
+    src += ";";
+    Tree t = parse(kInfixSchema, std::move(src));
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    // 2000 ops → exactly 2000 binaryExpr wrappers (left-nested).
+    const auto binRule = t.rules().find("binaryExpr");
+    ASSERT_TRUE(binRule.valid());
+    std::size_t wrappers = 0;
+    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+        const NodeId id{i};
+        if (t.kind(id) == NodeKind::Internal && t.rule(id).v == binRule.v) {
+            ++wrappers;
+        }
+    }
+    EXPECT_EQ(wrappers, 2000u);
+}
+
+// Trivia hold-then-place: a same-prec chain with whitespace AND with
+// the operator flush against the operands must produce the SAME
+// AST-mode shape (trivia placement can't perturb wrap targets), and
+// the CST leaf stream must cover the source byte-for-byte.
+TEST(PrattWalker, SpacedChainMatchesUnspacedShapeAndKeepsLeafOrder) {
+    Tree spaced   = parse(kInfixSchema, "a  +  b\t+ c;");
+    Tree unspaced = parse(kInfixSchema, "a+b+c;");
+    ASSERT_NE(spaced.root(), InvalidNode);
+    ASSERT_NE(unspaced.root(), InvalidNode);
+    EXPECT_FALSE(spaced.diagnostics().hasErrors());
+    EXPECT_FALSE(unspaced.diagnostics().hasErrors());
+    // AST-mode prettyPrint skips EmptySpace leaves → identical shapes.
+    EXPECT_EQ(prettyPrint(spaced), prettyPrint(unspaced));
+
+    // Full-fidelity pin: concatenating EVERY leaf in CST order must
+    // reproduce the source text exactly (trivia held at the climb top
+    // is re-placed without loss or reordering).
+    std::string rebuilt;
+    walkPreOrder(TreeCursor{spaced, spaced.root(), CursorMode::Cst},
+                 [&](TreeCursor const& c) {
+        const auto id = c.current();
+        if (spaced.kind(id) != NodeKind::Internal) rebuilt += spaced.text(id);
+    });
+    EXPECT_EQ(rebuilt, "a  +  b\t+ c;");
 }
 
 // ── prefix ──────────────────────────────────────────────────────────────

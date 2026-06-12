@@ -1070,66 +1070,6 @@ struct Parser::Impl {
         return true;
     }
 
-    // Four-machine snapshot used by `DefaultPrattWalker` to roll back
-    // a tentatively-built primary so it can be rebuilt inside a wrap
-    // (the schema's `expr.wrapperRules.binary` / `.postfix` rules).
-    // Distinct from `SpeculationProbe` —
-    // the walker's rollback is always intentional (no commit-vs-fail
-    // discipline) and the budget / watchdog re-baseline aren't
-    // applicable. Token bookmark + builder checkpoint + schema-walker
-    // snapshot + frame depth + diag counter, restored in dtor order.
-    struct WalkerSnapshot {
-        TokenStream::Bookmark                  tokenBookmark;
-        std::optional<TreeBuilder::Checkpoint> builderCp;
-        std::optional<SchemaWalker::Snapshot>  walkerSnap;
-        std::size_t                            frameDepth;
-        std::size_t                            diagsBefore;
-        // FC2: the binder sketch rolls back with the other machines.
-        // c-subset declarations never nest inside expressions, but the
-        // contract is engine-generic (a language with let-expressions
-        // would bind inside a replayed primary) — restoring here keeps
-        // the rollback-replay sound for any grammar.
-        BinderSketch::Snapshot                 sketchSnap;
-    };
-
-    [[nodiscard]] WalkerSnapshot snapForWalker() {
-        return WalkerSnapshot{
-            tokens.mark(),
-            builder->checkpoint(),
-            walker.snapshot(),
-            frames.size(),
-            diagsEmitted,
-            sketch.snapshot(),
-        };
-    }
-
-    // Rolls back the four-machine state to the snapshot. Consumes
-    // `s.builderCp` / `s.walkerSnap` (move-only). Callers that want
-    // to rollback AGAIN must re-snap before each rollback. Callers
-    // that DON'T rollback must call `commitWalkerSnap` before the
-    // snapshot goes out of scope — otherwise the embedded
-    // `TreeBuilder::Checkpoint` dtor silently rolls back everything
-    // built since the snap (the "uncommitted Checkpoint" RAII rule).
-    void rollbackForWalker(WalkerSnapshot& s) noexcept {
-        while (frames.size() > s.frameDepth) {
-            frames.pop_back();
-            if (!frameRules.empty()) frameRules.pop_back();
-        }
-        walker.restore(std::move(*s.walkerSnap));
-        builder->rollback(std::move(*s.builderCp));
-        tokens.restore(s.tokenBookmark);
-        diagsEmitted = s.diagsBefore;
-        sketch.restore(std::move(s.sketchSnap));
-    }
-
-    // Commit the snapshot's builder Checkpoint so its dtor doesn't
-    // auto-rollback the post-snap work. Used when the walker decides
-    // the tentatively-built primary stands on its own (no op at >=
-    // minPrec) and the snap should be discarded.
-    void commitWalkerSnap(WalkerSnapshot& s) noexcept {
-        if (s.builderCp) builder->commit(std::move(*s.builderCp));
-    }
-
     // Try one speculative branch. Opens the branch frame inside a
     // `SpeculationProbe` and drives `stepOnce` repeatedly until
     // either the branch's frame closes (`frames.size() ==
@@ -1167,9 +1107,10 @@ struct Parser::Impl {
         // the candidate OUT and it is recorded after the probe
         // destructs, into the restored sketch. An ENCLOSING probe that
         // later rolls back erases it correctly (the winning parse
-        // re-encounters and re-records the site), and the Pratt
-        // walker's rollback-replay re-records it on each replay —
-        // convergent to exactly the surviving parse's candidates.
+        // re-encounters and re-records the site) — convergent to
+        // exactly the surviving parse's candidates. (The Pratt walker
+        // itself records each site exactly once: its wrap-in-place
+        // climb never rolls back.)
         std::optional<AmbiguousTypeNameCandidate> rolledBackCandidate;
 
         const bool committed = [&]() -> bool {
@@ -1785,23 +1726,30 @@ ParseResult Parser::parse() && {
 
 // ── DefaultPrattWalker ──────────────────────────────────────────────────
 //
-// Schema-driven operator-precedence climber. Produces a right-recursive
-// tree wrapping operator results in the three rules declared by the
-// schema's `expr.wrapperRules.{binary,unary,postfix}` block — names
-// are config-sourced (loader auto-interns them when any `expr` shape
-// is declared). Left- vs. right-associativity is encoded in the
-// operator table, not in the tree's structural nesting — a downstream
-// semantic pass reads associativity from
-// `operatorTable().lookup(kind, Infix)->associativity`.
+// Schema-driven operator-precedence climber. Produces a STRUCTURALLY
+// associative tree wrapping operator results in the rules declared by
+// the schema's `expr.wrapperRules.{binary,unary,postfix,ternary}`
+// block — names are config-sourced (loader auto-interns them when any
+// `expr` shape is declared). The operator table's declared
+// `associativity` is consumed HERE, by the walker, when it picks the
+// RHS minimum precedence for an infix wrap: Left (and None, the
+// loader's omitted-field default) chains build ITERATIVELY — O(n)
+// wraps, no per-operator recursion, stack-friendly — nesting LEFT;
+// Right-assoc chains recurse via the RHS parse at the operator's own
+// precedence, nesting RIGHT.
 //
 // Each `parseExpressionAt(minPrec)` call:
-//   1. Takes a four-machine snapshot (tokens, builder, walker, frames,
-//      diag counter).
-//   2. Parses a primary (prefix-op + nested expression OR the atom).
-//   3. Loops: while peek is an op at >= minPrec, rolls back to the
-//      snapshot, opens a wrapper, rebuilds LHS via recursion with
-//      minPrec = op.prec + 1 (so LHS doesn't gobble this same op),
-//      pushes the op, recurses RHS at op.prec (right-recursive).
+//   1. Parses a primary (prefix-op + nested expression OR the atom).
+//   2. Loops: while peek is an op at >= minPrec, wraps the already-
+//      built last child in the matching wrapper frame
+//      (`TreeBuilder::wrapLastChildInFrame`) and parses the operator's
+//      remaining operands inside the still-open wrapper:
+//        - infix: RHS at `prec + 1` for Left/None (the next same-prec
+//          op returns to THIS loop and wraps THIS wrapper → left
+//          nesting), at `prec` for Right (the RHS recursion consumes
+//          the chain → right nesting).
+//        - postfix: no further operand (or a grouped/follower body).
+//        - ternary: middle at 0, else at `prec` (right-assoc chain).
 //      Each iteration strictly extends the consumed range — no loop.
 namespace {
 
@@ -1864,6 +1812,11 @@ void parsePrimary(Parser::Impl& I, PrattRules const& rules,
 
 void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                        std::int32_t minPrec) {
+    // Depth guard: recursion occurs only through OPERANDS (nested
+    // parens, prefix operands, grouped-postfix bodies, ternary
+    // clauses) and RIGHT-associative RHS chains — Left/None-assoc
+    // chains build iteratively in the climb loop below and never
+    // deepen the C++ stack.
     if (I.expressionDepth >= I.config.maxExpressionDepth) {
         fatal("dss::DefaultPrattWalker: expression recursion depth "
               "exceeded ParserConfig::maxExpressionDepth — deeply "
@@ -1876,14 +1829,44 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
         ~DepthGuard() { --depth; }
     } guard{I.expressionDepth};
 
-    auto snap = I.snapForWalker();
     parsePrimary(I, rules, minPrec);
 
+    // Operator climb — wrap-in-place for ALL three arms (postfix /
+    // ternary / infix): the already-built previous child is adopted by
+    // the new wrapper via `wrapLastChildExprFrame`, and the remaining
+    // operands parse inside the still-open wrapper. There is no
+    // snapshot / rollback-replay here (the former WalkerSnapshot
+    // mechanism is deleted). Behavior preservation vs that design:
+    //   (a) diagnostics: the replay rolled diagnostics back with the
+    //       builder (TreeBuilder::CheckpointSnapshot carries a
+    //       DiagnosticReporter::Snapshot) and re-emitted them on the
+    //       replay — emitting ONCE under wrap-in-place produces the
+    //       identical diagnostic stream.
+    //   (b) binder sketch: snapshot restore was truncate-to-count and
+    //       the replay re-recorded the same bindings/candidates ⇒
+    //       convergent — recording once reaches the same final state.
+    std::vector<Token> heldTrivia;
+    auto const placeHeldTrivia = [&I, &heldTrivia] {
+        for (Token const& t : heldTrivia) I.builder->pushToken(t);
+    };
     while (true) {
-        pumpTrivia(I);
+        // Hold-then-place trivia: collect the trivia run (same
+        // token-level classification `pumpTrivia` uses) WITHOUT
+        // pushing it, so the wrap decision below sees the real
+        // expression subtree — never a whitespace/comment leaf — as
+        // the open frame's last pending child (`f (x)` must wrap `f`,
+        // not the space). If an arm fires, the held run is pushed into
+        // the just-opened wrapper, before the operator token; if the
+        // loop exits, it's pushed into the current frame. Both
+        // reproduce the token-ordered leaf stream byte-for-byte.
+        heldTrivia.clear();
+        while (!I.tokens.isAtEnd() && isSkippableTrivia(I.tokens.peek())) {
+            heldTrivia.push_back(I.tokens.advance());
+        }
+
         Token const& peek = I.tokens.peek();
         if (peek.coreKind == CoreTokenKind::Eof) {
-            I.commitWalkerSnap(snap);
+            placeHeldTrivia();
             return;
         }
         const SchemaTokenId kind =
@@ -1908,7 +1891,7 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
             ternary && ternary->precedence >= minPrec && rules.ternary.valid();
 
         if (!postfixInClimb && !infixInClimb && !ternaryInClimb) {
-            I.commitWalkerSnap(snap);
+            placeHeldTrivia();
             return;
         }
 
@@ -1921,14 +1904,10 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
         // Postfix is LEFT-associative: iterative wrapping via
         // `wrapLastChildExprFrame` wraps the previously-built primary
         // (or a prior chain wrap) as the new postfix-wrapper's first
-        // child. The pre-primary `snap` is INTENTIONALLY NOT advanced
-        // across postfix iterations — a later same-level infix iter
-        // (`f(a) + g(b)`) needs that snap to roll the entire chain
-        // back and rebuild it inside the binary-wrapper via the
-        // recursive LHS parse at `prec + 1`. Using rollback-replay
-        // (infix's strategy) for postfix would lose iter-1's wrap on iter-2.
+        // child.
         if (postfixInClimb) {
             I.wrapLastChildExprFrame(rules.postfix);
+            placeHeldTrivia();
             if (!I.pushOperatorToken()) {
                 // Truly defensive: peek was non-Eof when we entered
                 // this iteration, so pushOperatorToken should have
@@ -1941,7 +1920,6 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                     peek.span,
                     "expression ended before postfix operator");
                 I.closeFrameOnce();
-                I.commitWalkerSnap(snap);
                 return;
             }
             if (postfix->followerRule.has_value()) {
@@ -2017,32 +1995,25 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                 }
             }
             I.closeFrameOnce();
-            // Snap intentionally NOT advanced — see header comment
-            // above the postfix branch. A subsequent infix iteration
-            // at the same level needs the original pre-primary snap
-            // so its rollback-replay can wipe this postfix wrap and
-            // rebuild the chain inside the binary-wrapper frame.
             continue;
         }
 
-        // Ternary (mixfix `cond ? then : else`). Like infix, it gathers the
-        // already-built primary as its condition via rollback-replay, then
-        // parses the middle clause (to the `:` separator) and the else operand.
+        // Ternary (mixfix `cond ? then : else`). Wraps the already-built
+        // chain in place as its condition, then parses the middle clause
+        // (to the `:` separator) and the else operand inside the wrapper.
         // The middle parses at minPrec 0 — between `?` and `:` anything binds
         // (assignment, even a nested ternary); the climb naturally stops at `:`
         // (which carries no operator-table entry). The else parses at the
         // ternary's own precedence → right-associative (`a?b:c?d:e` = a?b:(c?d:e)).
         if (ternaryInClimb) {
-            I.rollbackForWalker(snap);
-            snap = I.snapForWalker();
-            I.openExprFrame(rules.ternary);
-            parseExpressionAt(I, rules, ternary->precedence + 1);   // condition
-            pumpTrivia(I);
+            I.wrapLastChildExprFrame(rules.ternary);
+            placeHeldTrivia();
             if (!I.pushOperatorToken()) {                            // `?`
+                // Defensive — same contract as the postfix arm's
+                // pushOperatorToken failure path.
                 I.emitParserError(DiagnosticCode::P_PrematureEndOfInput, peek.span,
                                   "expression ended before ternary '?'");
                 I.closeFrameOnce();
-                I.commitWalkerSnap(snap);
                 return;
             }
             parseExpressionAt(I, rules, 0);                          // then (middle)
@@ -2058,7 +2029,6 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                                   "ternary expression is missing its ':' separator");
                 I.builder->pushErrorNode(midPeek.span);
                 I.closeFrameOnce();
-                I.commitWalkerSnap(snap);
                 return;
             }
             (void)I.pushOperatorToken();                             // `:`
@@ -2067,32 +2037,33 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
             continue;
         }
 
-        // Infix path keeps the right-recursive rollback-replay: roll
-        // back to before the primary was built, open the binary
-        // wrapper, and rebuild the primary inside it. Re-snap to the
-        // post-rollback state so a chained infix at lower precedence
-        // can do the same dance.
-        I.rollbackForWalker(snap);
-        snap = I.snapForWalker();
-
-        I.openExprFrame(rules.binary);
-        // LHS: strictly tighter (op.prec + 1) so it doesn't gobble
-        // this same-prec op (which would loop forever).
-        parseExpressionAt(I, rules, infix->precedence + 1);
-        pumpTrivia(I);
+        // Infix: wrap the already-built chain in place as the LHS,
+        // then parse the RHS inside the still-open wrapper. The RHS
+        // minimum precedence encodes the operator's DECLARED
+        // associativity:
+        //   - Left (and None, the loader's omitted-field default):
+        //     prec + 1 — the next same-prec operator does NOT bind
+        //     inside the RHS; it returns to this loop and wraps THIS
+        //     wrapper → chains nest LEFT, iteratively.
+        //   - Right: prec — the next same-prec operator binds inside
+        //     the RHS recursion → chains nest RIGHT.
+        I.wrapLastChildExprFrame(rules.binary);
+        placeHeldTrivia();
         if (!I.pushOperatorToken()) {
+            // Defensive — same contract as the postfix arm's
+            // pushOperatorToken failure path.
             I.emitParserError(
                 DiagnosticCode::P_PrematureEndOfInput,
                 peek.span,
                 "expression ended before infix operator");
             I.closeFrameOnce();
-            I.commitWalkerSnap(snap);
             return;
         }
-        // RHS uses op.prec, so same-prec ops fold into a nested
-        // binary-wrapper (right-recursive shape; left-assoc is conveyed
-        // only via the operator table).
-        parseExpressionAt(I, rules, infix->precedence);
+        const std::int32_t rhsMin =
+            (infix->associativity == OperatorAssoc::Right)
+                ? infix->precedence
+                : infix->precedence + 1;
+        parseExpressionAt(I, rules, rhsMin);
         I.closeFrameOnce();
     }
 }
