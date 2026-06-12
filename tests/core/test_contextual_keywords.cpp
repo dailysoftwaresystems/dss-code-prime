@@ -558,17 +558,23 @@ TEST(ContextualKeywords, CSubsetIntDeclEmitsNoContextualResolution) {
         auto root = b.open(schema->rules().find("root"));
         auto top  = b.open(schema->rules().find("topLevel"));
         auto tld  = b.open(schema->rules().find("topLevelDecl"));
+        // FC4 c1: the specifier/declarator topLevelDecl shape — head
+        // carries the type; the name lives in the declarator; `;` is the
+        // tail's EndStatement arm.
         {
-            auto ty = b.open(schema->rules().find("typeRef"));
-            auto tb = b.open(schema->rules().find("typeBase"));
-            // FC3 c1: typeBase routes keywords through typeSpecifierSeq.
-            auto ts = b.open(schema->rules().find("typeSpecifierSeq"));
+            auto head = b.open(schema->rules().find("topLevelHead"));
+            auto ts   = b.open(schema->rules().find("typeSpecifierSeq"));
             b.pushToken(tokAt(*src, "int", CoreTokenKind::Word));
         }
-        b.pushToken(tokAt(*src, "x", CoreTokenKind::Word));
         {
-            auto tail   = b.open(schema->rules().find("topLevelDeclTail"));
-            auto vdTail = b.open(schema->rules().find("varDeclTail"));
+            auto list   = b.open(schema->rules().find("initDeclaratorList"));
+            auto idecl  = b.open(schema->rules().find("initDeclarator"));
+            auto dtor   = b.open(schema->rules().find("declarator"));
+            auto direct = b.open(schema->rules().find("directDeclarator"));
+            b.pushToken(tokAt(*src, "x", CoreTokenKind::Word));
+        }
+        {
+            auto tail = b.open(schema->rules().find("topLevelDeclTail"));
             b.pushToken(tokAt(*src, ";", CoreTokenKind::Operator));
         }
     }

@@ -112,8 +112,12 @@ TEST(ParserCSubsetSmoke, IntVarDeclWithLiteralInitializer) {
     EXPECT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(hasInternalNodeWithRule(t, "topLevel"))
         << "tree must include a topLevel frame";
-    EXPECT_TRUE(hasInternalNodeWithRule(t, "typeRef"))
-        << "tree must include a typeRef frame (exercises optional-skip)";
+    // FC4 c1: the specifier/declarator split — the head carries the type,
+    // the name + init live under the initDeclaratorList.
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "topLevelHead"))
+        << "tree must include a topLevelHead frame (exercises optional-skip)";
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "initDeclarator"))
+        << "tree must include an initDeclarator frame";
 }
 
 // Closes v2-gap-catalog row 1: parser-driven c-subset, mixed-precedence
@@ -521,10 +525,9 @@ TEST(ParserCSubsetSmoke, ExternFunctionPrototypeParses) {
 
     const NodeId ext = findFirstNodeWithRule(t, "externDecl");
     ASSERT_NE(ext, NodeId{});
-    // D5.1 cycle 3: `param` now uses `typeRefAllowingStruct` (which wraps
-    // `typeBaseAllowingStruct`) so a struct-typed parameter parses; primitive
-    // types like `char` flow through the SAME rules — the rule names below
-    // change accordingly.
+    // FC4 c1: `param` is now declarator-shaped — `declHeadForParam` carries
+    // the base type and the (optional) `declarator` carries the name. The
+    // externDecl spine itself stays legacy (typeRef + Identifier).
     constexpr std::string_view kExpected =
         "rule:externDecl\n"
         "  tok:\"extern\"\n"
@@ -538,11 +541,12 @@ TEST(ParserCSubsetSmoke, ExternFunctionPrototypeParses) {
         "      tok:\"(\"\n"
         "      rule:paramList\n"
         "        rule:param\n"
-        "          rule:typeRefAllowingStruct\n"
-        "            rule:typeBaseAllowingStruct\n"
-        "              rule:typeSpecifierSeq\n"
-        "                tok:\"char\"\n"
-        "          tok:\"x\"\n"
+        "          rule:declHeadForParam\n"
+        "            rule:typeSpecifierSeq\n"
+        "              tok:\"char\"\n"
+        "          rule:declarator\n"
+        "            rule:directDeclarator\n"
+        "              tok:\"x\"\n"
         "      tok:\")\"\n"
         "      tok:\";\"\n";
     EXPECT_EQ(prettyPrintSubtree(t, ext), kExpected);
@@ -575,27 +579,28 @@ TEST(ParserCSubsetSmoke, TopLevelArrayDeclParses) {
 
     const NodeId tl = findFirstNodeWithRule(t, "topLevel");
     ASSERT_NE(tl, NodeId{});
-    // SE6 reshaped the top-level decl: `topLevel` now wraps a named
-    // `topLevelDecl` (shared `typeRef Identifier` prefix) whose
-    // `topLevelDeclTail` splits func-vs-var (LL(1), funcDefTail FIRST=`(`
-    // vs varDeclTail FIRST=`[`/`=`/`;`).
+    // FC4 c1: the specifier/declarator split — the array suffix now lives
+    // INSIDE the directDeclarator (C 6.7.6), and the `;` is the
+    // topLevelDeclTail's EndStatement arm (vs `{` = function definition).
     constexpr std::string_view kExpected =
         "rule:topLevel\n"
         "  rule:topLevelDecl\n"
-        "    rule:typeRef\n"
-        "      rule:typeBase\n"
-        "        rule:typeSpecifierSeq\n"
-        "          tok:\"int\"\n"
-        "    tok:\"a\"\n"
+        "    rule:topLevelHead\n"
+        "      rule:typeSpecifierSeq\n"
+        "        tok:\"int\"\n"
+        "    rule:initDeclaratorList\n"
+        "      rule:initDeclarator\n"
+        "        rule:declarator\n"
+        "          rule:directDeclarator\n"
+        "            tok:\"a\"\n"
+        "            rule:arrayDeclSuffix\n"
+        "              tok:\"[\"\n"
+        "              rule:expression\n"
+        "                rule:operand\n"
+        "                  tok:\"10\"\n"
+        "              tok:\"]\"\n"
         "    rule:topLevelDeclTail\n"
-        "      rule:varDeclTail\n"
-        "        rule:arrayDeclSuffix\n"
-        "          tok:\"[\"\n"
-        "          rule:expression\n"
-        "            rule:operand\n"
-        "              tok:\"10\"\n"
-        "          tok:\"]\"\n"
-        "        tok:\";\"\n";
+        "      tok:\";\"\n";
     EXPECT_EQ(prettyPrintSubtree(t, tl), kExpected);
 }
 
@@ -628,24 +633,29 @@ TEST(ParserCSubsetSmoke, InnerArrayDeclParses) {
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors());
 
-    const NodeId head = findFirstNodeWithRule(t, "varDeclHead");
+    const NodeId head = findFirstNodeWithRule(t, "varDecl");
     ASSERT_NE(head, NodeId{});
-    // D5.1 cycle 3: `varDeclHead` now uses `typeRefAllowingStruct` so a local
-    // variable's type can be `struct Foo *p`; primitive types like `int`
-    // flow through the same rules.
+    // FC4 c1: the local declaration statement is `varDecl` — keyword-led
+    // head (kwDeclHead) + initDeclaratorList; the array suffix lives
+    // INSIDE the directDeclarator (C 6.7.6).
     constexpr std::string_view kExpected =
-        "rule:varDeclHead\n"
-        "  rule:typeRefAllowingStruct\n"
-        "    rule:typeBaseAllowingStruct\n"
+        "rule:varDecl\n"
+        "  rule:kwDeclHead\n"
+        "    rule:typeSpecifierForDecl\n"
         "      rule:typeSpecifierSeq\n"
         "        tok:\"int\"\n"
-        "  tok:\"buf\"\n"
-        "  rule:arrayDeclSuffix\n"
-        "    tok:\"[\"\n"
-        "    rule:expression\n"
-        "      rule:operand\n"
-        "        tok:\"64\"\n"
-        "    tok:\"]\"\n";
+        "  rule:initDeclaratorList\n"
+        "    rule:initDeclarator\n"
+        "      rule:declarator\n"
+        "        rule:directDeclarator\n"
+        "          tok:\"buf\"\n"
+        "          rule:arrayDeclSuffix\n"
+        "            tok:\"[\"\n"
+        "            rule:expression\n"
+        "              rule:operand\n"
+        "                tok:\"64\"\n"
+        "            tok:\"]\"\n"
+        "  tok:\";\"\n";
     EXPECT_EQ(prettyPrintSubtree(t, head), kExpected);
 }
 
@@ -992,4 +1002,117 @@ TEST(ParserCSubsetSmoke, CharLiteralParsesAsOperand) {
     }
     EXPECT_TRUE(sawCharLiteralToken)
         << "expected at least one CharLiteral body-token in the parse tree";
+}
+
+// ── FC4 c1 stage 2b: the decl-vs-expr TRIAGE matrix (parser tier) ───────
+//
+// The declOrExprStmt ambiguity site probes identVarDecl FIRST (declared
+// order — the FC4 c0 fix) under the PreferType commit guard. These pins
+// fix the STRUCTURAL outcome per triage row; the semantic-tier mirrors
+// (symbol typing / undeclared positioning) live in
+// test_semantic_analyzer_c_subset.cpp.
+
+// Sketch-KNOWN Type: `MyP * p;` after `typedef int MyP;` COMMITS the
+// declaration reading — an identVarDecl node exists, no binaryExpr
+// multiplication wraps `MyP * p`.
+TEST(ParserCSubsetSmoke, TypedefNameStarCommitsDeclarationStatement) {
+    auto h = loadAndTokenize(
+        "typedef int MyP;\n"
+        "int main() { MyP * p; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto const result = std::move(p).parse();
+    auto const& t = result.tree;
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "identVarDecl"))
+        << "MyP * p; must parse as a DECLARATION statement";
+}
+
+// Sketch-KNOWN Value: `a * b;` (both locals) ROLLS BACK to the
+// expression statement — NO identVarDecl; the `*` is the binary
+// multiplication.
+TEST(ParserCSubsetSmoke, ValueStarValueRollsBackToExpression) {
+    auto h = loadAndTokenize("int main() { int a; int b; a * b; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto const result = std::move(p).parse();
+    auto const& t = result.tree;
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_FALSE(hasInternalNodeWithRule(t, "identVarDecl"))
+        << "a * b; with VALUE operands must stay an expression statement";
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "binaryExpr"))
+        << "the multiplication must materialize as a binaryExpr";
+}
+
+// UNKNOWN lone identifier: `u * v;` with NO `u` anywhere — the
+// follower-operator test sees `*` (continues a value reading) and ROLLS
+// BACK; single-file compile keeps the expression reading (the
+// cross-file oracle candidate is recorded for the CU reparse, which a
+// single-file unit never seeds). Structure pin only — the TWO
+// positioned S_UndeclaredIdentifier are the semantic-tier mirror.
+TEST(ParserCSubsetSmoke, UnknownStarUnknownRollsBackToExpression) {
+    auto h = loadAndTokenize("int main() { u * v; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto const result = std::move(p).parse();
+    auto const& t = result.tree;
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_FALSE(hasInternalNodeWithRule(t, "identVarDecl"))
+        << "unknown-led `u * v;` must stay an expression statement";
+}
+
+// C23 `auto x = 1;` type INFERENCE is NOT supported — `auto` is a
+// storage-class specifier only, so the head consumes `x` as the type
+// name and the missing declarator fails LOUD at the `=`:
+// P_NoAlternativeMatched, positioned. Layout:
+//   "int main() { auto x = 1; }"
+//    0123456789012345678901234
+// the `=` sits at offset 20. Pinned residue:
+// D-CSUBSET-C23-AUTO-INFERENCE (registry).
+TEST(ParserCSubsetSmoke, AutoInferenceFormIsALoudParseError) {
+    auto h = loadAndTokenize("int main() { auto x = 1; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto const result = std::move(p).parse();
+    auto const& t = result.tree;
+    EXPECT_TRUE(t.diagnostics().hasErrors())
+        << "C23 auto-inference must fail LOUD (never silently mistype)";
+    bool sawPositionedMiss = false;
+    for (auto const& d : t.diagnostics().all()) {
+        if (d.code == DiagnosticCode::P_NoAlternativeMatched
+            && d.span.start() == 20u) {
+            sawPositionedMiss = true;
+        }
+    }
+    EXPECT_TRUE(sawPositionedMiss)
+        << "expected P_NoAlternativeMatched at the `=` (offset 20)";
+}
+
+// ── FC4 c1 stage 2b: the speculative-probe BUDGET guard ─────────────────
+//
+// An identifier-led declaration (typedef'd head -> rides the
+// declOrExprStmt SPECULATIVE path, lookahead 256 = 4096-token probe
+// budget) whose initializer is LONG: a 600-argument call is ~1205
+// tokens. That EXCEEDS the operand alt's 1024-token budget (lookahead
+// 64 — the OLD assumption a statement-probe regression would fall back
+// to) — proving the OUTER statement probe's budget governs the whole
+// `MyT x = <expr> ;` swallow — while staying inside 4096.
+//
+// Shape note: the initializer is WIDE (many flat call arguments), not a
+// long `1 + 1 + ...` binary CHAIN — the Pratt walker counts each chain
+// continuation against ParserConfig::maxExpressionDepth (256, the
+// C++-call-stack watchdog), so a 600-term chain trips THAT orthogonal
+// guard first. Each call argument parses as a fresh shallow expression,
+// keeping depth ~constant while the TOKEN count stresses the budget.
+TEST(ParserCSubsetSmoke, LongInitializerRidesTheStatementProbeBudget) {
+    std::string src = "typedef int MyT;\nint main() { MyT x = f(1";
+    for (int i = 0; i < 599; ++i) src += ", 1";
+    src += "); return x; }";
+    auto h = loadAndTokenize(std::move(src));
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto const result = std::move(p).parse();
+    auto const& t = result.tree;
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "a 600-argument initializer (~1205 tokens, past the 1024-token "
+           "operand budget) must parse clean under the 4096-token "
+           "statement probe budget";
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "identVarDecl"))
+        << "the long-initializer statement must still commit as a "
+           "DECLARATION";
 }

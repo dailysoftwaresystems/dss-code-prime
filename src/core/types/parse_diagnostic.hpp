@@ -259,6 +259,43 @@ enum class DiagnosticCode : std::uint16_t {
     // wasm/spirv skeleton formats). Fail loud at analysis rather than
     // silently typing `long`/pointers with untested widths.
     S_UnsupportedDataModel        = 0xE013,
+    // FC4 c1: a declaration carries the language's `volatile`-class marker
+    // token, declared via a `DeclarationRule.gatedMarkers` entry — the
+    // qualifier is grammar-ADMITTED but its semantics (no caching / no
+    // reordering of accesses) are NOT implemented, so every use fails loud
+    // rather than silently compiling the object as plain memory. Config-
+    // driven: WHICH token gates and THAT it maps to this code are both
+    // per-language config (the engine only honors the declared token→code
+    // pair; nothing here hardcodes the word "volatile").
+    S_VolatileNotSupported        = 0xE014,
+    // FC4 c1 (defined now, wired by the c-subset stage): a call through a
+    // function-pointer VALUE — an indirect call. Declarators can TYPE
+    // `int (*fp)(int)`, but the call path only encodes direct symbol
+    // calls (D-ML7-2.4 owns the indirect-call encoding); a language gates
+    // the indirect-call shape to this code so the unsupported form fails
+    // loud at semantic analysis instead of surfacing as the LIR tier's
+    // late L_IndirectCallUnsupported.
+    S_IndirectCallNotSupported    = 0xE015,
+    // FC4 c1 stage 2a: C 6.7.6.3p10 — a `(void)` parameter list declares
+    // zero parameters; a NAMED void parameter (`int f(void x)`) or void
+    // mixed with other parameters (`int f(void, int)`) is ill-formed.
+    // Emitted by the engine's param-harvest normalization when the
+    // language declares `parameters.soleVoidMeansEmpty`.
+    S_InvalidVoidParam            = 0xE016,
+    // FC4 c1 stage 2a: a declaration position that REQUIRES named
+    // declarators (`DeclarationRule.requireNamedDeclarators` — C's
+    // locals/globals/typedefs) carries an ABSTRACT declarator: `int *;`,
+    // `int (int);` — the declaration declares nothing. Config-driven per
+    // declaration row; parameter-like positions legally stay abstract.
+    S_DeclarationDeclaresNothing  = 0xE017,
+    // FC4 c1 stage 2a: a function-shaped declarator in an unsupported
+    // form/position — a definition whose init-declarator list has more
+    // than one declarator or an initializer, a definition whose named
+    // direct-declarator carries no function suffix (`int (*fp)(int) {}`),
+    // or a bare function-TYPED object declaration (a C prototype
+    // `int f();` — declaration-without-definition is deferred; externs
+    // carry that role today). Always an ERROR — never silent.
+    S_InvalidFunctionDeclarator   = 0xE018,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

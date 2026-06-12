@@ -927,6 +927,22 @@ struct Lowerer {
                 return mir.addGlobalAddr(SymbolId{sym},
                                          interner.pointer(declared));
             }
+            if (functionSymbols.contains(sym)) {
+                // FC4 c1: `&fn` — the address of a FUNCTION (C 6.5.3.2).
+                // The function's code address is its GlobalAddr, typed
+                // Ptr<FnSig> (what an `int (*fp)(int) = &helper;` init
+                // stores/compares). Mirrors the rvalue Ref arm's
+                // function case; calls THROUGH the pointer stay gated
+                // (S_IndirectCallNotSupported is stage 2b's wall).
+                TypeId const declared = hir.typeId(node);
+                if (!declared.valid()) {
+                    unsupported(node, std::format(
+                        "function Ref to symbol {} has no type", sym));
+                    return InvalidMirInst;
+                }
+                return mir.addGlobalAddr(SymbolId{sym},
+                                         interner.pointer(declared));
+            }
             unsupported(node, std::format(
                 "symbol {} has no storage slot (non-addressable param or "
                 "unbound) — required by lvalue use", sym));
@@ -1294,6 +1310,10 @@ struct Lowerer {
         switch (hir.kind(node)) {
             case HirKind::VarDecl:
             case HirKind::AssignStmt:
+            // FC4 c1: a multi-declarator for-init (`for (int i = 0, j = n;
+            // ...)`) lowers as a Block of VarDecls — statements, lowered
+            // sequentially into the entry block like any block body.
+            case HirKind::Block:
                 return lowerStmt(node);
             default:
                 return lowerExpr(node).valid();

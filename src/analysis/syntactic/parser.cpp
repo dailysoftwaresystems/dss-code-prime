@@ -2,6 +2,7 @@
 
 #include "analysis/syntactic/pratt_walker.hpp"
 #include "core/types/compiled_shape.hpp"
+#include "core/types/declarator_walk.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/schema_walker.hpp"
@@ -166,6 +167,15 @@ struct Parser::Impl {
     std::size_t  lastTokPos = 0;
     std::size_t  lastDepth  = 0;
     bool         firstIteration = true;
+
+    // FC4 c1: the all-candidates-failed fallback REPLAY's one-shot
+    // bookkeeping (see the speculative AltChoice arm). A replayed branch
+    // that fails without net consumption unwinds back to the same alt at
+    // the same position; the (cursor, tokPos) pair gates the second
+    // attempt into the P_BacktrackFailed forward-progress hatch instead.
+    bool         replayedFallback_ = false;
+    SchemaCursor lastReplayCursor_{};
+    std::size_t  lastReplayTokPos_ = 0;
 
     // True iff the PREVIOUS dispatch step performed a recovery (panic scan
     // or missing-rule synthesis). Lets `synthesizeMissingRule` SUPPRESS its
@@ -446,16 +456,19 @@ struct Parser::Impl {
     void closeFrameOnce() noexcept {
         if (frames.empty()) return;
         const RuleId rule = builder->currentRule();
-        // FC2 binder sketch: extract the declared name BEFORE the frame
+        // FC2 binder sketch: extract the declared name(s) BEFORE the frame
         // closes (its direct children are still in the builder's pending
-        // staging area), but RECORD it after any scope this rule itself
+        // staging area), but RECORD them after any scope this rule itself
         // owns has closed — a scope-opening declaration (e.g. a struct)
         // binds its NAME in the ENCLOSING scope, while its members were
         // bound into its own scope as their frames closed earlier.
-        std::optional<std::pair<std::string, bool>> binderName;
+        // (FC4 c1: a declarator-mode row's initDeclarator LIST yields
+        // MULTIPLE bindings — `typedef int A, *B;` binds both — hence the
+        // vector; legacy rows yield 0 or 1.)
+        std::vector<std::pair<std::string, bool>> binderNames;
         if (sketch.enabled()) {
             if (auto const* decl = sketch.binderFor(rule)) {
-                binderName = extractBinderName_(*decl);
+                binderNames = extractBinderNames_(*decl);
             }
         }
         walker.leaveRule(SourceSpan::empty(0), rule);
@@ -464,9 +477,8 @@ struct Parser::Impl {
         if (!frameRules.empty()) frameRules.pop_back();
         if (sketch.enabled()) {
             if (sketch.isScopeRule(rule)) sketch.closeScope();
-            if (binderName.has_value()) {
-                sketch.record(std::move(binderName->first),
-                              binderName->second);
+            for (auto& [name, isType] : binderNames) {
+                sketch.record(std::move(name), isType);
             }
         }
     }
@@ -519,16 +531,41 @@ struct Parser::Impl {
         return found;
     }
 
-    // Extract (name, isType) from the ABOUT-TO-CLOSE top frame — a
-    // binder rule per the sketch's view. The frame's direct children are
-    // its pending staging range; everything BELOW the top level is
-    // already closed (children ranges finalized), so descent is safe.
-    // Returns nullopt when the name child is structurally absent or not
-    // a plain identifier leaf (e.g. an errored declaration) — the sketch
-    // then simply has no entry and the name reads as Unknown, the safe
-    // direction (semantic analysis remains the authority).
-    [[nodiscard]] std::optional<std::pair<std::string, bool>>
-    extractBinderName_(BinderSketch::BinderDecl const& decl) const {
+    // FC4 c1: the TreeBuilder-substrate adapter for the SHARED declarator
+    // name-extraction walk (`core/types/declarator_walk.hpp` — the one
+    // walk implementation, two substrates). Valid because the about-to-
+    // close frame's pending children are CLOSED nodes (children ranges
+    // finalized), so the builder's node accessors are exact below them.
+    struct BuilderDeclaratorView {
+        TreeBuilder const& b;
+        [[nodiscard]] NodeKind kind(NodeId n) const { return b.nodeKind(n); }
+        [[nodiscard]] RuleId rule(NodeId n) const { return b.nodeRule(n); }
+        [[nodiscard]] SchemaTokenId tokenKind(NodeId n) const {
+            return b.nodeTokenKind(n);
+        }
+        [[nodiscard]] bool isVisible(NodeId n) const {
+            return !isEmptySpace(b.nodeFlags(n));
+        }
+        [[nodiscard]] std::span<NodeId const> children(NodeId n) const {
+            return b.nodeChildren(n);
+        }
+    };
+
+    // Extract every (name, isType) binding from the ABOUT-TO-CLOSE top
+    // frame — a binder rule per the sketch's view. The frame's direct
+    // children are its pending staging range; everything BELOW the top
+    // level is already closed (children ranges finalized), so descent is
+    // safe. Returns empty when the name child is structurally absent or
+    // not a plain identifier leaf (e.g. an errored declaration) — the
+    // sketch then simply has no entry and the name reads as Unknown, the
+    // safe direction (semantic analysis remains the authority).
+    //
+    // Legacy rows yield 0 or 1 entries; FC4 declarator-mode rows yield one
+    // entry PER named declarator below the carrier child (abstract
+    // declarators contribute nothing — a legal outcome).
+    [[nodiscard]] std::vector<std::pair<std::string, bool>>
+    extractBinderNames_(BinderSketch::BinderDecl const& decl) const {
+        std::vector<std::pair<std::string, bool>> out;
         std::vector<NodeId> kids;
         for (NodeId c : builder->currentFramePendingChildren()) {
             if (!isEmptySpace(builder->nodeFlags(c))) kids.push_back(c);
@@ -542,17 +579,40 @@ struct Parser::Impl {
                    == decl.specifierPrefixRule.v) {
             kids.erase(kids.begin());
         }
-        if (decl.nameChild >= kids.size()) return std::nullopt;
+        if (decl.declaratorMode) {
+            // FC4 c1: the shared declarator walk over the builder
+            // substrate. The sketch only enrolls declarator-mode rows when
+            // the schema declares the `declarators` block (ctor invariant),
+            // so the dereference is guarded-by-construction; the null check
+            // keeps the miss loud-by-absence rather than UB.
+            auto const& dcOpt = schema->semantics().declarators;
+            if (!dcOpt.has_value() || decl.carrierChild >= kids.size()) {
+                return out;
+            }
+            BuilderDeclaratorView const view{*builder};
+            std::vector<NodeId> declarators;
+            collectDeclarators(view, kids[decl.carrierChild], *dcOpt,
+                               declarators);
+            for (NodeId d : declarators) {
+                const NodeId nameNode = declaratorNameNode(view, d, *dcOpt);
+                if (!nameNode.valid()) continue;   // abstract — no binding
+                out.emplace_back(
+                    std::string{src->slice(builder->nodeSpan(nameNode))},
+                    decl.isType);
+            }
+            return out;
+        }
+        if (decl.nameChild >= kids.size()) return out;
         const NodeId nameNode =
             resolveNameNode_(kids[decl.nameChild], decl.nameMatch);
         if (!nameNode.valid()
             || builder->nodeKind(nameNode) != NodeKind::Token
             || builder->nodeTokenKind(nameNode).v != identifierKind.v) {
-            return std::nullopt;
+            return out;
         }
-        return std::make_pair(
-            std::string{src->slice(builder->nodeSpan(nameNode))},
-            decl.isType);
+        out.emplace_back(std::string{src->slice(builder->nodeSpan(nameNode))},
+                         decl.isType);
+        return out;
     }
 
     // ── FC2 type-name commit triage ─────────────────────────────────────
@@ -587,27 +647,37 @@ struct Parser::Impl {
     //   (2) lone identifier the sketch knows as a TYPE → COMMIT.
     //   (3) lone identifier the sketch knows as a VALUE → ROLLBACK
     //       (the value reading is the meaning; shadowing-aware).
-    //   (4) lone identifier the sketch has NO entry for → COMMIT iff
-    //       the token after the type position (the first token of the
-    //       following operand subtree) could NOT continue a value
-    //       reading — i.e. it is not an infix/postfix/ternary operator
-    //       per the operator table. Ternary is included beyond the
-    //       plan's "binary/postfix" wording because `(a) ? b : c` is a
-    //       continuable value reading too; the test is "could the
-    //       parenthesized value parse keep going", derived ENTIRELY
-    //       from the operator table — never a hardcoded token list.
-    //       When it IS an operator: ROLLBACK to the value reading and
-    //       hand an AmbiguousTypeNameCandidate out via `outCandidate`
-    //       for the compilation unit's cross-file oracle (one-shot
-    //       seeded reparse). The CALLER records it after the probe's
-    //       rollback so it survives (the probe restore would otherwise
-    //       erase it with the rest of the sketch delta).
+    //   (4) lone identifier the sketch has NO entry for → POLARITY-
+    //       dependent (FC4 c1 M4, the D2a decision):
+    //       * PreferType (the FC2 default) — COMMIT iff the token after
+    //         the type position (the first token of the following
+    //         operand subtree) could NOT continue a value reading —
+    //         i.e. it is not an infix/postfix/ternary operator per the
+    //         operator table. Ternary is included beyond the plan's
+    //         "binary/postfix" wording because `(a) ? b : c` is a
+    //         continuable value reading too; the test is "could the
+    //         parenthesized value parse keep going", derived ENTIRELY
+    //         from the operator table — never a hardcoded token list.
+    //         When it IS an operator: ROLLBACK to the value reading and
+    //         hand an AmbiguousTypeNameCandidate out via `outCandidate`
+    //         for the compilation unit's cross-file oracle (one-shot
+    //         seeded reparse). The CALLER records it after the probe's
+    //         rollback so it survives (the probe restore would otherwise
+    //         erase it with the rest of the sketch delta).
+    //       * RequireKnownType (C 6.7.6.3p11 — `T (name)` in parameter
+    //         position is a parenthesized declarator unless `name` is a
+    //         visible typedef) — NEVER commit on Unknown: always roll
+    //         back AND record the candidate, so a cross-file typedef in
+    //         the guarded position still resolves on the oracle reparse.
+    //       Rules 1-3 are polarity-INDEPENDENT: a keyword-led type child
+    //       commits always (rule 1 — it cannot be an expression), a
+    //       sketch-KNOWN Type commits, a sketch-KNOWN Value rolls back.
     //
     // Returning false lets the caller's SpeculationProbe restore all
     // five machines; the alt's next candidate branch then parses the
     // value reading.
     [[nodiscard]] bool typeNameCommitApproved_(
-        RuleId branch, RuleId typeRule,
+        RuleId branch, RuleId typeRule, TypeNameCommitPolarity polarity,
         std::optional<AmbiguousTypeNameCandidate>& outCandidate) {
         // The just-built branch subtree is the parent frame's newest
         // pending child (the branch frame closed inside the probe loop).
@@ -663,7 +733,19 @@ struct Parser::Impl {
         case BinderSketch::NameKind::Unknown: break;
         }
 
-        // Rule 4 — unknown name: follower-operator test.
+        // Rule 4 — unknown name. Strict polarity first (FC4 c1 M4):
+        // RequireKnownType never commits an unknown — roll back to the
+        // competing reading and record the candidate so the CU oracle's
+        // seeded reparse gives a cross-file typedef its second chance.
+        if (polarity == TypeNameCommitPolarity::RequireKnownType) {
+            outCandidate = AmbiguousTypeNameCandidate{
+                .name = std::string{name},
+                .span = nameSpan,
+            };
+            return false;
+        }
+
+        // PreferType — follower-operator test.
         SchemaTokenId followerKind{};
         if (operandSibling.valid()) {
             std::vector<NodeId> fl;
@@ -783,6 +865,18 @@ struct Parser::Impl {
                       ? impl.walker.lookahead() * 16u
                       : 64u))
             , stepRecoveredBefore_(impl.stepRecovered_)
+            // FC4 c1: the forward-progress watchdog tuple is probe state
+            // too. Without restoring it, a rolled-back probe leaves
+            // `last*` pointing at a position INSIDE the discarded branch
+            // — and a later non-speculative dispatch (the all-fail
+            // fallback REPLAY) that legitimately re-reaches that same
+            // (cursor, tokPos, depth) trips the watchdog on real
+            // progress. Same restore discipline as diagsEmitted /
+            // stepRecovered_.
+            , lastCursorBefore_(impl.lastCursor)
+            , lastTokPosBefore_(impl.lastTokPos)
+            , lastDepthBefore_(impl.lastDepth)
+            , firstIterationBefore_(impl.firstIteration)
             // FC2: the binder sketch is the FIFTH machine a probe
             // touches (binder-rule frames closing inside the branch
             // record bindings; the type-name triage records
@@ -821,6 +915,10 @@ struct Parser::Impl {
                 impl_.tokens.restore(bookmark_);
                 impl_.diagsEmitted = diagsBefore_;
                 impl_.stepRecovered_ = stepRecoveredBefore_;
+                impl_.lastCursor     = lastCursorBefore_;
+                impl_.lastTokPos     = lastTokPosBefore_;
+                impl_.lastDepth      = lastDepthBefore_;
+                impl_.firstIteration = firstIterationBefore_;
                 impl_.sketch.restore(std::move(sketchSnap_));
             }
             --impl_.speculationDepth;
@@ -855,6 +953,15 @@ struct Parser::Impl {
             impl_.lastCursor = impl_.walker.cursor();
             impl_.lastTokPos = impl_.tokens.position();
             impl_.lastDepth  = impl_.frames.size();
+            // FC4 c1: the post-commit tuple just recorded is EXACTLY what
+            // the next dispatch iteration snaps when the committed branch
+            // leaves the cursor at a non-End slot with no token consumed
+            // in between (e.g. a committed declarator base suffix landing
+            // on the suffix-repeat AltChoice) — the watchdog would trip on
+            // legitimate progress. Skip exactly ONE comparison; a true
+            // stall still trips on the following iteration, so the
+            // watchdog stays sound.
+            impl_.firstIteration = true;
             committed_       = true;
         }
 
@@ -874,6 +981,10 @@ struct Parser::Impl {
         bool                                   desyncedBefore_;
         std::size_t                            budget_;
         bool                                   stepRecoveredBefore_;
+        SchemaCursor                           lastCursorBefore_;
+        std::size_t                            lastTokPosBefore_;
+        std::size_t                            lastDepthBefore_;
+        bool                                   firstIterationBefore_;
         BinderSketch::Snapshot                 sketchSnap_;
         bool                                   committed_ = false;
     };
@@ -1064,6 +1175,23 @@ struct Parser::Impl {
         const bool committed = [&]() -> bool {
         SpeculationProbe probe{*this};
 
+        // FC4 c1: an `expr`-shape BRANCH (e.g. c-subset forInitAmbig's
+        // `expression`) must hand off to the Pratt walker exactly like the
+        // RuleLeaf dispatch does — `openExprFrame` would compile the branch
+        // as its transparent atom reference, parse ONLY the first operand,
+        // and silently COMMIT a truncated expression (`i = 9` consuming
+        // just `i`). The walker balances its own frames; failure surfaces
+        // via the probe's diagnostic/desync deltas and rolls back so the
+        // alt's next candidate gets its shot.
+        if (schema->isExprRule(branch)) {
+            prattWalker->walkExpression(*outer, branch,
+                                        schema->exprMinPrecedence(branch));
+            if (probe.emittedDiag())   return false;
+            if (probe.isDesynced())    return false;
+            probe.commit();
+            return true;
+        }
+
         openExprFrame(branch);
 
         while (frames.size() > probe.targetDepth()) {
@@ -1098,12 +1226,14 @@ struct Parser::Impl {
         // FC2 type-name commit guard: a `commitRequiresTypeName`-marked
         // branch commits only per the generic triage (lone-identifier
         // type names need binder-sketch / follower evidence; every other
-        // type form commits). Returning false lets the probe's RAII
-        // restore roll the branch back and the caller try the alt's
+        // type form commits). The guard's declared POLARITY (FC4 c1 M4)
+        // selects the unknown-name arm. Returning false lets the probe's
+        // RAII restore roll the branch back and the caller try the alt's
         // next candidate — the value reading.
         if (const RuleId typeRule = schema->typeNameCommitRule(branch);
             typeRule.valid()) {
             if (!typeNameCommitApproved_(branch, typeRule,
+                                         schema->typeNameCommitPolarity(branch),
                                          rolledBackCandidate)) {
                 return false;
             }
@@ -1182,17 +1312,23 @@ struct Parser::Impl {
             && curCursor == lastCursor
             && curTokPos == lastTokPos
             && curDepth  == lastDepth) {
-            emitParserError(
-                DiagnosticCode::P_RecoveryStalled,
-                tokens.peek().span,
-                std::format(
-                    "parser forward-progress watchdog tripped at slot kind {}, "
-                    "core kind {}, schema kind {}, frame depth {}",
-                    static_cast<int>(walker.slotKind()),
-                    static_cast<int>(tokens.peek().coreKind),
-                    tokens.peek().schemaKind.v,
-                    frames.size()));
-            fatal("dss::Parser: forward-progress watchdog tripped");
+            std::string const stallDetail = std::format(
+                "parser forward-progress watchdog tripped at slot kind {}, "
+                "core kind {}, schema kind {}, frame depth {}, token pos {}, "
+                "rule '{}'",
+                static_cast<int>(walker.slotKind()),
+                static_cast<int>(tokens.peek().coreKind),
+                tokens.peek().schemaKind.v,
+                frames.size(),
+                tokens.position(),
+                frameRules.empty()
+                    ? std::string{"<none>"}
+                    : std::string{schema->rules().name(frameRules.back())});
+            emitParserError(DiagnosticCode::P_RecoveryStalled,
+                            tokens.peek().span, stallDetail);
+            // The fatal abort happens before the diagnostic drain can
+            // print, so the detail rides the abort message too.
+            fatal(stallDetail.c_str());
         }
         lastCursor = curCursor;
         lastTokPos = curTokPos;
@@ -1397,13 +1533,49 @@ struct Parser::Impl {
 
                 // Try each candidate RULE branch in declaration order.
                 // First success commits and falls through to the
-                // next outer iteration; full failure emits one
-                // P_BacktrackFailed + consumes for forward progress.
+                // next outer iteration.
                 const auto candidates = candidateBranches(tokKind);
                 for (auto const branch : candidates) {
                     if (trySpeculativeBranch(branch)) {
                         return StepOutcome::Continue;
                     }
+                }
+
+                // FC4 c1: every candidate failed. At the OUTERMOST level,
+                // REPLAY the declared-LAST candidate non-speculatively so
+                // its precise diagnostics land where the user can act on
+                // them — the declared order makes the last branch the
+                // language's fallback reading (c-subset declOrExprStmt's
+                // exprStmt), and pre-FC4 that reading was a direct alt
+                // branch whose errors surfaced directly. Pure rollback
+                // would bury the real error (`a ? b ;` → "missing ':'")
+                // under an opaque P_BacktrackFailed.
+                //
+                // ONE-SHOT per (cursor, token position): a replayed branch
+                // that fails WITHOUT net token consumption unwinds back to
+                // this very alt with the same peek — a second replay would
+                // loop until the forward-progress watchdog aborts. The
+                // re-entry falls through to the P_BacktrackFailed +
+                // consume hatch, which guarantees progress exactly as the
+                // pre-replay contract did. Inside a NESTED probe the
+                // rollback semantics stay pure (the outer probe owns the
+                // failure), so no replay fires there either.
+                if (speculationDepth == 0 && !candidates.empty()
+                    && !(replayedFallback_
+                         && lastReplayCursor_ == walker.cursor()
+                         && lastReplayTokPos_ == tokens.position())) {
+                    replayedFallback_  = true;
+                    lastReplayCursor_  = walker.cursor();
+                    lastReplayTokPos_  = tokens.position();
+                    const RuleId fallback = candidates.back();
+                    if (schema->isExprRule(fallback)) {
+                        prattWalker->walkExpression(
+                            *outer, fallback,
+                            schema->exprMinPrecedence(fallback));
+                        return StepOutcome::Continue;
+                    }
+                    openExprFrame(fallback);
+                    return StepOutcome::Continue;
                 }
 
                 return recoverAt(DiagnosticCode::P_BacktrackFailed,

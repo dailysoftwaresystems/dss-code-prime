@@ -1783,6 +1783,26 @@ TEST(HirLoweringCSubset, CstConstEval_ArrayLengthConstRef) {
     EXPECT_EQ(arrayLengthOfVar(model, "xs"), 4);
 }
 
+// FC4 c1 (audit F1) — the PER-DECLARATOR const-init name match.
+// `const int A = 100, B = 2;` carries TWO initDeclarators under ONE
+// decl node; findInitExprInDecl must resolve each symbol's init by
+// its OWN name node. The silent failure this pins: degrading the
+// match to "the FIRST declarator's init" keeps every single-
+// declarator test green while B folds as 100 — so `xs[B + 1]`
+// becomes Array<101>, not Array<3>. The A-fed sibling stays green
+// under that degrade (A IS the first declarator); the B assertion
+// is the discriminating lever (red-on-disable demonstrated by
+// short-circuiting the name match to the list head).
+TEST(HirLoweringCSubset, CstConstEval_MultiDeclaratorConstInitsResolvePerName) {
+    SemanticModel model = analyzeCSubset(
+        "const int A = 100, B = 2;\n"
+        "void f() { int xs[B + 1]; int ys[A - 97]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 3);
+    EXPECT_EQ(arrayLengthOfVar(model, "ys"), 3);
+}
+
 // UnaryOp fold: `-(-3)` → 3. Pins the UnaryExprRule branch
 // (previously test-coverage gap).
 TEST(HirLoweringCSubset, CstConstEval_UnaryFolds) {
@@ -2345,12 +2365,20 @@ TEST(HirLoweringCSubset, D5_5_LiftOptOutRespected) {
     std::string const target =
         "\"compositeKind\": \"enum\",\n"
         "                           \"liftToEnclosingScope\": true";
-    auto const pos = text.find(target);
-    ASSERT_NE(pos, std::string::npos)
+    // FC4 c1: TWO enum-composite rows carry the lift flag now (the
+    // statement-position `enumDecl` AND the typedef-position
+    // `enumSpecifierBody`); flip EVERY occurrence so the opt-out is
+    // total — the bare-name `A` below must resolve through NEITHER.
+    std::size_t flipped = 0;
+    for (auto pos = text.find(target); pos != std::string::npos;
+         pos = text.find(target, pos)) {
+        text.replace(pos, target.size(),
+            "\"compositeKind\": \"enum\",\n"
+            "                           \"liftToEnclosingScope\": false");
+        ++flipped;
+    }
+    ASSERT_GE(flipped, 1u)
         << "c-subset config no longer carries the expected enum lift flag";
-    text.replace(pos, target.size(),
-        "\"compositeKind\": \"enum\",\n"
-        "                           \"liftToEnclosingScope\": false");
 
     auto loaded = GrammarSchema::loadFromText(text, "<c-subset-no-lift>");
     ASSERT_TRUE(loaded.has_value())

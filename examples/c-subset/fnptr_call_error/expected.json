@@ -1,0 +1,11 @@
+{
+  "$comment": "D-CSUBSET-FNPTR-INDIRECT-CALL: this example FLIPS to a RUNTIME example in FC4 c2 (call-via-register encoding) — fp(40) == helper(40) == 42, so the manifest then becomes exitCode 42 with the standard 4-target arms.",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "S_IndirectCallNotSupported", "line": 16, "col": 12 }
+  ]
+}

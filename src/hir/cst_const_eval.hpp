@@ -122,11 +122,18 @@ asInt64Bridge(HirLiteralValue const& v) noexcept;
 // HIR-lowering's frozen-model lookup). Callers must already have
 // confirmed isConst / tree match.
 //
+// FC4 c1: DECLARATOR-mode rows carry one init PER init-declarator
+// (`const int K = 8, L = 9;`), so the caller passes the symbol's NAME
+// node (`SymbolRecord::declNode`) and the helper returns the init of
+// the init-declarator that declares THAT name (via the shared
+// declarator walk over the schema's `declarators` roles). `nameNode`
+// is ignored for legacy positional rows.
+//
 // Forward-declared `DeclarationRule` is included via core/types; the
 // helper definition resolves it from the loaded schema.
 struct DeclarationRule;
 [[nodiscard]] DSS_EXPORT std::optional<NodeId>
 findInitExprInDecl(Tree const& tree, DeclarationRule const& decl,
-                   NodeId declRuleNode);
+                   NodeId declRuleNode, NodeId nameNode = {});
 
 } // namespace dss

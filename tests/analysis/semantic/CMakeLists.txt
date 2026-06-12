@@ -27,6 +27,13 @@ dss_add_test(NAME analysis/semantic/test_semantic_analyzer_genericity
 dss_add_test(NAME analysis/semantic/test_fc3_width_semantics
              SOURCES test_fc3_width_semantics.cpp)
 
+# FC4 c1: the C-declarator engine substrate against a SYNTHETIC schema —
+# the `declarators` role-block loader matrix (M1), the shared name-
+# extraction walk (M2), the declarator-inversion fold (M3), and the
+# gatedMarkers fail-loud gates (M5).
+dss_add_test(NAME analysis/semantic/test_declarator_engine
+             SOURCES test_declarator_engine.cpp)
+
 # All semantic e2e tests share `semantic_test_fixture.hpp`. Add tests/
 # (NOT the repo root — its `VERSION` file shadows the C++ standard
 # `<version>` header on case-insensitive filesystems and breaks
@@ -43,4 +50,10 @@ target_include_directories(dss_analysis_semantic_test_fc3_width_semantics
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 # The FC3 suite perturbs the SHIPPED c-subset JSON — it needs nlohmann.
 target_link_libraries(dss_analysis_semantic_test_fc3_width_semantics
+                      PRIVATE nlohmann_json::nlohmann_json)
+# The FC4 declarator suite perturbs its SYNTHETIC schema doc the same way
+# (loader accept/reject matrix) and reuses the fixture + RawTreeBuilder.
+target_include_directories(dss_analysis_semantic_test_declarator_engine
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(dss_analysis_semantic_test_declarator_engine
                       PRIVATE nlohmann_json::nlohmann_json)

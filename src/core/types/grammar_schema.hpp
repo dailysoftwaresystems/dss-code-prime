@@ -580,6 +580,12 @@ public:
     // parser's generic type-name triage before committing — see
     // `Parser::Impl::typeNameCommitApproved_`.
     [[nodiscard]] RuleId       typeNameCommitRule(RuleId rule) const noexcept;
+    // FC4 c1 (M4): the guard's UNKNOWN-name polarity (the bare-string
+    // config form keeps `PreferType`; the object form may select
+    // `RequireKnownType` — C 6.7.6.3p11). Only meaningful when
+    // `typeNameCommitRule(rule).valid()`; returns the default otherwise.
+    [[nodiscard]] TypeNameCommitPolarity
+        typeNameCommitPolarity(RuleId rule) const noexcept;
 
     // Pratt-walker wrapper rule ids declared by `expr.wrapperRules`
     // for `rule`. The loader auto-interned the declared names and

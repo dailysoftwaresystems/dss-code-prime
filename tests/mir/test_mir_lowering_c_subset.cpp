@@ -2210,3 +2210,87 @@ TEST(MirLoweringCSubset, BoolKeywordLiteralsCarryFixedValues) {
     EXPECT_TRUE(sawTrue)  << "true must lower as the fixed value 1";
     EXPECT_TRUE(sawFalse) << "false must lower as the fixed value 0";
 }
+
+// ── FC4 c1 stage 2b: the visibility("hidden") DCE lever ─────────────────
+// (closes D-CSUBSET-LINKAGE-VISIBILITY-SYNTAX)
+//
+// END-TO-END through the REAL c-subset attribute (not hand-built MIR —
+// that half lives in tests/opt/test_dce_linkage.cpp): the composite
+// linkage key `visibility:hidden` threads SymbolVisibility::Hidden from
+// `__attribute__((visibility("hidden")))` source through the linkage
+// side-table into MIR, where `isExternallyVisible(Global, Hidden)` is
+// FALSE — so an UNCALLED hidden function is DCE-eliminated exactly like
+// a `static` one, while a plain Global/Default uncalled function is
+// linkage-protected and RETAINED. Red-on-disable lever: strip the
+// `"visibility:hidden"` row from c-subset.lang.json's linkageSpecifiers
+// and hidden_unused stays Default -> retained -> this test goes RED.
+TEST(MirLoweringCSubset, HiddenVisibilityUnusedFunctionIsDceEliminated) {
+    auto L = lowerCSubset(
+        "__attribute__((visibility(\"hidden\"))) int hidden_unused(int v) "
+        "{ return v + 1; }\n"
+        "int plain_unused(int v) { return v + 2; }\n"
+        "int main() { return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    // Resolve the two symbols by NAME from the semantic model so the pin
+    // is independent of minting order.
+    SymbolId hiddenSym, plainSym;
+    for (std::size_t i = 1; i < L.model.symbols().size(); ++i) {
+        if (L.model.symbols()[i].name == "hidden_unused") {
+            hiddenSym = SymbolId{static_cast<std::uint32_t>(i)};
+        }
+        if (L.model.symbols()[i].name == "plain_unused") {
+            plainSym = SymbolId{static_cast<std::uint32_t>(i)};
+        }
+    }
+    ASSERT_TRUE(hiddenSym.valid());
+    ASSERT_TRUE(plainSym.valid());
+
+    auto findFunc = [&](SymbolId sym) -> MirFuncId {
+        for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+            if (m.funcSymbol(m.funcAt(i)) == sym) return m.funcAt(i);
+        }
+        return MirFuncId{};
+    };
+
+    // PRE-DCE: all three functions present; the attribute actually
+    // threaded (Hidden visibility = not externally visible) while the
+    // plain one is Global/Default (externally visible). These two
+    // asserts ARE the red-on-disable lever's anchor — without the
+    // config row hidden_unused would read Default here.
+    ASSERT_EQ(m.moduleFuncCount(), 3u);
+    MirFuncId const hiddenFn = findFunc(hiddenSym);
+    MirFuncId const plainFn  = findFunc(plainSym);
+    ASSERT_TRUE(hiddenFn.valid());
+    ASSERT_TRUE(plainFn.valid());
+    EXPECT_EQ(m.funcVisibility(hiddenFn), SymbolVisibility::Hidden);
+    EXPECT_EQ(m.funcBinding(hiddenFn),   SymbolBinding::Global);
+    EXPECT_FALSE(isExternallyVisible(m.funcBinding(hiddenFn),
+                                     m.funcVisibility(hiddenFn)));
+    EXPECT_EQ(m.funcVisibility(plainFn), SymbolVisibility::Default);
+    EXPECT_TRUE(isExternallyVisible(m.funcBinding(plainFn),
+                                    m.funcVisibility(plainFn)));
+
+    // Run DCE (the tests/opt/test_dce_linkage.cpp pipeline shape).
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    opt::OptPipeline pipeline{"fc4-visibility-lever", {opt::PassId::Dce}};
+    auto const result = opt::optimize(m, **targetR,
+                                      L.model.lattice().interner(),
+                                      pipeline, rep);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    // POST-DCE: hidden+uncalled ELIMINATED; plain Global/Default
+    // uncalled RETAINED (linkage protect); main retained.
+    EXPECT_FALSE(findFunc(hiddenSym).valid())
+        << "hidden_unused (Global/Hidden, no callers) must be "
+           "DCE-eliminated exactly like a static function";
+    EXPECT_TRUE(findFunc(plainSym).valid())
+        << "plain_unused (Global/Default) must survive — externally "
+           "visible symbols are linkage-protected";
+}

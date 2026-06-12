@@ -117,6 +117,7 @@
     ".":  [{ "kind": "DotOp"   }],
     "->": [{ "kind": "ArrowOp" }],
     "...":[{ "kind": "EllipsisOp" }],
+    "::": [{ "kind": "ColonColonOp" }],
 
     "+=":  [{ "kind": "PlusAssignOp"   }],
     "-=":  [{ "kind": "MinusAssignOp"  }],
@@ -197,7 +198,11 @@
     { "word": "false",    "kind": "FalseKeyword"      },
     { "word": "float",    "kind": "FloatKeyword"      },
     { "word": "double",   "kind": "DoubleKeyword"     },
-    { "word": "const",   "kind": "ConstKeyword"   },
+    { "word": "const",    "kind": "ConstKeyword"    },
+    { "word": "volatile", "kind": "VolatileKeyword" },
+    { "word": "restrict", "kind": "RestrictKeyword" },
+    { "word": "register", "kind": "RegisterKeyword" },
+    { "word": "auto",     "kind": "AutoKeyword"     },
     { "word": "typedef", "kind": "TypedefKeyword" },
     { "word": "struct",  "kind": "StructKeyword"  },
     { "word": "union",   "kind": "UnionKeyword"   },
@@ -303,33 +308,183 @@
     },
 
     "topLevelDecl": {
-      "sequence": [ { "optional": "declSpecifiers" }, "typeRef", "Identifier", "topLevelDeclTail" ]
+      "sequence": [ { "optional": "declSpecifiers" }, "topLevelHead", "initDeclaratorList", "topLevelDeclTail" ]
+    },
+
+    "topLevelHead": {
+      "$comment": "Top-level head: keyword specifier run OR a lone Identifier (typedef name). Identifier is UNAMBIGUOUS at top level — no expression statements exist there — so no speculation/guard is needed. Struct/union/enum heads at top level stay unsupported (pre-FC4 parity; the residue is pinned).",
+      "sequence": [
+        { "repeat": "headQualifier" },
+        { "alt": [ "typeSpecifierSeq", "Identifier" ] },
+        { "repeat": "headQualifier" }
+      ]
+    },
+
+    "topLevelDeclTail": {
+      "$comment": "FIRST(block)={BlockOpen} vs {EndStatement} — disjoint. A block tail makes the FIRST init-declarator a function DEFINITION (semantic-tier checks enforce: exactly one declarator, named, fn-suffix-bearing, no initializer); an EndStatement tail makes every declarator a global variable.",
+      "alt": [ "block", "EndStatement" ]
     },
 
     "declSpecifiers": {
       "sequence": [ "singleDeclSpecifier", { "repeat": "singleDeclSpecifier" } ]
     },
     "singleDeclSpecifier": {
-      "alt": [ "StaticKeyword", "attrSpec" ]
+      "alt": [ "StaticKeyword", "attrSpec", "stdAttr" ]
     },
     "attrSpec": {
-      "sequence": [ "AttributeKeyword", "ParenOpen", "ParenOpen", { "optional": "Identifier" }, "ParenClose", "ParenClose" ]
+      "$comment": "FC4 c1: the argument grew the parenthesized-string form `visibility(\"hidden\")` — an Identifier optionally followed by `( string-literal )`. The inline sequences add NO wrapper nodes, so the bare `weak`/`static` tree shapes are byte-identical to pre-FC4. linkageFrom's composite-key lookup (`visibility:hidden`) pairs the identifier with the decoded string body.",
+      "sequence": [
+        "AttributeKeyword", "ParenOpen", "ParenOpen",
+        { "optional": { "sequence": [
+            "Identifier",
+            { "optional": { "sequence": [ "ParenOpen", "stringLiteralExpr", "ParenClose" ] } }
+        ] } },
+        "ParenClose", "ParenClose"
+      ]
+    },
+    "stdAttr": {
+      "$comment": "C23 [[...]] attribute specifier (D14: parsed, semantically IGNORED — linkageSpecifierIgnoredRules skips the whole subtree in the linkage scan). Namespaced `[[gnu::attr]]` and a parenthesized string argument are accepted; richer argument forms are residue.",
+      "sequence": [
+        "BracketOpen", "BracketOpen",
+        "stdAttrItem",
+        { "repeat": { "sequence": [ "Comma", "stdAttrItem" ] } },
+        "BracketClose", "BracketClose"
+      ]
+    },
+    "stdAttrItem": {
+      "sequence": [
+        "Identifier",
+        { "optional": { "sequence": [ "ColonColonOp", "Identifier" ] } },
+        { "optional": { "sequence": [ "ParenOpen", { "optional": "stringLiteralExpr" }, "ParenClose" ] } }
+      ]
     },
 
-    "topLevelDeclTail": {
-      "alt": [ "funcDefTail", "varDeclTail" ]
+    "headQualifier": { "alt": [ "ConstKeyword", "VolatileKeyword" ] },
+    "ptrQualifier":  { "alt": [ "ConstKeyword", "VolatileKeyword", "RestrictKeyword" ] },
+
+    "pointerLayer": {
+      "sequence": [ "StarOp", { "repeat": "ptrQualifier" } ]
     },
 
-    "funcDefTail": {
-      "sequence": [ "funcParams", "block" ]
+    "declarator": {
+      "$comment": "alt of (pointer-led, direct-led): NON-nullable (at least one star or a direct), so `int = 5;` / `int;` stay parse errors; the pointer-led branch's OPTIONAL direct admits the abstract star-only form (`int *` in param position). The branch sequences are INLINE so pointerLayer/directDeclarator land as DIRECT children — the shape the engine's declarators roles describe.",
+      "alt": [
+        { "sequence": [ "pointerLayer", { "repeat": "pointerLayer" }, { "optional": "directDeclarator" } ] },
+        "directDeclarator"
+      ]
     },
 
-    "funcParams": {
-      "sequence": [ "ParenOpen", { "optional": "paramList" }, "ParenClose" ]
+    "directDeclarator": {
+      "$comment": "Base alt is INLINE + SPECULATIVE: fnSuffix vs parenDeclarator genuinely collide on `(` (C 6.7.6.3p11) — fnSuffix probes FIRST (declared order) under its requireKnownType guard; rollback yields the parenthesized-declarator reading. Identifier rides the token-leaf route (no probe); arrayDeclSuffix at base is the abstract `int [3]` param form. lookahead 64 = the operand-alt precedent (1024-token probe budget): a probe must swallow a whole parenthesized param list / nested declarator.",
+      "sequence": [
+        { "alt": [ "Identifier", "fnSuffix", "parenDeclarator", "arrayDeclSuffix" ],
+          "speculative": true, "lookahead": 64 },
+        { "repeat": { "alt": [ "fnSuffix", "arrayDeclSuffix" ] } }
+      ]
+    },
+
+    "parenDeclarator": {
+      "sequence": [ "ParenOpen", "declarator", "ParenClose" ]
+    },
+
+    "fnSuffix": {
+      "$comment": "The commit guard fires ONLY when fnSuffix is probed speculatively (the directDeclarator BASE position); the post-base suffix position dispatches non-speculatively on `(` and never consults it. requireKnownType = C 6.7.6.3p11: a lone unknown identifier between the parens rolls back to the parenthesized-declarator reading AND records the ambiguous-type-name candidate for the CU oracle's seeded reparse.",
+      "sequence": [ "ParenOpen", { "optional": "paramList" }, "ParenClose" ],
+      "commitRequiresTypeName": { "rule": "paramList", "polarity": "requireKnownType" }
+    },
+
+    "initDeclarator": {
+      "sequence": [
+        "declarator",
+        { "optional": { "sequence": [ "AssignOp", "initValue" ] } }
+      ]
+    },
+
+    "initDeclaratorList": {
+      "sequence": [
+        "initDeclarator",
+        { "repeat": { "sequence": [ "Comma", "initDeclarator" ] } }
+      ]
+    },
+
+    "typeSpecifierForDecl": {
+      "$comment": "KEYWORD/composite-led type specifiers for declaration heads — deliberately NO Identifier arm (the typedef-name head is the ambiguous form, routed through identDeclHead/declOrExprStmt or the committed post-specifier/post-qualifier heads).",
+      "alt": [ "typeSpecifierSeq", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
+    },
+
+    "declHead": {
+      "$comment": "The COMMITTED any-form head: reached only after a leading storage-class specifier run (`register T x;`) — the statement is already known to be a declaration, so the Identifier (typedef-name) arm is unambiguous here.",
+      "sequence": [
+        { "repeat": "headQualifier" },
+        { "alt": [ "typeSpecifierForDecl", "Identifier" ] },
+        { "repeat": "headQualifier" }
+      ]
+    },
+
+    "kwDeclHead": {
+      "$comment": "The keyword-or-qualifier-led head (the non-speculative varDecl statement branch). Qualifier-led admits the Identifier (typedef) base — `const T x;` is committed by the `const` (no expression starts with a qualifier). Keyword-led is the plain `int x;` form. FIRSTs {Const,Volatile} vs type-keywords/struct/union/enum — disjoint.",
+      "alt": [
+        { "sequence": [
+            "headQualifier", { "repeat": "headQualifier" },
+            { "alt": [ "typeSpecifierForDecl", "Identifier" ] },
+            { "repeat": "headQualifier" }
+        ] },
+        { "sequence": [ "typeSpecifierForDecl", { "repeat": "headQualifier" } ] }
+      ]
+    },
+
+    "identDeclHead": {
+      "$comment": "The AMBIGUOUS bare-typedef-name head (`T x;` vs the expression `T(x)`/`a*b`): lone Identifier + trailing qualifiers only. Leading qualifiers/specifiers route to kwDeclHead/varDecl instead (any of them commits a declaration).",
+      "sequence": [ "Identifier", { "repeat": "headQualifier" } ]
     },
 
     "typedefDecl": {
-      "sequence": [ "TypedefKeyword", "typeRefAllowingStruct", "Identifier", "EndStatement" ]
+      "sequence": [ "TypedefKeyword", "typedefHeadFull", "declarator", "EndStatement" ]
+    },
+
+    "typedefHeadFull": {
+      "sequence": [ { "repeat": "headQualifier" }, "typedefHead", { "repeat": "headQualifier" } ]
+    },
+
+    "typedefHead": {
+      "$comment": "SPECULATIVE: the struct/union/enum BODY forms collide with the ref forms on their lead keyword — body forms probe FIRST (declared order); `typedef struct P MyP;` rolls back to structTypeRef when no `{` follows. lookahead 256 (4096-token budget): a body probe must swallow the whole member list.",
+      "alt": [
+        "typeSpecifierSeq",
+        "structSpecifierBody", "structTypeRef",
+        "unionSpecifierBody",  "unionTypeRef",
+        "enumSpecifierBody",   "enumTypeRef",
+        "Identifier"
+      ],
+      "speculative": true, "lookahead": 256
+    },
+
+    "structSpecifierBody": {
+      "$comment": "The typedef-position struct SPECIFIER (C 6.7.2.1): optional tag + member body. Tagged form also binds the tag (a Type symbol) in the enclosing scope; the anonymous form mints an anonymous composite (semantics row: anonymousNameAllowed).",
+      "sequence": [
+        "StructKeyword", { "optional": "Identifier" },
+        "BlockOpen", { "repeat": "structField" }, "BlockClose"
+      ]
+    },
+
+    "unionSpecifierBody": {
+      "sequence": [
+        "UnionKeyword", { "optional": "Identifier" },
+        "BlockOpen", { "repeat": "unionField" }, "BlockClose"
+      ]
+    },
+
+    "enumSpecifierBody": {
+      "sequence": [
+        "EnumKeyword", { "optional": "Identifier" },
+        "BlockOpen",
+        { "optional": {
+            "sequence": [
+              "enumerator",
+              { "repeat": { "sequence": [ "Comma", { "optional": "enumerator" } ] } }
+            ]
+        }},
+        "BlockClose"
+      ]
     },
 
     "includeDirective": {
@@ -422,16 +577,33 @@
       ]
     },
 
-    "varDeclHead": {
-      "sequence": [
-        "typeRefAllowingStruct",
-        "Identifier",
-        { "optional": "arrayDeclSuffix" },
-        { "optional": { "sequence": [ "AssignOp", "initValue" ] } }
+    "varDecl": {
+      "$comment": "The COMMITTED local declaration statement — its FIRST set has NO Identifier (the bare-typedef-name form lives in declOrExprStmt). Branch 1: storage-class-specifier-led (`register T x;` — the specifier commits the decl, so the head admits the typedef-name arm); branch 2: qualifier-or-keyword-led (`const T x;` / `int x;`). Inline branches keep the children flat: [localDeclSpecifiers?, head, initDeclaratorList, ;] — the row's specifierPrefix strip makes head=0/list=1 stable.",
+      "alt": [
+        { "sequence": [ "localDeclSpecifiers", "declHead", "initDeclaratorList", "EndStatement" ] },
+        { "sequence": [ "kwDeclHead", "initDeclaratorList", "EndStatement" ] }
       ]
     },
 
-    "varDecl": { "sequence": [ "varDeclHead", "EndStatement" ] },
+    "identVarDecl": {
+      "$comment": "The bare-typedef-name declaration statement (`T x, *p;`). The PreferType commit guard (bare-string form — the FC2 triage): sketch-known Type commits, known Value rolls back (`a * b;` stays a multiplication), unknown runs the follower-operator test (`T x;` commits — `x` continues no value reading; `a * b;` rolls back — `*` does) and records the cross-file-oracle candidate on rollback.",
+      "sequence": [ "identDeclHead", "initDeclaratorList", "EndStatement" ],
+      "commitRequiresTypeName": "identDeclHead"
+    },
+
+    "declOrExprStmt": {
+      "$comment": "The C statement ambiguity site: identVarDecl BEFORE exprStmt (declared probe order is authoritative — the FC4 c0 fix). lookahead 256 (= 4096-token probe budget, vs the operand alt's 64): the identVarDecl probe must swallow an entire declaration INCLUDING initializer expressions and brace-init lists before its frame closes.",
+      "alt": [ "identVarDecl", "exprStmt" ],
+      "speculative": true, "lookahead": 256
+    },
+
+    "localDeclSpecifiers": {
+      "sequence": [ "localDeclSpecifier", { "repeat": "localDeclSpecifier" } ]
+    },
+    "localDeclSpecifier": {
+      "$comment": "Local storage-class specifiers + attributes. NO static (C-valid but unsupported local-lifetime semantics — stays a parse error); register/auto parse and are semantically inert (C: hints/default storage).",
+      "alt": [ "RegisterKeyword", "AutoKeyword", "attrSpec", "stdAttr" ]
+    },
 
     "paramList": {
       "sequence": [
@@ -440,7 +612,18 @@
       ]
     },
 
-    "param": { "sequence": [ "typeRefAllowingStruct", "Identifier" ] },
+    "param": {
+      "$comment": "FC4 c1: head + OPTIONAL declarator (named `int v`, pointer `const char *s`, abstract `int` / `int *` / `int (*)(int)`). The head admits a lone Identifier — C23 semantics: a lone identifier in param position is ALWAYS a type name (K&R identifier-lists were removed), so `int f(T)` is an unnamed param of type T (S_UnknownType when T isn't one).",
+      "sequence": [ "declHeadForParam", { "optional": "declarator" } ]
+    },
+
+    "declHeadForParam": {
+      "sequence": [
+        { "repeat": "headQualifier" },
+        { "alt": [ "typeSpecifierSeq", "structTypeRef", "unionTypeRef", "enumTypeRef", "Identifier" ] },
+        { "repeat": "headQualifier" }
+      ]
+    },
 
     "paramOrEllipsis": {
       "alt": [
@@ -470,7 +653,7 @@
         "breakStmt",
         "continueStmt",
         "returnStmt",
-        "exprStmt"
+        "declOrExprStmt"
       ]
     },
 
@@ -502,10 +685,11 @@
     },
 
     "forStmt": {
+      "$comment": "FC4 c1: the init clause mirrors the statement-level decl split — committed keyword/qualifier/specifier-led forDecl (non-speculative) vs the identifier-led forInitAmbig probe. Both are semicolon-LESS (the for grammar owns the `;`).",
       "sequence": [
         "ForKeyword",
         "ParenOpen",
-        { "optional": { "alt": [ "varDeclHead", "expression" ] } },
+        { "optional": { "alt": [ "forDecl", "forInitAmbig" ] } },
         "EndStatement",
         { "optional": "expression" },
         "EndStatement",
@@ -513,6 +697,23 @@
         "ParenClose",
         "statement"
       ]
+    },
+
+    "forDecl": {
+      "alt": [
+        { "sequence": [ "localDeclSpecifiers", "declHead", "initDeclaratorList" ] },
+        { "sequence": [ "kwDeclHead", "initDeclaratorList" ] }
+      ]
+    },
+
+    "forIdentDecl": {
+      "sequence": [ "identDeclHead", "initDeclaratorList" ],
+      "commitRequiresTypeName": "identDeclHead"
+    },
+
+    "forInitAmbig": {
+      "alt": [ "forIdentDecl", "expression" ],
+      "speculative": true, "lookahead": 256
     },
 
     "returnStmt": {
@@ -681,32 +882,77 @@
       "strictAliasingOnDistinctTypes":      true,
       "charTypesAliasAll":                  true
     },
+    "$declaratorsComment": "FC4 c1 stage 2a: the C 6.7.6 declarator role vocabulary. The shared declarator walk (name extraction — binder sketch + analyzer) and the Pass 1.5 inversion engine consume ONLY these resolved roles. The pointer/fn/array/group structure lives in the DECLARATOR; heads carry the base type alone.",
+    "declarators": {
+      "declaratorRule":     "declarator",
+      "pointerLayerRule":   "pointerLayer",
+      "pointerToken":       "StarOp",
+      "directRule":         "directDeclarator",
+      "groupRule":          "parenDeclarator",
+      "nameToken":          "Identifier",
+      "fnSuffixRule":       "fnSuffix",
+      "fnSuffixParamsRule": "paramList",
+      "arraySuffixRule":    "arrayDeclSuffix",
+      "initDeclaratorRule": "initDeclarator",
+      "listRule":           "initDeclaratorList"
+    },
+    "$parametersComment": "C 6.7.6.3p10: a parameter list of exactly `(void)` declares ZERO parameters. The engine applies this at the ONE param-harvest chokepoint when the sole param resolves to lattice Void AND is unnamed; a NAMED void param or void-mixed-with-others is S_InvalidVoidParam. Languages without the flag keep raw param lists.",
+    "parameters": { "soleVoidMeansEmpty": true },
     "declarations": [
-      { "rule": "varDeclHead", "name": 1, "type": 0, "kind": "variable",
+      { "rule": "varDecl", "head": 0, "declaratorList": 1, "kind": "variable",
         "constMarker": "ConstKeyword", "warnIfUnused": true,
-        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 } },
-      { "rule": "param",       "name": 1, "type": 0, "kind": "variable",
-        "constMarker": "ConstKeyword" },
-      { "rule": "topLevelDecl", "name": 1, "type": 0, "kind": "variable",
+        "specifierPrefix": "localDeclSpecifiers",
+        "requireNamedDeclarators": true,
+        "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" } ] },
+      { "rule": "identVarDecl", "head": 0, "declaratorList": 1, "kind": "variable",
+        "constMarker": "ConstKeyword", "warnIfUnused": true,
+        "requireNamedDeclarators": true,
+        "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" } ] },
+      { "rule": "forDecl", "head": 0, "declaratorList": 1, "kind": "variable",
+        "constMarker": "ConstKeyword", "warnIfUnused": true,
+        "specifierPrefix": "localDeclSpecifiers",
+        "requireNamedDeclarators": true,
+        "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" } ] },
+      { "rule": "forIdentDecl", "head": 0, "declaratorList": 1, "kind": "variable",
+        "constMarker": "ConstKeyword", "warnIfUnused": true,
+        "requireNamedDeclarators": true,
+        "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" } ] },
+      { "rule": "param", "head": 0, "declarator": 1, "kind": "variable",
         "constMarker": "ConstKeyword",
-        "$linkageSpecifiersComment": "D-CSUBSET-LINKAGE-SPECIFIERS (pre-OPT7 P1): 'static' -> internal (Local) binding; '__attribute__((weak))' -> Weak. 'specifierPrefix' names the optional leading declSpecifiers rule the resolver strips before positional name/type/body resolution; 'linkageSpecifiers' maps each specifier token's SOURCE TEXT to its binding/visibility effect, stamped onto the HIR/MIR symbol so DCE preserves externally-visible symbols and elides a static-with-no-callers. Visibility (__attribute__((visibility(\"hidden\")))) is substrate-ready (facet + HIR + MIR all carry visibility) but the c-subset string-arg grammar form is deferred -- see plan 22 + the deferred-anchor registry.",
+        "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" } ] },
+      { "rule": "topLevelDecl", "head": 0, "declaratorList": 1, "kind": "variable",
+        "constMarker": "ConstKeyword",
+        "requireNamedDeclarators": true,
+        "$linkageSpecifiersComment": "D-CSUBSET-LINKAGE-SPECIFIERS: 'static' -> internal (Local) binding; '__attribute__((weak))' -> Weak; FC4 c1 adds the COMPOSITE key 'visibility:hidden' — linkageFrom forms '<identifier>:<decoded-string-body>' when a specifier identifier is immediately followed by a parenthesized string literal (__attribute__((visibility(\"hidden\")))). 'linkageSpecifierIgnoredRules' skips C23 [[...]] stdAttr subtrees wholesale (D14: parsed, ignored).",
         "specifierPrefix": "declSpecifiers",
         "linkageSpecifiers": {
           "static": { "binding": "local" },
-          "weak":   { "binding": "weak"  }
+          "weak":   { "binding": "weak"  },
+          "visibility:hidden": { "visibility": "hidden" }
         },
         "linkageSpecifierIgnoredKinds": ["AttributeKeyword", "ParenOpen", "ParenClose"],
-        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
+        "linkageSpecifierIgnoredRules": ["stdAttr"],
+        "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" } ],
         "kindByChild": {
+          "$comment": "Post-strip children: [topLevelHead, initDeclaratorList, topLevelDeclTail]. childPath [2,0] = the tail's sole child — a `block` node (function definition) or the EndStatement token (variable; whenRule never matches a token). paramsPath/bodyPath are ABSENT: in declarator mode the params live inside the declarator's fnSuffix and the matched block IS the body.",
           "childPath": [2, 0],
-          "whenRule": "funcDefTail",
-          "whenKind": "function",
-          "paramsPath": [0],
-          "bodyPath":   [1]
+          "whenRule": "block",
+          "whenKind": "function"
         },
         "$implicitReturnZeroForFunctionNamesComment": "C99 §5.1.2.2.3: when control reaches the closing '}' of main without an explicit return, the semantics are equivalent to 'return 0;'. The HIR lowering appends a synthetic ReturnStmt(IntLiteral(0)) to main's body if it doesn't structurally terminate. SOURCE-AGNOSTIC: this list lives on the per-language semantic config so each language declares its own entry-fn convention (Pascal's 'program', Rust's 'fn main', etc.) without touching shared HIR substrate. Closes D-LK10-ENTRY-MAIN-IMPLICIT-RETURN.",
         "implicitReturnZeroForFunctionNames": ["main"] },
-      { "rule": "typedefDecl", "name": 2, "type": 1, "kind": "type" },
+      { "rule": "typedefDecl", "head": 1, "declarator": 2, "kind": "type",
+        "requireNamedDeclarators": true },
+      { "rule": "structSpecifierBody", "name": 1, "kind": "type",
+        "anonymousNameAllowed": true,
+        "fieldChildren": { "rule": "structField", "compositeKind": "struct" } },
+      { "rule": "unionSpecifierBody", "name": 1, "kind": "type",
+        "anonymousNameAllowed": true,
+        "fieldChildren": { "rule": "unionField", "compositeKind": "union" } },
+      { "rule": "enumSpecifierBody", "name": 1, "kind": "type",
+        "anonymousNameAllowed": true,
+        "fieldChildren": { "rule": "enumerator", "compositeKind": "enum",
+                           "liftToEnclosingScope": true } },
       { "rule": "structDecl",  "name": 1, "kind": "type",
         "fieldChildren": { "rule": "structField", "compositeKind": "struct" } },
       { "rule": "structField", "name": 1, "type": 0, "kind": "variable" },
@@ -739,7 +985,9 @@
       { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,
         "dereferences": true,  "operatorToken": "ArrowOp" }
     ],
-    "scopes": [ "block", "funcDefTail", "structDecl", "unionDecl", "enumDecl" ],
+    "$scopesComment": "FC4 c1: topLevelDecl replaced funcDefTail — a function's params now live INSIDE its declarator's fnSuffix, so the scope that holds them must dominate BOTH the declarator and the block; the topLevelDecl node is that dominator (harmless for variable-kind topLevelDecls — nothing binds into the scope). The three *SpecifierBody rules are fieldChildren composites (typedef-position struct/union/enum bodies).",
+    "scopes": [ "block", "topLevelDecl", "structDecl", "unionDecl", "enumDecl",
+                "structSpecifierBody", "unionSpecifierBody", "enumSpecifierBody" ],
     "assignments": [
       { "rule": "binaryExpr", "operatorToken": "AssignOp",       "lhs": 0, "rhs": 2 },
       { "rule": "binaryExpr", "operatorToken": "PlusAssignOp",   "lhs": 0, "rhs": 2 },
@@ -859,7 +1107,10 @@
     "ruleMappings": [
       { "rule": "includeDirective", "hirKind": "Skip"    },
       { "rule": "topLevelDecl", "hirKind": "Decl"        },
-      { "rule": "varDeclHead",  "hirKind": "VarDecl"     },
+      { "rule": "varDecl",      "hirKind": "VarDecl"     },
+      { "rule": "identVarDecl", "hirKind": "VarDecl"     },
+      { "rule": "forDecl",      "hirKind": "VarDecl"     },
+      { "rule": "forIdentDecl", "hirKind": "VarDecl"     },
       { "rule": "param",        "hirKind": "VarDecl"     },
       { "rule": "typedefDecl",  "hirKind": "TypeDecl"    },
       { "rule": "structDecl",   "hirKind": "TypeDecl"    },

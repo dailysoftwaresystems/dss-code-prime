@@ -31,11 +31,11 @@ using dss::tests::prettyPrint;
 using dss::tests::pushNext;
 using dss::tests::tokenizeShipped;
 
-// Drives `int x = 5;` through the disambiguated topLevel shape:
-// typeRef → Identifier → topLevelTail → varDeclTail. The shape graph
-// resolves funcDecl-vs-varDecl on the post-Identifier token (ParenOpen vs
-// AssignOp/EndStatement); both branches share a single typeRef + Identifier
-// prefix so the loader's alt-FIRST ambiguity check stays happy.
+// Drives `int x = 5;` through the FC4 c1 specifier/declarator topLevel
+// shape: topLevelHead carries the base type; the name + init live in the
+// initDeclaratorList's initDeclarator (declarator → directDeclarator →
+// Identifier); the `;` is the topLevelDeclTail's EndStatement arm
+// (vs `{` = function definition — FIRST-disjoint).
 TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
     auto h = tokenizeShipped("c-subset", "int x = 5;");
     ASSERT_NE(h.schema, nullptr);
@@ -46,24 +46,30 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
         auto top  = b.open(h.schema->rules().find("topLevel"));
         auto tld  = b.open(h.schema->rules().find("topLevelDecl"));
         {
-            auto ty = b.open(h.schema->rules().find("typeRef"));
-            auto tb = b.open(h.schema->rules().find("typeBase"));
-            // FC3 c1: typeBase routes keywords through typeSpecifierSeq.
-            auto ts = b.open(h.schema->rules().find("typeSpecifierSeq"));
+            auto head = b.open(h.schema->rules().find("topLevelHead"));
+            auto ts   = b.open(h.schema->rules().find("typeSpecifierSeq"));
             b.pushToken(h.stream.advance());
         }
-        drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());
         {
-            auto tail   = b.open(h.schema->rules().find("topLevelDeclTail"));
-            auto vdTail = b.open(h.schema->rules().find("varDeclTail"));
+            auto list  = b.open(h.schema->rules().find("initDeclaratorList"));
+            auto idecl = b.open(h.schema->rules().find("initDeclarator"));
+            {
+                auto dtor   = b.open(h.schema->rules().find("declarator"));
+                auto direct = b.open(h.schema->rules().find("directDeclarator"));
+                drainWhitespace(b, h.stream);
+                b.pushToken(h.stream.advance());
+            }
             drainWhitespace(b, h.stream);
             pushNext(b, h.stream);
             {
+                auto iv   = b.open(h.schema->rules().find("initValue"));
                 auto expr = b.open(h.schema->rules().find("expression"));
                 auto opr  = b.open(h.schema->rules().find("operand"));
                 b.pushToken(h.stream.advance());
             }
+        }
+        {
+            auto tail = b.open(h.schema->rules().find("topLevelDeclTail"));
             b.pushToken(h.stream.advance());
         }
     }
@@ -76,18 +82,21 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
         "rule:root\n"
         "  rule:topLevel\n"
         "    rule:topLevelDecl\n"
-        "      rule:typeRef\n"
-        "        rule:typeBase\n"
-        "          rule:typeSpecifierSeq\n"
-        "            tok:\"int\"\n"
-        "      tok:\"x\"\n"
-        "      rule:topLevelDeclTail\n"
-        "        rule:varDeclTail\n"
+        "      rule:topLevelHead\n"
+        "        rule:typeSpecifierSeq\n"
+        "          tok:\"int\"\n"
+        "      rule:initDeclaratorList\n"
+        "        rule:initDeclarator\n"
+        "          rule:declarator\n"
+        "            rule:directDeclarator\n"
+        "              tok:\"x\"\n"
         "          tok:\"=\"\n"
-        "          rule:expression\n"
-        "            rule:operand\n"
-        "              tok:\"5\"\n"
-        "          tok:\";\"\n";
+        "          rule:initValue\n"
+        "            rule:expression\n"
+        "              rule:operand\n"
+        "                tok:\"5\"\n"
+        "      rule:topLevelDeclTail\n"
+        "        tok:\";\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
 }
 
@@ -106,31 +115,32 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
         auto top  = b.open(h.schema->rules().find("topLevel"));
         auto tld  = b.open(h.schema->rules().find("topLevelDecl"));
         {
-            auto ty = b.open(h.schema->rules().find("typeRef"));
-            auto tb = b.open(h.schema->rules().find("typeBase"));
-            // FC3 c1: typeBase routes keywords through typeSpecifierSeq.
-            auto ts = b.open(h.schema->rules().find("typeSpecifierSeq"));
+            auto head = b.open(h.schema->rules().find("topLevelHead"));
+            auto ts   = b.open(h.schema->rules().find("typeSpecifierSeq"));
             b.pushToken(h.stream.advance());
         }
-        drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());
+        // FC4 c1: the name + parameter list live in the DECLARATOR — the
+        // fn suffix is a direct-declarator child, the block is the tail.
         {
-            auto tail = b.open(h.schema->rules().find("topLevelDeclTail"));
-            auto fn   = b.open(h.schema->rules().find("funcDefTail"));
-            auto fp   = b.open(h.schema->rules().find("funcParams"));
+            auto list   = b.open(h.schema->rules().find("initDeclaratorList"));
+            auto idecl  = b.open(h.schema->rules().find("initDeclarator"));
+            auto dtor   = b.open(h.schema->rules().find("declarator"));
+            auto direct = b.open(h.schema->rules().find("directDeclarator"));
+            drainWhitespace(b, h.stream);
+            b.pushToken(h.stream.advance());
+            auto fs = b.open(h.schema->rules().find("fnSuffix"));
             b.pushToken(h.stream.advance());
             {
-                auto pl = b.open(h.schema->rules().find("paramList"));
-                auto p  = b.open(h.schema->rules().find("param"));
-                auto ty = b.open(h.schema->rules().find("typeRef"));
-                auto tb = b.open(h.schema->rules().find("typeBase"));
-                auto ts = b.open(h.schema->rules().find("typeSpecifierSeq"));
+                auto pl   = b.open(h.schema->rules().find("paramList"));
+                auto p    = b.open(h.schema->rules().find("param"));
+                auto head = b.open(h.schema->rules().find("declHeadForParam"));
+                auto ts   = b.open(h.schema->rules().find("typeSpecifierSeq"));
                 b.pushToken(h.stream.advance());
             }
             pushNext(b, h.stream);
-            // funcParams closes here (after the `)`); the block is a
-            // sibling of funcParams under funcDefTail.
-            fp.close();
+        }
+        {
+            auto tail = b.open(h.schema->rules().find("topLevelDeclTail"));
             {
                 auto blk = b.open(h.schema->rules().find("block"));
                 pushNext(b, h.stream);
@@ -182,44 +192,45 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
         "rule:root\n"
         "  rule:topLevel\n"
         "    rule:topLevelDecl\n"
-        "      rule:typeRef\n"
-        "        rule:typeBase\n"
-        "          rule:typeSpecifierSeq\n"
-        "            tok:\"int\"\n"
-        "      tok:\"main\"\n"
-        "      rule:topLevelDeclTail\n"
-        "        rule:funcDefTail\n"
-        "          rule:funcParams\n"
-        "            tok:\"(\"\n"
-        "            rule:paramList\n"
-        "              rule:param\n"
-        "                rule:typeRef\n"
-        "                  rule:typeBase\n"
-        "                    rule:typeSpecifierSeq\n"
-        "                      tok:\"void\"\n"
-        "            tok:\")\"\n"
-        "          rule:block\n"
-        "            tok:\"{\"\n"
-        "            rule:statement\n"
-        "              rule:ifStmt\n"
-        "                tok:\"if\"\n"
+        "      rule:topLevelHead\n"
+        "        rule:typeSpecifierSeq\n"
+        "          tok:\"int\"\n"
+        "      rule:initDeclaratorList\n"
+        "        rule:initDeclarator\n"
+        "          rule:declarator\n"
+        "            rule:directDeclarator\n"
+        "              tok:\"main\"\n"
+        "              rule:fnSuffix\n"
         "                tok:\"(\"\n"
-        "                rule:expression\n"
-        "                  rule:operand\n"
-        "                    tok:\"x\"\n"
+        "                rule:paramList\n"
+        "                  rule:param\n"
+        "                    rule:declHeadForParam\n"
+        "                      rule:typeSpecifierSeq\n"
+        "                        tok:\"void\"\n"
         "                tok:\")\"\n"
-        "                rule:statement\n"
-        "                  rule:block\n"
-        "                    tok:\"{\"\n"
-        "                    rule:statement\n"
-        "                      rule:returnStmt\n"
-        "                        tok:\"return\"\n"
-        "                        rule:expression\n"
-        "                          rule:operand\n"
-        "                            tok:\"x\"\n"
-        "                        tok:\";\"\n"
-        "                    tok:\"}\"\n"
-        "            tok:\"}\"\n";
+        "      rule:topLevelDeclTail\n"
+        "        rule:block\n"
+        "          tok:\"{\"\n"
+        "          rule:statement\n"
+        "            rule:ifStmt\n"
+        "              tok:\"if\"\n"
+        "              tok:\"(\"\n"
+        "              rule:expression\n"
+        "                rule:operand\n"
+        "                  tok:\"x\"\n"
+        "              tok:\")\"\n"
+        "              rule:statement\n"
+        "                rule:block\n"
+        "                  tok:\"{\"\n"
+        "                  rule:statement\n"
+        "                    rule:returnStmt\n"
+        "                      tok:\"return\"\n"
+        "                      rule:expression\n"
+        "                        rule:operand\n"
+        "                          tok:\"x\"\n"
+        "                      tok:\";\"\n"
+        "                  tok:\"}\"\n"
+        "          tok:\"}\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
 }
 

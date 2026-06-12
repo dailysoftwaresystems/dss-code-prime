@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/data_model.hpp"
+#include "core/types/parse_diagnostic.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 
@@ -166,6 +167,76 @@ struct DSS_EXPORT LinkageSpecifierEffect {
     std::optional<SymbolVisibility> visibility;
 };
 
+// FC4 c1 (M5): a config-driven fail-loud gate on a declaration form. When the
+// declaration's subtree contains a token of `token` kind, semantic analysis
+// emits the named diagnostic (an ERROR, positioned at the first such token).
+// This is the "volatile wall" vocabulary: a language whose grammar ADMITS a
+// marker it does not yet implement (C `volatile`) declares the marker here so
+// every use fails loud instead of silently compiling without the semantics.
+// Both the token AND the diagnostic code are per-language config — the loader
+// resolves `code` through the shared `diagnosticCodeName` table and rejects
+// unknown names, so a typo can never silently disarm the wall.
+struct DSS_EXPORT GatedMarker {
+    SchemaTokenId  token{};
+    std::string    tokenName;   // source spelling, for diagnostics
+    DiagnosticCode code = DiagnosticCode::None;
+    std::string    codeName;    // source spelling, for diagnostics
+};
+
+// ── FC4 c1: the `declarators` block (C 6.7.6 declarator grammar roles) ──
+//
+// Full C declarators invert: the DECLARATION's type-specifier head carries
+// only the base type; pointer stars, function suffixes `(params)`, array
+// suffixes `[n]`, and grouping parens live in a recursive DECLARATOR that
+// wraps the declared NAME. A language whose grammar produces that shape
+// declares here WHICH of its rules/tokens play each role; the engine's
+// shared declarator walk (`core/types/declarator_walk.hpp` — name
+// extraction, used by BOTH the parser's binder sketch and the semantic
+// analyzer) and the semantic declarator-inversion fold (Pass 1.5) consume
+// ONLY these resolved ids — never a hardcoded rule name.
+//
+// Grammar contract the roles describe (shapes, not names):
+//   declaratorRule     :=  pointerLayerRule* directRule
+//   pointerLayerRule   :=  pointerToken qualifier-tokens*
+//   directRule         :=  (nameToken | groupRule) suffix*
+//                          where suffix ∈ { fnSuffixRule, arraySuffixRule }
+//   groupRule          :=  '(' declaratorRule ')'
+//   fnSuffixRule       :=  '(' fnSuffixParamsRule? ')'
+//   arraySuffixRule    :=  '[' length? ']'
+//   initDeclaratorRule :=  declaratorRule ('=' init)?
+//   listRule           :=  initDeclaratorRule (',' initDeclaratorRule)*
+//
+// `fnSuffixParamsRule` is the OPTIONAL param-list rule inside a fn suffix
+// (for param-type harvesting); absent ⇒ fn suffixes always build zero-param
+// signatures. Every other role is required — the loader rejects a partial
+// block (a missing role would silently truncate the walk mid-declarator).
+struct DSS_EXPORT DeclaratorConfig {
+    RuleId        declaratorRule{};
+    RuleId        pointerLayerRule{};
+    SchemaTokenId pointerToken{};
+    RuleId        directRule{};
+    RuleId        groupRule{};
+    SchemaTokenId nameToken{};
+    RuleId        fnSuffixRule{};
+    std::optional<RuleId> fnSuffixParamsRule;
+    RuleId        arraySuffixRule{};
+    RuleId        initDeclaratorRule{};
+    RuleId        listRule{};
+    // Source spellings, retained for diagnostics (mirrors the
+    // rule+ruleName pairing convention of the other facets).
+    std::string   declaratorRuleName;
+    std::string   pointerLayerRuleName;
+    std::string   pointerTokenName;
+    std::string   directRuleName;
+    std::string   groupRuleName;
+    std::string   nameTokenName;
+    std::string   fnSuffixRuleName;
+    std::string   fnSuffixParamsRuleName;
+    std::string   arraySuffixRuleName;
+    std::string   initDeclaratorRuleName;
+    std::string   listRuleName;
+};
+
 struct DSS_EXPORT DeclarationRule {
     // The rule (resolved to RuleId) whose subtree introduces the decl.
     RuleId          rule{};
@@ -175,6 +246,20 @@ struct DSS_EXPORT DeclarationRule {
     std::optional<std::uint32_t> nameChild;
     std::optional<std::uint32_t> typeChild;
     std::optional<std::uint32_t> initChild;
+    // FC4 c1: DECLARATOR-mode child roles (C 6.7.6). A row sets EITHER the
+    // legacy positional `nameChild`/`typeChild` pair above OR this trio —
+    // the loader rejects mixing them (C_ConflictingField). In declarator
+    // mode the row's type information splits: `headChild` is the
+    // type-specifier HEAD (base type only — NO pointer stars; those live in
+    // the declarator), and exactly one of `declaratorListChild` (an
+    // initDeclarator LIST — `int *p, q;` mints one symbol PER declarator)
+    // or `declaratorChild` (a SINGLE declarator — param-like rows) names
+    // where the declarator(s) sit. All three require the language to
+    // declare the `declarators` block (the role vocabulary the walk/fold
+    // consume); the loader rejects declarator-mode rows without it.
+    std::optional<std::uint32_t> headChild;
+    std::optional<std::uint32_t> declaratorListChild;
+    std::optional<std::uint32_t> declaratorChild;
     // Function-decl child roles (SE6). `paramsChild` points at the visible
     // child whose subtree holds the parameter declarations; `bodyChild` at
     // the body subtree (which is also a `scopes` rule so params bind into
@@ -232,8 +317,35 @@ struct DSS_EXPORT DeclarationRule {
     // loader-side from token-kind names (unknown name → fail-loud). Empty for a
     // declaration form that derives no linkage from specifiers.
     std::vector<SchemaTokenId> linkageSpecifierIgnoredKinds;
+    // FC4 c1 (D14): RULES whose entire SUBTREES the linkage prefix scan skips
+    // wholesale — attribute forms a language parses but semantically IGNORES
+    // (C23 `[[deprecated]]`: its identifiers must neither resolve as linkage
+    // specifiers nor fire H_UnknownLinkageSpecifier). Loader-resolved rule
+    // names (unknown → fail-loud); empty ⇒ nothing skipped (the strict
+    // default — an unanticipated subtree's tokens are still validated).
+    std::vector<RuleId>        linkageSpecifierIgnoredRules;
     DeclarationKind kind        = DeclarationKind::Variable;
     NameMatchMode   nameMatch   = NameMatchMode::Self;
+    // FC4 c1 stage 2a: when true, every declarator under this (declarator-
+    // mode) row must carry a NAME — an abstract declarator (`int *;`,
+    // `int (int);`) emits S_DeclarationDeclaresNothing positioned at the
+    // declarator. C's named declaration positions (locals, globals,
+    // typedefs) declare true; parameter-like positions (abstract
+    // declarators legal) leave it false. Default false = the permissive
+    // direction ONLY because abstract declarators mint nothing — there is
+    // no silent-wrong-binding risk, just a silently-useless declaration,
+    // which named-position rows opt into rejecting.
+    bool            requireNamedDeclarators = false;
+    // FC4 c1 stage 2a: when true, a row whose name child is structurally
+    // absent or not an identifier leaf (C's ANONYMOUS composite forms —
+    // `typedef struct { ... } T;`) still mints a TYPE symbol under a
+    // synthesized unique name ("<anon:rule:node>") with the declaration
+    // node itself as the symbol's node anchor. The composite/fieldChildren
+    // machinery then composes its lattice type exactly like a named one,
+    // and type-position resolution returns the minted type via the node
+    // anchor. Default false: a garbled name child mints nothing (the
+    // legacy degrade).
+    bool            anonymousNameAllowed = false;
     // D8 unused-variable warning: when true, a symbol minted by this
     // declaration that is NEVER referenced (empty use-set after analysis)
     // emits S_UnusedVariable (a WARNING). Per-declaration opt-in so a
@@ -288,8 +400,22 @@ struct DSS_EXPORT DeclarationRule {
     // `kind` must be `Type` and the rule must also appear in `scopes`. Generic
     // across record-bearing languages.
     std::optional<FieldChildrenDescriptor> fieldChildren;
+    // FC4 c1 (M5): config-driven fail-loud marker gates. At semantic
+    // analysis of this declaration (declarator-mode AND legacy rows alike),
+    // each entry whose token appears in the decl subtree emits its declared
+    // diagnostic as an ERROR, positioned at the first such token. See
+    // `GatedMarker` above. Empty ⇒ no gates for this declaration form.
+    std::vector<GatedMarker> gatedMarkers;
     // Source-text name of the declared rule, retained for diagnostics.
     std::string     ruleName;
+
+    // FC4 c1: true when this row declares the declarator-mode child roles
+    // (any of head/declaratorList/declarator set — the loader guarantees a
+    // consistent trio). The mode discriminator every consumer branches on.
+    [[nodiscard]] bool isDeclaratorMode() const noexcept {
+        return headChild.has_value() || declaratorListChild.has_value()
+            || declaratorChild.has_value();
+    }
 };
 
 // SE4: an assignment expression. When Pass 2 sees a node with this rule,
@@ -689,10 +815,30 @@ struct DSS_EXPORT LiteralTypeMapping {
     std::optional<std::int64_t> fixedValue;
 };
 
+// ── FC4 c1: parameter-list conventions (`semantics.parameters`) ──
+//
+// C 6.7.6.3p10: a parameter list of exactly `(void)` declares a function
+// taking NO parameters. When `soleVoidMeansEmpty` is true, the engine's
+// param-harvest chokepoint drops a SOLE, UNNAMED parameter whose resolved
+// type is lattice `Void`; a NAMED void parameter, or void mixed with other
+// parameters, is ill-formed and emits S_InvalidVoidParam (an ERROR,
+// positioned at the param). Default false ⇒ raw param lists (toy / tsql —
+// pinned; a void-typed param would then surface through the normal
+// invalid-type checks downstream).
+struct DSS_EXPORT ParametersConfig {
+    bool soleVoidMeansEmpty = false;
+};
+
 // The full `semantics` block. Every facet is optional; absent ⇒ that
 // facet is just not analyzed.
 struct DSS_EXPORT SemanticConfig {
     std::vector<DeclarationRule>    declarations;
+    // FC4 c1: the declarator role vocabulary (C 6.7.6) — see
+    // DeclaratorConfig above. nullopt ⇒ the language has no recursive
+    // declarators; every declarator-mode DeclarationRule row requires it
+    // (loader-enforced), so consumers may dereference when a row's
+    // `isDeclaratorMode()` is true.
+    std::optional<DeclaratorConfig> declarators;
     std::vector<ReferenceRule>      references;
     // D5.1: member-access expression rules (`obj.field` and `ptr->field`). Pass 2
     // resolves each to its field's SymbolId + type. Empty ⇒ the language has no
@@ -719,6 +865,9 @@ struct DSS_EXPORT SemanticConfig {
     // nullopt ⇒ the legacy `TypeInterner::commonType` behavior at every
     // HIR combine site (toy / tsql — pinned). See ArithmeticConversions.
     std::optional<ArithmeticConversions>  arithmeticConversions;
+    // FC4 c1: parameter-list conventions (C's `(void)` = zero params).
+    // Default-constructed (all false) for languages without the block.
+    ParametersConfig                parameters;
     std::vector<AssignmentRule>     assignments;       // SE4 const-correctness
     std::vector<CallRule>           callRules;         // SE6 call checking
     std::vector<CastRule>           castRules;         // FC2 explicit casts

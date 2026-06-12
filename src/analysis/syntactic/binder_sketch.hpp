@@ -81,6 +81,16 @@ public:
         bool          isType    = false; // DeclarationKind::Type (static kind)
         NameMatchMode nameMatch = NameMatchMode::Self;
         RuleId        specifierPrefixRule{};   // invalid ⇒ no prefix to strip
+        // FC4 c1: declarator-mode rows have no positional nameChild — the
+        // name(s) live inside recursive declarators. `carrierChild` is the
+        // visible-child index (post specifier-strip) of the row's
+        // declarator-list / single-declarator subtree; the parser runs the
+        // SHARED declarator walk (core/types/declarator_walk.hpp) below it
+        // at frame close and records EVERY extracted name (an
+        // initDeclarator LIST binds multiple — `typedef int A, *B;` binds
+        // both A and B as types).
+        bool          declaratorMode = false;
+        std::uint32_t carrierChild   = 0;
     };
 
     explicit BinderSketch(GrammarSchema const& schema);

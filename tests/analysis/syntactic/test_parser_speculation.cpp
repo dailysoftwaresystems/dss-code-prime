@@ -285,11 +285,12 @@ TEST(ParserSpeculation, CommitsCaseBOnLaterBranchInput) {
 
 TEST(ParserSpeculation, BacktrackFailedAndRecoveryOnBogusInput) {
     // `A X ;` — X is illegal. The tokenizer emits an Error token.
-    // Speculation probes through some tokens, the cursor desyncs,
-    // rollback fires, parser falls through to non-speculative
-    // dispatch which either descends caseA/caseB or emits
-    // P_NoAlternativeMatched + recovers. Either way: parser must
-    // terminate AND emit at least one P_BacktrackFailed signal.
+    // Speculation probes every branch; all fail and roll back. FC4 c1:
+    // the parser then REPLAYS the declared-LAST candidate (caseB)
+    // non-speculatively so the branch's own precise diagnostics land
+    // (pre-replay this surfaced only an opaque P_BacktrackFailed). The
+    // pinned contract: the parser terminates AND a loud error from the
+    // replayed branch surfaces.
     auto h = loadAndTokenize("A X ;");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
@@ -298,9 +299,10 @@ TEST(ParserSpeculation, BacktrackFailedAndRecoveryOnBogusInput) {
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_TRUE(t.diagnostics().hasErrors())
         << "bogus speculative input must surface an error";
-    EXPECT_GE(countCode(t.diagnostics().all(),
-                        DiagnosticCode::P_BacktrackFailed), 1u)
-        << "P_BacktrackFailed must fire when every speculative branch fails";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u)
+        << "the fallback replay owns the diagnostics — no opaque "
+           "P_BacktrackFailed at the outermost level";
 }
 
 TEST(ParserSpeculation, MaxDepthCapEmitsAndStopsRecursion) {
@@ -328,20 +330,21 @@ TEST(ParserSpeculation, MaxDepthCapEmitsAndStopsRecursion) {
 TEST(ParserSpeculation, NoCommittableBranchTerminatesCleanly) {
     // Forward-progress guarantee under adversarial speculative
     // input: every branch's FIRST matches `A` but the input gives
-    // neither caseA's body (B) nor caseB's body (C). Without the
-    // P_BacktrackFailed + consume forward-progress hatch, this is
-    // the canonical stall that the watchdog protects against. The
-    // test asserts termination (no hang) + the recovery signals.
+    // neither caseA's body (B) nor caseB's body (C). FC4 c1: the
+    // all-fail outcome replays the declared-LAST candidate (caseB)
+    // non-speculatively — its own dispatch then emits the precise
+    // missing-child/premature-EOF diagnostics and the normal recovery
+    // machinery guarantees forward progress. The test asserts
+    // termination (no hang) + a loud error.
     auto h = loadAndTokenize("A");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_TRUE(t.diagnostics().hasErrors());
-    EXPECT_GE(countCode(t.diagnostics().all(),
-                        DiagnosticCode::P_BacktrackFailed), 1u)
-        << "every-branch-fails input must emit P_BacktrackFailed";
+    EXPECT_TRUE(t.diagnostics().hasErrors())
+        << "every-branch-fails input must surface a loud error from the "
+           "replayed fallback branch";
 }
 
 TEST(ParserSpeculation, EmptyInputSkipsSpeculativeRepeat) {

@@ -7,6 +7,7 @@
 #include "analysis/semantic/type_rules.hpp"
 #include "core/types/data_model.hpp"
 #include "core/types/decl_prefix_strip.hpp"   // declRoleChildren / descendVisibleDecl / specifierPrefixChild
+#include "core/types/declarator_walk.hpp"     // FC4: declaratorNameNode / collectDeclarators
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/integer_literal_ladder.hpp"
@@ -223,9 +224,19 @@ descendVisible(Tree const& tree, NodeId start,
 // Forward declarations (these helpers are referenced by the passes
 // before their definitions appear). `CallRule` comes from
 // semantic_config.hpp (dss namespace).
+//
+// FC4 c1: `collectParamTypes` collects (param NODE, resolved type) pairs —
+// the node lets the `(void)` normalization decide named-vs-unnamed and
+// position its diagnostic. `emitOnMiss=false` suppresses re-diagnosis when
+// a harvest re-resolves types a param row's own visit already reported.
 void collectParamTypes(EngineState& s, SemanticConfig const& cfg,
                        Tree const& tree, NodeId cur, ScopeId scope,
-                       std::vector<TypeId>& out);
+                       std::vector<std::pair<NodeId, TypeId>>& out,
+                       bool emitOnMiss = true);
+void normalizeSoleVoidParams(EngineState& s, SemanticConfig const& cfg,
+                             Tree const& tree,
+                             std::vector<std::pair<NodeId, TypeId>>& params,
+                             bool emitOnMiss);
 void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                NodeId node, ScopeId scope, CallRule const& call);
 void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
@@ -524,6 +535,40 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             }
             return InvalidType;
         }
+        // FC4 c1: an inline TYPE-DECLARATION in type position — C's
+        // `typedef struct {...} T;` / `typedef struct P {...} MyP;`,
+        // where the head subtree IS a composite-minting declaration
+        // (a `declarations` row of kind Type). Resolve to the type the
+        // declaration's own (post-order-earlier) Pass 1.5 visit minted
+        // for its symbol — named rows anchor the symbol on the name
+        // node; anonymous rows (anonymousNameAllowed) on the decl node
+        // itself. WITHOUT this arm the generic child-descent below
+        // would recurse into the struct BODY and silently resolve the
+        // FIRST FIELD's type as the head type. An unresolved minted
+        // type returns InvalidType and the outer miss arm reports.
+        {
+            auto declIt = s.idx().declByRule.find(rule.v);
+            if (declIt != s.idx().declByRule.end()
+                && cfg.declarations[declIt->second].kind
+                       == DeclarationKind::Type) {
+                auto const& drow = cfg.declarations[declIt->second];
+                SymbolId sym{};
+                auto dkids = declRoleChildren(tree, node, drow);
+                if (drow.nameChild.has_value()
+                    && *drow.nameChild < dkids.size()) {
+                    auto rn = extractNameNode(
+                        tree, dkids[*drow.nameChild], drow.nameMatch,
+                        cfg.identifierToken, cfg.bracketIdentifierToken);
+                    if (rn.node.valid()) sym = s.symbolAtOr(rn.node);
+                }
+                if (!sym.valid()) sym = s.symbolAtOr(node);
+                if (sym.valid()) {
+                    auto const& rec = s.symbols.at(sym);
+                    if (rec.type.valid()) return rec.type;
+                }
+                return InvalidType;
+            }
+        }
         // FC3 c1: type-specifier keyword run (C 6.7.2 — `unsigned long
         // long int` in any order). An Internal node whose visible
         // children are ALL tokens of the language's declared specifier
@@ -687,7 +732,7 @@ resolveConstSymbolInit(EngineState const& s, Tree const& tree,
     auto declIt = s.idx().declByRule.find(tree.rule(rec.declRuleNode).v);
     if (declIt == s.idx().declByRule.end()) return std::nullopt;
     auto initExpr = findInitExprInDecl(tree, cfg.declarations[declIt->second],
-                                       rec.declRuleNode);
+                                       rec.declRuleNode, rec.declNode);
     if (!initExpr.has_value()) return std::nullopt;
     // D7: return the SYMBOL's defining scope so the engine evaluates
     // its init expression in the scope where the symbol was declared
@@ -777,6 +822,274 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     return s.lattice.interner().array(base, *len);
 }
 
+// ── FC4 c1: the declarator-inversion engine (M3) ────────────────────────────
+//
+// A declarator-mode DeclarationRule splits a declaration's type across the
+// type-specifier HEAD (base type only) and a recursive DECLARATOR wrapping
+// the name (C 6.7.6). The verified inversion, for one declarator `d` over
+// the head type `T`:
+//
+//   declared(d, T):
+//     T1 = Ptr^k(T)          — one Ptr per pointerLayer child of `d`;
+//     T2 = fold the direct's suffixes RIGHT-to-LEFT over T1 — the FIRST
+//          suffix in source order is the OUTERMOST type constructor:
+//            `x[2][3]`   → Array2<Array3<T>>   (s2 applied first, s1 wraps)
+//            `*fp(int)`  → FnSig([int] → Ptr<T>)  (stars bind first, the
+//                          suffix wraps the star-applied type)
+//     then bind: a nameToken direct binds the name : T2; a group direct
+//     RECURSES into the parenthesized declarator with T2 as its base —
+//            `(*fp)(int)` → the fn suffix builds FnSig BEFORE the descent,
+//                          the inner star then yields Ptr<FnSig> at `fp`.
+//     An ABSTRACT direct (no name, no group) — or a star-only declarator
+//     with no direct — declares T2/T1 itself (a parameter type).
+//
+// Suffix meanings (config-resolved roles, never rule names):
+//   fnSuffixRule    → FnSig(paramTypes, T) — params harvested from the
+//                     suffix's `fnSuffixParamsRule` child: each child that
+//                     IS a declaration-rule node yields its computed type
+//                     via the SAME machinery (recursive; abstract params
+//                     have no name but their type still computes; order =
+//                     source order, deterministic).
+//   arraySuffixRule → Array<T, n> via the existing array semantics — the
+//                     length is the suffix's first visible Internal child
+//                     folded by the shared CST const-eval; a missing /
+//                     non-constant length is S_NonConstantArrayLength and
+//                     a non-positive one S_ArrayLengthOutOfRange, exactly
+//                     like the legacy ArraySuffix facet (never a silent
+//                     decay).
+//
+// `emitOnMiss` keeps diagnostics exactly-once: a declaration row's OWN
+// Pass 1.5 visit folds with emission ON (named AND abstract declarators —
+// the definitive diagnostic site); the fn-suffix param HARVEST re-computes
+// types with emission OFF (the param rows already diagnosed themselves,
+// post-order runs them first).
+
+[[nodiscard]] TypeId
+declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
+                       Tree const& tree, NodeId node, TypeId base,
+                       ScopeId scope, bool emitOnMiss);
+
+// The declared type of ONE declaration-row node — the fn-suffix param
+// harvest's per-param resolution. Legacy rows resolve their `typeChild`
+// (+ legacy array suffix, mirroring `collectParamTypes`); declarator-mode
+// rows resolve the head then fold the single `declaratorChild` (absent in
+// the tree ⇒ a type-only param — the head itself). A list-mode row has no
+// single type and yields InvalidType (a config-shape mismatch the FnSig
+// then surfaces as an unresolved param type — never a guessed one).
+[[nodiscard]] TypeId
+declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                    NodeId declNode, ScopeId scope, bool emitOnMiss) {
+    auto declIt = s.idx().declByRule.find(tree.rule(declNode).v);
+    if (declIt == s.idx().declByRule.end()) return InvalidType;
+    auto const& decl = cfg.declarations[declIt->second];
+    auto kids = declRoleChildren(tree, declNode, decl);
+    if (decl.isDeclaratorMode()) {
+        if (!cfg.declarators.has_value()) return InvalidType;  // loader invariant
+        TypeId head = InvalidType;
+        if (decl.headChild.has_value() && *decl.headChild < kids.size()) {
+            head = resolveTypeNode(s, cfg, tree, kids[*decl.headChild], scope,
+                                   emitOnMiss);
+        }
+        if (decl.declaratorChild.has_value()) {
+            if (*decl.declaratorChild < kids.size()) {
+                return declaratorDeclaredType(
+                    s, cfg, tree, kids[*decl.declaratorChild], head, scope,
+                    emitOnMiss);
+            }
+            return head;   // declarator structurally absent — type-only param
+        }
+        return InvalidType;   // a LIST row has no single param type
+    }
+    if (decl.typeChild.has_value() && *decl.typeChild < kids.size()) {
+        TypeId pty = resolveTypeNode(s, cfg, tree, kids[*decl.typeChild], scope,
+                                     emitOnMiss);
+        pty = applyArraySuffix(s, tree, decl, declNode, pty, scope, &cfg);
+        return pty;
+    }
+    return InvalidType;
+}
+
+// Apply ONE declarator suffix (fn / array per the config roles) to the
+// type accumulated so far. See the inversion comment above for ordering.
+[[nodiscard]] TypeId
+applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
+                      Tree const& tree, NodeId suffix, TypeId inner,
+                      ScopeId scope, bool emitOnMiss) {
+    DeclaratorConfig const& dc = *cfg.declarators;
+    RuleId const r = tree.rule(suffix);
+    if (r == dc.fnSuffixRule) {
+        // The param harvest is the SHARED `collectParamTypes` walker (one
+        // chokepoint with the legacy function-decl path): it descends
+        // wrapper rules (c-subset's `paramOrEllipsis` alt wrapper),
+        // resolves each declaration-rule node via `declRowDeclaredType`
+        // (declarator-mode aware), and stops at each param (a nested
+        // fn-ptr param's inner params never leak into THIS signature).
+        // emitOnMiss threads through so a harvest re-resolution never
+        // re-reports what the param row's own visit already diagnosed.
+        std::vector<std::pair<NodeId, TypeId>> params;
+        if (dc.fnSuffixParamsRule.has_value()) {
+            NodeId paramsList{};
+            for (NodeId c : visibleChildren(tree, suffix)) {
+                if (tree.kind(c) == NodeKind::Internal
+                    && tree.rule(c) == *dc.fnSuffixParamsRule) {
+                    paramsList = c;
+                    break;
+                }
+            }
+            if (paramsList.valid()) {
+                collectParamTypes(s, cfg, tree, paramsList, scope, params,
+                                  emitOnMiss);
+            }
+        }
+        // C 6.7.6.3p10 `(void)` normalization — the same call the legacy
+        // function-decl FnSig build applies (ONE convention, two paths).
+        normalizeSoleVoidParams(s, cfg, tree, params, emitOnMiss);
+        std::vector<TypeId> paramTypes;
+        paramTypes.reserve(params.size());
+        for (auto const& [pNode, pTy] : params) paramTypes.push_back(pTy);
+        // CcSysV is the canonical MIR-tier placeholder — the SAME cc source
+        // every interner `fnSig()` call site uses pre-ML7 (the function-decl
+        // path above, builtins, moduleInit); ML7's calling-convention pass
+        // applies the target's real convention at materialize time.
+        return s.lattice.interner().fnSig(paramTypes, inner, CallConv::CcSysV);
+    }
+    if (r == dc.arraySuffixRule) {
+        auto const emit = [&](DiagnosticCode code) {
+            if (!emitOnMiss) return;
+            ParseDiagnostic d;
+            d.code     = code;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(suffix);
+            d.actual   = std::string{tree.text(suffix)};
+            s.reporter.report(std::move(d));
+        };
+        // The length is whichever of the suffix's visible children
+        // CONSTANT-FOLDS (`[ n ]` — a bare literal TOKEN or an expression
+        // rule; the bracket tokens fold to nothing, so the first foldable
+        // child IS the length — no per-language child index needed). Same
+        // validation as the legacy ArraySuffix facet: missing /
+        // non-constant fails loud, non-positive is out of range — never a
+        // silent pointer decay.
+        std::optional<std::int64_t> len;
+        for (NodeId c : visibleChildren(tree, suffix)) {
+            len = constIntExpr(s, tree, c, scope, &cfg);
+            if (len.has_value()) break;
+        }
+        if (!len.has_value()) {
+            emit(DiagnosticCode::S_NonConstantArrayLength);
+            return InvalidType;
+        }
+        if (*len <= 0) {
+            emit(DiagnosticCode::S_ArrayLengthOutOfRange);
+            return InvalidType;
+        }
+        return s.lattice.interner().array(inner, *len);
+    }
+    return InvalidType;   // caller filters to the two suffix roles
+}
+
+TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
+                              Tree const& tree, NodeId node, TypeId base,
+                              ScopeId scope, bool emitOnMiss) {
+    if (!cfg.declarators.has_value()) return InvalidType;
+    DeclaratorConfig const& dc = *cfg.declarators;
+    if (!node.valid() || !base.valid()) return InvalidType;
+    if (tree.kind(node) != NodeKind::Internal) return InvalidType;
+    RuleId const r = tree.rule(node);
+    if (r == dc.initDeclaratorRule) {
+        NodeId const inner = declarator_walk_detail::firstChildOfRule(
+            TreeDeclaratorView{tree}, node, dc.declaratorRule);
+        if (!inner.valid()) return InvalidType;
+        return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
+                                      emitOnMiss);
+    }
+    if (r != dc.declaratorRule) return InvalidType;
+
+    // Pointer layers bind FIRST (innermost): T1 = Ptr^k(base).
+    TypeId t = base;
+    NodeId direct{};
+    for (NodeId c : visibleChildren(tree, node)) {
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        RuleId const cr = tree.rule(c);
+        if (cr == dc.pointerLayerRule) {
+            t = s.lattice.interner().pointer(t);
+            continue;
+        }
+        if (cr == dc.directRule && !direct.valid()) direct = c;
+    }
+    if (!direct.valid()) return t;   // star-only abstract declarator
+
+    // The direct's base (name token or group) + suffixes, one scan.
+    NodeId nameTok{};
+    NodeId group{};
+    std::vector<NodeId> suffixes;
+    for (NodeId c : visibleChildren(tree, direct)) {
+        if (tree.kind(c) == NodeKind::Token) {
+            if (tree.tokenKind(c) == dc.nameToken && !nameTok.valid()) {
+                nameTok = c;
+            }
+            continue;
+        }
+        RuleId const cr = tree.rule(c);
+        if (cr == dc.fnSuffixRule || cr == dc.arraySuffixRule) {
+            suffixes.push_back(c);
+            continue;
+        }
+        if (cr == dc.groupRule && !group.valid()) group = c;
+    }
+
+    // Suffixes fold RIGHT-to-LEFT (source-first suffix = outermost type).
+    for (std::size_t i = suffixes.size(); i-- > 0;) {
+        t = applyDeclaratorSuffix(s, cfg, tree, suffixes[i], t, scope,
+                                  emitOnMiss);
+        if (!t.valid()) return InvalidType;
+    }
+
+    if (nameTok.valid()) return t;   // bound at the name
+    if (group.valid()) {
+        NodeId const inner = declarator_walk_detail::firstChildOfRule(
+            TreeDeclaratorView{tree}, group, dc.declaratorRule);
+        if (!inner.valid()) return InvalidType;   // malformed group
+        return declaratorDeclaredType(s, cfg, tree, inner, t, scope,
+                                      emitOnMiss);
+    }
+    return t;   // abstract direct — the type itself
+}
+
+// FC4 c1 (M5): first token of `kind` in `node`'s subtree in SOURCE order —
+// the positioned gate site. Same nested-decl-rule descent stop as
+// `subtreeContainsToken` (each nested decl row runs its own gate scan, so
+// stopping prevents a double-fire on the same token).
+[[nodiscard]] NodeId
+findTokenInSubtree(Tree const& tree, NodeId node, SchemaTokenId kind,
+                   std::unordered_map<std::uint32_t, std::size_t> const*
+                       declByRule) {
+    if (!node.valid() || !kind.valid()) return {};
+    std::vector<NodeId> stack{node};
+    bool firstPop = true;
+    while (!stack.empty()) {
+        NodeId cur = stack.back();
+        stack.pop_back();
+        if (tree.kind(cur) == NodeKind::Token && tree.tokenKind(cur) == kind) {
+            return cur;
+        }
+        if (!firstPop && declByRule != nullptr
+            && tree.kind(cur) == NodeKind::Internal
+            && declByRule->contains(tree.rule(cur).v)) {
+            continue;
+        }
+        firstPop = false;
+        auto const cs = tree.children(cur);
+        // Reverse-push so pop order is left-to-right (source order — the
+        // FIRST occurrence positions the diagnostic).
+        for (auto it = cs.rbegin(); it != cs.rend(); ++it) {
+            if (!isEmptySpace(tree.flags(*it))) stack.push_back(*it);
+        }
+    }
+    return {};
+}
+
 // ── Pass 1: pre-order — mint decls + push/pop scopes + const marking ───────
 void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
            NodeId node, ScopeId current) {
@@ -798,6 +1111,25 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             auto const& decl = cfg.declarations[declIt->second];
             auto kids = declRoleChildren(tree, node, decl);
 
+            // FC4 c1 (M5): config-driven fail-loud marker gates — each
+            // declared (token → diagnostic) pair fires when the token
+            // appears in THIS declaration's subtree, positioned at its
+            // first occurrence. Runs for declarator-mode AND legacy rows
+            // alike; the scan stops at nested decl rows (they run their
+            // own gates), so one use site fires exactly once.
+            for (auto const& gate : decl.gatedMarkers) {
+                NodeId const hit = findTokenInSubtree(
+                    tree, node, gate.token, &s.idx().declByRule);
+                if (!hit.valid()) continue;
+                ParseDiagnostic d;
+                d.code     = gate.code;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(hit);
+                d.actual   = std::string{tree.text(hit)};
+                s.reporter.report(std::move(d));
+            }
+
             // Evaluate the kindByChild discriminator (if any) BEFORE
             // minting the symbol so its `kind` reflects the structural
             // choice in the tree (e.g. c-subset's topLevelDecl with a
@@ -813,11 +1145,110 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 }
             }
 
-            if (decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
+            // FC4 c1 (M3): declarator-mode rows mint ONE symbol PER named
+            // declarator below the list/single carrier child — `int *p, q;`
+            // mints p and q (the SHARED walk extracts each name; abstract
+            // declarators mint nothing, a legal outcome). Each symbol binds
+            // into the ENCLOSING scope exactly like the legacy path; the
+            // const marker has no typeChild home in this mode (it lives in
+            // the head / pointer layers), so the scan covers the whole decl
+            // subtree — the legacy no-typeChild fallback scope.
+            if (decl.isDeclaratorMode() && cfg.declarators.has_value()) {
+                auto const carrierIdx = decl.declaratorListChild.has_value()
+                                            ? decl.declaratorListChild
+                                            : decl.declaratorChild;
+                if (carrierIdx.has_value() && *carrierIdx < kids.size()) {
+                    std::vector<NodeId> declarators;
+                    collectDeclarators(tree, kids[*carrierIdx],
+                                       *cfg.declarators, declarators);
+                    for (NodeId dNode : declarators) {
+                        NodeId const nameNode = declaratorNameNode(
+                            tree, dNode, *cfg.declarators);
+                        if (!nameNode.valid()) {
+                            // FC4 c1 stage 2a: an ABSTRACT declarator. Legal
+                            // in parameter-like positions; a named position
+                            // (requireNamedDeclarators — C locals/globals/
+                            // typedefs) rejects it LOUD: `int *;` declares
+                            // nothing and must not silently no-op.
+                            if (decl.requireNamedDeclarators) {
+                                ParseDiagnostic d;
+                                d.code = DiagnosticCode::
+                                    S_DeclarationDeclaresNothing;
+                                d.severity = DiagnosticSeverity::Error;
+                                d.buffer   = tree.source().id();
+                                d.span     = tree.span(dNode);
+                                d.actual   = std::string{tree.text(dNode)};
+                                s.reporter.report(std::move(d));
+                            }
+                            continue;   // abstract — mints nothing
+                        }
+                        std::string name{tree.text(nameNode)};
+                        if (name.empty()) continue;
+                        ScopeId const bindScope = current;
+                        SymbolRecord rec;
+                        rec.name         = name;
+                        rec.scope        = bindScope;
+                        rec.declNode     = nameNode;
+                        rec.declRuleNode = node;
+                        rec.tree         = tree.id();
+                        rec.kind         = effectiveKind;
+                        rec.warnIfUnused = decl.warnIfUnused;
+                        rec.fieldIndex   = static_cast<std::uint32_t>(
+                            s.scopes.scopes()[bindScope.v].bindings.size());
+                        if (decl.constMarker.has_value()) {
+                            rec.isConst = subtreeContainsToken(
+                                tree, node, *decl.constMarker,
+                                &s.idx().declByRule);
+                        }
+                        SymbolId const newId = s.symbols.mint(rec);
+                        SymbolId const prior =
+                            s.scopes.bind(bindScope, name, newId);
+                        if (prior.valid()) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_RedeclaredSymbol;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(nameNode);
+                            d.actual   = name;
+                            auto const& priorRec = s.symbols.at(prior);
+                            if (priorRec.tree.v == tree.id().v) {
+                                d.related.push_back(RelatedLocation{
+                                    tree.source().id(),
+                                    tree.span(priorRec.declNode),
+                                    "previously declared here",
+                                });
+                            }
+                            s.reporter.report(std::move(d));
+                        } else {
+                            s.nodeToSymbol.set(nameNode, newId);
+                        }
+                    }
+                }
+            } else if (decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
                 NodeId const nameContainer = kids[*decl.nameChild];
                 auto resolved = extractNameNode(
                     tree, nameContainer, decl.nameMatch, cfg.identifierToken,
                     cfg.bracketIdentifierToken);
+                // FC4 c1 stage 2a (anonymousNameAllowed): an OPTIONAL name in
+                // the grammar shifts the positional name child onto whatever
+                // follows (C's anonymous `typedef struct { ... } T;` puts the
+                // body's `{` at the tag's index). For flagged rows, a resolved
+                // node that is NOT an identifier leaf means ANONYMOUS: mint
+                // under a synthesized unique name, anchored on the DECL node
+                // itself (the type-position resolver looks the symbol up
+                // there). Unflagged rows keep the legacy behavior exactly.
+                if (decl.anonymousNameAllowed) {
+                    std::string leafText;
+                    bool const isIdentLeaf = resolved.node.valid()
+                        && nameLeafText(tree, resolved.node,
+                                        cfg.identifierToken,
+                                        cfg.bracketIdentifierToken, leafText);
+                    if (!isIdentLeaf) {
+                        resolved.name = std::format("<anon:{}:{}>",
+                                                    decl.ruleName, node.v);
+                        resolved.node = node;
+                    }
+                }
                 if (!resolved.name.empty() && resolved.node.valid()) {
                     // A declaration's NAME binds into the ENCLOSING scope
                     // (`current`), NOT the scope this rule itself opens
@@ -949,10 +1380,185 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
         if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
             auto kids = declRoleChildren(tree, node, decl);
-            if (decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
+            // FC4 c1 (M3): declarator-mode rows — resolve the HEAD once via
+            // the standard type-position resolver (it carries NO stars; the
+            // declarator owns all type structure), then fold EVERY
+            // declarator's declared type via the inversion (see
+            // declaratorDeclaredType). Named declarators get their Pass-1
+            // symbol's type set; abstract ones still fold so their
+            // diagnostics (bad array length, unresolvable nested param
+            // head) fire here, at the row's own definitive visit.
+            if (decl.isDeclaratorMode() && cfg.declarators.has_value()) {
+                TypeId headTy = InvalidType;
+                if (decl.headChild.has_value() && *decl.headChild < kids.size()) {
+                    headTy = resolveTypeNode(
+                        s, cfg, tree, kids[*decl.headChild], here);
+                }
+                // kindByChild discriminator (mirrors the legacy arm): a
+                // matched Function discriminator makes this a function
+                // DEFINITION — the body is the matched node itself when
+                // `bodyPath` is empty (the declarator-mode convention:
+                // params live inside the declarator's fn suffix, the
+                // matched block IS the body).
+                bool isFunctionForm = false;
+                NodeId bodyNode{};
+                if (decl.kindByChild.has_value()) {
+                    auto const& disc = *decl.kindByChild;
+                    NodeId const disChild =
+                        descendVisibleDecl(tree, node, disc.childPath, decl);
+                    if (disChild.valid()
+                        && tree.kind(disChild) == NodeKind::Internal
+                        && tree.rule(disChild) == disc.whenRule
+                        && disc.whenKind == DeclarationKind::Function) {
+                        isFunctionForm = true;
+                        bodyNode = disc.bodyPath.empty()
+                            ? disChild
+                            : descendVisible(tree, disChild, disc.bodyPath);
+                    }
+                }
+                auto const carrierIdx = decl.declaratorListChild.has_value()
+                                            ? decl.declaratorListChild
+                                            : decl.declaratorChild;
+                // SINGLE-declarator rows (param-like) with the declarator
+                // structurally ABSENT — a type-only parameter (`int f(int)`):
+                // the head IS the declared type; stamp it on the row node so
+                // the HIR lowering can type the (nameless) param slot.
+                if (decl.declaratorChild.has_value()
+                    && (!carrierIdx.has_value() || *carrierIdx >= kids.size())
+                    && headTy.valid()) {
+                    s.nodeToType.set(node, headTy);
+                }
+                if (carrierIdx.has_value() && *carrierIdx < kids.size()) {
+                    std::vector<NodeId> declarators;
+                    collectDeclarators(tree, kids[*carrierIdx],
+                                       *cfg.declarators, declarators);
+                    auto const emitInvalidFn = [&](NodeId at,
+                                                   std::string detail) {
+                        ParseDiagnostic d;
+                        d.code = DiagnosticCode::S_InvalidFunctionDeclarator;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(at);
+                        d.actual   = std::move(detail);
+                        s.reporter.report(std::move(d));
+                    };
+                    // C 6.9.1: a function DEFINITION has exactly ONE
+                    // declarator (`int a, main() { }` is ill-formed).
+                    if (isFunctionForm && declarators.size() != 1) {
+                        emitInvalidFn(node,
+                                      "a function definition declares "
+                                      "exactly one declarator");
+                    }
+                    for (NodeId dNode : declarators) {
+                        TypeId const declTy = declaratorDeclaredType(
+                            s, cfg, tree, dNode, headTy, here,
+                            /*emitOnMiss=*/true);
+                        // SINGLE-declarator rows (param-like): also stamp
+                        // the row node — an ABSTRACT param has no name
+                        // node to carry the type, but its slot still
+                        // exists and the HIR lowering needs its type.
+                        if (decl.declaratorChild.has_value()
+                            && declTy.valid()) {
+                            s.nodeToType.set(node, declTy);
+                        }
+                        NodeId const nameNode = declaratorNameNode(
+                            tree, dNode, *cfg.declarators);
+                        if (!nameNode.valid()) continue;   // abstract
+                        SymbolId const sym = s.symbolAtOr(nameNode);
+                        if (!sym.valid()) continue;   // redeclared-error path
+                        if (declTy.valid()) {
+                            s.symbols.at(sym).type = declTy;
+                            s.nodeToType.set(nameNode, declTy);
+                        }
+                        bool const isFnSig = declTy.valid()
+                            && s.lattice.interner().kind(declTy)
+                                   == TypeKind::FnSig;
+                        if (isFunctionForm && declarators.size() == 1) {
+                            // C 6.9.1 definition constraints, checked LOUD:
+                            //  * the named direct-declarator must carry a
+                            //    function suffix (`int (*fp)(int) { }` and
+                            //    `int x { }` are not function declarators);
+                            //  * no initializer on the init-declarator
+                            //    (`int main() = 5 { }` parses; reject here).
+                            NodeId const direct = tree.parent(nameNode);
+                            bool fnSuffixOnName = false;
+                            if (direct.valid()
+                                && tree.kind(direct) == NodeKind::Internal
+                                && tree.rule(direct)
+                                       == cfg.declarators->directRule) {
+                                for (NodeId c : visibleChildren(tree, direct)) {
+                                    if (tree.kind(c) == NodeKind::Internal
+                                        && tree.rule(c)
+                                               == cfg.declarators->fnSuffixRule) {
+                                        fnSuffixOnName = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!fnSuffixOnName) {
+                                emitInvalidFn(nameNode,
+                                              "a function definition's "
+                                              "declarator must be a function "
+                                              "declarator (name followed by "
+                                              "a parameter list)");
+                            }
+                            if (tree.rule(dNode)
+                                    == cfg.declarators->initDeclaratorRule) {
+                                std::size_t internals = 0;
+                                for (NodeId c : visibleChildren(tree, dNode)) {
+                                    if (tree.kind(c) == NodeKind::Internal)
+                                        ++internals;
+                                }
+                                if (internals > 1) {
+                                    emitInvalidFn(
+                                        dNode,
+                                        "a function definition cannot carry "
+                                        "an initializer");
+                                }
+                            }
+                            // GAP A: the function's RESULT type, keyed on
+                            // the scope its body opens (the return-check
+                            // walks the scope chain to here).
+                            if (isFnSig && bodyNode.valid()) {
+                                ScopeId const bodyScope =
+                                    scopeAnchoredAt(s, tree, bodyNode);
+                                if (bodyScope.valid()) {
+                                    s.fnResultByScope[bodyScope.v] =
+                                        s.lattice.interner().fnResult(declTy);
+                                }
+                            }
+                        } else if (isFnSig
+                                   && s.symbols.at(sym).kind
+                                          == DeclarationKind::Variable) {
+                            // A bare function-TYPED object declaration — a C
+                            // prototype (`int f();`). Declaration-without-
+                            // definition is NOT wired (externs carry that
+                            // role); a silent FnSig-typed data global would
+                            // miscompile, so fail loud. Pinned residue:
+                            // D-CSUBSET-FN-PROTOTYPE (stage 2b registry).
+                            emitInvalidFn(nameNode,
+                                          "function prototype declarations "
+                                          "are not supported here; use "
+                                          "'extern' for cross-unit "
+                                          "declarations");
+                        }
+                    }
+                }
+            } else if (decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
                 auto resolved = extractNameNode(
                     tree, kids[*decl.nameChild], decl.nameMatch, cfg.identifierToken,
                     cfg.bracketIdentifierToken);
+                // FC4 c1 (anonymousNameAllowed): mirror Pass 1's anonymous
+                // re-anchor — the symbol lives on the DECL node when the
+                // name child resolved to a non-identifier leaf.
+                if (decl.anonymousNameAllowed) {
+                    std::string leafText;
+                    bool const isIdentLeaf = resolved.node.valid()
+                        && nameLeafText(tree, resolved.node,
+                                        cfg.identifierToken,
+                                        cfg.bracketIdentifierToken, leafText);
+                    if (!isIdentLeaf) resolved.node = node;
+                }
                 SymbolId sym = resolved.node.valid()
                     ? s.symbolAtOr(resolved.node) : InvalidSymbol;
                 if (sym.valid()) {
@@ -1188,11 +1794,24 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             }
                         }
                     } else if (effectiveKind == DeclarationKind::Function) {
-                        // SE6: build a FnSig over the param types.
-                        std::vector<TypeId> paramTypes;
+                        // SE6: build a FnSig over the param types. Each
+                        // param row's own visit is the definitive
+                        // diagnostic site, so this harvest re-resolution
+                        // runs with emitOnMiss=false (one diagnostic per
+                        // bad param type, not two). The `(void)`
+                        // convention applies at the same chokepoint the
+                        // declarator fn-suffix fold uses.
+                        std::vector<std::pair<NodeId, TypeId>> params;
                         if (paramsNode.valid()) {
                             collectParamTypes(s, cfg, tree, paramsNode, here,
-                                              paramTypes);
+                                              params, /*emitOnMiss=*/false);
+                        }
+                        normalizeSoleVoidParams(s, cfg, tree, params,
+                                                /*emitOnMiss=*/true);
+                        std::vector<TypeId> paramTypes;
+                        paramTypes.reserve(params.size());
+                        for (auto const& [pNode, pTy] : params) {
+                            paramTypes.push_back(pTy);
                         }
                         // D-LANG-VARIADIC (step 13.4): scan the params
                         // subtree for the declaration's configured
@@ -1734,6 +2353,84 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
             auto kids = declRoleChildren(tree, node, decl);
+            // FC4 c1: declarator-mode rows — each init-declarator carries
+            // its OWN optional initializer (`int x = 1, *p = q;`); check
+            // every (declared type, init type) pair with the SAME
+            // assignability + null-pointer-constant rules the legacy
+            // positional path applies below.
+            if (decl.isDeclaratorMode() && cfg.declarators.has_value()) {
+                auto const carrierIdx = decl.declaratorListChild.has_value()
+                                            ? decl.declaratorListChild
+                                            : decl.declaratorChild;
+                if (carrierIdx.has_value() && *carrierIdx < kids.size()) {
+                    std::vector<NodeId> declarators;
+                    collectDeclarators(tree, kids[*carrierIdx],
+                                       *cfg.declarators, declarators);
+                    for (NodeId dNode : declarators) {
+                        if (tree.rule(dNode)
+                                != cfg.declarators->initDeclaratorRule) {
+                            continue;   // no init slot on a bare declarator
+                        }
+                        // The init subtree = the Internal child that is
+                        // NOT the declarator (`[declarator, '=', init]`).
+                        NodeId initNode{};
+                        for (NodeId c : visibleChildren(tree, dNode)) {
+                            if (tree.kind(c) != NodeKind::Internal) continue;
+                            if (tree.rule(c) == cfg.declarators->declaratorRule)
+                                continue;
+                            initNode = c;
+                            break;
+                        }
+                        if (!initNode.valid()) continue;
+                        NodeId const nameNode = declaratorNameNode(
+                            tree, dNode, *cfg.declarators);
+                        if (!nameNode.valid()) continue;
+                        SymbolId const sym = s.symbolAtOr(nameNode);
+                        if (!sym.valid()) continue;
+                        auto& rec = s.symbols.at(sym);
+                        // The init's type = the first stamped type along
+                        // the SINGLE-child wrapper chain (initValue →
+                        // expression → operand/binaryExpr/...). An
+                        // aggregate brace-init list (multi-child) yields
+                        // none and is deliberately SKIPPED here — its
+                        // per-element checks live in the HIR brace-init
+                        // lowering, contextually typed by the declared
+                        // type; a DFS into the braces would surface a
+                        // member literal's type and false-fire
+                        // S_TypeMismatch against the aggregate.
+                        TypeId initTy = InvalidType;
+                        for (NodeId walk = initNode; walk.valid();) {
+                            initTy = s.typeAt(walk);
+                            if (initTy.valid()) break;
+                            auto wk = visibleChildren(tree, walk);
+                            if (wk.size() != 1) break;
+                            walk = wk[0];
+                        }
+                        if (!rec.type.valid()) {
+                            if (initTy.valid()) {
+                                rec.type = initTy;
+                                s.nodeToType.set(nameNode, initTy);
+                            }
+                        } else if (initTy.valid()
+                                   && !isAssignable(s.lattice.interner(),
+                                                    rec.type, initTy,
+                                                    tree.schema().semantics()
+                                                        .pointerConversions)
+                                   && !admitsNullPointerConstant(
+                                          s, tree, rec.type, initNode,
+                                          tree.schema().semantics()
+                                              .pointerConversions)) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_TypeMismatch;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(initNode);
+                            d.actual   = std::string{tree.text(initNode)};
+                            s.reporter.report(std::move(d));
+                        }
+                    }
+                }
+            }
             if (decl.initChild.has_value() && *decl.initChild < kids.size()
                 && decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
                 NodeId initNode = kids[*decl.initChild];
@@ -1874,38 +2571,125 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     }
 }
 
-// Collect parameter types from a params subtree, in source (left-to-right)
-// order, by recursively walking it for declaration rules and resolving
-// each one's typeChild. A param-decl node is NOT descended into (its own
-// children are the param's type/name, not nested params). SE6.
+// Collect (param node, resolved type) pairs from a params subtree, in
+// source (left-to-right) order, by recursively walking it for declaration
+// rules and resolving each via `declRowDeclaredType` (legacy typeChild AND
+// FC4 declarator-mode rows alike — ONE per-param resolution). A param-decl
+// node is NOT descended into (its own children are the param's type/name —
+// and a declarator-mode fn-ptr param's NESTED params must never leak into
+// the enclosing signature). SE6 + FC4 c1.
 void collectParamTypes(EngineState& s, SemanticConfig const& cfg,
                        Tree const& tree, NodeId cur, ScopeId scope,
-                       std::vector<TypeId>& out) {
+                       std::vector<std::pair<NodeId, TypeId>>& out,
+                       bool emitOnMiss) {
     if (!cur.valid() || isEmptySpace(tree.flags(cur))) return;
     if (tree.kind(cur) == NodeKind::Internal) {
         auto declIt = s.idx().declByRule.find(tree.rule(cur).v);
         if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
-            auto kids = declRoleChildren(tree, cur, decl);
-            if (decl.typeChild.has_value() && *decl.typeChild < kids.size()) {
-                TypeId pty = resolveTypeNode(
-                    s, cfg, tree, kids[*decl.typeChild], scope);
-                // SE-arrays: an array-declarator param (`int a[10]`) carries
-                // the Array type into the signature.
-                pty = applyArraySuffix(s, tree, decl, cur, pty, scope, &cfg);
-                out.push_back(pty);
+            if (decl.isDeclaratorMode()
+                || decl.typeChild.has_value()) {
+                out.emplace_back(cur, declRowDeclaredType(
+                    s, cfg, tree, cur, scope, emitOnMiss));
             }
             return;  // a param decl is a leaf for parameter-collection
         }
     }
     for (auto const& child : tree.children(cur)) {
-        collectParamTypes(s, cfg, tree, child, scope, out);
+        collectParamTypes(s, cfg, tree, child, scope, out, emitOnMiss);
+    }
+}
+
+// FC4 c1: the name (if any) declared by one PARAM-row node — drives the
+// `(void)` normalization's named-vs-unnamed distinction across BOTH row
+// shapes (declarator-mode walk / legacy positional nameChild).
+[[nodiscard]] bool paramRowIsNamed(EngineState& s, SemanticConfig const& cfg,
+                                   Tree const& tree, NodeId declNode) {
+    auto declIt = s.idx().declByRule.find(tree.rule(declNode).v);
+    if (declIt == s.idx().declByRule.end()) return false;
+    auto const& decl = cfg.declarations[declIt->second];
+    auto kids = declRoleChildren(tree, declNode, decl);
+    if (decl.isDeclaratorMode() && cfg.declarators.has_value()) {
+        auto const carrier = decl.declaratorListChild.has_value()
+                                 ? decl.declaratorListChild
+                                 : decl.declaratorChild;
+        if (!carrier.has_value() || *carrier >= kids.size()) return false;
+        std::vector<NodeId> ds;
+        collectDeclarators(tree, kids[*carrier], *cfg.declarators, ds);
+        for (NodeId dn : ds) {
+            if (declaratorNameNode(tree, dn, *cfg.declarators).valid()) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (!decl.nameChild.has_value() || *decl.nameChild >= kids.size()) {
+        return false;
+    }
+    auto rn = extractNameNode(tree, kids[*decl.nameChild], decl.nameMatch,
+                              cfg.identifierToken, cfg.bracketIdentifierToken);
+    return rn.node.valid() && !rn.name.empty();
+}
+
+// FC4 c1: C 6.7.6.3p10 — the `(void)` parameter-list convention, applied at
+// the ONE chokepoint both FnSig builders share (the legacy function-decl
+// arm and the declarator fn-suffix fold). When the language declares
+// `parameters.soleVoidMeansEmpty`:
+//   * exactly ONE param, resolved type Void, UNNAMED  → zero params;
+//   * any OTHER Void param (named, or void-among-others) → ill-formed,
+//     S_InvalidVoidParam positioned at the param (suppressed when
+//     `emitOnMiss` is false — a harvest re-resolution must not re-report
+//     what the definitive visit already did; the normalization itself
+//     still applies so the two computations agree on the type).
+void normalizeSoleVoidParams(EngineState& s, SemanticConfig const& cfg,
+                             Tree const& tree,
+                             std::vector<std::pair<NodeId, TypeId>>& params,
+                             bool emitOnMiss) {
+    if (!cfg.parameters.soleVoidMeansEmpty) return;
+    auto const isVoid = [&](TypeId t) {
+        return t.valid()
+            && s.lattice.interner().kind(t) == TypeKind::Void;
+    };
+    bool anyVoid = false;
+    for (auto const& [n, t] : params) anyVoid = anyVoid || isVoid(t);
+    if (!anyVoid) return;
+    if (params.size() == 1 && isVoid(params[0].second)
+        && !paramRowIsNamed(s, cfg, tree, params[0].first)) {
+        params.clear();
+        return;
+    }
+    if (!emitOnMiss) return;
+    for (auto const& [n, t] : params) {
+        if (!isVoid(t)) continue;
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_InvalidVoidParam;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(n);
+        d.actual   = std::string{tree.text(n)};
+        s.reporter.report(std::move(d));
     }
 }
 
 // SE6: verify a call node against the callee's signature. Resolves the
 // callee child to a symbol; emits S_NotCallable / S_ArgCountMismatch /
-// S_TypeMismatch / S_UndeclaredIdentifier as appropriate.
+// S_TypeMismatch / S_UndeclaredIdentifier / S_IndirectCallNotSupported
+// as appropriate.
+
+// D-CSUBSET-FNPTR-INDIRECT-CALL: TYPE-driven test for "this value is a
+// function pointer" — lattice kinds only (Ptr whose sole operand is a
+// FnSig), zero language identity. Declarators can TYPE `int (*fp)(int)`
+// (FC4 c1 stage 2a), but the call path only encodes direct symbol calls
+// (D-ML7-2.4 owns the indirect-call encoding: LIR call-reg opcode,
+// x86 FF /2, arm64 BLR), so calling THROUGH the pointer fails loud at
+// the semantic tier instead of surfacing as the LIR tier's late,
+// unpositioned L_IndirectCallUnsupported.
+[[nodiscard]] bool isFnPointerType(TypeInterner const& in, TypeId t) {
+    return t.valid()
+        && in.kind(t) == TypeKind::Ptr
+        && in.kind(in.operands(t)[0]) == TypeKind::FnSig;
+}
+
 void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                NodeId node, ScopeId scope, CallRule const& call) {
     auto kids = visibleChildren(tree, node);
@@ -1935,7 +2719,47 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         || tree.kind(resolved.node) != NodeKind::Token
         || !cfg.identifierToken.valid()
         || tree.tokenKind(resolved.node) != cfg.identifierToken) {
-        return;  // not a simple identifier callee — out of v1 scope
+        // Not a simple identifier callee. FC4 c1 stage 2b: triage by the
+        // callee EXPRESSION's stamped type instead of returning blind.
+        //   * stamped Ptr<FnSig> (`((H)fp)(3)` — a cast-typed fn-ptr
+        //     value) → S_IndirectCallNotSupported, the
+        //     D-CSUBSET-FNPTR-INDIRECT-CALL wall (pre-gate this died as
+        //     an opaque HIR-tier H_UnsupportedConstruct).
+        //   * stamped plain FnSig → SILENT, deliberately: today's only
+        //     stamped-FnSig non-identifier callee is the paren-wrapped
+        //     direct designator `(f)(args)` (subtreeType descends
+        //     through parenExpr to the resolved identifier leaf), which
+        //     lowers correctly and is RUNTIME-PROVEN (exit-42 probe) —
+        //     walling it would regress a working form. C 6.5.1p5: a
+        //     parenthesized expression keeps the designator's meaning.
+        //     A future deref-typing arm (`(*fp)` stamping FnSig) must
+        //     revisit this case; today `(*fp)` is UNSTAMPED (subtreeType
+        //     stops at prefix-operator wrappers) and stays on the
+        //     conservative silent path below.
+        //   * any other stamped type (`((int)x)(3)` — castExpr stamped
+        //     I32) → S_NotCallable: the value is typed and provably not
+        //     callable.
+        //   * UNSTAMPED → conservative silent return (no semantic-tier
+        //     expression typing for that shape yet — do not invent
+        //     types; deeper tiers keep their own fail-loud walls).
+        TypeId const calleeTy = subtreeType(s, tree, calleeNode);
+        if (!calleeTy.valid()) {
+            return;  // unstamped callee expression — out of v1 scope
+        }
+        auto const& in = s.lattice.interner();
+        if (in.kind(calleeTy) == TypeKind::FnSig) {
+            return;  // paren-wrapped direct designator — lowers as direct
+        }
+        ParseDiagnostic d;
+        d.code     = isFnPointerType(in, calleeTy)
+            ? DiagnosticCode::S_IndirectCallNotSupported
+            : DiagnosticCode::S_NotCallable;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(calleeNode);
+        d.actual   = std::string{tree.text(calleeNode)};
+        s.reporter.report(std::move(d));
+        return;
     }
     SymbolId const calleeSym = s.scopes.lookup(scope, resolved.name);
     if (!calleeSym.valid()) {
@@ -1982,8 +2806,16 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     TypeId const fnTy = s.symbols.at(calleeSym).type;
 
     if (!fnTy.valid() || s.lattice.interner().kind(fnTy) != TypeKind::FnSig) {
+        // D-CSUBSET-FNPTR-INDIRECT-CALL: a bare-identifier callee whose
+        // symbol is typed Ptr<FnSig> (`int (*fp)(int) = &helper; fp(3);`)
+        // is a well-typed INDIRECT call the backend cannot encode yet —
+        // distinguish it from a genuinely non-callable value (S_NotCallable
+        // would be the WRONG code: the value IS callable in C, the
+        // implementation gap is ours). Purely lattice-kind-driven.
         ParseDiagnostic d;
-        d.code     = DiagnosticCode::S_NotCallable;
+        d.code     = isFnPointerType(s.lattice.interner(), fnTy)
+            ? DiagnosticCode::S_IndirectCallNotSupported
+            : DiagnosticCode::S_NotCallable;
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(resolved.node);

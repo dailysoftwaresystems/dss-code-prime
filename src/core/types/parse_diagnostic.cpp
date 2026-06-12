@@ -92,6 +92,13 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_InvalidTypeSpecifierCombination";
         case DiagnosticCode::S_IntegerLiteralTooLarge:   return "S_IntegerLiteralTooLarge";
         case DiagnosticCode::S_UnsupportedDataModel:     return "S_UnsupportedDataModel";
+        case DiagnosticCode::S_VolatileNotSupported:     return "S_VolatileNotSupported";
+        case DiagnosticCode::S_IndirectCallNotSupported: return "S_IndirectCallNotSupported";
+        case DiagnosticCode::S_InvalidVoidParam:         return "S_InvalidVoidParam";
+        case DiagnosticCode::S_DeclarationDeclaresNothing:
+            return "S_DeclarationDeclaresNothing";
+        case DiagnosticCode::S_InvalidFunctionDeclarator:
+            return "S_InvalidFunctionDeclarator";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
