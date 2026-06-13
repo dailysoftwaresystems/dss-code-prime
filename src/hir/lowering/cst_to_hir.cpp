@@ -2142,10 +2142,19 @@ struct Lowerer {
             if (tree().kind(c) == NodeKind::Internal) { exprChild = c; break; }
         }
         if (!exprChild.valid()) return std::nullopt;
-        // Hand off to the shared CST const-eval engine (plan 12.5
-        // §0.2 D6). Folds literal arithmetic / bitops / ternary /
-        // parens, plus identifier refs to `isConst`-bound symbols
-        // resolved through the frozen SemanticModel.
+        return evalCstConstInt(exprChild);
+    }
+
+    // Fold a CST expression to a compile-time `int64` through the shared
+    // CST const-eval engine (plan 12.5 §0.2 D6). Folds literal
+    // arithmetic / bitops / ternary / parens, plus identifier refs to
+    // `isConst`-bound symbols resolved through the frozen SemanticModel.
+    // Returns nullopt when the expression is not a foldable integer
+    // constant. Single source of truth for "what is a compile-time
+    // integer at this lowering tier" — shared by the index-designator
+    // resolver and the provably-infinite-loop condition test, so the
+    // two can never drift on what folds.
+    [[nodiscard]] std::optional<std::int64_t> evalCstConstInt(NodeId exprNode) {
         std::unordered_set<std::uint32_t> intLits;
         for (auto const& [tok, kind] : litCore_) {
             if (!isFloatCore(kind)) intLits.insert(tok);
@@ -2186,7 +2195,7 @@ struct Lowerer {
             }
             return std::nullopt;
         };
-        ConstEvalResult const r = evaluateConstantCst(exprChild, ctx, env);
+        ConstEvalResult const r = evaluateConstantCst(exprNode, ctx, env);
         if (!r.value.has_value()) return std::nullopt;
         return asInt64Bridge(*r.value);
     }
@@ -2859,12 +2868,102 @@ struct Lowerer {
         return track(builder.makeIfStmt(condId, then, els), node);
     }
 
+    // ── provably-infinite-loop detection (D-HIR-INFINITE-LOOP-NOT-TERMINATING) ──
+    //
+    // The verifier's `pathTerminates` is deliberately conservative — a loop body
+    // is never counted as terminating. The documented design closes the gap at
+    // the lowering tier: a provably-infinite loop is wrapped as
+    // `Block{ loop, Unreachable }`, so `pathTerminates` (which recurses to a
+    // Block's last child) sees the synthetic `Unreachable` and reports the
+    // construct as terminating. This removes the over-rejection of a non-void
+    // function whose terminating tail is such a loop, WITHOUT touching the
+    // verifier / H0003 / the dead-code rule (a `Block` is not an
+    // `isUnconditionalTerminator`, so a statement after the wrapper is still not
+    // flagged dead — keeping this decoupled from the dead-code-after-terminator
+    // anchor). The synthetic `Unreachable` is never reached at runtime; orphaned
+    // dead blocks are dropped by the MIR unreachable-prune (a `while(1)` exit the
+    // const-true `CondBr` keeps structurally reachable stays a never-executed
+    // `Unreachable` until SimplifyCfg folds the branch), so runtime is unaffected.
+
+    // (1) Does this loop's CONDITION guarantee the test never fails — i.e. is the
+    // loop, on the condition alone, non-exiting? `nullopt` cond (`for(;;)`) is
+    // infinite by construction. A present cond is infinite iff it const-folds to a
+    // NONZERO integer (`while(1)`, `while(1==1)`, `while(K)` for a const `K!=0`).
+    // Uses the shared CST const-eval (single source of truth with the index-
+    // designator path). A cond that does not fold, or folds to zero, is NOT
+    // provably-infinite — we fall back to today's behavior (no wrap), so a
+    // not-provably-infinite loop can never be wrongly marked infinite.
+    [[nodiscard]] bool conditionIsProvablyTruthy(std::optional<NodeId> condNode) {
+        if (!condNode.has_value()) return true;          // for(;;) — no test
+        auto v = evalCstConstInt(*condNode);
+        return v.has_value() && *v != 0;
+    }
+
+    // (2) Can a `break` exit THIS loop's frame? Scans the loop's lowered HIR body,
+    // RESPECTING nesting: a `BreakStmt` reached in this loop's own frame (through
+    // if / block, but NOT through a nested loop or switch) targets THIS loop and
+    // so exits it. A `break` inside a nested loop/switch targets that inner
+    // construct — the scan does not descend into nested loop/switch bodies, so
+    // such a break does not count. `continue` (re-loops) and `return` (exits the
+    // function, not to after-the-loop) never make the loop fall through, so they
+    // are ignored. The de Bruijn break depth is not yet assigned at lowering
+    // (`makeBreak(0)`), so this STRUCTURAL frame-respecting scan — mirroring how
+    // an innermost-enclosing break target resolves — is the precise mechanism.
+    // Conservatism is one-directional: if in doubt we report a break exists
+    // (loop NOT infinite), never the reverse — a breakable loop is never wrongly
+    // wrapped.
+    [[nodiscard]] bool bodyHasReachableBreak(HirNodeId body) const {
+        switch (builder.kind(body)) {
+            case HirKind::BreakStmt:
+                return true;                              // targets this loop's frame
+            // A nested loop / switch captures any `break` inside it — do not
+            // descend; a break there does not exit THIS loop.
+            case HirKind::WhileStmt:
+            case HirKind::DoWhileStmt:
+            case HirKind::ForStmt:
+            case HirKind::SwitchStmt:
+                return false;
+            default:
+                for (HirNodeId c : builder.children(body))
+                    if (bodyHasReachableBreak(c)) return true;
+                return false;
+        }
+    }
+
+    // A loop is PROVABLY-INFINITE iff control can never fall through past it:
+    // its condition is constant-truthy/absent AND no `break` in its own frame
+    // exits it. `loopStmt` is the freshly-built (unparented) loop node;
+    // `loopBody` is its body subtree (already attached to `loopStmt`).
+    [[nodiscard]] bool loopIsProvablyInfinite(std::optional<NodeId> condNode,
+                                              HirNodeId loopBody) {
+        return conditionIsProvablyTruthy(condNode)
+            && !bodyHasReachableBreak(loopBody);
+    }
+
+    // Wrap a provably-infinite `loopStmt` as `Block{ loopStmt, Unreachable }`
+    // (both the Block and the leaf flagged `Synthetic`) so the construct
+    // structurally terminates; otherwise return `loopStmt` unchanged. `node` is
+    // the loop's CST node, used only for span tracking (the synthetic
+    // `Unreachable` has no source of its own).
+    [[nodiscard]] HirNodeId wrapIfProvablyInfinite(NodeId node, HirNodeId loopStmt,
+                                                   std::optional<NodeId> condNode,
+                                                   HirNodeId loopBody) {
+        if (!loopIsProvablyInfinite(condNode, loopBody)) return loopStmt;
+        HirNodeId const unreachable =
+            builder.addLeaf(HirKind::Unreachable, InvalidType, /*payload=*/0,
+                            HirFlags::Synthetic);
+        HirNodeId const wrapped[] = {loopStmt, unreachable};
+        return track(builder.makeBlock(wrapped, HirFlags::Synthetic), node);
+    }
+
     HirNodeId lowerWhile(NodeId node, bool doWhile) {
         std::optional<HirNodeId> cond, body;
+        std::optional<NodeId>    condNode;
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
             Role const role = classify(c);
             if (role == Role::Expr && !cond) {
+                condNode = c;
                 E const condE = lowerExpr(c);
                 cond = coerceCondition(condE, c).id;
             }
@@ -2872,8 +2971,10 @@ struct Lowerer {
         }
         HirNodeId condId = orError(cond, node, "loop has no condition");
         HirNodeId bodyId = orError(body, node, "loop has no body");
-        return doWhile ? track(builder.makeDoWhileStmt(bodyId, condId), node)
-                       : track(builder.makeWhileStmt(condId, bodyId), node);
+        HirNodeId const loop =
+            doWhile ? track(builder.makeDoWhileStmt(bodyId, condId), node)
+                    : track(builder.makeWhileStmt(condId, bodyId), node);
+        return wrapIfProvablyInfinite(node, loop, condNode, bodyId);
     }
 
     HirNodeId lowerFor(NodeId node) {
@@ -2893,16 +2994,19 @@ struct Lowerer {
         NodeId bodyN = clauses.back().second;
         clauses.pop_back();
         std::optional<HirNodeId> init, cond, update;
+        std::optional<NodeId>    condNode;   // nullopt for a clause-less `for(;;)`
         for (auto const& [s, c] : clauses) {
             if (s == 0)      init   = lowerForClause(c);
             else if (s == 1) {
+                condNode = c;
                 E const condE = lowerExpr(c);
                 cond = coerceCondition(condE, c).id;
             }
             else if (s == 2) update = lowerForClause(c);
         }
         HirNodeId body = lowerStmt(bodyN);
-        return track(builder.makeForStmt(init, cond, update, body), node);
+        HirNodeId const loop = track(builder.makeForStmt(init, cond, update, body), node);
+        return wrapIfProvablyInfinite(node, loop, condNode, body);
     }
 
     // A for init/update clause: a varDeclHead → VarDecl; an assignment → AssignStmt;

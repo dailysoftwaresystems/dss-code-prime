@@ -1327,8 +1327,25 @@ struct Lowerer {
         HirKind const k = hir.kind(node);
         switch (k) {
             case HirKind::Block: {
-                for (HirNodeId child : hir.children(node)) {
-                    if (!lowerStmt(child)) return false;
+                auto kids = hir.children(node);
+                for (std::size_t i = 0; i < kids.size(); ++i) {
+                    if (!lowerStmt(kids[i])) return false;
+                    // A child may unconditionally transfer control and seal the
+                    // open block mid-block (the `Block{ infinite-loop, Unreachable }`
+                    // wrapper cst_to_hir synthesizes for a provably-infinite loop —
+                    // D-HIR-INFINITE-LOOP-NOT-TERMINATING — seals its exit with an
+                    // `Unreachable`). Any FOLLOWING sibling is dynamically
+                    // unreachable, but the HIR dead-code rule deliberately permits
+                    // it after such a wrapper (a `Block` is not an unconditional
+                    // terminator), so it still reaches MIR and must lower somewhere.
+                    // Open a fresh dead block for the remainder; `addInst` aborts on
+                    // a sealed/absent open block otherwise. The dead block has no
+                    // predecessor and is removed by the mandatory MIR
+                    // unreachable-prune (D-MIR-UNREACHABLE-PRUNE-NORMALIZE).
+                    if (i + 1 < kids.size() && mir.openBlockHasTerminator()) {
+                        MirBlockId const dead = mir.createBlock(StructCfMarker::Linear);
+                        mir.beginBlock(dead);
+                    }
                 }
                 return true;
             }
@@ -1341,6 +1358,21 @@ struct Lowerer {
                 } else {
                     mir.addReturn();
                 }
+                return true;
+            }
+            case HirKind::Unreachable: {
+                // A statement-position `Unreachable` (cst_to_hir synthesizes one
+                // after a provably-infinite loop — D-HIR-INFINITE-LOOP-NOT-
+                // TERMINATING — wrapping it as `Block{ loop, Unreachable }` so the
+                // HIR verifier's structural-termination check matches the dynamic
+                // truth). It lowers to a MIR `Unreachable` terminator on the open
+                // block. Control provably never arrives here, so the block (and
+                // this terminator) is dropped by the MIR unreachable-prune
+                // (D-MIR-UNREACHABLE-PRUNE-NORMALIZE) — runtime is unaffected.
+                // Guard on `openBlockHasTerminator` so a preceding terminator in
+                // the same block (e.g. the loop already sealed its exit) is not
+                // double-sealed.
+                if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                 return true;
             }
             case HirKind::ExprStmt: {
