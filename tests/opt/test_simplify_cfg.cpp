@@ -1100,3 +1100,62 @@ TEST(SimplifyCfg, RuntimeInitGlobalsModuleEmitsXOptPassSkippedInfo) {
     }
     EXPECT_EQ(infoCount, 1u);
 }
+
+// ── D15 cycle C (c): constant-CondBr fold PRUNES the dead arm in the
+// SAME rebuild → verifier-clean, EXACT post-fold block count. ───────
+// entry: CondBr(Const(true), then, else); then: return 42; else: return 99.
+// The fold rewrites entry's terminator to Br(then) AND (C2 post-fold
+// reachability) drops the now-unreachable `else` arm in the SAME rebuild.
+// So the rebuilt function has EXACTLY 2 blocks (entry + then), the dead
+// `else` is GONE, branchesFolded == 1, and the MirVerifier — whose per-
+// pass I_UnreachableBlock check would otherwise fire on an emitted-but-
+// orphan else — passes clean.
+// RED-on-disable: dropping the `postFoldReachable_` filter in
+// `selectBlocks` re-emits the dead `else` arm → it becomes an orphan
+// island unreachable from entry → MirVerifier fires I_UnreachableBlock →
+// verifier.verify(rep) returns false (demonstrated in the cycle gate),
+// and the post-fold block count is 3 (the dead arm survives), failing the
+// EXACT-count assertion.
+TEST(SimplifyCfg, ConstantCondBrFoldPrunesDeadArmVerifierClean) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const fArm  = mb.createBlock(StructCfMarker::IfElse);
+    mb.beginBlock(entry);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const c = mb.addConst(tru, boolT);
+    mb.addCondBr(c, tArm, fArm);
+    mb.beginBlock(tArm);
+    MirLiteralValue v1; v1.value = std::int64_t{42}; v1.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v1, i32));
+    mb.beginBlock(fArm);
+    MirLiteralValue v2; v2.value = std::int64_t{99}; v2.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v2, i32));
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(totalBlockCount(mir), 3u) << "before: entry + then + else";
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.branchesFolded, 1u) << "the constant CondBr folds once";
+
+    // THE post-fold count pin: the dead `else` arm is GONE (pruned in the
+    // SAME rebuild). EXACTLY 2 blocks survive.
+    EXPECT_EQ(totalBlockCount(mir), 2u)
+        << "the dead else arm must be pruned in the fold's own rebuild "
+           "(entry + surviving then-arm only)";
+
+    // THE verifier pin: no orphan island → no I_UnreachableBlock → clean.
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "post-fold reachability leaves no unreachable block for the "
+           "per-pass verifier to reject";
+    EXPECT_EQ(rep.errorCount(), 0u) << "zero error-severity diagnostics";
+}

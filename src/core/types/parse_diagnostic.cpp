@@ -137,6 +137,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_TextMalformed:            return "I_TextMalformed";
         case DiagnosticCode::I_TextVersionMismatch:      return "I_TextVersionMismatch";
         case DiagnosticCode::I_TextUnknownName:          return "I_TextUnknownName";
+        case DiagnosticCode::I_LayoutUseBeforeDef:       return "I_LayoutUseBeforeDef";
         case DiagnosticCode::L_UnsupportedLoweringForOpcode: return "L_UnsupportedLoweringForOpcode";
         case DiagnosticCode::L_RequiredLirOpcodeMissing:     return "L_RequiredLirOpcodeMissing";
         case DiagnosticCode::L_VirtualRegInPostRegalloc:     return "L_VirtualRegInPostRegalloc";

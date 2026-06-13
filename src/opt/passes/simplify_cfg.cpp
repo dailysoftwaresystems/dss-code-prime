@@ -39,12 +39,23 @@ public:
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
         // Walk reachable-from-entry blocks in RPO order, excluding
-        // those flagged for elision by `analyze()`. Two elision
-        // categories share this filter: trampoline blocks (keys of
-        // `jumpThreadMap_`) and absorbed-into-predecessor blocks
-        // (values of `absorbMap_` — the merge "tail" of each
-        // P→B pair; P stays, B vanishes). Both maps are the single
-        // sources of truth for their respective elision sets.
+        // those flagged for elision by `analyze()`. THREE elision
+        // categories share this filter:
+        //   * trampoline blocks (keys of `jumpThreadMap_`);
+        //   * absorbed-into-predecessor blocks (keys of
+        //     `absorbedToHead_` — the merge "tail" of each P→B pair);
+        //   * POST-FOLD-UNREACHABLE blocks (not in `postFoldReachable_`)
+        //     — the dead arms a branch-fold disconnected, plus their
+        //     exclusive subtrees. Branch-folding `CondBr(b,T,F)` → `Br(T)`
+        //     severs the b→F edge in the OUTPUT; F (and any block reached
+        //     ONLY through it) is no longer reachable from entry. Emitting
+        //     it would leave an orphan island the per-pass MirVerifier
+        //     rejects (I_UnreachableBlock) BEFORE a later Dce could prune
+        //     it — so SimplifyCfg prunes the arms its OWN folds disconnect,
+        //     in the SAME rebuild, by construction.
+        // `mirReversePostOrder` walks the SOURCE CFG (it does not know the
+        // fold), so the `postFoldReachable_` filter is what removes the
+        // dead arm; the source-RPO is only the iteration order.
         auto const rpo = mirReversePostOrder(src, src.funcEntry(fn));
         std::vector<MirBlockId> out;
         out.reserve(rpo.size());
@@ -53,6 +64,9 @@ public:
             // Absorbed blocks are keys of `absorbedToHead_` — single
             // source of truth for the merge elision set.
             if (absorbedToHead_.count(b) != 0) continue;
+            // Post-fold-unreachable blocks (dead arms + their exclusive
+            // subtrees) vanish in this rebuild.
+            if (postFoldReachable_.count(b) == 0) continue;
             out.push_back(b);
         }
         return out;
@@ -91,19 +105,43 @@ public:
     // absorb-chain walk and its ≤1-non-Linear-per-chain admission
     // gate (D-OPT4-1-NON-LINEAR-MARKER-MERGE closure).
 
-    // Branch-fold phi hygiene: folding `CondBr(b, T, F)` → `Br(taken)`
-    // removes the b → abandoned CFG edge while b itself STAYS LIVE, so
-    // a phi in the abandoned target naming b as a pred would go stale
-    // (I_PhiPredNotInCfg — the unreachable-pred cleanup never fires for
-    // a live pred). Drop exactly those (pred == b, owner == abandoned)
-    // incomings. A phi left with ZERO incomings still hits the
-    // rebuilder's fail-loud `onZeroPhiIncomings` (a 1-pred phi-bearing
-    // block whose only edge was folded away) — loud, never silent.
+    // Branch-fold phi hygiene — TWO composed drops:
+    //
+    // (1) The dead-EDGE case (cycle B): folding `CondBr(b, T, F)` →
+    //     `Br(taken)` removes the b → abandoned CFG edge while b itself
+    //     STAYS LIVE, so a phi in the abandoned target naming b as a pred
+    //     would go stale (I_PhiPredNotInCfg — the unreachable-pred
+    //     cleanup never fires for a live pred). Drop exactly those
+    //     (pred == b, owner == abandoned) incomings, keyed by EDGE.
+    //
+    // (2) The dead-PRED case (C2): a phi-bearing block can survive the
+    //     fold (it stays post-fold-reachable) while ONE of its preds
+    //     becomes post-fold-UNREACHABLE (the pred lived only on a folded-
+    //     away arm). That pred is elided from `selectBlocks`, so its phi
+    //     incoming must be dropped too — accept only incomings whose pred
+    //     is post-fold-reachable. COMPLETENESS (the rebuilder phase-3
+    //     abort, mir_rebuild_helper.cpp ~185): an accepted incoming's
+    //     redirected pred MUST be in blockMap. A reachable pred is either
+    //     kept verbatim (in blockMap), or absorbed → `redirectBlockTarget`
+    //     sends it to its (reachable, non-absorbed) chain head (in
+    //     blockMap), or a trampoline → its phi-free target (and a
+    //     trampoline is never a phi's pred by the jump-thread gate). So
+    //     "reachable pred" is exactly the accept set the redirect can
+    //     complete. A reachable phi-block always keeps >= 1 incoming
+    //     (a phi-block with ALL preds unreachable would itself be
+    //     unreachable, hence excluded from selectBlocks) — so this never
+    //     starves a surviving phi to zero incomings.
     [[nodiscard]] bool acceptPhiIncoming(
         MirPhiIncoming const& inc, MirBlockId oldPhiBlock,
         std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) override {
-        return abandonedPhiEdges_.find(edgeKey_(inc.pred.v, oldPhiBlock.v))
-            == abandonedPhiEdges_.end();
+        if (abandonedPhiEdges_.find(edgeKey_(inc.pred.v, oldPhiBlock.v))
+            != abandonedPhiEdges_.end()) {
+            return false;  // (1) dead EDGE
+        }
+        if (postFoldReachable_.count(inc.pred) == 0) {
+            return false;  // (2) dead PRED
+        }
+        return true;
     }
 
     [[nodiscard]] std::optional<MirInstId>
@@ -136,6 +174,7 @@ public:
         absorbMap_.clear();
         absorbedToHead_.clear();
         abandonedPhiEdges_.clear();
+        postFoldReachable_.clear();
     }
 
     // Branch-folding emits a Br whose new id is structurally
@@ -180,6 +219,16 @@ private:
     // folding, keyed (pred << 32 | owner). `acceptPhiIncoming` drops a
     // phi incoming that travels a dead edge (see the override's doc).
     std::unordered_set<std::uint64_t> abandonedPhiEdges_;
+    // Blocks reachable from entry over POST-FOLD effective successors
+    // (C2): a folded block's only effective successor is its taken
+    // target; every other block keeps its source successors. Computed
+    // after `foldedBranches_` is populated. `selectBlocks` filters to
+    // this set (dead arms + exclusive subtrees vanish) and
+    // `acceptPhiIncoming` drops incomings from preds outside it. Absorbed
+    // and jump-threaded blocks that are still reachable REMAIN in this set
+    // (their own elision is owned by `absorbedToHead_` / `jumpThreadMap_`;
+    // this set is purely the post-fold reachability fact).
+    std::unordered_set<MirBlockId> postFoldReachable_;
 
     [[nodiscard]] static std::uint64_t edgeKey_(std::uint32_t pred,
                                                 std::uint32_t owner) noexcept {
@@ -398,6 +447,44 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn) {
         auto const it = jumpThreadMap_.find(rawTgt);
         MirBlockId const tgt = (it == jumpThreadMap_.end()) ? rawTgt : it->second;
         foldedBranches_[term] = tgt;
+    }
+
+    // Step 3: post-fold reachability (C2). DFS from entry over EFFECTIVE
+    // successors: a block whose terminator was folded has its taken
+    // target as its ONLY successor (the abandoned arm is severed); every
+    // other block keeps its source `blockSuccessors`. The reachable set
+    // is the blocks `selectBlocks` keeps (minus the trampoline / absorb
+    // elisions) — dead arms + their exclusive subtrees are excluded by
+    // construction, so the rebuilt function has no orphan island for the
+    // per-pass MirVerifier to reject (I_UnreachableBlock). The fold
+    // target stored in `foldedBranches_` is already jump-thread-
+    // compressed, so the DFS reaches the surviving chain tail directly.
+    {
+        std::vector<MirBlockId> stack;
+        stack.push_back(entry);
+        postFoldReachable_.insert(entry);
+        while (!stack.empty()) {
+            MirBlockId const b = stack.back();
+            stack.pop_back();
+            std::uint32_t const n = src_.blockInstCount(b);
+            // Effective successors. A folded terminator collapses to its
+            // single taken target; otherwise the source successors stand.
+            auto pushSucc = [&](MirBlockId s) {
+                if (postFoldReachable_.insert(s).second) stack.push_back(s);
+            };
+            bool folded = false;
+            if (n != 0) {
+                MirInstId const term = src_.blockInstAt(b, n - 1);
+                if (auto const fit = foldedBranches_.find(term);
+                    fit != foldedBranches_.end()) {
+                    pushSucc(fit->second);
+                    folded = true;
+                }
+            }
+            if (!folded) {
+                for (MirBlockId const s : src_.blockSuccessors(b)) pushSucc(s);
+            }
+        }
     }
 }
 

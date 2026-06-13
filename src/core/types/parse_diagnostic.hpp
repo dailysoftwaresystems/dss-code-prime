@@ -588,6 +588,20 @@ enum class DiagnosticCode : std::uint16_t {
     I_TextMalformed           = 0xA00D,
     I_TextVersionMismatch     = 0xA00E,
     I_TextUnknownName         = 0xA00F,
+    // A REACHABLE non-Phi operand use whose definition dominates it
+    // (so SSA dominance holds — I_NotDominated does NOT fire) but whose
+    // defining block appears LATER in the function's block LAYOUT
+    // (funcBlockAt order) than the using block. Dominance is necessary
+    // but NOT sufficient for the linear MIR→LIR lowering: every linear
+    // consumer (MirFunctionRebuilder's rewrite map, mir_to_lir's
+    // regForValue) requires a TOPOLOGICAL layout — a def must be EMITTED
+    // before its use. A dominating-but-layout-later def is a producer
+    // contract violation surfaced AT the producing pass (verify-after-
+    // every-pass) rather than as a downstream rebuilder abort / silent
+    // miscompile. Phi incomings are EXEMPT (loop back-edges legitimately
+    // carry a def whose layout follows the use — the dominance arm owns
+    // their semantics). Closes the D-OPT2 layout-contract class.
+    I_LayoutUseBeforeDef      = 0xA010,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //

@@ -249,6 +249,20 @@ void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
                 indexInBlock[mir_.blockInstAt(b, i).v] = i;
             }
         }
+        // Block LAYOUT-position map (funcBlockAt order — the order the
+        // MIR→LIR lowering + every MirFunctionRebuilder emits blocks).
+        // Indexed by block .v; slot 0 unused. Drives the layout rule
+        // below: a cross-block operand whose definition DOMINATES its use
+        // (SSA-legal) must ALSO be laid out before it, or no linear
+        // consumer can resolve it (D-OPT2 layout contract, I0010).
+        std::vector<std::uint32_t> layoutPos(mir_.blockCount(),
+            static_cast<std::uint32_t>(-1));
+        {
+            std::uint32_t const nBlocksF = mir_.funcBlockCount(f);
+            for (std::uint32_t bi = 0; bi < nBlocksF; ++bi) {
+                layoutPos[mir_.funcBlockAt(f, bi).v] = bi;
+            }
+        }
         // Orphan-block diagnostic: any block in the function that is
         // NOT in `rpo` is unreachable from entry. ExitBlock + LoopExit
         // / IfJoin blocks ARE reachable via the CFG (their preds carry
@@ -353,6 +367,44 @@ void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
                                             "#{} (def block #{}, use block #{}) "
                                             "— idom chain step-cap exceeded",
                                     op.v, defBlock.v, useBlock.v));
+                        } else {
+                            // LAYOUT RULE (I_LayoutUseBeforeDef, D-OPT2
+                            // layout contract). GATED on Dominates: a
+                            // non-dominating def already reported above —
+                            // one bad operand must not double-report. When
+                            // the def DOES dominate (SSA-legal), the linear
+                            // lowering ALSO requires it to be laid out
+                            // before the use. Phi incomings are EXEMPT
+                            // (handled by the Phi arm above): a loop
+                            // back-edge legitimately carries a def whose
+                            // layout FOLLOWS the use, and the dominance arm
+                            // owns that semantics — only NON-Phi linear
+                            // operands flow here. Defensive index guard:
+                            // both blocks are reachable (in rpo ⊆ this
+                            // function), so both have a valid layoutPos.
+                            std::uint32_t const defPos =
+                                (defBlock.v < layoutPos.size())
+                                    ? layoutPos[defBlock.v]
+                                    : static_cast<std::uint32_t>(-1);
+                            std::uint32_t const usePos =
+                                (useBlock.v < layoutPos.size())
+                                    ? layoutPos[useBlock.v]
+                                    : static_cast<std::uint32_t>(-1);
+                            if (defPos != static_cast<std::uint32_t>(-1)
+                             && usePos != static_cast<std::uint32_t>(-1)
+                             && defPos >= usePos) {
+                                reportInst(reporter,
+                                    DiagnosticCode::I_LayoutUseBeforeDef, use,
+                                    std::format("uses value #{} defined in block "
+                                                "#{} (layout pos {}) which "
+                                                "dominates but is laid out at or "
+                                                "after use block #{} (layout pos "
+                                                "{}) — no linear consumer can "
+                                                "resolve a def emitted after its "
+                                                "use",
+                                        op.v, defBlock.v, defPos,
+                                        useBlock.v, usePos));
+                            }
                         }
                     }
                 }

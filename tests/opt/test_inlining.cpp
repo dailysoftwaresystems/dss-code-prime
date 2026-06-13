@@ -40,6 +40,7 @@
 //   * callsInlined counter accuracy + verifier-clean rebuild.
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -49,12 +50,16 @@
 #include "mir/mir_verifier.hpp"
 #include "opt/optimizer.hpp"
 #include "opt/passes/inlining.hpp"
+#include "diagnostic_count.hpp"
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <variant>
+
+using dss::test_support::countCode;
 
 using namespace dss;
 
@@ -1866,4 +1871,183 @@ TEST(Inlining, InlineCostModelZeroThresholdRefusesAll) {
 
     MirVerifier verifier{mir, &interner};
     EXPECT_TRUE(verifier.verify(rep));
+}
+
+// ── D15 cycle C (a): a LOOP-BEARING callee inlines, LAYOUT-clean ────
+// f(k){ int acc=37; while(k){acc++; k--;} return acc; } in its PRE-Mem2Reg
+// alloca form (the shape `runInlining` sees in release — Inlining runs
+// BEFORE Mem2Reg, so the loop variable lives in an alloca, no callee Phi).
+// The callee is MULTI-BLOCK with a real loop back-edge (body→header). The
+// C1 by-construction topological pre-creation lays the cloned header
+// before its body and the continuation after every clone, so the
+// MirVerifier — WITH the new layout rule (I_LayoutUseBeforeDef) — sees
+// ZERO diagnostics. This is the iter.c RC-B shape at the unit tier.
+// RED-on-disable: reverting C1's creation order (continuation created
+// before the clones) lays a clone-defined value's def AFTER the
+// continuation that consumes it → I_LayoutUseBeforeDef fires →
+// verifier.verify(rep) returns false (demonstrated in the cycle gate).
+TEST(Inlining, LoopBearingCalleeInlinesLayoutClean) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const i32p  = interner.pointer(i32);
+    TypeId const params[] = {i32};
+    TypeId const fSig  = interner.fnSig(params, i32, CallConv::CcSysV);
+    TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // f(int k): alloca-based counted loop (Phi-free — the gate forbids
+    // callee Phis; this is the pre-Mem2Reg lowering).
+    mb.addFunction(fSig, SymbolId{50});
+    MirBlockId const fEntry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const fHeader = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const fBody   = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const fExit   = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(fEntry);
+    MirInstId const kArg    = mb.addArg(0, i32);
+    MirInstId const accSlot = mb.addInst(MirOpcode::Alloca, {}, i32p);
+    MirInstId const kSlot   = mb.addInst(MirOpcode::Alloca, {}, i32p);
+    {
+        MirInstId const st0[] = {kArg, kSlot};
+        (void)mb.addInst(MirOpcode::Store, st0, InvalidType);
+        MirInstId const c37 = mb.addConst(i32Lit(37), i32);
+        MirInstId const st1[] = {c37, accSlot};
+        (void)mb.addInst(MirOpcode::Store, st1, InvalidType);
+    }
+    mb.addBr(fHeader);
+    mb.beginBlock(fHeader);
+    MirInstId const kv   = mb.addInst(MirOpcode::Load, std::array{kSlot}, i32);
+    MirInstId const zero = mb.addConst(i32Lit(0), i32);
+    MirInstId const ne   = mb.addInst(MirOpcode::ICmpNe, std::array{kv, zero}, boolT);
+    mb.addCondBr(ne, fBody, fExit);
+    mb.beginBlock(fBody);
+    {
+        MirInstId const a    = mb.addInst(MirOpcode::Load, std::array{accSlot}, i32);
+        MirInstId const one  = mb.addConst(i32Lit(1), i32);
+        MirInstId const a1   = mb.addInst(MirOpcode::Add, std::array{a, one}, i32);
+        MirInstId const sta[] = {a1, accSlot};
+        (void)mb.addInst(MirOpcode::Store, sta, InvalidType);
+        MirInstId const kk   = mb.addInst(MirOpcode::Load, std::array{kSlot}, i32);
+        MirInstId const one2 = mb.addConst(i32Lit(1), i32);
+        MirInstId const kk1  = mb.addInst(MirOpcode::Sub, std::array{kk, one2}, i32);
+        MirInstId const stk[] = {kk1, kSlot};
+        (void)mb.addInst(MirOpcode::Store, stk, InvalidType);
+    }
+    mb.addBr(fHeader);  // back edge
+    mb.beginBlock(fExit);
+    MirInstId const rv = mb.addInst(MirOpcode::Load, std::array{accSlot}, i32);
+    mb.addReturn(rv);
+
+    // main(): return f(5)
+    mb.addFunction(mainSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const fAddr = mb.addGlobalAddr(SymbolId{50}, fSig);
+    MirInstId const arg5  = mb.addConst(i32Lit(5), i32);
+    MirInstId const callOps[] = {fAddr, arg5};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(call);
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "the loop-bearing (alloca-form) callee MUST inline (one call)";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
+        << "main's call to f must be spliced away";
+
+    // THE pin: the spliced module — INCLUDING the new layout rule — is
+    // verifier-clean. ZERO diagnostics (not just verify==true).
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the loop-bearing splice must verify clean WITH the layout rule";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::I_LayoutUseBeforeDef), 0u)
+        << "C1's by-construction topological layout must leave NO layout "
+           "violation in the cloned loop body / continuation";
+    EXPECT_EQ(rep.errorCount(), 0u) << "zero diagnostics of any kind";
+}
+
+// ── D15 cycle C (b): recursion × inlining — main→rec inlines, rec→rec
+// survives (the cross-SCC edge). ────────────────────────────────────
+// rec(k){ if(k){ return rec(k-1)+1; } return 37; }  main(){ return rec(5); }
+// `rec` is self-recursive → its self-call is in rec's own SCC → the SCC
+// gate (rule 3) REFUSES rec→rec (it stays out-of-line). But main→rec is
+// a CROSS-SCC edge (main is not in rec's SCC) → it IS inlined. So exactly
+// ONE call inlines (main→rec); the recursive self-call survives INSIDE
+// the now-inlined-into-main body. Verifier-clean incl. the layout rule
+// (rec is a multi-block diamond — the splice's continuation consumes the
+// merged return value, which C1 lays out correctly).
+TEST(Inlining, RecursionCrossSccInlinesCallerSelfCallSurvives) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {i32};
+    TypeId const recSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // rec(int k): if (k) return rec(k-1)+1; return 37;  (alloca-free,
+    // Phi-free diamond — entry CondBr to a recursive-then arm + a base
+    // else arm; each arm Returns, so no merge Phi).
+    mb.addFunction(recSig, SymbolId{50});
+    MirBlockId const rEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const rThen  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const rElse  = mb.createBlock(StructCfMarker::IfElse);
+    mb.beginBlock(rEntry);
+    MirInstId const kArg = mb.addArg(0, i32);
+    MirInstId const zero = mb.addConst(i32Lit(0), i32);
+    MirInstId const ne   = mb.addInst(MirOpcode::ICmpNe, std::array{kArg, zero}, boolT);
+    mb.addCondBr(ne, rThen, rElse);
+    mb.beginBlock(rThen);
+    {
+        MirInstId const selfAddr = mb.addGlobalAddr(SymbolId{50}, recSig);
+        MirInstId const one  = mb.addConst(i32Lit(1), i32);
+        MirInstId const km1  = mb.addInst(MirOpcode::Sub, std::array{kArg, one}, i32);
+        MirInstId const recOps[] = {selfAddr, km1};
+        MirInstId const recCall = mb.addInst(MirOpcode::Call, recOps, i32);
+        MirInstId const one2 = mb.addConst(i32Lit(1), i32);
+        MirInstId const sum  = mb.addInst(MirOpcode::Add, std::array{recCall, one2}, i32);
+        mb.addReturn(sum);
+    }
+    mb.beginBlock(rElse);
+    mb.addReturn(mb.addConst(i32Lit(37), i32));
+
+    // main(): return rec(5)
+    mb.addFunction(mainSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const recAddr = mb.addGlobalAddr(SymbolId{50}, recSig);
+    MirInstId const arg5    = mb.addConst(i32Lit(5), i32);
+    MirInstId const callOps[] = {recAddr, arg5};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(call);
+    Mir mir = std::move(mb).finish();
+
+    // Before: 2 calls (main→rec, rec→rec self-call).
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "exactly ONE call inlines: the cross-SCC main→rec edge. The "
+           "rec→rec self-call is in rec's own SCC and the gate refuses it.";
+    // rec's own body still holds its self-call (refused, out-of-line).
+    EXPECT_EQ(countOpInFuncBySymbol(mir, 50, MirOpcode::Call), 1u)
+        << "rec's recursive self-call MUST survive (SCC gate refusal)";
+    // main inlined rec's SOURCE body → it now carries the cloned self-call
+    // (the residual recursive Call spliced in from rec's then-arm).
+    EXPECT_EQ(countOpInFuncBySymbol(mir, 100, MirOpcode::Call), 1u)
+        << "main holds the cloned residual self-call from rec's then-arm";
+
+    // Verifier-clean incl. the layout rule (the diamond's continuation).
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the cross-SCC recursion splice must verify clean (layout rule)";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::I_LayoutUseBeforeDef), 0u);
 }

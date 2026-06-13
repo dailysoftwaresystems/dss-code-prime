@@ -143,9 +143,20 @@ struct ExampleTarget {
 // copy_prop_across_join, licm_conditional_mutation, cse_noncommutative)
 // list the buggy-opt exit codes they would produce — making any
 // regression bisectable via the diff between the two arms.
+// An arm declares EXACTLY ONE OF:
+//   * `passes`: an inline PassId-name array (resolved via
+//     optPassIdFromName) → an ad-hoc pipeline (maxIterations 1,
+//     default inlineThreshold), OR
+//   * `shippedPipeline`: the NAME of a shipped config
+//     (src/dss-config/pipelines/<name>.pipeline.json) → the arm runs
+//     the SHIPPED pipeline ITSELF (name/maxIterations/inlineThreshold
+//     loaded from the file — ZERO drift between corpus + shipped config).
+// `buildPipeline` enforces the exactly-one-of (both / neither → fail).
 struct OptimizedArm {
     std::string                  label;   // diagnostic-rendering name (free-form)
-    std::vector<std::string>     passes;  // PassId names (resolved via optPassIdFromName)
+    std::vector<std::string>     passes;  // PassId names (inline-array form)
+    bool                         hasPasses = false;          // `passes` key present
+    std::optional<std::string>   shippedPipeline;            // shipped-config form
 };
 
 // V2-4 Part C (D-DIAG-CLI-POSITION-RENDER-AND-ASSERT): one declared
@@ -311,9 +322,12 @@ struct ExampleManifest {
         }
         m.targets.push_back(std::move(et));
     }
-    // D-OPT1-DIFFERENTIAL-VERIFY-RUNNER. Manifest shape:
+    // D-OPT1-DIFFERENTIAL-VERIFY-RUNNER. Manifest shape — each arm
+    // declares EXACTLY ONE OF `passes` (inline array) or `shippedPipeline`
+    // (a config name); the exactly-one-of is enforced in `buildPipeline`:
     //   "optimizedPipelines": [
-    //     {"label": "constfold-only", "passes": ["ConstFold"]}
+    //     {"label": "constfold-only", "passes": ["ConstFold"]},
+    //     {"label": "release", "shippedPipeline": "release"}
     //   ]
     if (j.contains("optimizedPipelines")) {
         if (!j.at("optimizedPipelines").is_array()) {
@@ -322,24 +336,42 @@ struct ExampleManifest {
             return m;
         }
         for (auto const& arm : j.at("optimizedPipelines")) {
-            if (!arm.is_object() ||
-                !arm.contains("label") || !arm.at("label").is_string() ||
-                !arm.contains("passes") || !arm.at("passes").is_array()) {
+            if (!arm.is_object()
+                || !arm.contains("label") || !arm.at("label").is_string()) {
                 ADD_FAILURE() << "manifest " << path.generic_string()
                               << " each optimizedPipelines entry needs string"
-                                 " 'label' + array 'passes'";
+                                 " 'label' + exactly one of 'passes' /"
+                                 " 'shippedPipeline'";
                 return m;
             }
             OptimizedArm oa;
             oa.label = arm.at("label").get<std::string>();
-            for (auto const& p : arm.at("passes")) {
-                if (!p.is_string()) {
+            if (arm.contains("passes")) {
+                if (!arm.at("passes").is_array()) {
                     ADD_FAILURE() << "manifest " << path.generic_string()
-                                  << " optimizedPipelines.passes entries must"
-                                     " be strings";
+                                  << " optimizedPipelines 'passes' must be an"
+                                     " array";
                     return m;
                 }
-                oa.passes.push_back(p.get<std::string>());
+                oa.hasPasses = true;
+                for (auto const& p : arm.at("passes")) {
+                    if (!p.is_string()) {
+                        ADD_FAILURE() << "manifest " << path.generic_string()
+                                      << " optimizedPipelines.passes entries"
+                                         " must be strings";
+                        return m;
+                    }
+                    oa.passes.push_back(p.get<std::string>());
+                }
+            }
+            if (arm.contains("shippedPipeline")) {
+                if (!arm.at("shippedPipeline").is_string()) {
+                    ADD_FAILURE() << "manifest " << path.generic_string()
+                                  << " optimizedPipelines 'shippedPipeline'"
+                                     " must be a string";
+                    return m;
+                }
+                oa.shippedPipeline = arm.at("shippedPipeline").get<std::string>();
             }
             m.optimizedPipelines.push_back(std::move(oa));
         }
@@ -353,6 +385,39 @@ struct ExampleManifest {
 // the PassId enum.
 [[nodiscard]] std::optional<::dss::opt::OptPipeline>
 buildPipeline(OptimizedArm const& arm, fs::path const& manifestPath) {
+    // EXACTLY-ONE-OF `passes` / `shippedPipeline` — fail loud on both or
+    // neither (a manifest typo must surface, never silently pick a
+    // default). `hasPasses` (not `passes`-non-empty) is the presence
+    // signal: an empty inline `passes: []` is still "the inline form".
+    bool const hasPasses  = arm.hasPasses;
+    bool const hasShipped = arm.shippedPipeline.has_value();
+    if (hasPasses == hasShipped) {
+        ADD_FAILURE() << "manifest " << manifestPath.generic_string()
+                      << ": optimizedPipelines arm '" << arm.label
+                      << "' must declare EXACTLY ONE OF 'passes' or"
+                         " 'shippedPipeline' (got "
+                      << (hasPasses ? "both" : "neither") << ")";
+        return std::nullopt;
+    }
+
+    // Shipped-config form: load the pipeline ITSELF (name/maxIterations/
+    // inlineThreshold from the file — ZERO drift between the corpus arm
+    // and the shipped configuration it claims to exercise).
+    if (hasShipped) {
+        auto loaded = ::dss::opt::loadShippedPipeline(*arm.shippedPipeline);
+        if (!loaded.has_value()) {
+            std::ostringstream diag;
+            for (auto const& d : loaded.error()) diag << "\n    " << d.message;
+            ADD_FAILURE() << "manifest " << manifestPath.generic_string()
+                          << ": arm '" << arm.label
+                          << "' shippedPipeline '" << *arm.shippedPipeline
+                          << "' failed to load:" << diag.str();
+            return std::nullopt;
+        }
+        return std::move(*loaded);
+    }
+
+    // Inline-array form: resolve each PassId name.
     ::dss::opt::OptPipeline p;
     p.name = arm.label;
     p.passes.reserve(arm.passes.size());

@@ -9,6 +9,7 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
+#include "mir/mir_struct_markers.hpp"
 #include "mir/mir_verifier.hpp"
 #include "diagnostic_count.hpp"
 
@@ -567,4 +568,147 @@ TEST(MirVerifier, InternerGatedRulesSkippedWhenInternerAbsent) {
     DiagnosticReporter r;
     MirVerifier v{m};  // No interner.
     EXPECT_TRUE(v.verify(r));
+}
+
+// ── the LAYOUT rule (I_LayoutUseBeforeDef, D-OPT2 layout contract) ──────────
+//
+// Dominance is necessary but NOT sufficient for the linear MIR→LIR
+// lowering: every linear consumer requires a TOPOLOGICAL block layout
+// (a def emitted before its use). The verifier's layout rule catches a
+// def that DOMINATES its use but is laid out AFTER it — a class no
+// dominance check can see. These three pins:
+//   (1) dominance-VALID but layout-INVERTED → EXACTLY 1
+//       I_LayoutUseBeforeDef (and ZERO I_NotDominated — the rule is
+//       GATED on Dominates so one bad operand never double-reports);
+//   (2) the topological SIBLING (same CFG, correct layout) → clean;
+//   (3) a loop back-edge Phi incoming whose value is defined in the
+//       latch (laid out AFTER the header) → clean (Phi incomings are
+//       EXEMPT; the dominance arm owns their semantics).
+
+// (1) entry → B(def) → C(use), but C is CREATED before B, so C is laid
+// out before B. B dominates C (straight-line entry→B→C), so SSA holds —
+// yet the def in B is laid out AFTER its use in C. The layout rule fires
+// EXACTLY once; I_NotDominated does NOT (the def dominates).
+TEST(MirVerifier, LayoutInvertedDominatingDefEmitsLayoutUseBeforeDef) {
+    MirBuilder b;
+    MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
+    (void)f;
+    // Creation order == layout order: [entry, C, B]. C precedes B.
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const cUse  = b.createBlock(StructCfMarker::Linear);
+    MirBlockId const bDef  = b.createBlock(StructCfMarker::Linear);
+    // CFG: entry → B → C → return (a straight line — B dominates C).
+    b.beginBlock(entry);
+    b.addBr(bDef);
+    b.beginBlock(bDef);
+    MirInstId const tv = b.addConst(intLit(10), kI32);  // def in B
+    b.addBr(cUse);
+    b.beginBlock(cUse);
+    std::array<MirInstId, 2> const useOps{tv, tv};       // use of B's def in C
+    MirInstId const use = b.addInst(MirOpcode::Add, useOps, kI32);
+    b.addReturn(use);
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m};
+    EXPECT_FALSE(v.verify(r))
+        << "a dominating-but-layout-later def must be rejected — no linear "
+           "consumer can resolve a def emitted after its use";
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_LayoutUseBeforeDef), 1u)
+        << "EXACTLY one layout violation (the single cross-block use of "
+           "B's def in the earlier-laid-out C)";
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_NotDominated), 0u)
+        << "the def DOMINATES the use (SSA holds) — the layout rule is "
+           "gated on Dominates so it must NOT double-report I_NotDominated";
+}
+
+// (2) The TOPOLOGICAL sibling: identical CFG, but B is created (laid
+// out) BEFORE C — [entry, B, C]. The def now precedes its use in layout
+// → clean.
+TEST(MirVerifier, TopologicalLayoutDominatingDefIsClean) {
+    MirBuilder b;
+    MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
+    (void)f;
+    // Creation order == layout order: [entry, B, C]. B precedes C.
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const bDef  = b.createBlock(StructCfMarker::Linear);
+    MirBlockId const cUse  = b.createBlock(StructCfMarker::Linear);
+    b.beginBlock(entry);
+    b.addBr(bDef);
+    b.beginBlock(bDef);
+    MirInstId const tv = b.addConst(intLit(10), kI32);
+    b.addBr(cUse);
+    b.beginBlock(cUse);
+    std::array<MirInstId, 2> const useOps{tv, tv};
+    MirInstId const use = b.addInst(MirOpcode::Add, useOps, kI32);
+    b.addReturn(use);
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m};
+    EXPECT_TRUE(v.verify(r))
+        << "a topological layout (def laid out before use) is clean";
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_LayoutUseBeforeDef), 0u);
+}
+
+// (3) THE EXEMPTION pin: a loop header Phi has a back-edge incoming whose
+// VALUE is defined in the latch — and the latch is laid out AFTER the
+// header. A loop back-edge legitimately carries a def whose layout
+// FOLLOWS the phi-use; Phi incomings are EXEMPT from the layout rule (the
+// dominance arm owns their semantics), so this canonical counted loop
+// verifies clean. Layout order [entry, header, latch, exit].
+//   entry:  br header
+//   header: i_phi = phi[(0,entry),(i_next,latch)]; condbr latch, exit
+//   latch:  i_next = i_phi + 1; br header   (back edge; laid out AFTER header)
+//   exit:   return i_phi
+// Markers are stamped by the canonical derivation (`rederiveStructCfMarkers`,
+// exactly as every real producer does post-finish) so the test isolates the
+// LAYOUT-rule's Phi exemption from marker bookkeeping — the back-edge i_next
+// (defined in the later-laid-out latch) is the subject, and it must NOT trip
+// I_LayoutUseBeforeDef.
+TEST(MirVerifier, LoopBackEdgePhiIncomingIsExemptFromLayoutRule) {
+    MirBuilder b;
+    MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
+    (void)f;
+    MirBlockId const entry  = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = b.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const latch  = b.createBlock(StructCfMarker::Linear);
+    MirBlockId const exit   = b.createBlock(StructCfMarker::Linear);
+    b.beginBlock(entry);
+    MirInstId const zero = b.addConst(intLit(0), kI32);
+    b.addBr(header);
+    // header: phi joins entry's 0 with the latch's i_next (defined LATER
+    // in layout). Emit the phi placeholder, then add incomings after the
+    // latch defines i_next.
+    b.beginBlock(header);
+    MirInstId const iPhi = b.addPhi(kI32);
+    MirInstId const hcond = b.addConst(intLit(1), kBool);
+    b.addCondBr(hcond, latch, exit);
+    // latch: i_next = i_phi + 1; back-edge to header.
+    b.beginBlock(latch);
+    MirInstId const one = b.addConst(intLit(1), kI32);
+    std::array<MirInstId, 2> const incOps{iPhi, one};
+    MirInstId const iNext = b.addInst(MirOpcode::Add, incOps, kI32);
+    b.addBr(header);
+    // exit: return the phi.
+    b.beginBlock(exit);
+    b.addReturn(iPhi);
+    // Wire the header phi's incomings now that i_next exists. The (i_next,
+    // latch) incoming is the back edge — value defined in a block laid out
+    // AFTER the header.
+    b.addPhiIncoming(iPhi, MirPhiIncoming{zero, entry});
+    b.addPhiIncoming(iPhi, MirPhiIncoming{iNext, latch});
+    Mir m = std::move(b).finish();
+    // Stamp canonical markers (the back-edge makes `header` a LoopHeader,
+    // `latch` a LoopLatch, etc.) so only the layout rule is under test.
+    rederiveStructCfMarkers(m);
+
+    DiagnosticReporter r;
+    MirVerifier v{m};
+    EXPECT_TRUE(v.verify(r))
+        << "a loop back-edge Phi incoming (value defined in the later-laid-"
+           "out latch) is EXEMPT from the layout rule — the dominance arm "
+           "owns Phi-incoming semantics";
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_LayoutUseBeforeDef), 0u)
+        << "the layout rule must not fire on a Phi back-edge incoming";
 }

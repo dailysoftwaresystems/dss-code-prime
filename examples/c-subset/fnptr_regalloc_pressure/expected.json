@@ -1,5 +1,5 @@
 {
-  "$comment": "FC4 c2: runtime witness for the indirect-callee/arg-reg regalloc exclusion — the pools are drained so the callee's natural pick reaches the SysV arg registers; only the exclusion rule keeps the callee out of its own call's arg-setup clobber zone. fp is runtime-selected (recursion-guarded selector) so no pipeline devirtualizes the call.",
+  "$comment": "FC4 c2: runtime witness for the indirect-callee/arg-reg regalloc exclusion — the pools are drained so the callee's natural pick reaches the SysV arg registers; only the exclusion rule keeps the callee out of its own call's arg-setup clobber zone. fp is runtime-selected (recursion-guarded selector) so no pipeline devirtualizes the call. D15 cycle C: a `release` arm runs the SHIPPED release.pipeline.json ITSELF (shippedPipeline) — the self-recursive `sel` is exactly the recursive control-flow class RC-A/RC-B closed, witnessed here end-to-end under the shipped composition.",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,
@@ -28,6 +28,7 @@
     }
   ],
   "optimizedPipelines": [
-    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
   ]
 }
