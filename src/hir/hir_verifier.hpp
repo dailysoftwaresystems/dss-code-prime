@@ -138,10 +138,14 @@ private:
     void checkDeclarationShape(DiagnosticReporter& reporter) const;
 
     // Block dead-code (HR6, plan §2.8 "no fall-through past Return/Unreachable",
-    // extended to all unconditional transfers): no statement may follow an
+    // extended to all unconditional transfers): a statement following an
     // unconditional terminator (`Return`/`Unreachable`/`Break`/`Continue`) within
-    // a `Block` — control can never reach it. Each violation emits
-    // `H_VerifierFailure`.
+    // a `Block` can never be reached. ISO C permits this (C 6.8.x imposes no
+    // reachability constraint), so — matching real compilers — each occurrence is
+    // a WARNING (`H_UnreachableCode`), NOT a rejection: the module still compiles
+    // and the dead statement is dropped at the MIR unreachable-prune. One
+    // diagnostic per block (the rest is cascade). This is the ONLY verifier rule
+    // that does not reject; every other rule emits an Error.
     void checkBlockTermination(DiagnosticReporter& reporter) const;
 
     // Return completeness (HR6, plan §2.8): a non-void `Function`'s body `Block`

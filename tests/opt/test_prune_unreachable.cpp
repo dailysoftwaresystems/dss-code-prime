@@ -249,17 +249,20 @@ TEST(PruneUnreachable, SwitchAllArmsReturnOrphansExit) {
         /*expectedOrphans=*/1);
 }
 
-// NOTE on shapes deliberately NOT pinned here (verified out-of-band, NOT
-// prune bugs — they never reach the MIR prune):
-//   * dead-code-after-return (`return 42; return 7;`) is rejected EARLIER
-//     by the HIR verifier (H0003 "statement is unreachable"), so it never
-//     produces orphan MIR. The prune is not its guard; H0003 is.
-//   * a loop whose body UNCONDITIONALLY returns with NO reachable exit
-//     (`while(1){return;}`, `do{return;}while(c);`, `for(;;){return;}`)
-//     trips a PRE-EXISTING HirBuilder `addParent` double-attach fatal
-//     during HIR construction — upstream of MIR, orthogonal to this prune.
-//     The `for`-with-condition returning-body case above covers the loop
-//     orphan (the update block) without hitting that frontend bug.
+// NOTE on related shapes covered ELSEWHERE (not re-pinned in this prune file):
+//   * dead-code-after-terminator (`return 42; return 7;`) is now ACCEPTED with a
+//     WARNING (`H_UnreachableCode`; D-HIR-DEAD-CODE-AFTER-RETURN-REJECTED), so it
+//     DOES reach this prune — the dead statement lowers into the Block-lowering
+//     fresh-dead-block and is dropped. Pinned by the `dead_code_after_return`
+//     corpus + the `test_hir_verifier` warning pins.
+//   * a provably-infinite loop whose body returns (`while(1){return;}`,
+//     `for(;;){return;}`, `do{return;}while(1)`) is wrapped as
+//     `Block{ loop, Unreachable }` in HIR lowering (D-HIR-INFINITE-LOOP-NOT-
+//     TERMINATING) so the function structurally terminates; pinned by the
+//     `nonmain_*_inf_return` corpus. (The earlier HirBuilder double-attach on
+//     such non-terminating `main`s was fixed in D-HIR-LOOP-BODY-ONLY-RETURN-
+//     DOUBLE-ATTACH.) The `for`-with-condition returning-body case above still
+//     exercises the update-block orphan in THIS prune file.
 
 // ── PHI INTEGRITY (pins acceptPhiIncoming) ─────────────────────────────
 // A reachable join `J` whose phi has TWO incomings: one from a reachable

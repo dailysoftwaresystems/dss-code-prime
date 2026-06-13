@@ -449,10 +449,11 @@ enum class DiagnosticCode : std::uint16_t {
     // H_VerifierFailure: a node violates a structural invariant — HR3 uses it for
     //   a wrong child-arity for the node's kind (e.g. a BinaryOp with 1 child, a
     //   ForStmt whose child count disagrees with its clause-presence mask). HR6
-    //   extends it to: a statement after an unconditional terminator in a Block
-    //   (dead code), a non-void function body that may fall through without
+    //   extends it to: a non-void function body that may fall through without
     //   returning, and a Call whose argument count/types disagree with the
-    //   callee's FnSig.
+    //   callee's FnSig. (Dead code after an unconditional terminator is NOT a
+    //   failure — it is ISO-C-valid; the verifier reports it as the
+    //   `H_UnreachableCode` WARNING below, not as an error.)
     H_VerifierFailure             = 0xF003,
     // H_UnknownIntrinsic: an IntrinsicCall whose payload (intrinsic id) does not
     //   resolve to an intrinsic registered in the module's HirIntrinsicRegistry.
@@ -535,6 +536,17 @@ enum class DiagnosticCode : std::uint16_t {
     // DIAGNOSTIC). Source-agnostic: the recognized + ignored sets are both
     // per-language config; the engine never hardcodes a specifier identity.
     H_UnknownLinkageSpecifier     = 0xF00C,
+    // H_UnreachableCode: a statement following an unconditional terminator
+    //   (Return / Unreachable / Break / Continue) within a Block — control can
+    //   never reach it. ISO C permits this (C 6.8.x has no reachability
+    //   constraint on statements); real compilers warn rather than reject, so
+    //   the HIR verifier emits this as a WARNING (NOT the `H_VerifierFailure`
+    //   error) and the module still compiles. The dead statement flows to MIR
+    //   where the generic Block-lowering's fresh-dead-block + the mandatory MIR
+    //   unreachable-prune drop it, so runtime is unaffected. A WARNING, not an
+    //   error — and intentionally suppressible (NOT in the unsuppressable
+    //   closed-table): silencing it cannot mask a miscompile.
+    H_UnreachableCode             = 0xF00D,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,

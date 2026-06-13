@@ -31,11 +31,19 @@ namespace {
 // `actual` ("hir node #N …"); because `actual` participates in the reporter's
 // dedup key, two findings on DIFFERENT nodes are never coalesced even when both
 // lack a span and so share the empty one.
+//
+// `severity` defaults to `Error` — almost every verifier rule reports a
+// structural-invariant breach that REJECTS the module, so every existing call
+// site stays unchanged. The one exception is `checkBlockTermination`'s
+// unreachable-after-terminator finding, which is ISO-C-valid and so passes
+// `DiagnosticSeverity::Warning` (a warning doesn't bump `errorCount`, so
+// `verify()` still returns true and the module compiles).
 void reportAt(DiagnosticReporter& reporter, DiagnosticCode code, HirNodeId id,
-              std::string actual, HirSourceMap const* sourceMap) {
+              std::string actual, HirSourceMap const* sourceMap,
+              DiagnosticSeverity severity = DiagnosticSeverity::Error) {
     ParseDiagnostic d;
     d.code     = code;
-    d.severity = DiagnosticSeverity::Error;
+    d.severity = severity;
     if (sourceMap != nullptr && sourceMap->has(id)) {
         HirSourceLoc const& loc = sourceMap->get(id);
         d.buffer = loc.buffer;
@@ -303,14 +311,18 @@ void HirVerifier::checkBlockTermination(DiagnosticReporter& reporter) const {
 
         auto kids = hir_.children(id);
         // An unconditional terminator must be the LAST statement; anything after
-        // it is unreachable. One diagnostic per block — the rest is cascade.
+        // it is unreachable. ISO C permits unreachable statements (no reachability
+        // constraint in C 6.8.x), so this is a WARNING, not a rejection — the
+        // module still compiles and the dead statement is dropped at the MIR
+        // unreachable-prune (so runtime is unaffected). One diagnostic per block
+        // — the rest is cascade.
         for (std::size_t k = 0; k + 1 < kids.size(); ++k) {
             if (isUnconditionalTerminator(hir_.kind(kids[k]))) {
-                reportAt(reporter, DiagnosticCode::H_VerifierFailure, kids[k + 1],
+                reportAt(reporter, DiagnosticCode::H_UnreachableCode, kids[k + 1],
                          std::format("statement #{} in block #{} is unreachable: it follows "
                                      "unconditional terminator #{}",
                                      kids[k + 1].v, id.v, kids[k].v),
-                         sourceMap_);
+                         sourceMap_, DiagnosticSeverity::Warning);
                 break;
             }
         }

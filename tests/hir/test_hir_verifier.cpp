@@ -606,9 +606,35 @@ TEST(HirVerifier, UntypedSourceDeclarationsFireButExternsDoNot) {
     EXPECT_EQ(countCode(reporter, DiagnosticCode::H_TypeUnresolved), 3u);
 }
 
-// ── block dead-code rule (HR6, H_VerifierFailure) ──
+// ── block dead-code rule (HR6, H_UnreachableCode WARNING) ──
+//
+// D-HIR-DEAD-CODE-AFTER-RETURN-REJECTED closure: a statement after an
+// unconditional terminator is ISO-C-valid (C 6.8.x has no reachability
+// constraint), so — matching real compilers — the verifier now WARNS
+// (`H_UnreachableCode`) rather than REJECTS. `verify()` returns true (a warning
+// doesn't bump errorCount), the module compiles, and the dead statement is
+// dropped at the MIR unreachable-prune. These tests pin verify()==true AND the
+// exact code + Warning severity; reverting to the old `H_VerifierFailure`-Error
+// emission makes `verify()` return false (red-on-disable).
 
-TEST(HirVerifier, DeadCodeAfterReturnFires) {
+namespace {
+// Assert exactly one diagnostic carrying `code` is present and its severity is
+// `sev` (the dead-code rule's contract is "one per block, at Warning severity").
+void expectExactlyOneAt(DiagnosticReporter const& r, DiagnosticCode code,
+                        DiagnosticSeverity sev) {
+    EXPECT_EQ(countCode(r, code), 1u);
+    bool saw = false;
+    for (auto const& d : r.all()) {
+        if (d.code != code) continue;
+        saw = true;
+        EXPECT_EQ(d.severity, sev)
+            << "dead-code diagnostic must carry the expected severity";
+    }
+    EXPECT_TRUE(saw) << "expected a diagnostic with the given code";
+}
+} // namespace
+
+TEST(HirVerifier, DeadCodeAfterReturnWarns) {
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
     HirBuilder b{"toy"};
@@ -618,11 +644,17 @@ TEST(HirVerifier, DeadCodeAfterReturnFires) {
     Hir h = std::move(b).finish(blk);
 
     DiagnosticReporter reporter;
-    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
-    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+    // ISO-C-valid: the module is ACCEPTED (verify==true) and the dead statement
+    // is reported only as a WARNING — no error bumps errorCount.
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+    expectExactlyOneAt(reporter, DiagnosticCode::H_UnreachableCode,
+                       DiagnosticSeverity::Warning);
+    // The OLD rejection code must no longer fire for dead code.
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 0u);
 }
 
-TEST(HirVerifier, DeadCodeAfterBreakFires) {
+TEST(HirVerifier, DeadCodeAfterBreakWarns) {
     // Break is an unconditional transfer too — code after it in the block is dead.
     TypeInterner ti = makeInterner();
     TypeId const i32   = ti.primitive(TypeKind::I32);
@@ -635,8 +667,10 @@ TEST(HirVerifier, DeadCodeAfterBreakFires) {
     Hir h = std::move(b).finish(wh);
 
     DiagnosticReporter reporter;
-    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
-    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+    expectExactlyOneAt(reporter, DiagnosticCode::H_UnreachableCode,
+                       DiagnosticSeverity::Warning);
 }
 
 TEST(HirVerifier, TerminatorAsLastStatementIsClean) {
@@ -954,7 +988,7 @@ TEST(HirVerifier, WellFormedShaderFunctionIsClean) {
 
 // ── HR6 review-pass coverage: distinct branches the first tests didn't exercise ──
 
-TEST(HirVerifier, DeadCodeAfterUnreachableFires) {
+TEST(HirVerifier, DeadCodeAfterUnreachableWarns) {
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
     HirBuilder b{"toy"};
@@ -964,11 +998,13 @@ TEST(HirVerifier, DeadCodeAfterUnreachableFires) {
     Hir h = std::move(b).finish(blk);
 
     DiagnosticReporter reporter;
-    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
-    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+    expectExactlyOneAt(reporter, DiagnosticCode::H_UnreachableCode,
+                       DiagnosticSeverity::Warning);
 }
 
-TEST(HirVerifier, DeadCodeAfterContinueFires) {
+TEST(HirVerifier, DeadCodeAfterContinueWarns) {
     TypeInterner ti = makeInterner();
     TypeId const i32   = ti.primitive(TypeKind::I32);
     TypeId const boolT = ti.primitive(TypeKind::Bool);
@@ -980,13 +1016,16 @@ TEST(HirVerifier, DeadCodeAfterContinueFires) {
     Hir h = std::move(b).finish(wh);
 
     DiagnosticReporter reporter;
-    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
-    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+    expectExactlyOneAt(reporter, DiagnosticCode::H_UnreachableCode,
+                       DiagnosticSeverity::Warning);
 }
 
 TEST(HirVerifier, OnlyOneDeadCodeDiagnosticPerBlock) {
     // Two terminator+follower pairs in one block must still yield ONE diagnostic
-    // (the rest is cascade) — guards the inner-loop `break`.
+    // (the rest is cascade) — guards the inner-loop `break`. The single
+    // diagnostic is the `H_UnreachableCode` WARNING; the module is accepted.
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
     HirBuilder b{"toy"};
@@ -996,8 +1035,10 @@ TEST(HirVerifier, OnlyOneDeadCodeDiagnosticPerBlock) {
     Hir h = std::move(b).finish(blk);
 
     DiagnosticReporter reporter;
-    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
-    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+    expectExactlyOneAt(reporter, DiagnosticCode::H_UnreachableCode,
+                       DiagnosticSeverity::Warning);
 }
 
 TEST(HirVerifier, NonVoidSwitchWithDefaultAllArmsReturnIsClean) {
