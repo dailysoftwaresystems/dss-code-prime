@@ -55,6 +55,46 @@ cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
     return GlobalClonePrelude::Cloned;
 }
 
+void cloneGlobalsVerbatim(Mir const& mir, MirBuilder& builder) {
+    // Same alias-analysis polarity propagation as cloneGlobalsOrCarveOut
+    // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE) — without it the
+    // rebuilt module silently downgrades strict-TBAA / char-aliases-all
+    // to the MirBuilder defaults.
+    builder.setAliasingMode(mir.aliasingMode());
+    builder.setCharTypesAliasAll(mir.charTypesAliasAll());
+
+    // CONTRACT: call this AFTER every function has been re-added to
+    // `builder` (the prune adds functions in source order, so the new
+    // func ORDINAL equals the old one). A global's `initFunc` therefore
+    // needs only its arena TAG re-stamped to the new module — the
+    // optimizer mints a FRESH MirModuleId per rebuild (strong_ids.hpp:
+    // "each rebuilt module gets a fresh MirModuleId"), so the OLD id's
+    // tag is foreign and `MirBuilder::addGlobal`'s cross-module guard
+    // would abort on it. The ordinal is the stable part; the tag re-stamp
+    // is mechanical (mir_merge likewise re-targets initFunc into its builder's
+    // id space, but there via a SYMBOL-keyed remap, because the merge
+    // reorders/drops functions; here a tag re-stamp alone suffices precisely
+    // because the prune preserves ordinals). NO ordinal remap — the prune
+    // drops BLOCKS only, never functions, and never reorders them.
+    std::uint32_t const newTag = builder.id().v;
+    std::size_t const ng = mir.moduleGlobalCount();
+    for (std::uint32_t i = 0; i < ng; ++i) {
+        MirGlobalId const g = mir.globalAt(i);
+        std::uint32_t const initIdx = mir.globalInitLiteralIndex(g);
+        std::uint32_t newInitIdx = UINT32_MAX;
+        if (initIdx != UINT32_MAX) {
+            newInitIdx = builder.literalPoolAdd(mir.literalValue(initIdx));
+        }
+        MirFuncId const oldInitFunc = mir.globalInitFunc(g);
+        MirFuncId const newInitFunc = oldInitFunc.valid()
+            ? MirFuncId{oldInitFunc.v, newTag}   // same ordinal, new module tag
+            : MirFuncId{};
+        builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
+                          newInitIdx, newInitFunc,
+                          mir.globalBinding(g), mir.globalVisibility(g));
+    }
+}
+
 void MirRebuildPolicy::onZeroPhiIncomings(MirInstId oldPhi, MirBlockId oldBlock,
                                          MirFuncId oldFn, MirInstId newPhi) {
     std::fprintf(stderr,

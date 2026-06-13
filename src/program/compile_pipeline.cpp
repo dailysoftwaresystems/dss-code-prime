@@ -19,6 +19,7 @@
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly consumes it)
 #include "opt/optimizer.hpp"
+#include "opt/passes/prune_unreachable.hpp"
 
 #include <algorithm>
 #include <format>
@@ -71,6 +72,14 @@ bool optimizeModule(Mir&                  mir,
                     CompileOptions const& opts,
                     DiagnosticReporter&   reporter) {
     auto const optEntry = reporter.errorCount();
+    // MANDATORY post-lowering normalize: drop verifier-rejected unreachable
+    // continuation blocks the frontend creates eagerly (D-MIR-UNREACHABLE-PRUNE-NORMALIZE).
+    // Runs before opt::optimize's verify-after-every-pass, on EVERY CU and the merged
+    // module — the universal chokepoint. NOT a PassId (a pipeline config must not omit it).
+    if (!::dss::opt::passes::runPruneUnreachableBlocks(mir, interner, reporter).ok
+        || !tierClean(reporter, optEntry)) {
+        return false;
+    }
     ::dss::opt::OptPipeline loadedPipeline;
     ::dss::opt::OptPipeline const* effectivePipeline = opts.pipelineOverride;
     if (effectivePipeline == nullptr) {

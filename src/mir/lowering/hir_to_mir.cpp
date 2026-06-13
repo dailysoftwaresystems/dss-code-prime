@@ -1446,7 +1446,13 @@ struct Lowerer {
                 // Open the join block iff at least one path needs it. If
                 // neither path falls through (both returned/unreachable),
                 // the join block is unreferenced — seal it with Unreachable
-                // so finish() doesn't abort on a created-but-unfilled block.
+                // so this lowering's finish() doesn't abort on a created-
+                // but-unfilled block. The block is then UNREACHABLE-from-
+                // entry: the mandatory post-lowering prune
+                // (D-MIR-UNREACHABLE-PRUNE-NORMALIZE, runPruneUnreachableBlocks
+                // in optimizeModule) drops it centrally before any verifier
+                // sees the module — this seal exists only to satisfy the
+                // local finish() invariant.
                 mir.beginBlock(joinBB);
                 if (!joinReached) {
                     mir.addUnreachable();
@@ -1539,6 +1545,11 @@ struct Lowerer {
                     mir.addCondBr(cond, body, exit);
                 } else {
                     // No predecessor → seal as unreachable; cond is dead.
+                    // This NORMAL-path orphan (body self-sealed AND no
+                    // `continue` referenced the frame) is dropped centrally
+                    // by the mandatory post-lowering prune
+                    // (D-MIR-UNREACHABLE-PRUNE-NORMALIZE); the seal only
+                    // satisfies this lowering's finish() invariant.
                     sealCreatedAsUnreachable(continueBB);
                 }
 

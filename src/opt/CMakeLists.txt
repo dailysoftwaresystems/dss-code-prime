@@ -10,6 +10,7 @@ add_library(opt OBJECT
     passes/licm.cpp
     passes/mem2reg.cpp
     passes/mir_rebuild_helper.cpp
+    passes/prune_unreachable.cpp
     passes/simplify_cfg.cpp
 )
 
