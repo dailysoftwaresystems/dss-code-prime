@@ -46,10 +46,13 @@
 //      callees inline via the CFG-clone + return-merge-Phi machinery
 //      (cycle 2); a callee containing a regular `Call` (non-leaf) is
 //      admitted (cycle 3); a callee containing an `IntrinsicCall` is
-//      admitted (cycle 6). What REMAINS refused: a callee `Phi`
-//      (D-OPT7-MULTIBLOCK-SPLICE-PHI), a callee with NO returning path,
-//      a recursive-cycle call (the call-graph SCC gate, rule 3), and a
-//      callee whose instruction-count exceeds the cost bound (cycle 28).
+//      admitted (cycle 6); a callee containing a `Phi` is admitted
+//      (cycle 7 — cloned via a deferred-incoming-flush: value remapped
+//      via the shared `local` map, pred via the callee-block clone map;
+//      D-OPT7-MULTIBLOCK-SPLICE-PHI). What REMAINS refused: a callee with
+//      NO returning path, a recursive-cycle call (the call-graph SCC
+//      gate, rule 3), and a callee whose instruction-count exceeds the
+//      cost bound (cycle 28).
 //      The IntrinsicCall admission carries a frame-sensitivity caveat —
 //      a frame-sensitive intrinsic (va_start / frameaddress / setjmp-
 //      class) must NOT be inlined — but no shipped frontend emits any

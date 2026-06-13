@@ -203,15 +203,20 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // callee whose body contains an `IntrinsicCall` is now ADMITTED (it
     // clones SSA-correctly via the same generic arm; the per-op check below
     // carries the frame-sensitivity caveat + its trigger-gated anchor
-    // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC). What STAYS refused:
-    //   * A callee `Phi` in ANY block. A multi-block callee CAN legally
-    //     carry a Phi at a real CFG merge (e.g. a post-Mem2Reg join), but
-    //     cloning a Phi requires remapping its incomings through the
-    //     callee-block→caller-block map with the rebuilder's phase-3
-    //     deferral discipline — a distinct correctness surface deferred
-    //     to a later cycle (D-OPT7-MULTIBLOCK-SPLICE-PHI). The two-return
-    //     diamond this cycle delivers (`pick(x){if(x)return 7;else return
-    //     9;}`) has NO Phi — its merge IS the inserted return-merge Phi.
+    // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC). OPT7 (D-OPT7-MULTIBLOCK-
+    // SPLICE-PHI) LIFTS the callee-`Phi` refusal too — a multi-block callee
+    // that carries a `Phi` at a real CFG merge (a value-producing `?:` /
+    // `&&` / `||` lowers to a MIR Phi BEFORE Mem2Reg; or a post-Mem2Reg
+    // join / loop header) is now ADMITTED. `spliceMultiBlock` clones each
+    // callee Phi via a DEFERRED flush (placeholder in the clone loop, then
+    // its incomings remapped through the value (`local`) + block
+    // (`calleeBlockMap`) maps AFTER the loop) — the SAME deferral discipline
+    // the caller's own phis already use (phase 3) and the SIBLING of the
+    // `returnEdges` flush, with DISJOINT maps so the two compose. The
+    // deferral is UNIFORM across phi shapes: a loop/back-edge phi resolves
+    // for free (its back-edge incoming value is defined later in RPO, so
+    // `local` is complete only after the loop — exactly when the flush
+    // runs). What STAYS refused:
     //   * A callee with NO RETURNING PATH (no `Return` in ANY block; every
     //     path ends in `Unreachable` — e.g. `int f(){ while(1){} }`). The
     //     multi-block splice routes each callee `Return` to a continuation
@@ -261,7 +266,14 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // current intrinsic model. Gating on a per-intrinsic inline-
             // safety attribute is trigger-gated to the first frame-sensitive
             // intrinsic — D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.
-            if (op == MirOpcode::Phi)  return std::nullopt;  // deferred (see above)
+            //
+            // OPT7 (D-OPT7-MULTIBLOCK-SPLICE-PHI): a callee `Phi` is NO
+            // LONGER a refusal — `spliceMultiBlock` clones it via a deferred
+            // flush (see rule 5, above). A Phi only ever appears in a MULTI-
+            // block callee (a single-block leaf is Return-terminated, no
+            // merge), so the multi-block CFG-clone path is the only one that
+            // can encounter one; it still counts as 1 instruction here (the
+            // cost model is unchanged — Phis are not special-cased).
             if (op == MirOpcode::Return) hasReturn = true;
             if (op == MirOpcode::Arg && mir.argIndex(cid) >= callArgCount) {
                 return std::nullopt;  // arg index out of range → refuse
@@ -352,10 +364,14 @@ mapActualArgs(Mir const& src, MirInstId oldCall,
 // block. `Arg(i)` → the actual argument; Const / GlobalAddr re-emit
 // through their dedicated builders; every other op re-emits via
 // `addInst` with operands mapped through `local`. Records the
-// calleeOld→callerNew mapping into `local`. The legality gate excludes
-// callee Phis (any block), so a Phi here is a structural violation.
-// An out-of-range `Arg` index sets `malformed` (the gate guarantees it
-// can't happen; this is the defensive fail-loud guard).
+// calleeOld→callerNew mapping into `local`. A callee `Phi` must NEVER
+// reach here: `spliceMultiBlock` handles callee Phis BEFORE dispatching
+// to this helper (a placeholder-then-deferred-flush, like the caller's
+// own phis), and a single-block leaf is Return-terminated so it provably
+// has no Phi — so a Phi reaching this helper is a structural violation
+// (defensive fail-loud guard, below). An out-of-range `Arg` index sets
+// `malformed` (the gate guarantees it can't happen; this is the
+// defensive fail-loud guard).
 void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
                     MirBuilder& dst,
                     std::vector<MirInstId> const& actualArgs,
@@ -383,9 +399,12 @@ void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
     }
     if (cop == MirOpcode::Phi) {
         std::fprintf(stderr,
-            "dss::opt::passes::Inlining fatal: callee funcId v=%u "
-            "contains a Phi during splice — the legality gate must "
-            "have excluded it (D-OPT7-MULTIBLOCK-SPLICE-PHI).\n", callee.v);
+            "dss::opt::passes::Inlining fatal: callee funcId v=%u Phi "
+            "reached emitCalleeInst — spliceMultiBlock handles callee Phis "
+            "BEFORE dispatching here (deferred placeholder + flush), and a "
+            "single-block leaf is Return-terminated so it has no Phi; a Phi "
+            "here is a structural violation (D-OPT7-MULTIBLOCK-SPLICE-PHI).\n",
+            callee.v);
         std::abort();
     }
     auto const cops = src.instOperands(cid);
@@ -969,6 +988,13 @@ private:
         // (value, cloned-pred-block) pairs collected from each rewritten
         // callee Return — the incomings of the return-merge Phi.
         std::vector<MirPhiIncoming> returnEdges;
+        // DEFERRED callee phis: a placeholder Phi is emitted in the clone
+        // loop (so later insts referencing it resolve through `local`); its
+        // incomings are flushed AFTER the loop (so a back-edge incoming
+        // VALUE, defined later in RPO, has its `local` entry). {oldPhi,
+        // newPhi}. Sibling of `returnEdges` with DISJOINT maps — the two
+        // compose without interference (D-OPT7-MULTIBLOCK-SPLICE-PHI).
+        std::vector<std::pair<MirInstId, MirInstId>> deferredCalleePhis;
         for (MirBlockId const fb : calleeRpo) {
             MirBlockId const newFb = calleeBlockMap.at(fb.v);
             dst_.beginBlock(newFb);
@@ -981,8 +1007,45 @@ private:
                                          local, contBlock, newFb, returnEdges);
                     break;
                 }
+                if (cop == MirOpcode::Phi) {
+                    // Placeholder now (incomings flushed after the loop, so
+                    // a back-edge value resolves); record the mapping so
+                    // later insts referencing this phi resolve via `local`.
+                    MirInstId const newPhi = dst_.addPhi(src_.instType(cid));
+                    local.emplace(cid.v, newPhi);
+                    deferredCalleePhis.emplace_back(cid, newPhi);
+                    continue;
+                }
                 emitCalleeInst(src_, cid, cop, dst_, actualArgs, local, callee,
                                malformed_);
+            }
+        }
+
+        // Flush callee-phi incomings. `local` is complete after the clone
+        // loop → a back-edge (loop-phi) incoming VALUE resolves;
+        // `calleeBlockMap` is complete from phase 1 → every incoming PRED
+        // resolves. NO exit-redirect (callee blocks are 1:1, never split —
+        // unlike the caller's phase-3, which routes a split pred through
+        // blockExitMap_). addPhiIncoming is keyed by phi id → needs no open
+        // block (same as the caller phase-3). A `calleeBlockMap` miss is a
+        // structural violation (every callee block is pre-created in phase
+        // 1) → fail loud.
+        for (auto const& [oldPhi, newPhi] : deferredCalleePhis) {
+            for (MirPhiIncoming const& inc : src_.phiIncomings(oldPhi)) {
+                MirInstId const newVal =
+                    mapCalleeOperand(src_, inc.value, local, callee);
+                auto const predIt = calleeBlockMap.find(inc.pred.v);
+                if (predIt == calleeBlockMap.end()) {
+                    std::fprintf(stderr,
+                        "dss::opt::passes::Inlining fatal: cloned callee "
+                        "funcId v=%u phi v=%u incoming pred block v=%u not "
+                        "in clone map — every callee block is pre-created in "
+                        "phase 1 (D-OPT7-MULTIBLOCK-SPLICE-PHI).\n",
+                        callee.v, oldPhi.v, inc.pred.v);
+                    std::abort();
+                }
+                dst_.addPhiIncoming(newPhi,
+                                    MirPhiIncoming{newVal, predIt->second});
             }
         }
 
