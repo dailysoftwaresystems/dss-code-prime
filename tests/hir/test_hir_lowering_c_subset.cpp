@@ -946,6 +946,97 @@ TEST(HirLoweringCSubset, GlobalInitConstEvalIsLeftAssociative) {
         << "10 - 3 + 1 must evaluate LEFT-associatively: (10-3)+1 = 8";
 }
 
+// D-HIR-LOOP-BODY-ONLY-RETURN-DOUBLE-ATTACH: `main` whose body does NOT
+// structurally terminate gets an implicit `return 0` (C99 §5.1.2.2.3)
+// appended by `maybeAppendImplicitReturnZero`. The append must NEST the
+// already-lowered body Block + the synthetic return inside a fresh outer
+// Block — re-wrapping the body's existing (already-parented) children
+// would double-attach and trip `HirBuilder::addParent`'s fail-loud guard
+// (the bug: std::abort on every such `main`). These pins assert (1) the
+// lowering COMPLETES — reaching any assertion below means no abort — (2)
+// the verifier is clean, and (3) the synthetic `return 0` contract holds:
+// the function body is the synthetic outer Block whose FIRST child is the
+// original body and whose LAST child is the Synthetic ReturnStmt.
+//
+// `while (1)` is the headline shape (a provably-infinite loop whose only
+// exit is its own return). The verifier treats the loop as non-
+// terminating, so the trailing synthetic return is NOT flagged dead — it
+// is pruned later in MIR. Red-on-disable: revert the fix to the
+// children-re-wrap and the lowering aborts here before any EXPECT runs.
+TEST(HirLoweringCSubset, InfiniteLoopMainNestsImplicitReturnZero) {
+    SemanticModel model = analyzeCSubset("int main() { while (1) { return 5; } }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto const decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    HirNodeId const fn = decls[0];
+    ASSERT_EQ(res->hir.kind(fn), HirKind::Function);
+
+    // The body is the synthetic OUTER block: { <original body>, return 0; }.
+    HirNodeId const outer = res->hir.functionBody(fn);
+    ASSERT_EQ(res->hir.kind(outer), HirKind::Block);
+    EXPECT_TRUE(has(res->hir.flags(outer), HirFlags::Synthetic))
+        << "the appended wrapper block must be flagged Synthetic";
+    auto const outerKids = res->hir.children(outer);
+    ASSERT_EQ(outerKids.size(), 2u)
+        << "outer block must hold exactly [original-body, synthetic-return]";
+
+    // First child: the ORIGINAL lowered body, nested (not flattened). It
+    // is the block that holds the WhileStmt — proof the children were not
+    // re-parented out of it.
+    HirNodeId const inner = outerKids[0];
+    ASSERT_EQ(res->hir.kind(inner), HirKind::Block);
+    auto const innerKids = res->hir.children(inner);
+    ASSERT_EQ(innerKids.size(), 1u);
+    EXPECT_EQ(res->hir.kind(innerKids[0]), HirKind::WhileStmt);
+
+    // Last child: the synthetic `return 0` — a Synthetic ReturnStmt whose
+    // value is a literal (the implicit-return-0 contract).
+    HirNodeId const ret = outerKids[1];
+    ASSERT_EQ(res->hir.kind(ret), HirKind::ReturnStmt);
+    EXPECT_TRUE(has(res->hir.flags(ret), HirFlags::Synthetic))
+        << "the appended return must be flagged Synthetic";
+    auto const retVal = res->hir.returnValue(ret);
+    ASSERT_TRUE(retVal.has_value()) << "implicit return must carry a zero value";
+    EXPECT_EQ(res->hir.kind(*retVal), HirKind::Literal);
+}
+
+// Breadth pin: the double-attach was NOT loop-specific — ANY non-empty
+// `main` body that doesn't structurally terminate hit the re-wrap. A
+// straight-line body (`int x; x = 1;`) has no terminator, so the implicit
+// return is appended the same way. Same nesting contract; same red-on-
+// disable (abort before any EXPECT on the pre-fix children-re-wrap).
+TEST(HirLoweringCSubset, NonTerminatingStraightLineMainNestsImplicitReturnZero) {
+    SemanticModel model = analyzeCSubset("int main() { int x; x = 1; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto const decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    HirNodeId const outer = res->hir.functionBody(decls[0]);
+    ASSERT_EQ(res->hir.kind(outer), HirKind::Block);
+    EXPECT_TRUE(has(res->hir.flags(outer), HirFlags::Synthetic));
+    auto const outerKids = res->hir.children(outer);
+    ASSERT_EQ(outerKids.size(), 2u);
+
+    // The original body is nested as child 0 and still holds its two
+    // statements (the VarDecl + the assignment ExprStmt) — not re-parented.
+    HirNodeId const inner = outerKids[0];
+    ASSERT_EQ(res->hir.kind(inner), HirKind::Block);
+    EXPECT_EQ(res->hir.children(inner).size(), 2u);
+
+    HirNodeId const ret = outerKids[1];
+    ASSERT_EQ(res->hir.kind(ret), HirKind::ReturnStmt);
+    EXPECT_TRUE(has(res->hir.flags(ret), HirFlags::Synthetic));
+    ASSERT_TRUE(res->hir.returnValue(ret).has_value());
+    EXPECT_EQ(res->hir.kind(*res->hir.returnValue(ret)), HirKind::Literal);
+}
+
 TEST(HirLoweringCSubset, NonConstantArrayLengthFailsLoud) {
     // `int a[n]` (variable length) must NOT silently decay or assume a length —
     // the semantic phase emits S_NonConstantArrayLength.

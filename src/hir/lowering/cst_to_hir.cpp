@@ -3347,20 +3347,32 @@ struct Lowerer {
         if (pathTerminates(builder, body)) return body;
 
         // Build the synthetic return — a zero literal of retType
-        // wrapped in a ReturnStmt, both flagged Synthetic. Then
-        // wrap the original body's children + the new return in a
-        // fresh outer Block (also Synthetic). The original Block
-        // node remains in the arena but is orphaned — HIR is built
-        // bottom-up immutable; node mutation is not supported.
+        // wrapped in a ReturnStmt, both flagged Synthetic. Then NEST
+        // the (still-unparented) body Block and the new return inside
+        // a fresh outer Block (also Synthetic): `{ <body> return 0; }`.
+        //
+        // We must NOT re-wrap the body's existing children: HIR is
+        // immutable and tree-shaped — every node has at most one parent
+        // and there is no detach/re-parent. The body's children are
+        // already attached to `body`, so reusing them under a new Block
+        // would double-attach and trip `addParent`'s fail-loud guard.
+        // `body` ITSELF is unparented here (the lowered function body is
+        // not attached until `makeFunction` consumes the value we
+        // return), so attaching it once as the outer Block's first child
+        // is safe. A Block whose first child is a Block is valid HIR
+        // (a nested scope, `{ {…} return 0; }`); the verifier's
+        // return-completeness check recurses to the outer Block's LAST
+        // child (the return) and the dead-code check sees the leading
+        // Block — not an unconditional terminator — so the trailing
+        // return is never flagged unreachable. MIR's unreachable-prune
+        // later drops the dead return for a body that does terminate
+        // (e.g. an infinite-loop main), so runtime stays correct.
         HirNodeId const zero = synthZeroOrError(node, retType);
         HirNodeId const ret  = track(
             builder.makeReturn(zero, HirFlags::Synthetic), node);
-        auto const oldKids = builder.children(body);
-        std::vector<HirNodeId> newKids(
-            oldKids.begin(), oldKids.end());
-        newKids.push_back(ret);
+        HirNodeId const wrapped[] = {body, ret};
         return track(
-            builder.makeBlock(newKids, HirFlags::Synthetic), node);
+            builder.makeBlock(wrapped, HirFlags::Synthetic), node);
     }
 
     HirNodeId lowerFunctionDecl(NodeId node) {
