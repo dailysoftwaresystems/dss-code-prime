@@ -144,7 +144,7 @@ The HIR is the pivot, so when the C++ engine transpiles to DSS Code Prime, both 
 
 If those two paths diverge, either HIR isn't language-neutral, or a lowering config has a bug, or the transpilation layer has a bug. This is the regression net that makes the entire config-driven thesis falsifiable in production. Few transpilers ever get this test; we get it for free because we're self-hosting through our own pivot.
 
-**Plan placeholder:** when bootstrap work starts, open `22-self-hosting-plan` (currently unreserved — will be its own document at that time).
+**Plan placeholder:** self-hosting is now reserved within [`24-dss-axis-language-reserved-plan`](./24-dss-axis-language-reserved-plan%20-%20tbd.md) §7 (the DSS Axis arc) and executed via [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md) (the C++ engine → DSS Axis transpile, anchor `D-AXIS-SELF-HOST-TRANSPILE`). *(The former `22-self-hosting-plan` placeholder is retired — plan 22 is now the optimizer.)*
 
 ---
 
@@ -175,7 +175,7 @@ The execution risks are real, named, and tracked. The disciplines that mitigate 
 3. **HIR fragmentation.** If different languages need fundamentally different HIR shapes (e.g., dynamic dispatch can't be modeled the same way as static dispatch), HIR splits into multiple pivots and the transpilation story collapses. *Mitigation:* attribute side-tables instead of forking node shapes; HR5's attribute system was specifically designed for this growth.
 4. **Backend scope.** Plans 13/14/15/16 (assembler / linker / debug-info / codesign) are the largest single chunk of v1 work and the area furthest from current expertise. Underestimating this is the most likely cause of v1 slipping by years. *Mitigation:* the plans are already broken into PR-sized chunks; ship in vertical slices (one OS × one arch end-to-end before broadening).
 5. **Self-hosting timing.** Attempting self-hosting before the language is mature enough produces a worse codebase than the C++ original. *Mitigation:* sequencing rule — self-hosting only after the language has been used in anger for at least one substantial non-compiler project (likely the database or a smaller stdlib component).
-6. **DSS Code Prime language overfitting.** If the language is designed after only the current shipped languages (toy / c-subset / tsql), it overfits to imperative + typed and won't serve dynamic, functional, or ownership-based use cases. *Mitigation:* before opening plan 20, the engine must have compiled at least one dynamic language (Python or JS) and one ownership/affine language (Rust). Three paradigms is the minimum for the HIR to inform an honest universal language design.
+6. **DSS Code Prime language overfitting.** If the language is designed after only the current shipped languages (toy / c-subset / tsql), it overfits to imperative + typed and won't serve dynamic, functional, or ownership-based use cases. *Mitigation:* before opening plan 24 (DSS Axis), the engine must have compiled at least one dynamic language (Python or JS) and one ownership/affine language (Rust). Three paradigms is the minimum for the HIR to inform an honest universal language design.
 7. **Execution stamina.** A 10–20 year arc requires a sustained engineering culture, not a heroic sprint. *Mitigation:* the per-PR review cadence + the standing discipline of closing every gap (no silent deferrals — D-registry in plan 00) keeps quality from eroding under time pressure.
 
 ### Disciplines (standing rules — do not relax)
