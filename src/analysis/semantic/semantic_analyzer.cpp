@@ -131,7 +131,8 @@ struct EngineState {
     explicit EngineState(CompilationUnit const& cu)
         : lattice{cu.id(), cu.compositeSourceLanguage()},
           nodeToSymbol{cu},
-          nodeToType{cu} {}
+          nodeToType{cu},
+          nullPointerConstantNodes{cu} {}
 
     DiagnosticReporter         reporter;
     TypeLattice                lattice;
@@ -139,6 +140,17 @@ struct EngineState {
     SymbolTable                symbols;
     UnitAttribute<SymbolId>    nodeToSymbol;
     UnitAttribute<TypeId>      nodeToType;
+    // R2 (D-SEMANTIC-NULL-CONSTANT-FOLDING): source nodes admitted as a null-
+    // pointer constant via the FOLDED path — a non-literal integer constant
+    // expression that folds to 0 (`1-1`, `-0`). The HIR lowerer materializes a
+    // synthetic Literal 0 in their place (the literal-0 path needs no marker: the
+    // coerce arm admits a real Literal directly). MUST be a TREE-KEYED
+    // UnitAttribute (NOT a flat NodeId.v set): NodeId is tree-LOCAL, so a
+    // multi-source CU's trees each restart numbering at 1 — a flat set would alias
+    // node K across files → a cross-tree false positive → a silent miscompile (an
+    // unrelated expression replaced by Literal 0). UnitAttribute routes per-tree,
+    // exactly like nodeToType/nodeToSymbol.
+    UnitAttribute<bool>        nullPointerConstantNodes;
     // FC3 c1: the analysis-time data model (`analyze()`'s parameter —
     // the active format's width triple). Read by `buildIndexes` (the
     // `coreByDataModel` overrides), the integer-literal ladder, and the
@@ -254,6 +266,37 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
 [[nodiscard]] TypeId subtreeType(EngineState const& s, Tree const& tree,
                                  NodeId node, ScopeId scope = {});
 
+// R1: the SINGLE source for member-access (`obj.field` / `ptr->field`) field-type
+// resolution, shared by the Pass-2 member arm (which adds diagnostics + symbol
+// binding) and `subtreeType` (Pass 1.5, which needs only the field TYPE — e.g.
+// `sizeof(s.y)` in an array dimension). It resolves the access and reports the
+// OUTCOME so each caller reacts: Pass-2 emits the matching diagnostic + binds the
+// SymbolId; subtreeType takes `fieldType` on `Ok` (InvalidType otherwise — the
+// array length then fails loud, never a guessed size). AGNOSTIC: drives entirely
+// off the config `memberAccesses` table + `compositeScopeByType`; no rule/op
+// identity is hardcoded.
+struct MemberResolution {
+    enum class Status {
+        NotMemberAccess,  // node's rule is not a configured member-access (or op-token mismatch)
+        LhsUntyped,       // LHS type could not be resolved (chained error — caller stays quiet)
+        NotAPointer,      // arrow form `p->x` on a non-pointer LHS
+        NotAComposite,    // effective type has no struct scope
+        BadNameNode,      // nameChild did not resolve to an identifier leaf
+        UndeclaredField,  // field name not found in the struct scope
+        Ok,               // field binding found (fieldType may still be invalid if the field's own type is unresolved)
+    };
+    Status      status        = Status::NotMemberAccess;
+    TypeId      fieldType      {};       // valid iff Ok AND the field's type resolved
+    SymbolId    fieldSym       {};       // valid iff Ok
+    NodeId      nameChildNode  {};       // raw nameChild (span for NotAPointer/NotAComposite/BadNameNode)
+    NodeId      nameNode       {};       // extracted identifier leaf (span for UndeclaredField + binding target)
+    std::string fieldName;               // its text (UndeclaredField diag actual)
+    bool        dereferences   = false;  // arrow form (NotAComposite message disambiguation)
+};
+[[nodiscard]] MemberResolution
+resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
+                    Tree const& tree, NodeId node, ScopeId scope);
+
 // FC6 (C99 §6.7.2.1p18): does `t` CONTAIN a flexible array member — i.e. is it a
 // struct whose LAST member is an incomplete array (so `t` is itself a FAM
 // struct), or an aggregate that recursively holds one (a struct field, an array
@@ -280,9 +323,10 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
     return false;
 }
 [[nodiscard]] bool admitsNullPointerConstant(
-    EngineState const& s, Tree const& tree,
+    EngineState& s, Tree const& tree,
     TypeId lhsTy, NodeId rhsExpr,
-    SemanticConfig::PointerConversionRules const& rules);
+    SemanticConfig::PointerConversionRules const& rules,
+    ScopeId scope, SemanticConfig const& cfg);
 
 // True iff a token of kind `kind` appears anywhere in `node`'s subtree,
 // stopping descent at any NESTED declaration-rule node (other than the
@@ -2355,181 +2399,82 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             }
         }
 
-        // D5.1: member-access resolution (`obj.field` and `ptr->field`).
-        // Pass 2 visits post-order so the LHS's type is already in
-        // `nodeToType` by the time we reach the member-access internal
-        // node. We:
-        //   1. read LHS type via `typeAt(kids[lhsChild])`,
-        //   2. unwrap one Ptr layer if the access dereferences (arrow form),
-        //   3. find the resolved struct's inner scope via
-        //      `compositeScopeByType` (populated by Pass 1.5),
-        //   4. extract the field-name identifier text from `kids[nameChild]`,
-        //   5. look it up in the struct's scope → bind the field SymbolId on
-        //      the name node and propagate the field type to the
-        //      member-access node (so chained access `f.x.y` resolves the
-        //      next layer in the same post-order step).
-        // No conflict with the reference-resolution block above: that one
-        // resolves identifier USES against the LEXICAL scope chain; this one
-        // resolves field-names against a struct's STRUCT scope — orthogonal.
-        auto maIt = s.idx().memberAccessByRule.find(rule.v);
-        // Pick the matching entry by operator-token (mirrors `assignByRule`'s
-        // discipline: multiple entries per rule are distinguished by which
-        // operator token — `.` vs `->` — is present in the node). Ungated
-        // entries match unconditionally and must be the sole entry for the
-        // rule. Returns null when no entry's operator-token matches: the node
-        // is structurally a member-access-rule node but carries a different
-        // operator (e.g. c-subset's `postfixExpr` with `++`/`(`/`[`).
-        MemberAccessRule const* const ma = [&]() -> MemberAccessRule const* {
-            if (maIt == s.idx().memberAccessByRule.end()) return nullptr;
-            for (std::size_t midx : maIt->second) {
-                auto const& cand = cfg.memberAccesses[midx];
-                if (!cand.operatorToken.has_value()) return &cand;  // ungated
-                for (auto kid : tree.children(node)) {
-                    if (tree.kind(kid) == NodeKind::Token
-                        && tree.tokenKind(kid) == *cand.operatorToken) {
-                        return &cand;
-                    }
+        // D5.1: member-access resolution (`obj.field` / `ptr->field`). The shared
+        // `resolveMemberAccess` (R1) performs the resolution — LHS type → one-Ptr
+        // unwrap for the arrow form → struct scope via `compositeScopeByType` →
+        // field lookup — and this arm reacts to the OUTCOME: emit the matching
+        // diagnostic, and on success bind the field SymbolId + propagate the field
+        // type onto both the name leaf and the member-access node (so a chained
+        // `f.x.y` resolves the next layer in the same post-order step). No conflict
+        // with the reference-resolution block above: that resolves identifier USES
+        // against the LEXICAL scope chain; this resolves field-names against a
+        // struct's STRUCT scope — orthogonal. subtreeType (Pass 1.5) calls the SAME
+        // helper for the field TYPE only (e.g. `sizeof(s.y)` in an array dim).
+        {
+            auto const mr = resolveMemberAccess(s, cfg, tree, node, here);
+            using St = MemberResolution::Status;
+            switch (mr.status) {
+                case St::NotMemberAccess:  // non-member postfix verb — not our node
+                case St::LhsUntyped:       // chained error — stay quiet
+                    break;
+                case St::NotAPointer: {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_NotAPointer;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(mr.nameChildNode);
+                    d.actual   = "arrow operator '->' requires a pointer operand";
+                    s.reporter.report(std::move(d));
+                    break;
                 }
-            }
-            return nullptr;
-        }();
-        if (ma != nullptr) {
-            auto kids = visibleChildren(tree, node);
-            if (ma->lhsChild < kids.size() && ma->nameChild < kids.size()) {
-                NodeId const lhsNode  = kids[ma->lhsChild];
-                NodeId const nameNode = kids[ma->nameChild];
-                // subtreeType (not raw typeAt) — the LHS of `p->x` /
-                // `s.x` is the expression-wrapper node, not the leaf;
-                // pass 2 sets the type on the inner identifier-leaf
-                // for bare references and on the leaf literal for
-                // immediates. typeAt() against the wrapper returns
-                // InvalidType for both, silently bypassing
-                // S_NotAPointer / S_NotAComposite / field-type
-                // write-back. The DFS-descent helper handles both
-                // cases. Mirrors the same fix applied to checkCall
-                // (D-LANG-POINTER-VOID-CONVERT closure, step 13.2 —
-                // the void-pointer negative pin surfaced the
-                // checkCall variant of this gap; the silent-failure
-                // hunt review surfaced the parallel sites here +
-                // initNode below).
-                TypeId lhsType = subtreeType(s, tree, lhsNode);
-                if (lhsType.valid()) {
-                    TypeId effectiveType = lhsType;
-                    bool   typeOk = true;
-                    if (ma->dereferences) {
-                        // Arrow form: `p->x` is sugar for `(*p).x`. The LHS
-                        // must be `Ptr<Struct>`; one indirection only. If the
-                        // LHS isn't even a pointer, emit S_NotAPointer; the
-                        // post-unwrap "non-composite" case (Ptr<int>->x) falls
-                        // through to S_NotAComposite below with arrow-aware
-                        // wording.
-                        if (s.lattice.interner().kind(effectiveType)
-                            == TypeKind::Ptr) {
-                            auto ops = s.lattice.interner()
-                                       .operands(effectiveType);
-                            if (!ops.empty()) effectiveType = ops[0];
-                            else typeOk = false;
-                        } else {
-                            typeOk = false;
-                        }
-                        if (!typeOk) {
-                            ParseDiagnostic d;
-                            d.code     = DiagnosticCode::S_NotAPointer;
-                            d.severity = DiagnosticSeverity::Error;
-                            d.buffer   = tree.source().id();
-                            d.span     = tree.span(nameNode);
-                            d.actual   = "arrow operator '->' requires a "
-                                         "pointer operand";
-                            s.reporter.report(std::move(d));
-                        }
-                    }
-                    if (typeOk) {
-                        auto scopeIt =
-                            s.compositeScopeByType.find(effectiveType.v);
-                        if (scopeIt == s.compositeScopeByType.end()) {
-                            ParseDiagnostic d;
-                            d.code     = DiagnosticCode::S_NotAComposite;
-                            d.severity = DiagnosticSeverity::Error;
-                            d.buffer   = tree.source().id();
-                            d.span     = tree.span(nameNode);
-                            // Disambiguate the two arrow-form failure shapes
-                            // in the message text so the reader knows whether
-                            // the LHS itself was non-composite (`.x` form) or
-                            // the LHS was Ptr<T> but T is non-composite (`->x`
-                            // form — review F5).
-                            d.actual   = ma->dereferences
-                                ? "arrow operator '->' pointee is not a "
-                                  "composite type"
-                                : "member access '.' requires a composite-"
-                                  "typed operand";
-                            s.reporter.report(std::move(d));
-                        } else {
-                            auto fnRes = extractNameNode(
-                                tree, nameNode, NameMatchMode::Self,
-                                cfg.identifierToken,
-                                cfg.bracketIdentifierToken);
-                            // Gate to a real identifier leaf, mirroring the
-                            // reference-resolution discipline above. A non-
-                            // identifier nameChild is a schema-shape bug
-                            // (member-access's nameChild is positionally
-                            // fixed by the rule) — emit C_InvalidSemantics
-                            // rather than silently failing or producing a
-                            // phantom S_UndeclaredIdentifier on the token's
-                            // raw source text (reviews F3 + F7).
-                            bool isIdentifier = false;
-                            if (fnRes.node.valid()
-                                && tree.kind(fnRes.node) == NodeKind::Token) {
-                                auto const rtk = tree.tokenKind(fnRes.node);
-                                if (cfg.identifierToken.valid()
-                                    && rtk == cfg.identifierToken) {
-                                    isIdentifier = true;
-                                } else if (cfg.bracketIdentifierToken
-                                               .has_value()
-                                           && cfg.bracketIdentifierToken
-                                                  ->valid()
-                                           && rtk == *cfg.bracketIdentifierToken) {
-                                    isIdentifier = true;
-                                }
-                            }
-                            if (!isIdentifier || fnRes.name.empty()) {
-                                ParseDiagnostic d;
-                                d.code     = DiagnosticCode::C_InvalidSemantics;
-                                d.severity = DiagnosticSeverity::Error;
-                                d.buffer   = tree.source().id();
-                                d.span     = tree.span(nameNode);
-                                d.actual   = "member-access nameChild did not "
-                                             "resolve to an identifier leaf";
-                                s.reporter.report(std::move(d));
-                            } else {
-                                ScopeId const fieldScope = scopeIt->second;
-                                auto const& sc =
-                                    s.scopes.scopes()[fieldScope.v];
-                                auto bindIt = sc.bindings.find(fnRes.name);
-                                if (bindIt != sc.bindings.end()) {
-                                    SymbolId const fieldSym = bindIt->second;
-                                    SymbolRecord const& frec =
-                                        s.symbols.at(fieldSym);
-                                    s.nodeToSymbol.set(fnRes.node, fieldSym);
-                                    s.usesBySymbol[fieldSym.v].push_back(
-                                        fnRes.node);
-                                    if (frec.type.valid()) {
-                                        s.nodeToType.set(fnRes.node, frec.type);
-                                        s.nodeToType.set(node, frec.type);
-                                    }
-                                } else {
-                                    ParseDiagnostic d;
-                                    d.code     = DiagnosticCode::S_UndeclaredIdentifier;
-                                    d.severity = DiagnosticSeverity::Error;
-                                    d.buffer   = tree.source().id();
-                                    d.span     = tree.span(fnRes.node);
-                                    d.actual   = fnRes.name;
-                                    s.reporter.report(std::move(d));
-                                }
-                            }
-                        }
-                    }
+                case St::NotAComposite: {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_NotAComposite;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(mr.nameChildNode);
+                    // Disambiguate the two failure shapes in the message text: the
+                    // LHS itself was non-composite (`.x`) vs the LHS was Ptr<T> but
+                    // T is non-composite (`->x`).
+                    d.actual   = mr.dereferences
+                        ? "arrow operator '->' pointee is not a composite type"
+                        : "member access '.' requires a composite-typed operand";
+                    s.reporter.report(std::move(d));
+                    break;
                 }
-                // lhsType invalid ⇒ likely a chained error; stay quiet.
+                case St::BadNameNode: {
+                    // A non-identifier nameChild is a schema-shape bug (the
+                    // nameChild is positionally fixed by the rule) — emit
+                    // C_InvalidSemantics, not a phantom S_UndeclaredIdentifier.
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::C_InvalidSemantics;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(mr.nameChildNode);
+                    d.actual   = "member-access nameChild did not "
+                                 "resolve to an identifier leaf";
+                    s.reporter.report(std::move(d));
+                    break;
+                }
+                case St::UndeclaredField: {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_UndeclaredIdentifier;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(mr.nameNode);
+                    d.actual   = mr.fieldName;
+                    s.reporter.report(std::move(d));
+                    break;
+                }
+                case St::Ok: {
+                    s.nodeToSymbol.set(mr.nameNode, mr.fieldSym);
+                    s.usesBySymbol[mr.fieldSym.v].push_back(mr.nameNode);
+                    if (mr.fieldType.valid()) {
+                        s.nodeToType.set(mr.nameNode, mr.fieldType);
+                        s.nodeToType.set(node, mr.fieldType);
+                    }
+                    break;
+                }
             }
         }
     }
@@ -2610,7 +2555,8 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                    && !admitsNullPointerConstant(
                                           s, tree, rec.type, initNode,
                                           tree.schema().semantics()
-                                              .pointerConversions)) {
+                                              .pointerConversions,
+                                          here, cfg)) {
                             ParseDiagnostic d;
                             d.code     = DiagnosticCode::S_TypeMismatch;
                             d.severity = DiagnosticSeverity::Error;
@@ -2659,7 +2605,8 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                    && !admitsNullPointerConstant(
                                           s, tree, rec.type, initNode,
                                           tree.schema().semantics()
-                                              .pointerConversions)) {
+                                              .pointerConversions,
+                                          here, cfg)) {
                             ParseDiagnostic d;
                             d.code     = DiagnosticCode::S_TypeMismatch;
                             d.severity = DiagnosticSeverity::Error;
@@ -2894,11 +2841,11 @@ void normalizeSoleVoidParams(EngineState& s, SemanticConfig const& cfg,
 // through a pointer value). The FnSig's own C-style variadic bit
 // (`fnIsVariadic`) needs no symbol, so variadic signatures check
 // identically through every path.
-void checkCallAgainstSig(EngineState& s, SemanticConfig const& /*cfg*/,
+void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
                          Tree const& tree, NodeId node,
                          std::vector<NodeId> const& kids,
                          CallRule const& call, TypeId fnSig,
-                         bool variadicBuiltin) {
+                         bool variadicBuiltin, ScopeId scope) {
     // FIX 2: the call EXPRESSION carries the callee's RESULT type — not its
     // FnSig. Without this, a `return f(args);` walk (subtreeType) would
     // surface the callee identifier's FnSig (which IS typed, below) and
@@ -2974,7 +2921,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& /*cfg*/,
             // check lives here (NOT in isAssignable) because it is
             // value-aware (looks at the literal's decoded value).
             if (admitsNullPointerConstant(s, tree, params[i],
-                                          argNodes[i], ptrRules)) {
+                                          argNodes[i], ptrRules, scope, cfg)) {
                 continue;
             }
             ParseDiagnostic d;
@@ -3148,13 +3095,13 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         }
         if (in.kind(landedTy) == TypeKind::FnSig) {
             checkCallAgainstSig(s, cfg, tree, node, kids, call, landedTy,
-                                landedVariadicBuiltin);
+                                landedVariadicBuiltin, scope);
             return;
         }
         if (isFnPointerType(in, landedTy)) {
             checkCallAgainstSig(s, cfg, tree, node, kids, call,
                                 in.operands(landedTy)[0],
-                                /*variadicBuiltin=*/false);
+                                /*variadicBuiltin=*/false, scope);
             return;
         }
         ParseDiagnostic d;
@@ -3225,7 +3172,7 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         if (isFnPointerType(s.lattice.interner(), fnTy)) {
             checkCallAgainstSig(s, cfg, tree, node, kids, call,
                                 s.lattice.interner().operands(fnTy)[0],
-                                /*variadicBuiltin=*/false);
+                                /*variadicBuiltin=*/false, scope);
             return;
         }
         // Genuinely non-callable value (S_NotCallable is the RIGHT code
@@ -3245,34 +3192,28 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // symbol arm threads its own `variadicBuiltin` flag (e.g. tsql
     // COALESCE admits any arg count).
     checkCallAgainstSig(s, cfg, tree, node, kids, call, fnTy,
-                        s.symbols.at(calleeSym).variadicBuiltin);
+                        s.symbols.at(calleeSym).variadicBuiltin, scope);
 }
 
 // D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): per C §6.3.2.3.3,
 // an integer constant expression with value 0 is a null pointer constant
 // — convertible WITHOUT cast to any object-pointer or function-pointer
 // type. This helper admits ONLY the bare integer-literal `0` form (not
-// `+0` / `-0` / `0+0` / `(int)0`). Audit fold (6-agent 2nd-order F3,
-// 2026-06-02): the wider unary/cast/const-eval admission was DROPPED to
-// avoid a HIR/semantic divergence — the HIR `coerce()` arm matches on
-// `HirKind::Literal` of the child node, and a `-0` source expression
-// lowers to `UnaryOp(Neg, Literal(0))` whose top-level HIR kind is
-// `UnaryOp`. Semantic admission of `-0` without HIR materialization
-// would leak an un-Cast `I32` into a `Ptr<*>` slot at the verifier. The
-// wider admission lives at D-LANG-NULL-PTR-CONST-EVAL, which adds a
-// const-eval pre-pass producing a typed integer-zero result that both
-// tiers can recognize uniformly.
+// `+0` / `-0` / `0+0` / `(int)0`). This is the structural FAST PATH of
+// `admitsNullPointerConstant`; the WIDER folded admission (`-0`, `1-1`,
+// `(int)(2-2)` — any integer constant expression with value 0) lives in that
+// caller's R2 folded path (D-SEMANTIC-NULL-CONSTANT-FOLDING ✅ CLOSED).
 //
-// **Honest behavior note** (2nd-order audit comment-analyzer #3,
-// 2026-06-02): the helper itself rejects `-0` (returns false on the
-// MinusOp non-literal token). But callers thread through
-// `subtreeType` first to compute `argTy`; with `-0` the operator-stop
-// in subtreeType returns InvalidType, and the caller's
-// `if (!argTy.valid()) continue;` cascade-suppression silently
-// skips the assignability check — `f(-0)` neither admits nor fires
-// a diagnostic. Closing this cascade-suppression false-negative
-// requires pass-2 expression typing on unary wrappers (anchored at
-// D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS full closure).
+// History (resolved by R2, 2026-06-15): an earlier audit DROPPED the wider
+// admission to avoid a HIR/semantic divergence — the HIR `coerce()` arm matches
+// `HirKind::Literal`, and `-0` lowers to `UnaryOp(Neg, Literal 0)` / `1-1` to a
+// `BinaryOp`, so semantic admission WITHOUT HIR materialization would leak an
+// un-Cast `I32` into a `Ptr<*>` slot at the verifier. R2 closes exactly that: the
+// folded path MARKS the admitted node (`EngineState::nullPointerConstantNodes` →
+// `SemanticModel::isNullPointerConstant`), and the CST→HIR lowerer materializes a
+// synthetic `Literal 0` in its place, so the existing literal-0 coerce arm emits
+// the `Cast(0 → Ptr)` uniformly. So `f(-0)` / `f(1-1)` now ADMIT (and lower to
+// NULL) at every conversion site — no divergence, no leaked I32.
 //
 // Implementation: walks the subtree, rejecting on any non-literal
 // token (operator / delimiter / etc.) and requiring exactly one
@@ -3332,13 +3273,39 @@ isLiteralIntegerZero(EngineState const& s, Tree const& tree, NodeId node) {
 // here; `isLiteralIntegerZero` is a structural-only helper that
 // makes no config check.
 [[nodiscard]] bool
-admitsNullPointerConstant(EngineState const& s, Tree const& tree,
+admitsNullPointerConstant(EngineState& s, Tree const& tree,
                           TypeId lhsTy, NodeId rhsExpr,
-                          SemanticConfig::PointerConversionRules const& rules) {
+                          SemanticConfig::PointerConversionRules const& rules,
+                          ScopeId scope, SemanticConfig const& cfg) {
     if (!rules.nullPointerConstantFromIntegerZero) return false;
     if (!lhsTy.valid()) return false;
     if (s.lattice.interner().kind(lhsTy) != TypeKind::Ptr) return false;
-    return isLiteralIntegerZero(s, tree, rhsExpr);
+    // Fast path: a STRUCTURAL integer literal 0 (`0`). The HIR coerce arm admits a
+    // real Literal directly, so this path needs NO marker — byte-identical to the
+    // pre-R2 behavior.
+    if (isLiteralIntegerZero(s, tree, rhsExpr)) return true;
+    // R2 (D-SEMANTIC-NULL-CONSTANT-FOLDING) folded path — C §6.3.2.3p3: ANY integer
+    // constant expression with value 0 (`1-1`, `-0`, `(int)(2-2)`) is a null pointer
+    // constant. The operand must be (a) INTEGER-typed — excludes a float `1.5-1.5`;
+    // a cast `(int)x` makes it integer-typed — and (b) const-fold to 0. On admit,
+    // MARK the node: the HIR lowerer materializes a synthetic Literal 0 in its place
+    // (the operator tree would otherwise lower to a BinaryOp the literal-only coerce
+    // arm cannot admit → a silent tier divergence). The integer-kind gate mirrors
+    // `isLiteralIntegerZero` (signed/unsigned int ranks only, not Char/Bool) so the
+    // two admit forms stay consistent.
+    TypeId const ot = subtreeType(s, tree, rhsExpr, scope);
+    if (!ot.valid()) return false;
+    {
+        using namespace detail::type_rules;
+        TypeKind const ok = s.lattice.interner().kind(ot);
+        if (signedIntRank(ok) == 0 && unsignedIntRank(ok) == 0) return false;
+    }
+    auto const folded = constIntExpr(s, tree, rhsExpr, scope, &cfg);
+    if (folded.has_value() && *folded == 0) {
+        s.nullPointerConstantNodes.set(rhsExpr, true);
+        return true;
+    }
+    return false;
 }
 
 // Core operator NAME → HirOpKind (the reverse of `opName`). Mirrors the
@@ -3557,10 +3524,10 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) 
         if (e->target == "Index")   return indexResultType(interner, bt);
         if (e->target == "PostInc" || e->target == "PostDec") return bt;
         // Call / member access are Pass-2-stamped (the leading `typeAt` returns
-        // before here). Unstamped is only reachable at Pass 1.5; a Call there
-        // can still resolve its result from the callee signature, while member
-        // access is exotic in a sizeof operand — InvalidType (acceptable
-        // fail-loud, mirrors cst_to_hir's typeAtOr-fallback shape).
+        // before here). Unstamped is only reachable at Pass 1.5; a Call resolves
+        // its result from the callee signature, and member access resolves its
+        // field type via the shared `resolveMemberAccess` (R1 — so `sizeof(s.y)`
+        // in an array dimension folds, instead of failing loud spuriously).
         if (e->target == "Call") {
             // Unwrap the callee type to its FnSig — a direct FnSig designator or
             // a `Ptr<FnSig>` function-pointer value (one pointer level), the same
@@ -3579,7 +3546,12 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) 
             }
             return sig.valid() ? interner.fnResult(sig) : InvalidType;
         }
-        return InvalidType;   // MemberAccess / MemberAccessThruPtr
+        // Member access (`.` / `->`): the shared helper resolves the field type.
+        // It returns NotMemberAccess for any non-member postfix verb, yielding
+        // InvalidType — the same fail-loud as before for an unhandled verb.
+        auto const mr = resolveMemberAccess(s, sem, tree, node, scope);
+        return mr.status == MemberResolution::Status::Ok ? mr.fieldType
+                                                         : InvalidType;
     }
 
     // ── ternary: mirror cst_to_hir lowerTernary ──
@@ -3611,6 +3583,97 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) 
         if (TypeId t = subtreeType(s, tree, c, scope); t.valid()) return t;
     }
     return InvalidType;
+}
+
+// R1: shared member-access resolver (declared after subtreeType's forward decl).
+// Walks `obj.field` / `ptr->field` → the field's declared type, reporting the
+// outcome. NO side effects (no diagnostics, no symbol binding) — the Pass-2 arm
+// owns those and reacts to `status`; subtreeType (Pass 1.5) takes `fieldType` on
+// Ok. Mirrors the resolution the Pass-2 arm performed inline before R1; the spans
+// it exposes (`nameChildNode` for the pre-extraction failures, `nameNode` for the
+// undeclared-field case) preserve the exact diagnostic positions the corpus pins.
+[[nodiscard]] MemberResolution
+resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
+                    Tree const& tree, NodeId node, ScopeId scope) {
+    MemberResolution out;
+    // Locate the matching MemberAccessRule for this node's rule, distinguished by
+    // operator-token (mirrors the assignByRule discipline: an ungated entry is the
+    // sole entry; otherwise the entry whose `.`/`->` token is present wins). No
+    // match ⇒ this postfix node carries a non-member operator (`++`/`(`/`[`).
+    RuleId const rule = tree.rule(node);
+    auto maIt = s.idx().memberAccessByRule.find(rule.v);
+    if (maIt == s.idx().memberAccessByRule.end()) return out;  // NotMemberAccess
+    MemberAccessRule const* ma = nullptr;
+    for (std::size_t midx : maIt->second) {
+        auto const& cand = cfg.memberAccesses[midx];
+        if (!cand.operatorToken.has_value()) { ma = &cand; break; }  // ungated
+        bool matched = false;
+        for (auto kid : tree.children(node)) {
+            if (tree.kind(kid) == NodeKind::Token
+                && tree.tokenKind(kid) == *cand.operatorToken) { matched = true; break; }
+        }
+        if (matched) { ma = &cand; break; }
+    }
+    if (ma == nullptr) return out;  // NotMemberAccess (operator mismatch)
+    out.dereferences = ma->dereferences;
+
+    auto kids = visibleChildren(tree, node);
+    if (ma->lhsChild >= kids.size() || ma->nameChild >= kids.size()) return out;
+    NodeId const lhsNode = kids[ma->lhsChild];
+    out.nameChildNode    = kids[ma->nameChild];
+
+    // F5: thread `scope` so a Pass-1.5 unstamped leaf (`s` in `sizeof(s.y)`)
+    // resolves by scope-lookup. In Pass 2 the leaf is already stamped, so
+    // subtreeType short-circuits on `typeAt` and `scope` is unused.
+    TypeId const lhsType = subtreeType(s, tree, lhsNode, scope);
+    if (!lhsType.valid()) { out.status = MemberResolution::Status::LhsUntyped; return out; }
+
+    TypeId effectiveType = lhsType;
+    if (ma->dereferences) {
+        // Arrow form `p->x` = `(*p).x`: the LHS must be `Ptr<Struct>` (one level).
+        if (s.lattice.interner().kind(effectiveType) == TypeKind::Ptr) {
+            auto const ops = s.lattice.interner().operands(effectiveType);
+            if (ops.empty()) { out.status = MemberResolution::Status::NotAPointer; return out; }
+            effectiveType = ops[0];
+        } else {
+            out.status = MemberResolution::Status::NotAPointer; return out;
+        }
+    }
+
+    auto scopeIt = s.compositeScopeByType.find(effectiveType.v);
+    if (scopeIt == s.compositeScopeByType.end()) {
+        out.status = MemberResolution::Status::NotAComposite; return out;
+    }
+
+    auto fnRes = extractNameNode(tree, out.nameChildNode, NameMatchMode::Self,
+                                 cfg.identifierToken, cfg.bracketIdentifierToken);
+    out.nameNode  = fnRes.node;
+    out.fieldName = fnRes.name;
+    bool isIdentifier = false;
+    if (fnRes.node.valid() && tree.kind(fnRes.node) == NodeKind::Token) {
+        auto const rtk = tree.tokenKind(fnRes.node);
+        if (cfg.identifierToken.valid() && rtk == cfg.identifierToken) {
+            isIdentifier = true;
+        } else if (cfg.bracketIdentifierToken.has_value()
+                   && cfg.bracketIdentifierToken->valid()
+                   && rtk == *cfg.bracketIdentifierToken) {
+            isIdentifier = true;
+        }
+    }
+    if (!isIdentifier || fnRes.name.empty()) {
+        out.status = MemberResolution::Status::BadNameNode; return out;
+    }
+
+    ScopeId const fieldScope = scopeIt->second;
+    auto const& sc = s.scopes.scopes()[fieldScope.v];
+    auto bindIt = sc.bindings.find(fnRes.name);
+    if (bindIt == sc.bindings.end()) {
+        out.status = MemberResolution::Status::UndeclaredField; return out;
+    }
+    out.fieldSym  = bindIt->second;
+    out.fieldType = s.symbols.at(out.fieldSym).type;   // may be invalid ⇒ still Ok (binding found)
+    out.status    = MemberResolution::Status::Ok;
+    return out;
 }
 
 // GAP A: check a return statement against the nearest enclosing function
@@ -3682,7 +3745,7 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit `return 0;`
         // from a Ptr<*>-returning function per C §6.3.2.3.3.
         if (admitsNullPointerConstant(s, tree, fnResult,
-                                      valueNode, ptrRules)) {
+                                      valueNode, ptrRules, scope, cfg)) {
             return;
         }
         emitMismatch(valueNode);
@@ -4040,6 +4103,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
         std::move(s.reporter),
         std::move(s.usesBySymbol),
         std::move(s.compositeScopeByType),
+        std::move(s.nullPointerConstantNodes),
         std::move(shippedExterns),
         dataModel,
     };

@@ -1,0 +1,33 @@
+{
+  "$comment": "R2 (D-SEMANTIC-NULL-CONSTANT-FOLDING): a folded-zero integer constant expression `1 - 1` passed to a pointer parameter is a C null pointer constant — it must lower to NULL across every target, not fail loud and not pass garbage. f(p)=p?7:42 is non-inlined so the pointer value flows through param-passing; NULL yields 42, a mis-materialized non-null would yield 7 (42 vs 7, mod-256-safe). The optimizedPipelines arm confirms the semantic-materialized synthetic Literal-0 / Cast-to-Ptr survives the full release pipeline identically (baseline==optimized). Red-on-disable: revert R2 and `f(1 - 1)` fails to COMPILE (S_TypeMismatch).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}

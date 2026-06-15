@@ -809,8 +809,32 @@ struct Lowerer {
         return Role::Other;
     }
 
+    // R2 (D-SEMANTIC-NULL-CONSTANT-FOLDING): a source node the semantic tier
+    // admitted as a FOLDED null-pointer constant (`1-1`, `-0` — a non-literal
+    // integer constant expression with value 0) lowers to a synthetic Literal 0,
+    // NOT its operator tree. The value is provably 0 (semantic-verified), so the
+    // existing coerce() literal-0 arm materializes `Cast(0 → Ptr)` downstream.
+    // Short-circuiting at the lowering ENTRY means the operator subtree is never
+    // emitted (no dead node) and const-folding stays OUT of lowering — the semantic
+    // marker is the single authority. Fixed I32 zero: the marked node's own type is
+    // an interior arithmetic node Pass 2 never stamped (model.typeAt would be
+    // invalid); the coerce arm + verifier fallback need only an integer-typed
+    // Literal. Mirrors the null-materialization template at the ternary-condition
+    // arm. nullopt for an unmarked node (the overwhelming common case).
+    [[nodiscard]] std::optional<E> nullPointerConstantLiteral(NodeId node) {
+        if (!model.isNullPointerConstant(node)) return std::nullopt;
+        HirLiteralValue v;
+        v.core  = TypeKind::I32;
+        v.value = std::int64_t{0};
+        HirNodeId const zeroLit = builder.makeLiteral(
+            interner.primitive(TypeKind::I32), literals.add(v),
+            HirFlags::Synthetic);
+        return E{track(zeroLit, node), interner.primitive(TypeKind::I32)};
+    }
+
     // ── expressions ───────────────────────────────────────────────────────────
     E lowerExpr(NodeId node) {
+        if (auto npc = nullPointerConstantLiteral(node)) return *npc;
         if (tree().kind(node) == NodeKind::Internal) {
             std::uint32_t const r = tree().rule(node).v;
             if (cfg.flatExprRule.valid() && r == cfg.flatExprRule.v)
@@ -982,6 +1006,7 @@ struct Lowerer {
     // A flat `operand (binaryOpRule operand)*` sequence (SQL's `expression`),
     // left-folded into nested core BinaryOp nodes. Distinct from the Pratt path.
     E lowerFlatExpr(NodeId node) {
+        if (auto npc = nullPointerConstantLiteral(node)) return *npc;
         std::vector<NodeId> operands;
         std::vector<NodeId> opToks;
         for (NodeId c : visible(node)) {
