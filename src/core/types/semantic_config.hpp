@@ -385,6 +385,16 @@ struct DSS_EXPORT DeclarationRule {
     // "garbage-rax-at-exit" downstream of the runnable-binary
     // trampoline (D-LK10-ENTRY).
     std::vector<std::string> implicitReturnZeroForFunctionNames;
+    // FC5 (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN): the program ENTRY-point function
+    // name(s) — the symbol(s) the driver resolves as the executable's entry. This
+    // is SEPARATE from `implicitReturnZeroForFunctionNames` (the C `main`-style
+    // reach-`}`-⇒-`return 0` set): a language could declare an entry whose
+    // fall-through is NOT a return-0 (e.g. a `void`-returning runtime entry), or a
+    // return-0 function that is not the entry. For c-subset both are `["main"]`,
+    // but the driver's entry-symbol resolution reads THIS field so the two
+    // concepts can diverge without one silently dragging the other. Absent/empty →
+    // the driver falls back to its format-declared entry default.
+    std::vector<std::string> entryFunctionNames;
     // Optional kind-discriminator. When set, the engine evaluates it at
     // pass 1 and uses the resulting effective kind / params / body
     // instead of the static fields above.

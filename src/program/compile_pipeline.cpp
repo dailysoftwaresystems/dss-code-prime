@@ -502,15 +502,18 @@ namespace {
 // Cycle-25); it stays CU-specific because it ENUMERATES the model's symbol records
 // (which the merged path's symbol→name `nameOf` cannot express). The merged path's
 // equivalent runs inside `mergeCuMirs` against the merged functions. Source-agnostic:
-// the trigger is the grammar's `implicitReturnZeroForFunctionNames`, never a
-// hardcoded "main".
+// the trigger is the grammar's `entryFunctionNames` (FC5 — falling back to the
+// `implicitReturnZeroForFunctionNames` return-0 set when absent), never a hardcoded "main".
 [[nodiscard]] std::optional<SymbolId>
 resolveSingleCuUserEntry(SemanticModel const& model, GrammarSchema const& grammar,
                          DiagnosticReporter& reporter, bool& ok) {
     ok = true;
     std::vector<std::string_view> entryNames;
     for (auto const& decl : grammar.semantics().declarations) {
-        for (auto const& n : decl.implicitReturnZeroForFunctionNames) {
+        auto const& names = decl.entryFunctionNames.empty()
+                                ? decl.implicitReturnZeroForFunctionNames
+                                : decl.entryFunctionNames;
+        for (auto const& n : names) {
             entryNames.push_back(n);
         }
     }

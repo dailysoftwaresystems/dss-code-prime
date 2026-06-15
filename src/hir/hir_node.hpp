@@ -43,6 +43,10 @@ enum class HirKind : std::uint16_t {
     // ── Structured Statements ──
     Block, IfStmt, WhileStmt, DoWhileStmt, ForStmt, SwitchStmt, CaseArm,
     BreakStmt, ContinueStmt, ReturnStmt, ExprStmt, VarDecl, AssignStmt,
+    // ── Unstructured control flow (FC5) — GotoStmt jumps to a function-scoped
+    //    LabelStmt; the CFG is general at the MIR tier (struct-CF markers are a
+    //    derived function of the CFG, so unstructured edges derive Linear). ──
+    GotoStmt, LabelStmt,
     // ── Expressions ──
     Literal, Ref, Call, IntrinsicCall, BinaryOp, UnaryOp, Cast, MemberAccess,
     Index, Swizzle, ConstructAggregate, Ternary, LogicalAnd, LogicalOr,
@@ -115,6 +119,7 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
         case HirKind::WhileStmt: case HirKind::DoWhileStmt: case HirKind::ForStmt:
         case HirKind::SwitchStmt: case HirKind::CaseArm: case HirKind::BreakStmt:
         case HirKind::ContinueStmt: case HirKind::ReturnStmt: case HirKind::ExprStmt:
+        case HirKind::GotoStmt: case HirKind::LabelStmt:
         case HirKind::AssignStmt: case HirKind::Unreachable:
         case HirKind::Error: case HirKind::Extension: case HirKind::Count_:
             return false;
@@ -218,6 +223,9 @@ struct ChildArity {
             return {0, 1};                                             // [value/init?]
         case HirKind::BreakStmt: case HirKind::ContinueStmt: case HirKind::Unreachable:
             return {0, 0};
+        // ── Unstructured CF (FC5) ──
+        case HirKind::GotoStmt:           return {0, 0};   // leaf; target label ordinal in payload
+        case HirKind::LabelStmt:          return {1, 1};   // [labeledStmt]; label ordinal in payload
         // ── Declarations (HR4) ──
         case HirKind::Function:      return {1, kUnboundedArity};  // [params…, body Block]
         case HirKind::ExternFunction: return {0, kUnboundedArity}; // [params…] (no body)

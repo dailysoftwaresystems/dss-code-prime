@@ -2041,6 +2041,56 @@ TEST(GrammarSchema, SemanticsImplicitReturnZeroDuplicateElementReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
+// FC5 (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN) — the de-conflation pin. The new
+// `entryFunctionNames` (the program-entry set, read by the driver's entry-symbol
+// resolution) and `implicitReturnZeroForFunctionNames` (the C main-style return-0
+// set) load INDEPENDENTLY. No shipped language declares them DIFFERENTLY (c-subset
+// sets both to `["main"]`), so this synthetic config builds the consuming shape
+// itself: the two lists differ, and each field must hold its own value. A loader
+// that aliased them (or dropped entryFunctionNames) would fail this — the
+// red-on-disable lever for the split.
+TEST(GrammarSchema, SemanticsEntryFunctionNamesLoadIndependentlyFromReturnZeroSet) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "declarations": [ { "rule": "root", "name": 0, "kind": "function",
+                            "implicitReturnZeroForFunctionNames": ["main"],
+                            "entryFunctionNames": ["custom_entry", "_start"] } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << "a config declaring both name lists must load";
+    auto const& decls = (*r)->semantics().declarations;
+    ASSERT_EQ(decls.size(), 1u);
+    // The two fields are SEPARATE — neither aliases the other.
+    EXPECT_EQ(decls[0].implicitReturnZeroForFunctionNames,
+              (std::vector<std::string>{"main"}));
+    EXPECT_EQ(decls[0].entryFunctionNames,
+              (std::vector<std::string>{"custom_entry", "_start"}));
+}
+
+// FC5 — entryFunctionNames carries the same load-time duplicate check as the
+// return-0 set (a paste-error in a language config is caught at load).
+TEST(GrammarSchema, SemanticsEntryFunctionNamesDuplicateElementReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "declarations": [ { "rule": "root", "name": 0, "kind": "function",
+                            "entryFunctionNames": ["main", "main"] } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
 // FF6 Slice 2 + audit fold (2026-06-02 post-fold #1): per-language
 // `externLibraryByFormat` JSON loader. Closes test-analyzer G3 —
 // the 80+ LOC of new validation shipped without direct tests.

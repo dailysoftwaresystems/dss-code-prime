@@ -382,9 +382,16 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
 
     // entryNames: the grammar's entry-function name list (the same list the single-CU
     // user-entry scan reads). The merge uses it to compute the merged `userEntrySymbol`.
+    // FC5: read the de-conflated `entryFunctionNames` (the program-entry concept),
+    // falling back to `implicitReturnZeroForFunctionNames` (the C return-0 set) when a
+    // declaration doesn't separately declare its entry names — so the two concepts can
+    // diverge without one silently dragging the other (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN).
     std::vector<std::string> entryNames;
     for (auto const& decl : grammar.semantics().declarations) {
-        for (auto const& n : decl.implicitReturnZeroForFunctionNames) {
+        auto const& names = decl.entryFunctionNames.empty()
+                                ? decl.implicitReturnZeroForFunctionNames
+                                : decl.entryFunctionNames;
+        for (auto const& n : names) {
             entryNames.push_back(n);
         }
     }

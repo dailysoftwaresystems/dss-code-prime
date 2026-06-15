@@ -53,6 +53,7 @@ This plan opens module-by-module:
 - Memory ordering (acquire / release / seq_cst).
 - Atomic primitives lowered to ISA atomics (x86_64 `LOCK XCHG`; ARM64 `LDXR` / `STXR`).
 - Mutex / condvar primitives — FFI to OS-supplied pthread / Win32 (per [`11-ffi-plan`](./11-ffi-plan%20-%20tbd.md)) OR in-tree implementations atop futex / WaitOnAddress.
+- **Impl substrate for [`plan-24`](./24-dss-axis-language-reserved-plan%20-%20tbd.md) §3.8** — DSS Axis's parallelism & synchronization toolkit (interlocked, semaphores, locks, barriers, channels, concurrent collections) is the *language-level API*; **this section owns the low-level primitives it lowers to** (atomics, fences, raw mutex/condvar). Toolkit families carry the `D-AXIS-PAR-*` anchors. The async forms compose with §2.3's scheduler + the async GC (one scheduler, not a dedicated GC thread).
 
 ---
 

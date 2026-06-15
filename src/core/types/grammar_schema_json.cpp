@@ -4347,6 +4347,50 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // FC5 (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN): the optional
+                        // `entryFunctionNames` string-array — the de-conflated
+                        // entry-point name set (SEPARATE from the return-0 set
+                        // above; the driver's entry-symbol resolution reads this,
+                        // falling back to the return-0 set when absent). Same
+                        // array-of-non-empty-strings shape + load-time dup check.
+                        if (entry.contains("entryFunctionNames")) {
+                            auto const& arr = entry.at("entryFunctionNames");
+                            if (!arr.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/entryFunctionNames",
+                                          "'entryFunctionNames' must be an "
+                                          "array of strings");
+                            } else {
+                                rule.entryFunctionNames.reserve(arr.size());
+                                for (std::size_t ni = 0; ni < arr.size(); ++ni) {
+                                    if (!arr[ni].is_string()
+                                        || arr[ni].get<std::string>().empty()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  std::format("{}/entryFunctionNames/{}",
+                                                              path, ni),
+                                                  "each entry must be a non-empty "
+                                                  "string");
+                                        continue;
+                                    }
+                                    rule.entryFunctionNames.push_back(
+                                        arr[ni].get<std::string>());
+                                }
+                                std::size_t const n = rule.entryFunctionNames.size();
+                                for (std::size_t a = 0; a < n; ++a)
+                                    for (std::size_t b = a + 1; b < n; ++b)
+                                        if (rule.entryFunctionNames[a]
+                                         == rule.entryFunctionNames[b])
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      std::format("{}/entryFunctionNames/{}",
+                                                                  path, b),
+                                                      std::format("duplicate function "
+                                                                  "name '{}' (already "
+                                                                  "declared at index {})",
+                                                                  rule.entryFunctionNames[a],
+                                                                  a));
+                            }
+                        }
+
                         if (entry.contains("kind")) {
                             if (!entry.at("kind").is_string()) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,

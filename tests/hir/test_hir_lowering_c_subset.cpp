@@ -1171,6 +1171,110 @@ TEST(HirLoweringCSubset, BreakableInfiniteLoopIsNotWrapped) {
         << "the breakable loop must lower to a bare WhileStmt, not a wrapper Block";
 }
 
+// ── FC5: goto / labels ──────────────────────────────────────────────────────
+
+namespace {
+[[nodiscard]] std::size_t countKind(Hir const& h, HirKind k) {
+    std::size_t n = 0;
+    std::uint32_t const tag = h.id().v;
+    for (std::uint32_t i = 1; i < h.nodeCount(); ++i)
+        if (h.kind(HirNodeId{i, tag}) == k) ++n;
+    return n;
+}
+}  // namespace
+
+// FC5 — `goto`/labels lower to the new GotoStmt/LabelStmt kinds, and a function
+// whose ONLY return is reached through a forward goto + a label still lowers
+// clean (pathTerminates treats `goto` as a terminator and a LabelStmt as
+// transparent — a labeled `return` terminates). Red-on-disable: if LabelStmt
+// transparency in `pathTerminates` were reverted, the body would look like it
+// falls through and `lowerToHir` would fail H_VerifierFailure.
+TEST(HirLoweringCSubset, GotoAndLabelLowerCleanAndTerminateViaLabel) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int c){ if(c) goto a; return 1; a: return 2; } "
+        "int main(){ return f(0); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u)
+        << "a goto+labeled-return function must not look like it falls through";
+    EXPECT_EQ(countKind(res->hir, HirKind::GotoStmt), 1u);
+    EXPECT_EQ(countKind(res->hir, HirKind::LabelStmt), 1u);
+
+    // A function that ONLY terminates via a labeled return (`goto a; a: ...`).
+    SemanticModel m2 = analyzeCSubset(
+        "int g(){ goto a; a: return 5; } int main(){ return g(); }");
+    ASSERT_FALSE(m2.hasErrors());
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(m2, r2);
+    EXPECT_TRUE(res2->ok) << (r2.all().empty() ? "" : r2.all()[0].actual);
+    EXPECT_EQ(countCode(r2, DiagnosticCode::H_VerifierFailure), 0u);
+}
+
+// FC5 (audit MUST-FIX 2) — the dead-code scan must NOT flag a goto's TARGET label
+// as unreachable: `goto X; X: …` is the universal cleanup idiom and the label is
+// manifestly reachable. But a genuinely-dead NON-label statement after a goto
+// still warns. This is the carve-out's red-on-disable lever: reverting it makes
+// the first case emit a spurious H_UnreachableCode on the label.
+TEST(HirLoweringCSubset, GotoTargetLabelIsNotFlaggedUnreachable) {
+    // `goto skip; skip: return 1;` — the label directly follows the goto: ZERO.
+    SemanticModel clean = analyzeCSubset(
+        "int f(){ goto skip; skip: return 1; } int main(){ return f(); }");
+    ASSERT_FALSE(clean.hasErrors());
+    DiagnosticReporter cr;
+    auto cres = lowerToHir(clean, cr);
+    ASSERT_TRUE(cres->ok) << (cr.all().empty() ? "" : cr.all()[0].actual);
+    EXPECT_EQ(countCode(cr, DiagnosticCode::H_UnreachableCode), 0u)
+        << "a goto's target label must NOT be flagged as dead code";
+
+    // `goto skip; r = 1; skip: return r;` — the `r = 1` between the goto and the
+    // label IS dead: EXACTLY ONE warning (on the assignment, not the label).
+    SemanticModel dead = analyzeCSubset(
+        "int f(){ int r; goto skip; r = 1; skip: return r; } "
+        "int main(){ return f(); }");
+    ASSERT_FALSE(dead.hasErrors());
+    DiagnosticReporter dr;
+    auto dres = lowerToHir(dead, dr);
+    ASSERT_TRUE(dres->ok) << (dr.all().empty() ? "" : dr.all()[0].actual);
+    EXPECT_EQ(countCode(dr, DiagnosticCode::H_UnreachableCode), 1u)
+        << "a genuinely-dead non-label statement after a goto must still warn";
+}
+
+// FC5 — the comma operator lowers to a SeqExpr (the existing sequencing
+// substrate); a programmer comma is built non-Synthetic. A multi-declarator with
+// a comma SEPARATOR stays two VarDecls (the comma-gate), never one SeqExpr-typed
+// declarator — the structural side of the multi-site contract.
+TEST(HirLoweringCSubset, CommaOperatorLowersToSeqExprAndSeparatorStaysTwoDecls) {
+    SemanticModel op = analyzeCSubset(
+        "int f(int x){ return (x = x + 1, x + 1); } int main(){ return f(40); }");
+    ASSERT_FALSE(op.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(op, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_GE(countKind(res->hir, HirKind::SeqExpr), 1u)
+        << "the comma operator must lower to a SeqExpr";
+
+    // `int a = 1, b = 2;` — two declarators (the comma is a SEPARATOR). If the
+    // comma-gate broke, the initializer would swallow `, b = 2` into one SeqExpr
+    // and `b` would never be declared (so there would be ONE VarDecl, and `b`
+    // would be undeclared at the return — a semantic error).
+    SemanticModel sep = analyzeCSubset(
+        "int f(){ int a = 1, b = 2; return a + b; } int main(){ return f(); }");
+    ASSERT_FALSE(sep.hasErrors())
+        << "int a=1,b=2 must declare BOTH a and b (comma is a separator here)";
+    DiagnosticReporter sr;
+    auto sres = lowerToHir(sep, sr);
+    ASSERT_TRUE(sres->ok) << (sr.all().empty() ? "" : sr.all()[0].actual);
+    // BOTH a and b are declared — neither f nor main has params, so the module's
+    // VarDecl count is exactly 2 (a, b). If the comma-gate broke, the initializer
+    // would swallow `, b = 2` into one declarator (1 VarDecl) and `b` would be
+    // undeclared (already caught by the hasErrors assertion above; this pins the
+    // count too).
+    EXPECT_EQ(countKind(sres->hir, HirKind::VarDecl), 2u)
+        << "int a=1,b=2 must lower to TWO VarDecls (comma is a separator here)";
+}
+
 // NEGATIVE — a const-FALSE condition (`while(0)`) and a NON-constant condition
 // (`while(x)`) are not provably-infinite and must not be wrapped. (Both rely on
 // the trailing `return 7` to terminate; neither loop is touched by the wrapper.)

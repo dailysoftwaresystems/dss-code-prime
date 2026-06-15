@@ -133,6 +133,7 @@
 
   "operators": {
     "groups": [
+      { "precedence": 10, "associativity": "left",                       "operators": [","]                                    },
       { "precedence": 15, "associativity": "right",                      "operators": ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="] },
       { "precedence": 16, "associativity": "right", "arity": "ternary",   "operators": ["?"], "middle": ":"                       },
       { "precedence": 20, "associativity": "left",                       "operators": ["||"]                                   },
@@ -219,6 +220,7 @@
     { "word": "default", "kind": "DefaultKeyword" },
     { "word": "break",    "kind": "BreakKeyword"    },
     { "word": "continue", "kind": "ContinueKeyword" },
+    { "word": "goto",     "kind": "GotoKeyword"     },
 
     { "word": "extern",  "kind": "ExternKeyword"  },
 
@@ -295,7 +297,7 @@
     "enumerator": {
       "sequence": [
         "Identifier",
-        { "optional": { "sequence": [ "AssignOp", "expression" ] } }
+        { "optional": { "sequence": [ "AssignOp", "assignmentExpr" ] } }
       ]
     },
 
@@ -535,7 +537,7 @@
       ]
     },
 
-    "initValue": { "alt": [ "braceInitList", "expression" ] },
+    "initValue": { "$comment": "FC5: assignmentExpr (NOT expression) — the comma-gate. Covers ALL three initializer consumers (initDeclarator, structField, braceInitList initElement), so `int a = b, c;` stays 2 declarators (not `a = (b,c)`).", "alt": [ "braceInitList", "assignmentExpr" ] },
 
     "arrayDeclSuffix": {
       "sequence": [
@@ -592,10 +594,14 @@
     },
 
     "declOrExprStmt": {
-      "$comment": "The C statement ambiguity site: identVarDecl BEFORE exprStmt (declared probe order is authoritative — the FC4 c0 fix). lookahead 256 (= 4096-token probe budget, vs the operand alt's 64): the identVarDecl probe must swallow an entire declaration INCLUDING initializer expressions and brace-init lists before its frame closes.",
-      "alt": [ "identVarDecl", "exprStmt" ],
+      "$comment": "The C statement ambiguity site: FC5 prepends labelStmt (`Identifier Colon …` — a 2-token commit point disjoint from identVarDecl/exprStmt, neither of which has Colon in 2nd position), then identVarDecl BEFORE exprStmt (declared probe order is authoritative — the FC4 c0 fix). lookahead 256 (= 4096-token probe budget, vs the operand alt's 64): the identVarDecl probe must swallow an entire declaration INCLUDING initializer expressions and brace-init lists before its frame closes.",
+      "alt": [ "labelStmt", "identVarDecl", "exprStmt" ],
       "speculative": true, "lookahead": 256
     },
+
+    "gotoStmt":  { "sequence": [ "GotoKeyword", "Identifier", "EndStatement" ] },
+    "labelStmt": { "sequence": [ "Identifier", "Colon", "statement" ] },
+    "emptyStmt": { "sequence": [ "EndStatement" ] },
 
     "localDeclSpecifiers": {
       "sequence": [ "localDeclSpecifier", { "repeat": "localDeclSpecifier" } ]
@@ -653,6 +659,8 @@
         "breakStmt",
         "continueStmt",
         "returnStmt",
+        "gotoStmt",
+        "emptyStmt",
         "declOrExprStmt"
       ]
     },
@@ -761,6 +769,20 @@
       }
     },
 
+    "assignmentExpr": {
+      "$comment": "FC5: a C `assignment-expression` — every operator EXCEPT the comma (the two-level expression gate). minPrecedence 15 folds assignment (prec 15) and everything tighter but STOPS before the comma operator (prec 10, looser), so a `,` at a separator site (argList / initValue / enumerator) is left for the surrounding rule's separator, never swallowed as a comma-operator. The top-level `expression` rule (minPrec 0) keeps the comma operator for expr-statements / for-clauses / return / parens / index / conditions.",
+      "expr": {
+        "atom": "operand",
+        "minPrecedence": 15,
+        "wrapperRules": {
+          "binary":  "binaryExpr",
+          "unary":   "unaryExpr",
+          "postfix": "postfixExpr",
+          "ternary": "ternaryExpr"
+        }
+      }
+    },
+
     "operand": {
       "alt": [
         "Identifier",
@@ -851,10 +873,11 @@
     "stringLiteralExpr": { "sequence": [ "StringStart", "StringLiteral" ] },
 
     "argList": {
+      "$comment": "FC5: assignmentExpr (NOT expression) — the comma here is an arg SEPARATOR, never a comma-operator, so `f(a, b)` is 2 args. A comma-operator arg is written parenthesized: `f((a, b))`.",
       "optional": {
         "sequence": [
-          "expression",
-          { "repeat": { "sequence": [ "Comma", "expression" ] } }
+          "assignmentExpr",
+          { "repeat": { "sequence": [ "Comma", "assignmentExpr" ] } }
         ]
       }
     }
@@ -940,7 +963,9 @@
           "whenKind": "function"
         },
         "$implicitReturnZeroForFunctionNamesComment": "C99 §5.1.2.2.3: when control reaches the closing '}' of main without an explicit return, the semantics are equivalent to 'return 0;'. The HIR lowering appends a synthetic ReturnStmt(IntLiteral(0)) to main's body if it doesn't structurally terminate. SOURCE-AGNOSTIC: this list lives on the per-language semantic config so each language declares its own entry-fn convention (Pascal's 'program', Rust's 'fn main', etc.) without touching shared HIR substrate. Closes D-LK10-ENTRY-MAIN-IMPLICIT-RETURN.",
-        "implicitReturnZeroForFunctionNames": ["main"] },
+        "implicitReturnZeroForFunctionNames": ["main"],
+        "$entryFunctionNamesComment": "FC5: the program ENTRY-point name(s) — read by the driver's entry-symbol resolution. SEPARATE from implicitReturnZeroForFunctionNames (the C main-style return-0 set); for C both are `main`, but declaring them distinctly de-conflates the two concepts (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN).",
+        "entryFunctionNames": ["main"] },
       { "rule": "typedefDecl", "head": 1, "declarator": 2, "kind": "type",
         "requireNamedDeclarators": true },
       { "rule": "structSpecifierBody", "name": 1, "kind": "type",
@@ -1126,6 +1151,9 @@
       { "rule": "breakStmt",    "hirKind": "BreakStmt"    },
       { "rule": "continueStmt", "hirKind": "ContinueStmt" },
       { "rule": "returnStmt",   "hirKind": "ReturnStmt"  },
+      { "rule": "gotoStmt",     "hirKind": "GotoStmt"    },
+      { "rule": "labelStmt",    "hirKind": "LabelStmt"   },
+      { "rule": "emptyStmt",    "hirKind": "Skip"        },
       { "rule": "exprStmt",     "hirKind": "ExprStmt"    }
     ],
 
@@ -1165,6 +1193,8 @@
       { "token": "ShlOp",    "target": "Shl"    },
       { "token": "ShrOp",    "target": "Shr"    },
       { "token": "AssignOp", "target": "Assign" },
+
+      { "token": "Comma",    "target": "Comma"  },
 
       { "token": "PlusAssignOp",   "target": "Assign", "compoundBase": "Add"    },
       { "token": "MinusAssignOp",  "target": "Assign", "compoundBase": "Sub"    },

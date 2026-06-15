@@ -257,10 +257,12 @@ namespace {
 // A statement kind that unconditionally transfers control away, so any sibling
 // after it in the same Block is unreachable. The plan §2.8 names Return /
 // Unreachable; Break / Continue transfer just as unconditionally, so code after
-// them in the same block is equally dead.
+// them in the same block is equally dead. FC5: `goto` likewise — code after
+// `goto X;` (other than the target LabelStmt itself) is unreachable.
 bool isUnconditionalTerminator(HirKind k) noexcept {
     return k == HirKind::ReturnStmt || k == HirKind::Unreachable
-        || k == HirKind::BreakStmt  || k == HirKind::ContinueStmt;
+        || k == HirKind::BreakStmt  || k == HirKind::ContinueStmt
+        || k == HirKind::GotoStmt;
 }
 
 // (pathTerminates lives in hir_verifier.hpp as a header template
@@ -318,6 +320,12 @@ void HirVerifier::checkBlockTermination(DiagnosticReporter& reporter) const {
         // — the rest is cascade.
         for (std::size_t k = 0; k + 1 < kids.size(); ++k) {
             if (isUnconditionalTerminator(hir_.kind(kids[k]))) {
+                // FC5 carve-out: a LabelStmt is a control-flow merge point (a
+                // goto/label target), so it is REACHABLE even immediately after an
+                // unconditional terminator — `goto X; X: …;` must NOT warn. Skip it
+                // and keep scanning so a genuinely-dead non-label statement later
+                // (`goto X; foo(); X: …`) still warns.
+                if (hir_.kind(kids[k + 1]) == HirKind::LabelStmt) continue;
                 reportAt(reporter, DiagnosticCode::H_UnreachableCode, kids[k + 1],
                          std::format("statement #{} in block #{} is unreachable: it follows "
                                      "unconditional terminator #{}",

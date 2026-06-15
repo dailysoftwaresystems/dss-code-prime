@@ -32,7 +32,7 @@ rule:root
               tok:"g_iter_count"
           tok:"="
           rule:initValue
-            rule:expression
+            rule:assignmentExpr
               rule:operand
                 tok:"0"
       rule:topLevelDeclTail
@@ -316,7 +316,7 @@ rule:root
                       tok:"total"
                   tok:"="
                   rule:initValue
-                    rule:expression
+                    rule:assignmentExpr
                       rule:operand
                         tok:"0"
               tok:";"
@@ -333,7 +333,7 @@ rule:root
                       tok:"i"
                   tok:"="
                   rule:initValue
-                    rule:expression
+                    rule:assignmentExpr
                       rule:operand
                         tok:"0"
               tok:";"
@@ -451,7 +451,7 @@ rule:root
                       tok:"fact"
                     tok:"("
                     rule:argList
-                      rule:expression
+                      rule:assignmentExpr
                         rule:binaryExpr
                           rule:operand
                             tok:"n"
@@ -518,7 +518,7 @@ rule:root
                       tok:"fib"
                     tok:"("
                     rule:argList
-                      rule:expression
+                      rule:assignmentExpr
                         rule:binaryExpr
                           rule:operand
                             tok:"n"
@@ -532,7 +532,7 @@ rule:root
                       tok:"fib"
                     tok:"("
                     rule:argList
-                      rule:expression
+                      rule:assignmentExpr
                         rule:binaryExpr
                           rule:operand
                             tok:"n"
@@ -636,7 +636,7 @@ rule:root
                       tok:"count"
                   tok:"="
                   rule:initValue
-                    rule:expression
+                    rule:assignmentExpr
                       rule:operand
                         tok:"0"
               tok:";"
@@ -653,7 +653,7 @@ rule:root
                       tok:"v"
                   tok:"="
                   rule:initValue
-                    rule:expression
+                    rule:assignmentExpr
                       rule:operand
                         tok:"value"
               tok:";"
@@ -885,26 +885,26 @@ rule:root
                     tok:"min"
                   tok:"("
                   rule:argList
-                    rule:expression
+                    rule:assignmentExpr
                       rule:postfixExpr
                         rule:operand
                           tok:"max3"
                         tok:"("
                         rule:argList
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"x"
                           tok:","
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"lo"
                           tok:","
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"lo"
                         tok:")"
                     tok:","
-                    rule:expression
+                    rule:assignmentExpr
                       rule:operand
                         tok:"hi"
                   tok:")"
@@ -965,7 +965,7 @@ rule:root
                       tok:"s"
                   tok:"="
                   rule:initValue
-                    rule:expression
+                    rule:assignmentExpr
                       rule:binaryExpr
                         rule:operand
                           tok:"a"
@@ -1086,14 +1086,14 @@ rule:root
                       tok:"t1"
                   tok:"="
                   rule:initValue
-                    rule:expression
+                    rule:assignmentExpr
                       rule:binaryExpr
                         rule:postfixExpr
                           rule:operand
                             tok:"square"
                           tok:"("
                           rule:argList
-                            rule:expression
+                            rule:assignmentExpr
                               rule:operand
                                 tok:"a"
                           tok:")"
@@ -1103,7 +1103,7 @@ rule:root
                             tok:"square"
                           tok:"("
                           rule:argList
-                            rule:expression
+                            rule:assignmentExpr
                               rule:operand
                                 tok:"b"
                           tok:")"
@@ -1121,23 +1121,23 @@ rule:root
                       tok:"t2"
                   tok:"="
                   rule:initValue
-                    rule:expression
+                    rule:assignmentExpr
                       rule:postfixExpr
                         rule:operand
                           tok:"add"
                         tok:"("
                         rule:argList
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"t1"
                           tok:","
-                          rule:expression
+                          rule:assignmentExpr
                             rule:postfixExpr
                               rule:operand
                                 tok:"square"
                               tok:"("
                               rule:argList
-                                rule:expression
+                                rule:assignmentExpr
                                   rule:operand
                                     tok:"c"
                               tok:")"
@@ -1156,13 +1156,13 @@ rule:root
                       tok:"t3"
                   tok:"="
                   rule:initValue
-                    rule:expression
+                    rule:assignmentExpr
                       rule:postfixExpr
                         rule:operand
                           tok:"bit_count"
                         tok:"("
                         rule:argList
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"t2"
                         tok:")"
@@ -1243,17 +1243,17 @@ rule:root
                       tok:"sum"
                   tok:"="
                   rule:initValue
-                    rule:expression
+                    rule:assignmentExpr
                       rule:postfixExpr
                         rule:operand
                           tok:"sum_array"
                         tok:"("
                         rule:argList
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"arr"
                           tok:","
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"10"
                         tok:")"
@@ -1288,34 +1288,34 @@ rule:root
                       tok:"m"
                   tok:"="
                   rule:initValue
-                    rule:expression
+                    rule:assignmentExpr
                       rule:postfixExpr
                         rule:operand
                           tok:"max3"
                         tok:"("
                         rule:argList
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"sum"
                           tok:","
-                          rule:expression
+                          rule:assignmentExpr
                             rule:postfixExpr
                               rule:operand
                                 tok:"fact"
                               tok:"("
                               rule:argList
-                                rule:expression
+                                rule:assignmentExpr
                                   rule:operand
                                     tok:"5"
                               tok:")"
                           tok:","
-                          rule:expression
+                          rule:assignmentExpr
                             rule:postfixExpr
                               rule:operand
                                 tok:"fib"
                               tok:"("
                               rule:argList
-                                rule:expression
+                                rule:assignmentExpr
                                   rule:operand
                                     tok:"8"
                               tok:")"
@@ -1334,21 +1334,21 @@ rule:root
                       tok:"c"
                   tok:"="
                   rule:initValue
-                    rule:expression
+                    rule:assignmentExpr
                       rule:postfixExpr
                         rule:operand
                           tok:"clamp"
                         tok:"("
                         rule:argList
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"m"
                           tok:","
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"0"
                           tok:","
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"100"
                         tok:")"
@@ -1366,21 +1366,21 @@ rule:root
                       tok:"s"
                   tok:"="
                   rule:initValue
-                    rule:expression
+                    rule:assignmentExpr
                       rule:postfixExpr
                         rule:operand
                           tok:"saturating_add"
                         tok:"("
                         rule:argList
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"c"
                           tok:","
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"50"
                           tok:","
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"200"
                         tok:")"
@@ -1394,15 +1394,15 @@ rule:root
                     tok:"compose_calc"
                   tok:"("
                   rule:argList
-                    rule:expression
+                    rule:assignmentExpr
                       rule:operand
                         tok:"sum"
                     tok:","
-                    rule:expression
+                    rule:assignmentExpr
                       rule:operand
                         tok:"m"
                     tok:","
-                    rule:expression
+                    rule:assignmentExpr
                       rule:operand
                         tok:"s"
                   tok:")"

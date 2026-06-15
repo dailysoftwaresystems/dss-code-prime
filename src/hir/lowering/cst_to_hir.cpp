@@ -233,6 +233,19 @@ struct Lowerer {
     // function body (top-level Module / global initializers).
     TypeId currentReturnType_{};
 
+    // FC5: per-function label namespace — label NAME → a per-function ordinal.
+    // Pre-scanned from the function body CST BEFORE lowering (so a forward
+    // `goto end;` resolves to a later `end:`), saved/restored around each function
+    // body like `currentReturnType_`. A GotoStmt and its target LabelStmt carry
+    // the same ordinal in their payload; the MIR lowering maps ordinal → block.
+    // Label-namespace validation (duplicate / undefined) is emitted HERE at the
+    // label-resolution chokepoint — `prescanLabels` (S_DuplicateLabel) and
+    // `lowerGoto` (S_UndefinedLabel) — NOT in a separate semantic pass, since this
+    // pre-scan is the single site that collects label names; both errors halt the
+    // pipeline before MIR (the HIR-tier error gate), so a downstream consumer
+    // never sees an unresolved label.
+    std::unordered_map<std::string, std::uint32_t> labelOrdinals_;
+
     // The result of lowering an expression: the HIR node + its resolved type.
     struct E { HirNodeId id; TypeId type; };
 
@@ -1496,6 +1509,21 @@ struct Lowerer {
             return {track(builder.makeSeqExpr(stmts, yield, lv->type, HirFlags::Synthetic), node),
                     lv->type};
         }
+        // FC5: the comma operator `a, b` — evaluate `a` for its side effects and
+        // DISCARD its value (an ExprStmt), then yield `b` (value + type). The
+        // existing SeqExpr substrate models exactly this (and its MIR lowering
+        // evaluates the effect-statements in order, then yields the result). Built
+        // NON-synthetic (programmer source — carries the comma's own span). Chains
+        // `a, b, c` nest left-assoc into Seq([ExprStmt(Seq([ExprStmt a], b))], c) =
+        // evaluate a, b (discard), value c — correct C semantics.
+        if (e.target == "Comma") {
+            E lhsE = lowerExpr(lhsN);
+            HirNodeId const effect = builder.makeExprStmt(lhsE.id);
+            E rhsE = lowerExpr(rhsN);
+            std::array<HirNodeId, 1> const stmts{effect};
+            return {track(builder.makeSeqExpr(stmts, rhsE.id, rhsE.type, HirFlags::None), node),
+                    rhsE.type};
+        }
         return combineBinary(node, e, lowerExpr(lhsN), lowerExpr(rhsN));
     }
 
@@ -1806,10 +1834,83 @@ struct Lowerer {
         if (k == "DoWhileStmt") return lowerWhile(node, /*doWhile=*/true);
         if (k == "ForStmt")     return lowerFor(node);
         if (k == "SwitchStmt")  return lowerSwitch(node);
+        if (k == "GotoStmt")    return lowerGoto(node);
+        if (k == "LabelStmt")   return lowerLabel(node);
+        // FC5: an empty statement `;` lowers to a no-op (an empty Block: it lowers
+        // to nothing in MIR, doesn't terminate, and emits no warning). `Skip` is
+        // also the include-directive's kind, handled at the top-level decl path.
+        if (k == "Skip")        return track(builder.makeBlock({}), node);
         // HR10: a rule mapped to a registered extension kind → an Extension node.
         if (extKindByName_.count(k)) return lowerExtensionNode(node, *m);
         unsupported(node, std::format("statement maps to unsupported HIR kind '{}'", k));
         return errorNode(node);
+    }
+
+    // FC5 — pre-assign a per-function ordinal to every label in `node`'s subtree
+    // (labels are function-scoped + forward-referenceable, so all ordinals must
+    // exist before `lowerGoto` runs). First-definition-wins; a same-name duplicate
+    // keeps the first ordinal AND emits S_DuplicateLabel here (C 6.8.1).
+    // Descends through nested blocks/
+    // statements but does NOT cross into nested functions (the front-end has no
+    // nested-function grammar; a function body subtree is self-contained).
+    void prescanLabels(NodeId node) {
+        if (!node.valid()) return;
+        HirRuleMapping const* m = mappingFor(node);
+        if (m != nullptr && m->hirKind == "LabelStmt") {
+            NodeId const nameTok = firstIdentifierToken(node);
+            if (nameTok.valid()) {
+                auto const [it, inserted] = labelOrdinals_.try_emplace(
+                    std::string{tree().text(nameTok)},
+                    static_cast<std::uint32_t>(labelOrdinals_.size()));
+                if (!inserted) {   // C 6.8.1: a label name has function scope
+                    emitH(DiagnosticCode::S_DuplicateLabel, nameTok,
+                          std::format("duplicate label '{}' in this function",
+                                      tree().text(nameTok)));
+                }
+            }
+        }
+        for (NodeId c : visible(node))
+            if (!isToken(c)) prescanLabels(c);
+    }
+
+    // `label: stmt` — carry the pre-scanned ordinal; lower the labeled statement
+    // (the sole non-token child). The shared ordinal links it to its goto(s).
+    HirNodeId lowerLabel(NodeId node) {
+        NodeId const nameTok = firstIdentifierToken(node);
+        NodeId bodyStmt{};
+        for (NodeId c : visible(node)) { if (!isToken(c)) { bodyStmt = c; break; } }
+        if (!nameTok.valid() || !bodyStmt.valid()) {
+            unsupported(node, "malformed labeled statement");
+            return errorNode(node);
+        }
+        auto it = labelOrdinals_.find(std::string{tree().text(nameTok)});
+        if (it == labelOrdinals_.end()) {        // pre-scan covers every label
+            unsupported(node, std::format("label '{}' was not pre-scanned",
+                                          tree().text(nameTok)));
+            return errorNode(node);
+        }
+        HirNodeId const bodyH = lowerStmt(bodyStmt);
+        return track(builder.makeLabelStmt(it->second, bodyH), node);
+    }
+
+    // `goto label;` — resolve the target name to its pre-scanned ordinal. A miss
+    // means no matching label in this function (C 6.8.6.1): emit the positioned
+    // S_UndefinedLabel here (the pre-scan is the single label-collection site) and
+    // fail loud — never a silent bad ordinal.
+    HirNodeId lowerGoto(NodeId node) {
+        NodeId const nameTok = firstIdentifierToken(node);
+        if (!nameTok.valid()) {
+            unsupported(node, "goto is missing a target label");
+            return errorNode(node);
+        }
+        auto it = labelOrdinals_.find(std::string{tree().text(nameTok)});
+        if (it == labelOrdinals_.end()) {   // C 6.8.6.1: goto needs a defined label
+            emitH(DiagnosticCode::S_UndefinedLabel, nameTok,
+                  std::format("goto target label '{}' is not defined in this function",
+                              tree().text(nameTok)));
+            return errorNode(node);
+        }
+        return track(builder.makeGotoStmt(it->second), node);
     }
 
     // A statement-context expression: an assignment becomes an AssignStmt (HIR
@@ -2923,6 +3024,19 @@ struct Lowerer {
             case HirKind::ForStmt:
             case HirKind::SwitchStmt:
                 return false;
+            // FC5 — a `goto` inside a provably-infinite loop is NOT counted here
+            // (it falls to `default`; a GotoStmt is a leaf, so it returns false).
+            // This is deliberate and HARMLESS in both directions: an INTERNAL goto
+            // (target inside the loop) keeps the loop genuinely infinite, so the
+            // Block{loop,Unreachable} wrap is correct; a FRAME-ESCAPING goto
+            // (`while(1){ if(c) goto out; } out: …`) still gets the wrap, but the
+            // wrap's synthetic Unreachable lands on a no-predecessor block that the
+            // mandatory MIR unreachable-prune drops, while the goto's own Br keeps
+            // the target label live — runtime-correct (witnessed by the
+            // goto_infinite_escape corpus). Counting gotos as breaks here would be
+            // BOTH unsound (a goto has no frame, so the break's frame-respecting
+            // non-descent rule doesn't apply) and would FALSE-REJECT a valid
+            // infinite loop whose goto stays internal — so we intentionally do not.
             default:
                 for (HirNodeId c : builder.children(body))
                     if (bodyHasReachableBreak(c)) return true;
@@ -3327,9 +3441,13 @@ struct Lowerer {
             TypeId const retType =
                 sig.valid() ? interner.fnResult(sig) : InvalidType;
             currentReturnType_ = retType;
+            auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
+            labelOrdinals_.clear();
+            if (bodyNode.valid()) prescanLabels(bodyNode);
             HirNodeId body = bodyNode.valid()
                 ? lowerStmt(bodyNode)
                 : track(builder.makeBlock({}), node);
+            labelOrdinals_ = std::move(savedLabels);
             currentReturnType_ = savedReturn;
             body = maybeAppendImplicitReturnZero(node, body, sym, retType,
                                                  decl);
@@ -3503,9 +3621,15 @@ struct Lowerer {
         TypeId const retType =
             sig.valid() ? interner.fnResult(sig) : InvalidType;
         currentReturnType_ = retType;
-        HirNodeId body = (decl.bodyChild && *decl.bodyChild < vis.size())
-                       ? lowerStmt(vis[*decl.bodyChild])
+        NodeId const bodyNode = (decl.bodyChild && *decl.bodyChild < vis.size())
+                              ? vis[*decl.bodyChild] : NodeId{};
+        auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
+        labelOrdinals_.clear();
+        if (bodyNode.valid()) prescanLabels(bodyNode);
+        HirNodeId body = bodyNode.valid()
+                       ? lowerStmt(bodyNode)
                        : track(builder.makeBlock({}), node);
+        labelOrdinals_ = std::move(savedLabels);
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
@@ -3720,7 +3844,11 @@ struct Lowerer {
         TypeId const retType =
             sig.valid() ? interner.fnResult(sig) : InvalidType;
         currentReturnType_ = retType;
+        auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
+        labelOrdinals_.clear();
+        if (bodyNode.valid()) prescanLabels(bodyNode);
         HirNodeId body = bodyNode.valid() ? lowerStmt(bodyNode) : track(builder.makeBlock({}), node);
+        labelOrdinals_ = std::move(savedLabels);
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);

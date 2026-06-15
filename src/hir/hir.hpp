@@ -126,6 +126,11 @@ public:
     [[nodiscard]] std::optional<HirNodeId> returnValue(HirNodeId id)  const;
     [[nodiscard]] HirNodeId                exprStmtExpr(HirNodeId id) const;
 
+    // goto/label per-function ordinal (payload); a LabelStmt's labeled statement
+    // (its sole child). A GotoStmt and its target LabelStmt share the ordinal.
+    [[nodiscard]] std::uint32_t            labelOrdinal(HirNodeId id) const;
+    [[nodiscard]] HirNodeId                labelBody(HirNodeId id)    const;
+
     // SeqExpr: the statements evaluated for effect (all but the last child) and
     // the result expression (the last child, which supplies the SeqExpr's value
     // + type).
@@ -431,6 +436,14 @@ public:
     // loop/switch). Leaves; the index lives in `payload`.
     HirNodeId makeBreak(std::uint32_t depth = 0, HirFlags flags = HirFlags::None);
     HirNodeId makeContinue(std::uint32_t depth = 0, HirFlags flags = HirFlags::None);
+
+    // goto label; — leaf, the target label's per-function ordinal in `payload`
+    // (FC5). label: — child [labeledStmt], the same per-function ordinal in
+    // `payload`; a GotoStmt and its target LabelStmt share the ordinal. Labels
+    // are function-scoped, forward-referenceable, in their own namespace.
+    HirNodeId makeGotoStmt(std::uint32_t labelOrdinal, HirFlags flags = HirFlags::None);
+    HirNodeId makeLabelStmt(std::uint32_t labelOrdinal, HirNodeId labeledStmt,
+                            HirFlags flags = HirFlags::None);
 
     // return [value]; — children [value] or [].
     HirNodeId makeReturn(std::optional<HirNodeId> value = std::nullopt,
