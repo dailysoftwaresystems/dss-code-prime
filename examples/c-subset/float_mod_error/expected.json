@@ -5,6 +5,6 @@
     { "spec": "x86_64:elf64-x86_64-linux-exec" }
   ],
   "expectDiagnostics": [
-    { "code": "H_UnsupportedLoweringForKind", "line": 9, "col": 12 }
+    { "code": "H_UnsupportedLoweringForKind", "line": 16, "col": 5 }
   ]
 }

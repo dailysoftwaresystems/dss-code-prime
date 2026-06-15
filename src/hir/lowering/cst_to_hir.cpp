@@ -1576,9 +1576,11 @@ struct Lowerer {
                     return operand;
                 }
             }
-            TypeId result = InvalidType;
-            if (operand.type.valid() && interner.kind(operand.type) == TypeKind::Ptr)
-                result = interner.operands(operand.type)[0];
+            // The pointee-of derivation is the SINGLE source shared with the
+            // semantic-tier expression typer (type_rules.hpp). On the non-
+            // identity path here it yields Ptr<T>→T / non-Ptr→InvalidType,
+            // exactly as the prior inline computation.
+            TypeId const result = derefResultType(interner, operand.type);
             return {track(builder.makeDeref(operand.id, result), node), result};
         }
         auto op = coreOpFromName(e.target);
@@ -1713,13 +1715,9 @@ struct Lowerer {
         if (e.target == "Index") {
             HirNodeId idx = rest.empty() ? reportedError(node, "index has no subscript expression")
                                          : lowerExpr(rest.front()).id;
-            TypeId inferred = InvalidType;
-            if (base.type.valid()) {
-                TypeKind const bk = interner.kind(base.type);
-                if ((bk == TypeKind::Array || bk == TypeKind::Ptr || bk == TypeKind::Slice)
-                    && !interner.operands(base.type).empty())
-                    inferred = interner.operands(base.type)[0];
-            }
+            // element-of-base derivation — the SINGLE source shared with the
+            // semantic-tier typer (type_rules.hpp `indexResultType`).
+            TypeId const inferred = indexResultType(interner, base.type);
             TypeId const result = typeAtOr(node, inferred);
             return {track(builder.makeIndex(base.id, idx, result), node), result};
         }

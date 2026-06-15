@@ -407,34 +407,52 @@ TEST(SemanticAnalyzerCSubset, InfixArithmeticStillFiresMismatchAtCallArg) {
            "the integer literal, not the operator)";
 }
 
-// 2nd-order audit pin (silent-failure B-1, step 13.3a): document
-// the CURRENT cascade-suppression behavior on `f(-0)` so a future
-// tightening of subtreeType (pass-2 expression typing closure)
-// EXPLICITLY surfaces this case. Today the operator-stop returns
-// InvalidType for the `-0` wrapper (MinusOp at first position is
-// a registered Prefix operator); the call-arg check then
-// silently suppresses via `if (!argTy.valid()) continue;`. NO
-// diagnostic fires. This is the documented trade-off: false-
-// negative on Prefix-`-` rather than false-positive on `a-b`. The
-// fix is pass-2 expression typing of unary wrappers (anchored at
-// D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS full closure). If a
-// future tightening EITHER emits a diagnostic for `f(-0)` OR
-// admits `-0` as a null-pointer constant, this test will fail and
-// the maintainer will need to consciously update the pin.
-TEST(SemanticAnalyzerCSubset, NegativeZeroSilentlySuppressedAtCallArg) {
+// CONSCIOUSLY UPDATED (D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS ✅ CLOSED):
+// the pin below USED to document the cascade-suppressed false-NEGATIVE on
+// `f(-0)` — the old operator-stop returned InvalidType for the `-0` wrapper
+// (Prefix MinusOp) and the call-arg check silently suppressed the mismatch.
+// The complete semantic-tier expression typer now types `-0` as `I32`, so the
+// `int → void*` mismatch CORRECTLY fires — exactly the surfaced change the old
+// pin predicted ("If a future tightening EITHER emits a diagnostic for `f(-0)`
+// … the maintainer will need to consciously update the pin"). NOTE: DSS's
+// null-pointer-constant rule is the LITERAL `0` only (`isLiteralIntegerZero`),
+// so `-0` / `0+0` / `1-1` are NOT null constants here — a non-literal-zero
+// integer in a pointer slot is a mismatch (broadening to folded-zero is the
+// separate, pre-existing `D-SEMANTIC-NULL-CONSTANT-FOLDING`). This is now a
+// POSITIVE pin: the unary-typed arg surfaces the mismatch (red-on-disable for
+// the unary arm of the typer).
+TEST(SemanticAnalyzerCSubset, NegativeZeroAtVoidPtrArgFiresMismatch) {
     auto cu = buildShippedUnit("c-subset", {
         "extern void f(void* p);\n"
         "int main() { f(-0); return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    // CURRENT documented behavior: zero diagnostics. Pre-13.3a
-    // (with the original looser arity-check) and post-13.3a (with
-    // the position-based stop) BOTH produce zero diagnostics here
-    // — silent-suppression via cascade. Pin so future closures
-    // surface the change.
+    // `-0` types as I32 (unary Neg of literal 0); not the literal-`0` null
+    // constant → the int→void* call-arg mismatch fires exactly once.
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 0u);
+                        DiagnosticCode::S_TypeMismatch), 1u);
+}
+
+// The latent-bug FIX (D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS closure): a
+// mixed-width binary in a checked position is now typed against its UNIFIED
+// (UAC) type, not whichever leaf the old DFS-suppressor happened to reach. For
+// `sink(int); long a; int b; sink(a + b)` the argument `a + b` is `long` (UAC of
+// long+int), which narrows to the `int` param → S_TypeMismatch fires. Under the
+// old suppressor this was DFS-dependent: it reached the `int` leaf `b` and
+// silently ADMITTED the narrowing. RED-ON-DISABLE: revert the binary arm to a
+// leaf type and this drops to 0 diagnostics (the narrowing is silently let
+// through — the exact latent unsoundness this closure removes).
+TEST(SemanticAnalyzerCSubset, MixedWidthBinaryArgTypedByUacNotLeaf) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int sink(int v);\n"
+        "int f(long a, int b) { return sink(a + b); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // `a + b` is `long`; the `int` param narrows → exactly one mismatch.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u);
 }
 
 // F1 audit-fix pin (6-agent 2nd-order, step 13.3a): paren-wrapped
