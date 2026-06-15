@@ -24,13 +24,16 @@
 //     trap), and the global keeps its initFunc.
 //   * IDEMPOTENT: running the prune twice is a no-op on the second run.
 //
-// FC5 (goto/labels) does NOT lower today — the parser rejects a `label:`
-// statement (verified out-of-band). When it lands, add a probe:
-//   `int main(){ int x=0; goto L; x=5; L: return x; }` — the dead
-//   `x=5;` block branches to the reachable label `L`; the prune must drop
-//   that dead pred AND `acceptPhiIncoming` must drop any phi-incoming it
-//   contributed to a reachable join. The MirBuilder PhiIncomingFromPruned-
-//   Pred pin below already exercises that exact acceptPhiIncoming path.
+// FC5 (goto/labels) LANDED 2026-06-15 — `goto`/labels now lower end-to-end. The
+// goto-dead-block prune is exercised at runtime by `examples/c-subset/goto_cleanup`
+// (a forward goto over a cleanup block leaves it unreachable → pruned; exit 42 with
+// + without the optimizer) and `goto_infinite_escape` (the `while(1){…goto out…}`
+// wrap's no-pred Unreachable is dropped by this prune). The hand-built MIR shape
+// below pins the same prune + `acceptPhiIncoming` path at the unit tier:
+//   `int main(){ int x=0; goto L; x=5; L: return x; }` — the dead `x=5;` block
+//   branches to the reachable label `L`; the prune drops that dead pred AND
+//   `acceptPhiIncoming` drops any phi-incoming it contributed to a reachable join.
+//   The MirBuilder PhiIncomingFromPrunedPred pin below exercises that exact path.
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"

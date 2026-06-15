@@ -299,6 +299,16 @@ enum class DiagnosticCode : std::uint16_t {
     // `int f();` — declaration-without-definition is deferred; externs
     // carry that role today). Always an ERROR — never silent.
     S_InvalidFunctionDeclarator   = 0xE018,
+    // FC5: two `goto` labels with the SAME name in one function (C 6.8.1 — a
+    // label name has function scope, so a duplicate is a constraint violation).
+    // Positioned at the redefinition. Emitted at the label-resolution chokepoint
+    // (CST→HIR's per-function label pre-scan, where label names are assigned
+    // ordinals — the single collection site, so the check rides the resolution
+    // rather than duplicating a separate semantic-tier label walk).
+    S_DuplicateLabel              = 0xE019,
+    // FC5: a `goto` whose target label is not defined anywhere in the enclosing
+    // function (C 6.8.6.1). Positioned at the goto's target identifier.
+    S_UndefinedLabel              = 0xE01A,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

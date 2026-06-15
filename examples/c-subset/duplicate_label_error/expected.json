@@ -1,0 +1,6 @@
+{
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [ { "spec": "x86_64:elf64-x86_64-linux-exec" } ],
+  "expectDiagnostics": [ { "code": "S_DuplicateLabel", "line": 2, "col": 11 } ]
+}

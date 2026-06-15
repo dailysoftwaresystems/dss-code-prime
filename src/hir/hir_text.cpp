@@ -640,6 +640,14 @@ private:
                 return;
             case HirKind::Unreachable:
                 out_ += "unreachable"; out_ += flagsStr(f); out_ += '\n'; return;
+            case HirKind::GotoStmt:
+                out_ += "goto"; out_ += flagsStr(f);
+                out_ += std::format(" L{}", hir_.labelOrdinal(id)); out_ += '\n'; return;
+            case HirKind::LabelStmt:
+                out_ += "label"; out_ += flagsStr(f);
+                out_ += std::format(" L{}:\n", hir_.labelOrdinal(id));
+                emitNodeLine(hir_.labelBody(id), ind + 1);
+                return;
             case HirKind::Error: case HirKind::Extension:
                 emitExtOrError(id, /*inlineForm=*/false, ind); out_ += '\n'; return;
             default:

@@ -99,6 +99,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_DeclarationDeclaresNothing";
         case DiagnosticCode::S_InvalidFunctionDeclarator:
             return "S_InvalidFunctionDeclarator";
+        case DiagnosticCode::S_DuplicateLabel:           return "S_DuplicateLabel";
+        case DiagnosticCode::S_UndefinedLabel:           return "S_UndefinedLabel";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

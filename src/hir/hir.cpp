@@ -476,6 +476,16 @@ HirNodeId HirBuilder::makeContinue(std::uint32_t depth, HirFlags flags) {
     return addLeaf(HirKind::ContinueStmt, InvalidType, depth, flags);
 }
 
+HirNodeId HirBuilder::makeGotoStmt(std::uint32_t labelOrdinal, HirFlags flags) {
+    return addLeaf(HirKind::GotoStmt, InvalidType, labelOrdinal, flags);
+}
+
+HirNodeId HirBuilder::makeLabelStmt(std::uint32_t labelOrdinal, HirNodeId labeledStmt,
+                                    HirFlags flags) {
+    HirNodeId const kids[] = {labeledStmt};
+    return addParent(HirKind::LabelStmt, kids, InvalidType, labelOrdinal, flags);
+}
+
 HirNodeId HirBuilder::makeReturn(std::optional<HirNodeId> value, HirFlags flags) {
     if (value) {
         HirNodeId const kids[] = {*value};
@@ -654,6 +664,14 @@ std::optional<HirNodeId> Hir::returnValue(HirNodeId id) const {
 }
 HirNodeId Hir::exprStmtExpr(HirNodeId id) const {
     assert(kind(id) == HirKind::ExprStmt);
+    return childAt(id, 0);
+}
+std::uint32_t Hir::labelOrdinal(HirNodeId id) const {
+    assert(kind(id) == HirKind::GotoStmt || kind(id) == HirKind::LabelStmt);
+    return payload(id);
+}
+HirNodeId Hir::labelBody(HirNodeId id) const {
+    assert(kind(id) == HirKind::LabelStmt);
     return childAt(id, 0);
 }
 std::span<HirNodeId const> Hir::seqExprStmts(HirNodeId id) const {

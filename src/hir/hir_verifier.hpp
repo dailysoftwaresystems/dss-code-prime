@@ -67,7 +67,17 @@ template <typename Source>
         case HirKind::ReturnStmt:
         case HirKind::Unreachable:
             return true;
-        case HirKind::Block: {
+        // FC5: `goto` unconditionally transfers control — it never falls through,
+        // so a block ending in `goto` definitely leaves. This is sound for the
+        // fall-off-end invariant: if the goto's target leads nowhere, THAT block's
+        // own structural check catches the fall-off (matches the break/continue +
+        // infinite-loop-as-Unreachable treatment). A LabelStmt is transparent —
+        // it terminates iff its labeled statement does (so `end: return 0;` as a
+        // function's last statement still terminates).
+        case HirKind::GotoStmt:
+            return true;
+        case HirKind::Block:
+        case HirKind::LabelStmt: {
             auto kids = src.children(id);
             return !kids.empty() && pathTerminates(src, kids.back());
         }

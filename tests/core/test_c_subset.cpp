@@ -63,7 +63,7 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
             pushNext(b, h.stream);
             {
                 auto iv   = b.open(h.schema->rules().find("initValue"));
-                auto expr = b.open(h.schema->rules().find("expression"));
+                auto expr = b.open(h.schema->rules().find("assignmentExpr"));
                 auto opr  = b.open(h.schema->rules().find("operand"));
                 b.pushToken(h.stream.advance());
             }
@@ -92,7 +92,7 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
         "              tok:\"x\"\n"
         "          tok:\"=\"\n"
         "          rule:initValue\n"
-        "            rule:expression\n"
+        "            rule:assignmentExpr\n"
         "              rule:operand\n"
         "                tok:\"5\"\n"
         "      rule:topLevelDeclTail\n"

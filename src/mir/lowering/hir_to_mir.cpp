@@ -111,6 +111,22 @@ struct Lowerer {
     };
     std::vector<BranchFrame> branchStack;
 
+    // FC5: per-function `goto`/label lowering. A LabelStmt and its goto(s) share a
+    // per-function ordinal (HIR payload); this maps the ordinal → its MIR block.
+    // `getOrCreateLabelBlock` is lazy so a FORWARD goto (`goto end;` before `end:`)
+    // and a BACKWARD goto resolve uniformly — whichever reaches the ordinal first
+    // creates the block; the other reuses it. Unstructured edges are fine: the MIR
+    // CFG is a general graph, markers are re-derived from it after `finish()`, and
+    // any block left unreachable is dropped by the mandatory unreachable-prune.
+    std::unordered_map<std::uint32_t, MirBlockId> labelBlocks_;
+    MirBlockId getOrCreateLabelBlock(std::uint32_t ordinal) {
+        auto it = labelBlocks_.find(ordinal);
+        if (it != labelBlocks_.end()) return it->second;
+        MirBlockId const b = mir.createBlock(StructCfMarker::Linear);
+        labelBlocks_.emplace(ordinal, b);
+        return b;
+    }
+
     // D-LK4-RODATA-PRODUCER-STRING (2026-06-02): synthetic-symbol
     // counter for string-literal-promoted globals. Initialized to
     // 1 + max(existing function/extern/global SymbolId.v) on first
@@ -1701,6 +1717,28 @@ struct Lowerer {
                 mir.addBr(frame.continueBB);
                 return true;
             }
+            case HirKind::GotoStmt: {
+                // Unconditional jump to the target label's block (created lazily so
+                // forward + backward gotos resolve identically). The open block is
+                // now terminated; a following sibling opens a fresh dead block (the
+                // Block-lowering does this), which the unreachable-prune drops.
+                mir.addBr(getOrCreateLabelBlock(hir.labelOrdinal(node)));
+                return true;
+            }
+            case HirKind::LabelStmt: {
+                // `label: stmt` — the label is a control-flow merge point. If the
+                // open block still falls through (control arrives by fall-through,
+                // not only by goto), branch into the label block; then continue
+                // emitting INTO it and lower the labeled statement.
+                // INVARIANT: every label ordinal is UNIQUE here — a duplicate label
+                // name emits S_DuplicateLabel at the HIR-tier label pre-scan, which
+                // halts the pipeline before MIR. (Without that gate, two LabelStmts
+                // sharing an ordinal would self-branch B→B + double-beginBlock here.)
+                MirBlockId const lb = getOrCreateLabelBlock(hir.labelOrdinal(node));
+                if (!mir.openBlockHasTerminator()) mir.addBr(lb);
+                mir.beginBlock(lb);
+                return lowerStmt(hir.labelBody(node));
+            }
             case HirKind::SwitchStmt: {
                 // C-style switch: each `CaseArm` has an optional match value
                 // and a body span; arms execute in declaration order with
@@ -1844,6 +1882,7 @@ struct Lowerer {
         // bindings — entries from the previous function are stale.
         symbolToValue.clear();
         addressableLocal.clear();
+        labelBlocks_.clear();   // FC5: labels are function-scoped
 
         // Pre-pass: scan the body to find params (and locals) whose address
         // is taken. Address-taken params must live in memory (alloca-backed),
