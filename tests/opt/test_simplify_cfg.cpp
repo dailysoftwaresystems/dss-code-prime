@@ -23,6 +23,7 @@
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "mir/mir_verifier.hpp"
 #include "opt/optimizer.hpp"
 #include "opt/passes/simplify_cfg.hpp"
 
@@ -330,18 +331,25 @@ TEST(SimplifyCfg, LinearChainBlockMerged) {
     EXPECT_LT(totalBlockCount(mir), blocksBefore);
 }
 
-// Non-Linear marker on BOTH sides → block-merge skipped (conservative
-// scope; full marker re-derivation is anchored as
-// D-OPT4-1-NON-LINEAR-MARKER-MERGE for a future cycle).
-TEST(SimplifyCfg, BothNonLinearMarkersNotMerged) {
+// D-OPT4-1-NON-LINEAR-MARKER-MERGE — CLOSED. Non-Linear markers on
+// BOTH sides of a (P, B) pair no longer block the merge: admission is
+// pure CFG-legality, and the post-rebuild canonical re-derivation
+// (`rederiveStructCfMarkers`) stamps the merged block's ACTUAL role.
+// This is the closing pin — the predecessor test
+// (`BothNonLinearMarkersNotMerged`) asserted blocksMerged == 0 for
+// exactly this fixture.
+// RED-on-disable: re-add the old marker condition to
+// `isCandidateForMerge` ("both non-Linear → return false") → the
+// merges below are refused → the blocksMerged expectation goes red.
+TEST(SimplifyCfg, BothNonLinearMarkersNowMerge) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
     TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
     mb.addFunction(fnSig, SymbolId{100});
-    // entry → tArm → join, both non-Linear; tArm.terminator = Br(join);
-    // join has 1 pred (tArm). Would be a merge candidate EXCEPT both
-    // markers are non-Linear → conservative gate refuses.
+    // entry → tArm → join, both non-Linear stamps; tArm.terminator =
+    // Br(join); join has 1 pred (tArm). Both pairs are CFG-legal, so
+    // the whole straight-line chain collapses into one block.
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
     MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
@@ -360,23 +368,32 @@ TEST(SimplifyCfg, BothNonLinearMarkersNotMerged) {
     DiagnosticReporter rep;
     auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
     EXPECT_TRUE(r.ok);
-    // tArm IS trampoline-shaped? No — it has real content (Add).
-    // Block-merge gate would fire EXCEPT both markers non-Linear.
-    EXPECT_EQ(r.blocksMerged, 0u)
-        << "BOTH candidate pairs in this fixture — (entry, tArm) and "
-           "(tArm, join) — share the both-non-Linear shape "
-           "(EntryBlock+IfThen, then IfThen+IfJoin). The c3 gate "
-           "rejects both pairs (D-OPT4-1-NON-LINEAR-MARKER-MERGE).";
+    EXPECT_EQ(r.blocksMerged, 2u)
+        << "BOTH pairs - (entry, tArm) and (tArm, join) - now merge; "
+           "markers are not an admission gate "
+           "(D-OPT4-1-NON-LINEAR-MARKER-MERGE closed)";
     EXPECT_EQ(r.blocksJumpThreaded, 0u);
+    // The single surviving block derives EntryBlock (it IS the entry),
+    // and the module satisfies the verifier's stored==derived equality.
+    MirFuncId const f = mir.funcAt(0);
+    ASSERT_EQ(mir.funcBlockCount(f), 1u)
+        << "the whole straight-line chain collapses into the entry";
+    EXPECT_EQ(mir.blockMarker(mir.funcEntry(f)), StructCfMarker::EntryBlock);
+    DiagnosticReporter vrep;
+    MirVerifier v{mir, &interner};
+    EXPECT_TRUE(v.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
 }
 
-// Marker re-derivation: P=Linear, B=LoopExit → merged block becomes
-// LoopExit (the surviving non-Linear marker). Pin the survivor's
-// marker post-merge. The fixture uses entry → CondBr split → only
-// the false-arm reaches the merge chain; this prevents the entry's
-// own merge from collapsing the chain into entry (which would
-// inherit EntryBlock and shadow the marker-re-derivation test).
-TEST(SimplifyCfg, MergeSurvivorInheritsNonLinearMarker) {
+// Derivation-era successor of `MergeSurvivorInheritsNonLinearMarker`
+// (which pinned the deleted "non-Linear wins" absorb-chain walk over a
+// CFG-INCONSISTENT fixture — LoopExit stamped on a loop-free CFG).
+// Now: the merged block's marker is the CANONICAL DERIVATION of the
+// post-merge CFG — the stale LoopExit creation stamp is corrected, not
+// propagated. Shape: entry CondBr(tArm, mid); tArm returns; mid → exit
+// merge into one returning block. Both arms return → ipdom(entry) =
+// virtual → tArm derives IfThen, the MERGED block derives IfElse.
+TEST(SimplifyCfg, MergeSurvivorTakesDerivedMarker) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
     TypeId const boolT = interner.primitive(TypeKind::Bool);
@@ -414,19 +431,14 @@ TEST(SimplifyCfg, MergeSurvivorInheritsNonLinearMarker) {
     EXPECT_EQ(r.blocksMerged, 1u)
         << "exactly one merge fires — (mid, exit). Entry's terminator "
            "is CondBr, so it can't merge with anyone.";
-    // Tighter pin (test-analyzer rating 4): assert LoopExit marker
-    // lands on the MERGED block specifically, not "somewhere" — a
-    // regression that bled the marker to an unrelated block would
-    // pass the "found somewhere" check but fail this stricter pin.
-    // The merged block is identified by its instruction count: it's
-    // the only block whose instCount equals (mid.preMerge - 1 for
-    // the dropped Br + exitB.preMerge) = (3 + 2) - 1 = 4. The
-    // unmerged tArm has 2 insts. Entry has 3 (Arg + 2 Consts +
-    // CondBr — wait, MirBuilder stores Arg/Const as instructions;
-    // entry has Arg + CondBr cond + actual CondBr = 3 inst items).
-    // The marker should land on the 4-inst block specifically.
-    std::size_t loopExitCount = 0;
-    bool mergedBlockHasLoopExit = false;
+    // The merged block is identified by its instruction count: mid's
+    // 2 non-terminator insts + exitB's 2 insts (incl. its Return) = 4;
+    // the unmerged tArm has 2. Its marker must be the DERIVED role of
+    // the post-merge CFG — IfElse (entry's false arm; both arms return
+    // so there is no real join) — NOT the stale LoopExit creation
+    // stamp the fixture planted (the derivation corrects it).
+    std::size_t ifElseCount = 0;
+    bool mergedBlockIsIfElse = false;
     std::size_t const nf = mir.moduleFuncCount();
     for (std::uint32_t fi = 0; fi < nf; ++fi) {
         MirFuncId const f = mir.funcAt(fi);
@@ -436,22 +448,28 @@ TEST(SimplifyCfg, MergeSurvivorInheritsNonLinearMarker) {
             MirBlockId const blk = mir.funcBlockAt(f, bi);
             StructCfMarker const m = mir.blockMarker(blk);
             if (m == StructCfMarker::LoopExit) {
-                ++loopExitCount;
-                // The merged block has instCount > 2 (mid's 2 non-
-                // terminator insts + exitB's 2 insts including its
-                // Return terminator = 4). Unmerged tArm has only 2.
+                ADD_FAILURE() << "no block may keep the stale LoopExit "
+                                 "stamp - the post-merge re-derivation "
+                                 "must correct it";
+            }
+            if (m == StructCfMarker::IfElse) {
+                ++ifElseCount;
                 if (mir.blockInstCount(blk) > 2) {
-                    mergedBlockHasLoopExit = true;
+                    mergedBlockIsIfElse = true;
                 }
             }
         }
     }
-    EXPECT_EQ(loopExitCount, 1u)
-        << "exactly one block carries the LoopExit marker post-merge";
-    EXPECT_TRUE(mergedBlockHasLoopExit)
-        << "the LoopExit marker lands on the MERGED block (instCount > 2 "
-           "— contains both mid's and exitB's content), NOT on an "
-           "unrelated block (D-OPT4-1)";
+    EXPECT_EQ(ifElseCount, 1u)
+        << "exactly one block derives IfElse post-merge";
+    EXPECT_TRUE(mergedBlockIsIfElse)
+        << "the derived IfElse lands on the MERGED block (instCount > 2 "
+           "- contains both mid's and exitB's content) - D-OPT4-1";
+    // And the module satisfies verifier equality by construction.
+    DiagnosticReporter vrep;
+    MirVerifier v{mir, &interner};
+    EXPECT_TRUE(v.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
 }
 
 // Block-merge skipped: B has a Phi node (degenerate single-incoming
@@ -664,13 +682,14 @@ TEST(SimplifyCfg, PhiIncomingRedirectedAcrossMerge) {
            "head tHead, NOT silently dropped or aliased to fArm";
 }
 
-// Chain non-Linear marker invariant: a chain like H(Linear) →
-// B1(IfThen) → B2(LoopExit) would violate the "≤1 non-Linear marker
-// per chain" rule that c3's marker re-derivation depends on.
-// analyze() rejects the second admission to keep the chain
-// single-non-Linear. Without this guard, the marker re-derivation
-// would silently pick one and drop the other.
-TEST(SimplifyCfg, ChainNonLinearMarkerRejectsSecondAdmission) {
+// Derivation-era successor of `ChainNonLinearMarkerRejectsSecondAdmission`
+// (which pinned the deleted "≤1 non-Linear per chain" admission
+// rejection). Markers no longer gate admission AT ALL: a straight-line
+// chain carrying MULTIPLE non-Linear stamps collapses entirely, and the
+// canonical re-derivation stamps the single survivor's actual role.
+// This doubles as the EFFECTIVENESS pin: the exact shapes the old gate
+// refused now merge (D-OPT4-1-NON-LINEAR-MARKER-MERGE closed).
+TEST(SimplifyCfg, WholeChainMergesRegardlessOfMarkerMultiplicity) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
     TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
@@ -714,39 +733,24 @@ TEST(SimplifyCfg, ChainNonLinearMarkerRejectsSecondAdmission) {
     DiagnosticReporter rep;
     auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
     EXPECT_TRUE(r.ok);
-    // Pairs by-the-gate: (linkage1, ifThen) admits (head=linkage1,
-    // chain non-Linear=IfThen). (ifThen, linkage2) — head is still
-    // linkage1; chain has IfThen + linkage2 is Linear → admit.
-    // (linkage2, loopExit) — head is linkage1; chain has IfThen
-    // non-Linear AND loopExit is non-Linear → REJECT (would push to
-    // 2 non-Linear). So 2 admissions, not 3.
-    EXPECT_EQ(r.blocksMerged, 2u)
-        << "the third admission (linkage2 → loopExit) is rejected "
-           "to keep the chain at ≤1 non-Linear marker; loopExit "
-           "survives as its own block";
-    // Surviving non-Linear markers: EntryBlock (entry), IfThen
-    // (linkage1's chain inherits via override), LoopExit (loopExit
-    // standalone). The chain's surviving marker should be IfThen.
-    std::vector<int> survivors;
-    std::size_t const nf = mir.moduleFuncCount();
-    for (std::uint32_t fi = 0; fi < nf; ++fi) {
-        MirFuncId const f = mir.funcAt(fi);
-        std::uint32_t const nb = mir.funcBlockCount(f);
-        for (std::uint32_t bi = 0; bi < nb; ++bi) {
-            survivors.push_back(static_cast<int>(
-                mir.blockMarker(mir.funcBlockAt(f, bi))));
-        }
-    }
-    std::sort(survivors.begin(), survivors.end());
-    std::vector<int> expected = {
-        static_cast<int>(StructCfMarker::EntryBlock),
-        static_cast<int>(StructCfMarker::IfThen),
-        static_cast<int>(StructCfMarker::LoopExit),
-    };
-    std::sort(expected.begin(), expected.end());
-    EXPECT_EQ(survivors, expected)
-        << "after chain-non-Linear rejection, surviving markers are "
-           "{EntryBlock, IfThen (from chain via override), LoopExit}";
+    // EVERY straight-line pair admits — (entry, linkage1), (linkage1,
+    // ifThen), (ifThen, linkage2), (linkage2, loopExit) — regardless
+    // of the IfThen + LoopExit stamps in the chain. The old gate
+    // refused the 4th admission (blocksMerged was 2); pure
+    // CFG-legality admits all 4.
+    EXPECT_EQ(r.blocksMerged, 4u)
+        << "the whole 5-block straight line collapses into the entry; "
+           "markers are not an admission gate";
+    MirFuncId const f = mir.funcAt(0);
+    ASSERT_EQ(mir.funcBlockCount(f), 1u);
+    // The single survivor derives EntryBlock — the stale IfThen /
+    // LoopExit stamps are corrected by the canonical re-derivation,
+    // not "picked" by a chain heuristic.
+    EXPECT_EQ(mir.blockMarker(mir.funcEntry(f)), StructCfMarker::EntryBlock);
+    DiagnosticReporter vrep;
+    MirVerifier v{mir, &interner};
+    EXPECT_TRUE(v.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
 }
 
 // Three-transform composition (test-analyzer rating 6): a SINGLE
@@ -858,15 +862,15 @@ TEST(SimplifyCfg, BlockMergeProducesVerifierAcceptedMir) {
     EXPECT_EQ(verifierFailureCount, 0u);
 }
 
-// D-OPT4-1 marker preservation (RULE: c2's transforms — branch-fold +
-// empty-block elision — NEVER mutate a surviving block's structural
-// role). Build a multi-marker CFG with NO trampolines (so no blocks
-// elided) + NO constant-condition CondBrs (so no folding). Snapshot
-// markers pre-pass, run the pass, snapshot post-pass, byte-compare.
-// A regression where the rebuilder accidentally defaulted markers to
-// `Linear` (e.g. via a refactor of `createBlock`) would flip them
-// silently — WASM/SPIR-V lowering depends on the markers to detect
-// structured-CF regions without a Relooper recovery pass.
+// D-OPT4-1 marker stability: when NO transform fires, the pass's
+// post-rebuild re-derivation must reproduce the same markers the
+// (derivation-consistent) input carried — the fixture is a clean
+// diamond whose stamps EQUAL their derivation (IfThen/IfElse/IfJoin
+// around a Returning join; ipdom(entry) = join). CONTINGENCY NOTE:
+// this stays green under the equality model precisely because the
+// join RETURNS and ExitBlock is NOT a derived marker — if a future
+// rule ever derived ExitBlock, this fixture's expectations would
+// need revisiting.
 TEST(SimplifyCfg, StructCfMarkersUnchangedWhenNoTransformsFire) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
@@ -942,27 +946,108 @@ TEST(SimplifyCfg, StructCfMarkersUnchangedWhenNoTransformsFire) {
            "which a sorted-multiset compare pins.";
 }
 
-// Marker SURVIVAL under elision: when SimplifyCFG elides one or more
-// trampoline blocks, the surviving blocks must retain their original
-// markers. Build a CFG where exactly one trampoline gets elided;
-// assert the post-pass marker SEQUENCE for surviving blocks matches
-// the pre-pass marker sequence MINUS the elided block's slot.
-TEST(SimplifyCfg, StructCfMarkersPreservedAfterTrampolineElision) {
+// Branch-fold PHI HYGIENE: folding `CondBr(b, T, F)` → `Br(taken)`
+// removes the b → abandoned edge while b stays LIVE — a phi in the
+// abandoned target naming b would go stale (I_PhiPredNotInCfg; the
+// unreachable-pred cleanup never fires for a live pred). The fold must
+// drop exactly that incoming. This shape was UNREACHABLE before the
+// canonical marker derivation (a constant loop condition tripped the
+// old LoopHeader-back-edge rejection first), so the latent bug had no
+// witness until the degenerate-loop class started compiling.
+// RED-on-disable: remove the `abandonedPhiEdges_` recording in
+// analyze() → the stale incoming survives → the verifier emits
+// I_PhiPredNotInCfg and the phi keeps 2 incomings → both pins red.
+TEST(SimplifyCfg, BranchFoldDropsAbandonedTargetPhiIncoming) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
     TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    // entry CondBr(true, t, j); t: real inst + Br(j); j: phi{(v1,entry),
+    // (v2,t)} + Return. The fold rewires entry → t; j stays reachable
+    // via t but the entry → j edge is GONE.
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const t     = mb.createBlock();
+    MirBlockId const j     = mb.createBlock();
+    mb.beginBlock(entry);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    MirLiteralValue v1; v1.value = std::int64_t{3}; v1.core = TypeKind::I32;
+    MirInstId const c1 = mb.addConst(v1, i32);
+    mb.addCondBr(cond, t, j);
+    mb.beginBlock(t);
+    MirLiteralValue v2; v2.value = std::int64_t{4}; v2.core = TypeKind::I32;
+    MirInstId const c2 = mb.addConst(v2, i32);
+    MirInstId const aops[] = {c2, c2};
+    (void)mb.addInst(MirOpcode::Add, aops, i32);
+    mb.addBr(j);
+    mb.beginBlock(j);
+    MirPhiIncoming const incs[] = {{c1, entry}, {c2, t}};
+    MirInstId const phi = mb.addPhi(i32, incs);
+    mb.addReturn(phi);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    ASSERT_EQ(r.branchesFolded, 1u);
+    // The phi keeps EXACTLY the surviving edge's incoming (pred = t).
+    bool sawPhi = false;
+    MirFuncId const f = mir.funcAt(0);
+    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(f); ++bi) {
+        MirBlockId const b = mir.funcBlockAt(f, bi);
+        for (std::uint32_t ii = 0; ii < mir.blockInstCount(b); ++ii) {
+            MirInstId const id = mir.blockInstAt(b, ii);
+            if (mir.instOpcode(id) != MirOpcode::Phi) continue;
+            sawPhi = true;
+            EXPECT_EQ(mir.phiIncomings(id).size(), 1u)
+                << "the abandoned-edge incoming (pred = the folded "
+                   "CondBr's block) must be dropped";
+        }
+    }
+    EXPECT_TRUE(sawPhi);
+    DiagnosticReporter vrep;
+    MirVerifier v{mir, &interner};
+    EXPECT_TRUE(v.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+}
+
+// Derivation-era successor of `StructCfMarkersPreservedAfterTrampoline-
+// Elision` (whose fixture stamped LoopExit on a LOOP-FREE straight line
+// — CFG-inconsistent under the equality model). Markers are no longer
+// "preserved" through elision; they are RE-DERIVED from the post-
+// elision CFG. Fixture (CFG-consistent): a diamond whose else-arm is a
+// trampoline — entry CondBr(tArm, tramp); tArm: Add + Br(join); tramp:
+// Br(join); join: Return. After the trampoline elides, entry's false
+// edge goes STRAIGHT to join; the destination derives its actual role
+// (IfJoin) and the module satisfies verifier equality.
+TEST(SimplifyCfg, TrampolineElisionOutputSatisfiesDerivedMarkers) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
     mb.addFunction(fnSig, SymbolId{100});
-    // entry (EntryBlock) → tramp (Linear, will elide) → dst (LoopExit).
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
     MirBlockId const tramp = mb.createBlock(StructCfMarker::Linear);
-    MirBlockId const dst   = mb.createBlock(StructCfMarker::LoopExit);
-    mb.beginBlock(entry); mb.addBr(tramp);
-    mb.beginBlock(tramp); mb.addBr(dst);
-    mb.beginBlock(dst);
-    MirLiteralValue v; v.value = std::int64_t{42}; v.core = TypeKind::I32;
-    mb.addReturn(mb.addConst(v, i32));
+    MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
+    mb.beginBlock(entry);
+    MirInstId const cond = mb.addArg(0, boolT);
+    mb.addCondBr(cond, tArm, tramp);
+    mb.beginBlock(tArm);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirInstId const a = mb.addConst(v3, i32);
+    MirInstId const addOps[] = {a, a};
+    (void)mb.addInst(MirOpcode::Add, addOps, i32);
+    mb.addBr(join);
+    mb.beginBlock(tramp); mb.addBr(join);  // 1-inst trampoline → elided
+    mb.beginBlock(join);
+    MirLiteralValue v7; v7.value = std::int64_t{7}; v7.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v7, i32));
     Mir mir = std::move(mb).finish();
 
     DiagnosticReporter rep;
@@ -970,28 +1055,23 @@ TEST(SimplifyCfg, StructCfMarkersPreservedAfterTrampolineElision) {
     EXPECT_TRUE(r.ok);
     ASSERT_EQ(r.blocksJumpThreaded, 1u);
 
-    // Post-pass: tramp is gone. The surviving sequence in RPO order
-    // is [EntryBlock, LoopExit] — entry's marker preserved, dst's
-    // marker preserved, the Linear trampoline elided. A regression
-    // that re-marked dst as `Linear` (e.g. by collapsing markers
-    // during block-elision) would change the visible sequence.
-    std::vector<StructCfMarker> after;
-    std::size_t const nf = mir.moduleFuncCount();
-    for (std::uint32_t i = 0; i < nf; ++i) {
-        MirFuncId const f = mir.funcAt(i);
-        std::uint32_t const nb = mir.funcBlockCount(f);
-        for (std::uint32_t bi = 0; bi < nb; ++bi) {
-            after.push_back(mir.blockMarker(mir.funcBlockAt(f, bi)));
-        }
-    }
-    ASSERT_EQ(after.size(), 2u);
-    EXPECT_EQ(static_cast<int>(after[0]),
-              static_cast<int>(StructCfMarker::EntryBlock))
-        << "entry's marker must survive trampoline elision";
-    EXPECT_EQ(static_cast<int>(after[1]),
-              static_cast<int>(StructCfMarker::LoopExit))
-        << "destination's marker must survive trampoline elision "
-           "unchanged (NOT re-marked to Linear)";
+    // Post-pass: 3 blocks (tramp gone). The destination of the elided
+    // trampoline derives IfJoin (it post-dominates the CondBr); tArm
+    // derives IfThen; everything equals the canonical derivation.
+    MirFuncId const f = mir.funcAt(0);
+    ASSERT_EQ(mir.funcBlockCount(f), 3u);
+    MirBlockId const newEntry = mir.funcEntry(f);
+    auto const succs = mir.blockSuccessors(newEntry);
+    ASSERT_EQ(succs.size(), 2u);
+    EXPECT_EQ(mir.blockMarker(succs[0]), StructCfMarker::IfThen);
+    EXPECT_EQ(mir.blockMarker(succs[1]), StructCfMarker::IfJoin)
+        << "the elided trampoline's destination derives its actual "
+           "role (the if's join) after elision";
+    DiagnosticReporter vrep;
+    MirVerifier v{mir, &interner};
+    EXPECT_TRUE(v.verify(vrep))
+        << "elision output must satisfy verifier marker equality: "
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
 }
 
 // Runtime-init carve-out parity.
@@ -1019,4 +1099,63 @@ TEST(SimplifyCfg, RuntimeInitGlobalsModuleEmitsXOptPassSkippedInfo) {
         if (d.code == DiagnosticCode::X_OptPassSkipped) ++infoCount;
     }
     EXPECT_EQ(infoCount, 1u);
+}
+
+// ── D15 cycle C (c): constant-CondBr fold PRUNES the dead arm in the
+// SAME rebuild → verifier-clean, EXACT post-fold block count. ───────
+// entry: CondBr(Const(true), then, else); then: return 42; else: return 99.
+// The fold rewrites entry's terminator to Br(then) AND (C2 post-fold
+// reachability) drops the now-unreachable `else` arm in the SAME rebuild.
+// So the rebuilt function has EXACTLY 2 blocks (entry + then), the dead
+// `else` is GONE, branchesFolded == 1, and the MirVerifier — whose per-
+// pass I_UnreachableBlock check would otherwise fire on an emitted-but-
+// orphan else — passes clean.
+// RED-on-disable: dropping the `postFoldReachable_` filter in
+// `selectBlocks` re-emits the dead `else` arm → it becomes an orphan
+// island unreachable from entry → MirVerifier fires I_UnreachableBlock →
+// verifier.verify(rep) returns false (demonstrated in the cycle gate),
+// and the post-fold block count is 3 (the dead arm survives), failing the
+// EXACT-count assertion.
+TEST(SimplifyCfg, ConstantCondBrFoldPrunesDeadArmVerifierClean) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const fArm  = mb.createBlock(StructCfMarker::IfElse);
+    mb.beginBlock(entry);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const c = mb.addConst(tru, boolT);
+    mb.addCondBr(c, tArm, fArm);
+    mb.beginBlock(tArm);
+    MirLiteralValue v1; v1.value = std::int64_t{42}; v1.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v1, i32));
+    mb.beginBlock(fArm);
+    MirLiteralValue v2; v2.value = std::int64_t{99}; v2.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v2, i32));
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(totalBlockCount(mir), 3u) << "before: entry + then + else";
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.branchesFolded, 1u) << "the constant CondBr folds once";
+
+    // THE post-fold count pin: the dead `else` arm is GONE (pruned in the
+    // SAME rebuild). EXACTLY 2 blocks survive.
+    EXPECT_EQ(totalBlockCount(mir), 2u)
+        << "the dead else arm must be pruned in the fold's own rebuild "
+           "(entry + surviving then-arm only)";
+
+    // THE verifier pin: no orphan island → no I_UnreachableBlock → clean.
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "post-fold reachability leaves no unreachable block for the "
+           "per-pass verifier to reject";
+    EXPECT_EQ(rep.errorCount(), 0u) << "zero error-severity diagnostics";
 }

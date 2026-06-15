@@ -22,6 +22,28 @@ enum class SlotKind : std::uint8_t {
     End,         // body completed
 };
 
+// FC4 c1 (M4 — the D2a guard-polarity decision, C11 6.7.6.3p11): how the
+// type-name commit triage treats a lone identifier the binder sketch has NO
+// entry for (triage rule 4). KNOWN names are polarity-independent (Type →
+// commit, Value → rollback), as is the rule-1 multi-leaf commit (a
+// keyword-led type child cannot be an expression).
+//
+//   PreferType       — the FC2 default: commit iff the follower token could
+//                      not continue a value reading (not an infix/postfix/
+//                      ternary operator per the operator table); an
+//                      operator follower rolls back + records the
+//                      AmbiguousTypeNameCandidate for the CU oracle.
+//   RequireKnownType — commit ONLY on a sketch-KNOWN type. Unknown always
+//                      rolls back to the competing reading AND records the
+//                      candidate (so a cross-file typedef still resolves on
+//                      the oracle's seeded reparse). The C 6.7.6.3p11
+//                      parameter-position rule: `T (name)` is a parenthesized
+//                      declarator unless `name` is a visible typedef.
+enum class TypeNameCommitPolarity : std::uint8_t {
+    PreferType,
+    RequireKnownType,
+};
+
 namespace detail {
 
 // One position in a rule's compiled shape body. Built once by the loader
@@ -141,6 +163,14 @@ struct CompiledRule {
     // probe commits on structural success exactly as before. Config-
     // sourced — the engine never hardcodes which rule is a "cast".
     RuleId                     typeNameCommitRule{};
+    // FC4 c1 (M4): the guard's UNKNOWN-name polarity (see
+    // TypeNameCommitPolarity). The bare-string `commitRequiresTypeName`
+    // form keeps the FC2 default; the object form
+    // `{ "rule": ..., "polarity": "requireKnownType" }` selects the
+    // strict C 6.7.6.3p11 behavior. Meaningless unless
+    // `typeNameCommitRule.valid()`.
+    TypeNameCommitPolarity     typeNameCommitPolarity =
+        TypeNameCommitPolarity::PreferType;
 };
 
 } // namespace dss::detail

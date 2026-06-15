@@ -1,5 +1,6 @@
 #include "lir/lir_regalloc.hpp"
 
+#include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
 
@@ -126,6 +127,60 @@ collectCallPositions(Lir const& lir, TargetSchema const& schema,
             auto const* info = schema.opcodeInfo(lir.instOpcode(inst));
             if (info != nullptr && info->isCall) {
                 out.push_back(pos);
+            }
+            pos += 2u;
+        }
+    }
+    return out;
+}
+
+// FC4 c2 — the indirect-callee/arg-setup collision rule (R2). For
+// every `isCall` instruction whose ops[0] is a VIRTUAL Reg (the
+// indirect-call callee, post-isel pre-regalloc), record its position
+// (EARLY slot, same 2-slot scale as collectCallPositions), the callee
+// vreg id, and the call payload's variadic bit.
+//
+// WHY: the callconv materializer inserts the arg-passing moves (and
+// the variadic count-reg set) POST-regalloc, BETWEEN the callee's
+// definition and its use at the call. A callee consumed AT the call
+// does not "cross" it (`rangeCrossesCall` requires `pos + 1 < r.end`),
+// so every caller-saved register — INCLUDING all arg registers — is
+// otherwise eligible for the callee vreg; fixed-def interference from
+// the not-yet-emitted moves is not modeled. A callee parked in an arg
+// register is then clobbered by its own call's arg setup → the call
+// jumps THROUGH AN ARGUMENT VALUE (silent garbage). The consumer in
+// allocateOneFunc excludes the cc's argGprs ∪ argFprs (+ the variadic
+// vector-count register when the payload's variadic bit is set —
+// lir_callconv's count-reg ordering comment predicted exactly this
+// collision) from any range of the callee vreg covering the call.
+// Entirely cc-config-driven — no register names, no arch identity.
+struct IndirectCalleeAt {
+    std::uint32_t position;      // call's EARLY slot
+    std::uint32_t calleeVregId;
+    bool          variadic;      // call payload's isVariadic bit
+};
+
+[[nodiscard]] std::vector<IndirectCalleeAt>
+collectIndirectCalleePositions(Lir const& lir, TargetSchema const& schema,
+                               LirFuncLiveness const& flow) {
+    std::vector<IndirectCalleeAt> out;
+    std::uint32_t pos = 0;
+    for (auto const& b : flow.blockOrder) {
+        std::uint32_t const n = lir.blockInstCount(b);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const inst = lir.blockInstAt(b, i);
+            auto const* info = schema.opcodeInfo(lir.instOpcode(inst));
+            if (info != nullptr && info->isCall) {
+                auto const ops = lir.instOperands(inst);
+                if (!ops.empty()
+                    && ops[0].kind == LirOperandKind::Reg
+                    && ops[0].reg.valid()
+                    && ops[0].reg.isPhysical == 0) {
+                    out.push_back({pos,
+                                   static_cast<std::uint32_t>(ops[0].reg.id),
+                                   ::dss::call_payload::isVariadic(
+                                       lir.instPayload(inst))});
+                }
             }
             pos += 2u;
         }
@@ -542,6 +597,47 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
     // by every range that crosses an implicit-clobber position.
     std::vector<ImplicitClobberAt> const implicitClobbers =
         collectImplicitClobberPositions(lir, schema, flow);
+    // FC4 c2 (R2): indirect-call callee vregs (see IndirectCalleeAt's
+    // docblock for the silent-garbage-jump hazard this rule closes).
+    // The cc's arg-register ordinal set is resolved ONLY when the
+    // function actually contains an indirect callee — zero new
+    // failure modes for every function without one. A cc register
+    // name that fails to resolve is a schema misconfiguration: fail
+    // LOUD here rather than allocate with a weakened exclusion (the
+    // missing ordinal would re-open the clobber hazard silently).
+    std::vector<IndirectCalleeAt> const indirectCallees =
+        collectIndirectCalleePositions(lir, schema, flow);
+    std::vector<std::uint16_t> ccArgRegOrdinals;
+    std::optional<std::uint16_t> ccVariadicCountRegOrdinal;
+    if (!indirectCallees.empty()) {
+        auto const resolveInto = [&](std::vector<std::string> const& names)
+            -> bool {
+            for (auto const& name : names) {
+                auto const ord = schema.registerByName(name);
+                if (!ord.has_value()) {
+                    report(reporter,
+                           DiagnosticCode::R_CallingConventionLookupFailed,
+                           DiagnosticSeverity::Error,
+                           std::format("regalloc: cc '{}' arg register "
+                                       "'{}' does not resolve in the "
+                                       "target register table — cannot "
+                                       "build the indirect-callee "
+                                       "exclusion set",
+                                       cc->name, name));
+                    return false;
+                }
+                ccArgRegOrdinals.push_back(*ord);
+            }
+            return true;
+        };
+        if (!resolveInto(cc->argGprs) || !resolveInto(cc->argFprs)) {
+            out.ok = false;
+            return out;
+        }
+        if (cc->variadicVectorCountReg.has_value()) {
+            ccVariadicCountRegOrdinal = cc->variadicVectorCountReg->ordinal;
+        }
+    }
 
     std::uint32_t maxVRegId = 0;
     for (auto const& r : flow.ranges) {
@@ -741,6 +837,33 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         // Universal across CPUs — driven entirely by the per-opcode
         // schema declaration; no `if (opcode == idiv)` branch.
         implicitClobbersCrossedBy(r, implicitClobbers, excludedScratch);
+        // FC4 c2 (R2): when THIS range is the callee vreg of an
+        // indirect call it covers, exclude the cc's argGprs ∪ argFprs
+        // (+ the variadic vector-count register when that call's
+        // payload is variadic). The callee is consumed AT the call
+        // (`range.end == call.early + 1`), so covered-position
+        // semantics — NOT rangeCrossesCall — are required, exactly
+        // like the compound-op clobbers above: the arg-passing moves
+        // the materializer emits post-regalloc land BETWEEN the
+        // callee's def and the call. cc-config-driven only.
+        if (!indirectCallees.empty()) {
+            auto const addExcluded = [&](std::uint16_t ord) {
+                for (std::uint16_t const e : excludedScratch) {
+                    if (e == ord) return;
+                }
+                excludedScratch.push_back(ord);
+            };
+            for (auto const& ic : indirectCallees) {
+                if (ic.calleeVregId != r.vreg.id) continue;
+                if (ic.position < r.start || ic.position >= r.end) continue;
+                for (std::uint16_t const ord : ccArgRegOrdinals) {
+                    addExcluded(ord);
+                }
+                if (ic.variadic && ccVariadicCountRegOrdinal.has_value()) {
+                    addExcluded(*ccVariadicCountRegOrdinal);
+                }
+            }
+        }
 
         std::span<std::uint16_t const> const excluded{
             excludedScratch.data(), excludedScratch.size()};

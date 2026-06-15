@@ -1,14 +1,17 @@
 #include "lir/lir_rewrite.hpp"
 
+#include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -145,20 +148,52 @@ struct ResolvedReg {
 // spilled vreg, allocates the NEXT scratch reg of its class (advancing
 // the cursor). For non-spilled, returns the assigned phys reg.
 // Returns InvalidLirReg on exhaustion (cursor exhausted scratch list).
+//
+// FC4 c2 (B2): `forbiddenOrdinals` (empty for every operand except an
+// `isCall` instruction's ops[0] — the indirect-call CALLEE) filters
+// the scratch pick. A SPILLED callee reloads into a scratch register
+// BETWEEN the callconv pass's not-yet-emitted arg-passing moves and
+// the call — a scratch from the cc's argGprs/argFprs (or the variadic
+// count register) would be overwritten by its own call's arg setup
+// (silent garbage jump; same hazard the allocator-side exclusion
+// closes for register-resident callees — the allocator CANNOT close
+// this one, because the scratch pool is by definition the registers
+// the allocator did NOT assign). The first admissible entry is
+// ROTATED to the cursor position before the cursor advances, so the
+// skipped (forbidden) entries stay available to this instruction's
+// later spilled operands — exhaustion semantics stay exact and loud.
 [[nodiscard]] ResolvedReg
 resolveReg(LirReg r, LirFuncAllocation const& alloc,
-           ScratchPerClass const& scratch,
-           std::array<std::size_t, 5>& cursor) {
+           ScratchPerClass& scratch,
+           std::array<std::size_t, 5>& cursor,
+           std::span<std::uint16_t const> forbiddenOrdinals = {}) {
     if (!r.valid() || r.isPhysical != 0) return {r, std::nullopt};
     auto const* a = alloc.forVReg(r.id);
     if (a == nullptr) return {r, std::nullopt};
     if (!a->isSpilled()) return {a->physReg(), std::nullopt};
     std::size_t const c = static_cast<std::size_t>(r.regClass());
     if (c >= scratch.pool.size()) return {InvalidLirReg, a->spillSlot()};
-    if (cursor[c] >= scratch.pool[c].size()) {
-        return {InvalidLirReg, a->spillSlot()};
+    auto& pool = scratch.pool[c];
+    auto const isForbidden = [&](LirReg s) {
+        for (auto const ord : forbiddenOrdinals) {
+            if (static_cast<std::uint32_t>(ord) == s.id) return true;
+        }
+        return false;
+    };
+    std::size_t j = cursor[c];
+    while (j < pool.size() && isForbidden(pool[j])) ++j;
+    if (j >= pool.size()) {
+        return {InvalidLirReg, a->spillSlot()};  // exhaustion stays loud
     }
-    LirReg const s = scratch.pool[c][cursor[c]++];
+    if (j != cursor[c]) {
+        // Move the admissible entry to the cursor slot; the skipped
+        // forbidden entries shift up one (relative order preserved)
+        // and remain available to later operands.
+        std::rotate(pool.begin() + static_cast<std::ptrdiff_t>(cursor[c]),
+                    pool.begin() + static_cast<std::ptrdiff_t>(j),
+                    pool.begin() + static_cast<std::ptrdiff_t>(j) + 1);
+    }
+    LirReg const s = pool[cursor[c]++];
     return {s, a->spillSlot()};
 }
 
@@ -173,8 +208,71 @@ rewriteOneFunc(Lir const&               src,
                LirBuilder&              b,
                DiagnosticReporter&      reporter) {
     bool scratchOk = true;
-    ScratchPerClass const scratch = pickScratchRegs(schema, alloc, reporter, scratchOk);
+    // Non-const: resolveReg's FC4 c2 forbidden-filter may rotate a
+    // pool entry to the cursor position (see its docblock).
+    ScratchPerClass scratch = pickScratchRegs(schema, alloc, reporter, scratchOk);
     if (!scratchOk) return false;
+
+    // FC4 c2 (B2): the forbidden-scratch set for a SPILLED indirect-
+    // call callee reload — the cc's argGprs ∪ argFprs (+ the variadic
+    // vector-count register for variadic call sites). Resolved
+    // LAZILY on the first spilled-callee occurrence so functions
+    // without one gain zero new failure modes; a cc register name
+    // that fails to resolve is a schema misconfiguration → fail LOUD
+    // (a silently-weakened filter would re-open the callee-clobber
+    // hazard). Entirely cc-config-driven.
+    bool forbiddenBuilt = false;
+    bool forbiddenBuildFailed = false;
+    std::vector<std::uint16_t> forbiddenBase;
+    std::vector<std::uint16_t> forbiddenWithCountReg;
+    auto const buildForbidden = [&]() -> bool {
+        if (forbiddenBuilt) return !forbiddenBuildFailed;
+        forbiddenBuilt = true;
+        auto const* cc =
+            schema.callingConvention(alloc.callingConventionIndex);
+        if (cc == nullptr) {
+            // pickScratchRegs already failed loud for a missing cc;
+            // defensive arm for a future caller bypass.
+            report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+                   DiagnosticSeverity::Error,
+                   std::format("rewriteOneFunc: calling-convention index "
+                               "{} is missing — cannot build the spilled-"
+                               "callee forbidden-scratch set",
+                               static_cast<unsigned>(
+                                   alloc.callingConventionIndex)));
+            forbiddenBuildFailed = true;
+            return false;
+        }
+        auto const resolveInto =
+            [&](std::vector<std::string> const& names) -> bool {
+            for (auto const& name : names) {
+                auto const ord = schema.registerByName(name);
+                if (!ord.has_value()) {
+                    report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+                           DiagnosticSeverity::Error,
+                           std::format("rewriteOneFunc: cc '{}' arg "
+                                       "register '{}' does not resolve in "
+                                       "the target register table — "
+                                       "cannot build the spilled-callee "
+                                       "forbidden-scratch set",
+                                       cc->name, name));
+                    return false;
+                }
+                forbiddenBase.push_back(*ord);
+            }
+            return true;
+        };
+        if (!resolveInto(cc->argGprs) || !resolveInto(cc->argFprs)) {
+            forbiddenBuildFailed = true;
+            return false;
+        }
+        forbiddenWithCountReg = forbiddenBase;
+        if (cc->variadicVectorCountReg.has_value()) {
+            forbiddenWithCountReg.push_back(
+                cc->variadicVectorCountReg->ordinal);
+        }
+        return true;
+    };
     auto const frameLoadOp  = schema.opcodeByMnemonic(schema.frameLoadMnemonic());
     auto const frameStoreOp = schema.opcodeByMnemonic(schema.frameStoreMnemonic());
     if (!frameLoadOp.has_value() || !frameStoreOp.has_value()) {
@@ -221,14 +319,43 @@ rewriteOneFunc(Lir const&               src,
             // later loads' overwrites.
             std::array<std::size_t, 5> cursor{};
 
+            // Hoisted above the operand loop (FC4 c2): the loop needs
+            // `info->isCall` to apply the spilled-callee forbidden-
+            // scratch filter at operand index 0.
+            auto const* info = schema.opcodeInfo(op);
+
             struct PendingLoad { LirReg scratch; LirSpillSlot slot; };
             std::vector<PendingLoad> loads;
             std::vector<LirOperand> newOps;
             newOps.reserve(ops.size());
-            for (auto const& o : ops) {
+            for (std::size_t opIdx = 0; opIdx < ops.size(); ++opIdx) {
+                auto const& o = ops[opIdx];
                 if (o.kind == LirOperandKind::Reg && o.reg.valid()
                     && o.reg.isPhysical == 0) {
-                    auto const rr = resolveReg(o.reg, alloc, scratch, cursor);
+                    // FC4 c2 (B2): an `isCall` instruction's ops[0] is
+                    // the indirect-call CALLEE — when it was SPILLED,
+                    // its reload scratch must avoid the cc's arg
+                    // registers (+ the variadic count register), or
+                    // the callconv pass's arg-setup moves would
+                    // overwrite the reloaded callee before the call
+                    // consumes it (see resolveReg's docblock). The
+                    // L_IndirectCalleeClobberedByArgSetup backstop in
+                    // lir_callconv catches any escape loudly.
+                    std::span<std::uint16_t const> forbidden{};
+                    if (opIdx == 0 && info != nullptr && info->isCall) {
+                        auto const* a = alloc.forVReg(o.reg.id);
+                        if (a != nullptr && a->isSpilled()) {
+                            if (!buildForbidden()) return false;
+                            forbidden = ::dss::call_payload::isVariadic(
+                                            payload)
+                                ? std::span<std::uint16_t const>{
+                                      forbiddenWithCountReg}
+                                : std::span<std::uint16_t const>{
+                                      forbiddenBase};
+                        }
+                    }
+                    auto const rr = resolveReg(o.reg, alloc, scratch,
+                                               cursor, forbidden);
                     if (!rr.phys.valid()) {
                         classExhausted = true;
                         newOps.push_back(o);
@@ -258,7 +385,6 @@ rewriteOneFunc(Lir const&               src,
                 }
             }
 
-            auto const* info = schema.opcodeInfo(op);
             bool const isTerm = (info != nullptr && info->isTerminator());
             if (isTerm) {
                 auto const succs = src.blockSuccessors(srcBlock);

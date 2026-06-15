@@ -11,6 +11,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "hir/const_eval.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_intrinsic_registry.hpp"
 #include "hir/hir_text.hpp"
@@ -18,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -25,6 +27,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 using namespace dss;
@@ -917,6 +920,330 @@ TEST(HirLoweringCSubset, GlobalArrayLowersToArrayTypeWithNoInit) {
     EXPECT_FALSE(res->hir.globalInit(g).has_value()) << "the `[10]` length must not become an initializer";
 }
 
+TEST(HirLoweringCSubset, GlobalInitConstEvalIsLeftAssociative) {
+    // `int g = 10 - 3 + 1;` — the parse tree is now STRUCTURALLY
+    // left-associative, and const-eval follows the tree: (10-3)+1 = 8.
+    // The right-recursive mis-shape would fold 10-(3+1) = 6. This pins
+    // the full source→parse→semantic→HIR→const-eval pipeline (the
+    // hand-built Rig tests in test_const_eval.cpp can't see parser
+    // shape bugs).
+    SemanticModel model =
+        analyzeCSubset("int g = 10 - 3 + 1;\nint main() { return 0; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId g = res->hir.moduleDecls(res->hir.root())[0];
+    ASSERT_EQ(res->hir.kind(g), HirKind::Global);
+    auto const init = res->hir.globalInit(g);
+    ASSERT_TRUE(init.has_value());
+    auto cer = evaluateConstant(res->hir, model.lattice().interner(),
+                                res->literalPool, *init);
+    ASSERT_TRUE(cer.value.has_value())
+        << "the global initializer chain must const-fold";
+    EXPECT_EQ(std::get<std::int64_t>(cer.value->value), 8)
+        << "10 - 3 + 1 must evaluate LEFT-associatively: (10-3)+1 = 8";
+}
+
+// D-HIR-INFINITE-LOOP-NOT-TERMINATING × D-LK10-ENTRY-MAIN-IMPLICIT-RETURN
+// interaction: `int main() { while (1) { return 5; } }`. The `while (1)` is
+// provably-infinite (constant-truthy condition, no break exits its frame), so
+// `lowerWhile` wraps it as `Block{ WhileStmt, Synthetic Unreachable }`. That
+// wrapper makes the body structurally TERMINATE (`pathTerminates` recurses to
+// the wrapper Block's last child, the `Unreachable`). Consequently
+// `maybeAppendImplicitReturnZero` correctly sees a `main` that can NEVER fall
+// through and appends NO implicit `return 0` (C99 §5.1.2.2.3 only matters when
+// `main` can fall off the end — this one provably cannot). The earlier
+// double-attach regression (D-LK10 / D-HIR-LOOP-BODY-ONLY-RETURN-DOUBLE-ATTACH)
+// stays covered by the straight-line-body pin below, whose body genuinely
+// does NOT terminate and so still exercises the implicit-return-0 nest.
+//
+// Asserts: (1) lowering COMPLETES (no abort), (2) the verifier is clean
+// (`res->ok` — the wrapper's `Unreachable` is what satisfies the non-void
+// return-completeness check), (3) the loop lowered to the Synthetic-Unreachable
+// wrapper, and (4) NO synthetic return was appended (the body is the plain
+// lowered block holding exactly the wrapper). The wrapper's `Unreachable` is
+// pruned in MIR, so runtime is unchanged (exit 5).
+TEST(HirLoweringCSubset, InfiniteLoopMainWrapsLoopAndSkipsImplicitReturn) {
+    SemanticModel model = analyzeCSubset("int main() { while (1) { return 5; } }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto const decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    HirNodeId const fn = decls[0];
+    ASSERT_EQ(res->hir.kind(fn), HirKind::Function);
+
+    // The body is the plain lowered Block (NOT a synthetic implicit-return-0
+    // wrapper — `main` provably terminates, so none was appended). It holds
+    // exactly the loop wrapper.
+    HirNodeId const body = res->hir.functionBody(fn);
+    ASSERT_EQ(res->hir.kind(body), HirKind::Block);
+    auto const bodyKids = res->hir.children(body);
+    ASSERT_EQ(bodyKids.size(), 1u)
+        << "no implicit return-0 appended: body holds only the loop wrapper";
+
+    // The loop wrapper: a Synthetic Block whose children are [WhileStmt,
+    // Synthetic Unreachable] — the D-HIR-INFINITE-LOOP-NOT-TERMINATING shape.
+    HirNodeId const wrapper = bodyKids[0];
+    ASSERT_EQ(res->hir.kind(wrapper), HirKind::Block);
+    EXPECT_TRUE(has(res->hir.flags(wrapper), HirFlags::Synthetic))
+        << "the infinite-loop wrapper Block must be flagged Synthetic";
+    auto const wrapKids = res->hir.children(wrapper);
+    ASSERT_EQ(wrapKids.size(), 2u)
+        << "wrapper must hold exactly [loop, synthetic-unreachable]";
+    EXPECT_EQ(res->hir.kind(wrapKids[0]), HirKind::WhileStmt);
+    ASSERT_EQ(res->hir.kind(wrapKids[1]), HirKind::Unreachable);
+    EXPECT_TRUE(has(res->hir.flags(wrapKids[1]), HirFlags::Synthetic))
+        << "the synthetic Unreachable terminator must be flagged Synthetic";
+}
+
+// Breadth pin: the double-attach was NOT loop-specific — ANY non-empty
+// `main` body that doesn't structurally terminate hit the re-wrap. A
+// straight-line body (`int x; x = 1;`) has no terminator, so the implicit
+// return is appended the same way. Same nesting contract; same red-on-
+// disable (abort before any EXPECT on the pre-fix children-re-wrap).
+TEST(HirLoweringCSubset, NonTerminatingStraightLineMainNestsImplicitReturnZero) {
+    SemanticModel model = analyzeCSubset("int main() { int x; x = 1; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto const decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    HirNodeId const outer = res->hir.functionBody(decls[0]);
+    ASSERT_EQ(res->hir.kind(outer), HirKind::Block);
+    EXPECT_TRUE(has(res->hir.flags(outer), HirFlags::Synthetic));
+    auto const outerKids = res->hir.children(outer);
+    ASSERT_EQ(outerKids.size(), 2u);
+
+    // The original body is nested as child 0 and still holds its two
+    // statements (the VarDecl + the assignment ExprStmt) — not re-parented.
+    HirNodeId const inner = outerKids[0];
+    ASSERT_EQ(res->hir.kind(inner), HirKind::Block);
+    EXPECT_EQ(res->hir.children(inner).size(), 2u);
+
+    HirNodeId const ret = outerKids[1];
+    ASSERT_EQ(res->hir.kind(ret), HirKind::ReturnStmt);
+    EXPECT_TRUE(has(res->hir.flags(ret), HirFlags::Synthetic));
+    ASSERT_TRUE(res->hir.returnValue(ret).has_value());
+    EXPECT_EQ(res->hir.kind(*res->hir.returnValue(ret)), HirKind::Literal);
+}
+
+// ── D-HIR-INFINITE-LOOP-NOT-TERMINATING HIR-tier pins ───────────────────────
+//
+// `lowerWhile`/`lowerFor` wrap a PROVABLY-INFINITE loop (constant-truthy/absent
+// condition AND no `break` exits its own frame) as `Block{ loop, Synthetic
+// Unreachable }`, so the verifier's structural-termination check (which recurses
+// to a Block's last child) sees the loop as terminating. This removes the
+// over-rejection of a non-`main` non-void function whose terminating tail is
+// such a loop, WITHOUT touching the verifier / H0003. The pins below assert the
+// wrapper shape (positive) and — critically — that a BREAKABLE / non-constant /
+// const-false loop is NOT wrapped (negative, no false positives).
+
+namespace {
+
+// True iff `id`'s subtree contains a Synthetic `Unreachable` leaf — the marker
+// the infinite-loop wrapper synthesizes. Used to assert presence (positive pin)
+// and ABSENCE (negative pins).
+[[nodiscard]] bool subtreeHasSyntheticUnreachable(Hir const& hir, HirNodeId id) {
+    if (hir.kind(id) == HirKind::Unreachable
+        && has(hir.flags(id), HirFlags::Synthetic))
+        return true;
+    for (HirNodeId c : hir.children(id))
+        if (subtreeHasSyntheticUnreachable(hir, c)) return true;
+    return false;
+}
+
+// The function declaration whose symbol name is `name` (functions appear in
+// source order in `moduleDecls`); InvalidId-shaped HirNodeId if absent.
+[[nodiscard]] HirNodeId functionNamed(Hir const& hir, SemanticModel const& m,
+                                      std::string_view name) {
+    for (HirNodeId d : hir.moduleDecls(hir.root())) {
+        if (hir.kind(d) != HirKind::Function) continue;
+        SymbolId const sym = hir.functionSymbol(d);
+        auto const* rec = m.recordFor(sym);
+        if (rec != nullptr && rec->name == name) return d;
+    }
+    return HirNodeId{};
+}
+
+} // namespace
+
+// POSITIVE — the anchor's exact repro: a NON-`main` non-void function whose
+// terminating tail is a provably-infinite `while (1)`. Pre-fix this was
+// over-rejected H0003 ("non-void function may fall through"); now the loop is
+// wrapped, the body structurally terminates, and the verifier is clean.
+TEST(HirLoweringCSubset, NonMainInfiniteLoopTailWrapsAndVerifies) {
+    SemanticModel model =
+        analyzeCSubset("int f(int x){ while(1){ return 5; } } int main(){ return f(0); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    // res->ok folds the verify-on-load pass: TRUE here means the non-void `f`
+    // is NO LONGER rejected by checkReturnCompleteness (H0003) — the wrapper's
+    // Unreachable made pathTerminates(f-body) true.
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u)
+        << "the wrapped infinite-loop tail must satisfy non-void return completeness";
+
+    HirNodeId const f = functionNamed(res->hir, model, "f");
+    ASSERT_TRUE(f.valid());
+    HirNodeId const body = res->hir.functionBody(f);
+    ASSERT_EQ(res->hir.kind(body), HirKind::Block);
+    auto const bodyKids = res->hir.children(body);
+    ASSERT_EQ(bodyKids.size(), 1u);
+
+    // The loop lowered to a Synthetic Block of [WhileStmt, Synthetic Unreachable].
+    HirNodeId const wrapper = bodyKids[0];
+    ASSERT_EQ(res->hir.kind(wrapper), HirKind::Block);
+    EXPECT_TRUE(has(res->hir.flags(wrapper), HirFlags::Synthetic));
+    auto const wrapKids = res->hir.children(wrapper);
+    ASSERT_EQ(wrapKids.size(), 2u);
+    EXPECT_EQ(res->hir.kind(wrapKids[0]), HirKind::WhileStmt);
+    ASSERT_EQ(res->hir.kind(wrapKids[1]), HirKind::Unreachable);
+    EXPECT_TRUE(has(res->hir.flags(wrapKids[1]), HirFlags::Synthetic));
+}
+
+// POSITIVE — the other two provably-infinite shapes also wrap: `for(;;)`
+// (absent condition) and `do{...}while(1)` (constant-truthy condition).
+TEST(HirLoweringCSubset, ForEverAndDoWhileOneWrapWithUnreachable) {
+    SemanticModel forModel =
+        analyzeCSubset("int f(int x){ for(;;){ return 9; } } int main(){ return f(0); }");
+    ASSERT_FALSE(forModel.hasErrors());
+    DiagnosticReporter fr;
+    auto forRes = lowerToHir(forModel, fr);
+    ASSERT_TRUE(forRes->ok) << (fr.all().empty() ? "" : fr.all()[0].actual);
+    HirNodeId const ff = functionNamed(forRes->hir, forModel, "f");
+    ASSERT_TRUE(ff.valid());
+    auto const fKids = forRes->hir.children(forRes->hir.functionBody(ff));
+    ASSERT_EQ(fKids.size(), 1u);
+    ASSERT_EQ(forRes->hir.kind(fKids[0]), HirKind::Block);
+    auto const fWrap = forRes->hir.children(fKids[0]);
+    ASSERT_EQ(fWrap.size(), 2u);
+    EXPECT_EQ(forRes->hir.kind(fWrap[0]), HirKind::ForStmt);
+    EXPECT_EQ(forRes->hir.kind(fWrap[1]), HirKind::Unreachable);
+
+    SemanticModel doModel =
+        analyzeCSubset("int f(int x){ do{ return 7; }while(1); } int main(){ return f(0); }");
+    ASSERT_FALSE(doModel.hasErrors());
+    DiagnosticReporter dr;
+    auto doRes = lowerToHir(doModel, dr);
+    ASSERT_TRUE(doRes->ok) << (dr.all().empty() ? "" : dr.all()[0].actual);
+    HirNodeId const df = functionNamed(doRes->hir, doModel, "f");
+    ASSERT_TRUE(df.valid());
+    auto const dKids = doRes->hir.children(doRes->hir.functionBody(df));
+    ASSERT_EQ(dKids.size(), 1u);
+    ASSERT_EQ(doRes->hir.kind(dKids[0]), HirKind::Block);
+    auto const dWrap = doRes->hir.children(dKids[0]);
+    ASSERT_EQ(dWrap.size(), 2u);
+    EXPECT_EQ(doRes->hir.kind(dWrap[0]), HirKind::DoWhileStmt);
+    EXPECT_EQ(doRes->hir.kind(dWrap[1]), HirKind::Unreachable);
+}
+
+// NEGATIVE (no false positives) — a BREAKABLE `while(1)` is NOT provably-
+// infinite: a `break` reachable in its own frame (through an `if`) exits it.
+// The loop must NOT be wrapped (no synthetic Unreachable anywhere in `f`),
+// and the bare WhileStmt must sit directly in the body — proof the wrapper
+// was not applied. The trailing `return 7` is the real terminator.
+TEST(HirLoweringCSubset, BreakableInfiniteLoopIsNotWrapped) {
+    SemanticModel model =
+        analyzeCSubset("int f(int x){ while(1){ if(x) break; } return 7; } "
+                       "int main(){ return f(1); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId const f = functionNamed(res->hir, model, "f");
+    ASSERT_TRUE(f.valid());
+    EXPECT_FALSE(subtreeHasSyntheticUnreachable(res->hir, f))
+        << "a breakable while(1) must NOT be wrapped with a synthetic Unreachable";
+
+    // The body's first statement is the bare WhileStmt (not a wrapper Block).
+    auto const bodyKids = res->hir.children(res->hir.functionBody(f));
+    ASSERT_GE(bodyKids.size(), 1u);
+    EXPECT_EQ(res->hir.kind(bodyKids[0]), HirKind::WhileStmt)
+        << "the breakable loop must lower to a bare WhileStmt, not a wrapper Block";
+}
+
+// NEGATIVE — a const-FALSE condition (`while(0)`) and a NON-constant condition
+// (`while(x)`) are not provably-infinite and must not be wrapped. (Both rely on
+// the trailing `return 7` to terminate; neither loop is touched by the wrapper.)
+TEST(HirLoweringCSubset, FalseAndNonConstConditionsAreNotWrapped) {
+    SemanticModel zeroModel =
+        analyzeCSubset("int f(int x){ while(0){ return 5; } return 7; } "
+                       "int main(){ return f(0); }");
+    ASSERT_FALSE(zeroModel.hasErrors());
+    DiagnosticReporter zr;
+    auto zeroRes = lowerToHir(zeroModel, zr);
+    ASSERT_TRUE(zeroRes->ok) << (zr.all().empty() ? "" : zr.all()[0].actual);
+    HirNodeId const zf = functionNamed(zeroRes->hir, zeroModel, "f");
+    ASSERT_TRUE(zf.valid());
+    EXPECT_FALSE(subtreeHasSyntheticUnreachable(zeroRes->hir, zf))
+        << "while(0) is provably FINITE — must not be wrapped";
+
+    SemanticModel varModel =
+        analyzeCSubset("int f(int x){ while(x){ x = x - 1; } return 7; } "
+                       "int main(){ return f(3); }");
+    ASSERT_FALSE(varModel.hasErrors());
+    DiagnosticReporter vr;
+    auto varRes = lowerToHir(varModel, vr);
+    ASSERT_TRUE(varRes->ok) << (vr.all().empty() ? "" : vr.all()[0].actual);
+    HirNodeId const vf = functionNamed(varRes->hir, varModel, "f");
+    ASSERT_TRUE(vf.valid());
+    EXPECT_FALSE(subtreeHasSyntheticUnreachable(varRes->hir, vf))
+        << "while(x) is not a constant-truthy condition — must not be wrapped";
+}
+
+// NEGATIVE (nesting) — a `break` inside a NESTED loop targets the INNER loop,
+// not the outer. So `while(1){ while(1){ break; } }` has an OUTER loop that is
+// provably-infinite (no break in ITS frame) and an INNER loop that is breakable
+// (NOT infinite). The break-scan must respect that frame boundary: the outer
+// loop IS wrapped; the inner loop is NOT. Exactly one synthetic Unreachable in
+// the function (the outer wrapper's), and the inner WhileStmt is bare.
+TEST(HirLoweringCSubset, NestedInnerBreakDoesNotDeInfiniteOuterLoop) {
+    SemanticModel model =
+        analyzeCSubset("int f(int x){ while(1){ while(1){ break; } return 5; } } "
+                       "int main(){ return f(0); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId const f = functionNamed(res->hir, model, "f");
+    ASSERT_TRUE(f.valid());
+
+    // Outer loop wrapped: body holds exactly the Synthetic wrapper Block whose
+    // first child is the OUTER WhileStmt.
+    auto const bodyKids = res->hir.children(res->hir.functionBody(f));
+    ASSERT_EQ(bodyKids.size(), 1u);
+    HirNodeId const wrapper = bodyKids[0];
+    ASSERT_EQ(res->hir.kind(wrapper), HirKind::Block);
+    EXPECT_TRUE(has(res->hir.flags(wrapper), HirFlags::Synthetic));
+    auto const wrapKids = res->hir.children(wrapper);
+    ASSERT_EQ(wrapKids.size(), 2u);
+    HirNodeId const outerWhile = wrapKids[0];
+    ASSERT_EQ(res->hir.kind(outerWhile), HirKind::WhileStmt);
+    ASSERT_EQ(res->hir.kind(wrapKids[1]), HirKind::Unreachable);
+
+    // The inner loop (inside the outer loop's body) is a BARE WhileStmt — NOT
+    // wrapped — because its `break` exits it. Find it under the outer while's
+    // body and confirm its own subtree carries no synthetic Unreachable.
+    HirNodeId const outerBody = res->hir.loopBody(outerWhile);
+    HirNodeId innerWhile{};
+    for (HirNodeId c : res->hir.children(outerBody))
+        if (res->hir.kind(c) == HirKind::WhileStmt) { innerWhile = c; break; }
+    ASSERT_TRUE(innerWhile.valid())
+        << "the inner WhileStmt must sit bare in the outer loop's body";
+    EXPECT_FALSE(subtreeHasSyntheticUnreachable(res->hir, innerWhile))
+        << "the breakable INNER loop must not be wrapped";
+}
+
 TEST(HirLoweringCSubset, NonConstantArrayLengthFailsLoud) {
     // `int a[n]` (variable length) must NOT silently decay or assume a length —
     // the semantic phase emits S_NonConstantArrayLength.
@@ -1783,6 +2110,26 @@ TEST(HirLoweringCSubset, CstConstEval_ArrayLengthConstRef) {
     EXPECT_EQ(arrayLengthOfVar(model, "xs"), 4);
 }
 
+// FC4 c1 (audit F1) — the PER-DECLARATOR const-init name match.
+// `const int A = 100, B = 2;` carries TWO initDeclarators under ONE
+// decl node; findInitExprInDecl must resolve each symbol's init by
+// its OWN name node. The silent failure this pins: degrading the
+// match to "the FIRST declarator's init" keeps every single-
+// declarator test green while B folds as 100 — so `xs[B + 1]`
+// becomes Array<101>, not Array<3>. The A-fed sibling stays green
+// under that degrade (A IS the first declarator); the B assertion
+// is the discriminating lever (red-on-disable demonstrated by
+// short-circuiting the name match to the list head).
+TEST(HirLoweringCSubset, CstConstEval_MultiDeclaratorConstInitsResolvePerName) {
+    SemanticModel model = analyzeCSubset(
+        "const int A = 100, B = 2;\n"
+        "void f() { int xs[B + 1]; int ys[A - 97]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 3);
+    EXPECT_EQ(arrayLengthOfVar(model, "ys"), 3);
+}
+
 // UnaryOp fold: `-(-3)` → 3. Pins the UnaryExprRule branch
 // (previously test-coverage gap).
 TEST(HirLoweringCSubset, CstConstEval_UnaryFolds) {
@@ -2345,12 +2692,20 @@ TEST(HirLoweringCSubset, D5_5_LiftOptOutRespected) {
     std::string const target =
         "\"compositeKind\": \"enum\",\n"
         "                           \"liftToEnclosingScope\": true";
-    auto const pos = text.find(target);
-    ASSERT_NE(pos, std::string::npos)
+    // FC4 c1: TWO enum-composite rows carry the lift flag now (the
+    // statement-position `enumDecl` AND the typedef-position
+    // `enumSpecifierBody`); flip EVERY occurrence so the opt-out is
+    // total — the bare-name `A` below must resolve through NEITHER.
+    std::size_t flipped = 0;
+    for (auto pos = text.find(target); pos != std::string::npos;
+         pos = text.find(target, pos)) {
+        text.replace(pos, target.size(),
+            "\"compositeKind\": \"enum\",\n"
+            "                           \"liftToEnclosingScope\": false");
+        ++flipped;
+    }
+    ASSERT_GE(flipped, 1u)
         << "c-subset config no longer carries the expected enum lift flag";
-    text.replace(pos, target.size(),
-        "\"compositeKind\": \"enum\",\n"
-        "                           \"liftToEnclosingScope\": false");
 
     auto loaded = GrammarSchema::loadFromText(text, "<c-subset-no-lift>");
     ASSERT_TRUE(loaded.has_value())

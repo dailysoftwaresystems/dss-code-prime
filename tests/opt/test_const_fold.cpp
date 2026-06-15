@@ -144,6 +144,38 @@ TEST(ConstFold, FoldsSubOfTwoConstants) {
     EXPECT_EQ(ret.constValue, 42);
 }
 
+// Left-associative chain shape: `10 - 3 + 1` lowers to
+// Add(Sub(10, 3), 1) — both ops must fold through to Const(8).
+// (The right-recursive parser mis-shape Sub(10, Add(3, 1)) would fold
+// to 6; pinning 8 here keeps the MIR tier honest about the chain
+// shape it receives.)
+TEST(ConstFold, FoldsLeftAssociativeChainToEight) {
+    TypeInterner interner{CompilationUnitId{1}};
+    BuildResult br;
+    br.i32   = interner.primitive(TypeKind::I32);
+    br.fnSig = interner.fnSig({}, br.i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(br.fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirLiteralValue v10; v10.value = std::int64_t{10}; v10.core = TypeKind::I32;
+    MirLiteralValue v3;  v3.value  = std::int64_t{3};  v3.core  = TypeKind::I32;
+    MirLiteralValue v1;  v1.value  = std::int64_t{1};  v1.core  = TypeKind::I32;
+    MirInstId const subOps[] = {mb.addConst(v10, br.i32), mb.addConst(v3, br.i32)};
+    MirInstId const sub = mb.addInst(MirOpcode::Sub, subOps, br.i32);
+    MirInstId const addOps[] = {sub, mb.addConst(v1, br.i32)};
+    mb.addReturn(mb.addInst(MirOpcode::Add, addOps, br.i32));
+    br.mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runConstFold(br.mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsFolded, 2u);
+    auto const ret = inspectReturnOperand(br.mir);
+    EXPECT_TRUE(ret.isConst);
+    EXPECT_EQ(ret.constValue, 8) << "(10 - 3) + 1 must fold to 8";
+}
+
 // Not foldable: one operand is a function Arg. The pass MUST NOT
 // rewrite the Add — the result is still an Add inst, not a Const.
 TEST(ConstFold, DoesNotFoldWhenOperandIsArg) {

@@ -53,12 +53,14 @@ namespace dss {
 //     K_NoMatchingObjectFormat, K_FormatLacksImportSupport,
 //     K_RelocationKindMismatch, K_WalkerInputContractViolation
 //     (format-walker dispatch / extern / reloc invariants).
-//   - LIR verifier / lowering structural invariants (10 L_* codes):
+//   - LIR verifier / lowering structural invariants (11 L_* codes):
 //     L_UnsupportedLoweringForOpcode (MIR→LIR coverage-gap fail-loud),
 //     L_RequiredLirOpcodeMissing, L_VirtualRegInPostRegalloc,
 //     L_MemOperandMalformed, L_PhysRegOrdinalOutOfRange,
 //     L_InvalidSpillSlotSentinel, L_MoveCycleUnsupported,
-//     L_IndirectCallUnsupported, L_StackPassedArgUnsupported,
+//     L_IndirectCallUnsupported,
+//     L_IndirectCalleeClobberedByArgSetup (FC4 c2 — the indirect-
+//     callee/arg-setup collision backstop), L_StackPassedArgUnsupported,
 //     L_CcRegLookupFailed.
 //   - Regalloc Error-severity invariants (3 R_* codes; Info-
 //     severity spillage codes intentionally OUT):

@@ -45,6 +45,33 @@ cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
                        DiagnosticReporter& reporter,
                        std::string_view passName);
 
+// Verbatim globals clone for the MANDATORY unreachable-block prune
+// (D-MIR-UNREACHABLE-PRUNE-NORMALIZE). Does what `cloneGlobalsOrCarveOut`'s
+// Cloned path does, with TWO differences that make it correct for a pass
+// that MUST process every module:
+//   (1) It NEVER carves out — no runtime-init `globalInitFunc.valid()`
+//       check, no early return. The prune is a verifier-correctness
+//       normalize that must run on EVERY compilation unit (and the merged
+//       module); skipping it on a runtime-init module would leave the
+//       verifier-rejected orphan continuation blocks in place.
+//   (2) It PRESERVES each runtime-init global's `initFunc` (the carve-out
+//       helper passes `MirFuncId{}`, dropping it — safe there only because
+//       its Cloned path is unreachable whenever any initFunc is valid).
+//       The prune drops only BLOCKS — never functions, never reordering
+//       them — so the func ORDINAL is stable across the rebuild and needs
+//       NO remap. The arena TAG, however, IS re-stamped: the optimizer
+//       mints a FRESH MirModuleId per rebuild, so initFunc is carried as
+//       `MirFuncId{old.v, builder.id().v}` (same ordinal, new tag). Passing
+//       the raw old id would trip MirBuilder's cross-module guard.
+//
+// ORDERING CONTRACT: call this AFTER every function has been re-added to
+// `builder` — the tag re-stamp at the old ordinal requires the function
+// slots to already exist (else finish()'s dangling-initFunc check fires).
+//
+// The setAliasingMode / setCharTypesAliasAll propagation is identical to
+// the shared helper (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE).
+DSS_EXPORT void cloneGlobalsVerbatim(Mir const& mir, MirBuilder& builder);
+
 // Per-pass policy driving the rebuild. Pass-specific state lives on
 // the concrete subclass; the rebuilder owns only the rewrite map +
 // the per-function block map. Default-method implementations express
@@ -189,9 +216,15 @@ public:
 
     // Phase 3: per-phi-incoming filter. Default = accept everything.
     // DCE: skip incomings whose pred isn't in the (RPO-reachable)
-    // blockMap. ConstFold: identity (all preds reachable).
+    // blockMap. SimplifyCFG: skip incomings whose CFG EDGE the
+    // branch-fold abandoned — `oldPhiBlock` (the OLD id of the block
+    // owning the phi) makes the hook an EDGE-level filter
+    // (pred → phi-owner), which a block-level pred check cannot
+    // express: a folded CondBr's block stays live, only its edge into
+    // the not-taken target dies. ConstFold: identity (all preds
+    // reachable, no edges removed).
     [[nodiscard]] virtual bool acceptPhiIncoming(
-        MirPhiIncoming const& /*inc*/,
+        MirPhiIncoming const& /*inc*/, MirBlockId /*oldPhiBlock*/,
         std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) {
         return true;
     }

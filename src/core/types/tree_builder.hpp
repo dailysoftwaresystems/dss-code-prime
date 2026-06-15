@@ -159,12 +159,12 @@ public:
     // subtree as the new frame's first child. The new frame replaces
     // the popped subtree's position in the parent's child list.
     //
-    // Used by the Pratt walker to handle left-associative postfix
-    // chains (`f(a)[i]`, `a[i][j]`, `f()()`) where each postfix wraps
-    // the result of the previous one. The classical rollback-replay
-    // strategy can't express this — rolling back to before the prior
-    // wrap loses it, and re-parsing at `prec+1` excludes the same-prec
-    // postfix that the wrap was built around.
+    // The Pratt walker's wrap-in-place primitive for EVERY operator
+    // arm (infix / ternary / postfix): each operator wraps the
+    // already-built chain (`f(a)[i]`, `a - b + c`) as the new
+    // wrapper's first child, building left-associative chains
+    // iteratively — no snapshot/rollback-replay, no per-operator
+    // recursion.
     //
     // Contract: requires an open frame containing at least one pending
     // child. Operates on the TOP frame (`open_.back()`) — callers must

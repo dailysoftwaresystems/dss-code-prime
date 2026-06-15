@@ -284,11 +284,22 @@ TEST(GrammarSchema, LoadShippedCSubset) {
     // Every shape name declared in the JSON must resolve. A typo would
     // currently load cleanly and only fail when a caller asks for the
     // missing name; pinning here makes the regression visible at load.
+    // FC4 c1: funcDefTail/funcParams/varDeclHead were dissolved by the
+    // C11 specifier/declarator split — the declarator core rules + the
+    // statement-ambiguity rules replace them.
     for (std::string_view rule : {"root", "topLevel", "topLevelDecl",
-                                  "topLevelDeclTail", "funcDefTail",
-                                  "funcParams", "varDeclTail",
+                                  "topLevelDeclTail", "topLevelHead",
+                                  "varDeclTail",
                                   "typeBase", "typeRef",
-                                  "varDeclHead", "varDecl",
+                                  "declarator", "directDeclarator",
+                                  "parenDeclarator", "pointerLayer",
+                                  "fnSuffix", "initDeclarator",
+                                  "initDeclaratorList", "declHead",
+                                  "kwDeclHead", "identDeclHead",
+                                  "identVarDecl", "declOrExprStmt",
+                                  "forDecl", "forIdentDecl", "forInitAmbig",
+                                  "typedefHead", "structSpecifierBody",
+                                  "stdAttr", "varDecl",
                                   "paramList", "param", "block", "statement",
                                   "ifStmt", "whileStmt", "doStmt", "forStmt",
                                   "returnStmt", "exprStmt", "expression",

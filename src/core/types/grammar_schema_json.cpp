@@ -962,28 +962,102 @@ void buildPositionTables(GrammarSchemaData& data, json const& shapesJson,
         // names the child rule in this shape's TYPE position. The parser's
         // speculative-probe commit consults the generic type-name triage
         // for rules carrying this guard (see CompiledRule::
-        // typeNameCommitRule). Validated here: must be a string naming a
-        // declared shape. The semantics-side requirement (the language
-        // must declare `semantics.identifierToken` so "lone identifier"
-        // is decidable) is validated late, after the `semantics` block is
-        // parsed — see validateTypeNameCommitGuards.
+        // typeNameCommitRule). Two accepted shapes (FC4 c1, M4):
+        //   * bare string  — `"commitRequiresTypeName": "castTypeRef"` —
+        //     the FC2 form; UNKNOWN-name polarity stays the PreferType
+        //     default (commit on a non-operator follower).
+        //   * object       — `{ "rule": "<child>",
+        //                       "polarity": "requireKnownType" }` —
+        //     selects the guard's unknown-name polarity explicitly
+        //     (closed enum; closed keys — a typo'd polarity or key would
+        //     otherwise silently keep the default and flip the grammar's
+        //     disambiguation behavior).
+        // The semantics-side requirement (the language must declare
+        // `semantics.identifierToken` so "lone identifier" is decidable)
+        // is validated late, after the `semantics` block is parsed — see
+        // validateTypeNameCommitGuards.
         if (body.is_object() && body.contains("commitRequiresTypeName")) {
             json const& guard = body.at("commitRequiresTypeName");
-            if (!guard.is_string() || guard.get<std::string>().empty()) {
-                coll.emit(DiagnosticCode::C_UnknownShape,
-                          std::format("{}/commitRequiresTypeName", shapePath),
-                          "'commitRequiresTypeName' must be a non-empty string "
-                          "naming the shape's type-position child rule");
-            } else {
-                const auto& typeRuleName = guard.get<std::string>();
+            const auto guardPath =
+                std::format("{}/commitRequiresTypeName", shapePath);
+            auto const resolveTypeRule = [&](std::string const& typeRuleName) {
                 if (!data.rules->contains(typeRuleName)) {
-                    coll.emit(DiagnosticCode::C_UnknownShape,
-                              std::format("{}/commitRequiresTypeName", shapePath),
+                    coll.emit(DiagnosticCode::C_UnknownShape, guardPath,
                               std::format("'commitRequiresTypeName' names unknown "
                                           "shape '{}'", typeRuleName));
-                } else {
-                    rule.typeNameCommitRule = data.rules->find(typeRuleName);
+                    return;
                 }
+                rule.typeNameCommitRule = data.rules->find(typeRuleName);
+            };
+            if (guard.is_string() && !guard.get<std::string>().empty()) {
+                resolveTypeRule(guard.get<std::string>());
+            } else if (guard.is_object()) {
+                static constexpr std::array<std::string_view, 2>
+                    kGuardKeys{"rule", "polarity"};
+                bool gOk = true;
+                for (auto it = guard.begin(); it != guard.end(); ++it) {
+                    bool known = false;
+                    for (auto const& k : kGuardKeys) {
+                        if (it.key() == k) { known = true; break; }
+                    }
+                    if (!known) {
+                        coll.emit(DiagnosticCode::C_UnknownShape,
+                                  std::format("{}/{}", guardPath, it.key()),
+                                  std::format("unknown key '{}' — allowed keys "
+                                              "are 'rule', 'polarity' (typo "
+                                              "discriminator)", it.key()));
+                        gOk = false;
+                    }
+                }
+                if (!guard.contains("rule") || !guard.at("rule").is_string()
+                    || guard.at("rule").get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              guardPath + "/rule",
+                              "'commitRequiresTypeName.rule' is required and "
+                              "must be a non-empty string naming the shape's "
+                              "type-position child rule");
+                    gOk = false;
+                }
+                // The object form exists to express a polarity; require it
+                // (an object without one is indistinguishable from a typo'd
+                // attempt at the strict mode — fail loud, never default).
+                TypeNameCommitPolarity polarity =
+                    TypeNameCommitPolarity::PreferType;
+                if (!guard.contains("polarity")
+                    || !guard.at("polarity").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              guardPath + "/polarity",
+                              "'commitRequiresTypeName.polarity' is required in "
+                              "the object form and must be 'preferType' or "
+                              "'requireKnownType'");
+                    gOk = false;
+                } else {
+                    auto const p = guard.at("polarity").get<std::string>();
+                    if (p == "preferType") {
+                        polarity = TypeNameCommitPolarity::PreferType;
+                    } else if (p == "requireKnownType") {
+                        polarity =
+                            TypeNameCommitPolarity::RequireKnownType;
+                    } else {
+                        coll.emit(DiagnosticCode::C_UnknownShape,
+                                  guardPath + "/polarity",
+                                  std::format("unknown polarity '{}' (expected "
+                                              "'preferType' or "
+                                              "'requireKnownType')", p));
+                        gOk = false;
+                    }
+                }
+                if (gOk) {
+                    resolveTypeRule(guard.at("rule").get<std::string>());
+                    if (rule.typeNameCommitRule.valid()) {
+                        rule.typeNameCommitPolarity = polarity;
+                    }
+                }
+            } else {
+                coll.emit(DiagnosticCode::C_UnknownShape, guardPath,
+                          "'commitRequiresTypeName' must be a non-empty string "
+                          "naming the shape's type-position child rule, or a "
+                          "{rule, polarity} object");
             }
         }
     }
@@ -3422,6 +3496,162 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 out = static_cast<std::uint32_t>(v);
             };
 
+            // FC4 c1 (M5): resolve a diagnostic-code NAME ("S_VolatileNotSupported")
+            // to its DiagnosticCode via the shared `diagnosticCodeName` table —
+            // the same closed-enum linear scan the CLI's `--suppress` parser
+            // uses (one name home, no second drifting table). The sentinel
+            // names ("Unknown" = un-enumerated hole, "None" = the no-diagnostic
+            // zero) are rejected up front: a gate resolving to either would be
+            // a wall that never fires.
+            auto const diagnosticCodeFromName =
+                [](std::string_view name) -> std::optional<DiagnosticCode> {
+                if (name == "Unknown" || name == "None") return std::nullopt;
+                for (std::uint32_t v = 0; v < 0x10000u; ++v) {
+                    auto const code = static_cast<DiagnosticCode>(v);
+                    auto const n = diagnosticCodeName(code);
+                    if (n == "Unknown") continue;
+                    if (n == name) return code;
+                }
+                return std::nullopt;
+            };
+
+            // ── declarators (FC4 c1) ── the C 6.7.6 declarator role
+            // vocabulary (see DeclaratorConfig). Parsed BEFORE `declarations`
+            // so declarator-mode rows can validate against its presence.
+            // Closed keys (typo discriminator — a misspelled role would
+            // otherwise silently leave the walk blind to that role); every
+            // rule name must resolve to a declared shape and every token
+            // name to a declared token kind; `fnSuffixParamsRule` is the one
+            // OPTIONAL role. The block is all-or-nothing: any rejected field
+            // leaves `cfg.declarators` unset (a partial role table would
+            // truncate the declarator walk mid-shape — fail loud instead).
+            if (sem.contains("declarators")) {
+                json const& dj = sem.at("declarators");
+                const std::string dPath = "/semantics/declarators";
+                if (!dj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, dPath,
+                              "'semantics.declarators' must be an object of "
+                              "declarator role names");
+                } else {
+                    static constexpr std::array<std::string_view, 11>
+                        kDeclaratorKeys{
+                            "declaratorRule",     "pointerLayerRule",
+                            "pointerToken",       "directRule",
+                            "groupRule",          "nameToken",
+                            "fnSuffixRule",       "fnSuffixParamsRule",
+                            "arraySuffixRule",    "initDeclaratorRule",
+                            "listRule"};
+                    bool dOk = true;
+                    for (auto it = dj.begin(); it != dj.end(); ++it) {
+                        bool known = false;
+                        for (auto const& k : kDeclaratorKeys) {
+                            if (it.key() == k) { known = true; break; }
+                        }
+                        if (!known) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      std::format("{}/{}", dPath, it.key()),
+                                      std::format("unknown key '{}' in "
+                                                  "'declarators' (typo "
+                                                  "discriminator)", it.key()));
+                            dOk = false;
+                        }
+                    }
+                    DeclaratorConfig dc;
+                    auto const readRuleRole = [&](char const* key, RuleId& out,
+                                                  std::string& outName) {
+                        if (!dj.contains(key) || !dj.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      std::format("{}/{}", dPath, key),
+                                      std::format("'declarators.{}' is required "
+                                                  "and must be a rule-name "
+                                                  "string", key));
+                            dOk = false;
+                            return;
+                        }
+                        outName = dj.at(key).get<std::string>();
+                        if (!data.rules->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape,
+                                      std::format("{}/{}", dPath, key),
+                                      std::format("'declarators.{}' references "
+                                                  "unknown shape '{}'",
+                                                  key, outName));
+                            dOk = false;
+                            return;
+                        }
+                        out = data.rules->find(outName);
+                    };
+                    auto const readTokenRole = [&](char const* key,
+                                                   SchemaTokenId& out,
+                                                   std::string& outName) {
+                        if (!dj.contains(key) || !dj.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      std::format("{}/{}", dPath, key),
+                                      std::format("'declarators.{}' is required "
+                                                  "and must be a token-kind "
+                                                  "name string", key));
+                            dOk = false;
+                            return;
+                        }
+                        outName = dj.at(key).get<std::string>();
+                        if (!data.schemaTokens->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownToken,
+                                      std::format("{}/{}", dPath, key),
+                                      std::format("'declarators.{}' references "
+                                                  "unknown token kind '{}'",
+                                                  key, outName));
+                            dOk = false;
+                            return;
+                        }
+                        out = data.schemaTokens->find(outName);
+                    };
+                    readRuleRole("declaratorRule", dc.declaratorRule,
+                                 dc.declaratorRuleName);
+                    readRuleRole("pointerLayerRule", dc.pointerLayerRule,
+                                 dc.pointerLayerRuleName);
+                    readTokenRole("pointerToken", dc.pointerToken,
+                                  dc.pointerTokenName);
+                    readRuleRole("directRule", dc.directRule,
+                                 dc.directRuleName);
+                    readRuleRole("groupRule", dc.groupRule, dc.groupRuleName);
+                    readTokenRole("nameToken", dc.nameToken, dc.nameTokenName);
+                    readRuleRole("fnSuffixRule", dc.fnSuffixRule,
+                                 dc.fnSuffixRuleName);
+                    readRuleRole("arraySuffixRule", dc.arraySuffixRule,
+                                 dc.arraySuffixRuleName);
+                    readRuleRole("initDeclaratorRule", dc.initDeclaratorRule,
+                                 dc.initDeclaratorRuleName);
+                    readRuleRole("listRule", dc.listRule, dc.listRuleName);
+                    // The one OPTIONAL role (absent ⇒ fn suffixes build
+                    // zero-param signatures); present-but-dangling rejects.
+                    if (dj.contains("fnSuffixParamsRule")) {
+                        if (!dj.at("fnSuffixParamsRule").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      dPath + "/fnSuffixParamsRule",
+                                      "'declarators.fnSuffixParamsRule' must "
+                                      "be a rule-name string");
+                            dOk = false;
+                        } else {
+                            dc.fnSuffixParamsRuleName =
+                                dj.at("fnSuffixParamsRule").get<std::string>();
+                            if (!data.rules->contains(
+                                    dc.fnSuffixParamsRuleName)) {
+                                coll.emit(DiagnosticCode::C_UnknownShape,
+                                          dPath + "/fnSuffixParamsRule",
+                                          std::format(
+                                              "'declarators.fnSuffixParamsRule' "
+                                              "references unknown shape '{}'",
+                                              dc.fnSuffixParamsRuleName));
+                                dOk = false;
+                            } else {
+                                dc.fnSuffixParamsRule = data.rules->find(
+                                    dc.fnSuffixParamsRuleName);
+                            }
+                        }
+                    }
+                    if (dOk) cfg.declarators = std::move(dc);
+                }
+            }
+
             // ── declarations ──
             if (sem.contains("declarations")) {
                 json const& arr = sem.at("declarations");
@@ -3476,6 +3706,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         readIndex("init",   rule.initChild);
                         readIndex("params", rule.paramsChild);
                         readIndex("body",   rule.bodyChild);
+                        // FC4 c1: declarator-mode child roles (validated
+                        // against the legacy roles + the `declarators`
+                        // block after the row's fields are read — see the
+                        // mode-consistency check below).
+                        readIndex("head",           rule.headChild);
+                        readIndex("declaratorList", rule.declaratorListChild);
+                        readIndex("declarator",     rule.declaratorChild);
 
                         // SE4: optional const-marker token. A bad token
                         // name is C_UnknownToken; the symbol is still
@@ -3699,6 +3936,117 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // FC4 c1 (M5): optional config-driven fail-loud
+                        // marker gates:
+                        //   "gatedMarkers": [ { "token": "VolatileKeyword",
+                        //                       "code": "S_VolatileNotSupported" } ]
+                        // Each entry pairs a token KIND with a diagnostic-code
+                        // NAME (resolved through the shared diagnosticCodeName
+                        // table); at semantic analysis a declaration whose
+                        // subtree contains the token emits the code as an
+                        // ERROR positioned at the token. Closed keys per
+                        // entry; unknown token → C_UnknownToken; unknown /
+                        // sentinel code name → C_InvalidSemantics (a typo'd
+                        // code would silently disarm the wall).
+                        if (entry.contains("gatedMarkers")) {
+                            auto const& gms = entry.at("gatedMarkers");
+                            if (!gms.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/gatedMarkers",
+                                          std::format("'declarations[{}]."
+                                                      "gatedMarkers' must be an "
+                                                      "array of {{token, code}} "
+                                                      "objects", i));
+                            } else {
+                                for (std::size_t gi = 0; gi < gms.size(); ++gi) {
+                                    auto const gPath = std::format(
+                                        "{}/gatedMarkers/{}", path, gi);
+                                    json const& g = gms[gi];
+                                    if (!g.is_object()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  gPath,
+                                                  "each gatedMarkers entry must "
+                                                  "be a {token, code} object");
+                                        continue;
+                                    }
+                                    bool gOk = true;
+                                    for (auto it = g.begin(); it != g.end(); ++it) {
+                                        if (it.key() != "token"
+                                            && it.key() != "code") {
+                                            coll.emit(
+                                                DiagnosticCode::C_InvalidSemantics,
+                                                std::format("{}/{}", gPath,
+                                                            it.key()),
+                                                std::format("unknown key '{}' — "
+                                                            "allowed keys are "
+                                                            "'token', 'code' "
+                                                            "(typo discriminator)",
+                                                            it.key()));
+                                            gOk = false;
+                                        }
+                                    }
+                                    GatedMarker gm;
+                                    if (!g.contains("token")
+                                        || !g.at("token").is_string()) {
+                                        coll.emit(DiagnosticCode::C_MissingField,
+                                                  gPath + "/token",
+                                                  "'token' is required and must "
+                                                  "be a token-kind name string");
+                                        gOk = false;
+                                    } else {
+                                        gm.tokenName =
+                                            g.at("token").get<std::string>();
+                                        if (!data.schemaTokens->contains(
+                                                gm.tokenName)) {
+                                            coll.emit(
+                                                DiagnosticCode::C_UnknownToken,
+                                                gPath + "/token",
+                                                std::format("'gatedMarkers[{}]."
+                                                            "token' references "
+                                                            "unknown token kind "
+                                                            "'{}'", gi,
+                                                            gm.tokenName));
+                                            gOk = false;
+                                        } else {
+                                            gm.token = data.schemaTokens->find(
+                                                gm.tokenName);
+                                        }
+                                    }
+                                    if (!g.contains("code")
+                                        || !g.at("code").is_string()) {
+                                        coll.emit(DiagnosticCode::C_MissingField,
+                                                  gPath + "/code",
+                                                  "'code' is required and must "
+                                                  "be a diagnostic-code name "
+                                                  "string");
+                                        gOk = false;
+                                    } else {
+                                        gm.codeName =
+                                            g.at("code").get<std::string>();
+                                        auto const code = diagnosticCodeFromName(
+                                            gm.codeName);
+                                        if (!code.has_value()) {
+                                            coll.emit(
+                                                DiagnosticCode::C_InvalidSemantics,
+                                                gPath + "/code",
+                                                std::format("'gatedMarkers[{}]."
+                                                            "code' names unknown "
+                                                            "diagnostic code "
+                                                            "'{}'", gi,
+                                                            gm.codeName));
+                                            gOk = false;
+                                        } else {
+                                            gm.code = *code;
+                                        }
+                                    }
+                                    if (gOk) {
+                                        rule.gatedMarkers.push_back(
+                                            std::move(gm));
+                                    }
+                                }
+                            }
+                        }
+
                         // SE-arrays (HR9): optional C-style declarator suffix.
                         //   "arraySuffix": { "rule": "arrayDeclSuffix",
                         //                    "lengthChild": 1 }
@@ -3844,6 +4192,78 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             } else {
                                 rule.warnIfUnused =
                                     entry.at("warnIfUnused").get<bool>();
+                            }
+                        }
+
+                        // FC4 c1 stage 2a: optional `requireNamedDeclarators`
+                        // flag (default false). Declarator-mode named
+                        // positions (locals/globals/typedefs) declare true so
+                        // an abstract declarator (`int *;`) fails loud with
+                        // S_DeclarationDeclaresNothing instead of silently
+                        // declaring nothing.
+                        if (entry.contains("requireNamedDeclarators")) {
+                            if (!entry.at("requireNamedDeclarators").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/requireNamedDeclarators",
+                                          "'requireNamedDeclarators' must be a boolean");
+                            } else {
+                                rule.requireNamedDeclarators =
+                                    entry.at("requireNamedDeclarators").get<bool>();
+                            }
+                        }
+
+                        // FC4 c1 stage 2a: optional `anonymousNameAllowed`
+                        // flag (default false). A type row whose name child
+                        // is structurally absent / not an identifier leaf
+                        // (C's anonymous `typedef struct { ... } T;`) still
+                        // mints a TYPE symbol under a synthesized unique name
+                        // anchored on the declaration node.
+                        if (entry.contains("anonymousNameAllowed")) {
+                            if (!entry.at("anonymousNameAllowed").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/anonymousNameAllowed",
+                                          "'anonymousNameAllowed' must be a boolean");
+                            } else {
+                                rule.anonymousNameAllowed =
+                                    entry.at("anonymousNameAllowed").get<bool>();
+                            }
+                        }
+
+                        // FC4 c1 (D14): optional `linkageSpecifierIgnoredRules`
+                        // — RULE names whose whole subtrees the linkage prefix
+                        // scan skips (parsed-but-semantically-ignored attribute
+                        // forms, e.g. C23 `[[...]]`). Mirrors the ignored-KINDS
+                        // validation: unknown rule name → C_UnknownShape.
+                        if (entry.contains("linkageSpecifierIgnoredRules")) {
+                            auto const& lir = entry.at("linkageSpecifierIgnoredRules");
+                            if (!lir.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/linkageSpecifierIgnoredRules",
+                                          std::format("'declarations[{}]."
+                                                      "linkageSpecifierIgnoredRules' must be "
+                                                      "an array of rule names", i));
+                            } else {
+                                for (auto const& elem : lir) {
+                                    if (!elem.is_string()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  path + "/linkageSpecifierIgnoredRules",
+                                                  "each ignored-rule entry must be a "
+                                                  "rule-name string");
+                                        continue;
+                                    }
+                                    auto const rn = elem.get<std::string>();
+                                    if (!data.rules->contains(rn)) {
+                                        coll.emit(DiagnosticCode::C_UnknownShape,
+                                                  path + "/linkageSpecifierIgnoredRules",
+                                                  std::format("'declarations[{}]."
+                                                              "linkageSpecifierIgnoredRules' "
+                                                              "references unknown shape '{}'",
+                                                              i, rn));
+                                        continue;
+                                    }
+                                    rule.linkageSpecifierIgnoredRules.push_back(
+                                        data.rules->find(rn));
+                                }
                             }
                         }
 
@@ -4119,6 +4539,73 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     rule.kindByChild = std::move(disc);
                                 }
                             }
+                        }
+
+                        // FC4 c1: declarator-mode consistency. A row that
+                        // sets ANY of head/declaratorList/declarator must
+                        // (a) belong to a language that declared the
+                        // `declarators` role block, (b) NOT also set the
+                        // legacy positional name/type roles (the two
+                        // models would compete for the same symbol), and
+                        // (c) set `head` plus EXACTLY ONE of
+                        // declaratorList / declarator. An inconsistent row
+                        // is dropped (continue) — a half-wired mode would
+                        // silently mint nothing or the wrong symbols.
+                        if (rule.isDeclaratorMode()) {
+                            bool modeOk = true;
+                            if (!cfg.declarators.has_value()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path,
+                                          std::format("'declarations[{}]' uses "
+                                                      "declarator-mode fields "
+                                                      "but the language declares "
+                                                      "no 'semantics.declarators' "
+                                                      "block", i));
+                                modeOk = false;
+                            }
+                            if (rule.nameChild.has_value()
+                                || rule.typeChild.has_value()) {
+                                coll.emit(DiagnosticCode::C_ConflictingField,
+                                          path,
+                                          std::format("'declarations[{}]' mixes "
+                                                      "declarator-mode fields "
+                                                      "(head/declaratorList/"
+                                                      "declarator) with the "
+                                                      "legacy 'name'/'type' "
+                                                      "roles — set one model, "
+                                                      "not both", i));
+                                modeOk = false;
+                            }
+                            if (!rule.headChild.has_value()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/head",
+                                          std::format("'declarations[{}]' is in "
+                                                      "declarator mode but sets "
+                                                      "no 'head' (the type-"
+                                                      "specifier head index)", i));
+                                modeOk = false;
+                            }
+                            if (rule.declaratorListChild.has_value()
+                                && rule.declaratorChild.has_value()) {
+                                coll.emit(DiagnosticCode::C_ConflictingField,
+                                          path,
+                                          std::format("'declarations[{}]' sets "
+                                                      "both 'declaratorList' and "
+                                                      "'declarator' — exactly one "
+                                                      "is required", i));
+                                modeOk = false;
+                            } else if (!rule.declaratorListChild.has_value()
+                                       && !rule.declaratorChild.has_value()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path,
+                                          std::format("'declarations[{}]' is in "
+                                                      "declarator mode but sets "
+                                                      "neither 'declaratorList' "
+                                                      "nor 'declarator' — exactly "
+                                                      "one is required", i));
+                                modeOk = false;
+                            }
+                            if (!modeOk) continue;   // drop the inconsistent row
                         }
 
                         cfg.declarations.push_back(std::move(rule));
@@ -5160,6 +5647,40 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                           "map cannot type", sfx));
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            // ── FC4 c1: parameters (parameter-list conventions) ────────
+            // `soleVoidMeansEmpty` (C 6.7.6.3p10): a `(void)` list means
+            // zero params at the engine's param-harvest chokepoint. Closed
+            // keys; non-bool value fails loud.
+            if (sem.contains("parameters")) {
+                json const& pj = sem.at("parameters");
+                if (!pj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/parameters",
+                              "'parameters' must be an object");
+                } else {
+                    for (auto const& [key, _] : pj.items()) {
+                        if (key != "soleVoidMeansEmpty"
+                            && key.rfind("$", 0) != 0) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/parameters/" + key,
+                                      std::format("unknown 'parameters' field "
+                                                  "'{}' — expected "
+                                                  "'soleVoidMeansEmpty'", key));
+                        }
+                    }
+                    if (pj.contains("soleVoidMeansEmpty")) {
+                        if (!pj.at("soleVoidMeansEmpty").is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/parameters/soleVoidMeansEmpty",
+                                      "'soleVoidMeansEmpty' must be a boolean");
+                        } else {
+                            cfg.parameters.soleVoidMeansEmpty =
+                                pj.at("soleVoidMeansEmpty").get<bool>();
                         }
                     }
                 }

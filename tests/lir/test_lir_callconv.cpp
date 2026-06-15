@@ -1428,66 +1428,225 @@ TEST(LirCallconvAbi, Win64FiveArgFunctionStackPassesViaSlotAligned) {
            "(the canonical Win64 stack-arg location AFTER shadow space)";
 }
 
-TEST(LirCallconvAbi, RejectsIndirectCallLoud) {
-    // The c-subset frontend doesn't emit function-pointer calls, so
-    // we synthesize a minimal LIR module by hand to drive the
-    // indirect-call rejection path. The shape: one function with one
-    // block whose only inst is `call <reg-callee>` — the callconv
-    // pass must trip `L_IndirectCallUnsupported` citing D-ML7-2.4
-    // rather than silently emit a malformed `call <reg>` that the
-    // assembler can't encode (the schema's call variant guard is
-    // `["symbol"]`).
-    auto target = TargetSchema::loadShipped("x86_64");
-    ASSERT_TRUE(target.has_value());
-    TargetSchema const& sch = **target;
+// ── FC4 c2: indirect-call materialization (`call <reg>`) ───────────
+// Successors of the retired RejectsIndirectCallLoud wall pin: a Reg
+// callee now materializes through the SAME planning as a SymbolRef
+// callee (arg moves, hazard detection, result capture), the
+// callee-in-arg-reg collision trips the loud
+// L_IndirectCalleeClobberedByArgSetup backstop, and any OTHER callee
+// operand kind keeps the (re-messaged) L_IndirectCallUnsupported
+// totality wall ALIVE.
 
-    auto const callOp = sch.opcodeByMnemonic("call");
-    ASSERT_TRUE(callOp.has_value());
-    auto const retOp  = sch.opcodeByMnemonic("ret");
-    ASSERT_TRUE(retOp.has_value());
+namespace {
 
-    // Construct a synthetic LIR module: one function, one block with
-    // `call <rax_reg>` followed by `ret`.
-    LirBuilder b{sch};
-    b.addFunction(SymbolId{42});
-    LirBlockId const block = b.createBlock();
-    b.beginBlock(block);
-    auto const raxOrd = sch.registerByName("rax");
-    ASSERT_TRUE(raxOrd.has_value());
-    LirReg const rax = makePhysicalReg(*raxOrd, LirRegClass::GPR);
-    // call <rax> — callee operand is a Reg, not a SymbolRef.
-    std::array<LirOperand, 1> callOps{LirOperand::makeReg(rax)};
-    b.addInst(*callOp, InvalidLirReg, callOps);
-    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
-    Lir lir = std::move(b).finish();
-
-    // Minimal LirAllocation with one valid per-function entry pointing
-    // at cc index 0 (the materializer reads this to pick the cc).
+// Minimal single-entry LirAllocation pointing at cc index 0 — the
+// materializer reads it to pick the cc (sysv_amd64 on x86_64).
+[[nodiscard]] LirAllocation singleFnCc0Alloc() {
     LirAllocation alloc;
     alloc.perFunc.emplace_back();
     alloc.perFunc.back().ok                       = true;
     alloc.perFunc.back().originalSymbol           = SymbolId{42};
     alloc.perFunc.back().callingConventionIndex   = 0;
     alloc.perFunc.back().numSpillSlots            = 0;
+    return alloc;
+}
+
+} // namespace
+
+TEST(LirCallconvAbi, MaterializesIndirectCallViaRegCallee) {
+    // `result(rbx) = call <r10>, arg(r11)` — callee in a NON-arg
+    // caller-saved register. The materializer must emit, in order:
+    //   mov rdi, r11      (sysv argGprs[0] <- the arg)
+    //   call r10          (single Reg operand — the schema's ["reg"]
+    //                      encoding variant)
+    //   mov rbx, rax      (result capture from returnGprs[0])
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+
+    auto const callOp = sch.opcodeByMnemonic("call");
+    auto const retOp  = sch.opcodeByMnemonic("ret");
+    auto const movOp  = sch.opcodeByMnemonic("mov");
+    ASSERT_TRUE(callOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+    ASSERT_TRUE(movOp.has_value());
+    auto const r10Ord = sch.registerByName("r10");
+    auto const r11Ord = sch.registerByName("r11");
+    auto const rdiOrd = sch.registerByName("rdi");
+    auto const raxOrd = sch.registerByName("rax");
+    auto const rbxOrd = sch.registerByName("rbx");
+    ASSERT_TRUE(r10Ord.has_value() && r11Ord.has_value()
+                && rdiOrd.has_value() && raxOrd.has_value()
+                && rbxOrd.has_value());
+    LirReg const r10 = makePhysicalReg(*r10Ord, LirRegClass::GPR);
+    LirReg const r11 = makePhysicalReg(*r11Ord, LirRegClass::GPR);
+    LirReg const rbx = makePhysicalReg(*rbxOrd, LirRegClass::GPR);
+
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{42});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    std::array<LirOperand, 2> callOps{LirOperand::makeReg(r10),
+                                      LirOperand::makeReg(r11)};
+    b.addInst(*callOp, rbx, callOps);
+    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
 
     DiagnosticReporter ccRep;
-    auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
+    auto result = materializeCallingConvention(lir, sch,
+                                               singleFnCc0Alloc(), ccRep);
+    ASSERT_TRUE(result.ok())
+        << "a Reg-callee call must MATERIALIZE (FC4 c2), not reject";
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+
+    // Scan the materialized function: locate the call and the two
+    // movs, asserting both order and exact register identities.
+    LirFuncId const fn = result.lir.funcAt(0);
+    std::optional<std::size_t> argMoveAt;
+    std::optional<std::size_t> callAt;
+    std::optional<std::size_t> resultMoveAt;
+    std::size_t flat = 0;
+    std::uint32_t const blkN = result.lir.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < blkN; ++bi) {
+        LirBlockId const blk = result.lir.funcBlockAt(fn, bi);
+        std::uint32_t const n = result.lir.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < n; ++i, ++flat) {
+            LirInstId const inst = result.lir.blockInstAt(blk, i);
+            auto const ops = result.lir.instOperands(inst);
+            if (result.lir.instOpcode(inst) == *callOp) {
+                ASSERT_EQ(ops.size(), 1u)
+                    << "materialized call carries the single callee "
+                       "operand only";
+                ASSERT_EQ(ops[0].kind, LirOperandKind::Reg);
+                EXPECT_EQ(ops[0].reg.id,
+                          static_cast<std::uint32_t>(*r10Ord))
+                    << "callee register must pass through untouched";
+                callAt = flat;
+                continue;
+            }
+            if (result.lir.instOpcode(inst) == *movOp
+                && ops.size() == 1 && ops[0].kind == LirOperandKind::Reg) {
+                LirReg const res = result.lir.instResult(inst);
+                if (res.valid()
+                    && res.id == static_cast<std::uint32_t>(*rdiOrd)
+                    && ops[0].reg.id
+                           == static_cast<std::uint32_t>(*r11Ord)) {
+                    argMoveAt = flat;
+                }
+                if (res.valid()
+                    && res.id == static_cast<std::uint32_t>(*rbxOrd)
+                    && ops[0].reg.id
+                           == static_cast<std::uint32_t>(*raxOrd)) {
+                    resultMoveAt = flat;
+                }
+            }
+        }
+    }
+    ASSERT_TRUE(callAt.has_value()) << "no call instruction emitted";
+    ASSERT_TRUE(argMoveAt.has_value())
+        << "missing `mov rdi, r11` arg-passing move (indirect calls "
+           "must share the direct path's arg planning)";
+    ASSERT_TRUE(resultMoveAt.has_value())
+        << "missing `mov rbx, rax` result capture (indirect calls "
+           "must share the direct path's result capture)";
+    EXPECT_LT(*argMoveAt, *callAt) << "arg move must precede the call";
+    EXPECT_GT(*resultMoveAt, *callAt)
+        << "result capture must follow the call";
+}
+
+TEST(LirCallconvAbi, RejectsCalleeInArgRegLoud) {
+    // `call <rdi>, arg(r11)` — the callee sits in sysv argGprs[0],
+    // which is ALSO the destination of this call's own arg-passing
+    // move (`mov rdi, r11`). Emitting would overwrite the callee
+    // before the call consumes it (jump through an argument value).
+    // The regalloc-tier rules make this unreachable from the
+    // pipeline; the materializer's backstop must convert a regression
+    // into the loud L_IndirectCalleeClobberedByArgSetup, never a
+    // silent garbage jump. (This hand-built shape bypasses regalloc
+    // on purpose — it IS the backstop's red-on-disable lever.)
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+
+    auto const callOp = sch.opcodeByMnemonic("call");
+    auto const retOp  = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(callOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+    auto const rdiOrd = sch.registerByName("rdi");
+    auto const r11Ord = sch.registerByName("r11");
+    ASSERT_TRUE(rdiOrd.has_value() && r11Ord.has_value());
+    LirReg const rdi = makePhysicalReg(*rdiOrd, LirRegClass::GPR);
+    LirReg const r11 = makePhysicalReg(*r11Ord, LirRegClass::GPR);
+
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{42});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    std::array<LirOperand, 2> callOps{LirOperand::makeReg(rdi),
+                                      LirOperand::makeReg(r11)};
+    b.addInst(*callOp, InvalidLirReg, callOps);
+    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch,
+                                               singleFnCc0Alloc(), ccRep);
     EXPECT_FALSE(result.ok())
-        << "indirect call (reg callee) must trip the loud guard";
+        << "callee parked in an arg-passing destination must fail LOUD";
     bool sawCode = false;
-    bool sawAnchor = false;
+    for (auto const& d : ccRep.all()) {
+        if (d.code == DiagnosticCode::L_IndirectCalleeClobberedByArgSetup) {
+            sawCode = true;
+        }
+    }
+    EXPECT_TRUE(sawCode)
+        << "must surface L_IndirectCalleeClobberedByArgSetup (the "
+           "regalloc-rule backstop)";
+}
+
+TEST(LirCallconvAbi, RejectsNonRegNonSymbolCalleeLoud) {
+    // ops[0] is an IMMEDIATE — neither SymbolRef (direct) nor Reg
+    // (indirect). The fail-loud totality wall must stay ALIVE with
+    // the re-messaged L_IndirectCallUnsupported (an upstream lowering
+    // bug must never silently materialize).
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+
+    auto const callOp = sch.opcodeByMnemonic("call");
+    auto const retOp  = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(callOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{42});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    std::array<LirOperand, 1> callOps{LirOperand::makeImmInt32(7)};
+    b.addInst(*callOp, InvalidLirReg, callOps);
+    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch,
+                                               singleFnCc0Alloc(), ccRep);
+    EXPECT_FALSE(result.ok())
+        << "an immediate callee operand must trip the loud guard";
+    bool sawCode = false;
+    bool sawMessage = false;
     for (auto const& d : ccRep.all()) {
         if (d.code == DiagnosticCode::L_IndirectCallUnsupported) {
             sawCode = true;
-            if (d.actual.find("D-ML7-2.4") != std::string::npos) {
-                sawAnchor = true;
+            if (d.actual.find("neither SymbolRef") != std::string::npos) {
+                sawMessage = true;
             }
         }
     }
     EXPECT_TRUE(sawCode)
-        << "the reg-callee call must surface L_IndirectCallUnsupported";
-    EXPECT_TRUE(sawAnchor)
-        << "the diagnostic must cite the D-ML7-2.4 anchor for triage";
+        << "the residual-kind callee must surface "
+           "L_IndirectCallUnsupported (the code stays ALIVE)";
+    EXPECT_TRUE(sawMessage)
+        << "the diagnostic must carry the re-messaged totality text";
 }
 
 TEST(LirCallconvAbi, OrderableChainArgPassingSucceeds) {

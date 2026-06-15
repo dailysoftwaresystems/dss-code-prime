@@ -4,6 +4,8 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/type_rules.hpp"      // FC3 c1: usualArithmeticCommonType / resolveArithmeticRules
 #include "core/types/data_model.hpp"
+#include "core/types/decl_prefix_strip.hpp"     // declRoleChildren / descendVisibleDecl / specifierPrefixChild
+#include "core/types/declarator_walk.hpp"       // FC4: collectDeclarators / declaratorNameNode
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/char_decode.hpp"
@@ -582,48 +584,16 @@ struct Lowerer {
 
     // ── declaration-specifier prefix (D-DECL-SPECIFIER-PREFIX-SUBSTRATE consumer)
     // The c-subset's `static`/`__attribute__` prefix rides as an OPTIONAL leading
-    // child of a declaration. These helpers mirror the semantic analyzer's
-    // `declRoleChildren`/`descendVisibleDecl` so CST→HIR resolves the same
-    // prefix-free positional indices the analyzer minted symbols against — without
-    // the strip, a leading prefix shifts name/type/params/body/kindByChild by one
-    // (silent wrong-child). The prefix subtree stays reachable for `linkageFrom`.
-    // NOTE (D-DECL-PREFIX-STRIP-SHARED-HELPER): this is the 3rd file-local copy of
-    // the strip guard (analyzer + cst_const_eval + here) — a shared helper is
-    // pinned for extraction.
+    // child of a declaration. CST→HIR resolves positional declaration children
+    // via the SHARED strip-aware helpers in `core/types/decl_prefix_strip.hpp`
+    // (`declRoleChildren` / `descendVisibleDecl` / `specifierPrefixChild` —
+    // D-DECL-PREFIX-STRIP-SHARED-HELPER: one source of truth with the semantic
+    // analyzer and cst_const_eval), so lowering sees the same prefix-free
+    // positional indices the analyzer minted symbols against — without the
+    // strip, a leading prefix shifts name/type/params/body/kindByChild by one
+    // (silent wrong-child). The prefix subtree stays reachable for `linkageFrom`
+    // via `specifierPrefixChild`.
 
-    // The declaration's specifier-prefix subtree, or invalid if none/not-first.
-    [[nodiscard]] NodeId specifierPrefix(NodeId node, DeclarationRule const& decl) const {
-        if (!decl.specifierPrefixRule.has_value()) return {};
-        auto vis = visible(node);
-        if (!vis.empty() && tree().kind(vis.front()) == NodeKind::Internal
-            && tree().rule(vis.front()) == *decl.specifierPrefixRule)
-            return vis.front();
-        return {};
-    }
-    // Visible children with a leading specifier prefix stripped — the list the
-    // positional name/type/params/body indices resolve against.
-    [[nodiscard]] std::vector<NodeId> declVisible(NodeId node, DeclarationRule const& decl) const {
-        auto vis = visible(node);
-        if (specifierPrefix(node, decl).valid()) vis.erase(vis.begin());
-        return vis;
-    }
-    // `descend` whose FIRST step resolves against the prefix-stripped children
-    // (start IS the declaration); deeper steps use ordinary `visible` (past any
-    // prefix). Mirrors the analyzer's `descendVisibleDecl`.
-    [[nodiscard]] NodeId descendDecl(NodeId start, std::vector<std::uint32_t> const& path,
-                                     DeclarationRule const& decl) {
-        if (path.empty()) return start;
-        auto vis = declVisible(start, decl);
-        if (path.front() >= vis.size()) return {};
-        NodeId cur = vis[path.front()];
-        for (std::size_t i = 1; i < path.size(); ++i) {
-            if (!cur.valid()) return {};
-            auto v = visible(cur);
-            if (path[i] >= v.size()) return {};
-            cur = v[path[i]];
-        }
-        return cur;
-    }
     // Fold the linkage effects of every specifier token in `prefixNode` onto a
     // LinkageAttr, per the declaration's `linkageSpecifiers` facet (token SOURCE
     // TEXT → effect). A token whose KIND is in `linkageSpecifierIgnoredKinds` (the
@@ -637,27 +607,94 @@ struct Lowerer {
     [[nodiscard]] LinkageAttr linkageFrom(NodeId prefixNode, DeclarationRule const& decl) {
         LinkageAttr attr{};
         if (!prefixNode.valid() || decl.linkageSpecifiers.empty()) return attr;
-        std::vector<NodeId> stack{prefixNode};
-        while (!stack.empty()) {
-            NodeId n = stack.back();
-            stack.pop_back();
-            if (isToken(n)) {
-                SchemaTokenId const kind = tree().tokenKind(n);
-                bool ignored = false;
-                for (SchemaTokenId k : decl.linkageSpecifierIgnoredKinds)
-                    if (k == kind) { ignored = true; break; }
-                if (ignored) continue;  // declared structural syntax (e.g. __attribute__, parens)
-                auto it = decl.linkageSpecifiers.find(std::string{tree().text(n)});
-                if (it != decl.linkageSpecifiers.end()) {
-                    if (it->second.binding)    attr.binding    = *it->second.binding;
-                    if (it->second.visibility) attr.visibility = *it->second.visibility;
-                } else {
-                    emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
-                          std::format("'{}' is not a recognized linkage specifier",
-                                      tree().text(n)));
+        // Collect the prefix's tokens in SOURCE order (the composite-key
+        // pairing below is order-sensitive), skipping the subtrees of any
+        // `linkageSpecifierIgnoredRules` rule wholesale (FC4 c1 / D14 —
+        // attribute forms the language parses but semantically ignores,
+        // e.g. C23 `[[deprecated]]`: their identifiers must neither
+        // resolve as linkage specifiers nor fail loud as unknown ones).
+        std::vector<NodeId> toks;
+        {
+            std::vector<NodeId> stack{prefixNode};
+            while (!stack.empty()) {
+                NodeId n = stack.back();
+                stack.pop_back();
+                if (isToken(n)) {
+                    toks.push_back(n);
+                    continue;
                 }
+                bool skip = false;
+                for (RuleId rid : decl.linkageSpecifierIgnoredRules) {
+                    if (tree().rule(n).v == rid.v) { skip = true; break; }
+                }
+                if (skip) continue;
+                auto const kids = visible(n);
+                for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
+                    stack.push_back(*it);   // reverse-push → source order
+                }
+            }
+        }
+        // String-literal token kinds (from the language's hirLowering
+        // literal config) drive the COMPOSITE form: a specifier identifier
+        // immediately followed by a parenthesized string literal forms the
+        // lookup key `<identifier>:<decoded-body>` — c-subset's
+        // `__attribute__((visibility("hidden")))` resolves the declared
+        // facet key "visibility:hidden". Generic: ANY attr-with-string-arg
+        // works; an unknown composite fails loud with the composite key.
+        SchemaTokenId const strStart = cfg.stringStartToken;
+        SchemaTokenId const strBody  = cfg.stringBodyToken;
+        auto const isIgnoredKind = [&](SchemaTokenId kind) {
+            for (SchemaTokenId k : decl.linkageSpecifierIgnoredKinds)
+                if (k == kind) return true;
+            return false;
+        };
+        for (std::size_t i = 0; i < toks.size(); ++i) {
+            NodeId const n = toks[i];
+            SchemaTokenId const kind = tree().tokenKind(n);
+            if (isIgnoredKind(kind)) continue;  // declared structural syntax
+            if (strStart.valid()
+                && (kind == strStart
+                    || (strBody.valid() && kind == strBody))) {
+                // String tokens are consumed by the composite pairing
+                // below; a string with NO preceding specifier identifier
+                // falls through that pairing and is skipped here (the
+                // grammar only admits strings inside an attr argument).
+                continue;
+            }
+            std::string key{tree().text(n)};
+            // Composite probe: the next non-ignored token opens a string
+            // literal → pair this specifier with the decoded body.
+            if (strStart.valid() && strBody.valid()) {
+                std::size_t j = i + 1;
+                while (j < toks.size()
+                       && isIgnoredKind(tree().tokenKind(toks[j]))) {
+                    ++j;
+                }
+                if (j + 1 < toks.size()
+                    && tree().tokenKind(toks[j]) == strStart
+                    && tree().tokenKind(toks[j + 1]) == strBody) {
+                    auto decoded =
+                        decodeStringLiteralBody(tree().text(toks[j + 1]));
+                    if (decoded.has_value()) {
+                        key += ':';
+                        key += *decoded;
+                    } else {
+                        emitH(DiagnosticCode::H_UnknownLinkageSpecifier,
+                              toks[j + 1],
+                              std::format("malformed string argument in "
+                                          "specifier '{}'", key));
+                        continue;
+                    }
+                }
+            }
+            auto it = decl.linkageSpecifiers.find(key);
+            if (it != decl.linkageSpecifiers.end()) {
+                if (it->second.binding)    attr.binding    = *it->second.binding;
+                if (it->second.visibility) attr.visibility = *it->second.visibility;
             } else {
-                for (NodeId c : visible(n)) stack.push_back(c);
+                emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
+                      std::format("'{}' is not a recognized linkage specifier",
+                                  key));
             }
         }
         return attr;
@@ -1003,6 +1040,28 @@ struct Lowerer {
         return exprError(node, "SQL operand has no recognizable form");
     }
 
+    // Shared callee-signature resolution (FC4 c2, plan-lock MUST-FIX 3):
+    // a callee expression carries either the FnSig directly (a direct /
+    // paren-wrapped designator) or `Ptr<FnSig>` (a function-pointer
+    // value — the canonical c-subset fn-ptr type). Unwrap ONE pointer
+    // level, mirroring hir_verifier.cpp's checkCallArguments. Feeds
+    // BOTH call arms' param COERCION + inferred result type — without
+    // it, indirect-call arguments would silently skip coercion (the
+    // width/signedness miscompile class). InvalidType when the callee
+    // type is neither shape (opaque/extension callee — the verifier
+    // owns arity rules there).
+    [[nodiscard]] TypeId calleeSigOf(TypeId t) const {
+        if (!t.valid()) return InvalidType;
+        if (interner.kind(t) == TypeKind::FnSig) return t;
+        if (interner.kind(t) == TypeKind::Ptr) {
+            auto const ops = interner.operands(t);
+            if (!ops.empty() && interner.kind(ops[0]) == TypeKind::FnSig) {
+                return ops[0];
+            }
+        }
+        return InvalidType;
+    }
+
     // SQL `f(args)` → a core Call (callee Ref + lowered argument expressions),
     // reusing the semantics `callRules` callee/args child positions.
     E lowerSqlCall(NodeId callNode) {
@@ -1026,8 +1085,11 @@ struct Lowerer {
             return exprError(callNode, "call has no callee child");
         }
         std::vector<HirNodeId> args;
-        // If the callee's typeId is a FnSig, coerce each arg to its declared
-        // param type. Variadic / unknown signatures pass through unchanged
+        // If the callee resolves to a signature — a FnSig designator OR
+        // a `Ptr<FnSig>` function-pointer value (FC4 c2: `calleeSigOf`
+        // unwraps one level so indirect-call args coerce exactly like
+        // direct-call args) — coerce each arg to its declared param
+        // type. Variadic / unknown signatures pass through unchanged
         // (the verifier owns the arity-vs-FnSig rule).
         //
         // M2 silent-failure fix (3-agent root-cause analysis, 2026-06-02):
@@ -1038,9 +1100,10 @@ struct Lowerer {
         // (e.g., `interner.pointer()` / `interner.array()` during a
         // nested arg lowering), silently dangling the span. Same
         // pattern applied at lowerPostfix's call arm.
+        TypeId const calleeSig = calleeSigOf(calleeTy);
         std::vector<TypeId> paramTypes;
-        if (calleeTy.valid() && interner.kind(calleeTy) == TypeKind::FnSig) {
-            auto const paramSpan = interner.fnParams(calleeTy);
+        if (calleeSig.valid()) {
+            auto const paramSpan = interner.fnParams(calleeSig);
             paramTypes.assign(paramSpan.begin(), paramSpan.end());
         }
         std::size_t argIdx = 0;
@@ -1070,8 +1133,9 @@ struct Lowerer {
                 ++argIdx;
             }
         }
-        TypeId const result = (calleeTy.valid() && interner.kind(calleeTy) == TypeKind::FnSig)
-                            ? interner.fnResult(calleeTy) : typeAtOr(callNode, InvalidType);
+        TypeId const result = calleeSig.valid()
+                            ? interner.fnResult(calleeSig)
+                            : typeAtOr(callNode, InvalidType);
         return {track(builder.makeCall(callee, args, result), callNode), result};
     }
 
@@ -1459,6 +1523,27 @@ struct Lowerer {
             return {track(builder.makeAddressOf(operand.id, result), node), result};
         }
         if (e.target == "Deref") {
+            // FC4 c2 — C 6.5.3.2p4 designator decay as a lattice law:
+            // `*` applied to a function pointer yields the function
+            // DESIGNATOR, which (outside sizeof/&) immediately decays
+            // back to the pointer — the deref is the IDENTITY. Return
+            // the operand UNCHANGED (no Deref node): covers
+            // `(*fp)(40)` and the recursive `(***fp)(x)` (each level
+            // folds), and `(*helper)(40)` (operand's own type is the
+            // FnSig designator). WITHOUT this fold a Deref node would
+            // lower to a memory LOAD THROUGH the code pointer —
+            // executing the callee's first 8 instruction bytes as an
+            // address: silent garbage. Lattice-kind-driven only.
+            if (operand.type.valid()) {
+                TypeKind const opk = interner.kind(operand.type);
+                if (opk == TypeKind::FnSig) return operand;
+                if (opk == TypeKind::Ptr
+                    && !interner.operands(operand.type).empty()
+                    && interner.kind(interner.operands(operand.type)[0])
+                           == TypeKind::FnSig) {
+                    return operand;
+                }
+            }
             TypeId result = InvalidType;
             if (operand.type.valid() && interner.kind(operand.type) == TypeKind::Ptr)
                 result = interner.operands(operand.type)[0];
@@ -1548,9 +1633,14 @@ struct Lowerer {
         E base = lowerExpr(baseN);
         if (e.target == "Call") {
             std::vector<HirNodeId> args;
-            // Coerce each arg to its FnSig param type (when the callee's
-            // signature is known). Same discipline as the lowerFlatExpr's
-            // call arm above — single source of truth for arg-coercion.
+            // Coerce each arg to its declared param type when the
+            // callee's signature is known — a FnSig designator OR a
+            // `Ptr<FnSig>` function-pointer value (FC4 c2:
+            // `calleeSigOf` unwraps one level so INDIRECT-call args
+            // coerce exactly like direct-call args; skipping coercion
+            // here would be the width/signedness miscompile class).
+            // Same discipline as lowerSqlCall — single source of truth
+            // for arg-coercion.
             //
             // M2 silent-failure fix (3-agent root-cause analysis,
             // 2026-06-02): `interner.fnParams()` returns a span into
@@ -1564,9 +1654,10 @@ struct Lowerer {
             // interner growth. Cost: one small heap allocation per
             // call site; rare alternative is a `std::array`-backed
             // small-buffer for ≤8-param calls (most calls).
+            TypeId const calleeSig = calleeSigOf(base.type);
             std::vector<TypeId> paramTypes;
-            if (base.type.valid() && interner.kind(base.type) == TypeKind::FnSig) {
-                auto const paramSpan = interner.fnParams(base.type);
+            if (calleeSig.valid()) {
+                auto const paramSpan = interner.fnParams(calleeSig);
                 paramTypes.assign(paramSpan.begin(), paramSpan.end());
             }
             std::size_t argIdx = 0;
@@ -1580,10 +1671,10 @@ struct Lowerer {
                 ++argIdx;
             }
             // Prefer the semantic phase's resolved call type (it types call nodes);
-            // fall back to the callee FnSig's result.
+            // fall back to the callee signature's result (direct FnSig
+            // or unwrapped Ptr<FnSig> — FC4 c2).
             TypeId inferred = InvalidType;
-            if (base.type.valid() && interner.kind(base.type) == TypeKind::FnSig)
-                inferred = interner.fnResult(base.type);
+            if (calleeSig.valid()) inferred = interner.fnResult(calleeSig);
             TypeId const result = typeAtOr(node, inferred);
             return {track(builder.makeCall(base.id, args, result), node), result};
         }
@@ -2051,10 +2142,19 @@ struct Lowerer {
             if (tree().kind(c) == NodeKind::Internal) { exprChild = c; break; }
         }
         if (!exprChild.valid()) return std::nullopt;
-        // Hand off to the shared CST const-eval engine (plan 12.5
-        // §0.2 D6). Folds literal arithmetic / bitops / ternary /
-        // parens, plus identifier refs to `isConst`-bound symbols
-        // resolved through the frozen SemanticModel.
+        return evalCstConstInt(exprChild);
+    }
+
+    // Fold a CST expression to a compile-time `int64` through the shared
+    // CST const-eval engine (plan 12.5 §0.2 D6). Folds literal
+    // arithmetic / bitops / ternary / parens, plus identifier refs to
+    // `isConst`-bound symbols resolved through the frozen SemanticModel.
+    // Returns nullopt when the expression is not a foldable integer
+    // constant. Single source of truth for "what is a compile-time
+    // integer at this lowering tier" — shared by the index-designator
+    // resolver and the provably-infinite-loop condition test, so the
+    // two can never drift on what folds.
+    [[nodiscard]] std::optional<std::int64_t> evalCstConstInt(NodeId exprNode) {
         std::unordered_set<std::uint32_t> intLits;
         for (auto const& [tok, kind] : litCore_) {
             if (!isFloatCore(kind)) intLits.insert(tok);
@@ -2084,14 +2184,18 @@ struct Lowerer {
             if (rec->tree.v != tree().id().v) return std::nullopt;
             for (auto const& dr : sem.declarations) {
                 if (dr.rule.v == tree().rule(rec->declRuleNode).v) {
-                    auto initExpr = findInitExprInDecl(tree(), dr, rec->declRuleNode);
+                    // FC4 c1: declarator-mode rows need the symbol's NAME
+                    // node to pick the right init out of a multi-
+                    // declarator list (`const int K = 8, L = 9;`).
+                    auto initExpr = findInitExprInDecl(
+                        tree(), dr, rec->declRuleNode, rec->declNode);
                     if (!initExpr.has_value()) return std::nullopt;
                     return CstResolvedSymbol{*initExpr, rec->scope.v};
                 }
             }
             return std::nullopt;
         };
-        ConstEvalResult const r = evaluateConstantCst(exprChild, ctx, env);
+        ConstEvalResult const r = evaluateConstantCst(exprNode, ctx, env);
         if (!r.value.has_value()) return std::nullopt;
         return asInt64Bridge(*r.value);
     }
@@ -2764,12 +2868,102 @@ struct Lowerer {
         return track(builder.makeIfStmt(condId, then, els), node);
     }
 
+    // ── provably-infinite-loop detection (D-HIR-INFINITE-LOOP-NOT-TERMINATING) ──
+    //
+    // The verifier's `pathTerminates` is deliberately conservative — a loop body
+    // is never counted as terminating. The documented design closes the gap at
+    // the lowering tier: a provably-infinite loop is wrapped as
+    // `Block{ loop, Unreachable }`, so `pathTerminates` (which recurses to a
+    // Block's last child) sees the synthetic `Unreachable` and reports the
+    // construct as terminating. This removes the over-rejection of a non-void
+    // function whose terminating tail is such a loop, WITHOUT touching the
+    // verifier / H0003 / the dead-code rule (a `Block` is not an
+    // `isUnconditionalTerminator`, so a statement after the wrapper is still not
+    // flagged dead — keeping this decoupled from the dead-code-after-terminator
+    // anchor). The synthetic `Unreachable` is never reached at runtime; orphaned
+    // dead blocks are dropped by the MIR unreachable-prune (a `while(1)` exit the
+    // const-true `CondBr` keeps structurally reachable stays a never-executed
+    // `Unreachable` until SimplifyCfg folds the branch), so runtime is unaffected.
+
+    // (1) Does this loop's CONDITION guarantee the test never fails — i.e. is the
+    // loop, on the condition alone, non-exiting? `nullopt` cond (`for(;;)`) is
+    // infinite by construction. A present cond is infinite iff it const-folds to a
+    // NONZERO integer (`while(1)`, `while(1==1)`, `while(K)` for a const `K!=0`).
+    // Uses the shared CST const-eval (single source of truth with the index-
+    // designator path). A cond that does not fold, or folds to zero, is NOT
+    // provably-infinite — we fall back to today's behavior (no wrap), so a
+    // not-provably-infinite loop can never be wrongly marked infinite.
+    [[nodiscard]] bool conditionIsProvablyTruthy(std::optional<NodeId> condNode) {
+        if (!condNode.has_value()) return true;          // for(;;) — no test
+        auto v = evalCstConstInt(*condNode);
+        return v.has_value() && *v != 0;
+    }
+
+    // (2) Can a `break` exit THIS loop's frame? Scans the loop's lowered HIR body,
+    // RESPECTING nesting: a `BreakStmt` reached in this loop's own frame (through
+    // if / block, but NOT through a nested loop or switch) targets THIS loop and
+    // so exits it. A `break` inside a nested loop/switch targets that inner
+    // construct — the scan does not descend into nested loop/switch bodies, so
+    // such a break does not count. `continue` (re-loops) and `return` (exits the
+    // function, not to after-the-loop) never make the loop fall through, so they
+    // are ignored. The de Bruijn break depth is not yet assigned at lowering
+    // (`makeBreak(0)`), so this STRUCTURAL frame-respecting scan — mirroring how
+    // an innermost-enclosing break target resolves — is the precise mechanism.
+    // Conservatism is one-directional: if in doubt we report a break exists
+    // (loop NOT infinite), never the reverse — a breakable loop is never wrongly
+    // wrapped.
+    [[nodiscard]] bool bodyHasReachableBreak(HirNodeId body) const {
+        switch (builder.kind(body)) {
+            case HirKind::BreakStmt:
+                return true;                              // targets this loop's frame
+            // A nested loop / switch captures any `break` inside it — do not
+            // descend; a break there does not exit THIS loop.
+            case HirKind::WhileStmt:
+            case HirKind::DoWhileStmt:
+            case HirKind::ForStmt:
+            case HirKind::SwitchStmt:
+                return false;
+            default:
+                for (HirNodeId c : builder.children(body))
+                    if (bodyHasReachableBreak(c)) return true;
+                return false;
+        }
+    }
+
+    // A loop is PROVABLY-INFINITE iff control can never fall through past it:
+    // its condition is constant-truthy/absent AND no `break` in its own frame
+    // exits it. `loopStmt` is the freshly-built (unparented) loop node;
+    // `loopBody` is its body subtree (already attached to `loopStmt`).
+    [[nodiscard]] bool loopIsProvablyInfinite(std::optional<NodeId> condNode,
+                                              HirNodeId loopBody) {
+        return conditionIsProvablyTruthy(condNode)
+            && !bodyHasReachableBreak(loopBody);
+    }
+
+    // Wrap a provably-infinite `loopStmt` as `Block{ loopStmt, Unreachable }`
+    // (both the Block and the leaf flagged `Synthetic`) so the construct
+    // structurally terminates; otherwise return `loopStmt` unchanged. `node` is
+    // the loop's CST node, used only for span tracking (the synthetic
+    // `Unreachable` has no source of its own).
+    [[nodiscard]] HirNodeId wrapIfProvablyInfinite(NodeId node, HirNodeId loopStmt,
+                                                   std::optional<NodeId> condNode,
+                                                   HirNodeId loopBody) {
+        if (!loopIsProvablyInfinite(condNode, loopBody)) return loopStmt;
+        HirNodeId const unreachable =
+            builder.addLeaf(HirKind::Unreachable, InvalidType, /*payload=*/0,
+                            HirFlags::Synthetic);
+        HirNodeId const wrapped[] = {loopStmt, unreachable};
+        return track(builder.makeBlock(wrapped, HirFlags::Synthetic), node);
+    }
+
     HirNodeId lowerWhile(NodeId node, bool doWhile) {
         std::optional<HirNodeId> cond, body;
+        std::optional<NodeId>    condNode;
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
             Role const role = classify(c);
             if (role == Role::Expr && !cond) {
+                condNode = c;
                 E const condE = lowerExpr(c);
                 cond = coerceCondition(condE, c).id;
             }
@@ -2777,8 +2971,10 @@ struct Lowerer {
         }
         HirNodeId condId = orError(cond, node, "loop has no condition");
         HirNodeId bodyId = orError(body, node, "loop has no body");
-        return doWhile ? track(builder.makeDoWhileStmt(bodyId, condId), node)
-                       : track(builder.makeWhileStmt(condId, bodyId), node);
+        HirNodeId const loop =
+            doWhile ? track(builder.makeDoWhileStmt(bodyId, condId), node)
+                    : track(builder.makeWhileStmt(condId, bodyId), node);
+        return wrapIfProvablyInfinite(node, loop, condNode, bodyId);
     }
 
     HirNodeId lowerFor(NodeId node) {
@@ -2798,16 +2994,19 @@ struct Lowerer {
         NodeId bodyN = clauses.back().second;
         clauses.pop_back();
         std::optional<HirNodeId> init, cond, update;
+        std::optional<NodeId>    condNode;   // nullopt for a clause-less `for(;;)`
         for (auto const& [s, c] : clauses) {
             if (s == 0)      init   = lowerForClause(c);
             else if (s == 1) {
+                condNode = c;
                 E const condE = lowerExpr(c);
                 cond = coerceCondition(condE, c).id;
             }
             else if (s == 2) update = lowerForClause(c);
         }
         HirNodeId body = lowerStmt(bodyN);
-        return track(builder.makeForStmt(init, cond, update, body), node);
+        HirNodeId const loop = track(builder.makeForStmt(init, cond, update, body), node);
+        return wrapIfProvablyInfinite(node, loop, condNode, body);
     }
 
     // A for init/update clause: a varDeclHead → VarDecl; an assignment → AssignStmt;
@@ -2873,13 +3072,112 @@ struct Lowerer {
     // inside a block and to a `Global` at module scope (`asGlobal`); a language
     // whose top-level and local variables share one rule — toy's `varDecl` — is
     // disambiguated by lowering context, not by a second rule.
+    // FC4 c1: declarator-mode rows lower ONE VarDecl/Global PER NAMED
+    // declarator (`int x = 1, *p = q;` → two nodes). Appends to `out` so
+    // multi-node consumers (lowerTopLevelInto's module globals) stay flat;
+    // single-node statement consumers wrap via `lowerVarLike` below.
+    void lowerVarLikeInto(NodeId node, bool asGlobal,
+                          std::vector<HirNodeId>& out) {
+        auto it = declMap_.find(tree().rule(node).v);
+        DeclarationRule const* decl =
+            (it != declMap_.end()) ? &sem.declarations[it->second] : nullptr;
+        if (decl == nullptr || !decl->isDeclaratorMode()
+            || !sem.declarators.has_value()) {
+            out.push_back(lowerVarLikeLegacy(node, asGlobal, decl));
+            return;
+        }
+        DeclaratorConfig const& dc = *sem.declarators;
+        auto vis = declRoleChildren(tree(), node, *decl);
+        auto const carrier = decl->declaratorListChild.has_value()
+                                 ? decl->declaratorListChild
+                                 : decl->declaratorChild;
+        // SINGLE-declarator (param-like) rows: an ABSTRACT param (no name,
+        // or no declarator at all — `int f(int)` / `int f(int *)`) STILL
+        // occupies an argument slot. Emit a nameless VarDecl typed by the
+        // semantic stamp on the row node — skipping it would silently
+        // shift every later parameter's argument register (a miscompile).
+        bool const singleMode = decl->declaratorChild.has_value();
+        auto const emitAbstractSlot = [&]() {
+            TypeId const slotTy = typeAtOr(node, InvalidType);
+            // C 6.7.6.3p10 (`parameters.soleVoidMeansEmpty`): the sole
+            // `(void)` parameter declares NO parameter — the semantic
+            // FnSig already dropped it; emitting a VarDecl slot here
+            // would desynchronize the Function node's param count from
+            // its FnSig (the verifier's param-count check). Any OTHER
+            // abstract void param was already rejected loud
+            // (S_InvalidVoidParam), so skipping void-typed abstract
+            // slots is exact, not lossy.
+            if (sem.parameters.soleVoidMeansEmpty && slotTy.valid()
+                && interner.kind(slotTy) == TypeKind::Void) {
+                return;
+            }
+            out.push_back(track(
+                builder.makeVarDecl(slotTy, 0, std::nullopt), node));
+        };
+        if (!carrier.has_value() || *carrier >= vis.size()) {
+            if (singleMode) emitAbstractSlot();
+            return;
+        }
+        std::vector<NodeId> declarators;
+        collectDeclarators(tree(), vis[*carrier], dc, declarators);
+        if (singleMode && declarators.empty()) {
+            emitAbstractSlot();
+            return;
+        }
+        for (NodeId d : declarators) {
+            NodeId const nameNode = declaratorNameNode(tree(), d, dc);
+            if (!nameNode.valid()) {
+                // Abstract: param-like rows keep the slot (above);
+                // list rows mint nothing — the semantic tier already
+                // rejected the form where names are required.
+                if (singleMode) emitAbstractSlot();
+                continue;
+            }
+            SymbolId const sym = model.symbolAt(nameNode);
+            TypeId type = InvalidType;
+            if (auto const* rec = model.recordFor(sym)) type = rec->type;
+            // The init = the init-declarator's visible Internal child that
+            // is NOT the declarator (`[declarator, '=', initValue]`).
+            std::optional<HirNodeId> init;
+            if (tree().rule(d).v == dc.initDeclaratorRule.v) {
+                for (NodeId c : visible(d)) {
+                    if (isToken(c)) continue;
+                    if (tree().rule(c).v == dc.declaratorRule.v) continue;
+                    init = lowerExprOrBraceInit(c, type);
+                    break;
+                }
+            }
+            out.push_back(asGlobal
+                ? track(builder.makeGlobal(type, sym.v, init), d)
+                : track(builder.makeVarDecl(type, sym.v, init), d));
+        }
+    }
+
+    // Single-node statement-context wrapper: one declarator lowers to its
+    // bare VarDecl (the pre-FC4 shape, unchanged for every single-
+    // declarator program); a multi-declarator statement wraps its VarDecls
+    // in a Block (statement positions hold exactly one node). Zero named
+    // declarators yield an empty Block — never silent: the semantic tier's
+    // requireNamedDeclarators already erred for the named positions.
     HirNodeId lowerVarLike(NodeId node, bool asGlobal) {
+        std::vector<HirNodeId> out;
+        lowerVarLikeInto(node, asGlobal, out);
+        if (out.size() == 1) return out[0];
+        return track(builder.makeBlock(out), node);
+    }
+
+    HirNodeId lowerVarLikeLegacy(NodeId node, bool asGlobal,
+                                 DeclarationRule const* decl) {
         if (subtreeHasDeferred(node))
             return reportedError(node, "array declarator is deferred to HR9 "
                                        "(the lattice has no Array type yet)");
-        auto it = declMap_.find(tree().rule(node).v);
-        DeclarationRule const* decl = (it != declMap_.end()) ? &sem.declarations[it->second] : nullptr;
-        auto vis = visible(node);
+        // STRIP-AWARE on purpose (D-DECL-PREFIX-STRIP-SHARED-HELPER closure
+        // fix): this used raw `visible(node)` — a latent wrong-child shift the
+        // day a VarDecl-dispatch rule gains a `specifierPrefix` (no shipped one
+        // does today, so this is behavior-preserving now and load-bearing when
+        // local declarations gain specifiers). No DeclarationRule ⇒ no prefix
+        // possible ⇒ raw visible children.
+        auto vis = decl ? declRoleChildren(tree(), node, *decl) : visible(node);
         SymbolId sym{};
         TypeId type = InvalidType;
         if (decl && decl->nameChild && *decl->nameChild < vis.size()) {
@@ -2918,23 +3216,145 @@ struct Lowerer {
     HirNodeId lowerTypeDecl(NodeId node) {
         auto it = declMap_.find(tree().rule(node).v);
         DeclarationRule const* decl = (it != declMap_.end()) ? &sem.declarations[it->second] : nullptr;
-        auto vis = visible(node);
+        // Strip-aware for the same reason as `lowerVarLike` above: no shipped
+        // type-decl rule declares a `specifierPrefix` today (behavior-
+        // preserving), but a prefixed one must not shift `nameChild`.
+        auto vis = decl ? declRoleChildren(tree(), node, *decl) : visible(node);
         SymbolId sym{};
         TypeId type = InvalidType;
-        if (decl && decl->nameChild && *decl->nameChild < vis.size()) {
+        // FC4 c1: declarator-mode type rows (c-subset typedefDecl) carry the
+        // declared name inside the declarator — the shared walk finds it.
+        if (decl && decl->isDeclaratorMode() && sem.declarators.has_value()) {
+            auto const carrier = decl->declaratorListChild.has_value()
+                                     ? decl->declaratorListChild
+                                     : decl->declaratorChild;
+            if (carrier.has_value() && *carrier < vis.size()) {
+                std::vector<NodeId> declarators;
+                collectDeclarators(tree(), vis[*carrier], *sem.declarators,
+                                   declarators);
+                for (NodeId d : declarators) {
+                    NodeId const nameNode =
+                        declaratorNameNode(tree(), d, *sem.declarators);
+                    if (!nameNode.valid()) continue;
+                    sym = model.symbolAt(nameNode);
+                    if (auto const* rec = model.recordFor(sym)) type = rec->type;
+                    break;   // typedefs declare a single declarator
+                }
+            }
+        } else if (decl && decl->nameChild && *decl->nameChild < vis.size()) {
             sym = model.symbolAt(vis[*decl->nameChild]);
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
         }
         return track(builder.makeTypeDecl(type, sym.v), node);
     }
 
+    // FC4 c1: declarator-mode topLevelDecl — Function (the kindByChild
+    // discriminator matched the block tail) or one Global PER named
+    // declarator. Appends to `out` (module decls are a flat list — a
+    // Block wrapper would hide globals from the HIR→MIR module walk).
+    void lowerTopLevelInto(NodeId node, std::vector<HirNodeId>& out) {
+        auto it = declMap_.find(tree().rule(node).v);
+        if (it == declMap_.end()) {
+            unsupported(node, "top-level decl has no semantics rule");
+            out.push_back(errorNode(node));
+            return;
+        }
+        DeclarationRule const& decl = sem.declarations[it->second];
+        if (!decl.isDeclaratorMode() || !sem.declarators.has_value()) {
+            out.push_back(lowerTopLevel(node));   // legacy positional path
+            return;
+        }
+        DeclaratorConfig const& dc = *sem.declarators;
+        auto vis = declRoleChildren(tree(), node, decl);
+        LinkageAttr const linkAttr =
+            linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
+        // Function iff the kindByChild discriminator matches (the block
+        // tail). bodyPath empty ⇒ the matched node IS the body (the
+        // declarator-mode convention — params live in the declarator).
+        NodeId discNode{};
+        bool isFn = false;
+        if (decl.kindByChild) {
+            discNode = descendVisibleDecl(tree(), node,
+                                          decl.kindByChild->childPath, decl);
+            isFn = discNode.valid()
+                && tree().kind(discNode) == NodeKind::Internal
+                && tree().rule(discNode).v == decl.kindByChild->whenRule.v;
+        }
+        auto const carrier = decl.declaratorListChild.has_value()
+                                 ? decl.declaratorListChild
+                                 : decl.declaratorChild;
+        if (!carrier.has_value() || *carrier >= vis.size()) return;
+        std::vector<NodeId> declarators;
+        collectDeclarators(tree(), vis[*carrier], dc, declarators);
+
+        if (isFn) {
+            // The function = the sole named declarator (the semantic tier
+            // enforces exactly-one / named / fn-suffix / no-init via
+            // S_InvalidFunctionDeclarator + S_DeclarationDeclaresNothing;
+            // lowering degrades to an Error node when those fired).
+            NodeId fnName{};
+            for (NodeId d : declarators) {
+                fnName = declaratorNameNode(tree(), d, dc);
+                if (fnName.valid()) break;
+            }
+            if (!fnName.valid()) {
+                out.push_back(errorNode(node));
+                return;
+            }
+            SymbolId const sym = model.symbolAt(fnName);
+            TypeId sig = InvalidType;
+            if (auto const* rec = model.recordFor(sym)) sig = rec->type;
+            // Params live in the fn suffix attached to the NAME's direct
+            // declarator (`int (*f(int a))(int b)` — f's params are `a`;
+            // the outer suffix shapes the return type only).
+            std::vector<HirNodeId> params;
+            NodeId const direct = tree().parent(fnName);
+            if (direct.valid() && tree().kind(direct) == NodeKind::Internal
+                && tree().rule(direct).v == dc.directRule.v) {
+                for (NodeId c : visible(direct)) {
+                    if (tree().kind(c) == NodeKind::Internal
+                        && tree().rule(c).v == dc.fnSuffixRule.v) {
+                        collectParams(c, params);
+                        break;
+                    }
+                }
+            }
+            NodeId const bodyNode =
+                (decl.kindByChild && !decl.kindByChild->bodyPath.empty())
+                    ? descend(discNode, decl.kindByChild->bodyPath)
+                    : discNode;
+            TypeId const savedReturn = currentReturnType_;
+            TypeId const retType =
+                sig.valid() ? interner.fnResult(sig) : InvalidType;
+            currentReturnType_ = retType;
+            HirNodeId body = bodyNode.valid()
+                ? lowerStmt(bodyNode)
+                : track(builder.makeBlock({}), node);
+            currentReturnType_ = savedReturn;
+            body = maybeAppendImplicitReturnZero(node, body, sym, retType,
+                                                 decl);
+            HirNodeId const fn_ =
+                track(builder.makeFunction(sig, sym.v, params, body), node);
+            recordLinkage(fn_, linkAttr);
+            out.push_back(fn_);
+            return;
+        }
+
+        // Globals — one per named declarator, each with the decl's linkage.
+        std::size_t const before = out.size();
+        lowerVarLikeInto(node, /*asGlobal=*/true, out);
+        for (std::size_t i = before; i < out.size(); ++i) {
+            recordLinkage(out[i], linkAttr);
+        }
+    }
+
     // topLevelDecl → Function (when the kindByChild discriminator resolves to
-    // funcDefTail) or Global.
+    // funcDefTail) or Global. LEGACY positional path (toy-style rows).
     HirNodeId lowerTopLevel(NodeId node) {
         auto it = declMap_.find(tree().rule(node).v);
         if (it == declMap_.end()) { unsupported(node, "top-level decl has no semantics rule"); return errorNode(node); }
         DeclarationRule const& decl = sem.declarations[it->second];
-        auto vis = declVisible(node, decl);
+        auto vis = declRoleChildren(tree(), node, decl);
         SymbolId sym{};
         TypeId type = InvalidType;
         if (decl.nameChild && *decl.nameChild < vis.size()) {
@@ -2944,11 +3364,13 @@ struct Lowerer {
         // D-CSUBSET-LINKAGE-SPECIFIERS: linkage from the (optional) specifier
         // prefix, attached below to the lowered Function/Global node and threaded
         // to MIR for DCE protection.
-        LinkageAttr const linkAttr = linkageFrom(specifierPrefix(node, decl), decl);
+        LinkageAttr const linkAttr =
+            linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
         // Function iff the kindByChild discriminator matches funcDefTail.
         NodeId discNode{};
         if (decl.kindByChild) {
-            discNode = descendDecl(node, decl.kindByChild->childPath, decl);
+            discNode = descendVisibleDecl(tree(), node,
+                                          decl.kindByChild->childPath, decl);
             if (discNode.valid() && tree().kind(discNode) == NodeKind::Internal
                 && tree().rule(discNode).v == decl.kindByChild->whenRule.v) {
                 return lowerFunction(node, sym, type, decl, *decl.kindByChild, discNode, linkAttr);
@@ -2960,7 +3382,7 @@ struct Lowerer {
                                        "(the lattice has no Array type yet)");
         std::optional<HirNodeId> init;
         RuleId const skip = arraySuffixSkipRule(decl);
-        for (NodeId c : descendantsForInit(node, skip)) if (isExprNode(c)) {
+        for (NodeId c : descendantsForInit(node, skip, &decl)) if (isExprNode(c)) {
             // Coerce the initializer to the declared variable type — the same
             // discipline `lowerVarLike` applies for local VarDecls. Without
             // this, a module global declared `int g = 1.7 + 2.5;` lands with
@@ -3029,34 +3451,47 @@ struct Lowerer {
         if (pathTerminates(builder, body)) return body;
 
         // Build the synthetic return — a zero literal of retType
-        // wrapped in a ReturnStmt, both flagged Synthetic. Then
-        // wrap the original body's children + the new return in a
-        // fresh outer Block (also Synthetic). The original Block
-        // node remains in the arena but is orphaned — HIR is built
-        // bottom-up immutable; node mutation is not supported.
+        // wrapped in a ReturnStmt, both flagged Synthetic. Then NEST
+        // the (still-unparented) body Block and the new return inside
+        // a fresh outer Block (also Synthetic): `{ <body> return 0; }`.
+        //
+        // We must NOT re-wrap the body's existing children: HIR is
+        // immutable and tree-shaped — every node has at most one parent
+        // and there is no detach/re-parent. The body's children are
+        // already attached to `body`, so reusing them under a new Block
+        // would double-attach and trip `addParent`'s fail-loud guard.
+        // `body` ITSELF is unparented here (the lowered function body is
+        // not attached until `makeFunction` consumes the value we
+        // return), so attaching it once as the outer Block's first child
+        // is safe. A Block whose first child is a Block is valid HIR
+        // (a nested scope, `{ {…} return 0; }`); the verifier's
+        // return-completeness check recurses to the outer Block's LAST
+        // child (the return) and the dead-code check sees the leading
+        // Block — not an unconditional terminator — so the trailing
+        // return is never flagged unreachable. MIR's unreachable-prune
+        // later drops the dead return for a body that does terminate
+        // (e.g. an infinite-loop main), so runtime stays correct.
         HirNodeId const zero = synthZeroOrError(node, retType);
         HirNodeId const ret  = track(
             builder.makeReturn(zero, HirFlags::Synthetic), node);
-        auto const oldKids = builder.children(body);
-        std::vector<HirNodeId> newKids(
-            oldKids.begin(), oldKids.end());
-        newKids.push_back(ret);
+        HirNodeId const wrapped[] = {body, ret};
         return track(
-            builder.makeBlock(newKids, HirFlags::Synthetic), node);
+            builder.makeBlock(wrapped, HirFlags::Synthetic), node);
     }
 
     HirNodeId lowerFunctionDecl(NodeId node) {
         auto it = declMap_.find(tree().rule(node).v);
         if (it == declMap_.end()) return reportedError(node, "function decl has no semantics rule");
         DeclarationRule const& decl = sem.declarations[it->second];
-        auto vis = declVisible(node, decl);
+        auto vis = declRoleChildren(tree(), node, decl);
         SymbolId sym{};
         TypeId sig = InvalidType;
         if (decl.nameChild && *decl.nameChild < vis.size()) {
             sym = model.symbolAt(vis[*decl.nameChild]);
             if (auto const* rec = model.recordFor(sym)) sig = rec->type;
         }
-        LinkageAttr const linkAttr = linkageFrom(specifierPrefix(node, decl), decl);
+        LinkageAttr const linkAttr =
+            linkageFrom(specifierPrefixChild(tree(), node, decl), decl);
         std::vector<HirNodeId> params;
         if (decl.paramsChild && *decl.paramsChild < vis.size())
             collectParams(vis[*decl.paramsChild], params);
@@ -3085,7 +3520,7 @@ struct Lowerer {
         auto it = declMap_.find(tree().rule(node).v);
         if (it == declMap_.end()) return reportedError(node, "extern decl has no semantics rule");
         DeclarationRule const& decl = sem.declarations[it->second];
-        auto vis = declVisible(node, decl);
+        auto vis = declRoleChildren(tree(), node, decl);
         SymbolId sym{};
         TypeId type = InvalidType;
         if (decl.nameChild && *decl.nameChild < vis.size()) {
@@ -3104,7 +3539,11 @@ struct Lowerer {
         // the override string body.
         auto extractLibraryOverride = [&]() -> std::string {
             if (!decl.kindByChild) return {};
-            NodeId disc = descend(node, decl.kindByChild->childPath);
+            // Strip-aware: `childPath` is authored against the declaration's
+            // prefix-free numbering (D-DECL-PREFIX-STRIP-SHARED-HELPER). A
+            // no-op today — externDecl declares no specifierPrefix.
+            NodeId disc = descendVisibleDecl(tree(), node,
+                                             decl.kindByChild->childPath, decl);
             if (!disc.valid() || tree().kind(disc) != NodeKind::Internal) {
                 return {};
             }
@@ -3165,10 +3604,11 @@ struct Lowerer {
             // Gate 1): route the extern arm through the SAME linkageFrom chokepoint
             // as lowerTopLevel/lowerFunctionDecl, so specifier validation is
             // by-construction for EVERY decl-lowering arm, not a hand-picked subset.
-            // A no-op today (externDecl declares no specifierPrefix → specifierPrefix
-            // returns invalid → linkageFrom early-returns); structural for the day an
-            // extern gains specifiers.
-            recordLinkage(h, linkageFrom(specifierPrefix(node, decl), decl));
+            // A no-op today (externDecl declares no specifierPrefix →
+            // specifierPrefixChild returns invalid → linkageFrom early-returns);
+            // structural for the day an extern gains specifiers.
+            recordLinkage(h, linkageFrom(specifierPrefixChild(tree(), node, decl),
+                                         decl));
             auto const* rec = model.recordFor(sym);
             // Model 3: the source `"libname"` override is format-independent →
             // project it under every object-format key so the compile-pipeline
@@ -3178,7 +3618,11 @@ struct Lowerer {
                                    uniformLibraryMap(extractLibraryOverride())});
         };
         if (decl.kindByChild) {
-            NodeId disc = descend(node, decl.kindByChild->childPath);
+            // Strip-aware: `childPath` is authored against the declaration's
+            // prefix-free numbering (D-DECL-PREFIX-STRIP-SHARED-HELPER). A
+            // no-op today — externDecl declares no specifierPrefix.
+            NodeId disc = descendVisibleDecl(tree(), node,
+                                             decl.kindByChild->childPath, decl);
             if (disc.valid() && tree().kind(disc) == NodeKind::Internal
                 && tree().rule(disc).v == decl.kindByChild->whenRule.v) {
                 std::vector<HirNodeId> params;
@@ -3229,7 +3673,9 @@ struct Lowerer {
                   "extern shape can be lowered safely");
             return errorNode(node);
         }
-        NodeId const varDeclTail = descend(node, decl.kindByChild->childPath);
+        // Strip-aware for the same reason as the two `disc` probes above.
+        NodeId const varDeclTail =
+            descendVisibleDecl(tree(), node, decl.kindByChild->childPath, decl);
         if (!varDeclTail.valid()
             || tree().kind(varDeclTail) != NodeKind::Internal) {
             // Post-fold #12 D-FF2-MSG-JARGON: user-facing message
@@ -3283,19 +3729,36 @@ struct Lowerer {
         return fn_;
     }
 
-    // Gather param VarDecls under a funcParams subtree (nodes mapped to VarDecl).
+    // Gather param VarDecls under a funcParams/fnSuffix subtree (nodes
+    // mapped to VarDecl). FC4 c1: route through `lowerVarLikeInto` — a
+    // declarator-mode param appends exactly its slots (0 for the dropped
+    // sole-`(void)` param, 1 otherwise); the single-node `lowerVarLike`
+    // wrapper would wrap a zero-slot param in an empty Block, which the
+    // HIR verifier rightly rejects in parameter position.
     void collectParams(NodeId n, std::vector<HirNodeId>& out) {
         HirRuleMapping const* m = mappingFor(n);
-        if (m != nullptr && m->hirKind == "VarDecl") { out.push_back(lowerVarDecl(n)); return; }
+        if (m != nullptr && m->hirKind == "VarDecl") {
+            lowerVarLikeInto(n, /*asGlobal=*/false, out);
+            return;
+        }
         for (NodeId c : visible(n)) if (!isToken(c)) collectParams(c, out);
     }
 
     // Direct children to scan for a global's initializer expression. A subtree
     // rooted at `skipRule` (the array-declarator suffix) is pruned so a global
-    // array's `[N]` length is never mistaken for the initializer.
-    [[nodiscard]] std::vector<NodeId> descendantsForInit(NodeId node, RuleId skipRule = {}) {
+    // array's `[N]` length is never mistaken for the initializer. When `decl`
+    // is supplied the walk seeds from the declaration's ROLE children
+    // (specifier prefix stripped — D-DECL-PREFIX-STRIP-SHARED-HELPER), so an
+    // expr-shaped specifier argument (e.g. a future
+    // `__attribute__((aligned(8)))`) can never be mistaken for the global's
+    // initializer. A no-op for every shipped prefix today (c-subset's
+    // specifiers contain no expr-rule nodes).
+    [[nodiscard]] std::vector<NodeId>
+    descendantsForInit(NodeId node, RuleId skipRule = {},
+                       DeclarationRule const* decl = nullptr) {
         std::vector<NodeId> out;
-        std::vector<NodeId> stack = visible(node);
+        std::vector<NodeId> stack =
+            decl ? declRoleChildren(tree(), node, *decl) : visible(node);
         while (!stack.empty()) {
             NodeId c = stack.back(); stack.pop_back();
             if (skipRule.valid() && tree().kind(c) == NodeKind::Internal
@@ -3319,7 +3782,10 @@ struct Lowerer {
         return cur;
     }
 
-    HirNodeId lowerDecl(NodeId node) {
+    // FC4 c1: appends 0..N module-level HIR nodes for one top-level CST
+    // construct ("Skip" appends nothing; a declarator-mode multi-global
+    // appends one Global per declarator — module decls are a FLAT list).
+    void lowerDeclInto(NodeId node, std::vector<HirNodeId>& out) {
         // Peel the `topLevel` alt wrapper (and any nested wrappers) to the real
         // declaration node.
         NodeId core = peelToCore(node);
@@ -3330,22 +3796,24 @@ struct Lowerer {
                                           tree().kind(core) == NodeKind::Internal
                                               ? std::string{tree().rules().name(tree().rule(core))}
                                               : std::string{"<token>"}));
-            return errorNode(core);
+            out.push_back(errorNode(core));
+            return;
         }
         // "Skip": a top-level construct that contributes NO HIR node (e.g. an
         // `#include` directive — its declarations arrive via the CU import
         // resolver's cross-refs, not as HIR nodes from the directive itself).
-        // Config-driven (no hardcoded rule name); lowerModule drops invalid ids.
-        if (m->hirKind == "Skip")       return HirNodeId{};
-        if (m->hirKind == "Decl")       return lowerTopLevel(core);
-        if (m->hirKind == "Function")   return lowerFunctionDecl(core);
-        if (m->hirKind == "TypeDecl")   return lowerTypeDecl(core);
-        if (m->hirKind == "ExternDecl") return lowerExternDecl(core);
+        // Config-driven (no hardcoded rule name).
+        if (m->hirKind == "Skip")       return;
+        if (m->hirKind == "Decl")       { lowerTopLevelInto(core, out); return; }
+        if (m->hirKind == "Function")   { out.push_back(lowerFunctionDecl(core)); return; }
+        if (m->hirKind == "TypeDecl")   { out.push_back(lowerTypeDecl(core)); return; }
+        if (m->hirKind == "ExternDecl") { out.push_back(lowerExternDecl(core)); return; }
         // A `var`-style declaration at module scope is a Global (the same rule
-        // is a local VarDecl inside a block — see lowerVarLike).
-        if (m->hirKind == "VarDecl")    return lowerVarLike(core, /*asGlobal=*/true);
+        // is a local VarDecl inside a block — see lowerVarLike). Declarator-
+        // mode rows append one Global per declarator (flat).
+        if (m->hirKind == "VarDecl")    { lowerVarLikeInto(core, /*asGlobal=*/true, out); return; }
         // A bare statement-level decl appearing at top level (unusual): route it.
-        return lowerStmt(core);
+        out.push_back(lowerStmt(core));
     }
 
     // ── driver ─────────────────────────────────────────────────────────────────
@@ -3357,8 +3825,14 @@ struct Lowerer {
         if (!t.root().valid()) return;
         for (NodeId top : visible(t.root())) {
             if (isToken(top)) continue;
-            HirNodeId const d = lowerDecl(top);
-            if (d.valid()) decls.push_back(d);   // skip "Skip"-mapped nodes (e.g. #include)
+            // FC4 c1: a top-level construct appends 0..N module nodes
+            // ("Skip" appends none; a multi-declarator global appends one
+            // Global per declarator). Invalid ids are filtered defensively.
+            std::vector<HirNodeId> lowered;
+            lowerDeclInto(top, lowered);
+            for (HirNodeId d : lowered) {
+                if (d.valid()) decls.push_back(d);
+            }
         }
     }
 };

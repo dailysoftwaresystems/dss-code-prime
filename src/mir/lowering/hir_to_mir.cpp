@@ -4,6 +4,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "hir/const_eval.hpp"
 #include "hir/hir_op.hpp"
+#include "mir/mir_struct_markers.hpp"
 
 #include <array>
 #include <format>
@@ -927,6 +928,22 @@ struct Lowerer {
                 return mir.addGlobalAddr(SymbolId{sym},
                                          interner.pointer(declared));
             }
+            if (functionSymbols.contains(sym)) {
+                // FC4 c1: `&fn` — the address of a FUNCTION (C 6.5.3.2).
+                // The function's code address is its GlobalAddr, typed
+                // Ptr<FnSig> (what an `int (*fp)(int) = &helper;` init
+                // stores/compares). Mirrors the rvalue Ref arm's
+                // function case; calls THROUGH the pointer lower via
+                // the indirect call-reg path (FC4 c2).
+                TypeId const declared = hir.typeId(node);
+                if (!declared.valid()) {
+                    unsupported(node, std::format(
+                        "function Ref to symbol {} has no type", sym));
+                    return InvalidMirInst;
+                }
+                return mir.addGlobalAddr(SymbolId{sym},
+                                         interner.pointer(declared));
+            }
             unsupported(node, std::format(
                 "symbol {} has no storage slot (non-addressable param or "
                 "unbound) — required by lvalue use", sym));
@@ -1294,6 +1311,10 @@ struct Lowerer {
         switch (hir.kind(node)) {
             case HirKind::VarDecl:
             case HirKind::AssignStmt:
+            // FC4 c1: a multi-declarator for-init (`for (int i = 0, j = n;
+            // ...)`) lowers as a Block of VarDecls — statements, lowered
+            // sequentially into the entry block like any block body.
+            case HirKind::Block:
                 return lowerStmt(node);
             default:
                 return lowerExpr(node).valid();
@@ -1306,8 +1327,25 @@ struct Lowerer {
         HirKind const k = hir.kind(node);
         switch (k) {
             case HirKind::Block: {
-                for (HirNodeId child : hir.children(node)) {
-                    if (!lowerStmt(child)) return false;
+                auto kids = hir.children(node);
+                for (std::size_t i = 0; i < kids.size(); ++i) {
+                    if (!lowerStmt(kids[i])) return false;
+                    // A child may unconditionally transfer control and seal the
+                    // open block mid-block (the `Block{ infinite-loop, Unreachable }`
+                    // wrapper cst_to_hir synthesizes for a provably-infinite loop —
+                    // D-HIR-INFINITE-LOOP-NOT-TERMINATING — seals its exit with an
+                    // `Unreachable`). Any FOLLOWING sibling is dynamically
+                    // unreachable, but the HIR dead-code rule deliberately permits
+                    // it after such a wrapper (a `Block` is not an unconditional
+                    // terminator), so it still reaches MIR and must lower somewhere.
+                    // Open a fresh dead block for the remainder; `addInst` aborts on
+                    // a sealed/absent open block otherwise. The dead block has no
+                    // predecessor and is removed by the mandatory MIR
+                    // unreachable-prune (D-MIR-UNREACHABLE-PRUNE-NORMALIZE).
+                    if (i + 1 < kids.size() && mir.openBlockHasTerminator()) {
+                        MirBlockId const dead = mir.createBlock(StructCfMarker::Linear);
+                        mir.beginBlock(dead);
+                    }
                 }
                 return true;
             }
@@ -1320,6 +1358,21 @@ struct Lowerer {
                 } else {
                     mir.addReturn();
                 }
+                return true;
+            }
+            case HirKind::Unreachable: {
+                // A statement-position `Unreachable` (cst_to_hir synthesizes one
+                // after a provably-infinite loop — D-HIR-INFINITE-LOOP-NOT-
+                // TERMINATING — wrapping it as `Block{ loop, Unreachable }` so the
+                // HIR verifier's structural-termination check matches the dynamic
+                // truth). It lowers to a MIR `Unreachable` terminator on the open
+                // block. Control provably never arrives here, so the block (and
+                // this terminator) is dropped by the MIR unreachable-prune
+                // (D-MIR-UNREACHABLE-PRUNE-NORMALIZE) — runtime is unaffected.
+                // Guard on `openBlockHasTerminator` so a preceding terminator in
+                // the same block (e.g. the loop already sealed its exit) is not
+                // double-sealed.
+                if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                 return true;
             }
             case HirKind::ExprStmt: {
@@ -1425,7 +1478,13 @@ struct Lowerer {
                 // Open the join block iff at least one path needs it. If
                 // neither path falls through (both returned/unreachable),
                 // the join block is unreferenced — seal it with Unreachable
-                // so finish() doesn't abort on a created-but-unfilled block.
+                // so this lowering's finish() doesn't abort on a created-
+                // but-unfilled block. The block is then UNREACHABLE-from-
+                // entry: the mandatory post-lowering prune
+                // (D-MIR-UNREACHABLE-PRUNE-NORMALIZE, runPruneUnreachableBlocks
+                // in optimizeModule) drops it centrally before any verifier
+                // sees the module — this seal exists only to satisfy the
+                // local finish() invariant.
                 mir.beginBlock(joinBB);
                 if (!joinReached) {
                     mir.addUnreachable();
@@ -1518,6 +1577,11 @@ struct Lowerer {
                     mir.addCondBr(cond, body, exit);
                 } else {
                     // No predecessor → seal as unreachable; cond is dead.
+                    // This NORMAL-path orphan (body self-sealed AND no
+                    // `continue` referenced the frame) is dropped centrally
+                    // by the mandatory post-lowering prune
+                    // (D-MIR-UNREACHABLE-PRUNE-NORMALIZE); the seal only
+                    // satisfies this lowering's finish() invariant.
                     sealCreatedAsUnreachable(continueBB);
                 }
 
@@ -2304,6 +2368,16 @@ HirToMirResult lowerToMir(Hir const&               hir,
     lwr.lower();
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();
+    // Canonical-marker stamping (D-OPT4-1): the creation-time
+    // `createBlock(StructCfMarker::X)` stamps above are creation-time
+    // DEFAULTS documenting lowering intent; the canonical CFG-derived
+    // markers are stamped here as the FINAL step, module-wide. This is
+    // what makes degenerate shapes verify: `while(1){break;}` lowers
+    // with a LoopHeader stamp, but the break removed the back-edge —
+    // the derivation normalizes the header to its actual role instead
+    // of the verifier rejecting the program (the pre-derivation
+    // behavior). See mir_struct_markers.hpp for the placement principle.
+    rederiveStructCfMarkers(result.mir);
     result.externImports = std::move(lwr.externImports);
     result.ok = (reporter.errorCount() == errorsBefore);
     return result;

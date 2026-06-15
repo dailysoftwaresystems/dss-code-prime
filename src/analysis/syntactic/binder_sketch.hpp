@@ -53,8 +53,8 @@ struct DSS_EXPORT AmbiguousTypeNameCandidate {
 //   * Closed-scope bindings are RETAINED (marked dead via scope-id
 //     liveness) rather than truncated, so a Snapshot is four integers +
 //     a depth-sized stack copy and restore is pure truncation — the
-//     speculation-rollback contract (SpeculationProbe / WalkerSnapshot)
-//     stays O(depth) per probe.
+//     speculation-rollback contract (SpeculationProbe) stays O(depth)
+//     per probe.
 //
 // KNOWN SHALLOWNESS (by design — the sketch only needs to be right
 // about TYPE-vs-VALUE for names it has SEEN; everything else routes to
@@ -81,6 +81,16 @@ public:
         bool          isType    = false; // DeclarationKind::Type (static kind)
         NameMatchMode nameMatch = NameMatchMode::Self;
         RuleId        specifierPrefixRule{};   // invalid ⇒ no prefix to strip
+        // FC4 c1: declarator-mode rows have no positional nameChild — the
+        // name(s) live inside recursive declarators. `carrierChild` is the
+        // visible-child index (post specifier-strip) of the row's
+        // declarator-list / single-declarator subtree; the parser runs the
+        // SHARED declarator walk (core/types/declarator_walk.hpp) below it
+        // at frame close and records EVERY extracted name (an
+        // initDeclarator LIST binds multiple — `typedef int A, *B;` binds
+        // both A and B as types).
+        bool          declaratorMode = false;
+        std::uint32_t carrierChild   = 0;
     };
 
     explicit BinderSketch(GrammarSchema const& schema);
@@ -123,10 +133,10 @@ public:
 
     // ── speculation safety ──
     // Captured/restored exactly like the parser's other four state
-    // machines (SpeculationProbe / WalkerSnapshot): bindings +
-    // candidates are append-only between snapshots so restore is
-    // truncate-to-count; the live-scope stack is small (lexical depth)
-    // so a full copy is cheap.
+    // machines (SpeculationProbe): bindings + candidates are
+    // append-only between snapshots so restore is truncate-to-count;
+    // the live-scope stack is small (lexical depth) so a full copy is
+    // cheap.
     struct Snapshot {
         std::size_t                bindingCount   = 0;
         std::size_t                candidateCount = 0;

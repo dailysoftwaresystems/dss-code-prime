@@ -512,7 +512,7 @@
       }
     },
     {
-      "$comment": "call sym — direct near call to a symbol. Encoding: 0xE8 + 4-byte signed PC-relative displacement to the call target (filled with 0 by the assembler; the linker patches via the rel32 relocation). The schema's maxOperands=255 admits a call ABI where extra operands carry arg-register hints; cycle-4 wires the single-SymbolRef variant (the direct-call form). An indirect-call form (call rax, encoding REX 0xFF /2) is anchored as a future variant.",
+      "$comment": "call — direct AND indirect near call, one mnemonic with per-callee-kind variants (FC4 c2). Direct `call sym`: 0xE8 + 4-byte signed PC-relative displacement (filled with 0 by the assembler; the linker patches via the rel32 relocation). Indirect `call reg` (function-pointer callee): 0xFF /2 with the callee register in ModR/M.rm — NO REX.W (FF /2 defaults to 64-bit operand size in long mode); REX.B derives automatically from the register's high ordinal bit (call r10 = 41 FF D2). Keeping both under ONE mnemonic (a variant, not a second opcode) keeps isCall / functionHasCalls / caller-saved-clobber semantics shared by construction. The schema's maxOperands=255 admits a call ABI where extra operands carry arg-register hints; the callconv materializer emits the single-operand forms.",
       "mnemonic":      "call",
       "result":        "optional",
       "hasSideEffects": true,
@@ -529,6 +529,14 @@
             "template": { "opcode": [232] },
             "wires":    [
               { "index": 0, "slotKind": "disp32", "relocationKind": "rel32" }
+            ]
+          },
+          {
+            "$comment": "FC4 c2: call r/m64 — 0xFF /2 (indirect call through a register; call rax = FF D0). No width key: FF /2 is 64-bit by default in long mode, so the variant matches any declared operation width. /digit precedent: idiv /7, div /6, shl /4.",
+            "guard":    { "operandKinds": ["reg"] },
+            "template": { "opcode": [255], "modrmRegExt": 2 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
             ]
           }
         ]

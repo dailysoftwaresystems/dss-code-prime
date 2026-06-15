@@ -753,6 +753,171 @@ TEST(LirRegAlloc, PressuredDivCoveringVregsExcludeImplicitInputAndClobberSet) {
            "vacuous";
 }
 
+// ── FC4 c2: the indirect-callee/arg-reg exclusion (R2) ─────────────
+// An indirect call's CALLEE vreg is consumed AT the call, so it does
+// not "cross" it (`rangeCrossesCall` requires `pos + 1 < r.end`) —
+// every caller-saved register, INCLUDING all arg-passing registers,
+// is otherwise eligible. But the callconv materializer inserts the
+// arg-passing moves POST-regalloc, BETWEEN the callee's def and the
+// call: a callee parked in an arg register is clobbered by its own
+// call's arg setup → the call jumps THROUGH AN ARGUMENT VALUE
+// (silent garbage). Fixed-def interference from the not-yet-emitted
+// moves is not modeled, so the allocator must EXCLUDE the cc's
+// argGprs ∪ argFprs from any range of the callee vreg covering the
+// call (lir_regalloc.cpp's indirect-callee consumer).
+//
+// THE PIN MUST BE PRESSURED (the D-LIR-REGALLOC-PRESSURED-IMPLICIT-
+// CLOBBER-PIN lesson): unpressured, the linear scan picks a non-arg
+// caller-saved register (r11/r10 first on SysV's LIFO) and the pin
+// passes even with the exclusion disabled. The shape below drains the
+// pools at the callee's allocation point:
+//   * crossing locals c0..c7 + x + n + the post-call re-read of fp
+//     soak the callee-saved pool (and spill beyond it);
+//   * the k arg locals t0..t{k-1} hold their alloca-ADDRESS vregs
+//     live ACROSS the callee load (each address's last use is its
+//     arg load, which hir_to_mir emits AFTER the callee load —
+//     children order [callee, args...]) — draining the caller-saved
+//     LIFO past r11/r10 toward the argGpr tail;
+// so at the upper sweep points the natural pick for the callee
+// REACHES the arg registers — only the R2 exclusion keeps it off.
+//
+// **Red-on-disable (demonstrated 2026-06-12 + restored)**: comment
+// out the indirect-callee exclusion block in lir_regalloc.cpp's
+// allocateOneFunc (the `if (!indirectCallees.empty())` consumer) →
+// the callee lands on an argGpr at the drained sweep points → this
+// pin goes RED. Agnostic: the forbidden set is read back from the
+// ACTIVE cc's declared argGprs/argFprs via the schema register
+// table; no register names, no arch identity in the assertions.
+TEST(LirRegAlloc, PressuredIndirectCalleeExcludesArgRegs) {
+    bool sawIndirectCall       = false;
+    bool sawPhysAssignedCallee = false;
+
+    for (int k = 5; k <= 9; ++k) {
+        // pick takes k int params; fp(t0..t{k-1}) is the indirect call.
+        std::string pickParams;
+        std::string pickSum;
+        for (int i = 0; i < k; ++i) {
+            if (i > 0) { pickParams += ", "; pickSum += " + "; }
+            pickParams += "int a" + std::to_string(i);
+            pickSum    += "a" + std::to_string(i);
+        }
+        std::string fpParams;
+        for (int i = 0; i < k; ++i) {
+            if (i > 0) fpParams += ", ";
+            fpParams += "int";
+        }
+        std::string src =
+            "int pick(" + pickParams + ") { return " + pickSum + "; }\n"
+            "int f(int x, int n) {\n"
+            "    int (*fp)(" + fpParams + ") = &pick;\n";
+        for (int i = 0; i < 8; ++i) {            // crossing locals
+            src += "    int c" + std::to_string(i) + " = x + "
+                 + std::to_string(i + 1) + ";\n";
+        }
+        for (int i = 0; i < k; ++i) {            // arg locals
+            src += "    int t" + std::to_string(i) + " = x + "
+                 + std::to_string(i + 11) + ";\n";
+        }
+        src += "    int s = fp(t0";
+        for (int i = 1; i < k; ++i) src += ", t" + std::to_string(i);
+        src += ");\n";
+        // Re-read fp AFTER the call so its alloca-address vreg
+        // CROSSES the call (otherwise it expires exactly at the
+        // callee load and hands its caller-saved register straight
+        // back to the callee — un-draining the pool).
+        src += "    int z = 0;\n";
+        src += "    if (fp != 0) { z = 1; }\n";
+        src += "    return s + x + n + z";
+        for (int i = 0; i < 8; ++i) src += " + c" + std::to_string(i);
+        src += ";\n}\n";
+
+        auto lowered = lowerCSubsetToLir(src);
+        ASSERT_FALSE(lowered.model.hasErrors()) << "k=" << k;
+        ASSERT_TRUE(lowered.lir.ok) << "k=" << k;
+        Lir const& lir = lowered.lir.lir;
+
+        // The forbidden set, read back from the ACTIVE cc's declared
+        // arg-register lists (config-driven; no names here).
+        auto const* cc = lowered.target->callingConvention(0);
+        ASSERT_NE(cc, nullptr);
+        std::unordered_set<std::uint32_t> argRegOrdinals;
+        auto const absorb = [&](std::vector<std::string> const& names) {
+            for (auto const& name : names) {
+                auto const ord = lowered.target->registerByName(name);
+                ASSERT_TRUE(ord.has_value())
+                    << "cc arg register '" << name << "' must resolve";
+                argRegOrdinals.insert(*ord);
+            }
+        };
+        absorb(cc->argGprs);
+        absorb(cc->argFprs);
+        ASSERT_FALSE(argRegOrdinals.empty());
+
+        LirLiveness const lv = analyzeLiveness(lir);
+        DiagnosticReporter regallocRep;
+        // ccIndex 0 = sysv_amd64 (matches the shift/div siblings).
+        LirAllocation const out = allocateRegisters(
+            lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
+        ASSERT_TRUE(out.ok()) << "k=" << k;
+
+        // Find every isCall instruction whose ops[0] is a VIRTUAL Reg
+        // (the indirect callee) — agnostic discovery via the schema's
+        // isCall flag, exactly the allocator's own scan.
+        std::size_t const funcCount = lir.moduleFuncCount();
+        for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
+            LirFuncId const fn = lir.funcAt(fi);
+            // Match this function's allocation entry by symbol.
+            LirFuncAllocation const* alloc = nullptr;
+            for (auto const& fa : out.perFunc) {
+                if (fa.fn == fn) { alloc = &fa; break; }
+            }
+            ASSERT_NE(alloc, nullptr) << "k=" << k;
+            std::uint32_t const blockCount = lir.funcBlockCount(fn);
+            for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+                LirBlockId const blk = lir.funcBlockAt(fn, bi);
+                std::uint32_t const instCount = lir.blockInstCount(blk);
+                for (std::uint32_t ii = 0; ii < instCount; ++ii) {
+                    LirInstId const inst = lir.blockInstAt(blk, ii);
+                    auto const* info =
+                        lowered.target->opcodeInfo(lir.instOpcode(inst));
+                    if (info == nullptr || !info->isCall) continue;
+                    auto const ops = lir.instOperands(inst);
+                    if (ops.empty()
+                        || ops[0].kind != LirOperandKind::Reg
+                        || ops[0].reg.isPhysical != 0) {
+                        continue;  // direct call (SymbolRef callee)
+                    }
+                    sawIndirectCall = true;
+                    auto const* a = alloc->forVReg(ops[0].reg.id);
+                    if (a == nullptr || a->isSpilled()) continue;
+                    sawPhysAssignedCallee = true;
+                    auto const ord =
+                        static_cast<std::uint32_t>(a->physReg().id);
+                    EXPECT_FALSE(argRegOrdinals.contains(ord))
+                        << "k=" << k << ": indirect-call callee vreg "
+                        << ops[0].reg.id
+                        << " was allocated to cc arg register ordinal "
+                        << ord
+                        << " — the post-regalloc arg-passing moves "
+                           "would clobber the callee before the call "
+                           "consumes it (silent jump through an "
+                           "argument value).";
+                }
+            }
+        }
+    }
+    // Non-vacuity guards (mirrors the shift/div siblings): the sweep
+    // must actually contain an indirect call, and at least one callee
+    // must be register-allocated (an all-spilled sweep would assert
+    // nothing).
+    EXPECT_TRUE(sawIndirectCall)
+        << "sweep produced no Reg-callee call — the fn-ptr lowering "
+           "shape regressed";
+    EXPECT_TRUE(sawPhysAssignedCallee)
+        << "no indirect callee was register-allocated anywhere in the "
+           "sweep — the pin would be vacuous";
+}
+
 // ── D-OPT-REGALLOC-EXCLUSION-BUFFER closure pins (2026-06-11) ──────
 // The exclusion scratch in allocateOneFunc was a fixed
 // std::array<uint16_t, 8>; a schema whose per-range (inputs ∪

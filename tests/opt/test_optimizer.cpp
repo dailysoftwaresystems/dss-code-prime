@@ -18,11 +18,15 @@
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
+#include "mir/mir_opcode.hpp"
+#include "mir/mir_struct_markers.hpp"
+#include "mir/mir_verifier.hpp"
 #include "opt/optimizer.hpp"
 #include "opt/passes/cse.hpp"
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <numeric>
 
@@ -903,4 +907,187 @@ TEST(Optimizer, EffectivenessInliningFiresOnLeafCall) {
     EXPECT_GE(result.mutationCount(opt::PassId::Inlining), 1u)
         << "Inlining must record >= 1 mutation on a module with an "
            "eligible Global single-block leaf call";
+}
+
+// ── D15 cycle C (e): the SHIPPED release pipeline COMPILES both probe
+// shapes — MIR tier, target-blind. ──────────────────────────────────
+// The two acceptance probes (rec.c recursion, iter.c loop) are exactly
+// the RC-A (SimplifyCfg post-fold reachability) + RC-B (MultiBlockInliner
+// topological layout) shapes. This pin runs the SHIPPED
+// release.pipeline.json ITSELF (loadShippedPipeline — name/maxIterations/
+// inlineThreshold from the file, zero drift) over each probe's MIR and
+// asserts (a) optimize() ok + (b) the post-pipeline module is verifier-
+// clean (incl. the new I_LayoutUseBeforeDef rule). `optimize` already
+// verifies after every pass, so result.ok implies per-pass cleanliness;
+// the explicit final verify is the belt-and-suspenders MIR-tier capstone.
+// (The CORPUS rows release_pipeline_recursion / release_pipeline_loop
+// carry the runtime exit-42 proof across all four targets; this is the
+// target-blind MIR-tier twin.)
+TEST(Optimizer, ShippedReleasePipelineCompilesBothProbeShapes) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+
+    // rec(k){ if(k) return rec(k-1)+1; return 37; } main(){ return rec(5); }
+    // — recursion (RC-A: a constant base-case CondBr folds; SimplifyCfg
+    // must prune the dead arm in-rebuild). The SCC gate keeps rec
+    // out-of-line; main→rec inlines.
+    auto buildRecModule = [](TypeInterner& interner) -> Mir {
+        TypeId const i32   = interner.primitive(TypeKind::I32);
+        TypeId const boolT = interner.primitive(TypeKind::Bool);
+        TypeId const params[] = {i32};
+        TypeId const recSig  = interner.fnSig(params, i32, CallConv::CcSysV);
+        TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
+        MirBuilder b;
+        b.addFunction(recSig, SymbolId{50},
+                      SymbolBinding::Global, SymbolVisibility::Default);
+        MirBlockId const rEntry = b.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const rThen  = b.createBlock(StructCfMarker::IfThen);
+        MirBlockId const rElse  = b.createBlock(StructCfMarker::IfElse);
+        b.beginBlock(rEntry);
+        MirInstId const kArg = b.addArg(0, i32);
+        MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+        MirInstId const zero = b.addConst(z, i32);
+        MirInstId const neOps[] = {kArg, zero};
+        MirInstId const ne = b.addInst(MirOpcode::ICmpNe, neOps, boolT);
+        b.addCondBr(ne, rThen, rElse);
+        b.beginBlock(rThen);
+        MirInstId const selfAddr = b.addGlobalAddr(SymbolId{50}, recSig);
+        MirLiteralValue o; o.value = std::int64_t{1}; o.core = TypeKind::I32;
+        MirInstId const one = b.addConst(o, i32);
+        MirInstId const subOps[] = {kArg, one};
+        MirInstId const km1 = b.addInst(MirOpcode::Sub, subOps, i32);
+        MirInstId const recOps[] = {selfAddr, km1};
+        MirInstId const recCall = b.addInst(MirOpcode::Call, recOps, i32);
+        MirInstId const one2 = b.addConst(o, i32);
+        MirInstId const addOps[] = {recCall, one2};
+        MirInstId const sum = b.addInst(MirOpcode::Add, addOps, i32);
+        b.addReturn(sum);
+        b.beginBlock(rElse);
+        MirLiteralValue t; t.value = std::int64_t{37}; t.core = TypeKind::I32;
+        b.addReturn(b.addConst(t, i32));
+        b.addFunction(mainSig, SymbolId{100},
+                      SymbolBinding::Global, SymbolVisibility::Default);
+        MirBlockId const mEntry = b.createBlock(StructCfMarker::EntryBlock);
+        b.beginBlock(mEntry);
+        MirInstId const recAddr = b.addGlobalAddr(SymbolId{50}, recSig);
+        MirLiteralValue five; five.value = std::int64_t{5}; five.core = TypeKind::I32;
+        MirInstId const arg5 = b.addConst(five, i32);
+        MirInstId const callOps[] = {recAddr, arg5};
+        MirInstId const call = b.addInst(MirOpcode::Call, callOps, i32);
+        b.addReturn(call);
+        return std::move(b).finish();
+    };
+
+    // f(k){ int acc=37; while(k){acc++; k--;} return acc; } (alloca-form)
+    // main(){ return f(5); } — loop (RC-B: the multi-block splice's
+    // continuation consumes a clone-defined value; C1 lays it out
+    // topologically).
+    auto buildLoopModule = [](TypeInterner& interner) -> Mir {
+        TypeId const i32   = interner.primitive(TypeKind::I32);
+        TypeId const boolT = interner.primitive(TypeKind::Bool);
+        TypeId const i32p  = interner.pointer(i32);
+        TypeId const params[] = {i32};
+        TypeId const fSig    = interner.fnSig(params, i32, CallConv::CcSysV);
+        TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
+        MirBuilder b;
+        b.addFunction(fSig, SymbolId{50},
+                      SymbolBinding::Global, SymbolVisibility::Default);
+        MirBlockId const fEntry  = b.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const fHeader = b.createBlock(StructCfMarker::LoopHeader);
+        MirBlockId const fBody   = b.createBlock(StructCfMarker::Linear);
+        MirBlockId const fExit   = b.createBlock(StructCfMarker::Linear);
+        b.beginBlock(fEntry);
+        MirInstId const kArg    = b.addArg(0, i32);
+        MirInstId const accSlot = b.addInst(MirOpcode::Alloca, {}, i32p);
+        MirInstId const kSlot   = b.addInst(MirOpcode::Alloca, {}, i32p);
+        MirInstId const st0[] = {kArg, kSlot};
+        (void)b.addInst(MirOpcode::Store, st0, InvalidType);
+        MirLiteralValue t; t.value = std::int64_t{37}; t.core = TypeKind::I32;
+        MirInstId const c37 = b.addConst(t, i32);
+        MirInstId const st1[] = {c37, accSlot};
+        (void)b.addInst(MirOpcode::Store, st1, InvalidType);
+        b.addBr(fHeader);
+        b.beginBlock(fHeader);
+        MirInstId const kv = b.addInst(MirOpcode::Load, std::array{kSlot}, i32);
+        MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+        MirInstId const zero = b.addConst(z, i32);
+        MirInstId const ne = b.addInst(MirOpcode::ICmpNe, std::array{kv, zero}, boolT);
+        b.addCondBr(ne, fBody, fExit);
+        b.beginBlock(fBody);
+        MirInstId const a = b.addInst(MirOpcode::Load, std::array{accSlot}, i32);
+        MirLiteralValue o; o.value = std::int64_t{1}; o.core = TypeKind::I32;
+        MirInstId const one = b.addConst(o, i32);
+        MirInstId const a1 = b.addInst(MirOpcode::Add, std::array{a, one}, i32);
+        MirInstId const sta[] = {a1, accSlot};
+        (void)b.addInst(MirOpcode::Store, sta, InvalidType);
+        MirInstId const kk = b.addInst(MirOpcode::Load, std::array{kSlot}, i32);
+        MirInstId const one2 = b.addConst(o, i32);
+        MirInstId const kk1 = b.addInst(MirOpcode::Sub, std::array{kk, one2}, i32);
+        MirInstId const stk[] = {kk1, kSlot};
+        (void)b.addInst(MirOpcode::Store, stk, InvalidType);
+        b.addBr(fHeader);
+        b.beginBlock(fExit);
+        MirInstId const rv = b.addInst(MirOpcode::Load, std::array{accSlot}, i32);
+        b.addReturn(rv);
+        b.addFunction(mainSig, SymbolId{100},
+                      SymbolBinding::Global, SymbolVisibility::Default);
+        MirBlockId const mEntry = b.createBlock(StructCfMarker::EntryBlock);
+        b.beginBlock(mEntry);
+        MirInstId const fAddr = b.addGlobalAddr(SymbolId{50}, fSig);
+        MirLiteralValue five; five.value = std::int64_t{5}; five.core = TypeKind::I32;
+        MirInstId const arg5 = b.addConst(five, i32);
+        MirInstId const callOps[] = {fAddr, arg5};
+        MirInstId const call = b.addInst(MirOpcode::Call, callOps, i32);
+        b.addReturn(call);
+        return std::move(b).finish();
+    };
+
+    auto pipelineR = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(pipelineR.has_value())
+        << "shipped release.pipeline.json must load";
+
+    // Probe 1: recursion (RC-A).
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildRecModule(interner);
+        // Canonical markers (what a real frontend stamps post-lowering) so
+        // the test isolates the optimizer, not hand-marker bookkeeping.
+        rederiveStructCfMarkers(mir);
+        DiagnosticReporter rep;
+        auto const result = opt::optimize(mir, target, interner, *pipelineR, rep);
+        EXPECT_TRUE(result.ok)
+            << "the SHIPPED release pipeline must optimize the recursion "
+               "probe shape (RC-A) without error";
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_GE(result.mutationCount(opt::PassId::Inlining), 1u)
+            << "the SHIPPED release pipeline must actually RUN Inlining on "
+               "the recursion probe (main->rec inlines via the cross-SCC "
+               "edge) — proves this arm EXERCISES the composition that broke, "
+               "not a vacuous no-op that would mask the RC-A/RC-B fix";
+        MirVerifier verifier{mir, &interner};
+        EXPECT_TRUE(verifier.verify(rep))
+            << "post-release-pipeline recursion module must be verifier-clean";
+    }
+
+    // Probe 2: loop (RC-B).
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildLoopModule(interner);
+        rederiveStructCfMarkers(mir);
+        DiagnosticReporter rep;
+        auto const result = opt::optimize(mir, target, interner, *pipelineR, rep);
+        EXPECT_TRUE(result.ok)
+            << "the SHIPPED release pipeline must optimize the loop probe "
+               "shape (RC-B) without error";
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_GE(result.mutationCount(opt::PassId::Inlining), 1u)
+            << "the SHIPPED release pipeline must actually RUN Inlining on "
+               "the loop probe (main->f inlines the multi-block leaf) — "
+               "proves this arm EXERCISES the RC-B splice, not a vacuous "
+               "no-op that would mask the fix";
+        MirVerifier verifier{mir, &interner};
+        EXPECT_TRUE(verifier.verify(rep))
+            << "post-release-pipeline loop module must be verifier-clean";
+    }
 }

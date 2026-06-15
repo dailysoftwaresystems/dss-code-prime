@@ -2,6 +2,7 @@
 
 #include "analysis/syntactic/pratt_walker.hpp"
 #include "core/types/compiled_shape.hpp"
+#include "core/types/declarator_walk.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/schema_walker.hpp"
@@ -166,6 +167,15 @@ struct Parser::Impl {
     std::size_t  lastTokPos = 0;
     std::size_t  lastDepth  = 0;
     bool         firstIteration = true;
+
+    // FC4 c1: the all-candidates-failed fallback REPLAY's one-shot
+    // bookkeeping (see the speculative AltChoice arm). A replayed branch
+    // that fails without net consumption unwinds back to the same alt at
+    // the same position; the (cursor, tokPos) pair gates the second
+    // attempt into the P_BacktrackFailed forward-progress hatch instead.
+    bool         replayedFallback_ = false;
+    SchemaCursor lastReplayCursor_{};
+    std::size_t  lastReplayTokPos_ = 0;
 
     // True iff the PREVIOUS dispatch step performed a recovery (panic scan
     // or missing-rule synthesis). Lets `synthesizeMissingRule` SUPPRESS its
@@ -446,16 +456,19 @@ struct Parser::Impl {
     void closeFrameOnce() noexcept {
         if (frames.empty()) return;
         const RuleId rule = builder->currentRule();
-        // FC2 binder sketch: extract the declared name BEFORE the frame
+        // FC2 binder sketch: extract the declared name(s) BEFORE the frame
         // closes (its direct children are still in the builder's pending
-        // staging area), but RECORD it after any scope this rule itself
+        // staging area), but RECORD them after any scope this rule itself
         // owns has closed — a scope-opening declaration (e.g. a struct)
         // binds its NAME in the ENCLOSING scope, while its members were
         // bound into its own scope as their frames closed earlier.
-        std::optional<std::pair<std::string, bool>> binderName;
+        // (FC4 c1: a declarator-mode row's initDeclarator LIST yields
+        // MULTIPLE bindings — `typedef int A, *B;` binds both — hence the
+        // vector; legacy rows yield 0 or 1.)
+        std::vector<std::pair<std::string, bool>> binderNames;
         if (sketch.enabled()) {
             if (auto const* decl = sketch.binderFor(rule)) {
-                binderName = extractBinderName_(*decl);
+                binderNames = extractBinderNames_(*decl);
             }
         }
         walker.leaveRule(SourceSpan::empty(0), rule);
@@ -464,9 +477,8 @@ struct Parser::Impl {
         if (!frameRules.empty()) frameRules.pop_back();
         if (sketch.enabled()) {
             if (sketch.isScopeRule(rule)) sketch.closeScope();
-            if (binderName.has_value()) {
-                sketch.record(std::move(binderName->first),
-                              binderName->second);
+            for (auto& [name, isType] : binderNames) {
+                sketch.record(std::move(name), isType);
             }
         }
     }
@@ -519,16 +531,41 @@ struct Parser::Impl {
         return found;
     }
 
-    // Extract (name, isType) from the ABOUT-TO-CLOSE top frame — a
-    // binder rule per the sketch's view. The frame's direct children are
-    // its pending staging range; everything BELOW the top level is
-    // already closed (children ranges finalized), so descent is safe.
-    // Returns nullopt when the name child is structurally absent or not
-    // a plain identifier leaf (e.g. an errored declaration) — the sketch
-    // then simply has no entry and the name reads as Unknown, the safe
-    // direction (semantic analysis remains the authority).
-    [[nodiscard]] std::optional<std::pair<std::string, bool>>
-    extractBinderName_(BinderSketch::BinderDecl const& decl) const {
+    // FC4 c1: the TreeBuilder-substrate adapter for the SHARED declarator
+    // name-extraction walk (`core/types/declarator_walk.hpp` — the one
+    // walk implementation, two substrates). Valid because the about-to-
+    // close frame's pending children are CLOSED nodes (children ranges
+    // finalized), so the builder's node accessors are exact below them.
+    struct BuilderDeclaratorView {
+        TreeBuilder const& b;
+        [[nodiscard]] NodeKind kind(NodeId n) const { return b.nodeKind(n); }
+        [[nodiscard]] RuleId rule(NodeId n) const { return b.nodeRule(n); }
+        [[nodiscard]] SchemaTokenId tokenKind(NodeId n) const {
+            return b.nodeTokenKind(n);
+        }
+        [[nodiscard]] bool isVisible(NodeId n) const {
+            return !isEmptySpace(b.nodeFlags(n));
+        }
+        [[nodiscard]] std::span<NodeId const> children(NodeId n) const {
+            return b.nodeChildren(n);
+        }
+    };
+
+    // Extract every (name, isType) binding from the ABOUT-TO-CLOSE top
+    // frame — a binder rule per the sketch's view. The frame's direct
+    // children are its pending staging range; everything BELOW the top
+    // level is already closed (children ranges finalized), so descent is
+    // safe. Returns empty when the name child is structurally absent or
+    // not a plain identifier leaf (e.g. an errored declaration) — the
+    // sketch then simply has no entry and the name reads as Unknown, the
+    // safe direction (semantic analysis remains the authority).
+    //
+    // Legacy rows yield 0 or 1 entries; FC4 declarator-mode rows yield one
+    // entry PER named declarator below the carrier child (abstract
+    // declarators contribute nothing — a legal outcome).
+    [[nodiscard]] std::vector<std::pair<std::string, bool>>
+    extractBinderNames_(BinderSketch::BinderDecl const& decl) const {
+        std::vector<std::pair<std::string, bool>> out;
         std::vector<NodeId> kids;
         for (NodeId c : builder->currentFramePendingChildren()) {
             if (!isEmptySpace(builder->nodeFlags(c))) kids.push_back(c);
@@ -542,17 +579,40 @@ struct Parser::Impl {
                    == decl.specifierPrefixRule.v) {
             kids.erase(kids.begin());
         }
-        if (decl.nameChild >= kids.size()) return std::nullopt;
+        if (decl.declaratorMode) {
+            // FC4 c1: the shared declarator walk over the builder
+            // substrate. The sketch only enrolls declarator-mode rows when
+            // the schema declares the `declarators` block (ctor invariant),
+            // so the dereference is guarded-by-construction; the null check
+            // keeps the miss loud-by-absence rather than UB.
+            auto const& dcOpt = schema->semantics().declarators;
+            if (!dcOpt.has_value() || decl.carrierChild >= kids.size()) {
+                return out;
+            }
+            BuilderDeclaratorView const view{*builder};
+            std::vector<NodeId> declarators;
+            collectDeclarators(view, kids[decl.carrierChild], *dcOpt,
+                               declarators);
+            for (NodeId d : declarators) {
+                const NodeId nameNode = declaratorNameNode(view, d, *dcOpt);
+                if (!nameNode.valid()) continue;   // abstract — no binding
+                out.emplace_back(
+                    std::string{src->slice(builder->nodeSpan(nameNode))},
+                    decl.isType);
+            }
+            return out;
+        }
+        if (decl.nameChild >= kids.size()) return out;
         const NodeId nameNode =
             resolveNameNode_(kids[decl.nameChild], decl.nameMatch);
         if (!nameNode.valid()
             || builder->nodeKind(nameNode) != NodeKind::Token
             || builder->nodeTokenKind(nameNode).v != identifierKind.v) {
-            return std::nullopt;
+            return out;
         }
-        return std::make_pair(
-            std::string{src->slice(builder->nodeSpan(nameNode))},
-            decl.isType);
+        out.emplace_back(std::string{src->slice(builder->nodeSpan(nameNode))},
+                         decl.isType);
+        return out;
     }
 
     // ── FC2 type-name commit triage ─────────────────────────────────────
@@ -587,27 +647,37 @@ struct Parser::Impl {
     //   (2) lone identifier the sketch knows as a TYPE → COMMIT.
     //   (3) lone identifier the sketch knows as a VALUE → ROLLBACK
     //       (the value reading is the meaning; shadowing-aware).
-    //   (4) lone identifier the sketch has NO entry for → COMMIT iff
-    //       the token after the type position (the first token of the
-    //       following operand subtree) could NOT continue a value
-    //       reading — i.e. it is not an infix/postfix/ternary operator
-    //       per the operator table. Ternary is included beyond the
-    //       plan's "binary/postfix" wording because `(a) ? b : c` is a
-    //       continuable value reading too; the test is "could the
-    //       parenthesized value parse keep going", derived ENTIRELY
-    //       from the operator table — never a hardcoded token list.
-    //       When it IS an operator: ROLLBACK to the value reading and
-    //       hand an AmbiguousTypeNameCandidate out via `outCandidate`
-    //       for the compilation unit's cross-file oracle (one-shot
-    //       seeded reparse). The CALLER records it after the probe's
-    //       rollback so it survives (the probe restore would otherwise
-    //       erase it with the rest of the sketch delta).
+    //   (4) lone identifier the sketch has NO entry for → POLARITY-
+    //       dependent (FC4 c1 M4, the D2a decision):
+    //       * PreferType (the FC2 default) — COMMIT iff the token after
+    //         the type position (the first token of the following
+    //         operand subtree) could NOT continue a value reading —
+    //         i.e. it is not an infix/postfix/ternary operator per the
+    //         operator table. Ternary is included beyond the plan's
+    //         "binary/postfix" wording because `(a) ? b : c` is a
+    //         continuable value reading too; the test is "could the
+    //         parenthesized value parse keep going", derived ENTIRELY
+    //         from the operator table — never a hardcoded token list.
+    //         When it IS an operator: ROLLBACK to the value reading and
+    //         hand an AmbiguousTypeNameCandidate out via `outCandidate`
+    //         for the compilation unit's cross-file oracle (one-shot
+    //         seeded reparse). The CALLER records it after the probe's
+    //         rollback so it survives (the probe restore would otherwise
+    //         erase it with the rest of the sketch delta).
+    //       * RequireKnownType (C 6.7.6.3p11 — `T (name)` in parameter
+    //         position is a parenthesized declarator unless `name` is a
+    //         visible typedef) — NEVER commit on Unknown: always roll
+    //         back AND record the candidate, so a cross-file typedef in
+    //         the guarded position still resolves on the oracle reparse.
+    //       Rules 1-3 are polarity-INDEPENDENT: a keyword-led type child
+    //       commits always (rule 1 — it cannot be an expression), a
+    //       sketch-KNOWN Type commits, a sketch-KNOWN Value rolls back.
     //
     // Returning false lets the caller's SpeculationProbe restore all
     // five machines; the alt's next candidate branch then parses the
     // value reading.
     [[nodiscard]] bool typeNameCommitApproved_(
-        RuleId branch, RuleId typeRule,
+        RuleId branch, RuleId typeRule, TypeNameCommitPolarity polarity,
         std::optional<AmbiguousTypeNameCandidate>& outCandidate) {
         // The just-built branch subtree is the parent frame's newest
         // pending child (the branch frame closed inside the probe loop).
@@ -663,7 +733,19 @@ struct Parser::Impl {
         case BinderSketch::NameKind::Unknown: break;
         }
 
-        // Rule 4 — unknown name: follower-operator test.
+        // Rule 4 — unknown name. Strict polarity first (FC4 c1 M4):
+        // RequireKnownType never commits an unknown — roll back to the
+        // competing reading and record the candidate so the CU oracle's
+        // seeded reparse gives a cross-file typedef its second chance.
+        if (polarity == TypeNameCommitPolarity::RequireKnownType) {
+            outCandidate = AmbiguousTypeNameCandidate{
+                .name = std::string{name},
+                .span = nameSpan,
+            };
+            return false;
+        }
+
+        // PreferType — follower-operator test.
         SchemaTokenId followerKind{};
         if (operandSibling.valid()) {
             std::vector<NodeId> fl;
@@ -709,19 +791,25 @@ struct Parser::Impl {
     }
 
     // Enumerate candidate branch rules at the current speculative
-    // AltChoice: rule ids `r` for which both
+    // AltChoice: the alt's RuleLeaf branches `r` (depth-first through
+    // nested AltChoice positions) for which both
     //   (1) `FIRST(r)` contains the upcoming token's effective kind, AND
     //   (2) `routeToRuleLeaf(walker.cursor(), r)` is valid (the alt
     //       structurally allows descending into r).
-    // O(rules) per AltChoice miss; acceptable for current grammar sizes.
+    //
+    // CONTRACT: speculative candidates probe in DECLARED grammar order
+    // — author-controlled, never interner/name order. The list comes
+    // from the AltChoice's compiled branch table (JSON-array order via
+    // `altRuleBranches`); sourcing it from the rule interner instead
+    // (the pre-FC4 behavior) made probe priority an accident of rule
+    // NAMING — interner ids are assigned in alphabetical key order —
+    // silently overriding the author's declared branch order whenever
+    // two branches structurally accept the same input.
     [[nodiscard]] std::vector<RuleId>
     candidateBranches(SchemaTokenId tokKind) const {
         std::vector<RuleId> out;
-        const auto& interner = schema->rules();
-        // Skip `RuleId{0}` — the invalid-sentinel slot — and iterate
-        // real rules `[1, interner.size())`.
-        for (std::uint32_t r = 1; r < interner.size(); ++r) {
-            const RuleId candidate{r};
+        for (RuleId const candidate
+             : schema->altRuleBranches(walker.cursor())) {
             const auto firstSet = schema->firstSetOf(candidate);
             if (firstSet.empty()) continue;
             if (std::ranges::find(firstSet, tokKind) == firstSet.end()) continue;
@@ -777,6 +865,18 @@ struct Parser::Impl {
                       ? impl.walker.lookahead() * 16u
                       : 64u))
             , stepRecoveredBefore_(impl.stepRecovered_)
+            // FC4 c1: the forward-progress watchdog tuple is probe state
+            // too. Without restoring it, a rolled-back probe leaves
+            // `last*` pointing at a position INSIDE the discarded branch
+            // — and a later non-speculative dispatch (the all-fail
+            // fallback REPLAY) that legitimately re-reaches that same
+            // (cursor, tokPos, depth) trips the watchdog on real
+            // progress. Same restore discipline as diagsEmitted /
+            // stepRecovered_.
+            , lastCursorBefore_(impl.lastCursor)
+            , lastTokPosBefore_(impl.lastTokPos)
+            , lastDepthBefore_(impl.lastDepth)
+            , firstIterationBefore_(impl.firstIteration)
             // FC2: the binder sketch is the FIFTH machine a probe
             // touches (binder-rule frames closing inside the branch
             // record bindings; the type-name triage records
@@ -815,6 +915,10 @@ struct Parser::Impl {
                 impl_.tokens.restore(bookmark_);
                 impl_.diagsEmitted = diagsBefore_;
                 impl_.stepRecovered_ = stepRecoveredBefore_;
+                impl_.lastCursor     = lastCursorBefore_;
+                impl_.lastTokPos     = lastTokPosBefore_;
+                impl_.lastDepth      = lastDepthBefore_;
+                impl_.firstIteration = firstIterationBefore_;
                 impl_.sketch.restore(std::move(sketchSnap_));
             }
             --impl_.speculationDepth;
@@ -849,6 +953,15 @@ struct Parser::Impl {
             impl_.lastCursor = impl_.walker.cursor();
             impl_.lastTokPos = impl_.tokens.position();
             impl_.lastDepth  = impl_.frames.size();
+            // FC4 c1: the post-commit tuple just recorded is EXACTLY what
+            // the next dispatch iteration snaps when the committed branch
+            // leaves the cursor at a non-End slot with no token consumed
+            // in between (e.g. a committed declarator base suffix landing
+            // on the suffix-repeat AltChoice) — the watchdog would trip on
+            // legitimate progress. Skip exactly ONE comparison; a true
+            // stall still trips on the following iteration, so the
+            // watchdog stays sound.
+            impl_.firstIteration = true;
             committed_       = true;
         }
 
@@ -868,6 +981,10 @@ struct Parser::Impl {
         bool                                   desyncedBefore_;
         std::size_t                            budget_;
         bool                                   stepRecoveredBefore_;
+        SchemaCursor                           lastCursorBefore_;
+        std::size_t                            lastTokPosBefore_;
+        std::size_t                            lastDepthBefore_;
+        bool                                   firstIterationBefore_;
         BinderSketch::Snapshot                 sketchSnap_;
         bool                                   committed_ = false;
     };
@@ -953,66 +1070,6 @@ struct Parser::Impl {
         return true;
     }
 
-    // Four-machine snapshot used by `DefaultPrattWalker` to roll back
-    // a tentatively-built primary so it can be rebuilt inside a wrap
-    // (the schema's `expr.wrapperRules.binary` / `.postfix` rules).
-    // Distinct from `SpeculationProbe` —
-    // the walker's rollback is always intentional (no commit-vs-fail
-    // discipline) and the budget / watchdog re-baseline aren't
-    // applicable. Token bookmark + builder checkpoint + schema-walker
-    // snapshot + frame depth + diag counter, restored in dtor order.
-    struct WalkerSnapshot {
-        TokenStream::Bookmark                  tokenBookmark;
-        std::optional<TreeBuilder::Checkpoint> builderCp;
-        std::optional<SchemaWalker::Snapshot>  walkerSnap;
-        std::size_t                            frameDepth;
-        std::size_t                            diagsBefore;
-        // FC2: the binder sketch rolls back with the other machines.
-        // c-subset declarations never nest inside expressions, but the
-        // contract is engine-generic (a language with let-expressions
-        // would bind inside a replayed primary) — restoring here keeps
-        // the rollback-replay sound for any grammar.
-        BinderSketch::Snapshot                 sketchSnap;
-    };
-
-    [[nodiscard]] WalkerSnapshot snapForWalker() {
-        return WalkerSnapshot{
-            tokens.mark(),
-            builder->checkpoint(),
-            walker.snapshot(),
-            frames.size(),
-            diagsEmitted,
-            sketch.snapshot(),
-        };
-    }
-
-    // Rolls back the four-machine state to the snapshot. Consumes
-    // `s.builderCp` / `s.walkerSnap` (move-only). Callers that want
-    // to rollback AGAIN must re-snap before each rollback. Callers
-    // that DON'T rollback must call `commitWalkerSnap` before the
-    // snapshot goes out of scope — otherwise the embedded
-    // `TreeBuilder::Checkpoint` dtor silently rolls back everything
-    // built since the snap (the "uncommitted Checkpoint" RAII rule).
-    void rollbackForWalker(WalkerSnapshot& s) noexcept {
-        while (frames.size() > s.frameDepth) {
-            frames.pop_back();
-            if (!frameRules.empty()) frameRules.pop_back();
-        }
-        walker.restore(std::move(*s.walkerSnap));
-        builder->rollback(std::move(*s.builderCp));
-        tokens.restore(s.tokenBookmark);
-        diagsEmitted = s.diagsBefore;
-        sketch.restore(std::move(s.sketchSnap));
-    }
-
-    // Commit the snapshot's builder Checkpoint so its dtor doesn't
-    // auto-rollback the post-snap work. Used when the walker decides
-    // the tentatively-built primary stands on its own (no op at >=
-    // minPrec) and the snap should be discarded.
-    void commitWalkerSnap(WalkerSnapshot& s) noexcept {
-        if (s.builderCp) builder->commit(std::move(*s.builderCp));
-    }
-
     // Try one speculative branch. Opens the branch frame inside a
     // `SpeculationProbe` and drives `stepOnce` repeatedly until
     // either the branch's frame closes (`frames.size() ==
@@ -1050,13 +1107,31 @@ struct Parser::Impl {
         // the candidate OUT and it is recorded after the probe
         // destructs, into the restored sketch. An ENCLOSING probe that
         // later rolls back erases it correctly (the winning parse
-        // re-encounters and re-records the site), and the Pratt
-        // walker's rollback-replay re-records it on each replay —
-        // convergent to exactly the surviving parse's candidates.
+        // re-encounters and re-records the site) — convergent to
+        // exactly the surviving parse's candidates. (The Pratt walker
+        // itself records each site exactly once: its wrap-in-place
+        // climb never rolls back.)
         std::optional<AmbiguousTypeNameCandidate> rolledBackCandidate;
 
         const bool committed = [&]() -> bool {
         SpeculationProbe probe{*this};
+
+        // FC4 c1: an `expr`-shape BRANCH (e.g. c-subset forInitAmbig's
+        // `expression`) must hand off to the Pratt walker exactly like the
+        // RuleLeaf dispatch does — `openExprFrame` would compile the branch
+        // as its transparent atom reference, parse ONLY the first operand,
+        // and silently COMMIT a truncated expression (`i = 9` consuming
+        // just `i`). The walker balances its own frames; failure surfaces
+        // via the probe's diagnostic/desync deltas and rolls back so the
+        // alt's next candidate gets its shot.
+        if (schema->isExprRule(branch)) {
+            prattWalker->walkExpression(*outer, branch,
+                                        schema->exprMinPrecedence(branch));
+            if (probe.emittedDiag())   return false;
+            if (probe.isDesynced())    return false;
+            probe.commit();
+            return true;
+        }
 
         openExprFrame(branch);
 
@@ -1092,12 +1167,14 @@ struct Parser::Impl {
         // FC2 type-name commit guard: a `commitRequiresTypeName`-marked
         // branch commits only per the generic triage (lone-identifier
         // type names need binder-sketch / follower evidence; every other
-        // type form commits). Returning false lets the probe's RAII
-        // restore roll the branch back and the caller try the alt's
+        // type form commits). The guard's declared POLARITY (FC4 c1 M4)
+        // selects the unknown-name arm. Returning false lets the probe's
+        // RAII restore roll the branch back and the caller try the alt's
         // next candidate — the value reading.
         if (const RuleId typeRule = schema->typeNameCommitRule(branch);
             typeRule.valid()) {
             if (!typeNameCommitApproved_(branch, typeRule,
+                                         schema->typeNameCommitPolarity(branch),
                                          rolledBackCandidate)) {
                 return false;
             }
@@ -1176,17 +1253,23 @@ struct Parser::Impl {
             && curCursor == lastCursor
             && curTokPos == lastTokPos
             && curDepth  == lastDepth) {
-            emitParserError(
-                DiagnosticCode::P_RecoveryStalled,
-                tokens.peek().span,
-                std::format(
-                    "parser forward-progress watchdog tripped at slot kind {}, "
-                    "core kind {}, schema kind {}, frame depth {}",
-                    static_cast<int>(walker.slotKind()),
-                    static_cast<int>(tokens.peek().coreKind),
-                    tokens.peek().schemaKind.v,
-                    frames.size()));
-            fatal("dss::Parser: forward-progress watchdog tripped");
+            std::string const stallDetail = std::format(
+                "parser forward-progress watchdog tripped at slot kind {}, "
+                "core kind {}, schema kind {}, frame depth {}, token pos {}, "
+                "rule '{}'",
+                static_cast<int>(walker.slotKind()),
+                static_cast<int>(tokens.peek().coreKind),
+                tokens.peek().schemaKind.v,
+                frames.size(),
+                tokens.position(),
+                frameRules.empty()
+                    ? std::string{"<none>"}
+                    : std::string{schema->rules().name(frameRules.back())});
+            emitParserError(DiagnosticCode::P_RecoveryStalled,
+                            tokens.peek().span, stallDetail);
+            // The fatal abort happens before the diagnostic drain can
+            // print, so the detail rides the abort message too.
+            fatal(stallDetail.c_str());
         }
         lastCursor = curCursor;
         lastTokPos = curTokPos;
@@ -1391,13 +1474,49 @@ struct Parser::Impl {
 
                 // Try each candidate RULE branch in declaration order.
                 // First success commits and falls through to the
-                // next outer iteration; full failure emits one
-                // P_BacktrackFailed + consumes for forward progress.
+                // next outer iteration.
                 const auto candidates = candidateBranches(tokKind);
                 for (auto const branch : candidates) {
                     if (trySpeculativeBranch(branch)) {
                         return StepOutcome::Continue;
                     }
+                }
+
+                // FC4 c1: every candidate failed. At the OUTERMOST level,
+                // REPLAY the declared-LAST candidate non-speculatively so
+                // its precise diagnostics land where the user can act on
+                // them — the declared order makes the last branch the
+                // language's fallback reading (c-subset declOrExprStmt's
+                // exprStmt), and pre-FC4 that reading was a direct alt
+                // branch whose errors surfaced directly. Pure rollback
+                // would bury the real error (`a ? b ;` → "missing ':'")
+                // under an opaque P_BacktrackFailed.
+                //
+                // ONE-SHOT per (cursor, token position): a replayed branch
+                // that fails WITHOUT net token consumption unwinds back to
+                // this very alt with the same peek — a second replay would
+                // loop until the forward-progress watchdog aborts. The
+                // re-entry falls through to the P_BacktrackFailed +
+                // consume hatch, which guarantees progress exactly as the
+                // pre-replay contract did. Inside a NESTED probe the
+                // rollback semantics stay pure (the outer probe owns the
+                // failure), so no replay fires there either.
+                if (speculationDepth == 0 && !candidates.empty()
+                    && !(replayedFallback_
+                         && lastReplayCursor_ == walker.cursor()
+                         && lastReplayTokPos_ == tokens.position())) {
+                    replayedFallback_  = true;
+                    lastReplayCursor_  = walker.cursor();
+                    lastReplayTokPos_  = tokens.position();
+                    const RuleId fallback = candidates.back();
+                    if (schema->isExprRule(fallback)) {
+                        prattWalker->walkExpression(
+                            *outer, fallback,
+                            schema->exprMinPrecedence(fallback));
+                        return StepOutcome::Continue;
+                    }
+                    openExprFrame(fallback);
+                    return StepOutcome::Continue;
                 }
 
                 return recoverAt(DiagnosticCode::P_BacktrackFailed,
@@ -1440,16 +1559,17 @@ struct Parser::Impl {
                 return StepOutcome::Continue;
             }
 
-            // AltChoice → RuleLeaf branch route. The schema's
-            // public API doesn't enumerate an AltChoice's branch
-            // RuleIds, so we linear-scan the rule interner for a
-            // candidate whose FIRST contains tokKind and for which
-            // `routeToRuleLeaf` accepts from the current cursor.
-            // O(rules) per AltChoice miss; acceptable for current
-            // grammar sizes.
-            const auto& interner = schema->rules();
-            for (std::uint32_t r = 1; r < interner.size(); ++r) {
-                const RuleId candidate{r};
+            // AltChoice → RuleLeaf branch route, candidates sourced
+            // from the alt's compiled branch table in DECLARED grammar
+            // order (same contract as `candidateBranches`: speculative
+            // candidates probe in DECLARED grammar order — author-
+            // controlled, never interner/name order). Non-speculative
+            // alts are loader-checked for FIRST-set overlap
+            // (C_AmbiguousAlternatives), so at most one branch admits
+            // `tokKind` here; declared order keeps the tie-break
+            // uniform with the speculative path regardless.
+            for (RuleId const candidate
+                 : schema->altRuleBranches(walker.cursor())) {
                 const auto firstSet = schema->firstSetOf(candidate);
                 if (firstSet.empty()) continue;
                 if (std::ranges::find(firstSet, tokKind) == firstSet.end()) continue;
@@ -1606,23 +1726,30 @@ ParseResult Parser::parse() && {
 
 // ── DefaultPrattWalker ──────────────────────────────────────────────────
 //
-// Schema-driven operator-precedence climber. Produces a right-recursive
-// tree wrapping operator results in the three rules declared by the
-// schema's `expr.wrapperRules.{binary,unary,postfix}` block — names
-// are config-sourced (loader auto-interns them when any `expr` shape
-// is declared). Left- vs. right-associativity is encoded in the
-// operator table, not in the tree's structural nesting — a downstream
-// semantic pass reads associativity from
-// `operatorTable().lookup(kind, Infix)->associativity`.
+// Schema-driven operator-precedence climber. Produces a STRUCTURALLY
+// associative tree wrapping operator results in the rules declared by
+// the schema's `expr.wrapperRules.{binary,unary,postfix,ternary}`
+// block — names are config-sourced (loader auto-interns them when any
+// `expr` shape is declared). The operator table's declared
+// `associativity` is consumed HERE, by the walker, when it picks the
+// RHS minimum precedence for an infix wrap: Left (and None, the
+// loader's omitted-field default) chains build ITERATIVELY — O(n)
+// wraps, no per-operator recursion, stack-friendly — nesting LEFT;
+// Right-assoc chains recurse via the RHS parse at the operator's own
+// precedence, nesting RIGHT.
 //
 // Each `parseExpressionAt(minPrec)` call:
-//   1. Takes a four-machine snapshot (tokens, builder, walker, frames,
-//      diag counter).
-//   2. Parses a primary (prefix-op + nested expression OR the atom).
-//   3. Loops: while peek is an op at >= minPrec, rolls back to the
-//      snapshot, opens a wrapper, rebuilds LHS via recursion with
-//      minPrec = op.prec + 1 (so LHS doesn't gobble this same op),
-//      pushes the op, recurses RHS at op.prec (right-recursive).
+//   1. Parses a primary (prefix-op + nested expression OR the atom).
+//   2. Loops: while peek is an op at >= minPrec, wraps the already-
+//      built last child in the matching wrapper frame
+//      (`TreeBuilder::wrapLastChildInFrame`) and parses the operator's
+//      remaining operands inside the still-open wrapper:
+//        - infix: RHS at `prec + 1` for Left/None (the next same-prec
+//          op returns to THIS loop and wraps THIS wrapper → left
+//          nesting), at `prec` for Right (the RHS recursion consumes
+//          the chain → right nesting).
+//        - postfix: no further operand (or a grouped/follower body).
+//        - ternary: middle at 0, else at `prec` (right-assoc chain).
 //      Each iteration strictly extends the consumed range — no loop.
 namespace {
 
@@ -1685,6 +1812,11 @@ void parsePrimary(Parser::Impl& I, PrattRules const& rules,
 
 void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                        std::int32_t minPrec) {
+    // Depth guard: recursion occurs only through OPERANDS (nested
+    // parens, prefix operands, grouped-postfix bodies, ternary
+    // clauses) and RIGHT-associative RHS chains — Left/None-assoc
+    // chains build iteratively in the climb loop below and never
+    // deepen the C++ stack.
     if (I.expressionDepth >= I.config.maxExpressionDepth) {
         fatal("dss::DefaultPrattWalker: expression recursion depth "
               "exceeded ParserConfig::maxExpressionDepth — deeply "
@@ -1697,14 +1829,44 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
         ~DepthGuard() { --depth; }
     } guard{I.expressionDepth};
 
-    auto snap = I.snapForWalker();
     parsePrimary(I, rules, minPrec);
 
+    // Operator climb — wrap-in-place for ALL three arms (postfix /
+    // ternary / infix): the already-built previous child is adopted by
+    // the new wrapper via `wrapLastChildExprFrame`, and the remaining
+    // operands parse inside the still-open wrapper. There is no
+    // snapshot / rollback-replay here (the former WalkerSnapshot
+    // mechanism is deleted). Behavior preservation vs that design:
+    //   (a) diagnostics: the replay rolled diagnostics back with the
+    //       builder (TreeBuilder::CheckpointSnapshot carries a
+    //       DiagnosticReporter::Snapshot) and re-emitted them on the
+    //       replay — emitting ONCE under wrap-in-place produces the
+    //       identical diagnostic stream.
+    //   (b) binder sketch: snapshot restore was truncate-to-count and
+    //       the replay re-recorded the same bindings/candidates ⇒
+    //       convergent — recording once reaches the same final state.
+    std::vector<Token> heldTrivia;
+    auto const placeHeldTrivia = [&I, &heldTrivia] {
+        for (Token const& t : heldTrivia) I.builder->pushToken(t);
+    };
     while (true) {
-        pumpTrivia(I);
+        // Hold-then-place trivia: collect the trivia run (same
+        // token-level classification `pumpTrivia` uses) WITHOUT
+        // pushing it, so the wrap decision below sees the real
+        // expression subtree — never a whitespace/comment leaf — as
+        // the open frame's last pending child (`f (x)` must wrap `f`,
+        // not the space). If an arm fires, the held run is pushed into
+        // the just-opened wrapper, before the operator token; if the
+        // loop exits, it's pushed into the current frame. Both
+        // reproduce the token-ordered leaf stream byte-for-byte.
+        heldTrivia.clear();
+        while (!I.tokens.isAtEnd() && isSkippableTrivia(I.tokens.peek())) {
+            heldTrivia.push_back(I.tokens.advance());
+        }
+
         Token const& peek = I.tokens.peek();
         if (peek.coreKind == CoreTokenKind::Eof) {
-            I.commitWalkerSnap(snap);
+            placeHeldTrivia();
             return;
         }
         const SchemaTokenId kind =
@@ -1729,7 +1891,7 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
             ternary && ternary->precedence >= minPrec && rules.ternary.valid();
 
         if (!postfixInClimb && !infixInClimb && !ternaryInClimb) {
-            I.commitWalkerSnap(snap);
+            placeHeldTrivia();
             return;
         }
 
@@ -1742,14 +1904,10 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
         // Postfix is LEFT-associative: iterative wrapping via
         // `wrapLastChildExprFrame` wraps the previously-built primary
         // (or a prior chain wrap) as the new postfix-wrapper's first
-        // child. The pre-primary `snap` is INTENTIONALLY NOT advanced
-        // across postfix iterations — a later same-level infix iter
-        // (`f(a) + g(b)`) needs that snap to roll the entire chain
-        // back and rebuild it inside the binary-wrapper via the
-        // recursive LHS parse at `prec + 1`. Using rollback-replay
-        // (infix's strategy) for postfix would lose iter-1's wrap on iter-2.
+        // child.
         if (postfixInClimb) {
             I.wrapLastChildExprFrame(rules.postfix);
+            placeHeldTrivia();
             if (!I.pushOperatorToken()) {
                 // Truly defensive: peek was non-Eof when we entered
                 // this iteration, so pushOperatorToken should have
@@ -1762,7 +1920,6 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                     peek.span,
                     "expression ended before postfix operator");
                 I.closeFrameOnce();
-                I.commitWalkerSnap(snap);
                 return;
             }
             if (postfix->followerRule.has_value()) {
@@ -1838,32 +1995,25 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                 }
             }
             I.closeFrameOnce();
-            // Snap intentionally NOT advanced — see header comment
-            // above the postfix branch. A subsequent infix iteration
-            // at the same level needs the original pre-primary snap
-            // so its rollback-replay can wipe this postfix wrap and
-            // rebuild the chain inside the binary-wrapper frame.
             continue;
         }
 
-        // Ternary (mixfix `cond ? then : else`). Like infix, it gathers the
-        // already-built primary as its condition via rollback-replay, then
-        // parses the middle clause (to the `:` separator) and the else operand.
+        // Ternary (mixfix `cond ? then : else`). Wraps the already-built
+        // chain in place as its condition, then parses the middle clause
+        // (to the `:` separator) and the else operand inside the wrapper.
         // The middle parses at minPrec 0 — between `?` and `:` anything binds
         // (assignment, even a nested ternary); the climb naturally stops at `:`
         // (which carries no operator-table entry). The else parses at the
         // ternary's own precedence → right-associative (`a?b:c?d:e` = a?b:(c?d:e)).
         if (ternaryInClimb) {
-            I.rollbackForWalker(snap);
-            snap = I.snapForWalker();
-            I.openExprFrame(rules.ternary);
-            parseExpressionAt(I, rules, ternary->precedence + 1);   // condition
-            pumpTrivia(I);
+            I.wrapLastChildExprFrame(rules.ternary);
+            placeHeldTrivia();
             if (!I.pushOperatorToken()) {                            // `?`
+                // Defensive — same contract as the postfix arm's
+                // pushOperatorToken failure path.
                 I.emitParserError(DiagnosticCode::P_PrematureEndOfInput, peek.span,
                                   "expression ended before ternary '?'");
                 I.closeFrameOnce();
-                I.commitWalkerSnap(snap);
                 return;
             }
             parseExpressionAt(I, rules, 0);                          // then (middle)
@@ -1879,7 +2029,6 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                                   "ternary expression is missing its ':' separator");
                 I.builder->pushErrorNode(midPeek.span);
                 I.closeFrameOnce();
-                I.commitWalkerSnap(snap);
                 return;
             }
             (void)I.pushOperatorToken();                             // `:`
@@ -1888,32 +2037,33 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
             continue;
         }
 
-        // Infix path keeps the right-recursive rollback-replay: roll
-        // back to before the primary was built, open the binary
-        // wrapper, and rebuild the primary inside it. Re-snap to the
-        // post-rollback state so a chained infix at lower precedence
-        // can do the same dance.
-        I.rollbackForWalker(snap);
-        snap = I.snapForWalker();
-
-        I.openExprFrame(rules.binary);
-        // LHS: strictly tighter (op.prec + 1) so it doesn't gobble
-        // this same-prec op (which would loop forever).
-        parseExpressionAt(I, rules, infix->precedence + 1);
-        pumpTrivia(I);
+        // Infix: wrap the already-built chain in place as the LHS,
+        // then parse the RHS inside the still-open wrapper. The RHS
+        // minimum precedence encodes the operator's DECLARED
+        // associativity:
+        //   - Left (and None, the loader's omitted-field default):
+        //     prec + 1 — the next same-prec operator does NOT bind
+        //     inside the RHS; it returns to this loop and wraps THIS
+        //     wrapper → chains nest LEFT, iteratively.
+        //   - Right: prec — the next same-prec operator binds inside
+        //     the RHS recursion → chains nest RIGHT.
+        I.wrapLastChildExprFrame(rules.binary);
+        placeHeldTrivia();
         if (!I.pushOperatorToken()) {
+            // Defensive — same contract as the postfix arm's
+            // pushOperatorToken failure path.
             I.emitParserError(
                 DiagnosticCode::P_PrematureEndOfInput,
                 peek.span,
                 "expression ended before infix operator");
             I.closeFrameOnce();
-            I.commitWalkerSnap(snap);
             return;
         }
-        // RHS uses op.prec, so same-prec ops fold into a nested
-        // binary-wrapper (right-recursive shape; left-assoc is conveyed
-        // only via the operator table).
-        parseExpressionAt(I, rules, infix->precedence);
+        const std::int32_t rhsMin =
+            (infix->associativity == OperatorAssoc::Right)
+                ? infix->precedence
+                : infix->precedence + 1;
+        parseExpressionAt(I, rules, rhsMin);
         I.closeFrameOnce();
     }
 }

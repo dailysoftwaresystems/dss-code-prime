@@ -5,6 +5,7 @@
 #include "mir/mir_cfg.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "mir/mir_struct_markers.hpp"
 #include "opt/analysis/call_graph_scc.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
@@ -202,15 +203,20 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // callee whose body contains an `IntrinsicCall` is now ADMITTED (it
     // clones SSA-correctly via the same generic arm; the per-op check below
     // carries the frame-sensitivity caveat + its trigger-gated anchor
-    // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC). What STAYS refused:
-    //   * A callee `Phi` in ANY block. A multi-block callee CAN legally
-    //     carry a Phi at a real CFG merge (e.g. a post-Mem2Reg join), but
-    //     cloning a Phi requires remapping its incomings through the
-    //     callee-block→caller-block map with the rebuilder's phase-3
-    //     deferral discipline — a distinct correctness surface deferred
-    //     to a later cycle (D-OPT7-MULTIBLOCK-SPLICE-PHI). The two-return
-    //     diamond this cycle delivers (`pick(x){if(x)return 7;else return
-    //     9;}`) has NO Phi — its merge IS the inserted return-merge Phi.
+    // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC). OPT7 (D-OPT7-MULTIBLOCK-
+    // SPLICE-PHI) LIFTS the callee-`Phi` refusal too — a multi-block callee
+    // that carries a `Phi` at a real CFG merge (a value-producing `?:` /
+    // `&&` / `||` lowers to a MIR Phi BEFORE Mem2Reg; or a post-Mem2Reg
+    // join / loop header) is now ADMITTED. `spliceMultiBlock` clones each
+    // callee Phi via a DEFERRED flush (placeholder in the clone loop, then
+    // its incomings remapped through the value (`local`) + block
+    // (`calleeBlockMap`) maps AFTER the loop) — the SAME deferral discipline
+    // the caller's own phis already use (phase 3) and the SIBLING of the
+    // `returnEdges` flush, with DISJOINT maps so the two compose. The
+    // deferral is UNIFORM across phi shapes: a loop/back-edge phi resolves
+    // for free (its back-edge incoming value is defined later in RPO, so
+    // `local` is complete only after the loop — exactly when the flush
+    // runs). What STAYS refused:
     //   * A callee with NO RETURNING PATH (no `Return` in ANY block; every
     //     path ends in `Unreachable` — e.g. `int f(){ while(1){} }`). The
     //     multi-block splice routes each callee `Return` to a continuation
@@ -260,7 +266,14 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // current intrinsic model. Gating on a per-intrinsic inline-
             // safety attribute is trigger-gated to the first frame-sensitive
             // intrinsic — D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.
-            if (op == MirOpcode::Phi)  return std::nullopt;  // deferred (see above)
+            //
+            // OPT7 (D-OPT7-MULTIBLOCK-SPLICE-PHI): a callee `Phi` is NO
+            // LONGER a refusal — `spliceMultiBlock` clones it via a deferred
+            // flush (see rule 5, above). A Phi only ever appears in a MULTI-
+            // block callee (a single-block leaf is Return-terminated, no
+            // merge), so the multi-block CFG-clone path is the only one that
+            // can encounter one; it still counts as 1 instruction here (the
+            // cost model is unchanged — Phis are not special-cased).
             if (op == MirOpcode::Return) hasReturn = true;
             if (op == MirOpcode::Arg && mir.argIndex(cid) >= callArgCount) {
                 return std::nullopt;  // arg index out of range → refuse
@@ -351,10 +364,14 @@ mapActualArgs(Mir const& src, MirInstId oldCall,
 // block. `Arg(i)` → the actual argument; Const / GlobalAddr re-emit
 // through their dedicated builders; every other op re-emits via
 // `addInst` with operands mapped through `local`. Records the
-// calleeOld→callerNew mapping into `local`. The legality gate excludes
-// callee Phis (any block), so a Phi here is a structural violation.
-// An out-of-range `Arg` index sets `malformed` (the gate guarantees it
-// can't happen; this is the defensive fail-loud guard).
+// calleeOld→callerNew mapping into `local`. A callee `Phi` must NEVER
+// reach here: `spliceMultiBlock` handles callee Phis BEFORE dispatching
+// to this helper (a placeholder-then-deferred-flush, like the caller's
+// own phis), and a single-block leaf is Return-terminated so it provably
+// has no Phi — so a Phi reaching this helper is a structural violation
+// (defensive fail-loud guard, below). An out-of-range `Arg` index sets
+// `malformed` (the gate guarantees it can't happen; this is the
+// defensive fail-loud guard).
 void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
                     MirBuilder& dst,
                     std::vector<MirInstId> const& actualArgs,
@@ -382,9 +399,12 @@ void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
     }
     if (cop == MirOpcode::Phi) {
         std::fprintf(stderr,
-            "dss::opt::passes::Inlining fatal: callee funcId v=%u "
-            "contains a Phi during splice — the legality gate must "
-            "have excluded it (D-OPT7-MULTIBLOCK-SPLICE-PHI).\n", callee.v);
+            "dss::opt::passes::Inlining fatal: callee funcId v=%u Phi "
+            "reached emitCalleeInst — spliceMultiBlock handles callee Phis "
+            "BEFORE dispatching here (deferred placeholder + flush), and a "
+            "single-block leaf is Return-terminated so it has no Phi; a Phi "
+            "here is a structural violation (D-OPT7-MULTIBLOCK-SPLICE-PHI).\n",
+            callee.v);
         std::abort();
     }
     auto const cops = src.instOperands(cid);
@@ -557,25 +577,47 @@ private:
 // terminator is tracked separately (`blockExitMap[old] → last cont`),
 // and caller Phi incomings redirect their `pred` through it.
 //
-// StructCfMarker: the cloned callee blocks + every continuation block
-// are re-derived to `Linear` (the SimplifyCfg cycle-9 marker re-
-// derivation precedent). Re-deriving is the clean choice — a clone of
-// the callee's `EntryBlock` would violate the verifier's "exactly one
-// EntryBlock == funcBlockAt(f,0)" rule, a clone of an `ExitBlock` whose
-// Return became a `Br` would violate "ExitBlock terminates in
-// Return/Unreachable", and transplanting the callee's If/Loop marker
-// COUNTS would pollute the caller's marker-parity checks. `Linear`
-// contributes to zero parity counts and to neither special rule, so
-// the post-splice CFG verifies. The caller's OWN block markers are
-// preserved unchanged (the caller's structure is untouched).
+// StructCfMarker: markers are NOT maintained through the rebuild — after
+// it, `runInlining` re-stamps EVERY block from the canonical CFG
+// derivation (`rederiveStructCfMarkers`, mir_struct_markers.hpp), so an
+// inlined callee's loop headers RE-EMERGE as `LoopHeader` in the caller
+// (the splice preserves the back-edges, and the derivation reads them)
+// and an inlined if-diamond re-derives IfThen/IfElse/IfJoin around the
+// caller's post-dominator structure. Every block is therefore CREATED
+// with a creation-time default marker only (caller blocks keep their
+// source marker, cloned/continuation blocks are `Linear`); the post-
+// finish re-derivation is the single source of marker truth. The
+// verifier checks stored == derived per reachable block, which the
+// final stamping satisfies by construction.
+//
+// LAYOUT (the C1 contract — D-OPT2 layout class, MirVerifier I0010):
+// every block is pre-created in FINAL-LAYOUT order BEFORE any fill, so
+// the function's block layout (= `funcBlockAt` / creation order) is
+// TOPOLOGICAL for every flow a splice can produce. Phase 1 walks each
+// caller block in layout order, creating that caller block, then — for
+// every plan'd MULTI-BLOCK call in it (scanned in inst order) — the
+// splice's cloned-callee blocks (callee-RPO) FOLLOWED BY its
+// continuation block. The resulting layout is
+// `[A', clones1, cont1, clones2, cont2, B', ...]`: a clone-defined value
+// consumed in a continuation (the 1-return degenerate-Phi-elision case),
+// a continuation-Phi consumed in a later caller block (a post-Mem2Reg
+// iteration-2 caller), and an earlier call's result consumed as a later
+// call's argument all have their def laid out before their use. Without
+// this, a ≥2-return merge Phi laundered the cross-layout flow (Phi
+// operands are layout-exempt) but the EXACTLY-1-return elision fed a
+// clone-defined value to the continuation as a NON-Phi operand —
+// dominance-valid (the clone dominates the continuation) but
+// layout-inverted, which no linear consumer (rebuilder rewrite map,
+// mir_to_lir regForValue) can resolve. The MirVerifier's layout rule
+// now enforces this contract at every producing pass.
 //
 // SSA: callee blocks are emitted in RPO from the callee entry (a valid
 // def-before-use order for a Phi-free SSA body — every def dominates
 // its uses, and RPO visits a block's dominators first), so the shared
 // calleeOld→callerNew `local` map is always populated before a use.
 // The engine's verify-after-every-pass hook re-runs MirVerifier, so any
-// splice that broke SSA dominance / Phi completeness / a CFG edge is a
-// build break, never a runtime miscompile.
+// splice that broke SSA dominance / Phi completeness / a CFG edge / the
+// layout contract is a build break, never a runtime miscompile.
 class MultiBlockInliner {
 public:
     // `plan` (callId .v → callee) is precomputed by `planHasMultiBlock`
@@ -594,19 +636,40 @@ public:
 
         std::uint32_t const nb = src_.funcBlockCount(caller);
 
-        // Phase 1: pre-create one NEW caller block per ORIGINAL caller
-        // block (preserving the caller's own marker), so terminators
-        // can target forward references (loop back-edges). The entry of
-        // each original block keeps its identity in `blockMap_`.
         blockMap_.clear();
         blockExitMap_.clear();
         rewrite_.clear();
         deferredPhis_.clear();
+        splicePlans_.clear();
+
+        // Phase 1: pre-create EVERY block in FINAL-LAYOUT order, BEFORE
+        // any fill (the C1 layout contract — see the class-doc). Walk each
+        // caller block in layout order: create that caller block FIRST
+        // (it keeps its identity in `blockMap_` as a branch target), then
+        // scan its instructions in order and, for each plan'd MULTI-BLOCK
+        // call, pre-create that splice's cloned-callee blocks (in
+        // callee-RPO) FOLLOWED BY its continuation block — stored per
+        // callId in `splicePlans_`. This yields the topological layout
+        // `[A', clones1, cont1, clones2, cont2, B', ...]`. Terminators can
+        // still target forward references (loop back-edges) because every
+        // block exists before phase 2 emits a single instruction. A
+        // single-block-leaf call pre-creates NOTHING (it splices linearly
+        // into its host block); only multi-block calls add blocks here.
         for (std::uint32_t bi = 0; bi < nb; ++bi) {
             MirBlockId const oldB = src_.funcBlockAt(caller, bi);
             MirBlockId const newB = dst_.createBlock(src_.blockMarker(oldB));
             blockMap_.emplace(oldB.v, newB);
             blockExitMap_.emplace(oldB.v, newB);  // updated if split
+            std::uint32_t const ni = src_.blockInstCount(oldB);
+            for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                MirInstId const id = src_.blockInstAt(oldB, ii);
+                if (src_.instOpcode(id) != MirOpcode::Call) continue;
+                auto const it = plan_.find(id.v);
+                if (it == plan_.end()) continue;
+                MirFuncId const callee = it->second;
+                if (src_.funcBlockCount(callee) == 1) continue;  // linear splice
+                precreateMultiBlockSplice(callee, id);
+            }
         }
 
         // Phase 2: fill blocks.
@@ -690,6 +753,19 @@ private:
         MirInstId  oldPhi;
         MirInstId  newPhi;
         MirBlockId oldBlock;
+    };
+
+    // PHASE-1 pre-created blocks for ONE multi-block splice (the C1
+    // layout contract). `calleeRpo` is the callee's block RPO (the fill
+    // order, == def-before-use); `calleeBlockMap` maps each callee block
+    // .v → its pre-created clone; `contBlock` is the pre-created
+    // continuation. All created in final-layout order in phase 1 so the
+    // function layout stays topological; phase-2 `spliceMultiBlock`
+    // consumes these (it never calls createBlock).
+    struct SplicePlan {
+        std::vector<MirBlockId>                       calleeRpo;
+        std::unordered_map<std::uint32_t, MirBlockId> calleeBlockMap;
+        MirBlockId                                    contBlock{};
     };
 
     // Map an operand of a CALLER instruction (a caller-OLD value) to its
@@ -827,31 +903,73 @@ private:
         return result;
     }
 
-    // Splice a MULTI-BLOCK leaf callee. The open block `cur` is split:
-    // it is sealed with a Br to the cloned callee entry; the callee CFG
-    // is cloned; every callee Return becomes a Br to a fresh continuation
-    // block; a return-merge Phi in the continuation joins the per-return
-    // values. Returns the continuation block (the new open block for the
-    // remaining instructions of the host caller block).
+    // Pre-create (PHASE 1) the blocks of a multi-block splice in
+    // FINAL-LAYOUT order: the cloned-callee blocks (callee-RPO) FOLLOWED
+    // BY the continuation block, keyed by callId in `splicePlans_`. RPO
+    // order is the same def-before-use order phase-2 fill uses, so a
+    // clone's layout precedes every clone that consumes it; the
+    // continuation comes LAST so a clone-defined value it consumes (the
+    // 1-return elision) is laid out before it. Creates NO instructions —
+    // only blocks. All blocks are `Linear` (markers re-derived post-
+    // finish). Fail-loud on a duplicate callId (a Call id is unique).
+    void precreateMultiBlockSplice(MirFuncId callee, MirInstId oldCall) {
+        if (splicePlans_.count(oldCall.v) != 0) {
+            std::fprintf(stderr,
+                "dss::opt::passes::Inlining fatal: multi-block call v=%u "
+                "pre-created twice in phase 1 — a Call instruction id must "
+                "be unique within a function (substrate-contract "
+                "violation).\n", oldCall.v);
+            std::abort();
+        }
+        SplicePlan sp;
+        MirBlockId const calleeEntry = src_.funcEntry(callee);
+        sp.calleeRpo = mirReversePostOrder(src_, calleeEntry);
+        sp.calleeBlockMap.reserve(sp.calleeRpo.size());
+        for (MirBlockId const fb : sp.calleeRpo) {
+            sp.calleeBlockMap.emplace(fb.v,
+                                      dst_.createBlock(StructCfMarker::Linear));
+        }
+        // Continuation LAST → laid out after every clone.
+        sp.contBlock = dst_.createBlock(StructCfMarker::Linear);
+        splicePlans_.emplace(oldCall.v, std::move(sp));
+    }
+
+    // Splice a MULTI-BLOCK leaf callee using the PHASE-1 pre-created
+    // blocks (the C1 layout contract — `spliceMultiBlock` never calls
+    // createBlock). The open block `cur` is split: it is sealed with a Br
+    // to the cloned callee entry; the callee CFG is filled into the pre-
+    // created clones; every callee Return becomes a Br to the pre-created
+    // continuation; a return-merge Phi in the continuation joins the per-
+    // return values. Returns the continuation block (the new open block
+    // for the remaining instructions of the host caller block).
     [[nodiscard]] MirBlockId
     spliceMultiBlock(MirFuncId callee, MirInstId oldCall, MirBlockId cur) {
+        (void)cur;
         std::vector<MirInstId> const actualArgs =
             mapActualArgs(src_, oldCall, rewrite_);
 
-        // Callee blocks in RPO from entry — a valid def-before-use order
-        // for the Phi-free callee body (the gate forbids callee Phis).
-        MirBlockId const calleeEntry = src_.funcEntry(callee);
-        std::vector<MirBlockId> const calleeRpo =
-            mirReversePostOrder(src_, calleeEntry);
-
-        // Pre-create the continuation + one fresh caller block per cloned
-        // callee block (all Linear — see the class-doc marker rationale).
-        MirBlockId const contBlock = dst_.createBlock(StructCfMarker::Linear);
-        std::unordered_map<std::uint32_t, MirBlockId> calleeBlockMap;
-        calleeBlockMap.reserve(calleeRpo.size());
-        for (MirBlockId const fb : calleeRpo) {
-            calleeBlockMap.emplace(fb.v, dst_.createBlock(StructCfMarker::Linear));
+        // Consume the PHASE-1 pre-created blocks. A plan'd multi-block
+        // callId with no pre-created entry would mean phase 1 and phase 2
+        // disagree on which calls are multi-block — a silent createBlock
+        // fallback here would reintroduce the layout-inversion bug class,
+        // so fail loud instead (C1 fail-loud requirement).
+        auto const planIt = splicePlans_.find(oldCall.v);
+        if (planIt == splicePlans_.end()) {
+            std::fprintf(stderr,
+                "dss::opt::passes::Inlining fatal: multi-block call v=%u "
+                "(callee funcId v=%u) has no phase-1 pre-created {clones, "
+                "cont} entry — phase 1/phase 2 plan disagreement; a "
+                "createBlock fallback would reintroduce the layout-"
+                "inversion bug class (D-OPT2 layout contract).\n",
+                oldCall.v, callee.v);
+            std::abort();
         }
+        SplicePlan const& sp = planIt->second;
+        std::vector<MirBlockId> const& calleeRpo = sp.calleeRpo;
+        std::unordered_map<std::uint32_t, MirBlockId> const& calleeBlockMap =
+            sp.calleeBlockMap;
+        MirBlockId const contBlock = sp.contBlock;
+        MirBlockId const calleeEntry = src_.funcEntry(callee);
 
         // Seal `cur` with a Br to the cloned callee entry.
         auto const entryIt = calleeBlockMap.find(calleeEntry.v);
@@ -870,6 +988,13 @@ private:
         // (value, cloned-pred-block) pairs collected from each rewritten
         // callee Return — the incomings of the return-merge Phi.
         std::vector<MirPhiIncoming> returnEdges;
+        // DEFERRED callee phis: a placeholder Phi is emitted in the clone
+        // loop (so later insts referencing it resolve through `local`); its
+        // incomings are flushed AFTER the loop (so a back-edge incoming
+        // VALUE, defined later in RPO, has its `local` entry). {oldPhi,
+        // newPhi}. Sibling of `returnEdges` with DISJOINT maps — the two
+        // compose without interference (D-OPT7-MULTIBLOCK-SPLICE-PHI).
+        std::vector<std::pair<MirInstId, MirInstId>> deferredCalleePhis;
         for (MirBlockId const fb : calleeRpo) {
             MirBlockId const newFb = calleeBlockMap.at(fb.v);
             dst_.beginBlock(newFb);
@@ -882,8 +1007,45 @@ private:
                                          local, contBlock, newFb, returnEdges);
                     break;
                 }
+                if (cop == MirOpcode::Phi) {
+                    // Placeholder now (incomings flushed after the loop, so
+                    // a back-edge value resolves); record the mapping so
+                    // later insts referencing this phi resolve via `local`.
+                    MirInstId const newPhi = dst_.addPhi(src_.instType(cid));
+                    local.emplace(cid.v, newPhi);
+                    deferredCalleePhis.emplace_back(cid, newPhi);
+                    continue;
+                }
                 emitCalleeInst(src_, cid, cop, dst_, actualArgs, local, callee,
                                malformed_);
+            }
+        }
+
+        // Flush callee-phi incomings. `local` is complete after the clone
+        // loop → a back-edge (loop-phi) incoming VALUE resolves;
+        // `calleeBlockMap` is complete from phase 1 → every incoming PRED
+        // resolves. NO exit-redirect (callee blocks are 1:1, never split —
+        // unlike the caller's phase-3, which routes a split pred through
+        // blockExitMap_). addPhiIncoming is keyed by phi id → needs no open
+        // block (same as the caller phase-3). A `calleeBlockMap` miss is a
+        // structural violation (every callee block is pre-created in phase
+        // 1) → fail loud.
+        for (auto const& [oldPhi, newPhi] : deferredCalleePhis) {
+            for (MirPhiIncoming const& inc : src_.phiIncomings(oldPhi)) {
+                MirInstId const newVal =
+                    mapCalleeOperand(src_, inc.value, local, callee);
+                auto const predIt = calleeBlockMap.find(inc.pred.v);
+                if (predIt == calleeBlockMap.end()) {
+                    std::fprintf(stderr,
+                        "dss::opt::passes::Inlining fatal: cloned callee "
+                        "funcId v=%u phi v=%u incoming pred block v=%u not "
+                        "in clone map — every callee block is pre-created in "
+                        "phase 1 (D-OPT7-MULTIBLOCK-SPLICE-PHI).\n",
+                        callee.v, oldPhi.v, inc.pred.v);
+                    std::abort();
+                }
+                dst_.addPhiIncoming(newPhi,
+                                    MirPhiIncoming{newVal, predIt->second});
             }
         }
 
@@ -995,6 +1157,10 @@ private:
     // Function-wide caller-OLD inst .v → caller-NEW id.
     std::unordered_map<std::uint32_t, MirInstId>  rewrite_;
     std::vector<DeferredPhi> deferredPhis_;
+    // PHASE-1 pre-created splice blocks, keyed by the multi-block Call's
+    // OLD inst .v. Populated in phase 1 (final-layout order), consumed in
+    // phase 2 by `spliceMultiBlock`. Cleared per function.
+    std::unordered_map<std::uint32_t, SplicePlan> splicePlans_;
     std::size_t callsInlined_ = 0;
     bool        malformed_    = false;
 };
@@ -1089,6 +1255,11 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
 
     result.callsInlined = callsInlined;
     mir = std::move(builder).finish();
+    // Canonical-marker stamping (D-OPT4-1): the splice changed the
+    // caller's CFG (split blocks, cloned callee bodies). Markers are
+    // re-derived from the NEW shape — inlined loop headers re-emerge
+    // as LoopHeader; continuation blocks take their actual role.
+    rederiveStructCfMarkers(mir);
     result.ok = true;
     return result;
 }

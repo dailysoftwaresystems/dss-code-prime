@@ -6,6 +6,9 @@
 
 #include "mir/mir_dom.hpp"
 
+#include "mir/mir_cfg.hpp"   // mirReversePostOrder (forward-reachability for the exit set)
+#include "mir/mir_opcode.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +18,100 @@
 #include <vector>
 
 namespace dss {
+
+namespace {
+
+// ── the shared Cooper-Harvey-Kennedy core ────────────────────────────────────
+//
+// ONE graph-pure implementation parameterized by (nodeCount, entrySlot,
+// order-of-slots, preds-of-slots) — both the forward tree
+// (`computeMirDomTree`) and the reverse tree (`computeMirPostDomTree`)
+// call it; the core never touches `Mir`. Slots are raw u32 node indices
+// (`kUnsetSlot` = unresolved); the callers adapt to/from `MirBlockId`.
+//
+// Contract: `order[0]` must be `entrySlot` (the iteration skips index 0
+// — the root's idom is its own self-loop, seeded here). Nodes not in
+// `order` are unreachable from the root and keep `kUnsetSlot`.
+constexpr std::uint32_t kUnsetSlot = static_cast<std::uint32_t>(-1);
+
+struct ChkResult {
+    std::vector<std::uint32_t> idom;    // slot → idom slot; kUnsetSlot = unresolved
+    std::vector<std::uint8_t>  gaveUp;
+};
+
+ChkResult runChkCore(std::size_t nodeCount, std::uint32_t entrySlot,
+                     std::vector<std::uint32_t> const& order,
+                     std::vector<std::vector<std::uint32_t>> const& preds) {
+    ChkResult st;
+    st.idom.assign(nodeCount, kUnsetSlot);
+    st.gaveUp.assign(nodeCount, 0);
+    auto& idom = st.idom;
+    std::vector<std::uint32_t> rpoIndex(nodeCount, kUnsetSlot);
+    for (std::uint32_t i = 0; i < order.size(); ++i) {
+        rpoIndex[order[i]] = i;
+    }
+    if (entrySlot >= nodeCount) return st;
+    idom[entrySlot] = entrySlot;
+    std::uint32_t const stepCap = static_cast<std::uint32_t>(idom.size() * 2 + 4);
+    auto intersect = [&](std::uint32_t b1, std::uint32_t b2) {
+        std::uint32_t finger1 = b1;
+        std::uint32_t finger2 = b2;
+        std::uint32_t steps = 0;
+        while (finger1 != finger2) {
+            if (++steps > stepCap) return kUnsetSlot;
+            if (rpoIndex[finger1] == kUnsetSlot
+             || rpoIndex[finger2] == kUnsetSlot) {
+                return kUnsetSlot;
+            }
+            while (rpoIndex[finger1] > rpoIndex[finger2]) {
+                std::uint32_t const next = idom[finger1];
+                if (next == kUnsetSlot || rpoIndex[next] == kUnsetSlot) {
+                    return kUnsetSlot;
+                }
+                finger1 = next;
+                if (++steps > stepCap) return kUnsetSlot;
+            }
+            while (rpoIndex[finger2] > rpoIndex[finger1]) {
+                std::uint32_t const next = idom[finger2];
+                if (next == kUnsetSlot || rpoIndex[next] == kUnsetSlot) {
+                    return kUnsetSlot;
+                }
+                finger2 = next;
+                if (++steps > stepCap) return kUnsetSlot;
+            }
+        }
+        return finger1;
+    };
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (std::size_t i = 1; i < order.size(); ++i) {
+            std::uint32_t const b = order[i];
+            std::uint32_t newIdom = kUnsetSlot;
+            for (std::uint32_t const p : preds[b]) {
+                if (rpoIndex[p] == kUnsetSlot) continue;
+                if (idom[p] == kUnsetSlot) continue;
+                if (newIdom == kUnsetSlot) {
+                    newIdom = p;
+                } else {
+                    std::uint32_t const interSlot = intersect(newIdom, p);
+                    if (interSlot == kUnsetSlot) {
+                        st.gaveUp[b] = true;
+                        continue;
+                    }
+                    newIdom = interSlot;
+                }
+            }
+            if (newIdom != kUnsetSlot && idom[b] != newIdom) {
+                idom[b] = newIdom;
+                changed = true;
+            }
+        }
+    }
+    return st;
+}
+
+} // namespace
 
 std::vector<std::vector<MirBlockId>>
 mirBuildPredecessors(Mir const& mir) {
@@ -38,73 +135,124 @@ computeMirDomTree(Mir const&                                  mir,
     MirDomTree st;
     st.idom.resize(mir.blockCount());
     st.gaveUp.resize(mir.blockCount(), false);
-    auto& idom = st.idom;
-    std::vector<std::uint32_t> rpoIndex(mir.blockCount(),
-        static_cast<std::uint32_t>(-1));
-    for (std::uint32_t i = 0; i < order.size(); ++i) {
-        rpoIndex[order[i].v] = i;
-    }
     if (!entry.valid()) return st;
-    idom[entry.v] = entry;
-    std::uint32_t const stepCap = static_cast<std::uint32_t>(idom.size() * 2 + 4);
-    auto intersect = [&](MirBlockId b1, MirBlockId b2) {
-        MirBlockId finger1 = b1;
-        MirBlockId finger2 = b2;
-        std::uint32_t steps = 0;
-        while (finger1.v != finger2.v) {
-            if (++steps > stepCap) return MirBlockId{};
-            if (rpoIndex[finger1.v] == static_cast<std::uint32_t>(-1)
-             || rpoIndex[finger2.v] == static_cast<std::uint32_t>(-1)) {
-                return MirBlockId{};
-            }
-            while (rpoIndex[finger1.v] > rpoIndex[finger2.v]) {
-                MirBlockId const next = idom[finger1.v];
-                if (!next.valid()
-                 || rpoIndex[next.v] == static_cast<std::uint32_t>(-1)) {
-                    return MirBlockId{};
-                }
-                finger1 = next;
-                if (++steps > stepCap) return MirBlockId{};
-            }
-            while (rpoIndex[finger2.v] > rpoIndex[finger1.v]) {
-                MirBlockId const next = idom[finger2.v];
-                if (!next.valid()
-                 || rpoIndex[next.v] == static_cast<std::uint32_t>(-1)) {
-                    return MirBlockId{};
-                }
-                finger2 = next;
-                if (++steps > stepCap) return MirBlockId{};
-            }
-        }
-        return finger1;
-    };
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (std::size_t i = 1; i < order.size(); ++i) {
-            MirBlockId const b = order[i];
-            MirBlockId newIdom{};
-            for (MirBlockId const p : preds[b.v]) {
-                if (rpoIndex[p.v] == static_cast<std::uint32_t>(-1)) continue;
-                if (!idom[p.v].valid()) continue;
-                if (!newIdom.valid()) {
-                    newIdom = p;
-                } else {
-                    MirBlockId const interBlock = intersect(newIdom, p);
-                    if (!interBlock.valid()) {
-                        st.gaveUp[b.v] = true;
-                        continue;
-                    }
-                    newIdom = interBlock;
-                }
-            }
-            if (newIdom.valid() && idom[b.v].v != newIdom.v) {
-                idom[b.v] = newIdom;
-                changed = true;
-            }
-        }
+    // Adapt the strong-id graph to the slot-parameterized shared core.
+    std::vector<std::uint32_t> orderSlots;
+    orderSlots.reserve(order.size());
+    for (MirBlockId const b : order) orderSlots.push_back(b.v);
+    std::vector<std::vector<std::uint32_t>> predSlots(mir.blockCount());
+    for (std::size_t i = 0; i < preds.size() && i < predSlots.size(); ++i) {
+        predSlots[i].reserve(preds[i].size());
+        for (MirBlockId const p : preds[i]) predSlots[i].push_back(p.v);
+    }
+    ChkResult core = runChkCore(mir.blockCount(), entry.v, orderSlots, predSlots);
+    st.gaveUp = std::move(core.gaveUp);
+    for (std::size_t i = 0; i < core.idom.size(); ++i) {
+        st.idom[i] = (core.idom[i] == kUnsetSlot)
+            ? MirBlockId{}
+            : MirBlockId{core.idom[i], mir.id().v};
     }
     return st;
+}
+
+MirPostDomTree
+computeMirPostDomTree(Mir const& mir, MirFuncId f) {
+    std::size_t const n = mir.blockCount();
+    std::uint32_t const virtualSlot = static_cast<std::uint32_t>(n);
+    MirPostDomTree st;
+    st.virtualExit = virtualSlot;
+    st.ipdom.assign(n + 1, MirBlockId{});
+    st.gaveUp.assign(n + 1, 0);
+    if (mir.funcBlockCount(f) == 0) return st;
+
+    // Forward-reachability gates the exit set: an UNREACHABLE
+    // Return-terminated block (dead code) must not define the join
+    // structure of live code.
+    MirBlockId const entry = mir.funcEntry(f);
+    auto const rpo = mirReversePostOrder(mir, entry);
+    std::unordered_set<std::uint32_t> reachable;
+    reachable.reserve(rpo.size());
+    for (MirBlockId const b : rpo) reachable.insert(b.v);
+
+    // Reverse graph over slots [0, n]; slot n is the virtual exit.
+    //   reverse-preds(b)  = forward successors of b (+ virtual for exits)
+    //   reverse-succs(b)  = forward predecessors of b
+    //   reverse-succs(virtual) = the exit blocks (reverse-graph root edges)
+    std::vector<std::vector<std::uint32_t>> revPreds(n + 1);
+    std::vector<std::vector<std::uint32_t>> revSuccs(n + 1);
+    std::uint32_t const nb = mir.funcBlockCount(f);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const b = mir.funcBlockAt(f, bi);
+        for (MirBlockId const s : mir.blockSuccessors(b)) {
+            if (!s.valid() || s.v >= n) continue;  // verifier owns the diagnostic
+            revPreds[b.v].push_back(s.v);
+            revSuccs[s.v].push_back(b.v);
+        }
+        if (!reachable.contains(b.v)) continue;
+        std::uint32_t const ni = mir.blockInstCount(b);
+        if (ni == 0) continue;  // unterminated — verifier owns the diagnostic
+        MirOpcode const term = mir.instOpcode(mir.blockInstAt(b, ni - 1));
+        if (term == MirOpcode::Return || term == MirOpcode::Unreachable) {
+            revPreds[b.v].push_back(virtualSlot);
+            revSuccs[virtualSlot].push_back(b.v);
+        }
+    }
+
+    // Reverse-RPO from the virtual exit (iterative post-order, reversed
+    // — the same traversal shape as mirReversePostOrder, over revSuccs).
+    std::vector<std::uint32_t> order;
+    {
+        std::vector<std::uint8_t> visited(n + 1, 0);
+        struct Frame { std::uint32_t slot; std::size_t nextSucc; };
+        std::vector<Frame> stack;
+        visited[virtualSlot] = 1;
+        stack.push_back({virtualSlot, 0});
+        while (!stack.empty()) {
+            Frame& top = stack.back();
+            auto const& succs = revSuccs[top.slot];
+            if (top.nextSucc < succs.size()) {
+                std::uint32_t const s = succs[top.nextSucc++];
+                if (!visited[s]) {
+                    visited[s] = 1;
+                    stack.push_back({s, 0});
+                }
+            } else {
+                order.push_back(top.slot);
+                stack.pop_back();
+            }
+        }
+        std::reverse(order.begin(), order.end());
+    }
+
+    ChkResult core = runChkCore(n + 1, virtualSlot, order, revPreds);
+    st.gaveUp = std::move(core.gaveUp);
+    for (std::size_t i = 0; i <= n; ++i) {
+        // Three-valued mapping (see MirPostDomTree): kUnsetSlot →
+        // INVALID (reverse-unreachable: no path to any exit); the
+        // virtual slot maps to a SYNTHETIC id callers must compare,
+        // never dereference.
+        st.ipdom[i] = (core.idom[i] == kUnsetSlot)
+            ? MirBlockId{}
+            : MirBlockId{core.idom[i], mir.id().v};
+    }
+    return st;
+}
+
+MirDomResult
+mirPostDominatesBlock(MirBlockId a, MirBlockId b, MirPostDomTree const& postdom) {
+    if (!a.valid() || !b.valid()) return MirDomResult::DoesNot;
+    if (a.v == b.v) return MirDomResult::Dominates;
+    auto const& ipdom = postdom.ipdom;
+    if (b.v >= ipdom.size()) return MirDomResult::DoesNot;
+    MirBlockId cur = b;
+    std::uint32_t steps = 0;
+    std::uint32_t const stepCap = static_cast<std::uint32_t>(ipdom.size() + 2);
+    while (ipdom[cur.v].valid() && ipdom[cur.v].v != cur.v) {
+        if (++steps > stepCap) return MirDomResult::GaveUp;
+        cur = ipdom[cur.v];
+        if (cur.v == a.v) return MirDomResult::Dominates;
+    }
+    return MirDomResult::DoesNot;
 }
 
 MirDomResult

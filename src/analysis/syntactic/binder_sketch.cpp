@@ -21,11 +21,26 @@ namespace {
 BinderSketch::BinderSketch(GrammarSchema const& schema) {
     SemanticConfig const& sem = schema.semantics();
     for (auto const& decl : sem.declarations) {
-        // Only name-bearing rows participate — a declaration with no
-        // `nameChild` binds nothing the triage could look up.
-        if (!decl.rule.valid() || !decl.nameChild.has_value()) continue;
+        // Only name-bearing rows participate — a declaration that binds
+        // nothing gives the triage nothing to look up. Two name-bearing
+        // shapes exist: the legacy positional `nameChild`, and (FC4 c1)
+        // declarator-mode rows whose names the declarator walk extracts
+        // below the list/single carrier child. The loader guarantees a
+        // declarator-mode row's language declares the `declarators` block.
+        if (!decl.rule.valid()) continue;
         BinderDecl row;
-        row.nameChild = *decl.nameChild;
+        if (decl.nameChild.has_value()) {
+            row.nameChild = *decl.nameChild;
+        } else if (sem.declarators.has_value()
+                   && (decl.declaratorListChild.has_value()
+                       || decl.declaratorChild.has_value())) {
+            row.declaratorMode = true;
+            row.carrierChild   = decl.declaratorListChild.has_value()
+                                     ? *decl.declaratorListChild
+                                     : *decl.declaratorChild;
+        } else {
+            continue;
+        }
         // STATIC kind only. `kindByChild` discriminators flip
         // Variable→Function — both VALUES to the type-name triage — so
         // evaluating the discriminator here would buy nothing. A future

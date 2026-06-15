@@ -259,6 +259,46 @@ enum class DiagnosticCode : std::uint16_t {
     // wasm/spirv skeleton formats). Fail loud at analysis rather than
     // silently typing `long`/pointers with untested widths.
     S_UnsupportedDataModel        = 0xE013,
+    // FC4 c1: a declaration carries the language's `volatile`-class marker
+    // token, declared via a `DeclarationRule.gatedMarkers` entry — the
+    // qualifier is grammar-ADMITTED but its semantics (no caching / no
+    // reordering of accesses) are NOT implemented, so every use fails loud
+    // rather than silently compiling the object as plain memory. Config-
+    // driven: WHICH token gates and THAT it maps to this code are both
+    // per-language config (the engine only honors the declared token→code
+    // pair; nothing here hardcodes the word "volatile").
+    S_VolatileNotSupported        = 0xE014,
+    // S_IndirectCallNotSupported: RETIRED 2026-06-12 (FC4 c2). The
+    // indirect-call encoding landed end-to-end (semantic Ptr<FnSig>
+    // unwrap → HIR deref-decay + arg coercion → LIR call-reg
+    // materialization + the regalloc callee/arg-reg exclusion rule →
+    // x86 FF /2 + arm64 BLR encoding variants), so the semantic wall
+    // this code gated is gone: a Ptr<FnSig> callee now routes through
+    // the SAME result-stamp + arity + per-arg checking as a direct
+    // call. Both emit sites removed. The number is kept reserved (NOT
+    // renumbered) so historical diagnostics remain decodeable —
+    // 0xC034 precedent.
+    S_IndirectCallNotSupported    = 0xE015,  // RETIRED — see comment
+    // FC4 c1 stage 2a: C 6.7.6.3p10 — a `(void)` parameter list declares
+    // zero parameters; a NAMED void parameter (`int f(void x)`) or void
+    // mixed with other parameters (`int f(void, int)`) is ill-formed.
+    // Emitted by the engine's param-harvest normalization when the
+    // language declares `parameters.soleVoidMeansEmpty`.
+    S_InvalidVoidParam            = 0xE016,
+    // FC4 c1 stage 2a: a declaration position that REQUIRES named
+    // declarators (`DeclarationRule.requireNamedDeclarators` — C's
+    // locals/globals/typedefs) carries an ABSTRACT declarator: `int *;`,
+    // `int (int);` — the declaration declares nothing. Config-driven per
+    // declaration row; parameter-like positions legally stay abstract.
+    S_DeclarationDeclaresNothing  = 0xE017,
+    // FC4 c1 stage 2a: a function-shaped declarator in an unsupported
+    // form/position — a definition whose init-declarator list has more
+    // than one declarator or an initializer, a definition whose named
+    // direct-declarator carries no function suffix (`int (*fp)(int) {}`),
+    // or a bare function-TYPED object declaration (a C prototype
+    // `int f();` — declaration-without-definition is deferred; externs
+    // carry that role today). Always an ERROR — never silent.
+    S_InvalidFunctionDeclarator   = 0xE018,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -409,10 +449,11 @@ enum class DiagnosticCode : std::uint16_t {
     // H_VerifierFailure: a node violates a structural invariant — HR3 uses it for
     //   a wrong child-arity for the node's kind (e.g. a BinaryOp with 1 child, a
     //   ForStmt whose child count disagrees with its clause-presence mask). HR6
-    //   extends it to: a statement after an unconditional terminator in a Block
-    //   (dead code), a non-void function body that may fall through without
+    //   extends it to: a non-void function body that may fall through without
     //   returning, and a Call whose argument count/types disagree with the
-    //   callee's FnSig.
+    //   callee's FnSig. (Dead code after an unconditional terminator is NOT a
+    //   failure — it is ISO-C-valid; the verifier reports it as the
+    //   `H_UnreachableCode` WARNING below, not as an error.)
     H_VerifierFailure             = 0xF003,
     // H_UnknownIntrinsic: an IntrinsicCall whose payload (intrinsic id) does not
     //   resolve to an intrinsic registered in the module's HirIntrinsicRegistry.
@@ -495,6 +536,17 @@ enum class DiagnosticCode : std::uint16_t {
     // DIAGNOSTIC). Source-agnostic: the recognized + ignored sets are both
     // per-language config; the engine never hardcodes a specifier identity.
     H_UnknownLinkageSpecifier     = 0xF00C,
+    // H_UnreachableCode: a statement following an unconditional terminator
+    //   (Return / Unreachable / Break / Continue) within a Block — control can
+    //   never reach it. ISO C permits this (C 6.8.x has no reachability
+    //   constraint on statements); real compilers warn rather than reject, so
+    //   the HIR verifier emits this as a WARNING (NOT the `H_VerifierFailure`
+    //   error) and the module still compiles. The dead statement flows to MIR
+    //   where the generic Block-lowering's fresh-dead-block + the mandatory MIR
+    //   unreachable-prune drop it, so runtime is unaffected. A WARNING, not an
+    //   error — and intentionally suppressible (NOT in the unsuppressable
+    //   closed-table): silencing it cannot mask a miscompile.
+    H_UnreachableCode             = 0xF00D,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
@@ -533,9 +585,11 @@ enum class DiagnosticCode : std::uint16_t {
     // every extension type must have been resolved to a core lattice
     // kind at the HIR→MIR boundary. Interner-gated.
     I_ExtensionTypeInMir      = 0xA00A,
-    // StructCfMarker pairing — IfThen has matching IfElse/IfJoin;
-    // LoopHeader has matching LoopLatch/LoopExit; ExitBlock terminates
-    // in Return/Unreachable.
+    // A reachable block's stored StructCfMarker differs from the
+    // canonical CFG derivation (`deriveStructCfMarkers`,
+    // mir/mir_struct_markers.hpp) — the verifier recomputes the
+    // derivation independently and requires stored == derived per
+    // reachable block; the diagnostic names both markers.
     I_StructCfMismatch        = 0xA00B,
     // A block in a function is not reachable from the function's
     // entry block. Orphan CFG islands are a structural invariant
@@ -546,6 +600,20 @@ enum class DiagnosticCode : std::uint16_t {
     I_TextMalformed           = 0xA00D,
     I_TextVersionMismatch     = 0xA00E,
     I_TextUnknownName         = 0xA00F,
+    // A REACHABLE non-Phi operand use whose definition dominates it
+    // (so SSA dominance holds — I_NotDominated does NOT fire) but whose
+    // defining block appears LATER in the function's block LAYOUT
+    // (funcBlockAt order) than the using block. Dominance is necessary
+    // but NOT sufficient for the linear MIR→LIR lowering: every linear
+    // consumer (MirFunctionRebuilder's rewrite map, mir_to_lir's
+    // regForValue) requires a TOPOLOGICAL layout — a def must be EMITTED
+    // before its use. A dominating-but-layout-later def is a producer
+    // contract violation surfaced AT the producing pass (verify-after-
+    // every-pass) rather than as a downstream rebuilder abort / silent
+    // miscompile. Phi incomings are EXEMPT (loop back-edges legitimately
+    // carry a def whose layout follows the use — the dominance arm owns
+    // their semantics). Closes the D-OPT2 layout-contract class.
+    I_LayoutUseBeforeDef      = 0xA010,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //
@@ -595,14 +663,29 @@ enum class DiagnosticCode : std::uint16_t {
     //   such a cycle — second mov reads a clobbered source. v1 detects
     //   loud; D-ML7-2.3 anchors the proper parallel-copy resolution.
     // L_IndirectCallUnsupported: the LIR `call` instruction's callee
-    //   operand is not a `SymbolRef`. v1 only encodes direct calls
-    //   (the schema's encoding variant guard is `["symbol"]`); indirect
-    //   calls need a new schema variant + the materializer must emit
-    //   `call <reg>` instead of `call <sym>`. Anchor: D-ML7-2.4.
+    //   operand is neither a `SymbolRef` (direct call) nor a `Reg`
+    //   (indirect call through a register — FC4 c2 landed that
+    //   encoding: schema `call` variant guard `["reg"]`, x86 FF /2 /
+    //   arm64 BLR). Any OTHER operand kind in callee position is a
+    //   lowering bug upstream — fail-loud totality, the code stays
+    //   ALIVE as the residual-kind backstop.
+    // L_IndirectCalleeClobberedByArgSetup (FC4 c2): an indirect call's
+    //   post-regalloc callee REGISTER is also the destination of one
+    //   of that same call's arg-passing moves (or the cc's variadic
+    //   vector-count register on a variadic call). The materializer
+    //   emits those moves BETWEEN the callee's definition and the
+    //   `call <reg>` — the callee would be overwritten and the call
+    //   would jump THROUGH AN ARGUMENT VALUE (silent garbage jump).
+    //   The regalloc-tier rules (the indirect-callee arg-reg exclusion
+    //   in lir_regalloc.cpp + the spill-reload scratch filter in
+    //   lir_rewrite.cpp) make this unreachable; this code is the
+    //   BACKSTOP that converts any future regression of either rule
+    //   from a silent garbage jump into a loud compile error.
     L_StackPassedArgUnsupported    = 0xB007,
     L_CcRegLookupFailed            = 0xB008,
     L_MoveCycleUnsupported         = 0xB009,
     L_IndirectCallUnsupported      = 0xB00A,
+    L_IndirectCalleeClobberedByArgSetup = 0xB00B,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //

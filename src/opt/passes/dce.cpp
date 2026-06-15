@@ -236,7 +236,7 @@ public:
     }
 
     [[nodiscard]] bool acceptPhiIncoming(
-        MirPhiIncoming const& inc,
+        MirPhiIncoming const& inc, MirBlockId /*oldPhiBlock*/,
         std::unordered_map<std::uint32_t, MirBlockId> const& blockMap) override {
         return blockMap.count(inc.pred.v) != 0;
     }

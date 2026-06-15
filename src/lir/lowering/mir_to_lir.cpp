@@ -1697,8 +1697,9 @@ struct Lowerer {
     // MIR Call → LIR `call callee, args...`. Convention:
     //   operand[0] = callee value (typically a GlobalAddr — direct
     //                call — peepholed into a SymbolRef LIR operand;
-    //                anything else routes through the indirect-call
-    //                path which is anchored at D-ML7-2.4)
+    //                anything else passes through as a Reg callee =
+    //                the indirect-call path, materialized to
+    //                `call <reg>` by lir_callconv — FC4 c2)
     //   operand[1..N] = argument values
     // ML7 cycle 2 (landed) rewrites this to the explicit
     // mov-to-arg-register + call + mov-from-return-register sequence
@@ -1752,19 +1753,20 @@ struct Lowerer {
         // matches the target schema's `call` encoding variant guard
         // `["symbol"]` AND lets ML7 cycle 2's callconv materialization
         // pass leave the callee operand intact while just rewriting
-        // the args. Indirect-call form (callee is any other MIR
-        // instruction — IntToPtr from a function pointer load, etc.)
-        // is anchored at D-ML7-2.4 (an indirect-call schema variant
-        // + the assembler-side encoder for `call <reg>` must land
-        // together; today the assembler trips on it loud).
+        // the args. The indirect-call form (callee is any other MIR
+        // instruction — a function-pointer load, an Arg, a call
+        // result) keeps the callee's value REGISTER at ops[0]; the
+        // callconv pass materializes it as `call <reg>` against the
+        // schema's `["reg"]` encoding variant (x86 FF /2, arm64 BLR
+        // — FC4 c2, D-CSUBSET-FNPTR-INDIRECT-CALL closed).
         MirInstId const calleeMir = operands[0];
         bool const calleeIsGlobalAddr =
             mir.instOpcode(calleeMir) == MirOpcode::GlobalAddr;
 
         // Determine extern-vs-internal based on the GlobalAddr's
-        // SymbolId. Indirect-without-GlobalAddr (function-pointer
-        // call) is anchored at D-ML7-2.4 — surfaces loud at
-        // materialization for now.
+        // SymbolId. An indirect callee (no GlobalAddr) is never an
+        // extern-import call site — it dispatches through the value
+        // in the register, not through an import slot.
         bool calleeIsExtern = false;
         SymbolId calleeSym{};
         if (calleeIsGlobalAddr) {
@@ -1816,7 +1818,8 @@ struct Lowerer {
         //     IAT slot RVA at link time; the opcode encoding
         //     dereferences it).
         // Indirect (fn-pointer): [callee_reg, arg0, arg1, ...]
-        //     (anchored D-ML7-2.4; trips loud at materialization).
+        //     (FC4 c2 — materialized as `call <reg>` by lir_callconv
+        //     against the schema's `["reg"]` encoding variant).
         std::vector<LirOperand> ops;
         ops.reserve(argRegs.size() + 1);
         if (calleeIsGlobalAddr) {

@@ -910,14 +910,15 @@ TEST(SemanticAnalyzerCSubset, UnusedLocalEmitsWarning) {
     ASSERT_NE(d, nullptr);
     EXPECT_EQ(d->actual, "unused") << "the warning names the unused variable";
     EXPECT_EQ(d->severity, DiagnosticSeverity::Warning);
-    // The span points at `unused`'s declaration (the varDeclHead node).
+    // The span points at `unused`'s declaration (the varDecl node).
     // Layout: "int main(){ int unused; int used=1; return used; }"
     //          0123456789012345678901234567890
-    // The varDeclHead `int unused` starts at column 12 (`int`) and ends at
-    // the end of `unused` (column 22, half-open). Pin both ends so a
-    // regression that drifts the emit point off the decl node is loud.
+    // FC4 c1: the declaration statement rule is `varDecl` (which INCLUDES
+    // the terminating `;` — pre-FC4 the anchor was the semicolon-less
+    // varDeclHead): `int unused;` spans 12..23 half-open. Pin both ends so
+    // a regression that drifts the emit point off the decl node is loud.
     EXPECT_EQ(d->span.start(), 12u);
-    EXPECT_EQ(d->span.end(),   22u);
+    EXPECT_EQ(d->span.end(),   23u);
 }
 
 // A function PARAMETER that is unused does NOT warn — c-subset sets
@@ -1684,4 +1685,352 @@ TEST(SemanticAnalyzerCSubset, CompoundLiteralValueIdentifierIsLoudError) {
         << "(a){...} with a VALUE identifier must fail LOUD at parse "
            "(C 6.5.2.5 requires a type name; the triage rolls back to "
            "the value reading whose orphan `{` cannot parse)";
+}
+
+// ── FC4 c1 stage 2b: declarator typing pins on the SHIPPED grammar ──────
+//
+// The synthetic-grammar engine pins live in test_declarator_engine.cpp;
+// these mirror the canonical cases through the REAL c-subset config so a
+// c-subset.lang.json role-wiring regression (not just an engine bug) is
+// loud. Every pin walks the interner kinds/operands EXACTLY.
+
+namespace {
+
+[[nodiscard]] TypeId typeOfSymbol(SemanticModel const& m,
+                                  std::string_view name) {
+    for (std::size_t i = 1; i < m.symbols().size(); ++i) {
+        if (m.symbols()[i].name == name) return m.symbols()[i].type;
+    }
+    ADD_FAILURE() << "no symbol named '" << name << "'";
+    return InvalidType;
+}
+
+// Assert `t` is exactly Ptr<FnSig([I32] -> I32)>.
+void expectPtrToIntIntFnSig(TypeInterner const& in, TypeId t) {
+    ASSERT_TRUE(t.valid());
+    ASSERT_EQ(in.kind(t), TypeKind::Ptr);
+    ASSERT_EQ(in.operands(t).size(), 1u);
+    TypeId const fn = in.operands(t)[0];
+    ASSERT_EQ(in.kind(fn), TypeKind::FnSig);
+    auto const params = in.fnParams(fn);
+    ASSERT_EQ(params.size(), 1u);
+    EXPECT_EQ(in.kind(params[0]), TypeKind::I32);
+    EXPECT_EQ(in.kind(in.fnResult(fn)), TypeKind::I32);
+}
+
+} // namespace
+
+// `int (*fp)(int);` — POINTER TO FUNCTION at file scope: the canonical
+// C 6.7.6 inversion through the shipped declarator roles.
+TEST(SemanticAnalyzerCSubset, FnPtrDeclaratorTypedAsPtrFnSig) {
+    auto model = analyzeShipped("c-subset", { "int (*fp)(int);\n" });
+    EXPECT_FALSE(model.hasErrors());
+    expectPtrToIntIntFnSig(model.lattice().interner(),
+                           typeOfSymbol(model, "fp"));
+}
+
+// `typedef int (*H)(int); H h;` — the typedef'd fn-ptr alias declares
+// the SAME interned TypeId as the direct declarator form (structural
+// canonicalization is the witness that the alias resolved through the
+// identical inversion, not a lookalike).
+TEST(SemanticAnalyzerCSubset, TypedefFnPtrAliasDeclaresSameInternedType) {
+    auto model = analyzeShipped("c-subset", {
+        "int (*fp)(int);\n"
+        "typedef int (*H)(int);\n"
+        "H h;\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const& in = model.lattice().interner();
+    TypeId const th = typeOfSymbol(model, "h");
+    expectPtrToIntIntFnSig(in, th);
+    EXPECT_EQ(th.v, typeOfSymbol(model, "fp").v)
+        << "alias-declared and directly-declared fn-ptr types must intern "
+           "to ONE TypeId";
+}
+
+// `int *p, q;` — the star binds PER-DECLARATOR (C 6.7.6) on the shipped
+// grammar: p : Ptr<I32>, q : I32.
+TEST(SemanticAnalyzerCSubset, StarBindsPerDeclaratorOnShippedGrammar) {
+    auto model = analyzeShipped("c-subset", { "int *p, q;\n" });
+    EXPECT_FALSE(model.hasErrors());
+    auto const& in = model.lattice().interner();
+    TypeId const tp = typeOfSymbol(model, "p");
+    ASSERT_TRUE(tp.valid());
+    ASSERT_EQ(in.kind(tp), TypeKind::Ptr);
+    EXPECT_EQ(in.kind(in.operands(tp)[0]), TypeKind::I32);
+    TypeId const tq = typeOfSymbol(model, "q");
+    ASSERT_TRUE(tq.valid());
+    EXPECT_EQ(in.kind(tq), TypeKind::I32);
+}
+
+// `int (*arr[2])(int);` — ARRAY OF POINTER-TO-FUNCTION:
+// Array<2, Ptr<FnSig([I32] -> I32)>> (suffix folds before the descent,
+// stars inside the group bind first).
+TEST(SemanticAnalyzerCSubset, ArrayOfFnPtrDeclaratorTyped) {
+    auto model = analyzeShipped("c-subset", { "int (*arr[2])(int);\n" });
+    EXPECT_FALSE(model.hasErrors());
+    auto const& in = model.lattice().interner();
+    TypeId const t = typeOfSymbol(model, "arr");
+    ASSERT_TRUE(t.valid());
+    ASSERT_EQ(in.kind(t), TypeKind::Array);
+    ASSERT_EQ(in.scalars(t).size(), 1u);
+    EXPECT_EQ(in.scalars(t)[0], 2);
+    expectPtrToIntIntFnSig(in, in.operands(t)[0]);
+}
+
+// C 6.7.6.3p10: `int f(void)` declares ZERO parameters — the FnSig's
+// param span is EMPTY (not a one-void-param signature).
+TEST(SemanticAnalyzerCSubset, VoidParamListDeclaresZeroParams) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(void) { return 1; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const& in = model.lattice().interner();
+    TypeId const tf = typeOfSymbol(model, "f");
+    ASSERT_TRUE(tf.valid());
+    ASSERT_EQ(in.kind(tf), TypeKind::FnSig);
+    EXPECT_EQ(in.fnParams(tf).size(), 0u);
+    EXPECT_EQ(in.kind(in.fnResult(tf)), TypeKind::I32);
+}
+
+// A NAMED void param is ill-formed (C 6.7.6.3p10 admits only the sole
+// UNNAMED `(void)`): S_InvalidVoidParam, positioned ON the param node.
+TEST(SemanticAnalyzerCSubset, NamedVoidParamFiresInvalidVoidParamPositioned) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int g(void x) { return 1; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidVoidParam), 1u);
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_InvalidVoidParam) continue;
+        EXPECT_EQ(cu->trees()[0].source().slice(d.span), "void x")
+            << "the diagnostic must span the offending param";
+    }
+}
+
+// Unnamed params (C23: a lone type name in param position is ALWAYS a
+// type) still contribute their types: `int h(int, char)` -> FnSig with
+// exactly [I32, Char].
+TEST(SemanticAnalyzerCSubset, UnnamedParamsBuildTwoParamFnSig) {
+    auto model = analyzeShipped("c-subset", {
+        "int h(int, char) { return 1; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const& in = model.lattice().interner();
+    TypeId const th = typeOfSymbol(model, "h");
+    ASSERT_TRUE(th.valid());
+    ASSERT_EQ(in.kind(th), TypeKind::FnSig);
+    auto const params = in.fnParams(th);
+    ASSERT_EQ(params.size(), 2u);
+    EXPECT_EQ(in.kind(params[0]), TypeKind::I32);
+    EXPECT_EQ(in.kind(params[1]), TypeKind::Char);
+}
+
+// ── FC4 c1 stage 2b: the decl-vs-expr triage matrix END-TO-END ──────────
+
+// `MyP * p;` after `typedef int MyP;` — the c0 probe-order + FC2 triage
+// pin: the sketch KNOWS MyP is a Type, so the identVarDecl probe COMMITS
+// and p types Ptr<I32> (not the expression `MyP * p`).
+TEST(SemanticAnalyzerCSubset, TypedefNameStarDeclaresPointerLocal) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int MyP;\n"
+        "int main() { MyP * p; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 0u);
+    auto const& in = model.lattice().interner();
+    TypeId const tp = typeOfSymbol(model, "p");
+    ASSERT_TRUE(tp.valid()) << "MyP * p; must DECLARE p";
+    ASSERT_EQ(in.kind(tp), TypeKind::Ptr);
+    EXPECT_EQ(in.kind(in.operands(tp)[0]), TypeKind::I32);
+}
+
+// `a * b;` where a/b are KNOWN VALUES — the triage rolls back to the
+// expression statement: NO new symbol is minted (main + a + b only) and
+// the program is clean.
+TEST(SemanticAnalyzerCSubset, ValueStarValueStaysExpressionStatement) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() { int a = 2; int b = 3; a * b; return a; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(model.symbols().size() - 1, 3u)
+        << "main + a + b — the multiplication must mint NO symbol";
+}
+
+// UNKNOWN `u * v;` (no `u` anywhere, single file) — the oracle-candidate
+// path: the follower-operator test rolls back (the `*` continues a value
+// reading), the statement stays an EXPRESSION, and BOTH unknowns fire
+// positioned S_UndeclaredIdentifier. Layout:
+//   "int main() {\n  u * v;\n  return 0;\n}\n"
+//    0-12 line 1; line 2 starts at 13; u at 15; v at 19.
+TEST(SemanticAnalyzerCSubset, UnknownStarUnknownStaysExpressionWithUndeclared) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() {\n  u * v;\n  return 0;\n}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 2u);
+    bool sawU = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_UndeclaredIdentifier) continue;
+        if (d.actual == "u") {
+            sawU = true;
+            EXPECT_EQ(d.span.start(), 15u);
+            EXPECT_EQ(d.span.end(),   16u);
+        }
+    }
+    EXPECT_TRUE(sawU) << "`u` must carry a positioned S_UndeclaredIdentifier";
+}
+
+// ── FC4 c2: indirect calls TYPE-CHECK like direct calls ─────────────────
+// D-CSUBSET-FNPTR-INDIRECT-CALL closed — the c1 walls flipped to
+// positive signature checking: a Ptr<FnSig> callee (bare identifier,
+// cast expression, paren/deref form) unwraps to its FnSig and runs the
+// SAME result-stamp + arity + per-arg path as a direct symbol call.
+
+// (a) bare-identifier callee typed Ptr<FnSig> — clean when the args
+// match, exactly one S_ArgCountMismatch on wrong arity, S_TypeMismatch
+// on a wrong arg type. (c1 predecessor: BareFnPtrIdentifierCallFires
+// IndirectGate pinned the S_IndirectCallNotSupported wall.)
+TEST(SemanticAnalyzerCSubset, BareFnPtrCallTypesAndChecks) {
+    // Clean: fp(3) against int(*)(int).
+    auto clean = analyzeShipped("c-subset", {
+        "int helper(int v) { return v; }\n"
+        "int main() { int (*fp)(int) = &helper; return fp(3); }\n",
+    });
+    EXPECT_FALSE(clean.hasErrors())
+        << "a well-typed indirect call must be CLEAN (the c1 wall is "
+           "retired)";
+
+    // Arity: fp(1, 2) against int(*)(int) -> exactly 1 S_ArgCountMismatch.
+    auto arity = analyzeShipped("c-subset", {
+        "int helper(int v) { return v; }\n"
+        "int main() { int (*fp)(int) = &helper; return fp(1, 2); }\n",
+    });
+    EXPECT_EQ(countCode(arity.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 1u)
+        << "indirect calls must get the SAME arity checking as direct";
+    EXPECT_EQ(countCode(arity.diagnostics(),
+                        DiagnosticCode::S_NotCallable), 0u);
+
+    // Arg type: passing a pointer where the FnSig declares int.
+    auto badArg = analyzeShipped("c-subset", {
+        "int helper(int v) { return v; }\n"
+        "int main() {\n"
+        "    int (*fp)(int) = &helper;\n"
+        "    int x = 1;\n"
+        "    int *p = &x;\n"
+        "    return fp(p);\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(badArg.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "indirect calls must get the SAME per-arg checking as direct";
+}
+
+// (b) non-identifier callee whose STAMPED type is Ptr<FnSig> (the cast
+// form `((H)fp)(3)`) — clean, plus the arity-error sibling. (c1
+// predecessor: CastFnPtrCalleeFiresIndirectGate pinned the wall.)
+TEST(SemanticAnalyzerCSubset, CastFnPtrCalleeTypesAndChecks) {
+    auto clean = analyzeShipped("c-subset", {
+        "int helper(int v) { return v; }\n"
+        "typedef int (*H)(int);\n"
+        "int main() { int (*fp)(int) = &helper; return ((H)fp)(3); }\n",
+    });
+    EXPECT_FALSE(clean.hasErrors());
+
+    auto arity = analyzeShipped("c-subset", {
+        "int helper(int v) { return v; }\n"
+        "typedef int (*H)(int);\n"
+        "int main() { int (*fp)(int) = &helper; return ((H)fp)(1, 2); }\n",
+    });
+    EXPECT_EQ(countCode(arity.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 1u);
+    EXPECT_EQ(countCode(arity.diagnostics(),
+                        DiagnosticCode::S_NotCallable), 0u);
+}
+
+// (b) non-identifier callee whose stamped type is provably NOT callable
+// (`((int)x)(3)` — castExpr stamped I32) -> S_NotCallable. UNCHANGED by
+// FC4 c2: the triage's other-valid-type arm.
+TEST(SemanticAnalyzerCSubset, CastNonCallableCalleeFiresNotCallable) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() { int x = 1; return ((int)x)(3); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotCallable), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 0u);
+}
+
+// The paren-wrapped DIRECT designator `(helper)(40)` stays CLEAN — it is
+// a direct call (C 6.5.1p5: parentheses preserve the designator) and is
+// RUNTIME-PROVEN end-to-end (exit-42 CLI probe, 2026-06-11). FC4 c2
+// UPGRADE: the callee peel lands on `helper`'s FnSig and runs the full
+// signature check — so the form is no longer silently admitted, it is
+// POSITIVELY checked: `(helper)(1, 2)` now fires exactly one
+// S_ArgCountMismatch (no double-emission with any other path — the
+// plan-lock MUST-FIX 8 pin).
+TEST(SemanticAnalyzerCSubset, ParenWrappedDirectCalleeStaysClean) {
+    auto model = analyzeShipped("c-subset", {
+        "int helper(int v) { return v + 2; }\n"
+        "int main() { return (helper)(40); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotCallable), 0u);
+
+    // FC4 c2: wrong arity through the paren-wrapped designator is now
+    // CAUGHT (c1 deliberately admitted it silently) — and exactly ONCE.
+    auto arity = analyzeShipped("c-subset", {
+        "int helper(int v) { return v + 2; }\n"
+        "int main() { return (helper)(1, 2); }\n",
+    });
+    EXPECT_EQ(countCode(arity.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 1u)
+        << "exactly one emission — the peel path must not double-report "
+           "with the bare-identifier/refByRule paths";
+    EXPECT_EQ(countCode(arity.diagnostics(),
+                        DiagnosticCode::S_NotCallable), 0u);
+}
+
+// `(*fp)(3)` / `(*helper)(40)` — the deref-designator forms. FC4 c2:
+// the callee peel folds `*` on a function pointer / function designator
+// (C 6.5.3.2p4 — deref is the identity for call purposes, the
+// designator decays right back), lands on the designator, and runs the
+// full signature check: clean when well-typed, exactly one
+// S_ArgCountMismatch on wrong arity. (c1 predecessor:
+// DerefFnPtrCalleeStaysSemanticallySilent pinned the conservative
+// silent tier, with the LIR-tier L_IndirectCallUnsupported as the
+// downstream wall — both retired by the end-to-end encoding.)
+TEST(SemanticAnalyzerCSubset, DerefFnPtrCalleeTypesAndChecks) {
+    auto clean = analyzeShipped("c-subset", {
+        "int helper(int v) { return v; }\n"
+        "int main() { int (*fp)(int) = &helper; return (*fp)(3); }\n",
+    });
+    EXPECT_FALSE(clean.hasErrors())
+        << "(*fp)(3) is a well-typed indirect call — must be clean";
+
+    auto arity = analyzeShipped("c-subset", {
+        "int helper(int v) { return v; }\n"
+        "int main() { int (*fp)(int) = &helper; return (*fp)(1, 2); }\n",
+    });
+    EXPECT_EQ(countCode(arity.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 1u)
+        << "the deref peel must feed the SAME arity check";
+    EXPECT_EQ(countCode(arity.diagnostics(),
+                        DiagnosticCode::S_NotCallable), 0u);
+
+    // Deref of the bare DESIGNATOR (`(*helper)(40)` — operand's own
+    // type is the FnSig, no pointer involved): C idiom, stays clean.
+    auto derefDesignator = analyzeShipped("c-subset", {
+        "int helper(int v) { return v + 2; }\n"
+        "int main() { return (*helper)(40); }\n",
+    });
+    EXPECT_FALSE(derefDesignator.hasErrors())
+        << "deref of a function designator decays right back (C "
+           "6.5.3.2p4) — must be clean";
 }

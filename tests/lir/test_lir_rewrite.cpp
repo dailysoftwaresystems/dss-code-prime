@@ -5,7 +5,10 @@
 //   * Block topology preserved
 //   * Spill path inserts frame_load/frame_store pseudo-ops with the
 //     correct payload (slot v)
+//   * FC4 c2 (B2): a SPILLED indirect-call CALLEE's reload scratch
+//     skips the cc's arg registers (+ the variadic count register)
 
+#include "core/types/call_payload.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -25,6 +28,8 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace dss;
@@ -490,4 +495,195 @@ TEST(LirRewrite, RewriteSkipsFunctionsWithFailedAllocation) {
         }
     }
     EXPECT_TRUE(foundDiag);
+}
+
+TEST(LirRewrite, SpilledVariadicIndirectCalleeReloadScratchSkipsArgAndCountRegs) {
+    // FC4 c2 (B2): an `isCall` instruction's ops[0] is the indirect-
+    // call CALLEE. When the allocator SPILLS the callee vreg, the
+    // rewrite reloads it into a scratch register that sits BETWEEN the
+    // callconv pass's (not-yet-emitted) arg-passing moves and the call
+    // itself — so the reload scratch must SKIP the cc's argGprs ∪
+    // argFprs plus, for a VARIADIC call site, the variadic vector-
+    // count register (SysV §3.5.7: rax/AL). A scratch from that set
+    // would be overwritten by the call's own arg setup → the call
+    // jumps THROUGH AN ARGUMENT VALUE (silent garbage). The allocator-
+    // side exclusion (R2) cannot close this hazard: the scratch pool
+    // is by definition the registers the allocator did NOT assign.
+    //
+    // DISCRIMINATING BY CONSTRUCTION: pickScratchRegs builds the pool
+    // in register-table-ordinal order and ABSORBS the cc's arg/return
+    // sets — with nothing register-assigned below, the sysv pool's
+    // FIRST GPR entry is the variadic count register itself (rax,
+    // ordinal 0), followed by argGprs rcx/rdx. With B2's forbidden-
+    // filter disabled the callee reload picks exactly that forbidden
+    // first entry, so the set-membership pin below goes RED
+    // (red-on-disable demonstrated 2026-06-12 + restored).
+    //
+    // The two spilled ARG vregs pin the cursor/rotation contract:
+    // entries skipped for the CALLEE are ROTATED (kept available for
+    // later spilled operands of the same inst), not burned — the
+    // rewrite stays ok (no spurious exhaustion) and all three reloads
+    // receive pairwise-DISTINCT scratches.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+    auto const callOp      = sch.opcodeByMnemonic("call");
+    auto const retOp       = sch.opcodeByMnemonic("ret");
+    auto const frameLoadOp = sch.opcodeByMnemonic("frame_load");
+    ASSERT_TRUE(callOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+    ASSERT_TRUE(frameLoadOp.has_value());
+    auto const* callInfo = sch.opcodeInfo(*callOp);
+    ASSERT_NE(callInfo, nullptr);
+    ASSERT_TRUE(callInfo->isCall);  // ops[0] = callee per the call contract
+
+    // Hand-build (mirrors VerifierFiresOnFrameOpWithZeroSlotPayload):
+    // one function, one block, one VARIADIC indirect call
+    // `vr1(vr2, vr3)` — fixedArgCount 1, so vr2 is the fixed arg and
+    // vr3 rides the vararg region (printf-shaped).
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    b.beginBlock(entry);
+    LirReg const calleeV = b.newVReg(LirRegClass::GPR);  // vreg id 1
+    LirReg const arg1V   = b.newVReg(LirRegClass::GPR);  // vreg id 2
+    LirReg const arg2V   = b.newVReg(LirRegClass::GPR);  // vreg id 3
+    std::array<LirOperand, 3> const callOperands{
+        LirOperand::makeReg(calleeV),
+        LirOperand::makeReg(arg1V),
+        LirOperand::makeReg(arg2V),
+    };
+    std::uint32_t const variadicPayload = call_payload::encode(true, 1u);
+    b.addInst(*callOp, InvalidLirReg, callOperands, variadicPayload);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+    LirFuncId const fn = lir.funcAt(0);
+
+    // Hand-build the allocation: ALL THREE vregs spilled (slots 1..3),
+    // nothing register-assigned — the scratch pool is the full cc-
+    // allocatable register set in table order, so the callee's natural
+    // (unfiltered) pick would be the pool's first entry.
+    LirAllocation alloc;
+    LirFuncAllocation fa;
+    fa.fn             = fn;
+    fa.originalSymbol = SymbolId{1};
+    fa.assignments.resize(4);  // slot 0 = sentinel; vreg ids 1..3
+    fa.assignments[1] = LirRegAssignment::makeSpill(calleeV, LirSpillSlot{1});
+    fa.assignments[2] = LirRegAssignment::makeSpill(arg1V,   LirSpillSlot{2});
+    fa.assignments[3] = LirRegAssignment::makeSpill(arg2V,   LirSpillSlot{3});
+    fa.numSpillSlots          = 3;
+    fa.ok                     = true;
+    fa.callingConventionIndex = 0;  // sysv_amd64
+    alloc.perFunc.push_back(std::move(fa));
+
+    DiagnosticReporter rewriteRep;
+    auto rewritten = rewriteWithAllocation(lir, sch, alloc, rewriteRep);
+    ASSERT_TRUE(rewritten.ok)
+        << "skipping forbidden entries must not exhaust the pool";
+
+    // The forbidden set, read back from the ACTIVE cc's declared
+    // arg-register lists + variadic count register (config-driven —
+    // no register names in the assertions).
+    auto const* cc = sch.callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    std::unordered_set<std::uint32_t> forbidden;
+    auto const absorb = [&](std::vector<std::string> const& names) {
+        for (auto const& name : names) {
+            auto const ord = sch.registerByName(name);
+            ASSERT_TRUE(ord.has_value())
+                << "cc arg register '" << name << "' must resolve";
+            forbidden.insert(*ord);
+        }
+    };
+    absorb(cc->argGprs);
+    absorb(cc->argFprs);
+    ASSERT_TRUE(cc->variadicVectorCountReg.has_value())
+        << "sysv_amd64 must declare the variadic vector-count register";
+    forbidden.insert(cc->variadicVectorCountReg->ordinal);
+    ASSERT_EQ(forbidden.size(),
+              cc->argGprs.size() + cc->argFprs.size() + 1u)
+        << "every cc arg register must resolve to a distinct ordinal "
+           "and the count register must not alias an arg register";
+
+    // Exact rewritten shape: 3 reloads + the call + ret.
+    Lir const& dst = rewritten.lir;
+    ASSERT_EQ(dst.moduleFuncCount(), 1u);
+    LirFuncId const dfn = dst.funcAt(0);
+    ASSERT_EQ(dst.funcBlockCount(dfn), 1u);
+    LirBlockId const blk = dst.funcBlockAt(dfn, 0);
+    ASSERT_EQ(dst.blockInstCount(blk), 5u)
+        << "expected frame_load x3 + call + ret";
+
+    // Locate the call via the schema's isCall flag (agnostic walk).
+    std::uint32_t callIdx   = 0;
+    std::size_t   callCount = 0;
+    for (std::uint32_t i = 0; i < dst.blockInstCount(blk); ++i) {
+        auto const* info =
+            sch.opcodeInfo(dst.instOpcode(dst.blockInstAt(blk, i)));
+        ASSERT_NE(info, nullptr);
+        if (info->isCall) { callIdx = i; ++callCount; }
+    }
+    ASSERT_EQ(callCount, 1u);
+    LirInstId const callInst = dst.blockInstAt(blk, callIdx);
+    // The variadic payload must survive the rewrite bit-identically —
+    // it is what arms the count-register exclusion here (and what the
+    // ML7 materializer later reads to emit the count mov).
+    EXPECT_EQ(dst.instPayload(callInst), variadicPayload);
+    auto const rewrittenOps = dst.instOperands(callInst);
+    ASSERT_EQ(rewrittenOps.size(), 3u);
+
+    // Map each spilled operand to its reload by SPILL-SLOT payload
+    // (slot v == opIdx+1 was assigned to operand opIdx above): exactly
+    // ONE frame_load per slot, each BEFORE the call, dest == the
+    // register the rewritten call consumes at that operand position.
+    // This is the non-vacuity spine: the callee reload REALLY happened
+    // and the call's ops[0] is REALLY its dest.
+    std::array<LirReg, 3> reloadDest{};
+    for (std::uint32_t opIdx = 0; opIdx < 3; ++opIdx) {
+        std::uint32_t const slotV = opIdx + 1u;
+        std::size_t   found   = 0;
+        std::uint32_t loadIdx = 0;
+        for (std::uint32_t i = 0; i < dst.blockInstCount(blk); ++i) {
+            LirInstId const inst = dst.blockInstAt(blk, i);
+            if (dst.instOpcode(inst) != *frameLoadOp) continue;
+            if (dst.instPayload(inst) != slotV) continue;
+            ++found;
+            loadIdx = i;
+            reloadDest[opIdx] = dst.instResult(inst);
+        }
+        ASSERT_EQ(found, 1u)
+            << "exactly one reload for spill slot " << slotV;
+        EXPECT_LT(loadIdx, callIdx)
+            << "the reload for slot " << slotV << " must precede the call";
+        ASSERT_EQ(rewrittenOps[opIdx].kind, LirOperandKind::Reg);
+        LirReg const r = rewrittenOps[opIdx].reg;
+        ASSERT_TRUE(r.valid());
+        EXPECT_EQ(r.isPhysical, 1u);
+        EXPECT_EQ(r.regClass(), LirRegClass::GPR);
+        EXPECT_EQ(reloadDest[opIdx].isPhysical, 1u);
+        EXPECT_EQ(reloadDest[opIdx].regClass(), LirRegClass::GPR);
+        EXPECT_EQ(r.id, reloadDest[opIdx].id)
+            << "call operand " << opIdx
+            << " must consume its own reload's dest";
+    }
+
+    // ── THE B2 PIN ── the spilled CALLEE's reload scratch ordinal is
+    // outside argGprs ∪ argFprs ∪ {variadic count register}.
+    std::uint32_t const calleeOrd = reloadDest[0].id;
+    EXPECT_EQ(forbidden.count(calleeOrd), 0u)
+        << "B2 regression: the spilled indirect-call CALLEE was "
+           "reloaded into cc arg/count register ordinal " << calleeOrd
+        << " — the post-regalloc arg-setup moves (or the variadic "
+           "count mov) would clobber the callee before the call "
+           "consumes it (silent jump through an argument value)";
+
+    // Cursor/rotation discipline: three reloads, three DISTINCT
+    // scratches — entries skipped for the callee stayed available
+    // (rotated, not burned) and no two operands share a scratch.
+    EXPECT_NE(reloadDest[0].id, reloadDest[1].id);
+    EXPECT_NE(reloadDest[0].id, reloadDest[2].id);
+    EXPECT_NE(reloadDest[1].id, reloadDest[2].id);
+
+    DiagnosticReporter verifyRep;
+    EXPECT_TRUE(verifyLirPostRegalloc(rewritten.lir, sch, verifyRep));
 }

@@ -538,10 +538,11 @@ TEST(MirLoweringCSubset, LogicalOrShortCircuitsWithPhi) {
     MirBlockId const joinBB = succs[0];
     EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::IfJoin);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(joinBB, 0)), MirOpcode::Phi);
-    // rhsBB sits on the FALSE edge for `||` — still the conditional
-    // arm of the diamond, still IfThen (the marker pairs counts; it
-    // carries no edge polarity).
-    EXPECT_EQ(m.blockMarker(succs[1]), StructCfMarker::IfThen);
+    // rhsBB sits on the FALSE edge for `||` — the canonical derivation
+    // is edge-polarity-faithful (succs[1] != join → IfElse), unlike the
+    // old hand-stamp which marked every short-circuit arm IfThen for
+    // the dead count-pairing model.
+    EXPECT_EQ(m.blockMarker(succs[1]), StructCfMarker::IfElse);
 }
 
 // FC3.5 sweep-c1 (chip task_bd58aa3d): `&&`/`||` AS AN IF-CONDITION.
@@ -626,9 +627,12 @@ TEST(MirLoweringCSubset, IfElseDiamondWithReturnsInBothArms) {
     MirBlockId const thenBB = succs[0];
     EXPECT_EQ(m.blockMarker(thenBB), StructCfMarker::IfThen);
     EXPECT_EQ(m.instOpcode(m.blockTerminator(thenBB)), MirOpcode::Return);
-    // The false edge goes to the join block.
+    // The false edge: BOTH paths return, so the canonical derivation
+    // sees NO real join (ipdom(entry) = the virtual exit) — the
+    // false-edge block derives as the ELSE-arm, not IfJoin (the old
+    // hand-stamp's name for the block it created as a join).
     MirBlockId const joinBB = succs[1];
-    EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::IfJoin);
+    EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::IfElse);
     EXPECT_EQ(m.instOpcode(m.blockTerminator(joinBB)), MirOpcode::Return);
 }
 
@@ -656,14 +660,19 @@ TEST(MirLoweringCSubset, WhileLoopWithEarlyReturn) {
     // entry → header (unconditional)
     EXPECT_EQ(m.instOpcode(m.blockTerminator(entry)), MirOpcode::Br);
     MirBlockId const header = m.blockSuccessors(entry)[0];
-    EXPECT_EQ(m.blockMarker(header), StructCfMarker::LoopHeader);
+    // DERIVATION TRUTH: the body always returns, so there is NO
+    // back-edge — this "while" is not a loop in the CFG. The canonical
+    // derivation leaves the header Linear (it is a plain CondBr whose
+    // arms diverge to distinct exits → IfThen/IfElse, no join).
+    EXPECT_EQ(m.blockMarker(header), StructCfMarker::Linear);
     // header → CondBr(body, exit)
     EXPECT_EQ(m.instOpcode(m.blockTerminator(header)), MirOpcode::CondBr);
     auto hsuccs = m.blockSuccessors(header);
     ASSERT_EQ(hsuccs.size(), 2u);
     MirBlockId const body = hsuccs[0];
     MirBlockId const exit = hsuccs[1];
-    EXPECT_EQ(m.blockMarker(exit), StructCfMarker::LoopExit);
+    EXPECT_EQ(m.blockMarker(body), StructCfMarker::IfThen);
+    EXPECT_EQ(m.blockMarker(exit), StructCfMarker::IfElse);
     // body returns (its own Return seals it before a back-edge would emit).
     EXPECT_EQ(m.instOpcode(m.blockTerminator(body)), MirOpcode::Return);
     // exit gets the implicit-void-return synthesized for the function.
@@ -689,9 +698,14 @@ TEST(MirLoweringCSubset, IfBothArmsReturnSealsJoinAsUnreachable) {
     ASSERT_EQ(succs.size(), 2u);
     EXPECT_EQ(m.instOpcode(m.blockTerminator(succs[0])), MirOpcode::Return);
     EXPECT_EQ(m.instOpcode(m.blockTerminator(succs[1])), MirOpcode::Return);
-    // The 4th block (the join) is sealed with Unreachable.
+    // The 4th block (the join) is sealed with Unreachable. It is
+    // UNREACHABLE (neither arm falls through), and the canonical
+    // derivation stamps unreachable blocks Linear — the arms derive
+    // IfThen/IfElse around the VIRTUAL exit, with no real join.
+    // (I_UnreachableBlock ownership of this block is a pre-existing,
+    // separately-tracked issue — not this test's subject.)
     MirBlockId const joinBB = m.funcBlockAt(fn, 3);
-    EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::IfJoin);
+    EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::Linear);
     EXPECT_EQ(m.instOpcode(m.blockTerminator(joinBB)), MirOpcode::Unreachable);
 }
 
@@ -740,24 +754,19 @@ TEST(MirLoweringCSubset, DoWhileBodyReturnsElidesCondTest) {
     EXPECT_EQ(m.funcBlockCount(fn), 4u);
     MirBlockId const entry = m.funcEntry(fn);
     MirBlockId const body = m.blockSuccessors(entry)[0];
-    EXPECT_EQ(m.blockMarker(body), StructCfMarker::LoopHeader);
+    // DERIVATION TRUTH: the body always returns → no back-edge → this
+    // do-while is not a loop in the CFG; the body derives Linear.
+    EXPECT_EQ(m.blockMarker(body), StructCfMarker::Linear);
     EXPECT_EQ(m.instOpcode(m.blockTerminator(body)), MirOpcode::Return);
     // The continueBB exists but is sealed as Unreachable — the cond was
-    // NOT lowered (so no ICmp/Const instructions other than possibly the
-    // exit's implicit return). Locate the LoopLatch block; its terminator
-    // must be Unreachable, NOT CondBr.
-    bool sawLatch = false;
-    auto const blockCount = m.funcBlockCount(fn);
-    for (std::uint32_t i = 0; i < blockCount; ++i) {
-        MirBlockId const b = m.funcBlockAt(fn, i);
-        if (m.blockMarker(b) == StructCfMarker::LoopLatch) {
-            sawLatch = true;
-            EXPECT_EQ(m.instOpcode(m.blockTerminator(b)),
-                      MirOpcode::Unreachable);
-            break;
-        }
-    }
-    EXPECT_TRUE(sawLatch);
+    // NOT lowered. LoopLatch is no longer stamped (a dormant marker the
+    // canonical derivation never produces), so locate continueBB by
+    // CREATION POSITION: do-while creates body, continueBB, exit in
+    // order after entry → continueBB = funcBlockAt(fn, 2). Its
+    // terminator must be Unreachable, NOT CondBr.
+    MirBlockId const continueBB = m.funcBlockAt(fn, 2);
+    EXPECT_EQ(m.instOpcode(m.blockTerminator(continueBB)),
+              MirOpcode::Unreachable);
 }
 
 // The fall-through path: body has no self-seal, so continueBB IS lowered
@@ -771,18 +780,20 @@ TEST(MirLoweringCSubset, DoWhileBodyFallsThroughLowersCondTest) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirFuncId const fn = m.funcAt(0);
-    bool sawLatchWithCondBr = false;
-    auto const blockCount = m.funcBlockCount(fn);
-    for (std::uint32_t i = 0; i < blockCount; ++i) {
-        MirBlockId const b = m.funcBlockAt(fn, i);
-        if (m.blockMarker(b) == StructCfMarker::LoopLatch) {
-            if (m.instOpcode(m.blockTerminator(b)) == MirOpcode::CondBr) {
-                sawLatchWithCondBr = true;
-            }
-            break;
-        }
-    }
-    EXPECT_TRUE(sawLatchWithCondBr);
+    // The body falls through into the cond test. LoopLatch is no longer
+    // stamped (dormant marker) — locate continueBB by CREATION POSITION
+    // (entry, body, continueBB, exit) and pin the CFG truth directly:
+    // it carries the cond test (CondBr) and its true-arm is the
+    // back-edge to the body (which derives LoopHeader).
+    ASSERT_EQ(m.funcBlockCount(fn), 4u);
+    MirBlockId const body       = m.funcBlockAt(fn, 1);
+    MirBlockId const continueBB = m.funcBlockAt(fn, 2);
+    EXPECT_EQ(m.blockMarker(body), StructCfMarker::LoopHeader);
+    ASSERT_EQ(m.instOpcode(m.blockTerminator(continueBB)), MirOpcode::CondBr);
+    auto const contSuccs = m.blockSuccessors(continueBB);
+    ASSERT_EQ(contSuccs.size(), 2u);
+    EXPECT_EQ(contSuccs[0].v, body.v)
+        << "the cond test's true-arm is the back-edge to the loop body";
 }
 
 // Review-fix I-4: a for-loop with cond/update/body lowers to the
@@ -808,13 +819,20 @@ TEST(MirLoweringCSubset, ForLoopLowersWithUpdateOnBackEdge) {
     EXPECT_EQ(m.funcBlockCount(fn), 5u);
     MirBlockId const entry  = m.funcEntry(fn);
     MirBlockId const header = m.blockSuccessors(entry)[0];
-    EXPECT_EQ(m.blockMarker(header), StructCfMarker::LoopHeader);
+    // DERIVATION TRUTH: the body always returns, so the update block
+    // (the only Br-to-header) is UNREACHABLE — live code never closes
+    // the loop. The header derives Linear (its CondBr arms diverge to
+    // distinct exits → IfThen/IfElse), and the dead update block
+    // derives Linear (unreachable blocks always do).
+    EXPECT_EQ(m.blockMarker(header), StructCfMarker::Linear);
     EXPECT_EQ(m.instOpcode(m.blockTerminator(header)), MirOpcode::CondBr);
     MirBlockId const body = m.blockSuccessors(header)[0];
+    EXPECT_EQ(m.blockMarker(body), StructCfMarker::IfThen);
     EXPECT_EQ(m.instOpcode(m.blockTerminator(body)), MirOpcode::Return);
-    // Update block is marked LoopLatch.
+    // The update block still exists (created before the lowering knows
+    // which paths fall through) and still Brs to the header.
     MirBlockId const update = m.funcBlockAt(fn, 3);
-    EXPECT_EQ(m.blockMarker(update), StructCfMarker::LoopLatch);
+    EXPECT_EQ(m.blockMarker(update), StructCfMarker::Linear);
     EXPECT_EQ(m.instOpcode(m.blockTerminator(update)), MirOpcode::Br);
     EXPECT_EQ(m.blockSuccessors(update)[0], header);
 }
@@ -843,21 +861,37 @@ TEST(MirLoweringCSubset, ForLoopWithAssignmentUpdateLowers) {
             ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirFuncId const fn = m.funcAt(0);
-    // Find the LoopLatch (update) block: it must contain a Store (the
-    // `i = i - 1` write-back) and terminate with Br(header).
+    // Find the update block by CFG SHAPE (LoopLatch is a dormant marker
+    // the canonical derivation never stamps): the header is the derived
+    // LoopHeader; the update block is the NON-ENTRY block whose Br
+    // targets it (the back-edge source — entry also Brs to the header,
+    // but entry is funcBlockAt(fn, 0)). It must contain the Store (the
+    // `i = i - 1` write-back).
+    MirBlockId const entry = m.funcEntry(fn);
+    MirBlockId header{};
+    for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+        MirBlockId const b = m.funcBlockAt(fn, bi);
+        if (m.blockMarker(b) == StructCfMarker::LoopHeader) { header = b; break; }
+    }
+    ASSERT_TRUE(header.valid()) << "the for-loop must derive a LoopHeader";
     bool sawLatchStore = false;
     for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
         MirBlockId const b = m.funcBlockAt(fn, bi);
-        if (m.blockMarker(b) != StructCfMarker::LoopLatch) continue;
+        if (b.v == entry.v) continue;
+        if (m.blockInstCount(b) == 0) continue;
+        if (m.instOpcode(m.blockTerminator(b)) != MirOpcode::Br) continue;
+        auto const succ = m.blockSuccessors(b);
+        if (succ.size() != 1 || succ[0].v != header.v) continue;
+        // This is the back-edge source — the update block.
         for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
             if (m.instOpcode(m.blockInstAt(b, ii)) == MirOpcode::Store) {
                 sawLatchStore = true;
             }
         }
-        EXPECT_EQ(m.instOpcode(m.blockTerminator(b)), MirOpcode::Br);
     }
     EXPECT_TRUE(sawLatchStore)
-        << "the assignment update must lower to a Store in the latch";
+        << "the assignment update must lower to a Store in the back-edge "
+           "source (the update block)";
     // The whole function verifies clean (loop pairing intact).
     DiagnosticReporter vrep;
     MirVerifier v{m};
@@ -1433,7 +1467,11 @@ TEST(MirLoweringCSubset, BreakInsideWhileBranchesToExit) {
     ASSERT_EQ(hdrSuccs.size(), 2u);
     MirBlockId const body = hdrSuccs[0];
     MirBlockId const exit = hdrSuccs[1];
-    EXPECT_EQ(m.blockMarker(exit), StructCfMarker::LoopExit);
+    // DERIVATION TRUTH: the body always breaks → no back-edge → not a
+    // loop. The header's CondBr is a plain if-shape whose join is the
+    // "exit" block (both the false edge and the body's break converge
+    // there) → it derives IfJoin, not LoopExit.
+    EXPECT_EQ(m.blockMarker(exit), StructCfMarker::IfJoin);
     // Body's terminator is the break → Br(exit).
     auto bodySuccs = m.blockSuccessors(body);
     ASSERT_EQ(bodySuccs.size(), 1u);
@@ -1460,7 +1498,11 @@ TEST(MirLoweringCSubset, ContinueInsideDoWhileBranchesToCondTest) {
     auto bodySuccs = m.blockSuccessors(body);
     ASSERT_EQ(bodySuccs.size(), 1u);
     MirBlockId const cont = bodySuccs[0];
-    EXPECT_EQ(m.blockMarker(cont), StructCfMarker::LoopLatch);
+    // The cond-test block derives Linear (LoopLatch is a dormant marker
+    // — a back-edge SOURCE is not CFG-distinguishable from a plain
+    // body-tail; the load-bearing pin is the CFG: continue targets the
+    // CondBr block, whose true-arm is the back-edge).
+    EXPECT_EQ(m.blockMarker(cont), StructCfMarker::Linear);
     EXPECT_EQ(m.instOpcode(m.blockTerminator(cont)), MirOpcode::CondBr);
 }
 
@@ -2209,4 +2251,88 @@ TEST(MirLoweringCSubset, BoolKeywordLiteralsCarryFixedValues) {
     }
     EXPECT_TRUE(sawTrue)  << "true must lower as the fixed value 1";
     EXPECT_TRUE(sawFalse) << "false must lower as the fixed value 0";
+}
+
+// ── FC4 c1 stage 2b: the visibility("hidden") DCE lever ─────────────────
+// (closes D-CSUBSET-LINKAGE-VISIBILITY-SYNTAX)
+//
+// END-TO-END through the REAL c-subset attribute (not hand-built MIR —
+// that half lives in tests/opt/test_dce_linkage.cpp): the composite
+// linkage key `visibility:hidden` threads SymbolVisibility::Hidden from
+// `__attribute__((visibility("hidden")))` source through the linkage
+// side-table into MIR, where `isExternallyVisible(Global, Hidden)` is
+// FALSE — so an UNCALLED hidden function is DCE-eliminated exactly like
+// a `static` one, while a plain Global/Default uncalled function is
+// linkage-protected and RETAINED. Red-on-disable lever: strip the
+// `"visibility:hidden"` row from c-subset.lang.json's linkageSpecifiers
+// and hidden_unused stays Default -> retained -> this test goes RED.
+TEST(MirLoweringCSubset, HiddenVisibilityUnusedFunctionIsDceEliminated) {
+    auto L = lowerCSubset(
+        "__attribute__((visibility(\"hidden\"))) int hidden_unused(int v) "
+        "{ return v + 1; }\n"
+        "int plain_unused(int v) { return v + 2; }\n"
+        "int main() { return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    Mir& m = L.mir.mir;
+
+    // Resolve the two symbols by NAME from the semantic model so the pin
+    // is independent of minting order.
+    SymbolId hiddenSym, plainSym;
+    for (std::size_t i = 1; i < L.model.symbols().size(); ++i) {
+        if (L.model.symbols()[i].name == "hidden_unused") {
+            hiddenSym = SymbolId{static_cast<std::uint32_t>(i)};
+        }
+        if (L.model.symbols()[i].name == "plain_unused") {
+            plainSym = SymbolId{static_cast<std::uint32_t>(i)};
+        }
+    }
+    ASSERT_TRUE(hiddenSym.valid());
+    ASSERT_TRUE(plainSym.valid());
+
+    auto findFunc = [&](SymbolId sym) -> MirFuncId {
+        for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i) {
+            if (m.funcSymbol(m.funcAt(i)) == sym) return m.funcAt(i);
+        }
+        return MirFuncId{};
+    };
+
+    // PRE-DCE: all three functions present; the attribute actually
+    // threaded (Hidden visibility = not externally visible) while the
+    // plain one is Global/Default (externally visible). These two
+    // asserts ARE the red-on-disable lever's anchor — without the
+    // config row hidden_unused would read Default here.
+    ASSERT_EQ(m.moduleFuncCount(), 3u);
+    MirFuncId const hiddenFn = findFunc(hiddenSym);
+    MirFuncId const plainFn  = findFunc(plainSym);
+    ASSERT_TRUE(hiddenFn.valid());
+    ASSERT_TRUE(plainFn.valid());
+    EXPECT_EQ(m.funcVisibility(hiddenFn), SymbolVisibility::Hidden);
+    EXPECT_EQ(m.funcBinding(hiddenFn),   SymbolBinding::Global);
+    EXPECT_FALSE(isExternallyVisible(m.funcBinding(hiddenFn),
+                                     m.funcVisibility(hiddenFn)));
+    EXPECT_EQ(m.funcVisibility(plainFn), SymbolVisibility::Default);
+    EXPECT_TRUE(isExternallyVisible(m.funcBinding(plainFn),
+                                    m.funcVisibility(plainFn)));
+
+    // Run DCE (the tests/opt/test_dce_linkage.cpp pipeline shape).
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    opt::OptPipeline pipeline{"fc4-visibility-lever", {opt::PassId::Dce}};
+    auto const result = opt::optimize(m, **targetR,
+                                      L.model.lattice().interner(),
+                                      pipeline, rep);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    // POST-DCE: hidden+uncalled ELIMINATED; plain Global/Default
+    // uncalled RETAINED (linkage protect); main retained.
+    EXPECT_FALSE(findFunc(hiddenSym).valid())
+        << "hidden_unused (Global/Hidden, no callers) must be "
+           "DCE-eliminated exactly like a static function";
+    EXPECT_TRUE(findFunc(plainSym).valid())
+        << "plain_unused (Global/Default) must survive — externally "
+           "visible symbols are linkage-protected";
 }

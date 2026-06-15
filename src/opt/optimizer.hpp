@@ -140,8 +140,10 @@ struct OptPipeline {
     // pass, the historical behavior). Set higher in pipelines that
     // include mutually-enabling passes (e.g. ConstFold + SimplifyCfg
     // + Dce — ConstFold folds `if (5<3)` to `if (false)`, SimplifyCfg
-    // folds the CondBr, DCE drops the dead arm, potentially exposing
-    // more ConstFold opportunities). The loader rejects 0 (silent
+    // folds the CondBr AND prunes the dead arm its own fold disconnects
+    // (post-fold reachability — the rebuild emits no orphan block), then
+    // DCE sweeps the now-dead instructions, potentially exposing more
+    // ConstFold opportunities). The loader rejects 0 (silent
     // no-op trap) and caps at 32 (an upper bound large enough for
     // any realistic mutually-enabling cluster — anything more is
     // either a non-converging pass or a pathological input).

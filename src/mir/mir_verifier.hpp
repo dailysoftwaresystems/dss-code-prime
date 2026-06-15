@@ -70,13 +70,6 @@ private:
     // direct-ctor path.) Emits I_BlockNotTerminated.
     void checkBlockTermination(DiagnosticReporter& reporter) const;
 
-    // Marker pairing: `ExitBlock`s terminate in `Return`/`Unreachable`;
-    // `IfThen` requires matching `IfElse`/`IfJoin` in the function;
-    // `LoopHeader` requires matching `LoopLatch`/`LoopExit`. Pure
-    // marker-presence check; full structural validity needs the dom
-    // tree (cycle 2). Emits I_StructCfMismatch.
-    void checkStructCfMarkers(DiagnosticReporter& reporter) const;
-
     // Every Phi's incoming.pred must be a CFG-predecessor of the phi's
     // enclosing block. Computes predecessors in O(E) by inverting
     // `blockSuccessors`. Emits I_PhiPredNotInCfg.
@@ -86,6 +79,16 @@ private:
     // DOMINATES the use site (or in the same block, with the def
     // preceding the use). Computes dominator tree via Cooper-Harvey-
     // Kennedy iterative algorithm per-function. Emits I_NotDominated.
+    //
+    // ALSO hosts the StructCfMarker EQUALITY check (it shares the
+    // per-function preds/RPO/dom computation): every REACHABLE block's
+    // stored marker must equal the canonical CFG derivation
+    // (`deriveStructCfMarkers`, recomputed INDEPENDENTLY here — the
+    // verifier never trusts a producer-supplied vector). Emits one
+    // I_StructCfMismatch per mismatching block, naming stored +
+    // derived. Replaced the pre-derivation count-parity model
+    // (IfThen/IfJoin pairing counts, the ExitBlock-terminator rule,
+    // the LoopHeader-back-edge rule) — all subsumed by equality.
     void checkDomination(DiagnosticReporter& reporter) const;
 
     // Interner-gated rules — skipped when `interner_ == nullptr`:

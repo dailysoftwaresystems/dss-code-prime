@@ -486,6 +486,22 @@ public:
     [[nodiscard]] SchemaCursor routeToRuleLeaf(SchemaCursor parentCur,
                                                RuleId rule) const noexcept;
 
+    // Enumerate the RuleLeaf branch rules reachable from `cur` through
+    // AltChoice positions, in DECLARED grammar order — the JSON-array
+    // order the grammar author wrote, depth-first through nested
+    // AltChoice positions (exactly the order `routeToRuleLeaf` tries
+    // branches; first occurrence wins for a rule reachable through
+    // more than one branch). Token-leaf branches are NOT reported —
+    // token routing goes through `advance`. Returns `{rule}` when
+    // `cur` is already at RuleLeaf(rule); empty for an invalid cursor
+    // or when no RuleLeaf is reachable.
+    //
+    // Consumed by the parser's AltChoice candidate enumeration so that
+    // branch probe order is author-controlled (declared order), never
+    // an accident of rule-interner id (= alphabetical name) order.
+    [[nodiscard]] std::vector<RuleId>
+    altRuleBranches(SchemaCursor cur) const noexcept;
+
     [[nodiscard]] std::span<SchemaTokenId const> expectedSet(SchemaCursor cur) const noexcept;
 
     [[nodiscard]] SlotKind slotKind(SchemaCursor cur) const noexcept;
@@ -564,6 +580,12 @@ public:
     // parser's generic type-name triage before committing — see
     // `Parser::Impl::typeNameCommitApproved_`.
     [[nodiscard]] RuleId       typeNameCommitRule(RuleId rule) const noexcept;
+    // FC4 c1 (M4): the guard's UNKNOWN-name polarity (the bare-string
+    // config form keeps `PreferType`; the object form may select
+    // `RequireKnownType` — C 6.7.6.3p11). Only meaningful when
+    // `typeNameCommitRule(rule).valid()`; returns the default otherwise.
+    [[nodiscard]] TypeNameCommitPolarity
+        typeNameCommitPolarity(RuleId rule) const noexcept;
 
     // Pratt-walker wrapper rule ids declared by `expr.wrapperRules`
     // for `rule`. The loader auto-interned the declared names and

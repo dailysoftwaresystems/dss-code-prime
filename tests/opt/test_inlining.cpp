@@ -40,6 +40,7 @@
 //   * callsInlined counter accuracy + verifier-clean rebuild.
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -49,12 +50,18 @@
 #include "mir/mir_verifier.hpp"
 #include "opt/optimizer.hpp"
 #include "opt/passes/inlining.hpp"
+#include "diagnostic_count.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <variant>
+#include <vector>
+
+using dss::test_support::countCode;
 
 using namespace dss;
 
@@ -382,14 +389,14 @@ TEST(Inlining, MultiBlockLeafCalleeIsInlined) {
     MirBuilder mb;
 
     // pick (SymbolId 50): entry → CondBr to two blocks that each return.
-    // Markers: entry=EntryBlock; the two return blocks=ExitBlock (each
-    // terminates in Return). This keeps the un-inlined `pick` verifier-
-    // valid (no orphan IfThen/IfElse without an IfJoin) — the inliner
-    // re-derives the CLONED blocks to Linear regardless.
+    // Markers are derivation-consistent (both arms return → ipdom is the
+    // virtual exit → IfThen/IfElse, no join) so the un-inlined `pick`
+    // is verifier-valid; the post-inline re-derivation re-stamps every
+    // block from the spliced CFG regardless.
     mb.addFunction(fnSig, SymbolId{50});
     MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const fThen  = mb.createBlock(StructCfMarker::ExitBlock);
-    MirBlockId const fElse  = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const fThen  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const fElse  = mb.createBlock(StructCfMarker::IfElse);
     mb.beginBlock(fEntry);
     MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
     MirInstId const cond = mb.addConst(tru, boolT);
@@ -552,12 +559,13 @@ TEST(Inlining, MultiBlockNonLeafCalleeIsInlined) {
         mb.beginBlock(hEntry);
         mb.addReturn(mb.addConst(i32Lit(11), i32));
         // g (SymbolId 50): multi-block; then-arm CALLS h → NON-LEAF (now
-        // admitted). Balanced markers (entry=EntryBlock, return arms=
-        // ExitBlock) so g stays verifier-valid whether or not h is inlined.
+        // admitted). Derivation-consistent markers (both arms return →
+        // IfThen/IfElse around the virtual exit) so g stays verifier-
+        // valid whether or not h is inlined.
         mb.addFunction(fnSig, SymbolId{50});
         MirBlockId const gEntry = mb.createBlock(StructCfMarker::EntryBlock);
-        MirBlockId const gThen  = mb.createBlock(StructCfMarker::ExitBlock);
-        MirBlockId const gElse  = mb.createBlock(StructCfMarker::ExitBlock);
+        MirBlockId const gThen  = mb.createBlock(StructCfMarker::IfThen);
+        MirBlockId const gElse  = mb.createBlock(StructCfMarker::IfElse);
         mb.beginBlock(gEntry);
         MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
         MirInstId const gcond = mb.addConst(tru, boolT);
@@ -638,13 +646,14 @@ TEST(Inlining, NonReturningLeafCalleeIsNotInlined) {
     MirBuilder mb;
 
     // loopForever (SymbolId 50): entry block branches to L; L ends in
-    // Unreachable. Two blocks, leaf, NO Return on any path. Markers:
-    // entry=EntryBlock; L=ExitBlock terminating in Unreachable (the
-    // verifier explicitly allows an ExitBlock to end in Unreachable), so
-    // the un-inlined callee is itself verifier-valid.
+    // Unreachable. Two blocks, leaf, NO Return on any path. Markers
+    // are derivation-consistent (EntryBlock + Linear — a straight line;
+    // ExitBlock is a dormant marker the equality verifier would reject
+    // on a reachable block), so the un-inlined callee module is itself
+    // verifier-valid.
     mb.addFunction(fnSig, SymbolId{50});
     MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const fLoop  = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const fLoop  = mb.createBlock(StructCfMarker::Linear);
     mb.beginBlock(fEntry);
     mb.addBr(fLoop);
     mb.beginBlock(fLoop);
@@ -1007,11 +1016,12 @@ TEST(Inlining, MultiBlockIntrinsicCalleeIsInlined) {
     MirBuilder mb;
 
     // f (SymbolId 55): entry → Br B1; B1 computes an IntrinsicCall and
-    // returns it. Markers: entry=EntryBlock, B1=ExitBlock so the un-
-    // inlined f is verifier-valid; the inliner re-derives clones to Linear.
+    // returns it. Derivation-consistent markers (a straight line —
+    // EntryBlock + Linear) so the un-inlined f is verifier-valid; the
+    // post-inline re-derivation re-stamps the spliced result anyway.
     mb.addFunction(fnSig, SymbolId{55});
     MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const fB1    = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const fB1    = mb.createBlock(StructCfMarker::Linear);
     mb.beginBlock(fEntry);
     mb.addBr(fB1);
     mb.beginBlock(fB1);
@@ -1232,11 +1242,12 @@ TEST(Inlining, MixedSingleAndMultiBlockLeavesBothInlined) {
     mb.addReturn(mb.addConst(i32Lit(3), i32));
 
     // m (SymbolId 50): multi-block leaf, two return paths (early-return
-    // shape; balanced markers so the un-inlined m is verifier-valid).
+    // shape; derivation-consistent markers — both arms return →
+    // IfThen/IfElse — so the un-inlined m is verifier-valid).
     mb.addFunction(fnSig, SymbolId{50});
     MirBlockId const mEntryB = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const mThen   = mb.createBlock(StructCfMarker::ExitBlock);
-    MirBlockId const mAfter  = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const mThen   = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const mAfter  = mb.createBlock(StructCfMarker::IfElse);
     mb.beginBlock(mEntryB);
     MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
     MirInstId const mcond = mb.addConst(tru, boolT);
@@ -1307,12 +1318,13 @@ TEST(Inlining, MultiBlockSingleReturnLeafElidesMergePhi) {
     MirBuilder mb;
 
     // f (SymbolId 50): entry branches to B1; B1 returns 7. Two blocks,
-    // leaf, NO Phi, exactly ONE Return. Markers: entry=EntryBlock;
-    // B1=ExitBlock (terminates in Return) so the un-inlined f is itself
-    // verifier-valid. The inliner re-derives the CLONED blocks to Linear.
+    // leaf, NO Phi, exactly ONE Return. Derivation-consistent markers
+    // (a straight line — EntryBlock + Linear) so the un-inlined f is
+    // itself verifier-valid; the post-inline re-derivation re-stamps
+    // the spliced result.
     mb.addFunction(fnSig, SymbolId{50});
     MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const fB1    = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const fB1    = mb.createBlock(StructCfMarker::Linear);
     mb.beginBlock(fEntry);
     mb.addBr(fB1);
     mb.beginBlock(fB1);
@@ -1439,12 +1451,12 @@ TEST(Inlining, MultiBlockVoidLeafIsInlined) {
 
     // g (SymbolId 80): VOID multi-block leaf. entry branches to B1; B1
     // holds a real (non-terminator) body inst — a Const the splice must
-    // clone — then a bare void Return (no value). Markers: entry=Entry,
-    // B1=ExitBlock terminating in a (void) Return → un-inlined g valid.
+    // clone — then a bare void Return (no value). Derivation-consistent
+    // markers (straight line — EntryBlock + Linear) → un-inlined g valid.
     mb.addFunction(voidSig, SymbolId{80}, SymbolBinding::Global,
                    SymbolVisibility::Default);
     MirBlockId const gEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const gB1    = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const gB1    = mb.createBlock(StructCfMarker::Linear);
     mb.beginBlock(gEntry);
     mb.addBr(gB1);
     mb.beginBlock(gB1);
@@ -1861,4 +1873,1140 @@ TEST(Inlining, InlineCostModelZeroThresholdRefusesAll) {
 
     MirVerifier verifier{mir, &interner};
     EXPECT_TRUE(verifier.verify(rep));
+}
+
+// ── D15 cycle C (a): a LOOP-BEARING callee inlines, LAYOUT-clean ────
+// f(k){ int acc=37; while(k){acc++; k--;} return acc; } in its PRE-Mem2Reg
+// alloca form (the shape `runInlining` sees in release — Inlining runs
+// BEFORE Mem2Reg, so the loop variable lives in an alloca, no callee Phi).
+// The callee is MULTI-BLOCK with a real loop back-edge (body→header). The
+// C1 by-construction topological pre-creation lays the cloned header
+// before its body and the continuation after every clone, so the
+// MirVerifier — WITH the new layout rule (I_LayoutUseBeforeDef) — sees
+// ZERO diagnostics. This is the iter.c RC-B shape at the unit tier.
+// RED-on-disable: reverting C1's creation order (continuation created
+// before the clones) lays a clone-defined value's def AFTER the
+// continuation that consumes it → I_LayoutUseBeforeDef fires →
+// verifier.verify(rep) returns false (demonstrated in the cycle gate).
+TEST(Inlining, LoopBearingCalleeInlinesLayoutClean) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const i32p  = interner.pointer(i32);
+    TypeId const params[] = {i32};
+    TypeId const fSig  = interner.fnSig(params, i32, CallConv::CcSysV);
+    TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // f(int k): alloca-based counted loop (Phi-free — the gate forbids
+    // callee Phis; this is the pre-Mem2Reg lowering).
+    mb.addFunction(fSig, SymbolId{50});
+    MirBlockId const fEntry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const fHeader = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const fBody   = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const fExit   = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(fEntry);
+    MirInstId const kArg    = mb.addArg(0, i32);
+    MirInstId const accSlot = mb.addInst(MirOpcode::Alloca, {}, i32p);
+    MirInstId const kSlot   = mb.addInst(MirOpcode::Alloca, {}, i32p);
+    {
+        MirInstId const st0[] = {kArg, kSlot};
+        (void)mb.addInst(MirOpcode::Store, st0, InvalidType);
+        MirInstId const c37 = mb.addConst(i32Lit(37), i32);
+        MirInstId const st1[] = {c37, accSlot};
+        (void)mb.addInst(MirOpcode::Store, st1, InvalidType);
+    }
+    mb.addBr(fHeader);
+    mb.beginBlock(fHeader);
+    MirInstId const kv   = mb.addInst(MirOpcode::Load, std::array{kSlot}, i32);
+    MirInstId const zero = mb.addConst(i32Lit(0), i32);
+    MirInstId const ne   = mb.addInst(MirOpcode::ICmpNe, std::array{kv, zero}, boolT);
+    mb.addCondBr(ne, fBody, fExit);
+    mb.beginBlock(fBody);
+    {
+        MirInstId const a    = mb.addInst(MirOpcode::Load, std::array{accSlot}, i32);
+        MirInstId const one  = mb.addConst(i32Lit(1), i32);
+        MirInstId const a1   = mb.addInst(MirOpcode::Add, std::array{a, one}, i32);
+        MirInstId const sta[] = {a1, accSlot};
+        (void)mb.addInst(MirOpcode::Store, sta, InvalidType);
+        MirInstId const kk   = mb.addInst(MirOpcode::Load, std::array{kSlot}, i32);
+        MirInstId const one2 = mb.addConst(i32Lit(1), i32);
+        MirInstId const kk1  = mb.addInst(MirOpcode::Sub, std::array{kk, one2}, i32);
+        MirInstId const stk[] = {kk1, kSlot};
+        (void)mb.addInst(MirOpcode::Store, stk, InvalidType);
+    }
+    mb.addBr(fHeader);  // back edge
+    mb.beginBlock(fExit);
+    MirInstId const rv = mb.addInst(MirOpcode::Load, std::array{accSlot}, i32);
+    mb.addReturn(rv);
+
+    // main(): return f(5)
+    mb.addFunction(mainSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const fAddr = mb.addGlobalAddr(SymbolId{50}, fSig);
+    MirInstId const arg5  = mb.addConst(i32Lit(5), i32);
+    MirInstId const callOps[] = {fAddr, arg5};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(call);
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "the loop-bearing (alloca-form) callee MUST inline (one call)";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
+        << "main's call to f must be spliced away";
+
+    // THE pin: the spliced module — INCLUDING the new layout rule — is
+    // verifier-clean. ZERO diagnostics (not just verify==true).
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the loop-bearing splice must verify clean WITH the layout rule";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::I_LayoutUseBeforeDef), 0u)
+        << "C1's by-construction topological layout must leave NO layout "
+           "violation in the cloned loop body / continuation";
+    EXPECT_EQ(rep.errorCount(), 0u) << "zero diagnostics of any kind";
+}
+
+// ── D15 cycle C (b): recursion × inlining — main→rec inlines, rec→rec
+// survives (the cross-SCC edge). ────────────────────────────────────
+// rec(k){ if(k){ return rec(k-1)+1; } return 37; }  main(){ return rec(5); }
+// `rec` is self-recursive → its self-call is in rec's own SCC → the SCC
+// gate (rule 3) REFUSES rec→rec (it stays out-of-line). But main→rec is
+// a CROSS-SCC edge (main is not in rec's SCC) → it IS inlined. So exactly
+// ONE call inlines (main→rec); the recursive self-call survives INSIDE
+// the now-inlined-into-main body. Verifier-clean incl. the layout rule
+// (rec is a multi-block diamond — the splice's continuation consumes the
+// merged return value, which C1 lays out correctly).
+TEST(Inlining, RecursionCrossSccInlinesCallerSelfCallSurvives) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {i32};
+    TypeId const recSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // rec(int k): if (k) return rec(k-1)+1; return 37;  (alloca-free,
+    // Phi-free diamond — entry CondBr to a recursive-then arm + a base
+    // else arm; each arm Returns, so no merge Phi).
+    mb.addFunction(recSig, SymbolId{50});
+    MirBlockId const rEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const rThen  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const rElse  = mb.createBlock(StructCfMarker::IfElse);
+    mb.beginBlock(rEntry);
+    MirInstId const kArg = mb.addArg(0, i32);
+    MirInstId const zero = mb.addConst(i32Lit(0), i32);
+    MirInstId const ne   = mb.addInst(MirOpcode::ICmpNe, std::array{kArg, zero}, boolT);
+    mb.addCondBr(ne, rThen, rElse);
+    mb.beginBlock(rThen);
+    {
+        MirInstId const selfAddr = mb.addGlobalAddr(SymbolId{50}, recSig);
+        MirInstId const one  = mb.addConst(i32Lit(1), i32);
+        MirInstId const km1  = mb.addInst(MirOpcode::Sub, std::array{kArg, one}, i32);
+        MirInstId const recOps[] = {selfAddr, km1};
+        MirInstId const recCall = mb.addInst(MirOpcode::Call, recOps, i32);
+        MirInstId const one2 = mb.addConst(i32Lit(1), i32);
+        MirInstId const sum  = mb.addInst(MirOpcode::Add, std::array{recCall, one2}, i32);
+        mb.addReturn(sum);
+    }
+    mb.beginBlock(rElse);
+    mb.addReturn(mb.addConst(i32Lit(37), i32));
+
+    // main(): return rec(5)
+    mb.addFunction(mainSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const recAddr = mb.addGlobalAddr(SymbolId{50}, recSig);
+    MirInstId const arg5    = mb.addConst(i32Lit(5), i32);
+    MirInstId const callOps[] = {recAddr, arg5};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(call);
+    Mir mir = std::move(mb).finish();
+
+    // Before: 2 calls (main→rec, rec→rec self-call).
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "exactly ONE call inlines: the cross-SCC main→rec edge. The "
+           "rec→rec self-call is in rec's own SCC and the gate refuses it.";
+    // rec's own body still holds its self-call (refused, out-of-line).
+    EXPECT_EQ(countOpInFuncBySymbol(mir, 50, MirOpcode::Call), 1u)
+        << "rec's recursive self-call MUST survive (SCC gate refusal)";
+    // main inlined rec's SOURCE body → it now carries the cloned self-call
+    // (the residual recursive Call spliced in from rec's then-arm).
+    EXPECT_EQ(countOpInFuncBySymbol(mir, 100, MirOpcode::Call), 1u)
+        << "main holds the cloned residual self-call from rec's then-arm";
+
+    // Verifier-clean incl. the layout rule (the diamond's continuation).
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the cross-SCC recursion splice must verify clean (layout rule)";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::I_LayoutUseBeforeDef), 0u);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// D-OPT7-MULTIBLOCK-SPLICE-PHI: inline a callee that contains a `Phi`.
+//
+// The multi-block inliner now clones a callee `Phi` via a DEFERRED flush
+// (placeholder in the clone loop; incomings remapped through the value
+// (`local`) + block (`calleeBlockMap`) maps AFTER the loop) — the same
+// discipline the caller's own phis use, sibling of the `returnEdges`
+// flush, DISJOINT maps. The deferral is UNIFORM across phi shapes (join +
+// loop): loop-phi support is the ABSENCE of an artificial restriction.
+//
+// THE PRIMARY GUARANTEE the MirVerifier provably CANNOT give is value↔
+// pred pairing: when both incoming values dominate both preds (the
+// constant-armed ternary), a transposition (right preds, wrong value↔
+// pred pairing) still passes the verifier (the documented blind spot at
+// MultiBlockLeafCalleeIsInlined's pairing block). So every Phi-clone test
+// below carries a STRUCTURAL pairing assertion via the shared helper.
+// ════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Find the function with symbol `sym` in `mir` (Invalid if absent).
+MirFuncId funcBySymbol(Mir const& mir, std::uint32_t sym) {
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        if (mir.funcSymbol(f).v == sym) return f;
+    }
+    return MirFuncId{};
+}
+
+// Collect every Phi instruction in the function with symbol `sym`, in
+// (block-layout, in-block) order.
+std::vector<MirInstId> phisInFuncBySymbol(Mir const& mir, std::uint32_t sym) {
+    std::vector<MirInstId> phis;
+    MirFuncId const f = funcBySymbol(mir, sym);
+    if (!f.valid()) return phis;
+    std::uint32_t const nb = mir.funcBlockCount(f);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const b = mir.funcBlockAt(f, bi);
+        std::uint32_t const ni = mir.blockInstCount(b);
+        for (std::uint32_t i = 0; i < ni; ++i) {
+            MirInstId const id = mir.blockInstAt(b, i);
+            if (mir.instOpcode(id) == MirOpcode::Phi) phis.push_back(id);
+        }
+    }
+    return phis;
+}
+
+// Capture the SORTED multiset of Const incoming values of a phi (read
+// from the module the phi belongs to). Called on the SOURCE callee phi
+// BEFORE inlining — `runInlining` produces a NEW Mir (the source phi's id
+// becomes stale across the module boundary), so we capture plain data
+// here and compare the CLONE against it after.
+std::vector<std::int64_t> captureConstPhiValues(Mir const& m, MirInstId phi) {
+    std::vector<std::int64_t> vs;
+    for (MirPhiIncoming const& inc : m.phiIncomings(phi)) {
+        if (m.instOpcode(inc.value) != MirOpcode::Const) continue;
+        vs.push_back(std::get<std::int64_t>(
+            m.literalValue(m.constLiteralIndex(inc.value)).value));
+    }
+    std::sort(vs.begin(), vs.end());
+    return vs;
+}
+
+// THE MANDATORY STRUCTURAL PAIRING ASSERTION (mirrors the return-merge
+// proof at MultiBlockLeafCalleeIsInlined). Given the CLONE callee phi (in
+// the caller after inlining) and the SOURCE phi's captured Const-value
+// multiset (`srcConstVals`, from `captureConstPhiValues` pre-inline),
+// assert the clone's {(value, pred)} incoming set matches the source's
+// under the value/block remap. The clone is a CFG isomorphism (callee
+// blocks 1:1), so we check the load-bearing pairing invariant the verifier
+// cannot see — for fixtures whose phi incomings carry DISTINCT Const
+// values (one per arm):
+//   (a) same incoming count (count == captured value count);
+//   (b) the clone's Const-value multiset equals the source's captured one
+//       (no value dropped or fabricated);
+//   (c) THE PAIRING — each clone incoming's Const value is DEFINED IN ITS
+//       OWN pred block (instBlock(value) == pred), EXACTLY as the source
+//       phi paired them. A transposition (value of arm A attributed to arm
+//       B's pred) makes instBlock(value) != pred for the swapped edges →
+//       RED, while the verifier stays green.
+void assertConstArmedPhiClonePairing(
+    Mir const& cloned, MirInstId clonePhi,
+    std::vector<std::int64_t> const& srcConstVals) {
+    auto const cloneIncs = cloned.phiIncomings(clonePhi);
+    ASSERT_EQ(cloneIncs.size(), srcConstVals.size())
+        << "the cloned callee phi must have the SAME incoming count as the "
+           "source callee phi";
+
+    // (b) identical multiset of incoming Const values.
+    auto const cloneVals = captureConstPhiValues(cloned, clonePhi);
+    EXPECT_EQ(cloneVals, srcConstVals)
+        << "the cloned phi's incoming Const values must match the source's "
+           "(no value dropped or fabricated by the clone)";
+
+    // (c) THE PAIRING INVARIANT — each clone incoming's value is defined in
+    // its OWN pred block, EXACTLY as the source phi pairs them. This is the
+    // ONLY thing that catches a value↔pred transposition the verifier can't.
+    bool pairingHolds = true;
+    for (MirPhiIncoming const& inc : cloneIncs) {
+        if (cloned.instBlock(inc.value).v != inc.pred.v) pairingHolds = false;
+    }
+    EXPECT_TRUE(pairingHolds)
+        << "STRUCTURAL PAIRING: each cloned-callee-phi incoming value must be "
+           "defined in its OWN predecessor block — a value↔pred transposition "
+           "(which the MirVerifier provably cannot catch when both values "
+           "dominate both preds) breaks this and goes RED here";
+}
+
+// Build a callee `f(int x)` that contains BOTH a join-Phi AND two returns
+// — so a callee JOIN-PHI and the inserted RETURN-MERGE Phi coexist in one
+// splice (proving they compose via disjoint maps). Shape (Phi-free of any
+// loop; a value-producing ternary join then an early-return diamond):
+//
+//   entry:  br tjoin                       (unconditional, x is Arg 0)
+//   tA:     (unreachable in practice; we build the join directly)
+//
+// We hand-build the canonical ternary-join then a CondBr diamond:
+//   entry:   cbr x?  -> ta, tb
+//   ta:      va = 7;  br join
+//   tb:      vb = 9;  br join
+//   join:    t = phi [va, ta], [vb, tb]      ← the CALLEE JOIN-PHI
+//            cbr x?  -> r1, r2
+//   r1:      return t                         ← return edge 1 (value t)
+//   r2:      return 100                       ← return edge 2 (const 100)
+//
+// After inlining into `main` (which calls f(...)): the join-phi is
+// recloned (deferred flush) AND a 2-incoming return-merge Phi joins
+// (clone-of-t, r1-clone) + (100, r2-clone). DISJOINT: the join-phi's
+// incomings are {7,9}; the return-merge's are {t, 100}.
+Mir buildJoinPhiPlusTwoReturnsModule(TypeInterner& interner) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {i32};
+    TypeId const fSig  = interner.fnSig(params, i32, CallConv::CcSysV);
+    TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // f(int x): ternary-join then early-return diamond (markers
+    // derivation-consistent: join is a real IfJoin reached by both arms;
+    // the two return arms make their ipdom the virtual exit → IfThen/
+    // IfElse). The post-inline re-derivation re-stamps regardless.
+    mb.addFunction(fSig, SymbolId{50});
+    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const fTa    = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const fTb    = mb.createBlock(StructCfMarker::IfElse);
+    MirBlockId const fJoin  = mb.createBlock(StructCfMarker::IfJoin);
+    MirBlockId const fR1    = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const fR2    = mb.createBlock(StructCfMarker::IfElse);
+
+    mb.beginBlock(fEntry);
+    MirInstId const x    = mb.addArg(0, i32);
+    MirInstId const zero = mb.addConst(i32Lit(0), i32);
+    MirInstId const ne0  = mb.addInst(MirOpcode::ICmpNe, std::array{x, zero}, boolT);
+    mb.addCondBr(ne0, fTa, fTb);
+
+    mb.beginBlock(fTa);
+    MirInstId const va = mb.addConst(i32Lit(7), i32);
+    mb.addBr(fJoin);
+
+    mb.beginBlock(fTb);
+    MirInstId const vb = mb.addConst(i32Lit(9), i32);
+    mb.addBr(fJoin);
+
+    mb.beginBlock(fJoin);
+    std::array<MirPhiIncoming, 2> tIncs{
+        MirPhiIncoming{va, fTa},
+        MirPhiIncoming{vb, fTb},
+    };
+    MirInstId const t = mb.addPhi(i32, tIncs);  // THE callee join-phi
+    // second condition reuses x (still nonzero-test) → CondBr to r1/r2.
+    MirInstId const zero2 = mb.addConst(i32Lit(0), i32);
+    MirInstId const ne1   = mb.addInst(MirOpcode::ICmpNe, std::array{x, zero2}, boolT);
+    mb.addCondBr(ne1, fR1, fR2);
+
+    mb.beginBlock(fR1);
+    mb.addReturn(t);                              // return edge 1: value = t
+
+    mb.beginBlock(fR2);
+    mb.addReturn(mb.addConst(i32Lit(100), i32));  // return edge 2: const 100
+
+    // main(): return f(1)
+    mb.addFunction(mainSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const fAddr = mb.addGlobalAddr(SymbolId{50}, fSig);
+    MirInstId const arg1  = mb.addConst(i32Lit(1), i32);
+    MirInstId const callOps[] = {fAddr, arg1};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(call);
+    return std::move(mb).finish();
+}
+
+} // namespace
+
+// ── MANDATORY SHAPE (1): a callee JOIN-PHI and the RETURN-MERGE Phi
+// COEXIST in one splice and compose (disjoint maps). ─────────────────
+// The callee has a value-producing ternary (a join-Phi `t` over {7,9})
+// AND two returns (so the splice ALSO inserts a return-merge Phi over
+// {t, 100}). After inlining: BOTH phis are present in main, the cloned
+// JOIN-phi is correctly value↔pred paired (the structural assertion),
+// and the module verifies. RED-on-disable: dropping the clone-loop Phi
+// arm makes the join-phi hit emitCalleeInst's defensive abort; mis-wiring
+// the join-phi incomings breaks the structural pairing assertion below.
+TEST(Inlining, CalleePhiJoinAndReturnMergeCoexist) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildJoinPhiPlusTwoReturnsModule(interner);
+
+    // Capture the SOURCE callee join-phi's Const incoming values (the only
+    // Phi in f, sym 50) BEFORE inlining — runInlining makes a NEW Mir, so
+    // the source phi id is stale across the boundary; we compare the clone
+    // against this captured data.
+    auto const srcPhis = phisInFuncBySymbol(mir, 50);
+    ASSERT_EQ(srcPhis.size(), 1u) << "f must hold exactly one join-phi pre-inline";
+    auto const srcJoinVals = captureConstPhiValues(mir, srcPhis[0]);
+    ASSERT_EQ(srcJoinVals.size(), 2u) << "the join-phi has two Const arms {7,9}";
+    // The un-inlined module is itself verifier-valid.
+    {
+        DiagnosticReporter pre;
+        MirVerifier preV{mir, &interner};
+        ASSERT_TRUE(preV.verify(pre))
+            << "the join-phi callee module must be valid pre-inlining";
+    }
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Phi), 1u)
+        << "before: only f's join-phi exists";
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "the Phi-bearing multi-block callee MUST now inline";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
+        << "main's Call must be replaced by the spliced Phi-bearing body";
+
+    // BOTH phis coexist in main: the cloned join-phi AND the return-merge
+    // Phi. f's own join-phi still exists (not deleted — DCE's job), so the
+    // module-wide Phi count is 3 (f's original 1 + main's cloned 2).
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi), 3u)
+        << "f's original join-phi (1) + main's {cloned join-phi, return-merge} "
+           "(2) = 3 — the two deferred mechanisms compose via disjoint maps";
+    auto const mainPhis = phisInFuncBySymbol(mir, 100);
+    ASSERT_EQ(mainPhis.size(), 2u)
+        << "main holds BOTH the cloned join-phi AND the return-merge phi";
+
+    // Identify the CLONED join-phi in main (the one whose incomings are the
+    // {7,9} arms — the return-merge's incomings are {t, 100}). The cloned
+    // join-phi has BOTH incoming values being Const (7 and 9); the return-
+    // merge has one Phi-typed incoming (the cloned t) + one Const (100).
+    MirInstId clonedJoinPhi{};
+    for (MirInstId const p : mainPhis) {
+        auto const incs = mir.phiIncomings(p);
+        bool allConst = true;
+        for (MirPhiIncoming const& inc : incs) {
+            if (mir.instOpcode(inc.value) != MirOpcode::Const) { allConst = false; break; }
+        }
+        // The cloned join-phi's incomings are Const {7,9}; the return-merge
+        // has a non-Const incoming (the cloned phi value t). Distinguish by
+        // the {7,9} value set.
+        if (allConst && incs.size() == 2) {
+            std::int64_t a = std::get<std::int64_t>(
+                mir.literalValue(mir.constLiteralIndex(incs[0].value)).value);
+            std::int64_t b = std::get<std::int64_t>(
+                mir.literalValue(mir.constLiteralIndex(incs[1].value)).value);
+            if ((a == 7 && b == 9) || (a == 9 && b == 7)) clonedJoinPhi = p;
+        }
+    }
+    ASSERT_TRUE(clonedJoinPhi.valid())
+        << "the cloned callee join-phi (incomings {7,9}) must be in main";
+
+    // ★ THE STRUCTURAL PAIRING PIN (the ONLY thing catching a transposition):
+    // the cloned join-phi's (value,pred) pairing equals the source's.
+    assertConstArmedPhiClonePairing(mir, clonedJoinPhi, srcJoinVals);
+
+    // The return-merge Phi is the OTHER phi; assert it carries the cloned-t
+    // and the 100 (it joins the two return edges).
+    MirInstId returnMerge{};
+    for (MirInstId const p : mainPhis) if (p.v != clonedJoinPhi.v) returnMerge = p;
+    ASSERT_TRUE(returnMerge.valid());
+    {
+        auto const incs = mir.phiIncomings(returnMerge);
+        ASSERT_EQ(incs.size(), 2u) << "two return edges → two return-merge incomings";
+        bool sawHundred = false, sawPhiVal = false;
+        for (MirPhiIncoming const& inc : incs) {
+            if (mir.instOpcode(inc.value) == MirOpcode::Const) {
+                EXPECT_EQ(std::get<std::int64_t>(
+                    mir.literalValue(mir.constLiteralIndex(inc.value)).value), 100)
+                    << "the const return edge carries 100";
+                // The const-100 was defined in r2 → its own pred (r2-clone).
+                EXPECT_EQ(mir.instBlock(inc.value).v, inc.pred.v)
+                    << "the const-100 return edge: value defined in its own pred";
+                sawHundred = true;
+            } else if (mir.instOpcode(inc.value) == MirOpcode::Phi) {
+                EXPECT_EQ(inc.value.v, clonedJoinPhi.v)
+                    << "the value return edge carries the cloned join-phi t";
+                // `t` (the cloned join-phi) is defined in the cloned-join
+                // block and flows out through r1-clone — it DOMINATES its
+                // pred but is NOT defined IN it (the return-merge value is a
+                // dominating def, not a same-block def — the disjoint-maps
+                // composition, not a transposition).
+                EXPECT_NE(mir.instBlock(inc.value).v, inc.pred.v)
+                    << "the cloned-join-phi return edge: t is defined in the "
+                       "cloned join block, dominating (not equal to) its pred";
+                sawPhiVal = true;
+            }
+        }
+        EXPECT_TRUE(sawHundred) << "return-merge must include the const-100 edge";
+        EXPECT_TRUE(sawPhiVal)
+            << "return-merge must include the cloned-join-phi (t) edge — the "
+               "two deferred mechanisms compose";
+        // The two return edges arrive from DISTINCT cloned predecessor blocks.
+        EXPECT_NE(incs[0].pred.v, incs[1].pred.v)
+            << "the two return paths arrive from distinct cloned blocks";
+    }
+
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the join-phi + return-merge splice must verify clean";
+}
+
+// ── RED-ON-DISABLE (value-transposition → PAIRING-red, verifier STAYS
+// GREEN). ────────────────────────────────────────────────────────────
+// This DEMONSTRATES the verifier's documented blind spot. `Mir` is
+// immutable post-`finish` (no incoming-mutation API), so — matching the
+// suite idiom (test_mir_verifier builds the bad module directly) — we
+// hand-build TWO diamond modules with a join-phi over {7,9} where BOTH
+// constants are defined in the ENTRY block (a common dominator of both
+// arms):
+//   * CORRECT:    phi [7, then], [9, else]   (canonical `cond ? 7 : 9`)
+//   * TRANSPOSED: phi [9, then], [7, else]   (values swapped; preds intact)
+// Because both 7 and 9 dominate BOTH preds (defined in the entry), the
+// verifier's phi-incoming dominance rule passes for EITHER pairing → the
+// MirVerifier passes BOTH. Only the value↔pred PAIRING (the then-arm must
+// carry 7) distinguishes them. This is the proof that the structural
+// pairing assertion is the ONLY guard against a value-transposition
+// miscompile — exactly the wiring a mis-remap in the deferred flush would
+// produce when the merged values share a dominator.
+namespace {
+// Build a single-function diamond with a join-phi over two values BOTH
+// DEFINED IN THE ENTRY block (a common dominator of both arms), so the
+// verifier's phi-incoming dominance rule (defBlock must dominate the
+// incoming pred) is satisfied for EITHER value↔pred pairing — that is the
+// precondition for the blind spot. `transpose` swaps which arm each value
+// is attributed to (the preds stay {then,else}). Returns module + phi id.
+// To distinguish the two arms STRUCTURALLY we tag each value with a
+// distinct per-arm marker instruction in its arm and feed the marker into
+// the phi value via an Add against the entry const — no: simpler — we make
+// the phi VALUES be entry consts {7,9} (dominating) and recover the
+// intended pairing from a per-arm WITNESS map the test captures. Here the
+// pairing invariant we assert is the SOURCE-INTENT one: arm `then` is
+// meant to carry 7, arm `else` 9 (the canonical `cond ? 7 : 9`).
+Mir buildDiamondPhiModule(TypeInterner& interner, bool transpose,
+                          MirInstId& phiOut, MirBlockId& thenOut,
+                          MirBlockId& elseOut, std::int64_t& thenValOut) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {i32};
+    TypeId const fSig  = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const thenB = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const elseB = mb.createBlock(StructCfMarker::IfElse);
+    MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
+    mb.beginBlock(entry);
+    MirInstId const x     = mb.addArg(0, i32);
+    MirInstId const zero  = mb.addConst(i32Lit(0), i32);
+    // BOTH phi values are defined in the ENTRY (dominates both arms) → a
+    // transposition keeps both dominating, so the verifier CANNOT catch it.
+    MirInstId const seven = mb.addConst(i32Lit(7), i32);
+    MirInstId const nine  = mb.addConst(i32Lit(9), i32);
+    MirInstId const ne    = mb.addInst(MirOpcode::ICmpNe, std::array{x, zero}, boolT);
+    mb.addCondBr(ne, thenB, elseB);
+    mb.beginBlock(thenB);
+    mb.addBr(join);
+    mb.beginBlock(elseB);
+    mb.addBr(join);
+    mb.beginBlock(join);
+    // The canonical intent: `then`→7, `else`→9. TRANSPOSED swaps them.
+    std::array<MirPhiIncoming, 2> incs =
+        transpose
+            ? std::array<MirPhiIncoming, 2>{MirPhiIncoming{nine,  thenB},
+                                            MirPhiIncoming{seven, elseB}}
+            : std::array<MirPhiIncoming, 2>{MirPhiIncoming{seven, thenB},
+                                            MirPhiIncoming{nine,  elseB}};
+    phiOut = mb.addPhi(i32, incs);
+    mb.addReturn(phiOut);
+    thenOut = thenB;
+    elseOut = elseB;
+    thenValOut = transpose ? 9 : 7;  // the value the `then` arm carries
+    return std::move(mb).finish();
+}
+
+// THE PAIRING the verifier cannot see: in the canonical `cond ? 7 : 9`,
+// the `then`-arm pred must carry 7 (and `else` carries 9). Returns true
+// iff the phi pairs `then`→7. A transposition flips this to `then`→9 while
+// the verifier stays green (both consts dominate from the entry).
+bool diamondPairingHolds(Mir const& m, MirInstId phi, MirBlockId thenB) {
+    for (MirPhiIncoming const& inc : m.phiIncomings(phi)) {
+        if (inc.pred.v != thenB.v) continue;
+        std::int64_t const v = std::get<std::int64_t>(
+            m.literalValue(m.constLiteralIndex(inc.value)).value);
+        return v == 7;  // the `then` arm must carry 7 in the canonical intent
+    }
+    return false;
+}
+} // namespace
+
+TEST(Inlining, CalleePhiValueTranspositionIsCaughtOnlyStructurally) {
+    TypeInterner interner{CompilationUnitId{1}};
+
+    MirInstId goodPhi{}, badPhi{};
+    MirBlockId gThen{}, gElse{}, bThen{}, bElse{};
+    std::int64_t gThenVal = 0, bThenVal = 0;
+    Mir good = buildDiamondPhiModule(interner, /*transpose=*/false, goodPhi,
+                                     gThen, gElse, gThenVal);
+    Mir bad  = buildDiamondPhiModule(interner, /*transpose=*/true,  badPhi,
+                                     bThen, bElse, bThenVal);
+
+    // (1) BOTH modules verify GREEN — the verifier provably cannot tell the
+    // transposition apart: both 7 and 9 are defined in the ENTRY (a common
+    // dominator), so each dominates BOTH preds regardless of pairing, and
+    // the pred set is identical. This is the documented blind spot.
+    {
+        DiagnosticReporter rg, rb;
+        MirVerifier vg{good, &interner}, vb{bad, &interner};
+        EXPECT_TRUE(vg.verify(rg)) << "the correct diamond verifies";
+        EXPECT_TRUE(vb.verify(rb))
+            << "the TRANSPOSED diamond ALSO verifies — a value-transposition "
+               "(right preds, swapped values, both dominating from the entry) "
+               "is the documented blind spot the structural assertion covers";
+    }
+
+    // (2) The intended PAIRING (then-arm carries 7) holds for the CORRECT
+    // module and is BROKEN for the transposed one — the ONLY signal of a
+    // value-transposition miscompile, structural, not verifier-visible.
+    EXPECT_TRUE(diamondPairingHolds(good, goodPhi, gThen))
+        << "the correct phi pairs the then-arm with 7 (canonical intent)";
+    EXPECT_FALSE(diamondPairingHolds(bad, badPhi, bThen))
+        << "the transposed phi BREAKS the pairing (then-arm now carries 9) "
+           "— caught ONLY by the value↔pred pairing, never by the verifier";
+}
+
+// ── MANDATORY SHAPE (2): a real LOOP-PHI callee inlines (the ONLY shape
+// that exercises the DEFERRAL). ──────────────────────────────────────
+// A join-phi resolves even under an immediate flush (all incoming values
+// precede the phi in RPO). A LOOP header-phi does NOT: its back-edge
+// incoming VALUE is defined in the latch, LATER in RPO — so flushing the
+// incomings inside the clone loop would hit mapCalleeOperand's def-before-
+// use abort. The deferral (flush AFTER the clone loop, when `local` is
+// complete) is what makes the loop-phi resolve. We hand-build the MIR
+// (a loop-phi is NOT frontend-reachable in release — Inlining runs before
+// Mem2Reg, so the loop var is still an alloca, not a phi):
+//
+//   entry:   acc0 = 0;  br header
+//   header:  acc = phi [acc0, entry], [acc1, latch]    ← THE LOOP-PHI
+//            i   = phi [0, entry], [i1, latch]
+//            c   = i < N ? ...                          (ICmpSlt vs N)
+//            cbr c -> latch, exit
+//   latch:   acc1 = acc + i;  i1 = i + 1;  br header    ← back-edge VALUES
+//   exit:    return acc
+//
+// The header-phi's back-edge incoming `acc1` is DEFINED IN THE LATCH,
+// which RPO visits AFTER the header → the deferral is mandatory.
+// Asserts: inlines, verifier-clean (incl. layout rule), and the loop-phi's
+// back-edge incoming is correctly remapped (the cloned acc1 in the cloned
+// latch, paired with the cloned latch as pred — the structural pairing).
+TEST(Inlining, LoopPhiCalleeInlinesBackEdgeRemapped) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {i32};
+    TypeId const fSig  = interner.fnSig(params, i32, CallConv::CcSysV);
+    TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // f(int n): a Phi-form counted loop summing 0..n-1 (hand-built SSA).
+    // Markers are derivation-consistent: the header is a LoopHeader (rule
+    // 2 — the latch is a pred it dominates); the exit is the target of the
+    // header's loop-EXITING edge → LoopExit (rule 3); the latch (loop body)
+    // is Linear. Mis-stamping the exit as Linear would fire I_StructCfMismatch
+    // PRE-inlining; the post-inline re-derivation re-stamps the clone anyway.
+    mb.addFunction(fSig, SymbolId{50});
+    MirBlockId const fEntry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const fHeader = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const fLatch  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const fExit   = mb.createBlock(StructCfMarker::LoopExit);
+
+    mb.beginBlock(fEntry);
+    MirInstId const n     = mb.addArg(0, i32);
+    MirInstId const acc0  = mb.addConst(i32Lit(0), i32);
+    MirInstId const i0    = mb.addConst(i32Lit(0), i32);
+    mb.addBr(fHeader);
+
+    // header: two phis. Back-edge incomings (acc1, i1) are defined LATER
+    // (in the latch) → supplied as deferred incomings now; the inliner's
+    // clone must reproduce this deferral.
+    mb.beginBlock(fHeader);
+    MirInstId const accPhi = mb.addPhi(i32);   // acc = phi [acc0, entry],[acc1, latch]
+    MirInstId const iPhi   = mb.addPhi(i32);   // i   = phi [i0,   entry],[i1,   latch]
+    MirInstId const cond   = mb.addInst(MirOpcode::ICmpSlt, std::array{iPhi, n}, boolT);
+    mb.addCondBr(cond, fLatch, fExit);
+
+    mb.beginBlock(fLatch);
+    MirInstId const acc1 = mb.addInst(MirOpcode::Add, std::array{accPhi, iPhi}, i32);
+    MirInstId const one  = mb.addConst(i32Lit(1), i32);
+    MirInstId const i1   = mb.addInst(MirOpcode::Add, std::array{iPhi, one}, i32);
+    mb.addBr(fHeader);  // back edge
+
+    mb.beginBlock(fExit);
+    mb.addReturn(accPhi);
+
+    // Wire the header phis' incomings (entry forward + latch back-edge).
+    mb.addPhiIncoming(accPhi, MirPhiIncoming{acc0, fEntry});
+    mb.addPhiIncoming(accPhi, MirPhiIncoming{acc1, fLatch});   // back-edge VALUE
+    mb.addPhiIncoming(iPhi,   MirPhiIncoming{i0,   fEntry});
+    mb.addPhiIncoming(iPhi,   MirPhiIncoming{i1,   fLatch});   // back-edge VALUE
+
+    // main(): return f(4)
+    mb.addFunction(mainSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const fAddr = mb.addGlobalAddr(SymbolId{50}, fSig);
+    MirInstId const arg4  = mb.addConst(i32Lit(4), i32);
+    MirInstId const callOps[] = {fAddr, arg4};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(call);
+    Mir mir = std::move(mb).finish();
+
+    // The un-inlined module (with real loop phis) is itself verifier-valid.
+    {
+        DiagnosticReporter pre;
+        MirVerifier preV{mir, &interner};
+        ASSERT_TRUE(preV.verify(pre))
+            << "the loop-phi callee module must be valid pre-inlining";
+    }
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Phi), 2u)
+        << "before: f's two header phis";
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "the LOOP-PHI callee MUST inline (the deferral handles the back-"
+           "edge value defined later in RPO)";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
+        << "main's Call to the loop-phi callee must be spliced away";
+
+    // f's two phis stay (un-deleted) + main gains 2 cloned header phis = 4.
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi), 4u)
+        << "f's 2 header phis + main's 2 cloned header phis = 4";
+
+    // ★ THE DEFERRAL PIN: the cloned loop-phi's back-edge incoming is
+    // correctly remapped. For each cloned header phi, find its back-edge
+    // incoming (the one whose value is an `Add`, defined in the cloned
+    // latch) and assert that value is DEFINED IN ITS OWN pred (the cloned
+    // latch). A flush that resolved the back-edge value too early (inside
+    // the clone loop) would have aborted; a flush that mis-paired it would
+    // break instBlock(value) == pred here.
+    {
+        MirFuncId const mainFn = funcBySymbol(mir, 100);
+        ASSERT_TRUE(mainFn.valid());
+        auto const clonedPhis = phisInFuncBySymbol(mir, 100);
+        ASSERT_EQ(clonedPhis.size(), 2u);
+        std::size_t backEdgesChecked = 0;
+        for (MirInstId const p : clonedPhis) {
+            auto const incs = mir.phiIncomings(p);
+            ASSERT_EQ(incs.size(), 2u)
+                << "each cloned header phi has entry + back-edge incomings";
+            for (MirPhiIncoming const& inc : incs) {
+                // EVERY incoming (forward AND back-edge) must be defined in
+                // its own predecessor block — the load-bearing pairing.
+                EXPECT_EQ(mir.instBlock(inc.value).v, inc.pred.v)
+                    << "cloned loop-phi incoming value must be defined in its "
+                       "OWN pred (back-edge value lives in the cloned latch)";
+                if (mir.instOpcode(inc.value) == MirOpcode::Add) {
+                    // This is the back-edge incoming — its pred (the cloned
+                    // latch) must be the block holding the Add.
+                    ++backEdgesChecked;
+                }
+            }
+        }
+        EXPECT_EQ(backEdgesChecked, 2u)
+            << "both cloned header phis must carry an Add-valued back-edge "
+               "incoming (acc1, i1) — the deferral resolved them";
+    }
+
+    // Verifier-clean INCLUDING the layout rule — the cloned loop body is
+    // laid out topologically (C1 by-construction) and the loop-phi back-edge
+    // is the only layout-exempt cross-edge.
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the loop-phi splice must verify clean WITH the layout rule";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::I_LayoutUseBeforeDef), 0u)
+        << "the cloned loop body must leave NO layout violation";
+    EXPECT_EQ(rep.errorCount(), 0u) << "zero diagnostics of any kind";
+}
+
+// ── RED-ON-DISABLE (pred mis-remap/drop → VERIFIER-red). ─────────────
+// The SPLIT's other half: a pred mis-remap (the flush keys each incoming
+// pred via `calleeBlockMap`; a WRONG mapping yields a pred that is not in
+// the phi-block's CFG predecessor set) goes VERIFIER-red — distinct from a
+// value-transposition (structural-only, proven above). `Mir` is immutable
+// post-`finish`, so (suite idiom) we hand-build a loop module two ways:
+//   * CORRECT: the header phi's back-edge pred is the latch (a real pred).
+//   * MIS-REMAPPED: the back-edge pred is an ORPHAN block that does NOT
+//     branch to the header — exactly what a wrong calleeBlockMap lookup
+//     would produce. The verifier's phi-pred-in-CFG check (I_PhiPredNotInCfg)
+//     must fire.
+namespace {
+// Build a loop module whose header phi's back-edge pred is the `latch`
+// (a REAL predecessor of the header) if `correct`, else the `exit` block
+// — a REACHABLE block that does NOT branch to the header, so naming it as
+// the phi's back-edge pred is exactly a pred mis-remap (a wrong
+// calleeBlockMap lookup in the flush). Using a reachable block (not an
+// orphan) isolates the failure to I_PhiPredNotInCfg, NOT I_UnreachableBlock.
+Mir buildLoopPhiModule(TypeInterner& interner, bool correct) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {i32};
+    TypeId const fSig  = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const latch  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const exit   = mb.createBlock(StructCfMarker::LoopExit);
+
+    mb.beginBlock(entry);
+    MirInstId const n    = mb.addArg(0, i32);
+    MirInstId const acc0 = mb.addConst(i32Lit(0), i32);
+    MirInstId const i0   = mb.addConst(i32Lit(0), i32);
+    mb.addBr(header);
+    mb.beginBlock(header);
+    MirInstId const accPhi = mb.addPhi(i32);
+    MirInstId const iPhi   = mb.addPhi(i32);
+    MirInstId const cond   = mb.addInst(MirOpcode::ICmpSlt, std::array{iPhi, n}, boolT);
+    mb.addCondBr(cond, latch, exit);
+    mb.beginBlock(latch);
+    MirInstId const acc1 = mb.addInst(MirOpcode::Add, std::array{accPhi, iPhi}, i32);
+    MirInstId const one  = mb.addConst(i32Lit(1), i32);
+    MirInstId const i1   = mb.addInst(MirOpcode::Add, std::array{iPhi, one}, i32);
+    mb.addBr(header);  // the only real back-edge into `header`
+    mb.beginBlock(exit);
+    mb.addReturn(accPhi);
+
+    // CORRECT: back-edge pred = latch (a real predecessor). MIS-REMAP:
+    // back-edge pred = exit (reachable, but NOT a predecessor of header).
+    MirBlockId const backPred = correct ? latch : exit;
+    mb.addPhiIncoming(accPhi, MirPhiIncoming{acc0, entry});
+    mb.addPhiIncoming(accPhi, MirPhiIncoming{acc1, backPred});  // mis-remap if !correct
+    mb.addPhiIncoming(iPhi,   MirPhiIncoming{i0,   entry});
+    mb.addPhiIncoming(iPhi,   MirPhiIncoming{i1,   backPred});
+    return std::move(mb).finish();
+}
+} // namespace
+
+TEST(Inlining, CalleePhiPredMisremapGoesVerifierRed) {
+    TypeInterner interner{CompilationUnitId{1}};
+
+    Mir good = buildLoopPhiModule(interner, /*correct=*/true);
+    Mir bad  = buildLoopPhiModule(interner, /*correct=*/false);
+
+    // CORRECT back-edge pred (latch) verifies (control).
+    {
+        DiagnosticReporter v0;
+        MirVerifier verifier{good, &interner};
+        ASSERT_TRUE(verifier.verify(v0))
+            << "the loop-phi with its real latch back-edge pred must verify";
+    }
+
+    // MIS-REMAPPED back-edge pred (orphan, not a real predecessor of the
+    // header) must go RED — the verifier's phi-pred-in-CFG check fires.
+    DiagnosticReporter vrep;
+    MirVerifier verifier{bad, &interner};
+    EXPECT_FALSE(verifier.verify(vrep))
+        << "a phi back-edge pred mis-remap (pred = orphan, not a real "
+           "predecessor) MUST be caught by the MirVerifier";
+    EXPECT_GT(countCode(vrep, DiagnosticCode::I_PhiPredNotInCfg) +
+                  countCode(vrep, DiagnosticCode::I_NotDominated),
+              0u)
+        << "the pred mis-remap goes VERIFIER-red (I_PhiPredNotInCfg / "
+           "I_NotDominated) — distinct from the value-transposition path "
+           "(structural-assert-red)";
+}
+
+// ── MANDATORY SHAPE (3, unit mirror of the runtime witness): an
+// argument-keyed value-ternary callee inlines, Phi cloned + paired. ──
+// pick(k){ return k ? 7 : 9; } — the EXACT corpus witness shape
+// (examples/c-subset/phi_inline). Hand-built in its pre-Mem2Reg Phi form
+// (a value-producing ternary lowers to a join-Phi). main calls pick(0).
+// We assert the cloned Phi is correctly value↔pred paired (structural),
+// so the post-inline fold over k==0 would read the `9` arm. The runtime
+// exit (9) is pinned at the corpus tier; here we pin the WIRING.
+TEST(Inlining, ArgKeyedTernaryPhiCalleeInlinesPaired) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {i32};
+    TypeId const fSig  = interner.fnSig(params, i32, CallConv::CcSysV);
+    TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // pick(int k): the ternary diamond `k ? 7 : 9`, exactly as hir_to_mir
+    // lowers it (entry CondBr → then(7)/else(9) → join-phi → return phi).
+    mb.addFunction(fSig, SymbolId{50});
+    MirBlockId const pEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const pThen  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const pElse  = mb.createBlock(StructCfMarker::IfElse);
+    MirBlockId const pJoin  = mb.createBlock(StructCfMarker::IfJoin);
+    mb.beginBlock(pEntry);
+    MirInstId const k    = mb.addArg(0, i32);
+    MirInstId const zero = mb.addConst(i32Lit(0), i32);
+    MirInstId const ne   = mb.addInst(MirOpcode::ICmpNe, std::array{k, zero}, boolT);
+    mb.addCondBr(ne, pThen, pElse);
+    mb.beginBlock(pThen);
+    MirInstId const seven = mb.addConst(i32Lit(7), i32);
+    mb.addBr(pJoin);
+    mb.beginBlock(pElse);
+    MirInstId const nine = mb.addConst(i32Lit(9), i32);
+    mb.addBr(pJoin);
+    mb.beginBlock(pJoin);
+    std::array<MirPhiIncoming, 2> incs{
+        MirPhiIncoming{seven, pThen},
+        MirPhiIncoming{nine,  pElse},
+    };
+    MirInstId const phi = mb.addPhi(i32, incs);
+    mb.addReturn(phi);
+
+    // main(): return pick(0)  (constant arg, but in the CALLEE not the
+    // condition — the condition is the arg, so the callee Phi is real).
+    mb.addFunction(mainSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const pAddr = mb.addGlobalAddr(SymbolId{50}, fSig);
+    MirInstId const arg0  = mb.addConst(i32Lit(0), i32);
+    MirInstId const callOps[] = {pAddr, arg0};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(call);
+    Mir mir = std::move(mb).finish();
+
+    auto const srcPhis = phisInFuncBySymbol(mir, 50);
+    ASSERT_EQ(srcPhis.size(), 1u);
+    auto const srcPhiVals = captureConstPhiValues(mir, srcPhis[0]);
+    ASSERT_EQ(srcPhiVals.size(), 2u) << "pick's join-phi has Const arms {7,9}";
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "the arg-keyed value-ternary (Phi-bearing) callee MUST inline";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u);
+
+    // The cloned ternary join-phi is the single return edge's value → the
+    // return-merge Phi is ELIDED (1 return). So main holds exactly ONE phi:
+    // the cloned join-phi. (Module-wide: pick's original + main's clone = 2.)
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi), 2u)
+        << "pick's original join-phi + main's single cloned join-phi "
+           "(return-merge elided — exactly one return) = 2";
+    auto const mainPhis = phisInFuncBySymbol(mir, 100);
+    ASSERT_EQ(mainPhis.size(), 1u)
+        << "main holds exactly the cloned ternary join-phi (return-merge "
+           "elided for the single-return callee)";
+
+    // ★ STRUCTURAL PAIRING: the cloned join-phi's (value,pred) pairing
+    // equals pick's source phi. This is what guarantees pick(0) folds to 9
+    // (not 7) post-inline — the runtime witness's correctness, pinned at
+    // the wiring tier.
+    assertConstArmedPhiClonePairing(mir, mainPhis[0], srcPhiVals);
+
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the arg-keyed ternary-phi splice must verify clean";
+}
+
+namespace {
+// Build `f(int k, int a, int b) { return k ? a : b; }` where the ternary's
+// phi VALUES are the callee's ARGS a,b (NOT arm-local consts), then main
+// calls `f(0, 7, 9)`. After the arg-substituting splice, the cloned join-
+// phi's incomings are main's consts {7,9}, BOTH defined in main's entry —
+// a COMMON DOMINATOR of both spliced arms. That is the precondition for the
+// verifier blind spot: a value↔pred transposition keeps each value
+// dominating BOTH preds and leaves the pred set unchanged, so the
+// MirVerifier's dominance/pred-in-CFG rules stay GREEN either way. (Also
+// exercises mapCalleeOperand on an Arg-VALUED phi incoming — the one
+// incoming kind the const-armed fixtures never present to it.)
+Mir buildArgValuedTernaryModule(TypeInterner& interner) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {i32, i32, i32};
+    TypeId const fSig    = interner.fnSig(params, i32, CallConv::CcSysV);
+    TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // f(int k, int a, int b): entry CondBr(k!=0)->then/else (both empty,
+    // br join); join phi [a, then],[b, else]; return phi. The phi VALUES
+    // are the Args a,b — entry-dominating, so post-splice (a→7, b→9) the
+    // cloned phi's values land in main's entry (common dominator).
+    mb.addFunction(fSig, SymbolId{50});
+    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const fThen  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const fElse  = mb.createBlock(StructCfMarker::IfElse);
+    MirBlockId const fJoin  = mb.createBlock(StructCfMarker::IfJoin);
+    mb.beginBlock(fEntry);
+    MirInstId const k    = mb.addArg(0, i32);
+    MirInstId const a    = mb.addArg(1, i32);   // then-arm intent value
+    MirInstId const b    = mb.addArg(2, i32);   // else-arm intent value
+    MirInstId const zero = mb.addConst(i32Lit(0), i32);
+    MirInstId const ne   = mb.addInst(MirOpcode::ICmpNe, std::array{k, zero}, boolT);
+    mb.addCondBr(ne, fThen, fElse);
+    mb.beginBlock(fThen);
+    mb.addBr(fJoin);
+    mb.beginBlock(fElse);
+    mb.addBr(fJoin);
+    mb.beginBlock(fJoin);
+    std::array<MirPhiIncoming, 2> incs{
+        MirPhiIncoming{a, fThen},   // SOURCE INTENT: then-arm carries a
+        MirPhiIncoming{b, fElse},   // SOURCE INTENT: else-arm carries b
+    };
+    MirInstId const phi = mb.addPhi(i32, incs);
+    mb.addReturn(phi);
+
+    // main(): return f(0, 7, 9). The actuals (consts in main's entry)
+    // become the cloned phi's incoming VALUES → common-dominator armed.
+    mb.addFunction(mainSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const fAddr = mb.addGlobalAddr(SymbolId{50}, fSig);
+    MirInstId const a0 = mb.addConst(i32Lit(0), i32);  // k = 0
+    MirInstId const a1 = mb.addConst(i32Lit(7), i32);  // a = 7 (then intent)
+    MirInstId const a2 = mb.addConst(i32Lit(9), i32);  // b = 9 (else intent)
+    MirInstId const callOps[] = {fAddr, a0, a1, a2};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(call);
+    return std::move(mb).finish();
+}
+
+// The (single) CondBr's [ifTrue, ifFalse] successors in function `sym`.
+// After inlining the spliced diamond retains exactly one CondBr; its true
+// edge reaches the then-arm clone, its false edge the else-arm clone — the
+// ONLY way to label two otherwise-identical empty arms once block ids are
+// fresh and StructCfMarkers are re-derived. `found=false` if absent.
+struct CondBrArms { MirBlockId ifTrue{}, ifFalse{}; bool found = false; };
+CondBrArms condBrArmsInFunc(Mir const& mir, std::uint32_t sym) {
+    MirFuncId const f = funcBySymbol(mir, sym);
+    if (!f.valid()) return {};
+    std::uint32_t const nb = mir.funcBlockCount(f);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const blk  = mir.funcBlockAt(f, bi);
+        MirInstId const  term = mir.blockTerminator(blk);
+        if (mir.instOpcode(term) != MirOpcode::CondBr) continue;
+        auto const succ = mir.blockSuccessors(blk);
+        if (succ.size() != 2) continue;
+        return {succ[0], succ[1], true};
+    }
+    return {};
+}
+} // namespace
+
+// ── MANDATORY SHAPE (4): the value↔pred pairing is the SOLE red-on-disable
+// guard THROUGH the real inliner on a VERIFIER-BLIND shape. ───────────────
+// The arm-local-const fixtures (ArgKeyedTernary, JoinPhiPlusTwoReturns) pin
+// the pairing via assertConstArmedPhiClonePairing's instBlock(value)==pred
+// proxy — but a transposition THERE is ALSO verifier-caught (each const
+// lives in its own arm, so a swap breaks dominance), making the structural
+// pin belt-and-suspenders. The standalone diamond
+// (CalleePhiValueTranspositionIsCaughtOnlyStructurally) shows the assertion
+// catches a verifier-INVISIBLE swap — but on a HAND-BUILT module, never
+// through runInlining. THIS unifies them: an Arg-valued ternary whose cloned
+// phi values land in a COMMON DOMINATOR (main's entry) after the real splice
+// of f(0,7,9). A transposition here keeps both values dominating both preds
+// → the verifier stays GREEN, so the source-intent pairing (then→7, else→9)
+// asserted below — navigated via the spliced CondBr, since instBlock(value)
+// ==pred cannot apply when values live in a common dominator — is the ONLY
+// thing that would catch it. RED-on-disable: a swapped flush flips thenVal
+// to 9 (EXPECT_EQ(thenVal,7) fails) while verify() stays true. (The
+// mechanism reads value and pred from one `inc` so cannot transpose by
+// construction; this proves that end-to-end on the exact shape where nothing
+// else guards it.)
+TEST(Inlining, CalleePhiCommonDominatorArmsPairedThroughInliner) {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildArgValuedTernaryModule(interner);
+
+    // The SOURCE phi's incoming VALUES are callee Args (entry-dominating) —
+    // the blind-spot precondition + the Arg-valued-incoming coverage.
+    auto const srcPhis = phisInFuncBySymbol(mir, 50);
+    ASSERT_EQ(srcPhis.size(), 1u) << "f holds exactly one join-phi pre-inline";
+    {
+        auto const srcIncs = mir.phiIncomings(srcPhis[0]);
+        ASSERT_EQ(srcIncs.size(), 2u);
+        for (MirPhiIncoming const& inc : srcIncs)
+            EXPECT_EQ(mir.instOpcode(inc.value), MirOpcode::Arg)
+                << "the source phi's incoming values are callee Args";
+    }
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "the Arg-VALUED ternary-phi callee MUST inline";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u);
+    // f's original join-phi + main's single cloned join-phi (return-merge
+    // elided — exactly one return) = 2.
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi), 2u);
+
+    auto const mainPhis = phisInFuncBySymbol(mir, 100);
+    ASSERT_EQ(mainPhis.size(), 1u)
+        << "main holds exactly the cloned join-phi (return-merge elided)";
+    auto const incs = mir.phiIncomings(mainPhis[0]);
+    ASSERT_EQ(incs.size(), 2u);
+
+    // VERIFIER-BLIND precondition: both cloned incoming values live in ONE
+    // block (main's entry, a common dominator) → each dominates BOTH preds,
+    // so a transposition is invisible to the dominance rule.
+    EXPECT_EQ(mir.instBlock(incs[0].value).v, mir.instBlock(incs[1].value).v)
+        << "both cloned phi values share one common-dominator block — the "
+           "precondition that makes a transposition VERIFIER-INVISIBLE";
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the common-dominator-armed splice verifies GREEN — the verifier "
+           "is BLIND to which value pairs with which pred here";
+
+    // ★ THE SOLE GUARD: label the arms via the spliced CondBr (ifTrue=then,
+    // ifFalse=else), then assert the source intent (then→7, else→9) survived
+    // the clone. A transposition flips these while verify() stays true.
+    CondBrArms const arms = condBrArmsInFunc(mir, 100);
+    ASSERT_TRUE(arms.found) << "the spliced diamond retains its CondBr";
+    EXPECT_TRUE((arms.ifTrue.v == incs[0].pred.v && arms.ifFalse.v == incs[1].pred.v) ||
+                (arms.ifTrue.v == incs[1].pred.v && arms.ifFalse.v == incs[0].pred.v))
+        << "the CondBr's two edges are exactly the cloned phi's two preds";
+
+    bool sawThen = false, sawElse = false;
+    std::int64_t thenVal = 0, elseVal = 0;
+    for (MirPhiIncoming const& inc : incs) {
+        std::int64_t const v = std::get<std::int64_t>(
+            mir.literalValue(mir.constLiteralIndex(inc.value)).value);
+        if (inc.pred.v == arms.ifTrue.v)       { sawThen = true; thenVal = v; }
+        else if (inc.pred.v == arms.ifFalse.v) { sawElse = true; elseVal = v; }
+    }
+    ASSERT_TRUE(sawThen && sawElse)
+        << "each cloned phi incoming pred is one of the CondBr arms";
+    EXPECT_EQ(thenVal, 7)
+        << "SOURCE-INTENT PAIRING: the then-arm (CondBr ifTrue, clone of the "
+           "arm carrying Arg a) must carry a's actual value 7 — a value↔pred "
+           "transposition (verifier-GREEN here) flips this to 9";
+    EXPECT_EQ(elseVal, 9)
+        << "SOURCE-INTENT PAIRING: the else-arm (CondBr ifFalse, clone of the "
+           "arm carrying Arg b) must carry b's actual value 9";
 }

@@ -13,6 +13,10 @@
 //     the extern is STRIPPED + verifier-clean.
 //   * MergeClonesMultiBlockCallee — a multi-block callee's CFG is cloned 1:1
 //     (block count + CondBr/Return shape preserved) + verifies.
+//   * MergeRederivesStaleInputMarkers — an input block carrying a STALE
+//     StructCfMarker (dormant ExitBlock) is corrected to the DERIVED marker by
+//     the merge's post-clone rederiveStructCfMarkers call (RED-on-disable: the
+//     merge's internal stored==derived verifier fires I_StructCfMismatch).
 //   * MergeReinternsTypesIntoHost — a CU1-built pointer type is HOST-stamped in
 //     the merged module + structurally a pointer.
 //   * MergeDropsShadowedWeak — CU0 weak f shadowed by CU1 strong f: only the
@@ -315,9 +319,13 @@ TEST(MirMerge, MergeClonesMultiBlockCallee) {
     {
         MirBuilder mb;
         mb.addFunction(sig1, SymbolId{50});  // f
+        // Derivation-consistent stamps (both arms return → IfThen/IfElse
+        // around the virtual exit; ExitBlock is a dormant marker the
+        // merged module's equality verifier would correct anyway —
+        // mergeCuMirs re-derives post-clone).
         MirBlockId const e    = mb.createBlock(StructCfMarker::EntryBlock);
-        MirBlockId const then = mb.createBlock(StructCfMarker::ExitBlock);
-        MirBlockId const els  = mb.createBlock(StructCfMarker::ExitBlock);
+        MirBlockId const then = mb.createBlock(StructCfMarker::IfThen);
+        MirBlockId const els  = mb.createBlock(StructCfMarker::IfElse);
         mb.beginBlock(e);
         MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
         MirInstId const cond = mb.addConst(tru, boolT1);
@@ -367,6 +375,92 @@ TEST(MirMerge, MergeClonesMultiBlockCallee) {
 
     MirVerifier verifier{mm, &merged->host.interner()};
     EXPECT_TRUE(verifier.verify(rep)) << "merged multi-block module must verify";
+}
+
+// ── Merge RE-DERIVES markers: a stale input stamp is corrected ─────
+// CU1's f is two blocks: entry --Br--> tail(Return 7), with the TAIL hand-
+// stamped `StructCfMarker::ExitBlock` — a DORMANT marker NO derivation rule
+// ever assigns (mir_struct_markers.hpp spec: an unclaimed straight-line block
+// derives `Linear`). The input stamp is STALE by construction. The merge clone
+// copies markers VERBATIM (clone phase 1), so the post-clone
+// `rederiveStructCfMarkers(merged)` call in mergeCuMirs is the ONLY thing
+// standing between the stale stamp and the merge's internal stored==derived
+// equality verifier.
+//
+// RED-on-disable lever: remove the `rederiveStructCfMarkers(merged)` call in
+// mir_merge.cpp → the stale ExitBlock survives the clone → the merge's
+// internal MirVerifier emits I_StructCfMismatch ("stored marker ExitBlock !=
+// derived marker Linear") → mergeCuMirs returns nullopt → this test goes RED
+// at `merged.has_value()`.
+TEST(MirMerge, MergeRederivesStaleInputMarkers) {
+    // CU0: int main() { return 0; }
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32_0 = in0.primitive(TypeKind::I32);
+    TypeId const sig0  = in0.fnSig({}, i32_0, CallConv::CcSysV);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        mb.addFunction(sig0, SymbolId{100});  // main
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(0), i32_0));
+        mir0 = std::move(mb).finish();
+    }
+
+    // CU1: int f() — entry --Br--> tail(Return 7); the tail carries the STALE
+    // ExitBlock stamp the merge's rederive must correct to Linear.
+    TypeInterner in1{CompilationUnitId{2}};
+    TypeId const i32_1 = in1.primitive(TypeKind::I32);
+    TypeId const sig1  = in1.fnSig({}, i32_1, CallConv::CcSysV);
+    Mir mir1;
+    {
+        MirBuilder mb;
+        mb.addFunction(sig1, SymbolId{50});  // f
+        MirBlockId const e    = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const tail = mb.createBlock(StructCfMarker::ExitBlock);  // STALE
+        mb.beginBlock(e);
+        mb.addBr(tail);
+        mb.beginBlock(tail);
+        mb.addReturn(mb.addConst(i32Lit(7), i32_1));
+        mir1 = std::move(mb).finish();
+    }
+    // Precondition pin: the INPUT really is stale (stored ExitBlock where the
+    // derivation says Linear) — guards the fixture against silently becoming
+    // derivation-consistent, which would re-open the no-lever gap.
+    EXPECT_EQ(mir1.blockMarker(mir1.funcBlockAt(mir1.funcAt(0), 1)),
+              StructCfMarker::ExitBlock)
+        << "fixture precondition: the input tail must carry the stale stamp";
+
+    std::vector<MergeCuInput> cus = {
+        MergeCuInput{&mir0, &in0, namerOf({{100, "main"}}), {}},
+        MergeCuInput{&mir1, &in1, namerOf({{50, "f"}}), {}},
+    };
+    std::vector<std::string> const entries = {"main"};
+
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    // (a) the merge SUCCEEDS: its internal stored==derived verifier passes
+    // BECAUSE the post-clone rederive corrected the stale stamp first.
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    Mir const& mm = merged->mir;
+    auto const fF = findFuncByName(mm, merged->symbolNames, "f");
+    ASSERT_TRUE(fF.has_value());
+    ASSERT_EQ(mm.funcBlockCount(*fF), 2u) << "f's 2 blocks cloned 1:1";
+
+    // (b) the merged tail carries the DERIVED marker. Clone phase 1 preserves
+    // block order 1:1, so index 1 is the tail — pinned by its Return.
+    MirBlockId const tail = mm.funcBlockAt(*fF, 1);
+    ASSERT_EQ(mm.instOpcode(mm.blockTerminator(tail)), MirOpcode::Return);
+    EXPECT_EQ(mm.blockMarker(tail), StructCfMarker::Linear)
+        << "the stale ExitBlock stamp must be re-derived to Linear";
+    EXPECT_EQ(mm.blockMarker(mm.funcEntry(*fF)), StructCfMarker::EntryBlock);
+
+    // (c) the merged module verifies clean — zero I_StructCfMismatch.
+    MirVerifier verifier{mm, &merged->host.interner()};
+    EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
+    EXPECT_EQ(test_support::countCode(rep, DiagnosticCode::I_StructCfMismatch), 0u);
 }
 
 // ── Types are re-interned into the host lattice ────────────────────

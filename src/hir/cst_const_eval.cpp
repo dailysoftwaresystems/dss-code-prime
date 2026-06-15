@@ -1,5 +1,7 @@
 #include "hir/cst_const_eval.hpp"
 
+#include "core/types/decl_prefix_strip.hpp"   // declRoleChildren (shared specifier-prefix strip)
+#include "core/types/declarator_walk.hpp"     // FC4: collectDeclarators / declaratorNameNode
 #include "core/types/grammar_schema.hpp"
 #include "core/types/hir_lowering_config.hpp"
 #include "core/types/semantic_config.hpp"
@@ -344,22 +346,48 @@ std::optional<std::int64_t> asInt64Bridge(HirLiteralValue const& v) noexcept {
 
 std::optional<NodeId>
 findInitExprInDecl(Tree const& tree, DeclarationRule const& decl,
-                   NodeId declRuleNode) {
+                   NodeId declRuleNode, NodeId nameNode) {
     if (!declRuleNode.valid()) return std::nullopt;
-    std::vector<NodeId> kids;
-    for (auto const& child : tree.children(declRuleNode)) {
-        if (!isEmptySpace(tree.flags(child))) kids.push_back(child);
-    }
-    // D-DECL-SPECIFIER-PREFIX-SUBSTRATE: strip a leading declaration-specifier
-    // prefix so both the positional `initChild` path and the role-fallback loop
-    // below resolve against the same prefix-free child numbering the analyzer's
-    // `declRoleChildren` uses — otherwise a `static`/`__attribute__` prefix node
-    // shifts initChild AND (being a non-skip-listed Internal child) would be
-    // wrongly returned as the init by the fallback. Mirrors `declRoleChildren`.
-    if (decl.specifierPrefixRule.has_value() && !kids.empty()
-        && tree.kind(kids.front()) == NodeKind::Internal
-        && tree.rule(kids.front()) == *decl.specifierPrefixRule) {
-        kids.erase(kids.begin());
+    // D-DECL-SPECIFIER-PREFIX-SUBSTRATE: role children = visible children with
+    // a leading declaration-specifier prefix stripped — the SHARED
+    // `declRoleChildren` (core/types/decl_prefix_strip.hpp,
+    // D-DECL-PREFIX-STRIP-SHARED-HELPER) — so both the positional `initChild`
+    // path and the role-fallback loop below resolve against the same
+    // prefix-free child numbering the analyzer minted symbols against.
+    // Otherwise a `static`/`__attribute__` prefix node shifts initChild AND
+    // (being a non-skip-listed Internal child) would be wrongly returned as
+    // the init by the fallback.
+    auto kids = declRoleChildren(tree, declRuleNode, decl);
+    // FC4 c1: declarator-mode rows — locate the init-declarator whose
+    // declarator names `nameNode` (the symbol's declNode anchor) and
+    // return ITS init subtree: the visible Internal child that is not
+    // the declarator (`[declarator, '=', initValue]`). Multi-declarator
+    // lists carry one independent init per name; without the name match
+    // the FIRST declarator's init would silently stand in for every
+    // symbol in the list.
+    if (decl.isDeclaratorMode()) {
+        auto const& dcOpt = tree.schema().semantics().declarators;
+        if (!dcOpt.has_value() || !nameNode.valid()) return std::nullopt;
+        auto const carrier = decl.declaratorListChild.has_value()
+                                 ? decl.declaratorListChild
+                                 : decl.declaratorChild;
+        if (!carrier.has_value() || *carrier >= kids.size()) {
+            return std::nullopt;
+        }
+        std::vector<NodeId> declarators;
+        collectDeclarators(tree, kids[*carrier], *dcOpt, declarators);
+        for (NodeId d : declarators) {
+            if (declaratorNameNode(tree, d, *dcOpt).v != nameNode.v) continue;
+            if (tree.rule(d) != dcOpt->initDeclaratorRule) return std::nullopt;
+            for (auto const& c : tree.children(d)) {
+                if (isEmptySpace(tree.flags(c))) continue;
+                if (tree.kind(c) != NodeKind::Internal) continue;
+                if (tree.rule(c) == dcOpt->declaratorRule) continue;
+                return c;
+            }
+            return std::nullopt;
+        }
+        return std::nullopt;
     }
     // Explicit positional `initChild` wins when configured.
     if (decl.initChild.has_value()) {

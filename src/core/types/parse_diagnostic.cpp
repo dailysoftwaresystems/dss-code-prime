@@ -92,6 +92,13 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_InvalidTypeSpecifierCombination";
         case DiagnosticCode::S_IntegerLiteralTooLarge:   return "S_IntegerLiteralTooLarge";
         case DiagnosticCode::S_UnsupportedDataModel:     return "S_UnsupportedDataModel";
+        case DiagnosticCode::S_VolatileNotSupported:     return "S_VolatileNotSupported";
+        case DiagnosticCode::S_IndirectCallNotSupported: return "S_IndirectCallNotSupported";
+        case DiagnosticCode::S_InvalidVoidParam:         return "S_InvalidVoidParam";
+        case DiagnosticCode::S_DeclarationDeclaresNothing:
+            return "S_DeclarationDeclaresNothing";
+        case DiagnosticCode::S_InvalidFunctionDeclarator:
+            return "S_InvalidFunctionDeclarator";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
@@ -115,6 +122,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_ExternHasInitializer:     return "H_ExternHasInitializer";
         case DiagnosticCode::H_ExternDeclMalformed:      return "H_ExternDeclMalformed";
         case DiagnosticCode::H_UnknownLinkageSpecifier:  return "H_UnknownLinkageSpecifier";
+        case DiagnosticCode::H_UnreachableCode:          return "H_UnreachableCode";
         case DiagnosticCode::I_VerifierFailure:          return "I_VerifierFailure";
         case DiagnosticCode::I_NoEntryBlock:             return "I_NoEntryBlock";
         case DiagnosticCode::I_MultipleEntryBlocks:      return "I_MultipleEntryBlocks";
@@ -130,6 +138,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_TextMalformed:            return "I_TextMalformed";
         case DiagnosticCode::I_TextVersionMismatch:      return "I_TextVersionMismatch";
         case DiagnosticCode::I_TextUnknownName:          return "I_TextUnknownName";
+        case DiagnosticCode::I_LayoutUseBeforeDef:       return "I_LayoutUseBeforeDef";
         case DiagnosticCode::L_UnsupportedLoweringForOpcode: return "L_UnsupportedLoweringForOpcode";
         case DiagnosticCode::L_RequiredLirOpcodeMissing:     return "L_RequiredLirOpcodeMissing";
         case DiagnosticCode::L_VirtualRegInPostRegalloc:     return "L_VirtualRegInPostRegalloc";
@@ -140,6 +149,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::L_CcRegLookupFailed:            return "L_CcRegLookupFailed";
         case DiagnosticCode::L_MoveCycleUnsupported:         return "L_MoveCycleUnsupported";
         case DiagnosticCode::L_IndirectCallUnsupported:      return "L_IndirectCallUnsupported";
+        case DiagnosticCode::L_IndirectCalleeClobberedByArgSetup: return "L_IndirectCalleeClobberedByArgSetup";
         case DiagnosticCode::R_NoCallingConventions:          return "R_NoCallingConventions";
         case DiagnosticCode::R_CallingConventionLookupFailed: return "R_CallingConventionLookupFailed";
         case DiagnosticCode::R_VRegHasNoClass:                return "R_VRegHasNoClass";

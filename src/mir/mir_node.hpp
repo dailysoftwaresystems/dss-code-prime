@@ -63,30 +63,45 @@ enum class MirInstFlags : std::uint8_t {
 
 // ── structured-CF markers (block metadata) ───────────────────────────────────
 //
-// Each block carries the structural control-flow role it plays in the source
-// program (plan 12 §2.3). HIR→MIR lowering (ML2) stamps these; ML1 defaults
-// every block to `Linear`. WASM lowering (plan 18) consumes them DIRECTLY to
-// emit block/loop/if without ever running a Relooper recovery pass — which is
-// why the marker is preserved as first-class block metadata rather than being
-// re-derived. A marker is a property of the block, NOT a computation, so it is a
-// block field and never appears in the instruction stream (keeping the stream
-// clean for the optimizer and instruction selection).
+// Each block carries the structural control-flow role it plays in the program
+// (plan 12 §2.3). The marker is CANONICALLY DERIVED FROM THE CFG —
+// `deriveStructCfMarkers` (mir/mir_struct_markers.hpp) computes it from
+// dominators / post-dominators / natural loops, and every producer (HIR→MIR
+// lowering, CFG-mutating optimizer passes, the cross-CU merge) re-stamps its
+// output from that derivation after `finish()`; creation-time
+// `createBlock(marker)` stamps are intent-documenting DEFAULTS the final
+// stamping overwrites. The verifier checks stored == derived per reachable
+// block (I_StructCfMismatch). A future WASM lowering (plan 18) still consumes
+// the stored field directly — the derivation keeps it TRUSTWORTHY through
+// arbitrary CFG transforms without a Relooper recovery pass at consume time.
+// A marker is a per-block byte, never an instruction-stream entity (keeping
+// the stream clean for the optimizer and instruction selection).
 //
-// ML1 models ONE marker per block. A block can in principle play two structural
-// roles at once (e.g. a LoopExit that is also an IfJoin); if a real consumer
-// needs that, this becomes a small bitset without changing the POD layout (the
-// field is already a full uint8). Kept single-role until then.
+// ONE marker per block; the derivation's priority order (the spec in
+// mir_struct_markers.hpp) IS the multi-role collision policy — e.g. a block
+// that is both a back-edge target and an if-join derives LoopHeader (the
+// higher-priority claim wins). If a real consumer ever needs multi-role
+// visibility, this becomes a small bitset without changing the POD layout.
+//
+// DORMANT VALUES — NOT derived (and no producer emits them); they remain
+// `mir_text` round-trip vocabulary only:
+//   - ExitBlock:  no producer ever emitted it.
+//   - LoopLatch:  not CFG-derivable (a while body-tail and a for-update block
+//     can present identical CFG shapes); back-edge SOURCES are recoverable
+//     from `mirNaturalLoops::backEdgeSources` when a consumer needs them.
+//   - SwitchHead: never emitted; the discriminant block derives by the
+//     lower-priority rules (usually Linear/EntryBlock).
 enum class StructCfMarker : std::uint8_t {
     Linear,       // no structural role (straight-line code) — the default
     EntryBlock,   // function entry
-    ExitBlock,    // function exit (Return / Unreachable terminator)
+    ExitBlock,    // DORMANT (see above) — function exit
     LoopHeader,   // loop entry; target of the back-edge; dominates the body
-    LoopLatch,    // back-edge source (closes the loop)
-    LoopExit,     // leaves the loop body
+    LoopLatch,    // DORMANT (see above) — back-edge source
+    LoopExit,     // target of a loop-exiting edge
     IfThen,       // then-arm of a conditional
     IfElse,       // else-arm of a conditional
     IfJoin,       // post-dominating merge of an if
-    SwitchHead,   // the switch discriminant block
+    SwitchHead,   // DORMANT (see above) — the switch discriminant block
     SwitchCase,   // a case arm
     SwitchJoin,   // post-dominating merge of a switch
 };
