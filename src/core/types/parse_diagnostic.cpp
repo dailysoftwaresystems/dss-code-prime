@@ -101,6 +101,9 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_InvalidFunctionDeclarator";
         case DiagnosticCode::S_DuplicateLabel:           return "S_DuplicateLabel";
         case DiagnosticCode::S_UndefinedLabel:           return "S_UndefinedLabel";
+        case DiagnosticCode::S_FlexibleArrayNotLast:     return "S_FlexibleArrayNotLast";
+        case DiagnosticCode::S_FlexibleArraySoleMember:  return "S_FlexibleArraySoleMember";
+        case DiagnosticCode::S_FlexibleArrayInAggregate: return "S_FlexibleArrayInAggregate";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

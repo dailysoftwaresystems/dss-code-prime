@@ -309,6 +309,21 @@ enum class DiagnosticCode : std::uint16_t {
     // FC5: a `goto` whose target label is not defined anywhere in the enclosing
     // function (C 6.8.6.1). Positioned at the goto's target identifier.
     S_UndefinedLabel              = 0xE01A,
+    // FC6: flexible-array-member (FAM) constraint violations (C99 §6.7.2.1).
+    // A FAM (`T x[];` — an incomplete-array struct field) must be the LAST
+    // member; a non-last FAM is rejected (its trailing siblings would overlay
+    // the unsized tail). Positioned at the offending field. The layout engine
+    // also fails loud on a non-last FAM (`computeLayout` nullopt) — this is the
+    // positioned SEMANTIC diagnostic that surfaces it earlier + with a span.
+    S_FlexibleArrayNotLast        = 0xE01B,
+    // FC6: a struct whose ONLY member is a FAM (C99 §6.7.2.1p3: the struct shall
+    // have more than one named member). Without this, `sizeof` of a sole-FAM
+    // struct would silently fold to 0. Positioned at the FAM field.
+    S_FlexibleArraySoleMember     = 0xE01C,
+    // FC6: a FAM-bearing struct used as a struct member or an array element
+    // (C99 §6.7.2.1p18 — a structure containing a FAM shall not be a member of a
+    // structure or an element of an array). Positioned at the embedding field.
+    S_FlexibleArrayInAggregate    = 0xE01D,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

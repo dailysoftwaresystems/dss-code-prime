@@ -151,7 +151,15 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
     // (builtinTypes/typeSpecifiers `coreByDataModel`, the integer-
     // literal ladder, descriptor `signatureByDataModel`). The HIR
     // lowering reads the SAME value back off the SemanticModel.
-    auto model = analyze(std::move(borrowed), format.dataModel());
+    // FC6 deferral-close: also thread the target's aggregate-layout params so a
+    // `sizeof` in an array-dimension const-expression (`int a[sizeof(T)]`) folds
+    // through the same `computeLayout` engine MIR uses — `nullopt` when the
+    // target declared no block (the fold then fails loud, never a wrong size).
+    auto model = analyze(
+        std::move(borrowed), format.dataModel(),
+        target.aggregateLayoutLoaded()
+            ? std::optional<AggregateLayoutParams>{target.aggregateLayout()}
+            : std::nullopt);
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
         return std::nullopt;

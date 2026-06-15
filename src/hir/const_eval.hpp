@@ -123,15 +123,26 @@ enum class ConstEvalFailure : std::uint8_t {
 using ConstSymbolResolver =
     std::function<std::optional<HirNodeId>(SymbolId)>;
 
+// FC6: the SizeOf-folding resolver the comment below long predicted. Given the
+// TypeId being sized (the SizeOf node's type-ref child), return its byte size,
+// or `nullopt` when the type is incomplete / un-sizeable / the target declared
+// no layout params — the engine then surfaces `NotAConstantExpression`. The
+// closure carries the target's `AggregateLayoutParams` + `DataModel` + the
+// `computeLayout` engine (kept OUT of `const_eval`, which must not depend on the
+// layout library beyond the `TypeId` it already passes); absent closure ⇒ SizeOf
+// is non-constant, exactly as before (verifier consumers keep that behaviour).
+using TypeSizeResolver =
+    std::function<std::optional<std::uint64_t>(TypeId)>;
+
 // Caller-supplied environment — closure-carrying capabilities (resolvers)
 // the engine uses to descend into things outside the local subtree. Kept
 // SEPARATE from `EvalOptions` (policy bools) so the two structurally
 // different concerns don't tangle as more resolvers accrete (architecture-
-// review folded item D4 from plan 12.5 §0.2). When a second function-
-// typed field arrives (e.g. `resolveTypeLayout` for SizeOf folding,
-// tracked in plan 12 post-ML8), it joins here, not `EvalOptions`.
+// review folded item D4 from plan 12.5 §0.2). The SizeOf resolver (`resolveTypeSize`)
+// is the second function-typed field this comment anticipated.
 struct EvalEnvironment {
     ConstSymbolResolver resolveConstSymbol{};   // CE2
+    TypeSizeResolver    resolveTypeSize{};      // FC6 — SizeOf folding
 };
 
 // Caller-controlled policy. Pure bool knobs — no closures, no environment.

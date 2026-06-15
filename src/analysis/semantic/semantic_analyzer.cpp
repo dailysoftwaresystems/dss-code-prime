@@ -19,6 +19,7 @@
 #include "core/types/tree.hpp"
 #include "core/types/tree_cursor.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"
+#include "core/types/type_lattice/type_layout.hpp"  // FC6: computeLayout (sizeof in array dims)
 #include "ffi/shipped_lib_descriptor.hpp"   // FF11 neutral-JSON descriptor reader
 #include "hir/cst_const_eval.hpp"
 
@@ -142,6 +143,12 @@ struct EngineState {
     // `coreByDataModel` overrides), the integer-literal ladder, and the
     // shipped-lib descriptor reader. Set ONCE before any index is built.
     DataModel                  dataModel = DataModel::Lp64;
+    // FC6 deferral-close: the active target's aggregate-layout params
+    // (`analyze()`'s parameter — target.aggregateLayout()). `nullopt` ⇒ the
+    // target declared no `aggregateLayout` block, so a `sizeof` in an array
+    // dimension fails loud rather than folding a wrong size. Read by
+    // `constIntExpr`'s sizeof-folding closure (array-dimension const-context).
+    std::optional<AggregateLayoutParams> aggregateLayout;
     // HR11: per-schema index bundles, keyed by SchemaId.v; `active_` is the
     // bundle for the tree currently being processed (set via `activate`).
     std::unordered_map<std::uint32_t, SchemaIndexes> schemaIndexes;
@@ -245,6 +252,32 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
                           std::vector<NodeId>& out);
 [[nodiscard]] TypeId subtreeType(EngineState const& s, Tree const& tree,
                                  NodeId node);
+
+// FC6 (C99 §6.7.2.1p18): does `t` CONTAIN a flexible array member — i.e. is it a
+// struct whose LAST member is an incomplete array (so `t` is itself a FAM
+// struct), or an aggregate that recursively holds one (a struct field, an array
+// element)? Such a type may not be embedded as a struct member or array element.
+// Terminates: the interned operand DAG is finite + acyclic (C forbids a struct
+// containing itself by value). A BARE incomplete array (`t` itself a FAM) is NOT
+// "containing" one — that case is the struct's own valid trailing member,
+// checked directly at the composition site.
+[[nodiscard]] bool typeContainsFlexibleArray(TypeInterner const& in, TypeId t) {
+    if (!t.valid()) return false;
+    TypeKind const k = in.kind(t);
+    if (k == TypeKind::Struct) {
+        auto const ops = in.operands(t);
+        if (!ops.empty() && in.isIncompleteArray(ops[ops.size() - 1])) return true;
+        for (TypeId f : ops)
+            if (typeContainsFlexibleArray(in, f)) return true;
+        return false;
+    }
+    if (k == TypeKind::Array) {
+        if (in.isIncompleteArray(t)) return false;  // bare FAM — not "containing"
+        auto const ops = in.operands(t);
+        return !ops.empty() && typeContainsFlexibleArray(in, ops[0]);
+    }
+    return false;
+}
 [[nodiscard]] bool admitsNullPointerConstant(
     EngineState const& s, Tree const& tree,
     TypeId lhsTy, NodeId rhsExpr,
@@ -759,6 +792,51 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
             -> std::optional<CstResolvedSymbol> {
             return resolveConstSymbolInit(s, tree, *cfg, ScopeId{curScopeOpaque},
                                           tree.text(identTok));
+        };
+        // FC6: fold `sizeof(T)` in an array dimension (`int a[sizeof(T)]`). The
+        // engine dispatches the `sizeofRule` node here (ahead of its wrapper-
+        // peel); this closure resolves the SIZED type and sizes it through the
+        // same `computeLayout` engine MIR uses. The TYPE form (`sizeof(T)`)
+        // resolves its `castTypeRef` directly (type resolution does not depend on
+        // expression typing, so it works at this Pass-1.5 declaration-type
+        // stage); the VALUE form (`sizeof e`) reads the operand's resolved type,
+        // which is NOT yet available here (expression types are stamped in Pass
+        // 2) → `nullopt` → the array length fails loud (S_NonConstantArrayLength)
+        // rather than a wrong size. `nullopt` when the target declared no layout
+        // params, too — never a guessed size.
+        env.resolveSizeof = [&s, &tree, cfg, fromScope](NodeId sizeofNode)
+            -> std::optional<std::uint64_t> {
+            if (!s.aggregateLayout.has_value()) return std::nullopt;
+            TypeId sized{};
+            for (NodeId form : visibleChildren(tree, sizeofNode)) {
+                if (tree.kind(form) != NodeKind::Internal) continue;
+                RuleId const fr = tree.rule(form);
+                if (cfg->sizeofTypeRule.valid() && fr.v == cfg->sizeofTypeRule.v) {
+                    auto fk = visibleChildren(tree, form);
+                    if (cfg->sizeofTypeChild < fk.size())
+                        // emitOnMiss=false: an unknown sized-type yields nullopt
+                        // → the array length fails loud with ONE positioned
+                        // S_NonConstantArrayLength (the caller owns it), not a
+                        // redundant S_UnknownType + S_NonConstantArrayLength pair.
+                        sized = resolveTypeNode(s, *cfg, tree,
+                                                fk[cfg->sizeofTypeChild], fromScope,
+                                                /*emitOnMiss=*/false);
+                } else if (cfg->sizeofValueRule.valid()
+                           && fr.v == cfg->sizeofValueRule.v) {
+                    for (NodeId opnd : visibleChildren(tree, form)) {
+                        if (tree.kind(opnd) == NodeKind::Internal) {
+                            sized = subtreeType(s, tree, opnd);
+                            break;
+                        }
+                    }
+                }
+                break;  // the single sizeof form
+            }
+            if (!sized.valid()) return std::nullopt;
+            auto const layout = computeLayout(sized, s.lattice.interner(),
+                                              *s.aggregateLayout, s.dataModel);
+            if (!layout) return std::nullopt;
+            return layout->size;
         };
     }
     ConstEvalResult const r = evaluateConstantCst(node, ctx, env, {}, fromScope.v);
@@ -1636,7 +1714,14 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                         // through TypeDecl as H_TypeUnresolved (no silent gap).
                         SymbolRecord& srec = s.symbols.at(sym);
                         if (srec.structScope.valid()) {
-                            std::vector<std::pair<std::uint32_t, TypeId>> fields;
+                            // FC6: carry each field's decl node (its span) — the
+                            // FAM-constraint check positions diagnostics at the
+                            // offending field, and `scope.bindings` is unordered
+                            // (so the post-sort type list alone can't locate it).
+                            struct FieldEntry {
+                                std::uint32_t index; TypeId type; NodeId declNode;
+                            };
+                            std::vector<FieldEntry> fields;
                             auto const& scope = s.scopes.scopes()[srec.structScope.v];
                             bool anyInvalid = false;
                             // D5.5: enum members have NO declared type
@@ -1656,19 +1741,66 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                     anyInvalid = true;
                                     break;
                                 }
-                                fields.emplace_back(frec.fieldIndex, frec.type);
+                                fields.push_back({frec.fieldIndex, frec.type,
+                                                  frec.declRuleNode});
                             }
                             if (!anyInvalid) {
-                                std::sort(fields.begin(), fields.end());
+                                std::sort(fields.begin(), fields.end(),
+                                          [](FieldEntry const& a, FieldEntry const& b) {
+                                              return a.index < b.index;
+                                          });
                                 std::vector<TypeId> fieldTypes;
                                 fieldTypes.reserve(fields.size());
-                                for (auto const& [_idx, t] : fields)
-                                    fieldTypes.push_back(t);
+                                for (auto const& fe : fields)
+                                    fieldTypes.push_back(fe.type);
                                 // D5.4 / D5.5: struct vs union vs enum
                                 // dispatch is config-driven via
                                 // FieldChildrenDescriptor::compositeKind.
                                 CompositeKind const ck =
                                     decl.fieldChildren->compositeKind;
+                                // FC6: flexible-array-member constraints (C99
+                                // §6.7.2.1), positioned at the offending field.
+                                // The not-last / sole-member checks are
+                                // struct-only (a bare FAM in a union is rejected
+                                // earlier — the `allowFlexibleArray=false` gate on
+                                // `unionField` → S_NonConstantArrayLength); but the
+                                // EMBEDDED-FAM-struct check (p18) runs for unions
+                                // too, since a FAM-bearing struct may not be a
+                                // member of a struct OR a union (gcc/clang reject
+                                // both). Enums carry no field types. This is the
+                                // positioned SEMANTIC surface; the layout engine's
+                                // non-last-FAM nullopt is the backstop.
+                                if (ck == CompositeKind::Struct
+                                    || ck == CompositeKind::Union) {
+                                    TypeInterner const& in = s.lattice.interner();
+                                    for (std::size_t i = 0; i < fields.size(); ++i) {
+                                        TypeId const ft = fields[i].type;
+                                        NodeId const fn = fields[i].declNode;
+                                        auto famDiag = [&](DiagnosticCode code) {
+                                            ParseDiagnostic d;
+                                            d.code     = code;
+                                            d.severity = DiagnosticSeverity::Error;
+                                            d.buffer   = tree.source().id();
+                                            d.span     = tree.span(fn);
+                                            d.actual   = std::string{tree.text(fn)};
+                                            s.reporter.report(std::move(d));
+                                        };
+                                        if (in.isIncompleteArray(ft)) {
+                                            // A direct FAM (struct only — a bare
+                                            // union FAM never reaches here): legal
+                                            // ONLY as the last AND non-sole member.
+                                            if (i + 1 != fields.size())
+                                                famDiag(DiagnosticCode::S_FlexibleArrayNotLast);
+                                            else if (fields.size() == 1)
+                                                famDiag(DiagnosticCode::S_FlexibleArraySoleMember);
+                                        } else if (typeContainsFlexibleArray(in, ft)) {
+                                            // A field whose TYPE embeds a FAM (a
+                                            // nested FAM struct / array of one) —
+                                            // forbidden in a struct OR a union.
+                                            famDiag(DiagnosticCode::S_FlexibleArrayInAggregate);
+                                        }
+                                    }
+                                }
                                 TypeId compositeTy;
                                 if (ck == CompositeKind::Union) {
                                     compositeTy = s.lattice.interner().unionType(
@@ -3393,13 +3525,15 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 } // namespace
 
 SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
-                      DataModel dataModel) {
+                      DataModel dataModel,
+                      std::optional<AggregateLayoutParams> aggregateLayout) {
     if (!cu) {
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();
     }
     EngineState s{*cu};
     s.dataModel = dataModel;
+    s.aggregateLayout = aggregateLayout;
 
     // FC3 c1: ILP32 is DECLARED-ONLY (the wasm/spirv skeleton formats
     // carry it for honesty) — no exercised 32-bit width path exists, so

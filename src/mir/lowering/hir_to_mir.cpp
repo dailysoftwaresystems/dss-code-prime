@@ -2199,6 +2199,17 @@ struct Lowerer {
             }
             return std::nullopt;
         };
+        // FC6 deferral-close: let a global initializer `int g = sizeof(T)` fold
+        // through the SAME `computeLayout` engine the dedicated MIR SizeOf case
+        // uses. `config` carries the target's layout params; absent block ⇒
+        // nullopt ⇒ the engine surfaces `NotAConstantExpression` (fail loud).
+        env.resolveTypeSize = [&](TypeId t) -> std::optional<std::uint64_t> {
+            if (!config.aggregateLayoutLoaded) return std::nullopt;
+            auto const layout = computeLayout(t, interner, config.aggregateLayout,
+                                              config.dataModel);
+            if (!layout) return std::nullopt;
+            return layout->size;
+        };
         EvalOptions opts;
         // MIR-globals matches runtime behaviour: a narrowing initializer
         // wraps modularly (the runtime path would wrap too). Refusing to

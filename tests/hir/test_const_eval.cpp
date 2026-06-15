@@ -2,8 +2,10 @@
 // Builds HIR programmatically (no parser dependency) and exercises each
 // foldable + each refuse-to-fold case against `evaluateConstant`.
 
+#include "core/types/aggregate_layout.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_layout.hpp"
 #include "hir/const_eval.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_literal_pool.hpp"
@@ -1248,4 +1250,40 @@ TEST(ConstEval, RefAndArithmeticCompose) {
     auto res = evaluateConstant(hir, r.interner, r.literals, bInit, env);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_EQ(std::get<std::int64_t>(res.value->value), 7);
+}
+
+// FC6: `sizeof(T)` folds to T's byte size ONLY when the `resolveTypeSize` hook
+// is supplied — the hook is load-bearing. Without it the engine surfaces
+// NotAConstantExpression (the pre-FC6 behaviour verifier consumers keep), so a
+// regression that drops the hook from a consumer's EvalEnvironment goes RED.
+TEST(ConstEval, SizeOfFoldsOnlyWithTypeSizeResolver) {
+    Rig r;
+    // sizeof of an 8-byte primitive (I64). The TypeRef child carries the type.
+    TypeId const sized   = r.i64T();
+    HirNodeId const tref  = r.builder.makeTypeRef(sized);
+    HirNodeId const sizeOf =
+        r.builder.makeSizeOf(tref, r.interner.primitive(TypeKind::U64));
+    Hir hir = r.finishWith(sizeOf);
+
+    // No resolver → NotAConstantExpression (load-bearing red-on-disable).
+    {
+        auto res = evaluateConstant(hir, r.interner, r.literals, sizeOf);
+        EXPECT_FALSE(res.value.has_value());
+    }
+    // With the REAL computeLayout resolver → folds to size_t(8), core U64.
+    {
+        EvalEnvironment env;
+        env.resolveTypeSize = [&](TypeId t) -> std::optional<std::uint64_t> {
+            auto const l = computeLayout(
+                t, r.interner,
+                AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                DataModel::Lp64);
+            if (!l) return std::nullopt;
+            return l->size;
+        };
+        auto res = evaluateConstant(hir, r.interner, r.literals, sizeOf, env);
+        ASSERT_TRUE(res.value.has_value());
+        EXPECT_EQ(std::get<std::uint64_t>(res.value->value), 8u);
+        EXPECT_EQ(res.value->core, TypeKind::U64);
+    }
 }
