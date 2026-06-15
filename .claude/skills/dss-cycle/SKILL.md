@@ -357,10 +357,34 @@ The stop tightens the loop to a close; it never lowers the bar.
 
 ## F. Deferral & anchor pinning discipline
 
-Every deferral is explicit, located, and prioritized — never silent.
+Every deferral is explicit, located, and prioritized — never silent. **But first: most
+candidate deferrals are not admissible. The default is that the work lands THIS cycle** — a
+deferral is the rare exception that must earn its place, not the convenient way to end a cycle.
+
+0. **The admissibility gate — is this even a deferral?** Before anything is pinned, the
+   candidate must clear a strict bar, or it is *not a deferral at all* — it is this cycle's
+   work. A deferral is admissible **only** when ALL THREE hold:
+   - **(a) Blocked *now*, by a *named* prerequisite.** The work genuinely cannot complete this
+     cycle because one specific, nameable thing is absent: an unbuilt substrate it depends on,
+     an **unfired trigger** (§D), or a **§B decision** the user has not made. You must be able to
+     state the exact missing prerequisite *and* what event unblocks it. "Needs more design",
+     "needs a refactor first", "is complex/large" name no blocker — that is the hard part itself
+     (§A.3), and the hard part lands now.
+   - **(b) Deferring is the *best long-term* call, not a convenience.** Landing it now would
+     NOT force a workaround or a speculative build (§A.2). If it can land cleanly now, it must —
+     a deferral you *could* have closed this cycle is a silent slice.
+   - **(c) The reason survives the negative test.** "It was getting big", "the cycle is full",
+     "I'll circle back", "phase 1 / phase 2", "polish later", "follow-up", and "the natural next
+     step" are **inadmissible** — each is the hard part being sliced (§A.3). Scope size and
+     tedium are never blockers.
+
+   Fail ANY of (a)–(c) → **it is not a deferral; do it this cycle.** If it genuinely cannot land
+   now yet you cannot point to a clean *named* blocker, that uncertainty is itself a **§B
+   decision gate** — bring the options to the user, never quietly defer. **When in doubt, do the
+   work.** Only a candidate that clears all three proceeds to the pinning steps (1–4) below.
 
 1. **Explain it.** One clear paragraph: what is deferred and *why* (the real blocker or the
-   missing trigger).
+   missing trigger) — the *why* is the admissible reason from step 0, restated.
 2. **Pin it in the best home.** A feature-area `D-*` anchor → that plan's §3.1 anchor row.
    A project-level known-open item that is not a feature anchor → plan-00 **§0.2** (Deferred &
    Known-Open Items registry). An orphan / cross-cutting anchor → `_deferred-anchor-registry.md`.
