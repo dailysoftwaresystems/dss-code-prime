@@ -268,6 +268,12 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
         grammar.semantics().pointerAliasing.strictAliasingOnDistinctTypes;
     mirCfg.charTypesAliasAll =
         grammar.semantics().pointerAliasing.charTypesAliasAll;
+    // FC6: thread the active target's aggregate-layout params + the format's data
+    // model so HIR→MIR can fold `sizeof(T)` to T's byte size via the type_layout
+    // engine. The target supplies the alignment rule, the format the pointer width.
+    mirCfg.aggregateLayout       = target.aggregateLayout();
+    mirCfg.aggregateLayoutLoaded = target.aggregateLayoutLoaded();
+    mirCfg.dataModel             = format.dataModel();
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,
                           &hir->sourceMap, mirCfg, &ffiMap,

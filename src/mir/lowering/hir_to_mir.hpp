@@ -1,6 +1,8 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/aggregate_layout.hpp"
+#include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -76,6 +78,16 @@ struct DSS_EXPORT MirLoweringConfig {
     // MIR-tier alias predicate (`mirMayAlias` Rule 5) reads it without
     // language identity branches.
     bool charTypesAliasAll = true;
+
+    // FC6: the active target's aggregate-layout params + the format's data model,
+    // so the HIR→MIR lowering can fold a `HirKind::SizeOf` to its type's byte size
+    // via the `type_layout` engine. `aggregateLayoutLoaded` is false when the
+    // target declared no `aggregateLayout` block — a `sizeof` then fails loud at
+    // the lowering site (never a guessed size). `dataModel` supplies the pointer
+    // width the layout engine needs.
+    AggregateLayoutParams aggregateLayout{};
+    bool                  aggregateLayoutLoaded = false;
+    DataModel             dataModel = DataModel::Lp64;
 };
 
 // Lower the frozen `hir` module to MIR. `literals` is the HirLiteralPool

@@ -2,6 +2,7 @@
 
 #include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/type_lattice/type_layout.hpp"
 #include "hir/const_eval.hpp"
 #include "hir/hir_op.hpp"
 #include "mir/mir_struct_markers.hpp"
@@ -391,6 +392,35 @@ struct Lowerer {
                     return mir.addInst(MirOpcode::Load, ops, t);
                 }
                 return mir.addConst(toMirLiteral(src), t);
+            }
+            case HirKind::SizeOf: {
+                // FC6: fold sizeof(T) to T's byte size (result type size_t = U64,
+                // = `t`) via the type_layout engine. The TypeRef child carries the
+                // type being sized (its typeId). Fail loud — never a guessed size —
+                // if the target declared no layout params or the type is
+                // incomplete/un-sizeable.
+                if (!config.aggregateLayoutLoaded) {
+                    unsupported(node, "sizeof requires the target to declare its "
+                                      "'aggregateLayout' params");
+                    return InvalidMirInst;
+                }
+                auto kids = hir.children(node);
+                if (kids.empty()) {
+                    unsupported(node, "SizeOf has no type-ref child");
+                    return InvalidMirInst;
+                }
+                TypeId const sized = hir.typeId(kids.front());
+                auto const layout = computeLayout(sized, interner,
+                                                  config.aggregateLayout,
+                                                  config.dataModel);
+                if (!layout) {
+                    unsupported(node, "sizeof of an incomplete or un-sizeable type");
+                    return InvalidMirInst;
+                }
+                MirLiteralValue lit;
+                lit.value = static_cast<std::uint64_t>(layout->size);
+                lit.core  = TypeKind::U64;
+                return mir.addConst(std::move(lit), t);
             }
             case HirKind::Ref: {
                 // Resolution order:

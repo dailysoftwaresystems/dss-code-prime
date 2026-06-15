@@ -933,6 +933,67 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         }
     }
 
+    // ── aggregateLayout (FC6, D-FF3-1 layout half): the per-ABI struct/union/
+    //    array layout params the generic `type_layout` engine reads. REQUIRED on
+    //    a register-machine target — a silent default would bake a wrong alignment
+    //    rule into every aggregate (mirrors the format's required `dataModel`). ──
+    if (doc.contains("aggregateLayout")) {
+        auto const& al = doc.at("aggregateLayout");
+        if (!al.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/aggregateLayout",
+                      "must be an object { scalarAlignment, maxAlignment }");
+        } else {
+            bool ok = true;
+            if (!al.contains("scalarAlignment")
+                || !al.at("scalarAlignment").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/aggregateLayout/scalarAlignment",
+                          "missing required 'scalarAlignment' string (e.g. \"natural\")");
+                ok = false;
+            } else {
+                auto const name = al.at("scalarAlignment").get<std::string>();
+                auto const rule = scalarAlignmentRuleFromName(name);
+                if (!rule) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/aggregateLayout/scalarAlignment",
+                              std::format("unknown scalarAlignment '{}' "
+                                          "(expected \"natural\")", name));
+                    ok = false;
+                } else {
+                    data.aggregateLayout.scalarAlignment = *rule;
+                }
+            }
+            if (!al.contains("maxAlignment")
+                || !al.at("maxAlignment").is_number_integer()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/aggregateLayout/maxAlignment",
+                          "missing required 'maxAlignment' integer (the ISA's "
+                          "largest fundamental alignment, a power of two)");
+                ok = false;
+            } else {
+                auto const v = al.at("maxAlignment").get<std::int64_t>();
+                if (v < 1 || v > 256 || (v & (v - 1)) != 0) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/aggregateLayout/maxAlignment",
+                              std::format("maxAlignment {} must be a power of two "
+                                          "in [1, 256]", v));
+                    ok = false;
+                } else {
+                    data.aggregateLayout.maxAlignment =
+                        static_cast<std::uint32_t>(v);
+                }
+            }
+            if (ok) data.aggregateLayoutLoaded = true;
+        }
+    }
+    // NOTE: `aggregateLayout` is OPTIONAL at load — consistent with the
+    // callingConventions/registers relaxation for minimal schema-substrate targets
+    // (validate() allows a target with neither). A target that never compiles a
+    // C aggregate needs no layout params. The fail-loud is at the CONSUMER: the
+    // layout/sizeof site asserts `aggregateLayoutLoaded()` and emits a loud
+    // diagnostic if a target is asked to lay out an aggregate without declaring
+    // its params — a silent wrong-layout is thereby still impossible.
+
     // ── opcodes ──
     if (!doc.contains("opcodes") || !doc.at("opcodes").is_array()) {
         coll.emit(DiagnosticCode::C_MissingField, "/opcodes",

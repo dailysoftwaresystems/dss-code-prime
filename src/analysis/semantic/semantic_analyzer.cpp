@@ -810,6 +810,19 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         if (*as.lengthChild < sufKids.size())
             lenNode = sufKids[*as.lengthChild];
     }
+    // FC6 (FAM): an ABSENT length (`T x[]` — the length slot is empty, so it
+    // resolves to the closing-bracket token, not an expression) on a declaration
+    // form that `allowFlexibleArray` (a struct field) is a flexible/incomplete
+    // array (C99 §6.7.2.1). It is an INCOMPLETE type, legal only as a struct's
+    // LAST field; the type_layout engine lays a FAM struct out correctly and
+    // fails loud on a non-last FAM. A standalone `T x[]` (a local/global — NOT
+    // `allowFlexibleArray`) keeps the `S_NonConstantArrayLength` error below.
+    // Distinct from a present-but-non-constant length (`T x[n]`), always an error.
+    bool const absentLength =
+        !lenNode.valid() || tree.kind(lenNode) != NodeKind::Internal;
+    if (absentLength && decl.allowFlexibleArray) {
+        return s.lattice.interner().incompleteArray(base);
+    }
     auto len = constIntExpr(s, tree, lenNode, fromScope, cfg);
     if (!len.has_value()) { emit(DiagnosticCode::S_NonConstantArrayLength); return InvalidType; }
     // C99 §6.7.5.2: array length is a positive integer constant
@@ -2131,6 +2144,30 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 // S_UnknownType (fail loud); the cast node stays
                 // untyped and enclosing checks cascade-suppress.
             }
+        }
+
+        // FC6: sizeof typing. The TYPE form (`sizeof(T)`) resolves + stamps its
+        // castTypeRef child through the SAME type resolver casts use (so the HIR
+        // lowering's `resolveStampedTypeBelow` recovers the SIZED type); the VALUE
+        // form (`sizeof e`) leaves its operand typed normally. BOTH forms stamp the
+        // node `size_t` (U64) — the result type for enclosing checks. The operand
+        // is UNEVALUATED (C 6.5.3.4); only its type matters. NOTE: U64 is correct
+        // for LP64 + LLP64 (both 64-bit `size_t`); a future ILP32 target wants a
+        // 32-bit `size_t` here — track under D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-
+        // WIDTH (the FOLDED VALUE is already per-target-correct: the MIR layout
+        // engine reads `dataModel`; and `(int)sizeof(...)` is the idiom anyway).
+        if (cfg.sizeofTypeRule.valid() && rule.v == cfg.sizeofTypeRule.v) {
+            auto kids = visibleChildren(tree, node);
+            if (cfg.sizeofTypeChild < kids.size()) {
+                NodeId const typeNode = kids[cfg.sizeofTypeChild];
+                TypeId const sized = resolveTypeNode(s, cfg, tree, typeNode, here);
+                if (sized.valid()) s.nodeToType.set(typeNode, sized);
+                // sized invalid ⇒ resolveTypeNode emitted S_UnknownType (fail loud).
+            }
+            s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
+        }
+        if (cfg.sizeofValueRule.valid() && rule.v == cfg.sizeofValueRule.v) {
+            s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
         }
 
         // FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF):

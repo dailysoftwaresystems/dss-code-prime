@@ -21,6 +21,7 @@ add_library(core OBJECT
     types/tree_builder.cpp
     types/tree_cursor.cpp
     types/type_lattice/type_lattice.cpp
+    types/type_lattice/type_layout.cpp
     types/type_lattice/type_reintern.cpp
 
     # ── crypto/ — self-contained hashing primitives (codesign foundation) ──

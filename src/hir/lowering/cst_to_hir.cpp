@@ -880,6 +880,10 @@ struct Lowerer {
              && tree().rule(c).v == cfg.castRule.v) {
                 return lowerCast(c);
             }
+            if (cfg.sizeofRule.valid()
+             && tree().rule(c).v == cfg.sizeofRule.v) {
+                return lowerSizeof(c);
+            }
         }
         for (NodeId c : visible(node)) {
             if (tree().kind(c) == NodeKind::Internal) return lowerExpr(c);  // paren-wrapped
@@ -2166,6 +2170,36 @@ struct Lowerer {
         }
         HirNodeId const agg = lowerBraceInit(braceN, type);
         return {track(agg, clNode), type};
+    }
+
+    // FC6: `sizeof ( type-name )` | `sizeof unary-expression` → core
+    // `HirKind::SizeOf`, result type size_t (U64). The grammar's speculative
+    // `sizeofExpr` wraps the chosen form (`sizeofType` = `sizeof ( castTypeRef )`,
+    // `sizeofValue` = `sizeof castOperand`); in BOTH forms the operand carries the
+    // semantic-stamped TYPE being sized, which `resolveStampedTypeBelow` recovers
+    // by descending past the (unstamped) sizeof wrappers. The operand is
+    // UNEVALUATED (C 6.5.3.4) — only its type reaches the node; the SizeOf folds to
+    // that type's byte size via the `type_layout` engine at MIR lowering.
+    [[nodiscard]] E lowerSizeof(NodeId node) {
+        // The SIZED type lives on the OPERAND (the castTypeRef for `sizeof(T)`, the
+        // unary-expr for `sizeof e`), which sits BELOW the form node that semantic
+        // stamped size_t. Descend to the form, then scan its children for the
+        // operand's stamped type — skipping the form's own size_t stamp.
+        NodeId form{};
+        for (NodeId c : visible(node)) {
+            if (tree().kind(c) == NodeKind::Internal) { form = c; break; }
+        }
+        NodeId const scan = form.valid() ? form : node;
+        TypeId sized = InvalidType;
+        for (NodeId c : visible(scan)) {
+            if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { sized = t; break; }
+        }
+        if (!sized.valid()) {
+            return exprError(node, "sizeof operand did not resolve to a type");
+        }
+        HirNodeId const tref = track(builder.makeTypeRef(sized), node);
+        TypeId const u64 = interner.primitive(TypeKind::U64);
+        return {track(builder.makeSizeOf(tref, u64), node), u64};
     }
 
     // FC2: explicit cast `(T)expr` (`hirLowering.castRule`). The grammar

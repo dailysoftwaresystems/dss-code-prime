@@ -172,6 +172,16 @@ TypeId TypeInterner::slice(TypeId element) {
     return internContent(TypeKind::Slice, {}, ops, {}, {});
 }
 
+TypeId TypeInterner::incompleteArray(TypeId element) {
+    return array(element, kIncompleteArrayLength);
+}
+
+bool TypeInterner::isIncompleteArray(TypeId id) const {
+    if (arena_.at(id).kind != TypeKind::Array) return false;
+    auto const sc = scalars(id);
+    return !sc.empty() && sc[0] == kIncompleteArrayLength;
+}
+
 TypeId TypeInterner::tuple(std::span<TypeId const> elements) {
     return internContent(TypeKind::Tuple, {}, elements, {}, {});
 }

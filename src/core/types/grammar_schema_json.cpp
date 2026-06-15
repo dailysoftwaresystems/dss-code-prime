@@ -4097,6 +4097,21 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // FC6 (FAM): optional `allowFlexibleArray` — when true,
+                        // an absent array length on this form resolves to an
+                        // incomplete array (a flexible array member) instead of
+                        // `S_NonConstantArrayLength`. Only set on a struct field.
+                        if (entry.contains("allowFlexibleArray")) {
+                            json const& fa = entry.at("allowFlexibleArray");
+                            if (!fa.is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/allowFlexibleArray",
+                                          "'allowFlexibleArray' must be a boolean");
+                            } else {
+                                rule.allowFlexibleArray = fa.get<bool>();
+                            }
+                        }
+
                         // D5.1: optional `fieldChildren` descriptor — declares
                         // this declaration as a composite-type introducer.
                         //   "fieldChildren": { "rule": "structField" }
@@ -6092,6 +6107,49 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── sizeof (FC6) ──
+            // `{ typeRule, typeChild, valueRule }` — sizeof typing. Pass 2 resolves
+            // the type form's castTypeRef child + stamps both forms size_t.
+            if (sem.contains("sizeof")) {
+                json const& sz = sem.at("sizeof");
+                if (!sz.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/sizeof",
+                              "'semantics.sizeof' must be an object "
+                              "{ typeRule, typeChild, valueRule }");
+                } else {
+                    auto readRule = [&](char const* key, RuleId& outRule,
+                                        std::string& outName) {
+                        if (!sz.contains(key) || !sz.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      std::string{"/semantics/sizeof/"} + key,
+                                      std::format("'{}' is required and must be a "
+                                                  "string", key));
+                            return;
+                        }
+                        outName = sz.at(key).get<std::string>();
+                        if (!data.rules->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape,
+                                      std::string{"/semantics/sizeof/"} + key,
+                                      std::format("'sizeof.{}' references unknown "
+                                                  "shape '{}'", key, outName));
+                            return;
+                        }
+                        outRule = data.rules->find(outName);
+                    };
+                    readRule("typeRule",  cfg.sizeofTypeRule,  cfg.sizeofTypeRuleName);
+                    readRule("valueRule", cfg.sizeofValueRule, cfg.sizeofValueRuleName);
+                    // `typeChild` is required. readReqIndex emits its own
+                    // C_MissingField / C_InvalidSemantics into `coll` on a bad
+                    // value (failing the load), so — unlike the looped loaders
+                    // above — there is no entry-push to skip here; the flag just
+                    // satisfies the out-param.
+                    bool typeChildOk = true;
+                    readReqIndex(sz, "typeChild", "/semantics/sizeof",
+                                 cfg.sizeofTypeChild, typeChildOk);
+                    (void)typeChildOk;
+                }
+            }
+
             // ── compoundLiterals (FC3.5 sweep-c3,
             //    D-CSUBSET-COMPOUND-LITERAL-TYPEDEF) ──
             // `{ rule, typeChild }` — the compound-literal expression
@@ -6825,6 +6883,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readExprRule("compoundLiteralRule", cfg.compoundLiteralRule, cfg.compoundLiteralRuleName);
             // FC2: explicit cast `(T)expr` → core HirKind::Cast.
             readExprRule("castRule",            cfg.castRule,            cfg.castRuleName);
+            // FC6: `sizeof(T)` / `sizeof e` → core HirKind::SizeOf.
+            readExprRule("sizeofRule",          cfg.sizeofRule,          cfg.sizeofRuleName);
 
             // ── HR10: extensionKinds [{ name, lang }] ──
             if (hl.contains("extensionKinds")) {

@@ -221,6 +221,7 @@
     { "word": "break",    "kind": "BreakKeyword"    },
     { "word": "continue", "kind": "ContinueKeyword" },
     { "word": "goto",     "kind": "GotoKeyword"     },
+    { "word": "sizeof",   "kind": "SizeofKeyword"   },
 
     { "word": "extern",  "kind": "ExternKeyword"  },
 
@@ -254,7 +255,11 @@
     },
 
     "structField": {
-      "sequence": [ "typeRefAllowingStruct", "Identifier", "EndStatement" ]
+      "sequence": [
+        "typeRefAllowingStruct", "Identifier",
+        { "optional": "arrayDeclSuffix" },
+        "EndStatement"
+      ]
     },
 
     "structTypeRef": {
@@ -272,7 +277,11 @@
     },
 
     "unionField": {
-      "sequence": [ "typeRefAllowingStruct", "Identifier", "EndStatement" ]
+      "sequence": [
+        "typeRefAllowingStruct", "Identifier",
+        { "optional": "arrayDeclSuffix" },
+        "EndStatement"
+      ]
     },
 
     "unionTypeRef": {
@@ -793,6 +802,7 @@
         "stringLiteralExpr",
         "charLiteralExpr",
         "compoundLiteralExpr",
+        "sizeofExpr",
         "castExpr",
         "parenExpr"
       ],
@@ -812,6 +822,19 @@
     "castExpr": {
       "sequence": [ "ParenOpen", "castTypeRef", "ParenClose", "castOperand" ],
       "commitRequiresTypeName": "castTypeRef"
+    },
+
+    "sizeofExpr": {
+      "$comment": "FC6: `sizeof ( type-name )` | `sizeof unary-expression` (C 6.5.3.4). The type form reuses FC2's castTypeRef + commitRequiresTypeName binder triage — `sizeof(int)` / `sizeof(struct S)` / `sizeof(char*)` commit as types; `sizeof(x)` for a value `x` rolls back to the value form (a parenExpr operand); `sizeof x` (no parens) is the value form directly. The result type is size_t (U64); the operand is UNEVALUATED — only its type reaches the SizeOf node.",
+      "alt": [ "sizeofType", "sizeofValue" ],
+      "speculative": true, "lookahead": 64
+    },
+    "sizeofType": {
+      "sequence": [ "SizeofKeyword", "ParenOpen", "castTypeRef", "ParenClose" ],
+      "commitRequiresTypeName": "castTypeRef"
+    },
+    "sizeofValue": {
+      "sequence": [ "SizeofKeyword", "castOperand" ]
     },
 
     "castTypeBase": {
@@ -980,10 +1003,13 @@
                            "liftToEnclosingScope": true } },
       { "rule": "structDecl",  "name": 1, "kind": "type",
         "fieldChildren": { "rule": "structField", "compositeKind": "struct" } },
-      { "rule": "structField", "name": 1, "type": 0, "kind": "variable" },
+      { "rule": "structField", "name": 1, "type": 0, "kind": "variable",
+        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
+        "allowFlexibleArray": true },
       { "rule": "unionDecl",   "name": 1, "kind": "type",
         "fieldChildren": { "rule": "unionField", "compositeKind": "union" } },
-      { "rule": "unionField",  "name": 1, "type": 0, "kind": "variable" },
+      { "rule": "unionField",  "name": 1, "type": 0, "kind": "variable",
+        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 } },
       { "rule": "enumDecl",    "name": 1, "kind": "type",
         "fieldChildren": { "rule": "enumerator", "compositeKind": "enum",
                            "liftToEnclosingScope": true } },
@@ -1034,6 +1060,8 @@
     "casts": [
       { "rule": "castExpr", "typeChild": 1, "operandChild": 3 }
     ],
+    "$sizeofComment": "FC6: sizeof typing. sizeofType = [ SizeofKeyword, '(', castTypeRef, ')' ] → typeChild 2 is the castTypeRef (resolved + stamped through the SAME type resolver casts use). sizeofValue = [ SizeofKeyword, castOperand ] (the operand is typed normally). Both forms are stamped size_t (U64).",
+    "sizeof": { "typeRule": "sizeofType", "typeChild": 2, "valueRule": "sizeofValue" },
     "$compoundLiteralsComment": "FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF): the compound-literal type position resolves + stamps through the SAME type-position resolver casts use (typedefs included). typeChild is the visible-child index into compoundLiteralExpr = [ '(' , castTypeRef , ')' , braceInitList ]. NO operandChild / cast-matrix validation — a compound literal is C 6.5.2.5 postfix syntax, not a conversion.",
     "compoundLiterals": [
       { "rule": "compoundLiteralExpr", "typeChild": 1 }
@@ -1169,6 +1197,7 @@
     "designatedIndexRule": "designatedIndex",
     "compoundLiteralRule": "compoundLiteralExpr",
     "castRule":            "castExpr",
+    "sizeofRule":          "sizeofExpr",
 
     "globalsConstEval": { "allowFloat": true },
 
