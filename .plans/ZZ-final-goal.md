@@ -128,7 +128,7 @@ The point where DSS Code Prime stops being a project written *in* C++ and become
 
 1. **v1 minimal E2E** — C++ engine, source → binary, the languages currently shipped. Plans 00 through 16.
 2. **v2/v3 increments** — more language coverage; async, GC, reflection, exceptions land in HIR + runtime. Plans 17, 18 light up.
-3. **DSS Code Prime language exists** — designed *from HIR experience*, not in a vacuum. Plan 20 (currently reserved) opens. The language is informed by what the HIR proved universal across the Tier 1 + Tier 2 languages, so it doesn't suffer the "designed in isolation, missing real-world concerns" failure mode.
+3. **The DSS Code Prime language — now named DSS Axis — exists** — designed *from HIR experience*, not in a vacuum. Plan 24 (DSS Axis; reserved — supersedes the placeholder plan 20) opens. The language is informed by what the HIR proved universal across the Tier 1 + Tier 2 languages, so it doesn't suffer the "designed in isolation, missing real-world concerns" failure mode.
 4. **Transpile the C++ engine → DSS Code Prime** — plan 10 (source-to-source) stops being v1.x scope and becomes load-bearing. Phased, not big-bang: transpile the core first (HIR / MIR / LIR / passes), keep the platform layer in C++ for a release, then transpile the platform layer once the runtime is mature. Rust did this with `rustc`; Go did it all-at-once because its runtime was tiny.
 5. **Self-hosted compiler** — the C++ codebase becomes reference / legacy; new development happens in DSS Code Prime.
 6. **Database in DSS Code Prime** — leveraging the language's persistent collections, async I/O, and concurrency primitives.

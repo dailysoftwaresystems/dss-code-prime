@@ -1,5 +1,7 @@
 # Custom Language Onboarding — Reserved Sub-Plan (20)
 
+> **⤳ SUPERSEDED BY [`plan-24` — DSS Axis](./24-dss-axis-language-reserved-plan%20-%20tbd.md)** (2026-06-15). This plan reserved DSS Code Prime's own language as a thin early stub; **plan-24 is now the rich, named reservation** for that same language ("DSS Axis" = the language; "DSS Code Prime" = the engine). Kept as a historical breadcrumb — see plan-24 for live scope. The "just another `.lang.json`, no new core work needed" framing below remains accurate substrate context.
+>
 > **Reserved scope.** The user's stated final goal: "We will, after validating languages until full C++, C#, TSQL, SQLite support, have our own comprehensive language." Plus: "We will have GPU communication (for game development), using the exact same language of our own we'll create."
 >
 > This plan tracks the eventual user-authored language. The compiler substrate is built to make custom languages "just another `.lang.json`" — no new core work needed. This plan owns the **language design + standard library + custom-runtime decisions**, not the engine.
