@@ -1441,10 +1441,15 @@ struct Lowerer {
                         return false;
                     continue;
                 }
-                unsupported(aggNode, "initializing an aggregate field from an "
-                                      "aggregate value needs an aggregate copy "
-                                      "(D-FC7-AGGREGATE-COPY-MEMCPY)");
-                return false;
+                // FC7 (D-FC7-AGGREGATE-COPY-MEMCPY): an aggregate field
+                // initialized from an aggregate VALUE (`{ existingStruct, … }`,
+                // not a nested brace) is a copy from that value's lvalue
+                // address into the field's sub-slot.
+                MirInstId const srcPtr = lowerLvalueAddress(kids[i]);
+                if (!srcPtr.valid()) return false;
+                if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                    return false;
+                continue;
             }
 
             MirInstId const v = lowerExpr(kids[i]);
@@ -1455,27 +1460,75 @@ struct Lowerer {
         return true;
     }
 
-    // FC7 (D-FC7-MEMBER-ACCESS): copy a STRUCT value field-wise from
-    // `srcPtr` to `dstPtr` — one Load+Store per scalar field at the FC6
-    // byte offsets. Replaces the aggregate-width Load+Store (a single
-    // register move that would TRUNCATE a wider-than-register struct to its
-    // low bytes — the silent miscompile this closes). A UNION (variants
-    // overlap, so a field-wise copy of one misses the others' bytes) or a
-    // struct with an AGGREGATE field needs a byte-wise memcpy — fail loud
-    // (D-FC7-AGGREGATE-COPY-MEMCPY). Returns false on any failure
-    // (diagnostic already emitted).
+    // FC7 (D-FC7-AGGREGATE-COPY-MEMCPY): copy `size` bytes from `srcPtr` to
+    // `dstPtr` BYTE-WISE, using the widest available integer chunk at each
+    // step — I64 (8B), then one I32 (4B), then I8-via-`Char` (1B) for the
+    // 0–3 byte tail. There is NO width-16 memory form (memAccessWidthFlags:
+    // Char→8, I32→32, all else→64), so 2–3 byte tails are 1-byte Char copies;
+    // I8/U8 would silently widen to a 64-bit access, so `Char` is the only
+    // safe 1-byte vehicle. Each chunk loads (zero/full-extends) then stores
+    // the low width, round-tripping its bytes exactly. Chunk accesses may be
+    // unaligned — fine on x86_64 and AArch64 (normal mov/LDR/STR). The shared
+    // offset Const feeds both the src and dst GEP (immutable SSA). Returns
+    // false on any failure (diagnostic already emitted upstream).
+    [[nodiscard]] bool lowerByteWiseCopy(MirInstId srcPtr, MirInstId dstPtr,
+                                         std::uint64_t size) {
+        auto emit = [&](TypeKind chunkKind, std::uint64_t off) -> bool {
+            TypeId const chunkTy = interner.primitive(chunkKind);
+            TypeId const ptrTy   = interner.pointer(chunkTy);
+            MirInstId const offK = constInt(static_cast<std::int64_t>(off));
+            if (!offK.valid()) return false;
+            std::array<MirInstId, 2> sg{srcPtr, offK};
+            MirInstId const sp = mir.addInst(MirOpcode::Gep, sg, ptrTy);
+            if (!sp.valid()) return false;
+            std::array<MirInstId, 1> ld{sp};
+            MirInstId const v = mir.addInst(MirOpcode::Load, ld, chunkTy);
+            if (!v.valid()) return false;
+            std::array<MirInstId, 2> dg{dstPtr, offK};
+            MirInstId const dp = mir.addInst(MirOpcode::Gep, dg, ptrTy);
+            if (!dp.valid()) return false;
+            std::array<MirInstId, 2> st{v, dp};
+            mir.addInst(MirOpcode::Store, st);
+            return true;
+        };
+        std::uint64_t off = 0;
+        for (; off + 8 <= size; off += 8)
+            if (!emit(TypeKind::I64, off)) return false;
+        if (off + 4 <= size) {
+            if (!emit(TypeKind::I32, off)) return false;
+            off += 4;
+        }
+        for (; off < size; off += 1)
+            if (!emit(TypeKind::Char, off)) return false;
+        return true;
+    }
+
+    // FC7: copy an aggregate value from `srcPtr` to `dstPtr`.
+    //   • flat scalar STRUCT (no aggregate field) → FIELD-WISE: one Load+Store
+    //     per scalar field at its FC6 offset (width-exact, no padding copy —
+    //     the D-FC7-MEMBER-ACCESS path; an aggregate-width Load would TRUNCATE
+    //     a wider-than-register struct to its low bytes).
+    //   • UNION, or a struct with ANY aggregate field (struct/union/ARRAY) →
+    //     BYTE-WISE whole-object copy (D-FC7-AGGREGATE-COPY-MEMCPY): a union's
+    //     variants overlap so a field-wise copy of one misses the others'
+    //     bytes; an aggregate-typed field can't be realized by a single
+    //     field Load. Byte-wise copies the entire object representation
+    //     (incl. padding — C 6.2.6.1, harmless), covering every nested byte.
+    // Returns false on any failure (diagnostic already emitted).
     [[nodiscard]] bool lowerAggregateCopy(HirNodeId atNode, MirInstId srcPtr,
                                           MirInstId dstPtr, TypeId aggTy) {
-        if (interner.kind(aggTy) != TypeKind::Struct) {
-            unsupported(atNode, "copying a union value (assignment/init) needs "
-                                "a byte-wise copy — the variants overlap — not "
-                                "yet supported (D-FC7-AGGREGATE-COPY-MEMCPY)");
-            return false;
-        }
         StructLayout const* layout = cachedLayout(aggTy);
         if (layout == nullptr) {
-            unsupported(atNode, "struct copy requires a sizeable layout "
+            unsupported(atNode, "aggregate copy requires a sizeable layout "
                                 "(target 'aggregateLayout' / complete type)");
+            return false;
+        }
+        TypeKind const aggKind = interner.kind(aggTy);
+        if (aggKind == TypeKind::Union)
+            return lowerByteWiseCopy(srcPtr, dstPtr, layout->size);
+        if (aggKind != TypeKind::Struct) {
+            unsupported(atNode, "aggregate copy of a non-struct/union value "
+                                "is not supported");
             return false;
         }
         auto const fieldTypes = interner.operands(aggTy);
@@ -1484,14 +1537,20 @@ struct Lowerer {
                                 "layout field-offset count (internal invariant)");
             return false;
         }
-        for (std::size_t i = 0; i < fieldTypes.size(); ++i) {
-            TypeKind const fk = interner.kind(fieldTypes[i]);
-            if (fk == TypeKind::Struct || fk == TypeKind::Union) {
-                unsupported(atNode, "copying a struct with an aggregate field "
-                                    "needs a recursive/byte-wise copy "
-                                    "(D-FC7-AGGREGATE-COPY-MEMCPY)");
-                return false;
+        bool anyAggregateField = false;
+        for (TypeId ft : fieldTypes) {
+            TypeKind const fk = interner.kind(ft);
+            if (fk == TypeKind::Struct || fk == TypeKind::Union
+                || fk == TypeKind::Array) {
+                anyAggregateField = true;
+                break;
             }
+        }
+        if (anyAggregateField)
+            return lowerByteWiseCopy(srcPtr, dstPtr, layout->size);
+
+        // Flat scalar struct — field-wise, width-exact.
+        for (std::size_t i = 0; i < fieldTypes.size(); ++i) {
             MirInstId const offK = constInt(
                 static_cast<std::int64_t>(layout->fieldOffsets[i]));
             if (!offK.valid()) return false;

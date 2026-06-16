@@ -1947,6 +1947,107 @@ TEST(MirLoweringCSubset, ConstructAggregateNestedAllConstFolds) {
            "in global/expression position)";
 }
 
+// FC7 (D-FC7-AGGREGATE-COPY-MEMCPY): a UNION copy (`*d = *s`) is BYTE-WISE,
+// not field-wise — the variants overlap, so a field-wise copy of one variant
+// would miss the others' bytes. `union U { int n; struct P p; }` is 8 bytes →
+// ONE I64 chunk (Gep+Load(i64)+Gep+Store). The DISCRIMINATOR vs a wrong
+// field-wise copy: the Load type is I64 (full 8-byte chunk), NOT I32 (the `n`
+// variant) — a field-wise copy of `n` would move only 4 of the 8 bytes.
+TEST(MirLoweringCSubset, UnionCopyIsByteWiseNotFieldWise) {
+    auto L = lowerCSubset(
+        "struct P { int x; int y; };\n"
+        "union U { int n; struct P p; };\n"
+        "void copy(union U* d, union U* s) { *d = *s; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Load),  1u) << "one 8-byte chunk";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 1u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Gep),   2u) << "src + dst GEP";
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto const n = m.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Load) continue;
+        EXPECT_EQ(interner.kind(m.instType(ix)), TypeKind::I64)
+            << "byte-wise union copy loads an I64 chunk, not the 4-byte variant";
+    }
+}
+
+// FC7 (D-FC7-AGGREGATE-COPY-MEMCPY): a struct with an AGGREGATE field copies
+// BYTE-WISE (a field-wise copy can't realize an aggregate-width field Load).
+// `Outer { Inner in; int z; }` is 12 bytes → two chunks: I64 @0 (covers `in`),
+// I32 @8 (covers `z`). Chunk Load TYPES are {I64, I32} and GEP offsets are the
+// CHUNK offsets {0,0,8,8} — NOT field offsets. The far field `z`@8 is covered
+// by the second chunk (a truncating 8-byte copy would drop it).
+TEST(MirLoweringCSubset, StructWithStructFieldCopyIsByteWise) {
+    auto L = lowerCSubset(
+        "struct Inner { int x; int y; };\n"
+        "struct Outer { struct Inner in; int z; };\n"
+        "void copy(struct Outer* d, struct Outer* s) { *d = *s; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Load),  2u) << "I64 @0 + I32 @8";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 2u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Gep),   4u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto const n = m.blockInstCount(entry);
+    int c0 = 0, c8 = 0, cOther = 0, i64Loads = 0, i32Loads = 0;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) == MirOpcode::Gep) {
+            auto g = m.instOperands(ix);
+            ASSERT_EQ(g.size(), 2u);
+            auto const off = std::get<std::int64_t>(
+                m.literalValue(m.constLiteralIndex(g[1])).value);
+            if (off == 0) ++c0; else if (off == 8) ++c8; else ++cOther;
+        } else if (m.instOpcode(ix) == MirOpcode::Load) {
+            TypeKind const k = interner.kind(m.instType(ix));
+            if (k == TypeKind::I64) ++i64Loads; else if (k == TypeKind::I32) ++i32Loads;
+        }
+    }
+    EXPECT_EQ(c0, 2) << "src+dst GEP for the @0 I64 chunk";
+    EXPECT_EQ(c8, 2) << "src+dst GEP for the @8 I32 chunk (covers far field z)";
+    EXPECT_EQ(cOther, 0);
+    EXPECT_EQ(i64Loads, 1) << "8-byte chunk @0";
+    EXPECT_EQ(i32Loads, 1) << "4-byte chunk @8";
+}
+
+// FC7 (D-FC7-AGGREGATE-COPY-MEMCPY): an ARRAY field is ALSO an aggregate field
+// → the struct copies BYTE-WISE. `S { int arr[3]; int n; }` is 16 bytes → two
+// I64 chunks @0, @8. This pins the array-field arm of the byte-wise dispatch
+// at the MIR tier; reading an array field's ELEMENTS (`s.arr[i]`) is a
+// SEPARATE pre-existing gap (the unsupported 3-op storage-array GEP,
+// D-MIR-STORAGE-ARRAY-INDEX-GEP), so this is a MIR-tier (not runtime) pin.
+TEST(MirLoweringCSubset, StructWithArrayFieldCopyIsByteWise) {
+    auto L = lowerCSubset(
+        "struct S { int arr[3]; int n; };\n"
+        "void copy(struct S* d, struct S* s) { *d = *s; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Load),  2u) << "two I64 chunks (16 bytes)";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 2u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto const n = m.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Load) continue;
+        EXPECT_EQ(interner.kind(m.instType(ix)), TypeKind::I64)
+            << "16-byte struct-with-array-field copies as two I64 chunks";
+    }
+}
+
 // ML3 end-to-end: ML2-lowered MIR for a representative c-subset
 // corpus passes the MirVerifier (with TypeInterner). Validates that
 // the verifier finds no false-positives in production-shape MIR.
