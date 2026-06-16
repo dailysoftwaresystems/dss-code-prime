@@ -1204,20 +1204,22 @@ TEST(SemanticAnalyzerCSubset, BareReturnInVoidIsClean) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 0u);
 }
 
-// A type-mismatched return: `char c` declared, returned from an `int`
-// function is fine (Char≠I32 but the returned value is a use whose type is
-// Char — Char does not assign into I32 → mismatch). We use a `char`
-// parameter returned from an `int` function to force a non-widening
-// mismatch. The lattice REJECTS Char→I32 (Char is not in any widening rank;
-// see type_rules.hpp isAssignable), so this mismatch is non-vacuous.
-// Exactly one S_ReturnTypeMismatch.
-TEST(SemanticAnalyzerCSubset, ReturnTypeMismatchOnNonAssignable) {
+// char→int WIDENING is legal C (C 6.3.1.1: `char` is an integer type) — `int f(char
+// c){ return c; }` returns the char param widened to int. The BIDIRECTIONAL
+// `charConvertsToArith` arm (D-CSUBSET-CHAR-INT-WIDENING ✅) admits it; codegen
+// materializes the Char→int SExt (witnessed by the `char_value` corpus). This pin was
+// the INVERSE before (ReturnTypeMismatchOnNonAssignable — DSS's earlier strict-char
+// choice). RED-ON-DISABLE: revert the char→int arm direction → `isAssignable(I32,
+// Char)` is false → 1 S_ReturnTypeMismatch. (A genuinely non-assignable return still
+// fires — DistinctTypedReturnRemainsMismatch covers the mismatch mechanism.)
+TEST(SemanticAnalyzerCSubset, CharParamReturnedAsIntIsClean) {
     auto cu = buildShippedUnit("c-subset", {
         "int f(char c) { return c; }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 0u)
+        << "char widens to int on return (C 6.3.1.1) — the bidirectional char arm";
 }
 
 // FIX 6 companion (non-false-positive guard): returning a matching-typed
@@ -1253,20 +1255,70 @@ TEST(SemanticAnalyzerCSubset, ReturnOfCallResultIsClean) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 }
 
-// FIX 2 (genuine mismatch through a call): a `void` function f returning a
-// value-call into an `int` function would need f to be non-void; instead we
-// exercise a real mismatch THROUGH a call — `char h()` returned from an
-// `int` function. h's result is Char, which does NOT assign into I32, so the
-// call-result-typed expression yields exactly one S_ReturnTypeMismatch.
-TEST(SemanticAnalyzerCSubset, ReturnOfMismatchedCallResultEmitsMismatch) {
+// char→int WIDENING through a CALL result: `char h()` returned from an `int`
+// function `g` — h's Char result widens to int (C 6.3.1.1), now clean via the
+// bidirectional char arm. (Was the inverse: ReturnOfMismatchedCallResultEmitsMismatch.)
+// RED-ON-DISABLE: revert the char→int arm direction → 1 S_ReturnTypeMismatch. The
+// genuine call-result mismatch mechanism is covered by DistinctTypedReturnRemainsMismatch.
+TEST(SemanticAnalyzerCSubset, CharResultCallReturnedAsIntIsClean) {
     auto cu = buildShippedUnit("c-subset", {
         "char h() { return 'a'; }\n"
         "int g() { return h(); }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 1u)
-        << "a Char-result call returned into an int function must mismatch";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 0u)
+        << "a Char-result call widens to int on return (C 6.3.1.1)";
+}
+
+// R2 (sizeof char/string fold cycle): a CHARACTER constant has type `int`
+// (C 6.4.4.4 — the reason `sizeof('c')`==4, not 1). Pinned in a context where the
+// int type MATTERS: `f('c')` to an `int*` param fires a mismatch (int 99 is not a
+// pointer, and not the null constant 0). RED-ON-DISABLE: drop the CharLiteral→I32
+// `literalTypes` row → `'c'` is untyped → `isAssignable` short-circuits on
+// InvalidType → 0 mismatch (the literal would silently pass).
+TEST(SemanticAnalyzerCSubset, CharLiteralIsTypedIntNotUntyped) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern void f(int* p);\n"
+        "int main() { f('c'); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "'c' has type int (C 6.4.4.4) → passing it to an int* param is a mismatch";
+}
+
+// R2: a STRING literal has type `char[N+1]` (C 6.4.5 — the reason `sizeof("abcd")`
+// ==5). Pinned where the ELEMENT type matters: passing "abc" to an `int*` param
+// fires a mismatch (Array<Char>→Ptr<int> fails the same-element-type array-decay
+// rule), while to a `char*` param it decays cleanly (0 — covered by the existing
+// string corpus). RED-ON-DISABLE: drop the StringLiteral `stringArray` row → "abc"
+// is untyped → `isAssignable` short-circuits → 0 mismatch.
+TEST(SemanticAnalyzerCSubset, StringLiteralIsTypedCharArrayNotUntyped) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern void g(int* p);\n"
+        "int main() { g(\"abc\"); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "\"abc\" is Array<Char,4> → an int* arg is an element mismatch (Char != int)";
+}
+
+// R2: the int→char assignability arm (`charConvertsToArith`, C 6.3.1.1). Typing the
+// char literal `int` would otherwise REGRESS `char x = 'c';` (int → char slot, which
+// DSS's strict lattice rejects without the arm). RED-ON-DISABLE: drop the arm →
+// `isAssignable(Char, I32)` is false → 1 S_TypeMismatch. The arm is now BIDIRECTIONAL
+// (D-CSUBSET-CHAR-INT-WIDENING ✅): the char→int direction is pinned clean by
+// CharParamReturnedAsIntIsClean / CharResultCallReturnedAsIntIsClean above.
+TEST(SemanticAnalyzerCSubset, CharLiteralInitializesCharSlotCleanly) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { char x = 'c'; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "an int literal initializing a char slot is legal C (the char↔int arm)";
 }
 
 // FIX 3 (crit-8, nested return): a value `return 1;` nested inside an `if`

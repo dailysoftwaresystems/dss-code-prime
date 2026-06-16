@@ -32,14 +32,18 @@ namespace dss {
 // text round-trip ("payload=N flags=M" is mandatory-emitted) carry
 // it forward with ZERO changes — a width dropped at any rebuild
 // would silently re-select the 64-bit forms (a miscompile), so the
-// carrier that survives by construction is the safe one. Future
-// 16/8-bit forms extend this to a 2-bit field; the JSON loader
-// already rejects any guard width outside {32, 64}.
+// carrier that survives by construction is the safe one.
+// kLirInstFlagWidth8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN) adds the
+// sub-native byte form (`char` ≡ I8): movsx/movzx r/m8, mov r8, sxtb,
+// ldrb/strb. The two width bits are mutually exclusive (8 wins); the
+// JSON loader accepts a guard width of 8, 32, or 64.
 inline constexpr std::uint8_t kLirInstFlagWidth32 = 0x01;
+inline constexpr std::uint8_t kLirInstFlagWidth8  = 0x02;
 
 // The instruction's operation width in bits, derived from its flags.
 [[nodiscard]] constexpr std::uint8_t
 lirInstWidthBits(std::uint8_t flags) noexcept {
+    if ((flags & kLirInstFlagWidth8) != 0)  return std::uint8_t{8};
     return (flags & kLirInstFlagWidth32) != 0 ? std::uint8_t{32}
                                               : std::uint8_t{64};
 }

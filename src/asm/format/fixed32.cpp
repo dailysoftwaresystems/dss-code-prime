@@ -81,6 +81,13 @@ windowFor(EncodingSlotKind s) noexcept {
         // slot consumed (satisfying the "every guard position is wired"
         // validate rule). lsb is irrelevant at width 0.
         case EncodingSlotKind::MemBaseNoScale: return SlotBitWindow{ 0, 0 };
+        // MemOffsetZero (D-AS4-ARM64-BASE-INDEX-LEA): width-0 marker for
+        // a zero displacement on the base+index `lea` (AArch64 `ADD Xd,
+        // Xn, Xm` has no disp field). orInto width 0 writes nothing; the
+        // MemOffset wire arm range-checks the displacement IS zero first
+        // (fail-loud on a nonzero disp). The displacement twin of
+        // MemBaseNoScale.
+        case EncodingSlotKind::MemOffsetZero: return SlotBitWindow{ 0, 0 };
         // Imm12 (D-LK10-ENTRY-ARM64): AArch64 ADD/SUB-immediate
         // unsigned 12-bit field at bits 10..21 (frame-size stack
         // adjust). Range-checked 0..4095 in the wire loop.
@@ -588,6 +595,31 @@ bool encode(Lir const&                  lir,
             //             imm12 reach is the right fit — larger than Imm9.)
             // A future scaled LDR/STR form adds its own slot when that
             // consumer lands. Mirrors the ImmInt arm's dual-slot shape.
+            //
+            // D-AS4-ARM64-BASE-INDEX-LEA: the THIRD slot is the width-0
+            // MemOffsetZero marker (the base+index `lea` = `ADD Xd,Xn,Xm`
+            // has NO displacement field). Validate the displacement IS
+            // zero — a nonzero disp with an index has no single-ADD form,
+            // so fail LOUD rather than silently drop the offset — then
+            // write no bits (orInto width 0 marks the position consumed).
+            // Handled before the Imm9/Imm12 reject so it does not leak
+            // into the displacement-range logic.
+            if (wire.slotKind == EncodingSlotKind::MemOffsetZero) {
+                if (srcOp.offset != 0) {
+                    report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': the base+index 'lea' "
+                                       "(ADD Xd,Xn,Xm) requires a ZERO "
+                                       "displacement (got {}) — AArch64 has no "
+                                       "displacement field on the register-add "
+                                       "form; a base+index+disp address needs a "
+                                       "separate ADD (no consumer yet)",
+                                       info->mnemonic, srcOp.offset));
+                    return false;
+                }
+                if (!orInto(wire.slotKind, 0u, wire.wordIndex)) return false;
+                continue;
+            }
             bool const isSignedSlot = wire.slotKind == EncodingSlotKind::Imm9;
             bool const isUnsignedSlot = wire.slotKind == EncodingSlotKind::Imm12;
             if (!isSignedSlot && !isUnsignedSlot) {

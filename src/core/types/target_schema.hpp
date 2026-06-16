@@ -859,11 +859,23 @@ enum class EncodingSlotKind : std::uint8_t {
     // remainder expansion rem = n − (n/d)·d. NOT symbol-bearing; a
     // plain 5-bit register window exactly like Rd/Rn/Rm.
     Ra = 22,
+    // D-AS4-ARM64-BASE-INDEX-LEA: a MemOffset MARKER — a width-0 {0,0}
+    // slot, the displacement twin of `MemBaseNoScale`. It asserts the
+    // wired MemOffset operand's displacement is ZERO and writes NO bits.
+    // Reason: the AArch64 base+index `lea` is `ADD Xd, Xn, Xm` (shifted-
+    // register, NO displacement field), so the GEP's vestigial
+    // MemOffset(0) (a SIB artifact x86's 4-op lea needs for disp32) must
+    // be CONSUMED + validated zero on arm64 — wiring it to Imm12 would
+    // corrupt Rm (bits 10..21 overlap Rm at 16..20). A nonzero disp with
+    // an index never arises (the 3-op frame `lea` owns base+disp), so
+    // this is a pure fail-loud guard. Universal (any ISA whose indexed
+    // address-add has no disp field reuses it).
+    MemOffsetZero = 23,
     // Future fixed32 slots (paired with their consumer cycle):
     //   ImmShift / Sf-flag / scaled LDR imm12 / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 23> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 24> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -887,6 +899,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 23> kEncodingSlotKindTable{{{
     { EncodingSlotKind::Imm19,         "imm19"          },
     { EncodingSlotKind::Imm8,          "imm8"           },
     { EncodingSlotKind::Ra,            "ra"             },
+    { EncodingSlotKind::MemOffsetZero, "memoffset.zero" },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -905,7 +918,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 23,
+static_assert(kEncodingSlotKindCount == 24,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -941,6 +954,7 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Imm16:
         case EncodingSlotKind::Imm9:
         case EncodingSlotKind::MemBaseNoScale:
+        case EncodingSlotKind::MemOffsetZero:
         case EncodingSlotKind::Imm12:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
@@ -1119,6 +1133,7 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Imm16:
         case EncodingSlotKind::Imm9:
         case EncodingSlotKind::MemBaseNoScale:
+        case EncodingSlotKind::MemOffsetZero:
         case EncodingSlotKind::Imm12:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:

@@ -684,9 +684,11 @@ struct Lowerer {
     //     mov). 16/8/Bool results stay fail-loud here AND at the
     //     assembler (the trunc variants carry `width: 32`, so a
     //     non-32 trunc inst matches nothing — belt and suspenders).
-    //   * SExt — realized for I32 sources only (x86 movsxd r64,r/m32;
-    //     arm64 SXTW). An I8/I16/Char source would silently read a
-    //     32-bit register window.
+    //   * SExt — realized for I32 sources (x86 movsxd r64,r/m32; arm64
+    //     SXTW) AND Char sources (x86 movsx r64,r/m8; arm64 SXTB — the
+    //     byte form, D-CSUBSET-CHAR-STRING-VALUE-CODEGEN), discriminated
+    //     by the SOURCE width flag (32 vs 8). I8/I16 sources stay gated
+    //     (no realization yet) — fail-loud here AND at the assembler.
     //   * ZExt — realized for Bool sources only (x86 movzx r64,r/m8;
     //     arm64 W-form ORR over a 0/1 register). A U32 source through
     //     the x86 byte-form would silently read ONE byte — the
@@ -783,29 +785,42 @@ struct Lowerer {
                 return true;
             }
             case MirOpcode::Trunc: {
-                // Result-width gate: only 32-bit results are realized
-                // (I64-result Trunc cannot arise — its source would be
-                // a gated I128).
+                // Result-width gate: the 32-bit-result form (I32/U32) and
+                // the Char-result form (D-CSUBSET-CHAR-INT-WIDENING, the
+                // int→char direction). A Char Trunc routes through the
+                // SAME width-32 `mov r32,r32` realization (registerOpWidth-
+                // Flags collapses char→32): it keeps the low 32 bits, and
+                // the narrowing-to-1-byte is realized lazily at the next
+                // byte-EXACT consumer (a char→int SExt's movsx r/m8, or a
+                // byte STORE) — every char read is low-byte-only, so the
+                // value is C-correct (e.g. `char c=300` reads back 44). An
+                // I64-result Trunc cannot arise (its source would be a
+                // gated I128); I8/I16/U8/U16/Byte stay REJECTED (no value
+                // codegen this cycle — fail loud, never a silent narrow).
                 TypeId const ty = mir.instType(id);
                 if (ty.valid()) {
                     TypeKind const k = interner.kind(ty);
-                    if (k != TypeKind::I32 && k != TypeKind::U32) {
+                    if (k != TypeKind::I32 && k != TypeKind::U32
+                        && k != TypeKind::Char) {
                         return failConv(ty, "Trunc result",
-                                        "the 32-bit result form");
+                                        "the 32-bit- and Char-result forms");
                     }
                 }
                 return true;
             }
             case MirOpcode::SExt: {
-                // Source-width gate: movsxd / SXTW read a 32-bit
-                // source window.
+                // Source-width gate: the I32-source form (movsxd / SXTW, a
+                // 32-bit source window) and the Char/I8-source BYTE form
+                // (movsx r32,r/m8 / sxtb — D-CSUBSET-CHAR-STRING-VALUE-CODEGEN),
+                // discriminated by the SOURCE type's width flag on the LIR inst.
                 auto const operands = mir.instOperands(id);
                 if (!operands.empty()) {
                     TypeId const ty = mir.instType(operands[0]);
                     if (ty.valid()
-                        && interner.kind(ty) != TypeKind::I32) {
+                        && interner.kind(ty) != TypeKind::I32
+                        && interner.kind(ty) != TypeKind::Char) {
                         return failConv(ty, "SExt source",
-                                        "the I32-source form");
+                                        "the I32- and Char-source forms");
                     }
                 }
                 return true;
@@ -871,9 +886,50 @@ struct Lowerer {
         switch (interner.kind(ty)) {
             case TypeKind::I32: case TypeKind::U32: case TypeKind::F32:
                 return kLirInstFlagWidth32;
+            // C 6.2.5: `char` is a single byte. D-CSUBSET-CHAR-STRING-VALUE-CODEGEN:
+            // the byte forms (movsx/movzx r32,r/m8; mov r8; sxtb; ldrb/strb). A char
+            // memory op MUST be width-exact — a 64-bit load of a 1-byte string/array
+            // element would read 7 bytes past it.
+            case TypeKind::Char:
+                return kLirInstFlagWidth8;
             default:
                 return 0;
         }
+    }
+
+    // The width flag for a MEMORY access (Load/Store) of `ty` into class `cls`. An
+    // FPR access must be width-EXACT (movss vs movsd — an 8-byte read of a 4-byte
+    // F32 reads past it). A Char (1-byte) GPR access must ALSO be byte-exact — a
+    // 64-bit access of a 1-byte string/array element reads/writes 7 bytes past it
+    // (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN). Other GPR ints/ptrs use the width-
+    // default full-slot access (value-correct: their values are consumed low-bits-
+    // only, and a scalar local sits in an ≥8-byte slot).
+    [[nodiscard]] std::uint8_t memAccessWidthFlags(TypeId ty, LirRegClass cls) const {
+        if (cls == LirRegClass::FPR) return widthFlagsForType(ty);
+        if (ty.valid() && interner.kind(ty) == TypeKind::Char)
+            return kLirInstFlagWidth8;
+        return 0;
+    }
+
+    // The width for a REGISTER-RESIDENT value operation — const
+    // materialization, a register copy/mov, a narrowing Trunc result — of
+    // type `ty`. D-CSUBSET-CHAR-STRING-VALUE-CODEGEN: a sub-native byte
+    // type (`char` ≡ I8) has NO byte-width register-immediate / register-
+    // move / register-ALU form (and an 8-bit register WRITE is a partial-
+    // register hazard — stale upper bits), so a char VALUE lives PROMOTED
+    // in a ≥32-bit register, low-bits-significant — exactly C integer
+    // promotion (6.3.1.1). The byte width therefore collapses to the 32-
+    // bit form (whose 32-bit register write zero-extends into the full
+    // register; the low byte holds the char). This is the COMPLEMENT of
+    // the two byte-EXACT contexts: MEMORY access (`memAccessWidthFlags` —
+    // a byte load/store must touch exactly 1 byte) and an extension SOURCE
+    // (`widthFlagsForType` at the SExt/ZExt source — movsx/movzx r/m8
+    // reads exactly the low byte). Only register PLUMBING promotes; memory
+    // and extension sources stay byte-exact. (Every non-byte type is
+    // returned unchanged, so this is byte-identical for all pre-char code.)
+    [[nodiscard]] std::uint8_t registerOpWidthFlags(TypeId ty) const {
+        std::uint8_t const w = widthFlagsForType(ty);
+        return (w == kLirInstFlagWidth8) ? kLirInstFlagWidth32 : w;
     }
 
     // ── diagnostics ──────────────────────────────────────────────────
@@ -996,8 +1052,26 @@ struct Lowerer {
             case MirOpcode::Load:   return lowerLoad(id);
             case MirOpcode::Store:  return lowerStore(id);
             case MirOpcode::Gep:    return lowerGep(id);
-            case MirOpcode::Trunc:  return lowerCast(id, MnemonicSlot::Trunc, "MIR Trunc");
-            case MirOpcode::SExt:   return lowerCast(id, MnemonicSlot::SExt,  "MIR SExt");
+            case MirOpcode::Trunc:
+                // D-CSUBSET-CHAR-INT-WIDENING (int→char direction): a Trunc
+                // whose RESULT is `char` keys on `registerOpWidthFlags` (the
+                // promoted width-32 `mov r32,r32` — keeps the low 32 bits,
+                // the low byte being the char), NOT the byte-exact result
+                // width (there is no 8-bit trunc form; the char is consumed
+                // low-bits-only). Every wider Trunc (I64→I32) is unchanged.
+                return lowerCast(id, MnemonicSlot::Trunc, "MIR Trunc",
+                                 registerOpWidthFlags(mir.instType(id)));
+            case MirOpcode::SExt: {
+                // Like ZExt, the encoded SExt form is selected by the SOURCE
+                // type's width (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): an I32 source
+                // → the movsxd/SXTW 32-bit form; a Char source → the byte form
+                // (movsx r32,r/m8 / sxtb). The width axis rides the same LirInst flag.
+                auto const sextOps = mir.instOperands(id);
+                std::uint8_t const srcWidthFlags = (sextOps.size() == 1)
+                    ? widthFlagsForType(mir.instType(sextOps[0]))
+                    : 0;
+                return lowerCast(id, MnemonicSlot::SExt, "MIR SExt", srcWidthFlags);
+            }
             case MirOpcode::ZExt: {
                 // FC3.5 sweep-c1 (D-CSUBSET-ZEXT-32-TO-64): zext is
                 // the ONE conversion whose encoded form is selected by
@@ -1268,8 +1342,14 @@ struct Lowerer {
         // 4-byte immediate by construction — routing it to the
         // LiteralPool dead end (no encoder consumes LiteralIndex) was
         // a 64-bit-era artifact of the int32-signed range check.
+        // `registerOpWidthFlags` (not the byte-exact `widthFlagsForType`):
+        // a char-TYPED constant materializes through the width-32 mov-imm
+        // form (the value zero-extends into the full register; the low byte
+        // IS the char) — there is no 8-bit mov-imm form, and a char value
+        // is consumed low-bits-only (a later byte STORE / SExt re-reads the
+        // low byte). D-CSUBSET-CHAR-STRING-VALUE-CODEGEN.
         std::uint8_t const constWidthFlags =
-            widthFlagsForType(mir.instType(id));
+            registerOpWidthFlags(mir.instType(id));
         bool const is32Typed = constWidthFlags != 0;
 
         // ── narrow integer path: inline ImmInt32 ──
@@ -1409,9 +1489,13 @@ struct Lowerer {
                 poisonValue(id);
                 return;
             }
-            std::uint8_t const loadWidthFlags = (cls == LirRegClass::FPR)
-                ? widthFlagsForType(mir.instType(id))
-                : 0;
+            // Byte-EXACT for a Char load (D-CSUBSET-CHAR-STRING-VALUE-
+            // CODEGEN) exactly as the generic path below — a folded
+            // [rip+sym] load of a 1-byte item must read 1 byte, not 8.
+            // memAccessWidthFlags == the old FPR-width / GPR-0 ternary for
+            // every non-Char type, so this is byte-identical pre-char.
+            std::uint8_t const loadWidthFlags =
+                memAccessWidthFlags(mir.instType(id), cls);
             SymbolId const sym = mir.globalAddrSymbol(operands[0]);
             LirReg const result = lir.newVReg(cls);
             std::array<LirOperand, 1> ops{LirOperand::makeSymbolRef(sym.v)};
@@ -1442,9 +1526,8 @@ struct Lowerer {
             poisonValue(id);
             return;
         }
-        std::uint8_t const loadWidthFlags = (cls == LirRegClass::FPR)
-            ? widthFlagsForType(mir.instType(id))
-            : 0;
+        std::uint8_t const loadWidthFlags =
+            memAccessWidthFlags(mir.instType(id), cls);
         LirReg const result = lir.newVReg(cls);
         std::array<LirOperand, 3> ops{
             LirOperand::makeReg(*base),
@@ -1474,9 +1557,8 @@ struct Lowerer {
             reportMissingClassOp(cls, RegClassOp::Store, "MIR Store");
             return;
         }
-        std::uint8_t const storeWidthFlags = (cls == LirRegClass::FPR)
-            ? widthFlagsForType(mir.instType(operands[0]))
-            : 0;
+        std::uint8_t const storeWidthFlags =
+            memAccessWidthFlags(mir.instType(operands[0]), cls);
         std::array<LirOperand, 4> ops{
             LirOperand::makeReg(*value),
             LirOperand::makeReg(*base),
@@ -1658,9 +1740,12 @@ struct Lowerer {
         if (!loadOp.has_value()) return false;  // lowerLoad fails loud
         auto const* info = target.opcodeInfo(*loadOp);
         if (info == nullptr) return false;
-        std::uint8_t const loadWidthFlags = (cls == LirRegClass::FPR)
-            ? widthFlagsForType(mir.instType(user))
-            : 0;
+        // SAME width derivation the fold EMIT (`lowerLoad`) uses, so the
+        // predicate and the emit can never disagree (a Char load probes —
+        // and would fold to — the byte-width symbol variant). Byte-
+        // identical to the old FPR-width / GPR-0 ternary for non-Char.
+        std::uint8_t const loadWidthFlags =
+            memAccessWidthFlags(mir.instType(user), cls);
         std::uint8_t const widthBits = lirInstWidthBits(loadWidthFlags);
         for (auto const& v : info->encoding.variants) {
             if (v.operandKinds.size() == 1
@@ -1954,9 +2039,12 @@ struct Lowerer {
             return;
         }
         // FC3.5 c2: FPR width-exact like lowerLoad.
-        std::uint8_t const extWidthFlags = (cls == LirRegClass::FPR)
-            ? widthFlagsForType(mir.instType(id))
-            : 0;
+        // Byte-EXACT for a Char first-field (D-CSUBSET-CHAR-STRING-VALUE-
+        // CODEGEN) exactly as lowerLoad — extracting a 1-byte field must
+        // read 1 byte. memAccessWidthFlags == the old FPR-width / GPR-0
+        // ternary for every non-Char type (byte-identical pre-char).
+        std::uint8_t const extWidthFlags =
+            memAccessWidthFlags(mir.instType(id), cls);
         LirReg const result = lir.newVReg(cls);
         std::array<LirOperand, 3> ops{
             LirOperand::makeReg(*base),
@@ -1996,9 +2084,13 @@ struct Lowerer {
             reportMissingClassOp(cls, RegClassOp::Store, "MIR InsertValue");
             return;
         }
-        std::uint8_t const insWidthFlags = (cls == LirRegClass::FPR)
-            ? widthFlagsForType(mir.instType(operands[1]))
-            : 0;
+        // Byte-EXACT for a Char first-field store (D-CSUBSET-CHAR-STRING-
+        // VALUE-CODEGEN) exactly as lowerStore — inserting a 1-byte field
+        // must write 1 byte, not clobber 7 neighbours. memAccessWidthFlags
+        // == the old FPR-width / GPR-0 ternary for non-Char (byte-identical
+        // pre-char).
+        std::uint8_t const insWidthFlags =
+            memAccessWidthFlags(mir.instType(operands[1]), cls);
         std::array<LirOperand, 4> ops{
             LirOperand::makeReg(*value),
             LirOperand::makeReg(*base),

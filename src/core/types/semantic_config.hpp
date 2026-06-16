@@ -832,6 +832,13 @@ struct DSS_EXPORT LiteralTypeMapping {
     // map a keyword token to a fixed-value literal of any core (`true` →
     // Bool 1, a future `nil` → Ptr 0, …) with zero engine vocabulary.
     std::optional<std::int64_t> fixedValue;
+    // String-literal rows (C 6.4.5): a string literal's type is `Array<core, N+1>`
+    // where N is the decoded body length (per-occurrence, so NOT a fixed interned
+    // TypeId like the other rows). When `stringArray` is set, `core` is the ELEMENT
+    // type (e.g. Char) and the consumer builds the array per occurrence by decoding
+    // the token text — it is NOT placed in the fixed `literalTypeIds` map. Zero
+    // engine vocabulary: any language declaring a string body token gets it.
+    bool stringArray = false;
 };
 
 // ── FC4 c1: parameter-list conventions (`semantics.parameters`) ──
@@ -1082,6 +1089,13 @@ struct DSS_EXPORT SemanticConfig {
         bool nullPointerConstantFromIntegerZero = false;
     };
     PointerConversionRules pointerConversions;
+
+    // C 6.3.1.1: `char` is an integer type. Read by `isAssignable`'s char arm, which
+    // admits BOTH directions of the char↔integer conversion — int→char (`char x='c';`,
+    // narrowing) and char→int (`int y=c;`, widening; codegen materializes the Char→int
+    // SExt). Default false → a non-C schema (toy/tsql) keeps `Char` strictly distinct
+    // from the integer ranks. Required by the char-literal typing AND char value use.
+    bool charConvertsToArith = false;
 
     // Two orthogonal per-language alias-analysis opt-ins, both threaded
     // through `MirLoweringConfig` → `Mir` and read by CSE/LICM Load

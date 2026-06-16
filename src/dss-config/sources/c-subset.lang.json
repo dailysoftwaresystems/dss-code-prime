@@ -1117,11 +1117,15 @@
     ],
     "$literalTypesComment": "FC3 c1: IntLiteral's I32 is the BASE core; the integerLiteralTyping ladder below refines the width by magnitude/suffix/radix per C 6.4.4.1. FloatLiteral's F64 is the BASE core; the floatLiteralTyping suffix map below refines it per C 6.4.4.2 (FC3.5 sweep-c2 / D-CSUBSET-F32-CODEGEN closure: `1.5f` now types F32 — the F32 arithmetic surface shipped, so the typing flip pairs with real codegen). true/false are C23 keyword literals: type Bool with config-declared FIXED values (1/0) — the engine never decodes their text as a number.",
     "literalTypes": [
-      { "literal": "IntLiteral",   "core": "I32" },
-      { "literal": "FloatLiteral", "core": "F64" },
-      { "literal": "TrueKeyword",  "core": "Bool", "value": 1 },
-      { "literal": "FalseKeyword", "core": "Bool", "value": 0 }
+      { "literal": "IntLiteral",    "core": "I32" },
+      { "literal": "FloatLiteral",  "core": "F64" },
+      { "literal": "TrueKeyword",   "core": "Bool", "value": 1 },
+      { "literal": "FalseKeyword",  "core": "Bool", "value": 0 },
+      { "literal": "CharLiteral",   "core": "I32" },
+      { "literal": "StringLiteral", "core": "Char", "stringArray": true }
     ],
+    "$charStringLiteralComment": "C 6.4.4.4: a character constant has type `int` (so sizeof('c')==4, NOT 1) — CharLiteral→I32. C 6.4.5: a string literal has type char[N+1] — StringLiteral declares stringArray:true with element core Char, so the engine builds Array<Char, decodedLen+1> per occurrence (the HIR value path independently lowers the same Array<Char,N+1> via the shared char_decode). charConvertsToArith (below) admits the C char<->int implicit conversion in BOTH directions: int->char (`char x='c';`) and char->int widening (`int y=c;`; codegen materializes the Char->int SExt). Pinned by CharParamReturnedAsIntIsClean + the char_value corpus.",
+    "charConvertsToArith": true,
     "$floatLiteralTypingComment": "FC3.5 sweep-c2: C 6.4.4.2 — a floating constant's type is keyed by its SUFFIX alone (unsuffixed -> double, f/F -> float). Type names resolve through typeSpecifiers/builtinTypes at LOAD time like the integer ladder's candidates. The loader cross-checks every numberStyle.floatSuffixes spelling is covered exactly once + an unsuffixed rule exists. C's l/L long-double suffix is NOT declared in floatSuffixes (pre-existing FC1c2 note) — long double lands with its own width story, not here.",
     "floatLiteralTyping": [
       { "suffixes": [],         "type": "double" },

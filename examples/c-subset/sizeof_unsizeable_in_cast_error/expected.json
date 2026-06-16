@@ -1,0 +1,11 @@
+{
+  "$comment": "R1 crash-fix red-on-disable. A malformed string escape leaves the sizeof operand InvalidType; the enclosing cast must fail loud with exactly one H_UnsupportedLoweringForKind (the sizeof, 9:17), NOT crash. Pre-fix the cast called interner.kind() on the InvalidType operand → `TypeInterner::get: TypeId out of range` abort. Revert the lowerCast `if (!operand.type.valid()) return operand;` guard and this aborts instead of emitting the diagnostic, so the runner no longer finds the expected set.",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "H_UnsupportedLoweringForKind", "line": 9, "col": 17 }
+  ]
+}

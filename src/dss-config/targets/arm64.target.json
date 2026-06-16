@@ -620,8 +620,18 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg"] },
+            "$comment": "width 32: SXTW Xd, Wn (SBFM Xd,Xn,#0,#31 = 0x93407C00) — I32→I64. Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one. The MIR→LIR SExt arm threads widthFlagsForType(source): an I32 source → width 32 → here.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "fixedWord": 2470476800 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): SXTB Xd, Wn = SBFM Xd, Xn, #0, #7 — sign-extend the low BYTE to 64 bits (the x86_64 `movsx r64,r/m8` peer). Word 0x93401C00 = the SXTW word with imms 31→7 (bits 15:10): sf=1 | opc=00 | 100110 | N=1 | immr=0 | imms=7 | Rn | Rd (ARM ARM C6.2.* SBFM/SXTB). Selected when the SExt source type is Char (width 8 on the LIR inst) — the char→int widening. Reads exactly the low byte (the char), so the source register's upper bits (zero-extended by the LDURB byte load) are irrelevant.",
+            "guard":      { "operandKinds": ["reg"], "width": 8 },
+            "template":   { "fixedWord": 2470452224 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }
@@ -736,8 +746,20 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "$comment": "width 64: LDUR Xt, [Xn, #simm9] (0xF8400000). Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one. Every GPR integer/pointer load carries width 64 (memAccessWidthFlags returns 0 ⇒ width 64 for non-Char GPR types).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
             "template":   { "fixedWord": 4164943872 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm9"           }
+            ]
+          },
+          {
+            "$comment": "width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): LDURB Wt, [Xn, #simm9] (0x38400000 — the LDUR word with size 11→00). Loads ONE byte, ZERO-extending it into Wt (and a W-write zeroes bits 63:32 of Xt) — a char/byte memory access MUST be byte-EXACT, a 64-bit LDUR of a 1-byte string/array element reads 7 bytes past it. ZERO-extend is the signedness-AGNOSTIC byte fetch (the x86_64 movzx peer); sign semantics live in the following SXTB cast (char→int), which re-reads the low byte. Same operand layout as the 64-bit form. Selected when the Load's result type is Char (width 8 via memAccessWidthFlags).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "template":   { "fixedWord": 943718400 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn"             },
@@ -761,8 +783,20 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "$comment": "width 64: STUR Xt, [Xn, #simm9] (0xF8000000). Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one. Every GPR integer/pointer store carries width 64 (memAccessWidthFlags returns 0 ⇒ width 64 for non-Char GPR types).",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "template": { "fixedWord": 4160749568 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm9"           }
+            ]
+          },
+          {
+            "$comment": "width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): STURB Wt, [Xn, #simm9] (0x38000000 — the STUR word with size 11→00). Writes EXACTLY the low byte of Wt — a 64-bit STUR of a 1-byte element clobbers 7 neighbours. Signedness-agnostic (only the low 8 bits are written). Same operand layout as the 64-bit form. Selected when the stored value's type is Char (width 8 via memAccessWidthFlags).",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "fixedWord": 939524096 },
             "wires":    [
               { "index": 0, "slotKind": "rd"             },
               { "index": 1, "slotKind": "rn"             },
@@ -779,7 +813,7 @@
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   1,
-      "maxOperands":   3,
+      "maxOperands":   4,
       "minSuccessors": 0,
       "maxSuccessors": 0,
       "encoding": {
@@ -807,6 +841,18 @@
               { "index": 0, "slotKind": "rn"              },
               { "index": 1, "slotKind": "membase.noscale" },
               { "index": 2, "slotKind": "imm12"           }
+            ]
+          },
+          {
+            "$comment": "BASE+INDEX lea (D-AS4-ARM64-BASE-INDEX-LEA) — `lea Xd, [base + index*1 + 0]` = AArch64 `ADD Xd, Xn, Xm` (shifted-register add, LSL #0). The 4-op form `lowerGep` emits for an indexed pointer access `p[n]` ([base_reg, index_reg, MemBase(scale=1), MemOffset(disp=0)]), MIRRORING x86_64's 4-op SIB lea so the GEP stays target-blind (closing the gap that made `p[n]` fail loud on arm64 for int AND char alike). The GEP emits scale=1 + disp=0 ALWAYS today, so this single ADD is the complete realization: base→Rn (5..9), index→Rm (16..20), result→Rd (0..4); MemBase→membase.noscale (scale MUST be 1, fail-loud) and MemOffset→memoffset.zero (disp MUST be 0 — the register-add form has NO displacement field, and bits 10..21 overlap Rm so an Imm12 wiring would corrupt it; fail-loud on nonzero). Fixed word 0x8B000000 (the ADD reg-reg base, shared with `add`'s reg-reg variant). A scale!=1 (typed-array Gep scaling by sizeof(T)) needs the shifted form `ADD Xd,Xn,Xm,LSL #log2(scale)` — a FUTURE consumer (D-AS4-ARM64-INDEXED-LEA-SCALE, co-design with ML6 address-mode synthesis), NOT built speculatively.",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "template":   { "fixedWord": 2332033024 },
+            "resultSlot": "rd",
+            "wires": [
+              { "index": 0, "slotKind": "rn"              },
+              { "index": 1, "slotKind": "rm"              },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "memoffset.zero"  }
             ]
           }
         ]
