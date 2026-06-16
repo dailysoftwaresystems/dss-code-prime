@@ -88,6 +88,20 @@ struct DSS_EXPORT MirLoweringConfig {
     AggregateLayoutParams aggregateLayout{};
     bool                  aggregateLayoutLoaded = false;
     DataModel             dataModel = DataModel::Lp64;
+
+    // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the active CC's by-value aggregate
+    // classification strategy + max-register-bytes, threaded from the resolved
+    // `TargetCallingConvention` (the §B-locked HIR→MIR boundary, mirroring how
+    // `dataModel` is threaded). `aggregateClassification == None` (default) ⇒ the
+    // by-value guard stays FAIL-LOUD (no CC / unsupported strategy). When the
+    // strategy is implemented (`aggregateAbiImplemented`), HIR→MIR classifies a
+    // struct arg/return via the `aggregate_abi` engine and synthesizes pieces /
+    // a hidden sret pointer. `aggregateSretViaHiddenArg` = the CC has NO
+    // indirect-result register (SysV/Win64 ⇒ sret ptr is a hidden first INTEGER
+    // arg; AAPCS64's x8 path is false, C3).
+    AggregateClassKind aggregateClassification   = AggregateClassKind::None;
+    std::uint16_t      aggregateMaxRegBytes       = 0;
+    bool               aggregateSretViaHiddenArg  = true;
 };
 
 // Lower the frozen `hir` module to MIR. `literals` is the HirLiteralPool

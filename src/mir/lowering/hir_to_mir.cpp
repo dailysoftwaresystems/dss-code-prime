@@ -1,5 +1,6 @@
 #include "mir/lowering/hir_to_mir.hpp"
 
+#include "core/types/aggregate_abi.hpp"
 #include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
@@ -556,23 +557,67 @@ struct Lowerer {
                         return InvalidMirInst;
                     }
                 }
+                // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): resolve whether the
+                // callee is variadic (through one Ptr wrapper) BEFORE lowering
+                // args, so a by-value struct ARG to a variadic function is
+                // fail-loud this phase (its register-piece expansion would
+                // desync the prefix-sum Arg-ordinal accounting from variadic
+                // marshalling — FC12). The callPayload block below recomputes
+                // this for the variadic-count stamp; kept separate to avoid
+                // perturbing that audited path.
+                TypeId byvalCalleeSig = hir.typeId(kids[0]);
+                if (byvalCalleeSig.valid()
+                    && interner.kind(byvalCalleeSig) == TypeKind::Ptr) {
+                    auto const w = interner.operands(byvalCalleeSig);
+                    if (!w.empty()) byvalCalleeSig = w[0];
+                }
+                bool const calleeVariadic =
+                    byvalCalleeSig.valid()
+                    && interner.kind(byvalCalleeSig) == TypeKind::FnSig
+                    && interner.fnIsVariadic(byvalCalleeSig);
                 for (std::size_t i = 1; i < kids.size(); ++i) {
-                    // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): a struct/union
-                    // ARG by value needs per-ABI eightbyte/HFA classification
-                    // (SysV/AAPCS64/MS-x64 — Phase 2). Until then fail LOUD
-                    // rather than silently pass a pointer (which diverges
-                    // from C by-value-copy semantics and miscompiles a
-                    // mutated or register-classified struct).
                     TypeId const argTy = hir.typeId(kids[i]);
                     if (argTy.valid()) {
                         TypeKind const ak = interner.kind(argTy);
                         if (ak == TypeKind::Struct || ak == TypeKind::Union) {
-                            unsupported(kids[i],
-                                "passing a struct/union BY VALUE is not yet "
-                                "supported (per-ABI classification — "
-                                "D-FC7-STRUCT-BY-VALUE-ARG-RETURN); pass a "
-                                "pointer to it instead");
-                            return InvalidMirInst;
+                            // Classify + synthesize the by-value struct arg into
+                            // register pieces / a by-ref pointer. Variadic or an
+                            // unimplemented CC strategy ⇒ fail loud (never a
+                            // silent wrong-ABI pass).
+                            if (calleeVariadic) {
+                                unsupported(kids[i],
+                                    "passing a struct/union BY VALUE to a "
+                                    "variadic function is not yet supported "
+                                    "(D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                                return InvalidMirInst;
+                            }
+                            auto const abi = byValueClassify(argTy);
+                            if (!abi.has_value()) {
+                                unsupported(kids[i],
+                                    "passing a struct/union BY VALUE is not "
+                                    "supported by this target's calling "
+                                    "convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                                return InvalidMirInst;
+                            }
+                            // C1a: a 2-eightbyte (9–16 byte) struct passed IN
+                            // REGISTERS expands to >1 register Arg, which the MIR
+                            // Arg/verifier (one-Arg-per-param) can't yet represent
+                            // — fail loud until the multi-register Arg extension
+                            // (D-FC7-SYSV-STRUCT-ARG-MULTIREG). Single-register
+                            // (≤8B) and by-reference (>16B) need only one Arg and
+                            // work now.
+                            if (abi->kind == AbiPassing::Kind::InRegisters
+                                && abi->pieces.size() > 1) {
+                                unsupported(kids[i],
+                                    "passing a 9–16 byte struct/union BY VALUE in "
+                                    "registers needs the multi-register MIR Arg "
+                                    "extension (D-FC7-SYSV-STRUCT-ARG-MULTIREG); "
+                                    "pass a pointer instead for now");
+                                return InvalidMirInst;
+                            }
+                            if (!appendByValueArg(operands, kids[i], argTy, *abi))
+                                return InvalidMirInst;
+                            continue;
                         }
                     }
                     MirInstId const arg = lowerExpr(kids[i]);
@@ -1573,6 +1618,122 @@ struct Lowerer {
         return true;
     }
 
+    // ── FC7 by-value aggregate ABI synthesis (D-FC7-STRUCT-BY-VALUE-ARG-RETURN) ──
+    // §B-locked at HIR→MIR: a struct/union passed BY VALUE is classified via the
+    // `aggregate_abi` engine and synthesized into scalar register pieces (each an
+    // ordinary I64/F64 MIR arg the UNCHANGED callconv places by class) or a
+    // by-reference pointer; the callee reconstructs into the param's frame slot.
+    // Both sides derive the SAME piece sequence from (type × CC), so the caller's
+    // operand order matches the callee's Arg ordinals by construction. Struct
+    // RETURNS by value stay fail-loud this phase (sret needs the multi-register
+    // MIR Return — D-FC7-SYSV-STRUCT-RETURN-IN-REGS).
+
+    // Classify `aggTy` for by-value passing under the active CC's strategy.
+    // nullopt ⇒ the strategy is not implemented for this CC (the guard then
+    // fails loud) OR the type is un-sizeable.
+    [[nodiscard]] std::optional<AbiPassing> byValueClassify(TypeId aggTy) {
+        if (!config.aggregateLayoutLoaded) return std::nullopt;
+        return classifyAggregate(config.aggregateClassification,
+                                 config.aggregateMaxRegBytes, aggTy, interner,
+                                 config.aggregateLayout, config.dataModel);
+    }
+
+    // The MIR type of an eightbyte register piece: I64 for INTEGER (GPR), F64
+    // for SSE (FPR). The full 8-byte register moves; the byte-exact valid-byte
+    // copy happens at the temp/slot boundary (the register's unused high bytes
+    // are ABI-undefined). The piece's register CLASS follows from this type.
+    [[nodiscard]] TypeId pieceType(AbiPieceClass cls) {
+        return interner.primitive(cls == AbiPieceClass::Gpr ? TypeKind::I64
+                                                            : TypeKind::F64);
+    }
+
+    // An anonymous frame temp sized to hold aggregate `aggTy` (lir_callconv
+    // rounds the slot to a 16-byte multiple, so a full-eightbyte load/store can
+    // never over-run it). InvalidMirInst on an un-sizeable type.
+    [[nodiscard]] MirInstId freshAggregateTemp(TypeId aggTy) {
+        auto const sz = aggregateByteSize(aggTy);
+        if (!sz.has_value()
+            || *sz > std::numeric_limits<std::uint32_t>::max())
+            return InvalidMirInst;
+        return mir.addInst(MirOpcode::Alloca, {}, interner.pointer(aggTy),
+                           static_cast<std::uint32_t>(*sz));
+    }
+
+    // Append a by-value struct/union ARG (`argNode` of type `aggTy`, classified
+    // `abi`) to a Call's `operands`. InRegisters ⇒ copy the struct into an
+    // eightbyte-rounded temp (so a full-eightbyte load can't over-read a
+    // non-padded source) and load each eightbyte as an I64/F64 scalar arg.
+    // ByReference ⇒ copy to a temp and pass its address (the callee owns the
+    // copy → by-value semantics). Returns false (fail-loud already emitted).
+    [[nodiscard]] bool appendByValueArg(std::vector<MirInstId>& operands,
+                                        HirNodeId argNode, TypeId aggTy,
+                                        AbiPassing const& abi) {
+        MirInstId const srcAddr = lowerLvalueAddress(argNode);
+        if (!srcAddr.valid()) return false;
+        StructLayout const* layout = cachedLayout(aggTy);
+        MirInstId const temp = freshAggregateTemp(aggTy);
+        if (layout == nullptr || !temp.valid()) {
+            unsupported(argNode, "by-value aggregate arg requires a sizeable "
+                                 "layout (target 'aggregateLayout' / complete type)");
+            return false;
+        }
+        if (!lowerByteWiseCopy(srcAddr, temp, layout->size)) return false;
+        if (abi.kind == AbiPassing::Kind::ByReference) {
+            operands.push_back(temp);   // a pointer to the callee-owned copy
+            return true;
+        }
+        for (AbiPiece const& p : abi.pieces) {
+            TypeId const pty = pieceType(p.cls);
+            MirInstId const offK =
+                constInt(static_cast<std::int64_t>(p.byteOffset));
+            if (!offK.valid()) return false;
+            std::array<MirInstId, 2> g{temp, offK};
+            MirInstId const gp =
+                mir.addInst(MirOpcode::Gep, g, interner.pointer(pty));
+            if (!gp.valid()) return false;
+            std::array<MirInstId, 1> l{gp};
+            MirInstId const v = mir.addInst(MirOpcode::Load, l, pty);
+            if (!v.valid()) return false;
+            operands.push_back(v);
+        }
+        return true;
+    }
+
+    // Receive a by-value struct/union PARAM into its frame slot, consuming
+    // physical-arg ordinals from the running `argIdx` (kept in lockstep with the
+    // caller's operand order). InRegisters ⇒ one Arg per eightbyte, each stored
+    // into the slot at its offset (the 16-rounded slot absorbs trailing
+    // padding). ByReference ⇒ the incoming pointer to the caller's private copy
+    // IS the param's storage (no re-copy). Returns false (fail-loud emitted).
+    [[nodiscard]] bool receiveByValueParam(SymbolId sym, TypeId aggTy,
+                                           HirNodeId anchor, AbiPassing const& abi,
+                                           std::uint32_t& argIdx) {
+        if (abi.kind == AbiPassing::Kind::ByReference) {
+            MirInstId const ptr =
+                mir.addArg(argIdx++, interner.pointer(aggTy));
+            if (!ptr.valid()) return false;
+            addressableLocal[sym.v] = ptr;   // the caller's copy is the param
+            return true;
+        }
+        MirInstId const slot = allocaForLocal(sym, aggTy, anchor);
+        if (!slot.valid()) return false;
+        for (AbiPiece const& p : abi.pieces) {
+            TypeId const pty = pieceType(p.cls);
+            MirInstId const a = mir.addArg(argIdx++, pty);
+            if (!a.valid()) return false;
+            MirInstId const offK =
+                constInt(static_cast<std::int64_t>(p.byteOffset));
+            if (!offK.valid()) return false;
+            std::array<MirInstId, 2> g{slot, offK};
+            MirInstId const gp =
+                mir.addInst(MirOpcode::Gep, g, interner.pointer(pty));
+            if (!gp.valid()) return false;
+            std::array<MirInstId, 2> st{a, gp};
+            mir.addInst(MirOpcode::Store, st);
+        }
+        return true;
+    }
+
     // Recursively collect into `out` the set of `SymbolId.v`s whose lvalue
     // address is needed somewhere under `node` — i.e. symbols that must be
     // slot-backed rather than pure-SSA. Drives entry-block slot-promotion
@@ -2240,31 +2401,19 @@ struct Lowerer {
                             "count {}", params.size(), paramTypes.size()));
             return false;
         }
-        // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): a function with a BY-VALUE
-        // struct/union parameter or return type needs per-ABI eightbyte/HFA
-        // + sret classification (Phase 2). Fail LOUD at the definition so a
-        // struct param is never silently materialized from a wrong ABI slot
-        // (it would read a register/stack location the caller never filled),
-        // and a struct return never truncates into one return register.
-        for (TypeId const pt : paramTypes) {
-            if (pt.valid()) {
-                TypeKind const pk = interner.kind(pt);
-                if (pk == TypeKind::Struct || pk == TypeKind::Union) {
-                    unsupported(node,
-                        "a by-value struct/union parameter is not yet "
-                        "supported (per-ABI classification — "
-                        "D-FC7-STRUCT-BY-VALUE-ARG-RETURN); take a pointer "
-                        "parameter instead");
-                    return false;
-                }
-            }
-        }
+        // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): a by-value struct/union PARAM
+        // is classified + reconstructed in the param loop below (per the active
+        // CC's strategy, via `receiveByValueParam`). A by-value struct/union
+        // RETURN still needs sret via a multi-register MIR Return
+        // (D-FC7-SYSV-STRUCT-RETURN-IN-REGS) — fail LOUD here this phase rather
+        // than truncate the aggregate into one return register.
         if (TypeId const rt = interner.fnResult(signature); rt.valid()) {
             TypeKind const rk = interner.kind(rt);
             if (rk == TypeKind::Struct || rk == TypeKind::Union) {
                 unsupported(node,
                     "a by-value struct/union return type is not yet supported "
-                    "(per-ABI sret/HFA — D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                    "(sret needs a multi-register return — "
+                    "D-FC7-SYSV-STRUCT-RETURN-IN-REGS)");
                 return false;
             }
         }
@@ -2302,13 +2451,58 @@ struct Lowerer {
         // and store the arg into it — every read of that symbol then goes
         // through `Load(alloca)`. Otherwise the param stays in the pure-SSA
         // `symbolToValue` map.
+        // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): a by-value struct/union param
+        // expands to register pieces (or a by-ref pointer); `argIdx` is the
+        // RUNNING physical-arg ordinal (the prefix-sum over each param's piece
+        // count), kept in lockstep with the caller's operand order. A scalar
+        // param consumes ONE ordinal, so `argIdx == i` for scalar-only functions
+        // (no behaviour change there).
+        std::uint32_t argIdx = 0;
+        bool const fnVariadic = interner.fnIsVariadic(signature);
         for (std::size_t i = 0; i < params.size(); ++i) {
             HirNodeId const p = params[i];
             // A param is a VarDecl whose typeId carries the param's type;
             // verifier already enforced the kind invariant upstream.
             SymbolId const sym = hir.varDeclSymbol(p);
             TypeId const ty = paramTypes[i];
-            MirInstId const arg = mir.addArg(static_cast<std::uint32_t>(i), ty);
+            TypeKind const pk = interner.kind(ty);
+            if (pk == TypeKind::Struct || pk == TypeKind::Union) {
+                if (fnVariadic) {
+                    unsupported(p, "a by-value struct/union parameter in a "
+                                   "variadic function is not yet supported "
+                                   "(D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                auto const abi = byValueClassify(ty);
+                if (!abi.has_value()) {
+                    unsupported(p, "a by-value struct/union parameter is not "
+                                   "supported by this target's calling "
+                                   "convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                // C1a: a 2-eightbyte (9–16 byte) in-register struct param expands
+                // to >1 register Arg, which the MIR Arg/verifier can't yet
+                // represent — fail loud until the multi-register Arg extension
+                // (D-FC7-SYSV-STRUCT-ARG-MULTIREG). Single-register (≤8B) and
+                // by-reference (>16B) need only one Arg and work now.
+                if (abi->kind == AbiPassing::Kind::InRegisters
+                    && abi->pieces.size() > 1) {
+                    unsupported(p, "a 9–16 byte by-value struct/union parameter "
+                                   "in registers needs the multi-register MIR Arg "
+                                   "extension (D-FC7-SYSV-STRUCT-ARG-MULTIREG); "
+                                   "take a pointer parameter instead for now");
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                if (!receiveByValueParam(sym, ty, p, *abi, argIdx)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                continue;
+            }
+            MirInstId const arg = mir.addArg(argIdx++, ty);
             if (addressTaken.contains(sym.v)) {
                 MirInstId const slot = allocaForLocal(sym, ty, p);
                 if (!slot.valid()) {

@@ -282,6 +282,16 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
     mirCfg.aggregateLayout       = target.aggregateLayout();
     mirCfg.aggregateLayoutLoaded = target.aggregateLayoutLoaded();
     mirCfg.dataModel             = format.dataModel();
+    // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the RESOLVED calling
+    // convention's by-value aggregate strategy into HIR→MIR (the §B-locked
+    // boundary). A struct arg/return is classified + synthesized at HIR→MIR; the
+    // sret mechanism follows the CC's indirect-result register (absent ⇒ hidden
+    // first INTEGER arg, SysV/Win64; present ⇒ x8, AAPCS64 — C3).
+    if (auto const* cc = target.callingConvention(callingConventionIndex)) {
+        mirCfg.aggregateClassification  = cc->aggregateClassification;
+        mirCfg.aggregateMaxRegBytes     = cc->aggregateMaxRegBytes;
+        mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
+    }
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,
                           &hir->sourceMap, mirCfg, &ffiMap,

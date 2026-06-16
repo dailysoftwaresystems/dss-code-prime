@@ -67,6 +67,14 @@ struct Lowered {
     if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
         mirCfg.aggregateLayout       = (*t)->aggregateLayout();
         mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+        // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the SysV CC's by-value
+        // params so a struct passed/returned BY VALUE classifies (the sysv_amd64
+        // strategy). Mirrors compile_pipeline.cpp.
+        if (auto const* cc = (*t)->callingConventionByName("sysv_amd64")) {
+            mirCfg.aggregateClassification   = cc->aggregateClassification;
+            mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
+            mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
+        }
     }
     // D-CSUBSET-LINKAGE-SPECIFIERS: thread the native-decl linkage side-table
     // exactly as compile_pipeline.cpp does — so `static`/`__attribute__` source
@@ -2046,6 +2054,97 @@ TEST(MirLoweringCSubset, StructWithArrayFieldCopyIsByteWise) {
         EXPECT_EQ(interner.kind(m.instType(ix)), TypeKind::I64)
             << "16-byte struct-with-array-field copies as two I64 chunks";
     }
+}
+
+// FC7 C1a (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): an 8-byte struct param passed BY
+// VALUE under SysV is ONE eightbyte → the CALLEE receives a SINGLE I64 register
+// `Arg` (not a struct value) and stores it into the param's frame slot; the body
+// reads the fields from the slot. (The 2-eightbyte case is fail-loud,
+// D-FC7-SYSV-STRUCT-ARG-MULTIREG.)
+TEST(MirLoweringCSubset, SysVStructByValueParamReceivesOneRegisterPiece) {
+    auto L = lowerCSubset(
+        "struct Pair { int x; int y; };\n"
+        "int sum(struct Pair p) { return p.x + p.y; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Arg), 1u)
+        << "exactly one register Arg for the single-eightbyte struct param";
+    EXPECT_GE(countOpcode(ops, MirOpcode::Alloca), 1u)
+        << "the param is reconstructed into a frame slot (Alloca precedes the Arg)";
+    // The single Arg is an I64 register piece (the eightbyte), NOT a struct value.
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto const n = m.blockInstCount(entry);
+    bool sawArg = false;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Arg) continue;
+        sawArg = true;
+        EXPECT_EQ(interner.kind(m.instType(ix)), TypeKind::I64)
+            << "the 8-byte struct param arrives as ONE I64 register piece";
+    }
+    EXPECT_TRUE(sawArg);
+}
+
+// FC7 C1a: the CALLER copies the 8-byte struct arg to a temp, loads the ONE
+// eightbyte as an I64, and passes THAT scalar as the Call operand (not the
+// struct value). So `sum(p)`'s Call carries [callee, <I64 piece>].
+TEST(MirLoweringCSubset, SysVStructByValueCallPassesOneRegisterPiece) {
+    auto L = lowerCSubset(
+        "struct Pair { int x; int y; };\n"
+        "int sum(struct Pair p) { return p.x + p.y; }\n"
+        "int f(void) { struct Pair p; p.x = 1; p.y = 2; return sum(p); }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    // f is the second function; find its Call and check the arg operand.
+    MirBlockId const entry = m.funcEntry(m.funcAt(1));
+    auto const n = m.blockInstCount(entry);
+    bool sawCall = false;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Call) continue;
+        sawCall = true;
+        auto cops = m.instOperands(ix);
+        ASSERT_EQ(cops.size(), 2u) << "[callee, one I64 piece]";
+        EXPECT_EQ(interner.kind(m.instType(cops[1])), TypeKind::I64)
+            << "the struct arg is passed as ONE I64 register piece, not a struct";
+    }
+    EXPECT_TRUE(sawCall);
+}
+
+// FC7 C1a: a >16-byte struct param passed BY REFERENCE arrives as ONE POINTER
+// Arg (to the caller's private copy); the callee binds the param's address to it
+// directly (no piece reconstruction, no slot copy). The always-on structural
+// guard for the by-ref path — the runtime corpus runs on linux-x86_64 only.
+TEST(MirLoweringCSubset, SysVByRefStructParamReceivesOnePointerArg) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"
+        "long pick(struct Big b) { return b.c; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Arg), 1u)
+        << "one POINTER Arg for the by-reference (>16B) struct param";
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto const n = m.blockInstCount(entry);
+    bool sawArg = false;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Arg) continue;
+        sawArg = true;
+        EXPECT_EQ(interner.kind(m.instType(ix)), TypeKind::Ptr)
+            << "the >16-byte struct param arrives as a pointer to the caller's copy";
+    }
+    EXPECT_TRUE(sawArg);
 }
 
 // ML3 end-to-end: ML2-lowered MIR for a representative c-subset

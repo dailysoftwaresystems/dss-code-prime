@@ -23,6 +23,7 @@ add_library(core OBJECT
     types/type_lattice/type_lattice.cpp
     types/type_lattice/type_layout.cpp
     types/type_lattice/type_reintern.cpp
+    types/aggregate_abi.cpp
 
     # ── crypto/ — self-contained hashing primitives (codesign foundation) ──
     crypto/sha256.cpp

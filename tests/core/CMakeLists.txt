@@ -54,3 +54,4 @@ dss_add_test(NAME core/type_lattice/test_type_interner SOURCES type_lattice/test
 dss_add_test(NAME core/type_lattice/test_type_registry SOURCES type_lattice/test_type_registry.cpp)
 dss_add_test(NAME core/type_lattice/test_type_reintern SOURCES type_lattice/test_type_reintern.cpp)
 dss_add_test(NAME core/test_type_layout                SOURCES test_type_layout.cpp)
+dss_add_test(NAME core/test_aggregate_abi              SOURCES test_aggregate_abi.cpp)

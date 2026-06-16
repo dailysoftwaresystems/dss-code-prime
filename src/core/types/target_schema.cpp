@@ -1123,6 +1123,12 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             std::span<std::string const> spRefs{&cc.stackPointer->name, 1};
             checkRefs(i, "stackPointer", spRefs, TargetRegClass::GPR);
         }
+        // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the sret indirect-result
+        // register (AAPCS64 x8), when declared, must resolve to a GPR.
+        if (cc.indirectResultRegister.has_value()) {
+            std::span<std::string const> irRefs{&cc.indirectResultRegister->name, 1};
+            checkRefs(i, "indirectResultRegister", irRefs, TargetRegClass::GPR);
+        }
 
         // Stack alignment must be a power of two when ANY ABI field is
         // set (since the call frame is meaningless without it). Zero is

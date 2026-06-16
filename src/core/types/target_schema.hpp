@@ -386,6 +386,9 @@ struct DSS_EXPORT TargetRegisterClassOps {
 // driver flag. The `argGprs` / `argFprs` ordering is significant — the
 // caller must place int args in those registers in that order, spilling
 // to the stack when the register set is exhausted.
+// (FC7 `AggregateClassKind` — the by-value classification strategy enum — lives
+// in `aggregate_layout.hpp`, included above, so the lattice/lowering speak it
+// without the link/target substrate.)
 struct DSS_EXPORT TargetCallingConvention {
     std::string name;                     // "sysv_amd64" / "ms_x64" / ...
     std::vector<std::string> argGprs;     // arg-passing integer registers, in order
@@ -509,6 +512,20 @@ struct DSS_EXPORT TargetCallingConvention {
     // the two shapes; only mixed-class 5+ arg calls diverge.
     bool slotAligned = false;
 
+    // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the
+    // classification STRATEGY for a struct/union passed/returned by value.
+    // A closed enum (the `aggregate_abi` classifier switches on it, never on
+    // identity). `None` (default) ⇒ this CC fails loud on a by-value
+    // aggregate (un-built). x86_64 SysV = SysVEightbyte (C1); Win64 / AAPCS64
+    // flip on in C2 / C3.
+    AggregateClassKind aggregateClassification = AggregateClassKind::None;
+
+    // The max aggregate SIZE (bytes) this CC passes/returns in registers;
+    // larger ⇒ MEMORY (by-reference args / sret returns). SysV = 16 (two
+    // eightbytes); Win64 = 8; AAPCS64 = 16. 0 ⇒ unused (strategy = None).
+    // Consumed only by the `aggregate_abi` classifier.
+    std::uint16_t aggregateMaxRegBytes = 0;
+
     // Named register reference. Used for distinguished-role registers
     // (link register, stack pointer, frame pointer in future cycles).
     // The struct shape co-locates the JSON-side `name` (kept for
@@ -550,6 +567,15 @@ struct DSS_EXPORT TargetCallingConvention {
     // [fixedArgCount..N) and emits a `mov <reg>, <count>` before
     // the call instruction.
     std::optional<NamedRegisterRef> variadicVectorCountReg;
+
+    // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the
+    // register that carries a struct-return HIDDEN POINTER (sret) when
+    // ENGAGED — AAPCS64/Apple's x8 indirect-result-location register, which
+    // does NOT consume a normal arg slot (x0..x7 stay free for real args).
+    // ABSENT (SysV / Win64) ⇒ the sret pointer is a HIDDEN FIRST INTEGER ARG
+    // (consuming argGprs[0]) returned in returnGprs[0]. This one field selects
+    // between the two sret mechanisms agnostically — no per-CC branch.
+    std::optional<NamedRegisterRef> indirectResultRegister;
 };
 
 // Discriminates the byte-encoding shape an opcode commits to (plan 13
