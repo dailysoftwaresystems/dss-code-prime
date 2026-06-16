@@ -1,0 +1,21 @@
+{
+  "$comment": "Indexed char byte memory (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): runtime-index byte STORE `q[n]=66` (x86 mov [base+idx*1],r8) + indexed byte LOAD `q[n]` (movzx), through (char*)&int writable stack memory. 66 + 65 = 131. x86_64 ONLY — arm64's lea is symbol-form-only, a pre-existing gap blocking all indexed pointer arithmetic (int and char alike), so the indexed forms have no arm64 realization to exercise; the non-indexed char forms cover arm64 in char_value. The optimizedPipelines arm keeps `n` a runtime value (no const-fold of the index).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 131,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}

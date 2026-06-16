@@ -37,6 +37,7 @@ using namespace dss;
 namespace {
 
 constexpr std::uint8_t kW32 = kLirInstFlagWidth32;
+constexpr std::uint8_t kW8  = kLirInstFlagWidth8;
 
 [[nodiscard]] std::vector<std::uint8_t>
 assembleFirstFn(Lir const& lir, TargetSchema const& schema,
@@ -514,12 +515,16 @@ TEST(WidthAxisArm64, SxtwAndTruncWords) {
     auto const x0 = gpr(*schema, "x0");
     auto const x1 = gpr(*schema, "x1");
     {
-        // SXTW X0, W1 = SBFM X0, X1, #0, #31 = 0x93407C20 (the NEW
-        // arm64 `sext` opcode; source on Rn).
+        // SXTW X0, W1 = SBFM X0, X1, #0, #31 = 0x93407C20 (the arm64
+        // `sext` opcode; source on Rn). Width-keyed 32 since the byte
+        // form (SXTB) was added (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN) —
+        // the I32-source SExt threads width-32 exactly as MIR→LIR does
+        // (widthFlagsForType(I32)); the byte-source form is width-8.
         DiagnosticReporter rep;
         auto bytes = buildAndAssembleArm(*schema, rep, [&](LirBuilder& b) {
             LirOperand const ops[] = {LirOperand::makeReg(x1)};
-            (void)b.addInst(*schema->opcodeByMnemonic("sext"), x0, ops);
+            (void)b.addInst(*schema->opcodeByMnemonic("sext"), x0, ops,
+                            /*payload=*/0, kW32);
         });
         EXPECT_EQ(rep.errorCount(), 0u);
         EXPECT_EQ(firstInstWord(bytes), 0x93407C20u);
@@ -535,6 +540,112 @@ TEST(WidthAxisArm64, SxtwAndTruncWords) {
         });
         EXPECT_EQ(rep.errorCount(), 0u);
         EXPECT_EQ(firstInstWord(bytes), 0x2A0103E0u);
+    }
+}
+
+// ── D-CSUBSET-CHAR-STRING-VALUE-CODEGEN: the `char` BYTE memory/widen
+//    forms, byte-exact. These pin the EXACT encoding bytes (the flag →
+//    bytes tier) for the width-8 load/store/sext variants — a regression
+//    in a `.target.json` fixedWord/opcode surfaces here as a precise byte
+//    mismatch, not only as a runtime exit-code drift in the corpus. ─────
+
+TEST(WidthAxisX86, CharByteFormsEmitMovzxByteStoreAndMovsx) {
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const rax = gpr(*schema, "rax");
+    auto const rcx = gpr(*schema, "rcx");
+    {
+        // BYTE LOAD: movzx rcx, byte [rax+8] = REX.W 0F B6 /r; ModRM
+        // mod=10 reg=rcx(1) rm=rax(0) = 0x88; disp32 = 08 00 00 00.
+        DiagnosticReporter rep;
+        auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(rax),
+                                      LirOperand::makeMemBase(1),
+                                      LirOperand::makeMemOffset(8)};
+            (void)b.addInst(*schema->opcodeByMnemonic("load"), rcx, ops,
+                            /*payload=*/0, kW8);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        expectPrefix(bytes, {0x48, 0x0F, 0xB6, 0x88, 0x08, 0x00, 0x00, 0x00});
+    }
+    {
+        // BYTE STORE: mov byte [rax+8], cl = 0x88 /r with a FORCED REX
+        // (0x40 — no W/R/B for rcx/rax) so the value reg is the proper
+        // low byte (cl), never the ah/ch/dh/bh alias; ModRM mod=10
+        // reg=rcx(1) rm=rax(0) = 0x88; disp32.
+        DiagnosticReporter rep;
+        auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(rcx),   // value
+                                      LirOperand::makeReg(rax),   // base
+                                      LirOperand::makeMemBase(1),
+                                      LirOperand::makeMemOffset(8)};
+            (void)b.addInst(*schema->opcodeByMnemonic("store"),
+                            InvalidLirReg, ops, /*payload=*/0, kW8);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        expectPrefix(bytes, {0x40, 0x88, 0x88, 0x08, 0x00, 0x00, 0x00});
+    }
+    {
+        // BYTE SEXT: movsx rax, al = REX.W 0F BE /r; ModRM mod=11
+        // reg=rax(0) rm=rax(0) = 0xC0 (sign-extend the low byte → r64).
+        DiagnosticReporter rep;
+        auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(rax)};
+            (void)b.addInst(*schema->opcodeByMnemonic("sext"), rax, ops,
+                            /*payload=*/0, kW8);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        expectPrefix(bytes, {0x48, 0x0F, 0xBE, 0xC0});
+    }
+}
+
+TEST(WidthAxisArm64, CharByteFormsEmitSxtbLdurbSturb) {
+    auto schema = loadArm();
+    ASSERT_NE(schema, nullptr);
+    auto const x0 = gpr(*schema, "x0");
+    auto const x1 = gpr(*schema, "x1");
+    {
+        // SXTB X0, W1 = SBFM X0, X1, #0, #7 = 0x93401C00 | Rn(x1=1)<<5
+        // = 0x93401C20 (the SXTW word with imms 31→7; source on Rn).
+        DiagnosticReporter rep;
+        auto bytes = buildAndAssembleArm(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(x1)};
+            (void)b.addInst(*schema->opcodeByMnemonic("sext"), x0, ops,
+                            /*payload=*/0, kW8);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_EQ(firstInstWord(bytes), 0x93401C20u);
+    }
+    {
+        // LDURB W1, [X0, #8] = 0x38400000 | imm9(8)<<12 | Rn(x0=0)<<5
+        // | Rt(x1=1) = 0x38408001 (size=00 byte, opc=01 load — zero-
+        // extends into W1).
+        DiagnosticReporter rep;
+        auto bytes = buildAndAssembleArm(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(x0),
+                                      LirOperand::makeMemBase(1),
+                                      LirOperand::makeMemOffset(8)};
+            (void)b.addInst(*schema->opcodeByMnemonic("load"), x1, ops,
+                            /*payload=*/0, kW8);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_EQ(firstInstWord(bytes), 0x38408001u);
+    }
+    {
+        // STURB W1, [X0, #8] = 0x38000000 | imm9(8)<<12 | Rn(x0=0)<<5
+        // | Rt(x1=1) = 0x38008001 (size=00 byte, opc=00 store — writes
+        // exactly 1 byte).
+        DiagnosticReporter rep;
+        auto bytes = buildAndAssembleArm(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(x1),   // value
+                                      LirOperand::makeReg(x0),   // base
+                                      LirOperand::makeMemBase(1),
+                                      LirOperand::makeMemOffset(8)};
+            (void)b.addInst(*schema->opcodeByMnemonic("store"),
+                            InvalidLirReg, ops, /*payload=*/0, kW8);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_EQ(firstInstWord(bytes), 0x38008001u);
     }
 }
 

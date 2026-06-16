@@ -147,21 +147,20 @@ namespace detail::type_rules {
             || floatRank(lk) != 0)) {
         return true;
     }
-    // C 6.3.1.1 / 6.5.16.1: an integer value implicitly converts INTO a `char` slot
-    // (`char x = 'c';`, `char x = 5;`). DSS interns `char` as `TypeKind::Char`
-    // (distinct from the signed/unsigned int RANKS), so this dedicated arm admits an
-    // integer rhs into a Char lhs. REQUIRED by the char-LITERAL typing (a char
-    // constant has type `int` per C 6.4.4.4, so `sizeof('c')`==4) — without it,
-    // typing the literal `int` would regress `char x = 'c';`. Gated on
-    // `charConvertsToArith` (default false → non-C schemas keep Char strict);
-    // mirrors the `boolWidensToArith` gate. DELIBERATELY ONE-DIRECTIONAL: the
-    // char→int WIDENING direction stays strict (a documented DSS choice, pinned by
-    // `ReturnTypeMismatchOnNonAssignable` — `int f(char c){return c;}` is a mismatch);
-    // a future char cycle may relax it under this same flag. The char LITERAL only
-    // needs this direction (it is `int`, flowing into a Char slot, or into an int
-    // slot via the same-type path above).
-    if (charConvertsToArith && lk == TypeKind::Char
-        && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0)) {
+    // C 6.3.1.1 / 6.5.16.1: `char` is an integer type — implicitly convertible to AND
+    // from the integer ranks in assignment (the usual arithmetic conversions). DSS
+    // interns `char` as `TypeKind::Char` (outside the signed/unsigned int RANKS), so
+    // this arm bridges Char ↔ the integer ranks in BOTH directions: int→char
+    // (`char x = 'c';` / `char x = 5;`, narrowing) and char→int (`int y = c;`,
+    // `int f(char c){ return c; }`, widening — the codegen materializes a `Char→int`
+    // SExt). Gated on `charConvertsToArith` (default false → a non-C schema keeps
+    // `Char` strictly distinct from the integer ranks); mirrors the
+    // `boolWidensToArith` gate. Closes D-CSUBSET-CHAR-INT-WIDENING.
+    if (charConvertsToArith
+        && ((lk == TypeKind::Char
+             && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0))
+            || (rk == TypeKind::Char
+                && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0)))) {
         return true;
     }
     // C-standard array-to-pointer decay (D-LK4-RODATA-PRODUCER-STRING

@@ -1091,12 +1091,10 @@ struct DSS_EXPORT SemanticConfig {
     PointerConversionRules pointerConversions;
 
     // C 6.3.1.1: `char` is an integer type. Read by `isAssignable`'s char arm, which
-    // admits an integer value INTO a `char` slot (`char x = 'c';` — the int→char
-    // direction) — REQUIRED so typing the char literal `int` (C 6.4.4.4, for
-    // `sizeof('c')`==4) does not regress `char x = 'c';`. The char→int WIDENING
-    // direction deliberately stays STRICT (a documented DSS choice; a future char
-    // cycle may relax it under this same flag). Default false → a non-C schema
-    // (toy/tsql) keeps `Char` strictly distinct from the integer ranks.
+    // admits BOTH directions of the char↔integer conversion — int→char (`char x='c';`,
+    // narrowing) and char→int (`int y=c;`, widening; codegen materializes the Char→int
+    // SExt). Default false → a non-C schema (toy/tsql) keeps `Char` strictly distinct
+    // from the integer ranks. Required by the char-literal typing AND char value use.
     bool charConvertsToArith = false;
 
     // Two orthogonal per-language alias-analysis opt-ins, both threaded

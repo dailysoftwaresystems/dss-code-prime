@@ -308,7 +308,13 @@ TEST(X86VariableEncoder, SextRaxRaxEmits48_63_C0) {
 
     Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
         LirOperand const ops[] = { LirOperand::makeReg(rax) };
-        (void)b.addInst(*sextOp, rax, ops);
+        // The I32-source sext is width-32-keyed (movsxd r64, r/m32) since
+        // the byte form (movsx r/m8) was added — D-CSUBSET-CHAR-STRING-
+        // VALUE-CODEGEN. Thread width-32 exactly as MIR→LIR does
+        // (widthFlagsForType(I32)); flags=0 (width-64) now matches no sext
+        // variant (fail-loud), which is the convergence-fix-D contract.
+        (void)b.addInst(*sextOp, rax, ops, /*payload=*/0,
+                        ::dss::kLirInstFlagWidth32);
     });
 
     DiagnosticReporter rep;

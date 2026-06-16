@@ -588,8 +588,8 @@
         "format": "x86-variable",
         "variants": [
           {
-            "$comment": "3-op no-index form: `mov reg, [base + disp32]`.",
-            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "$comment": "3-op no-index form, width 64: `mov reg, [base + disp32]` (REX.W 0x8B). Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one of the SAME operandKinds. Every GPR integer/pointer load carries width 64 (memAccessWidthFlags returns 0 ⇒ width 64 for non-Char GPR types — full-slot read, value-correct since loaded ints are consumed low-bits-only).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
             "resultSlot": "modrm.reg",
             "template":   { "rexW": true, "opcode": [139] },
             "wires":      [
@@ -599,10 +599,33 @@
             ]
           },
           {
-            "$comment": "4-op indexed form (D-AS4-5): `mov reg, [base + index*scale + disp32]`. The walker emits SIB unconditionally when SibIndex wires.",
-            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "$comment": "3-op no-index form, width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): `movzx reg, byte [base + disp32]` (REX.W 0F B6 /r). A char/byte memory access MUST be byte-EXACT — a 64-bit read of a 1-byte string/array element reads 7 bytes past it (a fault at a section/page edge). ZERO-extend (movzx) is deliberate: the load is a SIGNEDNESS-AGNOSTIC byte fetch — sign semantics live in the explicit cast that follows (SExt for signed `char`, ZExt for unsigned `byte`), each of which re-reads the low byte, so the load's upper bits never reach a consumer un-recast (C integer-promotion always widens a char operand before arithmetic). REX.W sets the r64 dest (its low 8 hold the byte); the memory source has no high-byte-alias hazard (that is a register-source-only concern). Selected when the Load's result type is Char (width 8 on the LIR inst, via memAccessWidthFlags).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [15, 182] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "4-op indexed form (D-AS4-5), width 64: `mov reg, [base + index*scale + disp32]` (REX.W 0x8B). The walker emits SIB unconditionally when SibIndex wires.",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "resultSlot": "modrm.reg",
             "template":   { "rexW": true, "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "sib.index"     },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "4-op indexed form, width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): `movzx reg, byte [base + index*scale + disp32]` (REX.W 0F B6 /r + SIB). The byte-exact + signedness-agnostic rationale is the 3-op width-8 form's; this arm serves a runtime-index char-array access (`arr[i]`, scale 1 since sizeof(char)==1).",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [15, 182] },
             "wires":      [
               { "index": 0, "slotKind": "modrm.rm.mem"  },
               { "index": 1, "slotKind": "sib.index"     },
@@ -626,8 +649,8 @@
         "format": "x86-variable",
         "variants": [
           {
-            "$comment": "4-op no-index form (D-AS4-1).",
-            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "$comment": "4-op no-index form (D-AS4-1), width 64: `mov [base + disp32], reg` (REX.W 0x89). Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one of the SAME operandKinds. Every GPR integer/pointer store carries width 64 (memAccessWidthFlags returns 0 ⇒ width 64 for non-Char GPR types).",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "template": { "rexW": true, "opcode": [137] },
             "wires":    [
               { "index": 0, "slotKind": "modrm.reg"     },
@@ -637,9 +660,32 @@
             ]
           },
           {
-            "$comment": "5-op indexed form (D-AS4-5).",
-            "guard":    { "operandKinds": ["reg", "reg", "reg", "membase", "memoffset"] },
+            "$comment": "4-op no-index form, width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): `mov byte [base + disp32], reg8` (0x88 /r). A char/byte store writes EXACTLY the low byte — a 64-bit store of a 1-byte element would clobber 7 bytes past it. `forceRexPrefix: true` (NOT rexW — a byte op) forces a REX prefix so the stored VALUE register (wired to modrm.reg) addresses spl/bpl/sil/dil (low byte of r4..r7) instead of the legacy ah/ch/dh/bh high-byte aliases — exactly the setcc byte-register rationale. Signedness-agnostic: only the low 8 bits are written. Selected when the stored value's type is Char (width 8 via memAccessWidthFlags).",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [136], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "5-op indexed form (D-AS4-5), width 64: `mov [base + index*scale + disp32], reg` (REX.W 0x89 + SIB).",
+            "guard":    { "operandKinds": ["reg", "reg", "reg", "membase", "memoffset"], "width": 64 },
             "template": { "rexW": true, "opcode": [137] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "sib.index"     },
+              { "index": 3, "slotKind": "membase.scale" },
+              { "index": 4, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "5-op indexed form, width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): `mov byte [base + index*scale + disp32], reg8` (0x88 /r + SIB + forceRexPrefix). Byte-exact + forceRexPrefix rationale is the 4-op width-8 form's; this arm serves a runtime-index char-array store (`arr[i] = c`, scale 1).",
+            "guard":    { "operandKinds": ["reg", "reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [136], "forceRexPrefix": true },
             "wires":    [
               { "index": 0, "slotKind": "modrm.reg"     },
               { "index": 1, "slotKind": "modrm.rm.mem"  },
@@ -711,8 +757,16 @@
         "format": "x86-variable",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg"] },
+            "$comment": "width 32: I32→I64 movsxd r64, r/m32 (REX.W 0x63). Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one. The MIR→LIR SExt arm threads widthFlagsForType(source): an I32 source → width 32 → here.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "rexW": true, "opcode": [99] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): Char/I8→int movsx r64, r/m8 (REX.W 0F BE /r). REX.W double duty (mirrors the zext byte form's 0F B6): (a) r64 dest — the low 32 are the sign-extended byte = the int result, consumed low-bits-only; (b) forces REX so the SRC low-byte register uses spl/bpl/sil/dil (a proper 8-bit access, not the legacy ah/ch/dh/bh alias). ModR/M.reg=dest, ModR/M.rm=src byte. Selected when the SExt source type is Char (width 8 on the LIR inst).",
+            "guard":      { "operandKinds": ["reg"], "width": 8 },
+            "template":   { "rexW": true, "opcode": [15, 190] },
             "resultSlot": "modrm.reg",
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           }

@@ -3664,6 +3664,146 @@ TEST(MirToLir, SExtFromI16SourceStaysGatedButI32Lowers) {
                                ::dss::TypeKind::I64).ok);
 }
 
+// ─── D-CSUBSET-CHAR-STRING-VALUE-CODEGEN + D-CSUBSET-CHAR-INT-WIDENING ───
+// The width-flag pins for `char` value codegen. Each is RED-ON-DISABLE on a
+// specific derivation in mir_to_lir.cpp; together with the byte-encoding
+// (tests/asm) and the runtime corpus (examples/c-subset/char_value), they
+// cover the char byte forms flag → bytes → exit end-to-end. Width flags are
+// target-blind (set in MIR→LIR), so x86_64 is a sufficient witness here.
+
+TEST(MirToLir, CharToIntSExtCarriesByteSourceWidth8) {
+    // char→int widening selects the BYTE source form (movsx r/m8 / SXTB),
+    // discriminated by the source width-8 flag. RED-ON-DISABLE: drop the
+    // Char arm of widthFlagsForType (source → 8) or the SExt gate's Char
+    // arm → either the gate rejects (probe !ok) or the width is not 8.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto probe = lowerCastProbe(::dss::MirOpcode::SExt,
+                                ::dss::TypeKind::Char, ::dss::TypeKind::I32);
+    ASSERT_TRUE(probe.ok)
+        << "char→int SExt is realized (movsx r/m8): "
+        << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+    auto const widths = widthsOfMnemonic(probe.lir, **target, "sext");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 8u)
+        << "the Char-source SExt must carry the byte SOURCE width (8) so the "
+           "encoder picks movsx r/m8, not movsxd r/m32 (which sign-extends "
+           "from bit 31 — the WRONG bit for a 1-byte char)";
+}
+
+TEST(MirToLir, IntToCharTruncLowersAtPromotedWidth32) {
+    // int→char (D-CSUBSET-CHAR-INT-WIDENING, the narrowing direction) is
+    // realized through the width-32 `mov r32,r32` (registerOpWidthFlags
+    // collapses the char byte width → 32; the narrowing-to-1-byte is lazy,
+    // at the next byte-exact consumer). RED-ON-DISABLE: drop the Char arm of
+    // the Trunc gate → probe !ok; drop the registerOpWidthFlags collapse →
+    // the trunc carries width-8, which has NO trunc variant (the width pin
+    // below would read 8, and the asm encoder would fail loud).
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto probe = lowerCastProbe(::dss::MirOpcode::Trunc,
+                                ::dss::TypeKind::I32, ::dss::TypeKind::Char);
+    ASSERT_TRUE(probe.ok)
+        << "int→char Trunc is realized at the promoted width-32 form: "
+        << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+    auto const widths = widthsOfMnemonic(probe.lir, **target, "trunc");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 32u)
+        << "a Char-result Trunc plumbs at the promoted width 32 (mov r32,r32), "
+           "never the byte width — there is no 8-bit trunc form";
+}
+
+TEST(MirToLir, CharLoadIsByteExactWidth8) {
+    // A char LOAD must be byte-exact (movzx r/m8 / LDURB) — a 64-bit load of
+    // a 1-byte string/array element over-reads 7 bytes. RED-ON-DISABLE: drop
+    // the Char arm of memAccessWidthFlags → the load carries width-64.
+    std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::Ptr};
+    auto syn = ::dss::test_support::buildSyntheticFn(
+        paramKinds, ::dss::TypeKind::Char,
+        [](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+           std::span<::dss::TypeId const> params, ::dss::TypeId retT) {
+            ::dss::MirInstId const p = mb.addArg(0, params[0]);
+            std::array<::dss::MirInstId, 1> ops{p};
+            ::dss::MirInstId const r =
+                mb.addInst(::dss::MirOpcode::Load, ops, retT);  // retT = Char
+            mb.addReturn(r);
+        });
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    auto const widths = widthsOfMnemonic(result.lir, **target, "load");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 8u) << "a char load must be byte-exact (width 8)";
+}
+
+TEST(MirToLir, CharStoreIsByteExactWidth8) {
+    // A char STORE writes EXACTLY 1 byte (mov r/m8,r8 / STURB) — a 64-bit
+    // store clobbers 7 neighbours. The width keys on the stored VALUE's type
+    // (operand[0]). RED-ON-DISABLE: drop the Char arm of memAccessWidthFlags.
+    std::array<::dss::TypeKind, 2> paramKinds{::dss::TypeKind::Ptr,
+                                              ::dss::TypeKind::Char};
+    auto syn = ::dss::test_support::buildSyntheticFn(
+        paramKinds, ::dss::TypeKind::I32,
+        [](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+           std::span<::dss::TypeId const> params, ::dss::TypeId retT) {
+            ::dss::MirInstId const p = mb.addArg(0, params[0]);  // Ptr base
+            ::dss::MirInstId const c = mb.addArg(1, params[1]);  // Char value
+            std::array<::dss::MirInstId, 2> ops{c, p};           // [value, base]
+            // Store yields no value; its byte width keys on the stored
+            // VALUE's type (operand[0] = the Char arg), not a result type.
+            mb.addInst(::dss::MirOpcode::Store, ops, ::dss::InvalidType);
+            ::dss::MirLiteralValue lv;
+            lv.value = static_cast<std::int64_t>(0);
+            lv.core  = ::dss::TypeKind::I32;
+            ::dss::MirInstId const z = mb.addConst(lv, retT);
+            mb.addReturn(z);
+        });
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    auto const widths = widthsOfMnemonic(result.lir, **target, "store");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 8u) << "a char store must be byte-exact (width 8)";
+}
+
+TEST(MirToLir, CharConstMaterializesAtPromotedWidthNotByte) {
+    // A char CONSTANT materializes through a register mov at the PROMOTED
+    // width (registerOpWidthFlags collapses char → 32) — there is no 8-bit
+    // mov-imm form, and a char value lives low-bits-only in a full register.
+    // RED-ON-DISABLE: revert lowerConst to widthFlagsForType → the const mov
+    // carries width-8 (no variant → a stray width-8 plumbing mov appears).
+    auto syn = ::dss::test_support::buildSyntheticFn(
+        std::span<::dss::TypeKind const>{}, ::dss::TypeKind::Char,
+        [](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+           std::span<::dss::TypeId const>, ::dss::TypeId retT) {
+            ::dss::MirLiteralValue lv;
+            lv.value = static_cast<std::int64_t>(65);  // 'A'
+            lv.core  = ::dss::TypeKind::Char;
+            ::dss::MirInstId const k = mb.addConst(lv, retT);  // retT = Char
+            mb.addReturn(k);
+        });
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    auto const widths = widthsOfMnemonic(result.lir, **target, "mov");
+    ASSERT_FALSE(widths.empty()) << "the char const must materialize via a mov";
+    for (unsigned const w : widths) {
+        EXPECT_NE(w, 8u)
+            << "a char const/plumbing mov must NOT carry the byte width — it "
+               "promotes to a register width (32/64); width-8 belongs only to "
+               "the byte load/store/sext forms";
+    }
+}
+
 TEST(MirToLir, CSubsetSourceTypesThreadWidthToLirFlags) {
     // SOURCE-tier width-threading pin: the c-subset front end's
     // `unsigned int`/`int` (32-bit) vs `long long` (64-bit) typing

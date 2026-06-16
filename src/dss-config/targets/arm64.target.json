@@ -620,8 +620,18 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg"] },
+            "$comment": "width 32: SXTW Xd, Wn (SBFM Xd,Xn,#0,#31 = 0x93407C00) — I32→I64. Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one. The MIR→LIR SExt arm threads widthFlagsForType(source): an I32 source → width 32 → here.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "fixedWord": 2470476800 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): SXTB Xd, Wn = SBFM Xd, Xn, #0, #7 — sign-extend the low BYTE to 64 bits (the x86_64 `movsx r64,r/m8` peer). Word 0x93401C00 = the SXTW word with imms 31→7 (bits 15:10): sf=1 | opc=00 | 100110 | N=1 | immr=0 | imms=7 | Rn | Rd (ARM ARM C6.2.* SBFM/SXTB). Selected when the SExt source type is Char (width 8 on the LIR inst) — the char→int widening. Reads exactly the low byte (the char), so the source register's upper bits (zero-extended by the LDURB byte load) are irrelevant.",
+            "guard":      { "operandKinds": ["reg"], "width": 8 },
+            "template":   { "fixedWord": 2470452224 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }
@@ -736,8 +746,20 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "$comment": "width 64: LDUR Xt, [Xn, #simm9] (0xF8400000). Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one. Every GPR integer/pointer load carries width 64 (memAccessWidthFlags returns 0 ⇒ width 64 for non-Char GPR types).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
             "template":   { "fixedWord": 4164943872 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm9"           }
+            ]
+          },
+          {
+            "$comment": "width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): LDURB Wt, [Xn, #simm9] (0x38400000 — the LDUR word with size 11→00). Loads ONE byte, ZERO-extending it into Wt (and a W-write zeroes bits 63:32 of Xt) — a char/byte memory access MUST be byte-EXACT, a 64-bit LDUR of a 1-byte string/array element reads 7 bytes past it. ZERO-extend is the signedness-AGNOSTIC byte fetch (the x86_64 movzx peer); sign semantics live in the following SXTB cast (char→int), which re-reads the low byte. Same operand layout as the 64-bit form. Selected when the Load's result type is Char (width 8 via memAccessWidthFlags).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "template":   { "fixedWord": 943718400 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn"             },
@@ -761,8 +783,20 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "$comment": "width 64: STUR Xt, [Xn, #simm9] (0xF8000000). Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one. Every GPR integer/pointer store carries width 64 (memAccessWidthFlags returns 0 ⇒ width 64 for non-Char GPR types).",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "template": { "fixedWord": 4160749568 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm9"           }
+            ]
+          },
+          {
+            "$comment": "width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): STURB Wt, [Xn, #simm9] (0x38000000 — the STUR word with size 11→00). Writes EXACTLY the low byte of Wt — a 64-bit STUR of a 1-byte element clobbers 7 neighbours. Signedness-agnostic (only the low 8 bits are written). Same operand layout as the 64-bit form. Selected when the stored value's type is Char (width 8 via memAccessWidthFlags).",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "fixedWord": 939524096 },
             "wires":    [
               { "index": 0, "slotKind": "rd"             },
               { "index": 1, "slotKind": "rn"             },
