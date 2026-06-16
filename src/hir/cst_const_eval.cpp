@@ -141,6 +141,29 @@ evalImpl(NodeId                              expr,
     RuleId const rule = tree.rule(expr);
     auto kids = visibleChildren(tree, expr);
 
+    // FC6: `sizeof(T)` in a const-expr context (e.g. an array dimension).
+    // Dispatched by rule-id HERE — ahead of the wrapper-peel below — because a
+    // sizeof node has exactly one meaningful Internal child (its type-ref /
+    // operand), so the peel would otherwise transparently descend into it and
+    // either reject the type-ref as non-constant OR (value form) fold the
+    // operand to its VALUE instead of its size. The size itself is computed by
+    // the caller's `resolveSizeof` closure (it owns the type resolver + the
+    // target's layout params, which this engine must not depend on). Absent
+    // closure or un-sizeable operand ⇒ NotAConstantExpression (fail loud).
+    if (cfg.sizeofRule.valid() && rule.v == cfg.sizeofRule.v) {
+        if (!env.resolveSizeof) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        auto const sz = env.resolveSizeof(expr);
+        if (!sz.has_value()) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        HirLiteralValue v;
+        v.core  = TypeKind::U64;   // size_t
+        v.value = static_cast<std::uint64_t>(*sz);
+        return ok(std::move(v));
+    }
+
     // Binary expression: [lhs (internal), OP-token, rhs (internal)].
     if (cfg.binaryExprRule.valid() && rule.v == cfg.binaryExprRule.v) {
         NodeId lhsN{}, rhsN{}, opTok{};

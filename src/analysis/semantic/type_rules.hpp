@@ -105,11 +105,18 @@ namespace detail::type_rules {
 // Void`: it might be the no-value case OR the untyped-memory case
 // depending on context (look at whether it's the result kind or a
 // `Ptr<>` operand element).
+// `boolWidensToArith` (default false): admit a Bool rhs into an arithmetic
+// lhs (`_Bool` → int). It is a SEMANTIC-tier conversion — the HIR `coerce()`
+// materializes it as an explicit Cast, so post-coerce the slot holds an int.
+// The default is false so the HIR VERIFIER (post-coerce, strict) still catches
+// a RAW Bool reaching an int slot uncast (a coerce-bug); the four semantic-tier
+// checks (call-arg / return / two init sites) pass `true`.
 [[nodiscard]] inline bool isAssignable(
     TypeInterner const&                                interner,
     TypeId                                             lhs,
     TypeId                                             rhs,
-    SemanticConfig::PointerConversionRules const&      ptrRules = {}) noexcept {
+    SemanticConfig::PointerConversionRules const&      ptrRules = {},
+    bool                                               boolWidensToArith = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     if (sameType(lhs, rhs)) return true;
     auto const lk = interner.kind(lhs);
@@ -123,6 +130,21 @@ namespace detail::type_rules {
     }
     if (floatRank(lk) != 0 && floatRank(rk) != 0) {
         return floatRank(rk) <= floatRank(lk);
+    }
+    // A Bool value WIDENS into any arithmetic slot (C99 6.3.1.2 — `_Bool`
+    // promotes to `int`; a comparison/logical result `Bool` flowing into an
+    // int/float lhs, e.g. `int f(){ return a < b; }`, `int x = a && b;`).
+    // The complete semantic-tier expression typer (`subtreeType`) now types
+    // `a < b` as Bool, so this check actually runs; admitting it makes the
+    // semantic tier AGREE with the HIR `coerce()` (which materializes the
+    // Bool→int Cast). Gated on `boolWidensToArith` so ONLY the pre-coerce
+    // semantic checks admit it — the post-coerce verifier stays strict. This
+    // is the ASSIGNMENT direction only — `Bool` stays out of `isArithmetic`
+    // (above), so binary PROMOTION (`bool + bool`) is unaffected.
+    if (boolWidensToArith && rk == TypeKind::Bool
+        && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0
+            || floatRank(lk) != 0)) {
+        return true;
     }
     // C-standard array-to-pointer decay (D-LK4-RODATA-PRODUCER-STRING
     // closure, 2026-06-02): `Array<T,N>` is implicitly assignable to
@@ -284,6 +306,48 @@ namespace detail::type_rules {
     if (floatRank(ak) != 0 && floatRank(bk) != 0) {
         return floatRank(ak) >= floatRank(bk) ? a : b;
     }
+    return InvalidType;
+}
+
+// ── Per-verb expression-type DERIVATIONS — the SINGLE source ────────────
+//
+// The closed-universal result-type laws for the `Deref`/`Index` operator
+// verbs (the verb VOCABULARY is config — `hirLowering.{unaryOps,postfixOps}`
+// `target` strings; the per-verb DERIVATION is the verb's universal
+// definition, exactly as `usualArithmeticCommonType` is for `Add`). BOTH the
+// CST→HIR lowering (`cst_to_hir.cpp`) and the semantic-tier expression typer
+// (`subtreeType`/`exprType`) call these, so the two tiers cannot drift
+// (`D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS`). `AddressOf` is a one-liner
+// (`interner.pointer(t)`) inlined at both sites; the binary/ternary verbs use
+// `usualArithmeticCommonType` below.
+
+// `Deref` (`*p`): pointee of a pointer. C 6.5.3.2p4 designator decay as a
+// lattice law — `*` on a function designator (`FnSig`) or a function POINTER
+// (`Ptr<FnSig>`) is the IDENTITY (the designator decays straight back), so the
+// result is the operand type unchanged; a deref node there would lower to a
+// memory LOAD through the code pointer (silent garbage). Otherwise `Ptr<T>`→T;
+// a non-pointer operand → InvalidType (cascade-suppress; deeper tiers wall it).
+[[nodiscard]] inline TypeId
+derefResultType(TypeInterner const& interner, TypeId operand) noexcept {
+    if (!operand.valid()) return InvalidType;
+    TypeKind const opk = interner.kind(operand);
+    if (opk == TypeKind::FnSig) return operand;                       // identity
+    if (opk == TypeKind::Ptr && !interner.operands(operand).empty()
+        && interner.kind(interner.operands(operand)[0]) == TypeKind::FnSig)
+        return operand;                                              // identity
+    if (opk == TypeKind::Ptr) return interner.operands(operand)[0];   // pointee
+    return InvalidType;
+}
+
+// `Index` (`a[i]`): the element type of the base — an Array/Ptr/Slice (each
+// stores its element as operand[0]); any other base → InvalidType.
+[[nodiscard]] inline TypeId
+indexResultType(TypeInterner const& interner, TypeId base) noexcept {
+    if (!base.valid()) return InvalidType;
+    TypeKind const bk = interner.kind(base);
+    if ((bk == TypeKind::Array || bk == TypeKind::Ptr || bk == TypeKind::Slice)
+        && !interner.operands(base).empty())
+        return interner.operands(base)[0];
     return InvalidType;
 }
 

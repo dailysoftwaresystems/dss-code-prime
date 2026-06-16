@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/substrate/transparent_string_hash.hpp"
+#include "core/types/aggregate_layout.hpp"  // FC6: AggregateLayoutParams
 #include "core/types/grammar_schema.hpp"   // ConfigDiagnostic + LoadResult
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"  // TypeKind for regClassForCoreType
@@ -1807,6 +1808,16 @@ struct DSS_EXPORT TargetSchemaData {
     // OR'ing zero into the opcode byte.
     bool condCodeEncodingLoaded = false;
 
+    // FC6 (D-FF3-1 layout half): the per-ABI aggregate-layout parameters
+    // (`"aggregateLayout"` in .target.json) the generic `type_layout` engine reads
+    // — the natural-alignment rule + the ISA max alignment. OPTIONAL at load (a
+    // minimal target may omit it, like `callingConventions` / `registers`); the
+    // fail-loud is CONSUMER-side, not loader-side — `aggregateLayoutLoaded` gates
+    // the layout/`sizeof` path so an un-declared block fails loud (a positioned
+    // diagnostic, no artifact) at use rather than silently returning a zero param.
+    AggregateLayoutParams aggregateLayout{};
+    bool                  aggregateLayoutLoaded = false;
+
     // Relocation taxonomy (plan 13 AS1 §2.6 — the bucket-1 reloc
     // facet). Each row declares one relocation kind: a canonical text
     // name (for the linker's `*.format.json` cross-reference per plan
@@ -2015,6 +2026,19 @@ public:
     }
     [[nodiscard]] bool condCodeEncodingLoaded() const noexcept {
         return d_.condCodeEncodingLoaded;
+    }
+
+    // ── Aggregate layout (FC6, D-FF3-1) ──────────────────────────
+    // The per-ABI struct/union/array layout params the `type_layout` engine
+    // reads. `aggregateLayoutLoaded()` is false for a target that never declared
+    // the block (OPTIONAL at load; this accessor lets a consumer assert it and
+    // fail loud BEFORE computing layout — the consumer-side fail-loud, no loader
+    // requirement).
+    [[nodiscard]] AggregateLayoutParams aggregateLayout() const noexcept {
+        return d_.aggregateLayout;
+    }
+    [[nodiscard]] bool aggregateLayoutLoaded() const noexcept {
+        return d_.aggregateLayoutLoaded;
     }
 
     // ── Relocations (AS1) ────────────────────────────────────────

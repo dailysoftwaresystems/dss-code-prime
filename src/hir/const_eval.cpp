@@ -490,6 +490,25 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         folded.value = std::move(agg);
         return ok(std::move(folded));
     }
+    if (k == HirKind::SizeOf) {
+        // FC6: fold `sizeof(T)` to T's byte size (result `size_t` = U64),
+        // mirroring the MIR SizeOf fold (`hir_to_mir.cpp`). The TypeRef child
+        // carries the sized type. Absent resolver (verifier consumers) or an
+        // incomplete / un-sizeable type ⇒ `NotAConstantExpression` — never a
+        // guessed size. The type unevaluated (C 6.5.3.4) — only its size matters.
+        if (!env.resolveTypeSize) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        auto kids = hir.children(expr);
+        if (kids.empty()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        TypeId const sized = hir.typeId(kids.front());
+        auto const sz = env.resolveTypeSize(sized);
+        if (!sz) return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        HirLiteralValue v;
+        v.core  = TypeKind::U64;
+        v.value = static_cast<std::uint64_t>(*sz);
+        return ok(std::move(v));
+    }
     return fail(ConstEvalFailure::NotAConstantExpression, expr);
 }
 

@@ -72,8 +72,22 @@ struct CstResolvedSymbol {
 using CstSymbolInitResolver =
     std::function<std::optional<CstResolvedSymbol>(NodeId, std::uint32_t)>;
 
+// FC6: SizeOf-folding resolver for a const-expr context (an array dimension
+// `int a[sizeof(T)]`). Given the `sizeofRule` CST node, return its byte size,
+// or `nullopt` when un-sizeable / the target declared no layout params / the
+// operand's type is not yet resolved at this pass. The closure (supplied by the
+// semantic engine) owns the type resolver + the target's layout params — kept
+// OUT of this CST engine, which stays HIR-/interner-free. Absent closure ⇒
+// SizeOf is non-constant. The engine dispatches it by rule-id BEFORE the
+// wrapper-peel (the sizeof node's single meaningful child is its type-ref, which
+// the peel would otherwise descend into and reject — or, for the value form,
+// fold to the operand's VALUE instead of its size).
+using CstSizeofResolver =
+    std::function<std::optional<std::uint64_t>(NodeId)>;
+
 struct CstEvalEnvironment {
     CstSymbolInitResolver resolveSymbolInit{};
+    CstSizeofResolver     resolveSizeof{};   // FC6 — sizeof in a const-expr context
 };
 
 // Static recognition context. All fields are non-owning references

@@ -809,8 +809,32 @@ struct Lowerer {
         return Role::Other;
     }
 
+    // R2 (D-SEMANTIC-NULL-CONSTANT-FOLDING): a source node the semantic tier
+    // admitted as a FOLDED null-pointer constant (`1-1`, `-0` — a non-literal
+    // integer constant expression with value 0) lowers to a synthetic Literal 0,
+    // NOT its operator tree. The value is provably 0 (semantic-verified), so the
+    // existing coerce() literal-0 arm materializes `Cast(0 → Ptr)` downstream.
+    // Short-circuiting at the lowering ENTRY means the operator subtree is never
+    // emitted (no dead node) and const-folding stays OUT of lowering — the semantic
+    // marker is the single authority. Fixed I32 zero: the marked node's own type is
+    // an interior arithmetic node Pass 2 never stamped (model.typeAt would be
+    // invalid); the coerce arm + verifier fallback need only an integer-typed
+    // Literal. Mirrors the null-materialization template at the ternary-condition
+    // arm. nullopt for an unmarked node (the overwhelming common case).
+    [[nodiscard]] std::optional<E> nullPointerConstantLiteral(NodeId node) {
+        if (!model.isNullPointerConstant(node)) return std::nullopt;
+        HirLiteralValue v;
+        v.core  = TypeKind::I32;
+        v.value = std::int64_t{0};
+        HirNodeId const zeroLit = builder.makeLiteral(
+            interner.primitive(TypeKind::I32), literals.add(v),
+            HirFlags::Synthetic);
+        return E{track(zeroLit, node), interner.primitive(TypeKind::I32)};
+    }
+
     // ── expressions ───────────────────────────────────────────────────────────
     E lowerExpr(NodeId node) {
+        if (auto npc = nullPointerConstantLiteral(node)) return *npc;
         if (tree().kind(node) == NodeKind::Internal) {
             std::uint32_t const r = tree().rule(node).v;
             if (cfg.flatExprRule.valid() && r == cfg.flatExprRule.v)
@@ -879,6 +903,10 @@ struct Lowerer {
             if (cfg.castRule.valid()
              && tree().rule(c).v == cfg.castRule.v) {
                 return lowerCast(c);
+            }
+            if (cfg.sizeofRule.valid()
+             && tree().rule(c).v == cfg.sizeofRule.v) {
+                return lowerSizeof(c);
             }
         }
         for (NodeId c : visible(node)) {
@@ -978,6 +1006,7 @@ struct Lowerer {
     // A flat `operand (binaryOpRule operand)*` sequence (SQL's `expression`),
     // left-folded into nested core BinaryOp nodes. Distinct from the Pratt path.
     E lowerFlatExpr(NodeId node) {
+        if (auto npc = nullPointerConstantLiteral(node)) return *npc;
         std::vector<NodeId> operands;
         std::vector<NodeId> opToks;
         for (NodeId c : visible(node)) {
@@ -1572,9 +1601,11 @@ struct Lowerer {
                     return operand;
                 }
             }
-            TypeId result = InvalidType;
-            if (operand.type.valid() && interner.kind(operand.type) == TypeKind::Ptr)
-                result = interner.operands(operand.type)[0];
+            // The pointee-of derivation is the SINGLE source shared with the
+            // semantic-tier expression typer (type_rules.hpp). On the non-
+            // identity path here it yields Ptr<T>→T / non-Ptr→InvalidType,
+            // exactly as the prior inline computation.
+            TypeId const result = derefResultType(interner, operand.type);
             return {track(builder.makeDeref(operand.id, result), node), result};
         }
         auto op = coreOpFromName(e.target);
@@ -1709,13 +1740,9 @@ struct Lowerer {
         if (e.target == "Index") {
             HirNodeId idx = rest.empty() ? reportedError(node, "index has no subscript expression")
                                          : lowerExpr(rest.front()).id;
-            TypeId inferred = InvalidType;
-            if (base.type.valid()) {
-                TypeKind const bk = interner.kind(base.type);
-                if ((bk == TypeKind::Array || bk == TypeKind::Ptr || bk == TypeKind::Slice)
-                    && !interner.operands(base.type).empty())
-                    inferred = interner.operands(base.type)[0];
-            }
+            // element-of-base derivation — the SINGLE source shared with the
+            // semantic-tier typer (type_rules.hpp `indexResultType`).
+            TypeId const inferred = indexResultType(interner, base.type);
             TypeId const result = typeAtOr(node, inferred);
             return {track(builder.makeIndex(base.id, idx, result), node), result};
         }
@@ -2166,6 +2193,36 @@ struct Lowerer {
         }
         HirNodeId const agg = lowerBraceInit(braceN, type);
         return {track(agg, clNode), type};
+    }
+
+    // FC6: `sizeof ( type-name )` | `sizeof unary-expression` → core
+    // `HirKind::SizeOf`, result type size_t (U64). The grammar's speculative
+    // `sizeofExpr` wraps the chosen form (`sizeofType` = `sizeof ( castTypeRef )`,
+    // `sizeofValue` = `sizeof castOperand`); in BOTH forms the operand carries the
+    // semantic-stamped TYPE being sized, which `resolveStampedTypeBelow` recovers
+    // by descending past the (unstamped) sizeof wrappers. The operand is
+    // UNEVALUATED (C 6.5.3.4) — only its type reaches the node; the SizeOf folds to
+    // that type's byte size via the `type_layout` engine at MIR lowering.
+    [[nodiscard]] E lowerSizeof(NodeId node) {
+        // The SIZED type lives on the OPERAND (the castTypeRef for `sizeof(T)`, the
+        // unary-expr for `sizeof e`), which sits BELOW the form node that semantic
+        // stamped size_t. Descend to the form, then scan its children for the
+        // operand's stamped type — skipping the form's own size_t stamp.
+        NodeId form{};
+        for (NodeId c : visible(node)) {
+            if (tree().kind(c) == NodeKind::Internal) { form = c; break; }
+        }
+        NodeId const scan = form.valid() ? form : node;
+        TypeId sized = InvalidType;
+        for (NodeId c : visible(scan)) {
+            if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { sized = t; break; }
+        }
+        if (!sized.valid()) {
+            return exprError(node, "sizeof operand did not resolve to a type");
+        }
+        HirNodeId const tref = track(builder.makeTypeRef(sized), node);
+        TypeId const u64 = interner.primitive(TypeKind::U64);
+        return {track(builder.makeSizeOf(tref, u64), node), u64};
     }
 
     // FC2: explicit cast `(T)expr` (`hirLowering.castRule`). The grammar

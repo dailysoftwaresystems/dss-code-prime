@@ -3,9 +3,11 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "core/export.hpp"
+#include "core/types/aggregate_layout.hpp"
 #include "core/types/data_model.hpp"
 
 #include <memory>
+#include <optional>
 
 // Phase #8 entry point: drive symbol/scope/type analysis over a built
 // CompilationUnit and return a SemanticModel. The implementation is
@@ -38,8 +40,15 @@ namespace dss {
 // format JSON itself has NO default — a missing `dataModel` there is a
 // load reject. ILP32 is declared-only: selecting it fails loud
 // (S_UnsupportedDataModel) rather than running an untested width path.
+// FC6 deferral-close: `aggregateLayout` is the active target's aggregate-layout
+// params (`target.aggregateLayout()`, gated by `aggregateLayoutLoaded()`),
+// passed as `std::optional` — `nullopt` ⇒ the target declared no block, so a
+// `sizeof` in an array-dimension const-expression fails loud rather than folding
+// a wrong size. Direct-API callers (unit tests, LSP) default to `nullopt`: they
+// analyze exactly as before, and an array-dim `sizeof` simply does not fold.
 [[nodiscard]] DSS_EXPORT SemanticModel
 analyze(std::shared_ptr<CompilationUnit const> cu,
-        DataModel dataModel = DataModel::Lp64);
+        DataModel dataModel = DataModel::Lp64,
+        std::optional<AggregateLayoutParams> aggregateLayout = std::nullopt);
 
 } // namespace dss

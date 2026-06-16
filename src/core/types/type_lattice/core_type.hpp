@@ -55,6 +55,12 @@ static_assert(static_cast<std::uint32_t>(TypeKind::Count_) < 256,
 // the [0, kFirstExtensionKind) range of the open kind space.
 inline constexpr std::uint32_t kFirstExtensionKind = 256;
 
+// FC6: the length-scalar sentinel marking a kind=Array as an INCOMPLETE array
+// (C99 §6.7.2.1 flexible array member `T x[]`). Distinct from a real length
+// (which is >= 0; the semantic phase rejects 0/negative declared lengths, so -1
+// can never collide with a user-written array length).
+inline constexpr std::int64_t kIncompleteArrayLength = -1;
+
 // Calling conventions are machine-shaped (not language-shaped) — core lattice
 // members, attached to FnSig and consumed by the FFI plan. Stored in a
 // TypeRecord's scalar pool as the underlying integer.

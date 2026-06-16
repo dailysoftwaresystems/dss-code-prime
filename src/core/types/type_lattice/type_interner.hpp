@@ -44,6 +44,16 @@ public:
     // Count of distinct interned types (excludes the slot-0 sentinel).
     [[nodiscard]] std::size_t size() const noexcept { return arena_.size() - 1; }
 
+    // ── Arena concept (substrate/arena_tag.hpp) — lets an
+    //    `ArenaAttribute<TypeInterner, T>` side-table key a per-CU attribute by
+    //    TypeId (FC6's StructLayout layout table). `nodeCount()` is the full slot
+    //    count INCLUDING the slot-0 sentinel so the attribute's dense vector can
+    //    index by `TypeId::v` directly (v ∈ [1, size]).
+    using IdType  = TypeId;
+    using TagType = CompilationUnitId;
+    [[nodiscard]] TagType      id()        const noexcept { return arena_.id(); }
+    [[nodiscard]] std::size_t  nodeCount() const noexcept { return arena_.size(); }
+
     // ── canonicalizing builders ──
     // primitive: a leaf kind (Bool/I*/U*/F*/Char/Byte/Void) — no operands/scalars.
     TypeId primitive(TypeKind kind);
@@ -59,6 +69,15 @@ public:
     // array: operands=[element], scalars=[length]. slice: operands=[element].
     TypeId array(TypeId element, std::int64_t length);
     TypeId slice(TypeId element);
+    // incomplete array (C99 §6.7.2.1 flexible array member `T x[]`): a kind=Array
+    // type whose length scalar is the `kIncompleteArrayLength` sentinel. It is an
+    // INCOMPLETE type — it has no size of its own (FC6 lays it out contributing an
+    // offset but 0 bytes to the enclosing struct's size), and `sizeof` of it is
+    // ill-formed. Represented as a sentinel on the existing Array kind (no new
+    // TypeKind) so every Array consumer keeps working; only size-bearing consumers
+    // check `isIncompleteArray`.
+    TypeId incompleteArray(TypeId element);
+    [[nodiscard]] bool isIncompleteArray(TypeId id) const;
     // tuple: operands=[elements...].
     TypeId tuple(std::span<TypeId const> elements);
     // struct/union: nominal name + operands=[fields/variants...].

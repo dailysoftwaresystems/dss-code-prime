@@ -468,6 +468,7 @@ TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
         "stringLiteralExpr",
         "charLiteralExpr",
         "compoundLiteralExpr",
+        "sizeofExpr",            // FC6
         "castExpr",
         "parenExpr",
     };

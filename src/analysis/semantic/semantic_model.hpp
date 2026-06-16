@@ -137,6 +137,7 @@ public:
                   DiagnosticReporter                     diagnostics,
                   std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
+                  UnitAttribute<bool>                    nullPointerConstantNodes,
                   std::vector<ShippedExternSymbol>       shippedExterns,
                   DataModel                              dataModel) noexcept
         : cu_(std::move(cu)),
@@ -148,6 +149,7 @@ public:
           diagnostics_(std::move(diagnostics)),
           usesBySymbol_(std::move(usesBySymbol)),
           compositeScopeByType_(std::move(compositeScopeByType)),
+          nullPointerConstantNodes_(std::move(nullPointerConstantNodes)),
           shippedExterns_(std::move(shippedExterns)),
           dataModel_(dataModel) {}
 
@@ -202,6 +204,16 @@ public:
     // that want a uniform substrate.
     [[nodiscard]] ScopeId compositeScopeFor(TypeId type) const noexcept;
 
+    // R2 (D-SEMANTIC-NULL-CONSTANT-FOLDING): true iff `id` is a source node the
+    // analyzer admitted as a FOLDED null-pointer constant (a non-literal integer
+    // constant expression with value 0 — `1-1`, `-0`). The CST→HIR lowerer
+    // materializes a synthetic Literal 0 in its place so the existing coerce
+    // literal-0 arm emits the Cast→Ptr. False for every other node (incl. a
+    // structural literal `0`, which the coerce arm admits directly).
+    [[nodiscard]] bool isNullPointerConstant(NodeId id) const {
+        return nullPointerConstantNodes_.has(id);
+    }
+
     // The full attributes — convenient for tooling / forEach iteration.
     [[nodiscard]] UnitAttribute<SymbolId> const& nodeToSymbol() const noexcept { return nodeToSymbol_; }
     [[nodiscard]] UnitAttribute<TypeId>   const& nodeToType()   const noexcept { return nodeToType_; }
@@ -234,6 +246,12 @@ private:
     // Pass 1.5 when a struct's TypeId is interned (see
     // `compositeScopeByType` in semantic_analyzer.cpp's EngineState).
     std::unordered_map<std::uint32_t, ScopeId>             compositeScopeByType_;
+    // R2 (D-SEMANTIC-NULL-CONSTANT-FOLDING): source nodes the analyzer admitted as
+    // a FOLDED null-pointer constant (`1-1`, `-0`). The CST→HIR lowerer reads
+    // `isNullPointerConstant` to materialize a synthetic Literal 0 in place.
+    // TREE-KEYED UnitAttribute (NodeId is tree-local — a flat set would alias node
+    // indices across a multi-source CU's trees → cross-tree silent miscompile).
+    UnitAttribute<bool>                                   nullPointerConstantNodes_;
     // FF11: descriptor externs minted from resolved shipped-lib JSON
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the
     // CST→HIR lowerer.

@@ -404,6 +404,15 @@ struct DSS_EXPORT DeclarationRule {
     // the engine matches it by rule within the declaration subtree rather than
     // via `typeShapes`. `nullopt` ⇒ this declaration form has no array syntax.
     std::optional<ArraySuffix> arraySuffix;
+    // FC6 (FAM): when true, an ABSENT array length on this declaration form
+    // (`T x[]`) resolves to an INCOMPLETE array type (C99 §6.7.2.1 flexible
+    // array member) instead of the `S_NonConstantArrayLength` error. Only
+    // declaration forms that legally bear a flexible array set this — a struct
+    // field. A standalone `T x[]` (a local/global) keeps `allowFlexibleArray =
+    // false`, so its absent length still fails loud. Config-driven: the language
+    // declares which declaration forms may carry a flexible array; the engine
+    // never hard-codes "struct field".
+    bool allowFlexibleArray = false;
     // D5.1: optional composite-type collection. When set, Pass 1.5 composes the
     // declaration's `kind: type` symbol's TypeId via `interner.structType(name,
     // fieldTypes)` from the field-symbols minted in this declaration's scope.
@@ -881,6 +890,14 @@ struct DSS_EXPORT SemanticConfig {
     std::vector<AssignmentRule>     assignments;       // SE4 const-correctness
     std::vector<CallRule>           callRules;         // SE6 call checking
     std::vector<CastRule>           castRules;         // FC2 explicit casts
+    // FC6: `sizeof` typing. `sizeofTypeRule` = the `sizeof ( type-name )` form;
+    // pass 2 resolves + stamps its `sizeofTypeChild` castTypeRef child (so the HIR
+    // lowering recovers the SIZED type) and stamps the node size_t. `sizeofValueRule`
+    // = the `sizeof unary-expression` form; the node is stamped size_t (the operand
+    // is typed normally — its type is the sized type). Both invalid ⇒ no `sizeof`.
+    RuleId        sizeofTypeRule{};   std::string sizeofTypeRuleName;
+    std::uint32_t sizeofTypeChild = 0;
+    RuleId        sizeofValueRule{};  std::string sizeofValueRuleName;
     // FC3.5 sweep-c3: compound-literal type-position stamping rules
     // (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF). See CompoundLiteralRule.
     std::vector<CompoundLiteralRule> compoundLiteralRules;

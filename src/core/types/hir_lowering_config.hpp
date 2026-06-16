@@ -222,6 +222,14 @@ struct DSS_EXPORT HirLoweringConfig {
     // Invalid ⇒ the language has no explicit-cast surface.
     RuleId      castRule{};            std::string castRuleName;
 
+    // FC6: `sizeof ( type-name )` | `sizeof unary-expression` → core
+    // `HirKind::SizeOf`. The rule is the speculative `sizeofExpr` alt; the
+    // operand (a castTypeRef for the type form, a castOperand expr for the value
+    // form) carries the semantic-stamped type being sized — the SizeOf node folds
+    // to that type's byte size via the `type_layout` engine. Invalid ⇒ the
+    // language has no `sizeof` surface.
+    RuleId      sizeofRule{};          std::string sizeofRuleName;
+
     // Per-language MIR-globals const-evaluation policy. The shared
     // const-eval engine (plan 12.5) supports a float-folding gate via
     // its `allowFloat` knob; today every v1 schema is IEEE 754 so the

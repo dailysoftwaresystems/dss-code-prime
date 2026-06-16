@@ -407,34 +407,134 @@ TEST(SemanticAnalyzerCSubset, InfixArithmeticStillFiresMismatchAtCallArg) {
            "the integer literal, not the operator)";
 }
 
-// 2nd-order audit pin (silent-failure B-1, step 13.3a): document
-// the CURRENT cascade-suppression behavior on `f(-0)` so a future
-// tightening of subtreeType (pass-2 expression typing closure)
-// EXPLICITLY surfaces this case. Today the operator-stop returns
-// InvalidType for the `-0` wrapper (MinusOp at first position is
-// a registered Prefix operator); the call-arg check then
-// silently suppresses via `if (!argTy.valid()) continue;`. NO
-// diagnostic fires. This is the documented trade-off: false-
-// negative on Prefix-`-` rather than false-positive on `a-b`. The
-// fix is pass-2 expression typing of unary wrappers (anchored at
-// D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS full closure). If a
-// future tightening EITHER emits a diagnostic for `f(-0)` OR
-// admits `-0` as a null-pointer constant, this test will fail and
-// the maintainer will need to consciously update the pin.
-TEST(SemanticAnalyzerCSubset, NegativeZeroSilentlySuppressedAtCallArg) {
+// R2 (D-SEMANTIC-NULL-CONSTANT-FOLDING ✅ CLOSED) — F3 PIN FLIP: `f(-0)`. `-0` is a
+// non-literal integer constant expression that FOLDS to 0, so per C §6.3.2.3p3 it
+// IS a null pointer constant and admits to `void*` WITHOUT a mismatch. This pin was
+// the INVERSE before R2 (NegativeZeroAtVoidPtrArgFiresMismatch): the literal-only
+// `isLiteralIntegerZero` rejected `-0` → S_TypeMismatch and the test asserted that
+// reject. R2's folded path admits it. RED-ON-DISABLE: revert the const-fold path in
+// `admitsNullPointerConstant` and this flips back to 1× S_TypeMismatch. The
+// integer-kind + folds-to-0 gates keep `f(1)` / `f(1+1)` / `f(1.5-1.5)` rejected
+// (their own pins, above and below).
+TEST(SemanticAnalyzerCSubset, NegativeZeroAdmitsAsNullPointerConstant) {
     auto cu = buildShippedUnit("c-subset", {
         "extern void f(void* p);\n"
         "int main() { f(-0); return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    // CURRENT documented behavior: zero diagnostics. Pre-13.3a
-    // (with the original looser arity-check) and post-13.3a (with
-    // the position-based stop) BOTH produce zero diagnostics here
-    // — silent-suppression via cascade. Pin so future closures
-    // surface the change.
+    EXPECT_FALSE(model.hasErrors())
+        << "`-0` folds to integer 0 → a null pointer constant (C §6.3.2.3p3)";
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// R2: the folded-zero null-pointer admit fires at ALL THREE conversion contexts —
+// call-arg, return, and initializer (the shared `admitsNullPointerConstant` site,
+// reached from checkCallAgainstSig, checkReturn, and pass-2 decl-init). `1 - 1` /
+// `2 - 2` are non-literal integer constant expressions folding to 0.
+TEST(SemanticAnalyzerCSubset, FoldedZeroAdmitsAsPointerArg) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern void f(void* p);\n"
+        "int main() { f(1 - 1); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "`1 - 1` folds to 0 → null pointer constant at a call arg";
+}
+
+TEST(SemanticAnalyzerCSubset, FoldedZeroAdmitsAsReturn) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int* g() { return 1 - 1; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u)
+        << "`return 1 - 1;` from an int*-returning function is a null constant";
+}
+
+TEST(SemanticAnalyzerCSubset, FoldedZeroAdmitsAsInit) {
+    auto cu = buildShippedUnit("c-subset", {
+        "void f() { int* p = 2 - 2; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "`int* p = 2 - 2;` initializer is a null pointer constant";
+}
+
+// R2 negative: a FLOAT zero (`1.5 - 1.5`) is NOT a null pointer constant — C
+// §6.3.2.3p3 requires an INTEGER constant expression — so it is rejected
+// (S_TypeMismatch). HONEST NOTE (self-audit Finding 2): two INDEPENDENT guards
+// reject it — (a) the integer-kind gate (`subtreeType` types `1.5-1.5` as F64,
+// failing the signed/unsigned int-rank check) AND (b) a backstop: `constIntExpr`
+// returns nullopt for any float (`asInt64` has no `double` arm). So this pins the
+// BEHAVIOR (float-zero rejects), NOT the gate in isolation — removing the gate
+// leaves it green via the const-fold backstop. The gate is defense-in-depth that
+// additionally excludes a Char/Bool-typed fold the const-fold step would otherwise
+// fold to 0 (consistent with DSS typing comparisons as Bool, not C's int).
+TEST(SemanticAnalyzerCSubset, FloatZeroRejectsAsPointerArg) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern void f(void* p);\n"
+        "int main() { f(1.5 - 1.5); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "a float zero is NOT a null pointer constant — integer constant "
+           "expression required";
+}
+
+// R2 (self-audit Finding 1 guard): the folded-null marker is a TREE-KEYED
+// UnitAttribute, so a MULTI-SOURCE CU — where each tree restarts NodeId numbering
+// at 1 — routes the mark per-tree and cannot alias node K across files. A flat
+// NodeId.v set (the bug this replaced) would have risked falsely marking the other
+// tree's same-index node → a silent miscompile at HIR lowering. This exercises the
+// multi-tree set/route path (no other test compiles >1 tree through the marker);
+// the cross-tree QUERY correctness is by-construction (UnitAttribute is the exact
+// per-tree mechanism nodeToType/nodeToSymbol use). Both folded-zero nulls admit,
+// no cross-contamination.
+TEST(SemanticAnalyzerCSubset, FoldedNullMarkerIsTreeKeyedAcrossSources) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int* a() { return 1 - 1; }\n",
+        "int* b() { return 2 - 2; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "folded-zero null constants in two trees of one CU both admit, "
+           "tree-keyed marker → no cross-tree contamination";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u);
+}
+
+// The latent-bug FIX (D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS closure): a
+// mixed-width binary in a checked position is now typed against its UNIFIED
+// (UAC) type, not whichever leaf the old DFS-suppressor happened to reach. For
+// `sink(int); long a; int b; sink(a + b)` the argument `a + b` is `long` (UAC of
+// long+int), which narrows to the `int` param → S_TypeMismatch fires. Under the
+// old suppressor this was DFS-dependent: it reached the `int` leaf `b` and
+// silently ADMITTED the narrowing. RED-ON-DISABLE: revert the binary arm to a
+// leaf type and this drops to 0 diagnostics (the narrowing is silently let
+// through — the exact latent unsoundness this closure removes).
+TEST(SemanticAnalyzerCSubset, MixedWidthBinaryArgTypedByUacNotLeaf) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int sink(int v);\n"
+        "int f(long a, int b) { return sink(a + b); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // `a + b` is `long`; the `int` param narrows → exactly one mismatch.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u);
 }
 
 // F1 audit-fix pin (6-agent 2nd-order, step 13.3a): paren-wrapped
@@ -511,6 +611,74 @@ TEST(SemanticAnalyzerCSubset, StructDotMemberAccessOnBareRefIsClean) {
                         DiagnosticCode::S_NotAComposite), 0u)
         << "Direct `s.x` access on bare Struct ref must be clean — "
            "the swap admits both arrow-arm and dot-arm equally";
+}
+
+// R1 (D-EXPRTYPE-PASS15-FORWARD-REF member-access case ✅ CLOSED): a member access
+// in a Pass-1.5 const context — `int a[sizeof(s.y)]` — types the member via the
+// shared `resolveMemberAccess`, so the array dimension FOLDS (sizeof(int)=4)
+// instead of failing loud spuriously. Strong pin: `a` is Array<I32, 4>.
+// Red-on-disable: revert subtreeType's member arm (→ `return InvalidType` for the
+// member verb) → `s.y` is InvalidType at Pass 1.5 → the dim can't fold → `a` is
+// unresolved AND S_NonConstantArrayLength fires (BOTH asserts flip). NOTE: the
+// array's runtime readback (indexing / sizeof-value-of-a-local) is blocked by
+// independent gaps (FC7 local-array indexing; sizeof-VALUE-of-local), so R1 is a
+// semantic-tier feature proven HERE (the §A.5 carve-out), not via a runtime corpus.
+TEST(SemanticAnalyzerCSubset, MemberAccessSizeofResolvesArrayDimension) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; int y; };\n"
+        "int main() { struct S s; int a[sizeof(s.y)]; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    // aggregateLayout MUST be present for an array-dim sizeof to fold at all
+    // (nullopt ⇒ deliberate fail-loud). The scalar `int` size (4) is dataModel-
+    // driven, independent of these alignment params.
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u)
+        << "sizeof(s.y) must fold the member size — no spurious fail-loud";
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_TRUE(aRec->type.valid());
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    ASSERT_EQ(ti.scalars(aRec->type).size(), 1u);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 4)
+        << "dimension = sizeof(int) = 4 (member s.y resolved to int)";
+}
+
+// R1: the GENUINE forward-reference case (`int a[sizeof(b)]; int b;` — b used
+// before its declaration's type resolves) STAYS correct fail-loud (invalid C:
+// declare-before-use). This is NOT the closed member-access case — it pins the
+// reclassified anchor: forward-ref rejected, member-access-at-Pass-1.5 closed.
+TEST(SemanticAnalyzerCSubset, ForwardRefSizeofArrayDimensionStillRejected) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { int a[sizeof(b)]; int b; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 1u)
+        << "a forward-referenced sizeof operand must fail loud, never fold";
+}
+
+// R1: a non-existent field in the Pass-1.5 const context fails loud (the helper's
+// UndeclaredField → the dim cannot fold). Guards against the member arm admitting
+// a phantom field and folding a guessed size.
+TEST(SemanticAnalyzerCSubset, BadFieldSizeofArrayDimensionRejected) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; int y; };\n"
+        "int main() { struct S s; int a[sizeof(s.nope)]; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 1u)
+        << "sizeof(s.nope) — no such field — must fail loud, never fold a guess";
 }
 
 // SE-pointers (G5): a pointer parameter types as Ptr in the FnSig.
