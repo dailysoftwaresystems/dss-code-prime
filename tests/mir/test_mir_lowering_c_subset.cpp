@@ -1365,6 +1365,86 @@ TEST(MirLoweringCSubset, AddressOfMemberAccessReturnsGepDirectly) {
         << "Return value should be the Gep result, not a Load";
 }
 
+// FC7 (D-FC7-NESTED-STRUCT-FIELD): a struct-TYPED field declared by a bare
+// typedef-name (`Inner in;` — the new `typeBaseAllowingStruct` Identifier alt)
+// parses, and nested member access `p->in.y` COMPOSES the byte offsets via a
+// CHAINED GEP: Gep(p, off-of-`in`=0) then Gep(<that>, off-of-`y`-within-Inner
+// =4). The second GEP's BASE is the first GEP (not Arg p) and its offset is 4
+// — proving `.y` resolves against Inner's OWN layout, composed onto `in`'s
+// offset, not flattened or resolved against Outer. RED-ON-DISABLE: revert the
+// grammar `Identifier` alt → the struct-typed field no longer parses; parse-
+// recovery yields a tree that lowers to an unsupported top-level node, so the
+// `ASSERT_TRUE(L.mir.ok)` below trips (empirically verified — the failure is at
+// MIR-lowering, not `model.hasErrors()`, which recovery keeps false).
+TEST(MirLoweringCSubset, NestedMemberAccessComposesChainedGepOffsets) {
+    auto L = lowerCSubset(
+        "typedef struct { int x; int y; } Inner;\n"
+        "typedef struct { Inner in; int z; } Outer;\n"
+        "int read_iny(Outer* p) { return p->in.y; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "struct-typed field `Inner in;` must parse "
+           "(typeBaseAllowingStruct Identifier alt)";
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Arg p, Const(0=`in`@Outer), Gep1(p,0), Const(4=`y`@Inner),
+    //  Gep2(Gep1,4), Load, Return].
+    ASSERT_EQ(m.blockInstCount(entry), 7u);
+    MirInstId const argP = m.blockInstAt(entry, 0);
+    MirInstId const gep1 = m.blockInstAt(entry, 2);
+    MirInstId const gep2 = m.blockInstAt(entry, 4);
+    ASSERT_EQ(m.instOpcode(gep1), MirOpcode::Gep);
+    ASSERT_EQ(m.instOpcode(gep2), MirOpcode::Gep);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 5)), MirOpcode::Load);
+    auto g1 = m.instOperands(gep1);
+    ASSERT_EQ(g1.size(), 2u);
+    EXPECT_EQ(g1[0], argP) << "outer GEP bases on Arg p";
+    auto const& off1 =
+        m.literalValue(m.constLiteralIndex(m.blockInstAt(entry, 1)));
+    EXPECT_EQ(std::get<std::int64_t>(off1.value), 0) << "`in` at offset 0";
+    auto g2 = m.instOperands(gep2);
+    ASSERT_EQ(g2.size(), 2u);
+    EXPECT_EQ(g2[0], gep1)
+        << "nested `.y` chains off the inner GEP, not Arg p";
+    auto const& off2 =
+        m.literalValue(m.constLiteralIndex(m.blockInstAt(entry, 3)));
+    EXPECT_EQ(std::get<std::int64_t>(off2.value), 4)
+        << "`y` at offset 4 WITHIN Inner (composed 0 + 4)";
+}
+
+// FC7 (D-FC7-NESTED-STRUCT-FIELD): the SAME grammar alt admits a struct-typed
+// field in a UNION body (`unionField` shares `typeRefAllowingStruct`). A union
+// whose member is a struct type parses, and `u->p.y` accesses the struct
+// field through the union (all union members at offset 0, so the access
+// composes 0 + 4). Guards the union half of the multi-form contract.
+TEST(MirLoweringCSubset, UnionWithStructTypedFieldParsesAndAccesses) {
+    auto L = lowerCSubset(
+        "typedef struct { int x; int y; } Inner;\n"
+        "typedef union { Inner p; int n; } U;\n"
+        "int read(U* u) { return u->p.y; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "struct-typed field in a UNION body must parse";
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // Two chained GEPs: `p`@0 within the union, then `y`@4 within Inner.
+    std::vector<std::int64_t> offs;
+    auto const n = m.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Gep) continue;
+        auto gOps = m.instOperands(ix);
+        ASSERT_EQ(gOps.size(), 2u);
+        offs.push_back(
+            std::get<std::int64_t>(m.literalValue(m.constLiteralIndex(gOps[1])).value));
+    }
+    ASSERT_EQ(offs.size(), 2u) << "two chained GEPs for u->p.y";
+    EXPECT_EQ(offs[0], 0) << "union member `p` at offset 0";
+    EXPECT_EQ(offs[1], 4) << "`y` at offset 4 within Inner";
+}
+
 // SeqExpr: a value-yielding expression that bundles side-effect statements
 // + a result expression. HR8 emits these for assignment-as-expression and
 // compound-assign in c-subset. `x = 5` as an rvalue is the canonical case:
@@ -1798,9 +1878,58 @@ TEST(MirLoweringCSubset, StructLocalInitStoresEachFieldAtItsOffset) {
     EXPECT_EQ(gepOffsets[1], 4) << "field y at byte offset 4";
 }
 
-// Nested aggregate `{{1,2}, {3,4}}` exercises zeroLiteralOf's Struct
-// recursion + the const-fold path on a non-trivial shape. Fully
-// const → 1 Const, no InsertValue.
+// FC7 (D-FC7-NESTED-STRUCT-FIELD): a NESTED brace initializer
+// `Outer o = {{a, b}, c}` (the Inner-typed field `in` initialized by an inner
+// brace) lowers RECURSIVELY — `lowerAggregateInitIntoSlot` recurses into the
+// struct-typed field's sub-slot, emitting one scalar Store per LEAF field,
+// NEVER an aggregate-width store of the inner struct. Runtime params (a,b,c)
+// keep it off the const-fold path. The GEPs are: inner-slot Gep(o,0), then
+// leaf Gep(<>,0) for in.x, leaf Gep(<>,4) for in.y, then Gep(o,8) for z —
+// offset multiset {0,0,4,8} with exactly 3 leaf Stores. RED-ON-DISABLE:
+// revert the recursion and the inner field is lowerExpr'd as a non-realizable
+// aggregate value (≠ 3 scalar leaf stores at these composed offsets).
+TEST(MirLoweringCSubset, StructLocalNestedInitRecursesIntoSubSlot) {
+    auto L = lowerCSubset(
+        "typedef struct { int x; int y; } Inner;\n"
+        "typedef struct { Inner in; int z; } Outer;\n"
+        "void f(int a, int b, int c) { Outer o = {{a, b}, c}; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "recursive element-wise init, no aggregate InsertValue";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 3u)
+        << "one scalar Store per leaf field (in.x, in.y, z) — NOT one "
+           "aggregate store of `in`";
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    int c0 = 0, c4 = 0, c8 = 0, cOther = 0;
+    auto const n = m.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Gep) continue;
+        auto gOps = m.instOperands(ix);
+        ASSERT_EQ(gOps.size(), 2u);
+        auto const off =
+            std::get<std::int64_t>(m.literalValue(m.constLiteralIndex(gOps[1])).value);
+        if (off == 0) ++c0;
+        else if (off == 4) ++c4;
+        else if (off == 8) ++c8;
+        else ++cOther;
+    }
+    EXPECT_EQ(c0, 2) << "inner-slot Gep(o,0) + in.x leaf Gep(<>,0)";
+    EXPECT_EQ(c4, 1) << "in.y leaf at offset 4 within Inner";
+    EXPECT_EQ(c8, 1) << "z leaf at offset 8 within Outer";
+    EXPECT_EQ(cOther, 0) << "no GEP at an unexpected offset";
+}
+
+// Nested aggregate `{{1}, {2}}` as a LOCAL init: post-FC7
+// (D-FC7-NESTED-STRUCT-FIELD) it lowers ELEMENT-WISE — lowerAggregateInitIntoSlot
+// recurses into each struct field's sub-slot → leaf Stores, NO InsertValue
+// chain. (A global / expression-position fully-const aggregate still const-
+// folds to a single Const; either way the InsertValue count is 0 — the
+// invariant this guards. zeroLiteralOf's Struct recursion is also exercised.)
 TEST(MirLoweringCSubset, ConstructAggregateNestedAllConstFolds) {
     auto L = lowerCSubset(
         "struct Inner { int v; };\n"
@@ -1813,8 +1942,9 @@ TEST(MirLoweringCSubset, ConstructAggregateNestedAllConstFolds) {
               ? "" : L.mirReporter.all()[0].actual);
     auto const ops = entryOpcodes(L.mir.mir);
     EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
-        << "fully-const nested aggregate must const-fold to a single "
-           "Const(nested MirAggregateValue), not a chain";
+        << "nested aggregate init lowers without an InsertValue chain "
+           "(element-wise leaf stores for a local; a single folded Const "
+           "in global/expression position)";
 }
 
 // ML3 end-to-end: ML2-lowered MIR for a representative c-subset

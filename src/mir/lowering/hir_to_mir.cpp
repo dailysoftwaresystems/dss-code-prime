@@ -1418,8 +1418,6 @@ struct Lowerer {
                                       "or field-count mismatch)");
                 return false;
             }
-            MirInstId const v = lowerExpr(kids[i]);
-            if (!v.valid()) return false;
             MirInstId const offK = constInt(static_cast<std::int64_t>(*off));
             if (!offK.valid()) return false;
             TypeId const fieldTy = hir.typeId(kids[i]);
@@ -1427,6 +1425,30 @@ struct Lowerer {
             MirInstId const fieldPtr = mir.addInst(
                 MirOpcode::Gep, gepOps, interner.pointer(fieldTy));
             if (!fieldPtr.valid()) return false;
+
+            // FC7 D-FC7-NESTED-STRUCT-FIELD: a struct/union-TYPED field
+            // whose initializer is itself a brace-init lowers to a nested
+            // ConstructAggregate; recurse ELEMENT-WISE into the field's
+            // sub-slot at `fieldPtr` (there is no aggregate-width Store, so
+            // the scalar path below cannot realize it). An aggregate field
+            // initialized from an aggregate VALUE (not a brace-init) is a
+            // field-into-field copy — that needs the byte/field-wise
+            // aggregate copy, fail loud (D-FC7-AGGREGATE-COPY-MEMCPY).
+            TypeKind const fk = interner.kind(fieldTy);
+            if (fk == TypeKind::Struct || fk == TypeKind::Union) {
+                if (hir.kind(kids[i]) == HirKind::ConstructAggregate) {
+                    if (!lowerAggregateInitIntoSlot(kids[i], fieldPtr, fieldTy))
+                        return false;
+                    continue;
+                }
+                unsupported(aggNode, "initializing an aggregate field from an "
+                                      "aggregate value needs an aggregate copy "
+                                      "(D-FC7-AGGREGATE-COPY-MEMCPY)");
+                return false;
+            }
+
+            MirInstId const v = lowerExpr(kids[i]);
+            if (!v.valid()) return false;
             std::array<MirInstId, 2> stOps{v, fieldPtr};
             mir.addInst(MirOpcode::Store, stOps);
         }
