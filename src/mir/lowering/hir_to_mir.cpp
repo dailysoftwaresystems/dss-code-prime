@@ -84,6 +84,15 @@ struct Lowerer {
     // `fieldByteOffset` (member-access offset resolution) and
     // `aggregateByteSize` (aggregate-local Alloca sizing).
     std::unordered_map<std::uint32_t, StructLayout> layoutCache_;
+    // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): per-function by-value return
+    // state, reset at the top of each `lowerFunction`. `currentFnResult_` is the
+    // enclosing function's result type — a `ReturnStmt` needs it to classify a
+    // by-value struct/union return (its only other access is the FnSig in
+    // lowerFunction). `sretPtr_` is the hidden result pointer when the return is
+    // class MEMORY (>16B, ByReference): the ReturnStmt copies the result through
+    // it and returns it. InvalidMirInst for a scalar or in-register (≤16B) return.
+    TypeId    currentFnResult_{};
+    MirInstId sretPtr_{};
     // Set of module-level function symbols. A pre-pass populates this so a
     // direct `Call` whose callee is a `Ref` to a forward-declared function
     // resolves cleanly. The actual MirFuncId is irrelevant during lowering —
@@ -542,21 +551,10 @@ struct Lowerer {
                 std::vector<MirInstId> operands;
                 operands.reserve(kids.size());
                 operands.push_back(callee);
-                // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): a struct/union
-                // RETURN by value needs sret / HFA classification (Phase 2)
-                // — fail LOUD rather than truncate the aggregate into one
-                // return register.
-                if (t.valid()) {
-                    TypeKind const rk = interner.kind(t);
-                    if (rk == TypeKind::Struct || rk == TypeKind::Union) {
-                        unsupported(node,
-                            "returning a struct/union BY VALUE is not yet "
-                            "supported (per-ABI sret/HFA classification — "
-                            "D-FC7-STRUCT-BY-VALUE-ARG-RETURN); return a "
-                            "pointer to it instead");
-                        return InvalidMirInst;
-                    }
-                }
+                // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a struct/union
+                // RETURN by value is classified + synthesized below, AFTER the
+                // callee-variadic resolution (the sret hidden pointer prepends the
+                // first arg, so it must be in place before the arg loop runs).
                 // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): resolve whether the
                 // callee is variadic (through one Ptr wrapper) BEFORE lowering
                 // args, so a by-value struct ARG to a variadic function is
@@ -575,6 +573,35 @@ struct Lowerer {
                     byvalCalleeSig.valid()
                     && interner.kind(byvalCalleeSig) == TypeKind::FnSig
                     && interner.fnIsVariadic(byvalCalleeSig);
+                // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value
+                // struct/union RETURN. Classify it; allocate the result slot `R`;
+                // for sret (class MEMORY, >16B) prepend `R` as the hidden first
+                // arg so the arg loop below appends the real args AFTER it (the
+                // callee receives the pointer as arg 0 and writes the result
+                // through it). The `abi` + `R` are consumed at the Call-emit site.
+                std::optional<AbiPassing> structRetAbi;
+                MirInstId structRetSlot = InvalidMirInst;
+                if (t.valid()
+                    && (interner.kind(t) == TypeKind::Struct
+                        || interner.kind(t) == TypeKind::Union)) {
+                    structRetAbi = byValueClassify(t);
+                    if (!structRetAbi.has_value()) {
+                        unsupported(node,
+                            "returning a by-value struct/union is not supported "
+                            "by this target's calling convention "
+                            "(D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                        return InvalidMirInst;
+                    }
+                    structRetSlot = freshAggregateTemp(t);
+                    if (!structRetSlot.valid()) {
+                        unsupported(node,
+                            "by-value struct/union return requires a sizeable "
+                            "layout (complete type)");
+                        return InvalidMirInst;
+                    }
+                    if (structRetAbi->kind == AbiPassing::Kind::ByReference)
+                        operands.push_back(structRetSlot);  // hidden sret pointer
+                }
                 for (std::size_t i = 1; i < kids.size(); ++i) {
                     TypeId const argTy = hir.typeId(kids[i]);
                     if (argTy.valid()) {
@@ -663,6 +690,13 @@ struct Lowerer {
                     callPayload = ::dss::call_payload::encode(
                         true, static_cast<std::uint32_t>(fixedSz));
                 }
+                // FC7 C1c: a by-value struct/union return materializes the call
+                // into its result slot `R` (sret pointer or eightbyte pieces) and
+                // yields `R`'s address — the aggregate-by-address value the
+                // consumers (assign/arg/member/return) expect.
+                if (structRetAbi.has_value())
+                    return emitStructReturningCall(node, operands, callPayload,
+                                                   *structRetAbi, structRetSlot);
                 return mir.addInst(MirOpcode::Call, operands, t, callPayload);
             }
             case HirKind::IntrinsicCall: {
@@ -1089,6 +1123,20 @@ struct Lowerer {
     // Returns `InvalidMirInst` on failure.
     [[nodiscard]] MirInstId lowerLvalueAddress(HirNodeId node) {
         HirKind const k = hir.kind(node);
+        // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value struct/union-
+        // returning CALL is an aggregate rvalue materialized into a result slot;
+        // its lvalue address IS that slot. `lowerExpr(Call)` does the
+        // materialization and yields the slot address, so every aggregate
+        // consumer (`a = f()`, `g(f())`, `f().x`, `return f();`) reaches the
+        // result by address (the call is emitted exactly once — see the
+        // call-once pin). A scalar call is not an lvalue → falls through.
+        if (k == HirKind::Call) {
+            TypeId const ct = hir.typeId(node);
+            if (ct.valid()
+                && (interner.kind(ct) == TypeKind::Struct
+                    || interner.kind(ct) == TypeKind::Union))
+                return lowerExpr(node);
+        }
         if (k == HirKind::Ref) {
             std::uint32_t const sym = hir.payload(node);
             if (auto it = addressableLocal.find(sym);
@@ -1752,6 +1800,122 @@ struct Lowerer {
         return true;
     }
 
+    // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): emit a by-value struct/union-
+    // returning Call into its result slot `slot` and yield `slot` (the aggregate
+    // is accessed by address). `operands` already carries [callee, (sret slot,)
+    // args...]. ByReference (sret) ⇒ the call is void and the callee writes
+    // through the hidden pointer → `slot` already holds the result. InRegisters ⇒
+    // the call's result IS piece 0 (lir_callconv captures it from return-register
+    // ordinal 0 of its class) and each further eightbyte is a
+    // `ReturnPiece(call, ordinal)`; every piece is stored into `slot` at its
+    // offset. The per-class `ord` mirrors the callee's multi-Return assignment, so
+    // caller and callee agree on which register each piece occupies.
+    [[nodiscard]] MirInstId emitStructReturningCall(
+            HirNodeId node, std::span<MirInstId const> operands,
+            std::uint32_t callPayload, AbiPassing const& abi, MirInstId slot) {
+        if (abi.kind == AbiPassing::Kind::ByReference) {
+            MirInstId const call =
+                mir.addInst(MirOpcode::Call, operands, InvalidType, callPayload);
+            if (!call.valid()) return InvalidMirInst;
+            return slot;
+        }
+        if (abi.pieces.empty()) {
+            unsupported(node,
+                "in-register struct return classified with zero pieces "
+                "(classifier invariant violated)");
+            return InvalidMirInst;
+        }
+        TypeId const p0ty = pieceType(abi.pieces[0].cls);
+        MirInstId const call =
+            mir.addInst(MirOpcode::Call, operands, p0ty, callPayload);
+        if (!call.valid()) return InvalidMirInst;
+        // Pass 1: capture every piece IMMEDIATELY after the call — the
+        // lir_callconv caller look-ahead requires the `ReturnPiece` reads to be
+        // contiguous with the call (no Gep/Store may intervene, else the pieces
+        // would read return registers already clobbered). Piece 0 IS the call's
+        // own result; pieces 1..N-1 are ReturnPiece reads.
+        std::vector<MirInstId> pieceVals;
+        pieceVals.reserve(abi.pieces.size());
+        std::uint32_t gprRet = 0;
+        std::uint32_t fprRet = 0;
+        for (std::size_t k = 0; k < abi.pieces.size(); ++k) {
+            AbiPiece const& p = abi.pieces[k];
+            std::uint32_t const ord =
+                (p.cls == AbiPieceClass::Fpr) ? fprRet++ : gprRet++;
+            if (k == 0) { pieceVals.push_back(call); continue; }
+            MirInstId const rp =
+                mir.addReturnPiece(call, ord, pieceType(p.cls));
+            if (!rp.valid()) return InvalidMirInst;
+            pieceVals.push_back(rp);
+        }
+        // Pass 2: store each captured piece into the result slot at its offset.
+        for (std::size_t k = 0; k < abi.pieces.size(); ++k) {
+            AbiPiece const& p = abi.pieces[k];
+            TypeId const pty = pieceType(p.cls);
+            MirInstId const offK =
+                constInt(static_cast<std::int64_t>(p.byteOffset));
+            if (!offK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> g{slot, offK};
+            MirInstId const gp =
+                mir.addInst(MirOpcode::Gep, g, interner.pointer(pty));
+            if (!gp.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> st{pieceVals[k], gp};
+            mir.addInst(MirOpcode::Store, st);
+        }
+        return slot;
+    }
+
+    // FC7 C1c: lower `return <struct-expr>;` for a by-value struct/union-returning
+    // function. The returned aggregate is an lvalue/temp; take its ADDRESS and
+    // either copy it through the sret hidden pointer (ByReference) or load its
+    // eightbyte pieces into a multi-operand Return (InRegisters). Mirror of the
+    // caller's `emitStructReturningCall`.
+    [[nodiscard]] bool lowerStructReturn(HirNodeId valNode) {
+        auto const abi = byValueClassify(currentFnResult_);
+        if (!abi.has_value()) {
+            unsupported(valNode,
+                "returning a by-value struct/union is not supported by this "
+                "target's calling convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+            return false;
+        }
+        StructLayout const* layout = cachedLayout(currentFnResult_);
+        if (layout == nullptr) {
+            unsupported(valNode, "by-value struct/union return requires a sizeable "
+                                 "layout (complete type)");
+            return false;
+        }
+        MirInstId const srcAddr = lowerLvalueAddress(valNode);
+        if (!srcAddr.valid()) return false;
+        if (abi->kind == AbiPassing::Kind::ByReference) {
+            if (!sretPtr_.valid()) {
+                unsupported(valNode, "sret return reached without a hidden result "
+                                     "pointer (lowerFunction setup invariant)");
+                return false;
+            }
+            if (!lowerByteWiseCopy(srcAddr, sretPtr_, layout->size)) return false;
+            mir.addReturn(sretPtr_);
+            return true;
+        }
+        std::vector<MirInstId> pieces;
+        pieces.reserve(abi->pieces.size());
+        for (AbiPiece const& p : abi->pieces) {
+            TypeId const pty = pieceType(p.cls);
+            MirInstId const offK =
+                constInt(static_cast<std::int64_t>(p.byteOffset));
+            if (!offK.valid()) return false;
+            std::array<MirInstId, 2> g{srcAddr, offK};
+            MirInstId const gp =
+                mir.addInst(MirOpcode::Gep, g, interner.pointer(pty));
+            if (!gp.valid()) return false;
+            std::array<MirInstId, 1> l{gp};
+            MirInstId const v = mir.addInst(MirOpcode::Load, l, pty);
+            if (!v.valid()) return false;
+            pieces.push_back(v);
+        }
+        mir.addReturnMulti(pieces);
+        return true;
+    }
+
     // Recursively collect into `out` the set of `SymbolId.v`s whose lvalue
     // address is needed somewhere under `node` — i.e. symbols that must be
     // slot-backed rather than pure-SSA. Drives entry-block slot-promotion
@@ -1871,13 +2035,21 @@ struct Lowerer {
             }
             case HirKind::ReturnStmt: {
                 auto v = hir.returnValue(node);
-                if (v.has_value()) {
-                    MirInstId const value = lowerExpr(*v);
-                    if (!value.valid()) return false;
-                    mir.addReturn(value);
-                } else {
+                if (!v.has_value()) {
                     mir.addReturn();
+                    return true;
                 }
+                // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value
+                // struct/union return is lowered specially (sret copy-through or
+                // multi-piece Return) — never as a single truncating value.
+                if (currentFnResult_.valid()) {
+                    TypeKind const rk = interner.kind(currentFnResult_);
+                    if (rk == TypeKind::Struct || rk == TypeKind::Union)
+                        return lowerStructReturn(*v);
+                }
+                MirInstId const value = lowerExpr(*v);
+                if (!value.valid()) return false;
+                mir.addReturn(value);
                 return true;
             }
             case HirKind::Unreachable: {
@@ -2412,7 +2584,15 @@ struct Lowerer {
             return false;
         }
         auto params = hir.functionParams(node);
-        auto paramTypes = interner.fnParams(signature);
+        // COPY the param types out of the interner's pool: `fnParams` returns a
+        // SPAN into that pool, and the sret setup + by-value param/return
+        // synthesis below intern fresh `Ptr<…>` types — an intern can REALLOCATE
+        // the pool, dangling a retained span (an interner-state-dependent
+        // "TypeId out of range" crash; FC7 C1c). The owning vector is immune.
+        std::vector<TypeId> const paramTypes = [&] {
+            auto const s = interner.fnParams(signature);
+            return std::vector<TypeId>(s.begin(), s.end());
+        }();
         if (params.size() != paramTypes.size()) {
             unsupported(node,
                 std::format("Function param count {} mismatches FnSig param "
@@ -2422,25 +2602,21 @@ struct Lowerer {
         // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): a by-value struct/union PARAM
         // is classified + reconstructed in the param loop below (per the active
         // CC's strategy, via `receiveByValueParam`). A by-value struct/union
-        // RETURN still needs sret via a multi-register MIR Return
-        // (D-FC7-SYSV-STRUCT-RETURN-IN-REGS) — fail LOUD here this phase rather
-        // than truncate the aggregate into one return register.
-        if (TypeId const rt = interner.fnResult(signature); rt.valid()) {
-            TypeKind const rk = interner.kind(rt);
-            if (rk == TypeKind::Struct || rk == TypeKind::Union) {
-                unsupported(node,
-                    "a by-value struct/union return type is not yet supported "
-                    "(sret needs a multi-register return — "
-                    "D-FC7-SYSV-STRUCT-RETURN-IN-REGS)");
-                return false;
-            }
-        }
+        // RETURN by value (D-FC7-SYSV-STRUCT-RETURN-IN-REGS) is classified +
+        // synthesized AFTER the entry block opens: an sret return prepends a
+        // hidden result-pointer `Arg`, and an in-register return loads its
+        // eightbyte pieces in the `ReturnStmt`. See the `currentFnResult_` setup
+        // just below `beginBlock`. A CC whose strategy can't classify the
+        // aggregate (e.g. AAPCS64 until C3) fails loud there.
 
         // Per-function context reset: each function owns its own SSA/alloca
         // bindings — entries from the previous function are stale.
         symbolToValue.clear();
         addressableLocal.clear();
         labelBlocks_.clear();   // FC5: labels are function-scoped
+        // FC7 C1c: per-function by-value return state.
+        currentFnResult_ = interner.fnResult(signature);
+        sretPtr_         = InvalidMirInst;
 
         // Pre-pass: scan the body to find params (and locals) whose address
         // is taken. Address-taken params must live in memory (alloca-backed),
@@ -2464,6 +2640,42 @@ struct Lowerer {
         MirBlockId const entry = mir.createBlock(StructCfMarker::EntryBlock);
         mir.beginBlock(entry);
 
+        // FC7 C1c: the per-class arg-ordinal counter is SHARED by the sret hidden
+        // pointer (below) and the real params, so a struct-returning function's
+        // first INTEGER arg register goes to the result pointer and every real arg
+        // shifts by one — hoisted above the sret `Arg` so both use one counter.
+        ArgOrdinalCounter argCtr{config.argSlotAligned};
+
+        // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value struct/union
+        // RETURN. Classify under the active CC's strategy. ByReference (class
+        // MEMORY, >16B) ⇒ sret: prepend a hidden result-pointer `Arg` (consuming
+        // the first INTEGER ordinal); the `ReturnStmt` copies the result through
+        // it and returns it. InRegisters (≤16B) ⇒ no hidden arg; the `ReturnStmt`
+        // loads the eightbyte pieces. A strategy that can't classify the aggregate
+        // (AAPCS64 until C3) fails loud (sealing the open block first).
+        if (currentFnResult_.valid()) {
+            TypeKind const rk = interner.kind(currentFnResult_);
+            if (rk == TypeKind::Struct || rk == TypeKind::Union) {
+                auto const abi = byValueClassify(currentFnResult_);
+                if (!abi.has_value()) {
+                    unsupported(node,
+                        "returning a by-value struct/union is not supported by "
+                        "this target's calling convention "
+                        "(D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                if (abi->kind == AbiPassing::Kind::ByReference) {
+                    sretPtr_ = mir.addArg(argCtr.next(AbiPieceClass::Gpr),
+                                          interner.pointer(currentFnResult_));
+                    if (!sretPtr_.valid()) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        return false;
+                    }
+                }
+            }
+        }
+
         // Params: one `Arg` instruction per param, in declaration order. If
         // the param's address is ever taken in the body, ALSO allocate a slot
         // and store the arg into it — every read of that symbol then goes
@@ -2475,8 +2687,7 @@ struct Lowerer {
         // lockstep with the caller's operand order. For an all-GPR scalar-only
         // function the per-class GPR ordinal equals the param index (no change); a
         // mixed int/float signature now lands each arg in its own class (fixes
-        // D-ML7-2.10).
-        ArgOrdinalCounter argCtr{config.argSlotAligned};
+        // D-ML7-2.10). `argCtr` is hoisted above (shared with the sret arg).
         bool const fnVariadic = interner.fnIsVariadic(signature);
         for (std::size_t i = 0; i < params.size(); ++i) {
             HirNodeId const p = params[i];

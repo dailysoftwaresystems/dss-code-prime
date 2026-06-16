@@ -527,6 +527,10 @@ struct OpcodeHandles {
     std::uint16_t frameStore;
     // ML7 cycle 2: virtual-op handles materialized by the callconv pass.
     std::uint16_t arg;
+    // FC7 C1c: the caller-side struct-return piece read (mirror of `arg`).
+    // Optional — only SysV struct returns emit it; a target without it leaves
+    // this 0 (the `op == h.retPiece` look-ahead then never matches).
+    std::uint16_t retPiece;
     std::uint16_t call;
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02):
     // indirect call via extern import. Same arg-setup semantics as
@@ -690,28 +694,125 @@ argPassingReg(TargetSchema const&            schema,
     return resolveCcReg(schema, pool[index], cls, contextLabel, reporter);
 }
 
-// Lookup the primary return register (slot 0) for the given class.
-// Multi-register returns (SysV's rax+rdx for >64-bit aggregates) are
-// not yet exercised — anchored as a future cycle when the first
-// >64-bit aggregate return surfaces.
+// Lookup the `ordinal`-th return register of the given class. Slot 0 is the
+// primary return register (the scalar / first-eightbyte result); higher slots
+// are the additional eightbyte pieces of an in-register struct return (SysV's
+// rax+rdx / xmm0+xmm1 — FC7 C1c, D-FC7-SYSV-STRUCT-RETURN-IN-REGS). `ordinal` is
+// the PER-CLASS index (GPR and FPR pieces counted separately).
 [[nodiscard]] std::optional<LirReg>
 returnReg(TargetSchema const&            schema,
           TargetCallingConvention const& cc,
           LirRegClass                    cls,
+          std::uint32_t                  ordinal,
           std::string_view               contextLabel,
           DiagnosticReporter&            reporter) {
     auto const& pool = (cls == LirRegClass::FPR) ? cc.returnFprs : cc.returnGprs;
-    if (pool.empty()) {
+    if (ordinal >= pool.size()) {
         report(reporter, DiagnosticCode::L_CcRegLookupFailed,
                DiagnosticSeverity::Error,
-               std::format("{}: calling convention '{}' declares no {} "
-                           "return registers but the call has a {} result",
-                           contextLabel, cc.name,
+               std::format("{}: calling convention '{}' has only {} {} return "
+                           "register(s) but a {} result needs return-register "
+                           "ordinal {}",
+                           contextLabel, cc.name, pool.size(),
                            (cls == LirRegClass::FPR) ? "FPR" : "GPR",
-                           (cls == LirRegClass::FPR) ? "float" : "integer"));
+                           (cls == LirRegClass::FPR) ? "float" : "integer",
+                           ordinal));
         return std::nullopt;
     }
-    return resolveCcReg(schema, pool[0], cls, contextLabel, reporter);
+    return resolveCcReg(schema, pool[ordinal], cls, contextLabel, reporter);
+}
+
+// FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): one `dst <- src` register copy in
+// a parallel-move set (the return-register PIECES of a by-value struct return).
+struct RegMove { LirReg dst; LirReg src; };
+
+// Pick a caller-saved register of class `cls` not among the registers `moves`
+// touches — a free scratch at a call/return boundary (every caller-saved reg is
+// dead there except the return registers themselves, which are in the move set).
+// Agnostic: reads `cc.callerSaved`, never a hardcoded register. nullopt + loud
+// when none is free (would require more live return regs than exist — impossible
+// for SysV's ≤2 pieces).
+[[nodiscard]] std::optional<LirReg>
+pickScratchReg(TargetSchema const& schema, TargetCallingConvention const& cc,
+               LirRegClass cls, std::span<RegMove const> moves,
+               std::string_view ctx, DiagnosticReporter& reporter) {
+    TargetRegClass const want =
+        static_cast<TargetRegClass>(static_cast<std::uint8_t>(cls));
+    auto involved = [&](std::uint16_t id) {
+        for (auto const& m : moves)
+            if (m.dst.id == id || m.src.id == id) return true;
+        return false;
+    };
+    for (std::string_view const name : cc.callerSaved) {
+        auto const ord = schema.registerByName(name);
+        if (!ord.has_value()) continue;
+        auto const* info = schema.registerInfo(*ord);
+        if (info == nullptr || info->regClass != want) continue;
+        if (involved(*ord)) continue;
+        return makePhysicalReg(*ord, cls);
+    }
+    report(reporter, DiagnosticCode::L_MoveCycleUnsupported, DiagnosticSeverity::Error,
+           std::format("{}: no free caller-saved scratch register of the piece's "
+                       "class to break a return-register move cycle", ctx));
+    return std::nullopt;
+}
+
+// Emit a set of parallel register copies so every SOURCE is read before its
+// register is overwritten. Non-cyclic moves emit in dependency order; a true
+// cycle (a 2-swap — e.g. the two eightbytes of a {long,long} return landing
+// cross-wise in rax/rdx) is broken with a scratch register. D-ML7-2.3's arg path
+// only REJECTS cycles; struct-return pieces genuinely need the break. SysV is ≤2
+// pieces (≤ a 2-cycle); a ≥3-register cycle (a future AAPCS64 HFA at C3) fails
+// loud rather than mis-emit.
+[[nodiscard]] bool
+emitParallelRegMoves(LirBuilder& b, TargetSchema const& schema,
+                     TargetCallingConvention const& cc,
+                     std::vector<RegMove> moves, std::string_view ctx,
+                     DiagnosticReporter& reporter) {
+    std::erase_if(moves, [](RegMove const& m) { return m.dst.id == m.src.id; });
+    auto isPendingSrc = [&](std::uint16_t id) {
+        for (auto const& m : moves)
+            if (m.src.id == id) return true;
+        return false;
+    };
+    while (!moves.empty()) {
+        bool progressed = false;
+        for (std::size_t i = 0; i < moves.size(); ++i) {
+            // Safe to emit now iff nobody still needs to READ moves[i].dst.
+            if (isPendingSrc(moves[i].dst.id)) continue;
+            auto const mv = classOpHandle(schema, moves[i].dst.regClass(),
+                                          RegClassOp::Move, ctx, reporter);
+            if (!mv.has_value()) return false;
+            emitMov(b, *mv, moves[i].dst, moves[i].src);
+            moves.erase(moves.begin() + static_cast<std::ptrdiff_t>(i));
+            progressed = true;
+            break;
+        }
+        if (progressed) continue;
+        // Only cycles remain. SysV pieces ≤2 ⇒ at most a 2-swap.
+        if (moves.size() > 2) {
+            report(reporter, DiagnosticCode::L_MoveCycleUnsupported,
+                   DiagnosticSeverity::Error,
+                   std::format("{}: a >=3-register return-piece move cycle is not "
+                               "yet supported (SysV is <=2 pieces; AAPCS64 HFA "
+                               "lands at FC7 C3)", ctx));
+            return false;
+        }
+        // Break the cycle: copy one member's source aside, then redirect every
+        // reader of that source to the scratch — freeing the source register so a
+        // safe move opens up next iteration.
+        LirReg const cycSrc = moves.front().src;
+        auto const scratch = pickScratchReg(schema, cc, cycSrc.regClass(),
+                                            moves, ctx, reporter);
+        if (!scratch.has_value()) return false;
+        auto const mv = classOpHandle(schema, cycSrc.regClass(),
+                                      RegClassOp::Move, ctx, reporter);
+        if (!mv.has_value()) return false;
+        emitMov(b, *mv, *scratch, cycSrc);
+        for (auto& m : moves)
+            if (m.src.id == cycSrc.id) m.src = *scratch;
+    }
+    return true;
 }
 
 [[nodiscard]] std::optional<OpcodeHandles>
@@ -744,7 +845,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 12> const table{{
+    std::array<Entry, 13> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -755,6 +856,10 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // ML7 cycle 2: arg + call materialized inside this pass.
         {&OpcodeHandles::arg,        "arg",        false},
         {&OpcodeHandles::call,       "call",       false},
+        // FC7 C1c: optional — only a CC with in-register struct returns emits
+        // `ret_piece`. Absent ⇒ field stays 0; the `op == h.retPiece` look-ahead
+        // never matches (real opcodes are > 0), so no struct-return capture runs.
+        {&OpcodeHandles::retPiece,   "ret_piece",  true},
         // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02):
         // optional — a target without dynamic-import support legitimately
         // omits this opcode. MIR→LIR's separate per-call extern check at
@@ -886,6 +991,12 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     // matches the reserved `localAreaSize` (no neighbour overlap).
     std::uint32_t localAllocaByteOffset = 0;
 
+    // FC7 C1c: `ret_piece` instructions captured by their struct-returning call's
+    // look-ahead (they must immediately follow the call). A `ret_piece` reached in
+    // the loop WITHOUT being in this set means an optimizer broke that adjacency →
+    // fail loud rather than mis-capture.
+    std::unordered_set<std::uint32_t> consumedRetPieces;
+
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
         LirBlockId const srcBlock = src.funcBlockAt(fn, bi);
         LirBlockId const dstBlock = srcToDst.at(srcBlock.v);
@@ -1001,6 +1112,25 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     emitFrameLoad(b, *argLoad, result, sp, offset);
                 }
                 continue;
+            }
+
+            // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a `ret_piece` captures
+            // the k-th return register of its struct-returning call. It is
+            // CONSUMED by that call's look-ahead (below), which captures all the
+            // pieces together as ONE cycle-broken parallel move. Reaching one here
+            // unconsumed means an optimizer broke the call→piece adjacency the
+            // capture relies on → fail loud, never silently mis-capture a
+            // clobbered return register.
+            if (h.retPiece != 0 && op == h.retPiece) {
+                if (consumedRetPieces.count(inst.v) != 0) continue;
+                report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                       DiagnosticSeverity::Error,
+                       std::format("callconv: ret_piece inst {} is not adjacent to "
+                                   "its struct-returning call — the return-piece "
+                                   "reads must immediately follow the call "
+                                   "(D-FC7-SYSV-STRUCT-RETURN-IN-REGS)",
+                                   inst.v));
+                return false;
             }
 
             // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
@@ -1443,7 +1573,16 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 std::array<LirOperand, 1> callOps{calleeOp};
                 b.addInst(op, InvalidLirReg, callOps,
                           payload, src.instFlags(inst));
-                // Move return register into result (only if non-void).
+                // Capture the call's return register(s) into their result
+                // vreg(s). For a scalar call that is a single move of the primary
+                // return register. For a by-value struct return (FC7 C1c) the
+                // call's result is eightbyte PIECE 0 and the contiguous
+                // `ret_piece` insts HIR→MIR emits right after the call carry
+                // pieces 1..N-1 (each with its per-class return ordinal as
+                // payload); all are captured as ONE cycle-broken parallel move so
+                // a cross-wise piece landing (e.g. {long,long} in rax/rdx) can't
+                // clobber a register another piece still needs.
+                std::vector<RegMove> retMoves;
                 if (result.valid()) {
                     if (result.isPhysical == 0) {
                         report(reporter,
@@ -1454,16 +1593,40 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                            inst.v));
                         return false;
                     }
-                    auto const retReg =
-                        returnReg(schema, cc, result.regClass(),
-                                  "materializeOneFunc: call", reporter);
-                    if (!retReg.has_value()) return false;
-                    // FC2 Part B: FPR returns copy via the class move.
-                    auto const retMov = classOpHandle(
-                        schema, result.regClass(), RegClassOp::Move,
-                        "materializeOneFunc: call-result move", reporter);
-                    if (!retMov.has_value()) return false;
-                    maybeMov(b, *retMov, result, *retReg);
+                    auto const rr = returnReg(schema, cc, result.regClass(), 0,
+                                              "materializeOneFunc: call result",
+                                              reporter);
+                    if (!rr.has_value()) return false;
+                    retMoves.push_back({result, *rr});
+                }
+                if (h.retPiece != 0) {
+                    for (std::uint32_t j = i + 1; j < instN; ++j) {
+                        LirInstId const rp = src.blockInstAt(srcBlock, j);
+                        if (src.instOpcode(rp) != h.retPiece) break;
+                        LirReg const rpRes = src.instResult(rp);
+                        if (!rpRes.valid() || rpRes.isPhysical == 0) {
+                            report(reporter,
+                                   DiagnosticCode::L_VirtualRegInPostRegalloc,
+                                   DiagnosticSeverity::Error,
+                                   std::format("callconv: ret_piece inst {} has no "
+                                               "physical-reg result after regalloc",
+                                               rp.v));
+                            return false;
+                        }
+                        auto const rr =
+                            returnReg(schema, cc, rpRes.regClass(),
+                                      src.instPayload(rp),
+                                      "materializeOneFunc: ret_piece", reporter);
+                        if (!rr.has_value()) return false;
+                        retMoves.push_back({rpRes, *rr});
+                        consumedRetPieces.insert(rp.v);
+                    }
+                }
+                if (!retMoves.empty()
+                    && !emitParallelRegMoves(
+                           b, schema, cc, std::move(retMoves),
+                           "materializeOneFunc: call-result capture", reporter)) {
+                    return false;
                 }
                 continue;
             }
@@ -1525,31 +1688,44 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // skip this block and fall through to the
                     // epilogue + no-op-operand ret.
                     if (!ops.empty()) {
-                        if (ops.size() != 1
-                            || ops[0].kind != LirOperandKind::Reg
-                            || ops[0].reg.isPhysical == 0) {
-                            report(reporter,
-                                   DiagnosticCode::L_VirtualRegInPostRegalloc,
-                                   DiagnosticSeverity::Error,
-                                   std::format("callconv: ret inst {} has "
-                                               "non-physical-reg operand "
-                                               "after regalloc", inst.v));
+                        // FC7 C1c: a by-value struct return carries N eightbyte
+                        // pieces (SysV ≤16B → 2); a scalar / sret-pointer return
+                        // carries 1. Move each piece into its PER-CLASS return
+                        // register (GPR/FPR counted separately — returns are
+                        // per-class on every ABI, unlike slot-aligned args), as
+                        // ONE cycle-broken parallel move so cross-wise pieces
+                        // (e.g. a {long,long} landing rax↔rdx) can't clobber.
+                        std::uint32_t gprRet = 0;
+                        std::uint32_t fprRet = 0;
+                        std::vector<RegMove> retMoves;
+                        retMoves.reserve(ops.size());
+                        for (auto const& o : ops) {
+                            if (o.kind != LirOperandKind::Reg
+                                || o.reg.isPhysical == 0) {
+                                report(reporter,
+                                       DiagnosticCode::L_VirtualRegInPostRegalloc,
+                                       DiagnosticSeverity::Error,
+                                       std::format("callconv: ret inst {} has "
+                                                   "non-physical-reg operand "
+                                                   "after regalloc", inst.v));
+                                return false;
+                            }
+                            LirRegClass const cls = o.reg.regClass();
+                            std::uint32_t const ord =
+                                (cls == LirRegClass::FPR) ? fprRet++ : gprRet++;
+                            auto const rr =
+                                returnReg(schema, cc, cls, ord,
+                                          "materializeOneFunc: ret", reporter);
+                            if (!rr.has_value()) return false;
+                            retMoves.push_back({*rr, o.reg});
+                        }
+                        if (!emitParallelRegMoves(
+                                b, schema, cc, std::move(retMoves),
+                                "materializeOneFunc: ret-value", reporter)) {
                             return false;
                         }
-                        LirReg const valReg = ops[0].reg;
-                        auto const retReg =
-                            returnReg(schema, cc, valReg.regClass(),
-                                      "materializeOneFunc: ret", reporter);
-                        if (!retReg.has_value()) return false;
-                        // FC2 Part B: FPR return values move via the
-                        // class's declared move (movaps), never GPR mov.
-                        auto const retMov = classOpHandle(
-                            schema, valReg.regClass(), RegClassOp::Move,
-                            "materializeOneFunc: ret-value move", reporter);
-                        if (!retMov.has_value()) return false;
-                        maybeMov(b, *retMov, *retReg, valReg);
-                        // Strip the operand from the ret — the
-                        // value is now in the cc's return reg.
+                        // Strip the operands from the ret — the values are now in
+                        // the cc's return registers.
                         newOps.clear();
                     }
                     // Emit epilogue BEFORE the return.

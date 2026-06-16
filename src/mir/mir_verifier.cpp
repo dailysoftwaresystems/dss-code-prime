@@ -504,13 +504,48 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                             std::format("(return) has no value but func #{} "
                                         "returns a non-void type", f.v));
                     } else if (hasValue && wantValue) {
-                        TypeId const vt = mir_.instType(retOps[0]);
-                        if (vt.valid() && vt.v != returnTy.v) {
+                        TypeKind const rk = interner_->kind(returnTy);
+                        if (rk == TypeKind::Struct || rk == TypeKind::Union) {
+                            // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value
+                            // struct/union return is EITHER the first-class aggregate
+                            // VALUE (a single operand of the return type — the const-
+                            // fold / .dssir-text form, never lowered to LIR as-is) OR
+                            // the lowered ABI form: N register PIECES (I64/F64) or an
+                            // sret POINTER (>16B). Each operand must be one of those —
+                            // a DIFFERENT aggregate type is a real mismatch (and a
+                            // single struct-typed value reaching codegen is caught at
+                            // the HIR→MIR lowering, which always emits pieces/sret).
+                            for (MirInstId const opnd : retOps) {
+                                TypeId const vt = mir_.instType(opnd);
+                                if (!vt.valid() || vt.v == returnTy.v) continue;
+                                TypeKind const vk = interner_->kind(vt);
+                                if (vk != TypeKind::I64 && vk != TypeKind::F64
+                                    && vk != TypeKind::Ptr) {
+                                    reportInst(reporter,
+                                        DiagnosticCode::I_TerminatorTypeMismatch, id,
+                                        std::format("(return) of by-value struct/union "
+                                                    "func #{} must carry the aggregate "
+                                                    "value, register pieces (I64/F64), "
+                                                    "or an sret pointer, not a kind-{} "
+                                                    "value (FC7 C1c)",
+                                            f.v, static_cast<int>(vk)));
+                                }
+                            }
+                        } else if (retOps.size() != 1) {
                             reportInst(reporter,
                                 DiagnosticCode::I_TerminatorTypeMismatch, id,
-                                std::format("(return) value type {} does not "
-                                            "match func #{} return type {}",
-                                    vt.v, f.v, returnTy.v));
+                                std::format("(return) of scalar func #{} must carry "
+                                            "exactly one value, has {}",
+                                    f.v, retOps.size()));
+                        } else {
+                            TypeId const vt = mir_.instType(retOps[0]);
+                            if (vt.valid() && vt.v != returnTy.v) {
+                                reportInst(reporter,
+                                    DiagnosticCode::I_TerminatorTypeMismatch, id,
+                                    std::format("(return) value type {} does not "
+                                                "match func #{} return type {}",
+                                        vt.v, f.v, returnTy.v));
+                            }
                         }
                     }
                 }

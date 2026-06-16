@@ -65,6 +65,12 @@ enum class MirOpcode : std::uint16_t {
     // ── calls ──
     Call,          // operands [callee, args...]; result Optional (void ⇒ no value)
     IntrinsicCall, // operands [args...]; payload = intrinsic id; result Optional
+    // The k-th return-register piece of a preceding struct-returning Call
+    // (FC7 C1c, D-FC7-SYSV-STRUCT-RETURN-IN-REGS). operand [call] anchors it to
+    // its call (ordering + no cross-call CSE + DCE-safe); payload = the PER-CLASS
+    // return-register ordinal (≥1 — piece 0 is the Call's own result). Result =
+    // the piece's register type (I64/F64). The caller-side mirror of `Arg`.
+    ReturnPiece,
     // ── SSA join ──
     Phi,           // operand range addresses the PHI pool, not the operand pool
     // ── terminators (exactly one, last in a block; successors live in succ pool) ──
@@ -228,6 +234,10 @@ struct MirOpcodeInfo {
         // calls (result Optional — void callee ⇒ no value).
         case MirOpcode::Call:          return {1, N, 0, 0, R::Optional, false, true, false, "call"};
         case MirOpcode::IntrinsicCall: return {0, N, 0, 0, R::Optional, false, true, false, "intrinsic"};
+        // ReturnPiece: [call]; payload = per-class return-register ordinal. Side-
+        // effecting so DCE can't drop it and no pass hoists it above its Call (it
+        // reads a physical return register valid only immediately post-call).
+        case MirOpcode::ReturnPiece:   return {1, 1, 0, 0, R::Value, false, true, false, "returnpiece"};
 
         // phi — operand range addresses the PHI pool (incoming value/block pairs).
         case MirOpcode::Phi: return {0, N, 0, 0, R::Value, false, false, true, "phi"};

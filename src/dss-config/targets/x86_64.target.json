@@ -31,6 +31,16 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (FC7 C1c, D-FC7-SYSV-STRUCT-RETURN-IN-REGS): 'this LirReg is the k-th return register of the immediately-preceding struct-returning call' (payload = per-class return-register ordinal). The caller-side mirror of `arg`. ML7 calling-convention lowering captures it (a mov-from-returnReg, cycle-broken with its sibling pieces) and the ret_piece itself is never encoded. side-effecting so no pass drops/hoists it off its call.",
+      "mnemonic":      "ret_piece",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "2-operand-shape mov: destination = result vreg, source = operands[0]. AS2 cycle 2 wires this to two encoding variants: REX.W 0x8B /r (mov r64, r64) when source is a register; REX.W 0xC7 /0 imm32 (mov r/m64, imm32 SIGN-extended to 64-bit) when source is an immediate. FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): both shapes gain explicit `width` keys + 32-bit siblings (same opcodes WITHOUT REX.W, Intel SDM Vol. 2B MOV) — a 32-bit register write auto-zero-extends to the full 64-bit register, and the 32-bit imm32 form is EXACT (not sign-extending), the difference that matters for an `unsigned int` 0xFFFFFFFF. Plumbing movs (phi/copy/capture/spill) are emitted width-default (64) — full-register copies are value-correct for every type.",
       "mnemonic":      "mov",
       "result":        "value",

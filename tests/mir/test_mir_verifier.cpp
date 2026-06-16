@@ -442,6 +442,34 @@ TEST(MirVerifier, ReturnTypeMismatch) {
     EXPECT_GE(countCode(r, DiagnosticCode::I_TerminatorTypeMismatch), 1u);
 }
 
+// FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value struct-returning
+// function whose Return carries a value that is NEITHER the struct VALUE (first-
+// class aggregate), a register PIECE (I64/F64), NOR an sret POINTER — here an I32
+// — emits I_TerminatorTypeMismatch. This is the truncation / wrong-piece guard;
+// the positive shapes (multi-piece I64 Return, sret Ptr, mixed F64/I64) are
+// covered by the HIR→MIR lowering pins + the runtime corpus.
+TEST(MirVerifier, StructReturnWithWrongPieceTypeRejected) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    std::array<TypeId, 2> const fields{i32, i32};
+    TypeId const structTy = interner.structType("S", fields);
+    TypeId const fnSig = interner.fnSig({}, structTy, CallConv::CcSysV);  // returns S
+
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    // Return an I32 — not the struct value, not an I64/F64 register piece, not a Ptr.
+    MirInstId const c1 = b.addConst(intLit(1), i32);
+    b.addReturn(c1);
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &interner};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_GE(countCode(r, DiagnosticCode::I_TerminatorTypeMismatch), 1u);
+}
+
 // An orphan block — present in the function but with no predecessor
 // path from entry — fails I_UnreachableBlock. ML2-lowered code never
 // produces orphans, but a future optimizer pass that deletes dead

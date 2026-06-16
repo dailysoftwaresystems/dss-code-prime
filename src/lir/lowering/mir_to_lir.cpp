@@ -171,6 +171,11 @@ enum class MnemonicSlot : std::uint8_t {
     // inline range) keeps the single-mov materialization byte-
     // identically.
     MovkLsl16, MovkLsl32, MovkLsl48,
+    // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): the caller-side virtual op that
+    // captures the k-th return register of a struct-returning call into a vreg.
+    // Materialized away by lir_callconv (a mov-from-returnReg), like `arg` — never
+    // encoded. Declared in every target schema for substrate uniformity.
+    RetPiece,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -257,6 +262,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::MovkLsl16,     "movk_lsl16"},
     {MnemonicSlot::MovkLsl32,     "movk_lsl32"},
     {MnemonicSlot::MovkLsl48,     "movk_lsl48"},
+    {MnemonicSlot::RetPiece,      "ret_piece"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -1006,6 +1012,7 @@ struct Lowerer {
         if (!requireNativeIntWidth(id, op)) return;
         switch (op) {
             case MirOpcode::Arg:    return lowerArg(id);
+            case MirOpcode::ReturnPiece: return lowerReturnPiece(id);
             case MirOpcode::Const:  return lowerConst(id);
             case MirOpcode::Add:    return lowerBinaryOp(id, MnemonicSlot::Add);
             case MirOpcode::Sub:    return lowerBinaryOp(id, MnemonicSlot::Sub);
@@ -1210,6 +1217,22 @@ struct Lowerer {
         LirReg const result = lir.newVReg(regClassFor(id));
         emitInst(*opcode(MnemonicSlot::Arg), result, std::span<LirOperand const>{},
                     /*payload=*/mir.argIndex(id));
+        defineValue(id, result);
+    }
+
+    // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): the k-th return-register piece
+    // of a struct-returning call. The MIR `[call]` operand is the ordering anchor
+    // only (it keeps this read immediately after its call); the LIR `ret_piece` is
+    // a leaf carrying the per-class return ordinal as payload. lir_callconv
+    // captures it from the cc's return register (the caller-side mirror of `arg`).
+    void lowerReturnPiece(MirInstId id) {
+        if (!opcode(MnemonicSlot::RetPiece).has_value()) {
+            reportMissingOpcode(MnemonicSlot::RetPiece, "MIR ReturnPiece");
+            return;
+        }
+        LirReg const result = lir.newVReg(regClassFor(id));
+        emitInst(*opcode(MnemonicSlot::RetPiece), result, std::span<LirOperand const>{},
+                    /*payload=*/mir.returnPieceOrdinal(id));
         defineValue(id, result);
     }
 
@@ -3084,13 +3107,17 @@ struct Lowerer {
             emitReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
             return true;
         }
-        if (operands.size() != 1) {
-            reportUnsupported(MirOpcode::Return, id);
-            return false;
+        // FC7 C1c: a by-value struct/union returned IN REGISTERS carries N
+        // eightbyte pieces (SysV ≤16B → 2); a scalar / sret-pointer return
+        // carries one. lir_callconv moves each piece into its per-class return
+        // register (cycle-broken) before the ret. Carry every operand as a reg.
+        std::vector<LirOperand> ops;
+        ops.reserve(operands.size());
+        for (MirInstId const operand : operands) {
+            std::optional<LirReg> const v = regForValue(operand);
+            if (!v.has_value()) return false;
+            ops.push_back(LirOperand::makeReg(*v));
         }
-        std::optional<LirReg> const v = regForValue(operands[0]);
-        if (!v.has_value()) return false;
-        std::array<LirOperand, 1> ops{LirOperand::makeReg(*v)};
         emitReturn(*opcode(MnemonicSlot::Ret), ops);
         return true;
     }

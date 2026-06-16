@@ -1742,6 +1742,27 @@ namespace {
 [[nodiscard]] std::size_t countOpcode(std::vector<MirOpcode> const& ops, MirOpcode k) {
     return static_cast<std::size_t>(std::count(ops.begin(), ops.end(), k));
 }
+// Entry-block opcodes of function `fi` (the struct-return fixtures are all
+// straight-line single-block bodies, so the entry block is the whole function).
+[[nodiscard]] std::vector<MirOpcode> funcEntryOpcodes(Mir const& m, std::uint32_t fi) {
+    std::vector<MirOpcode> out;
+    MirBlockId const entry = m.funcEntry(m.funcAt(fi));
+    auto const n = m.blockInstCount(entry);
+    out.reserve(n);
+    for (std::uint32_t i = 0; i < n; ++i)
+        out.push_back(m.instOpcode(m.blockInstAt(entry, i)));
+    return out;
+}
+// The Return terminator of function `fi`'s entry block.
+[[nodiscard]] MirInstId entryReturn(Mir const& m, std::uint32_t fi) {
+    MirBlockId const entry = m.funcEntry(m.funcAt(fi));
+    auto const n = m.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) == MirOpcode::Return) return ix;
+    }
+    return InvalidMirInst;
+}
 } // namespace
 
 // All-constant `struct Point p = {1, 2}` const-folds to a single
@@ -2177,6 +2198,107 @@ TEST(MirLoweringCSubset, SysVByRefStructParamReceivesOnePointerArg) {
             << "the >16-byte struct param arrives as a pointer to the caller's copy";
     }
     EXPECT_TRUE(sawArg);
+}
+
+// FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a 12-byte (2-eightbyte) struct
+// RETURNED by value lowers the callee's `return t;` to a MULTI-OPERAND Return
+// carrying TWO I64 register pieces (loaded from t's slot) — never a single
+// truncating struct value. The aggregate types use `typedef` because a top-level
+// `struct Tag` return specifier is the pre-FC4 grammar residue
+// (D-CSUBSET-STRUCT-BODY-VARDECL-POSITION); the ABI codegen is identical.
+TEST(MirLoweringCSubset, SysVTwoEightbyteStructReturnEmitsMultiOperandReturn) {
+    auto L = lowerCSubset(
+        "typedef struct { int x; int y; int z; } Tri;\n"
+        "Tri mk(int a, int b, int c) { Tri t; t.x=a; t.y=b; t.z=c; return t; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    MirInstId const ret = entryReturn(m, 0);
+    ASSERT_TRUE(ret.valid()) << "mk has a Return terminator";
+    auto rops = m.instOperands(ret);
+    ASSERT_EQ(rops.size(), 2u)
+        << "a 2-eightbyte struct returns TWO register pieces, not one truncated "
+           "struct value";
+    for (auto const op : rops)
+        EXPECT_EQ(interner.kind(m.instType(op)), TypeKind::I64)
+            << "each eightbyte is an I64 register piece (rax:rdx)";
+}
+
+// FC7 C1c: a >16-byte struct returned by value uses SRET — the callee receives a
+// hidden result POINTER as its first Arg (GPR ordinal 0, shifting the real
+// params) and returns that pointer; the body copies the result through it.
+TEST(MirLoweringCSubset, SysVByRefStructReturnUsesSretHiddenPointer) {
+    auto L = lowerCSubset(
+        "typedef struct { long a; long b; long c; } Big;\n"
+        "Big mk(long a, long b, long c) { Big r; r.a=a; r.b=b; r.c=c; return r; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    MirInstId firstArg = InvalidMirInst;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) == MirOpcode::Arg) { firstArg = ix; break; }
+    }
+    ASSERT_TRUE(firstArg.valid());
+    EXPECT_EQ(interner.kind(m.instType(firstArg)), TypeKind::Ptr)
+        << "the sret hidden result pointer is the FIRST Arg (GPR ordinal 0)";
+    EXPECT_EQ(m.argIndex(firstArg), 0u);
+    MirInstId const ret = entryReturn(m, 0);
+    ASSERT_TRUE(ret.valid());
+    auto rops = m.instOperands(ret);
+    ASSERT_EQ(rops.size(), 1u) << "sret returns the single hidden pointer";
+    EXPECT_EQ(interner.kind(m.instType(rops[0])), TypeKind::Ptr);
+}
+
+// FC7 C1c: a {double; long} struct returns in MIXED register classes — eightbyte
+// 0 (double @0) is the SSE piece (F64 → xmm0), eightbyte 1 (long @8) is the
+// INTEGER piece (I64 → rax). Pins the per-class return split (the most likely
+// off-by-one: the GPR piece must NOT land in rdx).
+TEST(MirLoweringCSubset, SysVMixedClassStructReturnSplitsAcrossRegisterClasses) {
+    auto L = lowerCSubset(
+        "typedef struct { double d; long n; } Mix;\n"
+        "Mix mk(double d, long n) { Mix m; m.d=d; m.n=n; return m; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    MirInstId const ret = entryReturn(m, 0);
+    ASSERT_TRUE(ret.valid());
+    auto rops = m.instOperands(ret);
+    ASSERT_EQ(rops.size(), 2u) << "{double; long} returns in two register classes";
+    EXPECT_EQ(interner.kind(m.instType(rops[0])), TypeKind::F64)
+        << "eightbyte 0 (double @0) is the SSE piece → xmm0";
+    EXPECT_EQ(interner.kind(m.instType(rops[1])), TypeKind::I64)
+        << "eightbyte 1 (long @8) is the INTEGER piece → rax";
+}
+
+// FC7 C1c (SF-2): a struct-returning CALL is emitted EXACTLY ONCE — the factored
+// helper backs both `lowerExpr(Call)` and `lowerLvalueAddress(Call)`, so a
+// consumer that reaches the call by address (`Tri t = mk(...)`) must not double-
+// emit it. A 2-eightbyte return captures piece 0 as the Call result + ONE
+// `ReturnPiece` for piece 1.
+TEST(MirLoweringCSubset, StructReturningCallEmitsOneCallAndOneReturnPiece) {
+    auto L = lowerCSubset(
+        "typedef struct { int x; int y; int z; } Tri;\n"
+        "Tri mk(int a, int b, int c) { Tri t; t.x=a; t.y=b; t.z=c; return t; }\n"
+        "int use(void) { Tri t = mk(1, 2, 3); return t.x + t.y + t.z; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const ops = funcEntryOpcodes(m, 1);   // `use`
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Call), 1u)
+        << "the struct-returning call is emitted EXACTLY once (no double-emit "
+           "across lowerExpr / lowerLvalueAddress)";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::ReturnPiece), 1u)
+        << "a 2-eightbyte return captures piece 0 (the Call result) + ONE "
+           "ReturnPiece for piece 1";
 }
 
 // ML3 end-to-end: ML2-lowered MIR for a representative c-subset

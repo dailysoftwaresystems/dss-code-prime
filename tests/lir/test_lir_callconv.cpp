@@ -1181,6 +1181,94 @@ TEST(LirCallconvAbi, VoidReturnCallExercisesNoPostCallReturnMov) {
            "(`if (result.valid())` false branch in materializer)";
 }
 
+// FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS) — MF-2 cycle-break pin. A struct
+// returned in TWO eightbytes can land its piece vregs CROSS-WISE vs the return
+// registers (piece 0 in rdx, piece 1 in rax). The naive emit (`mov rax,rdx; mov
+// rdx,rax`) clobbers — the second mov reads rax, already overwritten. The callconv
+// pass MUST break the cycle with a scratch register so both pieces reach their
+// return registers intact. The runtime corpus can't force this coloring (the
+// allocator usually lands the pieces cleanly → the break path is uncovered), so
+// this pin builds the swap DIRECTLY and verifies the emitted move sequence is
+// value-correct by simulating it. RED-ON-DISABLE: revert the cycle-break to the
+// naive two-move emit (or the D-ML7-2.3 reject) and either `result.ok()` is false
+// or the simulation shows rdx ending with piece 0's value instead of piece 1's.
+TEST(LirCallconvAbi, MultiPieceReturnBreaksRegisterSwapCycle) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+    auto const retOp = sch.opcodeByMnemonic("ret");
+    auto const movOp = sch.opcodeByMnemonic("mov");
+    ASSERT_TRUE(retOp.has_value());
+    ASSERT_TRUE(movOp.has_value());
+    auto const* cc = sch.callingConvention(0);   // SysV (cc index 0)
+    ASSERT_NE(cc, nullptr);
+    ASSERT_GE(cc->returnGprs.size(), 2u);
+    auto const raxOrd = sch.registerByName(cc->returnGprs[0]);   // rax
+    auto const rdxOrd = sch.registerByName(cc->returnGprs[1]);   // rdx
+    ASSERT_TRUE(raxOrd.has_value());
+    ASSERT_TRUE(rdxOrd.has_value());
+
+    // ret [piece0=rdx, piece1=rax]: piece 0 must move to returnGprs[0]=rax, piece 1
+    // to returnGprs[1]=rdx — a cross-wise 2-swap that needs a scratch to resolve.
+    LirReg const pRax = makePhysicalReg(*raxOrd, LirRegClass::GPR);
+    LirReg const pRdx = makePhysicalReg(*rdxOrd, LirRegClass::GPR);
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{77});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    std::array<LirOperand, 2> retOps{LirOperand::makeReg(pRdx),    // piece 0 in rdx
+                                     LirOperand::makeReg(pRax)};   // piece 1 in rax
+    b.addInst(*retOp, InvalidLirReg, retOps);
+    Lir lir = std::move(b).finish();
+
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{77};
+    alloc.perFunc.back().callingConventionIndex = 0;
+    alloc.perFunc.back().numSpillSlots          = 0;
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
+    ASSERT_TRUE(result.ok())
+        << "the register-swap cycle must be broken cleanly, not rejected loud";
+
+    // Simulate the emitted movs over a register token-map: each register starts
+    // holding its own id; after the moves, rax must hold rdx's ORIGINAL token
+    // (piece 0) and rdx must hold rax's ORIGINAL token (piece 1).
+    std::unordered_map<std::uint32_t, std::uint32_t> regTok;
+    auto tok = [&](std::uint32_t id) {
+        auto it = regTok.find(id);
+        return it == regTok.end() ? id : it->second;
+    };
+    std::uint32_t movCount = 0;
+    for (std::uint32_t fi = 0; fi < result.lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = result.lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const b2 = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < result.lir.blockInstCount(b2); ++i) {
+                LirInstId const inst = result.lir.blockInstAt(b2, i);
+                if (result.lir.instOpcode(inst) != *movOp) continue;
+                LirReg const dst = result.lir.instResult(inst);
+                auto const ops = result.lir.instOperands(inst);
+                ASSERT_EQ(ops.size(), 1u);
+                ASSERT_EQ(ops[0].kind, LirOperandKind::Reg);
+                ++movCount;
+                regTok[dst.id] = tok(ops[0].reg.id);
+            }
+        }
+    }
+    EXPECT_GE(movCount, 3u)
+        << "a register-swap cycle needs >=3 movs (scratch-mediated); a 2-mov "
+           "naive emit would clobber";
+    EXPECT_EQ(tok(*raxOrd), *rdxOrd)
+        << "returnGprs[0]=rax must end holding piece 0 (the value that started "
+           "in rdx)";
+    EXPECT_EQ(tok(*rdxOrd), *raxOrd)
+        << "returnGprs[1]=rdx must end holding piece 1 (the value that started "
+           "in rax) — a naive non-cycle-broken swap leaves piece 0's value here";
+}
+
 TEST(LirCallconvAbi, MultiArgFunctionMaterializesEveryArgGpr) {
     // A 3-arg function must materialize 3 arg movs (or omit those
     // the regalloc happens to pin to the correct cc reg). All three

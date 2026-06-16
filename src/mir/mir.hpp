@@ -130,6 +130,7 @@ public:
     [[nodiscard]] std::uint32_t constLiteralIndex(MirInstId id) const; // Const
     [[nodiscard]] SymbolId      globalAddrSymbol(MirInstId id) const;  // GlobalAddr
     [[nodiscard]] std::uint32_t intrinsicId(MirInstId id) const;       // IntrinsicCall
+    [[nodiscard]] std::uint32_t returnPieceOrdinal(MirInstId id) const;// ReturnPiece
 
     // ── block accessors ──
     [[nodiscard]] StructCfMarker blockMarker(MirBlockId id) const { return blockArena_.at(id).marker; }
@@ -380,6 +381,12 @@ public:
     MirInstId addArg(std::uint32_t paramIndex, TypeId type, MirInstFlags flags = MirInstFlags::None);
     MirInstId addConst(MirLiteralValue value, TypeId type, MirInstFlags flags = MirInstFlags::None);
     MirInstId addGlobalAddr(SymbolId symbol, TypeId type, MirInstFlags flags = MirInstFlags::None);
+    // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): the k-th register piece of a
+    // struct-returning `call` (≥1 — piece 0 is the call's own result). `ordinal`
+    // is the PER-CLASS return-register index; `pieceType` is the piece's register
+    // type (I64/F64). The `call` operand anchors ordering + value-numbering.
+    MirInstId addReturnPiece(MirInstId call, std::uint32_t ordinal, TypeId pieceType,
+                             MirInstFlags flags = MirInstFlags::None);
 
     // D5.6: aggregate field/element read + write (first-class, no memory).
     // `path` is the field-index chain (length 1 for direct read of a top-
@@ -415,6 +422,10 @@ public:
                         std::span<std::pair<MirInstId, MirBlockId> const> cases,
                         MirBlockId defaultTarget);
     MirInstId addReturn(std::optional<MirInstId> value = std::nullopt);
+    // FC7 C1c: a by-value struct/union returned IN REGISTERS yields N eightbyte
+    // pieces (SysV ≤16B → 2). Each `values[i]` is a piece value (I64/F64); the
+    // callconv pass moves piece i into its per-class return register.
+    MirInstId addReturnMulti(std::span<MirInstId const> values);
     MirInstId addUnreachable();
 
     // ── introspection (read-only on the in-progress build) ──

@@ -31,6 +31,16 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (FC7 C1c) — caller-side mirror of `arg`: 'this LirReg is the k-th return register of the preceding struct-returning call' (payload = per-class return ordinal). ML7 callconv lowering captures it from the return register. Declared for substrate uniformity; AAPCS64 struct returns land at C3, so no arm64 ret_piece is emitted yet.",
+      "mnemonic":      "ret_piece",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "AAPCS64 has no native `mov reg, reg` instruction — the canonical encoding is `ORR Xd, XZR, Xm` (32-bit fixed word 0xAA0003E0 = base + Rn=XZR=31; Rd and Rm via slots). LIR's `mov` is 2-operand (result + 1 source); 3-address natively (no requires2Address).",
       "mnemonic":      "mov",
       "result":        "value",
