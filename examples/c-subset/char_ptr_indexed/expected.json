@@ -1,5 +1,5 @@
 {
-  "$comment": "Indexed char byte memory (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): runtime-index byte STORE `q[n]=66` (x86 mov [base+idx*1],r8) + indexed byte LOAD `q[n]` (movzx), through (char*)&int writable stack memory. 66 + 65 = 131. x86_64 ONLY — arm64's lea is symbol-form-only, a pre-existing gap blocking all indexed pointer arithmetic (int and char alike), so the indexed forms have no arm64 realization to exercise; the non-indexed char forms cover arm64 in char_value. The optimizedPipelines arm keeps `n` a runtime value (no const-fold of the index).",
+  "$comment": "Indexed char byte memory (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN + D-AS4-ARM64-BASE-INDEX-LEA): runtime-index byte STORE `q[n]=66` (x86 mov [base+idx*1],r8 / arm64 STURB) + indexed byte LOAD `q[n]` (movzx / LDURB), through (char*)&int writable stack memory. 66 + 65 = 131. The base+index address (`q+n`) lowers to a 4-op `lea` (x86 SIB / arm64 `ADD Xd,Xn,Xm`); arm64 gained that base+index lea form this cycle (the universal memoffset.zero slot), so the example now runs on EVERY target — it was x86-only ONLY because arm64's lea was symbol+disp with no base+index form. The optimizedPipelines arm keeps `n` a runtime value (no const-fold of the index).",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 131,
@@ -13,6 +13,18 @@
       "spec": "x86_64:elf64-x86_64-linux-exec",
       "artifact": "main",
       "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
     }
   ],
   "optimizedPipelines": [

@@ -813,7 +813,7 @@
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   1,
-      "maxOperands":   3,
+      "maxOperands":   4,
       "minSuccessors": 0,
       "maxSuccessors": 0,
       "encoding": {
@@ -841,6 +841,18 @@
               { "index": 0, "slotKind": "rn"              },
               { "index": 1, "slotKind": "membase.noscale" },
               { "index": 2, "slotKind": "imm12"           }
+            ]
+          },
+          {
+            "$comment": "BASE+INDEX lea (D-AS4-ARM64-BASE-INDEX-LEA) — `lea Xd, [base + index*1 + 0]` = AArch64 `ADD Xd, Xn, Xm` (shifted-register add, LSL #0). The 4-op form `lowerGep` emits for an indexed pointer access `p[n]` ([base_reg, index_reg, MemBase(scale=1), MemOffset(disp=0)]), MIRRORING x86_64's 4-op SIB lea so the GEP stays target-blind (closing the gap that made `p[n]` fail loud on arm64 for int AND char alike). The GEP emits scale=1 + disp=0 ALWAYS today, so this single ADD is the complete realization: base→Rn (5..9), index→Rm (16..20), result→Rd (0..4); MemBase→membase.noscale (scale MUST be 1, fail-loud) and MemOffset→memoffset.zero (disp MUST be 0 — the register-add form has NO displacement field, and bits 10..21 overlap Rm so an Imm12 wiring would corrupt it; fail-loud on nonzero). Fixed word 0x8B000000 (the ADD reg-reg base, shared with `add`'s reg-reg variant). A scale!=1 (typed-array Gep scaling by sizeof(T)) needs the shifted form `ADD Xd,Xn,Xm,LSL #log2(scale)` — a FUTURE consumer (D-AS4-ARM64-INDEXED-LEA-SCALE, co-design with ML6 address-mode synthesis), NOT built speculatively.",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "template":   { "fixedWord": 2332033024 },
+            "resultSlot": "rd",
+            "wires": [
+              { "index": 0, "slotKind": "rn"              },
+              { "index": 1, "slotKind": "rm"              },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "memoffset.zero"  }
             ]
           }
         ]

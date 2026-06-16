@@ -250,6 +250,7 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
         case EncodingSlotKind::Imm16:
         case EncodingSlotKind::Imm9:
         case EncodingSlotKind::MemBaseNoScale:
+        case EncodingSlotKind::MemOffsetZero:
         case EncodingSlotKind::Imm12:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:

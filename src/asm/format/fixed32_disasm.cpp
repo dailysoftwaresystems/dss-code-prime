@@ -61,6 +61,7 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::BlockRel32:
         case EncodingSlotKind::Imm9:
         case EncodingSlotKind::MemBaseNoScale:
+        case EncodingSlotKind::MemOffsetZero:
         case EncodingSlotKind::Imm12:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:

@@ -911,6 +911,80 @@ TEST(Arm64Encoder, FrameRelativeLeaEncodesAddImm12) {
     EXPECT_EQ(bytes[3], 0x91);
 }
 
+TEST(Arm64Encoder, BaseIndexLeaEncodesAddRegReg) {
+    // D-AS4-ARM64-BASE-INDEX-LEA: the 4-op base+index lea
+    // [base, index, MemBase(1), MemOffset(0)] = AArch64 `ADD Xd, Xn, Xm`
+    // — the form `lowerGep` emits for an indexed pointer access `p[n]`,
+    // closing the gap that made indexed access fail loud on arm64 (int
+    // AND char alike). HOST-INDEPENDENT byte-pin: the runtime witness is
+    // the qemu-gated char_ptr_indexed corpus (one leg), so this pin
+    // guards the encoding on EVERY leg (§A.5 cross-target closure).
+    //   lea X0, [X1 + X2*1 + 0] → ADD X0, X1, X2. Base 0x8B000000.
+    //   Rd = X0 (0)  at bits 0..4   → 0x00
+    //   Rn = X1 (1)  at bits 5..9   → 0x20
+    //   Rm = X2 (2)  at bits 16..20 → 0x20000
+    // word = 0x8B020020; LE: 20 00 02 8B. Distinct Rd/Rn/Rm → a wrong
+    // fixedWord, an Rn↔Rm swap, or a dropped operand all fail.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),   // base
+        LirOperand::makeReg(gpr(**s, "x2")),   // index
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(0)
+    };
+    (void)b.addInst(*leaOp, gpr(**s, "x0"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0x02);
+    EXPECT_EQ(bytes[3], 0x8B);
+}
+
+TEST(Arm64Encoder, BaseIndexLeaNonZeroDispFailsLoud) {
+    // RED-on-disable for the memoffset.zero guard: the base+index lea
+    // (ADD Xd,Xn,Xm) has NO displacement field, so a nonzero disp MUST
+    // fail loud — never silently drop the offset (a wrong address) and
+    // never corrupt Rm (bits 10..21 overlap Rm at 16..20, so an Imm12
+    // wiring would). A base+index+disp address needs a separate ADD,
+    // which has no consumer yet.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeReg(gpr(**s, "x2")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(8)   // nonzero — no field for it
+    };
+    (void)b.addInst(*leaOp, gpr(**s, "x0"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    (void)assembleFirstFn(lir, **s, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a base+index lea with a nonzero displacement must fail loud "
+           "(memoffset.zero guard), never silently drop or mis-encode it";
+}
+
 TEST(Arm64Encoder, FrameLeaOffsetWiderThanImm12FailsLoud) {
     // RED-on-disable for the UNSIGNED Imm12 range guard on the frame-lea:
     // a frame offset wider than unsigned 12-bit (0..4095) must fail loud
