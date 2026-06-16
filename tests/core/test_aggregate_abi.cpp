@@ -184,17 +184,85 @@ TEST(AggregateAbiSysV, UnimplementedStrategyIsNullopt) {
     auto ti = makeInterner(1);
     TypeId const s = structOf(ti, "II",
                  {ti.primitive(TypeKind::I32), ti.primitive(TypeKind::I32)});
+    // None + AAPCS64 (until C3) are unimplemented → nullopt (the caller fails
+    // loud). Win64 is implemented as of C2 (see the AggregateAbiWin64 suite).
     EXPECT_FALSE(classifyAggregate(AggregateClassKind::None, 16, s, ti,
-                                   kNatural16, DataModel::Lp64).has_value());
-    EXPECT_FALSE(classifyAggregate(AggregateClassKind::Win64BySize, 8, s, ti,
                                    kNatural16, DataModel::Lp64).has_value());
     EXPECT_FALSE(classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, s, ti,
                                    kNatural16, DataModel::Lp64).has_value());
 }
 
-TEST(AggregateAbiSysV, ImplementedFlagMatchesC1Scope) {
+TEST(AggregateAbiSysV, ImplementedFlagMatchesC1C2Scope) {
     EXPECT_TRUE(aggregateAbiImplemented(AggregateClassKind::SysVEightbyte));
+    EXPECT_TRUE(aggregateAbiImplemented(AggregateClassKind::Win64BySize));  // C2
     EXPECT_FALSE(aggregateAbiImplemented(AggregateClassKind::None));
-    EXPECT_FALSE(aggregateAbiImplemented(AggregateClassKind::Win64BySize));
-    EXPECT_FALSE(aggregateAbiImplemented(AggregateClassKind::Aapcs64Hfa));
+    EXPECT_FALSE(aggregateAbiImplemented(AggregateClassKind::Aapcs64Hfa));  // C3
+}
+
+// ── FC7 C2: MS x64 (Win64) by-size classification ──────────────────────────
+// A struct is passed/returned in ONE GPR iff its size is a power of two ≤ 8
+// (1/2/4/8); EVERY other size (3/5/6/7 or > 8) goes BY REFERENCE. Win64 has no
+// SSE/HFA rule — a small aggregate is an integer of its size, float members or
+// not. maxRegBytes = 8 (a single register).
+namespace {
+[[nodiscard]] std::optional<AbiPassing>
+classifyWin64(TypeId t, TypeInterner const& ti) {
+    return classifyAggregate(AggregateClassKind::Win64BySize, 8, t, ti,
+                             kNatural16, DataModel::Lp64);
+}
+}  // namespace
+
+TEST(AggregateAbiWin64, EightByteStruct_OneGprPiece) {
+    auto ti = makeInterner(1);
+    TypeId const i = ti.primitive(TypeKind::I32);
+    auto r = classifyWin64(structOf(ti, "II", {i, i}), ti);  // 8 bytes
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->kind, AbiPassing::Kind::InRegisters);
+    ASSERT_EQ(r->pieces.size(), 1u);
+    EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Gpr);
+    EXPECT_EQ(r->pieces[0].byteOffset, 0u);
+    EXPECT_EQ(r->pieces[0].widthBytes, 8u);
+}
+
+TEST(AggregateAbiWin64, FourByteFloatStruct_OneGprNotSse) {
+    auto ti = makeInterner(1);
+    // {float} = 4 bytes → ONE GPR (Win64 treats it as a 4-byte integer; NO SSE,
+    // unlike SysV which would put a float-only eightbyte in an FPR).
+    auto r = classifyWin64(structOf(ti, "F", {ti.primitive(TypeKind::F32)}), ti);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->kind, AbiPassing::Kind::InRegisters);
+    ASSERT_EQ(r->pieces.size(), 1u);
+    EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Gpr)
+        << "Win64 passes a small float-only struct in a GPR, not an FPR";
+    EXPECT_EQ(r->pieces[0].widthBytes, 4u);
+}
+
+TEST(AggregateAbiWin64, ThreeByteStruct_ByReference) {
+    auto ti = makeInterner(1);
+    TypeId const c = ti.primitive(TypeKind::Char);
+    // {char,char,char} = 3 bytes — NOT a power of two → BY REFERENCE.
+    auto r = classifyWin64(structOf(ti, "CCC", {c, c, c}), ti);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->kind, AbiPassing::Kind::ByReference)
+        << "a 3-byte struct is not power-of-two → by reference on Win64";
+}
+
+TEST(AggregateAbiWin64, TwelveByteStruct_ByReference) {
+    auto ti = makeInterner(1);
+    TypeId const i = ti.primitive(TypeKind::I32);
+    // {int,int,int} = 12 bytes — > 8 → BY REFERENCE (SysV would split into two
+    // eightbytes; Win64 always passes > 8 by reference).
+    auto r = classifyWin64(structOf(ti, "III", {i, i, i}), ti);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->kind, AbiPassing::Kind::ByReference);
+}
+
+TEST(AggregateAbiWin64, OneByteStruct_OneGprWidthOne) {
+    auto ti = makeInterner(1);
+    auto r = classifyWin64(structOf(ti, "C", {ti.primitive(TypeKind::Char)}), ti);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->kind, AbiPassing::Kind::InRegisters);
+    ASSERT_EQ(r->pieces.size(), 1u);
+    EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Gpr);
+    EXPECT_EQ(r->pieces[0].widthBytes, 1u);
 }

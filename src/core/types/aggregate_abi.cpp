@@ -8,9 +8,10 @@
 namespace dss {
 
 bool aggregateAbiImplemented(AggregateClassKind strategy) noexcept {
-    // C1: only the SysV AMD64 eightbyte strategy is realized. Win64 / AAPCS64
-    // are declared in config but not yet built — they stay fail-loud (C2/C3).
-    return strategy == AggregateClassKind::SysVEightbyte;
+    // SysV AMD64 (C1) + MS x64 (C2) are realized. AAPCS64 (C3) is declared in
+    // config but not yet built — it stays fail-loud.
+    return strategy == AggregateClassKind::SysVEightbyte
+        || strategy == AggregateClassKind::Win64BySize;
 }
 
 namespace {
@@ -68,13 +69,33 @@ std::optional<AbiPassing>
 classifyAggregate(AggregateClassKind strategy, std::uint16_t maxRegBytes,
                   TypeId aggTy, TypeInterner const& in,
                   AggregateLayoutParams lp, DataModel dm) {
-    if (strategy != AggregateClassKind::SysVEightbyte)
-        return std::nullopt;   // C1: only SysV; the guard fails the others loud
+    if (!aggregateAbiImplemented(strategy))
+        return std::nullopt;   // unimplemented strategy (AAPCS64 until C3) → fail loud
 
     auto const lay = computeLayout(aggTy, in, lp, dm);
     if (!lay.has_value()) return std::nullopt;   // un-sizeable → fail loud
     std::uint64_t const size = lay->size;
 
+    if (strategy == AggregateClassKind::Win64BySize) {
+        // MS x64: a struct/union is passed/returned in ONE GPR iff its size is a
+        // power of two ≤ maxRegBytes (1/2/4/8 bytes); every other size — 3/5/6/7,
+        // or > maxRegBytes — goes BY REFERENCE (a caller-allocated copy / sret).
+        // Win64 has NO SSE/HFA rule: a small aggregate is treated as an integer of
+        // its size regardless of float members (the full register moves; the
+        // byte-exact valid bytes are recovered at the temp/slot boundary).
+        AbiPassing wout;
+        bool const pow2 = size != 0 && (size & (size - 1)) == 0;
+        if (pow2 && size <= maxRegBytes) {
+            wout.kind = AbiPassing::Kind::InRegisters;
+            wout.pieces.push_back(AbiPiece{AbiPieceClass::Gpr, 0,
+                                           static_cast<std::uint32_t>(size)});
+        } else {
+            wout.kind = AbiPassing::Kind::ByReference;
+        }
+        return wout;
+    }
+
+    // SysVEightbyte (the only other implemented strategy).
     AbiPassing out;
     // SysV §3.2.3: an aggregate larger than two eightbytes (> maxRegBytes) — or
     // empty — goes in MEMORY (by reference for args; sret for returns).

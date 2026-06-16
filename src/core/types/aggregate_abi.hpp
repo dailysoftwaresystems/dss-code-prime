@@ -21,11 +21,11 @@
 // here = params-in-config + a bounded per-strategy ALGORITHM (SysV eightbyte
 // classification does not reduce to a flat table).
 //
-// Phase C1 implements the **SysV AMD64 eightbyte** strategy only; Win64 / AAPCS64
-// are declared-but-unrealized (the strategy-availability guard keeps them
-// fail-loud until C2/C3). The realization (synthesis of the register pieces /
-// pointer) lives at HIR→MIR (the §B-locked boundary), reusing the existing
-// aggregate primitives; this engine only CLASSIFIES.
+// C1 implements the **SysV AMD64 eightbyte** strategy and C2 the **MS x64
+// (Win64) by-size** strategy; AAPCS64 is declared-but-unrealized (the strategy-
+// availability guard keeps it fail-loud until C3). The realization (synthesis of
+// the register pieces / pointer) lives at HIR→MIR (the §B-locked boundary),
+// reusing the existing aggregate primitives; this engine only CLASSIFIES.
 
 namespace dss {
 
@@ -46,9 +46,10 @@ struct AbiPassing {
     std::vector<AbiPiece> pieces;   // populated iff InRegisters
 };
 
-// Whether the by-value aggregate ABI for `strategy` is IMPLEMENTED. C1 = SysV
-// only. The strategy-availability guard consults this so an un-built CC (None /
-// Win64 / AAPCS64 in C1) fails loud at the by-value site rather than mis-passing.
+// Whether the by-value aggregate ABI for `strategy` is IMPLEMENTED (C1 = SysV,
+// C2 = Win64; AAPCS64 lands at C3). The strategy-availability guard consults this
+// so an un-built CC (None / AAPCS64) fails loud at the by-value site rather than
+// mis-passing.
 [[nodiscard]] DSS_EXPORT bool
 aggregateAbiImplemented(AggregateClassKind strategy) noexcept;
 
