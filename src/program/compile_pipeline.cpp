@@ -291,6 +291,7 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
         mirCfg.aggregateClassification  = cc->aggregateClassification;
         mirCfg.aggregateMaxRegBytes     = cc->aggregateMaxRegBytes;
         mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
+        mirCfg.argSlotAligned           = cc->slotAligned;
     }
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,

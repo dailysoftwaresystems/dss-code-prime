@@ -937,8 +937,12 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             // slot index; pool size = max(argGprs, argFprs); register
             // resident when slot < poolSize, else stack-resident.
             // Independent counters (SysV/AAPCS64): payload IS the
-            // per-class index (existing semantics — see D-ML7-2.10
-            // anchor for the mixed-class latent gap).
+            // per-class index. HIR→MIR emits each param/struct-piece Arg
+            // with a monotonic per-class counter (D-ML7-2.10 ✅ CLOSED by
+            // FC7 C1b — the mixed-class latent gap is fixed: a scalar
+            // param's payload is now its per-class index, not the param
+            // index, so an int-then-float-then-int signature lands the
+            // float in xmm0, not xmm1).
             //
             // A future regalloc pre-coloring hint (D-ML7-2.5) would
             // eliminate most register-resident movs by pre-pinning

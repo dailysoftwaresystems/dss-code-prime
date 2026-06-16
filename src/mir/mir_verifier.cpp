@@ -442,10 +442,25 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
         // type-lattice followup; tier-2 — no current consumer would
         // benefit).
         auto operands = interner_->operands(fnSig);
-        std::uint32_t const paramCount = static_cast<std::uint32_t>(
-            operands.size() >= 1 ? operands.size() - 1 : 0);
         TypeId const returnTy = operands.empty() ? InvalidType : operands[0];
         std::uint32_t const nBlocks = mir_.funcBlockCount(f);
+        // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG): the physical-arg count is NOT the
+        // FnSig param count — a by-value struct param expands to MULTIPLE register
+        // `Arg`s (one per SysV eightbyte / AAPCS64 piece). The `Arg` payload is the
+        // PER-CLASS (or, for a slot-aligned CC, flat) physical register ordinal,
+        // which HIR→MIR emits with a MONOTONIC per-class counter — so every payload
+        // is < the number of `Arg` instructions in the function (a per-class payload
+        // < its class count <= the total; a flat payload < the total). Bound the
+        // check on THAT count, not the FnSig paramCount, so a multi-register struct
+        // param verifies while a stray out-of-range `Arg` is still rejected.
+        std::uint32_t argCount = 0;
+        for (std::uint32_t bi = 0; bi < nBlocks; ++bi) {
+            MirBlockId const b = mir_.funcBlockAt(f, bi);
+            std::uint32_t const n = mir_.blockInstCount(b);
+            for (std::uint32_t i = 0; i < n; ++i)
+                if (mir_.instOpcode(mir_.blockInstAt(b, i)) == MirOpcode::Arg)
+                    ++argCount;
+        }
         for (std::uint32_t bi = 0; bi < nBlocks; ++bi) {
             MirBlockId const b = mir_.funcBlockAt(f, bi);
             std::uint32_t const n = mir_.blockInstCount(b);
@@ -454,11 +469,11 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                 MirOpcode const op = mir_.instOpcode(id);
                 if (op == MirOpcode::Arg) {
                     std::uint32_t const idx = mir_.argIndex(id);
-                    if (idx >= paramCount) {
+                    if (idx >= argCount) {
                         reportInst(reporter, DiagnosticCode::I_ArgIndexOutOfRange, id,
-                            std::format("argIndex {} >= FnSig paramCount {} "
+                            std::format("argIndex {} >= physical-arg count {} "
                                         "for func #{}",
-                                idx, paramCount, f.v));
+                                idx, argCount, f.v));
                     }
                 } else if (op == MirOpcode::CondBr) {
                     auto condOps = mir_.instOperands(id);

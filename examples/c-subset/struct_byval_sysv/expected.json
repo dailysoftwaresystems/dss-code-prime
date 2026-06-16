@@ -1,5 +1,5 @@
 {
-  "$comment": "FC7 C1a (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): x86_64 SysV struct-by-value. two() takes an 8-byte struct in ONE register (eightbyte); three() takes a 24-byte struct BY REFERENCE (>16B MEMORY). Far fields p.y@4 + b.c@16 survive. (10+11)+(7+6+8)=42 via non-inlined mk(). SysV runtime = x86_64-ELF only (Win64/AAPCS64 fail loud, C2/C3; Mach-O-x86_64 SysV has no CI leg). The 9-16 byte 2-eightbyte case is fail-loud (D-FC7-SYSV-STRUCT-ARG-MULTIREG).",
+  "$comment": "FC7 C1a+C1b (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): x86_64 SysV struct-by-value across all three classes — two()=8B in ONE register, three()=12B in TWO registers (C1b multi-register, rdi:rsi), big()=24B BY REFERENCE (>16B MEMORY). Far fields t.z@8 (2nd eightbyte) + b.c@16 survive. (3+4)+(5+6+7)+(8+9+0)=42 via non-inlined mk(). SysV runtime = x86_64-ELF only (Win64/AAPCS64 fail loud, C2/C3; Mach-O-x86_64 SysV has no CI leg).",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,

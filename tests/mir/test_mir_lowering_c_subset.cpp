@@ -74,6 +74,7 @@ struct Lowered {
             mirCfg.aggregateClassification   = cc->aggregateClassification;
             mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
             mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
+            mirCfg.argSlotAligned            = cc->slotAligned;
         }
     }
     // D-CSUBSET-LINKAGE-SPECIFIERS: thread the native-decl linkage side-table
@@ -2116,6 +2117,37 @@ TEST(MirLoweringCSubset, SysVStructByValueCallPassesOneRegisterPiece) {
             << "the struct arg is passed as ONE I64 register piece, not a struct";
     }
     EXPECT_TRUE(sawCall);
+}
+
+// FC7 C1b (D-FC7-SYSV-STRUCT-ARG-MULTIREG): a 12-byte struct is TWO SysV
+// eightbytes → the callee receives TWO I64 register Args, with the PER-CLASS GPR
+// ordinals 0 and 1 (rdi, rsi), each stored into its eightbyte of the slot. This
+// is the multi-register case the verifier's physical-arg-count bound unblocks.
+TEST(MirLoweringCSubset, SysVTwoEightbyteStructParamReceivesTwoRegisterPieces) {
+    auto L = lowerCSubset(
+        "struct Tri { int x; int y; int z; };\n"
+        "int sum(struct Tri t) { return t.x + t.y + t.z; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Arg), 2u)
+        << "two register Args for the two-eightbyte struct param";
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto const n = m.blockInstCount(entry);
+    std::vector<std::uint32_t> argPayloads;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Arg) continue;
+        EXPECT_EQ(interner.kind(m.instType(ix)), TypeKind::I64)
+            << "each eightbyte is an I64 register piece";
+        argPayloads.push_back(m.argIndex(ix));
+    }
+    ASSERT_EQ(argPayloads.size(), 2u);
+    EXPECT_EQ(argPayloads[0], 0u) << "first eightbyte → per-class GPR ordinal 0 (rdi)";
+    EXPECT_EQ(argPayloads[1], 1u) << "second eightbyte → per-class GPR ordinal 1 (rsi)";
 }
 
 // FC7 C1a: a >16-byte struct param passed BY REFERENCE arrives as ONE POINTER

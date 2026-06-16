@@ -599,22 +599,12 @@ struct Lowerer {
                                     "convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
                                 return InvalidMirInst;
                             }
-                            // C1a: a 2-eightbyte (9–16 byte) struct passed IN
-                            // REGISTERS expands to >1 register Arg, which the MIR
-                            // Arg/verifier (one-Arg-per-param) can't yet represent
-                            // — fail loud until the multi-register Arg extension
-                            // (D-FC7-SYSV-STRUCT-ARG-MULTIREG). Single-register
-                            // (≤8B) and by-reference (>16B) need only one Arg and
-                            // work now.
-                            if (abi->kind == AbiPassing::Kind::InRegisters
-                                && abi->pieces.size() > 1) {
-                                unsupported(kids[i],
-                                    "passing a 9–16 byte struct/union BY VALUE in "
-                                    "registers needs the multi-register MIR Arg "
-                                    "extension (D-FC7-SYSV-STRUCT-ARG-MULTIREG); "
-                                    "pass a pointer instead for now");
-                                return InvalidMirInst;
-                            }
+                            // FC7 C1b: the caller pushes each eightbyte piece as
+                            // a scalar Call operand IN ORDER; lir_callconv assigns
+                            // them to consecutive per-class arg registers. No
+                            // multi-register guard — the callee's per-class Arg
+                            // counter + the verifier's physical-arg-count bound
+                            // (D-FC7-SYSV-STRUCT-ARG-MULTIREG) now handle >1 piece.
                             if (!appendByValueArg(operands, kids[i], argTy, *abi))
                                 return InvalidMirInst;
                             continue;
@@ -1628,6 +1618,32 @@ struct Lowerer {
     // RETURNS by value stay fail-loud this phase (sret needs the multi-register
     // MIR Return — D-FC7-SYSV-STRUCT-RETURN-IN-REGS).
 
+    // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG): the running physical-arg ordinal.
+    // INDEPENDENT CCs (SysV/AAPCS64, `slotAligned=false`) count GPR and FPR
+    // ordinals SEPARATELY (the `Arg` payload is the per-class register index);
+    // a SLOT-ALIGNED CC (Win64) uses one FLAT shared slot. Monotonic per class,
+    // so a struct's multiple pieces land in consecutive registers and no two
+    // Args of the same class collide. (Threading per-class here also fixes the
+    // latent mixed-class `D-ML7-2.10`: a scalar param now gets its per-class
+    // index, not the param index.)
+    struct ArgOrdinalCounter {
+        bool          slotAligned = false;
+        std::uint32_t flat = 0, gpr = 0, fpr = 0;
+        [[nodiscard]] std::uint32_t next(AbiPieceClass cls) {
+            if (slotAligned) return flat++;
+            return (cls == AbiPieceClass::Fpr) ? fpr++ : gpr++;
+        }
+    };
+
+    // The register class of a SCALAR/pointer param (for the per-class arg
+    // ordinal): FPR for a float type, GPR otherwise (ints, pointers, bool).
+    [[nodiscard]] AbiPieceClass scalarArgClass(TypeId ty) const {
+        TypeKind const k = interner.kind(ty);
+        return (k == TypeKind::F16 || k == TypeKind::F32
+                || k == TypeKind::F64 || k == TypeKind::F128)
+            ? AbiPieceClass::Fpr : AbiPieceClass::Gpr;
+    }
+
     // Classify `aggTy` for by-value passing under the active CC's strategy.
     // nullopt ⇒ the strategy is not implemented for this CC (the guard then
     // fails loud) OR the type is un-sizeable.
@@ -1700,17 +1716,19 @@ struct Lowerer {
     }
 
     // Receive a by-value struct/union PARAM into its frame slot, consuming
-    // physical-arg ordinals from the running `argIdx` (kept in lockstep with the
-    // caller's operand order). InRegisters ⇒ one Arg per eightbyte, each stored
+    // physical-arg ordinals from the per-class `ArgOrdinalCounter` (kept in
+    // lockstep with the caller's operand order). InRegisters ⇒ one Arg per
+    // eightbyte, each stored
     // into the slot at its offset (the 16-rounded slot absorbs trailing
     // padding). ByReference ⇒ the incoming pointer to the caller's private copy
     // IS the param's storage (no re-copy). Returns false (fail-loud emitted).
     [[nodiscard]] bool receiveByValueParam(SymbolId sym, TypeId aggTy,
                                            HirNodeId anchor, AbiPassing const& abi,
-                                           std::uint32_t& argIdx) {
+                                           ArgOrdinalCounter& ctr) {
         if (abi.kind == AbiPassing::Kind::ByReference) {
+            // The hidden pointer is GPR-class.
             MirInstId const ptr =
-                mir.addArg(argIdx++, interner.pointer(aggTy));
+                mir.addArg(ctr.next(AbiPieceClass::Gpr), interner.pointer(aggTy));
             if (!ptr.valid()) return false;
             addressableLocal[sym.v] = ptr;   // the caller's copy is the param
             return true;
@@ -1719,7 +1737,7 @@ struct Lowerer {
         if (!slot.valid()) return false;
         for (AbiPiece const& p : abi.pieces) {
             TypeId const pty = pieceType(p.cls);
-            MirInstId const a = mir.addArg(argIdx++, pty);
+            MirInstId const a = mir.addArg(ctr.next(p.cls), pty);
             if (!a.valid()) return false;
             MirInstId const offK =
                 constInt(static_cast<std::int64_t>(p.byteOffset));
@@ -2451,13 +2469,14 @@ struct Lowerer {
         // and store the arg into it — every read of that symbol then goes
         // through `Load(alloca)`. Otherwise the param stays in the pure-SSA
         // `symbolToValue` map.
-        // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): a by-value struct/union param
-        // expands to register pieces (or a by-ref pointer); `argIdx` is the
-        // RUNNING physical-arg ordinal (the prefix-sum over each param's piece
-        // count), kept in lockstep with the caller's operand order. A scalar
-        // param consumes ONE ordinal, so `argIdx == i` for scalar-only functions
-        // (no behaviour change there).
-        std::uint32_t argIdx = 0;
+        // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG): a by-value struct/union param
+        // expands to register pieces (or a by-ref pointer); `argCtr` hands out the
+        // PER-CLASS (or, for a slot-aligned CC, flat) physical-arg ordinal, kept in
+        // lockstep with the caller's operand order. For an all-GPR scalar-only
+        // function the per-class GPR ordinal equals the param index (no change); a
+        // mixed int/float signature now lands each arg in its own class (fixes
+        // D-ML7-2.10).
+        ArgOrdinalCounter argCtr{config.argSlotAligned};
         bool const fnVariadic = interner.fnIsVariadic(signature);
         for (std::size_t i = 0; i < params.size(); ++i) {
             HirNodeId const p = params[i];
@@ -2482,27 +2501,16 @@ struct Lowerer {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
                 }
-                // C1a: a 2-eightbyte (9–16 byte) in-register struct param expands
-                // to >1 register Arg, which the MIR Arg/verifier can't yet
-                // represent — fail loud until the multi-register Arg extension
-                // (D-FC7-SYSV-STRUCT-ARG-MULTIREG). Single-register (≤8B) and
-                // by-reference (>16B) need only one Arg and work now.
-                if (abi->kind == AbiPassing::Kind::InRegisters
-                    && abi->pieces.size() > 1) {
-                    unsupported(p, "a 9–16 byte by-value struct/union parameter "
-                                   "in registers needs the multi-register MIR Arg "
-                                   "extension (D-FC7-SYSV-STRUCT-ARG-MULTIREG); "
-                                   "take a pointer parameter instead for now");
-                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
-                    return false;
-                }
-                if (!receiveByValueParam(sym, ty, p, *abi, argIdx)) {
+                if (!receiveByValueParam(sym, ty, p, *abi, argCtr)) {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
                 }
                 continue;
             }
-            MirInstId const arg = mir.addArg(argIdx++, ty);
+            // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG / fixes D-ML7-2.10): a scalar
+            // param's `Arg` payload is its PER-CLASS register ordinal (GPR/FPR
+            // counted separately for an independent CC), not the param index.
+            MirInstId const arg = mir.addArg(argCtr.next(scalarArgClass(ty)), ty);
             if (addressTaken.contains(sym.v)) {
                 MirInstId const slot = allocaForLocal(sym, ty, p);
                 if (!slot.valid()) {

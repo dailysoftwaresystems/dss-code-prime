@@ -102,6 +102,17 @@ struct DSS_EXPORT MirLoweringConfig {
     AggregateClassKind aggregateClassification   = AggregateClassKind::None;
     std::uint16_t      aggregateMaxRegBytes       = 0;
     bool               aggregateSretViaHiddenArg  = true;
+
+    // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG): the active CC's `slotAligned` flag.
+    // When false (SysV/AAPCS64 — INDEPENDENT counters) the param `Arg` payload is
+    // the PER-CLASS physical register ordinal (GPR/FPR counted separately); when
+    // true (Win64 — SLOT-ALIGNED) it is the FLAT shared slot index. HIR→MIR emits
+    // each scalar param + each struct-piece `Arg` with the matching monotonic
+    // counter, so a multi-register struct param lands in consecutive arg
+    // registers and the lir_callconv per-class/flat lookup resolves it. (This
+    // also fixes the latent mixed-class `D-ML7-2.10`: a scalar param's payload is
+    // now its per-class index, not the param index.)
+    bool               argSlotAligned             = false;
 };
 
 // Lower the frozen `hir` module to MIR. `literals` is the HirLiteralPool
