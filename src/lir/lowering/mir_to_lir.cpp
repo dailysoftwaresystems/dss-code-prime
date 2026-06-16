@@ -1597,6 +1597,34 @@ struct Lowerer {
                 reportMissingOpcode(MnemonicSlot::Lea, "MIR Gep (dynamic-index)");
                 return;
             }
+            // FC7 (D-FC7-MEMBER-ACCESS): a CONSTANT second operand is a
+            // BYTE DISPLACEMENT — a struct field offset resolved at HIR→MIR
+            // via the FC6 `computeLayout` engine (`s.x` → Gep[base,
+            // Const(offset)]). Emit the 3-op base+disp `lea [base + disp]`
+            // (the no-index form BOTH targets ship: x86 `lea r,[base+disp32]`
+            // / arm64 `ADD Xd,Xn,#imm12`). A VREG second operand is a
+            // runtime array index → the 4-op base+index form below. The
+            // ≥3-op (multi-index) form stays unsupported (the array/struct
+            // Index arm's 3-op shape is out of FC7 scope).
+            if (auto const disp = constIntegerValue(operands[1])) {
+                if (*disp < std::numeric_limits<std::int32_t>::min()
+                    || *disp > std::numeric_limits<std::int32_t>::max()) {
+                    // A field offset > 2GiB is pathological — fail loud
+                    // rather than truncate to a wrong address.
+                    reportUnsupported(MirOpcode::Gep, id);
+                    return;
+                }
+                LirReg const result = lir.newVReg(LirRegClass::GPR);
+                std::array<LirOperand, 3> ops{
+                    LirOperand::makeReg(*base),
+                    LirOperand::makeMemBase(1),
+                    LirOperand::makeMemOffset(
+                        static_cast<std::int32_t>(*disp)),
+                };
+                emitInst(*opcode(MnemonicSlot::Lea), result, ops);
+                defineValue(id, result);
+                return;
+            }
             std::optional<LirReg> const index = regForValue(operands[1]);
             if (!index.has_value()) return;
             LirReg const result = lir.newVReg(LirRegClass::GPR);
@@ -1986,6 +2014,23 @@ struct Lowerer {
         if (auto const* u = std::get_if<std::uint64_t>(&lit.value)) return *u == 0;
         if (auto const* b = std::get_if<bool>(&lit.value))          return !*b;
         return false;
+    }
+
+    // FC7 (D-FC7-MEMBER-ACCESS): the integer value of a Const operand, or
+    // nullopt if the operand is not an integer Const. Distinguishes a
+    // CONSTANT Gep index (a struct field byte-offset resolved at HIR→MIR)
+    // from a runtime VREG index (an array subscript) — the byte-offset
+    // form lowers to the base+disp `lea`, the vreg form to base+index.
+    [[nodiscard]] std::optional<std::int64_t>
+    constIntegerValue(MirInstId idxOp) const {
+        if (mir.instOpcode(idxOp) != MirOpcode::Const) return std::nullopt;
+        std::uint32_t const litIdx = mir.constLiteralIndex(idxOp);
+        MirLiteralValue const& lit = mir.literalValue(litIdx);
+        if (auto const* i = std::get_if<std::int64_t>(&lit.value))  return *i;
+        if (auto const* u = std::get_if<std::uint64_t>(&lit.value))
+            return static_cast<std::int64_t>(*u);
+        if (auto const* b = std::get_if<bool>(&lit.value))          return *b ? 1 : 0;
+        return std::nullopt;
     }
 
     // ── cycle 3e: aggregate ops (memory-flattening lowering) ─────────

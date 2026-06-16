@@ -1,0 +1,13 @@
+{
+  "$comment": "FC7 (D-FC7-MEMBER-ACCESS): struct COPY by value copies field-wise (every field, not just the low 8 bytes). A 20-byte struct's far field e (offset 16) survives the copy → exit 99. An aggregate-width Load+Store would truncate e to 0 → exit 0 (the silent miscompile this pins).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 99,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [ {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]} ]
+}

@@ -153,6 +153,14 @@ collectUsedCalleeSaved(Lir const& lir, LirFuncId fn,
 // class of bug the trampoline cycle closed for the kernel→trampoline
 // transition, now closed for the user-fn→extern transition one frame
 // down.
+//
+// FC7 (D-FC7-MEMBER-ACCESS): forward-declared here — the slot-span formula
+// (defined below near `functionLocalAllocaPayloads`) that BOTH this layout
+// pass and the materialize pass call, keeping reserved-size and per-alloca
+// offsets in lockstep.
+[[nodiscard]] inline std::uint32_t
+allocaSlotCount(std::uint32_t payload, std::uint32_t slotWidth) noexcept;
+
 [[nodiscard]] std::optional<FrameLayout>
 computeFrameLayout(LirFuncAllocation const& alloc,
                    TargetSchema const& schema,
@@ -160,7 +168,7 @@ computeFrameLayout(LirFuncAllocation const& alloc,
                    std::vector<LirReg> savedRegs,
                    bool hasCalls,
                    std::uint32_t outgoingArgSlots,
-                   std::uint32_t numLocalAllocas,
+                   std::vector<std::uint32_t> const& allocaPayloads,
                    DiagnosticReporter& reporter) {
     std::uint32_t const slotWidth = std::max(widthForClass(schema, LirRegClass::GPR),
                                              widthForClass(schema, LirRegClass::FPR));
@@ -197,18 +205,24 @@ computeFrameLayout(LirFuncAllocation const& alloc,
         : 0u;
     layout.savedRegAreaSize    = static_cast<std::uint32_t>(layout.savedRegs.size()) * slotWidth;
     layout.spillAreaSize       = alloc.numSpillSlots * slotWidth;
-    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): local
-    // allocas sit ABOVE the spill area in the layout (positive RSP
-    // offset post-prologue). Each alloca consumes one slotSize-byte
-    // slot; ordering is by LIR scan order (the same order
-    // `computeNumLocalAllocas` discovers them, so materializeOneFunc
-    // assigns the same indices). slotSize matches the spill stride
-    // (max(GPR, FPR) = 16 on x86_64) for uniformity — locals are
-    // never wider than slotSize today; an aggregate-local cycle
-    // would extend this with per-alloca size encoded in the LIR
-    // alloca instruction's payload.
-    layout.numLocalAllocas     = numLocalAllocas;
-    layout.localAreaSize       = numLocalAllocas * slotWidth;
+    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b) + FC7 (D-FC7-MEMBER-ACCESS):
+    // local allocas sit ABOVE the spill area (positive RSP offset post-
+    // prologue), in LIR scan order — the SAME order materializeOneFunc
+    // assigns offsets, so the two stay in lockstep. Each alloca reserves
+    // `allocaSlotCount(payload, slotWidth)` slots: a SCALAR local (payload
+    // 0) = 1 slot (the pre-FC7 behaviour, preserved); a STRUCT/UNION local
+    // (payload = its layout byte size) = ceil(size / slotWidth) slots, so
+    // a >slotWidth aggregate reserves enough space and never overlaps its
+    // neighbour. `slotWidth` (max(GPR,FPR), the spill stride) ≥ every C
+    // scalar's alignment on the current targets, so a slotWidth-aligned
+    // slot satisfies any field's alignment; a target with slotWidth < a
+    // struct's alignment is a future concern (the layout `align` is
+    // available to fail loud on then).
+    layout.numLocalAllocas     = static_cast<std::uint32_t>(allocaPayloads.size());
+    std::uint32_t totalLocalSlots = 0;
+    for (std::uint32_t const p : allocaPayloads)
+        totalLocalSlots += allocaSlotCount(p, slotWidth);
+    layout.localAreaSize       = totalLocalSlots * slotWidth;
     layout.hasCalls            = hasCalls;
     // Frame zones stack from SP+0 upward: outgoing-args, saved regs,
     // spill slots, then local-alloca slots. Caller-side `frame_store
@@ -306,21 +320,43 @@ functionHasCalls(Lir const& src, LirFuncId fn,
 // so the incremental cost is marginal today; closure waits for
 // profile evidence. Trigger: profiling shows > 0.5% of compile
 // time in this helper on multi-function modules.
-[[nodiscard]] std::uint32_t
-functionLocalAllocaCount(Lir const& src, LirFuncId fn,
-                         std::uint16_t allocaOp) noexcept {
-    if (allocaOp == 0) return 0u;
-    std::uint32_t count = 0;
+// FC7 (D-FC7-MEMBER-ACCESS): the number of `slotWidth`-byte frame slots a
+// SINGLE alloca reserves. A scalar local (payload 0 — the sentinel) takes
+// ONE slot; a struct/union local (payload = its FC6 layout byte size,
+// encoded on the MIR/LIR Alloca) takes ceil(size / slotWidth) slots. This
+// is the SINGLE source of the slot formula — BOTH the frame-size sum
+// (`computeFrameLayout`) and the per-alloca offset progression
+// (`materializeOneFunc`) call it, so a struct local's RESERVED span and
+// its materialized ADDRESS can never disagree (a divergence would overlap
+// the struct onto its stack neighbour — a silent miscompile).
+[[nodiscard]] inline std::uint32_t
+allocaSlotCount(std::uint32_t payload, std::uint32_t slotWidth) noexcept {
+    return (payload == 0u) ? 1u : (payload + slotWidth - 1u) / slotWidth;
+}
+
+// Collect the PAYLOAD (0 for a scalar local; the layout byte size for a
+// struct/union local) of every `alloca` op in `fn`, in LIR scan order.
+// The count is `.size()`; each payload drives `allocaSlotCount`. A target
+// with no `alloca` opcode (allocaOp == 0 — shader / WASM operand-stack
+// ABIs) yields an empty vector. Agnostic: a mnemonic-match on the per-
+// target `alloca` handle. (Pre-scan timing + the caching trigger are
+// unchanged — D-CSUBSET-ALLOCA-COUNT-CACHE.)
+[[nodiscard]] std::vector<std::uint32_t>
+functionLocalAllocaPayloads(Lir const& src, LirFuncId fn,
+                            std::uint16_t allocaOp) {
+    std::vector<std::uint32_t> payloads;
+    if (allocaOp == 0) return payloads;
     std::uint32_t const blockCount = src.funcBlockCount(fn);
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
         LirBlockId const blk = src.funcBlockAt(fn, bi);
         std::uint32_t const instN = src.blockInstCount(blk);
         for (std::uint32_t i = 0; i < instN; ++i) {
             LirInstId const inst = src.blockInstAt(blk, i);
-            if (src.instOpcode(inst) == allocaOp) ++count;
+            if (src.instOpcode(inst) == allocaOp)
+                payloads.push_back(src.instPayload(inst));
         }
     }
-    return count;
+    return payloads;
 }
 
 // D-ML7-2.2 (closed co-with-D-ML7-2.6, 2026-06-02): compute the
@@ -819,12 +855,12 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     // slot per body-local declaration. Order-by-scan = order-by-
     // materialize-arm — the materialize loop assigns the same index
     // i to the same alloca as the count pre-scan visited.
-    std::uint32_t const numLocalAllocas =
-        functionLocalAllocaCount(src, fn, h.alloca_);
+    std::vector<std::uint32_t> const localAllocaPayloads =
+        functionLocalAllocaPayloads(src, fn, h.alloca_);
     auto layoutOpt = computeFrameLayout(alloc, schema, cc,
                                         std::move(usedSaved),
                                         hasCalls, outgoingArgSlots,
-                                        numLocalAllocas,
+                                        localAllocaPayloads,
                                         reporter);
     if (!layoutOpt.has_value()) return false;
     outLayout = std::move(*layoutOpt);
@@ -842,11 +878,13 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
 
     std::uint32_t const slotSize = outLayout.slotSize;
 
-    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): counter
-    // advanced once per `alloca` instruction in scan order. Matches
-    // the order `functionLocalAllocaCount` visited at frame-layout
-    // time, so each alloca's offset is stable + reproducible.
-    std::uint32_t localAllocaIndex = 0;
+    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b) + FC7 (D-FC7-MEMBER-ACCESS):
+    // a running BYTE offset advanced once per `alloca` instruction in scan
+    // order — by `allocaSlotCount(payload) * slotSize`, the SAME formula +
+    // scan order `functionLocalAllocaPayloads`/`computeFrameLayout` used at
+    // frame-layout time, so each alloca's offset is stable AND its span
+    // matches the reserved `localAreaSize` (no neighbour overlap).
+    std::uint32_t localAllocaByteOffset = 0;
 
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
         LirBlockId const srcBlock = src.funcBlockAt(fn, bi);
@@ -993,14 +1031,16 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                        inst.v));
                     return false;
                 }
-                // Assign this alloca a local index by scan order
-                // (matches functionLocalAllocaCount's traversal —
-                // shared loop nesting + identical instruction visit
-                // order guarantee the two counters stay in sync).
+                // Assign this alloca its frame offset = the running byte
+                // offset (matches functionLocalAllocaPayloads' traversal —
+                // shared loop nesting + identical visit order keep the two
+                // in sync), then advance by THIS alloca's slot span
+                // (`payload` = its byte size, 0 = scalar = 1 slot).
                 std::int32_t const offset = static_cast<std::int32_t>(
-                    outLayout.localAreaOffset()
-                    + localAllocaIndex * outLayout.slotSize);
-                ++localAllocaIndex;
+                    outLayout.localAreaOffset() + localAllocaByteOffset);
+                localAllocaByteOffset +=
+                    allocaSlotCount(payload, outLayout.slotSize)
+                    * outLayout.slotSize;
                 emitFrameAddr(b, h.lea, result, sp, offset);
                 continue;
             }

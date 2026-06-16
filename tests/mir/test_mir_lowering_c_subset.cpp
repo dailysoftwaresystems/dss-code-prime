@@ -59,6 +59,15 @@ struct Lowered {
     // in `c-subset.lang.json`.
     MirLoweringConfig mirCfg;
     mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    // FC7 (D-FC7-MEMBER-ACCESS): thread the target's aggregate-layout params
+    // (struct/union field offsets + sizes) into the MIR config exactly as
+    // compile_pipeline.cpp does, so member-access + aggregate-local lowering
+    // resolves field byte offsets. dataModel stays the Lp64 default (an
+    // int-based struct's field offsets are dataModel-independent here).
+    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
+        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+    }
     // D-CSUBSET-LINKAGE-SPECIFIERS: thread the native-decl linkage side-table
     // exactly as compile_pipeline.cpp does — so `static`/`__attribute__` source
     // flows binding/visibility into the MIR. Existing fixtures (no specifiers)
@@ -1259,19 +1268,26 @@ TEST(MirLoweringCSubset, MemberAccessReadEmitsGepThenLoad) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirBlockId const entry = m.funcEntry(m.funcAt(0));
-    // [Arg p, Const 0, Const 0(field), Gep, Load, Return]
-    ASSERT_EQ(m.blockInstCount(entry), 6u);
+    // FC7 (D-FC7-MEMBER-ACCESS): [Arg p, Const(byteOffset 0=field x),
+    // Gep(2-op), Load, Return].
+    ASSERT_EQ(m.blockInstCount(entry), 5u);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Arg);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Const);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Const);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Gep);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Load);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 5)), MirOpcode::Return);
-    // The GEP's operand[0] IS the Arg p (no Load — Deref's lvalue-address
-    // returns the pointer rvalue directly).
-    auto gepOps = m.instOperands(m.blockInstAt(entry, 3));
-    ASSERT_EQ(gepOps.size(), 3u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Gep);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Load);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Return);
+    // FC7: the GEP is now 2-op [base, byteOffset] — operand[0] IS the Arg p
+    // (Deref's lvalue-address returns the pointer rvalue directly), and
+    // operand[1] is the field's BYTE OFFSET (field x → 0), NOT a field index.
+    // (The old 3-op [base, 0, fieldIdx] shape MIR→LIR never realized.)
+    auto gepOps = m.instOperands(m.blockInstAt(entry, 2));
+    ASSERT_EQ(gepOps.size(), 2u);
     EXPECT_EQ(gepOps[0], m.blockInstAt(entry, 0));
+    EXPECT_EQ(gepOps[1], m.blockInstAt(entry, 1));
+    auto const& offLit =
+        m.literalValue(m.constLiteralIndex(m.blockInstAt(entry, 1)));
+    EXPECT_EQ(std::get<std::int64_t>(offLit.value), 0)
+        << "field x is at byte offset 0";
 }
 
 // Symmetric write: `p->y = v` lowers to GEP-then-Store, with the value
@@ -1284,15 +1300,23 @@ TEST(MirLoweringCSubset, MemberAccessAssignEmitsGepThenStore) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirBlockId const entry = m.funcEntry(m.funcAt(0));
-    // [Arg p, Arg v, Const 0, Const 1(field=y), Gep, Store, Return]
-    ASSERT_EQ(m.blockInstCount(entry), 7u);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Gep);
-    MirInstId const storeI = m.blockInstAt(entry, 5);
+    // FC7 (D-FC7-MEMBER-ACCESS): [Arg p, Arg v, Const(byteOffset 4=field y),
+    // Gep(2-op), Store, Return].
+    ASSERT_EQ(m.blockInstCount(entry), 6u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Const);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Gep);
+    MirInstId const storeI = m.blockInstAt(entry, 4);
     EXPECT_EQ(m.instOpcode(storeI), MirOpcode::Store);
     auto ops = m.instOperands(storeI);
     ASSERT_EQ(ops.size(), 2u);
     EXPECT_EQ(ops[0], m.blockInstAt(entry, 1)) << "Store value should be Arg v";
-    EXPECT_EQ(ops[1], m.blockInstAt(entry, 4)) << "Store ptr should be Gep";
+    EXPECT_EQ(ops[1], m.blockInstAt(entry, 3)) << "Store ptr should be Gep";
+    // FC7: the GEP's 2nd operand is field y's BYTE OFFSET (LP64: x@0, y@4),
+    // not field index 1 — a wrong offset would store into the wrong field.
+    auto const& offLit =
+        m.literalValue(m.constLiteralIndex(m.blockInstAt(entry, 2)));
+    EXPECT_EQ(std::get<std::int64_t>(offLit.value), 4)
+        << "field y is at byte offset 4 under LP64";
 }
 
 // `p[i]` over a POINTER base: GEP carries `[ptr, idx]` (no leading 0 —
@@ -1329,14 +1353,15 @@ TEST(MirLoweringCSubset, AddressOfMemberAccessReturnsGepDirectly) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirBlockId const entry = m.funcEntry(m.funcAt(0));
-    // [Arg p, Const 0, Const 0(field), Gep, Return(gep)]   — NO Load.
-    ASSERT_EQ(m.blockInstCount(entry), 5u);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Gep);
-    MirInstId const ret = m.blockInstAt(entry, 4);
+    // FC7 (D-FC7-MEMBER-ACCESS): [Arg p, Const(byteOffset 0=field x),
+    // Gep(2-op), Return(gep)] — NO Load.
+    ASSERT_EQ(m.blockInstCount(entry), 4u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Gep);
+    MirInstId const ret = m.blockInstAt(entry, 3);
     EXPECT_EQ(m.instOpcode(ret), MirOpcode::Return);
     auto retOps = m.instOperands(ret);
     ASSERT_EQ(retOps.size(), 1u);
-    EXPECT_EQ(retOps[0], m.blockInstAt(entry, 3))
+    EXPECT_EQ(retOps[0], m.blockInstAt(entry, 2))
         << "Return value should be the Gep result, not a Load";
 }
 
@@ -1656,10 +1681,11 @@ TEST(MirLoweringCSubset, ConstructAggregateAllConstFoldsToConst) {
            "Const, not an InsertValue chain";
 }
 
-// Mixed-runtime children force the InsertValue chain path. A struct
-// containing a parameter (`a`) cannot const-fold — must produce
-// `Const(zero) + InsertValue chain`.
-TEST(MirLoweringCSubset, ConstructAggregateWithRuntimeChildUsesInsertValueChain) {
+// FC7 (D-FC7-MEMBER-ACCESS): a struct LOCAL initializer with a runtime
+// child lowers ELEMENT-WISE — one Gep+Store per field into the slot — NOT
+// an InsertValue chain (whose non-zero-index form had no LIR realization).
+// `{a, 2}` → Store(a)→field x, Store(2)→field y.
+TEST(MirLoweringCSubset, StructLocalRuntimeInitEmitsPerFieldStores) {
     auto L = lowerCSubset(
         "struct Point { int x; int y; };\n"
         "void f(int a) { struct Point p = {a, 2}; }\n");
@@ -1669,17 +1695,18 @@ TEST(MirLoweringCSubset, ConstructAggregateWithRuntimeChildUsesInsertValueChain)
         << (L.mirReporter.all().empty()
               ? "" : L.mirReporter.all()[0].actual);
     auto const ops = entryOpcodes(L.mir.mir);
-    EXPECT_GE(countOpcode(ops, MirOpcode::InsertValue), 2u)
-        << "ConstructAggregate with runtime children must emit one "
-           "InsertValue per slot (2 fields = 2 InsertValue ops)";
-    EXPECT_GE(countOpcode(ops, MirOpcode::Const),  1u)
-        << "the chain must start from a Const(zero-aggregate) base";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "FC7 struct local init is element-wise, never an InsertValue chain";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Gep),   2u)
+        << "one Gep per field (x, y)";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 2u)
+        << "one Store per field";
 }
 
-// Union ConstructAggregate has a 1-child shape — verify the chain
-// produces a single InsertValue at index 0 when the runtime path is
-// taken (parameter-based variant value).
-TEST(MirLoweringCSubset, ConstructAggregateUnionRuntimeUsesOneInsertValue) {
+// FC7 (D-FC7-MEMBER-ACCESS): a UNION local initializer (1 child, the
+// active variant) lowers to ONE Gep+Store at byte offset 0 — never an
+// InsertValue.
+TEST(MirLoweringCSubset, UnionLocalRuntimeInitEmitsOneFieldStore) {
     auto L = lowerCSubset(
         "union U { int i; char c; };\n"
         "void f(int a) { union U u = { a }; }\n");
@@ -1689,8 +1716,11 @@ TEST(MirLoweringCSubset, ConstructAggregateUnionRuntimeUsesOneInsertValue) {
         << (L.mirReporter.all().empty()
               ? "" : L.mirReporter.all()[0].actual);
     auto const ops = entryOpcodes(L.mir.mir);
-    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 1u)
-        << "union ConstructAggregate has exactly 1 child → 1 InsertValue";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "FC7 union local init is element-wise, never an InsertValue chain";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Gep),   1u)
+        << "union has 1 active-variant child → 1 Gep at offset 0";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 1u);
 }
 
 // Variant-aware union seed (review fix-up lock-in): `.c = 'x'` is
@@ -1735,43 +1765,37 @@ TEST(MirLoweringCSubset, ConstructAggregateArrayRuntimeUsesChain) {
 // A regression that emitted N parallel InsertValue(zeroBase, v_i, [i])
 // would silently drop all but the last field. This test reads each
 // InsertValue's first operand and asserts the chain shape.
-TEST(MirLoweringCSubset, ConstructAggregateChainTopology) {
+// FC7 (D-FC7-MEMBER-ACCESS): a struct local init `{a, b}` (both runtime)
+// lowers to two INDEPENDENT Gep+Store pairs at the field BYTE OFFSETS
+// (x@0, y@4) — no InsertValue chain. Pins that each field lands at its OWN
+// offset (a wrong/duplicated offset would write both fields to one place).
+TEST(MirLoweringCSubset, StructLocalInitStoresEachFieldAtItsOffset) {
     auto L = lowerCSubset(
         "struct Point { int x; int y; };\n"
         "void f(int a, int b) { struct Point p = {a, b}; }\n");
-    ASSERT_TRUE(L.mir.ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "element-wise init, no InsertValue chain";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Gep),   2u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 2u);
+    // The two field GEPs carry distinct byte offsets 0 (x) and 4 (y).
     MirBlockId const entry = m.funcEntry(m.funcAt(0));
-    // Collect insertvalue instructions in block order.
-    std::vector<MirInstId> chain;
-    MirInstId seedConst{};
+    std::vector<std::int64_t> gepOffsets;
     auto const n = m.blockInstCount(entry);
     for (std::uint32_t i = 0; i < n; ++i) {
         MirInstId const ix = m.blockInstAt(entry, i);
-        MirOpcode const op = m.instOpcode(ix);
-        if (op == MirOpcode::InsertValue) {
-            chain.push_back(ix);
-        } else if (op == MirOpcode::Const && !seedConst.valid()
-                   && chain.empty() && m.instType(ix).valid()) {
-            // First Const before the chain begins — candidate seed.
-            // (There may be other Consts before, e.g. for the index
-            // path; we want the one passed as InsertValue's first
-            // operand, which we verify below.)
-        }
+        if (m.instOpcode(ix) != MirOpcode::Gep) continue;
+        auto gOps = m.instOperands(ix);
+        ASSERT_EQ(gOps.size(), 2u);
+        auto const& lit = m.literalValue(m.constLiteralIndex(gOps[1]));
+        gepOffsets.push_back(std::get<std::int64_t>(lit.value));
     }
-    ASSERT_GE(chain.size(), 2u);
-    // The first InsertValue's first operand IS the seed Const.
-    MirInstId const firstAggOperand = m.instOperands(chain[0])[0];
-    EXPECT_EQ(m.instOpcode(firstAggOperand), MirOpcode::Const)
-        << "InsertValue chain's seed must be a Const(zero-aggregate)";
-    // Each subsequent InsertValue's first operand IS the previous one
-    // — the chain threads through, NOT parallel writes against the seed.
-    for (std::size_t i = 1; i < chain.size(); ++i) {
-        MirInstId const prevOperand = m.instOperands(chain[i])[0];
-        EXPECT_EQ(prevOperand, chain[i - 1])
-            << "InsertValue[" << i << "].operand(0) must be InsertValue["
-            << (i - 1) << "] — chain must thread";
-    }
+    ASSERT_EQ(gepOffsets.size(), 2u);
+    EXPECT_EQ(gepOffsets[0], 0) << "field x at byte offset 0";
+    EXPECT_EQ(gepOffsets[1], 4) << "field y at byte offset 4";
 }
 
 // Nested aggregate `{{1,2}, {3,4}}` exercises zeroLiteralOf's Struct
