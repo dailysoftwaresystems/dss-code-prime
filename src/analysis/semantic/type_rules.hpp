@@ -116,7 +116,8 @@ namespace detail::type_rules {
     TypeId                                             lhs,
     TypeId                                             rhs,
     SemanticConfig::PointerConversionRules const&      ptrRules = {},
-    bool                                               boolWidensToArith = false) noexcept {
+    bool                                               boolWidensToArith = false,
+    bool                                               charConvertsToArith = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     if (sameType(lhs, rhs)) return true;
     auto const lk = interner.kind(lhs);
@@ -144,6 +145,23 @@ namespace detail::type_rules {
     if (boolWidensToArith && rk == TypeKind::Bool
         && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0
             || floatRank(lk) != 0)) {
+        return true;
+    }
+    // C 6.3.1.1 / 6.5.16.1: an integer value implicitly converts INTO a `char` slot
+    // (`char x = 'c';`, `char x = 5;`). DSS interns `char` as `TypeKind::Char`
+    // (distinct from the signed/unsigned int RANKS), so this dedicated arm admits an
+    // integer rhs into a Char lhs. REQUIRED by the char-LITERAL typing (a char
+    // constant has type `int` per C 6.4.4.4, so `sizeof('c')`==4) — without it,
+    // typing the literal `int` would regress `char x = 'c';`. Gated on
+    // `charConvertsToArith` (default false → non-C schemas keep Char strict);
+    // mirrors the `boolWidensToArith` gate. DELIBERATELY ONE-DIRECTIONAL: the
+    // char→int WIDENING direction stays strict (a documented DSS choice, pinned by
+    // `ReturnTypeMismatchOnNonAssignable` — `int f(char c){return c;}` is a mismatch);
+    // a future char cycle may relax it under this same flag. The char LITERAL only
+    // needs this direction (it is `int`, flowing into a Char slot, or into an int
+    // slot via the same-type path above).
+    if (charConvertsToArith && lk == TypeKind::Char
+        && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0)) {
         return true;
     }
     // C-standard array-to-pointer decay (D-LK4-RODATA-PRODUCER-STRING

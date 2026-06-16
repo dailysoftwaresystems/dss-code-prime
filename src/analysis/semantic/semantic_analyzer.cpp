@@ -20,6 +20,7 @@
 #include "core/types/tree_cursor.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"
 #include "core/types/type_lattice/type_layout.hpp"  // FC6: computeLayout (sizeof in array dims)
+#include "core/types/char_decode.hpp"  // C 6.4.5: decodeStringLiteralBody (string-literal typing)
 #include "ffi/shipped_lib_descriptor.hpp"   // FF11 neutral-JSON descriptor reader
 #include "hir/cst_const_eval.hpp"
 #include "hir/hir_op.hpp"   // FC6 c-subtreeType: HirOpKind / opName / isComparison (the per-verb laws cst_to_hir uses)
@@ -115,6 +116,12 @@ struct SchemaIndexes {
     std::unordered_map<std::string, TypeId>        builtinTypeIds;
     // Literal token-kind → TypeId.
     std::unordered_map<std::uint32_t, TypeId>      literalTypeIds;
+    // C 6.4.5: the string-literal body token kind + its element core (e.g. Char),
+    // diverted here from a `literalTypes` row with `stringArray:true` — a string's
+    // type is a PER-OCCURRENCE `Array<core, N+1>`, not a fixed TypeId. Unset (invalid
+    // token / Void core) when the language declares no string-array row (toy/tsql).
+    SchemaTokenId                                  stringLiteralBodyToken{};
+    TypeKind                                       stringLiteralElementCore = TypeKind::Void;
     // FC3 c1: type-specifier multiset resolution (C 6.7.2). The
     // VOCABULARY is every token kind appearing in any `typeSpecifiers`
     // row — `resolveTypeNode` treats an Internal node whose visible
@@ -541,6 +548,14 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
             s.lattice.interner().primitive(bt.resolveCore(s.dataModel));
     }
     for (auto const& lt : cfg.literalTypes) {
+        // A string-literal row carries an ELEMENT core (Char) + a per-occurrence
+        // Array<core, N+1> type — divert it to the dedicated index field (NOT the
+        // fixed literalTypeIds map, which holds one TypeId per token).
+        if (lt.stringArray) {
+            idx.stringLiteralBodyToken   = lt.literal;
+            idx.stringLiteralElementCore = lt.core;
+            continue;
+        }
         idx.literalTypeIds[lt.literal.v] = s.lattice.interner().primitive(lt.core);
     }
     // FC3 c1: type-specifier multiset table (C 6.7.2). Vocabulary = every
@@ -2202,6 +2217,22 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             }
             s.nodeToType.set(node, litTy);
         }
+        // C 6.4.5: a string literal has type `Array<elementCore, N+1>` (N = decoded
+        // body length, +1 for the NUL). Decode via the SHARED `decodeStringLiteralBody`
+        // — the exact helper the HIR uses, so both tiers produce the IDENTICAL type.
+        // Diverted from a `stringArray` literalTypes row (the body token + element
+        // core live in the index). A malformed escape leaves the node InvalidType →
+        // a `sizeof` of it fails loud, never a guessed size.
+        else if (s.idx().stringLiteralBodyToken.valid()
+                 && tk == s.idx().stringLiteralBodyToken) {
+            if (auto decoded = decodeStringLiteralBody(tree.text(node))) {
+                TypeId const elem = s.lattice.interner()
+                                        .primitive(s.idx().stringLiteralElementCore);
+                TypeId const arr  = s.lattice.interner().array(
+                    elem, static_cast<std::int64_t>(decoded->size() + 1));
+                s.nodeToType.set(node, arr);
+            }
+        }
     }
 
     // Reference resolution. Skip if the node is a declaration's own name
@@ -2551,7 +2582,8 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     rec.type, initTy,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
-                                                    /*boolWidensToArith=*/true)
+                                                    /*boolWidensToArith=*/true,
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith)
                                    && !admitsNullPointerConstant(
                                           s, tree, rec.type, initNode,
                                           tree.schema().semantics()
@@ -2598,7 +2630,8 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     rec.type, initTy,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
-                                                    /*boolWidensToArith=*/true)
+                                                    /*boolWidensToArith=*/true,
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith)
                                    // D-LANG-NULL-POINTER-CONSTANT (step
                                    // 13.3): admit `T* p = 0;` initializer
                                    // per C §6.3.2.3.3.
@@ -2915,7 +2948,8 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         TypeId argTy = subtreeType(s, tree, argNodes[i]);
         if (!argTy.valid()) continue;  // unknown arg type — suppress cascade
         if (!isAssignable(s.lattice.interner(), params[i], argTy, ptrRules,
-                          /*boolWidensToArith=*/true)) {
+                          /*boolWidensToArith=*/true,
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith)) {
             // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit literal-0
             // → Ptr<*> as null pointer constant per C §6.3.2.3.3. The
             // check lives here (NOT in isAssignable) because it is
@@ -3741,7 +3775,8 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     if (!fnResult.valid() || !exprTy.valid()) return;
     auto const& ptrRules = tree.schema().semantics().pointerConversions;
     if (!isAssignable(s.lattice.interner(), fnResult, exprTy, ptrRules,
-                      /*boolWidensToArith=*/true)) {
+                      /*boolWidensToArith=*/true,
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith)) {
         // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit `return 0;`
         // from a Ptr<*>-returning function per C §6.3.2.3.3.
         if (admitsNullPointerConstant(s, tree, fnResult,

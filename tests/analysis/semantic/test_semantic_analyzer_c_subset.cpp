@@ -1269,6 +1269,55 @@ TEST(SemanticAnalyzerCSubset, ReturnOfMismatchedCallResultEmitsMismatch) {
         << "a Char-result call returned into an int function must mismatch";
 }
 
+// R2 (sizeof char/string fold cycle): a CHARACTER constant has type `int`
+// (C 6.4.4.4 — the reason `sizeof('c')`==4, not 1). Pinned in a context where the
+// int type MATTERS: `f('c')` to an `int*` param fires a mismatch (int 99 is not a
+// pointer, and not the null constant 0). RED-ON-DISABLE: drop the CharLiteral→I32
+// `literalTypes` row → `'c'` is untyped → `isAssignable` short-circuits on
+// InvalidType → 0 mismatch (the literal would silently pass).
+TEST(SemanticAnalyzerCSubset, CharLiteralIsTypedIntNotUntyped) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern void f(int* p);\n"
+        "int main() { f('c'); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "'c' has type int (C 6.4.4.4) → passing it to an int* param is a mismatch";
+}
+
+// R2: a STRING literal has type `char[N+1]` (C 6.4.5 — the reason `sizeof("abcd")`
+// ==5). Pinned where the ELEMENT type matters: passing "abc" to an `int*` param
+// fires a mismatch (Array<Char>→Ptr<int> fails the same-element-type array-decay
+// rule), while to a `char*` param it decays cleanly (0 — covered by the existing
+// string corpus). RED-ON-DISABLE: drop the StringLiteral `stringArray` row → "abc"
+// is untyped → `isAssignable` short-circuits → 0 mismatch.
+TEST(SemanticAnalyzerCSubset, StringLiteralIsTypedCharArrayNotUntyped) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern void g(int* p);\n"
+        "int main() { g(\"abc\"); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "\"abc\" is Array<Char,4> → an int* arg is an element mismatch (Char != int)";
+}
+
+// R2: the int→char assignability arm (`charConvertsToArith`, C 6.3.1.1). Typing the
+// char literal `int` would otherwise REGRESS `char x = 'c';` (int → char slot, which
+// DSS's strict lattice rejects without the arm). RED-ON-DISABLE: drop the arm →
+// `isAssignable(Char, I32)` is false → 1 S_TypeMismatch. The char→int WIDENING
+// direction deliberately stays strict (pinned by ReturnTypeMismatchOnNonAssignable).
+TEST(SemanticAnalyzerCSubset, CharLiteralInitializesCharSlotCleanly) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { char x = 'c'; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "an int literal initializing a char slot is legal C (the char↔int arm)";
+}
+
 // FIX 3 (crit-8, nested return): a value `return 1;` nested inside an `if`
 // inside a `void` function body still checks against the function's result
 // type — exactly one S_ReturnTypeMismatch. Proves checkReturn's scope-

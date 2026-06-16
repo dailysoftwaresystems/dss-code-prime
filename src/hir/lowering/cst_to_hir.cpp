@@ -2256,6 +2256,15 @@ struct Lowerer {
                 "cast type-ref did not resolve to a type");
         }
         E operand = lowerExpr(operandN);
+        // The operand failed to lower (its diagnostic is ALREADY emitted — e.g. a
+        // `sizeof` of an un-typeable operand returned `{errorNode, InvalidType}`).
+        // Propagate the error rather than inspecting its type: `interner.kind()` on
+        // an InvalidType below (the Array-decay check) aborts (`TypeInterner::get:
+        // TypeId out of range`). The error's HasError flag flows to the enclosing
+        // context, which fails loud with the already-emitted diagnostic.
+        if (!operand.type.valid()) {
+            return operand;
+        }
         // FC3.5 sweep-c3 (D-CSUBSET-CAST-VOID-DISCARD): `(void)expr`
         // is C's evaluate-and-discard idiom (6.3.2.2) — the operand
         // lowers for its effects and NO Cast node wraps it (mapCast

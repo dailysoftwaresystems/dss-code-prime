@@ -5144,6 +5144,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                             m.fixedValue = entry.at("value").get<std::int64_t>();
                         }
+                        // C 6.4.5: a string literal's type is `Array<core, N+1>`
+                        // (per-occurrence length) — `core` is the ELEMENT type and
+                        // the consumer builds the array by decoding the token, NOT a
+                        // fixed `literalTypeIds` entry.
+                        if (entry.contains("stringArray")) {
+                            if (!entry.at("stringArray").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/stringArray",
+                                          "'stringArray' must be a boolean");
+                                continue;
+                            }
+                            m.stringArray = entry.at("stringArray").get<bool>();
+                        }
                         cfg.literalTypes.push_back(std::move(m));
                     }
                 }
@@ -6645,6 +6658,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                           k));
                         }
                     }
+                }
+            }
+
+            // C 6.3.1.1 / 6.5.16.1: `char` is an integer type — implicit char↔int
+            // conversion in assignment (read by `isAssignable`'s char↔int arm).
+            // Opt-in (default false → a non-C schema keeps Char strictly distinct).
+            if (sem.contains("charConvertsToArith")) {
+                auto const& v = sem.at("charConvertsToArith");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/charConvertsToArith",
+                              "'charConvertsToArith' must be a boolean");
+                } else {
+                    cfg.charConvertsToArith = v.get<bool>();
                 }
             }
 
