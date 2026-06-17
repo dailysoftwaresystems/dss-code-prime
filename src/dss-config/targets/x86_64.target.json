@@ -630,6 +630,28 @@
             ]
           },
           {
+            "$comment": "3-op no-index form, width 32 (D-LIR-INT-MEMORY-WIDTH-EXACT): `mov r32, [base + disp32]` (0x8B WITHOUT REX.W). A 4-byte int load MUST be width-exact — a 64-bit read of a PACKED int (an array element / struct field, NOT a stand-alone scalar local) reads 4 bytes past it (the store peer clobbers the neighbour / overruns the frame slot — the bug the array-storage cycle exposed). A 32-bit register write auto-zero-extends bits 63:32 (Intel SDM MOV), so the int lands clean in the full register. Selected when the Load's result type is a 4-byte integer (I32/U32, or `long` under LLP64) — width 32 via memAccessWidthFlags.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "resultSlot": "modrm.reg",
+            "template":   { "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "3-op no-index form, width 16 (D-LIR-INT-MEMORY-WIDTH-EXACT): `movzx r32, word [base + disp32]` (0F B7 /r, no REX.W). A 2-byte short load must be half-word-exact — a wider read of a packed short reads past it. ZERO-extend (movzx) is the signedness-agnostic half-word fetch (the width-8 char movzx peer at 0F B6); the short→int promote cast that follows re-reads the low 16 bits (SExt/ZExt-16 = D-CSUBSET-SUBNATIVE-ALU-FORMS, not yet encoded ⇒ short VALUE use fails loud, never silently miscompiles). Selected when the Load's result type is I16/U16 — width 16 via memAccessWidthFlags.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "resultSlot": "modrm.reg",
+            "template":   { "opcode": [15, 183] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
             "$comment": "4-op indexed form (D-AS4-5), width 64: `mov reg, [base + index*scale + disp32]` (REX.W 0x8B). The walker emits SIB unconditionally when SibIndex wires.",
             "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "resultSlot": "modrm.reg",
@@ -683,6 +705,28 @@
             "$comment": "4-op no-index form, width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): `mov byte [base + disp32], reg8` (0x88 /r). A char/byte store writes EXACTLY the low byte — a 64-bit store of a 1-byte element would clobber 7 bytes past it. `forceRexPrefix: true` (NOT rexW — a byte op) forces a REX prefix so the stored VALUE register (wired to modrm.reg) addresses spl/bpl/sil/dil (low byte of r4..r7) instead of the legacy ah/ch/dh/bh high-byte aliases — exactly the setcc byte-register rationale. Signedness-agnostic: only the low 8 bits are written. Selected when the stored value's type is Char (width 8 via memAccessWidthFlags).",
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
             "template": { "opcode": [136], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "4-op no-index form, width 32 (D-LIR-INT-MEMORY-WIDTH-EXACT): `mov [base + disp32], r32` (0x89 WITHOUT REX.W). A 4-byte int store MUST write EXACTLY 4 bytes — a 64-bit store of a PACKED int element clobbers 4 bytes of the neighbour and overruns the frame slot (the array-storage crash this cycle fixes). Selected when the stored value's type is a 4-byte integer (I32/U32, or `long` under LLP64) — width 32 via memAccessWidthFlags.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [137] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "4-op no-index form, width 16 (D-LIR-INT-MEMORY-WIDTH-EXACT): `mov [base + disp32], r16` (0x66 0x89 — the 0x66 operand-size prefix selects 16-bit, emitted before any REX). Writes EXACTLY 2 bytes — a wider store of a packed short clobbers its neighbour. No forceRexPrefix (a 16-bit store has no high-byte-alias hazard — that is a byte-register concern). Selected when the stored value's type is I16/U16 — width 16 via memAccessWidthFlags.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [137] },
             "wires":    [
               { "index": 0, "slotKind": "modrm.reg"     },
               { "index": 1, "slotKind": "modrm.rm.mem"  },

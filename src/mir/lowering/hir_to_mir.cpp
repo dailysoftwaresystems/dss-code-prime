@@ -1060,26 +1060,30 @@ struct Lowerer {
             return InvalidMirInst;
         }
         TypeId const ptrTy = interner.pointer(ty);
-        // FC7 (D-FC7-MEMBER-ACCESS): a struct/union local reserves its FULL
-        // layout size in the frame, not one scalar slot. Encode the byte
+        // FC7 (D-FC7-MEMBER-ACCESS): a struct/union/ARRAY local reserves its
+        // FULL layout size in the frame, not one scalar slot. Encode the byte
         // size in the Alloca payload (the channel ML6 anticipated; the LIR
         // callconv sums per-alloca slots from it — payload 0 = the scalar
-        // "one slot" sentinel). A struct whose size is unavailable
+        // "one slot" sentinel). An aggregate whose size is unavailable
         // (no aggregateLayout / un-sizeable type) fails LOUD — never a
         // silently under-sized slot, which would corrupt the neighbour.
+        // ARRAY locals are sized here too (D-MIR-STORAGE-ARRAY-INDEX-GEP): this
+        // cycle makes them runnable (index + brace-init), so a bare `int a[4]`
+        // must reserve 16 bytes, not the 8-byte scalar sentinel.
         std::uint32_t allocaPayload = 0;
         TypeKind const tk = interner.kind(ty);
-        if (tk == TypeKind::Struct || tk == TypeKind::Union) {
+        if (tk == TypeKind::Struct || tk == TypeKind::Union
+            || tk == TypeKind::Array) {
             auto const sz = aggregateByteSize(ty);
             if (!sz.has_value()) {
-                unsupported(anchor, "aggregate local requires a sizeable "
+                unsupported(anchor, "aggregate/array local requires a sizeable "
                                     "layout (target 'aggregateLayout' params "
                                     "and a complete type)");
                 return InvalidMirInst;
             }
             if (*sz > std::numeric_limits<std::uint32_t>::max()) {
-                unsupported(anchor, "aggregate local size exceeds the 32-bit "
-                                    "frame-slot payload encoding");
+                unsupported(anchor, "aggregate/array local size exceeds the "
+                                    "32-bit frame-slot payload encoding");
                 return InvalidMirInst;
             }
             allocaPayload = static_cast<std::uint32_t>(*sz);
@@ -1119,6 +1123,18 @@ struct Lowerer {
     // Alloca payload for a struct/union local (D-FC7 frame sizing).
     [[nodiscard]] std::optional<std::uint64_t> aggregateByteSize(TypeId aggTy) {
         StructLayout const* layout = cachedLayout(aggTy);
+        if (layout == nullptr) return std::nullopt;
+        return layout->size;
+    }
+
+    // The byte STRIDE of an array/pointer element of type `elemTy` — the
+    // multiplier that turns an element index into a byte offset (Option A,
+    // D-MIR-STORAGE-ARRAY-INDEX-GEP). `computeLayout` sizes ANY type: a scalar
+    // (int→4, a pointer→8) via the dataModel, an aggregate (incl. tail padding
+    // = the C array stride) via the layout params. nullopt (caller fail-louds)
+    // when the element type is incomplete / the target declared no layout.
+    [[nodiscard]] std::optional<std::uint64_t> elementStride(TypeId elemTy) {
+        StructLayout const* layout = cachedLayout(elemTy);
         if (layout == nullptr) return std::nullopt;
         return layout->size;
     }
@@ -1266,17 +1282,31 @@ struct Lowerer {
             TypeId const resTy = interner.pointer(elemTy);
             MirInstId const idx = lowerExpr(kids[1]);
             if (!idx.valid()) return InvalidMirInst;
+            // Option A (D-MIR-STORAGE-ARRAY-INDEX-GEP, user §B 2026-06-17):
+            // pre-scale the element index to a BYTE offset so the Gep index is
+            // uniformly bytes (matching the struct-field const-disp form). Both
+            // the pointer and storage arms funnel through scaleIndexToBytes —
+            // the ONE site element scaling is applied (also fixes the latent
+            // non-`char` `p[i]` scale-1 miscompile).
+            TypeId const indexTy = hir.typeId(kids[1]);
+            MirInstId const byteIdx =
+                scaleIndexToBytes(idx, elemTy, node, indexTy);
+            if (!byteIdx.valid()) return InvalidMirInst;
             if (baseKind == TypeKind::Ptr) {
                 MirInstId const basePtr = lowerExpr(kids[0]);
                 if (!basePtr.valid()) return InvalidMirInst;
-                std::array<MirInstId, 2> ops{basePtr, idx};
+                std::array<MirInstId, 2> ops{basePtr, byteIdx};
                 return mir.addInst(MirOpcode::Gep, ops, resTy);
             }
+            // Storage (array/struct) base: the lvalue address IS the base; the
+            // vestigial leading `0` of the old 3-op form (stepping through the
+            // pointer-to-array, contributing 0 bytes) is dropped — base+byteIdx
+            // is exact. Both arms now emit the same 2-op byte-offset Gep; the
+            // 3-op form is no longer produced (its LIR arm stays defensively
+            // fail-loud).
             MirInstId const basePtr = lowerLvalueAddress(kids[0]);
             if (!basePtr.valid()) return InvalidMirInst;
-            MirInstId const zero = constInt(0);
-            if (!zero.valid()) return InvalidMirInst;
-            std::array<MirInstId, 3> ops{basePtr, zero, idx};
+            std::array<MirInstId, 2> ops{basePtr, byteIdx};
             return mir.addInst(MirOpcode::Gep, ops, resTy);
         }
         unsupported(node, std::format(
@@ -1297,6 +1327,56 @@ struct Lowerer {
         lit.core  = TypeKind::I32;
         TypeId const i32 = interner.primitive(TypeKind::I32);
         return mir.addConst(std::move(lit), i32);
+    }
+
+    // An integer constant whose width matches `ty`'s integer kind. The
+    // stride-scaling `Mul` (scaleIndexToBytes) must have same-width operands:
+    // `constInt` is I32-only, so a 64-bit index (`long`/pointer subscript)
+    // would otherwise form a mixed-width `Mul(idxI64, constI32)` the verifier
+    // does not catch. `ty` must be an integer type (an array subscript is
+    // integer per the front-end); falls back to I32 if absent.
+    [[nodiscard]] MirInstId constIntOfType(std::int64_t v, TypeId ty) {
+        TypeKind const k = ty.valid() ? interner.kind(ty) : TypeKind::I32;
+        MirLiteralValue lit;
+        lit.value = v;
+        lit.core  = k;
+        return mir.addConst(std::move(lit), interner.primitive(k));
+    }
+
+    // Pre-multiply an element index by its element STRIDE so the resulting
+    // Gep index operand is a BYTE offset (Option A — agnostic MIR scaling,
+    // D-MIR-STORAGE-ARRAY-INDEX-GEP, user §B 2026-06-17; the LIR `lea` keeps
+    // scale=1). THIS is the single site both Index arms (pointer + storage)
+    // funnel through, so element scaling is applied by construction at every
+    // index (§A.5) — it also fixes the latent non-`char` `p[i]` scale-1
+    // miscompile. `stride == 1` (a 1-byte element: char/byte/1-byte struct)
+    // returns `idx` unchanged — no `imul`, and char indexing stays byte-
+    // identical (no regression). `indexTy` widths the stride constant + the
+    // Mul. InvalidMirInst (fail-loud already reported) on an un-sizeable
+    // element type.
+    [[nodiscard]] MirInstId scaleIndexToBytes(MirInstId idx, TypeId elemTy,
+                                              HirNodeId node, TypeId indexTy) {
+        std::optional<std::uint64_t> const stride = elementStride(elemTy);
+        if (!stride.has_value()) {
+            unsupported(node, "array/pointer index element type has no "
+                              "computable size (incomplete type or the target "
+                              "declared no aggregateLayout)");
+            return InvalidMirInst;
+        }
+        if (*stride == 0) {
+            // A zero-size element (e.g. an empty aggregate `struct E {}`) would
+            // make every index alias byte offset 0 — fail loud, never a silent
+            // `Mul(idx, 0)` miscompile.
+            unsupported(node, "array/pointer index element type has zero size "
+                              "(empty aggregate) — cannot form a byte offset");
+            return InvalidMirInst;
+        }
+        if (*stride == 1) return idx;  // 1-byte element: index already IS bytes
+        MirInstId const strideK =
+            constIntOfType(static_cast<std::int64_t>(*stride), indexTy);
+        if (!strideK.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> ops{idx, strideK};
+        return mir.addInst(MirOpcode::Mul, ops, indexTy);
     }
 
     // ML2 cycle 6: build a zero MirLiteralValue matching `type`'s shape.
@@ -1546,6 +1626,23 @@ struct Lowerer {
                 continue;
             }
 
+            // D-MIR-ARRAY-FIELD-AGGREGATE-INIT: an ARRAY-typed field. Array
+            // element offsets are `j·stride` (not struct fieldOffsets), so it
+            // routes to lowerArrayInitIntoSlot — a brace-init recurses element-
+            // wise; an array VALUE copies byte-wise (D-FC7-AGGREGATE-COPY).
+            if (fk == TypeKind::Array) {
+                if (hir.kind(kids[i]) == HirKind::ConstructAggregate) {
+                    if (!lowerArrayInitIntoSlot(kids[i], fieldPtr, fieldTy))
+                        return false;
+                    continue;
+                }
+                MirInstId const srcPtr = lowerLvalueAddress(kids[i]);
+                if (!srcPtr.valid()) return false;
+                if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                    return false;
+                continue;
+            }
+
             MirInstId const v = lowerExpr(kids[i]);
             if (!v.valid()) return false;
             std::array<MirInstId, 2> stOps{v, fieldPtr};
@@ -1554,13 +1651,82 @@ struct Lowerer {
         return true;
     }
 
+    // D-MIR-ARRAY-FIELD-AGGREGATE-INIT: lower an ARRAY ConstructAggregate
+    // initializer ELEMENT-WISE into the slot at `basePtr` — one Store (or
+    // nested recurse) per element at the CONSTANT byte offset `j·stride` (init
+    // indices are compile-time, so the offset is a const-disp Gep, already
+    // lowered). Mutually recursive with lowerAggregateInitIntoSlot (a struct/
+    // union element) and itself (a multi-dimensional array element).
+    // `lowerBraceInit` has zero-filled unspecified elements, so the child list
+    // is positional + complete. Returns false (fail-loud already reported) on
+    // any failure. Wired at both array-init sites — the array field recurse-
+    // guard above AND the VarDecl array-local arm — so every array brace-init
+    // funnels through this one helper (§A.5 by-construction coverage).
+    [[nodiscard]] bool lowerArrayInitIntoSlot(HirNodeId arrNode,
+                                              MirInstId basePtr,
+                                              TypeId /*arrTy*/) {
+        auto kids = hir.children(arrNode);
+        for (std::size_t j = 0; j < kids.size(); ++j) {
+            TypeId const elemTy = hir.typeId(kids[j]);
+            std::optional<std::uint64_t> const stride = elementStride(elemTy);
+            if (!stride.has_value()) {
+                unsupported(arrNode, "array initializer element type has no "
+                                      "computable size");
+                return false;
+            }
+            std::uint64_t const off = j * *stride;
+            MirInstId const offK = constInt(static_cast<std::int64_t>(off));
+            if (!offK.valid()) return false;
+            std::array<MirInstId, 2> gepOps{basePtr, offK};
+            MirInstId const elemPtr = mir.addInst(
+                MirOpcode::Gep, gepOps, interner.pointer(elemTy));
+            if (!elemPtr.valid()) return false;
+
+            TypeKind const ek = interner.kind(elemTy);
+            if (ek == TypeKind::Struct || ek == TypeKind::Union) {
+                if (hir.kind(kids[j]) == HirKind::ConstructAggregate) {
+                    if (!lowerAggregateInitIntoSlot(kids[j], elemPtr, elemTy))
+                        return false;
+                    continue;
+                }
+                MirInstId const srcPtr = lowerLvalueAddress(kids[j]);
+                if (!srcPtr.valid()) return false;
+                if (!lowerAggregateCopy(arrNode, srcPtr, elemPtr, elemTy))
+                    return false;
+                continue;
+            }
+            if (ek == TypeKind::Array) {
+                if (hir.kind(kids[j]) == HirKind::ConstructAggregate) {
+                    if (!lowerArrayInitIntoSlot(kids[j], elemPtr, elemTy))
+                        return false;
+                    continue;
+                }
+                MirInstId const srcPtr = lowerLvalueAddress(kids[j]);
+                if (!srcPtr.valid()) return false;
+                if (!lowerAggregateCopy(arrNode, srcPtr, elemPtr, elemTy))
+                    return false;
+                continue;
+            }
+
+            MirInstId const v = lowerExpr(kids[j]);
+            if (!v.valid()) return false;
+            std::array<MirInstId, 2> stOps{v, elemPtr};
+            mir.addInst(MirOpcode::Store, stOps);
+        }
+        return true;
+    }
+
     // FC7 (D-FC7-AGGREGATE-COPY-MEMCPY): copy `size` bytes from `srcPtr` to
     // `dstPtr` BYTE-WISE, using the widest available integer chunk at each
-    // step — I64 (8B), then one I32 (4B), then I8-via-`Char` (1B) for the
-    // 0–3 byte tail. There is NO width-16 memory form (memAccessWidthFlags:
-    // Char→8, I32→32, all else→64), so 2–3 byte tails are 1-byte Char copies;
-    // I8/U8 would silently widen to a 64-bit access, so `Char` is the only
-    // safe 1-byte vehicle. Each chunk loads (zero/full-extends) then stores
+    // step — I64 (8B), then one I32 (4B), then `Char` (1B) for the 0–3 byte
+    // tail. Each chunk's memory access is now width-EXACT to its type
+    // (D-LIR-INT-MEMORY-WIDTH-EXACT — memAccessWidthFlags: Char/I8/U8/Bool→8,
+    // I16/U16→16, I32/U32→32, else→64), so a chunk touches EXACTLY its bytes
+    // and never overruns the object (the I32 tail of a 12-byte struct now
+    // reads/writes bytes 8–11, not 8–15 — a latent overrun this width-
+    // exactness also fixed). `Char` stays the 1-byte tail vehicle (a width-16
+    // chunk for a 2-byte tail is a possible future optimization, not a
+    // correctness need). Each chunk loads (zero/full-extends) then stores
     // the low width, round-tripping its bytes exactly. Chunk accesses may be
     // unaligned — fine on x86_64 and AArch64 (normal mov/LDR/STR). The shared
     // offset Const feeds both the src and dst GEP (immutable SSA). Returns
@@ -2118,6 +2284,13 @@ struct Lowerer {
                         && (initKind == TypeKind::Struct
                             || initKind == TypeKind::Union)) {
                         if (!lowerAggregateInitIntoSlot(*initN, alloca, ty))
+                            return false;
+                    } else if (hir.kind(*initN) == HirKind::ConstructAggregate
+                               && initKind == TypeKind::Array) {
+                        // D-MIR-ARRAY-FIELD-AGGREGATE-INIT (array-LOCAL form):
+                        // `int a[3] = {1,2,3}` — element-wise into the slot via
+                        // the same helper the array-field recurse-guard uses.
+                        if (!lowerArrayInitIntoSlot(*initN, alloca, ty))
                             return false;
                     } else if (initKind == TypeKind::Struct
                                || initKind == TypeKind::Union) {

@@ -35,15 +35,19 @@ namespace dss {
 // carrier that survives by construction is the safe one.
 // kLirInstFlagWidth8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN) adds the
 // sub-native byte form (`char` ≡ I8): movsx/movzx r/m8, mov r8, sxtb,
-// ldrb/strb. The two width bits are mutually exclusive (8 wins); the
-// JSON loader accepts a guard width of 8, 32, or 64.
+// ldrb/strb. kLirInstFlagWidth16 (D-LIR-INT-MEMORY-WIDTH-EXACT) adds the
+// half-word memory form (I16/U16): x86 0x66-prefixed mov / movzx r16,
+// arm64 STURH/LDURH. The width bits are mutually exclusive (narrowest
+// wins); the JSON loader accepts a guard width of 8, 16, 32, or 64.
 inline constexpr std::uint8_t kLirInstFlagWidth32 = 0x01;
 inline constexpr std::uint8_t kLirInstFlagWidth8  = 0x02;
+inline constexpr std::uint8_t kLirInstFlagWidth16 = 0x04;
 
 // The instruction's operation width in bits, derived from its flags.
 [[nodiscard]] constexpr std::uint8_t
 lirInstWidthBits(std::uint8_t flags) noexcept {
     if ((flags & kLirInstFlagWidth8) != 0)  return std::uint8_t{8};
+    if ((flags & kLirInstFlagWidth16) != 0) return std::uint8_t{16};
     return (flags & kLirInstFlagWidth32) != 0 ? std::uint8_t{32}
                                               : std::uint8_t{64};
 }

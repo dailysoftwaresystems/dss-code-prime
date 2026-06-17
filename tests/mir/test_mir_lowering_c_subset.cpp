@@ -1333,27 +1333,225 @@ TEST(MirLoweringCSubset, MemberAccessAssignEmitsGepThenStore) {
         << "field y is at byte offset 4 under LP64";
 }
 
-// `p[i]` over a POINTER base: GEP carries `[ptr, idx]` (no leading 0 —
-// the pointer is already at the element-pointer layer). Pins the
-// pointer-vs-array discrimination in `lowerLvalueAddress`'s Index path.
-TEST(MirLoweringCSubset, IndexOverPointerEmitsTwoOperandGepThenLoad) {
+// `int* a; a[i]` over a POINTER base: the element index is PRE-SCALED by
+// sizeof(elem) to a BYTE offset (Option A, D-MIR-STORAGE-ARRAY-INDEX-GEP, user
+// §B 2026-06-17), so the GEP carries `[ptr, i*4]`. This FIXES the latent
+// scale-1 silent miscompile — the old shape `Gep[ptr, i]` lowered to
+// `lea [ptr + i*1]`, reading the element at byte `i` instead of `i*4` for any
+// non-`char` element. RED-ON-DISABLE: drop the scaleIndexToBytes call → the
+// GEP index reverts to the raw `Arg i` → the Mul + stride assertions fail.
+TEST(MirLoweringCSubset, IndexOverIntPointerScalesIndexToByteOffset) {
     auto L = lowerCSubset(
         "int f(int* a, int i) { return a[i]; }\n");
     ASSERT_TRUE(L.mir.ok)
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirBlockId const entry = m.funcEntry(m.funcAt(0));
-    // [Arg a, Arg i, Gep(a, i), Load, Return]  — no Const-0 prefix.
-    ASSERT_EQ(m.blockInstCount(entry), 5u);
+    // [Arg a, Arg i, Const(4), Mul(i,4), Gep(a, mul), Load, Return]
+    ASSERT_EQ(m.blockInstCount(entry), 7u);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Arg);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Arg);
-    MirInstId const gep = m.blockInstAt(entry, 2);
+    // the scaling constant = sizeof(int) = 4 under LP64
+    MirInstId const strideK = m.blockInstAt(entry, 2);
+    auto const& strideLit = m.literalValue(m.constLiteralIndex(strideK));
+    EXPECT_EQ(std::get<std::int64_t>(strideLit.value), 4)
+        << "int element stride is 4";
+    // the Mul scales the raw index by the stride
+    MirInstId const mul = m.blockInstAt(entry, 3);
+    ASSERT_EQ(m.instOpcode(mul), MirOpcode::Mul);
+    auto mulOps = m.instOperands(mul);
+    ASSERT_EQ(mulOps.size(), 2u);
+    EXPECT_EQ(mulOps[0], m.blockInstAt(entry, 1)) << "Mul lhs is Arg i";
+    EXPECT_EQ(mulOps[1], strideK) << "Mul rhs is the stride const";
+    // the GEP indexes by the SCALED byte offset, not the raw index
+    MirInstId const gep = m.blockInstAt(entry, 4);
     EXPECT_EQ(m.instOpcode(gep), MirOpcode::Gep);
     auto gepOps = m.instOperands(gep);
     ASSERT_EQ(gepOps.size(), 2u);
-    EXPECT_EQ(gepOps[0], m.blockInstAt(entry, 0));
-    EXPECT_EQ(gepOps[1], m.blockInstAt(entry, 1));
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Load);
+    EXPECT_EQ(gepOps[0], m.blockInstAt(entry, 0)) << "GEP base is Arg a";
+    EXPECT_EQ(gepOps[1], mul)
+        << "GEP index is the SCALED Mul result, not the raw Arg i "
+           "(the scale-1 miscompile fix)";
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 5)), MirOpcode::Load);
+}
+
+// `int a[5]; a[i]` — a STORAGE array index. PRE-FC: lowered to a 3-op GEP
+// `[&a, 0, i]` that FAILED LOUD at LIR (D-MIR-STORAGE-ARRAY-INDEX-GEP); it was
+// never a miscompile, it didn't compile. NOW: the vestigial leading 0 is
+// collapsed AND the index is byte-scaled → a 2-op GEP `[&a, i*4]`, identical in
+// shape to the pointer path. MIR-tier pin (lowerCSubset stops at MIR).
+// RED-ON-DISABLE: keep the 3-op form / raw index → the size==2 + Mul-stride
+// assertions fail.
+TEST(MirLoweringCSubset, IndexIntoIntArrayCollapsesToTwoOpGepAndScales) {
+    auto L = lowerCSubset(
+        "int g(int i) { int a[5]; return a[i]; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    bool foundScaledGep = false;
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k) {
+        MirInstId const id = m.blockInstAt(entry, k);
+        if (m.instOpcode(id) != MirOpcode::Gep) continue;
+        auto ops = m.instOperands(id);
+        ASSERT_EQ(ops.size(), 2u)
+            << "storage-array GEP must collapse the vestigial 0 to 2 operands";
+        MirInstId const idxOp = ops[1];
+        ASSERT_EQ(m.instOpcode(idxOp), MirOpcode::Mul)
+            << "the index must be byte-scaled (Mul by stride)";
+        auto mulOps = m.instOperands(idxOp);
+        ASSERT_EQ(mulOps.size(), 2u);
+        auto const& strideLit = m.literalValue(m.constLiteralIndex(mulOps[1]));
+        EXPECT_EQ(std::get<std::int64_t>(strideLit.value), 4)
+            << "int element stride is 4";
+        foundScaledGep = true;
+    }
+    EXPECT_TRUE(foundScaledGep)
+        << "expected a 2-op byte-scaled storage-array GEP";
+}
+
+// `char a[5]; a[i]` — element stride 1, so NO Mul is emitted (the stride==1
+// fast path): the GEP index IS the raw index. Guards the fast path AND that
+// `char` indexing stays byte-identical (no spurious `imul`). RED-ON-DISABLE:
+// remove the `stride == 1` short-circuit in scaleIndexToBytes → a `Mul(i, 1)`
+// appears → the "no Mul" assertion fails.
+TEST(MirLoweringCSubset, IndexIntoCharArrayDoesNotScale) {
+    auto L = lowerCSubset(
+        "int g(int i) { char a[5]; return a[i]; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    bool foundGep = false;
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k) {
+        MirInstId const id = m.blockInstAt(entry, k);
+        EXPECT_NE(m.instOpcode(id), MirOpcode::Mul)
+            << "char (stride 1) indexing must NOT emit a scaling Mul";
+        if (m.instOpcode(id) == MirOpcode::Gep) {
+            auto ops = m.instOperands(id);
+            ASSERT_EQ(ops.size(), 2u);
+            EXPECT_NE(m.instOpcode(ops[1]), MirOpcode::Mul)
+                << "char GEP index is the raw index, not a Mul";
+            foundGep = true;
+        }
+    }
+    EXPECT_TRUE(foundGep);
+}
+
+// `int a[3] = {10,20,30}` — an array-LOCAL brace-init. PRE-FC it fell to the
+// scalar `else` arm → a multi-element InsertValue chain → FAIL-LOUD at LIR.
+// NOW it lowers element-wise via lowerArrayInitIntoSlot (the VarDecl array
+// arm), one Store per element at byte offset j*4. RED-ON-DISABLE: drop the
+// VarDecl array arm → no per-element Stores at 0/4/8.
+TEST(MirLoweringCSubset, ArrayLocalBraceInitStoresPerElementAtStride) {
+    auto L = lowerCSubset(
+        "int g(void) { int a[3] = {10, 20, 30}; return a[0]; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    std::vector<std::int64_t> storeOffsets;
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k) {
+        MirInstId const id = m.blockInstAt(entry, k);
+        if (m.instOpcode(id) != MirOpcode::Store) continue;
+        auto stOps = m.instOperands(id);  // [value, ptr]
+        ASSERT_EQ(stOps.size(), 2u);
+        MirInstId const ptr = stOps[1];
+        if (m.instOpcode(ptr) != MirOpcode::Gep) continue;
+        auto gepOps = m.instOperands(ptr);
+        if (gepOps.size() != 2u) continue;
+        if (m.instOpcode(gepOps[1]) != MirOpcode::Const) continue;
+        storeOffsets.push_back(
+            std::get<std::int64_t>(
+                m.literalValue(m.constLiteralIndex(gepOps[1])).value));
+    }
+    // `return a[0]` reads via a Load (not a Store), so exactly the 3 element
+    // inits remain, in ascending order.
+    ASSERT_EQ(storeOffsets.size(), 3u)
+        << "exactly 3 array-element init Stores";
+    EXPECT_EQ(storeOffsets[0], 0) << "a[0] at byte offset 0";
+    EXPECT_EQ(storeOffsets[1], 4) << "a[1] at byte offset 4";
+    EXPECT_EQ(storeOffsets[2], 8) << "a[2] at byte offset 8";
+}
+
+// `struct S { int a[3]; int n; }; struct S x = {{1,2,3}, 9}` — the array-TYPED
+// FIELD brace-init (D-MIR-ARRAY-FIELD-AGGREGATE-INIT). PRE-FC the array field
+// fell through the Struct||Union recurse-guard → lowerExpr → InsertValue chain
+// → FAIL-LOUD at LIR. NOW the recurse-guard's Array arm routes it to
+// lowerArrayInitIntoSlot → per-element Stores at 0,4,8, then the scalar field
+// `n` at 12 — element-wise, NO InsertValue. RED-ON-DISABLE: drop the Array arm
+// in the recurse-guard → the array elements are not stored at 0/4/8.
+TEST(MirLoweringCSubset, ArrayFieldBraceInitStoresPerElementAtStride) {
+    auto L = lowerCSubset(
+        "struct S { int a[3]; int n; };\n"
+        "int g(void) { struct S x = { {1,2,3}, 9 }; return x.n; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    std::vector<std::int64_t> storeOffsets;
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k) {
+        MirInstId const id = m.blockInstAt(entry, k);
+        EXPECT_NE(m.instOpcode(id), MirOpcode::InsertValue)
+            << "element-wise array-field init, no InsertValue chain";
+        if (m.instOpcode(id) != MirOpcode::Store) continue;
+        auto stOps = m.instOperands(id);
+        ASSERT_EQ(stOps.size(), 2u);
+        MirInstId const ptr = stOps[1];
+        if (m.instOpcode(ptr) != MirOpcode::Gep) continue;
+        auto gepOps = m.instOperands(ptr);
+        if (gepOps.size() != 2u) continue;
+        if (m.instOpcode(gepOps[1]) != MirOpcode::Const) continue;
+        storeOffsets.push_back(
+            std::get<std::int64_t>(
+                m.literalValue(m.constLiteralIndex(gepOps[1])).value));
+    }
+    // a[0]@0, a[1]@4, a[2]@8 (array elements at stride 4), n@12.
+    ASSERT_EQ(storeOffsets.size(), 4u);
+    EXPECT_EQ(storeOffsets[0], 0) << "a[0] at byte offset 0";
+    EXPECT_EQ(storeOffsets[1], 4) << "a[1] at byte offset 4";
+    EXPECT_EQ(storeOffsets[2], 8) << "a[2] at byte offset 8";
+    EXPECT_EQ(storeOffsets[3], 12) << "field n after the 3-int array";
+}
+
+// `int a[4]` reserves its FULL 16-byte layout in the frame, not the 8-byte
+// scalar-slot sentinel. Array locals became RUNNABLE this cycle (index +
+// brace-init), so the Alloca MUST carry the array byte size — an under-sized
+// slot would let a high element write (a[2]/a[3]) clobber a neighbouring
+// local (the silent frame-overflow the FC7 struct-alloca sizing also guards).
+// The Alloca payload carries the byte size. RED-ON-DISABLE: omit Array from
+// allocaForLocal's sizing arm → payload reverts to 0 (the 1-slot sentinel).
+TEST(MirLoweringCSubset, ArrayLocalAllocaReservesFullByteSize) {
+    auto L = lowerCSubset("int g(void) { int a[4]; return a[0]; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    bool foundAlloca = false;
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k) {
+        MirInstId const id = m.blockInstAt(entry, k);
+        if (m.instOpcode(id) != MirOpcode::Alloca) continue;
+        EXPECT_EQ(m.instPayload(id), 16u)
+            << "int[4] reserves 16 bytes (4*sizeof(int)), not the 8-byte "
+               "scalar-slot sentinel (payload 0)";
+        foundAlloca = true;
+    }
+    EXPECT_TRUE(foundAlloca) << "expected an Alloca for the array local";
+}
+
+// A ZERO-size element type (an empty aggregate `struct E {}`) must FAIL LOUD
+// when indexed — never a silent `Mul(idx, 0)` that aliases every element to
+// byte offset 0. `&a[1]` drives scaleIndexToBytes with stride 0.
+// RED-ON-DISABLE: drop the `stride == 0` guard → MIR lowering succeeds
+// (ASSERT_FALSE trips) with an all-aliasing index.
+TEST(MirLoweringCSubset, IndexIntoZeroSizeElementArrayFailsLoud) {
+    auto L = lowerCSubset(
+        "struct E { };\n"
+        "int g(void) { struct E a[3]; struct E* p = &a[1]; return 0; }\n");
+    EXPECT_FALSE(L.mir.ok)
+        << "indexing a zero-size (empty-aggregate) element must fail loud, "
+           "not silently scale by 0";
 }
 
 // `&p->x` exercises AddressOf delegating to `lowerLvalueAddress` for the
@@ -1859,9 +2057,16 @@ TEST(MirLoweringCSubset, ConstructAggregateUnionNonZeroVariantRuntimeOk) {
               ? "" : L.mirReporter.all()[0].actual);
 }
 
-// Array ConstructAggregate with runtime children exercises the
-// zeroLiteralOf Array arm + positional indexing.
-TEST(MirLoweringCSubset, ConstructAggregateArrayRuntimeUsesChain) {
+// D-MIR-ARRAY-FIELD-AGGREGATE-INIT (array-LOCAL form): an array-local brace-
+// init with a RUNTIME element `int xs[3] = {a, 2, 3}` lowers ELEMENT-WISE (one
+// Gep+Store per element at byte offsets 0,4,8), NOT an InsertValue chain.
+// PRE-FC the array fell to lowerExpr → a multi-element InsertValue chain that
+// FAILED LOUD at LIR (`lowerInsertValue` rejects non-zero indices) — the same
+// non-realizability that drove struct init element-wise (see
+// StructLocalInitStoresEachFieldAtItsOffset). RED-ON-DISABLE: revert the
+// VarDecl array arm → the array falls to lowerExpr → the InsertValue chain
+// (count >= 3) reappears and the EXPECT_EQ(...,0) trips.
+TEST(MirLoweringCSubset, ArrayLocalRuntimeInitStoresElementWise) {
     auto L = lowerCSubset(
         "void f(int a) { int xs[3] = {a, 2, 3}; }\n");
     ASSERT_FALSE(L.model.hasErrors());
@@ -1869,10 +2074,28 @@ TEST(MirLoweringCSubset, ConstructAggregateArrayRuntimeUsesChain) {
     ASSERT_TRUE(L.mir.ok)
         << (L.mirReporter.all().empty()
               ? "" : L.mirReporter.all()[0].actual);
-    auto const ops = entryOpcodes(L.mir.mir);
-    EXPECT_GE(countOpcode(ops, MirOpcode::InsertValue), 3u)
-        << "array ConstructAggregate with N runtime children emits N "
-           "InsertValues (one per positional slot)";
+    Mir const& m = L.mir.mir;
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "array-local init is element-wise, no InsertValue chain";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 3u)
+        << "one Store per array element";
+    // the three element GEPs carry byte offsets 0, 4, 8 (stride 4).
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    std::vector<std::int64_t> gepOffsets;
+    auto const n = m.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Gep) continue;
+        auto gOps = m.instOperands(ix);
+        ASSERT_EQ(gOps.size(), 2u);
+        auto const& lit = m.literalValue(m.constLiteralIndex(gOps[1]));
+        gepOffsets.push_back(std::get<std::int64_t>(lit.value));
+    }
+    ASSERT_EQ(gepOffsets.size(), 3u);
+    EXPECT_EQ(gepOffsets[0], 0) << "xs[0] at byte offset 0";
+    EXPECT_EQ(gepOffsets[1], 4) << "xs[1] at byte offset 4";
+    EXPECT_EQ(gepOffsets[2], 8) << "xs[2] at byte offset 8";
 }
 
 // Chain TOPOLOGY: the runtime-chain test only COUNTS InsertValues —

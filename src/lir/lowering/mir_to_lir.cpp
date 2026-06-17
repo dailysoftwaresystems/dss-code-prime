@@ -910,16 +910,37 @@ struct Lowerer {
 
     // The width flag for a MEMORY access (Load/Store) of `ty` into class `cls`. An
     // FPR access must be width-EXACT (movss vs movsd — an 8-byte read of a 4-byte
-    // F32 reads past it). A Char (1-byte) GPR access must ALSO be byte-exact — a
-    // 64-bit access of a 1-byte string/array element reads/writes 7 bytes past it
-    // (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN). Other GPR ints/ptrs use the width-
-    // default full-slot access (value-correct: their values are consumed low-bits-
-    // only, and a scalar local sits in an ≥8-byte slot).
+    // F32 reads past it). A GPR integer access must ALSO be byte-EXACT to its
+    // type's size: a 64-bit access of a PACKED sub-8-byte element (an array
+    // element or a struct field — NOT a stand-alone scalar local, which sits in
+    // its own ≥8-byte slot) writes/reads past it, clobbering the neighbour or
+    // overrunning the frame slot (D-LIR-INT-MEMORY-WIDTH-EXACT — the bug the
+    // array-storage cycle exposed; the FC7 struct-field path was latently
+    // affected too). Width by integer byte size; 8-byte ints/pointers keep the
+    // width-default (0 ⇒ 64) full-register access.
     [[nodiscard]] std::uint8_t memAccessWidthFlags(TypeId ty, LirRegClass cls) const {
         if (cls == LirRegClass::FPR) return widthFlagsForType(ty);
-        if (ty.valid() && interner.kind(ty) == TypeKind::Char)
-            return kLirInstFlagWidth8;
-        return 0;
+        if (!ty.valid()) return 0;
+        switch (interner.kind(ty)) {
+            // 1-byte integers (Char already required byte-exactness;
+            // I8/U8/Bool/Byte join it — a packed signed/unsigned-char or bool
+            // element must be 1-byte-exact too).
+            case TypeKind::Char: case TypeKind::Byte:
+            case TypeKind::I8:   case TypeKind::U8: case TypeKind::Bool:
+                return kLirInstFlagWidth8;
+            // 2-byte integers (short). The memory access is width-exact; the
+            // short→int promote (SExt/ZExt-from-16) is a SEPARATE gap
+            // (D-CSUBSET-SUBNATIVE-ALU-FORMS), so value use still fails loud.
+            case TypeKind::I16: case TypeKind::U16:
+                return kLirInstFlagWidth16;
+            // 4-byte integers (int; and `long` under LLP64, already resolved to
+            // I32 by the dataModel — width-32 is the correct 4-byte access).
+            case TypeKind::I32: case TypeKind::U32:
+                return kLirInstFlagWidth32;
+            // 8-byte integers/pointers — width-default full-slot access.
+            default:
+                return 0;
+        }
     }
 
     // The width for a REGISTER-RESIDENT value operation — const
@@ -1634,10 +1655,15 @@ struct Lowerer {
         // Cycle 3d: dynamic-index Gep with a single index. Emits
         // `lea result, [base + index*1 + 0]` via the 4-operand `lea`
         // form (`[base_reg, index_reg, MemBase(scale=1), MemOffset(0)]`).
-        // The scale defaults to 1 for cycle 3d; element-size-driven
-        // scales (sizeof(T) for typed-array Gep) co-design with ML6's
-        // address-mode synthesis. Multi-index Gep — multiple
-        // dereferences — folds into a chain at the optimizer layer.
+        // GEP-INDEX CONTRACT (D-MIR-STORAGE-ARRAY-INDEX-GEP, Option A): the
+        // index operand is always a BYTE offset — a struct-field displacement
+        // (const) or an array index already pre-scaled by sizeof(elem) at
+        // HIR→MIR (scaleIndexToBytes). So scale=1 is correct by contract; no
+        // element-size scale is carried here. Folding a `Mul-by-pow2 + Gep`
+        // into a hardware-scaled `lea` is a future address-mode-synthesis
+        // OPTIMIZATION (D-AS4-ARM64-INDEXED-LEA-SCALE), not a correctness need.
+        // Multi-index Gep — multiple dereferences — folds into a chain at the
+        // optimizer layer.
         if (operands.size() == 2) {
             if (!opcode(MnemonicSlot::Lea).has_value()) {
                 reportMissingOpcode(MnemonicSlot::Lea, "MIR Gep (dynamic-index)");

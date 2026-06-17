@@ -786,6 +786,28 @@
               { "index": 1, "slotKind": "membase.noscale" },
               { "index": 2, "slotKind": "imm9"           }
             ]
+          },
+          {
+            "$comment": "width 32 (D-LIR-INT-MEMORY-WIDTH-EXACT): LDUR Wt, [Xn, #simm9] (0xB8400000 — the LDUR word with size 11→10). Loads 4 bytes into Wt; a W-write zeroes bits 63:32 of Xt, so the int lands clean. A 4-byte int load MUST be width-exact — a 64-bit LDUR of a PACKED int element reads 4 bytes past it. Same operand layout as the 64-bit form. Selected when the Load's result type is a 4-byte integer (I32/U32, or `long` under LLP64) — width 32 via memAccessWidthFlags.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "template":   { "fixedWord": 3091202048 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm9"           }
+            ]
+          },
+          {
+            "$comment": "width 16 (D-LIR-INT-MEMORY-WIDTH-EXACT): LDURH Wt, [Xn, #simm9] (0x78400000 — the LDUR word with size 11→01). Loads 2 bytes, ZERO-extending into Wt (signedness-agnostic, the LDURB peer); the short→int promote (SXTH/UXTH = D-CSUBSET-SUBNATIVE-ALU-FORMS, not yet encoded ⇒ short VALUE use fails loud) re-reads the low half-word. Same operand layout. Selected when the Load's result type is I16/U16 — width 16 via memAccessWidthFlags.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "template":   { "fixedWord": 2017460224 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm9"           }
+            ]
           }
         ]
       }
@@ -817,6 +839,28 @@
             "$comment": "width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): STURB Wt, [Xn, #simm9] (0x38000000 — the STUR word with size 11→00). Writes EXACTLY the low byte of Wt — a 64-bit STUR of a 1-byte element clobbers 7 neighbours. Signedness-agnostic (only the low 8 bits are written). Same operand layout as the 64-bit form. Selected when the stored value's type is Char (width 8 via memAccessWidthFlags).",
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
             "template": { "fixedWord": 939524096 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm9"           }
+            ]
+          },
+          {
+            "$comment": "width 32 (D-LIR-INT-MEMORY-WIDTH-EXACT): STUR Wt, [Xn, #simm9] (0xB8000000 — the STUR word with size 11→10). Writes EXACTLY 4 bytes — a 64-bit STUR of a PACKED int element clobbers 4 bytes of the neighbour / overruns the frame slot (the array-storage crash this cycle fixes). Same operand layout as the 64-bit form. Selected when the stored value's type is a 4-byte integer (I32/U32, or `long` under LLP64) — width 32 via memAccessWidthFlags.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "fixedWord": 3087007744 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm9"           }
+            ]
+          },
+          {
+            "$comment": "width 16 (D-LIR-INT-MEMORY-WIDTH-EXACT): STURH Wt, [Xn, #simm9] (0x78000000 — the STUR word with size 11→01). Writes EXACTLY 2 bytes (the low half-word of Wt) — a wider store of a packed short clobbers its neighbour. Signedness-agnostic. Same operand layout. Selected when the stored value's type is I16/U16 — width 16 via memAccessWidthFlags.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "fixedWord": 2013265920 },
             "wires":    [
               { "index": 0, "slotKind": "rd"             },
               { "index": 1, "slotKind": "rn"             },

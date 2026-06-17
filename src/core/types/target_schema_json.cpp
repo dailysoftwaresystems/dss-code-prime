@@ -87,19 +87,21 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
     // FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS) + D-CSUBSET-CHAR-STRING-VALUE-CODEGEN:
     // optional `width` key — the operation-width discriminator. Absent = the
     // variant matches an instruction of ANY width (every pre-FC3 variant).
-    // 8 (the byte forms: movsx/movzx r/m8, mov r8, sxtb, ldrb/strb), 32, and 64
-    // are encodable; any other value is a load-time reject, never a silent
-    // match-nothing variant.
+    // 8 (the byte forms: movsx/movzx r/m8, mov r8, sxtb, ldrb/strb), 16 (the
+    // half-word memory forms: 0x66 mov / movzx r16, STURH/LDURH —
+    // D-LIR-INT-MEMORY-WIDTH-EXACT), 32, and 64 are encodable; any other value
+    // is a load-time reject, never a silent match-nothing variant.
     if (g.contains("width")) {
         auto const& w = g.at("width");
         if (!w.is_number_integer()
-            || (w.get<std::int64_t>() != 8 && w.get<std::int64_t>() != 32
-                && w.get<std::int64_t>() != 64)) {
+            || (w.get<std::int64_t>() != 8 && w.get<std::int64_t>() != 16
+                && w.get<std::int64_t>() != 32 && w.get<std::int64_t>() != 64)) {
             coll.emit(DiagnosticCode::C_MalformedJson,
                       std::format("/opcodes/{}/encoding/variants/{}/guard/width", opIdx, vi),
-                      "'width' must be the integer 8, 32, or 64 "
+                      "'width' must be the integer 8, 16, 32, or 64 "
                       "(the shipped operation-width vocabulary; "
-                      "D-CSUBSET-32BIT-ALU-FORMS / CHAR-STRING-VALUE-CODEGEN)");
+                      "D-CSUBSET-32BIT-ALU-FORMS / CHAR-STRING-VALUE-CODEGEN / "
+                      "D-LIR-INT-MEMORY-WIDTH-EXACT)");
         } else {
             variant.guardWidthBits =
                 static_cast<std::uint8_t>(w.get<std::int64_t>());
