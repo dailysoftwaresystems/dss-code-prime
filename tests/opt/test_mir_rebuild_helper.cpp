@@ -170,6 +170,69 @@ TEST(MirRebuildHelper, IdentityRoundTripPreservesDiamondCfg) {
     EXPECT_EQ(countOp(dst, MirOpcode::Return), srcReturnCount);
 }
 
+// FC7 C1c — the rebuild substrate's `Return` clone must preserve EVERY operand.
+// A by-value struct returned IN REGISTERS lowers to a MULTI-operand `Return` (one
+// per eightbyte / HFA piece); the clone previously mapped only `oldOps[0]`,
+// silently DROPPING pieces 1..N-1. That truncation was a HIGH silent miscompile,
+// masked on x86_64 (the dropped piece's value often still aliased its arg register
+// at the return register — a 3rd field passed in rdx == returnGprs[1]) and exposed
+// only on AAPCS64's distinct arg/return mapping. RED-ON-DISABLE: revert the helper's
+// Return clone to `addReturn(mapOperand(oldOps[0]))` and the rebuilt Return drops
+// from 2 operands to 1 here (and `IdentityRoundTripPreservesDiamondCfg`'s scalar
+// Return — 1 operand — stays green, so this is the isolated multi-piece lever).
+TEST(MirRebuildHelper, IdentityRoundTripPreservesMultiPieceReturnAllOperands) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i64 = interner.primitive(TypeKind::I64);
+    // A 2-eightbyte (SysV) / 2-GPR (AAPCS64) struct return lowers to a Return
+    // carrying TWO I64 register pieces. The rebuild substrate runs no verifier, so
+    // the fnSig return type is metadata here — the operand-count round-trip is what
+    // this pins (the verifier's own multi-piece acceptance is covered by the
+    // struct-return corpus + Return's maxOperands=N descriptor).
+    TypeId const fnSig = interner.fnSig({}, i64, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{200});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirLiteralValue p0; p0.value = std::int64_t{11}; p0.core = TypeKind::I64;
+    MirLiteralValue p1; p1.value = std::int64_t{22}; p1.core = TypeKind::I64;
+    MirInstId const v0 = mb.addConst(p0, i64);
+    MirInstId const v1 = mb.addConst(p1, i64);
+    MirInstId const pieces[] = {v0, v1};
+    mb.addReturnMulti(pieces);
+    Mir src = std::move(mb).finish();
+
+    // Sanity: the source Return carries BOTH pieces.
+    auto findReturnOperandCount = [](Mir const& m) -> std::size_t {
+        std::size_t const nf = m.moduleFuncCount();
+        for (std::uint32_t fi = 0; fi < nf; ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            std::uint32_t const nb = m.funcBlockCount(f);
+            for (std::uint32_t bi = 0; bi < nb; ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                std::uint32_t const ni = m.blockInstCount(b);
+                for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                    MirInstId const id = m.blockInstAt(b, ii);
+                    if (m.instOpcode(id) == MirOpcode::Return)
+                        return m.instOperands(id).size();
+                }
+            }
+        }
+        return 0;
+    };
+    ASSERT_EQ(findReturnOperandCount(src), 2u);
+
+    Mir dst;
+    ASSERT_TRUE(identityRebuild(src, dst));
+
+    // The crux: the rebuilt Return MUST still carry BOTH pieces. A single-operand
+    // clone would drop piece 1 → 1 here (the silent miscompile).
+    EXPECT_EQ(findReturnOperandCount(dst), 2u)
+        << "the rebuild substrate dropped a return-register piece — multi-piece "
+           "struct returns would silently lose every field past the first";
+    EXPECT_EQ(countOp(dst, MirOpcode::Return), 1u);
+}
+
 // Multi-block straight-line with GlobalAddr + Load + Store + Add +
 // Return. Exercises terminator dispatch on Br (no-operand) and Return
 // (one-operand), plus GlobalAddr's payload threading + the operand-

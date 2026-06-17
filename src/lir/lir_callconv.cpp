@@ -531,6 +531,10 @@ struct OpcodeHandles {
     // Optional — only SysV struct returns emit it; a target without it leaves
     // this 0 (the `op == h.retPiece` look-ahead then never matches).
     std::uint16_t retPiece;
+    // FC7 C3: the callee-side indirect-result (x8 sret) entry read (mirror of
+    // `arg`). Optional — only a CC with a register-based sret (indirectResultRegister)
+    // emits it; absent ⇒ 0, and `op == h.readIndirectResult` never matches.
+    std::uint16_t readIndirectResult;
     std::uint16_t call;
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02):
     // indirect call via extern import. Same arg-setup semantics as
@@ -757,13 +761,47 @@ pickScratchReg(TargetSchema const& schema, TargetCallingConvention const& cc,
     return std::nullopt;
 }
 
+// FC7 C3 (AAPCS64/Apple x8 sret): resolve the cc's indirect-result register to a
+// typed `LirReg`. Used by BOTH sides of register-based sret — the callee entry
+// `read_indirect_result` materialization and the caller's IRR-reroute of a
+// `hasIndirectResult` call. nullopt + loud if the CC declares none (a flagged call
+// / ReadIndirectResult reached a CC without an indirectResultRegister — a config or
+// HIR→MIR-threading invariant break) or the resolved ordinal is out of range.
+// `validate()` guarantees the register is GPR-class; the class is read back from the
+// schema register table (never hardcoded) so a future non-GPR IRR resolves correctly.
+[[nodiscard]] std::optional<LirReg>
+indirectResultReg(TargetSchema const& schema, TargetCallingConvention const& cc,
+                  std::string_view ctx, DiagnosticReporter& reporter) {
+    if (!cc.indirectResultRegister.has_value()) {
+        report(reporter, DiagnosticCode::L_CcRegLookupFailed, DiagnosticSeverity::Error,
+               std::format("{}: calling convention '{}' declares no indirect-result "
+                           "register, but an x8-sret call/return requires one "
+                           "(HIR→MIR set the indirect-result path for a CC whose "
+                           "aggregateSretViaHiddenArg is true)", ctx, cc.name));
+        return std::nullopt;
+    }
+    std::uint16_t const ord = cc.indirectResultRegister->ordinal;
+    auto const* info = schema.registerInfo(ord);
+    if (info == nullptr) {
+        report(reporter, DiagnosticCode::L_CcRegLookupFailed, DiagnosticSeverity::Error,
+               std::format("{}: cc '{}' indirectResultRegister ordinal {} is out of "
+                           "range", ctx, cc.name, ord));
+        return std::nullopt;
+    }
+    return makePhysicalReg(
+        ord, static_cast<LirRegClass>(static_cast<std::uint8_t>(info->regClass)));
+}
+
 // Emit a set of parallel register copies so every SOURCE is read before its
-// register is overwritten. Non-cyclic moves emit in dependency order; a true
-// cycle (a 2-swap — e.g. the two eightbytes of a {long,long} return landing
-// cross-wise in rax/rdx) is broken with a scratch register. D-ML7-2.3's arg path
-// only REJECTS cycles; struct-return pieces genuinely need the break. SysV is ≤2
-// pieces (≤ a 2-cycle); a ≥3-register cycle (a future AAPCS64 HFA at C3) fails
-// loud rather than mis-emit.
+// register is overwritten. Non-cyclic moves emit in dependency order; a true cycle
+// (e.g. the two eightbytes of a {long,long} return landing cross-wise in rax/rdx,
+// or a 3-/4-FPR AAPCS64 HFA return cycle — FC7 C3) is broken with a scratch
+// register. D-ML7-2.3's arg path only REJECTS cycles; return pieces genuinely need
+// the break. The scratch-break linearizes a cycle of ANY length through ONE scratch
+// (it redirects all readers of one source to the scratch, freeing that source so the
+// progress scan drains the resulting chain), reused across disjoint cycles as `moves`
+// shrinks; `pickScratchReg` is the fail-loud backstop when no scratch of the class is
+// free (impossible while the move set leaves ≥1 caller-saved reg of that class idle).
 [[nodiscard]] bool
 emitParallelRegMoves(LirBuilder& b, TargetSchema const& schema,
                      TargetCallingConvention const& cc,
@@ -789,18 +827,13 @@ emitParallelRegMoves(LirBuilder& b, TargetSchema const& schema,
             break;
         }
         if (progressed) continue;
-        // Only cycles remain. SysV pieces ≤2 ⇒ at most a 2-swap.
-        if (moves.size() > 2) {
-            report(reporter, DiagnosticCode::L_MoveCycleUnsupported,
-                   DiagnosticSeverity::Error,
-                   std::format("{}: a >=3-register return-piece move cycle is not "
-                               "yet supported (SysV is <=2 pieces; AAPCS64 HFA "
-                               "lands at FC7 C3)", ctx));
-            return false;
-        }
-        // Break the cycle: copy one member's source aside, then redirect every
-        // reader of that source to the scratch — freeing the source register so a
-        // safe move opens up next iteration.
+        // Only cycles remain. Break ONE cycle per outer iteration; the break
+        // generalizes to any cycle length (FC7 C3 raised this from the SysV-only
+        // ≤2-piece gate — a 3-/4-FPR HFA return can form a ≥3-cycle): copy one
+        // member's source aside, then redirect every reader of that source to the
+        // scratch — freeing the source register so a safe move opens up next
+        // iteration, and the progress scan drains the rest of the (now linear)
+        // chain. Disjoint cycles are handled across successive outer iterations.
         LirReg const cycSrc = moves.front().src;
         auto const scratch = pickScratchReg(schema, cc, cycSrc.regClass(),
                                             moves, ctx, reporter);
@@ -845,7 +878,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 13> const table{{
+    std::array<Entry, 14> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -860,6 +893,10 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // `ret_piece`. Absent ⇒ field stays 0; the `op == h.retPiece` look-ahead
         // never matches (real opcodes are > 0), so no struct-return capture runs.
         {&OpcodeHandles::retPiece,   "ret_piece",  true},
+        // FC7 C3: optional — only a register-based-sret CC (AAPCS64/Apple x8)
+        // emits `read_indirect_result`. Absent ⇒ field 0; `op == h.readIndirectResult`
+        // never matches. x86_64 declares the opcode for uniformity but never emits it.
+        {&OpcodeHandles::readIndirectResult, "read_indirect_result", true},
         // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02):
         // optional — a target without dynamic-import support legitimately
         // omits this opcode. MIR→LIR's separate per-call extern check at
@@ -1114,6 +1151,34 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 continue;
             }
 
+            // FC7 C3 (AAPCS64/Apple x8 sret): the callee-side `read_indirect_result`
+            // materializes at function entry as `mov result, <indirectResultRegister>`
+            // — the callee mirror of the register-resident `arg` move (the incoming
+            // sret pointer arrives in x8, not an arg register). Class-routed via
+            // `classOpHandle` like every other move; the IRR is GPR (validate()
+            // enforces it). Only a register-based-sret CC emits it, so `h.read-
+            // IndirectResult == 0` (the optional handle) skips this on every other
+            // target.
+            if (h.readIndirectResult != 0 && op == h.readIndirectResult) {
+                if (!result.valid() || result.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_VirtualRegInPostRegalloc,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: read_indirect_result inst {} has "
+                                       "no physical-reg result after regalloc",
+                                       inst.v));
+                    return false;
+                }
+                auto const irr = indirectResultReg(
+                    schema, cc, "materializeOneFunc: read_indirect_result", reporter);
+                if (!irr.has_value()) return false;
+                auto const mv = classOpHandle(
+                    schema, result.regClass(), RegClassOp::Move,
+                    "materializeOneFunc: read_indirect_result copy", reporter);
+                if (!mv.has_value()) return false;
+                maybeMov(b, *mv, result, *irr);
+                continue;
+            }
+
             // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a `ret_piece` captures
             // the k-th return register of its struct-returning call. It is
             // CONSUMED by that call's look-ahead (below), which captures all the
@@ -1282,6 +1347,24 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 std::vector<ArgMove> argMoves;
                 std::vector<StackArgStore> stackStores;
                 argMoves.reserve(ops.size());
+                // FC7 C3 (AAPCS64/Apple x8 sret): a `hasIndirectResult` call
+                // PREPENDS the sret pointer at ops[1] (right after the callee at
+                // ops[0]). It is routed to the cc's indirect-result register (x8),
+                // NOT an arg register — so the real-arg scan starts past it
+                // (firstArgIdx == 2) and the IRR move is appended to argMoves below
+                // (hazard-checked + emitted with the arg moves). On every other CC
+                // (hidden-arg / non-sret) the flag is clear and firstArgIdx == 1.
+                bool const hasIrr =
+                    ::dss::call_payload::hasIndirectResult(payload);
+                std::size_t const firstArgIdx = hasIrr ? 2u : 1u;
+                if (hasIrr && ops.size() < 2) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: indirect-result call inst {} has "
+                                       "no sret-pointer operand (expected it "
+                                       "prepended at operand 1)", inst.v));
+                    return false;
+                }
                 // D-ML7-2.6: under slot-aligned cc (Win64 ms_x64),
                 // each arg consumes one shared slot index regardless
                 // of class. Under independent counters (SysV/AAPCS64),
@@ -1293,7 +1376,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 std::uint32_t fprIdx = 0;
                 std::uint32_t slotIdx = 0;
                 std::uint32_t overflowIdx = 0;  // count of stack-args so far
-                for (std::size_t i = 1; i < ops.size(); ++i) {
+                for (std::size_t i = firstArgIdx; i < ops.size(); ++i) {
                     LirOperand const& argOp = ops[i];
                     if (argOp.kind != LirOperandKind::Reg
                         || argOp.reg.isPhysical == 0) {
@@ -1302,7 +1385,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                DiagnosticSeverity::Error,
                                std::format("callconv: call inst {} arg {} "
                                            "is not a physical-reg operand "
-                                           "after regalloc", inst.v, i - 1));
+                                           "after regalloc", inst.v,
+                                           i - firstArgIdx));
                         return false;
                     }
                     LirReg const srcReg = argOp.reg;
@@ -1342,6 +1426,34 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         stackStores.push_back({srcReg, offset});
                         ++overflowIdx;
                     }
+                }
+                // FC7 C3: route the prepended sret pointer (ops[1]) to the cc's
+                // indirect-result register. APPENDED to argMoves (last) so it joins
+                // the SAME parallel-move hazard analysis + in-order emit as the arg
+                // moves: an arg that regalloc parked in the IRR (x8) is read by its
+                // own EARLIER arg-move before this LATER move overwrites x8 (safe);
+                // a genuine cross-dependency (the sret ptr parked in an arg-dest reg
+                // an arg-move overwrites, or vice-versa) trips the same loud
+                // L_MoveCycleUnsupported the arg path already uses (D-ML7-2.3) —
+                // never a silent clobber. R is a real Call operand ⇒ regalloc keeps
+                // it live to here (no post-regalloc dangling).
+                if (hasIrr) {
+                    auto const irr = indirectResultReg(
+                        schema, cc, "materializeOneFunc: call indirect-result",
+                        reporter);
+                    if (!irr.has_value()) return false;
+                    LirOperand const& sretOp = ops[1];
+                    if (sretOp.kind != LirOperandKind::Reg
+                        || sretOp.reg.isPhysical == 0) {
+                        report(reporter,
+                               DiagnosticCode::L_VirtualRegInPostRegalloc,
+                               DiagnosticSeverity::Error,
+                               std::format("callconv: indirect-result call inst {} "
+                                           "sret-pointer operand is not a physical "
+                                           "reg after regalloc", inst.v));
+                        return false;
+                    }
+                    argMoves.push_back({*irr, sretOp.reg});
                 }
                 // Move-ordering hazard detection (silent-failure-hunter
                 // CRITICAL F1 fold + post-fold inversion fix). The
@@ -1513,9 +1625,11 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     std::uint32_t const fixedCount =
                         ::dss::call_payload::fixedArgCount(payload);
                     std::uint32_t vectorArgsInVararg = 0;
-                    for (std::size_t i = 1; i < ops.size(); ++i) {
-                        // ops[0] is the callee; ops[1..] are args.
-                        std::size_t const argIdx = i - 1;
+                    for (std::size_t i = firstArgIdx; i < ops.size(); ++i) {
+                        // ops[0] is the callee; an x8-sret call also has the sret
+                        // pointer at ops[1] (firstArgIdx==2) — skip it so the vararg
+                        // index counts only real args.
+                        std::size_t const argIdx = i - firstArgIdx;
                         if (argIdx < fixedCount) continue;
                         if (ops[i].kind != LirOperandKind::Reg) continue;
                         if (ops[i].reg.regClass() == LirRegClass::FPR) {

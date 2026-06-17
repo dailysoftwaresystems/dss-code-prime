@@ -184,19 +184,17 @@ TEST(AggregateAbiSysV, UnimplementedStrategyIsNullopt) {
     auto ti = makeInterner(1);
     TypeId const s = structOf(ti, "II",
                  {ti.primitive(TypeKind::I32), ti.primitive(TypeKind::I32)});
-    // None + AAPCS64 (until C3) are unimplemented → nullopt (the caller fails
-    // loud). Win64 is implemented as of C2 (see the AggregateAbiWin64 suite).
+    // Only the `None` sentinel is unimplemented → nullopt (the caller fails
+    // loud). SysV (C1), Win64 (C2), AAPCS64 (C3) are all implemented now.
     EXPECT_FALSE(classifyAggregate(AggregateClassKind::None, 16, s, ti,
-                                   kNatural16, DataModel::Lp64).has_value());
-    EXPECT_FALSE(classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, s, ti,
                                    kNatural16, DataModel::Lp64).has_value());
 }
 
-TEST(AggregateAbiSysV, ImplementedFlagMatchesC1C2Scope) {
+TEST(AggregateAbiSysV, ImplementedFlagMatchesC1C2C3Scope) {
     EXPECT_TRUE(aggregateAbiImplemented(AggregateClassKind::SysVEightbyte));
-    EXPECT_TRUE(aggregateAbiImplemented(AggregateClassKind::Win64BySize));  // C2
+    EXPECT_TRUE(aggregateAbiImplemented(AggregateClassKind::Win64BySize));   // C2
+    EXPECT_TRUE(aggregateAbiImplemented(AggregateClassKind::Aapcs64Hfa));    // C3
     EXPECT_FALSE(aggregateAbiImplemented(AggregateClassKind::None));
-    EXPECT_FALSE(aggregateAbiImplemented(AggregateClassKind::Aapcs64Hfa));  // C3
 }
 
 // ── FC7 C2: MS x64 (Win64) by-size classification ──────────────────────────
@@ -265,4 +263,98 @@ TEST(AggregateAbiWin64, OneByteStruct_OneGprWidthOne) {
     ASSERT_EQ(r->pieces.size(), 1u);
     EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Gpr);
     EXPECT_EQ(r->pieces[0].widthBytes, 1u);
+}
+
+// ── FC7 C3: AAPCS64 / Apple arm64 classification ───────────────────────────
+// HFA (1-4 leaves all the SAME FP type) → that many FPR pieces, each the element
+// width (NOT size-limited to 16B). Non-HFA ≤16B → 1-2 GPR pieces; >16B → by-ref.
+namespace {
+[[nodiscard]] std::optional<AbiPassing>
+classifyAapcs64(TypeId t, TypeInterner const& ti) {
+    return classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, t, ti,
+                             kNatural16, DataModel::Lp64);
+}
+}  // namespace
+
+TEST(AggregateAbiAapcs64, TwoDoubles_TwoFprPiecesWidth8) {
+    auto ti = makeInterner(1);
+    TypeId const d = ti.primitive(TypeKind::F64);
+    auto r = classifyAapcs64(structOf(ti, "DD", {d, d}), ti);  // 16B HFA
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->kind, AbiPassing::Kind::InRegisters);
+    ASSERT_EQ(r->pieces.size(), 2u);
+    EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Fpr);
+    EXPECT_EQ(r->pieces[0].byteOffset, 0u);
+    EXPECT_EQ(r->pieces[0].widthBytes, 8u);
+    EXPECT_EQ(r->pieces[1].cls, AbiPieceClass::Fpr);
+    EXPECT_EQ(r->pieces[1].byteOffset, 8u);
+    EXPECT_EQ(r->pieces[1].widthBytes, 8u);
+}
+
+TEST(AggregateAbiAapcs64, ThreeFloats_ThreeFprPiecesWidth4) {
+    auto ti = makeInterner(1);
+    TypeId const f = ti.primitive(TypeKind::F32);
+    auto r = classifyAapcs64(structOf(ti, "FFF", {f, f, f}), ti);  // 12B float HFA
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->pieces.size(), 3u);
+    for (std::size_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(r->pieces[i].cls, AbiPieceClass::Fpr);
+        EXPECT_EQ(r->pieces[i].byteOffset, i * 4u);
+        EXPECT_EQ(r->pieces[i].widthBytes, 4u)
+            << "a float HFA element is 4 bytes (s-register), NOT a truncated 8";
+    }
+}
+
+TEST(AggregateAbiAapcs64, FourDoubles_FourFprPieces_NotByRefDespite32Bytes) {
+    auto ti = makeInterner(1);
+    TypeId const d = ti.primitive(TypeKind::F64);
+    auto r = classifyAapcs64(structOf(ti, "DDDD", {d, d, d, d}), ti);  // 32B HFA
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->kind, AbiPassing::Kind::InRegisters)
+        << "a 4-double HFA is 32 bytes but passes in v0..v3, NOT by reference";
+    ASSERT_EQ(r->pieces.size(), 4u);
+    EXPECT_EQ(r->pieces[3].cls, AbiPieceClass::Fpr);
+    EXPECT_EQ(r->pieces[3].byteOffset, 24u);
+}
+
+TEST(AggregateAbiAapcs64, SingleFloat_OneFprPiece) {
+    auto ti = makeInterner(1);
+    auto r = classifyAapcs64(structOf(ti, "F", {ti.primitive(TypeKind::F32)}), ti);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->pieces.size(), 1u);
+    EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Fpr);
+    EXPECT_EQ(r->pieces[0].widthBytes, 4u);
+}
+
+TEST(AggregateAbiAapcs64, ThreeInts_TwoGprPieces) {
+    auto ti = makeInterner(1);
+    TypeId const i = ti.primitive(TypeKind::I32);
+    auto r = classifyAapcs64(structOf(ti, "III", {i, i, i}), ti);  // 12B non-HFA
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->kind, AbiPassing::Kind::InRegisters);
+    ASSERT_EQ(r->pieces.size(), 2u);
+    EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Gpr);
+    EXPECT_EQ(r->pieces[1].cls, AbiPieceClass::Gpr);
+}
+
+TEST(AggregateAbiAapcs64, IntFloatMixed_NotHfa_OneGpr) {
+    auto ti = makeInterner(1);
+    // {int, float} = 8B — leaves are I32 + F32, NOT all the same FP type → NOT an
+    // HFA → general rule → 1 GPR piece (NOT 1 FPR).
+    auto r = classifyAapcs64(structOf(ti, "IF",
+                 {ti.primitive(TypeKind::I32), ti.primitive(TypeKind::F32)}), ti);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->pieces.size(), 1u);
+    EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Gpr)
+        << "a mixed int/float aggregate is not an HFA → GPR, not FPR";
+}
+
+TEST(AggregateAbiAapcs64, TwentyByteStruct_ByReference) {
+    auto ti = makeInterner(1);
+    TypeId const i = ti.primitive(TypeKind::I32);
+    TypeId const l = ti.primitive(TypeKind::I64);
+    // {int, long, long} = 24B (> 16, non-HFA) → by reference.
+    auto r = classifyAapcs64(structOf(ti, "ILL", {i, l, l}), ti);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->kind, AbiPassing::Kind::ByReference);
 }

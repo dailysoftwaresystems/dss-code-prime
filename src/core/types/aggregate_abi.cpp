@@ -8,10 +8,11 @@
 namespace dss {
 
 bool aggregateAbiImplemented(AggregateClassKind strategy) noexcept {
-    // SysV AMD64 (C1) + MS x64 (C2) are realized. AAPCS64 (C3) is declared in
-    // config but not yet built — it stays fail-loud.
+    // SysV AMD64 (C1) + MS x64 (C2) + AAPCS64/Apple (C3) are realized. Only the
+    // `None` sentinel stays unimplemented (a CC with no by-value strategy).
     return strategy == AggregateClassKind::SysVEightbyte
-        || strategy == AggregateClassKind::Win64BySize;
+        || strategy == AggregateClassKind::Win64BySize
+        || strategy == AggregateClassKind::Aapcs64Hfa;
 }
 
 namespace {
@@ -93,6 +94,56 @@ classifyAggregate(AggregateClassKind strategy, std::uint16_t maxRegBytes,
             wout.kind = AbiPassing::Kind::ByReference;
         }
         return wout;
+    }
+
+    if (strategy == AggregateClassKind::Aapcs64Hfa) {
+        // AAPCS64 §5.4 / Apple ARM64. An HFA (Homogeneous Float Aggregate) — a
+        // composite whose every fundamental leaf is the SAME floating-point type,
+        // 1..4 of them — is passed/returned in that many SIMD (FPR) registers,
+        // each the element's width (NOT size-limited to 16B: a 4-double HFA is 32
+        // bytes in v0..v3). A non-HFA aggregate ≤16B goes in 1-2 GPRs; >16B (or
+        // empty) by reference. NO per-eightbyte SSE merge (that is SysV's rule).
+        std::vector<LeafField> leaves;
+        if (!collectLeaves(aggTy, 0, in, lp, dm, leaves))
+            return std::nullopt;
+        // HFA element homogeneity: every leaf is the SAME float kind. The member
+        // COUNT is size/elem (NOT the leaf count) so a union of N floats — whose
+        // members overlap to one element — is a 1-member HFA, while a struct/array
+        // of N packs to N. count must be 1..4 and divide the size evenly.
+        bool allSameFp = !leaves.empty() && isFloatKind(leaves.front().kind);
+        if (allSameFp)
+            for (LeafField const& f : leaves)
+                if (f.kind != leaves.front().kind) { allSameFp = false; break; }
+        if (allSameFp) {
+            std::uint64_t const elem =
+                scalarByteSize(leaves.front().kind, dm).value_or(0);
+            if (elem == 0) return std::nullopt;   // un-sized FP leaf → fail loud
+            if (size % elem == 0) {
+                std::uint64_t const count = size / elem;
+                if (count >= 1 && count <= 4) {
+                    AbiPassing hout;
+                    hout.kind = AbiPassing::Kind::InRegisters;
+                    for (std::uint64_t i = 0; i < count; ++i)
+                        hout.pieces.push_back(AbiPiece{AbiPieceClass::Fpr,
+                            i * elem, static_cast<std::uint32_t>(elem)});
+                    return hout;
+                }
+            }
+        }
+        // Non-HFA: ≤16B → ceil(size/8) GPR pieces (1 or 2); >16B / empty → by ref.
+        AbiPassing aout;
+        if (size == 0 || size > maxRegBytes) {
+            aout.kind = AbiPassing::Kind::ByReference;
+            return aout;
+        }
+        aout.kind = AbiPassing::Kind::InRegisters;
+        std::size_t const n = static_cast<std::size_t>((size + 7) / 8);
+        for (std::size_t e = 0; e < n; ++e) {
+            std::uint64_t const eoff = e * 8;
+            aout.pieces.push_back(AbiPiece{AbiPieceClass::Gpr, eoff,
+                static_cast<std::uint32_t>(std::min<std::uint64_t>(8, size - eoff))});
+        }
+        return aout;
     }
 
     // SysVEightbyte (the only other implemented strategy).

@@ -387,6 +387,13 @@ public:
     // type (I64/F64). The `call` operand anchors ordering + value-numbering.
     MirInstId addReturnPiece(MirInstId call, std::uint32_t ordinal, TypeId pieceType,
                              MirInstFlags flags = MirInstFlags::None);
+    // FC7 C3 (AAPCS64/Apple x8 sret). Callee-side entry read of the indirect-
+    // result register (the incoming result-storage pointer); `pointerType` is the
+    // pointer-to-result type. (The caller side needs NO builder: the sret pointer
+    // is a normal prepended Call operand routed to the IRR by the
+    // `call_payload::kIndirectResultBit` flag — the IRR-reroute design.)
+    MirInstId addReadIndirectResult(TypeId pointerType,
+                                    MirInstFlags flags = MirInstFlags::None);
 
     // D5.6: aggregate field/element read + write (first-class, no memory).
     // `path` is the field-index chain (length 1 for direct read of a top-

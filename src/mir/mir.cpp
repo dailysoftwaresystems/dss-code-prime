@@ -662,6 +662,15 @@ MirInstId MirBuilder::addReturnPiece(MirInstId call, std::uint32_t ordinal,
     return appendInst_(pod, operands, /*terminates=*/false);
 }
 
+MirInstId MirBuilder::addReadIndirectResult(TypeId pointerType, MirInstFlags flags) {
+    if (!pointerType.valid()) requireValueType_("addReadIndirectResult");
+    detail::MirInst pod;
+    pod.opcode = MirOpcode::ReadIndirectResult;
+    pod.flags  = flags;
+    pod.typeId = pointerType;
+    return appendInst_(pod, {}, /*terminates=*/false);
+}
+
 MirInstId MirBuilder::addConst(MirLiteralValue value, TypeId type, MirInstFlags flags) {
     if (!type.valid()) requireValueType_("addConst");
     std::uint32_t const index = literalPool_.add(std::move(value));

@@ -5,6 +5,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/types/call_payload.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -40,7 +41,9 @@ struct Lowered {
     DiagnosticReporter               mirReporter;
 };
 
-[[nodiscard]] Lowered lowerCSubset(std::string src) {
+[[nodiscard]] Lowered lowerCSubset(std::string src,
+                                   std::string targetName = "x86_64",
+                                   std::string ccName     = "sysv_amd64") {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
     UnitBuilder builder{*loaded};
@@ -64,13 +67,15 @@ struct Lowered {
     // compile_pipeline.cpp does, so member-access + aggregate-local lowering
     // resolves field byte offsets. dataModel stays the Lp64 default (an
     // int-based struct's field offsets are dataModel-independent here).
-    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
+    if (auto t = TargetSchema::loadShipped(targetName); t.has_value()) {
         mirCfg.aggregateLayout       = (*t)->aggregateLayout();
         mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
-        // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the SysV CC's by-value
-        // params so a struct passed/returned BY VALUE classifies (the sysv_amd64
-        // strategy). Mirrors compile_pipeline.cpp.
-        if (auto const* cc = (*t)->callingConventionByName("sysv_amd64")) {
+        // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the active CC's by-value
+        // params so a struct passed/returned BY VALUE classifies. Mirrors
+        // compile_pipeline.cpp. `targetName`/`ccName` default to x86_64/sysv_amd64
+        // (the C1/C1c pins); the AAPCS64 x8-sret pins pass "arm64"/"aapcs64" so
+        // `aggregateSretViaHiddenArg` resolves false (indirectResultRegister = x8).
+        if (auto const* cc = (*t)->callingConventionByName(ccName)) {
             mirCfg.aggregateClassification   = cc->aggregateClassification;
             mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
             mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
@@ -2843,4 +2848,75 @@ TEST(MirLoweringCSubset, HiddenVisibilityUnusedFunctionIsDceEliminated) {
     EXPECT_TRUE(findFunc(plainSym).valid())
         << "plain_unused (Global/Default) must survive — externally "
            "visible symbols are linkage-protected";
+}
+
+// FC7 C3 (AAPCS64/Apple x8 sret) — N-3 host-independent MIR pin. A >16-byte struct
+// returned BY VALUE under AAPCS64 uses the register-based indirect-result (x8) path,
+// NOT the SysV/Win64 hidden-arg path. This pin lowers for arm64/aapcs64 (so
+// `aggregateSretViaHiddenArg` resolves FALSE — indirectResultRegister = x8) and
+// asserts, deterministically + on every host (no execution), that:
+//   (callee) the >16B-returning function reads the result pointer via a
+//            `ReadIndirectResult` op + returns VOID (0-operand Return) + does NOT
+//            consume a hidden GPR Arg for the sret pointer; and
+//   (caller) the Call to it carries the `kIndirectResultBit` payload flag (so
+//            lir_callconv reroutes the prepended sret pointer to x8, not arg0).
+// RED-ON-DISABLE: revert `hir_to_mir`'s `aggregateSretViaHiddenArg` branch (callee
+// → `addArg`+`addReturn(ptr)`, caller → no IRR bit) and both arms fail.
+TEST(MirLoweringCSubset, Aapcs64StructSretUsesReadIndirectResultAndFlagsCall) {
+    auto L = lowerCSubset(
+        "typedef struct { long a; long b; long c; } Big;\n"
+        "Big make(int tag, long a) { Big s; s.a = a + tag; s.b = a; s.c = a;"
+        " return s; }\n"
+        "int use(void) { Big b = make(7, 5); return (int)b.a; }\n",
+        /*targetName=*/"arm64", /*ccName=*/"aapcs64");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    // Scan every function: the callee (make) must read x8 + return void; the caller
+    // (use) must flag its Call with hasIndirectResult.
+    std::size_t readIndirectResultCount = 0;
+    std::size_t voidStructReturnCount   = 0;
+    std::size_t irrFlaggedCallCount     = 0;
+    std::size_t hiddenSretArgCount      = 0;  // a 3rd GPR Arg would be a hidden sret ptr
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        std::size_t argCount = 0;
+        bool fnReadsIrr = false;
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                MirInstId const id = m.blockInstAt(b, ii);
+                switch (m.instOpcode(id)) {
+                    case MirOpcode::ReadIndirectResult:
+                        ++readIndirectResultCount; fnReadsIrr = true; break;
+                    case MirOpcode::Arg: ++argCount; break;
+                    case MirOpcode::Call:
+                        if (::dss::call_payload::hasIndirectResult(m.instPayload(id)))
+                            ++irrFlaggedCallCount;
+                        break;
+                    case MirOpcode::Return:
+                        if (fnReadsIrr && m.instOperands(id).empty())
+                            ++voidStructReturnCount;
+                        break;
+                    default: break;
+                }
+            }
+        }
+        // `make` takes 2 real params (tag, a) → exactly 2 Args, NO hidden sret Arg.
+        if (fnReadsIrr && argCount > 2) ++hiddenSretArgCount;
+    }
+    EXPECT_EQ(readIndirectResultCount, 1u)
+        << "the x8-sret callee must read the indirect-result register once at entry";
+    EXPECT_EQ(voidStructReturnCount, 1u)
+        << "the x8-sret callee must return VOID (the caller owns the x8 storage)";
+    EXPECT_EQ(irrFlaggedCallCount, 1u)
+        << "the caller's Call must carry the hasIndirectResult payload flag so "
+           "lir_callconv routes the sret pointer to x8, not arg0";
+    EXPECT_EQ(hiddenSretArgCount, 0u)
+        << "the x8-sret callee must NOT also consume a hidden GPR Arg for the sret "
+           "pointer (that is the SysV/Win64 path; x8-sret uses ReadIndirectResult)";
 }

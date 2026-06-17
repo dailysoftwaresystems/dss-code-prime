@@ -1,0 +1,12 @@
+{
+  "$comment": "FC7 C3 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN, AAPCS64/Apple x8 sret + HFA): arm64 struct by-value ARG + RETURN across every class — mkPairD()={double;double} HFA in d0:d1, mkTriF()={float;float;float} float HFA in s0:s1:s2 (F32 pieces, MF-2), mkTri()=12B non-HFA in x0:x1 (2 GPR, no SSE), mkBig()=24B via x8 SRET WITH a real int arg `tag` in x0 (N-2: the sret pointer is NOT shifted into an arg reg), sumPairD()=HFA arg in d0:d1, sumBig()=24B arg BY REFERENCE. 15+7+7+13=42 via non-inlined mkd()/mkf()/mki()/mkl(). AAPCS64 runtime = arm64-ELF under qemu (Apple Mach-O is the same struct ABI, macos CI leg only; x86_64 SysV/Win64 use the hidden-arg sret path). RED-ON-DISABLE: a dropped HFA piece, a missed x8 sret copy, a float HFA loaded as a double, or the sret pointer shifting `tag` out of x0 knocks the exit off 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}

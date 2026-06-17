@@ -176,6 +176,10 @@ enum class MnemonicSlot : std::uint8_t {
     // Materialized away by lir_callconv (a mov-from-returnReg), like `arg` — never
     // encoded. Declared in every target schema for substrate uniformity.
     RetPiece,
+    // FC7 C3 (AAPCS64/Apple x8 sret): the callee entry read of the indirect-result
+    // register. Like `RetPiece`/`arg`, materialized away by lir_callconv (a
+    // mov-from-indirectResultRegister) — never encoded. Declared in every schema.
+    ReadIndirectResult,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -263,6 +267,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::MovkLsl32,     "movk_lsl32"},
     {MnemonicSlot::MovkLsl48,     "movk_lsl48"},
     {MnemonicSlot::RetPiece,      "ret_piece"},
+    {MnemonicSlot::ReadIndirectResult, "read_indirect_result"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -1013,6 +1018,7 @@ struct Lowerer {
         switch (op) {
             case MirOpcode::Arg:    return lowerArg(id);
             case MirOpcode::ReturnPiece: return lowerReturnPiece(id);
+            case MirOpcode::ReadIndirectResult: return lowerReadIndirectResult(id);
             case MirOpcode::Const:  return lowerConst(id);
             case MirOpcode::Add:    return lowerBinaryOp(id, MnemonicSlot::Add);
             case MirOpcode::Sub:    return lowerBinaryOp(id, MnemonicSlot::Sub);
@@ -1233,6 +1239,23 @@ struct Lowerer {
         LirReg const result = lir.newVReg(regClassFor(id));
         emitInst(*opcode(MnemonicSlot::RetPiece), result, std::span<LirOperand const>{},
                     /*payload=*/mir.returnPieceOrdinal(id));
+        defineValue(id, result);
+    }
+
+    // FC7 C3 (AAPCS64/Apple x8 sret): the callee-side entry read of the indirect-
+    // result register. A leaf (no operands), result = the incoming result-storage
+    // pointer. The virtual `read_indirect_result` LIR op carries no payload;
+    // lir_callconv materializes it at entry as `mov result, <indirectResultRegister>`
+    // (the callee mirror of `arg`). Fail loud if the schema lacks the opcode.
+    void lowerReadIndirectResult(MirInstId id) {
+        if (!opcode(MnemonicSlot::ReadIndirectResult).has_value()) {
+            reportMissingOpcode(MnemonicSlot::ReadIndirectResult,
+                                "MIR ReadIndirectResult");
+            return;
+        }
+        LirReg const result = lir.newVReg(regClassFor(id));
+        emitInst(*opcode(MnemonicSlot::ReadIndirectResult), result,
+                 std::span<LirOperand const>{}, /*payload=*/0);
         defineValue(id, result);
     }
 

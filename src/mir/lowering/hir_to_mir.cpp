@@ -690,6 +690,17 @@ struct Lowerer {
                     callPayload = ::dss::call_payload::encode(
                         true, static_cast<std::uint32_t>(fixedSz));
                 }
+                // FC7 C3 (AAPCS64/Apple x8 sret): when the by-value aggregate
+                // RETURN is class-MEMORY (ByReference) AND this CC carries the
+                // result pointer in a dedicated indirect-result register (x8, not
+                // a hidden arg), flag the call so lir_callconv ROUTES the prepended
+                // sret-pointer operand (operands[1]) to the IRR instead of arg0,
+                // and shifts the real-arg index past it. Bit-30; independent of the
+                // variadic bits already encoded above.
+                if (structRetAbi.has_value()
+                    && structRetAbi->kind == AbiPassing::Kind::ByReference
+                    && !config.aggregateSretViaHiddenArg)
+                    callPayload |= ::dss::call_payload::kIndirectResultBit;
                 // FC7 C1c: a by-value struct/union return materializes the call
                 // into its result slot `R` (sret pointer or eightbyte pieces) and
                 // yields `R`'s address — the aggregate-by-address value the
@@ -1702,13 +1713,18 @@ struct Lowerer {
                                  config.aggregateLayout, config.dataModel);
     }
 
-    // The MIR type of an eightbyte register piece: I64 for INTEGER (GPR), F64
-    // for SSE (FPR). The full 8-byte register moves; the byte-exact valid-byte
-    // copy happens at the temp/slot boundary (the register's unused high bytes
-    // are ABI-undefined). The piece's register CLASS follows from this type.
-    [[nodiscard]] TypeId pieceType(AbiPieceClass cls) {
-        return interner.primitive(cls == AbiPieceClass::Gpr ? TypeKind::I64
-                                                            : TypeKind::F64);
+    // The MIR type of a register piece. GPR → I64 (the full 8-byte register
+    // moves; the byte-exact valid-byte copy happens at the temp/slot boundary —
+    // the register's unused high bytes are ABI-undefined). FPR → F32 for a 4-byte
+    // piece (a float HFA element in an s-register), else F64 (a double / an 8-byte
+    // SSE eightbyte) — the WIDTH matters for FP so the load/store emits the right
+    // single/double form (a wrong F64 load of a float HFA would read 8 bytes and
+    // clobber the next element). The piece's register CLASS follows from the type.
+    [[nodiscard]] TypeId pieceType(AbiPiece const& p) {
+        if (p.cls == AbiPieceClass::Fpr)
+            return interner.primitive(p.widthBytes <= 4 ? TypeKind::F32
+                                                        : TypeKind::F64);
+        return interner.primitive(TypeKind::I64);
     }
 
     // An anonymous frame temp sized to hold aggregate `aggTy` (lir_callconv
@@ -1747,7 +1763,7 @@ struct Lowerer {
             return true;
         }
         for (AbiPiece const& p : abi.pieces) {
-            TypeId const pty = pieceType(p.cls);
+            TypeId const pty = pieceType(p);
             MirInstId const offK =
                 constInt(static_cast<std::int64_t>(p.byteOffset));
             if (!offK.valid()) return false;
@@ -1784,7 +1800,7 @@ struct Lowerer {
         MirInstId const slot = allocaForLocal(sym, aggTy, anchor);
         if (!slot.valid()) return false;
         for (AbiPiece const& p : abi.pieces) {
-            TypeId const pty = pieceType(p.cls);
+            TypeId const pty = pieceType(p);
             MirInstId const a = mir.addArg(ctr.next(p.cls), pty);
             if (!a.valid()) return false;
             MirInstId const offK =
@@ -1825,7 +1841,7 @@ struct Lowerer {
                 "(classifier invariant violated)");
             return InvalidMirInst;
         }
-        TypeId const p0ty = pieceType(abi.pieces[0].cls);
+        TypeId const p0ty = pieceType(abi.pieces[0]);
         MirInstId const call =
             mir.addInst(MirOpcode::Call, operands, p0ty, callPayload);
         if (!call.valid()) return InvalidMirInst;
@@ -1844,14 +1860,14 @@ struct Lowerer {
                 (p.cls == AbiPieceClass::Fpr) ? fprRet++ : gprRet++;
             if (k == 0) { pieceVals.push_back(call); continue; }
             MirInstId const rp =
-                mir.addReturnPiece(call, ord, pieceType(p.cls));
+                mir.addReturnPiece(call, ord, pieceType(p));
             if (!rp.valid()) return InvalidMirInst;
             pieceVals.push_back(rp);
         }
         // Pass 2: store each captured piece into the result slot at its offset.
         for (std::size_t k = 0; k < abi.pieces.size(); ++k) {
             AbiPiece const& p = abi.pieces[k];
-            TypeId const pty = pieceType(p.cls);
+            TypeId const pty = pieceType(p);
             MirInstId const offK =
                 constInt(static_cast<std::int64_t>(p.byteOffset));
             if (!offK.valid()) return InvalidMirInst;
@@ -1893,13 +1909,17 @@ struct Lowerer {
                 return false;
             }
             if (!lowerByteWiseCopy(srcAddr, sretPtr_, layout->size)) return false;
-            mir.addReturn(sretPtr_);
+            // SysV/Win64 return the result pointer in the integer return register
+            // (rax/rcx). AAPCS64/Apple x8-sret returns VOID — the caller owns x8 and
+            // the storage it points at; the callee must NOT also place it in x0.
+            if (config.aggregateSretViaHiddenArg) mir.addReturn(sretPtr_);
+            else                                  mir.addReturn();
             return true;
         }
         std::vector<MirInstId> pieces;
         pieces.reserve(abi->pieces.size());
         for (AbiPiece const& p : abi->pieces) {
-            TypeId const pty = pieceType(p.cls);
+            TypeId const pty = pieceType(p);
             MirInstId const offK =
                 constInt(static_cast<std::int64_t>(p.byteOffset));
             if (!offK.valid()) return false;
@@ -2666,8 +2686,16 @@ struct Lowerer {
                     return false;
                 }
                 if (abi->kind == AbiPassing::Kind::ByReference) {
-                    sretPtr_ = mir.addArg(argCtr.next(AbiPieceClass::Gpr),
-                                          interner.pointer(currentFnResult_));
+                    // SysV/Win64 ⇒ the result pointer is a hidden first INTEGER arg
+                    // (consumes the first GPR ordinal, shifting real args by one).
+                    // AAPCS64/Apple x8-sret ⇒ it arrives in the dedicated indirect-
+                    // result register via `ReadIndirectResult` and consumes NO arg
+                    // ordinal (real args still start at x0). FC7 C3.
+                    sretPtr_ = config.aggregateSretViaHiddenArg
+                        ? mir.addArg(argCtr.next(AbiPieceClass::Gpr),
+                                     interner.pointer(currentFnResult_))
+                        : mir.addReadIndirectResult(
+                              interner.pointer(currentFnResult_));
                     if (!sretPtr_.valid()) {
                         if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                         return false;

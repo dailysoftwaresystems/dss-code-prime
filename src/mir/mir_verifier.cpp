@@ -454,12 +454,22 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
         // check on THAT count, not the FnSig paramCount, so a multi-register struct
         // param verifies while a stray out-of-range `Arg` is still rejected.
         std::uint32_t argCount = 0;
+        // FC7 C3 (AAPCS64/Apple x8 sret): a function that reads the indirect-result
+        // register (ReadIndirectResult at entry) is a register-based-sret struct
+        // returner — its by-value aggregate result is written THROUGH x8 and the MIR
+        // `Return` is legitimately VOID (the SysV/Win64 hidden-arg path instead
+        // returns the sret pointer). This op is the CC-config-free marker that lets
+        // the return check below accept a void return for a non-void (struct) func.
+        bool hasIndirectResultRead = false;
         for (std::uint32_t bi = 0; bi < nBlocks; ++bi) {
             MirBlockId const b = mir_.funcBlockAt(f, bi);
             std::uint32_t const n = mir_.blockInstCount(b);
-            for (std::uint32_t i = 0; i < n; ++i)
-                if (mir_.instOpcode(mir_.blockInstAt(b, i)) == MirOpcode::Arg)
-                    ++argCount;
+            for (std::uint32_t i = 0; i < n; ++i) {
+                MirOpcode const o = mir_.instOpcode(mir_.blockInstAt(b, i));
+                if (o == MirOpcode::Arg) ++argCount;
+                else if (o == MirOpcode::ReadIndirectResult)
+                    hasIndirectResultRead = true;
+            }
         }
         for (std::uint32_t bi = 0; bi < nBlocks; ++bi) {
             MirBlockId const b = mir_.funcBlockAt(f, bi);
@@ -498,7 +508,11 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                             DiagnosticCode::I_TerminatorTypeMismatch, id,
                             std::format("(return) has a value but func #{} returns void",
                                 f.v));
-                    } else if (!hasValue && wantValue) {
+                    } else if (!hasValue && wantValue && !hasIndirectResultRead) {
+                        // x8-sret functions (hasIndirectResultRead) legitimately
+                        // return void — the result is written through the indirect-
+                        // result register, not returned. Every other non-void func
+                        // with a value-less return is a real lowering bug.
                         reportInst(reporter,
                             DiagnosticCode::I_TerminatorTypeMismatch, id,
                             std::format("(return) has no value but func #{} "
@@ -520,7 +534,7 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                                 if (!vt.valid() || vt.v == returnTy.v) continue;
                                 TypeKind const vk = interner_->kind(vt);
                                 if (vk != TypeKind::I64 && vk != TypeKind::F64
-                                    && vk != TypeKind::Ptr) {
+                                    && vk != TypeKind::F32 && vk != TypeKind::Ptr) {
                                     reportInst(reporter,
                                         DiagnosticCode::I_TerminatorTypeMismatch, id,
                                         std::format("(return) of by-value struct/union "

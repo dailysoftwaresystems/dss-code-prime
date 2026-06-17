@@ -929,6 +929,32 @@ TEST(CallPayload, EncodeDecodeRoundtripsVariadicAndFixedCount) {
     // fixedArgCount is non-zero.
     EXPECT_FALSE(isVariadic(encode(false, 42u)));
     EXPECT_EQ(fixedArgCount(encode(false, 42u)), 42u);
+
+    // FC7 C3 (AAPCS64/Apple x8 sret): bit 30 = hasIndirectResult, the flag
+    // lir_callconv reads to route the prepended sret-pointer operand to the cc's
+    // indirect-result register (x8) instead of arg0. It is INDEPENDENT of the
+    // variadic bit (31) and the fixedArgCount field (0..29) — a flip of any one must
+    // not perturb the others (else an x8-sret call would mis-route args or mis-stamp
+    // the variadic count).
+    EXPECT_FALSE(hasIndirectResult(encode(false, 0u)));
+    EXPECT_TRUE(hasIndirectResult(encode(false, 0u, /*hasIndirectResult=*/true)));
+    // Independent of fixedArgCount: an x8-sret call to a 3-fixed-param fn.
+    {
+        std::uint32_t const p = encode(false, 3u, true);
+        EXPECT_TRUE(hasIndirectResult(p));
+        EXPECT_FALSE(isVariadic(p));
+        EXPECT_EQ(fixedArgCount(p), 3u);
+    }
+    // Independent of variadic: all three bits coexist.
+    {
+        std::uint32_t const p = encode(true, 7u, true);
+        EXPECT_TRUE(isVariadic(p));
+        EXPECT_TRUE(hasIndirectResult(p));
+        EXPECT_EQ(fixedArgCount(p), 7u);
+    }
+    // Default (2-arg encode) never sets the IRR bit — every pre-C3 call site stays
+    // non-sret.
+    EXPECT_FALSE(hasIndirectResult(encode(true, 5u)));
 }
 
 TEST(LirCallconvAbi, CalleeArgReceivesFromArgGprAcrossSysVAndMsX64) {
@@ -1267,6 +1293,92 @@ TEST(LirCallconvAbi, MultiPieceReturnBreaksRegisterSwapCycle) {
     EXPECT_EQ(tok(*rdxOrd), *raxOrd)
         << "returnGprs[1]=rdx must end holding piece 1 (the value that started "
            "in rax) — a naive non-cycle-broken swap leaves piece 0's value here";
+}
+
+// FC7 C3 (AAPCS64 HFA returns) — SF-1 cycle-break generalization pin. A float HFA
+// (`{float,float,float}` / `{double×3}`) returns THREE FPR pieces; under a cross-wise
+// regalloc coloring they form a 3-register move CYCLE (d0←d1←d2←d0). C1c's
+// `emitParallelRegMoves` capped the scratch-break at a 2-swap (`moves.size() > 2`
+// failed loud — SysV is ≤2 pieces); FC7 C3 raised that gate because the scratch-break
+// linearizes a cycle of ANY length through one scratch. This pins a true 3-cycle is
+// broken CLEANLY + value-correctly (not rejected). RED-ON-DISABLE: restore the
+// `if (moves.size() > 2) return false;` guard and `result.ok()` flips false here (the
+// 2-piece swap pin above still passes — this is the isolated ≥3 lever).
+TEST(LirCallconvAbi, ThreeFprHfaReturnCycleBreaksViaScratch) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+    auto const retOp  = sch.opcodeByMnemonic("ret");
+    auto const fmovOp = sch.opcodeByMnemonic("fmov");
+    ASSERT_TRUE(retOp.has_value());
+    ASSERT_TRUE(fmovOp.has_value());
+    auto const* cc = sch.callingConvention(0);   // aapcs64 (cc index 0)
+    ASSERT_NE(cc, nullptr);
+    ASSERT_GE(cc->returnFprs.size(), 3u);
+    auto const d0 = sch.registerByName(cc->returnFprs[0]);
+    auto const d1 = sch.registerByName(cc->returnFprs[1]);
+    auto const d2 = sch.registerByName(cc->returnFprs[2]);
+    ASSERT_TRUE(d0.has_value() && d1.has_value() && d2.has_value());
+
+    // ret [piece0 in d1, piece1 in d2, piece2 in d0]: piece k must move to
+    // returnFprs[k] → moves {d0<-d1, d1<-d2, d2<-d0}, a cross-wise 3-CYCLE.
+    LirReg const pD0 = makePhysicalReg(*d0, LirRegClass::FPR);
+    LirReg const pD1 = makePhysicalReg(*d1, LirRegClass::FPR);
+    LirReg const pD2 = makePhysicalReg(*d2, LirRegClass::FPR);
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{88});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    std::array<LirOperand, 3> retOps{LirOperand::makeReg(pD1),    // piece 0 in d1
+                                     LirOperand::makeReg(pD2),    // piece 1 in d2
+                                     LirOperand::makeReg(pD0)};   // piece 2 in d0
+    b.addInst(*retOp, InvalidLirReg, retOps);
+    Lir lir = std::move(b).finish();
+
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{88};
+    alloc.perFunc.back().callingConventionIndex = 0;
+    alloc.perFunc.back().numSpillSlots          = 0;
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
+    ASSERT_TRUE(result.ok())
+        << "a 3-register HFA return cycle must be broken via scratch, not rejected "
+           "(the >2 guard was raised for FC7 C3)";
+
+    // Simulate the emitted fmov moves over a register token-map: each FPR starts
+    // holding its own id; after the moves, d0 must hold d1's ORIGINAL token (piece 0),
+    // d1 d2's (piece 1), d2 d0's (piece 2) — the cycle resolved value-correctly.
+    std::unordered_map<std::uint32_t, std::uint32_t> regTok;
+    auto tok = [&](std::uint32_t id) {
+        auto it = regTok.find(id);
+        return it == regTok.end() ? id : it->second;
+    };
+    std::uint32_t movCount = 0;
+    for (std::uint32_t fi = 0; fi < result.lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = result.lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const b2 = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < result.lir.blockInstCount(b2); ++i) {
+                LirInstId const inst = result.lir.blockInstAt(b2, i);
+                if (result.lir.instOpcode(inst) != *fmovOp) continue;
+                LirReg const dst = result.lir.instResult(inst);
+                auto const ops = result.lir.instOperands(inst);
+                ASSERT_EQ(ops.size(), 1u);
+                ASSERT_EQ(ops[0].kind, LirOperandKind::Reg);
+                ++movCount;
+                regTok[dst.id] = tok(ops[0].reg.id);
+            }
+        }
+    }
+    EXPECT_GE(movCount, 4u)
+        << "a 3-register cycle needs >=4 fmovs (1 scratch save + 3 chain moves); "
+           "fewer means the cycle was not broken";
+    EXPECT_EQ(tok(*d0), *d1) << "returnFprs[0]=d0 must end holding piece 0 (from d1)";
+    EXPECT_EQ(tok(*d1), *d2) << "returnFprs[1]=d1 must end holding piece 1 (from d2)";
+    EXPECT_EQ(tok(*d2), *d0) << "returnFprs[2]=d2 must end holding piece 2 (from d0)";
 }
 
 TEST(LirCallconvAbi, MultiArgFunctionMaterializesEveryArgGpr) {

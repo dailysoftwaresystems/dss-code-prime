@@ -849,9 +849,13 @@ private:
                 return;
             }
             case MirOpcode::Return: {
-                std::optional<MirInstId> rv;
-                if (!oldOps.empty()) rv = mapCallerValue(oldOps[0], id);
-                dst_.addReturn(rv);
+                // FC7 C1c: map EVERY return-piece operand (a multi-piece by-value
+                // struct return carries N pieces; taking only oldOps[0] dropped the
+                // rest — see mir_rebuild_helper's Return clone). 0/1/N all handled.
+                std::vector<MirInstId> rvs;
+                rvs.reserve(oldOps.size());
+                for (MirInstId const o : oldOps) rvs.push_back(mapCallerValue(o, id));
+                dst_.addReturnMulti(rvs);
                 return;
             }
             case MirOpcode::Unreachable:
@@ -1103,6 +1107,19 @@ private:
         };
         switch (cop) {
             case MirOpcode::Return: {
+                // FC7 C1c: a MULTI-PIECE by-value struct Return (N>1 piece operands)
+                // cannot be merged through a single continuation Phi — inlining a
+                // by-value-struct-returning callee is not supported (OPT7-gated;
+                // D-FC7-INLINE-MULTI-PIECE-RETURN). Fail loud rather than silently
+                // drop pieces 1..N-1.
+                if (cops.size() > 1) {
+                    std::fprintf(stderr,
+                        "dss::inlining fatal: callee %u has a multi-piece struct "
+                        "Return (%zu pieces); inlining by-value-struct-returning "
+                        "functions is unsupported (D-FC7-INLINE-MULTI-PIECE-RETURN).\n",
+                        callee.v, static_cast<std::size_t>(cops.size()));
+                    std::abort();
+                }
                 MirInstId rv{};
                 if (!cops.empty()) {
                     rv = mapCalleeOperand(src_, cops[0], local, callee);

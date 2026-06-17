@@ -41,6 +41,16 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (FC7 C3) — callee-side mirror of `arg`: 'this LirReg is the incoming indirect-result (sret) pointer', read from the cc's indirectResultRegister at function entry. Declared for substrate uniformity (like `ret_piece`); x86_64's SysV/ms_x64 conventions pass the sret pointer as a HIDDEN ARG (no indirectResultRegister), so this op is never EMITTED on x86_64 — only register-based sret (AAPCS64/Apple x8) emits it. No encoding (materialized away by lir_callconv).",
+      "mnemonic":      "read_indirect_result",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "2-operand-shape mov: destination = result vreg, source = operands[0]. AS2 cycle 2 wires this to two encoding variants: REX.W 0x8B /r (mov r64, r64) when source is a register; REX.W 0xC7 /0 imm32 (mov r/m64, imm32 SIGN-extended to 64-bit) when source is an immediate. FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): both shapes gain explicit `width` keys + 32-bit siblings (same opcodes WITHOUT REX.W, Intel SDM Vol. 2B MOV) — a 32-bit register write auto-zero-extends to the full 64-bit register, and the 32-bit imm32 form is EXACT (not sign-extending), the difference that matters for an `unsigned int` 0xFFFFFFFF. Plumbing movs (phi/copy/capture/spill) are emitted width-default (64) — full-register copies are value-correct for every type.",
       "mnemonic":      "mov",
       "result":        "value",
