@@ -274,6 +274,25 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // merge), so the multi-block CFG-clone path is the only one that
             // can encounter one; it still counts as 1 instruction here (the
             // cost model is unchanged — Phis are not special-cased).
+            // FC7 C1c/C3 (D-FC7-INLINE-MULTI-PIECE-RETURN): a by-value struct
+            // returned IN REGISTERS (a multi-piece `Return`, N>1 piece operands) or
+            // via x8-sret (a `ReadIndirectResult` entry op) is FRAME/ABI-sensitive
+            // and NOT safely inlinable. The single-block splice paths clone a
+            // callee `Return` taking only operand 0 — truncating the struct to its
+            // first field — and a spliced `ReadIndirectResult` would read the
+            // CALLER's indirect-result register (garbage; the caller is not itself
+            // sret) instead of the callee's incoming result pointer. Refuse at this
+            // chokepoint (fail-SAFE: refusing only forgoes the optimization, it
+            // cannot miscompile), covering every splice path (single- and multi-
+            // block) at once; the multi-block continuation-Phi `cops.size()>1`
+            // abort below is then a defensive backstop. Reachable under the shipped
+            // `release.pipeline.json` (which runs `Inlining`), so this is a real
+            // silent-miscompile fix, not a speculative guard.
+            if (op == MirOpcode::ReadIndirectResult) return std::nullopt;
+            if (op == MirOpcode::Return
+                && mir.instOperands(cid).size() > 1) {
+                return std::nullopt;
+            }
             if (op == MirOpcode::Return) hasReturn = true;
             if (op == MirOpcode::Arg && mir.argIndex(cid) >= callArgCount) {
                 return std::nullopt;  // arg index out of range → refuse

@@ -466,9 +466,12 @@ private:
                 break;
             }
             case MirOpcode::Return: {
-                auto operands = mir_.instOperands(id);
-                if (!operands.empty()) {
-                    out_ += std::format(" %v{}", operands[0].v);
+                // FC7 C1c: a by-value struct returned IN REGISTERS carries N piece
+                // operands — emit ALL of them (space-separated), not just operand 0,
+                // so the round-trip contract (emitMir∘parseMir∘emitMir == emitMir)
+                // holds for multi-piece struct returns. Scalar = 1, void = 0.
+                for (auto const& o : mir_.instOperands(id)) {
+                    out_ += std::format(" %v{}", o.v);
                 }
                 break;
             }
@@ -1343,12 +1346,18 @@ private:
                 break;
             }
             case MirOpcode::Return: {
-                Tok pk = lex_.peek();
-                if (pk.kind == TokKind::Percent) {
+                // FC7 C1c: parse EVERY return-piece operand (multi-piece struct
+                // return). 0 → void `addReturn()`; N≥1 → `addReturnMulti` (which
+                // covers the scalar 1-operand case identically to `addReturn(v)`).
+                std::vector<MirInstId> vals;
+                while (lex_.peek().kind == TokKind::Percent) {
                     std::uint32_t const v = parsePercentValue();
-                    builder_.addReturn(resolveValue(v));
-                } else {
+                    vals.push_back(resolveValue(v));
+                }
+                if (vals.empty()) {
                     builder_.addReturn();
+                } else {
+                    builder_.addReturnMulti(vals);
                 }
                 break;
             }
