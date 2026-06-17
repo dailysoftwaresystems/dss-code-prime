@@ -108,7 +108,14 @@ public:
     [[nodiscard]] bool isScopeRule(RuleId rule) const noexcept;
 
     // ── scope events (driven by the parser's frame open/close) ──
-    void openScope();
+    // `rule` is the scope-opening frame's rule — used to classify the new
+    // scope as a DECLARATOR-DOMINATOR (a `declarations`-rule scope that is
+    // NOT a composite-type body, e.g. c-subset's topLevelDecl, which opens a
+    // scope only to dominate a function's params). A composite TYPE tag minted
+    // in such a scope's HEAD (a file-scope `struct P { … } v;`) floats PAST it
+    // to the enclosing namespace at `record` time (C11 6.2.1) — mirrors the
+    // analyzer's `floatToNamespaceScope`.
+    void openScope(RuleId rule);
     void closeScope();   // aborts on global-scope underflow (caller bug)
 
     // ── bindings ──
@@ -141,6 +148,7 @@ public:
         std::size_t                bindingCount   = 0;
         std::size_t                candidateCount = 0;
         std::vector<std::uint32_t> liveScopes;
+        std::vector<bool>          liveScopeDominator;   // parallel to liveScopes
         std::uint32_t              nextScopeId    = 1;
     };
     [[nodiscard]] Snapshot snapshot() const;
@@ -155,12 +163,19 @@ private:
 
     std::unordered_map<std::uint32_t, BinderDecl> byRule_;
     std::unordered_set<std::uint32_t>             scopeRules_;
+    // Scope rules that open a DECLARATOR-DOMINATOR scope (a `declarations`
+    // row that is NOT a Type/composite body). A composite TYPE tag declared
+    // in such a scope floats past it to the enclosing namespace (see openScope).
+    std::unordered_set<std::uint32_t>             dominatorScopeRules_;
 
     // Chronological, append-only between snapshot/restore pairs. Closed
     // scopes do NOT truncate (liveness is scope-id-based) — see class doc.
     std::vector<Binding>                          bindings_;
     // Stack of live scope ids; [0] is the global scope (id 0), never popped.
     std::vector<std::uint32_t>                    liveScopes_;
+    // Parallel to liveScopes_: true iff that scope is a declarator-dominator
+    // (a TYPE tag recorded while it is live floats past it to the namespace).
+    std::vector<bool>                             liveScopeIsDominator_;
     std::uint32_t                                 nextScopeId_ = 1;
 
     std::vector<AmbiguousTypeNameCandidate>       candidates_;

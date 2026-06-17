@@ -1050,7 +1050,7 @@ struct Parser::Impl {
         // frames without closeFrameOnce; the sketch snapshot restore
         // covers those opens wholesale.)
         if (sketch.enabled() && sketch.isScopeRule(rule)) {
-            sketch.openScope();
+            sketch.openScope(rule);
         }
     }
 

@@ -233,12 +233,10 @@
     "root": { "sequence": [ { "repeat": "topLevel" } ] },
 
     "topLevel": {
+      "$comment": "NON-speculative: each alt has a disjoint FIRST. struct/union/enum heads route to topLevelDecl (via topLevelHead's body/ref specifier forms) — the bare top-level structDecl/unionDecl/enumDecl alts were folded into topLevelDecl (optional declarator) so a `struct` lead has ONE owner here and only topLevelHead's single-level speculation runs (the two-level topLevel-speculation path was unsound — D-CSUBSET-STRUCT-BODY-VARDECL-POSITION).",
       "alt": [
         "includeDirective",
         "typedefDecl",
-        "structDecl",
-        "unionDecl",
-        "enumDecl",
         "topLevelDecl",
         "externDecl"
       ]
@@ -319,16 +317,27 @@
     },
 
     "topLevelDecl": {
-      "sequence": [ { "optional": "declSpecifiers" }, "topLevelHead", "initDeclaratorList", "topLevelDeclTail" ]
+      "$comment": "C declaration = decl-specifiers init-declarator-list? `;` (or a function-definition block tail). The init-declarator-list is OPTIONAL: a bare `struct P { … };` / `enum E { … };` is a type-only declaration (head introduces the tag, no object declared) — the semantic tier mints the type from the head and emits a TypeDecl; a head that introduces NO tag with no declarator (`int ;`) is a C6.7p2 'declares nothing' constraint violation (fail-loud). A trailing declarator (`struct P { … } v;`) or a block tail (`struct Tri mkTri(void){…}`) takes the normal global/function path.",
+      "sequence": [ { "optional": "declSpecifiers" }, "topLevelHead", { "optional": "initDeclaratorList" }, "topLevelDeclTail" ]
     },
 
     "topLevelHead": {
-      "$comment": "Top-level head: keyword specifier run OR a lone Identifier (typedef name). Identifier is UNAMBIGUOUS at top level — no expression statements exist there — so no speculation/guard is needed. Struct/union/enum heads at top level stay unsupported (pre-FC4 parity; the residue is pinned).",
+      "$comment": "Top-level head: a keyword type specifier (`typeSpecifierSeq`, e.g. `int`/`unsigned long`), a struct/union/enum composite specifier (`topLevelCompositeSpec` — the SPECULATIVE body-vs-ref alt), OR a lone Identifier (typedef name). The OUTER alt is NON-speculative: FIRST(typeSpecifierSeq)={type keywords}, FIRST(topLevelCompositeSpec)={struct,union,enum}, FIRST(Identifier)={ident} are pairwise disjoint — so a plain `int x;` routes DIRECTLY to typeSpecifierSeq (NO extra wrapper node, preserving the pre-existing tree shape) and only a struct/union/enum lead enters the single-level speculation that closes D-CSUBSET-STRUCT-BODY-VARDECL-POSITION. topLevel stays non-speculative: `struct` routes unambiguously to topLevelDecl.",
       "sequence": [
         { "repeat": "headQualifier" },
-        { "alt": [ "typeSpecifierSeq", "Identifier" ] },
+        { "alt": [ "typeSpecifierSeq", "topLevelCompositeSpec", "Identifier" ] },
         { "repeat": "headQualifier" }
       ]
+    },
+
+    "topLevelCompositeSpec": {
+      "$comment": "The struct/union/enum SPECIFIER at a top-level declaration head — body form (`struct P { … }`) OR bare tag reference (`struct P`). SPECULATIVE (mirrors typeSpecifierForDecl / typedefHead): body forms probe FIRST; a ref with no `{` rolls back to the `*TypeRef` form (`struct Tri mkTri(void)` / `struct Q g;`). A NAMED rule (not an inline alt) so the speculation runs at the same depth proven to work for local decls — an inline alt at the top-level-decl depth hits the FC4-c1 depth-0 candidate replay and fails to roll back. The enum body's trailing-comma enumerator-list parses cleanly here now that the schema compiler propagates nested-nullable FOLLOW (recomputeAltExpectedSets).",
+      "alt": [
+        "structSpecifierBody", "structTypeRef",
+        "unionSpecifierBody",  "unionTypeRef",
+        "enumSpecifierBody",   "enumTypeRef"
+      ],
+      "speculative": true, "lookahead": 256
     },
 
     "topLevelDeclTail": {
@@ -419,8 +428,14 @@
     },
 
     "typeSpecifierForDecl": {
-      "$comment": "KEYWORD/composite-led type specifiers for declaration heads — deliberately NO Identifier arm (the typedef-name head is the ambiguous form, routed through identDeclHead/declOrExprStmt or the committed post-specifier/post-qualifier heads).",
-      "alt": [ "typeSpecifierSeq", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
+      "$comment": "KEYWORD/composite-led type specifiers for declaration heads — deliberately NO Identifier arm (the typedef-name head is the ambiguous form, routed through identDeclHead/declOrExprStmt or the committed post-specifier/post-qualifier heads). SPECULATIVE (mirror typedefHead, D-CSUBSET-STRUCT-BODY-VARDECL-POSITION): admits the struct/union/enum BODY forms so a body-defined LOCAL (`struct P { int a; } v;` as a statement) parses; body forms probe FIRST, a ref with no `{` rolls back to the `*TypeRef` form. Single-level.",
+      "alt": [
+        "typeSpecifierSeq",
+        "structSpecifierBody", "structTypeRef",
+        "unionSpecifierBody",  "unionTypeRef",
+        "enumSpecifierBody",   "enumTypeRef"
+      ],
+      "speculative": true, "lookahead": 256
     },
 
     "declHead": {
@@ -576,8 +591,15 @@
     },
 
     "typeBaseAllowingStruct": {
-      "$comment": "FC7 D-FC7-NESTED-STRUCT-FIELD: the trailing `Identifier` alt admits a typedef-name (user struct/union type) as a struct/union FIELD type — symmetric with `typeBase` above, which already carries it. A struct/union body has no expression-statement context, so a bare Identifier in field-type position is UNAMBIGUOUSLY a type-name (no binder-sketch guard needed); a non-type name fails loud at semantic scope-lookup. Tried last, so keyword/tag/enum forms keep priority.",
-      "alt": [ "typeSpecifierSeq", "structTypeRef", "unionTypeRef", "enumTypeRef", "Identifier" ]
+      "$comment": "FC7 D-FC7-NESTED-STRUCT-FIELD: the trailing `Identifier` alt admits a typedef-name (user struct/union type) as a struct/union FIELD type — symmetric with `typeBase` above, which already carries it. A struct/union body has no expression-statement context, so a bare Identifier in field-type position is UNAMBIGUOUSLY a type-name (no binder-sketch guard needed); a non-type name fails loud at semantic scope-lookup. Tried last, so keyword/tag/enum forms keep priority. D-CSUBSET-STRUCT-BODY-VARDECL-POSITION: also admits the struct/union/enum BODY forms (an inline nested definition `struct Inner { int x; } in;` as a field) — SPECULATIVE (mirror typedefHead), body-before-ref. This makes the body-in-head form RECURSIVE: a structSpecifierBody contains structFields, each of which may itself BE a structSpecifierBody (arbitrary nesting), the recursion falling out of the grammar — single-level speculation at each structField, never nested.",
+      "alt": [
+        "typeSpecifierSeq",
+        "structSpecifierBody", "structTypeRef",
+        "unionSpecifierBody",  "unionTypeRef",
+        "enumSpecifierBody",   "enumTypeRef",
+        "Identifier"
+      ],
+      "speculative": true, "lookahead": 256
     },
 
     "typeRefAllowingStruct": {
