@@ -233,22 +233,12 @@
     "root": { "sequence": [ { "repeat": "topLevel" } ] },
 
     "topLevel": {
-      "$comment": "NON-speculative: each alt has a disjoint FIRST. struct/union/enum heads route to topLevelDecl (via topLevelHead's body/ref specifier forms) — the bare top-level structDecl/unionDecl/enumDecl alts were folded into topLevelDecl (optional declarator) so a `struct` lead has ONE owner here and only topLevelHead's single-level speculation runs (the two-level topLevel-speculation path was unsound — D-CSUBSET-STRUCT-BODY-VARDECL-POSITION).",
+      "$comment": "NON-speculative: each alt has a disjoint FIRST. struct/union/enum heads route to topLevelDecl (via topLevelHead's body/ref specifier forms) — the bare top-level structDecl/unionDecl/enumDecl rules were folded into topLevelDecl (optional declarator) so a `struct` lead has ONE owner here and only topLevelHead's single-level speculation runs (the two-level topLevel-speculation path was unsound — D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). Those three now-unreferenced rules (+ their semantics/hirKind/scopes rows) were DELETED in the closing cycle (no dead config); the shared structField/unionField/enumerator helpers stay (the *SpecifierBody forms consume them).",
       "alt": [
         "includeDirective",
         "typedefDecl",
         "topLevelDecl",
         "externDecl"
-      ]
-    },
-
-    "structDecl": {
-      "sequence": [
-        "StructKeyword", "Identifier",
-        "BlockOpen",
-        { "repeat": "structField" },
-        "BlockClose",
-        "EndStatement"
       ]
     },
 
@@ -264,16 +254,6 @@
       "sequence": [ "StructKeyword", "Identifier" ]
     },
 
-    "unionDecl": {
-      "sequence": [
-        "UnionKeyword", "Identifier",
-        "BlockOpen",
-        { "repeat": "unionField" },
-        "BlockClose",
-        "EndStatement"
-      ]
-    },
-
     "unionField": {
       "sequence": [
         "typeRefAllowingStruct", "Identifier",
@@ -284,21 +264,6 @@
 
     "unionTypeRef": {
       "sequence": [ "UnionKeyword", "Identifier" ]
-    },
-
-    "enumDecl": {
-      "sequence": [
-        "EnumKeyword", "Identifier",
-        "BlockOpen",
-        { "optional": {
-            "sequence": [
-              "enumerator",
-              { "repeat": { "sequence": [ "Comma", { "optional": "enumerator" } ] } }
-            ]
-        }},
-        "BlockClose",
-        "EndStatement"
-      ]
     },
 
     "enumerator": {
@@ -1024,18 +989,11 @@
         "anonymousNameAllowed": true,
         "fieldChildren": { "rule": "enumerator", "compositeKind": "enum",
                            "liftToEnclosingScope": true } },
-      { "rule": "structDecl",  "name": 1, "kind": "type",
-        "fieldChildren": { "rule": "structField", "compositeKind": "struct" } },
       { "rule": "structField", "name": 1, "type": 0, "kind": "variable",
         "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
         "allowFlexibleArray": true },
-      { "rule": "unionDecl",   "name": 1, "kind": "type",
-        "fieldChildren": { "rule": "unionField", "compositeKind": "union" } },
       { "rule": "unionField",  "name": 1, "type": 0, "kind": "variable",
         "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 } },
-      { "rule": "enumDecl",    "name": 1, "kind": "type",
-        "fieldChildren": { "rule": "enumerator", "compositeKind": "enum",
-                           "liftToEnclosingScope": true } },
       { "rule": "enumerator",  "name": 0, "kind": "variable" },
       { "rule": "externDecl", "name": 2, "type": 1, "kind": "variable",
         "kindByChild": {
@@ -1060,7 +1018,7 @@
         "dereferences": true,  "operatorToken": "ArrowOp" }
     ],
     "$scopesComment": "FC4 c1: topLevelDecl replaced funcDefTail — a function's params now live INSIDE its declarator's fnSuffix, so the scope that holds them must dominate BOTH the declarator and the block; the topLevelDecl node is that dominator (harmless for variable-kind topLevelDecls — nothing binds into the scope). The three *SpecifierBody rules are fieldChildren composites (typedef-position struct/union/enum bodies).",
-    "scopes": [ "block", "topLevelDecl", "structDecl", "unionDecl", "enumDecl",
+    "scopes": [ "block", "topLevelDecl",
                 "structSpecifierBody", "unionSpecifierBody", "enumSpecifierBody" ],
     "assignments": [
       { "rule": "binaryExpr", "operatorToken": "AssignOp",       "lhs": 0, "rhs": 2 },
@@ -1193,9 +1151,6 @@
       { "rule": "forIdentDecl", "hirKind": "VarDecl"     },
       { "rule": "param",        "hirKind": "VarDecl"     },
       { "rule": "typedefDecl",  "hirKind": "TypeDecl"    },
-      { "rule": "structDecl",   "hirKind": "TypeDecl"    },
-      { "rule": "unionDecl",    "hirKind": "TypeDecl"    },
-      { "rule": "enumDecl",     "hirKind": "TypeDecl"    },
       { "rule": "externDecl",   "hirKind": "ExternDecl"  },
       { "rule": "block",        "hirKind": "Block"       },
       { "rule": "ifStmt",       "hirKind": "IfStmt"      },

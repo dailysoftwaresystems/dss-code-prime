@@ -3439,7 +3439,14 @@ struct Lowerer {
     // name list. First-match returns the OUTERMOST body (a nested inline body
     // sits deeper), which is the one this declaration introduces.
     NodeId findCompositeSpecifierIn(NodeId n) {
-        if (!n.valid()) return NodeId{};
+        // `visible()` yields TOKEN children too, and `tree().rule()` is valid
+        // only on Internal nodes. A token is never a composite body and has no
+        // children to recurse into, so stop here. (Without this guard a head
+        // that introduces NO composite — `int ;`, now grammar-parseable since
+        // the init-declarator-list became optional — drives the DFS into a
+        // leaf token and `rule()` asserts: a crash, not the fail-loud the
+        // semantic tier owns. D-CSUBSET-STRUCT-BODY-VARDECL-POSITION.)
+        if (!n.valid() || tree().kind(n) != NodeKind::Internal) return NodeId{};
         auto it = declMap_.find(tree().rule(n).v);
         if (it != declMap_.end()
             && sem.declarations[it->second].fieldChildren.has_value()) {
@@ -3555,9 +3562,7 @@ struct Lowerer {
         // composite definitions into topLevelDecl), so `declarators` is empty
         // here. Emit a TypeDecl from the head's composite-body node — the same
         // HirKind the retired structDecl/unionDecl/enumDecl rules produced (so
-        // the type registers in HIR exactly as before). A head that declares no
-        // tag at all (`int ;`) yields no composite specifier → nothing is
-        // emitted (the semantic tier raises S_DeclarationDeclaresNothing).
+        // the type registers in HIR exactly as before).
         bool hasNamedDeclarator = false;
         for (NodeId d : declarators) {
             if (declaratorNameNode(tree(), d, dc).valid()) {
@@ -3567,7 +3572,23 @@ struct Lowerer {
         }
         if (!hasNamedDeclarator) {
             NodeId const spec = findCompositeSpecifierIn(node);
-            if (spec.valid()) out.push_back(lowerTypeDecl(spec));
+            if (spec.valid()) {
+                out.push_back(lowerTypeDecl(spec));
+            } else {
+                // C 6.7p2: a declaration with NEITHER a named declarator NOR a
+                // tag (`int ;`) declares nothing — a constraint violation, now
+                // reachable because the init-declarator-list became grammar-
+                // optional (to admit the bare `struct P {…};` form). Fail loud:
+                // this is the tier with the structural certainty (no declarator
+                // AND no composite specifier in the head — exactly what the
+                // `findCompositeSpecifierIn` miss above proves). The sibling
+                // abstract-declarator form (`int *;`, which DOES have a
+                // declarator carrier) is caught earlier in the semantic
+                // analyzer's requireNamedDeclarators arm.
+                // D-CSUBSET-STRUCT-BODY-VARDECL-POSITION.
+                emitH(DiagnosticCode::S_DeclarationDeclaresNothing, node,
+                      std::string{tree().text(node)});
+            }
             return;
         }
 
