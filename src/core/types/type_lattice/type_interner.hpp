@@ -8,6 +8,7 @@
 #include "core/types/type_lattice/type_id.hpp"   // ArenaNames<TypeId, CompilationUnitId>
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <unordered_map>
@@ -82,7 +83,23 @@ public:
     TypeId tuple(std::span<TypeId const> elements);
     // struct/union: nominal name + operands=[fields/variants...].
     TypeId structType(std::string_view name, std::span<TypeId const> fields);
+    // FC8 bitfields (D-CSUBSET-BITFIELD): a struct with per-field bitfield widths.
+    // `fieldBitWidths[i]` is `kNotBitfield` for an ordinary field, or the field's
+    // declared bit-width in [0, 64] for a bitfield (0 = a zero-width unnamed
+    // packing-break marker). Stored in the struct's scalar pool as (width + 1);
+    // when EVERY field is ordinary the struct interns with EMPTY scalars —
+    // bit-identical to the 2-arg overload (no TypeId churn for existing structs).
+    // The width is part of the struct's CONTENT identity (it changes layout/size),
+    // so two structs differing only in a bitfield width are distinct interned types.
+    TypeId structType(std::string_view name, std::span<TypeId const> fields,
+                      std::span<std::int64_t const> fieldBitWidths);
     TypeId unionType(std::string_view name, std::span<TypeId const> variants);
+    // FC8 bitfields (D-CSUBSET-BITFIELD): a union with per-member bit-field widths
+    // (same `kNotBitfield`/width encoding + empty-scalars-when-none rule as the
+    // bitfield-aware structType). A union bit-field member occupies bits [0, W) of
+    // its own allocation unit at offset 0 (each member independent).
+    TypeId unionType(std::string_view name, std::span<TypeId const> variants,
+                     std::span<std::int64_t const> fieldBitWidths);
     // enum: nominal name + scalars=[(int)underlyingTypeKind]. Variants
     // are NOT stored as operands (each enumerator is a Variable symbol
     // with the enum TypeId; the enum type itself is int-compatible).
@@ -109,6 +126,15 @@ public:
     [[nodiscard]] std::span<TypeId const>       operands(TypeId id) const;
     [[nodiscard]] std::span<std::int64_t const> scalars(TypeId id)  const;
     [[nodiscard]] std::string_view              name(TypeId id)     const;
+
+    // FC8 bitfields (D-CSUBSET-BITFIELD): the declared bit-width of struct field
+    // `fieldIndex`, or nullopt if that field is ordinary (non-bitfield). A
+    // zero-width bitfield returns 0 (distinct from nullopt). A struct interned
+    // with no bitfields (empty scalars) returns nullopt for every field. The
+    // layout engine reads this to pack bitfields; codegen reads it to emit the
+    // extract/insert shift+mask.
+    [[nodiscard]] std::optional<std::uint32_t>
+    fieldBitWidth(TypeId structId, std::size_t fieldIndex) const;
 
     // FnSig decoders — hand back the result/params without the caller needing
     // to know the operands=[result, params...] storage convention. Abort if

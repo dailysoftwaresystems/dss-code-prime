@@ -243,11 +243,18 @@
     },
 
     "structField": {
+      "$comment": "FC8 D-CSUBSET-BITFIELD: a struct/union field gains an OPTIONAL name + an OPTIONAL `arrayDeclSuffix | bitfieldDeclSuffix` (disjoint FIRST — BracketOpen vs Colon — so the inner alt is non-speculative). The name is OPTIONAL only to admit an ANONYMOUS bit-field (`int : 3;` / zero-width `int : 0;`); the over-admitted nameless non-bitfield forms (`int;`, anonymous `int[3];`) FAIL LOUD at semantic composition (anonymous member must be a bit-field). A named bit-field is `int x : 3;`.",
       "sequence": [
-        "typeRefAllowingStruct", "Identifier",
-        { "optional": "arrayDeclSuffix" },
+        "typeRefAllowingStruct",
+        { "optional": "Identifier" },
+        { "optional": { "alt": [ "arrayDeclSuffix", "bitfieldDeclSuffix" ] } },
         "EndStatement"
       ]
+    },
+
+    "bitfieldDeclSuffix": {
+      "$comment": "FC8 D-CSUBSET-BITFIELD: the `: width` suffix; the width is a constant-expression evaluated + range-checked against the field's integer type at semantic.",
+      "sequence": [ "Colon", "assignmentExpr" ]
     },
 
     "structTypeRef": {
@@ -256,8 +263,9 @@
 
     "unionField": {
       "sequence": [
-        "typeRefAllowingStruct", "Identifier",
-        { "optional": "arrayDeclSuffix" },
+        "typeRefAllowingStruct",
+        { "optional": "Identifier" },
+        { "optional": { "alt": [ "arrayDeclSuffix", "bitfieldDeclSuffix" ] } },
         "EndStatement"
       ]
     },
@@ -991,9 +999,13 @@
                            "liftToEnclosingScope": true } },
       { "rule": "structField", "name": 1, "type": 0, "kind": "variable",
         "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
+        "bitfieldSuffix": { "rule": "bitfieldDeclSuffix", "widthChild": 1 },
+        "anonymousNameAllowed": true,
         "allowFlexibleArray": true },
       { "rule": "unionField",  "name": 1, "type": 0, "kind": "variable",
-        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 } },
+        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
+        "bitfieldSuffix": { "rule": "bitfieldDeclSuffix", "widthChild": 1 },
+        "anonymousNameAllowed": true },
       { "rule": "enumerator",  "name": 0, "kind": "variable" },
       { "rule": "externDecl", "name": 2, "type": 1, "kind": "variable",
         "kindByChild": {

@@ -8,7 +8,7 @@
     "$reservedFields": "The per-opcode minOperands/maxOperands fields are documented in the JSON for completeness but are NOT yet fully enforced by the substrate. Terminator-ness derives from `terminatorKind` (Br/CondBr/Switch/Return/Unreachable; default `none` = non-terminator); the parser's `parseInst` and `LirVerifier` consult it directly. Per-kind successor-count is enforced by `TargetSchemaData::validate()` via the shared `kTargetTerminatorShapes` table."
   },
   "$aggregateLayoutComment": "FC6 (D-FF3-1): per-ABI struct/union/array layout params the generic type_layout engine reads. `natural` = scalar alignment equals its byte size (capped at maxAlignment) — the rule all four current C ABIs (SysV/Win64/AAPCS64/Apple) share; the format's dataModel supplies the OS-dependent pointer width. maxAlignment 16 = the x86_64 max fundamental alignment (__int128/long double/max_align_t).",
-  "aggregateLayout": { "scalarAlignment": "natural", "maxAlignment": 16 },
+  "aggregateLayout": { "scalarAlignment": "natural", "maxAlignment": 16, "bitFieldStrategy": "gnu_packed" },
   "opcodes": [
     {
       "$comment": "Slot 0 = the Invalid sentinel. Every target must declare it as the first opcode so the substrate's `opcode == 0` check (in LirBuilder::addInst) catches default-constructed insts loudly.",

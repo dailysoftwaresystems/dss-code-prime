@@ -4141,6 +4141,55 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // FC8 D-CSUBSET-BITFIELD: optional `bitfieldSuffix` —
+                        //   "bitfieldSuffix": { "rule": "bitfieldDeclSuffix",
+                        //                       "widthChild": 1 }
+                        // `rule` names the suffix shape; `widthChild` is the
+                        // visible-child index of the width constant-expression
+                        // inside it. Mirrors `arraySuffix`; an unknown rule is
+                        // C_UnknownShape (the decl stays usable, sans bitfields).
+                        if (entry.contains("bitfieldSuffix")) {
+                            json const& bs = entry.at("bitfieldSuffix");
+                            if (!bs.is_object()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/bitfieldSuffix",
+                                          "'bitfieldSuffix' must be an object");
+                            } else if (!bs.contains("rule") || !bs.at("rule").is_string()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/bitfieldSuffix/rule",
+                                          "'bitfieldSuffix.rule' is required and must be a "
+                                          "rule-name string");
+                            } else {
+                                auto const rn = bs.at("rule").get<std::string>();
+                                if (!data.rules->contains(rn)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape,
+                                              path + "/bitfieldSuffix/rule",
+                                              std::format("'bitfieldSuffix.rule' references "
+                                                          "unknown shape '{}'", rn));
+                                } else {
+                                    BitfieldSuffix suffix;
+                                    suffix.rule     = data.rules->find(rn);
+                                    suffix.ruleName = rn;
+                                    if (bs.contains("widthChild")) {
+                                        auto const& wc = bs.at("widthChild");
+                                        if (!wc.is_number_integer()
+                                            || wc.get<std::int64_t>() < 0
+                                            || wc.get<std::int64_t>()
+                                                   > std::numeric_limits<std::int32_t>::max()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      path + "/bitfieldSuffix/widthChild",
+                                                      "'widthChild' must be a non-negative "
+                                                      "integer");
+                                        } else {
+                                            suffix.widthChild =
+                                                static_cast<std::uint32_t>(wc.get<std::int64_t>());
+                                        }
+                                    }
+                                    rule.bitfieldSuffix = std::move(suffix);
+                                }
+                            }
+                        }
+
                         // FC6 (FAM): optional `allowFlexibleArray` — when true,
                         // an absent array length on this form resolves to an
                         // incomplete array (a flexible array member) instead of

@@ -889,6 +889,15 @@ struct Lowerer {
                 // address via the shared lvalue path, then emit `Load`.
                 MirInstId const ptr = lowerLvalueAddress(node);
                 if (!ptr.valid()) return InvalidMirInst;
+                // FC8 D-CSUBSET-BITFIELD: a bit-field read loads the whole
+                // allocation unit (the Gep already targets the unit), then
+                // extracts the field's bits (shift + mask / sign-extend).
+                if (BitFieldPlacement const* bf = bitfieldPlacementOf(node)) {
+                    std::array<MirInstId, 1> lo{ptr};
+                    MirInstId const unit = mir.addInst(MirOpcode::Load, lo, t);
+                    if (!unit.valid()) return InvalidMirInst;
+                    return emitBitfieldExtract(unit, *bf, t);
+                }
                 std::array<MirInstId, 1> ops{ptr};
                 return mir.addInst(MirOpcode::Load, ops, t);
             }
@@ -1150,6 +1159,100 @@ struct Lowerer {
         StructLayout const* layout = cachedLayout(elemTy);
         if (layout == nullptr) return std::nullopt;
         return layout->size;
+    }
+
+    // FC8 D-CSUBSET-BITFIELD: the bit placement of a `MemberAccess` node IFF it
+    // names a bit-field, else nullptr. The aggregate's cached layout carries one
+    // `BitFieldPlacement` per field (empty unless the struct/union has a
+    // bit-field); a placement with `unitBytes != 0` is a bit-field. The returned
+    // pointer is stable (it lives in the memoized `layoutCache_`).
+    [[nodiscard]] BitFieldPlacement const* bitfieldPlacementOf(HirNodeId node) {
+        if (hir.kind(node) != HirKind::MemberAccess) return nullptr;
+        auto kids = hir.children(node);
+        if (kids.size() != 1) return nullptr;
+        TypeId const aggTy = hir.typeId(kids[0]);
+        if (!aggTy.valid()) return nullptr;
+        StructLayout const* layout = cachedLayout(aggTy);
+        if (layout == nullptr) return nullptr;
+        std::uint32_t const fieldIdx = hir.payload(node);
+        if (fieldIdx >= layout->bitFields.size()) return nullptr;
+        BitFieldPlacement const& p = layout->bitFields[fieldIdx];
+        return p.unitBytes != 0 ? &p : nullptr;
+    }
+
+    // True iff `k` is a SIGNED integer kind (so a bit-field extract must
+    // sign-extend). U*/Char/Bool extract zero-extended (char bit-field signedness
+    // is implementation-defined — we choose unsigned, self-consistently).
+    [[nodiscard]] static bool bitfieldIsSigned(TypeKind k) noexcept {
+        switch (k) {
+            case TypeKind::I8: case TypeKind::I16: case TypeKind::I32:
+            case TypeKind::I64: case TypeKind::I128: return true;
+            default:                                 return false;
+        }
+    }
+
+    // FC8 D-CSUBSET-BITFIELD: extract a bit-field value from a loaded allocation
+    // unit. Unsigned: `(unit >> bitOffset) & ((1<<W)-1)`. Signed: sign-extend via
+    // `(unit << (B - bitOffset - W)) >>arith (B - W)` (B = unit bits). All ops are
+    // computed at the field's (unit) type — reuses the existing MIR shift/and ops.
+    [[nodiscard]] MirInstId
+    emitBitfieldExtract(MirInstId unitVal, BitFieldPlacement const& p, TypeId fieldTy) {
+        std::uint32_t const B = p.unitBytes * 8;
+        // Shift/mask constants MUST be the field/unit type, NOT I32 — a 64-bit-
+        // unit bit-field (`unsigned long long x:40`) with an I32 const operand is
+        // a mixed-width op the verifier doesn't catch (silent miscompile); see
+        // constIntOfType. (Unit widths >64 are rejected at semantic, so the mask
+        // fits in u64.)
+        auto shiftBy = [&](MirInstId v, MirOpcode op, std::uint32_t amt) -> MirInstId {
+            if (amt == 0) return v;
+            MirInstId const sh = constIntOfType(static_cast<std::int64_t>(amt), fieldTy);
+            std::array<MirInstId, 2> ops{v, sh};
+            return mir.addInst(op, ops, fieldTy);
+        };
+        if (bitfieldIsSigned(interner.kind(fieldTy))) {
+            MirInstId v = shiftBy(unitVal, MirOpcode::Shl, B - p.bitOffset - p.bitWidth);
+            return shiftBy(v, MirOpcode::AShr, B - p.bitWidth);
+        }
+        MirInstId v = shiftBy(unitVal, MirOpcode::LShr, p.bitOffset);
+        if (p.bitWidth < B) {
+            std::uint64_t const mask =
+                p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
+            MirInstId const m = constIntOfType(static_cast<std::int64_t>(mask), fieldTy);
+            std::array<MirInstId, 2> ops{v, m};
+            v = mir.addInst(MirOpcode::And, ops, fieldTy);
+        }
+        return v;
+    }
+
+    // FC8 D-CSUBSET-BITFIELD: read-modify-write a bit-field at unit address
+    // `unitPtr` with `rhsVal`: `unit = (unit & ~(mask<<off)) | ((rhs & mask)<<off)`
+    // then store back. The RMW preserves every OTHER bit in the unit (incl. a
+    // neighbour field packed into the same unit). Computed at the field/unit type.
+    [[nodiscard]] bool
+    emitBitfieldInsert(MirInstId unitPtr, MirInstId rhsVal,
+                       BitFieldPlacement const& p, TypeId fieldTy) {
+        std::uint64_t const mask =
+            p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
+        std::uint64_t const fieldMask = mask << p.bitOffset;
+        std::array<MirInstId, 1> lo{unitPtr};
+        MirInstId const unit = mir.addInst(MirOpcode::Load, lo, fieldTy);
+        if (!unit.valid()) return false;
+        MirInstId const clrK = constIntOfType(static_cast<std::int64_t>(~fieldMask), fieldTy);
+        std::array<MirInstId, 2> ca{unit, clrK};
+        MirInstId const cleared = mir.addInst(MirOpcode::And, ca, fieldTy);
+        MirInstId const mK = constIntOfType(static_cast<std::int64_t>(mask), fieldTy);
+        std::array<MirInstId, 2> ma{rhsVal, mK};
+        MirInstId masked = mir.addInst(MirOpcode::And, ma, fieldTy);
+        if (p.bitOffset != 0) {
+            MirInstId const sh = constIntOfType(static_cast<std::int64_t>(p.bitOffset), fieldTy);
+            std::array<MirInstId, 2> sa{masked, sh};
+            masked = mir.addInst(MirOpcode::Shl, sa, fieldTy);
+        }
+        std::array<MirInstId, 2> oa{cleared, masked};
+        MirInstId const merged = mir.addInst(MirOpcode::Or, oa, fieldTy);
+        std::array<MirInstId, 2> st{merged, unitPtr};
+        mir.addInst(MirOpcode::Store, st);
+        return true;
     }
 
     // Resolve the ADDRESS of an lvalue expression — the pointer value a
@@ -1532,10 +1635,29 @@ struct Lowerer {
     // it to zeroLiteralOf so the seed's slot matches the InsertValue's
     // child type — otherwise variant identity is erased between seed
     // and chain.
+    // FC8 D-CSUBSET-BITFIELD: true iff `ty` is a struct/union WITH a bit-field
+    // (non-empty scalars under the structType encoding). Aggregate INITIALIZATION
+    // of such a type is not yet bit-field-aware (it would write each field full-
+    // width, clobbering co-resident bit-fields) — it FAILS LOUD (the field-by-
+    // field write path IS bit-field-aware). Closing work: D-CSUBSET-BITFIELD-INIT.
+    [[nodiscard]] bool hasBitfieldMember(TypeId ty) const {
+        if (!ty.valid()) return false;
+        TypeKind const k = interner.kind(ty);
+        return (k == TypeKind::Struct || k == TypeKind::Union)
+               && !interner.scalars(ty).empty();
+    }
+
     [[nodiscard]] MirInstId lowerConstructAggregate(HirNodeId node, TypeId aggTy) {
         if (!aggTy.valid()) {
             unsupported(node, "ConstructAggregate with invalid result type "
                               "(HIR verifier should have flagged)");
+            return InvalidMirInst;
+        }
+        if (hasBitfieldMember(aggTy)) {
+            unsupported(node, "aggregate initialization of a struct/union with a "
+                              "bit-field is not yet supported (D-CSUBSET-BITFIELD-"
+                              "INIT) — initialize the bit-field members by "
+                              "assignment (`s.x = v;`) instead");
             return InvalidMirInst;
         }
         // Try the constant-fold path first. `emptyEnv` is deliberate:
@@ -1595,6 +1717,16 @@ struct Lowerer {
     [[nodiscard]] bool lowerAggregateInitIntoSlot(HirNodeId aggNode,
                                                   MirInstId allocaPtr,
                                                   TypeId aggTy) {
+        // FC8 D-CSUBSET-BITFIELD: a bit-field struct/union initializer would write
+        // each field full-width into the shared unit, clobbering co-resident
+        // bit-fields — fail loud (D-CSUBSET-BITFIELD-INIT) rather than miscompile.
+        if (hasBitfieldMember(aggTy)) {
+            unsupported(aggNode, "aggregate initialization of a struct/union with "
+                                 "a bit-field is not yet supported (D-CSUBSET-"
+                                 "BITFIELD-INIT) — assign the bit-field members "
+                                 "(`s.x = v;`) instead");
+            return false;
+        }
         auto kids = hir.children(aggNode);
         for (std::size_t i = 0; i < kids.size(); ++i) {
             auto const off =
@@ -2353,6 +2485,13 @@ struct Lowerer {
                 if (!rhs.valid()) return false;
                 MirInstId const ptr = lowerLvalueAddress(targetN);
                 if (!ptr.valid()) return false;
+                // FC8 D-CSUBSET-BITFIELD: a bit-field write is a READ-MODIFY-WRITE
+                // of the allocation unit (the Gep targets the unit) — clear the
+                // field's bits, OR in the new value, store back. A plain Store
+                // would overwrite the neighbour bits packed in the same unit.
+                if (BitFieldPlacement const* bf = bitfieldPlacementOf(targetN)) {
+                    return emitBitfieldInsert(ptr, rhs, *bf, hir.typeId(targetN));
+                }
                 std::array<MirInstId, 2> ops{rhs, ptr};
                 mir.addInst(MirOpcode::Store, ops);
                 return true;

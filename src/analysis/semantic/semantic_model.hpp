@@ -10,7 +10,9 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -100,6 +102,16 @@ struct DSS_EXPORT SymbolRecord {
     // constant value at HIR Ref-lowering; folding a storage-backed local would be
     // a silent miscompile. Default false (every non-enumerator symbol).
     bool            isEnumerator = false;
+    // D-CSUBSET-BITFIELD (FC8): the declared bit-field width of a struct/union
+    // field, or nullopt for an ordinary field. A TRANSIENT carrier — set at the
+    // field's Pass 1.5 resolution (the `: width` const-expr evaluated + validated
+    // against the field's integer type there), then READ at the composite's
+    // Pass 1.5 type composition to build the `fieldBitWidths` passed to
+    // `structType`. After composition the interned TYPE is the authoritative
+    // source (layout + codegen read `TypeInterner::fieldBitWidth`); this record
+    // field is only the resolution→composition plumbing (cf. `enumValue`). A
+    // zero-width (anonymous `int : 0;`) bit-field stores 0 (distinct from nullopt).
+    std::optional<std::uint32_t> bitFieldWidth;
 };
 
 // FF11 neutral-JSON shipped-library descriptor extern

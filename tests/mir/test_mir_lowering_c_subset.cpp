@@ -1362,6 +1362,56 @@ TEST(MirLoweringCSubset, MemberAccessReadEmitsGepThenLoad) {
         << "field x is at byte offset 0";
 }
 
+// FC8 D-CSUBSET-BITFIELD: a bit-field READ lowers to Load-unit + extract
+// (LShr by bitOffset + And mask); a bit-field WRITE lowers to a read-modify-
+// write (Load + And-clear + And-mask + Shl + Or + Store). This is the
+// HOST-INDEPENDENT structural guard (runs on every CI leg) complementing the
+// runtime `bitfields` corpus. RED-ON-DISABLE: drop the bitfield intercepts and
+// a read is a plain Load (no LShr/And) and a write a plain Store (no Or/Shl).
+TEST(MirLoweringCSubset, BitFieldReadExtractsAndWriteIsReadModifyWrite) {
+    auto L = lowerCSubset(
+        "struct S { unsigned pad : 4; unsigned a : 3; };\n"
+        "unsigned read_a(struct S* p) { return p->a; }\n"
+        "void set_a(struct S* p, unsigned v) { p->a = v; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto countIn = [&](std::uint32_t fnIdx, MirOpcode op) {
+        MirBlockId const entry = m.funcEntry(m.funcAt(fnIdx));
+        int n = 0;
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i)
+            if (m.instOpcode(m.blockInstAt(entry, i)) == op) ++n;
+        return n;
+    };
+    // read_a (fn 0): a is at bitOffset 4 (after pad:4) → LShr 4 + And mask.
+    EXPECT_GE(countIn(0, MirOpcode::LShr), 1) << "bit-field read must shift by bitOffset";
+    EXPECT_GE(countIn(0, MirOpcode::And), 1)  << "bit-field read must mask the width";
+    // set_a (fn 1): read-modify-write → And (clear + mask) + Shl + Or + Store.
+    EXPECT_GE(countIn(1, MirOpcode::And), 2)   << "RMW clears the field AND masks the value";
+    EXPECT_GE(countIn(1, MirOpcode::Or), 1)    << "RMW ORs the shifted value back";
+    EXPECT_GE(countIn(1, MirOpcode::Shl), 1)   << "RMW shifts the value to bitOffset";
+    EXPECT_GE(countIn(1, MirOpcode::Store), 1) << "RMW stores the merged unit";
+}
+
+// FC8 D-CSUBSET-BITFIELD-INIT: aggregate INITIALIZATION of a bit-field struct
+// (`struct S s = {1,2};`) is rejected FAIL-LOUD at MIR lowering — the init path
+// would write each field full-width into the shared unit, clobbering co-resident
+// bit-fields (the review-caught silent miscompile). Field-by-field assignment is
+// the supported path. RED-ON-DISABLE: drop the `hasBitfieldMember` guard and the
+// init lowers (mir.ok) → silent miscompile. (The diag corpus captures parse +
+// semantic only, so this MIR-tier fail-loud needs a lowering pin.)
+TEST(MirLoweringCSubset, BitFieldStructInitializerFailsLoudAtLowering) {
+    auto L = lowerCSubset(
+        "struct S { unsigned a : 3; unsigned b : 5; };\n"
+        "void f(void) { struct S s = { 1, 2 }; }\n");
+    ASSERT_FALSE(L.model.hasErrors()) << "the initializer is well-typed; the gap is codegen";
+    ASSERT_TRUE(L.hir->ok);
+    EXPECT_FALSE(L.mir.ok)
+        << "a bit-field struct aggregate initializer must fail loud at MIR "
+           "(D-CSUBSET-BITFIELD-INIT), never silently miscompile";
+}
+
 // Symmetric write: `p->y = v` lowers to GEP-then-Store, with the value
 // operand being the Arg v and the ptr operand the GEP result.
 TEST(MirLoweringCSubset, MemberAccessAssignEmitsGepThenStore) {

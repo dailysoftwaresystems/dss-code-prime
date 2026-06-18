@@ -96,12 +96,54 @@ aggregateClassKindFromName(std::string_view s) noexcept {
     return std::nullopt;
 }
 
+// FC8 bitfields (D-CSUBSET-BITFIELD): the per-ABI bit-field PACKING strategy. A
+// CLOSED, config-declared enum — the layout engine switches on THIS, never on a
+// target name (the `ScalarAlignmentRule` / `AggregateClassKind` precedent). C
+// bit-field allocation is genuinely ABI-defined (notably MS straddling vs GNU/
+// SysV), so the rule is declared in `.target.json`, never hardcoded. `None` ⇒
+// the target declares no strategy ⇒ a struct WITH a bit-field FAILS LOUD at
+// layout (so a missing rule can never silently bake a wrong bit placement); a
+// struct with no bit-field never consults it (every pre-bitfield layout is
+// unchanged). `GnuPacked` is the one realized rule (all four current targets
+// declare it); a future MS-straddle ABI is a new arm + config value, never an
+// engine identity branch. Per D-CSUBSET-BITFIELD-ABI-EXACT, GnuPacked is
+// SELF-CONSISTENT (write+read use the same rule) but is NOT byte-ABI-exact to
+// every platform's native compiler — that divergence is trigger-gated.
+enum class BitFieldStrategy : std::uint8_t {
+    None      = 0,  // not declared → fail-loud when a bit-field is laid out
+    GnuPacked = 1,  // SysV/Itanium/GNU little-endian: LSB-first packing into the
+                    // field's declared-type storage unit; a field that would
+                    // cross its type's unit boundary starts at the next aligned
+                    // unit; a zero-width unnamed field forces the next field to
+                    // the unit boundary.
+};
+
+[[nodiscard]] constexpr std::string_view
+bitFieldStrategyName(BitFieldStrategy s) noexcept {
+    switch (s) {
+        case BitFieldStrategy::None:      return "none";
+        case BitFieldStrategy::GnuPacked: return "gnu_packed";
+    }
+    return {};
+}
+[[nodiscard]] constexpr std::optional<BitFieldStrategy>
+bitFieldStrategyFromName(std::string_view s) noexcept {
+    if (s == "none")       return BitFieldStrategy::None;
+    if (s == "gnu_packed") return BitFieldStrategy::GnuPacked;
+    return std::nullopt;
+}
+
 // The per-ABI aggregate-layout parameter block parsed from `.target.json`. A
 // default-constructed value is NOT valid (scalarAlignment 0 / maxAlignment 0 —
 // the loader requires both; validate() rejects a zero/non-pow2 maxAlignment).
 struct AggregateLayoutParams {
     ScalarAlignmentRule scalarAlignment{};  // required
     std::uint32_t       maxAlignment = 0;   // required; power of two, [1, 256]
+    // FC8 bitfields: the bit-field packing strategy (default None = not declared
+    // → fail-loud only when a bit-field is actually laid out). Consulted ONLY for
+    // a struct containing a bit-field, so a target that omits it keeps every
+    // existing (bitfield-free) layout byte-identical.
+    BitFieldStrategy    bitFieldStrategy = BitFieldStrategy::None;
 };
 
 } // namespace dss

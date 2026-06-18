@@ -190,8 +190,46 @@ TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> f
     return internContent(TypeKind::Struct, {}, fields, {}, names_.intern(name));
 }
 
+namespace {
+// FC8 bitfields (D-CSUBSET-BITFIELD): encode the per-field widths into the
+// scalar-pool form — (width + 1) per field, `kNotBitfield` → 0. Returns EMPTY
+// when no field is a bitfield, so a bitfield-free composite interns bit-
+// identically to the 2-arg overload (no TypeId churn). Shared by struct + union.
+[[nodiscard]] std::vector<std::int64_t>
+encodeFieldBitWidths(std::size_t fieldCount,
+                     std::span<std::int64_t const> fieldBitWidths) {
+    bool anyBitfield = false;
+    for (std::int64_t const w : fieldBitWidths) {
+        if (w != kNotBitfield) { anyBitfield = true; break; }
+    }
+    if (!anyBitfield) return {};
+    std::vector<std::int64_t> sc;
+    sc.reserve(fieldCount);
+    for (std::size_t i = 0; i < fieldCount; ++i) {
+        std::int64_t const w =
+            i < fieldBitWidths.size() ? fieldBitWidths[i] : kNotBitfield;
+        sc.push_back(w == kNotBitfield ? std::int64_t{0} : w + 1);
+    }
+    return sc;
+}
+} // namespace
+
+TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> fields,
+                                std::span<std::int64_t const> fieldBitWidths) {
+    // The bit-width is part of the interned content, so a struct with a bitfield
+    // is a distinct type from the same struct without (its layout/size differs).
+    auto const sc = encodeFieldBitWidths(fields.size(), fieldBitWidths);
+    return internContent(TypeKind::Struct, {}, fields, sc, names_.intern(name));
+}
+
 TypeId TypeInterner::unionType(std::string_view name, std::span<TypeId const> variants) {
     return internContent(TypeKind::Union, {}, variants, {}, names_.intern(name));
+}
+
+TypeId TypeInterner::unionType(std::string_view name, std::span<TypeId const> variants,
+                               std::span<std::int64_t const> fieldBitWidths) {
+    auto const sc = encodeFieldBitWidths(variants.size(), fieldBitWidths);
+    return internContent(TypeKind::Union, {}, variants, sc, names_.intern(name));
 }
 
 TypeId TypeInterner::enumType(std::string_view name, TypeKind underlying) {
@@ -258,6 +296,18 @@ std::span<std::int64_t const> TypeInterner::scalars(TypeId id) const {
 
 std::string_view TypeInterner::name(TypeId id) const {
     return names_.name(arena_.at(id).name);
+}
+
+std::optional<std::uint32_t>
+TypeInterner::fieldBitWidth(TypeId structId, std::size_t fieldIndex) const {
+    // FC8 bitfields: scalars[i] holds (width + 1) for a bitfield, 0 for an
+    // ordinary field; an empty scalar pool (no bitfields in the struct) → all
+    // ordinary. Decode back to the width (a zero-width bitfield → 0, not nullopt).
+    auto const sc = scalars(structId);
+    if (fieldIndex >= sc.size()) return std::nullopt;
+    std::int64_t const enc = sc[fieldIndex];
+    if (enc <= 0) return std::nullopt;
+    return static_cast<std::uint32_t>(enc - 1);
 }
 
 TypeId TypeInterner::fnResult(TypeId id) const {

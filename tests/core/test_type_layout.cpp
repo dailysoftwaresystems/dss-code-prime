@@ -217,3 +217,119 @@ TEST(TypeLayout, OutOfScopeTypesFailLoud) {
     std::array<TypeId, 1> const badv{v};
     EXPECT_FALSE(computeLayout(ti.structType("BadV", badv), ti, kNatural16, dm).has_value());
 }
+
+// ── FC8 D-CSUBSET-BITFIELD: bit-field packing (gnu_packed, little-endian) ──────
+// The params the shipped targets declare for bit-fields. Identical to kNatural16
+// but with the packing strategy ON. RED-ON-DISABLE for the WHOLE feature: with
+// `BitFieldStrategy::None` a struct that HAS a bit-field computes no layout.
+constexpr AggregateLayoutParams kGnu16{
+    ScalarAlignmentRule::Natural, 16, BitFieldStrategy::GnuPacked};
+
+// A struct with NO bit-field interns with EMPTY scalars → `bitFields` empty AND
+// the byte path is byte-identical (the anyBitfield gate). This pins that the
+// bitfield machinery NEVER perturbs an ordinary struct.
+TEST(TypeLayout, BitFieldFreeStructUnchangedAndNoBitFieldsVector) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::I32), ti.primitive(TypeKind::I32)};
+    auto const l = layoutOf(ti.structType("S", fields), ti, kGnu16);
+    EXPECT_EQ(l.size, 8u);
+    EXPECT_TRUE(l.bitFields.empty());
+    EXPECT_EQ(l.fieldOffsets[1], 4u);
+}
+
+// Adjacent bit-fields pack LSB-first into ONE allocation unit: a:3 at bit 0,
+// b:5 at bit 3 — both in the 4-byte unit at offset 0; struct size 4.
+// RED-ON-DISABLE: a regressed packer that treats each as a full int would place
+// b at offset 4 and size 8.
+TEST(TypeLayout, BitFieldPacksAdjacentIntoOneUnit) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::U32), ti.primitive(TypeKind::U32)};
+    std::array<std::int64_t, 2> const widths{3, 5};
+    auto const l = layoutOf(ti.structType("S", fields, widths), ti, kGnu16);
+    ASSERT_EQ(l.bitFields.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);
+    EXPECT_EQ(l.fieldOffsets[1], 0u);
+    EXPECT_EQ(l.bitFields[0].unitBytes, 4u);
+    EXPECT_EQ(l.bitFields[0].bitOffset, 0u);
+    EXPECT_EQ(l.bitFields[0].bitWidth, 3u);
+    EXPECT_EQ(l.bitFields[1].bitOffset, 3u);
+    EXPECT_EQ(l.bitFields[1].bitWidth, 5u);
+    EXPECT_EQ(l.size, 4u);
+}
+
+// A bit-field that would straddle its type's unit boundary starts the NEXT unit:
+// a:30 fills bits 0..29 of unit 0; b:5 (30+5 > 32) cannot fit → unit 1 (offset
+// 4), bit 0; struct size 8.
+TEST(TypeLayout, BitFieldStraddleStartsNewUnit) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::U32), ti.primitive(TypeKind::U32)};
+    std::array<std::int64_t, 2> const widths{30, 5};
+    auto const l = layoutOf(ti.structType("S", fields, widths), ti, kGnu16);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);
+    EXPECT_EQ(l.bitFields[0].bitOffset, 0u);
+    EXPECT_EQ(l.fieldOffsets[1], 4u);
+    EXPECT_EQ(l.bitFields[1].bitOffset, 0u);
+    EXPECT_EQ(l.size, 8u);
+}
+
+// A zero-width unnamed bit-field forces the next field to a fresh unit boundary:
+// a:3 in unit 0; the `:0` breaks; b:3 starts unit 1 (offset 4).
+TEST(TypeLayout, BitFieldZeroWidthForcesNewUnit) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 3> const fields{
+        ti.primitive(TypeKind::U32), ti.primitive(TypeKind::U32),
+        ti.primitive(TypeKind::U32)};
+    std::array<std::int64_t, 3> const widths{3, 0, 3};  // middle = zero-width break
+    auto const l = layoutOf(ti.structType("S", fields, widths), ti, kGnu16);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);
+    EXPECT_EQ(l.bitFields[0].bitOffset, 0u);
+    EXPECT_EQ(l.bitFields[1].unitBytes, 0u);   // the break is not an addressable field
+    EXPECT_EQ(l.fieldOffsets[2], 4u);          // c forced to the next unit
+    EXPECT_EQ(l.bitFields[2].bitOffset, 0u);
+}
+
+// A bit-field followed by an ORDINARY field: the ordinary field closes the open
+// bit-unit and lands at the next aligned BYTE offset (not packed into the unit).
+TEST(TypeLayout, BitFieldThenOrdinaryFieldClosesUnit) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::U32), ti.primitive(TypeKind::I32)};
+    std::array<std::int64_t, 2> const widths{3, kNotBitfield};
+    auto const l = layoutOf(ti.structType("S", fields, widths), ti, kGnu16);
+    EXPECT_EQ(l.bitFields[0].bitWidth, 3u);
+    EXPECT_EQ(l.bitFields[1].unitBytes, 0u);   // ordinary field
+    EXPECT_EQ(l.fieldOffsets[1], 4u);          // n at the next int slot
+    EXPECT_EQ(l.size, 8u);
+}
+
+// A struct WITH a bit-field but NO declared strategy fails loud (nullopt) — a
+// missing rule can never silently bake a wrong placement. RED-ON-DISABLE for the
+// config gate.
+TEST(TypeLayout, BitFieldWithoutStrategyFailsLoud) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 1> const fields{ti.primitive(TypeKind::U32)};
+    std::array<std::int64_t, 1> const widths{3};
+    // kNatural16 has bitFieldStrategy == None.
+    EXPECT_FALSE(
+        computeLayout(ti.structType("S", fields, widths), ti, kNatural16,
+                      DataModel::Lp64).has_value());
+}
+
+// The interner round-trips the per-field width via `fieldBitWidth`, and a
+// bitfield-free struct interns BIT-IDENTICALLY to the 2-arg overload.
+TEST(TypeLayout, InternerFieldBitWidthRoundTripAndIdentity) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::U32), ti.primitive(TypeKind::U32)};
+    std::array<std::int64_t, 2> const widths{3, kNotBitfield};
+    TypeId const bf = ti.structType("S", fields, widths);
+    ASSERT_TRUE(ti.fieldBitWidth(bf, 0).has_value());
+    EXPECT_EQ(*ti.fieldBitWidth(bf, 0), 3u);
+    EXPECT_FALSE(ti.fieldBitWidth(bf, 1).has_value());   // ordinary field
+    // All-ordinary widths ⇒ same TypeId as the 2-arg overload (empty scalars).
+    std::array<std::int64_t, 2> const none{kNotBitfield, kNotBitfield};
+    EXPECT_EQ(ti.structType("T", fields, none).v, ti.structType("T", fields).v);
+}

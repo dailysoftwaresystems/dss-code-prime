@@ -574,6 +574,12 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     TypeKind const k = in.kind(ty);
 
     if (k == TypeKind::Struct || k == TypeKind::Union) {
+        // FC8 D-CSUBSET-BITFIELD: a bit-field struct/union global would encode
+        // each field full-width at its byte offset, clobbering co-resident
+        // bit-fields. Static-data bit-field packing is not yet built — fail loud
+        // (D-CSUBSET-BITFIELD-INIT). (Front-end already rejects the initializer at
+        // MIR; this is the data-tier backstop so no path silently miscompiles.)
+        if (!in.scalars(ty).empty()) return false;
         if (!std::holds_alternative<MirAggregateValue>(v.value)) return false;
         auto const& agg = std::get<MirAggregateValue>(v.value);
         auto const  lay = computeLayout(ty, in, lp, dm);

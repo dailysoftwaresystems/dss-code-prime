@@ -111,6 +111,19 @@ struct DSS_EXPORT ArraySuffix {
     std::optional<std::uint32_t> lengthChild;   // visible-child index of the length expr
 };
 
+// FC8 D-CSUBSET-BITFIELD: a C bit-field declarator suffix (`int x : 3`). When a
+// declaration configures one and a node of `rule` appears in a field's subtree,
+// the field is a BIT-FIELD whose declared width is the constant integer in the
+// suffix's visible child at `widthChild`. The width is evaluated + range-checked
+// against the field's integer type at semantic (a non-integer field, width > the
+// type's bit size, or a negative width fails loud). Config-driven (the language
+// names the suffix rule); the engine never hard-codes "bitfieldDeclSuffix".
+struct DSS_EXPORT BitfieldSuffix {
+    RuleId                       rule{};        // the suffix shape rule
+    std::string                  ruleName;      // source spelling, for diagnostics
+    std::optional<std::uint32_t> widthChild;    // visible-child index of the width expr
+};
+
 // D5.1 / D5.4: a composite-type-introducing declaration. When a declaration
 // carries `fieldChildren`, Pass 1.5 walks the scope it opened, collects every
 // minted symbol whose declaring rule == `rule` (in declaration order, via each
@@ -404,6 +417,10 @@ struct DSS_EXPORT DeclarationRule {
     // the engine matches it by rule within the declaration subtree rather than
     // via `typeShapes`. `nullopt` ⇒ this declaration form has no array syntax.
     std::optional<ArraySuffix> arraySuffix;
+    // FC8 D-CSUBSET-BITFIELD: optional C bit-field declarator suffix (`int x:3`).
+    // Matched by rule within the field subtree (a sibling of the name, like
+    // arraySuffix). `nullopt` ⇒ this declaration form has no bit-field syntax.
+    std::optional<BitfieldSuffix> bitfieldSuffix;
     // FC6 (FAM): when true, an ABSENT array length on this declaration form
     // (`T x[]`) resolves to an INCOMPLETE array type (C99 §6.7.2.1 flexible
     // array member) instead of the `S_NonConstantArrayLength` error. Only
