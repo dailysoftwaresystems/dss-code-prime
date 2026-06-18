@@ -2732,6 +2732,49 @@ struct Lowerer {
             return isStruct ? structFields[i] : elemTypeForArray;
         };
 
+        // FC8 D-CSUBSET-BITFIELD-INIT (C 6.7.9): an UNNAMED bit-field
+        // (`unsigned : 0;` packing break, or `unsigned : 3;`) is NOT initialized
+        // by a POSITIONAL initializer — the cursor skips it (only NAMED fields
+        // consume a positional slot). It still occupies a type-field slot (so the
+        // packed layout is right), so without this skip a `{a,b,c}` whose struct
+        // has an interior anonymous bit-field would land `c` on the anon slot and
+        // zero-fill the real next field — a silent miscompile. A DESIGNATED write
+        // is unaffected: anon fields carry synthetic `<anon:…>` names no user
+        // designator can name. `positionallySkippable[i]` is true for an anon
+        // bit-field field; ordinary fields + named bit-fields are initializable.
+        std::vector<bool> positionallySkippable(slotCount, false);
+        if (isStruct) {
+            // A field index is NAMED iff the composite's scope binds a real
+            // (non-synthetic) name to it. Anonymous fields bind under `<anon:…>`.
+            ScopeId const sscope = model.compositeScopeFor(contextType);
+            // Only classify when the composite scope is resolvable — otherwise we
+            // can't tell named from anonymous, so skip NOTHING (never mis-skip a
+            // named bit-field; the worst case degrades to the prior behaviour).
+            if (sscope.valid()) {
+                std::vector<bool> named(slotCount, false);
+                for (auto const& [bname, bsym] : model.scopeRecord(sscope).bindings) {
+                    if (bname.rfind("<anon:", 0) == 0) continue;   // synthetic anon name
+                    auto const* brec = model.recordFor(bsym);
+                    if (brec == nullptr || brec->kind != DeclarationKind::Variable)
+                        continue;
+                    if (brec->fieldIndex < slotCount) named[brec->fieldIndex] = true;
+                }
+                for (std::uint32_t i = 0; i < slotCount; ++i) {
+                    // Only an UNNAMED bit-field is skippable; an ordinary unnamed
+                    // field cannot occur in C (a declarator with no name declares
+                    // nothing — rejected at semantic), so keying on `fieldBitWidth`
+                    // present is exact for the skippable case.
+                    if (!named[i] && interner.fieldBitWidth(contextType, i).has_value())
+                        positionallySkippable[i] = true;
+                }
+            }
+        }
+        // Advance `slot` past any positionally-skippable (anon bit-field) field.
+        auto skipAnon = [&](std::uint32_t slot) -> std::uint32_t {
+            while (slot < slotCount && positionallySkippable[slot]) ++slot;
+            return slot;
+        };
+
         // Root level of the InitSlot tree — one slot per top-level
         // field/element. Single-designator writes have empty residual
         // path (store directly at the slot); dot-chained writes have
@@ -2864,8 +2907,11 @@ struct Lowerer {
             }
 
             // Determine the OUTER target slot index + the residual path
-            // for nested writes.
-            std::uint32_t target = cursor;
+            // for nested writes. FC8 D-CSUBSET-BITFIELD-INIT: a POSITIONAL
+            // element skips any anonymous bit-field at the cursor (C 6.7.9);
+            // a DESIGNATED element targets its named field directly (anon
+            // fields are unnameable), so the skip applies only to positional.
+            std::uint32_t target = skipAnon(cursor);
             std::span<std::uint32_t const> residualPath;
             if (!designatorPath.empty()) {
                 target = designatorPath[0];

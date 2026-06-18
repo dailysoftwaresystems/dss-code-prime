@@ -1395,21 +1395,86 @@ TEST(MirLoweringCSubset, BitFieldReadExtractsAndWriteIsReadModifyWrite) {
 }
 
 // FC8 D-CSUBSET-BITFIELD-INIT: aggregate INITIALIZATION of a bit-field struct
-// (`struct S s = {1,2};`) is rejected FAIL-LOUD at MIR lowering — the init path
-// would write each field full-width into the shared unit, clobbering co-resident
-// bit-fields (the review-caught silent miscompile). Field-by-field assignment is
-// the supported path. RED-ON-DISABLE: drop the `hasBitfieldMember` guard and the
-// init lowers (mir.ok) → silent miscompile. (The diag corpus captures parse +
-// semantic only, so this MIR-tier fail-loud needs a lowering pin.)
-TEST(MirLoweringCSubset, BitFieldStructInitializerFailsLoudAtLowering) {
+// (`struct S s = {1,2};`) now LOWERS with per-allocation-unit PACKING (replacing
+// the cycle-2 fail-loud). Two co-resident bit-fields a:3,b:5 share unit 0, so the
+// slot init must: zero the unit ONCE, then read-modify-write each field in (And to
+// clear + And to mask the value + Shl to bitOffset + Or + Store) — NOT a plain
+// full-width store per field (which would clobber the neighbour). RED-ON-DISABLE:
+// revert lowerBitfieldAggregateInitIntoSlot to a fail-loud and `mir.ok` goes
+// false; revert the per-unit packing to plain stores and the And/Or/Shl chain
+// (the packing signature) disappears.
+TEST(MirLoweringCSubset, BitFieldStructInitializerPacksPerUnit) {
     auto L = lowerCSubset(
         "struct S { unsigned a : 3; unsigned b : 5; };\n"
         "void f(void) { struct S s = { 1, 2 }; }\n");
-    ASSERT_FALSE(L.model.hasErrors()) << "the initializer is well-typed; the gap is codegen";
+    ASSERT_FALSE(L.model.hasErrors()) << "the initializer is well-typed";
     ASSERT_TRUE(L.hir->ok);
-    EXPECT_FALSE(L.mir.ok)
-        << "a bit-field struct aggregate initializer must fail loud at MIR "
-           "(D-CSUBSET-BITFIELD-INIT), never silently miscompile";
+    ASSERT_TRUE(L.mir.ok)
+        << "a bit-field struct aggregate initializer must now LOWER with per-unit "
+           "packing (D-CSUBSET-BITFIELD-INIT): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto count = [&](MirOpcode op) {
+        int n = 0;
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i)
+            if (m.instOpcode(m.blockInstAt(entry, i)) == op) ++n;
+        return n;
+    };
+    // a + b share unit 0: zero-store + two read-modify-writes. b is at bitOffset 3
+    // (after a:3), so at least one Shl; each RMW masks the value (And) and clears
+    // the field (And) and ORs it back (Or). A plain full-width per-field store
+    // would emit neither the Or nor the Shl, and only 2 stores (no unit-zero).
+    EXPECT_GE(count(MirOpcode::Or), 2)  << "each bit-field init ORs its value into the unit";
+    EXPECT_GE(count(MirOpcode::And), 3) << "RMW clears the field AND masks the value";
+    EXPECT_GE(count(MirOpcode::Shl), 1) << "b is at bitOffset 3 → shifted before OR";
+    EXPECT_GE(count(MirOpcode::Store), 3) << "unit zeroed once + two RMW stores";
+}
+
+// F1 (review-caught silent miscompile): an ordinary field that PRECEDES a
+// bit-field sharing its allocation unit must NOT be clobbered by the unit's
+// zero-fill. `struct { char x; unsigned a:3; }` puts x at byte 0 and a's int
+// unit at bytes [0,4) — overlapping x. The fix zeroes every bit-field unit in a
+// PRE-PASS (before any field value is written), so x's store lands on the
+// already-zeroed unit and survives (a's read-modify-write then preserves it).
+// The buggy lazy-zero stored x first then wiped its unit → x == 0 (and a
+// global/local divergence, since the static-data encoder pre-zeroes once).
+// RED-ON-DISABLE: collapse the two passes (zero a unit on first touch in
+// declaration order) and the FIRST store becomes the ordinary field's value
+// store, not the unit zero → this assertion fails. The bitfield_init corpus is
+// the end-to-end witness (lt.x survives → exit 42, not 35).
+TEST(MirLoweringCSubset, BitFieldUnitZeroPrecedesOrdinaryFieldStoreInSharedUnit) {
+    auto L = lowerCSubset(
+        "struct T { char x; unsigned a : 3; };\n"
+        "void f(void) { struct T t = { 7, 5 }; }\n");
+    ASSERT_FALSE(L.model.hasErrors()) << "the initializer is well-typed";
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // The FIRST store into the slot must be the pass-1 unit zero (value Const 0),
+    // emitted BEFORE the ordinary field x is written. Under the lazy-zero bug the
+    // first store is instead x's value store (x precedes a in declaration order).
+    int firstStoreIdx = -1;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i)
+        if (m.instOpcode(m.blockInstAt(entry, i)) == MirOpcode::Store) {
+            firstStoreIdx = static_cast<int>(i);
+            break;
+        }
+    ASSERT_GE(firstStoreIdx, 0) << "the initializer must emit stores";
+    MirInstId const firstStore =
+        m.blockInstAt(entry, static_cast<std::uint32_t>(firstStoreIdx));
+    auto ops = m.instOperands(firstStore);
+    ASSERT_EQ(ops.size(), 2u);
+    ASSERT_EQ(m.instOpcode(ops[0]), MirOpcode::Const)
+        << "the FIRST store must be the pass-1 unit zero, not an ordinary value";
+    auto const& lit = m.literalValue(m.constLiteralIndex(ops[0]));
+    auto const* iv  = std::get_if<std::int64_t>(&lit.value);
+    ASSERT_NE(iv, nullptr);
+    EXPECT_EQ(*iv, 0)
+        << "the bit-field unit must be zeroed BEFORE the ordinary field x is "
+           "stored, else the zero clobbers x (the F1 silent miscompile)";
 }
 
 // FC8 D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY + NONSTRING-GLOBAL-ARRAY-DECAY: a

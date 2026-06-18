@@ -1646,9 +1646,11 @@ struct Lowerer {
     // and chain.
     // FC8 D-CSUBSET-BITFIELD: true iff `ty` is a struct/union WITH a bit-field
     // (non-empty scalars under the structType encoding). Aggregate INITIALIZATION
-    // of such a type is not yet bit-field-aware (it would write each field full-
-    // width, clobbering co-resident bit-fields) — it FAILS LOUD (the field-by-
-    // field write path IS bit-field-aware). Closing work: D-CSUBSET-BITFIELD-INIT.
+    // of such a type is bit-field-AWARE (D-CSUBSET-BITFIELD-INIT): a local slot
+    // init packs per allocation unit (lowerBitfieldAggregateInitIntoSlot), a
+    // const global folds to raw per-field values that the static-data byte
+    // encoder packs, and a non-foldable rvalue literal fails loud (clean
+    // diagnostic — D-CSUBSET-BITFIELD-RVALUE-RUNTIME).
     [[nodiscard]] bool hasBitfieldMember(TypeId ty) const {
         if (!ty.valid()) return false;
         TypeKind const k = interner.kind(ty);
@@ -1662,13 +1664,21 @@ struct Lowerer {
                               "(HIR verifier should have flagged)");
             return InvalidMirInst;
         }
-        if (hasBitfieldMember(aggTy)) {
-            unsupported(node, "aggregate initialization of a struct/union with a "
-                              "bit-field is not yet supported (D-CSUBSET-BITFIELD-"
-                              "INIT) — initialize the bit-field members by "
-                              "assignment (`s.x = v;`) instead");
-            return InvalidMirInst;
-        }
+        // FC8 D-CSUBSET-BITFIELD-INIT: a bit-field struct/union aggregate. The
+        // CONST-FOLD path below produces a raw per-field `MirAggregateValue`
+        // (each field's unmasked value); the bit-PACKING happens at the consumer
+        // — the static-data byte encoder (asm.cpp `encodeAggregateValue`) packs
+        // each field into its allocation unit. That is the GLOBAL path (a const
+        // bit-field-struct global), and it is correct. What is NOT supported is a
+        // NON-foldable bit-field-struct RVALUE (`f((struct S){x,y})` with runtime
+        // x/y): the runtime fallback is an InsertValue chain into an aggregate
+        // SSA value, but (a) LIR lowers only a zero-INDEX InsertValue and (b) an
+        // aggregate `Const` has no register materialization — neither can pack
+        // bit-fields. A LOCAL `struct S s = {…};` does NOT reach here (it lowers
+        // through `lowerBitfieldAggregateInitIntoSlot`). So: let the fold path
+        // run; if it can't fold a bit-field aggregate, fail loud cleanly rather
+        // than emit a silently-wrong chain (D-CSUBSET-BITFIELD-RVALUE-RUNTIME).
+        bool const isBitfieldAgg = hasBitfieldMember(aggTy);
         // Try the constant-fold path first. `emptyEnv` is deliberate:
         // function-body ConstructAggregate doesn't need the MIR-globals
         // sibling-resolver — a `Ref` to a fold-able global silently
@@ -1684,6 +1694,18 @@ struct Lowerer {
             hir, interner, literals, node, emptyEnv, evalOpts);
         if (folded.value.has_value()) {
             return mir.addConst(toMirLiteral(*folded.value), aggTy);
+        }
+        // FC8 D-CSUBSET-BITFIELD-INIT: a NON-foldable bit-field-struct rvalue
+        // can't be packed by the InsertValue fallback (see the note above) —
+        // fail loud rather than miscompile (D-CSUBSET-BITFIELD-RVALUE-RUNTIME).
+        if (isBitfieldAgg) {
+            unsupported(node, "a non-constant bit-field struct/union RVALUE "
+                              "literal (e.g. a compound literal with runtime "
+                              "operands passed by value) is not yet supported "
+                              "(D-CSUBSET-BITFIELD-RVALUE-RUNTIME) — use a named "
+                              "object initialized with `= {…}` (which packs), or "
+                              "constant operands (which fold + pack)");
+            return InvalidMirInst;
         }
         // Fall back to the InsertValue chain. Snapshot the error count
         // so we can refuse to emit a malformed seed → chain if
@@ -1715,6 +1737,145 @@ struct Lowerer {
         return acc;
     }
 
+    // FC8 D-CSUBSET-BITFIELD-INIT: lower a struct/union aggregate initializer
+    // whose type HAS bit-fields into the slot at `allocaPtr`. A bit-field shares
+    // its allocation UNIT with co-resident neighbours, so a plain full-width
+    // Store would clobber them — instead each unit is packed: zeroed ONCE (so
+    // un-covered bits + omitted fields are zero-filled, matching C aggregate
+    // init), then each bit-field's value is OR-ed in via the SAME read-modify-
+    // write `emitBitfieldInsert` the field-by-field assignment path uses (the
+    // single packing chokepoint — write+read stay self-consistent on every
+    // target). Ordinary fields among the bit-fields lower normally (Gep+Store,
+    // or nested aggregate recurse). `lowerBraceInit` has zero-filled unspecified
+    // fields, so `kids` is positional + complete; a zero-width bit-field marker
+    // (`bitFields[i].unitBytes == 0` AND not an ordinary field) carries no value
+    // child, so it is skipped by the parallel walk. Source/target-agnostic: keys
+    // only on the config-driven layout's `bitFields[]` + `fieldOffsets[]`.
+    [[nodiscard]] bool lowerBitfieldAggregateInitIntoSlot(HirNodeId aggNode,
+                                                          MirInstId allocaPtr,
+                                                          TypeId aggTy) {
+        StructLayout const* layout = cachedLayout(aggTy);
+        if (layout == nullptr) {
+            unsupported(aggNode, "bit-field aggregate initializer: layout "
+                                 "unavailable (un-sizeable type or the target "
+                                 "declared no aggregateLayout)");
+            return false;
+        }
+        auto kids = hir.children(aggNode);
+        // `lowerBraceInit` emits ONE positional child per struct field (omitted
+        // slots already zero-filled), so `kids[f]` ↔ field `f` directly — INCLUDING
+        // a zero-width bit-field (`unsigned : 0;`), which is a layout-only packing
+        // break carrying a synthetic zero child. A zero-width marker has no storage
+        // (`bitFields[f].unitBytes == 0` AND `fieldBitWidth(f)` present), so it is
+        // skipped: it touches no unit and its child is an unwritten zero.
+        std::size_t const fieldCount = layout->fieldOffsets.size() < kids.size()
+                                           ? layout->fieldOffsets.size()
+                                           : kids.size();
+        // PASS 1 — zero every bit-field allocation unit BEFORE any field value is
+        // written. A non-bit-field member can share an allocation unit's byte
+        // range with a bit-field (C/GNU packing: `struct { char x; int a:3; }`
+        // puts `x` at byte 0 and `a`'s int unit at bytes [0,4)), so zeroing a
+        // unit lazily in declaration order would clobber an ordinary field
+        // already stored into the same bytes — AND diverge from the static-data
+        // encoder, which pre-zeroes the whole buffer once (`asm.cpp`). Hoisting
+        // all unit-zeroes ahead of all value writes makes the result
+        // order-independent: ordinary Stores and bit-field read-modify-writes
+        // then all land on already-zeroed bytes (the RMW preserves the zero in
+        // the bits it does not set, ordinary fields occupy disjoint bytes). Dedup
+        // on (offset, unitBytes) so a unit is zeroed once, yet mixed-width
+        // bit-fields sharing an offset (`char a:3; int b:4;` → both at offset 0,
+        // units 1 and 4 bytes) each get their full unit covered.
+        std::unordered_set<std::uint64_t> zeroedUnits;
+        for (std::size_t f = 0; f < fieldCount; ++f) {
+            bool const isBitfield =
+                f < layout->bitFields.size() && layout->bitFields[f].unitBytes != 0;
+            if (!isBitfield) continue;
+            auto const          off       = layout->fieldOffsets[f];
+            std::uint32_t const unitBytes = layout->bitFields[f].unitBytes;
+            // off is a byte offset within a composite (« 4 GiB) — pack
+            // (off, unitBytes) into one key so a wider unit at the same offset is
+            // not skipped by a narrower one's earlier zero.
+            if (!zeroedUnits.insert((off << 32) | unitBytes).second) continue;
+            TypeId const    fieldTy = hir.typeId(kids[f]);
+            MirInstId const offK    = constInt(static_cast<std::int64_t>(off));
+            if (!offK.valid()) return false;
+            std::array<MirInstId, 2> gepOps{allocaPtr, offK};
+            MirInstId const          unitPtr =
+                mir.addInst(MirOpcode::Gep, gepOps, interner.pointer(fieldTy));
+            if (!unitPtr.valid()) return false;
+            MirInstId const zero = constIntOfType(0, fieldTy);
+            if (!zero.valid()) return false;
+            std::array<MirInstId, 2> zst{zero, unitPtr};
+            mir.addInst(MirOpcode::Store, zst);
+        }
+        // PASS 2 — write every field. Bit-fields read-modify-write their (now
+        // zeroed) unit; ordinary fields store/recurse; zero-width markers carry
+        // no storage. All zeroing is done, so no write can clobber another.
+        for (std::size_t f = 0; f < fieldCount; ++f) {
+            bool const isBitfield =
+                f < layout->bitFields.size() && layout->bitFields[f].unitBytes != 0;
+            bool const isZeroWidthMarker =
+                !isBitfield && interner.fieldBitWidth(aggTy, f).has_value();
+            if (isZeroWidthMarker) continue;   // no storage; child is a zero-fill
+            HirNodeId const child = kids[f];
+            auto const off = layout->fieldOffsets[f];
+            MirInstId const offK = constInt(static_cast<std::int64_t>(off));
+            if (!offK.valid()) return false;
+            TypeId const fieldTy = hir.typeId(child);
+            if (!isBitfield) {
+                // Ordinary field: Gep to its byte offset, then store/recurse
+                // exactly as the non-bit-field path does (a struct/union/array
+                // field recurses; a scalar field is a plain Store).
+                std::array<MirInstId, 2> gepOps{allocaPtr, offK};
+                MirInstId const fieldPtr = mir.addInst(
+                    MirOpcode::Gep, gepOps, interner.pointer(fieldTy));
+                if (!fieldPtr.valid()) return false;
+                TypeKind const fk = interner.kind(fieldTy);
+                if (fk == TypeKind::Struct || fk == TypeKind::Union) {
+                    if (hir.kind(child) == HirKind::ConstructAggregate) {
+                        if (!lowerAggregateInitIntoSlot(child, fieldPtr, fieldTy))
+                            return false;
+                    } else {
+                        MirInstId const srcPtr = lowerLvalueAddress(child);
+                        if (!srcPtr.valid()) return false;
+                        if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                            return false;
+                    }
+                    continue;
+                }
+                if (fk == TypeKind::Array) {
+                    if (hir.kind(child) == HirKind::ConstructAggregate) {
+                        if (!lowerArrayInitIntoSlot(child, fieldPtr, fieldTy))
+                            return false;
+                    } else {
+                        MirInstId const srcPtr = lowerLvalueAddress(child);
+                        if (!srcPtr.valid()) return false;
+                        if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                            return false;
+                    }
+                    continue;
+                }
+                MirInstId const v = lowerExpr(child);
+                if (!v.valid()) return false;
+                std::array<MirInstId, 2> stOps{v, fieldPtr};
+                mir.addInst(MirOpcode::Store, stOps);
+                continue;
+            }
+            // Bit-field: Gep to the UNIT (already zeroed in pass 1), then RMW the
+            // value in. The Gep width follows the field type = the unit width,
+            // matching emitBitfieldInsert's load/store width.
+            std::array<MirInstId, 2> gepOps{allocaPtr, offK};
+            MirInstId const unitPtr = mir.addInst(
+                MirOpcode::Gep, gepOps, interner.pointer(fieldTy));
+            if (!unitPtr.valid()) return false;
+            MirInstId const v = lowerExpr(child);
+            if (!v.valid()) return false;
+            if (!emitBitfieldInsert(unitPtr, v, layout->bitFields[f], fieldTy))
+                return false;
+        }
+        return true;
+    }
+
     // FC7 (D-FC7-MEMBER-ACCESS): lower a struct/union ConstructAggregate
     // initializer ELEMENT-WISE into the slot at `allocaPtr` — one
     // `Store(lowerExpr(child_i), Gep(allocaPtr, Const(fieldByteOffset_i)))`
@@ -1726,15 +1887,12 @@ struct Lowerer {
     [[nodiscard]] bool lowerAggregateInitIntoSlot(HirNodeId aggNode,
                                                   MirInstId allocaPtr,
                                                   TypeId aggTy) {
-        // FC8 D-CSUBSET-BITFIELD: a bit-field struct/union initializer would write
-        // each field full-width into the shared unit, clobbering co-resident
-        // bit-fields — fail loud (D-CSUBSET-BITFIELD-INIT) rather than miscompile.
+        // FC8 D-CSUBSET-BITFIELD-INIT: a struct/union initializer whose type has
+        // bit-fields packs per allocation unit — a plain field-wise Store would
+        // write each bit-field full-width into the shared unit, clobbering its
+        // co-resident neighbours. Routed to the unit-aware initializer.
         if (hasBitfieldMember(aggTy)) {
-            unsupported(aggNode, "aggregate initialization of a struct/union with "
-                                 "a bit-field is not yet supported (D-CSUBSET-"
-                                 "BITFIELD-INIT) — assign the bit-field members "
-                                 "(`s.x = v;`) instead");
-            return false;
+            return lowerBitfieldAggregateInitIntoSlot(aggNode, allocaPtr, aggTy);
         }
         auto kids = hir.children(aggNode);
         for (std::size_t i = 0; i < kids.size(); ++i) {

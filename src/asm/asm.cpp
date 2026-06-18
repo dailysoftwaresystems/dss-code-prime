@@ -574,12 +574,6 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     TypeKind const k = in.kind(ty);
 
     if (k == TypeKind::Struct || k == TypeKind::Union) {
-        // FC8 D-CSUBSET-BITFIELD: a bit-field struct/union global would encode
-        // each field full-width at its byte offset, clobbering co-resident
-        // bit-fields. Static-data bit-field packing is not yet built — fail loud
-        // (D-CSUBSET-BITFIELD-INIT). (Front-end already rejects the initializer at
-        // MIR; this is the data-tier backstop so no path silently miscompiles.)
-        if (!in.scalars(ty).empty()) return false;
         if (!std::holds_alternative<MirAggregateValue>(v.value)) return false;
         auto const& agg = std::get<MirAggregateValue>(v.value);
         auto const  lay = computeLayout(ty, in, lp, dm);
@@ -587,10 +581,43 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         auto const ops = in.operands(ty);
         if (ops.size() != lay->fieldOffsets.size()) return false;
         if (agg.fields.size() > ops.size()) return false;   // too many inits → fail loud
-        for (std::size_t i = 0; i < agg.fields.size(); ++i)
-            if (!encodeAggregateValue(ops[i], agg.fields[i], in, lp, dm, buf,
-                                      base + lay->fieldOffsets[i]))
-                return false;
+        // FC8 D-CSUBSET-BITFIELD-INIT: a struct/union WITH bit-fields packs each
+        // bit-field's value into its allocation unit (`buf` is pre-zeroed, so the
+        // OR is correct + leaves un-covered bits / omitted fields at 0). Fields
+        // sharing a unit share `fieldOffsets[i]`, so OR-ing each one in at its
+        // `bitOffset` accumulates into the same bytes. Ordinary fields among the
+        // bit-fields (`unitBytes == 0`) recurse normally. `bitFields` non-empty
+        // ⇔ the struct has a bit-field (the layout authority's invariant); the
+        // byte path below is byte-identical for a bit-field-free composite.
+        for (std::size_t i = 0; i < agg.fields.size(); ++i) {
+            bool const isBitfield =
+                i < lay->bitFields.size() && lay->bitFields[i].unitBytes != 0;
+            if (!isBitfield) {
+                // A zero-width bit-field marker (`unsigned : 0;`) has no storage
+                // (`unitBytes == 0` AND `fieldBitWidth` present); its `fieldOffsets`
+                // entry aliases the NEXT unit, so a full-width write here would
+                // touch that neighbour unit. Skip it (its synthetic child is 0).
+                if (in.fieldBitWidth(ty, i).has_value()) continue;
+                if (!encodeAggregateValue(ops[i], agg.fields[i], in, lp, dm, buf,
+                                          base + lay->fieldOffsets[i]))
+                    return false;
+                continue;
+            }
+            // Pack one bit-field: read its scalar value, mask to width, shift to
+            // bitOffset, OR into the unit at `base + fieldOffsets[i]`. The unit
+            // load/store width is `unitBytes` (little-endian, matching the MIR
+            // read-modify-write codegen + the layout's LSB-first packing).
+            BitFieldPlacement const& p = lay->bitFields[i];
+            auto const bitsOpt = decodeScalarLiteralBits(agg.fields[i], in.kind(ops[i]));
+            if (!bitsOpt.has_value()) return false;   // non-int bit-field leaf → fail loud
+            std::uint64_t const mask =
+                p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
+            std::uint64_t const placed = (*bitsOpt & mask) << p.bitOffset;
+            std::uint64_t const unitBase = base + lay->fieldOffsets[i];
+            if (unitBase + p.unitBytes > buf.size()) return false;  // layout↔buf disagreement
+            for (std::uint32_t j = 0; j < p.unitBytes; ++j)
+                buf[unitBase + j] |= static_cast<std::uint8_t>((placed >> (j * 8)) & 0xFFu);
+        }
         return true;
     }
 

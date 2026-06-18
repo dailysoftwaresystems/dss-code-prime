@@ -1097,6 +1097,62 @@ TEST(AsmAggregateGlobal, PaddedStructFullInitEncodesByteExact) {
     EXPECT_EQ(r.items[0].bytes, expect);
 }
 
+// FC8 D-CSUBSET-BITFIELD-INIT: a GLOBAL bit-field struct initializer packs each
+// field into its allocation UNIT in the static-data byte buffer (the path the
+// `bitfield_init` corpus drives end-to-end; this is the byte-exact unit pin).
+// `struct {unsigned a:3; unsigned b:5;}` (one 4-byte unit) initialized {5,20}:
+// a=5 at bitOffset 0, b=20 at bitOffset 3 → 5 | (20<<3) = 0xA5 in byte 0; the
+// other 3 unit bytes stay zero (pre-zeroed buffer). Red-on-disable: revert the
+// encoder's bit-field arm to the `scalars(ty) empty` fail-loud and this errors
+// instead of packing; or to a full-width per-field store and b clobbers a.
+TEST(AsmAggregateGlobal, BitFieldStructInitPacksIntoUnitByteExact) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    std::array<TypeId, 2> const f{u32, u32};
+    std::array<std::int64_t, 2> const widths{3, 5};
+    TypeId const s = ti.structType("Flags", f, widths);
+    AggregateLayoutParams gnuPacked{ScalarAlignmentRule::Natural, 16};
+    gnuPacked.bitFieldStrategy = BitFieldStrategy::GnuPacked;
+    auto const r = lowerOneAggGlobal(
+        ti, s,
+        aggOf({intField(5, TypeKind::U32), intField(20, TypeKind::U32)},
+              TypeKind::Struct),
+        gnuPacked, DataModel::Lp64);
+    ASSERT_EQ(r.errors, 0u);
+    ASSERT_EQ(r.items.size(), 1u);
+    std::vector<std::uint8_t> const expect{0xA5, 0, 0, 0};   // 5 | (20<<3)
+    EXPECT_EQ(r.items[0].bytes, expect);
+}
+
+// F1 (review-caught): an ORDINARY field that shares a bit-field's allocation
+// unit must survive the pack. `struct { char x; unsigned a:3; }` puts x at byte
+// 0 and a's u32 unit at bytes [0,4) — overlapping. The static-data encoder
+// pre-zeroes the whole buffer ONCE, then writes x (byte 0) and ORs a in at
+// bitOffset 8 (byte 1) → x is preserved. This is the GLOBAL side of the
+// global/local agreement the MIR two-pass fix restores (see the MIR pin
+// BitFieldUnitZeroPrecedesOrdinaryFieldStoreInSharedUnit). Red-on-disable: were
+// the encoder to write the bit-field unit full-width (clobbering x) or skip the
+// pre-zero, byte 0 would not read back 7.
+TEST(AsmAggregateGlobal, BitFieldUnitSharingOrdinaryFieldByteExact) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i8  = ti.primitive(TypeKind::I8);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    std::array<TypeId, 2> const f{i8, u32};
+    std::array<std::int64_t, 2> const widths{kNotBitfield, 3};   // x ordinary, a:3
+    TypeId const s = ti.structType("Tag", f, widths);
+    AggregateLayoutParams gnuPacked{ScalarAlignmentRule::Natural, 16};
+    gnuPacked.bitFieldStrategy = BitFieldStrategy::GnuPacked;
+    auto const r = lowerOneAggGlobal(
+        ti, s,
+        aggOf({intField(7, TypeKind::I8), intField(5, TypeKind::U32)},
+              TypeKind::Struct),
+        gnuPacked, DataModel::Lp64);
+    ASSERT_EQ(r.errors, 0u);
+    ASSERT_EQ(r.items.size(), 1u);
+    std::vector<std::uint8_t> const expect{7, 5, 0, 0};   // x=7 @byte0, a=5<<8 @byte1
+    EXPECT_EQ(r.items[0].bytes, expect);
+}
+
 // SHORT-init zero-fill — the path c-subset cannot reach (HIR delivers a full
 // field list). A {I32,I32,I32} with ONLY field 0 provided must encode field 0
 // then ZERO the trailing 8 bytes (the layout-sized, pre-zeroed buffer).
