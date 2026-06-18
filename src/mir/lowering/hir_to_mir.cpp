@@ -1200,12 +1200,26 @@ struct Lowerer {
         }
     }
 
+    // FC8 D-CSUBSET-ENUM-BITFIELD: an enum-typed bit-field's allocation unit IS
+    // its underlying integer (C 6.7.2.1 + the enum-behaves-as-underlying rule,
+    // D-CSUBSET-ENUM-INT-CONVERSION). Resolve Enum→underlying so the unit's
+    // load/store width, shift/mask constants, signedness, and op result types
+    // all run at the real integer type; a non-enum type passes through
+    // unchanged. Kept local (mirrors detail::type_rules::enumUnderlyingOrSelf)
+    // to avoid a MIR→semantic-layer header dependency.
+    [[nodiscard]] TypeId enumReprType(TypeId t) {
+        if (!t.valid() || interner.kind(t) != TypeKind::Enum) return t;
+        auto const sc = interner.scalars(t);
+        return sc.empty() ? t : interner.primitive(static_cast<TypeKind>(sc[0]));
+    }
+
     // FC8 D-CSUBSET-BITFIELD: extract a bit-field value from a loaded allocation
     // unit. Unsigned: `(unit >> bitOffset) & ((1<<W)-1)`. Signed: sign-extend via
     // `(unit << (B - bitOffset - W)) >>arith (B - W)` (B = unit bits). All ops are
     // computed at the field's (unit) type — reuses the existing MIR shift/and ops.
     [[nodiscard]] MirInstId
     emitBitfieldExtract(MirInstId unitVal, BitFieldPlacement const& p, TypeId fieldTy) {
+        fieldTy = enumReprType(fieldTy);   // enum bit-field → underlying integer
         std::uint32_t const B = p.unitBytes * 8;
         // Shift/mask constants MUST be the field/unit type, NOT I32 — a 64-bit-
         // unit bit-field (`unsigned long long x:40`) with an I32 const operand is
@@ -1240,6 +1254,7 @@ struct Lowerer {
     [[nodiscard]] bool
     emitBitfieldInsert(MirInstId unitPtr, MirInstId rhsVal,
                        BitFieldPlacement const& p, TypeId fieldTy) {
+        fieldTy = enumReprType(fieldTy);   // enum bit-field → underlying integer
         std::uint64_t const mask =
             p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
         std::uint64_t const fieldMask = mask << p.bitOffset;
@@ -1461,6 +1476,12 @@ struct Lowerer {
     // does not catch. `ty` must be an integer type (an array subscript is
     // integer per the front-end); falls back to I32 if absent.
     [[nodiscard]] MirInstId constIntOfType(std::int64_t v, TypeId ty) {
+        // An enum-typed operand's constant IS its underlying integer value
+        // (D-CSUBSET-ENUM-INT-CONVERSION) — resolve Enum→underlying so the
+        // const is a real primitive (interner.primitive(Enum) is not valid).
+        // This is the single chokepoint that also widths the enum-bit-field
+        // init zero-store (D-CSUBSET-ENUM-BITFIELD).
+        ty = enumReprType(ty);
         TypeKind const k = ty.valid() ? interner.kind(ty) : TypeKind::I32;
         MirLiteralValue lit;
         lit.value = v;

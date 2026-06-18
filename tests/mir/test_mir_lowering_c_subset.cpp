@@ -1477,6 +1477,94 @@ TEST(MirLoweringCSubset, BitFieldUnitZeroPrecedesOrdinaryFieldStoreInSharedUnit)
            "stored, else the zero clobbers x (the F1 silent miscompile)";
 }
 
+// FC8 D-CSUBSET-ENUM-BITFIELD: an enum-typed bit-field (`enum E e : W`) is
+// permitted (C 6.7.2.1) — an enum behaves AS its underlying integer
+// (D-CSUBSET-ENUM-INT-CONVERSION), so it must be ACCEPTED at semantic and LOWER
+// its allocation-unit access at the underlying. This pins two arms; the runtime
+// SIGNEDNESS arm (the load-bearing behavioural fix — a signed-underlying enum
+// bit-field must SIGN-extend) is pinned end-to-end by the `enum_bitfield`
+// corpus (a negative enumerator reads back -3, not 13 → exit 42, not 74).
+//  (a) RED-ON-DISABLE: revert resolveBitfieldSuffix's enum→underlying resolve →
+//      the field is rejected S_BitFieldNonIntegerType → model.hasErrors().
+//  (b) RED-ON-DISABLE: revert the enumReprType resolve at emitBitfieldExtract/
+//      emitBitfieldInsert → every bit-field shift/mask op result is typed at the
+//      Enum (primitive(Enum)) rather than the underlying integer. (The unit Load
+//      is intentionally left Enum-typed — the LIR `reprKind` tier resolves its
+//      WIDTH — so we assert the arithmetic OP results, which the resolve makes
+//      underlying; a behaviour-equivalent-but-malformed Enum-typed op is exactly
+//      what the LIR tier would mask, so this MIR-tier representation check is the
+//      only place it can be caught.) Exercises READ (extract) + WRITE (insert).
+TEST(MirLoweringCSubset, EnumTypedBitFieldResolvesAndLowers) {
+    auto L = lowerCSubset(
+        "enum Color { RED, GREEN = 5, BLUE };\n"
+        "struct S { enum Color c : 4; unsigned x : 3; };\n"
+        "int f(void) { struct S s = { GREEN, 3 }; s.c = BLUE; return (int)s.c; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "an enum-typed bit-field must be ACCEPTED (C 6.7.2.1), not rejected "
+           "S_BitFieldNonIntegerType";
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "an enum bit-field must LOWER (extract/insert resolve Enum→underlying): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // Every bit-field arithmetic op (the read extract's shift/mask, the write
+    // RMW's clear/mask/shift/merge) must be typed at the underlying integer, NOT
+    // the Enum. In this function those opcodes come ONLY from the bit-field
+    // codegen, so the check is unambiguous.
+    bool sawBitfieldOp = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        switch (m.instOpcode(ix)) {
+            case MirOpcode::And: case MirOpcode::Or:   case MirOpcode::Shl:
+            case MirOpcode::AShr: case MirOpcode::LShr:
+                sawBitfieldOp = true;
+                EXPECT_NE(interner.kind(m.instType(ix)), TypeKind::Enum)
+                    << "bit-field op #" << i << " must be typed at the enum's "
+                       "UNDERLYING integer (enumReprType), not the Enum itself";
+                break;
+            default: break;
+        }
+    }
+    EXPECT_TRUE(sawBitfieldOp)
+        << "the enum bit-field read + write must emit shift/mask ops";
+}
+
+// FC8 (cycle-4 audit coverage debt): two bit-fields of DIFFERENT declared-type
+// widths sharing one offset (`unsigned char a:3` → 1-byte unit at off 0;
+// `unsigned b:4` → 4-byte unit also at off 0). The init two-pass must zero BOTH
+// units up front, so the dedup keys on (offset, unitBytes) — NOT offset alone.
+// RED-ON-DISABLE: dedup on `off` only → the wider unit's high bytes are left
+// unzeroed (stale) → only ONE zero-store is emitted. This asserts TWO distinct
+// unit zero-stores (value Const 0).
+TEST(MirLoweringCSubset, MixedWidthBitFieldsSharingOffsetEachZeroTheirUnit) {
+    auto L = lowerCSubset(
+        "struct M { unsigned char a : 3; unsigned b : 4; };\n"
+        "void f(void) { struct M m = { 5, 9 }; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    int zeroStores = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Store) continue;
+        auto ops = m.instOperands(id);
+        if (ops.size() != 2 || m.instOpcode(ops[0]) != MirOpcode::Const) continue;
+        auto const& lit = m.literalValue(m.constLiteralIndex(ops[0]));
+        if (auto const* iv = std::get_if<std::int64_t>(&lit.value);
+            iv != nullptr && *iv == 0)
+            ++zeroStores;
+    }
+    EXPECT_EQ(zeroStores, 2)
+        << "each distinct-width unit at the shared offset must be zeroed once "
+           "(dedup on (offset,unitBytes)); off-only dedup leaves the wider unit "
+           "partly stale";
+}
+
 // FC8 D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY + NONSTRING-GLOBAL-ARRAY-DECAY: a
 // non-string array used as a pointer DECAYS to its first-element address — it
 // must LOWER (not fail loud as it did pre-FC8). RED-ON-DISABLE: revert the decay

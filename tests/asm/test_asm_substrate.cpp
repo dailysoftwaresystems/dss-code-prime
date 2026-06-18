@@ -1153,6 +1153,30 @@ TEST(AsmAggregateGlobal, BitFieldUnitSharingOrdinaryFieldByteExact) {
     EXPECT_EQ(r.items[0].bytes, expect);
 }
 
+// FC8 (cycle-4 audit coverage debt): a UNION bit-field aggregate init. A union
+// brace-init sets the FIRST member only; a bit-field member occupies bits [0,W)
+// of its own allocation unit at offset 0. `{5}` on `union { unsigned a:3; ... }`
+// packs a=5 into bits 0..2 of the pre-zeroed unit → byte 0 == 5, rest 0. Locks
+// the union arm of the static-data bit-field encoder (cycle-4's union-init path
+// was chokepoint-covered but unpinned).
+TEST(AsmAggregateGlobal, BitFieldUnionInitPacksFirstMemberByteExact) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    std::array<TypeId, 2> const f{u32, u32};
+    std::array<std::int64_t, 2> const widths{3, 5};   // a:3, b:5 (independent)
+    TypeId const u = ti.unionType("Flags", f, widths);
+    AggregateLayoutParams gnuPacked{ScalarAlignmentRule::Natural, 16};
+    gnuPacked.bitFieldStrategy = BitFieldStrategy::GnuPacked;
+    auto const r = lowerOneAggGlobal(
+        ti, u,
+        aggOf({intField(5, TypeKind::U32)}, TypeKind::Union),   // first member a:3=5
+        gnuPacked, DataModel::Lp64);
+    ASSERT_EQ(r.errors, 0u);
+    ASSERT_EQ(r.items.size(), 1u);
+    std::vector<std::uint8_t> const expect{5, 0, 0, 0};   // a=5 @bits 0..2 of unit 0
+    EXPECT_EQ(r.items[0].bytes, expect);
+}
+
 // SHORT-init zero-fill — the path c-subset cannot reach (HIR delivers a full
 // field list). A {I32,I32,I32} with ONLY field 0 provided must encode field 0
 // then ZERO the trailing 8 bytes (the layout-sized, pre-zeroed buffer).

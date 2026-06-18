@@ -1028,7 +1028,16 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
         s.reporter.report(std::move(d));
     };
     if (!fieldType.valid()) return out;   // unresolved base — upstream already loud
-    TypeKind const k = s.lattice.interner().kind(fieldType);
+    // FC8 D-CSUBSET-ENUM-BITFIELD: an enum-typed bit-field (`enum E e : 3;`) is
+    // permitted (C 6.7.2.1) — an enum behaves AS its underlying integer
+    // (D-CSUBSET-ENUM-INT-CONVERSION), so validate the width against the
+    // UNDERLYING's bit-size (a >32-bit underlying still hits the wide-unit
+    // reject below, consistent with a plain `long` bit-field). Non-enum types
+    // pass through unchanged.
+    using namespace detail::type_rules;
+    TypeId const reprType =
+        enumUnderlyingOrSelf(s.lattice.interner(), fieldType);
+    TypeKind const k = s.lattice.interner().kind(reprType);
     // The base type's bit-size (fixed-width integer kinds only; 0 ⇒ non-integer).
     auto intBits = [](TypeKind kk) -> std::uint32_t {
         switch (kk) {
