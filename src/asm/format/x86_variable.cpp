@@ -11,6 +11,7 @@
 #include <format>
 #include <optional>
 #include <span>
+#include <variant>
 
 namespace dss::x86_variable {
 
@@ -108,6 +109,17 @@ struct EncodingState {
     // carries both; an ENTER-style imm16+imm8 shape would need
     // wiring-order-preserving emission when it lands.
     std::vector<std::uint8_t>     imm8s;
+    // D-CSUBSET-BITFIELD-WIDE-UNIT: 8-byte immediates (the `io` field
+    // of `mov r64, imm64` = B8+rd io). `optional` makes a double-wire
+    // detectable (a malformed schema with two Imm64 wires would
+    // otherwise silently keep the last). Emitted AFTER imm32s (no
+    // shipped instruction carries both an imm32 AND an imm64).
+    std::optional<std::uint64_t>  imm64;
+    // D-CSUBSET-BITFIELD-WIDE-UNIT: the `B8+rd` opcode-plus-register
+    // form. When a slot wires the destination here, its low 3 bits are
+    // OR'd into the LAST opcode byte and its high bit drives REX.B.
+    // `optional` = the written-bit (a second writer fails loud).
+    std::optional<std::uint8_t>   opcodePlusReg3;
     std::optional<PendingRelocSlot> disp32;      // symbol-relative 32-bit slot (cycle 4)
     // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): pending
     // intra-function block-relative branch targets. Each entry
@@ -179,6 +191,40 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
             st.wroteModRmRm  = true;
             st.modMode       = EncodingState::ModMode::MemDisp32;
             return true;
+        case EncodingSlotKind::OpcodePlusReg:
+            // D-CSUBSET-BITFIELD-WIDE-UNIT: the `B8+rd` form — the
+            // register's low 3 bits are OR'd into the last opcode byte
+            // (done at emit time), and its high bit drives REX.B. No
+            // ModR/M byte. `optional` collision check makes a second
+            // writer fail loud (a malformed schema with two
+            // opcode-plus-reg placements).
+            if (st.opcodePlusReg3.has_value()) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': second writer to the "
+                                   "opcode-plus-register slot — only one "
+                                   "register rides the opcode byte",
+                                   mnemonic));
+                return false;
+            }
+            // The opcode-plus-reg form shares REX.B with ModR/M.rm. A
+            // schema that wired BOTH (a ModRmRm reg AND an OpcodePlusReg)
+            // would be malformed (the B8+rd form has no ModR/M); reject
+            // the REX.B collision loudly.
+            if (st.wroteModRmRm && st.rexB) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': opcode-plus-register slot "
+                                   "conflicts with a ModR/M.rm REX.B writer "
+                                   "— the B8+rd form has no ModR/M byte; "
+                                   "schema is malformed",
+                                   mnemonic));
+                return false;
+            }
+            st.opcodePlusReg3 =
+                static_cast<std::uint8_t>(hwEnc & 0x7u);
+            st.rexB           = (hwEnc & 0x8u) != 0u;
+            return true;
         case EncodingSlotKind::SibIndex:
             // D-AS4-5 indexed addressing: the index register's low 3
             // bits fill SIB.index; the high bit drives REX.X. With-
@@ -216,6 +262,10 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
             return true;
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Imm8:
+        // D-CSUBSET-BITFIELD-WIDE-UNIT: Imm64 carries the wide pool
+        // literal value, filled by the LiteralIndex dispatch arm below —
+        // never a register hwEnc.
+        case EncodingSlotKind::Imm64:
         case EncodingSlotKind::Disp32Mem:
         case EncodingSlotKind::RipRelDisp32:
         case EncodingSlotKind::CondCodeNibble:
@@ -319,6 +369,36 @@ wireImm8(EncodingState& st, std::int32_t v,
         return false;
     }
     st.imm8s.push_back(static_cast<std::uint8_t>(v));
+    return true;
+}
+
+// D-CSUBSET-BITFIELD-WIDE-UNIT: stash a wide pool literal's full 64-bit
+// value for the `Imm64` slot (`mov r64, imm64` = B8+rd io). The value
+// arrives from the LIR `LiteralIndex` operand (the wide constant lives
+// in `LirLiteralPool`, since the 8-byte `LirOperand` POD cannot inline
+// a 64-bit immediate alongside its kind tag). `optional` collision
+// check makes a second Imm64 wire (a malformed schema) fail loud rather
+// than silently keeping the last value.
+[[nodiscard]] bool
+wireImm64(EncodingState& st, EncodingSlotKind slot, std::uint64_t v,
+          std::string_view mnemonic, DiagnosticReporter& reporter) {
+    if (slot != EncodingSlotKind::Imm64) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': wide pool literal wired into a "
+                           "non-Imm64 slot '{}'",
+                           mnemonic, encodingSlotKindName(slot)));
+        return false;
+    }
+    if (st.imm64.has_value()) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': second writer to the Imm64 slot "
+                           "— only one 64-bit immediate per instruction",
+                           mnemonic));
+        return false;
+    }
+    st.imm64 = v;
     return true;
 }
 
@@ -497,6 +577,36 @@ bool encode(Lir const&                  lir,
                 }
             } else if (!wireImm32(st, wire.slotKind, srcOp.immInt32,
                                   info->mnemonic, reporter)) {
+                return false;
+            }
+        } else if (srcOp.kind == LirOperandKind::LiteralIndex) {
+            // D-CSUBSET-BITFIELD-WIDE-UNIT: a wide pool literal — the
+            // 64-bit immediate of `mov r64, imm64`. The value lives in
+            // `LirLiteralPool` (it does not fit the 8-byte `LirOperand`
+            // POD inline). Read the integer pattern and stash it for the
+            // Imm64 slot. INTEGER arms only: float literals are promoted
+            // to rodata at HIR→MIR and never reach the encoder as a
+            // Const-materialized LiteralIndex; a non-integer pool variant
+            // reaching here is a malformed Lir — fail loud.
+            auto const& lit = lir.literalValue(srcOp.litIndex);
+            std::uint64_t bits = 0;
+            if (auto const* i = std::get_if<std::int64_t>(&lit.value)) {
+                bits = static_cast<std::uint64_t>(*i);
+            } else if (auto const* u =
+                           std::get_if<std::uint64_t>(&lit.value)) {
+                bits = *u;
+            } else {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': LiteralIndex operand at "
+                                   "pool slot {} is not an integer literal "
+                                   "— the Imm64 slot encodes integers only "
+                                   "(floats route to rodata at HIR→MIR)",
+                                   info->mnemonic, srcOp.litIndex));
+                return false;
+            }
+            if (!wireImm64(st, wire.slotKind, bits,
+                           info->mnemonic, reporter)) {
                 return false;
             }
         } else if (srcOp.kind == LirOperandKind::MemBase) {
@@ -688,15 +798,36 @@ bool encode(Lir const&                  lir,
                                    condValue))));
             return false;
         }
+        // D-CSUBSET-BITFIELD-WIDE-UNIT: condCodeFromPayload and the
+        // opcode-plus-register form both OR into the LAST opcode byte;
+        // no shipped (or sane) instruction uses both. Reject the
+        // collision loudly rather than silently OR-ing a register's low
+        // 3 bits into a cond nibble.
+        if (st.opcodePlusReg3.has_value()) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': variant declares BOTH "
+                               "condCodeFromPayload and an opcode-plus-"
+                               "register slot — both modify the last "
+                               "opcode byte; schema is malformed",
+                               info->mnemonic));
+            return false;
+        }
         for (std::size_t i = 0; i + 1 < selected->tmpl.opcodeBytes.size(); ++i) {
             out.push_back(selected->tmpl.opcodeBytes[i]);
         }
         out.push_back(static_cast<std::uint8_t>(
             selected->tmpl.opcodeBytes.back() | (*condNibble & 0x0Fu)));
     } else {
-        for (auto b : selected->tmpl.opcodeBytes) {
-            out.push_back(b);
+        // D-CSUBSET-BITFIELD-WIDE-UNIT: the `B8+rd` form — OR the
+        // destination register's low 3 bits into the LAST opcode byte.
+        // Earlier bytes (any opcode prefix) emit verbatim.
+        for (std::size_t i = 0; i + 1 < selected->tmpl.opcodeBytes.size(); ++i) {
+            out.push_back(selected->tmpl.opcodeBytes[i]);
         }
+        out.push_back(static_cast<std::uint8_t>(
+            selected->tmpl.opcodeBytes.back()
+            | (st.opcodePlusReg3.value_or(0u) & 0x7u)));
     }
 
     // 4) ModR/M byte. Emit iff any slot wired into ModR/M, OR the
@@ -733,6 +864,22 @@ bool encode(Lir const&                  lir,
         std::uint8_t const modrm    = static_cast<std::uint8_t>(
             (modField << 6) | (regField << 3) | rmField);
         out.push_back(modrm);
+        // D-CSUBSET-BITFIELD-WIDE-UNIT coherence: the `B8+rd` form has
+        // NO ModR/M byte. If a schema wired an opcode-plus-register
+        // destination AND something that emits ModR/M, the destination
+        // register would be double-encoded (once in the opcode byte,
+        // once in ModR/M). Fail loud rather than emit a wrong-length
+        // instruction.
+        if (st.opcodePlusReg3.has_value()) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': variant uses the opcode-plus-"
+                               "register form (B8+rd) but also emits a "
+                               "ModR/M byte — the two destination encodings "
+                               "conflict; schema is malformed",
+                               info->mnemonic));
+            return false;
+        }
     }
 
     // 4.5) D-AS4-5 coherence: a SibIndex wire is only meaningful with
@@ -818,12 +965,18 @@ bool encode(Lir const&                  lir,
 
     // 7) Immediates: append in slot-wiring order — imm8 bytes first
     //    (the shift-count ib; no shipped instruction carries both an
-    //    imm8 AND an imm32), then the 4-byte immediates.
+    //    imm8 AND an imm32), then the 4-byte immediates, then the
+    //    8-byte immediate (D-CSUBSET-BITFIELD-WIDE-UNIT — `mov r64,
+    //    imm64` = B8+rd io; no shipped instruction carries both an
+    //    imm32 AND an imm64).
     for (auto v : st.imm8s) {
         out.push_back(v);
     }
     for (auto v : st.imm32s) {
         asm_byte_emit::appendImm32LE(out, v);
+    }
+    if (st.imm64.has_value()) {
+        asm_byte_emit::appendU64LE(out, *st.imm64);
     }
 
     // 8) Disp32 (symbol-relative, plan 13 AS4). The relocation

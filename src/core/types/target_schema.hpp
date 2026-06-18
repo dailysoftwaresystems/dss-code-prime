@@ -652,15 +652,31 @@ enum class OperandKindFilter : std::uint8_t {
                     // via `walker_util::BlockRelPatch`). ARM64 will
                     // use Imm19/Imm26 with different patch arithmetic
                     // (anchored D-AS3-BLOCK-REL-IMM19/26).
+    LiteralIndex = 6, // `LirOperand{kind == LiteralIndex}` — the wide-
+                    // literal pool index (D-CSUBSET-BITFIELD-WIDE-UNIT).
+                    // The pre-FC8 walkers never matched a `LiteralIndex`
+                    // operand (the inline `ImmInt` arm carried every
+                    // immediate that fit imm32, and float literals are
+                    // promoted to rodata at HIR→MIR, never reaching
+                    // MIR→LIR as a Const). A 64-bit INTEGER constant
+                    // wider than imm32 cannot ride the 8-byte `LirOperand`
+                    // POD inline, so it flows through `LirLiteralPool`;
+                    // this filter lets the `mov r64, imm64` variant guard
+                    // on "the operand is a wide pool literal", and the
+                    // x86 walker fetches the full 64-bit value from the
+                    // pool to emit the 8-byte immediate. JSON-side name
+                    // `"imm64"` (the width label, mirroring `"imm32"`'s
+                    // historical naming for `ImmInt`).
 };
 
-inline constexpr EnumNameTable<OperandKindFilter, 6> kOperandKindFilterTable{{{
+inline constexpr EnumNameTable<OperandKindFilter, 7> kOperandKindFilterTable{{{
     { OperandKindFilter::Reg,       "reg"      },
     { OperandKindFilter::ImmInt,    "imm32"    },  // JSON-side width label
     { OperandKindFilter::SymbolRef, "symbol"   },
     { OperandKindFilter::MemBase,   "membase"  },
     { OperandKindFilter::MemOffset, "memoffset"},
     { OperandKindFilter::BlockRef,  "blockref" },
+    { OperandKindFilter::LiteralIndex, "imm64" },  // JSON-side width label
 }}};
 
 [[nodiscard]] constexpr std::string_view
@@ -897,11 +913,33 @@ enum class EncodingSlotKind : std::uint8_t {
     // this is a pure fail-loud guard. Universal (any ISA whose indexed
     // address-add has no disp field reuses it).
     MemOffsetZero = 23,
+    // D-CSUBSET-BITFIELD-WIDE-UNIT (v0.0.2 FC8): the x86 "opcode + rd"
+    // destination form — the result register's low 3 bits are OR'd into
+    // the LAST opcode byte (`B8+rd`), and its high bit drives REX.B. NO
+    // ModR/M byte. The ONLY x86-64 instruction that materializes a full
+    // 64-bit immediate into a register is `mov r64, imm64` (REX.W B8+rd
+    // io); its destination lives in the opcode byte, not in ModR/M, so a
+    // new destination-bearing slot is required. The walker treats this as
+    // the variant's `resultSlot` — it is destination-bearing (rule G).
+    // Generic over any ISA whose register field rides the opcode byte
+    // (x86 `push r64` 50+rd, `xchg eax, r32` 90+rd reuse it). Writes no
+    // bytes itself; it modifies the opcode byte + REX.B during emission.
+    OpcodePlusReg = 24,
+    // D-CSUBSET-BITFIELD-WIDE-UNIT (v0.0.2 FC8): 8 immediate bytes
+    // appended after the opcode (and ModR/M/SIB, when present), little-
+    // endian — the `io` field of `mov r64, imm64`. The FIRST 64-bit
+    // immediate slot. The wired operand is a `LiteralIndex` (the wide
+    // value lives in `LirLiteralPool`, since it does not fit the inline
+    // `ImmInt` 8-byte POD); the walker reads the pool value and emits 8
+    // LE bytes. Range-unchecked by construction — every 64-bit pattern
+    // is representable. Distinct from `Imm32` (4 bytes, sign-extended
+    // consumers) and `Imm8` (1 byte, shift counts).
+    Imm64         = 25,
     // Future fixed32 slots (paired with their consumer cycle):
     //   ImmShift / Sf-flag / scaled LDR imm12 / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 24> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 26> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -926,6 +964,8 @@ inline constexpr EnumNameTable<EncodingSlotKind, 24> kEncodingSlotKindTable{{{
     { EncodingSlotKind::Imm8,          "imm8"           },
     { EncodingSlotKind::Ra,            "ra"             },
     { EncodingSlotKind::MemOffsetZero, "memoffset.zero" },
+    { EncodingSlotKind::OpcodePlusReg, "opcode.reg"     },
+    { EncodingSlotKind::Imm64,         "imm64"          },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -944,7 +984,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 24,
+static_assert(kEncodingSlotKindCount == 26,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -971,6 +1011,10 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::RipRelDisp32:
         case EncodingSlotKind::CondCodeNibble:
         case EncodingSlotKind::BlockRel32:
+        // D-CSUBSET-BITFIELD-WIDE-UNIT: `mov r64, imm64` (B8+rd io) is an
+        // x86-variable form — opcode-byte register + 8-byte immediate.
+        case EncodingSlotKind::OpcodePlusReg:
+        case EncodingSlotKind::Imm64:
             return TargetEncodingShape::X86Variable;
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
@@ -1152,6 +1196,10 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Imm8:
+        // D-CSUBSET-BITFIELD-WIDE-UNIT: the `mov r64, imm64` slots write
+        // the wide value / opcode-byte register directly — no relocation.
+        case EncodingSlotKind::Imm64:
+        case EncodingSlotKind::OpcodePlusReg:
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:

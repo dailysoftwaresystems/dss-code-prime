@@ -1053,14 +1053,15 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
     std::uint32_t const typeBits = intBits(k);
     if (typeBits == 0) { emit(DiagnosticCode::S_BitFieldNonIntegerType); return out; }
     // A bit-field on a >32-bit base (`long`/`long long`/I64/U64) needs a 64-bit
-    // allocation-unit access; the x86 backend's 64-bit `mov`/ALU encodings aren't
-    // yet complete for the extract/insert shapes (A_NoMatchingEncodingVariant —
-    // a pre-existing 64-bit-codegen gap, the NAMED blocker). With the `constInt`→
-    // `constIntOfType` fix that gap is a fail-loud, NEVER a silent miscompile; we
-    // reject 64-bit-base bit-fields HERE for a clean diagnostic instead of the
-    // opaque assembler error. 32-bit bit-fields (`int`/`unsigned`/char/short/bool)
-    // are the supported set. Deferred: D-CSUBSET-BITFIELD-WIDE-UNIT.
-    if (typeBits > 32) { emit(DiagnosticCode::S_BitFieldWidthOutOfRange); return out; }
+    // allocation-unit access. D-CSUBSET-BITFIELD-WIDE-UNIT (v0.0.2 FC8) closed the
+    // last codegen gap — materializing a 64-bit constant > int32 (the wide-mask
+    // dead-end): the x86 backend now emits `mov r64, imm64` (REX.W B8+rd io) and
+    // arm64 the MOVZ/MOVK ladder, both capability-probed in MIR→LIR. The
+    // extract/insert shapes (Load/Store/And/Or/Shl/LShr/AShr @64) already
+    // encoded, so 64-bit-base bit-fields now compile + run end-to-end. I128/U128
+    // bit-fields stay rejected — there is no 128-bit allocation-unit codegen (no
+    // 128-bit `mov`/ALU forms). 8/16/32/64-bit integer bases are the supported set.
+    if (typeBits > 64) { emit(DiagnosticCode::S_BitFieldWidthOutOfRange); return out; }
     NodeId widthNode{};
     if (bs.widthChild.has_value()) {
         auto sufKids = visibleChildren(tree, suffix);

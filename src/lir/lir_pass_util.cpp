@@ -87,4 +87,18 @@ bool emitTerminator(LirBuilder& b, std::uint16_t op,
     return false;
 }
 
+void
+copyLiteralPool(Lir const& src, LirBuilder& dst) {
+    // Append every source pool entry in index order. The destination
+    // builder is freshly constructed (empty pool), so `literalPoolAdd`
+    // returns 0, 1, 2, ... — reproducing the source indices that the
+    // copied `LiteralIndex` operands reference. (No dedup: the pool is a
+    // by-index store, not a value set; preserving identity is the whole
+    // point.)
+    auto const& pool = src.literalPool();
+    for (std::uint32_t i = 0; i < pool.size(); ++i) {
+        (void)dst.literalPoolAdd(pool.at(i));
+    }
+}
+
 } // namespace dss::lir_pass_util

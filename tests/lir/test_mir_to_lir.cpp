@@ -37,6 +37,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <variant>
 #include <string>
 #include <utility>
 #include <vector>
@@ -639,8 +640,17 @@ namespace {
 struct ConstChain {
     std::vector<std::uint16_t> opcodes;   // block opcode sequence
     std::vector<std::int32_t>  immValues; // each inst's ImmInt operand (or skip)
+    // D-CSUBSET-BITFIELD-WIDE-UNIT: each inst's LiteralIndex pool VALUE
+    // (the wide int64 carried for `mov r64, imm64`), or 0 when the inst
+    // has no LiteralIndex operand. Parallel-indexed with `opcodes`.
+    std::vector<std::uint64_t> litValues;
 };
 
+// `constKind` is the literal's declared TypeKind (drives width); when it
+// differs from the int64-carried `value`'s natural type the caller is
+// exercising a specific width path. For a value that exceeds int32 the
+// literal must be carried as a wide constant (the dead-end the FC8
+// wide-unit work closed) — the helper builds it the same way regardless.
 [[nodiscard]] ConstChain lowerConstChain(std::int64_t value, TypeKind kind,
                                          char const* targetName) {
     TypeInterner interner{CompilationUnitId{1}};
@@ -659,10 +669,20 @@ struct ConstChain {
         LirInstId const inst = lir.blockInstAt(bb, i);
         out.opcodes.push_back(lir.instOpcode(inst));
         std::int32_t imm = 0;
+        std::uint64_t litVal = 0;
         for (auto const& op : lir.instOperands(inst)) {
             if (op.kind == LirOperandKind::ImmInt) imm = op.immInt32;
+            if (op.kind == LirOperandKind::LiteralIndex) {
+                auto const& lit = lir.literalValue(op.litIndex);
+                if (auto const* u = std::get_if<std::uint64_t>(&lit.value))
+                    litVal = *u;
+                else if (auto const* s =
+                             std::get_if<std::int64_t>(&lit.value))
+                    litVal = static_cast<std::uint64_t>(*s);
+            }
         }
         out.immValues.push_back(imm);
+        out.litValues.push_back(litVal);
     }
     return out;
 }
@@ -770,6 +790,73 @@ TEST(MirToLir, X64WideConstKeepsSingleMovNoLadder) {
            "capability of movk-declaring targets only";
     EXPECT_EQ(chain.opcodes[0], *movOp);
     EXPECT_EQ(chain.immValues[0], 196608);
+}
+
+// ── D-CSUBSET-BITFIELD-WIDE-UNIT: constants > int32 (the wide-mask
+// dead-end the scoping pass found) materialize by CAPABILITY ──
+//
+// 0xABCDEF1234 = 40-bit, exceeds INT32_MAX, so it does NOT fit the
+// inline imm32 carrier — before FC8 it hit the LiteralPool dead-end (no
+// encoder consumed LiteralIndex). Now: x86_64 emits ONE `mov r64,
+// imm64` (LiteralIndex operand carrying the value); arm64 emits the
+// MOVZ + MOVK ladder (chunk0 0x1234, chunk1 0xCDEF, chunk2 0xAB). The
+// SAME source const routes to two different shapes purely by declared
+// capability — zero `if (arch)`.
+
+// arm64: the wide value (> int32) splits into the ladder. chunks of
+// 0xABCDEF1234: [0]=0x1234, [1]=0xCDEF, [2]=0x00AB, [3]=0. So mov
+// #0x1234 + movk_lsl16 #0xCDEF + movk_lsl32 #0xAB (+ ret) = 4 insts.
+// RED-ON-DISABLE: revert lowerConst's wide-int capability block →
+// 0xABCDEF1234 falls to the pool dead-end → lowering fail-loud → lirR.ok
+// is false → the `EXPECT_TRUE(lirR.ok)` in the helper goes RED.
+TEST(MirToLir, Arm64WideConstAboveInt32SplitsIntoLadder) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp = (*target)->opcodeByMnemonic("mov");
+    auto const mk16  = (*target)->opcodeByMnemonic("movk_lsl16");
+    auto const mk32  = (*target)->opcodeByMnemonic("movk_lsl32");
+    ASSERT_TRUE(movOp.has_value() && mk16.has_value() && mk32.has_value());
+
+    auto const chain = lowerConstChain(
+        static_cast<std::int64_t>(0xABCDEF1234ll), TypeKind::I64, "arm64");
+    ASSERT_EQ(chain.opcodes.size(), 4u)
+        << "0xABCDEF1234 (>int32) must lower as mov + 2 movk + ret";
+    EXPECT_EQ(chain.opcodes[0], *movOp);
+    EXPECT_EQ(chain.immValues[0], 0x1234);
+    EXPECT_EQ(chain.opcodes[1], *mk16);
+    EXPECT_EQ(chain.immValues[1], 0xCDEF);
+    EXPECT_EQ(chain.opcodes[2], *mk32);
+    EXPECT_EQ(chain.immValues[2], 0x00AB);
+}
+
+// x86_64: the SAME wide value (> int32) materializes via the single
+// `mov r64, imm64` — its source operand is a LiteralIndex carrying the
+// full 64-bit value (the inline imm32 carrier can't hold it). RED-ON-
+// DISABLE: revert the wide-int block → pool dead-end → at THIS tier the
+// helper's lowering succeeds but emits the (now unencodable) LiteralIndex
+// shape with no value capture / wrong opcode-count, and the asm tier
+// (the corpus) would fail-loud at encode. Here the litValues capture
+// pins the value made it onto the pool-carried operand.
+TEST(MirToLir, X64WideConstAboveInt32UsesMovImm64) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp = (*target)->opcodeByMnemonic("mov");
+    ASSERT_TRUE(movOp.has_value());
+    EXPECT_FALSE((*target)->opcodeByMnemonic("movk_lsl16").has_value())
+        << "precondition: x86_64 must not declare the arm64 movk family";
+
+    std::uint64_t const wide = 0xABCDEF1234ULL;
+    auto const chain = lowerConstChain(
+        static_cast<std::int64_t>(wide), TypeKind::I64, "x86_64");
+    ASSERT_EQ(chain.opcodes.size(), 2u)
+        << "x86 materializes a >int32 const as ONE mov r64, imm64 + ret";
+    EXPECT_EQ(chain.opcodes[0], *movOp);
+    // The value rides the literal pool (LiteralIndex operand), NOT the
+    // inline imm32 arm.
+    EXPECT_EQ(chain.immValues[0], 0)
+        << "wide const must NOT ride the inline imm32 operand";
+    EXPECT_EQ(chain.litValues[0], wide)
+        << "the full 64-bit value must be carried in the literal pool";
 }
 
 // D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD, the CAPABILITY boundary: arm64's

@@ -99,6 +99,10 @@ filterToLirKind(OperandKindFilter f) noexcept {
         case OperandKindFilter::MemBase:   return LirOperandKind::MemBase;
         case OperandKindFilter::MemOffset: return LirOperandKind::MemOffset;
         case OperandKindFilter::BlockRef:  return LirOperandKind::BlockRef;
+        // D-CSUBSET-BITFIELD-WIDE-UNIT: the wide-pool-literal filter
+        // (JSON `"imm64"`) matches a `LiteralIndex` LIR operand.
+        case OperandKindFilter::LiteralIndex:
+                                           return LirOperandKind::LiteralIndex;
     }
     return std::nullopt;
 }

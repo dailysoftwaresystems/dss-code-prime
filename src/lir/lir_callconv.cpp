@@ -1878,6 +1878,9 @@ materializeCallingConvention(Lir const&           src,
     }
 
     LirBuilder b{schema};
+    // D-CSUBSET-BITFIELD-WIDE-UNIT: carry the wide-literal pool across
+    // the rebuild (LiteralIndex operands reference it by index).
+    lir_pass_util::copyLiteralPool(src, b);
     std::size_t const fnCount = src.moduleFuncCount();
     out.perFunc.reserve(fnCount);
 

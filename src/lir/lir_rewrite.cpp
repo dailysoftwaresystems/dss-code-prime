@@ -425,6 +425,9 @@ rewriteWithAllocation(Lir const&           src,
                       LirAllocation const& alloc,
                       DiagnosticReporter&  reporter) {
     LirBuilder b{schema};
+    // D-CSUBSET-BITFIELD-WIDE-UNIT: carry the wide-literal pool across
+    // the rebuild (LiteralIndex operands reference it by index).
+    lir_pass_util::copyLiteralPool(src, b);
     auto const baseline = reporter.errorCount();
     bool anyFunctionFailed = false;
 

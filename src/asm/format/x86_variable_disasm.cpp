@@ -24,6 +24,29 @@ readImm32LE(std::span<std::uint8_t const> bytes, std::size_t offset) noexcept {
         | (static_cast<std::uint32_t>(bytes[offset + 3]) << 24));
 }
 
+// D-CSUBSET-BITFIELD-WIDE-UNIT: read an 8-byte little-endian uint64
+// starting at `bytes[offset]`. Caller ensures the bounds check. The
+// inverse of `asm_byte_emit::appendU64LE` (the `mov r64, imm64` io
+// field).
+[[nodiscard]] std::uint64_t
+readImm64LE(std::span<std::uint8_t const> bytes, std::size_t offset) noexcept {
+    std::uint64_t v = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        v |= static_cast<std::uint64_t>(bytes[offset + i]) << (8u * i);
+    }
+    return v;
+}
+
+// D-CSUBSET-BITFIELD-WIDE-UNIT: does this variant use the `B8+rd`
+// opcode-plus-register destination form? (The opcode byte's low 3 bits
+// carry the register, so the disasm must match the byte by its high 5
+// bits, not exact-match it.)
+[[nodiscard]] bool
+variantUsesOpcodePlusReg(TargetEncodingVariant const& v) noexcept {
+    return v.resultSlot.has_value()
+        && *v.resultSlot == EncodingSlotKind::OpcodePlusReg;
+}
+
 // Per-variant peel state — mirrors the encoder's EncodingState but
 // inverse. We extract the ordinals the encoder wrote.
 struct DisasmState {
@@ -39,12 +62,25 @@ struct DisasmState {
     std::uint8_t imm8      = 0;
     bool         hasImm8   = false;
     bool         hasDisp32 = false;
+    // D-CSUBSET-BITFIELD-WIDE-UNIT: the 8-byte immediate (mov r64,imm64
+    // io) + the opcode-plus-register destination (B8+rd). `opcodeReg3`
+    // is the low 3 bits peeled from the opcode byte; combined with REX.B
+    // it re-composes the destination's hwEncoding.
+    std::uint64_t imm64        = 0;
+    bool          hasImm64     = false;
+    std::uint8_t  opcodeReg3   = 0;
+    bool          hasOpcodeReg = false;
     // Re-composed hwEncodings (low 3 bits + REX high bit).
     std::uint8_t modRmRegFull() const noexcept {
         return static_cast<std::uint8_t>(modRmReg3 | (hasRexR ? 0x8 : 0));
     }
     std::uint8_t modRmRmFull() const noexcept {
         return static_cast<std::uint8_t>(modRmRm3 | (hasRexB ? 0x8 : 0));
+    }
+    // D-CSUBSET-BITFIELD-WIDE-UNIT: re-compose the opcode-plus-register
+    // destination's hwEncoding (low 3 from the opcode byte + REX.B).
+    std::uint8_t opcodeRegFull() const noexcept {
+        return static_cast<std::uint8_t>(opcodeReg3 | (hasRexB ? 0x8 : 0));
     }
 };
 
@@ -92,9 +128,26 @@ tryMatchPrefix(TargetEncodingVariant const& variant,
     }
 
     // 2) Opcode bytes — must match the variant's declared opcode
-    //    prefix exactly.
-    for (auto const expectedByte : variant.tmpl.opcodeBytes) {
-        if (cursor >= bytes.size() || bytes[cursor] != expectedByte) {
+    //    prefix exactly. EXCEPTION (D-CSUBSET-BITFIELD-WIDE-UNIT): for
+    //    the `B8+rd` opcode-plus-register form, the LAST opcode byte
+    //    carries the destination register's low 3 bits, so it is matched
+    //    by its high 5 bits and the low 3 are peeled into `opcodeReg3`.
+    bool const opcodePlusReg = variantUsesOpcodePlusReg(variant);
+    std::size_t const nOpc = variant.tmpl.opcodeBytes.size();
+    for (std::size_t oi = 0; oi < nOpc; ++oi) {
+        if (cursor >= bytes.size()) return std::nullopt;
+        bool const isLast = (oi + 1 == nOpc);
+        std::uint8_t const expectedByte = variant.tmpl.opcodeBytes[oi];
+        if (opcodePlusReg && isLast) {
+            // The base opcode byte is `expectedByte`; the encoded byte
+            // is `expectedByte | (reg & 7)`. Match the high 5 bits,
+            // peel the low 3.
+            if ((bytes[cursor] & 0xF8u) != (expectedByte & 0xF8u)) {
+                return std::nullopt;
+            }
+            st.opcodeReg3   = static_cast<std::uint8_t>(bytes[cursor] & 0x7u);
+            st.hasOpcodeReg = true;
+        } else if (bytes[cursor] != expectedByte) {
             return std::nullopt;
         }
         ++cursor;
@@ -187,6 +240,17 @@ disassemble(TargetSchema const&            schema,
                 state->imm8 = bytes[cursor];
                 state->hasImm8 = true;
                 cursor += 1;
+            } else if (w.slotKind == EncodingSlotKind::Imm64) {
+                // D-CSUBSET-BITFIELD-WIDE-UNIT: the 8-byte `io` immediate
+                // of `mov r64, imm64` — emitted after any imm8/imm32
+                // (shipped variants carry at most one immediate).
+                if (cursor + 8 > bytes.size()) {
+                    state = std::nullopt;
+                    break;
+                }
+                state->imm64 = readImm64LE(bytes, cursor);
+                state->hasImm64 = true;
+                cursor += 8;
             } else if (w.slotKind == EncodingSlotKind::Disp32) {
                 if (cursor + 4 > bytes.size()) {
                     state = std::nullopt;
@@ -240,6 +304,23 @@ disassemble(TargetSchema const&            schema,
                 case EncodingSlotKind::Imm8:
                     return state->hasImm8
                         ? std::optional<std::int64_t>{state->imm8}
+                        : std::nullopt;
+                // D-CSUBSET-BITFIELD-WIDE-UNIT: the opcode-plus-register
+                // destination (B8+rd) and the 8-byte immediate (io).
+                case EncodingSlotKind::OpcodePlusReg:
+                    return state->hasOpcodeReg
+                        ? std::optional<std::int64_t>{state->opcodeRegFull()}
+                        : std::nullopt;
+                case EncodingSlotKind::Imm64:
+                    // The 64-bit pattern reinterpreted as int64 (the
+                    // round-trip verifier compares the raw bit pattern;
+                    // the LIR side carries the value in the literal pool,
+                    // not on the operand, so the equality check is
+                    // structural — see roundTripVerify's LiteralIndex
+                    // handling).
+                    return state->hasImm64
+                        ? std::optional<std::int64_t>{
+                              static_cast<std::int64_t>(state->imm64)}
                         : std::nullopt;
                 case EncodingSlotKind::Disp32:
                     // Symbol-bearing slot: encoder writes ZEROS at

@@ -16,6 +16,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <span>
+#include <utility>
 #include <vector>
 
 using namespace dss;
@@ -278,6 +280,153 @@ TEST(X86VariableEncoder, MovR12Imm32AlsoDerivesRexB) {
     EXPECT_EQ(bytes[4], 0x00);
     EXPECT_EQ(bytes[5], 0x00);
     EXPECT_EQ(bytes[6], 0x00);
+}
+
+// ── `mov r64, imm64` — REX.W B8+rd io (D-CSUBSET-BITFIELD-WIDE-UNIT) ──
+//
+// The ONLY x86-64 form that loads a >imm32 constant into a register.
+// The wide value rides the LIR literal pool (a `LiteralIndex` operand);
+// the encoder reads it back and emits the 8-byte `io` field. The
+// destination register's low 3 bits ride the opcode byte (B8+rd), its
+// high bit drives REX.B. RED-ON-DISABLE: without the new `mov r64,
+// imm64` variant in x86_64.target.json, the LiteralIndex operand
+// matches no variant → A_NoMatchingEncodingVariant (the dead-end the
+// scoping pass found).
+
+namespace {
+// Build a `mov <dstReg>, imm64` LIR inst whose source is a 64-bit pool
+// literal, assemble it, and return the function bytes (with a trailing
+// ret the caller slices off).
+[[nodiscard]] std::vector<std::uint8_t>
+movRegImm64Bytes(TargetSchema const& schema, std::string_view dstName,
+                 std::uint64_t value, DiagnosticReporter& rep) {
+    auto const movOp  = schema.opcodeByMnemonic("mov");
+    auto const dstOrd = schema.registerByName(dstName);
+    EXPECT_TRUE(movOp.has_value());
+    EXPECT_TRUE(dstOrd.has_value());
+    LirReg const dst{static_cast<std::uint32_t>(*dstOrd), 1,
+                     static_cast<std::uint8_t>(LirRegClass::GPR)};
+    Lir lir = buildSingleFnLirWithRet(schema, [&](LirBuilder& b) {
+        LirLiteralValue lit;
+        lit.value = value;
+        std::uint32_t const idx = b.literalPoolAdd(std::move(lit));
+        LirOperand const ops[] = { LirOperand::makeLiteralIndex(idx) };
+        // width-default flags (0) = 64-bit; the imm64 variant is
+        // width-64-keyed and 64 is the lirInstWidthBits default.
+        (void)b.addInst(*movOp, dst, ops);
+    });
+    return assembleFirstFn(lir, schema, rep);
+}
+} // namespace
+
+TEST(X86VariableEncoder, MovRaxImm64Emits48_B8_EightLEBytes) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    DiagnosticReporter rep;
+    // mov rax, 0xFFFFFFFFFF (40-bit, > int32) =
+    //   REX.W (0x48) + B8+rax(0) (0xB8) + 8 LE bytes
+    //   (FF FF FF FF FF 00 00 00); then ret = 0xC3.
+    auto const bytes = movRegImm64Bytes(**schema, "rax", 0xFFFFFFFFFFULL, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(bytes.size(), 11u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0xB8);
+    EXPECT_EQ(bytes[2], 0xFF);
+    EXPECT_EQ(bytes[3], 0xFF);
+    EXPECT_EQ(bytes[4], 0xFF);
+    EXPECT_EQ(bytes[5], 0xFF);
+    EXPECT_EQ(bytes[6], 0xFF);
+    EXPECT_EQ(bytes[7], 0x00);
+    EXPECT_EQ(bytes[8], 0x00);
+    EXPECT_EQ(bytes[9], 0x00);
+    EXPECT_EQ(bytes[10], 0xC3);  // ret
+}
+
+TEST(X86VariableEncoder, MovR14Imm64DerivesRexB_49_BE) {
+    // dest=r14 (hwEncoding=14): low 3 bits = 6 → opcode byte B8|6 = 0xBE;
+    // high bit = 1 → REX.B. REX = 0x48 | B(1) = 0x49. Boundary: the
+    // opcode-plus-reg low-3 OR + REX.B derivation, both exercised.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    DiagnosticReporter rep;
+    auto const bytes = movRegImm64Bytes(**schema, "r14", 0xABCDEF1234ULL, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(bytes.size(), 11u);
+    EXPECT_EQ(bytes[0], 0x49);  // REX.W + REX.B
+    EXPECT_EQ(bytes[1], 0xBE);  // B8 | (14 & 7)=6
+    EXPECT_EQ(bytes[2], 0x34);
+    EXPECT_EQ(bytes[3], 0x12);
+    EXPECT_EQ(bytes[4], 0xEF);
+    EXPECT_EQ(bytes[5], 0xCD);
+    EXPECT_EQ(bytes[6], 0xAB);
+    EXPECT_EQ(bytes[7], 0x00);
+    EXPECT_EQ(bytes[8], 0x00);
+    EXPECT_EQ(bytes[9], 0x00);
+    EXPECT_EQ(bytes[10], 0xC3);
+}
+
+TEST(X86VariableEncoder, MovR8Imm64LowBitsZero_49_B8) {
+    // r8 (hwEncoding=8): low 3 bits = 0 → opcode byte stays 0xB8; high
+    // bit = 1 → REX.B. The case an `& 7` off-by-one or a missing REX.B
+    // would silently decode as rax. A full 64-bit value with the high
+    // byte set pins all 8 immediate bytes.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    DiagnosticReporter rep;
+    auto const bytes = movRegImm64Bytes(**schema, "r8",
+                                        0x8000000000000001ULL, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(bytes.size(), 11u);
+    EXPECT_EQ(bytes[0], 0x49);  // REX.W + REX.B
+    EXPECT_EQ(bytes[1], 0xB8);  // B8 | (8 & 7)=0
+    EXPECT_EQ(bytes[2], 0x01);
+    EXPECT_EQ(bytes[3], 0x00);
+    EXPECT_EQ(bytes[4], 0x00);
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
+    EXPECT_EQ(bytes[7], 0x00);
+    EXPECT_EQ(bytes[8], 0x00);
+    EXPECT_EQ(bytes[9], 0x80);
+    EXPECT_EQ(bytes[10], 0xC3);
+}
+
+TEST(X86VariableEncoder, MovImm64RoundTripsThroughDisasm) {
+    // The round-trip oracle must recover the wide value (B8+rd opcode-
+    // plus-reg + 8-byte io decode). RED-ON-DISABLE: a disasm that
+    // mis-peeled the opcode-reg low 3 bits or mis-read the 8 imm bytes
+    // would fire A_RoundTripMismatch.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    std::uint64_t const value = 0xF00000FFFFFFFFFFULL;
+    LirBuilder b{**schema};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    auto const movOp  = (*schema)->opcodeByMnemonic("mov");
+    auto const r14Ord = (*schema)->registerByName("r14");
+    ASSERT_TRUE(movOp.has_value() && r14Ord.has_value());
+    LirReg const r14{static_cast<std::uint32_t>(*r14Ord), 1,
+                     static_cast<std::uint8_t>(LirRegClass::GPR)};
+    LirLiteralValue lit; lit.value = value;
+    std::uint32_t const idx = b.literalPoolAdd(std::move(lit));
+    LirOperand const ops[] = { LirOperand::makeLiteralIndex(idx) };
+    LirInstId const movInst = b.addInst(*movOp, r14, ops);
+    auto const retOp = (*schema)->opcodeByMnemonic("ret");
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    DiagnosticReporter rep;
+    auto const result = assemble(lir, **schema, lirToMir, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(result.functions.size(), 1u);
+    auto const& bytes = result.functions[0].bytes;
+    // The mov is the first instruction; slice off its 10 bytes
+    // (REX + opcode + 8 imm) for the round-trip verify.
+    ASSERT_GE(bytes.size(), 10u);
+    std::span<std::uint8_t const> const movBytes{bytes.data(), 10u};
+    EXPECT_TRUE(roundTripVerify(**schema, lir, movInst, movBytes, rep));
+    EXPECT_EQ(rep.errorCount(), 0u);
 }
 
 // ── `sext` (movsxd r64, r/m32) — REX.W 0x63 /r ──────────────────────

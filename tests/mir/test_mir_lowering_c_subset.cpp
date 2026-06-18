@@ -1394,6 +1394,71 @@ TEST(MirLoweringCSubset, BitFieldReadExtractsAndWriteIsReadModifyWrite) {
     EXPECT_GE(countIn(1, MirOpcode::Store), 1) << "RMW stores the merged unit";
 }
 
+// FC8 D-CSUBSET-BITFIELD-WIDE-UNIT: a bit-field on a 64-BIT BASE
+// (`unsigned long long` / `long long` → a 64-bit allocation unit) now
+// COMPILES + LOWERS end-to-end. Before FC8 the semantic analyzer
+// REJECTED it (`S_BitFieldWidthOutOfRange` via the `typeBits > 32`
+// guard) because materializing the >int32 extract/insert masks hit a
+// literal-pool dead-end; FC8 closed that (x86 `mov r64, imm64` / arm64
+// MOVZ+MOVK ladder), so the guard is now `typeBits > 64` (I128/U128
+// still rejected). This is the SEMANTIC FLIP: the same shape that was a
+// reject is now a clean compile. RED-ON-DISABLE: restore the
+// `typeBits > 32` guard in resolveBitfieldSuffix → `model.hasErrors()`
+// becomes true (the field is rejected) → the `ASSERT_FALSE` goes RED.
+// The extract/insert chain (a 40-bit field at bitOffset 0, mask
+// 0xFFFFFFFFFF) lowers exactly like the 32-bit case — Load + And on
+// read, RMW And/Shl/Or/Store on write — just at 64-bit width.
+TEST(MirLoweringCSubset, WideUnitBitFieldOnLongLongBaseCompilesAndLowers) {
+    auto L = lowerCSubset(
+        "struct W { unsigned long long a : 40; unsigned long long b : 20; "
+        "long long s : 36; };\n"
+        "unsigned long long read_a(struct W* p) { return p->a; }\n"
+        "long long read_s(struct W* p) { return p->s; }\n"
+        "void set_a(struct W* p, unsigned long long v) { p->a = v; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "a 64-bit-base bit-field must now COMPILE (the wide-unit anchor "
+           "closed) — restoring the typeBits>32 guard turns this RED";
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto countIn = [&](std::uint32_t fnIdx, MirOpcode op) {
+        MirBlockId const entry = m.funcEntry(m.funcAt(fnIdx));
+        int n = 0;
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i)
+            if (m.instOpcode(m.blockInstAt(entry, i)) == op) ++n;
+        return n;
+    };
+    // read_a (fn 0): a 40-bit unsigned field at bitOffset 0 — masks the
+    // width (And); a is the low field so no shift needed for read but the
+    // And mask (0xFFFFFFFFFF) is the wide-constant witness.
+    EXPECT_GE(countIn(0, MirOpcode::And), 1) << "wide read masks the field width";
+    // read_s (fn 1): a SIGNED field sign-extends via Shl + AShr.
+    EXPECT_GE(countIn(1, MirOpcode::Shl), 1)  << "signed wide read sign-extends (Shl)";
+    EXPECT_GE(countIn(1, MirOpcode::AShr), 1) << "signed wide read sign-extends (AShr)";
+    // set_a (fn 2): read-modify-write → And (clear + mask) + Or + Store.
+    EXPECT_GE(countIn(2, MirOpcode::And), 2)   << "wide RMW clears the field AND masks the value";
+    EXPECT_GE(countIn(2, MirOpcode::Or), 1)    << "wide RMW ORs the value back";
+    EXPECT_GE(countIn(2, MirOpcode::Store), 1) << "wide RMW stores the merged unit";
+}
+
+// FC8 D-CSUBSET-BITFIELD-WIDE-UNIT: a width EXCEEDING the 64-bit base
+// stays REJECTED — the `*w > typeBits` check (typeBits=64 for long long)
+// fires for `long long s : 100`. This pins the UPPER bound the wide-unit
+// lift did NOT remove: 64 is the new ceiling for the BASE, and a width
+// larger than the base is still out of range. RED-ON-DISABLE: removing
+// the `*w > typeBits` check would let `: 100` compile → hasErrors false →
+// RED. (A 128-bit BASE — I128/U128 — is also rejected by the
+// `typeBits > 64` guard, but `__int128` is not in the c-subset's spelled
+// type set, so the BASE-128 path is unreachable from source and pinned
+// by the guard logic + comment rather than a corpus.)
+TEST(MirLoweringCSubset, WideUnitBitFieldWidthAboveBaseStaysRejected) {
+    auto L = lowerCSubset(
+        "struct H { long long s : 100; };\n"
+        "int main(void) { return 0; }\n");
+    EXPECT_TRUE(L.model.hasErrors())
+        << "a bit-field width exceeding its 64-bit base must stay rejected";
+}
+
 // FC8 D-CSUBSET-BITFIELD-INIT: aggregate INITIALIZATION of a bit-field struct
 // (`struct S s = {1,2};`) now LOWERS with per-allocation-unit PACKING (replacing
 // the cycle-2 fail-loud). Two co-resident bit-fields a:3,b:5 share unit 0, so the

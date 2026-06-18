@@ -68,6 +68,10 @@ legalizeTwoAddress(Lir const&          src,
 
     PassState state{schema};
     LirBuilder b{schema};
+    // D-CSUBSET-BITFIELD-WIDE-UNIT: carry the wide-literal pool across
+    // the rebuild — `LiteralIndex` operands copied below reference it by
+    // index (e.g. the `mov r64, imm64` carrier for a 64-bit constant).
+    lir_pass_util::copyLiteralPool(src, b);
 
     std::size_t const funcCount = src.moduleFuncCount();
     for (std::uint32_t fi = 0; fi < funcCount; ++fi) {

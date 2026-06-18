@@ -118,6 +118,11 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::RipRelDisp32:
         case EncodingSlotKind::CondCodeNibble:
         case EncodingSlotKind::BlockRel32:
+        // D-CSUBSET-BITFIELD-WIDE-UNIT: `mov r64, imm64` slots are
+        // x86-variable (opcode-byte register + 8-byte immediate); no
+        // fixed32 bit-window.
+        case EncodingSlotKind::OpcodePlusReg:
+        case EncodingSlotKind::Imm64:
             return std::nullopt;
     }
     // Unreachable for any in-range EncodingSlotKind — the switch above
