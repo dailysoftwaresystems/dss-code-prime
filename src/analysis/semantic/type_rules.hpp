@@ -84,6 +84,11 @@ namespace detail::type_rules {
 //   are deliberately NOT assignable; languages requiring them widen
 //   their config (typeShapes / numeric-promotion table) rather than
 //   getting silent C-style implicit conversions.
+//   NOTE (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT): c-subset's C-conformant
+//   signed↔unsigned implicit-conversion opt-in (C 6.3.1.3/6.5.16.1, needed
+//   for SQLite's int/unsigned mixing) is a DEFERRED config gate following the
+//   charConvertsToArith/enumConvertsToArith pattern — do NOT silently relax
+//   this strict default here; add the gate + thread it to the 4 callers.
 //
 // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): when the
 // caller supplies a `PointerConversionRules` block from the active
