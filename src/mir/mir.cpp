@@ -215,6 +215,9 @@ SymbolId Mir::globalAddrSymbol(MirInstId id) const {
 std::uint32_t Mir::intrinsicId(MirInstId id) const {
     return payloadForOpcode_(instArena_.at(id), MirOpcode::IntrinsicCall, id, "intrinsicId");
 }
+std::uint32_t Mir::returnPieceOrdinal(MirInstId id) const {
+    return payloadForOpcode_(instArena_.at(id), MirOpcode::ReturnPiece, id, "returnPieceOrdinal");
+}
 
 MirFuncId Mir::blockFunc(MirBlockId id) const {
     return MirFuncId{blockArena_.at(id).func, this->id().v};
@@ -642,6 +645,32 @@ MirInstId MirBuilder::addArg(std::uint32_t paramIndex, TypeId type, MirInstFlags
     return appendInst_(pod, {}, /*terminates=*/false);
 }
 
+MirInstId MirBuilder::addReturnPiece(MirInstId call, std::uint32_t ordinal,
+                                     TypeId pieceType, MirInstFlags flags) {
+    if (!pieceType.valid()) requireValueType_("addReturnPiece");
+    if (!call.valid()) {
+        std::fputs("dss::MirBuilder fatal: addReturnPiece: call operand must be valid\n",
+                   stderr);
+        std::abort();
+    }
+    detail::MirInst pod;
+    pod.opcode  = MirOpcode::ReturnPiece;
+    pod.flags   = flags;
+    pod.typeId  = pieceType;
+    pod.payload = ordinal;
+    MirInstId const operands[] = {call};
+    return appendInst_(pod, operands, /*terminates=*/false);
+}
+
+MirInstId MirBuilder::addReadIndirectResult(TypeId pointerType, MirInstFlags flags) {
+    if (!pointerType.valid()) requireValueType_("addReadIndirectResult");
+    detail::MirInst pod;
+    pod.opcode = MirOpcode::ReadIndirectResult;
+    pod.flags  = flags;
+    pod.typeId = pointerType;
+    return appendInst_(pod, {}, /*terminates=*/false);
+}
+
 MirInstId MirBuilder::addConst(MirLiteralValue value, TypeId type, MirInstFlags flags) {
     if (!type.valid()) requireValueType_("addConst");
     std::uint32_t const index = literalPool_.add(std::move(value));
@@ -822,6 +851,14 @@ MirInstId MirBuilder::addReturn(std::optional<MirInstId> value) {
     // No CFG edges, but route through recordSuccessors_ for symmetry with the
     // other terminators — the descriptor row is now the single source of truth
     // for every terminator's edge count, even the zero-edge ones.
+    recordSuccessors_(MirOpcode::Return, {});
+    return id;
+}
+
+MirInstId MirBuilder::addReturnMulti(std::span<MirInstId const> values) {
+    detail::MirInst pod;
+    pod.opcode = MirOpcode::Return;
+    MirInstId const id = appendInst_(pod, values, /*terminates=*/true);
     recordSuccessors_(MirOpcode::Return, {});
     return id;
 }

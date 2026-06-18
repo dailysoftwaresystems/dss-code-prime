@@ -962,7 +962,8 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
     // merged module has no surviving externs — the extern-call dispatch is
     // never consumed (nullopt is the faithful value; a guard fires only if
     // an extern import survives without one). D-FFI-EXTERN-CALL-DISPATCH.
-    auto mod = lowerMergedToAssembly(*merged, *grammar, **targetR, ccIndex,
+    auto mod = lowerMergedToAssembly(*merged, *grammar, **targetR,
+                                     (*formatR)->dataModel(), ccIndex,
                                      cuMirs[0].cuId, std::nullopt, rep);
     ASSERT_TRUE(mod.has_value()) << "errorCount=" << rep.errorCount();
 

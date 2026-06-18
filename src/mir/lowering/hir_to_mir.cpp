@@ -1,5 +1,6 @@
 #include "mir/lowering/hir_to_mir.hpp"
 
+#include "core/types/aggregate_abi.hpp"
 #include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
@@ -76,6 +77,22 @@ struct Lowerer {
     // `Ref` reads emit `Load(alloca)`; `AssignStmt` writes emit `Store(value,
     // alloca)`; `AddressOf(Ref(sym))` returns the alloca itself.
     std::unordered_map<std::uint32_t, MirInstId> addressableLocal;
+    // FC7 (D-FC7-MEMBER-ACCESS): per-CU memoized struct/union layouts keyed
+    // by TypeId.v. `computeLayout` is PURE and a TypeId's layout is
+    // invariant within the CU (one interner + one target config), so this
+    // caches across functions and is never cleared. Read by
+    // `fieldByteOffset` (member-access offset resolution) and
+    // `aggregateByteSize` (aggregate-local Alloca sizing).
+    std::unordered_map<std::uint32_t, StructLayout> layoutCache_;
+    // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): per-function by-value return
+    // state, reset at the top of each `lowerFunction`. `currentFnResult_` is the
+    // enclosing function's result type — a `ReturnStmt` needs it to classify a
+    // by-value struct/union return (its only other access is the FnSig in
+    // lowerFunction). `sretPtr_` is the hidden result pointer when the return is
+    // class MEMORY (>16B, ByReference): the ReturnStmt copies the result through
+    // it and returns it. InvalidMirInst for a scalar or in-register (≤16B) return.
+    TypeId    currentFnResult_{};
+    MirInstId sretPtr_{};
     // Set of module-level function symbols. A pre-pass populates this so a
     // direct `Call` whose callee is a `Ref` to a forward-declared function
     // resolves cleanly. The actual MirFuncId is irrelevant during lowering —
@@ -534,7 +551,92 @@ struct Lowerer {
                 std::vector<MirInstId> operands;
                 operands.reserve(kids.size());
                 operands.push_back(callee);
+                // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a struct/union
+                // RETURN by value is classified + synthesized below, AFTER the
+                // callee-variadic resolution (the sret hidden pointer prepends the
+                // first arg, so it must be in place before the arg loop runs).
+                // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): resolve whether the
+                // callee is variadic (through one Ptr wrapper) BEFORE lowering
+                // args, so a by-value struct ARG to a variadic function is
+                // fail-loud this phase (its register-piece expansion would
+                // desync the prefix-sum Arg-ordinal accounting from variadic
+                // marshalling — FC12). The callPayload block below recomputes
+                // this for the variadic-count stamp; kept separate to avoid
+                // perturbing that audited path.
+                TypeId byvalCalleeSig = hir.typeId(kids[0]);
+                if (byvalCalleeSig.valid()
+                    && interner.kind(byvalCalleeSig) == TypeKind::Ptr) {
+                    auto const w = interner.operands(byvalCalleeSig);
+                    if (!w.empty()) byvalCalleeSig = w[0];
+                }
+                bool const calleeVariadic =
+                    byvalCalleeSig.valid()
+                    && interner.kind(byvalCalleeSig) == TypeKind::FnSig
+                    && interner.fnIsVariadic(byvalCalleeSig);
+                // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value
+                // struct/union RETURN. Classify it; allocate the result slot `R`;
+                // for sret (class MEMORY, >16B) prepend `R` as the hidden first
+                // arg so the arg loop below appends the real args AFTER it (the
+                // callee receives the pointer as arg 0 and writes the result
+                // through it). The `abi` + `R` are consumed at the Call-emit site.
+                std::optional<AbiPassing> structRetAbi;
+                MirInstId structRetSlot = InvalidMirInst;
+                if (t.valid()
+                    && (interner.kind(t) == TypeKind::Struct
+                        || interner.kind(t) == TypeKind::Union)) {
+                    structRetAbi = byValueClassify(t);
+                    if (!structRetAbi.has_value()) {
+                        unsupported(node,
+                            "returning a by-value struct/union is not supported "
+                            "by this target's calling convention "
+                            "(D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                        return InvalidMirInst;
+                    }
+                    structRetSlot = freshAggregateTemp(t);
+                    if (!structRetSlot.valid()) {
+                        unsupported(node,
+                            "by-value struct/union return requires a sizeable "
+                            "layout (complete type)");
+                        return InvalidMirInst;
+                    }
+                    if (structRetAbi->kind == AbiPassing::Kind::ByReference)
+                        operands.push_back(structRetSlot);  // hidden sret pointer
+                }
                 for (std::size_t i = 1; i < kids.size(); ++i) {
+                    TypeId const argTy = hir.typeId(kids[i]);
+                    if (argTy.valid()) {
+                        TypeKind const ak = interner.kind(argTy);
+                        if (ak == TypeKind::Struct || ak == TypeKind::Union) {
+                            // Classify + synthesize the by-value struct arg into
+                            // register pieces / a by-ref pointer. Variadic or an
+                            // unimplemented CC strategy ⇒ fail loud (never a
+                            // silent wrong-ABI pass).
+                            if (calleeVariadic) {
+                                unsupported(kids[i],
+                                    "passing a struct/union BY VALUE to a "
+                                    "variadic function is not yet supported "
+                                    "(D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                                return InvalidMirInst;
+                            }
+                            auto const abi = byValueClassify(argTy);
+                            if (!abi.has_value()) {
+                                unsupported(kids[i],
+                                    "passing a struct/union BY VALUE is not "
+                                    "supported by this target's calling "
+                                    "convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                                return InvalidMirInst;
+                            }
+                            // FC7 C1b: the caller pushes each eightbyte piece as
+                            // a scalar Call operand IN ORDER; lir_callconv assigns
+                            // them to consecutive per-class arg registers. No
+                            // multi-register guard — the callee's per-class Arg
+                            // counter + the verifier's physical-arg-count bound
+                            // (D-FC7-SYSV-STRUCT-ARG-MULTIREG) now handle >1 piece.
+                            if (!appendByValueArg(operands, kids[i], argTy, *abi))
+                                return InvalidMirInst;
+                            continue;
+                        }
+                    }
                     MirInstId const arg = lowerExpr(kids[i]);
                     if (!arg.valid()) return InvalidMirInst;
                     operands.push_back(arg);
@@ -588,6 +690,24 @@ struct Lowerer {
                     callPayload = ::dss::call_payload::encode(
                         true, static_cast<std::uint32_t>(fixedSz));
                 }
+                // FC7 C3 (AAPCS64/Apple x8 sret): when the by-value aggregate
+                // RETURN is class-MEMORY (ByReference) AND this CC carries the
+                // result pointer in a dedicated indirect-result register (x8, not
+                // a hidden arg), flag the call so lir_callconv ROUTES the prepended
+                // sret-pointer operand (operands[1]) to the IRR instead of arg0,
+                // and shifts the real-arg index past it. Bit-30; independent of the
+                // variadic bits already encoded above.
+                if (structRetAbi.has_value()
+                    && structRetAbi->kind == AbiPassing::Kind::ByReference
+                    && !config.aggregateSretViaHiddenArg)
+                    callPayload |= ::dss::call_payload::kIndirectResultBit;
+                // FC7 C1c: a by-value struct/union return materializes the call
+                // into its result slot `R` (sret pointer or eightbyte pieces) and
+                // yields `R`'s address — the aggregate-by-address value the
+                // consumers (assign/arg/member/return) expect.
+                if (structRetAbi.has_value())
+                    return emitStructReturningCall(node, operands, callPayload,
+                                                   *structRetAbi, structRetSlot);
                 return mir.addInst(MirOpcode::Call, operands, t, callPayload);
             }
             case HirKind::IntrinsicCall: {
@@ -940,9 +1060,83 @@ struct Lowerer {
             return InvalidMirInst;
         }
         TypeId const ptrTy = interner.pointer(ty);
-        MirInstId const a = mir.addInst(MirOpcode::Alloca, {}, ptrTy);
+        // FC7 (D-FC7-MEMBER-ACCESS): a struct/union/ARRAY local reserves its
+        // FULL layout size in the frame, not one scalar slot. Encode the byte
+        // size in the Alloca payload (the channel ML6 anticipated; the LIR
+        // callconv sums per-alloca slots from it — payload 0 = the scalar
+        // "one slot" sentinel). An aggregate whose size is unavailable
+        // (no aggregateLayout / un-sizeable type) fails LOUD — never a
+        // silently under-sized slot, which would corrupt the neighbour.
+        // ARRAY locals are sized here too (D-MIR-STORAGE-ARRAY-INDEX-GEP): this
+        // cycle makes them runnable (index + brace-init), so a bare `int a[4]`
+        // must reserve 16 bytes, not the 8-byte scalar sentinel.
+        std::uint32_t allocaPayload = 0;
+        TypeKind const tk = interner.kind(ty);
+        if (tk == TypeKind::Struct || tk == TypeKind::Union
+            || tk == TypeKind::Array) {
+            auto const sz = aggregateByteSize(ty);
+            if (!sz.has_value()) {
+                unsupported(anchor, "aggregate/array local requires a sizeable "
+                                    "layout (target 'aggregateLayout' params "
+                                    "and a complete type)");
+                return InvalidMirInst;
+            }
+            if (*sz > std::numeric_limits<std::uint32_t>::max()) {
+                unsupported(anchor, "aggregate/array local size exceeds the "
+                                    "32-bit frame-slot payload encoding");
+                return InvalidMirInst;
+            }
+            allocaPayload = static_cast<std::uint32_t>(*sz);
+        }
+        MirInstId const a =
+            mir.addInst(MirOpcode::Alloca, {}, ptrTy, allocaPayload);
         addressableLocal[sym.v] = a;
         return a;
+    }
+
+    // FC7 (D-FC7-MEMBER-ACCESS): the cached layout of aggregate `aggTy`, or
+    // nullptr — the fail-loud signal the caller turns into a positioned
+    // diagnostic — when the target declared no `aggregateLayout` OR the type
+    // is incomplete / un-sizeable. Memoized in `layoutCache_`.
+    [[nodiscard]] StructLayout const* cachedLayout(TypeId aggTy) {
+        if (!config.aggregateLayoutLoaded) return nullptr;
+        if (auto it = layoutCache_.find(aggTy.v); it != layoutCache_.end())
+            return &it->second;
+        auto layout = computeLayout(aggTy, interner, config.aggregateLayout,
+                                    config.dataModel);
+        if (!layout) return nullptr;
+        return &layoutCache_.emplace(aggTy.v, std::move(*layout)).first->second;
+    }
+
+    // The byte offset of field `fieldIdx` within `aggTy`, or nullopt (caller
+    // fail-louds) when the layout is unavailable OR `fieldIdx` is out of
+    // range (a malformed HIR / field-count desync — never an OOB read).
+    [[nodiscard]] std::optional<std::uint64_t>
+    fieldByteOffset(TypeId aggTy, std::uint32_t fieldIdx) {
+        StructLayout const* layout = cachedLayout(aggTy);
+        if (layout == nullptr) return std::nullopt;
+        if (fieldIdx >= layout->fieldOffsets.size()) return std::nullopt;
+        return layout->fieldOffsets[fieldIdx];
+    }
+
+    // The total byte size of `aggTy`, or nullopt (caller fail-louds) — the
+    // Alloca payload for a struct/union local (D-FC7 frame sizing).
+    [[nodiscard]] std::optional<std::uint64_t> aggregateByteSize(TypeId aggTy) {
+        StructLayout const* layout = cachedLayout(aggTy);
+        if (layout == nullptr) return std::nullopt;
+        return layout->size;
+    }
+
+    // The byte STRIDE of an array/pointer element of type `elemTy` — the
+    // multiplier that turns an element index into a byte offset (Option A,
+    // D-MIR-STORAGE-ARRAY-INDEX-GEP). `computeLayout` sizes ANY type: a scalar
+    // (int→4, a pointer→8) via the dataModel, an aggregate (incl. tail padding
+    // = the C array stride) via the layout params. nullopt (caller fail-louds)
+    // when the element type is incomplete / the target declared no layout.
+    [[nodiscard]] std::optional<std::uint64_t> elementStride(TypeId elemTy) {
+        StructLayout const* layout = cachedLayout(elemTy);
+        if (layout == nullptr) return std::nullopt;
+        return layout->size;
     }
 
     // Resolve the ADDRESS of an lvalue expression — the pointer value a
@@ -956,6 +1150,20 @@ struct Lowerer {
     // Returns `InvalidMirInst` on failure.
     [[nodiscard]] MirInstId lowerLvalueAddress(HirNodeId node) {
         HirKind const k = hir.kind(node);
+        // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value struct/union-
+        // returning CALL is an aggregate rvalue materialized into a result slot;
+        // its lvalue address IS that slot. `lowerExpr(Call)` does the
+        // materialization and yields the slot address, so every aggregate
+        // consumer (`a = f()`, `g(f())`, `f().x`, `return f();`) reaches the
+        // result by address (the call is emitted exactly once — see the
+        // call-once pin). A scalar call is not an lvalue → falls through.
+        if (k == HirKind::Call) {
+            TypeId const ct = hir.typeId(node);
+            if (ct.valid()
+                && (interner.kind(ct) == TypeKind::Struct
+                    || interner.kind(ct) == TypeKind::Union))
+                return lowerExpr(node);
+        }
         if (k == HirKind::Ref) {
             std::uint32_t const sym = hir.payload(node);
             if (auto it = addressableLocal.find(sym);
@@ -1011,11 +1219,15 @@ struct Lowerer {
             }
             MirInstId const basePtr = lowerLvalueAddress(kids[0]);
             if (!basePtr.valid()) return InvalidMirInst;
-            // GEP carries indices as operands. For a struct field, the
-            // canonical shape is [basePtr, const-0, const-fieldIndex] —
-            // the leading 0 walks "through" the pointer to the struct,
-            // the fieldIndex picks the field. The HIR node's typeId is
-            // the field's type; the GEP result is `pointer(fieldType)`.
+            // FC7 (D-FC7-MEMBER-ACCESS): resolve the field's BYTE OFFSET via
+            // the FC6 `computeLayout` engine and emit a 2-op base+disp GEP
+            // `[basePtr, Const(byteOffset)]` — which MIR→LIR lowers to the
+            // base+disp `lea` BOTH targets ship (x86 lea [base+disp32] /
+            // arm64 ADD Xd,Xn,#imm12). The aggregate TypeId is `basePtr`'s
+            // pointee (basePtr : pointer(aggTy)); the HIR node's typeId is
+            // the FIELD type, so the GEP result is `pointer(fieldType)`.
+            // (Replaces the prior field-INDEX GEP `[basePtr, 0, fieldIdx]`,
+            // whose 3-op shape MIR→LIR never realized.)
             std::uint32_t const fieldIdx = hir.payload(node);
             TypeId const fieldTy = hir.typeId(node);
             if (!fieldTy.valid()) {
@@ -1023,10 +1235,27 @@ struct Lowerer {
                                    "(HIR verifier should have flagged)");
                 return InvalidMirInst;
             }
-            MirInstId const zero    = constInt(0);
-            MirInstId const fieldK  = constInt(fieldIdx);
-            if (!zero.valid() || !fieldK.valid()) return InvalidMirInst;
-            std::array<MirInstId, 3> ops{basePtr, zero, fieldK};
+            // The aggregate TypeId is the BASE child's HIR type (`s` →
+            // struct S; `*p` → struct S; `a.b` → struct B; `arr[i]` →
+            // struct Elem) — robust across every nested/indexed base shape.
+            TypeId const aggTy = hir.typeId(kids[0]);
+            if (!aggTy.valid()) {
+                unsupported(node, "MemberAccess base has no type "
+                                   "(HIR verifier should have flagged)");
+                return InvalidMirInst;
+            }
+            auto const byteOffset = fieldByteOffset(aggTy, fieldIdx);
+            if (!byteOffset.has_value()) {
+                unsupported(node, "MemberAccess field-offset resolution failed "
+                                   "(target lacks 'aggregateLayout', the "
+                                   "aggregate is un-sizeable, or the field "
+                                   "index is out of range)");
+                return InvalidMirInst;
+            }
+            MirInstId const offK =
+                constInt(static_cast<std::int64_t>(*byteOffset));
+            if (!offK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> ops{basePtr, offK};
             return mir.addInst(MirOpcode::Gep, ops, interner.pointer(fieldTy));
         }
         if (k == HirKind::Index) {
@@ -1053,17 +1282,31 @@ struct Lowerer {
             TypeId const resTy = interner.pointer(elemTy);
             MirInstId const idx = lowerExpr(kids[1]);
             if (!idx.valid()) return InvalidMirInst;
+            // Option A (D-MIR-STORAGE-ARRAY-INDEX-GEP, user §B 2026-06-17):
+            // pre-scale the element index to a BYTE offset so the Gep index is
+            // uniformly bytes (matching the struct-field const-disp form). Both
+            // the pointer and storage arms funnel through scaleIndexToBytes —
+            // the ONE site element scaling is applied (also fixes the latent
+            // non-`char` `p[i]` scale-1 miscompile).
+            TypeId const indexTy = hir.typeId(kids[1]);
+            MirInstId const byteIdx =
+                scaleIndexToBytes(idx, elemTy, node, indexTy);
+            if (!byteIdx.valid()) return InvalidMirInst;
             if (baseKind == TypeKind::Ptr) {
                 MirInstId const basePtr = lowerExpr(kids[0]);
                 if (!basePtr.valid()) return InvalidMirInst;
-                std::array<MirInstId, 2> ops{basePtr, idx};
+                std::array<MirInstId, 2> ops{basePtr, byteIdx};
                 return mir.addInst(MirOpcode::Gep, ops, resTy);
             }
+            // Storage (array/struct) base: the lvalue address IS the base; the
+            // vestigial leading `0` of the old 3-op form (stepping through the
+            // pointer-to-array, contributing 0 bytes) is dropped — base+byteIdx
+            // is exact. Both arms now emit the same 2-op byte-offset Gep; the
+            // 3-op form is no longer produced (its LIR arm stays defensively
+            // fail-loud).
             MirInstId const basePtr = lowerLvalueAddress(kids[0]);
             if (!basePtr.valid()) return InvalidMirInst;
-            MirInstId const zero = constInt(0);
-            if (!zero.valid()) return InvalidMirInst;
-            std::array<MirInstId, 3> ops{basePtr, zero, idx};
+            std::array<MirInstId, 2> ops{basePtr, byteIdx};
             return mir.addInst(MirOpcode::Gep, ops, resTy);
         }
         unsupported(node, std::format(
@@ -1084,6 +1327,56 @@ struct Lowerer {
         lit.core  = TypeKind::I32;
         TypeId const i32 = interner.primitive(TypeKind::I32);
         return mir.addConst(std::move(lit), i32);
+    }
+
+    // An integer constant whose width matches `ty`'s integer kind. The
+    // stride-scaling `Mul` (scaleIndexToBytes) must have same-width operands:
+    // `constInt` is I32-only, so a 64-bit index (`long`/pointer subscript)
+    // would otherwise form a mixed-width `Mul(idxI64, constI32)` the verifier
+    // does not catch. `ty` must be an integer type (an array subscript is
+    // integer per the front-end); falls back to I32 if absent.
+    [[nodiscard]] MirInstId constIntOfType(std::int64_t v, TypeId ty) {
+        TypeKind const k = ty.valid() ? interner.kind(ty) : TypeKind::I32;
+        MirLiteralValue lit;
+        lit.value = v;
+        lit.core  = k;
+        return mir.addConst(std::move(lit), interner.primitive(k));
+    }
+
+    // Pre-multiply an element index by its element STRIDE so the resulting
+    // Gep index operand is a BYTE offset (Option A — agnostic MIR scaling,
+    // D-MIR-STORAGE-ARRAY-INDEX-GEP, user §B 2026-06-17; the LIR `lea` keeps
+    // scale=1). THIS is the single site both Index arms (pointer + storage)
+    // funnel through, so element scaling is applied by construction at every
+    // index (§A.5) — it also fixes the latent non-`char` `p[i]` scale-1
+    // miscompile. `stride == 1` (a 1-byte element: char/byte/1-byte struct)
+    // returns `idx` unchanged — no `imul`, and char indexing stays byte-
+    // identical (no regression). `indexTy` widths the stride constant + the
+    // Mul. InvalidMirInst (fail-loud already reported) on an un-sizeable
+    // element type.
+    [[nodiscard]] MirInstId scaleIndexToBytes(MirInstId idx, TypeId elemTy,
+                                              HirNodeId node, TypeId indexTy) {
+        std::optional<std::uint64_t> const stride = elementStride(elemTy);
+        if (!stride.has_value()) {
+            unsupported(node, "array/pointer index element type has no "
+                              "computable size (incomplete type or the target "
+                              "declared no aggregateLayout)");
+            return InvalidMirInst;
+        }
+        if (*stride == 0) {
+            // A zero-size element (e.g. an empty aggregate `struct E {}`) would
+            // make every index alias byte offset 0 — fail loud, never a silent
+            // `Mul(idx, 0)` miscompile.
+            unsupported(node, "array/pointer index element type has zero size "
+                              "(empty aggregate) — cannot form a byte offset");
+            return InvalidMirInst;
+        }
+        if (*stride == 1) return idx;  // 1-byte element: index already IS bytes
+        MirInstId const strideK =
+            constIntOfType(static_cast<std::int64_t>(*stride), indexTy);
+        if (!strideK.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> ops{idx, strideK};
+        return mir.addInst(MirOpcode::Mul, ops, indexTy);
     }
 
     // ML2 cycle 6: build a zero MirLiteralValue matching `type`'s shape.
@@ -1278,6 +1571,537 @@ struct Lowerer {
         return acc;
     }
 
+    // FC7 (D-FC7-MEMBER-ACCESS): lower a struct/union ConstructAggregate
+    // initializer ELEMENT-WISE into the slot at `allocaPtr` — one
+    // `Store(lowerExpr(child_i), Gep(allocaPtr, Const(fieldByteOffset_i)))`
+    // per field. This avoids materializing an aggregate SSA value (there is
+    // no LIR aggregate-width Store / non-zero InsertValue). `lowerBraceInit`
+    // has already zero-filled unspecified fields, so the child list is
+    // positional + complete; a UNION carries one child written at offset 0.
+    // Returns false (fail-loud already reported) on any failure.
+    [[nodiscard]] bool lowerAggregateInitIntoSlot(HirNodeId aggNode,
+                                                  MirInstId allocaPtr,
+                                                  TypeId aggTy) {
+        auto kids = hir.children(aggNode);
+        for (std::size_t i = 0; i < kids.size(); ++i) {
+            auto const off =
+                fieldByteOffset(aggTy, static_cast<std::uint32_t>(i));
+            if (!off.has_value()) {
+                unsupported(aggNode, "aggregate initializer field-offset "
+                                      "resolution failed (un-sizeable layout "
+                                      "or field-count mismatch)");
+                return false;
+            }
+            MirInstId const offK = constInt(static_cast<std::int64_t>(*off));
+            if (!offK.valid()) return false;
+            TypeId const fieldTy = hir.typeId(kids[i]);
+            std::array<MirInstId, 2> gepOps{allocaPtr, offK};
+            MirInstId const fieldPtr = mir.addInst(
+                MirOpcode::Gep, gepOps, interner.pointer(fieldTy));
+            if (!fieldPtr.valid()) return false;
+
+            // FC7 D-FC7-NESTED-STRUCT-FIELD: a struct/union-TYPED field
+            // whose initializer is itself a brace-init lowers to a nested
+            // ConstructAggregate; recurse ELEMENT-WISE into the field's
+            // sub-slot at `fieldPtr` (there is no aggregate-width Store, so
+            // the scalar path below cannot realize it). An aggregate field
+            // initialized from an aggregate VALUE (not a brace-init) is a
+            // field-into-field copy — that needs the byte/field-wise
+            // aggregate copy, fail loud (D-FC7-AGGREGATE-COPY-MEMCPY).
+            TypeKind const fk = interner.kind(fieldTy);
+            if (fk == TypeKind::Struct || fk == TypeKind::Union) {
+                if (hir.kind(kids[i]) == HirKind::ConstructAggregate) {
+                    if (!lowerAggregateInitIntoSlot(kids[i], fieldPtr, fieldTy))
+                        return false;
+                    continue;
+                }
+                // FC7 (D-FC7-AGGREGATE-COPY-MEMCPY): an aggregate field
+                // initialized from an aggregate VALUE (`{ existingStruct, … }`,
+                // not a nested brace) is a copy from that value's lvalue
+                // address into the field's sub-slot.
+                MirInstId const srcPtr = lowerLvalueAddress(kids[i]);
+                if (!srcPtr.valid()) return false;
+                if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                    return false;
+                continue;
+            }
+
+            // D-MIR-ARRAY-FIELD-AGGREGATE-INIT: an ARRAY-typed field. Array
+            // element offsets are `j·stride` (not struct fieldOffsets), so it
+            // routes to lowerArrayInitIntoSlot — a brace-init recurses element-
+            // wise; an array VALUE copies byte-wise (D-FC7-AGGREGATE-COPY).
+            if (fk == TypeKind::Array) {
+                if (hir.kind(kids[i]) == HirKind::ConstructAggregate) {
+                    if (!lowerArrayInitIntoSlot(kids[i], fieldPtr, fieldTy))
+                        return false;
+                    continue;
+                }
+                MirInstId const srcPtr = lowerLvalueAddress(kids[i]);
+                if (!srcPtr.valid()) return false;
+                if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                    return false;
+                continue;
+            }
+
+            MirInstId const v = lowerExpr(kids[i]);
+            if (!v.valid()) return false;
+            std::array<MirInstId, 2> stOps{v, fieldPtr};
+            mir.addInst(MirOpcode::Store, stOps);
+        }
+        return true;
+    }
+
+    // D-MIR-ARRAY-FIELD-AGGREGATE-INIT: lower an ARRAY ConstructAggregate
+    // initializer ELEMENT-WISE into the slot at `basePtr` — one Store (or
+    // nested recurse) per element at the CONSTANT byte offset `j·stride` (init
+    // indices are compile-time, so the offset is a const-disp Gep, already
+    // lowered). Mutually recursive with lowerAggregateInitIntoSlot (a struct/
+    // union element) and itself (a multi-dimensional array element).
+    // `lowerBraceInit` has zero-filled unspecified elements, so the child list
+    // is positional + complete. Returns false (fail-loud already reported) on
+    // any failure. Wired at both array-init sites — the array field recurse-
+    // guard above AND the VarDecl array-local arm — so every array brace-init
+    // funnels through this one helper (§A.5 by-construction coverage).
+    [[nodiscard]] bool lowerArrayInitIntoSlot(HirNodeId arrNode,
+                                              MirInstId basePtr,
+                                              TypeId /*arrTy*/) {
+        auto kids = hir.children(arrNode);
+        for (std::size_t j = 0; j < kids.size(); ++j) {
+            TypeId const elemTy = hir.typeId(kids[j]);
+            std::optional<std::uint64_t> const stride = elementStride(elemTy);
+            if (!stride.has_value()) {
+                unsupported(arrNode, "array initializer element type has no "
+                                      "computable size");
+                return false;
+            }
+            std::uint64_t const off = j * *stride;
+            MirInstId const offK = constInt(static_cast<std::int64_t>(off));
+            if (!offK.valid()) return false;
+            std::array<MirInstId, 2> gepOps{basePtr, offK};
+            MirInstId const elemPtr = mir.addInst(
+                MirOpcode::Gep, gepOps, interner.pointer(elemTy));
+            if (!elemPtr.valid()) return false;
+
+            TypeKind const ek = interner.kind(elemTy);
+            if (ek == TypeKind::Struct || ek == TypeKind::Union) {
+                if (hir.kind(kids[j]) == HirKind::ConstructAggregate) {
+                    if (!lowerAggregateInitIntoSlot(kids[j], elemPtr, elemTy))
+                        return false;
+                    continue;
+                }
+                MirInstId const srcPtr = lowerLvalueAddress(kids[j]);
+                if (!srcPtr.valid()) return false;
+                if (!lowerAggregateCopy(arrNode, srcPtr, elemPtr, elemTy))
+                    return false;
+                continue;
+            }
+            if (ek == TypeKind::Array) {
+                if (hir.kind(kids[j]) == HirKind::ConstructAggregate) {
+                    if (!lowerArrayInitIntoSlot(kids[j], elemPtr, elemTy))
+                        return false;
+                    continue;
+                }
+                MirInstId const srcPtr = lowerLvalueAddress(kids[j]);
+                if (!srcPtr.valid()) return false;
+                if (!lowerAggregateCopy(arrNode, srcPtr, elemPtr, elemTy))
+                    return false;
+                continue;
+            }
+
+            MirInstId const v = lowerExpr(kids[j]);
+            if (!v.valid()) return false;
+            std::array<MirInstId, 2> stOps{v, elemPtr};
+            mir.addInst(MirOpcode::Store, stOps);
+        }
+        return true;
+    }
+
+    // FC7 (D-FC7-AGGREGATE-COPY-MEMCPY): copy `size` bytes from `srcPtr` to
+    // `dstPtr` BYTE-WISE, using the widest available integer chunk at each
+    // step — I64 (8B), then one I32 (4B), then `Char` (1B) for the 0–3 byte
+    // tail. Each chunk's memory access is now width-EXACT to its type
+    // (D-LIR-INT-MEMORY-WIDTH-EXACT — memAccessWidthFlags: Char/I8/U8/Bool→8,
+    // I16/U16→16, I32/U32→32, else→64), so a chunk touches EXACTLY its bytes
+    // and never overruns the object (the I32 tail of a 12-byte struct now
+    // reads/writes bytes 8–11, not 8–15 — a latent overrun this width-
+    // exactness also fixed). `Char` stays the 1-byte tail vehicle (a width-16
+    // chunk for a 2-byte tail is a possible future optimization, not a
+    // correctness need). Each chunk loads (zero/full-extends) then stores
+    // the low width, round-tripping its bytes exactly. Chunk accesses may be
+    // unaligned — fine on x86_64 and AArch64 (normal mov/LDR/STR). The shared
+    // offset Const feeds both the src and dst GEP (immutable SSA). Returns
+    // false on any failure (diagnostic already emitted upstream).
+    [[nodiscard]] bool lowerByteWiseCopy(MirInstId srcPtr, MirInstId dstPtr,
+                                         std::uint64_t size) {
+        auto emit = [&](TypeKind chunkKind, std::uint64_t off) -> bool {
+            TypeId const chunkTy = interner.primitive(chunkKind);
+            TypeId const ptrTy   = interner.pointer(chunkTy);
+            MirInstId const offK = constInt(static_cast<std::int64_t>(off));
+            if (!offK.valid()) return false;
+            std::array<MirInstId, 2> sg{srcPtr, offK};
+            MirInstId const sp = mir.addInst(MirOpcode::Gep, sg, ptrTy);
+            if (!sp.valid()) return false;
+            std::array<MirInstId, 1> ld{sp};
+            MirInstId const v = mir.addInst(MirOpcode::Load, ld, chunkTy);
+            if (!v.valid()) return false;
+            std::array<MirInstId, 2> dg{dstPtr, offK};
+            MirInstId const dp = mir.addInst(MirOpcode::Gep, dg, ptrTy);
+            if (!dp.valid()) return false;
+            std::array<MirInstId, 2> st{v, dp};
+            mir.addInst(MirOpcode::Store, st);
+            return true;
+        };
+        std::uint64_t off = 0;
+        for (; off + 8 <= size; off += 8)
+            if (!emit(TypeKind::I64, off)) return false;
+        if (off + 4 <= size) {
+            if (!emit(TypeKind::I32, off)) return false;
+            off += 4;
+        }
+        for (; off < size; off += 1)
+            if (!emit(TypeKind::Char, off)) return false;
+        return true;
+    }
+
+    // FC7: copy an aggregate value from `srcPtr` to `dstPtr`.
+    //   • flat scalar STRUCT (no aggregate field) → FIELD-WISE: one Load+Store
+    //     per scalar field at its FC6 offset (width-exact, no padding copy —
+    //     the D-FC7-MEMBER-ACCESS path; an aggregate-width Load would TRUNCATE
+    //     a wider-than-register struct to its low bytes).
+    //   • UNION, or a struct with ANY aggregate field (struct/union/ARRAY) →
+    //     BYTE-WISE whole-object copy (D-FC7-AGGREGATE-COPY-MEMCPY): a union's
+    //     variants overlap so a field-wise copy of one misses the others'
+    //     bytes; an aggregate-typed field can't be realized by a single
+    //     field Load. Byte-wise copies the entire object representation
+    //     (incl. padding — C 6.2.6.1, harmless), covering every nested byte.
+    // Returns false on any failure (diagnostic already emitted).
+    [[nodiscard]] bool lowerAggregateCopy(HirNodeId atNode, MirInstId srcPtr,
+                                          MirInstId dstPtr, TypeId aggTy) {
+        StructLayout const* layout = cachedLayout(aggTy);
+        if (layout == nullptr) {
+            unsupported(atNode, "aggregate copy requires a sizeable layout "
+                                "(target 'aggregateLayout' / complete type)");
+            return false;
+        }
+        TypeKind const aggKind = interner.kind(aggTy);
+        if (aggKind == TypeKind::Union)
+            return lowerByteWiseCopy(srcPtr, dstPtr, layout->size);
+        if (aggKind != TypeKind::Struct) {
+            unsupported(atNode, "aggregate copy of a non-struct/union value "
+                                "is not supported");
+            return false;
+        }
+        auto const fieldTypes = interner.operands(aggTy);
+        if (fieldTypes.size() != layout->fieldOffsets.size()) {
+            unsupported(atNode, "struct copy: field-type count mismatches the "
+                                "layout field-offset count (internal invariant)");
+            return false;
+        }
+        bool anyAggregateField = false;
+        for (TypeId ft : fieldTypes) {
+            TypeKind const fk = interner.kind(ft);
+            if (fk == TypeKind::Struct || fk == TypeKind::Union
+                || fk == TypeKind::Array) {
+                anyAggregateField = true;
+                break;
+            }
+        }
+        if (anyAggregateField)
+            return lowerByteWiseCopy(srcPtr, dstPtr, layout->size);
+
+        // Flat scalar struct — field-wise, width-exact.
+        for (std::size_t i = 0; i < fieldTypes.size(); ++i) {
+            MirInstId const offK = constInt(
+                static_cast<std::int64_t>(layout->fieldOffsets[i]));
+            if (!offK.valid()) return false;
+            TypeId const fptrTy = interner.pointer(fieldTypes[i]);
+            std::array<MirInstId, 2> srcGep{srcPtr, offK};
+            MirInstId const srcField =
+                mir.addInst(MirOpcode::Gep, srcGep, fptrTy);
+            if (!srcField.valid()) return false;
+            std::array<MirInstId, 1> loadOps{srcField};
+            MirInstId const v =
+                mir.addInst(MirOpcode::Load, loadOps, fieldTypes[i]);
+            if (!v.valid()) return false;
+            std::array<MirInstId, 2> dstGep{dstPtr, offK};
+            MirInstId const dstField =
+                mir.addInst(MirOpcode::Gep, dstGep, fptrTy);
+            if (!dstField.valid()) return false;
+            std::array<MirInstId, 2> stOps{v, dstField};
+            mir.addInst(MirOpcode::Store, stOps);
+        }
+        return true;
+    }
+
+    // ── FC7 by-value aggregate ABI synthesis (D-FC7-STRUCT-BY-VALUE-ARG-RETURN) ──
+    // §B-locked at HIR→MIR: a struct/union passed BY VALUE is classified via the
+    // `aggregate_abi` engine and synthesized into scalar register pieces (each an
+    // ordinary I64/F64 MIR arg the UNCHANGED callconv places by class) or a
+    // by-reference pointer; the callee reconstructs into the param's frame slot.
+    // Both sides derive the SAME piece sequence from (type × CC), so the caller's
+    // operand order matches the callee's Arg ordinals by construction. Struct
+    // RETURNS by value stay fail-loud this phase (sret needs the multi-register
+    // MIR Return — D-FC7-SYSV-STRUCT-RETURN-IN-REGS).
+
+    // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG): the running physical-arg ordinal.
+    // INDEPENDENT CCs (SysV/AAPCS64, `slotAligned=false`) count GPR and FPR
+    // ordinals SEPARATELY (the `Arg` payload is the per-class register index);
+    // a SLOT-ALIGNED CC (Win64) uses one FLAT shared slot. Monotonic per class,
+    // so a struct's multiple pieces land in consecutive registers and no two
+    // Args of the same class collide. (Threading per-class here also fixes the
+    // latent mixed-class `D-ML7-2.10`: a scalar param now gets its per-class
+    // index, not the param index.)
+    struct ArgOrdinalCounter {
+        bool          slotAligned = false;
+        std::uint32_t flat = 0, gpr = 0, fpr = 0;
+        [[nodiscard]] std::uint32_t next(AbiPieceClass cls) {
+            if (slotAligned) return flat++;
+            return (cls == AbiPieceClass::Fpr) ? fpr++ : gpr++;
+        }
+    };
+
+    // The register class of a SCALAR/pointer param (for the per-class arg
+    // ordinal): FPR for a float type, GPR otherwise (ints, pointers, bool).
+    [[nodiscard]] AbiPieceClass scalarArgClass(TypeId ty) const {
+        TypeKind const k = interner.kind(ty);
+        return (k == TypeKind::F16 || k == TypeKind::F32
+                || k == TypeKind::F64 || k == TypeKind::F128)
+            ? AbiPieceClass::Fpr : AbiPieceClass::Gpr;
+    }
+
+    // Classify `aggTy` for by-value passing under the active CC's strategy.
+    // nullopt ⇒ the strategy is not implemented for this CC (the guard then
+    // fails loud) OR the type is un-sizeable.
+    [[nodiscard]] std::optional<AbiPassing> byValueClassify(TypeId aggTy) {
+        if (!config.aggregateLayoutLoaded) return std::nullopt;
+        return classifyAggregate(config.aggregateClassification,
+                                 config.aggregateMaxRegBytes, aggTy, interner,
+                                 config.aggregateLayout, config.dataModel);
+    }
+
+    // The MIR type of a register piece. GPR → I64 (the full 8-byte register
+    // moves; the byte-exact valid-byte copy happens at the temp/slot boundary —
+    // the register's unused high bytes are ABI-undefined). FPR → F32 for a 4-byte
+    // piece (a float HFA element in an s-register), else F64 (a double / an 8-byte
+    // SSE eightbyte) — the WIDTH matters for FP so the load/store emits the right
+    // single/double form (a wrong F64 load of a float HFA would read 8 bytes and
+    // clobber the next element). The piece's register CLASS follows from the type.
+    [[nodiscard]] TypeId pieceType(AbiPiece const& p) {
+        if (p.cls == AbiPieceClass::Fpr)
+            return interner.primitive(p.widthBytes <= 4 ? TypeKind::F32
+                                                        : TypeKind::F64);
+        return interner.primitive(TypeKind::I64);
+    }
+
+    // An anonymous frame temp sized to hold aggregate `aggTy` (lir_callconv
+    // rounds the slot to a 16-byte multiple, so a full-eightbyte load/store can
+    // never over-run it). InvalidMirInst on an un-sizeable type.
+    [[nodiscard]] MirInstId freshAggregateTemp(TypeId aggTy) {
+        auto const sz = aggregateByteSize(aggTy);
+        if (!sz.has_value()
+            || *sz > std::numeric_limits<std::uint32_t>::max())
+            return InvalidMirInst;
+        return mir.addInst(MirOpcode::Alloca, {}, interner.pointer(aggTy),
+                           static_cast<std::uint32_t>(*sz));
+    }
+
+    // Append a by-value struct/union ARG (`argNode` of type `aggTy`, classified
+    // `abi`) to a Call's `operands`. InRegisters ⇒ copy the struct into an
+    // eightbyte-rounded temp (so a full-eightbyte load can't over-read a
+    // non-padded source) and load each eightbyte as an I64/F64 scalar arg.
+    // ByReference ⇒ copy to a temp and pass its address (the callee owns the
+    // copy → by-value semantics). Returns false (fail-loud already emitted).
+    [[nodiscard]] bool appendByValueArg(std::vector<MirInstId>& operands,
+                                        HirNodeId argNode, TypeId aggTy,
+                                        AbiPassing const& abi) {
+        MirInstId const srcAddr = lowerLvalueAddress(argNode);
+        if (!srcAddr.valid()) return false;
+        StructLayout const* layout = cachedLayout(aggTy);
+        MirInstId const temp = freshAggregateTemp(aggTy);
+        if (layout == nullptr || !temp.valid()) {
+            unsupported(argNode, "by-value aggregate arg requires a sizeable "
+                                 "layout (target 'aggregateLayout' / complete type)");
+            return false;
+        }
+        if (!lowerByteWiseCopy(srcAddr, temp, layout->size)) return false;
+        if (abi.kind == AbiPassing::Kind::ByReference) {
+            operands.push_back(temp);   // a pointer to the callee-owned copy
+            return true;
+        }
+        for (AbiPiece const& p : abi.pieces) {
+            TypeId const pty = pieceType(p);
+            MirInstId const offK =
+                constInt(static_cast<std::int64_t>(p.byteOffset));
+            if (!offK.valid()) return false;
+            std::array<MirInstId, 2> g{temp, offK};
+            MirInstId const gp =
+                mir.addInst(MirOpcode::Gep, g, interner.pointer(pty));
+            if (!gp.valid()) return false;
+            std::array<MirInstId, 1> l{gp};
+            MirInstId const v = mir.addInst(MirOpcode::Load, l, pty);
+            if (!v.valid()) return false;
+            operands.push_back(v);
+        }
+        return true;
+    }
+
+    // Receive a by-value struct/union PARAM into its frame slot, consuming
+    // physical-arg ordinals from the per-class `ArgOrdinalCounter` (kept in
+    // lockstep with the caller's operand order). InRegisters ⇒ one Arg per
+    // eightbyte, each stored
+    // into the slot at its offset (the 16-rounded slot absorbs trailing
+    // padding). ByReference ⇒ the incoming pointer to the caller's private copy
+    // IS the param's storage (no re-copy). Returns false (fail-loud emitted).
+    [[nodiscard]] bool receiveByValueParam(SymbolId sym, TypeId aggTy,
+                                           HirNodeId anchor, AbiPassing const& abi,
+                                           ArgOrdinalCounter& ctr) {
+        if (abi.kind == AbiPassing::Kind::ByReference) {
+            // The hidden pointer is GPR-class.
+            MirInstId const ptr =
+                mir.addArg(ctr.next(AbiPieceClass::Gpr), interner.pointer(aggTy));
+            if (!ptr.valid()) return false;
+            addressableLocal[sym.v] = ptr;   // the caller's copy is the param
+            return true;
+        }
+        MirInstId const slot = allocaForLocal(sym, aggTy, anchor);
+        if (!slot.valid()) return false;
+        for (AbiPiece const& p : abi.pieces) {
+            TypeId const pty = pieceType(p);
+            MirInstId const a = mir.addArg(ctr.next(p.cls), pty);
+            if (!a.valid()) return false;
+            MirInstId const offK =
+                constInt(static_cast<std::int64_t>(p.byteOffset));
+            if (!offK.valid()) return false;
+            std::array<MirInstId, 2> g{slot, offK};
+            MirInstId const gp =
+                mir.addInst(MirOpcode::Gep, g, interner.pointer(pty));
+            if (!gp.valid()) return false;
+            std::array<MirInstId, 2> st{a, gp};
+            mir.addInst(MirOpcode::Store, st);
+        }
+        return true;
+    }
+
+    // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): emit a by-value struct/union-
+    // returning Call into its result slot `slot` and yield `slot` (the aggregate
+    // is accessed by address). `operands` already carries [callee, (sret slot,)
+    // args...]. ByReference (sret) ⇒ the call is void and the callee writes
+    // through the hidden pointer → `slot` already holds the result. InRegisters ⇒
+    // the call's result IS piece 0 (lir_callconv captures it from return-register
+    // ordinal 0 of its class) and each further eightbyte is a
+    // `ReturnPiece(call, ordinal)`; every piece is stored into `slot` at its
+    // offset. The per-class `ord` mirrors the callee's multi-Return assignment, so
+    // caller and callee agree on which register each piece occupies.
+    [[nodiscard]] MirInstId emitStructReturningCall(
+            HirNodeId node, std::span<MirInstId const> operands,
+            std::uint32_t callPayload, AbiPassing const& abi, MirInstId slot) {
+        if (abi.kind == AbiPassing::Kind::ByReference) {
+            MirInstId const call =
+                mir.addInst(MirOpcode::Call, operands, InvalidType, callPayload);
+            if (!call.valid()) return InvalidMirInst;
+            return slot;
+        }
+        if (abi.pieces.empty()) {
+            unsupported(node,
+                "in-register struct return classified with zero pieces "
+                "(classifier invariant violated)");
+            return InvalidMirInst;
+        }
+        TypeId const p0ty = pieceType(abi.pieces[0]);
+        MirInstId const call =
+            mir.addInst(MirOpcode::Call, operands, p0ty, callPayload);
+        if (!call.valid()) return InvalidMirInst;
+        // Pass 1: capture every piece IMMEDIATELY after the call — the
+        // lir_callconv caller look-ahead requires the `ReturnPiece` reads to be
+        // contiguous with the call (no Gep/Store may intervene, else the pieces
+        // would read return registers already clobbered). Piece 0 IS the call's
+        // own result; pieces 1..N-1 are ReturnPiece reads.
+        std::vector<MirInstId> pieceVals;
+        pieceVals.reserve(abi.pieces.size());
+        std::uint32_t gprRet = 0;
+        std::uint32_t fprRet = 0;
+        for (std::size_t k = 0; k < abi.pieces.size(); ++k) {
+            AbiPiece const& p = abi.pieces[k];
+            std::uint32_t const ord =
+                (p.cls == AbiPieceClass::Fpr) ? fprRet++ : gprRet++;
+            if (k == 0) { pieceVals.push_back(call); continue; }
+            MirInstId const rp =
+                mir.addReturnPiece(call, ord, pieceType(p));
+            if (!rp.valid()) return InvalidMirInst;
+            pieceVals.push_back(rp);
+        }
+        // Pass 2: store each captured piece into the result slot at its offset.
+        for (std::size_t k = 0; k < abi.pieces.size(); ++k) {
+            AbiPiece const& p = abi.pieces[k];
+            TypeId const pty = pieceType(p);
+            MirInstId const offK =
+                constInt(static_cast<std::int64_t>(p.byteOffset));
+            if (!offK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> g{slot, offK};
+            MirInstId const gp =
+                mir.addInst(MirOpcode::Gep, g, interner.pointer(pty));
+            if (!gp.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> st{pieceVals[k], gp};
+            mir.addInst(MirOpcode::Store, st);
+        }
+        return slot;
+    }
+
+    // FC7 C1c: lower `return <struct-expr>;` for a by-value struct/union-returning
+    // function. The returned aggregate is an lvalue/temp; take its ADDRESS and
+    // either copy it through the sret hidden pointer (ByReference) or load its
+    // eightbyte pieces into a multi-operand Return (InRegisters). Mirror of the
+    // caller's `emitStructReturningCall`.
+    [[nodiscard]] bool lowerStructReturn(HirNodeId valNode) {
+        auto const abi = byValueClassify(currentFnResult_);
+        if (!abi.has_value()) {
+            unsupported(valNode,
+                "returning a by-value struct/union is not supported by this "
+                "target's calling convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+            return false;
+        }
+        StructLayout const* layout = cachedLayout(currentFnResult_);
+        if (layout == nullptr) {
+            unsupported(valNode, "by-value struct/union return requires a sizeable "
+                                 "layout (complete type)");
+            return false;
+        }
+        MirInstId const srcAddr = lowerLvalueAddress(valNode);
+        if (!srcAddr.valid()) return false;
+        if (abi->kind == AbiPassing::Kind::ByReference) {
+            if (!sretPtr_.valid()) {
+                unsupported(valNode, "sret return reached without a hidden result "
+                                     "pointer (lowerFunction setup invariant)");
+                return false;
+            }
+            if (!lowerByteWiseCopy(srcAddr, sretPtr_, layout->size)) return false;
+            // SysV/Win64 return the result pointer in the integer return register
+            // (rax/rcx). AAPCS64/Apple x8-sret returns VOID — the caller owns x8 and
+            // the storage it points at; the callee must NOT also place it in x0.
+            if (config.aggregateSretViaHiddenArg) mir.addReturn(sretPtr_);
+            else                                  mir.addReturn();
+            return true;
+        }
+        std::vector<MirInstId> pieces;
+        pieces.reserve(abi->pieces.size());
+        for (AbiPiece const& p : abi->pieces) {
+            TypeId const pty = pieceType(p);
+            MirInstId const offK =
+                constInt(static_cast<std::int64_t>(p.byteOffset));
+            if (!offK.valid()) return false;
+            std::array<MirInstId, 2> g{srcAddr, offK};
+            MirInstId const gp =
+                mir.addInst(MirOpcode::Gep, g, interner.pointer(pty));
+            if (!gp.valid()) return false;
+            std::array<MirInstId, 1> l{gp};
+            MirInstId const v = mir.addInst(MirOpcode::Load, l, pty);
+            if (!v.valid()) return false;
+            pieces.push_back(v);
+        }
+        mir.addReturnMulti(pieces);
+        return true;
+    }
+
     // Recursively collect into `out` the set of `SymbolId.v`s whose lvalue
     // address is needed somewhere under `node` — i.e. symbols that must be
     // slot-backed rather than pure-SSA. Drives entry-block slot-promotion
@@ -1397,13 +2221,21 @@ struct Lowerer {
             }
             case HirKind::ReturnStmt: {
                 auto v = hir.returnValue(node);
-                if (v.has_value()) {
-                    MirInstId const value = lowerExpr(*v);
-                    if (!value.valid()) return false;
-                    mir.addReturn(value);
-                } else {
+                if (!v.has_value()) {
                     mir.addReturn();
+                    return true;
                 }
+                // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value
+                // struct/union return is lowered specially (sret copy-through or
+                // multi-piece Return) — never as a single truncating value.
+                if (currentFnResult_.valid()) {
+                    TypeKind const rk = interner.kind(currentFnResult_);
+                    if (rk == TypeKind::Struct || rk == TypeKind::Union)
+                        return lowerStructReturn(*v);
+                }
+                MirInstId const value = lowerExpr(*v);
+                if (!value.valid()) return false;
+                mir.addReturn(value);
                 return true;
             }
             case HirKind::Unreachable: {
@@ -1443,10 +2275,40 @@ struct Lowerer {
                 MirInstId const alloca = allocaForLocal(sym, ty, node);
                 if (!alloca.valid()) return false;
                 if (auto initN = hir.varDeclInit(node); initN.has_value()) {
-                    MirInstId const initVal = lowerExpr(*initN);
-                    if (!initVal.valid()) return false;
-                    std::array<MirInstId, 2> ops{initVal, alloca};
-                    mir.addInst(MirOpcode::Store, ops);
+                    // FC7 (D-FC7-MEMBER-ACCESS): a struct/union initializer
+                    // (`P p = {3,4}` / `{.y=7}`) lowers ELEMENT-WISE — one
+                    // Gep+Store per field into the slot — never as an
+                    // aggregate-SSA Store (no LIR aggregate-width Store).
+                    TypeKind const initKind = interner.kind(ty);
+                    if (hir.kind(*initN) == HirKind::ConstructAggregate
+                        && (initKind == TypeKind::Struct
+                            || initKind == TypeKind::Union)) {
+                        if (!lowerAggregateInitIntoSlot(*initN, alloca, ty))
+                            return false;
+                    } else if (hir.kind(*initN) == HirKind::ConstructAggregate
+                               && initKind == TypeKind::Array) {
+                        // D-MIR-ARRAY-FIELD-AGGREGATE-INIT (array-LOCAL form):
+                        // `int a[3] = {1,2,3}` — element-wise into the slot via
+                        // the same helper the array-field recurse-guard uses.
+                        if (!lowerArrayInitIntoSlot(*initN, alloca, ty))
+                            return false;
+                    } else if (initKind == TypeKind::Struct
+                               || initKind == TypeKind::Union) {
+                        // FC7 (D-FC7-MEMBER-ACCESS): struct/union COPY-init
+                        // from another aggregate VALUE (`T a = b;`) — copy
+                        // field-wise from the source lvalue's address. An
+                        // aggregate-width Load+Store would truncate to one
+                        // register.
+                        MirInstId const srcPtr = lowerLvalueAddress(*initN);
+                        if (!srcPtr.valid()) return false;
+                        if (!lowerAggregateCopy(*initN, srcPtr, alloca, ty))
+                            return false;
+                    } else {
+                        MirInstId const initVal = lowerExpr(*initN);
+                        if (!initVal.valid()) return false;
+                        std::array<MirInstId, 2> ops{initVal, alloca};
+                        mir.addInst(MirOpcode::Store, ops);
+                    }
                 }
                 return true;
             }
@@ -1459,6 +2321,21 @@ struct Lowerer {
                 //   - `Deref(ptr)` → store into the lowered pointer.
                 HirNodeId const targetN = hir.assignTarget(node);
                 HirNodeId const valueN  = hir.assignValue(node);
+                // FC7 (D-FC7-MEMBER-ACCESS): a struct/union COPY assignment
+                // (`a = b`, `*pa = *pb`) copies field-wise from the source
+                // lvalue to the target lvalue — an aggregate-width Load+Store
+                // would TRUNCATE a wider-than-register struct to its low
+                // bytes (a silent miscompile).
+                TypeId const valTy = hir.typeId(valueN);
+                if (valTy.valid()
+                    && (interner.kind(valTy) == TypeKind::Struct
+                        || interner.kind(valTy) == TypeKind::Union)) {
+                    MirInstId const dstPtr = lowerLvalueAddress(targetN);
+                    if (!dstPtr.valid()) return false;
+                    MirInstId const srcPtr = lowerLvalueAddress(valueN);
+                    if (!srcPtr.valid()) return false;
+                    return lowerAggregateCopy(node, srcPtr, dstPtr, valTy);
+                }
                 MirInstId const rhs = lowerExpr(valueN);
                 if (!rhs.valid()) return false;
                 MirInstId const ptr = lowerLvalueAddress(targetN);
@@ -1900,19 +2777,39 @@ struct Lowerer {
             return false;
         }
         auto params = hir.functionParams(node);
-        auto paramTypes = interner.fnParams(signature);
+        // COPY the param types out of the interner's pool: `fnParams` returns a
+        // SPAN into that pool, and the sret setup + by-value param/return
+        // synthesis below intern fresh `Ptr<…>` types — an intern can REALLOCATE
+        // the pool, dangling a retained span (an interner-state-dependent
+        // "TypeId out of range" crash; FC7 C1c). The owning vector is immune.
+        std::vector<TypeId> const paramTypes = [&] {
+            auto const s = interner.fnParams(signature);
+            return std::vector<TypeId>(s.begin(), s.end());
+        }();
         if (params.size() != paramTypes.size()) {
             unsupported(node,
                 std::format("Function param count {} mismatches FnSig param "
                             "count {}", params.size(), paramTypes.size()));
             return false;
         }
+        // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): a by-value struct/union PARAM
+        // is classified + reconstructed in the param loop below (per the active
+        // CC's strategy, via `receiveByValueParam`). A by-value struct/union
+        // RETURN by value (D-FC7-SYSV-STRUCT-RETURN-IN-REGS) is classified +
+        // synthesized AFTER the entry block opens: an sret return prepends a
+        // hidden result-pointer `Arg`, and an in-register return loads its
+        // eightbyte pieces in the `ReturnStmt`. See the `currentFnResult_` setup
+        // just below `beginBlock`. A CC whose strategy can't classify the
+        // aggregate (e.g. AAPCS64 until C3) fails loud there.
 
         // Per-function context reset: each function owns its own SSA/alloca
         // bindings — entries from the previous function are stale.
         symbolToValue.clear();
         addressableLocal.clear();
         labelBlocks_.clear();   // FC5: labels are function-scoped
+        // FC7 C1c: per-function by-value return state.
+        currentFnResult_ = interner.fnResult(signature);
+        sretPtr_         = InvalidMirInst;
 
         // Pre-pass: scan the body to find params (and locals) whose address
         // is taken. Address-taken params must live in memory (alloca-backed),
@@ -1936,18 +2833,96 @@ struct Lowerer {
         MirBlockId const entry = mir.createBlock(StructCfMarker::EntryBlock);
         mir.beginBlock(entry);
 
+        // FC7 C1c: the per-class arg-ordinal counter is SHARED by the sret hidden
+        // pointer (below) and the real params, so a struct-returning function's
+        // first INTEGER arg register goes to the result pointer and every real arg
+        // shifts by one — hoisted above the sret `Arg` so both use one counter.
+        ArgOrdinalCounter argCtr{config.argSlotAligned};
+
+        // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value struct/union
+        // RETURN. Classify under the active CC's strategy. ByReference (class
+        // MEMORY, >16B) ⇒ sret: prepend a hidden result-pointer `Arg` (consuming
+        // the first INTEGER ordinal); the `ReturnStmt` copies the result through
+        // it and returns it. InRegisters (≤16B) ⇒ no hidden arg; the `ReturnStmt`
+        // loads the eightbyte pieces. A strategy that can't classify the aggregate
+        // (AAPCS64 until C3) fails loud (sealing the open block first).
+        if (currentFnResult_.valid()) {
+            TypeKind const rk = interner.kind(currentFnResult_);
+            if (rk == TypeKind::Struct || rk == TypeKind::Union) {
+                auto const abi = byValueClassify(currentFnResult_);
+                if (!abi.has_value()) {
+                    unsupported(node,
+                        "returning a by-value struct/union is not supported by "
+                        "this target's calling convention "
+                        "(D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                if (abi->kind == AbiPassing::Kind::ByReference) {
+                    // SysV/Win64 ⇒ the result pointer is a hidden first INTEGER arg
+                    // (consumes the first GPR ordinal, shifting real args by one).
+                    // AAPCS64/Apple x8-sret ⇒ it arrives in the dedicated indirect-
+                    // result register via `ReadIndirectResult` and consumes NO arg
+                    // ordinal (real args still start at x0). FC7 C3.
+                    sretPtr_ = config.aggregateSretViaHiddenArg
+                        ? mir.addArg(argCtr.next(AbiPieceClass::Gpr),
+                                     interner.pointer(currentFnResult_))
+                        : mir.addReadIndirectResult(
+                              interner.pointer(currentFnResult_));
+                    if (!sretPtr_.valid()) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        return false;
+                    }
+                }
+            }
+        }
+
         // Params: one `Arg` instruction per param, in declaration order. If
         // the param's address is ever taken in the body, ALSO allocate a slot
         // and store the arg into it — every read of that symbol then goes
         // through `Load(alloca)`. Otherwise the param stays in the pure-SSA
         // `symbolToValue` map.
+        // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG): a by-value struct/union param
+        // expands to register pieces (or a by-ref pointer); `argCtr` hands out the
+        // PER-CLASS (or, for a slot-aligned CC, flat) physical-arg ordinal, kept in
+        // lockstep with the caller's operand order. For an all-GPR scalar-only
+        // function the per-class GPR ordinal equals the param index (no change); a
+        // mixed int/float signature now lands each arg in its own class (fixes
+        // D-ML7-2.10). `argCtr` is hoisted above (shared with the sret arg).
+        bool const fnVariadic = interner.fnIsVariadic(signature);
         for (std::size_t i = 0; i < params.size(); ++i) {
             HirNodeId const p = params[i];
             // A param is a VarDecl whose typeId carries the param's type;
             // verifier already enforced the kind invariant upstream.
             SymbolId const sym = hir.varDeclSymbol(p);
             TypeId const ty = paramTypes[i];
-            MirInstId const arg = mir.addArg(static_cast<std::uint32_t>(i), ty);
+            TypeKind const pk = interner.kind(ty);
+            if (pk == TypeKind::Struct || pk == TypeKind::Union) {
+                if (fnVariadic) {
+                    unsupported(p, "a by-value struct/union parameter in a "
+                                   "variadic function is not yet supported "
+                                   "(D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                auto const abi = byValueClassify(ty);
+                if (!abi.has_value()) {
+                    unsupported(p, "a by-value struct/union parameter is not "
+                                   "supported by this target's calling "
+                                   "convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                if (!receiveByValueParam(sym, ty, p, *abi, argCtr)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                continue;
+            }
+            // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG / fixes D-ML7-2.10): a scalar
+            // param's `Arg` payload is its PER-CLASS register ordinal (GPR/FPR
+            // counted separately for an independent CC), not the param index.
+            MirInstId const arg = mir.addArg(argCtr.next(scalarArgClass(ty)), ty);
             if (addressTaken.contains(sym.v)) {
                 MirInstId const slot = allocaForLocal(sym, ty, p);
                 if (!slot.valid()) {

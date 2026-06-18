@@ -334,9 +334,18 @@ private:
                 return;
             }
             case MirOpcode::Return: {
-                std::optional<MirInstId> rv;
-                if (!ops.empty()) rv = mapValue(ops[0], id);
-                dst_.addReturn(rv);
+                // FC7 C1c: a by-value struct returned IN REGISTERS carries N
+                // eightbyte/HFA PIECES (every operand is a return-register value),
+                // not just one. The clone MUST map EVERY operand — taking only
+                // ops[0] silently dropped pieces 1..N-1, a miscompile masked on
+                // x86_64 only because the dropped piece's value often still aliased
+                // its arg register at the return reg (e.g. a 3rd field passed in rdx
+                // == returnGprs[1]); AAPCS64's distinct arg/return mapping exposed it.
+                // `addReturnMulti` handles 0 (void), 1 (scalar), and N (pieces).
+                std::vector<MirInstId> rvs;
+                rvs.reserve(ops.size());
+                for (MirInstId const o : ops) rvs.push_back(mapValue(o, id));
+                dst_.addReturnMulti(rvs);
                 return;
             }
             case MirOpcode::Unreachable:

@@ -274,6 +274,25 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // merge), so the multi-block CFG-clone path is the only one that
             // can encounter one; it still counts as 1 instruction here (the
             // cost model is unchanged — Phis are not special-cased).
+            // FC7 C1c/C3 (D-FC7-INLINE-MULTI-PIECE-RETURN): a by-value struct
+            // returned IN REGISTERS (a multi-piece `Return`, N>1 piece operands) or
+            // via x8-sret (a `ReadIndirectResult` entry op) is FRAME/ABI-sensitive
+            // and NOT safely inlinable. The single-block splice paths clone a
+            // callee `Return` taking only operand 0 — truncating the struct to its
+            // first field — and a spliced `ReadIndirectResult` would read the
+            // CALLER's indirect-result register (garbage; the caller is not itself
+            // sret) instead of the callee's incoming result pointer. Refuse at this
+            // chokepoint (fail-SAFE: refusing only forgoes the optimization, it
+            // cannot miscompile), covering every splice path (single- and multi-
+            // block) at once; the multi-block continuation-Phi `cops.size()>1`
+            // abort below is then a defensive backstop. Reachable under the shipped
+            // `release.pipeline.json` (which runs `Inlining`), so this is a real
+            // silent-miscompile fix, not a speculative guard.
+            if (op == MirOpcode::ReadIndirectResult) return std::nullopt;
+            if (op == MirOpcode::Return
+                && mir.instOperands(cid).size() > 1) {
+                return std::nullopt;
+            }
             if (op == MirOpcode::Return) hasReturn = true;
             if (op == MirOpcode::Arg && mir.argIndex(cid) >= callArgCount) {
                 return std::nullopt;  // arg index out of range → refuse
@@ -849,9 +868,13 @@ private:
                 return;
             }
             case MirOpcode::Return: {
-                std::optional<MirInstId> rv;
-                if (!oldOps.empty()) rv = mapCallerValue(oldOps[0], id);
-                dst_.addReturn(rv);
+                // FC7 C1c: map EVERY return-piece operand (a multi-piece by-value
+                // struct return carries N pieces; taking only oldOps[0] dropped the
+                // rest — see mir_rebuild_helper's Return clone). 0/1/N all handled.
+                std::vector<MirInstId> rvs;
+                rvs.reserve(oldOps.size());
+                for (MirInstId const o : oldOps) rvs.push_back(mapCallerValue(o, id));
+                dst_.addReturnMulti(rvs);
                 return;
             }
             case MirOpcode::Unreachable:
@@ -1103,6 +1126,19 @@ private:
         };
         switch (cop) {
             case MirOpcode::Return: {
+                // FC7 C1c: a MULTI-PIECE by-value struct Return (N>1 piece operands)
+                // cannot be merged through a single continuation Phi — inlining a
+                // by-value-struct-returning callee is not supported (OPT7-gated;
+                // D-FC7-INLINE-MULTI-PIECE-RETURN). Fail loud rather than silently
+                // drop pieces 1..N-1.
+                if (cops.size() > 1) {
+                    std::fprintf(stderr,
+                        "dss::inlining fatal: callee %u has a multi-piece struct "
+                        "Return (%zu pieces); inlining by-value-struct-returning "
+                        "functions is unsupported (D-FC7-INLINE-MULTI-PIECE-RETURN).\n",
+                        callee.v, static_cast<std::size_t>(cops.size()));
+                    std::abort();
+                }
                 MirInstId rv{};
                 if (!cops.empty()) {
                     rv = mapCalleeOperand(src_, cops[0], local, callee);

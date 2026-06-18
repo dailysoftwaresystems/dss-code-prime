@@ -1,7 +1,9 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/aggregate_layout.hpp"
 #include "core/types/alignment.hpp"
+#include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
 #include "core/types/section_kind.hpp"
@@ -397,10 +399,19 @@ assemble(Lir const&                 lir,
 // Reads each MirGlobal from `mir`, looks up its `initLiteralIndex`
 // in the module's `MirLiteralPool`, and encodes the literal value
 // into LE wire bytes sized by the global's `TypeId`. The
-// `TypeInterner` is consulted for primitive byte sizes; aggregate
-// types (Struct / Array / Slice / Vector / Matrix) and pointer
-// types are anchored as follow-up cycles — the function fail-louds
-// (K_NoMatchingObjectFormat) on those today.
+// `TypeInterner` is consulted for primitive byte sizes; AGGREGATE
+// types (Struct / Union / Array, recursively, incl. nested) are
+// encoded via the `type_layout` engine — `aggregateLayout` (the
+// target's per-ABI alignment params) + `dataModel` (the format's
+// pointer width) drive `computeLayout`, so a const-init
+// `struct P { int x; int y; } v = { 20, 22 };` at file scope reaches
+// the binary's `.rodata` byte-exact. `aggregateLayout` is nullopt
+// only when the target declared no `aggregateLayout` block; an
+// aggregate global then fails loud (no guessed layout). F16/F128
+// leaves + zero-init (`.bss`) globals + runtime-init globals stay
+// fail-loud-deferred (their own anchors). Pointer-with-address-
+// constant leaves are not byte-encodable (they need a relocation)
+// and fail loud — no consumer yet.
 //
 // Caller (`program/compile_pipeline.cpp` after `assemble()`)
 // assigns the returned vector to `AssembledModule::dataItems`
@@ -409,8 +420,10 @@ assemble(Lir const&                 lir,
 // here — their bytes land via the synthesized `__module_init__`
 // function at module-load time, not via the rodata pipeline.
 [[nodiscard]] DSS_EXPORT std::vector<AssembledData>
-lowerMirGlobalsToDataItems(Mir const&          mir,
-                           TypeInterner const& interner,
-                           DiagnosticReporter& reporter);
+lowerMirGlobalsToDataItems(Mir const&                           mir,
+                           TypeInterner const&                  interner,
+                           std::optional<AggregateLayoutParams> aggregateLayout,
+                           DataModel                            dataModel,
+                           DiagnosticReporter&                  reporter);
 
 } // namespace dss

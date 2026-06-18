@@ -282,6 +282,17 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
     mirCfg.aggregateLayout       = target.aggregateLayout();
     mirCfg.aggregateLayoutLoaded = target.aggregateLayoutLoaded();
     mirCfg.dataModel             = format.dataModel();
+    // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the RESOLVED calling
+    // convention's by-value aggregate strategy into HIR→MIR (the §B-locked
+    // boundary). A struct arg/return is classified + synthesized at HIR→MIR; the
+    // sret mechanism follows the CC's indirect-result register (absent ⇒ hidden
+    // first INTEGER arg, SysV/Win64; present ⇒ x8, AAPCS64 — C3).
+    if (auto const* cc = target.callingConvention(callingConventionIndex)) {
+        mirCfg.aggregateClassification  = cc->aggregateClassification;
+        mirCfg.aggregateMaxRegBytes     = cc->aggregateMaxRegBytes;
+        mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
+        mirCfg.argSlotAligned           = cc->slotAligned;
+    }
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,
                           &hir->sourceMap, mirCfg, &ffiMap,
@@ -313,6 +324,10 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
         // D-FFI-EXTERN-CALL-DISPATCH: capture the active format's extern-call
         // shape now (the LOWER half sees only this struct, not the format).
         format.externCallDispatch(),
+        // D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL: capture the format's data
+        // model now, for the same reason — the aggregate-global rodata encoder
+        // (in the LOWER half) needs the pointer width to compute byte layout.
+        format.dataModel(),
     };
     return cuMir;
 }
@@ -348,6 +363,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          std::vector<ExternImport>                    externImports,
                          std::optional<SymbolId>                     userEntrySymbol,
                          TargetSchema const&                         target,
+                         DataModel                                   dataModel,
                          std::uint16_t                               callingConventionIndex,
                          CompilationUnitId                           cuId,
                          std::optional<ExternCallDispatch>           externCallDispatch,
@@ -437,8 +453,18 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // these globals were declared in MIR but DROPPED at assemble()
     // since the assembler had no globals-bytes path. The new pass
     // closes the producer thread end-to-end.
+    // D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL: pass the target's per-ABI
+    // aggregate-layout params (nullopt if the target declared no block — an
+    // aggregate global then fails loud, never a guessed layout) + the format's
+    // data model (the pointer width) so a const-init aggregate global
+    // (`struct P { int x; int y; } v = { 20, 22 };`) reaches `.rodata`
+    // byte-exact via the shared `type_layout` engine.
     auto dataItems = lowerMirGlobalsToDataItems(
-        mir, interner, reporter);
+        mir, interner,
+        target.aggregateLayoutLoaded()
+            ? std::optional<AggregateLayoutParams>{target.aggregateLayout()}
+            : std::nullopt,
+        dataModel, reporter);
     if (!tierClean(reporter, asmEntry)) {
         // Any per-global encoding error already raised a loud
         // diagnostic via the function's internal `emit`.
@@ -607,7 +633,7 @@ lowerCuMirToAssembly(CuMirModule& cuMir, DiagnosticReporter& reporter) {
     return lowerMirModuleToAssembly(
         cuMir.mir, model.lattice().interner(), nameOf,
         std::move(cuMir.externImports), userEntry, *cuMir.target,
-        cuMir.callingConventionIndex, cuMir.cuId,
+        cuMir.dataModel, cuMir.callingConventionIndex, cuMir.cuId,
         cuMir.externCallDispatch, reporter);
 }
 
@@ -628,6 +654,7 @@ std::optional<AssembledModule>
 lowerMergedToAssembly(MergedMirModule&    merged,
                       GrammarSchema const& /*grammar*/,
                       TargetSchema const& target,
+                      DataModel           dataModel,
                       std::uint16_t       callingConventionIndex,
                       CompilationUnitId   cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
@@ -643,7 +670,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
     return lowerMirModuleToAssembly(
         merged.mir, merged.host.interner(), nameOf,
         std::move(merged.externImports), merged.userEntrySymbol, target,
-        callingConventionIndex, cuId, externCallDispatch, reporter);
+        dataModel, callingConventionIndex, cuId, externCallDispatch, reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU

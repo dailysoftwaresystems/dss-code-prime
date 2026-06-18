@@ -3428,6 +3428,37 @@ struct Lowerer {
         return track(builder.makeTypeDecl(type, sym.v), node);
     }
 
+    // DFS for the first descendant of `root` whose rule is a composite
+    // (fieldChildren) TYPE declaration — c-subset's structSpecifierBody /
+    // unionSpecifierBody / enumSpecifierBody. Used to recover the type-
+    // declaring node of a no-object top-level declaration (`struct P { … };`),
+    // which — since the bare top-level structDecl/unionDecl/enumDecl rules were
+    // folded into topLevelDecl (D-CSUBSET-STRUCT-BODY-VARDECL-POSITION) — now
+    // lives inside the head specifier rather than being the top node itself.
+    // Agnostic: driven by the `fieldChildren` declarations config, not a rule-
+    // name list. First-match returns the OUTERMOST body (a nested inline body
+    // sits deeper), which is the one this declaration introduces.
+    NodeId findCompositeSpecifierIn(NodeId n) {
+        // `visible()` yields TOKEN children too, and `tree().rule()` is valid
+        // only on Internal nodes. A token is never a composite body and has no
+        // children to recurse into, so stop here. (Without this guard a head
+        // that introduces NO composite — `int ;`, now grammar-parseable since
+        // the init-declarator-list became optional — drives the DFS into a
+        // leaf token and `rule()` asserts: a crash, not the fail-loud the
+        // semantic tier owns. D-CSUBSET-STRUCT-BODY-VARDECL-POSITION.)
+        if (!n.valid() || tree().kind(n) != NodeKind::Internal) return NodeId{};
+        auto it = declMap_.find(tree().rule(n).v);
+        if (it != declMap_.end()
+            && sem.declarations[it->second].fieldChildren.has_value()) {
+            return n;
+        }
+        for (NodeId c : visible(n)) {
+            NodeId const hit = findCompositeSpecifierIn(c);
+            if (hit.valid()) return hit;
+        }
+        return NodeId{};
+    }
+
     // FC4 c1: declarator-mode topLevelDecl — Function (the kindByChild
     // discriminator matched the block tail) or one Global PER named
     // declarator. Appends to `out` (module decls are a flat list — a
@@ -3521,6 +3552,43 @@ struct Lowerer {
                 track(builder.makeFunction(sig, sym.v, params, body), node);
             recordLinkage(fn_, linkAttr);
             out.push_back(fn_);
+            return;
+        }
+
+        // No-object declaration: a top-level head that declares ONLY a type,
+        // with no init-declarator-list (`struct P { … };` / `union U { … };` /
+        // `enum E { … };`). The init-declarator-list is grammar-optional
+        // (D-CSUBSET-STRUCT-BODY-VARDECL-POSITION folded the bare top-level
+        // composite definitions into topLevelDecl), so `declarators` is empty
+        // here. Emit a TypeDecl from the head's composite-body node — the same
+        // HirKind the retired structDecl/unionDecl/enumDecl rules produced (so
+        // the type registers in HIR exactly as before).
+        bool hasNamedDeclarator = false;
+        for (NodeId d : declarators) {
+            if (declaratorNameNode(tree(), d, dc).valid()) {
+                hasNamedDeclarator = true;
+                break;
+            }
+        }
+        if (!hasNamedDeclarator) {
+            NodeId const spec = findCompositeSpecifierIn(node);
+            if (spec.valid()) {
+                out.push_back(lowerTypeDecl(spec));
+            } else {
+                // C 6.7p2: a declaration with NEITHER a named declarator NOR a
+                // tag (`int ;`) declares nothing — a constraint violation, now
+                // reachable because the init-declarator-list became grammar-
+                // optional (to admit the bare `struct P {…};` form). Fail loud:
+                // this is the tier with the structural certainty (no declarator
+                // AND no composite specifier in the head — exactly what the
+                // `findCompositeSpecifierIn` miss above proves). The sibling
+                // abstract-declarator form (`int *;`, which DOES have a
+                // declarator carrier) is caught earlier in the semantic
+                // analyzer's requireNamedDeclarators arm.
+                // D-CSUBSET-STRUCT-BODY-VARDECL-POSITION.
+                emitH(DiagnosticCode::S_DeclarationDeclaresNothing, node,
+                      std::string{tree().text(node)});
+            }
             return;
         }
 

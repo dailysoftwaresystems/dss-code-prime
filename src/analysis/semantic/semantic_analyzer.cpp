@@ -1261,6 +1261,35 @@ findTokenInSubtree(Tree const& tree, NodeId node, SchemaTokenId kind,
     return {};
 }
 
+// Float a scope reference up to the nearest enclosing NAMESPACE scope (a block
+// or the file/CU root), past any DECLARATOR-DOMINATOR scope — a `declarations`-
+// rule scope that declares no members of its own (no fieldChildren). C11 6.2.1:
+// a struct/union/enum TAG, and an enum's enumerators, declared as a type
+// specifier belong to the enclosing block or file scope, NOT a transient
+// interior declaration scope. Some declaration rules open such a scope purely to
+// dominate a later sibling (c-subset's topLevelDecl opens one so a function's
+// params — living inside its declarator's fnSuffix — reach the body block); a
+// tag/enumerator minted from a specifier in that scope would VANISH when it pops
+// (invisible to the next declaration). Driven by declByRule/fieldChildren
+// membership — no rule-name identity branch. STOPS at a composite-body scope (a
+// member namespace), a block, or the file/CU root.
+ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
+                              Tree const& tree, ScopeId scope) {
+    auto const& scs = s.scopes.scopes();
+    while (scope.valid() && scope.v < scs.size()) {
+        NodeId const anchorN = scs[scope.v].anchor;
+        if (!anchorN.valid() || scs[scope.v].tree.v != tree.id().v)
+            break;  // file/CU root — the namespace
+        auto dIt = s.idx().declByRule.find(tree.rule(anchorN).v);
+        if (dIt == s.idx().declByRule.end())
+            break;  // a block / non-declaration scope
+        if (cfg.declarations[dIt->second].fieldChildren.has_value())
+            break;  // a composite body — a member namespace
+        scope = scs[scope.v].parent;  // skip the declarator dominator
+    }
+    return scope;
+}
+
 // ── Pass 1: pre-order — mint decls + push/pop scopes + const marking ───────
 void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
            NodeId node, ScopeId current) {
@@ -1427,7 +1456,21 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // scope opener (e.g. a function whose body is its own
                     // scope), this keeps the function name visible to its
                     // siblings/callers while its params/locals live inside.
-                    ScopeId const bindScope = current;
+                    // C11 6.2.1 tag scope: a struct/union/enum TAG declared as
+                    // a type specifier belongs to the nearest enclosing block
+                    // or file scope — never an interior DECLARATOR-DOMINATOR
+                    // scope (e.g. c-subset's topLevelDecl, which opens a scope
+                    // only to dominate a function's params). A tag minted from a
+                    // file-scope `struct P {…} v;` / `struct Q g;` specifier
+                    // would otherwise bind into that transient scope and VANISH
+                    // when it pops, invisible to the next declaration. Float
+                    // past it via the shared helper; gated on fieldChildren so
+                    // only composite TAGS float (a plain typedef-name keeps the
+                    // enclosing-scope binding).
+                    ScopeId const bindScope =
+                        decl.fieldChildren.has_value()
+                            ? floatToNamespaceScope(s, cfg, tree, current)
+                            : current;
                     SymbolRecord rec;
                     rec.name         = resolved.name;
                     rec.scope        = bindScope;
@@ -1800,6 +1843,7 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             // (so the post-sort type list alone can't locate it).
                             struct FieldEntry {
                                 std::uint32_t index; TypeId type; NodeId declNode;
+                                SymbolId sym;
                             };
                             std::vector<FieldEntry> fields;
                             auto const& scope = s.scopes.scopes()[srec.structScope.v];
@@ -1822,13 +1866,36 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                     break;
                                 }
                                 fields.push_back({frec.fieldIndex, frec.type,
-                                                  frec.declRuleNode});
+                                                  frec.declRuleNode, fieldSymId});
                             }
                             if (!anyInvalid) {
                                 std::sort(fields.begin(), fields.end(),
                                           [](FieldEntry const& a, FieldEntry const& b) {
                                               return a.index < b.index;
                                           });
+                                // Densify each field's ordinal to its position in
+                                // the interned composite (0..n-1). Pass 1 stamps
+                                // `fieldIndex` as the *total* binding count of the
+                                // scope at bind time — but a nested type-tag (an
+                                // inline `struct Inner {…}` defined in field
+                                // position, or any non-field binding interleaved
+                                // among the fields) also consumes a binding slot,
+                                // leaving the field ordinals SPARSE (e.g. in=0,
+                                // z=2 with `Inner` bound between them). The struct
+                                // type packs fields DENSELY (sorted order →
+                                // positions 0,1), and three consumers read
+                                // `fieldIndex` as an absolute index into that
+                                // packed type: the HIR MemberAccess payload, the
+                                // union-variant index, and the designated-init
+                                // path. Writing the dense position back here — the
+                                // single chokepoint where the composite's field
+                                // layout is canonically established — keeps
+                                // `symbol.fieldIndex == type field position` BY
+                                // CONSTRUCTION (idempotent for a gap-free struct;
+                                // a no-op for enum enumerators, already dense).
+                                for (std::size_t i = 0; i < fields.size(); ++i)
+                                    s.symbols.at(fields[i].sym).fieldIndex =
+                                        static_cast<std::uint32_t>(i);
                                 std::vector<TypeId> fieldTypes;
                                 fieldTypes.reserve(fields.size());
                                 for (auto const& fe : fields)
@@ -1904,8 +1971,15 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                     compositeTy = s.lattice.interner().enumType(
                                         srec.name, TypeKind::I32);
                                     if (srec.structScope.valid()) {
+                                        // Republish enumerators into the SAME
+                                        // namespace scope the enum TAG floats to
+                                        // (C11 6.2.1) — past any declarator-
+                                        // dominator (topLevelDecl) so a file-
+                                        // scope `enum E { A } … A` resolves `A`.
                                         auto const enclosingId =
-                                            s.scopes.scopes()[srec.structScope.v].parent;
+                                            floatToNamespaceScope(
+                                                s, cfg, tree,
+                                                s.scopes.scopes()[srec.structScope.v].parent);
                                         // Collect enumerators in fieldIndex
                                         // order so the running counter
                                         // matches source declaration order.

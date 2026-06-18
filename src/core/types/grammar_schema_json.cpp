@@ -1182,6 +1182,49 @@ void computeNullableTails(GrammarSchemaData& data) {
     }
 }
 
+// Re-derive every AltChoice position's `expectedSet` as the union of its
+// branches' expectedSets, iterated to a fixed point. The eager computation in
+// `build` is correct for an AltChoice whose branch positions all PRE-EXIST when
+// it is emplaced — but `repeat`'s tie-the-knot (PositionBuilder::build) reserves
+// the loop-entry slot as a placeholder `End`, builds the loop BODY against it,
+// THEN overwrites it with the real AltChoice. Any `optional`/`alt` INSIDE the
+// body whose fall-through `cont` is that loop entry therefore captured the
+// placeholder's EMPTY expectedSet — permanently missing the loop's exit FOLLOW
+// (e.g. an enumerator-list `enumerator (Comma enumerator?)*` before `}`: the
+// trailing `{optional enumerator}` never learned `}` could follow, so a
+// speculative probe of the body wrongly failed and rolled back to the ref form).
+// This pass — a monotone union over a finite token lattice, exactly like
+// computeNullableTails — propagates the loop-entry (and any forward-referenced
+// AltChoice) expectedSet back into the positions that point at it. Runs AFTER
+// detectAmbiguousAlternatives (so the more-complete sets can't manufacture a
+// false FIRST/FIRST overlap) and BEFORE computeFollowSets (which reads these).
+void recomputeAltExpectedSets(GrammarSchemaData& data) {
+    constexpr int kMaxIters = 10000;
+    for (auto& [_, rule] : data.compiledRules) {
+        auto& positions = rule.positions;
+        bool changed = true;
+        int iters = 0;
+        while (changed && iters++ < kMaxIters) {
+            changed = false;
+            for (auto& p : positions) {
+                if (p.slotKind() != SlotKind::AltChoice) continue;
+                std::vector<SchemaTokenId> ex;
+                for (auto bid : p.branches())
+                    mergeSorted(ex, positions[bid].expectedSet());
+                auto const cur = p.expectedSet();
+                if (ex.size() != cur.size()
+                    || !std::equal(ex.begin(), ex.end(), cur.begin(),
+                                   [](SchemaTokenId a, SchemaTokenId b) {
+                                       return a.v == b.v;
+                                   })) {
+                    p.setExpectedSet(std::move(ex));
+                    changed = true;
+                }
+            }
+        }
+    }
+}
+
 // FOLLOW(R) = the set of token kinds that can legitimately follow a
 // successful parse of rule R, anywhere it's referenced. Used by the
 // parser's panic-mode recovery to decide "have I reached a resync
@@ -2783,6 +2826,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 buildPositionTables        (data, doc.at("shapes"), coll);
                 detectAmbiguousAlternatives(data, coll, doc.at("shapes"));
                 computeNullableTails       (data);
+                recomputeAltExpectedSets   (data);
                 computeFollowSets          (data, coll);
                 validateBodyDefaultKindsOffGrammar(data, coll);
                 validateOperatorBodyRules  (data, coll);

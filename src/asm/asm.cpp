@@ -5,6 +5,7 @@
 #include "asm/format/walker_util.hpp"
 #include "asm/format/x86_variable.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/type_lattice/type_layout.hpp"   // computeLayout, scalarByteSize
 #include "lir/lir_pass_util.hpp"
 
 #include <cstring>
@@ -473,9 +474,10 @@ bool validateAssembledData(std::span<AssembledData const> items,
 namespace {
 
 // Byte-width of a primitive TypeKind. Returns nullopt for non-primitive
-// kinds (Array / Struct / Ptr / FnSig / ...) — those require an
-// interner-side recursive computation (anchored D-LK4-RODATA-PRODUCER-
-// AGGREGATE-GLOBAL when the first aggregate global needs encoding).
+// kinds (Array / Struct / Ptr / FnSig / ...). Aggregate globals do NOT pass
+// through here — they take the `MirAggregateValue` arm + `encodeAggregateValue`
+// (the interner-side recursive layout walk, D-LK4-RODATA-PRODUCER-AGGREGATE-
+// GLOBAL); this gate only widths the SCALAR-global fast path.
 [[nodiscard]] std::optional<std::size_t>
 primitiveByteSize(TypeKind k) noexcept {
     switch (k) {
@@ -510,12 +512,130 @@ void appendLE(std::vector<std::uint8_t>& bytes,
     }
 }
 
+// Decode a SCALAR literal to the little-endian bit pattern to emit (zero-
+// extended into a u64; the writer takes the low `width` bytes). Handles
+// bool / signed / unsigned integers and F32/F64 — a `double`-arm value is
+// NARROWED to `float` for an F32 leaf (writing the low 4 bytes of the
+// binary64 pattern would be garbage, not a valid binary32). Returns nullopt
+// for kinds the pool cannot represent as plain bytes: F16/F128 (no lossless
+// `double` arm) or a non-scalar / monostate variant (string /
+// MirAggregateValue / unknown). The SOLE scalar-encode chokepoint — the
+// scalar-global arm and the aggregate-leaf recursion both route through it,
+// so the int/float value semantics can never drift between the two encoders.
+[[nodiscard]] std::optional<std::uint64_t>
+decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
+    if (std::holds_alternative<std::uint64_t>(v.value))
+        return std::get<std::uint64_t>(v.value);
+    if (std::holds_alternative<std::int64_t>(v.value))
+        return static_cast<std::uint64_t>(std::get<std::int64_t>(v.value));
+    if (std::holds_alternative<bool>(v.value))
+        return std::get<bool>(v.value) ? 1u : 0u;
+    if (std::holds_alternative<double>(v.value)) {
+        double const dv = std::get<double>(v.value);
+        std::uint64_t bits = 0;
+        if (k == TypeKind::F32) {
+            float const fv = static_cast<float>(dv);
+            std::memcpy(&bits, &fv, sizeof(float));
+        } else if (k == TypeKind::F64) {
+            std::memcpy(&bits, &dv, sizeof(double));
+        } else {
+            return std::nullopt;   // F16/F128 — no lossless pool arm
+        }
+        return bits;
+    }
+    return std::nullopt;   // monostate / string / MirAggregateValue
+}
+
+// Recursively encode an aggregate (or scalar) literal `v` of type `ty` into
+// `buf` at absolute byte offset `base`. `buf` is pre-sized to the TOP
+// aggregate's layout `size` and zero-filled by the caller, so every padding
+// byte, partial-init tail, and union slack stays zero by construction — only
+// the provided leaves are written. Walks the TYPE tree and the init-VALUE
+// tree in lockstep — the MIRROR of `collectLeaves` (aggregate_abi.cpp), but
+// writing the VALUE bytes instead of collecting ABI leaves. Returns false
+// (the fail-loud signal) on any un-computable layout, a type↔value shape
+// mismatch, an over-long initializer, or an unencodable leaf. PURE
+// type/value-driven — no target/format/language identity branch (the per-ABI
+// layout enters ONLY through `lp`/`dm`).
+//
+// Field/element pairing (zero-fills already normalized at HIR lowering, see
+// cst_to_hir.cpp ConstructAggregate):
+//   * struct — one value field per type field (omitted slots are synthetic
+//     zero-fills) → `agg.fields[i]` ↔ field `i` at `fieldOffsets[i]`.
+//   * union  — a brace-init sets the FIRST member only → a 1-field value →
+//     field 0 ↔ member 0 at offset 0; the union's remaining bytes stay zero.
+//   * array  — `agg.fields[i]` ↔ element `i` at `base + i*elemStride`; a
+//     short initializer leaves the trailing elements zero.
+[[nodiscard]] bool
+encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
+                     TypeInterner const& in, AggregateLayoutParams lp,
+                     DataModel dm, std::vector<std::uint8_t>& buf,
+                     std::uint64_t base) {
+    TypeKind const k = in.kind(ty);
+
+    if (k == TypeKind::Struct || k == TypeKind::Union) {
+        if (!std::holds_alternative<MirAggregateValue>(v.value)) return false;
+        auto const& agg = std::get<MirAggregateValue>(v.value);
+        auto const  lay = computeLayout(ty, in, lp, dm);
+        if (!lay.has_value()) return false;
+        auto const ops = in.operands(ty);
+        if (ops.size() != lay->fieldOffsets.size()) return false;
+        if (agg.fields.size() > ops.size()) return false;   // too many inits → fail loud
+        for (std::size_t i = 0; i < agg.fields.size(); ++i)
+            if (!encodeAggregateValue(ops[i], agg.fields[i], in, lp, dm, buf,
+                                      base + lay->fieldOffsets[i]))
+                return false;
+        return true;
+    }
+
+    if (k == TypeKind::Array) {
+        if (!std::holds_alternative<MirAggregateValue>(v.value)) return false;
+        auto const& agg   = std::get<MirAggregateValue>(v.value);
+        auto const  ops   = in.operands(ty);
+        auto const  scals = in.scalars(ty);
+        // `scals[0]` is the element count (signed in the pool); a negative count
+        // is malformed — reject it (mirrors computeLayout's array guard) before
+        // the unsigned cast, so it can't become a huge `count`.
+        if (ops.empty() || scals.empty() || scals[0] < 0) return false;
+        TypeId const        elem  = ops[0];
+        std::uint64_t const count = static_cast<std::uint64_t>(scals[0]);
+        auto const elemLay = computeLayout(elem, in, lp, dm);
+        if (!elemLay.has_value()) return false;
+        if (agg.fields.size() > count) return false;        // too many inits → fail loud
+        // Stride EXACTLY as computeLayout sizes the array (`stride * len`, where
+        // stride = align-rounded element size) — NOT bare `elemLay->size`. They
+        // coincide for every complete C type (size is a multiple of align), but
+        // matching the layout authority's formula keeps element placement
+        // correct-by-construction rather than relying on that invariant.
+        std::uint64_t const stride = elemLay->align.alignUp(elemLay->size);
+        for (std::size_t i = 0; i < agg.fields.size(); ++i)
+            if (!encodeAggregateValue(elem, agg.fields[i], in, lp, dm, buf,
+                                      base + i * stride))
+                return false;
+        return true;
+    }
+
+    // Scalar / pointer leaf: write the literal's LE bytes at `base`. Width
+    // comes from `scalarByteSize` (the SAME sizing `computeLayout` used for
+    // the offsets, so leaf width and field offset can never disagree).
+    auto const wOpt = scalarByteSize(k, dm);
+    if (!wOpt.has_value()) return false;             // FnSig/Slice/Void/... → fail loud
+    auto const bits = decodeScalarLiteralBits(v, k);
+    if (!bits.has_value()) return false;             // F16/F128/non-scalar → fail loud
+    if (base + *wOpt > buf.size()) return false;     // layout↔encoder disagreement → fail loud
+    for (std::uint64_t j = 0; j < *wOpt; ++j)
+        buf[base + j] = static_cast<std::uint8_t>((*bits >> (j * 8)) & 0xFFu);
+    return true;
+}
+
 } // namespace
 
 std::vector<AssembledData>
-lowerMirGlobalsToDataItems(Mir const&          mir,
-                           TypeInterner const& interner,
-                           DiagnosticReporter& reporter) {
+lowerMirGlobalsToDataItems(Mir const&                           mir,
+                           TypeInterner const&                  interner,
+                           std::optional<AggregateLayoutParams> aggregateLayout,
+                           DataModel                            dataModel,
+                           DiagnosticReporter&                  reporter) {
     auto emit = [&](DiagnosticCode code, std::string msg) {
         ParseDiagnostic d;
         d.code     = code;
@@ -614,6 +734,60 @@ lowerMirGlobalsToDataItems(Mir const&          mir,
             continue;
         }
 
+        // Aggregate arm (Struct / Union / Array, recursively + nested —
+        // D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL). Dispatch on the LITERAL-
+        // POOL VARIANT (`MirAggregateValue`) — the same discriminator the
+        // `std::string` arm above uses, and it MUST fire BEFORE the
+        // TypeKind-keyed `primitiveByteSize` gate (which returns nullopt for
+        // every aggregate kind). The recursive `encodeAggregateValue` needs
+        // the target's per-ABI layout params; absent them (the target
+        // declared no `aggregateLayout` block) there is no sound layout, so
+        // fail loud rather than guess a wrong one.
+        if (std::holds_alternative<MirAggregateValue>(v.value)) {
+            if (!aggregateLayout.has_value()) {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: global "
+                                 "SymbolId={{ {} }} is an aggregate "
+                                 "(TypeKind={}) but the target declared no "
+                                 "`aggregateLayout` block — cannot compute "
+                                 "its byte layout (D-LK4-RODATA-PRODUCER-"
+                                 "AGGREGATE-GLOBAL).",
+                                 sym.v, static_cast<int>(k)));
+                continue;
+            }
+            auto const lay =
+                computeLayout(ty, interner, *aggregateLayout, dataModel);
+            if (!lay.has_value()) {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: global "
+                                 "SymbolId={{ {} }} has an un-sizeable "
+                                 "aggregate type (TypeKind={}) — incomplete "
+                                 "or out-of-scope (D-LK4-RODATA-PRODUCER-"
+                                 "AGGREGATE-GLOBAL).",
+                                 sym.v, static_cast<int>(k)));
+                continue;
+            }
+            // Pre-size + zero-fill to the layout total: every padding byte,
+            // partial-init tail, and union slack is then 0 by construction —
+            // the recursion writes only the provided leaves.
+            d.bytes.assign(static_cast<std::size_t>(lay->size), 0u);
+            if (!encodeAggregateValue(ty, v, interner, *aggregateLayout,
+                                      dataModel, d.bytes, 0)) {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: global "
+                                 "SymbolId={{ {} }} aggregate initializer "
+                                 "could not be encoded (a type↔value shape "
+                                 "mismatch or an unencodable leaf — e.g. "
+                                 "f16/f128 or an address-relocated pointer) "
+                                 "(D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL).",
+                                 sym.v));
+                continue;
+            }
+            d.alignment = lay->align;
+            out.push_back(std::move(d));
+            continue;
+        }
+
         // Primitive integer arm: encode the variant's u64/i64/
         // bool value as LE bytes sized by the type. Width is the
         // type's primitive byte size; HIR/MIR const-eval clamps
@@ -629,36 +803,18 @@ lowerMirGlobalsToDataItems(Mir const&          mir,
                              sym.v, static_cast<int>(k)));
             continue;
         }
-        std::uint64_t value = 0;
-        if (std::holds_alternative<std::uint64_t>(v.value)) {
-            value = std::get<std::uint64_t>(v.value);
-        } else if (std::holds_alternative<std::int64_t>(v.value)) {
-            value = static_cast<std::uint64_t>(
-                std::get<std::int64_t>(v.value));
-        } else if (std::holds_alternative<bool>(v.value)) {
-            value = std::get<bool>(v.value) ? 1u : 0u;
-        } else if (std::holds_alternative<double>(v.value)) {
-            // MirLiteralValue holds floats as `double` only — there
-            // is no `float` variant arm in the pool. For an `f32`
-            // global we MUST narrow `double → float` BEFORE the
-            // bit-cast: writing the low 4 bytes of the binary64
-            // representation directly yields garbage (the low
-            // mantissa bits, not a valid binary32). Same logic for
-            // F16/F128: they cannot be represented losslessly in
-            // the pool's `double` arm; fail loud rather than emit
-            // wrong bytes. (Code-reviewer F1 audit fold — silent
-            // miscompile for `float g = 1.0f;` at file scope.)
-            double const dv = std::get<double>(v.value);
-            if (k == TypeKind::F32) {
-                float const fv = static_cast<float>(dv);
-                std::memcpy(&value, &fv, sizeof(float));
-            } else if (k == TypeKind::F64) {
-                std::memcpy(&value, &dv, sizeof(double));
-            } else {
-                // F16 / F128: literal pool's double arm cannot
-                // represent these losslessly. Anchored
-                // D-LK4-RODATA-PRODUCER-EXOTIC-FLOAT until the
-                // pool grows a typed-float variant.
+        // Decode the scalar value through the shared chokepoint (the SAME
+        // int/float semantics the aggregate-leaf recursion uses, incl. the
+        // mandatory `double → float` narrow for an F32 global — writing the
+        // low 4 bytes of the binary64 pattern would be garbage). A nullopt
+        // means either an f16/f128 `double` (the pool can't represent it) or
+        // a non-scalar / monostate variant — distinguished HERE for a precise
+        // diagnostic (the `MirAggregateValue` arm already fired above, so a
+        // non-scalar here is monostate). (Code-reviewer F1 audit fold — the
+        // silent-miscompile guard for `float g = 1.0f;` at file scope.)
+        auto const bits = decodeScalarLiteralBits(v, k);
+        if (!bits.has_value()) {
+            if (std::holds_alternative<double>(v.value)) {
                 emit(DiagnosticCode::K_NoMatchingObjectFormat,
                      std::format("lowerMirGlobalsToDataItems: "
                                  "global SymbolId={{ {} }} has "
@@ -668,20 +824,19 @@ lowerMirGlobalsToDataItems(Mir const&          mir,
                                  "(D-LK4-RODATA-PRODUCER-EXOTIC-"
                                  "FLOAT).",
                                  sym.v, static_cast<int>(k)));
-                continue;
+            } else {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: global "
+                                 "SymbolId={{ {} }} has a literal "
+                                 "value of an unhandled variant arm "
+                                 "(monostate) — anchored under "
+                                 "D-LK4-RODATA-PRODUCER-AGGREGATE-"
+                                 "GLOBAL.",
+                                 sym.v));
             }
-        } else {
-            emit(DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("lowerMirGlobalsToDataItems: global "
-                             "SymbolId={{ {} }} has a literal "
-                             "value of an unhandled variant arm "
-                             "(monostate / MirAggregateValue) — "
-                             "anchored under D-LK4-RODATA-PRODUCER-"
-                             "AGGREGATE-GLOBAL.",
-                             sym.v));
             continue;
         }
-        appendLE(d.bytes, value, *widthOpt);
+        appendLE(d.bytes, *bits, *widthOpt);
         // `primitiveByteSize()` returns ∈ {1,2,4,8,16} — every
         // value is a power-of-two in [1,256], so the `optional`
         // unwrap path is dead. Use the runtime-asserting factory

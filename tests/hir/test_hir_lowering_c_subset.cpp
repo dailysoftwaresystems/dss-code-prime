@@ -459,6 +459,31 @@ TEST(HirLoweringCSubset, StructDeclarationLowersToTypeDecl) {
     EXPECT_EQ(interner.kind(fields[1]), TypeKind::I32);
 }
 
+// C 6.7p2 — a top-level declaration with NEITHER a named declarator NOR a tag
+// (`int ;`) declares nothing. This became grammar-parseable when the init-
+// declarator-list was made OPTIONAL (to admit the bare `struct P {…};` form,
+// D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). The HIR lowering must FAIL LOUD with
+// S_DeclarationDeclaresNothing — and must NOT crash: the prior code drove
+// `findCompositeSpecifierIn`'s `tree.rule()` over a leaf token (the `int`),
+// tripping the `Internal`-node assertion. RED-ON-DISABLE on BOTH halves: revert
+// the `findCompositeSpecifierIn` Internal guard → this test CRASHES; drop the
+// `emitH(S_DeclarationDeclaresNothing)` → `res->ok` stays true and the count is 0.
+// (The sibling `StructDeclarationLowersToTypeDecl` above proves the diagnostic
+// does NOT false-fire on a real bare tag-declaring def.)
+TEST(HirLoweringCSubset, TopLevelDeclaresNothingFailsLoudNoCrash) {
+    SemanticModel model = analyzeCSubset("int ;\nint main(void) { return 0; }\n");
+    // The constraint violation is HIR-tier: parse + semantic accept `int ;`.
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "`int ;` declares nothing — lowering must fail loud, not accept";
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
+        << "exactly one S_DeclarationDeclaresNothing for the empty `int ;` decl";
+}
+
 // D5.1: a struct used as a pointer-typed parameter + member access via `->`
 // resolves the field SymbolId AND propagates the field's type to the
 // member-access node. Pins the SEMANTIC layer (Pass 1.5 struct composition +
@@ -2681,11 +2706,32 @@ TEST(HirLoweringCSubset, D5_5_EnumValueUseViaBareName) {
     ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 }
 
-// Enum with trailing comma + multi-enumerator parse cleanly.
+// Top-level enum with a TRAILING COMMA parses cleanly — the RED-ON-DISABLE guard
+// for the schema-compiler `recomputeAltExpectedSets` fixpoint (D-CSUBSET-STRUCT-
+// BODY-VARDECL-POSITION §2d). The enum body `enumerator (Comma enumerator?)*` is
+// an `optional` inside a `repeat` before the required `}` closer; without the
+// fixpoint the trailing-comma optional never learns `}` can follow, so the
+// SPECULATIVE body probe (`topLevelCompositeSpec`) hits P_NoAlternativeMatched
+// and rolls back to the ref form → parse error. VERIFIED red-on-disable: toggling
+// off the `recomputeAltExpectedSets` orchestration call makes THIS test fail.
+// NOTE: only the TOP-LEVEL (named-rule `topLevelCompositeSpec`) surface is fixed;
+// the typedef-position inline-alt surface (`typedef enum {…,} T;`) is a separate
+// pre-existing gap — D-CSUBSET-TYPEDEF-ENUM-TRAILING-COMMA (fail-loud, pinned).
 TEST(HirLoweringCSubset, D5_5_EnumTrailingCommaParses) {
     SemanticModel model = analyzeCSubset(
         "enum E { A, B, C, };\n");
-    ASSERT_FALSE(model.hasErrors());
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    // The trailing comma must mint EXACTLY A, B, C — never a phantom 4th
+    // enumerator (an over-eager `(Comma enumerator?)*` that consumed the comma
+    // as introducing a fourth, empty enumerator would be a silent mis-parse a
+    // bare `!hasErrors()` check could miss).
+    int enumerators = 0;
+    for (auto const& s : model.symbols())
+        if (s.name == "A" || s.name == "B" || s.name == "C") ++enumerators;
+    EXPECT_EQ(enumerators, 3)
+        << "exactly A, B, C — the trailing comma introduces no enumerator";
 }
 
 // Enumerator values: implicit auto-increment + explicit integer-literal
@@ -2796,10 +2842,11 @@ TEST(HirLoweringCSubset, D5_5_LiftOptOutRespected) {
     std::string const target =
         "\"compositeKind\": \"enum\",\n"
         "                           \"liftToEnclosingScope\": true";
-    // FC4 c1: TWO enum-composite rows carry the lift flag now (the
-    // statement-position `enumDecl` AND the typedef-position
-    // `enumSpecifierBody`); flip EVERY occurrence so the opt-out is
-    // total — the bare-name `A` below must resolve through NEITHER.
+    // The enum-composite lift flag now rides ONE row — the `enumSpecifierBody`
+    // (the dead statement-position `enumDecl` row was deleted in the struct-head
+    // closing cycle, D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). Flip EVERY
+    // occurrence so the opt-out is total — the bare-name `A` below (its enum is
+    // parsed via `enumSpecifierBody`) must then resolve through NO lift.
     std::size_t flipped = 0;
     for (auto pos = text.find(target); pos != std::string::npos;
          pos = text.find(target, pos)) {

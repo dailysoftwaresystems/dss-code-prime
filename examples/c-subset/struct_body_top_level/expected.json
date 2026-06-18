@@ -1,0 +1,13 @@
+{
+  "$comment": "D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL (initialized aggregate globals → byte-exact rodata via encodeAggregateValue) + D-CSUBSET-STRUCT-BODY-VARDECL-POSITION (bare top-level struct def → TypeDecl + bare tag-REF return head `struct Tri make(void)`). Witnesses the c-subset-REACHABLE encoder shapes as byte-exact pins: PADDING (gpad.val=19 at offset 4 after char+pad), EXPLICIT-ZERO fields (gpart b,c written 0, read back 0), UNION first-member init (gun.i=6), NESTED aggregate (gnest), ARRAY stride (gv). 19+10+6+4+3=42; each summand is read from a const-init global, so a wrong offset/wrong value/bad stride flips the exit (the negative miscompile pin). The encoder's omitted-slot/short-init zero-fill (HIR pre-normalizes it away) and its fail-loud arms are UNREACHABLE from c-subset — pinned synthetically at the asm tier (tests/asm/test_asm_substrate.cpp AsmAggregateGlobal.*). The release optimizedPipelines arm proves optimized==baseline. arm64 runs under qemu; macho on the macos-latest leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [ {"label": "release", "shippedPipeline": "release"} ]
+}

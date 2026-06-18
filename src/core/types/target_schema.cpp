@@ -1123,6 +1123,27 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             std::span<std::string const> spRefs{&cc.stackPointer->name, 1};
             checkRefs(i, "stackPointer", spRefs, TargetRegClass::GPR);
         }
+        // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the sret indirect-result
+        // register (AAPCS64 x8), when declared, must resolve to a GPR.
+        if (cc.indirectResultRegister.has_value()) {
+            std::span<std::string const> irRefs{&cc.indirectResultRegister->name, 1};
+            checkRefs(i, "indirectResultRegister", irRefs, TargetRegClass::GPR);
+        }
+        // FC7 C2: a CC declaring a real aggregate-classification STRATEGY must
+        // also declare a non-zero `aggregateMaxRegBytes` — otherwise every
+        // by-value aggregate classifies BY REFERENCE (`size <= 0` is always
+        // false), a silent wrong-but-self-consistent ABI. Fail loud at load so a
+        // future target.json that wires the strategy but forgets the budget is
+        // caught instead of quietly mis-passing every struct.
+        if (cc.aggregateClassification != AggregateClassKind::None
+            && cc.aggregateMaxRegBytes == 0) {
+            fail(std::format("/callingConventions/{}/aggregateMaxRegBytes", i),
+                 std::format("callingConvention '{}' declares aggregateClassification "
+                             "'{}' but aggregateMaxRegBytes is 0 — a real strategy "
+                             "needs a non-zero register budget",
+                             cc.name,
+                             aggregateClassKindName(cc.aggregateClassification)));
+        }
 
         // Stack alignment must be a power of two when ANY ABI field is
         // set (since the call frame is meaningless without it). Zero is

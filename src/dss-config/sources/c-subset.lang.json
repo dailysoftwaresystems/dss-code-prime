@@ -42,7 +42,7 @@
     }
   },
 
-  "$fc2CastExprComment": "FC2 Part A: C-style cast `(type)expr` (castExpr/castTypeRef/castTypeBase/castOperand shapes). castExpr shares the `( ... )` opener with compoundLiteralExpr/parenExpr inside the speculative operand alt; the probe disambiguates structurally (a brace-init follows the compound literal's `)`, an expression follows the cast's). `commitRequiresTypeName` names the type-position child rule: a structurally-successful probe COMMITS only per the parser's GENERIC type-name triage — (1) a type that is NOT a lone Identifier (keyword/struct-tag/star/const present) always commits, those forms cannot be expressions; (2) a lone Identifier the binder sketch knows as a TYPE commits; (3) one it knows as a VALUE rolls back to the value reading (shadowing-aware); (4) an UNKNOWN lone Identifier commits iff the token after the type's closer is NOT an infix/postfix/ternary operator per the operator table (the value reading could not continue), else rolls back AND records an AmbiguousTypeNameCandidate for the compilation-unit oracle's one-shot reparse (cross-file typedefs). castTypeRef duplicates typeRefAllowingStruct PLUS a bare-Identifier base (typedef names in cast position) — deliberately NOT added to typeRefAllowingStruct itself, which would inject the C decl-vs-expr statement ambiguity (`T x;` vs `a * b;`) into varDecl/param/structField; that generalization stays anchored separately. castOperand is a second expr-entry rule re-entering the Pratt walker at PREFIX precedence (90): the cast operand binds prefix + postfix operators but NOT binary/ternary ones, giving C-correct `(int)a + b` == ((int)a)+b, `(int)x[2]` == (int)(x[2]), `-(int)x`, and `(int)(long)x` chains. Same wrapper vocabulary as `expression` (wrapper rule names are per-schema; the loader dedups).",
+  "$fc2CastExprComment": "FC2 Part A: C-style cast `(type)expr` (castExpr/castTypeRef/castTypeBase/castOperand shapes). castExpr shares the `( ... )` opener with compoundLiteralExpr/parenExpr inside the speculative operand alt; the probe disambiguates structurally (a brace-init follows the compound literal's `)`, an expression follows the cast's). `commitRequiresTypeName` names the type-position child rule: a structurally-successful probe COMMITS only per the parser's GENERIC type-name triage — (1) a type that is NOT a lone Identifier (keyword/struct-tag/star/const present) always commits, those forms cannot be expressions; (2) a lone Identifier the binder sketch knows as a TYPE commits; (3) one it knows as a VALUE rolls back to the value reading (shadowing-aware); (4) an UNKNOWN lone Identifier commits iff the token after the type's closer is NOT an infix/postfix/ternary operator per the operator table (the value reading could not continue), else rolls back AND records an AmbiguousTypeNameCandidate for the compilation-unit oracle's one-shot reparse (cross-file typedefs). castTypeRef duplicates typeRefAllowingStruct PLUS a bare-Identifier base (typedef names in cast position). NOTE (FC7 D-FC7-NESTED-STRUCT-FIELD): typeRefAllowingStruct ITSELF now also carries the bare-Identifier alt — but it is consumed ONLY by structField/unionField, and a struct/union body has NO expression-statement production, so the C decl-vs-expr ambiguity (`T x;` vs `a * b;`) cannot arise there (a bare name in field-type position is unambiguously a type; a non-type fails loud at semantic scope-lookup). varDecl/param do NOT use typeRefAllowingStruct — they use declHead/declHeadForParam with the binder-sketch `commitRequiresTypeName` commit — so the statement/param decl-vs-expr triage is untouched by that alt. castOperand is a second expr-entry rule re-entering the Pratt walker at PREFIX precedence (90): the cast operand binds prefix + postfix operators but NOT binary/ternary ones, giving C-correct `(int)a + b` == ((int)a)+b, `(int)x[2]` == (int)(x[2]), `-(int)x`, and `(int)(long)x` chains. Same wrapper vocabulary as `expression` (wrapper rule names are per-schema; the loader dedups).",
 
   "$ff11AngleIncludeComment": "FF11 angle-include lexing. `#` pushes the line-scoped `include-directive` mode (popAtNewline:true -> the frame auto-pops at the next newline, so a malformed `#include` with no header -- or any directive -- never leaks `<`-as-header-opener into the following line; C preprocessor directives are line-oriented). That mode inherits the top-level token map (tokens:default) so `include`, `\"...\"`, and identifiers all lex normally; the ONLY override is `<`, which there OPENS a header path (replaceMode -> header-body, stringStyle.endsAt `>`) instead of meaning LtOp. The override-first longest-match rule (language-config-spec section 9.6) means `<` wins at length 1 and the global `<<`/`<=` are deliberately suppressed inside a directive -- correct, since `#include <<x>>` is not valid C. The `header-body` mode mirrors the `string` body: a coalesced `HeaderPath` token captures the raw path bytes between `<` and the closing `>` (which pops the frame back to main); escapeKind:none -- header paths have no escapes. The quote form keeps the global `\"`->StringStart->string body unchanged (additive: both `#include <h>` and `#include \"h\"` work). The resolver reads the raw path slice (a filename, not a decoded string) for both forms, and picks the search path by which token kind it finds under the directive (imports.pathToken=StringStart -> self-dir+includeDirs; imports.systemPathToken=HeaderStart -> shippedLibDirs).",
 
@@ -233,24 +233,12 @@
     "root": { "sequence": [ { "repeat": "topLevel" } ] },
 
     "topLevel": {
+      "$comment": "NON-speculative: each alt has a disjoint FIRST. struct/union/enum heads route to topLevelDecl (via topLevelHead's body/ref specifier forms) — the bare top-level structDecl/unionDecl/enumDecl rules were folded into topLevelDecl (optional declarator) so a `struct` lead has ONE owner here and only topLevelHead's single-level speculation runs (the two-level topLevel-speculation path was unsound — D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). Those three now-unreferenced rules (+ their semantics/hirKind/scopes rows) were DELETED in the closing cycle (no dead config); the shared structField/unionField/enumerator helpers stay (the *SpecifierBody forms consume them).",
       "alt": [
         "includeDirective",
         "typedefDecl",
-        "structDecl",
-        "unionDecl",
-        "enumDecl",
         "topLevelDecl",
         "externDecl"
-      ]
-    },
-
-    "structDecl": {
-      "sequence": [
-        "StructKeyword", "Identifier",
-        "BlockOpen",
-        { "repeat": "structField" },
-        "BlockClose",
-        "EndStatement"
       ]
     },
 
@@ -266,16 +254,6 @@
       "sequence": [ "StructKeyword", "Identifier" ]
     },
 
-    "unionDecl": {
-      "sequence": [
-        "UnionKeyword", "Identifier",
-        "BlockOpen",
-        { "repeat": "unionField" },
-        "BlockClose",
-        "EndStatement"
-      ]
-    },
-
     "unionField": {
       "sequence": [
         "typeRefAllowingStruct", "Identifier",
@@ -286,21 +264,6 @@
 
     "unionTypeRef": {
       "sequence": [ "UnionKeyword", "Identifier" ]
-    },
-
-    "enumDecl": {
-      "sequence": [
-        "EnumKeyword", "Identifier",
-        "BlockOpen",
-        { "optional": {
-            "sequence": [
-              "enumerator",
-              { "repeat": { "sequence": [ "Comma", { "optional": "enumerator" } ] } }
-            ]
-        }},
-        "BlockClose",
-        "EndStatement"
-      ]
     },
 
     "enumerator": {
@@ -319,16 +282,27 @@
     },
 
     "topLevelDecl": {
-      "sequence": [ { "optional": "declSpecifiers" }, "topLevelHead", "initDeclaratorList", "topLevelDeclTail" ]
+      "$comment": "C declaration = decl-specifiers init-declarator-list? `;` (or a function-definition block tail). The init-declarator-list is OPTIONAL: a bare `struct P { … };` / `enum E { … };` is a type-only declaration (head introduces the tag, no object declared) — the semantic tier mints the type from the head and emits a TypeDecl; a head that introduces NO tag with no declarator (`int ;`) is a C6.7p2 'declares nothing' constraint violation (fail-loud). A trailing declarator (`struct P { … } v;`) or a block tail (`struct Tri mkTri(void){…}`) takes the normal global/function path.",
+      "sequence": [ { "optional": "declSpecifiers" }, "topLevelHead", { "optional": "initDeclaratorList" }, "topLevelDeclTail" ]
     },
 
     "topLevelHead": {
-      "$comment": "Top-level head: keyword specifier run OR a lone Identifier (typedef name). Identifier is UNAMBIGUOUS at top level — no expression statements exist there — so no speculation/guard is needed. Struct/union/enum heads at top level stay unsupported (pre-FC4 parity; the residue is pinned).",
+      "$comment": "Top-level head: a keyword type specifier (`typeSpecifierSeq`, e.g. `int`/`unsigned long`), a struct/union/enum composite specifier (`topLevelCompositeSpec` — the SPECULATIVE body-vs-ref alt), OR a lone Identifier (typedef name). The OUTER alt is NON-speculative: FIRST(typeSpecifierSeq)={type keywords}, FIRST(topLevelCompositeSpec)={struct,union,enum}, FIRST(Identifier)={ident} are pairwise disjoint — so a plain `int x;` routes DIRECTLY to typeSpecifierSeq (NO extra wrapper node, preserving the pre-existing tree shape) and only a struct/union/enum lead enters the single-level speculation that closes D-CSUBSET-STRUCT-BODY-VARDECL-POSITION. topLevel stays non-speculative: `struct` routes unambiguously to topLevelDecl.",
       "sequence": [
         { "repeat": "headQualifier" },
-        { "alt": [ "typeSpecifierSeq", "Identifier" ] },
+        { "alt": [ "typeSpecifierSeq", "topLevelCompositeSpec", "Identifier" ] },
         { "repeat": "headQualifier" }
       ]
+    },
+
+    "topLevelCompositeSpec": {
+      "$comment": "The struct/union/enum SPECIFIER at a top-level declaration head — body form (`struct P { … }`) OR bare tag reference (`struct P`). SPECULATIVE (mirrors typeSpecifierForDecl / typedefHead): body forms probe FIRST; a ref with no `{` rolls back to the `*TypeRef` form (`struct Tri mkTri(void)` / `struct Q g;`). A NAMED rule (not an inline alt) so the speculation runs at the same depth proven to work for local decls — an inline alt at the top-level-decl depth hits the FC4-c1 depth-0 candidate replay and fails to roll back. The enum body's trailing-comma enumerator-list parses cleanly here now that the schema compiler propagates nested-nullable FOLLOW (recomputeAltExpectedSets).",
+      "alt": [
+        "structSpecifierBody", "structTypeRef",
+        "unionSpecifierBody",  "unionTypeRef",
+        "enumSpecifierBody",   "enumTypeRef"
+      ],
+      "speculative": true, "lookahead": 256
     },
 
     "topLevelDeclTail": {
@@ -419,8 +393,14 @@
     },
 
     "typeSpecifierForDecl": {
-      "$comment": "KEYWORD/composite-led type specifiers for declaration heads — deliberately NO Identifier arm (the typedef-name head is the ambiguous form, routed through identDeclHead/declOrExprStmt or the committed post-specifier/post-qualifier heads).",
-      "alt": [ "typeSpecifierSeq", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
+      "$comment": "KEYWORD/composite-led type specifiers for declaration heads — deliberately NO Identifier arm (the typedef-name head is the ambiguous form, routed through identDeclHead/declOrExprStmt or the committed post-specifier/post-qualifier heads). SPECULATIVE (mirror typedefHead, D-CSUBSET-STRUCT-BODY-VARDECL-POSITION): admits the struct/union/enum BODY forms so a body-defined LOCAL (`struct P { int a; } v;` as a statement) parses; body forms probe FIRST, a ref with no `{` rolls back to the `*TypeRef` form. Single-level.",
+      "alt": [
+        "typeSpecifierSeq",
+        "structSpecifierBody", "structTypeRef",
+        "unionSpecifierBody",  "unionTypeRef",
+        "enumSpecifierBody",   "enumTypeRef"
+      ],
+      "speculative": true, "lookahead": 256
     },
 
     "declHead": {
@@ -576,7 +556,15 @@
     },
 
     "typeBaseAllowingStruct": {
-      "alt": [ "typeSpecifierSeq", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
+      "$comment": "FC7 D-FC7-NESTED-STRUCT-FIELD: the trailing `Identifier` alt admits a typedef-name (user struct/union type) as a struct/union FIELD type — symmetric with `typeBase` above, which already carries it. A struct/union body has no expression-statement context, so a bare Identifier in field-type position is UNAMBIGUOUSLY a type-name (no binder-sketch guard needed); a non-type name fails loud at semantic scope-lookup. Tried last, so keyword/tag/enum forms keep priority. D-CSUBSET-STRUCT-BODY-VARDECL-POSITION: also admits the struct/union/enum BODY forms (an inline nested definition `struct Inner { int x; } in;` as a field) — SPECULATIVE (mirror typedefHead), body-before-ref. This makes the body-in-head form RECURSIVE: a structSpecifierBody contains structFields, each of which may itself BE a structSpecifierBody (arbitrary nesting), the recursion falling out of the grammar — single-level speculation at each structField, never nested.",
+      "alt": [
+        "typeSpecifierSeq",
+        "structSpecifierBody", "structTypeRef",
+        "unionSpecifierBody",  "unionTypeRef",
+        "enumSpecifierBody",   "enumTypeRef",
+        "Identifier"
+      ],
+      "speculative": true, "lookahead": 256
     },
 
     "typeRefAllowingStruct": {
@@ -1001,18 +989,11 @@
         "anonymousNameAllowed": true,
         "fieldChildren": { "rule": "enumerator", "compositeKind": "enum",
                            "liftToEnclosingScope": true } },
-      { "rule": "structDecl",  "name": 1, "kind": "type",
-        "fieldChildren": { "rule": "structField", "compositeKind": "struct" } },
       { "rule": "structField", "name": 1, "type": 0, "kind": "variable",
         "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
         "allowFlexibleArray": true },
-      { "rule": "unionDecl",   "name": 1, "kind": "type",
-        "fieldChildren": { "rule": "unionField", "compositeKind": "union" } },
       { "rule": "unionField",  "name": 1, "type": 0, "kind": "variable",
         "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 } },
-      { "rule": "enumDecl",    "name": 1, "kind": "type",
-        "fieldChildren": { "rule": "enumerator", "compositeKind": "enum",
-                           "liftToEnclosingScope": true } },
       { "rule": "enumerator",  "name": 0, "kind": "variable" },
       { "rule": "externDecl", "name": 2, "type": 1, "kind": "variable",
         "kindByChild": {
@@ -1037,7 +1018,7 @@
         "dereferences": true,  "operatorToken": "ArrowOp" }
     ],
     "$scopesComment": "FC4 c1: topLevelDecl replaced funcDefTail — a function's params now live INSIDE its declarator's fnSuffix, so the scope that holds them must dominate BOTH the declarator and the block; the topLevelDecl node is that dominator (harmless for variable-kind topLevelDecls — nothing binds into the scope). The three *SpecifierBody rules are fieldChildren composites (typedef-position struct/union/enum bodies).",
-    "scopes": [ "block", "topLevelDecl", "structDecl", "unionDecl", "enumDecl",
+    "scopes": [ "block", "topLevelDecl",
                 "structSpecifierBody", "unionSpecifierBody", "enumSpecifierBody" ],
     "assignments": [
       { "rule": "binaryExpr", "operatorToken": "AssignOp",       "lhs": 0, "rhs": 2 },
@@ -1170,9 +1151,6 @@
       { "rule": "forIdentDecl", "hirKind": "VarDecl"     },
       { "rule": "param",        "hirKind": "VarDecl"     },
       { "rule": "typedefDecl",  "hirKind": "TypeDecl"    },
-      { "rule": "structDecl",   "hirKind": "TypeDecl"    },
-      { "rule": "unionDecl",    "hirKind": "TypeDecl"    },
-      { "rule": "enumDecl",     "hirKind": "TypeDecl"    },
       { "rule": "externDecl",   "hirKind": "ExternDecl"  },
       { "rule": "block",        "hirKind": "Block"       },
       { "rule": "ifStmt",       "hirKind": "IfStmt"      },

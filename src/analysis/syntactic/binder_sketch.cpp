@@ -56,7 +56,20 @@ BinderSketch::BinderSketch(GrammarSchema const& schema) {
     for (auto const& sc : sem.scopes) {
         if (sc.rule.valid()) scopeRules_.insert(sc.rule.v);
     }
+    // A scope rule that ALSO carries a non-Type `declarations` row opens a
+    // DECLARATOR-DOMINATOR scope (e.g. c-subset's topLevelDecl — a variable/
+    // function declaration that opens a scope only to dominate its params).
+    // A composite-TYPE-body scope rule (structSpecifierBody, isType) is NOT a
+    // dominator (its tag is recorded for it, then floats past any enclosing
+    // dominator). `block` and friends carry no `declarations` row at all.
+    for (auto rv : scopeRules_) {
+        auto it = byRule_.find(rv);
+        if (it != byRule_.end() && !it->second.isType) {
+            dominatorScopeRules_.insert(rv);
+        }
+    }
     liveScopes_.push_back(0);   // the global scope, id 0, never popped
+    liveScopeIsDominator_.push_back(false);   // global is a namespace scope
 }
 
 BinderSketch::BinderDecl const*
@@ -69,8 +82,9 @@ bool BinderSketch::isScopeRule(RuleId rule) const noexcept {
     return scopeRules_.contains(rule.v);
 }
 
-void BinderSketch::openScope() {
+void BinderSketch::openScope(RuleId rule) {
     liveScopes_.push_back(nextScopeId_++);
+    liveScopeIsDominator_.push_back(dominatorScopeRules_.contains(rule.v));
 }
 
 void BinderSketch::closeScope() {
@@ -82,13 +96,29 @@ void BinderSketch::closeScope() {
         bsFatal("closeScope underflow — scope events out of balance");
     }
     liveScopes_.pop_back();
+    liveScopeIsDominator_.pop_back();
 }
 
 void BinderSketch::record(std::string name, bool isType) {
     if (name.empty()) return;   // anonymous/malformed decl — nothing to bind
+    // A composite/typedef TYPE tag (C11 6.2.1) belongs to the nearest enclosing
+    // NAMESPACE scope (block or file), not an interior declarator-dominator
+    // scope it may have been minted inside (a file-scope `struct P { … } v;`
+    // tag is recorded as structSpecifierBody's frame closes — WHILE the
+    // enclosing topLevelDecl param-dominator scope is still live — and must
+    // bind at file scope so it is visible to the next declaration / exported in
+    // globalTypeNames). Float TYPE bindings past dominator scopes; VALUE
+    // bindings (params, locals) stay in the live scope. Mirrors the analyzer's
+    // floatToNamespaceScope.
+    std::uint32_t scope = liveScopes_.back();
+    if (isType) {
+        for (std::size_t i = liveScopes_.size(); i-- > 0;) {
+            if (!liveScopeIsDominator_[i]) { scope = liveScopes_[i]; break; }
+        }
+    }
     bindings_.push_back(Binding{
         .name   = std::move(name),
-        .scope  = liveScopes_.back(),
+        .scope  = scope,
         .isType = isType,
     });
 }
@@ -134,10 +164,11 @@ std::vector<AmbiguousTypeNameCandidate> BinderSketch::takeCandidates() {
 
 BinderSketch::Snapshot BinderSketch::snapshot() const {
     return Snapshot{
-        .bindingCount   = bindings_.size(),
-        .candidateCount = candidates_.size(),
-        .liveScopes     = liveScopes_,
-        .nextScopeId    = nextScopeId_,
+        .bindingCount       = bindings_.size(),
+        .candidateCount     = candidates_.size(),
+        .liveScopes         = liveScopes_,
+        .liveScopeDominator = liveScopeIsDominator_,
+        .nextScopeId        = nextScopeId_,
     };
 }
 
@@ -155,8 +186,9 @@ void BinderSketch::restore(Snapshot&& s) {
     candidates_.erase(
         candidates_.begin() + static_cast<std::ptrdiff_t>(s.candidateCount),
         candidates_.end());
-    liveScopes_  = std::move(s.liveScopes);
-    nextScopeId_ = s.nextScopeId;
+    liveScopes_           = std::move(s.liveScopes);
+    liveScopeIsDominator_ = std::move(s.liveScopeDominator);
+    nextScopeId_          = s.nextScopeId;
 }
 
 } // namespace dss

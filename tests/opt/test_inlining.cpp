@@ -226,6 +226,92 @@ TEST(Inlining, GlobalLeafCalleeIsInlined) {
         << "the inlined module must pass the MIR verifier";
 }
 
+// ── FC7 C1c/C3: frame/ABI-sensitive callees are REFUSED at the gate ──
+// (D-FC7-INLINE-MULTI-PIECE-RETURN — closed via the legality-gate refusal.)
+// A callee that returns a struct IN REGISTERS lowers to a MULTI-piece
+// `Return` (N>1 operands). The single-block splice paths clone a Return
+// taking only operand 0 — truncating the struct to its first field. The
+// legality gate MUST refuse (the Call survives). RED-ON-DISABLE: drop the
+// `instOperands(cid).size() > 1` gate refusal in inlineLegalityGate and this
+// callee inlines (callsInlined == 1) → the splice silently drops fields
+// 1..N-1. Reachable under the shipped release.pipeline.json (runs Inlining).
+TEST(Inlining, MultiPieceStructReturningCalleeIsNotInlined) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i64    = interner.primitive(TypeKind::I64);
+    std::array<TypeId, 2> fields{i64, i64};
+    TypeId const pairTy = interner.structType("Pair", fields);
+    TypeId const fnSig  = interner.fnSig({}, pairTy, CallConv::CcSysV);
+    MirBuilder mb;
+    // callee f (SymbolId 50): single-block leaf returning {11, 22} as TWO pieces.
+    mb.addFunction(fnSig, SymbolId{50});
+    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(fEntry);
+    MirInstId const p0 = mb.addConst(i32Lit(11), i64);
+    MirInstId const p1 = mb.addConst(i32Lit(22), i64);
+    std::array<MirInstId, 2> pieces{p0, p1};
+    mb.addReturnMulti(pieces);
+    // main (SymbolId 100): calls f.
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const calleeAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    std::array<MirInstId, 1> callOps{calleeAddr};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, pairTy);
+    mb.addReturnMulti(std::array<MirInstId, 1>{call});
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "a callee returning a struct IN REGISTERS (a multi-piece Return) MUST "
+           "NOT be inlined — the splice would truncate the Return to field 0";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u)
+        << "the Call must survive (refused, not spliced)";
+}
+
+// An x8-sret callee (>16B struct return under AAPCS64) reads its incoming
+// result pointer via `ReadIndirectResult` at ENTRY — a frame-sensitive op
+// that reads the CALLEE's indirect-result register. Inlining would splice it
+// into the CALLER's frame, reading the caller's (uninitialized) x8. The gate
+// MUST refuse. RED-ON-DISABLE: drop the `ReadIndirectResult` gate refusal and
+// this callee inlines → the spliced read binds to the wrong frame.
+TEST(Inlining, X8SretCalleeWithReadIndirectResultIsNotInlined) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, ptr, CallConv::CcSysV);
+    MirBuilder mb;
+    // callee f (SymbolId 50): reads the indirect-result register at entry,
+    // returns it (the x8-sret callee shape, modeled with a ptr result here).
+    mb.addFunction(fnSig, SymbolId{50});
+    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(fEntry);
+    MirInstId const irr = mb.addReadIndirectResult(ptr);
+    mb.addReturn(irr);
+    // main (SymbolId 100): calls f.
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const calleeAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    std::array<MirInstId, 1> callOps{calleeAddr};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, ptr);
+    mb.addReturn(call);
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "an x8-sret callee (ReadIndirectResult at entry) MUST NOT be inlined — "
+           "the spliced read would bind to the caller's frame, not the callee's";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+}
+
 // ── Argument substitution: a callee taking a parameter is inlined,
 // and the actual argument flows into the spliced body. ─────────────
 // Callee g(int x) { return x + 1; }; main() { return g(41); } → after

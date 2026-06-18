@@ -65,6 +65,22 @@ enum class MirOpcode : std::uint16_t {
     // ── calls ──
     Call,          // operands [callee, args...]; result Optional (void ⇒ no value)
     IntrinsicCall, // operands [args...]; payload = intrinsic id; result Optional
+    // The k-th return-register piece of a preceding struct-returning Call
+    // (FC7 C1c, D-FC7-SYSV-STRUCT-RETURN-IN-REGS). operand [call] anchors it to
+    // its call (ordering + no cross-call CSE + DCE-safe); payload = the PER-CLASS
+    // return-register ordinal (≥1 — piece 0 is the Call's own result). Result =
+    // the piece's register type (I64/F64). The caller-side mirror of `Arg`.
+    ReturnPiece,
+    // FC7 C3 (AAPCS64/Apple x8 sret). The CALLEE-side entry read of the indirect-
+    // result-register (x8): the incoming address of the caller-allocated result
+    // storage for a >16-byte by-value RETURN. A leaf value-origin like `Arg`, but
+    // sourced from the cc's `indirectResultRegister` instead of an arg register;
+    // result = a pointer. Used ONLY when the CC's sret is register-based
+    // (aggregateSretViaHiddenArg=false), NOT the SysV/Win64 hidden-arg path.
+    // (The CALLER side needs NO opcode: the sret-pointer is a normal prepended
+    // Call operand routed to the IRR by the `call_payload::kIndirectResultBit`
+    // flag — see the IRR-reroute design in lir_callconv. No WriteIndirectResult.)
+    ReadIndirectResult,
     // ── SSA join ──
     Phi,           // operand range addresses the PHI pool, not the operand pool
     // ── terminators (exactly one, last in a block; successors live in succ pool) ──
@@ -228,6 +244,13 @@ struct MirOpcodeInfo {
         // calls (result Optional — void callee ⇒ no value).
         case MirOpcode::Call:          return {1, N, 0, 0, R::Optional, false, true, false, "call"};
         case MirOpcode::IntrinsicCall: return {0, N, 0, 0, R::Optional, false, true, false, "intrinsic"};
+        // ReturnPiece: [call]; payload = per-class return-register ordinal. Side-
+        // effecting so DCE can't drop it and no pass hoists it above its Call (it
+        // reads a physical return register valid only immediately post-call).
+        case MirOpcode::ReturnPiece:   return {1, 1, 0, 0, R::Value, false, true, false, "returnpiece"};
+        // ReadIndirectResult: a leaf value-origin (reads x8 at entry) — mirror of
+        // Arg; side-effecting so it pins to entry and DCE can't drop it.
+        case MirOpcode::ReadIndirectResult:  return {0, 0, 0, 0, R::Value, false, true, false, "readindirectresult"};
 
         // phi — operand range addresses the PHI pool (incoming value/block pairs).
         case MirOpcode::Phi: return {0, N, 0, 0, R::Value, false, false, true, "phi"};
@@ -239,7 +262,14 @@ struct MirOpcodeInfo {
         case MirOpcode::Br:          return {0, 0, 1, 1, R::None, true, true, false, "br"};
         case MirOpcode::CondBr:      return {1, 1, 2, 2, R::None, true, true, false, "condbr"};
         case MirOpcode::Switch:      return {1, N, 1, S, R::None, true, true, false, "switch"};
-        case MirOpcode::Return:      return {0, 1, 0, 0, R::None, true, true, false, "return"};
+        // FC7 C1c: a by-value struct returned IN REGISTERS carries N eightbyte/HFA
+        // PIECE operands (each a return-register value); a scalar return carries 1, a
+        // void return 0. The bound must admit N — `1` truncated every multi-piece
+        // return at the verifier's structural check, the upper guard of the same
+        // miscompile the clone sites caused (masked on x86_64 by arg/return register
+        // aliasing, exposed on AAPCS64). The per-piece type/count is checked in
+        // checkTypeInvariants (the FC7 C1c multi-Return rule).
+        case MirOpcode::Return:      return {0, N, 0, 0, R::None, true, true, false, "return"};
         case MirOpcode::Unreachable: return {0, 0, 0, 0, R::None, true, true, false, "unreachable"};
 
         // SIMD (reserved — provisional arities).

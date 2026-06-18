@@ -429,6 +429,7 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // (target, format); pass that format's extern-call shape so MIR→LIR
     // selects the right call-site opcode for any surviving extern import.
     auto mod = lowerMergedToAssembly(*merged, grammar, **targetR,
+                                     (*formatR)->dataModel(),
                                      ccIndex, cuMirs[0].cuId,
                                      (*formatR)->externCallDispatch(),
                                      reporter);

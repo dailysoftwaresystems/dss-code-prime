@@ -87,19 +87,21 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
     // FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS) + D-CSUBSET-CHAR-STRING-VALUE-CODEGEN:
     // optional `width` key — the operation-width discriminator. Absent = the
     // variant matches an instruction of ANY width (every pre-FC3 variant).
-    // 8 (the byte forms: movsx/movzx r/m8, mov r8, sxtb, ldrb/strb), 32, and 64
-    // are encodable; any other value is a load-time reject, never a silent
-    // match-nothing variant.
+    // 8 (the byte forms: movsx/movzx r/m8, mov r8, sxtb, ldrb/strb), 16 (the
+    // half-word memory forms: 0x66 mov / movzx r16, STURH/LDURH —
+    // D-LIR-INT-MEMORY-WIDTH-EXACT), 32, and 64 are encodable; any other value
+    // is a load-time reject, never a silent match-nothing variant.
     if (g.contains("width")) {
         auto const& w = g.at("width");
         if (!w.is_number_integer()
-            || (w.get<std::int64_t>() != 8 && w.get<std::int64_t>() != 32
-                && w.get<std::int64_t>() != 64)) {
+            || (w.get<std::int64_t>() != 8 && w.get<std::int64_t>() != 16
+                && w.get<std::int64_t>() != 32 && w.get<std::int64_t>() != 64)) {
             coll.emit(DiagnosticCode::C_MalformedJson,
                       std::format("/opcodes/{}/encoding/variants/{}/guard/width", opIdx, vi),
-                      "'width' must be the integer 8, 32, or 64 "
+                      "'width' must be the integer 8, 16, 32, or 64 "
                       "(the shipped operation-width vocabulary; "
-                      "D-CSUBSET-32BIT-ALU-FORMS / CHAR-STRING-VALUE-CODEGEN)");
+                      "D-CSUBSET-32BIT-ALU-FORMS / CHAR-STRING-VALUE-CODEGEN / "
+                      "D-LIR-INT-MEMORY-WIDTH-EXACT)");
         } else {
             variant.guardWidthBits =
                 static_cast<std::uint8_t>(w.get<std::int64_t>());
@@ -1456,6 +1458,31 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // contract).
                 readBoundedInt(c, coll, ccPath, "callPushBytes",
                                cc.callPushBytes);
+                // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN):
+                // the max aggregate size passed/returned in registers (SysV 16,
+                // Win64 8, AAPCS64 16); larger ⇒ by-reference / sret.
+                readBoundedInt(c, coll, ccPath, "aggregateMaxRegBytes",
+                               cc.aggregateMaxRegBytes);
+                // FC7: the by-value aggregate CLASSIFICATION strategy (a closed
+                // verb set — the realization tier switches on this enum, never
+                // identity). Unknown strategy ⇒ FAIL-LOUD (no silent fallback).
+                if (c.contains("aggregateClassification")) {
+                    if (!c.at("aggregateClassification").is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/aggregateClassification", ccPath),
+                                  "'aggregateClassification' must be a strategy-name string");
+                    } else {
+                        auto const s = c.at("aggregateClassification").get<std::string>();
+                        if (auto const k = aggregateClassKindFromName(s); k.has_value()) {
+                            cc.aggregateClassification = *k;
+                        } else {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("{}/aggregateClassification", ccPath),
+                                      std::format("unknown aggregate-classification "
+                                                  "strategy '{}'", s));
+                        }
+                    }
+                }
                 // D-ML7-2.6: slot-aligned arg passing (Win64 ms_x64).
                 // Defaults to false (independent counters — SysV/AAPCS64
                 // semantics). A cc declaring `slotAligned: true` means
@@ -1534,6 +1561,29 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                       std::format("{}/variadicVectorCountReg", ccPath),
                                       std::format("variadic vector-count register "
                                                   "'{}' is not in the register table", name));
+                        }
+                    }
+                }
+                // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): AAPCS64/Apple's x8
+                // indirect-result-location register for sret returns. Omitted
+                // by SysV / Win64 (their sret pointer is a hidden first arg).
+                if (c.contains("indirectResultRegister")) {
+                    if (!c.at("indirectResultRegister").is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/indirectResultRegister", ccPath),
+                                  "must be a register-name string");
+                    } else {
+                        auto const name = c.at("indirectResultRegister").get<std::string>();
+                        auto it = data.registerIndex.find(name);
+                        if (it != data.registerIndex.end()) {
+                            cc.indirectResultRegister = TargetCallingConvention::NamedRegisterRef{
+                                name, it->second
+                            };
+                        } else {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("{}/indirectResultRegister", ccPath),
+                                      std::format("indirect-result register '{}' is not "
+                                                  "in the register table", name));
                         }
                     }
                 }

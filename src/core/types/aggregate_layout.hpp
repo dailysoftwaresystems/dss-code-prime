@@ -59,6 +59,43 @@ scalarAlignmentRuleFromName(std::string_view s) noexcept {
     return std::nullopt;
 }
 
+// FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the per-CC
+// discipline for classifying a struct/union passed or returned BY VALUE. A
+// CLOSED, config-declared strategy enum — the realization tier (the
+// `aggregate_abi` classifier) switches on THIS, never on `cc.name` / target /
+// format identity (the established `ScalarAlignmentRule` / `slotAligned`
+// precedent). `None` ⇒ the CC has no by-value aggregate support built yet ⇒
+// FAIL-LOUD (so an un-built CC can never silently mis-pass a struct). Phased:
+// SysVEightbyte (C1) is live; Win64BySize (C2) + Aapcs64Hfa (C3) are
+// declared-but-not-yet-realized (the strategy-availability guard keeps them
+// loud until built). Lives here (NOT target_schema.hpp) so the HIR→MIR lowering
+// config + the classifier speak it without pulling the link/target substrate.
+enum class AggregateClassKind : std::uint8_t {
+    None          = 0,  // unsupported → fail-loud
+    SysVEightbyte = 1,  // System V AMD64 §3.2.3: eightbyte INTEGER/SSE classes
+    Win64BySize   = 2,  // MS x64: ≤8B (power-of-2) in 1 reg, else by reference
+    Aapcs64Hfa    = 3,  // AAPCS64/Apple: HFA in SIMD, ≤16B in X regs, x8 sret
+};
+
+[[nodiscard]] constexpr std::string_view
+aggregateClassKindName(AggregateClassKind k) noexcept {
+    switch (k) {
+        case AggregateClassKind::None:          return "none";
+        case AggregateClassKind::SysVEightbyte: return "sysv_eightbyte";
+        case AggregateClassKind::Win64BySize:   return "win64_by_size";
+        case AggregateClassKind::Aapcs64Hfa:    return "aapcs64_hfa";
+    }
+    return {};
+}
+[[nodiscard]] constexpr std::optional<AggregateClassKind>
+aggregateClassKindFromName(std::string_view s) noexcept {
+    if (s == "none")           return AggregateClassKind::None;
+    if (s == "sysv_eightbyte") return AggregateClassKind::SysVEightbyte;
+    if (s == "win64_by_size")  return AggregateClassKind::Win64BySize;
+    if (s == "aapcs64_hfa")    return AggregateClassKind::Aapcs64Hfa;
+    return std::nullopt;
+}
+
 // The per-ABI aggregate-layout parameter block parsed from `.target.json`. A
 // default-constructed value is NOT valid (scalarAlignment 0 / maxAlignment 0 —
 // the loader requires both; validate() rejects a zero/non-pow2 maxAlignment).

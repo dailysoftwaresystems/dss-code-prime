@@ -3,6 +3,7 @@
 #include "analysis/semantic/semantic_model.hpp"  // SemanticModel (CuMirModule member, move-only)
 #include "asm/asm.hpp"  // AssembledModule (assembleUnit return + linkAndWrite span)
 #include "core/export.hpp"
+#include "core/types/data_model.hpp"  // DataModel (CuMirModule member + lowerMergedToAssembly arg)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"  // ExternImport (CuMirModule member)
 #include "core/types/grammar_schema.hpp"
@@ -214,6 +215,12 @@ struct DSS_EXPORT CuMirModule {
     // selects the right call-site opcode. nullopt iff the format declared
     // none — MIR→LIR then fails loud on any extern call.
     std::optional<ExternCallDispatch> externCallDispatch;
+    // D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL: the active format's data model
+    // (pointer width), captured here for the SAME reason as `externCallDispatch`
+    // — the LOWER half sees only this struct, and the aggregate-global rodata
+    // encoder needs it (with the target's `aggregateLayout`) to compute byte
+    // layout. The target's alignment params are read from `*target` directly.
+    DataModel dataModel{};
 };
 
 // BUILD half: semantic analysis → HIR → FFI synthesis → MIR → optimize. Returns the
@@ -272,6 +279,7 @@ lowerCuMirToAssembly(CuMirModule&        cuMir,
 lowerMergedToAssembly(MergedMirModule&    merged,
                       GrammarSchema const& grammar,
                       TargetSchema const&  target,
+                      DataModel            dataModel,
                       std::uint16_t        callingConventionIndex,
                       CompilationUnitId    cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,

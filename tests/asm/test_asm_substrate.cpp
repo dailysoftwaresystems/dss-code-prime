@@ -31,9 +31,11 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 using namespace dss;
 using dss::test_support::lowerCSubsetToLir;
@@ -1015,4 +1017,157 @@ TEST(AsmDiagnostics, AnNibbleRendersAsLetterA) {
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::A_NoEncodingDeclared),     "A0001");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::A_NoEncodingShapeWalker),  "A0002");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::A_LirToMirSizeMismatch),   "A0003");
+}
+
+// ── D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL: encoder unit pins ──────────
+//
+// `lowerMirGlobalsToDataItems` encodes const-init aggregate globals to
+// `.rodata` bytes via the recursive `encodeAggregateValue`. The c-subset
+// corpus `struct_body_top_level` is the end-to-end RUNTIME witness for the
+// encoder shapes a C source can REACH; these pins cover the shapes it cannot:
+// the short-init zero-fill (HIR pre-normalizes omitted slots into a FULL
+// positional field list, so the encoder never receives a short aggregate from
+// c-subset) and the fail-loud arms (over-long init, an exotic-float leaf, an
+// absent aggregate-layout). They build the `MirAggregateValue` shape DIRECTLY
+// — §A.5(b): an unconsumed substrate path is latent unless the test constructs
+// the consuming shape itself, not waits for a real consumer. Each pin is
+// red-on-disable; the comment on each names the guard it watches fail.
+
+namespace {
+
+// Build a Mir with ONE constant-init module global of `type` initialized by
+// `init`, lower it through `lowerMirGlobalsToDataItems`, return the emitted
+// data items + the reporter's error count.
+struct LoweredAgg {
+    std::vector<AssembledData> items;
+    std::size_t                errors;
+};
+[[nodiscard]] LoweredAgg lowerOneAggGlobal(
+        TypeInterner const& ti, TypeId type, MirLiteralValue init,
+        std::optional<AggregateLayoutParams> lp, DataModel dm) {
+    MirBuilder b;
+    std::uint32_t const lit = b.literalPoolAdd(std::move(init));
+    b.addGlobal(type, SymbolId{1}, lit);
+    Mir const m = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto items = lowerMirGlobalsToDataItems(m, ti, lp, dm, rep);
+    return {std::move(items), rep.errorCount()};
+}
+
+// A scalar field literal of `kind` carrying integer bits `v`.
+[[nodiscard]] MirLiteralValue intField(std::int64_t v, TypeKind kind) {
+    MirLiteralValue f;
+    f.value = v;
+    f.core  = kind;
+    return f;
+}
+
+// Wrap `fields` into a struct/array aggregate literal tagged `core`.
+[[nodiscard]] MirLiteralValue aggOf(std::vector<MirLiteralValue> fields, TypeKind core) {
+    MirAggregateValue agg;
+    agg.fields = std::move(fields);
+    MirLiteralValue v;
+    v.value = std::move(agg);
+    v.core  = core;
+    return v;
+}
+
+// The shipped-target params (natural alignment, 16-byte ISA cap).
+constexpr AggregateLayoutParams kNatural16{ScalarAlignmentRule::Natural, 16};
+
+} // namespace
+
+// POSITIVE control: a {char,int} struct (the padding classic) FULLY
+// initialized encodes char@0 + pad[1..3] + int@4 (LE), size 8 — at the unit
+// tier, complementing the runtime corpus. Red-on-disable: a wrong field offset
+// (or dropping the layout-driven pre-zero) changes the bytes.
+TEST(AsmAggregateGlobal, PaddedStructFullInitEncodesByteExact) {
+    TypeInterner ti{CompilationUnitId{1}};
+    std::array<TypeId, 2> const f{ti.primitive(TypeKind::Char),
+                                  ti.primitive(TypeKind::I32)};
+    TypeId const s = ti.structType("Padded", f);
+    auto const r = lowerOneAggGlobal(
+        ti, s,
+        aggOf({intField(7, TypeKind::Char), intField(0x11223344, TypeKind::I32)},
+              TypeKind::Struct),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(r.errors, 0u);
+    ASSERT_EQ(r.items.size(), 1u);
+    std::vector<std::uint8_t> const expect{0x07, 0, 0, 0, 0x44, 0x33, 0x22, 0x11};
+    EXPECT_EQ(r.items[0].bytes, expect);
+}
+
+// SHORT-init zero-fill — the path c-subset cannot reach (HIR delivers a full
+// field list). A {I32,I32,I32} with ONLY field 0 provided must encode field 0
+// then ZERO the trailing 8 bytes (the layout-sized, pre-zeroed buffer).
+// Red-on-disable: the trailing zeros come from the layout-sized pre-zero, so the
+// assertion depends on it — remove `d.bytes.assign(lay->size, 0)` and the buffer
+// is empty, so even field 0's write falls outside it → the leaf bounds-check fails
+// loud (errors != 0) instead of yielding 12 clean bytes.
+TEST(AsmAggregateGlobal, ShortInitZeroFillsTrailingFields) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 3> const f{i32, i32, i32};
+    TypeId const s = ti.structType("Triple", f);
+    auto const r = lowerOneAggGlobal(
+        ti, s,
+        aggOf({intField(0x11223344, TypeKind::I32)}, TypeKind::Struct),  // field 0 only
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(r.errors, 0u);
+    ASSERT_EQ(r.items.size(), 1u);
+    std::vector<std::uint8_t> const expect{
+        0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0, 0, 0, 0, 0};
+    EXPECT_EQ(r.items[0].bytes, expect);
+}
+
+// FAIL-LOUD: MORE init values than the struct has fields → reject, no data.
+// Red-on-disable: drop the `agg.fields.size() > ops.size()` guard and the loop
+// indexes `ops[i]` past the field count instead of failing loud.
+TEST(AsmAggregateGlobal, OverLongInitFailsLoud) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 2> const f{i32, i32};
+    TypeId const s = ti.structType("Pair", f);
+    auto const r = lowerOneAggGlobal(
+        ti, s,
+        aggOf({intField(1, TypeKind::I32), intField(2, TypeKind::I32),
+               intField(3, TypeKind::I32)}, TypeKind::Struct),  // 3 > 2 fields
+        kNatural16, DataModel::Lp64);
+    EXPECT_EQ(r.errors, 1u);
+    EXPECT_TRUE(r.items.empty());
+}
+
+// FAIL-LOUD: an F16 leaf — the literal pool's `double` arm cannot represent
+// f16/f128 losslessly. Reject, no data. Red-on-disable: make
+// `decodeScalarLiteralBits` encode f16 from the double and this emits SILENT
+// wrong bytes (0 errors, 1 item) instead of failing loud.
+TEST(AsmAggregateGlobal, ExoticFloatLeafFailsLoud) {
+    TypeInterner ti{CompilationUnitId{1}};
+    std::array<TypeId, 1> const f{ti.primitive(TypeKind::F16)};
+    TypeId const s = ti.structType("H", f);
+    MirLiteralValue leaf;
+    leaf.value = double{1.5};
+    leaf.core  = TypeKind::F16;
+    auto const r = lowerOneAggGlobal(
+        ti, s, aggOf({leaf}, TypeKind::Struct), kNatural16, DataModel::Lp64);
+    EXPECT_EQ(r.errors, 1u);
+    EXPECT_TRUE(r.items.empty());
+}
+
+// FAIL-LOUD: an aggregate global, but the target declared NO `aggregateLayout`
+// block (nullopt) → no sound layout → fail loud, never a guessed one.
+// Red-on-disable: drop the `!aggregateLayout.has_value()` check and
+// `computeLayout(…, *aggregateLayout, …)` dereferences a disengaged optional.
+TEST(AsmAggregateGlobal, MissingAggregateLayoutFailsLoud) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 2> const f{i32, i32};
+    TypeId const s = ti.structType("Pair", f);
+    auto const r = lowerOneAggGlobal(
+        ti, s,
+        aggOf({intField(1, TypeKind::I32), intField(2, TypeKind::I32)},
+              TypeKind::Struct),
+        std::nullopt, DataModel::Lp64);   // no layout params declared
+    EXPECT_EQ(r.errors, 1u);
+    EXPECT_TRUE(r.items.empty());
 }

@@ -1,0 +1,13 @@
+{
+  "$comment": "D-CSUBSET-STRUCT-BODY-VARDECL-POSITION (multi-level/recursive field nesting + local body-in-head): a typedef'd outer struct with an INLINE body-defined nested field `struct Inner { int x; int y; } in;` (the structField head admits *SpecifierBody, speculative single-level — the recursion falls out of structSpecifierBody->structField->structSpecifierBody) + a LOCAL body-in-head `struct Pt { int a; } p;`. o.in.x(30)+o.in.y(0)+o.z(12)+p.a(0) = 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [ {"label": "release", "shippedPipeline": "release"} ]
+}

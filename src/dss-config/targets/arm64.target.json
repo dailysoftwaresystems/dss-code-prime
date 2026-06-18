@@ -31,6 +31,26 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (FC7 C1c) — caller-side mirror of `arg`: 'this LirReg is the k-th return register of the preceding struct-returning call' (payload = per-class return ordinal). ML7 callconv lowering captures it from the return register. Declared for substrate uniformity; AAPCS64 struct returns land at C3.",
+      "mnemonic":      "ret_piece",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Virtual-ISA pseudo-op (FC7 C3, AAPCS64/Apple x8 sret) — callee-side mirror of `arg`: 'this LirReg is the incoming indirect-result (sret) pointer', read from the cc's indirectResultRegister (x8) at function entry. NO encoding: lir_callconv materializes it into `mov result, x8` (an ORR-alias), exactly like `arg`/`ret_piece`. payload unused. The caller side needs no opcode — the sret pointer is a normal prepended Call operand routed to x8 by the call payload's indirect-result bit.",
+      "mnemonic":      "read_indirect_result",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "AAPCS64 has no native `mov reg, reg` instruction — the canonical encoding is `ORR Xd, XZR, Xm` (32-bit fixed word 0xAA0003E0 = base + Rn=XZR=31; Rd and Rm via slots). LIR's `mov` is 2-operand (result + 1 source); 3-address natively (no requires2Address).",
       "mnemonic":      "mov",
       "result":        "value",
@@ -766,6 +786,28 @@
               { "index": 1, "slotKind": "membase.noscale" },
               { "index": 2, "slotKind": "imm9"           }
             ]
+          },
+          {
+            "$comment": "width 32 (D-LIR-INT-MEMORY-WIDTH-EXACT): LDUR Wt, [Xn, #simm9] (0xB8400000 — the LDUR word with size 11→10). Loads 4 bytes into Wt; a W-write zeroes bits 63:32 of Xt, so the int lands clean. A 4-byte int load MUST be width-exact — a 64-bit LDUR of a PACKED int element reads 4 bytes past it. Same operand layout as the 64-bit form. Selected when the Load's result type is a 4-byte integer (I32/U32, or `long` under LLP64) — width 32 via memAccessWidthFlags.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "template":   { "fixedWord": 3091202048 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm9"           }
+            ]
+          },
+          {
+            "$comment": "width 16 (D-LIR-INT-MEMORY-WIDTH-EXACT): LDURH Wt, [Xn, #simm9] (0x78400000 — the LDUR word with size 11→01). Loads 2 bytes, ZERO-extending into Wt (signedness-agnostic, the LDURB peer); the short→int promote (SXTH/UXTH = D-CSUBSET-SUBNATIVE-ALU-FORMS, not yet encoded ⇒ short VALUE use fails loud) re-reads the low half-word. Same operand layout. Selected when the Load's result type is I16/U16 — width 16 via memAccessWidthFlags.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "template":   { "fixedWord": 2017460224 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm9"           }
+            ]
           }
         ]
       }
@@ -797,6 +839,28 @@
             "$comment": "width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): STURB Wt, [Xn, #simm9] (0x38000000 — the STUR word with size 11→00). Writes EXACTLY the low byte of Wt — a 64-bit STUR of a 1-byte element clobbers 7 neighbours. Signedness-agnostic (only the low 8 bits are written). Same operand layout as the 64-bit form. Selected when the stored value's type is Char (width 8 via memAccessWidthFlags).",
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
             "template": { "fixedWord": 939524096 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm9"           }
+            ]
+          },
+          {
+            "$comment": "width 32 (D-LIR-INT-MEMORY-WIDTH-EXACT): STUR Wt, [Xn, #simm9] (0xB8000000 — the STUR word with size 11→10). Writes EXACTLY 4 bytes — a 64-bit STUR of a PACKED int element clobbers 4 bytes of the neighbour / overruns the frame slot (the array-storage crash this cycle fixes). Same operand layout as the 64-bit form. Selected when the stored value's type is a 4-byte integer (I32/U32, or `long` under LLP64) — width 32 via memAccessWidthFlags.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "fixedWord": 3087007744 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm9"           }
+            ]
+          },
+          {
+            "$comment": "width 16 (D-LIR-INT-MEMORY-WIDTH-EXACT): STURH Wt, [Xn, #simm9] (0x78000000 — the STUR word with size 11→01). Writes EXACTLY 2 bytes (the low half-word of Wt) — a wider store of a packed short clobbers its neighbour. Signedness-agnostic. Same operand layout. Selected when the stored value's type is I16/U16 — width 16 via memAccessWidthFlags.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "fixedWord": 2013265920 },
             "wires":    [
               { "index": 0, "slotKind": "rd"             },
               { "index": 1, "slotKind": "rn"             },
@@ -1305,7 +1369,11 @@
       "argGprs":          ["x0","x1","x2","x3","x4","x5","x6","x7"],
       "argFprs":          ["d0","d1","d2","d3","d4","d5","d6","d7"],
       "returnGprs":       ["x0","x1"],
-      "returnFprs":       ["d0"],
+      "returnFprs":       ["d0","d1","d2","d3"],
+      "$aggregateComment": "FC7 C3 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): AAPCS64 §5.4 by-value aggregates. HFA (1-4 leaves all the same FP type) → that many FPR pieces (v0..v3 / d0..d3 for returns, d0..d7 for args). A non-HFA aggregate <=16 bytes → 1-2 GPR pieces (x0..x1 returns / x0..x7 args); > 16 bytes → BY REFERENCE: a caller-allocated copy for args; for RETURNS the caller passes the result address in x8 (`indirectResultRegister`) and the callee returns VOID (it writes through x8 — distinct from SysV/Win64's hidden-arg-then-return-pointer; `aggregateSretViaHiddenArg` is false here because indirectResultRegister is set). `aapcs64_hfa` drives the bounded classifier arm; maxRegBytes = 16 (two X-registers).",
+      "aggregateClassification": "aapcs64_hfa",
+      "aggregateMaxRegBytes":    16,
+      "indirectResultRegister":  "x8",
       "$callerSavedFprComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): AAPCS64 §6.1.2 — v0-v7 (args/results) and v16-v31 are caller-saved; declared here in their d views. Being listed in callerSaved is what keeps the regalloc honest about them: an allocatable register NOT in callerSaved is treated as call-safe (lir_regalloc buildFreeLists), so omitting these while argFprs makes them allocatable would let a float live across a call sit unsaved in a volatile d-register — the same reason x86_64's sysv row lists all sixteen xmm registers here.",
       "callerSaved":      ["x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x18",
                            "d0","d1","d2","d3","d4","d5","d6","d7",
@@ -1329,7 +1397,11 @@
       "argGprs":          ["x0","x1","x2","x3","x4","x5","x6","x7"],
       "argFprs":          ["d0","d1","d2","d3","d4","d5","d6","d7"],
       "returnGprs":       ["x0","x1"],
-      "returnFprs":       ["d0"],
+      "returnFprs":       ["d0","d1","d2","d3"],
+      "$aggregateComment": "FC7 C3: Apple ARM64 by-value aggregate register-assignment is IDENTICAL to AAPCS64 (the documented Apple divergences are variadic-always-stack + small-int widening, NOT the struct/HFA/x8 rules) — so it carries the same aggregate fields. This CLOSES the struct-return / indirect-result half of D-FF3-APPLE-ARM64-ABI-DIVERGENCE (x8 sret modeled); the variadic-always-stack half stays open until a variadic arm64-Apple call.",
+      "aggregateClassification": "aapcs64_hfa",
+      "aggregateMaxRegBytes":    16,
+      "indirectResultRegister":  "x8",
       "$fprComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): the SIMD&FP register vocabulary is IDENTICAL to AAPCS64 (Apple's documented divergences are variadic/indirect-result rules, not register assignment): args d0..d7, return d0, v0-v7/v16-v31 caller-saved, v8-v15 callee-saved in their LOW 64 BITS only (d8..d15 — same F128/SIMD-cycle caveat as the aapcs64 row's $calleeSavedFprComment).",
       "callerSaved":      ["x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x18",
                            "d0","d1","d2","d3","d4","d5","d6","d7",

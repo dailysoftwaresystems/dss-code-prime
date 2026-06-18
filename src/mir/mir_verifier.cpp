@@ -442,10 +442,35 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
         // type-lattice followup; tier-2 — no current consumer would
         // benefit).
         auto operands = interner_->operands(fnSig);
-        std::uint32_t const paramCount = static_cast<std::uint32_t>(
-            operands.size() >= 1 ? operands.size() - 1 : 0);
         TypeId const returnTy = operands.empty() ? InvalidType : operands[0];
         std::uint32_t const nBlocks = mir_.funcBlockCount(f);
+        // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG): the physical-arg count is NOT the
+        // FnSig param count — a by-value struct param expands to MULTIPLE register
+        // `Arg`s (one per SysV eightbyte / AAPCS64 piece). The `Arg` payload is the
+        // PER-CLASS (or, for a slot-aligned CC, flat) physical register ordinal,
+        // which HIR→MIR emits with a MONOTONIC per-class counter — so every payload
+        // is < the number of `Arg` instructions in the function (a per-class payload
+        // < its class count <= the total; a flat payload < the total). Bound the
+        // check on THAT count, not the FnSig paramCount, so a multi-register struct
+        // param verifies while a stray out-of-range `Arg` is still rejected.
+        std::uint32_t argCount = 0;
+        // FC7 C3 (AAPCS64/Apple x8 sret): a function that reads the indirect-result
+        // register (ReadIndirectResult at entry) is a register-based-sret struct
+        // returner — its by-value aggregate result is written THROUGH x8 and the MIR
+        // `Return` is legitimately VOID (the SysV/Win64 hidden-arg path instead
+        // returns the sret pointer). This op is the CC-config-free marker that lets
+        // the return check below accept a void return for a non-void (struct) func.
+        bool hasIndirectResultRead = false;
+        for (std::uint32_t bi = 0; bi < nBlocks; ++bi) {
+            MirBlockId const b = mir_.funcBlockAt(f, bi);
+            std::uint32_t const n = mir_.blockInstCount(b);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                MirOpcode const o = mir_.instOpcode(mir_.blockInstAt(b, i));
+                if (o == MirOpcode::Arg) ++argCount;
+                else if (o == MirOpcode::ReadIndirectResult)
+                    hasIndirectResultRead = true;
+            }
+        }
         for (std::uint32_t bi = 0; bi < nBlocks; ++bi) {
             MirBlockId const b = mir_.funcBlockAt(f, bi);
             std::uint32_t const n = mir_.blockInstCount(b);
@@ -454,11 +479,11 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                 MirOpcode const op = mir_.instOpcode(id);
                 if (op == MirOpcode::Arg) {
                     std::uint32_t const idx = mir_.argIndex(id);
-                    if (idx >= paramCount) {
+                    if (idx >= argCount) {
                         reportInst(reporter, DiagnosticCode::I_ArgIndexOutOfRange, id,
-                            std::format("argIndex {} >= FnSig paramCount {} "
+                            std::format("argIndex {} >= physical-arg count {} "
                                         "for func #{}",
-                                idx, paramCount, f.v));
+                                idx, argCount, f.v));
                     }
                 } else if (op == MirOpcode::CondBr) {
                     auto condOps = mir_.instOperands(id);
@@ -483,19 +508,58 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                             DiagnosticCode::I_TerminatorTypeMismatch, id,
                             std::format("(return) has a value but func #{} returns void",
                                 f.v));
-                    } else if (!hasValue && wantValue) {
+                    } else if (!hasValue && wantValue && !hasIndirectResultRead) {
+                        // x8-sret functions (hasIndirectResultRead) legitimately
+                        // return void — the result is written through the indirect-
+                        // result register, not returned. Every other non-void func
+                        // with a value-less return is a real lowering bug.
                         reportInst(reporter,
                             DiagnosticCode::I_TerminatorTypeMismatch, id,
                             std::format("(return) has no value but func #{} "
                                         "returns a non-void type", f.v));
                     } else if (hasValue && wantValue) {
-                        TypeId const vt = mir_.instType(retOps[0]);
-                        if (vt.valid() && vt.v != returnTy.v) {
+                        TypeKind const rk = interner_->kind(returnTy);
+                        if (rk == TypeKind::Struct || rk == TypeKind::Union) {
+                            // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value
+                            // struct/union return is EITHER the first-class aggregate
+                            // VALUE (a single operand of the return type — the const-
+                            // fold / .dssir-text form, never lowered to LIR as-is) OR
+                            // the lowered ABI form: N register PIECES (I64/F64) or an
+                            // sret POINTER (>16B). Each operand must be one of those —
+                            // a DIFFERENT aggregate type is a real mismatch (and a
+                            // single struct-typed value reaching codegen is caught at
+                            // the HIR→MIR lowering, which always emits pieces/sret).
+                            for (MirInstId const opnd : retOps) {
+                                TypeId const vt = mir_.instType(opnd);
+                                if (!vt.valid() || vt.v == returnTy.v) continue;
+                                TypeKind const vk = interner_->kind(vt);
+                                if (vk != TypeKind::I64 && vk != TypeKind::F64
+                                    && vk != TypeKind::F32 && vk != TypeKind::Ptr) {
+                                    reportInst(reporter,
+                                        DiagnosticCode::I_TerminatorTypeMismatch, id,
+                                        std::format("(return) of by-value struct/union "
+                                                    "func #{} must carry the aggregate "
+                                                    "value, register pieces (I64/F64), "
+                                                    "or an sret pointer, not a kind-{} "
+                                                    "value (FC7 C1c)",
+                                            f.v, static_cast<int>(vk)));
+                                }
+                            }
+                        } else if (retOps.size() != 1) {
                             reportInst(reporter,
                                 DiagnosticCode::I_TerminatorTypeMismatch, id,
-                                std::format("(return) value type {} does not "
-                                            "match func #{} return type {}",
-                                    vt.v, f.v, returnTy.v));
+                                std::format("(return) of scalar func #{} must carry "
+                                            "exactly one value, has {}",
+                                    f.v, retOps.size()));
+                        } else {
+                            TypeId const vt = mir_.instType(retOps[0]);
+                            if (vt.valid() && vt.v != returnTy.v) {
+                                reportInst(reporter,
+                                    DiagnosticCode::I_TerminatorTypeMismatch, id,
+                                    std::format("(return) value type {} does not "
+                                                "match func #{} return type {}",
+                                        vt.v, f.v, returnTy.v));
+                            }
                         }
                     }
                 }

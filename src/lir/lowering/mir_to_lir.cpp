@@ -171,6 +171,15 @@ enum class MnemonicSlot : std::uint8_t {
     // inline range) keeps the single-mov materialization byte-
     // identically.
     MovkLsl16, MovkLsl32, MovkLsl48,
+    // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): the caller-side virtual op that
+    // captures the k-th return register of a struct-returning call into a vreg.
+    // Materialized away by lir_callconv (a mov-from-returnReg), like `arg` — never
+    // encoded. Declared in every target schema for substrate uniformity.
+    RetPiece,
+    // FC7 C3 (AAPCS64/Apple x8 sret): the callee entry read of the indirect-result
+    // register. Like `RetPiece`/`arg`, materialized away by lir_callconv (a
+    // mov-from-indirectResultRegister) — never encoded. Declared in every schema.
+    ReadIndirectResult,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -257,6 +266,8 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::MovkLsl16,     "movk_lsl16"},
     {MnemonicSlot::MovkLsl32,     "movk_lsl32"},
     {MnemonicSlot::MovkLsl48,     "movk_lsl48"},
+    {MnemonicSlot::RetPiece,      "ret_piece"},
+    {MnemonicSlot::ReadIndirectResult, "read_indirect_result"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -899,16 +910,37 @@ struct Lowerer {
 
     // The width flag for a MEMORY access (Load/Store) of `ty` into class `cls`. An
     // FPR access must be width-EXACT (movss vs movsd — an 8-byte read of a 4-byte
-    // F32 reads past it). A Char (1-byte) GPR access must ALSO be byte-exact — a
-    // 64-bit access of a 1-byte string/array element reads/writes 7 bytes past it
-    // (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN). Other GPR ints/ptrs use the width-
-    // default full-slot access (value-correct: their values are consumed low-bits-
-    // only, and a scalar local sits in an ≥8-byte slot).
+    // F32 reads past it). A GPR integer access must ALSO be byte-EXACT to its
+    // type's size: a 64-bit access of a PACKED sub-8-byte element (an array
+    // element or a struct field — NOT a stand-alone scalar local, which sits in
+    // its own ≥8-byte slot) writes/reads past it, clobbering the neighbour or
+    // overrunning the frame slot (D-LIR-INT-MEMORY-WIDTH-EXACT — the bug the
+    // array-storage cycle exposed; the FC7 struct-field path was latently
+    // affected too). Width by integer byte size; 8-byte ints/pointers keep the
+    // width-default (0 ⇒ 64) full-register access.
     [[nodiscard]] std::uint8_t memAccessWidthFlags(TypeId ty, LirRegClass cls) const {
         if (cls == LirRegClass::FPR) return widthFlagsForType(ty);
-        if (ty.valid() && interner.kind(ty) == TypeKind::Char)
-            return kLirInstFlagWidth8;
-        return 0;
+        if (!ty.valid()) return 0;
+        switch (interner.kind(ty)) {
+            // 1-byte integers (Char already required byte-exactness;
+            // I8/U8/Bool/Byte join it — a packed signed/unsigned-char or bool
+            // element must be 1-byte-exact too).
+            case TypeKind::Char: case TypeKind::Byte:
+            case TypeKind::I8:   case TypeKind::U8: case TypeKind::Bool:
+                return kLirInstFlagWidth8;
+            // 2-byte integers (short). The memory access is width-exact; the
+            // short→int promote (SExt/ZExt-from-16) is a SEPARATE gap
+            // (D-CSUBSET-SUBNATIVE-ALU-FORMS), so value use still fails loud.
+            case TypeKind::I16: case TypeKind::U16:
+                return kLirInstFlagWidth16;
+            // 4-byte integers (int; and `long` under LLP64, already resolved to
+            // I32 by the dataModel — width-32 is the correct 4-byte access).
+            case TypeKind::I32: case TypeKind::U32:
+                return kLirInstFlagWidth32;
+            // 8-byte integers/pointers — width-default full-slot access.
+            default:
+                return 0;
+        }
     }
 
     // The width for a REGISTER-RESIDENT value operation — const
@@ -1006,6 +1038,8 @@ struct Lowerer {
         if (!requireNativeIntWidth(id, op)) return;
         switch (op) {
             case MirOpcode::Arg:    return lowerArg(id);
+            case MirOpcode::ReturnPiece: return lowerReturnPiece(id);
+            case MirOpcode::ReadIndirectResult: return lowerReadIndirectResult(id);
             case MirOpcode::Const:  return lowerConst(id);
             case MirOpcode::Add:    return lowerBinaryOp(id, MnemonicSlot::Add);
             case MirOpcode::Sub:    return lowerBinaryOp(id, MnemonicSlot::Sub);
@@ -1210,6 +1244,39 @@ struct Lowerer {
         LirReg const result = lir.newVReg(regClassFor(id));
         emitInst(*opcode(MnemonicSlot::Arg), result, std::span<LirOperand const>{},
                     /*payload=*/mir.argIndex(id));
+        defineValue(id, result);
+    }
+
+    // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): the k-th return-register piece
+    // of a struct-returning call. The MIR `[call]` operand is the ordering anchor
+    // only (it keeps this read immediately after its call); the LIR `ret_piece` is
+    // a leaf carrying the per-class return ordinal as payload. lir_callconv
+    // captures it from the cc's return register (the caller-side mirror of `arg`).
+    void lowerReturnPiece(MirInstId id) {
+        if (!opcode(MnemonicSlot::RetPiece).has_value()) {
+            reportMissingOpcode(MnemonicSlot::RetPiece, "MIR ReturnPiece");
+            return;
+        }
+        LirReg const result = lir.newVReg(regClassFor(id));
+        emitInst(*opcode(MnemonicSlot::RetPiece), result, std::span<LirOperand const>{},
+                    /*payload=*/mir.returnPieceOrdinal(id));
+        defineValue(id, result);
+    }
+
+    // FC7 C3 (AAPCS64/Apple x8 sret): the callee-side entry read of the indirect-
+    // result register. A leaf (no operands), result = the incoming result-storage
+    // pointer. The virtual `read_indirect_result` LIR op carries no payload;
+    // lir_callconv materializes it at entry as `mov result, <indirectResultRegister>`
+    // (the callee mirror of `arg`). Fail loud if the schema lacks the opcode.
+    void lowerReadIndirectResult(MirInstId id) {
+        if (!opcode(MnemonicSlot::ReadIndirectResult).has_value()) {
+            reportMissingOpcode(MnemonicSlot::ReadIndirectResult,
+                                "MIR ReadIndirectResult");
+            return;
+        }
+        LirReg const result = lir.newVReg(regClassFor(id));
+        emitInst(*opcode(MnemonicSlot::ReadIndirectResult), result,
+                 std::span<LirOperand const>{}, /*payload=*/0);
         defineValue(id, result);
     }
 
@@ -1588,13 +1655,46 @@ struct Lowerer {
         // Cycle 3d: dynamic-index Gep with a single index. Emits
         // `lea result, [base + index*1 + 0]` via the 4-operand `lea`
         // form (`[base_reg, index_reg, MemBase(scale=1), MemOffset(0)]`).
-        // The scale defaults to 1 for cycle 3d; element-size-driven
-        // scales (sizeof(T) for typed-array Gep) co-design with ML6's
-        // address-mode synthesis. Multi-index Gep — multiple
-        // dereferences — folds into a chain at the optimizer layer.
+        // GEP-INDEX CONTRACT (D-MIR-STORAGE-ARRAY-INDEX-GEP, Option A): the
+        // index operand is always a BYTE offset — a struct-field displacement
+        // (const) or an array index already pre-scaled by sizeof(elem) at
+        // HIR→MIR (scaleIndexToBytes). So scale=1 is correct by contract; no
+        // element-size scale is carried here. Folding a `Mul-by-pow2 + Gep`
+        // into a hardware-scaled `lea` is a future address-mode-synthesis
+        // OPTIMIZATION (D-AS4-ARM64-INDEXED-LEA-SCALE), not a correctness need.
+        // Multi-index Gep — multiple dereferences — folds into a chain at the
+        // optimizer layer.
         if (operands.size() == 2) {
             if (!opcode(MnemonicSlot::Lea).has_value()) {
                 reportMissingOpcode(MnemonicSlot::Lea, "MIR Gep (dynamic-index)");
+                return;
+            }
+            // FC7 (D-FC7-MEMBER-ACCESS): a CONSTANT second operand is a
+            // BYTE DISPLACEMENT — a struct field offset resolved at HIR→MIR
+            // via the FC6 `computeLayout` engine (`s.x` → Gep[base,
+            // Const(offset)]). Emit the 3-op base+disp `lea [base + disp]`
+            // (the no-index form BOTH targets ship: x86 `lea r,[base+disp32]`
+            // / arm64 `ADD Xd,Xn,#imm12`). A VREG second operand is a
+            // runtime array index → the 4-op base+index form below. The
+            // ≥3-op (multi-index) form stays unsupported (the array/struct
+            // Index arm's 3-op shape is out of FC7 scope).
+            if (auto const disp = constIntegerValue(operands[1])) {
+                if (*disp < std::numeric_limits<std::int32_t>::min()
+                    || *disp > std::numeric_limits<std::int32_t>::max()) {
+                    // A field offset > 2GiB is pathological — fail loud
+                    // rather than truncate to a wrong address.
+                    reportUnsupported(MirOpcode::Gep, id);
+                    return;
+                }
+                LirReg const result = lir.newVReg(LirRegClass::GPR);
+                std::array<LirOperand, 3> ops{
+                    LirOperand::makeReg(*base),
+                    LirOperand::makeMemBase(1),
+                    LirOperand::makeMemOffset(
+                        static_cast<std::int32_t>(*disp)),
+                };
+                emitInst(*opcode(MnemonicSlot::Lea), result, ops);
+                defineValue(id, result);
                 return;
             }
             std::optional<LirReg> const index = regForValue(operands[1]);
@@ -1986,6 +2086,23 @@ struct Lowerer {
         if (auto const* u = std::get_if<std::uint64_t>(&lit.value)) return *u == 0;
         if (auto const* b = std::get_if<bool>(&lit.value))          return !*b;
         return false;
+    }
+
+    // FC7 (D-FC7-MEMBER-ACCESS): the integer value of a Const operand, or
+    // nullopt if the operand is not an integer Const. Distinguishes a
+    // CONSTANT Gep index (a struct field byte-offset resolved at HIR→MIR)
+    // from a runtime VREG index (an array subscript) — the byte-offset
+    // form lowers to the base+disp `lea`, the vreg form to base+index.
+    [[nodiscard]] std::optional<std::int64_t>
+    constIntegerValue(MirInstId idxOp) const {
+        if (mir.instOpcode(idxOp) != MirOpcode::Const) return std::nullopt;
+        std::uint32_t const litIdx = mir.constLiteralIndex(idxOp);
+        MirLiteralValue const& lit = mir.literalValue(litIdx);
+        if (auto const* i = std::get_if<std::int64_t>(&lit.value))  return *i;
+        if (auto const* u = std::get_if<std::uint64_t>(&lit.value))
+            return static_cast<std::int64_t>(*u);
+        if (auto const* b = std::get_if<bool>(&lit.value))          return *b ? 1 : 0;
+        return std::nullopt;
     }
 
     // ── cycle 3e: aggregate ops (memory-flattening lowering) ─────────
@@ -3039,13 +3156,17 @@ struct Lowerer {
             emitReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
             return true;
         }
-        if (operands.size() != 1) {
-            reportUnsupported(MirOpcode::Return, id);
-            return false;
+        // FC7 C1c: a by-value struct/union returned IN REGISTERS carries N
+        // eightbyte pieces (SysV ≤16B → 2); a scalar / sret-pointer return
+        // carries one. lir_callconv moves each piece into its per-class return
+        // register (cycle-broken) before the ret. Carry every operand as a reg.
+        std::vector<LirOperand> ops;
+        ops.reserve(operands.size());
+        for (MirInstId const operand : operands) {
+            std::optional<LirReg> const v = regForValue(operand);
+            if (!v.has_value()) return false;
+            ops.push_back(LirOperand::makeReg(*v));
         }
-        std::optional<LirReg> const v = regForValue(operands[0]);
-        if (!v.has_value()) return false;
-        std::array<LirOperand, 1> ops{LirOperand::makeReg(*v)};
         emitReturn(*opcode(MnemonicSlot::Ret), ops);
         return true;
     }

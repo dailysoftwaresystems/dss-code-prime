@@ -5,6 +5,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/types/call_payload.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -40,7 +41,9 @@ struct Lowered {
     DiagnosticReporter               mirReporter;
 };
 
-[[nodiscard]] Lowered lowerCSubset(std::string src) {
+[[nodiscard]] Lowered lowerCSubset(std::string src,
+                                   std::string targetName = "x86_64",
+                                   std::string ccName     = "sysv_amd64") {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
     UnitBuilder builder{*loaded};
@@ -59,6 +62,26 @@ struct Lowered {
     // in `c-subset.lang.json`.
     MirLoweringConfig mirCfg;
     mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    // FC7 (D-FC7-MEMBER-ACCESS): thread the target's aggregate-layout params
+    // (struct/union field offsets + sizes) into the MIR config exactly as
+    // compile_pipeline.cpp does, so member-access + aggregate-local lowering
+    // resolves field byte offsets. dataModel stays the Lp64 default (an
+    // int-based struct's field offsets are dataModel-independent here).
+    if (auto t = TargetSchema::loadShipped(targetName); t.has_value()) {
+        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+        // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the active CC's by-value
+        // params so a struct passed/returned BY VALUE classifies. Mirrors
+        // compile_pipeline.cpp. `targetName`/`ccName` default to x86_64/sysv_amd64
+        // (the C1/C1c pins); the AAPCS64 x8-sret pins pass "arm64"/"aapcs64" so
+        // `aggregateSretViaHiddenArg` resolves false (indirectResultRegister = x8).
+        if (auto const* cc = (*t)->callingConventionByName(ccName)) {
+            mirCfg.aggregateClassification   = cc->aggregateClassification;
+            mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
+            mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
+            mirCfg.argSlotAligned            = cc->slotAligned;
+        }
+    }
     // D-CSUBSET-LINKAGE-SPECIFIERS: thread the native-decl linkage side-table
     // exactly as compile_pipeline.cpp does — so `static`/`__attribute__` source
     // flows binding/visibility into the MIR. Existing fixtures (no specifiers)
@@ -1259,19 +1282,26 @@ TEST(MirLoweringCSubset, MemberAccessReadEmitsGepThenLoad) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirBlockId const entry = m.funcEntry(m.funcAt(0));
-    // [Arg p, Const 0, Const 0(field), Gep, Load, Return]
-    ASSERT_EQ(m.blockInstCount(entry), 6u);
+    // FC7 (D-FC7-MEMBER-ACCESS): [Arg p, Const(byteOffset 0=field x),
+    // Gep(2-op), Load, Return].
+    ASSERT_EQ(m.blockInstCount(entry), 5u);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Arg);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Const);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Const);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Gep);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Load);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 5)), MirOpcode::Return);
-    // The GEP's operand[0] IS the Arg p (no Load — Deref's lvalue-address
-    // returns the pointer rvalue directly).
-    auto gepOps = m.instOperands(m.blockInstAt(entry, 3));
-    ASSERT_EQ(gepOps.size(), 3u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Gep);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Load);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Return);
+    // FC7: the GEP is now 2-op [base, byteOffset] — operand[0] IS the Arg p
+    // (Deref's lvalue-address returns the pointer rvalue directly), and
+    // operand[1] is the field's BYTE OFFSET (field x → 0), NOT a field index.
+    // (The old 3-op [base, 0, fieldIdx] shape MIR→LIR never realized.)
+    auto gepOps = m.instOperands(m.blockInstAt(entry, 2));
+    ASSERT_EQ(gepOps.size(), 2u);
     EXPECT_EQ(gepOps[0], m.blockInstAt(entry, 0));
+    EXPECT_EQ(gepOps[1], m.blockInstAt(entry, 1));
+    auto const& offLit =
+        m.literalValue(m.constLiteralIndex(m.blockInstAt(entry, 1)));
+    EXPECT_EQ(std::get<std::int64_t>(offLit.value), 0)
+        << "field x is at byte offset 0";
 }
 
 // Symmetric write: `p->y = v` lowers to GEP-then-Store, with the value
@@ -1284,38 +1314,244 @@ TEST(MirLoweringCSubset, MemberAccessAssignEmitsGepThenStore) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirBlockId const entry = m.funcEntry(m.funcAt(0));
-    // [Arg p, Arg v, Const 0, Const 1(field=y), Gep, Store, Return]
-    ASSERT_EQ(m.blockInstCount(entry), 7u);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Gep);
-    MirInstId const storeI = m.blockInstAt(entry, 5);
+    // FC7 (D-FC7-MEMBER-ACCESS): [Arg p, Arg v, Const(byteOffset 4=field y),
+    // Gep(2-op), Store, Return].
+    ASSERT_EQ(m.blockInstCount(entry), 6u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Const);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Gep);
+    MirInstId const storeI = m.blockInstAt(entry, 4);
     EXPECT_EQ(m.instOpcode(storeI), MirOpcode::Store);
     auto ops = m.instOperands(storeI);
     ASSERT_EQ(ops.size(), 2u);
     EXPECT_EQ(ops[0], m.blockInstAt(entry, 1)) << "Store value should be Arg v";
-    EXPECT_EQ(ops[1], m.blockInstAt(entry, 4)) << "Store ptr should be Gep";
+    EXPECT_EQ(ops[1], m.blockInstAt(entry, 3)) << "Store ptr should be Gep";
+    // FC7: the GEP's 2nd operand is field y's BYTE OFFSET (LP64: x@0, y@4),
+    // not field index 1 — a wrong offset would store into the wrong field.
+    auto const& offLit =
+        m.literalValue(m.constLiteralIndex(m.blockInstAt(entry, 2)));
+    EXPECT_EQ(std::get<std::int64_t>(offLit.value), 4)
+        << "field y is at byte offset 4 under LP64";
 }
 
-// `p[i]` over a POINTER base: GEP carries `[ptr, idx]` (no leading 0 —
-// the pointer is already at the element-pointer layer). Pins the
-// pointer-vs-array discrimination in `lowerLvalueAddress`'s Index path.
-TEST(MirLoweringCSubset, IndexOverPointerEmitsTwoOperandGepThenLoad) {
+// `int* a; a[i]` over a POINTER base: the element index is PRE-SCALED by
+// sizeof(elem) to a BYTE offset (Option A, D-MIR-STORAGE-ARRAY-INDEX-GEP, user
+// §B 2026-06-17), so the GEP carries `[ptr, i*4]`. This FIXES the latent
+// scale-1 silent miscompile — the old shape `Gep[ptr, i]` lowered to
+// `lea [ptr + i*1]`, reading the element at byte `i` instead of `i*4` for any
+// non-`char` element. RED-ON-DISABLE: drop the scaleIndexToBytes call → the
+// GEP index reverts to the raw `Arg i` → the Mul + stride assertions fail.
+TEST(MirLoweringCSubset, IndexOverIntPointerScalesIndexToByteOffset) {
     auto L = lowerCSubset(
         "int f(int* a, int i) { return a[i]; }\n");
     ASSERT_TRUE(L.mir.ok)
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirBlockId const entry = m.funcEntry(m.funcAt(0));
-    // [Arg a, Arg i, Gep(a, i), Load, Return]  — no Const-0 prefix.
-    ASSERT_EQ(m.blockInstCount(entry), 5u);
+    // [Arg a, Arg i, Const(4), Mul(i,4), Gep(a, mul), Load, Return]
+    ASSERT_EQ(m.blockInstCount(entry), 7u);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Arg);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Arg);
-    MirInstId const gep = m.blockInstAt(entry, 2);
+    // the scaling constant = sizeof(int) = 4 under LP64
+    MirInstId const strideK = m.blockInstAt(entry, 2);
+    auto const& strideLit = m.literalValue(m.constLiteralIndex(strideK));
+    EXPECT_EQ(std::get<std::int64_t>(strideLit.value), 4)
+        << "int element stride is 4";
+    // the Mul scales the raw index by the stride
+    MirInstId const mul = m.blockInstAt(entry, 3);
+    ASSERT_EQ(m.instOpcode(mul), MirOpcode::Mul);
+    auto mulOps = m.instOperands(mul);
+    ASSERT_EQ(mulOps.size(), 2u);
+    EXPECT_EQ(mulOps[0], m.blockInstAt(entry, 1)) << "Mul lhs is Arg i";
+    EXPECT_EQ(mulOps[1], strideK) << "Mul rhs is the stride const";
+    // the GEP indexes by the SCALED byte offset, not the raw index
+    MirInstId const gep = m.blockInstAt(entry, 4);
     EXPECT_EQ(m.instOpcode(gep), MirOpcode::Gep);
     auto gepOps = m.instOperands(gep);
     ASSERT_EQ(gepOps.size(), 2u);
-    EXPECT_EQ(gepOps[0], m.blockInstAt(entry, 0));
-    EXPECT_EQ(gepOps[1], m.blockInstAt(entry, 1));
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Load);
+    EXPECT_EQ(gepOps[0], m.blockInstAt(entry, 0)) << "GEP base is Arg a";
+    EXPECT_EQ(gepOps[1], mul)
+        << "GEP index is the SCALED Mul result, not the raw Arg i "
+           "(the scale-1 miscompile fix)";
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 5)), MirOpcode::Load);
+}
+
+// `int a[5]; a[i]` — a STORAGE array index. PRE-FC: lowered to a 3-op GEP
+// `[&a, 0, i]` that FAILED LOUD at LIR (D-MIR-STORAGE-ARRAY-INDEX-GEP); it was
+// never a miscompile, it didn't compile. NOW: the vestigial leading 0 is
+// collapsed AND the index is byte-scaled → a 2-op GEP `[&a, i*4]`, identical in
+// shape to the pointer path. MIR-tier pin (lowerCSubset stops at MIR).
+// RED-ON-DISABLE: keep the 3-op form / raw index → the size==2 + Mul-stride
+// assertions fail.
+TEST(MirLoweringCSubset, IndexIntoIntArrayCollapsesToTwoOpGepAndScales) {
+    auto L = lowerCSubset(
+        "int g(int i) { int a[5]; return a[i]; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    bool foundScaledGep = false;
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k) {
+        MirInstId const id = m.blockInstAt(entry, k);
+        if (m.instOpcode(id) != MirOpcode::Gep) continue;
+        auto ops = m.instOperands(id);
+        ASSERT_EQ(ops.size(), 2u)
+            << "storage-array GEP must collapse the vestigial 0 to 2 operands";
+        MirInstId const idxOp = ops[1];
+        ASSERT_EQ(m.instOpcode(idxOp), MirOpcode::Mul)
+            << "the index must be byte-scaled (Mul by stride)";
+        auto mulOps = m.instOperands(idxOp);
+        ASSERT_EQ(mulOps.size(), 2u);
+        auto const& strideLit = m.literalValue(m.constLiteralIndex(mulOps[1]));
+        EXPECT_EQ(std::get<std::int64_t>(strideLit.value), 4)
+            << "int element stride is 4";
+        foundScaledGep = true;
+    }
+    EXPECT_TRUE(foundScaledGep)
+        << "expected a 2-op byte-scaled storage-array GEP";
+}
+
+// `char a[5]; a[i]` — element stride 1, so NO Mul is emitted (the stride==1
+// fast path): the GEP index IS the raw index. Guards the fast path AND that
+// `char` indexing stays byte-identical (no spurious `imul`). RED-ON-DISABLE:
+// remove the `stride == 1` short-circuit in scaleIndexToBytes → a `Mul(i, 1)`
+// appears → the "no Mul" assertion fails.
+TEST(MirLoweringCSubset, IndexIntoCharArrayDoesNotScale) {
+    auto L = lowerCSubset(
+        "int g(int i) { char a[5]; return a[i]; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    bool foundGep = false;
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k) {
+        MirInstId const id = m.blockInstAt(entry, k);
+        EXPECT_NE(m.instOpcode(id), MirOpcode::Mul)
+            << "char (stride 1) indexing must NOT emit a scaling Mul";
+        if (m.instOpcode(id) == MirOpcode::Gep) {
+            auto ops = m.instOperands(id);
+            ASSERT_EQ(ops.size(), 2u);
+            EXPECT_NE(m.instOpcode(ops[1]), MirOpcode::Mul)
+                << "char GEP index is the raw index, not a Mul";
+            foundGep = true;
+        }
+    }
+    EXPECT_TRUE(foundGep);
+}
+
+// `int a[3] = {10,20,30}` — an array-LOCAL brace-init. PRE-FC it fell to the
+// scalar `else` arm → a multi-element InsertValue chain → FAIL-LOUD at LIR.
+// NOW it lowers element-wise via lowerArrayInitIntoSlot (the VarDecl array
+// arm), one Store per element at byte offset j*4. RED-ON-DISABLE: drop the
+// VarDecl array arm → no per-element Stores at 0/4/8.
+TEST(MirLoweringCSubset, ArrayLocalBraceInitStoresPerElementAtStride) {
+    auto L = lowerCSubset(
+        "int g(void) { int a[3] = {10, 20, 30}; return a[0]; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    std::vector<std::int64_t> storeOffsets;
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k) {
+        MirInstId const id = m.blockInstAt(entry, k);
+        if (m.instOpcode(id) != MirOpcode::Store) continue;
+        auto stOps = m.instOperands(id);  // [value, ptr]
+        ASSERT_EQ(stOps.size(), 2u);
+        MirInstId const ptr = stOps[1];
+        if (m.instOpcode(ptr) != MirOpcode::Gep) continue;
+        auto gepOps = m.instOperands(ptr);
+        if (gepOps.size() != 2u) continue;
+        if (m.instOpcode(gepOps[1]) != MirOpcode::Const) continue;
+        storeOffsets.push_back(
+            std::get<std::int64_t>(
+                m.literalValue(m.constLiteralIndex(gepOps[1])).value));
+    }
+    // `return a[0]` reads via a Load (not a Store), so exactly the 3 element
+    // inits remain, in ascending order.
+    ASSERT_EQ(storeOffsets.size(), 3u)
+        << "exactly 3 array-element init Stores";
+    EXPECT_EQ(storeOffsets[0], 0) << "a[0] at byte offset 0";
+    EXPECT_EQ(storeOffsets[1], 4) << "a[1] at byte offset 4";
+    EXPECT_EQ(storeOffsets[2], 8) << "a[2] at byte offset 8";
+}
+
+// `struct S { int a[3]; int n; }; struct S x = {{1,2,3}, 9}` — the array-TYPED
+// FIELD brace-init (D-MIR-ARRAY-FIELD-AGGREGATE-INIT). PRE-FC the array field
+// fell through the Struct||Union recurse-guard → lowerExpr → InsertValue chain
+// → FAIL-LOUD at LIR. NOW the recurse-guard's Array arm routes it to
+// lowerArrayInitIntoSlot → per-element Stores at 0,4,8, then the scalar field
+// `n` at 12 — element-wise, NO InsertValue. RED-ON-DISABLE: drop the Array arm
+// in the recurse-guard → the array elements are not stored at 0/4/8.
+TEST(MirLoweringCSubset, ArrayFieldBraceInitStoresPerElementAtStride) {
+    auto L = lowerCSubset(
+        "struct S { int a[3]; int n; };\n"
+        "int g(void) { struct S x = { {1,2,3}, 9 }; return x.n; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    std::vector<std::int64_t> storeOffsets;
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k) {
+        MirInstId const id = m.blockInstAt(entry, k);
+        EXPECT_NE(m.instOpcode(id), MirOpcode::InsertValue)
+            << "element-wise array-field init, no InsertValue chain";
+        if (m.instOpcode(id) != MirOpcode::Store) continue;
+        auto stOps = m.instOperands(id);
+        ASSERT_EQ(stOps.size(), 2u);
+        MirInstId const ptr = stOps[1];
+        if (m.instOpcode(ptr) != MirOpcode::Gep) continue;
+        auto gepOps = m.instOperands(ptr);
+        if (gepOps.size() != 2u) continue;
+        if (m.instOpcode(gepOps[1]) != MirOpcode::Const) continue;
+        storeOffsets.push_back(
+            std::get<std::int64_t>(
+                m.literalValue(m.constLiteralIndex(gepOps[1])).value));
+    }
+    // a[0]@0, a[1]@4, a[2]@8 (array elements at stride 4), n@12.
+    ASSERT_EQ(storeOffsets.size(), 4u);
+    EXPECT_EQ(storeOffsets[0], 0) << "a[0] at byte offset 0";
+    EXPECT_EQ(storeOffsets[1], 4) << "a[1] at byte offset 4";
+    EXPECT_EQ(storeOffsets[2], 8) << "a[2] at byte offset 8";
+    EXPECT_EQ(storeOffsets[3], 12) << "field n after the 3-int array";
+}
+
+// `int a[4]` reserves its FULL 16-byte layout in the frame, not the 8-byte
+// scalar-slot sentinel. Array locals became RUNNABLE this cycle (index +
+// brace-init), so the Alloca MUST carry the array byte size — an under-sized
+// slot would let a high element write (a[2]/a[3]) clobber a neighbouring
+// local (the silent frame-overflow the FC7 struct-alloca sizing also guards).
+// The Alloca payload carries the byte size. RED-ON-DISABLE: omit Array from
+// allocaForLocal's sizing arm → payload reverts to 0 (the 1-slot sentinel).
+TEST(MirLoweringCSubset, ArrayLocalAllocaReservesFullByteSize) {
+    auto L = lowerCSubset("int g(void) { int a[4]; return a[0]; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    bool foundAlloca = false;
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k) {
+        MirInstId const id = m.blockInstAt(entry, k);
+        if (m.instOpcode(id) != MirOpcode::Alloca) continue;
+        EXPECT_EQ(m.instPayload(id), 16u)
+            << "int[4] reserves 16 bytes (4*sizeof(int)), not the 8-byte "
+               "scalar-slot sentinel (payload 0)";
+        foundAlloca = true;
+    }
+    EXPECT_TRUE(foundAlloca) << "expected an Alloca for the array local";
+}
+
+// A ZERO-size element type (an empty aggregate `struct E {}`) must FAIL LOUD
+// when indexed — never a silent `Mul(idx, 0)` that aliases every element to
+// byte offset 0. `&a[1]` drives scaleIndexToBytes with stride 0.
+// RED-ON-DISABLE: drop the `stride == 0` guard → MIR lowering succeeds
+// (ASSERT_FALSE trips) with an all-aliasing index.
+TEST(MirLoweringCSubset, IndexIntoZeroSizeElementArrayFailsLoud) {
+    auto L = lowerCSubset(
+        "struct E { };\n"
+        "int g(void) { struct E a[3]; struct E* p = &a[1]; return 0; }\n");
+    EXPECT_FALSE(L.mir.ok)
+        << "indexing a zero-size (empty-aggregate) element must fail loud, "
+           "not silently scale by 0";
 }
 
 // `&p->x` exercises AddressOf delegating to `lowerLvalueAddress` for the
@@ -1329,15 +1565,96 @@ TEST(MirLoweringCSubset, AddressOfMemberAccessReturnsGepDirectly) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirBlockId const entry = m.funcEntry(m.funcAt(0));
-    // [Arg p, Const 0, Const 0(field), Gep, Return(gep)]   — NO Load.
-    ASSERT_EQ(m.blockInstCount(entry), 5u);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Gep);
-    MirInstId const ret = m.blockInstAt(entry, 4);
+    // FC7 (D-FC7-MEMBER-ACCESS): [Arg p, Const(byteOffset 0=field x),
+    // Gep(2-op), Return(gep)] — NO Load.
+    ASSERT_EQ(m.blockInstCount(entry), 4u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Gep);
+    MirInstId const ret = m.blockInstAt(entry, 3);
     EXPECT_EQ(m.instOpcode(ret), MirOpcode::Return);
     auto retOps = m.instOperands(ret);
     ASSERT_EQ(retOps.size(), 1u);
-    EXPECT_EQ(retOps[0], m.blockInstAt(entry, 3))
+    EXPECT_EQ(retOps[0], m.blockInstAt(entry, 2))
         << "Return value should be the Gep result, not a Load";
+}
+
+// FC7 (D-FC7-NESTED-STRUCT-FIELD): a struct-TYPED field declared by a bare
+// typedef-name (`Inner in;` — the new `typeBaseAllowingStruct` Identifier alt)
+// parses, and nested member access `p->in.y` COMPOSES the byte offsets via a
+// CHAINED GEP: Gep(p, off-of-`in`=0) then Gep(<that>, off-of-`y`-within-Inner
+// =4). The second GEP's BASE is the first GEP (not Arg p) and its offset is 4
+// — proving `.y` resolves against Inner's OWN layout, composed onto `in`'s
+// offset, not flattened or resolved against Outer. RED-ON-DISABLE: revert the
+// grammar `Identifier` alt → the struct-typed field no longer parses; parse-
+// recovery yields a tree that lowers to an unsupported top-level node, so the
+// `ASSERT_TRUE(L.mir.ok)` below trips (empirically verified — the failure is at
+// MIR-lowering, not `model.hasErrors()`, which recovery keeps false).
+TEST(MirLoweringCSubset, NestedMemberAccessComposesChainedGepOffsets) {
+    auto L = lowerCSubset(
+        "typedef struct { int x; int y; } Inner;\n"
+        "typedef struct { Inner in; int z; } Outer;\n"
+        "int read_iny(Outer* p) { return p->in.y; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "struct-typed field `Inner in;` must parse "
+           "(typeBaseAllowingStruct Identifier alt)";
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Arg p, Const(0=`in`@Outer), Gep1(p,0), Const(4=`y`@Inner),
+    //  Gep2(Gep1,4), Load, Return].
+    ASSERT_EQ(m.blockInstCount(entry), 7u);
+    MirInstId const argP = m.blockInstAt(entry, 0);
+    MirInstId const gep1 = m.blockInstAt(entry, 2);
+    MirInstId const gep2 = m.blockInstAt(entry, 4);
+    ASSERT_EQ(m.instOpcode(gep1), MirOpcode::Gep);
+    ASSERT_EQ(m.instOpcode(gep2), MirOpcode::Gep);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 5)), MirOpcode::Load);
+    auto g1 = m.instOperands(gep1);
+    ASSERT_EQ(g1.size(), 2u);
+    EXPECT_EQ(g1[0], argP) << "outer GEP bases on Arg p";
+    auto const& off1 =
+        m.literalValue(m.constLiteralIndex(m.blockInstAt(entry, 1)));
+    EXPECT_EQ(std::get<std::int64_t>(off1.value), 0) << "`in` at offset 0";
+    auto g2 = m.instOperands(gep2);
+    ASSERT_EQ(g2.size(), 2u);
+    EXPECT_EQ(g2[0], gep1)
+        << "nested `.y` chains off the inner GEP, not Arg p";
+    auto const& off2 =
+        m.literalValue(m.constLiteralIndex(m.blockInstAt(entry, 3)));
+    EXPECT_EQ(std::get<std::int64_t>(off2.value), 4)
+        << "`y` at offset 4 WITHIN Inner (composed 0 + 4)";
+}
+
+// FC7 (D-FC7-NESTED-STRUCT-FIELD): the SAME grammar alt admits a struct-typed
+// field in a UNION body (`unionField` shares `typeRefAllowingStruct`). A union
+// whose member is a struct type parses, and `u->p.y` accesses the struct
+// field through the union (all union members at offset 0, so the access
+// composes 0 + 4). Guards the union half of the multi-form contract.
+TEST(MirLoweringCSubset, UnionWithStructTypedFieldParsesAndAccesses) {
+    auto L = lowerCSubset(
+        "typedef struct { int x; int y; } Inner;\n"
+        "typedef union { Inner p; int n; } U;\n"
+        "int read(U* u) { return u->p.y; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "struct-typed field in a UNION body must parse";
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // Two chained GEPs: `p`@0 within the union, then `y`@4 within Inner.
+    std::vector<std::int64_t> offs;
+    auto const n = m.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Gep) continue;
+        auto gOps = m.instOperands(ix);
+        ASSERT_EQ(gOps.size(), 2u);
+        offs.push_back(
+            std::get<std::int64_t>(m.literalValue(m.constLiteralIndex(gOps[1])).value));
+    }
+    ASSERT_EQ(offs.size(), 2u) << "two chained GEPs for u->p.y";
+    EXPECT_EQ(offs[0], 0) << "union member `p` at offset 0";
+    EXPECT_EQ(offs[1], 4) << "`y` at offset 4 within Inner";
 }
 
 // SeqExpr: a value-yielding expression that bundles side-effect statements
@@ -1628,6 +1945,27 @@ namespace {
 [[nodiscard]] std::size_t countOpcode(std::vector<MirOpcode> const& ops, MirOpcode k) {
     return static_cast<std::size_t>(std::count(ops.begin(), ops.end(), k));
 }
+// Entry-block opcodes of function `fi` (the struct-return fixtures are all
+// straight-line single-block bodies, so the entry block is the whole function).
+[[nodiscard]] std::vector<MirOpcode> funcEntryOpcodes(Mir const& m, std::uint32_t fi) {
+    std::vector<MirOpcode> out;
+    MirBlockId const entry = m.funcEntry(m.funcAt(fi));
+    auto const n = m.blockInstCount(entry);
+    out.reserve(n);
+    for (std::uint32_t i = 0; i < n; ++i)
+        out.push_back(m.instOpcode(m.blockInstAt(entry, i)));
+    return out;
+}
+// The Return terminator of function `fi`'s entry block.
+[[nodiscard]] MirInstId entryReturn(Mir const& m, std::uint32_t fi) {
+    MirBlockId const entry = m.funcEntry(m.funcAt(fi));
+    auto const n = m.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) == MirOpcode::Return) return ix;
+    }
+    return InvalidMirInst;
+}
 } // namespace
 
 // All-constant `struct Point p = {1, 2}` const-folds to a single
@@ -1656,10 +1994,11 @@ TEST(MirLoweringCSubset, ConstructAggregateAllConstFoldsToConst) {
            "Const, not an InsertValue chain";
 }
 
-// Mixed-runtime children force the InsertValue chain path. A struct
-// containing a parameter (`a`) cannot const-fold — must produce
-// `Const(zero) + InsertValue chain`.
-TEST(MirLoweringCSubset, ConstructAggregateWithRuntimeChildUsesInsertValueChain) {
+// FC7 (D-FC7-MEMBER-ACCESS): a struct LOCAL initializer with a runtime
+// child lowers ELEMENT-WISE — one Gep+Store per field into the slot — NOT
+// an InsertValue chain (whose non-zero-index form had no LIR realization).
+// `{a, 2}` → Store(a)→field x, Store(2)→field y.
+TEST(MirLoweringCSubset, StructLocalRuntimeInitEmitsPerFieldStores) {
     auto L = lowerCSubset(
         "struct Point { int x; int y; };\n"
         "void f(int a) { struct Point p = {a, 2}; }\n");
@@ -1669,17 +2008,18 @@ TEST(MirLoweringCSubset, ConstructAggregateWithRuntimeChildUsesInsertValueChain)
         << (L.mirReporter.all().empty()
               ? "" : L.mirReporter.all()[0].actual);
     auto const ops = entryOpcodes(L.mir.mir);
-    EXPECT_GE(countOpcode(ops, MirOpcode::InsertValue), 2u)
-        << "ConstructAggregate with runtime children must emit one "
-           "InsertValue per slot (2 fields = 2 InsertValue ops)";
-    EXPECT_GE(countOpcode(ops, MirOpcode::Const),  1u)
-        << "the chain must start from a Const(zero-aggregate) base";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "FC7 struct local init is element-wise, never an InsertValue chain";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Gep),   2u)
+        << "one Gep per field (x, y)";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 2u)
+        << "one Store per field";
 }
 
-// Union ConstructAggregate has a 1-child shape — verify the chain
-// produces a single InsertValue at index 0 when the runtime path is
-// taken (parameter-based variant value).
-TEST(MirLoweringCSubset, ConstructAggregateUnionRuntimeUsesOneInsertValue) {
+// FC7 (D-FC7-MEMBER-ACCESS): a UNION local initializer (1 child, the
+// active variant) lowers to ONE Gep+Store at byte offset 0 — never an
+// InsertValue.
+TEST(MirLoweringCSubset, UnionLocalRuntimeInitEmitsOneFieldStore) {
     auto L = lowerCSubset(
         "union U { int i; char c; };\n"
         "void f(int a) { union U u = { a }; }\n");
@@ -1689,8 +2029,11 @@ TEST(MirLoweringCSubset, ConstructAggregateUnionRuntimeUsesOneInsertValue) {
         << (L.mirReporter.all().empty()
               ? "" : L.mirReporter.all()[0].actual);
     auto const ops = entryOpcodes(L.mir.mir);
-    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 1u)
-        << "union ConstructAggregate has exactly 1 child → 1 InsertValue";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "FC7 union local init is element-wise, never an InsertValue chain";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Gep),   1u)
+        << "union has 1 active-variant child → 1 Gep at offset 0";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 1u);
 }
 
 // Variant-aware union seed (review fix-up lock-in): `.c = 'x'` is
@@ -1714,9 +2057,16 @@ TEST(MirLoweringCSubset, ConstructAggregateUnionNonZeroVariantRuntimeOk) {
               ? "" : L.mirReporter.all()[0].actual);
 }
 
-// Array ConstructAggregate with runtime children exercises the
-// zeroLiteralOf Array arm + positional indexing.
-TEST(MirLoweringCSubset, ConstructAggregateArrayRuntimeUsesChain) {
+// D-MIR-ARRAY-FIELD-AGGREGATE-INIT (array-LOCAL form): an array-local brace-
+// init with a RUNTIME element `int xs[3] = {a, 2, 3}` lowers ELEMENT-WISE (one
+// Gep+Store per element at byte offsets 0,4,8), NOT an InsertValue chain.
+// PRE-FC the array fell to lowerExpr → a multi-element InsertValue chain that
+// FAILED LOUD at LIR (`lowerInsertValue` rejects non-zero indices) — the same
+// non-realizability that drove struct init element-wise (see
+// StructLocalInitStoresEachFieldAtItsOffset). RED-ON-DISABLE: revert the
+// VarDecl array arm → the array falls to lowerExpr → the InsertValue chain
+// (count >= 3) reappears and the EXPECT_EQ(...,0) trips.
+TEST(MirLoweringCSubset, ArrayLocalRuntimeInitStoresElementWise) {
     auto L = lowerCSubset(
         "void f(int a) { int xs[3] = {a, 2, 3}; }\n");
     ASSERT_FALSE(L.model.hasErrors());
@@ -1724,10 +2074,28 @@ TEST(MirLoweringCSubset, ConstructAggregateArrayRuntimeUsesChain) {
     ASSERT_TRUE(L.mir.ok)
         << (L.mirReporter.all().empty()
               ? "" : L.mirReporter.all()[0].actual);
-    auto const ops = entryOpcodes(L.mir.mir);
-    EXPECT_GE(countOpcode(ops, MirOpcode::InsertValue), 3u)
-        << "array ConstructAggregate with N runtime children emits N "
-           "InsertValues (one per positional slot)";
+    Mir const& m = L.mir.mir;
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "array-local init is element-wise, no InsertValue chain";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 3u)
+        << "one Store per array element";
+    // the three element GEPs carry byte offsets 0, 4, 8 (stride 4).
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    std::vector<std::int64_t> gepOffsets;
+    auto const n = m.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Gep) continue;
+        auto gOps = m.instOperands(ix);
+        ASSERT_EQ(gOps.size(), 2u);
+        auto const& lit = m.literalValue(m.constLiteralIndex(gOps[1]));
+        gepOffsets.push_back(std::get<std::int64_t>(lit.value));
+    }
+    ASSERT_EQ(gepOffsets.size(), 3u);
+    EXPECT_EQ(gepOffsets[0], 0) << "xs[0] at byte offset 0";
+    EXPECT_EQ(gepOffsets[1], 4) << "xs[1] at byte offset 4";
+    EXPECT_EQ(gepOffsets[2], 8) << "xs[2] at byte offset 8";
 }
 
 // Chain TOPOLOGY: the runtime-chain test only COUNTS InsertValues —
@@ -1735,48 +2103,91 @@ TEST(MirLoweringCSubset, ConstructAggregateArrayRuntimeUsesChain) {
 // A regression that emitted N parallel InsertValue(zeroBase, v_i, [i])
 // would silently drop all but the last field. This test reads each
 // InsertValue's first operand and asserts the chain shape.
-TEST(MirLoweringCSubset, ConstructAggregateChainTopology) {
+// FC7 (D-FC7-MEMBER-ACCESS): a struct local init `{a, b}` (both runtime)
+// lowers to two INDEPENDENT Gep+Store pairs at the field BYTE OFFSETS
+// (x@0, y@4) — no InsertValue chain. Pins that each field lands at its OWN
+// offset (a wrong/duplicated offset would write both fields to one place).
+TEST(MirLoweringCSubset, StructLocalInitStoresEachFieldAtItsOffset) {
     auto L = lowerCSubset(
         "struct Point { int x; int y; };\n"
         "void f(int a, int b) { struct Point p = {a, b}; }\n");
-    ASSERT_TRUE(L.mir.ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "element-wise init, no InsertValue chain";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Gep),   2u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 2u);
+    // The two field GEPs carry distinct byte offsets 0 (x) and 4 (y).
     MirBlockId const entry = m.funcEntry(m.funcAt(0));
-    // Collect insertvalue instructions in block order.
-    std::vector<MirInstId> chain;
-    MirInstId seedConst{};
+    std::vector<std::int64_t> gepOffsets;
     auto const n = m.blockInstCount(entry);
     for (std::uint32_t i = 0; i < n; ++i) {
         MirInstId const ix = m.blockInstAt(entry, i);
-        MirOpcode const op = m.instOpcode(ix);
-        if (op == MirOpcode::InsertValue) {
-            chain.push_back(ix);
-        } else if (op == MirOpcode::Const && !seedConst.valid()
-                   && chain.empty() && m.instType(ix).valid()) {
-            // First Const before the chain begins — candidate seed.
-            // (There may be other Consts before, e.g. for the index
-            // path; we want the one passed as InsertValue's first
-            // operand, which we verify below.)
-        }
+        if (m.instOpcode(ix) != MirOpcode::Gep) continue;
+        auto gOps = m.instOperands(ix);
+        ASSERT_EQ(gOps.size(), 2u);
+        auto const& lit = m.literalValue(m.constLiteralIndex(gOps[1]));
+        gepOffsets.push_back(std::get<std::int64_t>(lit.value));
     }
-    ASSERT_GE(chain.size(), 2u);
-    // The first InsertValue's first operand IS the seed Const.
-    MirInstId const firstAggOperand = m.instOperands(chain[0])[0];
-    EXPECT_EQ(m.instOpcode(firstAggOperand), MirOpcode::Const)
-        << "InsertValue chain's seed must be a Const(zero-aggregate)";
-    // Each subsequent InsertValue's first operand IS the previous one
-    // — the chain threads through, NOT parallel writes against the seed.
-    for (std::size_t i = 1; i < chain.size(); ++i) {
-        MirInstId const prevOperand = m.instOperands(chain[i])[0];
-        EXPECT_EQ(prevOperand, chain[i - 1])
-            << "InsertValue[" << i << "].operand(0) must be InsertValue["
-            << (i - 1) << "] — chain must thread";
-    }
+    ASSERT_EQ(gepOffsets.size(), 2u);
+    EXPECT_EQ(gepOffsets[0], 0) << "field x at byte offset 0";
+    EXPECT_EQ(gepOffsets[1], 4) << "field y at byte offset 4";
 }
 
-// Nested aggregate `{{1,2}, {3,4}}` exercises zeroLiteralOf's Struct
-// recursion + the const-fold path on a non-trivial shape. Fully
-// const → 1 Const, no InsertValue.
+// FC7 (D-FC7-NESTED-STRUCT-FIELD): a NESTED brace initializer
+// `Outer o = {{a, b}, c}` (the Inner-typed field `in` initialized by an inner
+// brace) lowers RECURSIVELY — `lowerAggregateInitIntoSlot` recurses into the
+// struct-typed field's sub-slot, emitting one scalar Store per LEAF field,
+// NEVER an aggregate-width store of the inner struct. Runtime params (a,b,c)
+// keep it off the const-fold path. The GEPs are: inner-slot Gep(o,0), then
+// leaf Gep(<>,0) for in.x, leaf Gep(<>,4) for in.y, then Gep(o,8) for z —
+// offset multiset {0,0,4,8} with exactly 3 leaf Stores. RED-ON-DISABLE:
+// revert the recursion and the inner field is lowerExpr'd as a non-realizable
+// aggregate value (≠ 3 scalar leaf stores at these composed offsets).
+TEST(MirLoweringCSubset, StructLocalNestedInitRecursesIntoSubSlot) {
+    auto L = lowerCSubset(
+        "typedef struct { int x; int y; } Inner;\n"
+        "typedef struct { Inner in; int z; } Outer;\n"
+        "void f(int a, int b, int c) { Outer o = {{a, b}, c}; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "recursive element-wise init, no aggregate InsertValue";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 3u)
+        << "one scalar Store per leaf field (in.x, in.y, z) — NOT one "
+           "aggregate store of `in`";
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    int c0 = 0, c4 = 0, c8 = 0, cOther = 0;
+    auto const n = m.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Gep) continue;
+        auto gOps = m.instOperands(ix);
+        ASSERT_EQ(gOps.size(), 2u);
+        auto const off =
+            std::get<std::int64_t>(m.literalValue(m.constLiteralIndex(gOps[1])).value);
+        if (off == 0) ++c0;
+        else if (off == 4) ++c4;
+        else if (off == 8) ++c8;
+        else ++cOther;
+    }
+    EXPECT_EQ(c0, 2) << "inner-slot Gep(o,0) + in.x leaf Gep(<>,0)";
+    EXPECT_EQ(c4, 1) << "in.y leaf at offset 4 within Inner";
+    EXPECT_EQ(c8, 1) << "z leaf at offset 8 within Outer";
+    EXPECT_EQ(cOther, 0) << "no GEP at an unexpected offset";
+}
+
+// Nested aggregate `{{1}, {2}}` as a LOCAL init: post-FC7
+// (D-FC7-NESTED-STRUCT-FIELD) it lowers ELEMENT-WISE — lowerAggregateInitIntoSlot
+// recurses into each struct field's sub-slot → leaf Stores, NO InsertValue
+// chain. (A global / expression-position fully-const aggregate still const-
+// folds to a single Const; either way the InsertValue count is 0 — the
+// invariant this guards. zeroLiteralOf's Struct recursion is also exercised.)
 TEST(MirLoweringCSubset, ConstructAggregateNestedAllConstFolds) {
     auto L = lowerCSubset(
         "struct Inner { int v; };\n"
@@ -1789,8 +2200,333 @@ TEST(MirLoweringCSubset, ConstructAggregateNestedAllConstFolds) {
               ? "" : L.mirReporter.all()[0].actual);
     auto const ops = entryOpcodes(L.mir.mir);
     EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
-        << "fully-const nested aggregate must const-fold to a single "
-           "Const(nested MirAggregateValue), not a chain";
+        << "nested aggregate init lowers without an InsertValue chain "
+           "(element-wise leaf stores for a local; a single folded Const "
+           "in global/expression position)";
+}
+
+// FC7 (D-FC7-AGGREGATE-COPY-MEMCPY): a UNION copy (`*d = *s`) is BYTE-WISE,
+// not field-wise — the variants overlap, so a field-wise copy of one variant
+// would miss the others' bytes. `union U { int n; struct P p; }` is 8 bytes →
+// ONE I64 chunk (Gep+Load(i64)+Gep+Store). The DISCRIMINATOR vs a wrong
+// field-wise copy: the Load type is I64 (full 8-byte chunk), NOT I32 (the `n`
+// variant) — a field-wise copy of `n` would move only 4 of the 8 bytes.
+TEST(MirLoweringCSubset, UnionCopyIsByteWiseNotFieldWise) {
+    auto L = lowerCSubset(
+        "struct P { int x; int y; };\n"
+        "union U { int n; struct P p; };\n"
+        "void copy(union U* d, union U* s) { *d = *s; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Load),  1u) << "one 8-byte chunk";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 1u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Gep),   2u) << "src + dst GEP";
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto const n = m.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Load) continue;
+        EXPECT_EQ(interner.kind(m.instType(ix)), TypeKind::I64)
+            << "byte-wise union copy loads an I64 chunk, not the 4-byte variant";
+    }
+}
+
+// FC7 (D-FC7-AGGREGATE-COPY-MEMCPY): a struct with an AGGREGATE field copies
+// BYTE-WISE (a field-wise copy can't realize an aggregate-width field Load).
+// `Outer { Inner in; int z; }` is 12 bytes → two chunks: I64 @0 (covers `in`),
+// I32 @8 (covers `z`). Chunk Load TYPES are {I64, I32} and GEP offsets are the
+// CHUNK offsets {0,0,8,8} — NOT field offsets. The far field `z`@8 is covered
+// by the second chunk (a truncating 8-byte copy would drop it).
+TEST(MirLoweringCSubset, StructWithStructFieldCopyIsByteWise) {
+    auto L = lowerCSubset(
+        "struct Inner { int x; int y; };\n"
+        "struct Outer { struct Inner in; int z; };\n"
+        "void copy(struct Outer* d, struct Outer* s) { *d = *s; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Load),  2u) << "I64 @0 + I32 @8";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 2u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Gep),   4u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto const n = m.blockInstCount(entry);
+    int c0 = 0, c8 = 0, cOther = 0, i64Loads = 0, i32Loads = 0;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) == MirOpcode::Gep) {
+            auto g = m.instOperands(ix);
+            ASSERT_EQ(g.size(), 2u);
+            auto const off = std::get<std::int64_t>(
+                m.literalValue(m.constLiteralIndex(g[1])).value);
+            if (off == 0) ++c0; else if (off == 8) ++c8; else ++cOther;
+        } else if (m.instOpcode(ix) == MirOpcode::Load) {
+            TypeKind const k = interner.kind(m.instType(ix));
+            if (k == TypeKind::I64) ++i64Loads; else if (k == TypeKind::I32) ++i32Loads;
+        }
+    }
+    EXPECT_EQ(c0, 2) << "src+dst GEP for the @0 I64 chunk";
+    EXPECT_EQ(c8, 2) << "src+dst GEP for the @8 I32 chunk (covers far field z)";
+    EXPECT_EQ(cOther, 0);
+    EXPECT_EQ(i64Loads, 1) << "8-byte chunk @0";
+    EXPECT_EQ(i32Loads, 1) << "4-byte chunk @8";
+}
+
+// FC7 (D-FC7-AGGREGATE-COPY-MEMCPY): an ARRAY field is ALSO an aggregate field
+// → the struct copies BYTE-WISE. `S { int arr[3]; int n; }` is 16 bytes → two
+// I64 chunks @0, @8. This pins the array-field arm of the byte-wise dispatch
+// at the MIR tier; reading an array field's ELEMENTS (`s.arr[i]`) is a
+// SEPARATE pre-existing gap (the unsupported 3-op storage-array GEP,
+// D-MIR-STORAGE-ARRAY-INDEX-GEP), so this is a MIR-tier (not runtime) pin.
+TEST(MirLoweringCSubset, StructWithArrayFieldCopyIsByteWise) {
+    auto L = lowerCSubset(
+        "struct S { int arr[3]; int n; };\n"
+        "void copy(struct S* d, struct S* s) { *d = *s; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Load),  2u) << "two I64 chunks (16 bytes)";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Store), 2u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto const n = m.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Load) continue;
+        EXPECT_EQ(interner.kind(m.instType(ix)), TypeKind::I64)
+            << "16-byte struct-with-array-field copies as two I64 chunks";
+    }
+}
+
+// FC7 C1a (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): an 8-byte struct param passed BY
+// VALUE under SysV is ONE eightbyte → the CALLEE receives a SINGLE I64 register
+// `Arg` (not a struct value) and stores it into the param's frame slot; the body
+// reads the fields from the slot. (The 2-eightbyte case is fail-loud,
+// D-FC7-SYSV-STRUCT-ARG-MULTIREG.)
+TEST(MirLoweringCSubset, SysVStructByValueParamReceivesOneRegisterPiece) {
+    auto L = lowerCSubset(
+        "struct Pair { int x; int y; };\n"
+        "int sum(struct Pair p) { return p.x + p.y; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Arg), 1u)
+        << "exactly one register Arg for the single-eightbyte struct param";
+    EXPECT_GE(countOpcode(ops, MirOpcode::Alloca), 1u)
+        << "the param is reconstructed into a frame slot (Alloca precedes the Arg)";
+    // The single Arg is an I64 register piece (the eightbyte), NOT a struct value.
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto const n = m.blockInstCount(entry);
+    bool sawArg = false;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Arg) continue;
+        sawArg = true;
+        EXPECT_EQ(interner.kind(m.instType(ix)), TypeKind::I64)
+            << "the 8-byte struct param arrives as ONE I64 register piece";
+    }
+    EXPECT_TRUE(sawArg);
+}
+
+// FC7 C1a: the CALLER copies the 8-byte struct arg to a temp, loads the ONE
+// eightbyte as an I64, and passes THAT scalar as the Call operand (not the
+// struct value). So `sum(p)`'s Call carries [callee, <I64 piece>].
+TEST(MirLoweringCSubset, SysVStructByValueCallPassesOneRegisterPiece) {
+    auto L = lowerCSubset(
+        "struct Pair { int x; int y; };\n"
+        "int sum(struct Pair p) { return p.x + p.y; }\n"
+        "int f(void) { struct Pair p; p.x = 1; p.y = 2; return sum(p); }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    // f is the second function; find its Call and check the arg operand.
+    MirBlockId const entry = m.funcEntry(m.funcAt(1));
+    auto const n = m.blockInstCount(entry);
+    bool sawCall = false;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Call) continue;
+        sawCall = true;
+        auto cops = m.instOperands(ix);
+        ASSERT_EQ(cops.size(), 2u) << "[callee, one I64 piece]";
+        EXPECT_EQ(interner.kind(m.instType(cops[1])), TypeKind::I64)
+            << "the struct arg is passed as ONE I64 register piece, not a struct";
+    }
+    EXPECT_TRUE(sawCall);
+}
+
+// FC7 C1b (D-FC7-SYSV-STRUCT-ARG-MULTIREG): a 12-byte struct is TWO SysV
+// eightbytes → the callee receives TWO I64 register Args, with the PER-CLASS GPR
+// ordinals 0 and 1 (rdi, rsi), each stored into its eightbyte of the slot. This
+// is the multi-register case the verifier's physical-arg-count bound unblocks.
+TEST(MirLoweringCSubset, SysVTwoEightbyteStructParamReceivesTwoRegisterPieces) {
+    auto L = lowerCSubset(
+        "struct Tri { int x; int y; int z; };\n"
+        "int sum(struct Tri t) { return t.x + t.y + t.z; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Arg), 2u)
+        << "two register Args for the two-eightbyte struct param";
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto const n = m.blockInstCount(entry);
+    std::vector<std::uint32_t> argPayloads;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Arg) continue;
+        EXPECT_EQ(interner.kind(m.instType(ix)), TypeKind::I64)
+            << "each eightbyte is an I64 register piece";
+        argPayloads.push_back(m.argIndex(ix));
+    }
+    ASSERT_EQ(argPayloads.size(), 2u);
+    EXPECT_EQ(argPayloads[0], 0u) << "first eightbyte → per-class GPR ordinal 0 (rdi)";
+    EXPECT_EQ(argPayloads[1], 1u) << "second eightbyte → per-class GPR ordinal 1 (rsi)";
+}
+
+// FC7 C1a: a >16-byte struct param passed BY REFERENCE arrives as ONE POINTER
+// Arg (to the caller's private copy); the callee binds the param's address to it
+// directly (no piece reconstruction, no slot copy). The always-on structural
+// guard for the by-ref path — the runtime corpus runs on linux-x86_64 only.
+TEST(MirLoweringCSubset, SysVByRefStructParamReceivesOnePointerArg) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"
+        "long pick(struct Big b) { return b.c; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    auto const ops = entryOpcodes(m);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Arg), 1u)
+        << "one POINTER Arg for the by-reference (>16B) struct param";
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto const n = m.blockInstCount(entry);
+    bool sawArg = false;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Arg) continue;
+        sawArg = true;
+        EXPECT_EQ(interner.kind(m.instType(ix)), TypeKind::Ptr)
+            << "the >16-byte struct param arrives as a pointer to the caller's copy";
+    }
+    EXPECT_TRUE(sawArg);
+}
+
+// FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a 12-byte (2-eightbyte) struct
+// RETURNED by value lowers the callee's `return t;` to a MULTI-OPERAND Return
+// carrying TWO I64 register pieces (loaded from t's slot) — never a single
+// truncating struct value. The aggregate types use `typedef` because a top-level
+// `struct Tag` return specifier is the pre-FC4 grammar residue
+// (D-CSUBSET-STRUCT-BODY-VARDECL-POSITION); the ABI codegen is identical.
+TEST(MirLoweringCSubset, SysVTwoEightbyteStructReturnEmitsMultiOperandReturn) {
+    auto L = lowerCSubset(
+        "typedef struct { int x; int y; int z; } Tri;\n"
+        "Tri mk(int a, int b, int c) { Tri t; t.x=a; t.y=b; t.z=c; return t; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    MirInstId const ret = entryReturn(m, 0);
+    ASSERT_TRUE(ret.valid()) << "mk has a Return terminator";
+    auto rops = m.instOperands(ret);
+    ASSERT_EQ(rops.size(), 2u)
+        << "a 2-eightbyte struct returns TWO register pieces, not one truncated "
+           "struct value";
+    for (auto const op : rops)
+        EXPECT_EQ(interner.kind(m.instType(op)), TypeKind::I64)
+            << "each eightbyte is an I64 register piece (rax:rdx)";
+}
+
+// FC7 C1c: a >16-byte struct returned by value uses SRET — the callee receives a
+// hidden result POINTER as its first Arg (GPR ordinal 0, shifting the real
+// params) and returns that pointer; the body copies the result through it.
+TEST(MirLoweringCSubset, SysVByRefStructReturnUsesSretHiddenPointer) {
+    auto L = lowerCSubset(
+        "typedef struct { long a; long b; long c; } Big;\n"
+        "Big mk(long a, long b, long c) { Big r; r.a=a; r.b=b; r.c=c; return r; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    MirInstId firstArg = InvalidMirInst;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) == MirOpcode::Arg) { firstArg = ix; break; }
+    }
+    ASSERT_TRUE(firstArg.valid());
+    EXPECT_EQ(interner.kind(m.instType(firstArg)), TypeKind::Ptr)
+        << "the sret hidden result pointer is the FIRST Arg (GPR ordinal 0)";
+    EXPECT_EQ(m.argIndex(firstArg), 0u);
+    MirInstId const ret = entryReturn(m, 0);
+    ASSERT_TRUE(ret.valid());
+    auto rops = m.instOperands(ret);
+    ASSERT_EQ(rops.size(), 1u) << "sret returns the single hidden pointer";
+    EXPECT_EQ(interner.kind(m.instType(rops[0])), TypeKind::Ptr);
+}
+
+// FC7 C1c: a {double; long} struct returns in MIXED register classes — eightbyte
+// 0 (double @0) is the SSE piece (F64 → xmm0), eightbyte 1 (long @8) is the
+// INTEGER piece (I64 → rax). Pins the per-class return split (the most likely
+// off-by-one: the GPR piece must NOT land in rdx).
+TEST(MirLoweringCSubset, SysVMixedClassStructReturnSplitsAcrossRegisterClasses) {
+    auto L = lowerCSubset(
+        "typedef struct { double d; long n; } Mix;\n"
+        "Mix mk(double d, long n) { Mix m; m.d=d; m.n=n; return m; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    MirInstId const ret = entryReturn(m, 0);
+    ASSERT_TRUE(ret.valid());
+    auto rops = m.instOperands(ret);
+    ASSERT_EQ(rops.size(), 2u) << "{double; long} returns in two register classes";
+    EXPECT_EQ(interner.kind(m.instType(rops[0])), TypeKind::F64)
+        << "eightbyte 0 (double @0) is the SSE piece → xmm0";
+    EXPECT_EQ(interner.kind(m.instType(rops[1])), TypeKind::I64)
+        << "eightbyte 1 (long @8) is the INTEGER piece → rax";
+}
+
+// FC7 C1c (SF-2): a struct-returning CALL is emitted EXACTLY ONCE — the factored
+// helper backs both `lowerExpr(Call)` and `lowerLvalueAddress(Call)`, so a
+// consumer that reaches the call by address (`Tri t = mk(...)`) must not double-
+// emit it. A 2-eightbyte return captures piece 0 as the Call result + ONE
+// `ReturnPiece` for piece 1.
+TEST(MirLoweringCSubset, StructReturningCallEmitsOneCallAndOneReturnPiece) {
+    auto L = lowerCSubset(
+        "typedef struct { int x; int y; int z; } Tri;\n"
+        "Tri mk(int a, int b, int c) { Tri t; t.x=a; t.y=b; t.z=c; return t; }\n"
+        "int use(void) { Tri t = mk(1, 2, 3); return t.x + t.y + t.z; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const ops = funcEntryOpcodes(m, 1);   // `use`
+    EXPECT_EQ(countOpcode(ops, MirOpcode::Call), 1u)
+        << "the struct-returning call is emitted EXACTLY once (no double-emit "
+           "across lowerExpr / lowerLvalueAddress)";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::ReturnPiece), 1u)
+        << "a 2-eightbyte return captures piece 0 (the Call result) + ONE "
+           "ReturnPiece for piece 1";
 }
 
 // ML3 end-to-end: ML2-lowered MIR for a representative c-subset
@@ -2335,4 +3071,75 @@ TEST(MirLoweringCSubset, HiddenVisibilityUnusedFunctionIsDceEliminated) {
     EXPECT_TRUE(findFunc(plainSym).valid())
         << "plain_unused (Global/Default) must survive — externally "
            "visible symbols are linkage-protected";
+}
+
+// FC7 C3 (AAPCS64/Apple x8 sret) — N-3 host-independent MIR pin. A >16-byte struct
+// returned BY VALUE under AAPCS64 uses the register-based indirect-result (x8) path,
+// NOT the SysV/Win64 hidden-arg path. This pin lowers for arm64/aapcs64 (so
+// `aggregateSretViaHiddenArg` resolves FALSE — indirectResultRegister = x8) and
+// asserts, deterministically + on every host (no execution), that:
+//   (callee) the >16B-returning function reads the result pointer via a
+//            `ReadIndirectResult` op + returns VOID (0-operand Return) + does NOT
+//            consume a hidden GPR Arg for the sret pointer; and
+//   (caller) the Call to it carries the `kIndirectResultBit` payload flag (so
+//            lir_callconv reroutes the prepended sret pointer to x8, not arg0).
+// RED-ON-DISABLE: revert `hir_to_mir`'s `aggregateSretViaHiddenArg` branch (callee
+// → `addArg`+`addReturn(ptr)`, caller → no IRR bit) and both arms fail.
+TEST(MirLoweringCSubset, Aapcs64StructSretUsesReadIndirectResultAndFlagsCall) {
+    auto L = lowerCSubset(
+        "typedef struct { long a; long b; long c; } Big;\n"
+        "Big make(int tag, long a) { Big s; s.a = a + tag; s.b = a; s.c = a;"
+        " return s; }\n"
+        "int use(void) { Big b = make(7, 5); return (int)b.a; }\n",
+        /*targetName=*/"arm64", /*ccName=*/"aapcs64");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    // Scan every function: the callee (make) must read x8 + return void; the caller
+    // (use) must flag its Call with hasIndirectResult.
+    std::size_t readIndirectResultCount = 0;
+    std::size_t voidStructReturnCount   = 0;
+    std::size_t irrFlaggedCallCount     = 0;
+    std::size_t hiddenSretArgCount      = 0;  // a 3rd GPR Arg would be a hidden sret ptr
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        std::size_t argCount = 0;
+        bool fnReadsIrr = false;
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                MirInstId const id = m.blockInstAt(b, ii);
+                switch (m.instOpcode(id)) {
+                    case MirOpcode::ReadIndirectResult:
+                        ++readIndirectResultCount; fnReadsIrr = true; break;
+                    case MirOpcode::Arg: ++argCount; break;
+                    case MirOpcode::Call:
+                        if (::dss::call_payload::hasIndirectResult(m.instPayload(id)))
+                            ++irrFlaggedCallCount;
+                        break;
+                    case MirOpcode::Return:
+                        if (fnReadsIrr && m.instOperands(id).empty())
+                            ++voidStructReturnCount;
+                        break;
+                    default: break;
+                }
+            }
+        }
+        // `make` takes 2 real params (tag, a) → exactly 2 Args, NO hidden sret Arg.
+        if (fnReadsIrr && argCount > 2) ++hiddenSretArgCount;
+    }
+    EXPECT_EQ(readIndirectResultCount, 1u)
+        << "the x8-sret callee must read the indirect-result register once at entry";
+    EXPECT_EQ(voidStructReturnCount, 1u)
+        << "the x8-sret callee must return VOID (the caller owns the x8 storage)";
+    EXPECT_EQ(irrFlaggedCallCount, 1u)
+        << "the caller's Call must carry the hasIndirectResult payload flag so "
+           "lir_callconv routes the sret pointer to x8, not arg0";
+    EXPECT_EQ(hiddenSretArgCount, 0u)
+        << "the x8-sret callee must NOT also consume a hidden GPR Arg for the sret "
+           "pointer (that is the SysV/Win64 path; x8-sret uses ReadIndirectResult)";
 }

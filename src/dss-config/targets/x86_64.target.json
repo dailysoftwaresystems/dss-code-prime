@@ -31,6 +31,26 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (FC7 C1c, D-FC7-SYSV-STRUCT-RETURN-IN-REGS): 'this LirReg is the k-th return register of the immediately-preceding struct-returning call' (payload = per-class return-register ordinal). The caller-side mirror of `arg`. ML7 calling-convention lowering captures it (a mov-from-returnReg, cycle-broken with its sibling pieces) and the ret_piece itself is never encoded. side-effecting so no pass drops/hoists it off its call.",
+      "mnemonic":      "ret_piece",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Virtual-ISA pseudo-op (FC7 C3) — callee-side mirror of `arg`: 'this LirReg is the incoming indirect-result (sret) pointer', read from the cc's indirectResultRegister at function entry. Declared for substrate uniformity (like `ret_piece`); x86_64's SysV/ms_x64 conventions pass the sret pointer as a HIDDEN ARG (no indirectResultRegister), so this op is never EMITTED on x86_64 — only register-based sret (AAPCS64/Apple x8) emits it. No encoding (materialized away by lir_callconv).",
+      "mnemonic":      "read_indirect_result",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "2-operand-shape mov: destination = result vreg, source = operands[0]. AS2 cycle 2 wires this to two encoding variants: REX.W 0x8B /r (mov r64, r64) when source is a register; REX.W 0xC7 /0 imm32 (mov r/m64, imm32 SIGN-extended to 64-bit) when source is an immediate. FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): both shapes gain explicit `width` keys + 32-bit siblings (same opcodes WITHOUT REX.W, Intel SDM Vol. 2B MOV) — a 32-bit register write auto-zero-extends to the full 64-bit register, and the 32-bit imm32 form is EXACT (not sign-extending), the difference that matters for an `unsigned int` 0xFFFFFFFF. Plumbing movs (phi/copy/capture/spill) are emitted width-default (64) — full-register copies are value-correct for every type.",
       "mnemonic":      "mov",
       "result":        "value",
@@ -610,6 +630,28 @@
             ]
           },
           {
+            "$comment": "3-op no-index form, width 32 (D-LIR-INT-MEMORY-WIDTH-EXACT): `mov r32, [base + disp32]` (0x8B WITHOUT REX.W). A 4-byte int load MUST be width-exact — a 64-bit read of a PACKED int (an array element / struct field, NOT a stand-alone scalar local) reads 4 bytes past it (the store peer clobbers the neighbour / overruns the frame slot — the bug the array-storage cycle exposed). A 32-bit register write auto-zero-extends bits 63:32 (Intel SDM MOV), so the int lands clean in the full register. Selected when the Load's result type is a 4-byte integer (I32/U32, or `long` under LLP64) — width 32 via memAccessWidthFlags.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "resultSlot": "modrm.reg",
+            "template":   { "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "3-op no-index form, width 16 (D-LIR-INT-MEMORY-WIDTH-EXACT): `movzx r32, word [base + disp32]` (0F B7 /r, no REX.W). A 2-byte short load must be half-word-exact — a wider read of a packed short reads past it. ZERO-extend (movzx) is the signedness-agnostic half-word fetch (the width-8 char movzx peer at 0F B6); the short→int promote cast that follows re-reads the low 16 bits (SExt/ZExt-16 = D-CSUBSET-SUBNATIVE-ALU-FORMS, not yet encoded ⇒ short VALUE use fails loud, never silently miscompiles). Selected when the Load's result type is I16/U16 — width 16 via memAccessWidthFlags.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "resultSlot": "modrm.reg",
+            "template":   { "opcode": [15, 183] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
             "$comment": "4-op indexed form (D-AS4-5), width 64: `mov reg, [base + index*scale + disp32]` (REX.W 0x8B). The walker emits SIB unconditionally when SibIndex wires.",
             "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "resultSlot": "modrm.reg",
@@ -663,6 +705,28 @@
             "$comment": "4-op no-index form, width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): `mov byte [base + disp32], reg8` (0x88 /r). A char/byte store writes EXACTLY the low byte — a 64-bit store of a 1-byte element would clobber 7 bytes past it. `forceRexPrefix: true` (NOT rexW — a byte op) forces a REX prefix so the stored VALUE register (wired to modrm.reg) addresses spl/bpl/sil/dil (low byte of r4..r7) instead of the legacy ah/ch/dh/bh high-byte aliases — exactly the setcc byte-register rationale. Signedness-agnostic: only the low 8 bits are written. Selected when the stored value's type is Char (width 8 via memAccessWidthFlags).",
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
             "template": { "opcode": [136], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "4-op no-index form, width 32 (D-LIR-INT-MEMORY-WIDTH-EXACT): `mov [base + disp32], r32` (0x89 WITHOUT REX.W). A 4-byte int store MUST write EXACTLY 4 bytes — a 64-bit store of a PACKED int element clobbers 4 bytes of the neighbour and overruns the frame slot (the array-storage crash this cycle fixes). Selected when the stored value's type is a 4-byte integer (I32/U32, or `long` under LLP64) — width 32 via memAccessWidthFlags.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [137] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "4-op no-index form, width 16 (D-LIR-INT-MEMORY-WIDTH-EXACT): `mov [base + disp32], r16` (0x66 0x89 — the 0x66 operand-size prefix selects 16-bit, emitted before any REX). Writes EXACTLY 2 bytes — a wider store of a packed short clobbers its neighbour. No forceRexPrefix (a 16-bit store has no high-byte-alias hazard — that is a byte-register concern). Selected when the stored value's type is I16/U16 — width 16 via memAccessWidthFlags.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [137] },
             "wires":    [
               { "index": 0, "slotKind": "modrm.reg"     },
               { "index": 1, "slotKind": "modrm.rm.mem"  },
@@ -1415,6 +1479,9 @@
       "stackAlignment":   16,
       "shadowSpaceBytes": 0,
       "redZoneBytes":     128,
+      "$aggregateAbiComment": "FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): System V AMD64 §3.2.3 eightbyte classification — a struct/union ≤16 bytes is passed/returned in up to two registers (each 8-byte 'eightbyte' classified INTEGER→GPR or SSE→FPR per the field types overlapping it); larger than aggregateMaxRegBytes (16) goes in MEMORY (by-reference args / sret returns). No indirectResultRegister ⇒ the sret hidden pointer is a first INTEGER arg (rdi) returned in rax (vs AAPCS64's x8). The classification ALGORITHM lives in the aggregate_abi realization tier keyed on this strategy enum, never on cc.name/target identity.",
+      "aggregateClassification": "sysv_eightbyte",
+      "aggregateMaxRegBytes":    16,
       "$entryStackPointerBiasComment": "D-LK10-ENTRY-TRAMP-PROLOGUE: at SysV process entry the kernel maps the image and JUMPS to `_start` with RSP 16-byte-aligned and NO return address pushed — so RSP bias mod stackAlignment is 0. The trampoline emitter computes its prologue `sub rsp, N` via `alignedSizeWithBias(shadowSpaceBytes=0, stackAlignment=16, bias=0) = 0` — no prologue emitted, which is correct for SysV (no shadow space + already aligned).",
       "entryStackPointerBias": 0,
       "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: x86_64 `call` instruction pushes the 8-byte return address. ML7 `computeFrameLayout` consumes this as the bias for non-leaf functions so their prologue `sub rsp, N` produces RSP ≡ 0 mod 16 at the next call site. SysV's entry bias is 0 (kernel JMP) but this in-program call-push is 8 — the two distinct facts coincide on Win64 (both 8) and diverge here. Without this wired, the user-fn → extern-call shadow-space + alignment violation reappears one stack frame below the trampoline (the same 0xC0000005 class as D-LK10-ENTRY-TRAMP-PROLOGUE, now recurring at the user-fn boundary).",
@@ -1429,6 +1496,9 @@
       "argFprs":     ["xmm0", "xmm1", "xmm2", "xmm3"],
       "returnGprs":  ["rax"],
       "returnFprs":  ["xmm0"],
+      "$aggregateComment": "FC7 C2 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): MS x64 by-value aggregates. A struct/union of size 1/2/4/8 (power of two ≤ 8) is passed/returned in ONE GPR (treated as an integer of its size — Win64 has no SSE/HFA rule); every other size (3/5/6/7 or > 8) goes BY REFERENCE: a caller-allocated copy for args, an sret hidden pointer (in RCX, arg slot 0) returning the pointer in RAX for results. `win64_by_size` drives the bounded `classifyAggregate` arm; maxRegBytes = 8 (a single register).",
+      "aggregateClassification": "win64_by_size",
+      "aggregateMaxRegBytes":    8,
       "callerSaved": ["rax", "rcx", "rdx", "r8", "r9", "r10", "r11",
                       "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5"],
       "calleeSaved": ["rbx", "rbp", "rdi", "rsi", "r12", "r13", "r14", "r15",

@@ -114,6 +114,14 @@ public:
     // factory so the factory signature doesn't balloon with optional
     // fields most positions don't use).
     void setNullableTail(bool v) noexcept { nullableTail_ = v; }
+    // The loader's `recomputeAltExpectedSets` fixed-point: an AltChoice's
+    // expectedSet is the union of its branches', but `repeat`'s tie-the-knot
+    // builds the loop body BEFORE the loop-entry AltChoice exists, so an
+    // optional/alt INSIDE the body captures a stale-empty expectedSet for the
+    // loop-back branch. The post-build fixed-point re-unions to convergence.
+    void setExpectedSet(std::vector<SchemaTokenId> v) noexcept {
+        expectedSet_ = std::move(v);
+    }
     void setSpeculative(bool spec, std::uint16_t lookahead) noexcept {
         speculative_ = spec;
         lookahead_   = lookahead;

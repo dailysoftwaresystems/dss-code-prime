@@ -356,11 +356,16 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
             return;
         }
         case MirOpcode::Return: {
-            std::optional<MirInstId> retVal;
-            if (!oldOps.empty()) {
-                retVal = mapOperand(oldOps[0]);
-            }
-            MirInstId const newId = dst_.addReturn(retVal);
+            // FC7 C1c: a by-value struct returned IN REGISTERS carries N eightbyte/
+            // HFA PIECE operands (every operand is a return-register value), not one.
+            // Map EVERY operand — taking only oldOps[0] silently dropped pieces
+            // 1..N-1, a miscompile masked on x86_64 (the dropped piece's value often
+            // still aliased its arg register at the return register) but exposed on
+            // AAPCS64's distinct arg/return mapping. `addReturnMulti` covers 0/1/N.
+            std::vector<MirInstId> retVals;
+            retVals.reserve(oldOps.size());
+            for (MirInstId const o : oldOps) retVals.push_back(mapOperand(o));
+            MirInstId const newId = dst_.addReturnMulti(retVals);
             remember(newId);
             return;
         }

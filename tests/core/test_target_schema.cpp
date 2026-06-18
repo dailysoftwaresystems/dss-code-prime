@@ -1395,6 +1395,25 @@ TEST(TargetSchema, CallingConventionRedZoneMustAlignToStack) {
     EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
 }
 
+// FC7 C2 (review LOW-2): a CC declaring a REAL aggregate-classification strategy
+// but no (zero / omitted) `aggregateMaxRegBytes` would silently classify EVERY
+// by-value struct by-reference (`size <= 0` is always false) — validate() must
+// reject it so a future target.json that wires the strategy but forgets the
+// register budget is caught instead of quietly mis-passing every aggregate.
+TEST(TargetSchema, CallingConventionAggregateStrategyNeedsNonZeroMaxRegBytes) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"rax","class":"gpr","widthBytes":8}],
+            "callingConventions":[
+              {"name":"bad","argGprs":["rax"],"stackAlignment":16,
+               "aggregateClassification":"sysv_eightbyte"}
+            ]})");
+    ASSERT_FALSE(r.has_value())
+        << "a real aggregateClassification with aggregateMaxRegBytes=0 must fail-loud";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
 // ─── cycle 2b — JSON loader edge cases ────────────────────────────────────
 
 TEST(TargetSchema, RegistersSectionMustBeArray) {

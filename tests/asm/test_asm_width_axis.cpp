@@ -38,6 +38,7 @@ namespace {
 
 constexpr std::uint8_t kW32 = kLirInstFlagWidth32;
 constexpr std::uint8_t kW8  = kLirInstFlagWidth8;
+constexpr std::uint8_t kW16 = kLirInstFlagWidth16;
 
 [[nodiscard]] std::vector<std::uint8_t>
 assembleFirstFn(Lir const& lir, TargetSchema const& schema,
@@ -646,6 +647,127 @@ TEST(WidthAxisArm64, CharByteFormsEmitSxtbLdurbSturb) {
         });
         EXPECT_EQ(rep.errorCount(), 0u);
         EXPECT_EQ(firstInstWord(bytes), 0x38008001u);
+    }
+}
+
+// ── D-LIR-INT-MEMORY-WIDTH-EXACT: the width-32 (int) + width-16 (short)
+//    memory load/store byte forms. STRUCTURAL witness — for width-16
+//    especially, which cannot be runtime-witnessed end-to-end (the short→int
+//    promote SExt/ZExt-16 is the separate D-CSUBSET-SUBNATIVE-ALU-FORMS gap),
+//    the bytes ARE the proof. A regression in a .target.json fixedWord/opcode
+//    surfaces here as a precise byte mismatch, not only a runtime drift. ──────
+
+TEST(WidthAxisX86, Int32And16MemFormsEmitWidthExactMovAndMovzx) {
+    auto schema = loadX86();
+    ASSERT_NE(schema, nullptr);
+    auto const rax = gpr(*schema, "rax");
+    auto const rcx = gpr(*schema, "rcx");
+    {   // INT LOAD: mov ecx, [rax+8] = 0x8B /r, NO REX.W; ModRM 0x88; disp32.
+        DiagnosticReporter rep;
+        auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(rax),
+                                      LirOperand::makeMemBase(1),
+                                      LirOperand::makeMemOffset(8)};
+            (void)b.addInst(*schema->opcodeByMnemonic("load"), rcx, ops,
+                            /*payload=*/0, kW32);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        expectPrefix(bytes, {0x8B, 0x88, 0x08, 0x00, 0x00, 0x00});
+    }
+    {   // INT STORE: mov [rax+8], ecx = 0x89 /r, NO REX.W; ModRM 0x88; disp32.
+        DiagnosticReporter rep;
+        auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(rcx),   // value
+                                      LirOperand::makeReg(rax),   // base
+                                      LirOperand::makeMemBase(1),
+                                      LirOperand::makeMemOffset(8)};
+            (void)b.addInst(*schema->opcodeByMnemonic("store"),
+                            InvalidLirReg, ops, /*payload=*/0, kW32);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        expectPrefix(bytes, {0x89, 0x88, 0x08, 0x00, 0x00, 0x00});
+    }
+    {   // SHORT LOAD: movzx ecx, word [rax+8] = 0F B7 /r, no REX.W; ModRM 0x88.
+        DiagnosticReporter rep;
+        auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(rax),
+                                      LirOperand::makeMemBase(1),
+                                      LirOperand::makeMemOffset(8)};
+            (void)b.addInst(*schema->opcodeByMnemonic("load"), rcx, ops,
+                            /*payload=*/0, kW16);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        expectPrefix(bytes, {0x0F, 0xB7, 0x88, 0x08, 0x00, 0x00, 0x00});
+    }
+    {   // SHORT STORE: mov [rax+8], cx = 0x66 0x89 /r; ModRM 0x88; disp32.
+        DiagnosticReporter rep;
+        auto bytes = buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(rcx),   // value
+                                      LirOperand::makeReg(rax),   // base
+                                      LirOperand::makeMemBase(1),
+                                      LirOperand::makeMemOffset(8)};
+            (void)b.addInst(*schema->opcodeByMnemonic("store"),
+                            InvalidLirReg, ops, /*payload=*/0, kW16);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        expectPrefix(bytes, {0x66, 0x89, 0x88, 0x08, 0x00, 0x00, 0x00});
+    }
+}
+
+TEST(WidthAxisArm64, Int32And16MemFormsEmitLdurSturWordAndHalf) {
+    auto schema = loadArm();
+    ASSERT_NE(schema, nullptr);
+    auto const x0 = gpr(*schema, "x0");
+    auto const x1 = gpr(*schema, "x1");
+    {   // LDUR W1, [X0, #8] = 0xB8400000 | 8<<12 | 1 = 0xB8408001 (size=10).
+        DiagnosticReporter rep;
+        auto bytes = buildAndAssembleArm(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(x0),
+                                      LirOperand::makeMemBase(1),
+                                      LirOperand::makeMemOffset(8)};
+            (void)b.addInst(*schema->opcodeByMnemonic("load"), x1, ops,
+                            /*payload=*/0, kW32);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_EQ(firstInstWord(bytes), 0xB8408001u);
+    }
+    {   // STUR W1, [X0, #8] = 0xB8000000 | 8<<12 | 1 = 0xB8008001 (size=10).
+        DiagnosticReporter rep;
+        auto bytes = buildAndAssembleArm(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(x1),   // value
+                                      LirOperand::makeReg(x0),   // base
+                                      LirOperand::makeMemBase(1),
+                                      LirOperand::makeMemOffset(8)};
+            (void)b.addInst(*schema->opcodeByMnemonic("store"),
+                            InvalidLirReg, ops, /*payload=*/0, kW32);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_EQ(firstInstWord(bytes), 0xB8008001u);
+    }
+    {   // LDURH W1, [X0, #8] = 0x78400000 | 8<<12 | 1 = 0x78408001 (size=01).
+        DiagnosticReporter rep;
+        auto bytes = buildAndAssembleArm(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(x0),
+                                      LirOperand::makeMemBase(1),
+                                      LirOperand::makeMemOffset(8)};
+            (void)b.addInst(*schema->opcodeByMnemonic("load"), x1, ops,
+                            /*payload=*/0, kW16);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_EQ(firstInstWord(bytes), 0x78408001u);
+    }
+    {   // STURH W1, [X0, #8] = 0x78000000 | 8<<12 | 1 = 0x78008001 (size=01).
+        DiagnosticReporter rep;
+        auto bytes = buildAndAssembleArm(*schema, rep, [&](LirBuilder& b) {
+            LirOperand const ops[] = {LirOperand::makeReg(x1),   // value
+                                      LirOperand::makeReg(x0),   // base
+                                      LirOperand::makeMemBase(1),
+                                      LirOperand::makeMemOffset(8)};
+            (void)b.addInst(*schema->opcodeByMnemonic("store"),
+                            InvalidLirReg, ops, /*payload=*/0, kW16);
+        });
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_EQ(firstInstWord(bytes), 0x78008001u);
     }
 }
 
@@ -1524,17 +1646,31 @@ TEST(FloatWidthAxisArm64, CsetFloatCondsInvertNibbleAtBit12) {
 
 // ── loader validation: the width vocabulary is closed ─────────────────
 
-TEST(WidthAxisLoader, GuardWidthSixteenIsRejected) {
-    auto mutated = test_support::mutateShippedTargetSchemaDoc(
+// The width vocabulary is closed: {8, 16, 32, 64}. width-16 JOINED it for the
+// half-word memory forms (D-LIR-INT-MEMORY-WIDTH-EXACT — STURH/LDURH, 0x66
+// mov / movzx r16); an OUT-of-vocabulary width (e.g. 24) is still a load-time
+// reject — never a silent match-nothing variant.
+TEST(WidthAxisLoader, GuardWidthSixteenAcceptedOutOfVocabularyRejected) {
+    auto okWidth16 = test_support::mutateShippedTargetSchemaDoc(
         "x86_64", [](nlohmann::json& doc) {
             for (auto& op : doc["opcodes"]) {
                 if (op.value("mnemonic", "") != "neg") continue;
                 op["encoding"]["variants"][0]["guard"]["width"] = 16;
             }
         });
-    EXPECT_FALSE(mutated.has_value())
-        << "guard width 16 must be a load-time reject (only 32/64 are "
-           "encodable this cycle)";
+    EXPECT_TRUE(okWidth16.has_value())
+        << "guard width 16 is now in the closed width vocabulary "
+           "(D-LIR-INT-MEMORY-WIDTH-EXACT half-word memory forms)";
+
+    auto badWidth = test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            for (auto& op : doc["opcodes"]) {
+                if (op.value("mnemonic", "") != "neg") continue;
+                op["encoding"]["variants"][0]["guard"]["width"] = 24;
+            }
+        });
+    EXPECT_FALSE(badWidth.has_value())
+        << "an out-of-vocabulary width (24) must be a load-time reject";
 }
 
 TEST(WidthAxisLoader, AmbiguousWidthMixIsRejected) {
