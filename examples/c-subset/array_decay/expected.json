@@ -1,0 +1,15 @@
+{
+  "$comment": "D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY + D-LK4-RODATA-PRODUCER-NONSTRING-GLOBAL-ARRAY-DECAY (FC8): non-string array->pointer decay (C 6.3.2.1) for a LOCAL array (alloca base) and a GLOBAL array (GlobalAddr, bytes in rodata), incl. WRITE-THROUGH proving the decayed pointer aliases the real storage. a={3,4,1}; bump(a)->a[0]=4; sum3(a)=9; sum3(g)=31; 9+31+2=42. Runtime operands (non-inlined calls) so the decay is never folded away. A wrong address / a copy / a fail-loud flips the exit. arm64 under qemu; macho on the macos-latest leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}

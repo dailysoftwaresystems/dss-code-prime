@@ -935,15 +935,24 @@ struct Lowerer {
                 // Both fail loud here so a future producer can't slip
                 // a silent miscompile through this arm.
                 if (fromK == TypeKind::Array && toK == TypeKind::Ptr) {
+                    // FC8: NON-string-literal array→pointer DECAY (C 6.3.2.1) —
+                    // the decayed pointer is the address of the array's FIRST
+                    // ELEMENT. Any array LVALUE (a local alloca, a module global
+                    // whose bytes the aggregate-global producer already emits to
+                    // rodata, a struct field, an indexed sub-array) yields its
+                    // base address via `lowerLvalueAddress`; a byte-offset-0 Gep
+                    // re-types it as `Ptr<elem>` (`t`) — the C-standard `&arr[0]`
+                    // (array base == first-element address). Closes
+                    // D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY +
+                    // D-LK4-RODATA-PRODUCER-NONSTRING-GLOBAL-ARRAY-DECAY. A string
+                    // literal is an RVALUE (no lvalue address) → it keeps the
+                    // synthesize-a-rodata-global path below.
                     if (hir.kind(kids[0]) != HirKind::Literal) {
-                        unsupported(node,
-                            "Array→Pointer decay supported only on "
-                            "string-literal operands today (local + "
-                            "non-string-global arrays anchored "
-                            "D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY "
-                            "/ D-LK4-RODATA-PRODUCER-NONSTRING-GLOBAL-"
-                            "ARRAY-DECAY)");
-                        return InvalidMirInst;
+                        MirInstId const arrAddr = lowerLvalueAddress(kids[0]);
+                        if (!arrAddr.valid()) return InvalidMirInst;
+                        MirInstId const zero = constInt(0);
+                        std::array<MirInstId, 2> gep{arrAddr, zero};
+                        return mir.addInst(MirOpcode::Gep, gep, t);
                     }
                     std::uint32_t const litIdx0 = hir.payload(kids[0]);
                     HirLiteralValue const& src = literals.at(litIdx0);

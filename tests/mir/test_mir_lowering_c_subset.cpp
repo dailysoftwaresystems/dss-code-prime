@@ -1412,6 +1412,24 @@ TEST(MirLoweringCSubset, BitFieldStructInitializerFailsLoudAtLowering) {
            "(D-CSUBSET-BITFIELD-INIT), never silently miscompile";
 }
 
+// FC8 D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY + NONSTRING-GLOBAL-ARRAY-DECAY: a
+// non-string array used as a pointer DECAYS to its first-element address — it
+// must LOWER (not fail loud as it did pre-FC8). RED-ON-DISABLE: revert the decay
+// arm and the Cast(Array→Ptr) on a non-literal operand hits H0009 -> mir.ok
+// false. Covers a LOCAL array (alloca) and a GLOBAL array (GlobalAddr).
+TEST(MirLoweringCSubset, NonStringArrayDecaysToPointerNotFailLoud) {
+    auto L = lowerCSubset(
+        "int g[2] = { 1, 2 };\n"
+        "int use(int* p) { return p[0] + p[1]; }\n"
+        "int f(void) { int a[2]; a[0] = 3; a[1] = 4; return use(a) + use(g); }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    EXPECT_TRUE(L.mir.ok)
+        << "non-string array→pointer decay (local + global) must lower, not "
+           "fail loud: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+}
+
 // Symmetric write: `p->y = v` lowers to GEP-then-Store, with the value
 // operand being the Arg v and the ptr operand the GEP result.
 TEST(MirLoweringCSubset, MemberAccessAssignEmitsGepThenStore) {
