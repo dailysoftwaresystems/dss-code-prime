@@ -6719,6 +6719,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // C 6.7.2.2 / 6.3.1.1: an enum is an integer type — implicit enum↔int
+            // conversion in assignment (read by `isAssignable`'s enum↔int arm).
+            // Opt-in (default false → a non-C schema keeps Enum strictly distinct).
+            if (sem.contains("enumConvertsToArith")) {
+                auto const& v = sem.at("enumConvertsToArith");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/enumConvertsToArith",
+                              "'enumConvertsToArith' must be a boolean");
+                } else {
+                    cfg.enumConvertsToArith = v.get<bool>();
+                }
+            }
+
             // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d):
             // per-language `pointerAliasing` block. Single bool field
             // today (`strictAliasingOnDistinctTypes`); designed to

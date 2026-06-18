@@ -1622,6 +1622,61 @@ TEST(MirToLir, StoreEmitsCorrectOperandShape) {
     EXPECT_TRUE(foundStore);
 }
 
+TEST(MirToLir, EnumPackedFieldMemoryAccessIsWidthExactToUnderlying) {
+    // D-CSUBSET-ENUM-INT-CONVERSION × D-LIR-INT-MEMORY-WIDTH-EXACT: an enum has
+    // NO representation of its own (C 6.7.2.2) — it IS its underlying integer
+    // (default I32 → 4 bytes). A Load/Store of an enum value into a PACKED
+    // struct field must therefore be width-EXACT (kLirInstFlagWidth32), NEVER
+    // the width-default 64-bit: an 8-byte access of a 4-byte field overruns it
+    // and clobbers the neighbour. `mir_to_lir.cpp::reprKind()` resolves
+    // Enum → scalars[0] at the width tier so every width site (Load + Store)
+    // sees the underlying int. RED-ON-DISABLE: revert reprKind (Enum falls to
+    // the `default` arm → flag 0) and BOTH EXPECT flip. A scalar enum local
+    // sits in its own >=8-byte slot and MASKS this — so the struct-FIELD form
+    // is the load-bearing pin. This is the HOST-INDEPENDENT structural guard
+    // (runs on every CI leg) complementing the enum_value corpus, whose
+    // runtime exit-code witness only fires on legs the host/CI can EXECUTE.
+    // A plain pointer deref forces the read/write through memory (no struct →
+    // no aggregate layout needed): `*p` is a scalar enum store + load. The enum
+    // is I32-underlying (4 bytes) — a packed memory access whose width MUST be
+    // exact (a scalar enum LOCAL would sit in its own >=8-byte slot and mask a
+    // regression, so the through-pointer access is the load-bearing form).
+    auto L = lowerCSubsetToLir(
+        "enum E { Z, A }; "
+        "int f(enum E* p) { *p = A; return (int)*p; }");
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "LIR: " << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+    auto const storeOp = *L.target->opcodeByMnemonic("store");
+    auto const loadOp  = *L.target->opcodeByMnemonic("load");
+    Lir const& lir = L.lir.lir;
+    int stores = 0, loads = 0;
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(blk); ++i) {
+                LirInstId const inst = lir.blockInstAt(blk, i);
+                auto const op = lir.instOpcode(inst);
+                if (op == storeOp) {
+                    ++stores;
+                    EXPECT_NE(lir.instFlags(inst) & kLirInstFlagWidth32, 0u)
+                        << "enum field STORE must be width-32 (enum → I32 "
+                           "underlying), not the width-default 64-bit that "
+                           "overruns the 4-byte field and clobbers the neighbour";
+                }
+                if (op == loadOp) {
+                    ++loads;
+                    EXPECT_NE(lir.instFlags(inst) & kLirInstFlagWidth32, 0u)
+                        << "enum field LOAD must be width-32 (enum → I32 underlying)";
+                }
+            }
+        }
+    }
+    EXPECT_GE(stores, 1) << "the `p->c = A` enum-field store must reach LIR";
+    EXPECT_GE(loads, 1)  << "the `(int)p->c` enum-field load must reach LIR";
+}
+
 TEST(MirToLir, AllocaResultIsAddressableViaStore) {
     // Cycle-3c Alloca lowering: the LIR alloca's result register flows
     // into the immediately following Store as its `base` operand. This

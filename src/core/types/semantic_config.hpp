@@ -1097,6 +1097,15 @@ struct DSS_EXPORT SemanticConfig {
     // from the integer ranks. Required by the char-literal typing AND char value use.
     bool charConvertsToArith = false;
 
+    // C 6.7.2.2 / 6.3.1.1: an enum is an integer type with an underlying integer
+    // (DSS interns it as `TypeKind::Enum`, the underlying kind in `scalars[0]`).
+    // Read by `isAssignable`'s enum arm, which admits BOTH directions of the
+    // enum↔integer conversion — enum→int (`return BLUE;` / `int x = BLUE;`,
+    // widening) and int→enum (`enum Color e = 1;` / the `e += 1` write-back,
+    // narrowing). Default false → a non-C schema (toy/tsql) keeps `Enum` strictly
+    // distinct from the integer ranks. Closes D-CSUBSET-ENUM-INT-CONVERSION.
+    bool enumConvertsToArith = false;
+
     // Two orthogonal per-language alias-analysis opt-ins, both threaded
     // through `MirLoweringConfig` → `Mir` and read by CSE/LICM Load
     // admission via `Mir.aliasingMode()` + `Mir.charTypesAliasAll()`.

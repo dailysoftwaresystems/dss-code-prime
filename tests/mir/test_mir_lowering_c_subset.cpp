@@ -147,6 +147,64 @@ TEST(MirLoweringCSubset, StraightLineAddFunction) {
     EXPECT_EQ(retOps[0], sum);
 }
 
+// D-CSUBSET-ENUM-INT-CONVERSION (FC8): a bare enumerator lowers to a Const of its
+// value through HIR→MIR. RED-ON-DISABLE (and red TODAY before the A1 Ref→Const
+// fold): an enumerator Ref has no storage / SSA binding, so without the fold it
+// hits the unbound-symbol fail-loud here → `L.mir.ok` is false. The `enum_value`
+// corpus is the runtime witness; this pins the IR-tier fold in isolation.
+TEST(MirLoweringCSubset, EnumeratorLowersToConstNotUnboundRef) {
+    auto L = lowerCSubset(
+        "enum Color { RED, GREEN, BLUE };\n"
+        "int main(void) { return BLUE; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "enumerator must fold to a Const (no unbound-symbol fail-loud): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    // The folded enumerator BLUE is a Const(2) in the entry block.
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    bool sawConst = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        if (m.instOpcode(m.blockInstAt(entry, i)) == MirOpcode::Const) {
+            sawConst = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawConst) << "the enumerator `BLUE` must lower to a Const";
+}
+
+// §3 two-tier: an enum-typed COMPOUND expr (`c + 1`) must type cleanly through
+// BOTH the semantic typer (subtreeType, feeds the return check) AND HIR→MIR
+// lowering — they must AGREE that an enum promotes to its underlying int. The
+// param `c` is storage-backed, so it stays a Ref (isEnumerator false) — proving
+// the A1 fold's guard. RED-ON-DISABLE: revert the UAC enum-promotion → `c + 1`
+// stays enum → the int return check mismatches (or lowering fails).
+TEST(MirLoweringCSubset, EnumParamArithmeticLowersClean) {
+    auto L = lowerCSubset(
+        "enum Color { RED, GREEN, BLUE };\n"
+        "int g(enum Color c) { return c + 1; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+}
+
+// Scope guard at the SEMANTIC tier: enum↔DIFFERENT-enum stays a loud mismatch
+// (the conversion arm admits enum↔int ONLY). RED-ON-DISABLE: if the arm
+// over-admitted enum↔enum, this cross-enum assignment would wrongly type-check.
+TEST(MirLoweringCSubset, DifferentEnumAssignStaysMismatch) {
+    auto L = lowerCSubset(
+        "enum A { X };\n"
+        "enum B { Y };\n"
+        "int main(void) { enum A a = Y; return (int)a; }\n");
+    EXPECT_TRUE(L.model.hasErrors())
+        << "assigning a B enumerator to an A-typed var must be a loud mismatch";
+}
+
 // ML2 cycle 1: literal + return.
 // `int f() { return 42; }` lowers to one block with Const(42:i32), Return(%0).
 TEST(MirLoweringCSubset, ReturnLiteralProducesConst) {

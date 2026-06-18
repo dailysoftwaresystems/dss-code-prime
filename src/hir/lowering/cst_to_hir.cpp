@@ -227,6 +227,26 @@ struct Lowerer {
         return interner.commonType(a, b);
     }
 
+    // The arithmetic type for a read-modify-write of an lvalue of type `t`
+    // (++/--). C 6.7.2.2: an enum has NO arithmetic of its own — `x++` on an
+    // enum computes `x + 1` at the underlying integer, then converts back to
+    // the enum for the store (coerce() materializes both casts). Every other
+    // type operates as itself. Without this, ++/-- would mint an Enum-typed
+    // BinaryOp that reaches MIR's ALU/width tier AS an enum — correct only by
+    // luck of Add/Sub being signedness-agnostic (the FC8 review residue);
+    // resolving here keeps the codegen MIR int-typed and consistent with
+    // lowerCompoundAssign. Non-enum types are returned unchanged, so coerce()
+    // becomes a no-op (its equal-type early return) — byte-identical for all
+    // pre-enum code.
+    [[nodiscard]] TypeId incDecArithType(TypeId t) const {
+        if (t.valid() && interner.kind(t) == TypeKind::Enum) {
+            auto const sc = interner.scalars(t);
+            if (!sc.empty())
+                return interner.primitive(static_cast<TypeKind>(sc[0]));
+        }
+        return t;
+    }
+
     // The enclosing function's declared return type, threaded into `lowerReturn`
     // so a `return expr;` whose `expr.type` differs from the declared type
     // emits an implicit `Cast(expr → declaredType)`. Invalid outside any
@@ -408,6 +428,29 @@ struct Lowerer {
                 }
                 return {cast, target};
             }
+        }
+        // C 6.7.2.2 enum ↔ int implicit conversion (D-CSUBSET-ENUM-INT-
+        // CONVERSION): an enum HAS an integer type, so a context that mixes
+        // an enum value with an int (`int x = BLUE;`, `enum Color c = 1;`,
+        // a `c += 1` write-back, an enum arg to an int param) materializes
+        // a synthetic Cast so the MIR-tier sees a width-exact int↔int move.
+        // `isArithmeticCore` excludes Enum (it is not in the arith-core
+        // kinds), so this arm runs BEFORE the gate below — which would
+        // otherwise pass an enum-typed mismatch straight through uncoerced.
+        // The semantic tier already admitted the assignment (isAssignable's
+        // enum arm); coerce only realizes it. Different-enum mismatches
+        // never reach here as a coerce target (semantic rejects them).
+        if ((ck == TypeKind::Enum && isArithmeticCore(tk))
+            || (tk == TypeKind::Enum && isArithmeticCore(ck))) {
+            HirNodeId const cast =
+                builder.makeCast(child.id, target, HirFlags::Synthetic);
+            for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                if (it->first == child.id) {
+                    spans.push_back({cast, it->second});
+                    break;
+                }
+            }
+            return {cast, target};
         }
         // Pointers, structs, FnSig are not coerced implicitly; let the
         // caller decide whether the mismatch is a diagnostic. Arithmetic
@@ -918,6 +961,35 @@ struct Lowerer {
             if (sem.identifierToken.valid() && tk.v == sem.identifierToken.v) {
                 TypeId const type = typeAtOr(node, InvalidType);
                 SymbolId const sym = model.symbolAt(c);
+                // C 6.7.2.2 (D-CSUBSET-ENUM-INT-CONVERSION): an enumerator
+                // name is a CONSTANT, not a storage location — fold the Ref
+                // to its integer value at lowering. `isEnumerator` (set by
+                // semantic analysis only for a symbol bound under a
+                // `compositeKind:"enum"` decl) distinguishes it from a
+                // storage-backed `enum E e;` local that ALSO carries
+                // type.kind == Enum — folding THAT would drop its load and
+                // silently miscompile. The literal's core is the enum's
+                // underlying integer (scalars[0], default I32); the node keeps
+                // the enum `type` so downstream coerce / UAC see the enum and
+                // resolve it via enumUnderlyingOrSelf. The makeRef below is the
+                // fallback for every non-enumerator identifier.
+                if (auto const* erec = model.recordFor(sym);
+                    erec != nullptr && erec->isEnumerator) {
+                    TypeKind core = TypeKind::I32;
+                    if (type.valid() && interner.kind(type) == TypeKind::Enum) {
+                        auto const sc = interner.scalars(type);
+                        if (!sc.empty()) core = static_cast<TypeKind>(sc[0]);
+                    }
+                    HirLiteralValue lv;
+                    lv.core = core;
+                    if (isSignedCore(core))
+                        lv.value = static_cast<std::int64_t>(erec->enumValue);
+                    else
+                        lv.value = static_cast<std::uint64_t>(erec->enumValue);
+                    return {track(builder.makeLiteral(
+                                      type, literals.add(std::move(lv))), node),
+                            type};
+                }
                 return {track(builder.makeRef(type, sym.v), node), type};
             }
             auto lit = litType_.find(tk.v);
@@ -1680,10 +1752,13 @@ struct Lowerer {
             SymbolId const tmp = freshSymbol();
             std::vector<HirNodeId> stmts = lv->prep;
             stmts.push_back(builder.makeVarDecl(lv->type, tmp.v, lvRead(*lv), HirFlags::Synthetic));
-            HirNodeId one = synthOne(lv->type);
-            HirNodeId inc = builder.addParent(HirKind::BinaryOp, std::array{lvRead(*lv), one}, lv->type,
+            TypeId const opType = incDecArithType(lv->type);   // enum → underlying int
+            HirNodeId one = synthOne(opType);
+            HirNodeId lhs = coerce(E{lvRead(*lv), lv->type}, opType).id;   // no-op if non-enum
+            HirNodeId sum = builder.addParent(HirKind::BinaryOp, std::array{lhs, one}, opType,
                                               encodeOp(e.target == "PostInc" ? HirOpKind::Add
                                                                              : HirOpKind::Sub));
+            HirNodeId inc = coerce(E{sum, opType}, lv->type).id;          // int → enum write-back
             stmts.push_back(lvWrite(*lv, inc));
             HirNodeId yield = builder.makeRef(lv->type, tmp.v);
             return {track(builder.makeSeqExpr(stmts, yield, lv->type, HirFlags::Synthetic), node),
@@ -2943,11 +3018,14 @@ struct Lowerer {
         for (NodeId c : visible(postfixNode)) { if (!isToken(c)) { baseN = c; break; } }
         auto lv = baseN.valid() ? classifyLvalue(baseN) : std::nullopt;
         if (!lv) return reportedError(postfixNode, "++/-- needs an lvalue operand");
-        HirNodeId one = synthOne(lv->type);
-        HirNodeId value = track(builder.addParent(HirKind::BinaryOp, std::array{lvRead(*lv), one},
-                                                  lv->type,
-                                                  encodeOp(isInc ? HirOpKind::Add : HirOpKind::Sub)),
-                                postfixNode);
+        TypeId const opType = incDecArithType(lv->type);   // enum → underlying int
+        HirNodeId one = synthOne(opType);
+        HirNodeId lhs = coerce(E{lvRead(*lv), lv->type}, opType).id;   // no-op if non-enum
+        HirNodeId sum = track(builder.addParent(HirKind::BinaryOp, std::array{lhs, one},
+                                                opType,
+                                                encodeOp(isInc ? HirOpKind::Add : HirOpKind::Sub)),
+                              postfixNode);
+        HirNodeId value = coerce(E{sum, opType}, lv->type).id;         // int → enum write-back
         return asStmt(*lv, lvWrite(*lv, value), postfixNode);
     }
 

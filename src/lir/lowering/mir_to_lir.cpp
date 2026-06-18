@@ -892,9 +892,34 @@ struct Lowerer {
     // register; the low 4 bytes — the F32 value — ride along), and
     // regalloc spill/reload uses the width-default 8-byte forms over
     // 8-byte slots (value-preserving for both float widths).
+    // C 6.7.2.2: an enum has NO representation of its own — it IS its
+    // underlying integer type (scalars[0], default I32). Every width decision
+    // below MUST see that underlying scalar, never the `Enum` wrapper: a raw
+    // `interner.kind()` on an enum falls to the `default` (64-bit) arm and
+    // emits an OVER-WIDE access of a PACKED enum struct-field / array-element
+    // — the D-LIR-INT-MEMORY-WIDTH-EXACT clobber class (a scalar enum local
+    // sits in its own ≥8-byte slot, so it MASKS this — caught in the FC8
+    // enum review). This is the single enum→underlying resolve point for the
+    // width tier: `widthFlagsForType` + `memAccessWidthFlags` (and, via the
+    // former, `registerOpWidthFlags`) all switch on `reprKind(ty)`, so the
+    // projection is by-construction at every width site. `regClassForType`
+    // needs no change — `regClassForCoreType` already maps Enum → GPR; and the
+    // layout authority (`computeLayout`) already sizes an enum as its
+    // underlying, so field offsets and this access width can never disagree.
+    // Aggregates (Struct/Union/Array) keep their own kind — they are not
+    // scalars and route through the multi-leaf memory path, not these switches.
+    [[nodiscard]] TypeKind reprKind(TypeId ty) const {
+        TypeKind const k = interner.kind(ty);
+        if (k == TypeKind::Enum) {
+            auto const sc = interner.scalars(ty);
+            if (!sc.empty()) return static_cast<TypeKind>(sc[0]);
+        }
+        return k;
+    }
+
     [[nodiscard]] std::uint8_t widthFlagsForType(TypeId ty) const {
         if (!ty.valid()) return 0;
-        switch (interner.kind(ty)) {
+        switch (reprKind(ty)) {
             case TypeKind::I32: case TypeKind::U32: case TypeKind::F32:
                 return kLirInstFlagWidth32;
             // C 6.2.5: `char` is a single byte. D-CSUBSET-CHAR-STRING-VALUE-CODEGEN:
@@ -921,7 +946,7 @@ struct Lowerer {
     [[nodiscard]] std::uint8_t memAccessWidthFlags(TypeId ty, LirRegClass cls) const {
         if (cls == LirRegClass::FPR) return widthFlagsForType(ty);
         if (!ty.valid()) return 0;
-        switch (interner.kind(ty)) {
+        switch (reprKind(ty)) {   // enum → underlying int (see reprKind)
             // 1-byte integers (Char already required byte-exactness;
             // I8/U8/Bool/Byte join it — a packed signed/unsigned-char or bool
             // element must be 1-byte-exact too).

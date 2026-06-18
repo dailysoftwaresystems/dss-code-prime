@@ -93,6 +93,13 @@ struct DSS_EXPORT SymbolRecord {
     // missing initializer = previous + 1 (C99 §6.7.2.2). Meaningful only
     // for symbols whose `type.kind == Enum`; harmless 0 elsewhere.
     std::int64_t    enumValue = 0;
+    // D-CSUBSET-ENUM-INT-CONVERSION (FC8): TRUE iff this symbol IS an enumerator
+    // constant (bound under a `compositeKind:"enum"` decl, where `enumValue` was
+    // set). DISTINGUISHES an enumerator from a storage-backed `enum E e;` local —
+    // BOTH carry `type.kind == Enum`, but only the enumerator may fold to its
+    // constant value at HIR Ref-lowering; folding a storage-backed local would be
+    // a silent miscompile. Default false (every non-enumerator symbol).
+    bool            isEnumerator = false;
 };
 
 // FF11 neutral-JSON shipped-library descriptor extern

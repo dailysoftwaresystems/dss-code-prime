@@ -980,7 +980,20 @@ struct Lowerer {
                 }
                 MirInstId const operand = lowerExpr(kids[0]);
                 if (!operand.valid()) return InvalidMirInst;
-                MirOpcode const mop = mapCast(fromK, toK);
+                // C 6.7.2.2: an enum casts AS its underlying integer (the kind in
+                // the enum TypeId's `scalars[0]`). Resolve here so `mapCast`
+                // (TypeKind-only, can't read the interner) sees the real width —
+                // NO I32 assumption: a non-I32-underlying enum lowers via its
+                // declared kind. The Cast's RESULT type stays `t` (enum-typed for
+                // an int→enum cast). D-CSUBSET-ENUM-INT-CONVERSION.
+                auto const enumUnderlying =
+                    [&](TypeId ty, TypeKind k) noexcept -> TypeKind {
+                        if (k != TypeKind::Enum || !ty.valid()) return k;
+                        auto const sc = interner.scalars(ty);
+                        return sc.empty() ? k : static_cast<TypeKind>(sc[0]);
+                    };
+                MirOpcode const mop = mapCast(enumUnderlying(fromTy, fromK),
+                                              enumUnderlying(t, toK));
                 if (mop == MirOpcode::Invalid) {
                     unsupported(node, std::format(
                         "Cast from TypeKind {} to {} has no MIR opcode",

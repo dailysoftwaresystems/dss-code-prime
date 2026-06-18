@@ -117,7 +117,8 @@ namespace detail::type_rules {
     TypeId                                             rhs,
     SemanticConfig::PointerConversionRules const&      ptrRules = {},
     bool                                               boolWidensToArith = false,
-    bool                                               charConvertsToArith = false) noexcept {
+    bool                                               charConvertsToArith = false,
+    bool                                               enumConvertsToArith = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     if (sameType(lhs, rhs)) return true;
     auto const lk = interner.kind(lhs);
@@ -160,6 +161,26 @@ namespace detail::type_rules {
         && ((lk == TypeKind::Char
              && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0))
             || (rk == TypeKind::Char
+                && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0)))) {
+        return true;
+    }
+    // C 6.7.2.2: an enumeration constant / enum-typed value HAS an integer
+    // type (the implementation-defined underlying type — here the enum's
+    // scalars[0], default int). So an enum is implicitly assignable to AND
+    // from the integer ranks in BOTH directions: enum→int (`int x = BLUE;`,
+    // `return color;` from an int-returning fn — widening/identity) and
+    // int→enum (`enum Color c = 1;`, the `c += 1` read-modify-write-back).
+    // Gated on `enumConvertsToArith` (default false → a non-C schema keeps
+    // `Enum` strictly distinct from the integer ranks); mirrors the
+    // `charConvertsToArith` gate. SCOPE: admits enum↔INT only — an
+    // enum↔DIFFERENT-enum pair satisfies neither disjunct (signedIntRank/
+    // unsignedIntRank of an Enum kind is 0), so it stays a loud mismatch (a
+    // C constraint violation); same-enum is already caught by the sameType
+    // identity above. Closes D-CSUBSET-ENUM-INT-CONVERSION.
+    if (enumConvertsToArith
+        && ((lk == TypeKind::Enum
+             && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0))
+            || (rk == TypeKind::Enum
                 && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0)))) {
         return true;
     }
@@ -275,7 +296,7 @@ namespace detail::type_rules {
         using namespace detail::type_rules;
         return signedIntRank(k) != 0 || unsignedIntRank(k) != 0
             || k == TypeKind::Char || k == TypeKind::Byte
-            || k == TypeKind::Bool;
+            || k == TypeKind::Bool || k == TypeKind::Enum;
     };
     auto const isCastableScalar = [&](TypeKind k) noexcept {
         return isCastableInt(k) || detail::type_rules::floatRank(k) != 0;
@@ -438,6 +459,21 @@ promoteIntegerKind(TypeKind k, ResolvedArithmeticRules const& rules) noexcept {
 
 } // namespace detail::type_rules
 
+// C 6.7.2.2: an enum's "real" arithmetic type is its underlying integer
+// type. When an enum participates in the usual arithmetic conversions
+// (`e + 1`, `e == other`, a shift count), it does so AS that underlying int
+// — the result is int, never enum. This resolves an Enum TypeId to its
+// underlying primitive (scalars[0]); any non-enum passes through unchanged.
+// Used by `usualArithmeticCommonType` / `integerPromotedType` below so the
+// closed arithmetic verb never has to special-case Enum. Part of
+// D-CSUBSET-ENUM-INT-CONVERSION.
+[[nodiscard]] inline TypeId
+enumUnderlyingOrSelf(TypeInterner& interner, TypeId t) {
+    if (!t.valid() || interner.kind(t) != TypeKind::Enum) return t;
+    auto const sc = interner.scalars(t);
+    return sc.empty() ? t : interner.primitive(static_cast<TypeKind>(sc[0]));
+}
+
 // The C 6.3.1.8 common type of two operands under the language's
 // declared rules — the config-driven sibling of
 // `TypeInterner::commonType` (which keeps serving block-less languages
@@ -460,6 +496,8 @@ usualArithmeticCommonType(TypeInterner& interner, TypeId a, TypeId b,
                           ResolvedArithmeticRules const& rules) {
     if (!a.valid() || !b.valid()) return InvalidType;
     using namespace detail::type_rules;
+    a = enumUnderlyingOrSelf(interner, a);
+    b = enumUnderlyingOrSelf(interner, b);
     TypeKind const ka = interner.kind(a);
     TypeKind const kb = interner.kind(b);
     auto const isArith = [&](TypeKind k) noexcept {
@@ -510,6 +548,7 @@ integerPromotedType(TypeInterner& interner, TypeId t,
                     ResolvedArithmeticRules const& rules) {
     if (!t.valid()) return t;
     using namespace detail::type_rules;
+    t = enumUnderlyingOrSelf(interner, t);
     TypeKind const k = interner.kind(t);
     if (floatRank(k) != 0) return t;
     TypeKind const p = promoteIntegerKind(k, rules);
