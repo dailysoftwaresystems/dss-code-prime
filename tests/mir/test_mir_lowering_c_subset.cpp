@@ -2312,6 +2312,164 @@ namespace {
 }
 } // namespace
 
+// FC8 D-CSUBSET-BITFIELD-RVALUE-RUNTIME: a by-value aggregate COMPOUND LITERAL
+// rvalue `take((struct P){a, 2})` (a NON-bit-field struct, runtime first field)
+// is lowered through the SYNTHESIZED-SLOT carrier — `lowerLvalueAddress`'s new
+// ConstructAggregate arm materializes a slot (Alloca) and inits it ELEMENT-WISE
+// (one Gep+Store per field at its byte offset), exactly as a named local's
+// `= {…}` does; the by-value arg path then consumes that slot by ADDRESS. This
+// pins the MEMORY model and forbids regression to an SSA-aggregate InsertValue
+// chain. The literal's field stores land at byte offsets 0 (a) and 4 (the `2`);
+// offset 4 is written ONLY by the literal init (the 8-byte by-value copy is a
+// single I64 chunk at offset 0), so a Store at offset 4 is the literal-init
+// witness. RED-ON-DISABLE: revert the lowerLvalueAddress ConstructAggregate arm
+// → the by-value arg fail-louds H0009 (ordinal 32) and `mir.ok` goes false; a
+// regression to the InsertValue chain trips the `InsertValue == 0` assertion.
+TEST(MirLoweringCSubset, ByValueCompoundLiteralArgMaterializesSlotElementWise) {
+    auto L = lowerCSubset(
+        "struct P { int a; int b; };\n"
+        "int take(struct P p) { return p.a + p.b; }\n"
+        "int main(void) { int a = 40; return take((struct P){a, 2}); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a by-value compound-literal aggregate rvalue must lower via a "
+           "synthesized slot (D-CSUBSET-BITFIELD-RVALUE-RUNTIME): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // main is the function that CALLs take — find it by the entry-block Call.
+    // The compound-literal carrier lives in main's entry block.
+    std::uint32_t mainFi = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        auto const ops = funcEntryOpcodes(m, fi);
+        if (countOpcode(ops, MirOpcode::Call) > 0) { mainFi = fi; break; }
+    }
+    auto const ops = funcEntryOpcodes(m, mainFi);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "the compound literal is materialized in MEMORY — never an "
+           "SSA-aggregate InsertValue chain";
+    EXPECT_GE(countOpcode(ops, MirOpcode::Alloca), 1u)
+        << "a slot is synthesized for the compound-literal lvalue";
+    // The literal's two field stores land at byte offsets 0 (a) and 4 (b=2).
+    // Offset 4 is written ONLY by the literal init in this 8-byte layout.
+    MirBlockId const entry = m.funcEntry(m.funcAt(mainFi));
+    bool storeAt0 = false, storeAt4 = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Store) continue;
+        auto st = m.instOperands(ix);
+        if (st.size() != 2) continue;
+        // st[1] is the destination pointer — a Gep(base, Const(off)).
+        MirInstId const dst = st[1];
+        if (m.instOpcode(dst) != MirOpcode::Gep) continue;
+        auto g = m.instOperands(dst);
+        if (g.size() != 2) continue;
+        if (m.instOpcode(g[1]) != MirOpcode::Const) continue;
+        auto const& lit = m.literalValue(m.constLiteralIndex(g[1]));
+        auto const* off = std::get_if<std::int64_t>(&lit.value);
+        if (off == nullptr) continue;
+        if (*off == 0) storeAt0 = true;
+        if (*off == 4) storeAt4 = true;
+    }
+    EXPECT_TRUE(storeAt0) << "field a stored at byte offset 0";
+    EXPECT_TRUE(storeAt4)
+        << "field b (=2) stored at byte offset 4 — the literal-init witness "
+           "(only the element-wise slot init writes offset 4 here)";
+}
+
+// FC8 D-CSUBSET-BITFIELD-RVALUE-RUNTIME (bit-field variant): a by-value BIT-FIELD
+// compound literal `take((struct B){a, 20})` (a:3 + b:5 share unit 0, runtime
+// first field) is lowered through the synthesized-slot carrier whose init routes
+// to `lowerBitfieldAggregateInitIntoSlot` — so the literal PACKS per allocation
+// unit (zero the unit, then read-modify-write each field: And to clear + And to
+// mask the value + Shl to bitOffset + Or). A plain full-width per-field store
+// would clobber the neighbour in the shared unit. Mirrors
+// BitFieldStructInitializerPacksPerUnit but in by-value RVALUE position.
+// RED-ON-DISABLE: revert the lowerLvalueAddress ConstructAggregate arm → the
+// by-value arg fail-louds H0009 (ordinal 32), `mir.ok` false; revert the per-unit
+// packing → the And/Or/Shl packing signature disappears.
+TEST(MirLoweringCSubset, ByValueBitfieldCompoundLiteralArgPacksPerUnit) {
+    auto L = lowerCSubset(
+        "struct B { unsigned a : 3; unsigned b : 5; };\n"
+        "int take(struct B v) { return (int)v.a + (int)v.b; }\n"
+        "int main(void) { int a = 5; return take((struct B){a, 20}); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a by-value bit-field compound-literal rvalue must lower with per-unit "
+           "packing via a synthesized slot (D-CSUBSET-BITFIELD-RVALUE-RUNTIME): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t mainFi = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        auto const ops = funcEntryOpcodes(m, fi);
+        if (countOpcode(ops, MirOpcode::Call) > 0) { mainFi = fi; break; }
+    }
+    MirBlockId const entry = m.funcEntry(m.funcAt(mainFi));
+    auto count = [&](MirOpcode op) {
+        int n = 0;
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i)
+            if (m.instOpcode(m.blockInstAt(entry, i)) == op) ++n;
+        return n;
+    };
+    auto const ops = funcEntryOpcodes(m, mainFi);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "the bit-field literal is packed in MEMORY — no SSA-aggregate chain";
+    EXPECT_GE(countOpcode(ops, MirOpcode::Alloca), 1u)
+        << "a slot is synthesized for the bit-field compound-literal lvalue";
+    // a + b share unit 0; b is at bitOffset 3 → at least one Shl; each RMW masks
+    // (And) and clears the field (And) and ORs it back (Or). A full-width
+    // per-field store would emit neither the Or nor the Shl.
+    EXPECT_GE(count(MirOpcode::Or), 2)  << "each bit-field init ORs its value into the unit";
+    EXPECT_GE(count(MirOpcode::And), 3) << "RMW clears the field AND masks the value";
+    EXPECT_GE(count(MirOpcode::Shl), 1) << "b at bitOffset 3 → shifted before OR";
+}
+
+// D-CSUBSET-BITFIELD-RVALUE-RUNTIME (discard position): an aggregate compound
+// literal used as a DISCARDED statement (`(struct P){h(), 2};`) must lower —
+// materialized into a throwaway slot so its operand SIDE EFFECTS run, then the
+// address dropped. Completes the carrier across the discard position (and
+// removes the regression where a discarded aggregate literal fail-louded).
+// RED-ON-DISABLE: revert the ExprStmt ConstructAggregate routing → lowerExpr
+// hits the anti-resurrection fail-loud → mir.ok false.
+TEST(MirLoweringCSubset, DiscardedAggregateCompoundLiteralStatementRunsSideEffects) {
+    auto L = lowerCSubset(
+        "struct P { int a; int b; };\n"
+        "int h(void) { return 7; }\n"
+        "void f(void) { (struct P){h(), 2}; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a discarded aggregate compound-literal statement must lower (its "
+           "operand side effects run via a throwaway slot), not fail loud: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // f() is the function with the discarded literal — find it by its Call to
+    // h() (h() itself has no call). It must contain the h() side-effect call +
+    // the throwaway slot, and NO SSA-aggregate chain.
+    std::uint32_t fFi = 0;
+    bool found = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        if (countOpcode(funcEntryOpcodes(m, fi), MirOpcode::Call) > 0) {
+            fFi = fi; found = true; break;
+        }
+    }
+    ASSERT_TRUE(found) << "f() (the discarded-literal body, with the h() call) not found";
+    auto const ops = funcEntryOpcodes(m, fFi);
+    EXPECT_GE(countOpcode(ops, MirOpcode::Call), 1u)
+        << "the operand h() side effect must be lowered — the call survives the discard";
+    EXPECT_GE(countOpcode(ops, MirOpcode::Alloca), 1u)
+        << "a throwaway slot is synthesized for the discarded aggregate literal";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "memory-based — no SSA-aggregate chain";
+}
+
 // All-constant `struct Point p = {1, 2}` const-folds to a single
 // Const(MirAggregateValue) — no InsertValue chain needed because the
 // const-eval engine handles the whole aggregate at HIR→MIR time.
