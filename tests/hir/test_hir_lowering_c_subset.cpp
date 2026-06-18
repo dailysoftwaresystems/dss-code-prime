@@ -2714,9 +2714,11 @@ TEST(HirLoweringCSubset, D5_5_EnumValueUseViaBareName) {
 // SPECULATIVE body probe (`topLevelCompositeSpec`) hits P_NoAlternativeMatched
 // and rolls back to the ref form → parse error. VERIFIED red-on-disable: toggling
 // off the `recomputeAltExpectedSets` orchestration call makes THIS test fail.
-// NOTE: only the TOP-LEVEL (named-rule `topLevelCompositeSpec`) surface is fixed;
-// the typedef-position inline-alt surface (`typedef enum {…,} T;`) is a separate
-// pre-existing gap — D-CSUBSET-TYPEDEF-ENUM-TRAILING-COMMA (fail-loud, pinned).
+// NOTE: the `recomputeAltExpectedSets` fixpoint is GLOBAL (every grammar's
+// expectedSets), so it fixes the typedef-position surface (`typedef enum {…,} T;`)
+// too — see the parallel pin D5_5_TypedefEnumTrailingCommaParses
+// (D-CSUBSET-TYPEDEF-ENUM-TRAILING-COMMA CLOSED; the registry's earlier
+// "typedef is a separate gap" scoping was overly conservative).
 TEST(HirLoweringCSubset, D5_5_EnumTrailingCommaParses) {
     SemanticModel model = analyzeCSubset(
         "enum E { A, B, C, };\n");
@@ -2727,6 +2729,31 @@ TEST(HirLoweringCSubset, D5_5_EnumTrailingCommaParses) {
     // enumerator (an over-eager `(Comma enumerator?)*` that consumed the comma
     // as introducing a fourth, empty enumerator would be a silent mis-parse a
     // bare `!hasErrors()` check could miss).
+    int enumerators = 0;
+    for (auto const& s : model.symbols())
+        if (s.name == "A" || s.name == "B" || s.name == "C") ++enumerators;
+    EXPECT_EQ(enumerators, 3)
+        << "exactly A, B, C — the trailing comma introduces no enumerator";
+}
+
+// TYPEDEF-POSITION enum with a TRAILING COMMA parses cleanly — the parallel of
+// D5_5_EnumTrailingCommaParses for the typedef surface (closes the now-stale
+// D-CSUBSET-TYPEDEF-ENUM-TRAILING-COMMA). The global schema-compiler fixpoint
+// `recomputeAltExpectedSets` (D-PARSE-SCHEMA-NESTED-NULLABLE-FOLLOW) fixes EVERY
+// grammar's expectedSets, so the typedef speculative surface recovers the
+// trailing-comma enum body too — verified parsing AND running across anon /
+// named-tag / valued / single-element forms. RED-ON-DISABLE: toggling off the
+// `recomputeAltExpectedSets` orchestration call (grammar_schema_json.cpp) reddens
+// THIS pin alongside the top-level one — verified by the closing cycle.
+TEST(HirLoweringCSubset, D5_5_TypedefEnumTrailingCommaParses) {
+    SemanticModel model = analyzeCSubset(
+        "typedef enum { A, B, C, } T;\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    // Exactly A, B, C — the trailing comma must mint no phantom 4th enumerator
+    // (an over-eager `(Comma enumerator?)*` consuming the comma as a 4th empty
+    // enumerator would be a silent mis-parse a bare `!hasErrors()` would miss).
     int enumerators = 0;
     for (auto const& s : model.symbols())
         if (s.name == "A" || s.name == "B" || s.name == "C") ++enumerators;
