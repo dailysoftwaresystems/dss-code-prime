@@ -207,6 +207,75 @@ TEST(LirRewrite, ExhaustedClassEmitsLoudFailureNotSilentClobber) {
         << "scratch-exhausted rewrite must emit L_VirtualRegInPostRegalloc";
 }
 
+// FOLD #3 (adversarial-review) red-on-disable: the scratch-pool picker must key its
+// "register already assigned to a vreg" set by the GLOBAL register-table ordinal in an
+// UNBOUNDED set, not a 64-bit bitmask indexed by that ordinal. On arm64 the GPR table
+// (x0..x30, xzr, sp = 33 slots) pushes the FPR d-registers to global ordinals 33..64, so
+// d31 sits at ordinal 64 — past a 64-bit mask. A function with enough live F64 values to
+// allocate up into d31 (here: a variadic callee whose 9th double overflows the 8 VR arg
+// registers, the exact FP-overflow witness corpus) previously hit `pickScratchRegs:
+// phys ordinal 64 ... out of 64-bit/5-class bound` and FAILED TO COMPILE — a fail-loud
+// guard firing on legitimate input. RED-ON-DISABLE: revert pickScratchRegs to the
+// uint64 bitmask keyed by phys.id → this rewrite returns ok=false with that diagnostic.
+TEST(LirRewrite, Arm64HighFprSpillScratchPoolHandlesOrdinalsBeyond64) {
+    // 9 doubles → the 9th overflows v0..v7 to __stack; the materialization pressure
+    // allocates an FPR up into d31 (global ordinal 64). The named `n` is an int (x0).
+    auto out = AllocatedLir{lowerCSubsetToLir(
+        "double sum_d(int n, ...) {\n"
+        "    va_list ap; va_start(ap, n);\n"
+        "    double t = 0.0;\n"
+        "    for (int i = 0; i < n; i = i + 1) { t = t + va_arg(ap, double); }\n"
+        "    va_end(ap);\n"
+        "    return t;\n"
+        "}\n"
+        "int main(void) {\n"
+        "    return (int)sum_d(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0);\n"
+        "}\n",
+        "arm64", /*mirCcIndex=*/0)};
+    ASSERT_TRUE(out.lowered.lir.ok) << "arm64 c-subset → LIR failed";
+    out.liveness = analyzeLiveness(out.lowered.lir.lir);
+    out.alloc = allocateRegisters(out.lowered.lir.lir, *out.lowered.target,
+                                  out.liveness, /*ccIndex=*/0, out.regallocRep);
+    ASSERT_TRUE(out.alloc.ok()) << "arm64 regalloc must succeed";
+
+    // PRECONDITION (non-vacuity guard): this pin only exercises the >64 scratch-
+    // ordinal re-key if the allocator actually assigns a vreg to d31 (global
+    // register-table ordinal 64 — arm64's 33 GPR table slots push the FPR
+    // d-registers to ordinals 33..64, so d31 = 64, the FIRST ordinal past a
+    // 64-bit mask). Physical-reg `LirReg.id` IS that global ordinal (regalloc's
+    // `buildFreeLists` seeds the free lists with `schema.registers()` indices).
+    // If a future allocator change stops reaching d31, the rewrite below would
+    // pass VACUOUSLY (green but testing nothing). Assert the precondition holds
+    // so it fails LOUD instead. If asserting the exact ordinal ever becomes
+    // structurally awkward, the max-FPR-ordinal >= 64 fallback below suffices.
+    std::uint32_t maxFprOrdinal = 0;
+    bool sawD31 = false;
+    for (auto const& fa : out.alloc.perFunc) {
+        for (auto const& a : fa.assignments) {
+            if (a.isSpilled()) continue;
+            LirReg const phys = a.physReg();
+            if (phys.regClass() != LirRegClass::FPR) continue;
+            if (phys.id > maxFprOrdinal) maxFprOrdinal = phys.id;
+            if (phys.id == 64u) sawD31 = true;
+        }
+    }
+    ASSERT_TRUE(sawD31)
+        << "precondition: the FP-overflow corpus must allocate a vreg to d31 "
+           "(global ordinal 64) so the >64 scratch-ordinal re-key is actually "
+           "exercised — max FPR ordinal assigned was " << maxFprOrdinal
+        << " (if the allocator no longer reaches d31 this pin is vacuous; "
+           "restore the precondition or re-pressure the corpus)";
+
+    DiagnosticReporter rewriteRep;
+    auto rewritten = rewriteWithAllocation(out.lowered.lir.lir, *out.lowered.target,
+                                           out.alloc, rewriteRep);
+    EXPECT_TRUE(rewritten.ok)
+        << "the rewrite must handle FPR scratch ordinals > 64 (d31) — a uint64 "
+           "bitmask keyed by the global ordinal fails loud on legitimate input";
+    EXPECT_EQ(rewriteRep.errorCount(), 0u)
+        << "no L_RequiredLirOpcodeMissing 'out of 64-bit bound' on a high-FPR spill";
+}
+
 TEST(LirRewrite, SpilledFunctionEmitsFrameLoadStorePseudoOps) {
     // Cross-call spill pattern: several vregs live across a function
     // call. SysV has 5 callee-saved GPRs; live-across-call vregs

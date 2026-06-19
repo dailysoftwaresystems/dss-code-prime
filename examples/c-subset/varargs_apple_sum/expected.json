@@ -1,0 +1,13 @@
+{
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 100,
+  "targets": [
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ]
+}

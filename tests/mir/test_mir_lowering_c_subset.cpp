@@ -4239,6 +4239,63 @@ TEST(MirLoweringCSubset, VaStartFixedParamsOverflowToStackFailsLoud) {
            "LOUD at va_start (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)";
 }
 
+// AAPCS64 mirror of the SysV overflow-to-stack pin: a variadic ARM64 callee whose
+// FIXED params overflow the 8 int arg registers (x0..x7) to the stack MUST fail
+// loud at va_start — the dual-cursor's `__stack`/`__gr_offs` init does not yet
+// thread the fixed-stack-arg displacement (the negative cursor would underflow and
+// `__stack` would read a fixed STACK param as the first vararg), a silent miscompile
+// converted to fail-loud (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS,
+// deferred). RED-ON-DISABLE: temp-remove the `currentFnFixedGpr_ > vl.gpSaveCount`
+// arm of the Aapcs64DualCursor lowerVaStart guard (hir_to_mir.cpp ~line 2950) →
+// mir.ok flips TRUE (the function lowers with a wrong `__stack`/cursor base);
+// restore to make this go red again. (Verified by temp-revert.)
+TEST(MirLoweringCSubset, Aapcs64VaStartFixedParamsOverflowToStackFailsLoud) {
+    // 9 fixed int params (a..i): AAPCS64 has 8 integer arg registers (x0..x7), so
+    // `i` is passed ON THE STACK; the fixed-stack-arg displacement for `__stack` is
+    // not yet threaded, so this must reject loudly rather than silently miscompile.
+    auto L = lowerCSubset(
+        "int pick(int a, int b, int c, int d, int e, int f, int g, int h, int i,"
+        " ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, i);\n"
+        "  int v = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return a + i + v;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    EXPECT_FALSE(L.mir.ok)
+        << "an AAPCS64 variadic callee whose fixed INT params overflow to the stack "
+           "must FAIL LOUD at va_start "
+           "(D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)";
+    EXPECT_TRUE(anyDiagActualContains(
+        L.mirReporter, "D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS"))
+        << "the AAPCS64 va_start overflow fail-loud must cite the FC12c overflow anchor";
+}
+
+// FP-cursor variant of the AAPCS64 overflow pin: 9 fixed DOUBLE params overflow the
+// 8 fp arg registers (v0..v7) to the stack — the same fail-loud guard fires via its
+// `currentFnFixedFpr_ > vl.fpSaveCount` arm. RED-ON-DISABLE: temp-remove that fp arm
+// → mir.ok flips TRUE. (Verified by temp-revert.)
+TEST(MirLoweringCSubset, Aapcs64VaStartFixedDoubleParamsOverflowToStackFailsLoud) {
+    auto L = lowerCSubset(
+        "double pick(double a, double b, double c, double d, double e, double f,"
+        " double g, double h, double i, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, i);\n"
+        "  double v = va_arg(ap, double);\n"
+        "  va_end(ap);\n"
+        "  return a + i + v;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    EXPECT_FALSE(L.mir.ok)
+        << "an AAPCS64 variadic callee whose fixed FP params overflow to the stack "
+           "must FAIL LOUD at va_start "
+           "(D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)";
+    EXPECT_TRUE(anyDiagActualContains(
+        L.mirReporter, "D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS"))
+        << "the AAPCS64 va_start FP-overflow fail-loud must cite the FC12c overflow anchor";
+}
+
 namespace {
 // Find the FIRST Call inst in function `fi` and return its payload (0 if none).
 [[nodiscard]] std::uint32_t firstCallPayload(Mir const& m, std::uint32_t fi) {
@@ -4569,4 +4626,192 @@ TEST(MirLoweringCSubset, VaArgTwoSameClassStructThreadsCursorThroughAdd) {
         << "the 2nd same-class eightbyte must read reg_save_area + the BUMPED cursor "
            "(a Gep indexed off an Add); a Gep indexed only off the original gp_offset "
            "Load for both pieces is the threading regression (b aliases a's slot)";
+}
+
+// ─── FC12c (D-FC12C-*) AAPCS64 dual-cursor MIR pins (host-independent) ───
+
+namespace {
+// BLOCKER-2 pin support: true iff ANY Gep in function `fi` has an index operand that
+// is a SExt (sign-extend) instruction. The AAPCS64 va_arg reg arm MUST sign-extend
+// the NEGATIVE i32 cursor to i64 BEFORE the byte Gep (a zero-extended -40 becomes
+// ~+4 GiB → a wild address). Removing the SExt (the red-on-disable) flips this false.
+[[nodiscard]] bool sextFeedsGepIndex(Mir const& m, std::uint32_t fi) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Gep) continue;
+            auto const ops = m.instOperands(ix);
+            if (ops.size() < 2) continue;
+            MirInstId const idx = ops[1];
+            if (idx.valid() && m.instOpcode(idx) == MirOpcode::SExt) return true;
+        }
+    }
+    return false;
+}
+// True iff function `fi` contains a Const instruction whose integer value == `want`.
+[[nodiscard]] bool hasConstValue(Mir const& m, std::uint32_t fi, std::int64_t want) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Const) continue;
+            auto const& lit = m.literalValue(m.constLiteralIndex(ix));
+            if (auto const* v = std::get_if<std::int64_t>(&lit.value);
+                v != nullptr && *v == want)
+                return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+// Gate #2 + #9 (host-independent, BLOCKER-2): an AAPCS64 va_arg(int) lowers to the
+// dual-cursor diamond — ICmpSlt(offs, 0) (NEGATIVE cursor < 0, a SIGNED compare, not
+// the SysV ICmpUlt-vs-limit) feeding a CondBr, a Phi joining the two address arms,
+// AND — the BLOCKER-2 pin — a SExt feeding the reg-arm's address Gep index. RED-ON-
+// DISABLE: removing the SExt (the load-bearing sign-extend) flips sextFeedsGepIndex.
+TEST(MirLoweringCSubset, Aapcs64VaArgIntLowersToDualCursorDiamondSignExtend) {
+    auto L = lowerCSubset(
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "AAPCS64 variadic callee must type-check (va_list = __va_list struct)";
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "the AAPCS64 dual-cursor va_arg must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // SIGNED compare against 0 (the negative cursor) — NOT the SysV unsigned-vs-limit.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpSlt), 1u)
+        << "AAPCS64 va_arg compares the NEGATIVE class cursor against 0 (signed)";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUlt), 0u)
+        << "AAPCS64 does NOT use the SysV unsigned-vs-limit compare";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 1u)
+        << "AAPCS64 va_arg branches reg-vs-stack";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Phi), 1u)
+        << "AAPCS64 va_arg joins the two address arms with a Phi (scalar pointer)";
+    EXPECT_TRUE(sextFeedsGepIndex(m, fi))
+        << "BLOCKER-2: the reg arm MUST sign-extend the i32 cursor before the byte Gep "
+           "(a zero-extended negative cursor is a +4 GiB wild address → segfault); "
+           "remove the SExt and this assertion goes red";
+    // AAPCS64 uses the dual-cursor leaf (VaRegSaveAreaAddr), not the Win64 home leaf.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::VaRegSaveAreaAddr), 1u);
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::VaHomeArgAreaAddr), 0u);
+}
+
+// Gate #3 (host-independent): AAPCS64 va_start with N fixed int args sets __gr_offs =
+// -(8 - N) * 8. With N=1 (the fixed `n`) → -(8-1)*8 = -56. Emit a Const of that value.
+// RED-ON-DISABLE: a wrong sign (e.g. +56) or wrong arithmetic flips the Const value.
+TEST(MirLoweringCSubset, Aapcs64VaStartInitsNegativeGrOffs) {
+    auto L = lowerCSubset(
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // __gr_offs = -(8 - 1) * 8 = -56 (1 fixed int arg in x0).
+    EXPECT_TRUE(hasConstValue(m, fi, -56))
+        << "AAPCS64 va_start must init __gr_offs = -(gpSaveCount - fixedGpr)*gpSlotBytes "
+           "= -(8-1)*8 = -56 for one fixed int arg (a NEGATIVE cursor counting up to 0)";
+    // __vr_offs = -(8 - 0) * 16 = -128 (no fixed FP args).
+    EXPECT_TRUE(hasConstValue(m, fi, -128))
+        << "AAPCS64 va_start must init __vr_offs = -(8-0)*16 = -128 (no fixed FP args)";
+}
+
+// Gate #7 (host-independent): a struct/union va_arg under AAPCS64 FAILS LOUD citing
+// the FC12c HFA struct-vararg anchor (the SCALAR diamond ships; the HFA gather is
+// deferred). RED-ON-DISABLE: removing the Aapcs64DualCursor arm in lowerVaArgAggregate
+// lets it fall through to the SysV gather (a silent wrong-ABI struct read).
+TEST(MirLoweringCSubset, Aapcs64VaArgStructFailsLoud) {
+    auto L = lowerCSubset(
+        "struct Pt { int a; int b; };\n"   // 8B, would be InRegisters under SysV
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct Pt p = va_arg(ap, struct Pt);\n"
+        "  va_end(ap);\n"
+        "  return p.a + p.b;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    EXPECT_FALSE(L.mir.ok)
+        << "va_arg of a struct under AAPCS64 must FAIL LOUD "
+           "(D-FC12C-AAPCS64-HFA-STRUCT-VARARG)";
+    EXPECT_TRUE(anyDiagActualContains(L.mirReporter, "D-FC12C-AAPCS64-HFA-STRUCT-VARARG"))
+        << "the AAPCS64 struct-va_arg fail-loud must cite the FC12c HFA anchor";
+}
+
+// Gate #7 (host-independent): passing a struct BY VALUE to an AAPCS64 variadic CALLEE
+// FAILS LOUD citing the FC12c HFA struct-vararg anchor (the caller-side path). RED-ON-
+// DISABLE: removing the Aapcs64DualCursor arm in the Call arg loop lets the SysV-shaped
+// gpSaveCount fit-check run (mis-message / silent split).
+TEST(MirLoweringCSubset, Aapcs64StructByValueVarargCallFailsLoud) {
+    auto L = lowerCSubset(
+        "struct Pt { int a; int b; };\n"
+        "int sink(int n, ...);\n"
+        "int main(void) {\n"
+        "  struct Pt p; p.a = 1; p.b = 2;\n"
+        "  return sink(1, p);\n"          // struct BY VALUE to an AAPCS64 variadic fn
+        "}\n",
+        "arm64", "aapcs64");
+    EXPECT_FALSE(L.mir.ok)
+        << "a struct-by-value vararg to an AAPCS64 variadic fn must FAIL LOUD "
+           "(D-FC12C-AAPCS64-HFA-STRUCT-VARARG)";
+    EXPECT_TRUE(anyDiagActualContains(L.mirReporter, "D-FC12C-AAPCS64-HFA-STRUCT-VARARG"))
+        << "the caller-side AAPCS64 struct-vararg fail-loud must cite the FC12c anchor";
+}
+
+// FC12c MIR pin (Apple): the SAME va_arg(int) source lowers to a LINEAR pointer bump
+// under apple_arm64 (HomogeneousPointer) — NO dual-cursor diamond — and va_start
+// anchors at the OVERFLOW base (VaOverflowArgAreaAddr), NOT a home/save-area leaf.
+TEST(MirLoweringCSubset, AppleVaArgIntLowersLinearOverflowBase) {
+    auto L = lowerCSubset(
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+        "arm64", "apple_arm64");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "Apple variadic callee must type-check (va_list = char*)";
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    // Apple va_start emits VaOverflowArgAreaAddr (NOT VaHomeArgAreaAddr, NOT
+    // VaRegSaveAreaAddr) — the overflow-base anchor for the always-stacked varargs.
+    std::uint32_t afi = 0;
+    bool found = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        if (countOpcodeAllBlocks(m, fi, MirOpcode::VaOverflowArgAreaAddr) > 0) {
+            afi = fi; found = true; break;
+        }
+    }
+    ASSERT_TRUE(found) << "Apple va_start must emit a VaOverflowArgAreaAddr leaf";
+    EXPECT_EQ(countOpcodeAllBlocks(m, afi, MirOpcode::VaHomeArgAreaAddr), 0u)
+        << "Apple has NO home area (it always-stacks varargs)";
+    EXPECT_EQ(countOpcodeAllBlocks(m, afi, MirOpcode::VaRegSaveAreaAddr), 0u)
+        << "Apple HomogeneousPointer uses no register-save-area";
+    // LINEAR walk: no reg-vs-overflow diamond from va_arg (no CondBr/ICmp/Phi added).
+    EXPECT_EQ(countOpcodeAllBlocks(m, afi, MirOpcode::CondBr), 0u)
+        << "Apple va_arg is a LINEAR pointer bump — no diamond";
+    EXPECT_EQ(countOpcodeAllBlocks(m, afi, MirOpcode::Phi), 0u);
 }

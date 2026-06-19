@@ -2641,26 +2641,37 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // SHAPE of a va_list is STRATEGY-dependent (matching the injected type):
         //   * SysVRegisterSave (or nullopt): Array<__va_list_tag> or Ptr<__va_list_tag>
         //     (array-decay makes both shapes legitimate).
-        //   * HomogeneousPointer (Win64): `char*` = Ptr<I8> (the injected `va_list`).
+        //   * HomogeneousPointer (Win64 + Apple arm64): `char*` = Ptr<I8> (the injected
+        //     `va_list`).
+        //   * Aapcs64DualCursor (AAPCS64 ARM64-ELF): the `__va_list` STRUCT directly
+        //     (NOT array-decayed, NOT a pointer) — the ap operand is the struct lvalue.
         // A wrong `ap` (e.g. an int) is S_TypeMismatch. The check shares ONE helper.
         {
             auto& in = s.lattice.interner();
             bool const homogeneousVaList =
                 s.vaListStrategy.has_value()
                 && *s.vaListStrategy == VaListStrategy::HomogeneousPointer;
+            bool const aapcs64VaList =
+                s.vaListStrategy.has_value()
+                && *s.vaListStrategy == VaListStrategy::Aapcs64DualCursor;
             // True iff `ty` is a va_list for the active strategy.
             auto isVaList = [&](TypeId ty) -> bool {
                 if (!ty.valid()) return false;
                 TypeKind const k = in.kind(ty);
                 if (homogeneousVaList) {
-                    // Win64: `va_list` is `char*` (Ptr<I8>). Accept any Ptr-to-char
-                    // (the injected type) — its element width is what the linear
-                    // va_arg walk reads, so a Ptr<I8> is the precise shape.
+                    // Win64 / Apple arm64: `va_list` is `char*` (Ptr<I8>). Accept any
+                    // Ptr-to-char (the injected type) — its element width is what the
+                    // linear va_arg walk reads, so a Ptr<I8> is the precise shape.
                     if (k != TypeKind::Ptr) return false;
                     auto const ops = in.operands(ty);
                     if (ops.empty()) return false;
                     TypeId const inner = ops[0];
                     return inner.valid() && in.kind(inner) == TypeKind::I8;
+                }
+                if (aapcs64VaList) {
+                    // AAPCS64: `va_list` IS the `__va_list` struct (no decay). The ap
+                    // operand is the struct lvalue; its address is the cursor base.
+                    return k == TypeKind::Struct && in.name(ty) == "__va_list";
                 }
                 // SysV family: Array<__va_list_tag> or Ptr<__va_list_tag>.
                 if (k != TypeKind::Array && k != TypeKind::Ptr) return false;
@@ -4199,30 +4210,53 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
         //     va_start/va_arg/va_end. The per-field BYTE OFFSETS at codegen come from
         //     the target's `vaListLayout`; this struct only makes the type resolvable
         //     by name + sizes `ap`.
-        //   * HomogeneousPointer (Win64) → `va_list = char*` (a pointer to I8). NO
-        //     __va_list_tag struct: sizeof(va_list)==8 sizes `ap` as one pointer.
-        //   * Aapcs64DualCursor → fail loud (realized in FC12c).
+        //   * HomogeneousPointer (Win64 + Apple arm64) → `va_list = char*` (a pointer
+        //     to I8). NO __va_list_tag struct: sizeof(va_list)==8 sizes `ap` as one
+        //     pointer.
+        //   * Aapcs64DualCursor (AAPCS64 ARM64-ELF, FC12c) → `va_list = __va_list`, a
+        //     typedef to the 5-field STRUCT DIRECTLY (NOT an array like SysV, NOT a
+        //     pointer like Win64): {void* __stack; void* __gr_top; void* __vr_top;
+        //     int __gr_offs; int __vr_offs;} (32B). The va_start/va_arg/va_end ap
+        //     operand is this struct lvalue; its ADDRESS is the dual-cursor base.
         // A language without the surface injects nothing — no leak, no pollution.
         if (sch->semantics().vaArgRule.valid()) {
             auto& in = s.lattice.interner();
             VaListStrategy const strat =
                 vaListStrategy.value_or(VaListStrategy::SysVRegisterSave);
             if (strat == VaListStrategy::Aapcs64DualCursor) {
-                // No artifact: emit a positioned diagnostic at the tree root (this
-                // injection covers the whole CU). Analysis continues collect-all,
-                // but the error fails the compile.
-                ParseDiagnostic d;
-                d.code       = DiagnosticCode::S_VariadicCalleeUnsupported;
-                d.severity   = DiagnosticSeverity::Error;
-                d.actual     = std::string{vaListStrategyName(strat)};
-                d.suggestion = "Aapcs64DualCursor va_list not realized (FC12c)";
-                for (Tree const& tree : cu->trees()) {
-                    if (!tree.root().valid()) continue;
-                    d.buffer = tree.source().id();
-                    d.span   = tree.span(tree.root());
-                    break;
-                }
-                s.reporter.report(std::move(d));
+                // AAPCS64 §B.4: `va_list = __va_list` (the struct directly). The five
+                // members in declaration order — pointers first (8B each), then the two
+                // i32 cursors (4+4) — give a 32B struct under natural alignment, exactly
+                // the AAPCS64 `__va_list` layout. `va_list` typedefs DIRECTLY to this
+                // struct (no array decay): the va_start/va_arg/va_end ap operand IS the
+                // struct lvalue and its address is the dual-cursor base.
+                TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+                TypeId const i32     = in.primitive(TypeKind::I32);
+                std::array<TypeId, 5> vaFields{
+                    voidPtr,   // __stack
+                    voidPtr,   // __gr_top
+                    voidPtr,   // __vr_top
+                    i32,       // __gr_offs
+                    i32,       // __vr_offs
+                };
+                TypeId const vaStructTy = in.structType("__va_list", vaFields);
+                SymbolRecord structRec;
+                structRec.name  = "__va_list";
+                structRec.scope = builtinScope;
+                structRec.tree  = InvalidTree;
+                structRec.kind  = DeclarationKind::Type;
+                structRec.type  = vaStructTy;
+                SymbolId const structId = s.symbols.mint(structRec);
+                s.scopes.injectBinding(builtinScope, "__va_list", structId);
+
+                SymbolRecord vaRec;
+                vaRec.name  = "va_list";
+                vaRec.scope = builtinScope;
+                vaRec.tree  = InvalidTree;
+                vaRec.kind  = DeclarationKind::Type;
+                vaRec.type  = vaStructTy;   // typedef to the struct DIRECTLY
+                SymbolId const vaId = s.symbols.mint(vaRec);
+                s.scopes.injectBinding(builtinScope, "va_list", vaId);
             } else if (strat == VaListStrategy::HomogeneousPointer) {
                 // Win64: `va_list` is a plain `char*` (pointer to I8) — sizeof 8.
                 TypeId const charPtr = in.pointer(in.primitive(TypeKind::I8));

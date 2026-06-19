@@ -93,29 +93,33 @@ pickScratchRegs(TargetSchema const& schema, LirFuncAllocation const& alloc,
         return out;
     }
 
-    // `usedMask[c]` bit `i` set iff phys ordinal `i` of class `c` is
-    // assigned to a vreg in this function. 64 bits fits every shipped
-    // per-class register file. A future target with > 64 registers in
-    // a single class needs to widen this — the bounds-check below is
-    // a LOUD guard: `regallocFatal` on ordinal >= 64 rather than
-    // silently treating it as unused.
-    std::array<std::uint64_t, 5> usedMask{};
+    // `usedOrdinals[c]` holds the GLOBAL register-table ordinal of every
+    // phys reg of class `c` assigned to a vreg in this function. Keyed by
+    // the global ordinal in an unbounded set — NOT a fixed-width bitmask
+    // indexed by the ordinal — because the global ordinal space exceeds 64
+    // on a multi-class target (arm64: 33 GPR table slots push d31 to global
+    // ordinal 64, past a 64-bit mask). This mirrors `buildFreeLists`
+    // (lir_regalloc.cpp), which already represents the allocatable set as
+    // per-class vectors of global ordinals for the same reason. The only
+    // bound is the class index (kLirRegClassCount == 5), which is a true
+    // substrate invariant, not a per-target register-count limit.
+    std::array<std::unordered_set<std::uint16_t>, 5> usedOrdinals{};
     for (auto const& a : alloc.assignments) {
         if (a.vreg.id == 0 || a.isSpilled()) continue;
         LirReg const phys = a.physReg();
         if (!phys.valid()) continue;
         std::size_t const c = static_cast<std::size_t>(phys.regClass());
-        if (c >= usedMask.size() || phys.id >= 64) {
+        if (c >= usedOrdinals.size()) {
             report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
                    DiagnosticSeverity::Error,
-                   std::format("pickScratchRegs: phys ordinal {} or class {} "
-                               "out of 64-bit/5-class bound — widen masks",
-                               static_cast<std::uint32_t>(phys.id),
-                               static_cast<int>(phys.regClass())));
+                   std::format("pickScratchRegs: phys reg class {} out of the "
+                               "{}-class bound (internal invariant)",
+                               static_cast<int>(phys.regClass()),
+                               usedOrdinals.size()));
             outOk = false;
             return out;
         }
-        usedMask[c] |= std::uint64_t{1} << phys.id;
+        usedOrdinals[c].insert(phys.id);
     }
 
     auto const regs = schema.registers();
@@ -126,8 +130,7 @@ pickScratchRegs(TargetSchema const& schema, LirFuncAllocation const& alloc,
         if (!allocatable.contains(info.name)) continue;  // reserved-role filter
         std::size_t const c = static_cast<std::size_t>(info.regClass);
         if (c >= out.pool.size()) continue;
-        if (i >= 64) continue;  // outside mask range — skip defensively
-        if ((usedMask[c] >> i) & 1u) continue;
+        if (usedOrdinals[c].contains(i)) continue;  // already assigned to a vreg
         out.pool[c].push_back(
             makePhysicalReg(i, static_cast<LirRegClass>(info.regClass)));
     }

@@ -1622,6 +1622,84 @@ TEST(Arm64Encoder, FsturEncodesNegativeImm9) {
     EXPECT_EQ(bytes[3], 0xFC);
 }
 
+// FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE, BLOCKER-1): the 128-bit FPR store fstur_q
+// (STUR Qt, [Xn, #simm9]) used to spill v0..v7 into the AAPCS64 variadic VR save
+// block (16-byte slots). The fixedWord MUST be 0x3C800000 — 0x3C000000 is STURB
+// (8-bit byte store), which would spill 1 byte per FP slot → va_arg(double) garbage.
+// Byte-pin STUR Q0,[X1,#0]:
+//   base 0x3C800000
+//   | Rn = x1 (1) << 5 → 0x00000020
+//   | Rt = q0 (0)      → 0x00000000
+//   | Imm9 = 0         → 0x00000000
+//   = 0x3C800020 — LE bytes: 20 00 80 3C. A regression to 0x3C000000 (STURB) flips
+//   byte[3] to 0x38 (and would silently mis-encode the whole VR spill).
+TEST(Arm64Encoder, FsturQEncodesByteExact) {
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const stOp  = (*s)->opcodeByMnemonic("fstur_q");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(stOp.has_value()) << "arm64 must declare the fstur_q opcode (FC12c)";
+    ASSERT_TRUE(retOp.has_value());
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(fpr(**s, "d0")),   // q0 shares the d0 ordinal (V register)
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(0)
+    };
+    (void)b.addInst(*stOp, InvalidLirReg, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    // 0x3C800020, little-endian.
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0x80);
+    EXPECT_EQ(bytes[3], 0x3C)
+        << "fstur_q byte[3] must be 0x3C (STUR Q) — 0x38 would be STURB (1-byte)";
+}
+
+// FC12c (BLOCKER-1): the matching 128-bit Q disasm arm round-trips. Disassemble a
+// hand-encoded STUR Q3,[X5,#16] and verify the Rd/Rn/Imm9 wires decode (proves the
+// fixed32_disasm windowFor learned the Imm9 + MemBaseNoScale slots fstur_q uses).
+TEST(Arm64Encoder, FsturQDisassemblesRoundTrip) {
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const stOp = (*s)->opcodeByMnemonic("fstur_q");
+    ASSERT_TRUE(stOp.has_value());
+    // STUR Q3, [X5, #16]: 0x3C800000 | (16<<12)=0x10000 | (5<<5)=0xA0 | 3 = 0x3C8100A3.
+    // LE bytes: A3 00 81 3C.
+    std::array<std::uint8_t, 4> bytes{0xA3, 0x00, 0x81, 0x3C};
+    DiagnosticReporter rep;
+    auto disasmed = disassembleInst(**s, *stOp, bytes, rep);
+    ASSERT_TRUE(disasmed.has_value())
+        << "fstur_q must disassemble — the fixed32_disasm Imm9/MemBaseNoScale window";
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // result slot: none (a store). Wires: rd(Rt=3), rn(Rn=5), membase(no bits), imm9(16).
+    ASSERT_FALSE(disasmed->result.has_value());
+    ASSERT_EQ(disasmed->wires.size(), 4u);
+    // wire[0] = rd (Rt) = q3.
+    EXPECT_EQ(disasmed->wires[0].kind, EncodingSlotKind::Rd);
+    ASSERT_TRUE(disasmed->wires[0].value.has_value());
+    EXPECT_EQ(*disasmed->wires[0].value, 3);
+    // wire[1] = rn (Rn) = x5.
+    EXPECT_EQ(disasmed->wires[1].kind, EncodingSlotKind::Rn);
+    ASSERT_TRUE(disasmed->wires[1].value.has_value());
+    EXPECT_EQ(*disasmed->wires[1].value, 5);
+    // wire[3] = imm9 = 16.
+    EXPECT_EQ(disasmed->wires[3].kind, EncodingSlotKind::Imm9);
+    ASSERT_TRUE(disasmed->wires[3].value.has_value());
+    EXPECT_EQ(*disasmed->wires[3].value, 16);
+}
+
 // ── D-ARM64-FLOAT-SUBSTRATE: the FULL pipeline (the SSE-test mirror) ──
 
 namespace {

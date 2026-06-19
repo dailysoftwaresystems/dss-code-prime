@@ -1,0 +1,13 @@
+{
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 55,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ]
+}

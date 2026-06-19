@@ -431,20 +431,48 @@ struct VaListLayout {
     Field overflowArgAreaField{};     // pointer to the next incoming STACK arg
     Field regSaveAreaField{};         // pointer to the spilled register-save-area
 
+    // FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE): the AAPCS64 `__va_list` 5-field struct
+    // (AAPCS64 §B.4). Read ONLY when strategy == Aapcs64DualCursor (the SysV fields
+    // above are read only when SysVRegisterSave). The struct is
+    // `{void* __stack; void* __gr_top; void* __vr_top; int __gr_offs; int __vr_offs;}`
+    // (32B). `va_arg` runs a per-class dual-cursor walk: a NEGATIVE byte cursor
+    // (`__gr_offs`/`__vr_offs`) counts UP toward 0 from the head of that class's save
+    // block; while it is < 0 a register slot remains (read `<gr|vr>_top + cursor`,
+    // bump the cursor by the slot stride); once it reaches 0 the arg is on the stack
+    // (read `__stack`, bump by the GPR slot quantum). The save-area geometry reuses
+    // the gpSaveCount/gpSlotBytes (GR: 8×8) + fpSaveCount/fpSlotBytes (VR: 8×16)
+    // fields above; these five locate the cursor/top fields within the `ap` struct.
+    Field stackField{};               // __stack: next incoming STACK arg (AAPCS64 §B.4)
+    Field grTopField{};               // __gr_top: one past the GR save block
+    Field vrTopField{};               // __vr_top: one past the VR save block
+    Field grOffsField{};              // __gr_offs: NEGATIVE i32 GR cursor (→0)
+    Field vrOffsField{};              // __vr_offs: NEGATIVE i32 VR cursor (→0)
+
     // Register-save-area geometry. The prologue spills `gpSaveCount` integer arg
     // regs at `gpSlotBytes` stride, then `fpSaveCount` SSE arg regs at `fpSlotBytes`
     // stride (the SSE block follows the GPR block). For SysV: 6×8 then 8×16 = 176B.
-    std::uint32_t gpSaveCount = 0;    // integer arg regs spilled (SysV: 6)
-    std::uint32_t gpSlotBytes = 0;    // bytes per integer save slot (SysV: 8)
-    std::uint32_t fpSaveCount = 0;    // SSE arg regs spilled (SysV: 8)
-    std::uint32_t fpSlotBytes = 0;    // bytes per SSE save slot (SysV: 16)
+    // For AAPCS64 (Aapcs64DualCursor): GR 8×8 then VR 8×16 = 64 + 128 = 192B.
+    std::uint32_t gpSaveCount = 0;    // integer arg regs spilled (SysV: 6; AAPCS64: 8)
+    std::uint32_t gpSlotBytes = 0;    // bytes per integer save slot (SysV/AAPCS64: 8)
+    std::uint32_t fpSaveCount = 0;    // SSE/VR arg regs spilled (SysV/AAPCS64: 8)
+    std::uint32_t fpSlotBytes = 0;    // bytes per SSE/VR save slot (SysV/AAPCS64: 16)
 
     // `va_arg` reg-vs-overflow thresholds. gp_offset < gpOffsetLimit ⇒ read from
     // the save area (SysV: 48 = 6×8); fp_offset < fpOffsetLimit ⇒ likewise
     // (SysV: 176 = 48 + 8×16). These are CONFIG because they are a function of the
     // save-area geometry the ABI fixes, not anything the substrate may infer.
+    // (Aapcs64DualCursor does NOT use these — its threshold is the NEGATIVE cursor
+    // reaching 0, not a positive limit; left 0 there.)
     std::uint32_t gpOffsetLimit = 0;  // SysV: 48
     std::uint32_t fpOffsetLimit = 0;  // SysV: 176
+
+    // FC12c (D-FC12C-APPLE-ARM64-VARIADIC-CALLEE): when true, a HomogeneousPointer
+    // `va_start` anchors `ap` at the OVERFLOW (incoming-stack-arg) base
+    // (`VaOverflowArgAreaAddr`) rather than the named-arg HOME base
+    // (`VaHomeArgAreaAddr`). Apple arm64 has NO home area — its variadic args are
+    // ALWAYS stacked (see `variadicArgsAlwaysStack` on the CC), so the first vararg
+    // sits at the overflow base. Win64 (false, default) keeps the home base.
+    bool variadicUsesOverflowBase = false;
 
     // Total register-save-area size the prologue reserves = gpSaveCount*gpSlotBytes
     // + fpSaveCount*fpSlotBytes (derived; the layout pass uses it to size the zone).
@@ -584,6 +612,17 @@ struct DSS_EXPORT TargetCallingConvention {
     // the two shapes; only mixed-class 5+ arg calls diverge.
     bool slotAligned = false;
 
+    // FC12c (D-FC12C-APPLE-ARM64-VARIADIC-CALLEE): when true, EVERY variadic argument
+    // (an operand past `call_payload::fixedOperandCount`) of a variadic call is forced
+    // onto the stack overflow area regardless of available arg registers — Apple
+    // arm64's documented divergence from AAPCS64 (variadic args are ALWAYS stacked).
+    // NAMED args (operand index < fixedOperandCount) stay register-placed. Gated in
+    // the caller arg-placement loop on this flag + the call's isVariadic bit, so
+    // AAPCS64 (false) and the x86 CCs (false, default) are unaffected — they keep the
+    // register-then-stack placement. This realizes the variadic half of
+    // D-FF3-APPLE-ARM64-ABI-DIVERGENCE.
+    bool variadicArgsAlwaysStack = false;
+
     // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the
     // classification STRATEGY for a struct/union passed/returned by value.
     // A closed enum (the `aggregate_abi` classifier switches on it, never on
@@ -631,10 +670,15 @@ struct DSS_EXPORT TargetCallingConvention {
     // arguments used by varargs (0..8)`. Win64 ms_x64 has no
     // equivalent (the loader-side ABI uses GPR-shadow + double-spill
     // — anchored D-ML7-VARIADIC-WIN64-DOUBLE-SPILL — and this field
-    // is left empty). AAPCS64 (ARM64): no equivalent (variadic floats
-    // pass on the stack, no count register). Empty optional ⇒ this
-    // CC requires no caller-side vector-count register for variadic
-    // calls. When engaged, ML7 materialize for a Call with
+    // is left empty). AAPCS64 (ARM64-ELF): no equivalent — variadic FP
+    // args pass in v0..v7 and ARE spilled to the VR save area (the dual-
+    // cursor walk reads them via __vr_offs); there is simply no SysV-style
+    // al count register. (APPLE arm64 is the ABI where variadic args —
+    // int AND fp — are ALWAYS stacked; that is `variadicArgsAlwaysStack`,
+    // NOT this field.) Both arm64 CCs leave this empty for the same
+    // reason: no caller-side vector-COUNT register exists on AArch64.
+    // Empty optional ⇒ this CC requires no caller-side vector-count
+    // register for variadic calls. When engaged, ML7 materialize for a Call with
     // payload `isVariadic=true` counts FPR-class arg operands in
     // [fixedOperandCount..N) and emits a `mov <reg>, <count>` before
     // the call instruction.

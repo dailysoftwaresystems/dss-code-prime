@@ -1,0 +1,14 @@
+{
+  "$comment": "FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE) FP-OVERFLOW witness: a variadic callee summing 9 DOUBLES so the 9th overflows the 8 VR arg registers (v0..v7) and is read from __stack via va_arg(double)'s overflow arm (the read bumps __stack by gpSlotBytes=8, the NSAA quantum, not fpSlotBytes=16). The FP complement of integer-only varargs_aapcs64_overflow and the overflow complement of register-only varargs_aapcs64_double. Sum 10.5+20.25+19.25+0.5+0.25+0.25+1.0+2.0+6.0 = 60.0 (all exactly representable) -> (int) -> 60. RED-ON-DISABLE: a wrong FP-overflow geometry drops/mis-reads the 9th double -> exit != 60. arm64-ELF under qemu-aarch64.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 60,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ]
+}

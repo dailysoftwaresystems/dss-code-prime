@@ -32,6 +32,18 @@ windowFor(EncodingSlotKind s) noexcept {
         // symbol-bearing — extracted as a normal value (the Imm26
         // must-be-zero symbol-slot path below does not apply).
         case EncodingSlotKind::Imm16: return SlotBitWindow{ 5,  16 };
+        // FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE): the unscaled LDUR/STUR
+        // family slots, mirroring the ENCODER's `fixed32::windowFor`
+        // (Imm9 at bits 12..20; MemBaseNoScale a width-0 marker that
+        // carries no bits — the base register rides the Rn wire). Added
+        // so the new `fstur_q` (STUR Qt) round-trips through the disasm
+        // oracle. Imm9 is read as the raw 9-bit field; the round-trip
+        // oracle compares it to the LIR MemOffset value (the encoder's
+        // two's-complement of a negative displacement lands in the same
+        // 9-bit window, so the bit-for-bit compare is exact for both
+        // signs without re-sign-extending here).
+        case EncodingSlotKind::Imm9:           return SlotBitWindow{ 12, 9 };
+        case EncodingSlotKind::MemBaseNoScale: return SlotBitWindow{ 0,  0 };
         // Every remaining slot decodes to nullopt. This is an
         // intentionally PARTIAL mirror of `fixed32::windowFor`: the
         // round-trip decoder only needs the register/immediate windows
@@ -41,9 +53,10 @@ windowFor(EncodingSlotKind s) noexcept {
         //     RipRelDisp32, CondCodeNibble, BlockRel32, MemBaseScale)
         //     never appear on a fixed32 variant — validate() rejects
         //     cross-shape variants.
-        //   * The other fixed32 slots (Imm9/Imm12/Imm19/MemBaseNoScale/
+        //   * The other fixed32 slots (Imm12/Imm19/MemOffsetZero/
         //     SymbolPatchMarker) are not decoded by this mirror yet — the
         //     disasm-completeness gap tracked by D-AS5-MULTIWORD-DISASM.
+        //     (Imm9 + MemBaseNoScale ARE decoded above — FC12c fstur_q.)
         // Both return nullopt — behavior unchanged from the prior
         // enum-drift fallback. Listed EXHAUSTIVELY (no `default:`) so the
         // D-AS-ENCODINGSLOT-EXHAUSTIVE-WARN gate flags a new enumerator.
@@ -63,8 +76,6 @@ windowFor(EncodingSlotKind s) noexcept {
         // slots never appear on a fixed32 variant.
         case EncodingSlotKind::OpcodePlusReg:
         case EncodingSlotKind::Imm64:
-        case EncodingSlotKind::Imm9:
-        case EncodingSlotKind::MemBaseNoScale:
         case EncodingSlotKind::MemOffsetZero:
         case EncodingSlotKind::Imm12:
         case EncodingSlotKind::SymbolPatchMarker:

@@ -1522,6 +1522,19 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         cc.slotAligned = c.at("slotAligned").get<bool>();
                     }
                 }
+                // FC12c (D-FC12C-APPLE-ARM64-VARIADIC-CALLEE): optional — when true,
+                // every variadic arg of a variadic call is forced onto the stack
+                // (Apple arm64). Default false (AAPCS64 + x86 CCs unaffected).
+                if (c.contains("variadicArgsAlwaysStack")) {
+                    if (!c.at("variadicArgsAlwaysStack").is_boolean()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/variadicArgsAlwaysStack", ccPath),
+                                  "'variadicArgsAlwaysStack' must be a boolean");
+                    } else {
+                        cc.variadicArgsAlwaysStack =
+                            c.at("variadicArgsAlwaysStack").get<bool>();
+                    }
+                }
                 if (c.contains("linkRegister")) {
                     if (!c.at("linkRegister").is_string()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,
@@ -1690,11 +1703,25 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                 }
                             }
                         }
+                        // FC12c: an optional bool on the va_list block — default false.
+                        auto readBoolDefaultFalse =
+                            [&](char const* key, bool& out) {
+                                if (!vl.contains(key)) { out = false; return; }
+                                if (!vl.at(key).is_boolean()) {
+                                    coll.emit(DiagnosticCode::C_MalformedJson,
+                                              std::format("{}/vaListLayout/{}", ccPath, key),
+                                              std::format("'{}' must be a boolean", key));
+                                    vlOk = false;
+                                    return;
+                                }
+                                out = vl.at(key).get<bool>();
+                            };
                         // Branch the remaining parse on the strategy. SysVRegisterSave
                         // requires the full register-save geometry; HomogeneousPointer
-                        // requires only namedArgSlotBytes; Aapcs64DualCursor accepts
-                        // the block (consumers fail loud until FC12c). namedArgSlotBytes
-                        // is required on every realized arm.
+                        // requires only namedArgSlotBytes (+ optional variadicUsesOverflow
+                        // Base for Apple arm64); Aapcs64DualCursor (FC12c) requires the
+                        // 5 `__va_list` fields + the GR/VR save geometry. namedArgSlot
+                        // Bytes is required on every realized arm.
                         switch (layout.strategy) {
                             case VaListStrategy::SysVRegisterSave:
                                 readField("gpOffsetField",        layout.gpOffsetField);
@@ -1711,11 +1738,22 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                 break;
                             case VaListStrategy::HomogeneousPointer:
                                 readU32("namedArgSlotBytes", layout.namedArgSlotBytes);
+                                // FC12c: Apple arm64 anchors `ap` at the overflow base.
+                                readBoolDefaultFalse("variadicUsesOverflowBase",
+                                                     layout.variadicUsesOverflowBase);
                                 break;
                             case VaListStrategy::Aapcs64DualCursor:
-                                // Declared-but-not-realized: accept any block (the
-                                // consumers fail loud). Still require namedArgSlotBytes
-                                // so a future FC12c finds a sane slot stride.
+                                // FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE): the 5-field
+                                // `__va_list` locator + the GR/VR save-area geometry.
+                                readField("stackField",   layout.stackField);
+                                readField("grTopField",   layout.grTopField);
+                                readField("vrTopField",   layout.vrTopField);
+                                readField("grOffsField",  layout.grOffsField);
+                                readField("vrOffsField",  layout.vrOffsField);
+                                readU32("gpSaveCount",       layout.gpSaveCount);
+                                readU32("gpSlotBytes",       layout.gpSlotBytes);
+                                readU32("fpSaveCount",       layout.fpSaveCount);
+                                readU32("fpSlotBytes",       layout.fpSlotBytes);
                                 readU32("namedArgSlotBytes", layout.namedArgSlotBytes);
                                 break;
                         }

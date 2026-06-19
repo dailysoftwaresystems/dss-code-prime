@@ -297,21 +297,29 @@ functionHasCalls(Lir const& src, LirFuncId fn,
     return false;
 }
 
-// FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): does
-// function `fn` call va_start? Detected by the presence of the CC's va_start BASE op
-// — `va_reg_save_area` on SysVRegisterSave (the prologue spills the arg regs into a
-// save-area) OR `va_home_arg_area` on Win64 HomogeneousPointer (the prologue spills
-// the named int regs into the home slots). HIR→MIR emits one of these inside the
-// va_start lowering. The presence — NOT the FnSig's isVariadic bit — is the precise
-// signal: a variadic function that NEVER calls va_start needs neither spill (it never
-// reads the varargs), so the op-presence test triggers the prologue spill exactly
-// when needed. A `0` op handle (a CC that does not declare that strategy's op) never
-// matches, so a non-variadic-callee target answers false uniformly.
+// FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-CALLEE) + FC12c
+// (D-FC12C-*-VARIADIC-CALLEE): does function `fn` call va_start? Detected by the
+// presence of the CC's va_start BASE op — ONE of:
+//   * `va_reg_save_area`   — SysVRegisterSave (the prologue spills arg regs into the
+//     save-area) AND AAPCS64 Aapcs64DualCursor (its va_start anchors __gr_top/__vr_top
+//     at the spilled GR/VR register-save-area — same op).
+//   * `va_home_arg_area`   — Win64 HomogeneousPointer (named int regs → home slots).
+//   * `va_overflow_arg_area` — Apple arm64 HomogeneousPointer with overflow-base
+//     va_start (it has no home/save area — the start IS the overflow base). [FC12c
+//     SHOULD-FIX: reuse the EXISTING va_overflow_arg_area op — do NOT mint a new
+//     va_stack_arg_area op; teach this detector the third handle.]
+// HIR→MIR emits one of these inside the va_start lowering. The presence — NOT the
+// FnSig's isVariadic bit — is the precise signal: a variadic function that NEVER
+// calls va_start needs no spill (it never reads the varargs). A `0` op handle (a CC
+// that does not declare that strategy's op) never matches, so a non-variadic-callee
+// target answers false uniformly.
 [[nodiscard]] bool
 functionUsesVaStart(Lir const& src, LirFuncId fn,
                     std::uint16_t vaRegSaveAreaOp,
-                    std::uint16_t vaHomeArgAreaOp) noexcept {
-    if (vaRegSaveAreaOp == 0 && vaHomeArgAreaOp == 0) return false;
+                    std::uint16_t vaHomeArgAreaOp,
+                    std::uint16_t vaOverflowArgAreaOp) noexcept {
+    if (vaRegSaveAreaOp == 0 && vaHomeArgAreaOp == 0 && vaOverflowArgAreaOp == 0)
+        return false;
     std::uint32_t const blockCount = src.funcBlockCount(fn);
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
         LirBlockId const blk = src.funcBlockAt(fn, bi);
@@ -319,7 +327,8 @@ functionUsesVaStart(Lir const& src, LirFuncId fn,
         for (std::uint32_t i = 0; i < instN; ++i) {
             std::uint16_t const op = src.instOpcode(src.blockInstAt(blk, i));
             if ((vaRegSaveAreaOp != 0 && op == vaRegSaveAreaOp)
-                || (vaHomeArgAreaOp != 0 && op == vaHomeArgAreaOp))
+                || (vaHomeArgAreaOp != 0 && op == vaHomeArgAreaOp)
+                || (vaOverflowArgAreaOp != 0 && op == vaOverflowArgAreaOp))
                 return true;
         }
     }
@@ -446,8 +455,41 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
             std::uint32_t const argCount =
                 static_cast<std::uint32_t>(ops.size() - 1);
 
+            // FC12c (D-FC12C-APPLE-ARM64-VARIADIC-CALLEE): the outgoing-arg-area
+            // pre-scan MUST mirror the materialize placement loop's stack-forcing,
+            // else the forced varargs write outside the reserved area. Under a CC that
+            // always-stacks varargs, every operand past `fixedOperandCount` of a
+            // variadic call is on the stack regardless of class/pool — count it here.
+            std::uint32_t const payload = src.instPayload(inst);
+            bool const variadicForcesStack =
+                cc.variadicArgsAlwaysStack
+                && ::dss::call_payload::isVariadic(payload);
+
             std::uint32_t overflow = 0;
-            if (cc.slotAligned) {
+            if (variadicForcesStack) {
+                // Named args fill registers (no overflow until a class pool is full);
+                // EVERY vararg (operand index >= fixedOperandCount) is stacked. The
+                // named args here never exceed the pools in the corpora, but bound the
+                // named-arg overflow too so a >8-fixed-arg variadic call is still safe.
+                std::uint32_t const fixedOps =
+                    ::dss::call_payload::fixedOperandCount(payload);
+                std::uint32_t const forcedVarargs =
+                    (argCount > fixedOps) ? (argCount - fixedOps) : 0u;
+                // Named-arg overflow under independent counters (Apple is NOT
+                // slotAligned; bound by the larger pool defensively if it ever is).
+                std::uint32_t namedGpr = 0, namedFpr = 0;
+                for (std::size_t k = 1; k < ops.size(); ++k) {
+                    if ((k - 1) >= fixedOps) break;  // only the named region
+                    LirOperand const& argOp = ops[k];
+                    if (argOp.kind != LirOperandKind::Reg) continue;
+                    if (argOp.reg.regClass() == LirRegClass::FPR) ++namedFpr;
+                    else ++namedGpr;
+                }
+                std::uint32_t const namedOverflow =
+                    ((namedGpr > gprPoolSize) ? (namedGpr - gprPoolSize) : 0u)
+                    + ((namedFpr > fprPoolSize) ? (namedFpr - fprPoolSize) : 0u);
+                overflow = forcedVarargs + namedOverflow;
+            } else if (cc.slotAligned) {
                 // Each arg consumes one shared slot regardless of class.
                 if (argCount > slotAlignedPoolSize) {
                     overflow = argCount - slotAlignedPoolSize;
@@ -608,6 +650,14 @@ struct OpcodeHandles {
     // FP varargs differently). Absent ⇒ 0; the FP-dup path requires it and fails loud
     // if a HomogeneousPointer CC reaches the dup with the opcode missing.
     std::uint16_t movqXmmToGpr;
+    // FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE): the 128-bit VR spill store (`fstur_q`,
+    // STUR Qt) the AAPCS64 variadic prologue uses to spill v0..v7 into the VR block of
+    // the register-save-area (16B slots — the class `store` op is the 8-byte D-form,
+    // which would spill only the low half). Optional (arm64 declares it; x86_64 does
+    // not — its SSE save uses the 16-byte movaps via the class store). Absent ⇒ 0; the
+    // AAPCS64 spill path requires it and fails loud if a dual-cursor CC reaches the
+    // VR-spill with the opcode missing.
+    std::uint16_t vaVrSpillStore;
 };
 
 // FC2 Part B: resolve the class-correct opcode for a register-data-
@@ -714,16 +764,28 @@ resolveCcReg(TargetSchema const& schema, std::string_view name, LirRegClass cls,
 //     stays 0). NO SSE spill: an FP vararg is duplicated into its home GPR slot by
 //     the CALLER (the FP-dup in the variadic-call path), and a named FP arg is read
 //     by name (never via va_arg), so the callee spills no XMMs here.
-//   * Aapcs64DualCursor: fail loud (realized in FC12c).
+//   * Aapcs64DualCursor (FC12c): spill x0..x7 (GR block, 8B each via the class GPR
+//     store) then v0..v7 (VR block, 16B each via the 128-bit `fstur_q` = `vaVrSpill
+//     Store`) into the callee-local register-save-area at `vaRegSaveAreaOffset()`,
+//     ascending index order (x0/v0 at the block head). `va_start`'s NEGATIVE
+//     __gr_offs/__vr_offs then address the right slot from the (past-the-block)
+//     __gr_top/__vr_top cursors. UNLIKE Win64's home spill, the base is the callee's
+//     OWN save zone, not the caller's incoming area.
 [[nodiscard]] bool
 emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
                           TargetSchema const& schema,
                           TargetCallingConvention const& cc, LirReg sp,
+                          std::uint16_t vaVrSpillStore, std::uint16_t addOp,
                           DiagnosticReporter& reporter) {
     if (!cc.vaListLayout.has_value()) return true;   // guarded by caller, defensive
     VaListLayout const& vl = *cc.vaListLayout;
 
     if (vl.strategy == VaListStrategy::HomogeneousPointer) {
+        // FC12c: Apple arm64 (variadicUsesOverflowBase) has NO home area — its named
+        // args stay in their registers (read via SSA) and every vararg is stacked by
+        // the CALLER, so there is NOTHING to spill in the prologue. Win64
+        // (variadicUsesOverflowBase=false) spills the integer home register pool below.
+        if (vl.variadicUsesOverflowBase) return true;
         // Win64 home spill: store the integer home registers (rcx/rdx/r8/r9) into
         // their home slots at the contiguous no-shadow base. CRITICAL: spill ALL
         // `min(4, argGprs)` of them, NOT just the `namedArgCount` named ones — the
@@ -761,14 +823,128 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
         return true;
     }
 
+    if (vl.strategy == VaListStrategy::Aapcs64DualCursor) {
+        // ── AAPCS64: spill x0..x7 (GR block) then v0..v7 (VR block) ──
+        // Into the callee-local register-save-area at vaRegSaveAreaOffset(), ascending
+        // index order so __gr_offs=-(8-fixedGpr)*8 / __vr_offs=-(8-fixedFpr)*16 (added
+        // to the past-the-block __gr_top/__vr_top) address the right slot.
+        //
+        // The save area is the TOPMOST frame zone, so vaRegSaveAreaOffset() + the VR
+        // block (up to +192) can EXCEED the AArch64 unscaled STUR/STR `imm9` reach
+        // (±256). So materialize the save-area BASE into a scratch register ONCE
+        // (`add scratch, sp, #vaRegSaveAreaOffset()`) and spill at SMALL offsets off
+        // it (0..176, always within imm9) — the robust ARM64 form that does not depend
+        // on the frame staying small. The scratch is a caller-saved GPR that is neither
+        // an arg GPR (x0..x7, being spilled) NOR the indirect-result register (x8 — the
+        // live incoming sret pointer for a variadic fn that ALSO returns a >16B struct;
+        // `read_indirect_result` reads it LATER, in the per-inst loop, so clobbering x8
+        // here would silently mis-route the struct result into the callee's own frame).
+        // fp/lr (x29/x30) and sp are calleeSaved (not in callerSaved), so the
+        // callerSaved iteration never reaches them — only the arg-GPR + IRR exclusions
+        // are needed on top of it. The picker therefore lands on x9 (the first genuinely
+        // free intra-procedure scratch). At the prologue spill point — immediately after
+        // the SP-adjust + saved-reg stores, before any body inst — the only live values
+        // are the incoming args (x0..x7) and the incoming x8 sret pointer; every other
+        // caller-saved GPR holds nothing.
+        if (vaVrSpillStore == 0) {
+            report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                   DiagnosticSeverity::Error,
+                   "callconv: AAPCS64 variadic prologue VR spill requires the "
+                   "128-bit 'fstur_q' opcode (D-FC12C-AAPCS64-VARIADIC-CALLEE)");
+            return false;
+        }
+        // Pick a caller-saved GPR that is neither an arg register being spilled (x0..x7)
+        // NOR the indirect-result register (x8 — the live incoming sret pointer; see the
+        // block comment above). Config-derived over cc.callerSaved; on AAPCS64/Apple this
+        // lands on x9 (the first intra-procedure scratch). Reverting the IRR exclusion
+        // makes the picker fall back onto x8 and CLOBBER the sret pointer — silently
+        // mis-routing a >16B struct return; the structural pin
+        // `Aapcs64VariadicStructReturnPrologueScratchAvoidsX8` is the red-on-disable.
+        auto isArgGpr = [&](std::uint16_t ord) {
+            for (auto const& name : cc.argGprs)
+                if (auto const a = schema.registerByName(name);
+                    a.has_value() && *a == ord)
+                    return true;
+            return false;
+        };
+        // The IRR (x8) is declared only by CCs with register-based sret (AAPCS64/Apple);
+        // its ordinal is the avoid-set's second member. has_value()-guarded so a CC
+        // without one (none here, but defensively) adds nothing.
+        std::optional<std::uint16_t> const irrOrd =
+            cc.indirectResultRegister.has_value()
+                ? std::optional<std::uint16_t>(cc.indirectResultRegister->ordinal)
+                : std::nullopt;
+        std::optional<LirReg> scratch;
+        for (std::string_view const name : cc.callerSaved) {
+            auto const ord = schema.registerByName(name);
+            if (!ord.has_value()) continue;
+            auto const* info = schema.registerInfo(*ord);
+            if (info == nullptr || info->regClass != TargetRegClass::GPR) continue;
+            if (isArgGpr(*ord)) continue;
+            if (irrOrd.has_value() && *ord == *irrOrd) continue;
+            scratch = makePhysicalReg(*ord, LirRegClass::GPR);
+            break;
+        }
+        if (!scratch.has_value()) {
+            report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+                   DiagnosticSeverity::Error,
+                   "callconv: AAPCS64 variadic prologue spill found no free "
+                   "caller-saved scratch GPR for the save-area base "
+                   "(D-FC12C-AAPCS64-VARIADIC-CALLEE)");
+            return false;
+        }
+        // scratch = sp + vaRegSaveAreaOffset() (one ADD-imm).
+        {
+            std::array<LirOperand, 2> addOps{
+                LirOperand::makeReg(sp),
+                LirOperand::makeImmInt32(
+                    static_cast<std::int32_t>(layout.vaRegSaveAreaOffset()))
+            };
+            b.addInst(addOp, *scratch, addOps);
+        }
+        // GR block: 8-byte slots via the class GPR store (the SAME 8-byte store the
+        // SysV GPR spill uses — x-register width), at [scratch + i*8].
+        auto const gpStore = classOpHandle(schema, LirRegClass::GPR, RegClassOp::Store,
+                                           "callconv: AAPCS64 variadic GR spill",
+                                           reporter);
+        if (!gpStore.has_value()) return false;
+        std::uint32_t const gpN =
+            std::min<std::uint32_t>(vl.gpSaveCount,
+                                    static_cast<std::uint32_t>(cc.argGprs.size()));
+        for (std::uint32_t i = 0; i < gpN; ++i) {
+            auto const reg = resolveCcReg(schema, cc.argGprs[i], LirRegClass::GPR,
+                                          "callconv: AAPCS64 variadic GR spill",
+                                          reporter);
+            if (!reg.has_value()) return false;
+            emitFrameStore(b, *gpStore, *reg, *scratch,
+                           static_cast<std::int32_t>(i * vl.gpSlotBytes));
+        }
+        // VR block: 16-byte slots via the 128-bit `fstur_q` (the class store is the
+        // 8-byte D-form, which would spill only the low half of a v-register), at
+        // [scratch + gpBlock + i*16]. The VR block follows the full GR block.
+        std::uint32_t const vrBase = vl.gpSaveCount * vl.gpSlotBytes;
+        std::uint32_t const fpN =
+            std::min<std::uint32_t>(vl.fpSaveCount,
+                                    static_cast<std::uint32_t>(cc.argFprs.size()));
+        for (std::uint32_t i = 0; i < fpN; ++i) {
+            auto const reg = resolveCcReg(schema, cc.argFprs[i], LirRegClass::FPR,
+                                          "callconv: AAPCS64 variadic VR spill",
+                                          reporter);
+            if (!reg.has_value()) return false;
+            emitFrameStore(b, vaVrSpillStore, *reg, *scratch,
+                           static_cast<std::int32_t>(vrBase + i * vl.fpSlotBytes));
+        }
+        return true;
+    }
+
     if (vl.strategy != VaListStrategy::SysVRegisterSave) {
-        // Aapcs64DualCursor (or any future un-handled strategy): fail loud rather
-        // than silently run the SysV spill on a layout it does not describe.
+        // Any future un-handled strategy: fail loud rather than silently run the SysV
+        // spill on a layout it does not describe.
         report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
                DiagnosticSeverity::Error,
                std::format("callconv: variadic prologue spill for va_list strategy "
-                           "'{}' is not realized (D-FC12B-WIN64-VARIADIC-CALLEE / "
-                           "FC12c)", vaListStrategyName(vl.strategy)));
+                           "'{}' is not realized (internal: unknown VaListStrategy)",
+                           vaListStrategyName(vl.strategy)));
         return false;
     }
 
@@ -1058,7 +1234,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 18> const table{{
+    std::array<Entry, 19> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -1103,6 +1279,10 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         {&OpcodeHandles::vaOverflowArgArea, "va_overflow_arg_area", true},
         {&OpcodeHandles::vaHomeArgArea,     "va_home_arg_area",     true},
         {&OpcodeHandles::movqXmmToGpr,      "movq_xmm_to_gpr",      true},
+        // FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE): optional — only the AAPCS64 dual-
+        // cursor prologue's VR spill emits the 128-bit `fstur_q`. Absent ⇒ field 0;
+        // the spill fails loud if a dual-cursor CC reaches the VR-spill without it.
+        {&OpcodeHandles::vaVrSpillStore,    "fstur_q",              true},
     }};
     for (auto const& [field, mnem, optional] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
@@ -1187,22 +1367,26 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     // i to the same alloca as the count pre-scan visited.
     std::vector<std::uint32_t> const localAllocaPayloads =
         functionLocalAllocaPayloads(src, fn, h.alloca_);
-    // FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-CALLEE):
-    // does this function call va_start? Detected by the presence of EITHER va_start
-    // base op — `va_reg_save_area` (SysV) or `va_home_arg_area` (Win64). The op-
-    // presence test + the CC's has_value() guard keep this fully config-driven +
-    // fail-safe: a CC with no vaListLayout declares neither op (handles stay 0).
+    // FC12a/b/c: does this function call va_start? Detected by the presence of ANY
+    // va_start base op — `va_reg_save_area` (SysV + AAPCS64), `va_home_arg_area`
+    // (Win64), or `va_overflow_arg_area` (Apple arm64). The op-presence test + the
+    // CC's has_value() guard keep this fully config-driven + fail-safe: a CC with no
+    // vaListLayout declares no op (handles stay 0).
     bool const usesVaStart =
-        functionUsesVaStart(src, fn, h.vaRegSaveArea, h.vaHomeArgArea)
+        functionUsesVaStart(src, fn, h.vaRegSaveArea, h.vaHomeArgArea,
+                            h.vaOverflowArgArea)
         && cc.vaListLayout.has_value();
-    // FC12b: the register-save-area zone is a SysVRegisterSave construct ONLY. Win64
-    // HomogeneousPointer spills into the caller's home space (no callee-local zone),
-    // so vaRegSaveAreaSize stays 0 there (gated on the strategy, not just presence).
-    bool const usesSysVRegSave =
+    // FC12b/c: a callee-local register-save-area zone is reserved by the strategies
+    // that SPILL arg registers into a callee frame zone — SysVRegisterSave (6 GP + 8
+    // SSE) AND Aapcs64DualCursor (8 GR + 8 VR = 192B). Win64 + Apple arm64
+    // (HomogeneousPointer) spill into the caller's area / not at all, so their zone
+    // stays 0 (gated on the strategy, not just presence).
+    bool const usesCalleeRegSaveZone =
         usesVaStart
-        && cc.vaListLayout->strategy == VaListStrategy::SysVRegisterSave;
+        && (cc.vaListLayout->strategy == VaListStrategy::SysVRegisterSave
+            || cc.vaListLayout->strategy == VaListStrategy::Aapcs64DualCursor);
     std::uint32_t const vaRegSaveAreaBytes =
-        usesSysVRegSave ? cc.vaListLayout->regSaveAreaBytes() : 0u;
+        usesCalleeRegSaveZone ? cc.vaListLayout->regSaveAreaBytes() : 0u;
     auto layoutOpt = computeFrameLayout(alloc, schema, cc,
                                         std::move(usedSaved),
                                         hasCalls, outgoingArgSlots,
@@ -1249,15 +1433,14 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             emitPrologue(b, outLayout, schema, sp, h.sub, reporter,
                          prologueOk);
             if (!prologueOk) return false;
-            // FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-
-            // CALLEE): a function that calls va_start spills its arg registers
+            // FC12a/b/c: a function that calls va_start spills its arg registers
             // immediately after the prologue's SP-adjust + saved-reg stores (so the
             // save-area / home space, addressed by va_start, points at live values).
-            // The spill is strategy-dispatched (SysV register-save vs Win64 home);
-            // straight-line stores — no CFG.
+            // The spill is strategy-dispatched (SysV register-save / Win64 home /
+            // AAPCS64 GR+VR save / Apple no-op); straight-line stores — no CFG.
             if (usesVaStart
                 && !emitVariadicPrologueSpill(b, outLayout, schema, cc, sp,
-                                              reporter))
+                                              h.vaVrSpillStore, h.add, reporter))
                 return false;
         }
 
@@ -1640,13 +1823,24 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // `movq_xmm_to_gpr`. DERIVED from the strategy (no free-floating bool):
                 // the dup fires only for a variadic call under HomogeneousPointer.
                 // Fixed FP params + overflow (stack) FP args are NOT duplicated.
+                bool const isVariadicCall =
+                    ::dss::call_payload::isVariadic(payload);
                 bool const win64FpDup =
-                    ::dss::call_payload::isVariadic(payload)
+                    isVariadicCall
                     && cc.vaListLayout.has_value()
                     && cc.vaListLayout->strategy
                            == VaListStrategy::HomogeneousPointer;
                 std::uint32_t const fixedOperandCnt =
                     ::dss::call_payload::fixedOperandCount(payload);
+                // FC12c (D-FC12C-APPLE-ARM64-VARIADIC-CALLEE): Apple arm64 passes EVERY
+                // variadic arg (operand past the fixed ones) on the stack regardless of
+                // free arg registers. Gated on the CC flag + the call's isVariadic bit,
+                // so AAPCS64 + the x86 CCs (flag false) keep register-then-stack
+                // placement. The class counters still advance for the named args (they
+                // ARE register-placed), so forcing only the vararg region to the stack
+                // keeps the named-arg register assignment correct.
+                bool const variadicForcesStack =
+                    isVariadicCall && cc.variadicArgsAlwaysStack;
                 // Each dup: store the FP vararg's home GPR (dest) ← its xmm dest reg
                 // (src). Emitted AFTER the arg moves (the xmm holds the value by then)
                 // — the home GPR is the vararg slot's GPR, read by no other arg move.
@@ -1695,6 +1889,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     }
                     LirReg const srcReg = argOp.reg;
                     LirRegClass const cls = srcReg.regClass();
+                    std::size_t const argRegionIdx = i - firstArgIdx;
                     std::uint32_t argIndex;
                     std::uint32_t poolSize;
                     if (cc.slotAligned) {
@@ -1709,7 +1904,13 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                             poolSize = static_cast<std::uint32_t>(cc.argGprs.size());
                         }
                     }
-                    if (argIndex < poolSize) {
+                    // FC12c: a VARARG (operand past the fixed ones) under a CC that
+                    // always-stacks varargs is forced to the overflow area even if a
+                    // register slot is free. Named args (argRegionIdx < fixedOperandCnt)
+                    // are unaffected — they stay register-placed via argIndex<poolSize.
+                    bool const forceStack =
+                        variadicForcesStack && argRegionIdx >= fixedOperandCnt;
+                    if (argIndex < poolSize && !forceStack) {
                         // Register-resident arg: existing path.
                         auto const destReg =
                             argPassingReg(schema, cc, argIndex, cls,
@@ -1721,7 +1922,6 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         // slot-aligned so `argIndex` IS the slot index; argGprs[slot]
                         // pairs with argFprs[slot]. Only the VARARG region (operand
                         // index past the fixed operands) is duplicated.
-                        std::size_t const argRegionIdx = i - firstArgIdx;
                         if (win64FpDup && cls == LirRegClass::FPR
                             && argRegionIdx >= fixedOperandCnt
                             && argIndex

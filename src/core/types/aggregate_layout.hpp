@@ -183,11 +183,21 @@ bitFieldStrategyFromName(std::string_view s) noexcept {
 //     prologue spills the named integer arg regs into the home slots. FP varargs
 //     are read from the home (GPR) slot, so the CALLER duplicates each FP vararg
 //     into the matching integer register (lir_callconv, strategy-gated).
-//   * Aapcs64DualCursor  — AAPCS64/Apple: the dual gr/vr cursor `__va_list` (FC12c).
+//   * Aapcs64DualCursor  — AAPCS64 (ARM64-ELF, FC12c): the 5-field `__va_list`
+//     {void* __stack; void* __gr_top; void* __vr_top; int __gr_offs; int __vr_offs;}
+//     (32B). The prologue spills x0..x7 (GR, 8×8) then v0..v7 (VR, 8×16) into a
+//     callee-local register-save-area; `va_arg` runs a PER-CLASS dual cursor: a
+//     NEGATIVE byte offset (__gr_offs/__vr_offs) counts up toward 0 from the head of
+//     that class's save block — while < 0 a register slot remains (read
+//     `<gr|vr>_top + offs`, sign-extend the i32 cursor, bump by the slot stride);
+//     once 0 it walks `__stack` (bump by the 8-byte NSAA quantum). (Apple arm64 does
+//     NOT use this: it ships HomogeneousPointer + `variadicArgsAlwaysStack` —
+//     varargs are ALWAYS stacked, so a plain pointer-bump over the overflow area
+//     suffices; see `variadicUsesOverflowBase`.)
 enum class VaListStrategy : std::uint8_t {
     SysVRegisterSave   = 0,  // SysV AMD64 §3.5.7 register-save-area + per-class walk
-    HomogeneousPointer = 1,  // Win64: a `char*` into the contiguous home+overflow area
-    Aapcs64DualCursor  = 2,  // AAPCS64/Apple dual-cursor (declared; realized in FC12c)
+    HomogeneousPointer = 1,  // Win64 + Apple arm64: a pointer into a contiguous arg area
+    Aapcs64DualCursor  = 2,  // AAPCS64 ARM64-ELF dual gr/vr cursor `__va_list` (FC12c)
 };
 
 [[nodiscard]] constexpr std::string_view
