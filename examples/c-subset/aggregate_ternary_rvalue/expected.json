@@ -1,0 +1,15 @@
+{
+  "$comment": "D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR (FC8 SUBSTRATE) end-to-end: an AGGREGATE-typed Ternary `cond ? A : B` or comma/SeqExpr rvalue used BY VALUE now has a runtime carrier — a DIFFERENT carrier than the compound-literal slot (D-CSUBSET-BITFIELD-RVALUE-RUNTIME). Each control-flow arm is materialized into ONE COMMON result slot under a CFG diamond (CondBr -> arm-init-slot -> join), then consumed by ADDRESS; there is NO Phi of the aggregate (the memory-based aggregate model: the merge is a shared memory location, not an SSA Phi). Covers a NON-bit-field struct ternary in ARG position witnessed BOTH ways (two calls with runtime pick_t/pick_f -> then arm and else arm — the result reflects which arm was selected) + ASSIGN-from-rvalue; a BIT-FIELD struct ternary in RETURN position (each arm packs per allocation unit through the common slot: a:3+b:5 share unit 0, plus a SIGNED s:4 that must sign-extend on read); a comma/SeqExpr whose VALUE is an aggregate rvalue used by value (a LOCAL bump += 1 side effect must run); and a NON-bit-field struct ternary whose ARMS are NAMED LVALUES in ARG position (the copy-path: each arm is COPIED into the common slot via lowerAggregateCopy through the diamond, distinct from in-place compound-literal init). ANTI-FOLD: every condition + arm field value derives from the global g_seed (a LOAD, opaque to value-propagation) + runtime pick params, so the diamond + per-arm slot materialization (and bit-field RMW packing) run at runtime in BOTH the baseline and optimized arms; a runtime condition keeps both arms live. (No global is WRITTEN — a global load is all the anti-fold needs.) g_seed=5: non-bf arg(true)=12, arg(false)=110, asn=20; bit-field ret=22; comma arg=14 with bump==1; named-arm arg=16 (copy-path); each verified against its runtime expectation, return ok?42:13. A wrong arm, a wrong slot/offset, a clobbered bit-field neighbour, a mis-extracted field, a missing sign-extension, or a dropped comma side effect flips one equality -> 13. LAYOUT-RULE-AGNOSTIC: write+read share the gnu_packed rule, so the exit is correct on every target regardless of ABI-exactness (D-CSUBSET-BITFIELD-ABI-EXACT). The optimizedPipelines arm proves the flow survives Mem2Reg/ConstFold (the baseline arm is the real-codegen memory witness). arm64 runs under qemu; macho on the macos-latest leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}

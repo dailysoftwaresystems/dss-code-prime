@@ -732,6 +732,34 @@ struct Lowerer {
                 // own block, branches to the join, and the phi at the join
                 // takes the two incoming values keyed by their predecessor
                 // blocks.
+                //
+                // INVARIANT (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): a phi of
+                // an AGGREGATE type is forbidden — the aggregate model is
+                // MEMORY-based (no LIR aggregate-width SSA value, and a bit-field
+                // packs only by read-modify-write into its allocation unit). An
+                // aggregate-typed ternary is therefore NEVER lowered as a bare
+                // rvalue here; every consumer reaches it by ADDRESS via
+                // lowerLvalueAddress's Ternary arm (a CFG diamond into ONE common
+                // slot — no phi), and the discard position routes through it too
+                // (the ExprStmt chokepoint). Reaching here with an aggregate type
+                // means a NEW consumer lowered an aggregate ternary by value
+                // instead of by address — fail loud rather than silently
+                // synthesizing a phi-of-aggregate (plus aggregate-width arm
+                // Loads) that flows to LIR as a latent miscompile.
+                if (t.valid()) {
+                    TypeKind const tk = interner.kind(t);
+                    if (tk == TypeKind::Struct || tk == TypeKind::Union
+                        || tk == TypeKind::Array) {
+                        unsupported(node,
+                            "internal: an aggregate-typed ternary must be lowered "
+                            "into a slot by ADDRESS (lowerLvalueAddress — a CFG "
+                            "diamond into one common slot), never as a bare SSA "
+                            "rvalue — the MIR has no aggregate-width value and a "
+                            "phi-of-aggregate cannot pack bit-fields "
+                            "(D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR)");
+                        return InvalidMirInst;
+                    }
+                }
                 auto kids = hir.children(node);
                 if (kids.size() != 3) {
                     unsupported(node, "malformed Ternary (expect 3 children)");
@@ -1026,6 +1054,27 @@ struct Lowerer {
                 // Lower the side-effect statements in order, then lower the
                 // result expression. The result's value IS the SeqExpr's
                 // value; the typeId on the SeqExpr equals the result's type.
+                //
+                // INVARIANT (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): an
+                // aggregate-typed comma/SeqExpr has no SSA rvalue (memory-based
+                // model) — its consumers reach it by ADDRESS via
+                // lowerLvalueAddress's SeqExpr arm (run the side effects, then
+                // recurse to the result's lvalue), and the discard position
+                // routes through it too. Reaching here with an aggregate type is
+                // a misroute — fail loud rather than running the side effects and
+                // then producing an aggregate-width rvalue of the result.
+                if (t.valid()) {
+                    TypeKind const tk = interner.kind(t);
+                    if (tk == TypeKind::Struct || tk == TypeKind::Union
+                        || tk == TypeKind::Array) {
+                        unsupported(node,
+                            "internal: an aggregate-typed comma/SeqExpr must be "
+                            "lowered by ADDRESS (lowerLvalueAddress), never as a "
+                            "bare SSA rvalue (D-CSUBSET-AGGREGATE-VALUED-CONTROL-"
+                            "EXPR)");
+                        return InvalidMirInst;
+                    }
+                }
                 for (HirNodeId stmt : hir.seqExprStmts(node)) {
                     if (!lowerStmt(stmt)) return InvalidMirInst;
                 }
@@ -1512,18 +1561,135 @@ struct Lowerer {
             // violation (the brace-init target-type check rejects scalar
             // targets) — fall through to the fail-loud.
         }
-        // D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR (registered, normal priority):
-        // an AGGREGATE-typed Ternary (`cond ? (struct S){..} : (struct S){..}`)
-        // or comma/SeqExpr rvalue is a DIFFERENT carrier — each arm must be
-        // materialized into a COMMON slot under control flow, not a single
-        // compound-literal slot — so it is NOT handled by the arm above and
-        // stays fail-loud here until that anchor is built.
+        if (k == HirKind::Ternary) {
+            // D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR: an AGGREGATE-typed
+            // ternary `cond ? A : B` (A/B aggregate rvalues — compound
+            // literals, named lvalues, calls, or nested ternaries) used BY
+            // VALUE. Unlike the compound-literal arm above (one slot inited in
+            // place), the VALUE is control-flow-dependent — so we materialize
+            // each arm into ONE COMMON slot under a CFG diamond and return the
+            // slot. There is NO Phi of the aggregate: the compiler's aggregate
+            // model is memory-based (no LIR aggregate-width SSA value), so the
+            // "merge" is a shared memory location, not an SSA Phi (a scalar
+            // ternary in lowerExpr uses a Phi; an aggregate one cannot). Keys
+            // ONLY on HirKind + the type's kind (Struct/Union/Array) + the
+            // config-driven layout — no target/arch/format identity.
+            TypeId const at = hir.typeId(node);
+            TypeKind const ak = at.valid() ? interner.kind(at) : TypeKind::Void;
+            if (ak == TypeKind::Struct || ak == TypeKind::Union
+                || ak == TypeKind::Array) {
+                auto kids = hir.children(node);
+                if (kids.size() != 3) {
+                    unsupported(node, "malformed Ternary (expect 3 children)");
+                    return InvalidMirInst;
+                }
+                // The common result slot is allocated ONCE, BEFORE the branch,
+                // so both arms write the same storage and the join reads it.
+                MirInstId const slot = freshAggregateTemp(at);
+                if (!slot.valid()) {
+                    unsupported(node, "aggregate-valued ternary requires a "
+                                       "sizeable layout (un-sizeable type or the "
+                                       "target declared no aggregateLayout)");
+                    return InvalidMirInst;
+                }
+                MirInstId const cond = lowerExpr(kids[0]);
+                if (!cond.valid()) return InvalidMirInst;
+                // Mirror the scalar-ternary diamond's StructCfMarker usage
+                // (IfThen/IfElse/IfJoin) so the verifier's count-pairing
+                // invariant holds (markers pair by count, not edge polarity).
+                MirBlockId const thenBB =
+                    mir.createBlock(StructCfMarker::IfThen);
+                MirBlockId const elseBB =
+                    mir.createBlock(StructCfMarker::IfElse);
+                MirBlockId const joinBB =
+                    mir.createBlock(StructCfMarker::IfJoin);
+                mir.addCondBr(cond, thenBB, elseBB);
+
+                mir.beginBlock(thenBB);
+                if (!materializeAggregateArmIntoSlot(kids[1], slot, at)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(elseBB);
+                    sealCreatedAsUnreachable(joinBB);
+                    return InvalidMirInst;   // fail-loud already reported
+                }
+                mir.addBr(joinBB);
+
+                mir.beginBlock(elseBB);
+                if (!materializeAggregateArmIntoSlot(kids[2], slot, at)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(joinBB);
+                    return InvalidMirInst;   // fail-loud already reported
+                }
+                mir.addBr(joinBB);
+
+                // The slot IS the result — NO Phi, no SSA aggregate value. The
+                // by-value caller consumes the addr in the (now open) joinBB.
+                mir.beginBlock(joinBB);
+                return slot;
+            }
+            // A scalar-typed Ternary is not an lvalue → fall through to the
+            // fail-loud (a scalar ternary lowers as an rvalue via lowerExpr).
+        }
+        if (k == HirKind::SeqExpr) {
+            // D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR (comma operator): the
+            // VALUE of a comma/SeqExpr is its result expression's value; when
+            // that result is an aggregate used by value, its lvalue address is
+            // the result expression's lvalue address. Run the side-effect
+            // statements (exactly as the lowerExpr SeqExpr arm does), then
+            // recurse — the aggregate result reaches the compound-literal /
+            // ternary / named-lvalue arms. (A scalar SeqExpr is handled in
+            // lowerExpr; here we only need the aggregate-by-address path, but
+            // the recursion's own kind dispatch + fail-loud guards any
+            // non-lvalue result.)
+            for (HirNodeId stmt : hir.seqExprStmts(node)) {
+                if (!lowerStmt(stmt)) return InvalidMirInst;
+            }
+            return lowerLvalueAddress(hir.seqExprResult(node));
+        }
+        // Any OTHER lvalue kind is still unsupported — fail loud (the
+        // aggregate-valued Ternary/SeqExpr carriers above are
+        // D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR; the compound-literal carrier
+        // is the ConstructAggregate arm — D-CSUBSET-BITFIELD-RVALUE-RUNTIME).
         unsupported(node, std::format(
             "lvalue kind ordinal {} not supported by this lowering "
             "(only Ref-to-addressable-local, Deref, MemberAccess, Index, "
-            "compound-literal ConstructAggregate)",
+            "compound-literal ConstructAggregate, aggregate Ternary/SeqExpr)",
             static_cast<unsigned>(k)));
         return InvalidMirInst;
+    }
+
+    // D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR: materialize an aggregate ternary
+    // ARM (`armNode`, of the ternary's type `aggTy`) INTO the common result
+    // `slot`. A compound-literal arm is initialized in place (optimization: no
+    // intermediate slot + copy — the same per-field/per-unit init a named
+    // local's `= {…}` uses, which already routes a bit-field type through the
+    // per-allocation-unit packer, so a bit-field literal arm packs correctly).
+    // Any other aggregate arm (named lvalue, call, NESTED ternary, comma) is
+    // resolved to an ADDRESS via lowerLvalueAddress (recursion handles the
+    // nested cases) and COPIED into the slot — Struct/Union field/byte-wise,
+    // Array byte-wise (consistent with lowerArrayInitIntoSlot's element copy).
+    // Returns false (fail-loud already reported) on any failure.
+    [[nodiscard]] bool materializeAggregateArmIntoSlot(HirNodeId armNode,
+                                                       MirInstId slot,
+                                                       TypeId aggTy) {
+        TypeKind const ak = interner.kind(aggTy);
+        if (hir.kind(armNode) == HirKind::ConstructAggregate) {
+            return (ak == TypeKind::Array)
+                ? lowerArrayInitIntoSlot(armNode, slot, aggTy)
+                : lowerAggregateInitIntoSlot(armNode, slot, aggTy);
+        }
+        MirInstId const srcPtr = lowerLvalueAddress(armNode);
+        if (!srcPtr.valid()) return false;
+        if (ak == TypeKind::Array) {
+            auto const sz = aggregateByteSize(aggTy);
+            if (!sz.has_value()) {
+                unsupported(armNode, "aggregate-valued ternary array arm "
+                                      "requires a sizeable layout");
+                return false;
+            }
+            return lowerByteWiseCopy(srcPtr, slot, *sz);
+        }
+        return lowerAggregateCopy(armNode, srcPtr, slot, aggTy);
     }
 
     // Emit a 32-bit integer constant for use as a GEP index operand or
@@ -2456,17 +2622,26 @@ struct Lowerer {
             case HirKind::ExprStmt: {
                 // Discard the value; emit for side effects.
                 HirNodeId const expr = hir.exprStmtExpr(node);
-                // An aggregate compound literal used as a DISCARDED statement
-                // (`(struct S){f(),g()};`) has no SSA rvalue under the memory-
-                // based aggregate model — materialize it into a throwaway slot
-                // (running its operand side effects), then drop the address.
-                // This completes the by-value aggregate-rvalue carrier across
-                // the discard position (D-CSUBSET-BITFIELD-RVALUE-RUNTIME) and
-                // keeps lowerExpr's anti-resurrection guard intact for genuine
-                // internal misrouting (which is then truly unreachable from
-                // user code).
-                if (hir.kind(expr) == HirKind::ConstructAggregate) {
-                    TypeKind const ek = interner.kind(hir.typeId(expr));
+                // An AGGREGATE-typed expression used as a DISCARDED statement —
+                // a compound literal (`(struct S){f(),g()};`), an aggregate
+                // ternary (`(cond ? a : b);`), a comma/SeqExpr (`(f(), s);`), a
+                // struct-returning call (`g();`), or a bare aggregate lvalue —
+                // has NO SSA rvalue under the memory-based aggregate model (no
+                // aggregate-width value to produce-and-drop). Route EVERY
+                // aggregate-typed discard through ONE chokepoint —
+                // lowerLvalueAddress — so coverage is by construction (no
+                // per-kind miss): it materializes the value into a slot, running
+                // all operand/arm side effects, and yields an address we drop.
+                // This completes the by-value aggregate-rvalue carriers across
+                // the discard position — the compound-literal slot (D-CSUBSET-
+                // BITFIELD-RVALUE-RUNTIME) AND the aggregate Ternary / comma-
+                // SeqExpr control-expr carrier (D-CSUBSET-AGGREGATE-VALUED-
+                // CONTROL-EXPR) — and keeps lowerExpr's per-kind anti-
+                // resurrection fail-louds (ConstructAggregate / Ternary /
+                // SeqExpr) reachable ONLY by genuine internal misrouting (truly
+                // unreachable from user code).
+                if (TypeId const et = hir.typeId(expr); et.valid()) {
+                    TypeKind const ek = interner.kind(et);
                     if (ek == TypeKind::Struct || ek == TypeKind::Union
                         || ek == TypeKind::Array) {
                         return lowerLvalueAddress(expr).valid();

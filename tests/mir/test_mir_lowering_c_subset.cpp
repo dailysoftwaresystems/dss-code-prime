@@ -3645,3 +3645,259 @@ TEST(MirLoweringCSubset, Aapcs64StructSretUsesReadIndirectResultAndFlagsCall) {
         << "the x8-sret callee must NOT also consume a hidden GPR Arg for the sret "
            "pointer (that is the SysV/Win64 path; x8-sret uses ReadIndirectResult)";
 }
+
+// ─── D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR (FC8 SUBSTRATE) ──────────────────
+// An AGGREGATE-typed ternary / comma-SeqExpr used BY VALUE materializes each
+// control-flow arm into ONE COMMON result slot under a CFG diamond — the
+// memory-based aggregate model, NOT an SSA Phi-of-aggregate. These pins assert
+// the diamond + the common slot + the no-Phi-of-aggregate invariant (and the
+// bit-field arm's per-unit packing through the slot). They WALK ALL BLOCKS of
+// the function (the diamond spreads the arm stores across the then/else
+// blocks), unlike the entry-only `funcEntryOpcodes` helper.
+
+namespace {
+// Count `op` across EVERY block of function `fi` (the aggregate-ternary diamond
+// places per-arm stores in the then/else blocks, not the entry).
+[[nodiscard]] std::size_t countOpcodeAllBlocks(Mir const& m, std::uint32_t fi,
+                                               MirOpcode op) {
+    std::size_t n = 0;
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i)
+            if (m.instOpcode(m.blockInstAt(blk, i)) == op) ++n;
+    }
+    return n;
+}
+// The function index that CALLs another function (main/the by-value consumer's
+// caller — where the aggregate ternary/comma carrier lives).
+[[nodiscard]] std::uint32_t funcWithCall(Mir const& m) {
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi)
+        if (countOpcodeAllBlocks(m, fi, MirOpcode::Call) > 0) return fi;
+    return 0;
+}
+// True iff ANY instruction in function `fi` is a Phi whose RESULT type is an
+// aggregate (Struct/Union/Array). The memory-based model forbids this — the
+// aggregate "merge" of a ternary is a shared SLOT, never an SSA Phi.
+[[nodiscard]] bool hasAggregatePhi(Mir const& m, TypeInterner const& interner,
+                                   std::uint32_t fi) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Phi) continue;
+            TypeId const t = m.instType(ix);
+            if (!t.valid()) continue;
+            TypeKind const k = interner.kind(t);
+            if (k == TypeKind::Struct || k == TypeKind::Union
+                || k == TypeKind::Array)
+                return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+// CORE PIN: a by-value NON-bit-field aggregate ternary `take(cond ? A : B)`
+// lowers with (a) a CondBr diamond (the control-flow-dependent value); (b) a
+// COMMON result slot (Alloca) — allocated ONCE before the branch, written by
+// BOTH arms; (c) per-arm Stores into that slot (the arm materialization); (d)
+// InsertValue == 0 (memory-based, no SSA-aggregate chain); (e) NO Phi whose
+// type is the aggregate (the slot IS the merge, not a Phi). RED-ON-DISABLE:
+// revert the lowerLvalueAddress Ternary arm → the by-value arg fail-louds H0009
+// (ordinal 33) and `mir.ok` goes false (and the diamond/slot signatures vanish).
+TEST(MirLoweringCSubset, ByValueAggregateTernaryMaterializesCommonSlotUnderDiamond) {
+    // `pick` is a runtime PARAMETER (keeps the condition runtime so neither arm
+    // folds away — c-subset has no bare prototypes; a param is the clean lever).
+    auto L = lowerCSubset(
+        "struct P { int a; int b; };\n"
+        "int take(struct P p) { return p.a + p.b; }\n"
+        "int run(int pick, int a) {\n"
+        "  return take(pick ? (struct P){a, 2} : (struct P){a, 3});\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a by-value aggregate ternary must lower via a common slot under a "
+           "diamond (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    std::uint32_t const fi = funcWithCall(m);
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 1u)
+        << "the aggregate ternary lowers as a CONTROL-FLOW diamond (CondBr)";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
+        << "memory-based aggregate model — never an SSA-aggregate InsertValue chain";
+    EXPECT_FALSE(hasAggregatePhi(m, interner, fi))
+        << "the arms merge into a COMMON SLOT — there must be NO Phi whose type "
+           "is the aggregate (Struct/Union/Array)";
+    // The common result slot + the by-value arg's eightbyte temp are both
+    // Allocas; the slot init + each arm's stores into it give >= 2 Stores total
+    // (one per arm's 2 fields, across the then/else blocks). The diamond's two
+    // arms each store the literal's fields into the SAME slot.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Alloca), 1u)
+        << "a common result slot is synthesized for the aggregate ternary";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Store), 2u)
+        << "each arm materializes the aggregate into the common slot (per-field "
+           "Stores across the then/else blocks)";
+}
+
+// BIT-FIELD ARM PIN: a by-value BIT-FIELD aggregate ternary packs per allocation
+// unit THROUGH the common slot under the diamond — each arm's slot init routes
+// to lowerBitfieldAggregateInitIntoSlot (And/Or/Shl RMW packing), proving the
+// per-unit packing flows through the diamond-materialized slot (not a plain
+// per-field store that would clobber a shared-unit neighbour). RED-ON-DISABLE:
+// revert the Ternary arm → H0009 ordinal 33; revert the per-unit packing → the
+// And/Or/Shl signature disappears.
+TEST(MirLoweringCSubset, ByValueBitfieldAggregateTernaryPacksPerUnitUnderDiamond) {
+    auto L = lowerCSubset(
+        "struct B { unsigned a : 3; unsigned b : 5; };\n"
+        "int take(struct B v) { return (int)v.a + (int)v.b; }\n"
+        "int run(int pick, int a) {\n"
+        "  return take(pick ? (struct B){a, 20} : (struct B){a, 7});\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a by-value bit-field aggregate ternary must lower with per-unit "
+           "packing through a common slot under a diamond "
+           "(D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    std::uint32_t const fi = funcWithCall(m);
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 1u)
+        << "the bit-field aggregate ternary lowers as a control-flow diamond";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
+        << "memory-based — no SSA-aggregate chain";
+    EXPECT_FALSE(hasAggregatePhi(m, interner, fi))
+        << "no Phi of the aggregate — the arms merge into a common slot";
+    // a + b share unit 0; b is at bitOffset 3. Each arm packs via RMW (And to
+    // clear + And to mask + Shl + Or). Two arms → at least one Shl + several
+    // And/Or. A plain full-width per-field store would emit neither.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Or), 2u)
+        << "each bit-field arm ORs its packed value into the unit";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Shl), 1u)
+        << "field b at bitOffset 3 is shifted before OR (per-unit packing)";
+}
+
+// SeqExpr (comma) PIN: a comma/SeqExpr whose VALUE is an aggregate rvalue used
+// BY VALUE lowers — the side-effect statement runs (here a Call), then the
+// aggregate result recurses to its lvalue (the compound-literal slot). No fail-
+// loud, no Phi of aggregate. RED-ON-DISABLE: revert the lowerLvalueAddress
+// SeqExpr arm → the by-value arg fail-louds H0009 (ordinal 39) → mir.ok false.
+TEST(MirLoweringCSubset, AggregateSeqExprByValueLowersWithSideEffectAndSlot) {
+    auto L = lowerCSubset(
+        "struct P { int a; int b; };\n"
+        "int side(void) { return 7; }\n"
+        "int take(struct P p) { return p.a + p.b; }\n"
+        "int main(void) {\n"
+        "  int a = 40;\n"
+        "  return take((side(), (struct P){a, 2}));\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a by-value aggregate comma/SeqExpr rvalue must lower (side effect "
+           "runs, result recurses to its slot) "
+           "(D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    std::uint32_t const fi = funcWithCall(m);
+    // The side() call (side effect) AND the take() call both lower → >= 2 Calls.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Call), 2u)
+        << "the comma side-effect call must run, plus the by-value consumer call";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Alloca), 1u)
+        << "the aggregate result's compound-literal slot is synthesized";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
+        << "memory-based — no SSA-aggregate chain";
+    EXPECT_FALSE(hasAggregatePhi(m, interner, fi))
+        << "a comma aggregate rvalue is not a Phi-of-aggregate";
+}
+
+// COPY-PATH PIN: a by-value aggregate ternary whose ARMS are NAMED LVALUES (not
+// compound literals) exercises materializeAggregateArmIntoSlot's COPY branch
+// (lowerLvalueAddress(arm) + lowerAggregateCopy into the common slot) — distinct
+// from the in-place compound-literal init the pins above cover. Still a CFG
+// diamond into ONE common slot, still NO Phi-of-aggregate. RED-ON-DISABLE: revert
+// the lowerLvalueAddress Ternary arm → the by-value arg fail-louds → mir.ok false.
+TEST(MirLoweringCSubset, ByValueAggregateTernaryNamedLvalueArmsCopyIntoCommonSlot) {
+    auto L = lowerCSubset(
+        "struct P { int a; int b; };\n"
+        "int take(struct P p) { return p.a + p.b; }\n"
+        "int run(int pick, int a) {\n"
+        "  struct P s1 = {a, 2};\n"
+        "  struct P s2 = {a, 3};\n"
+        "  return take(pick ? s1 : s2);\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a by-value aggregate ternary with NAMED-LVALUE arms must lower via a "
+           "common slot under a diamond (the copy-path) "
+           "(D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    std::uint32_t const fi = funcWithCall(m);
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 1u)
+        << "a named-arm aggregate ternary still lowers as a control-flow diamond";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
+        << "memory-based — no SSA-aggregate chain";
+    EXPECT_FALSE(hasAggregatePhi(m, interner, fi))
+        << "the named arms are COPIED into a common slot — no Phi of the aggregate";
+    // Each arm copies a named local into the common slot (lowerAggregateCopy,
+    // field-wise for a flat scalar struct) → per-field Stores across the
+    // then/else blocks (on top of the two VarDecl inits before the branch).
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Store), 2u)
+        << "each arm copies its named local into the common result slot";
+}
+
+// DISCARD-POSITION PIN (gate-discovered silent-miscompile seal): a DISCARDED
+// aggregate ternary with NAMED-LVALUE arms (`(cond ? s1 : s2);` as a bare
+// statement) must route through the ExprStmt aggregate chokepoint →
+// lowerLvalueAddress's Ternary arm (a diamond into a throwaway slot, side effects
+// run, address dropped) — NOT through lowerExpr, which would silently synthesize a
+// phi-of-aggregate + aggregate-width arm Loads (the latent miscompile this seals).
+// RED-ON-DISABLE: revert the ExprStmt aggregate chokepoint → falls to lowerExpr's
+// Ternary arm → its anti-resurrection guard fail-louds → mir.ok false; revert that
+// guard TOO → hasAggregatePhi becomes true (the forbidden phi-of-aggregate appears).
+TEST(MirLoweringCSubset, DiscardedAggregateTernaryNamedArmsRoutesThroughSlotNoPhi) {
+    auto L = lowerCSubset(
+        "struct P { int a; int b; };\n"
+        "int sink(int x) { return x; }\n"
+        "int run(int pick, int a) {\n"
+        "  struct P s1 = {a, 2};\n"
+        "  struct P s2 = {a, 3};\n"
+        "  (pick ? s1 : s2);\n"
+        "  return sink(a);\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a discarded aggregate ternary must route through the slot carrier, not "
+           "a phi-of-aggregate (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    std::uint32_t const fi = funcWithCall(m);
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 1u)
+        << "the discarded aggregate ternary still lowers as a control-flow diamond";
+    EXPECT_FALSE(hasAggregatePhi(m, interner, fi))
+        << "the discard routes through a slot — NEVER a phi-of-aggregate (the "
+           "silent miscompile this seals)";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
+        << "memory-based — no SSA-aggregate chain";
+}
