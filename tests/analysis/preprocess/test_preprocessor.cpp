@@ -269,6 +269,120 @@ TEST(Preprocessor, RecursiveFunctionLikeMacroFreezes) {
     EXPECT_EQ(lexs[7], ";");
 }
 
+// ============================================================================
+// FC13 cycle 4 (D-PP-MACRO-HIDESET-PRECISE): the precise per-token hide set
+// (Prosser, C 6.10.3.4). The cycle-2/3 engine used a recursion-scoped blue-paint
+// set, which FROZE a function-like name whose `(` lived in the PARENT stream
+// (the paint had already popped when the rescan returned to the parent). The
+// precise hide set carries the disabled-name set PER TOKEN through the produced
+// stream, so a name and a `(` that become adjacent only ACROSS the
+// replacement/parent boundary now RE-PAIR and expand.
+//
+// FLIP 1: `#define A(x) x` + `#define F(x) ((x)+100)` + `A(F)(3)`.
+//   A(F) -> `F` (hide {A}); the trailing `(3)` is in the PARENT stream (empty
+//   hide). F ∉ hide(F-token) -> F expands with the parent's `(3)` -> ((3)+100).
+// Previously this emitted the literal `F ( 3 )` (a downstream parser error).
+// RED-ON-DISABLE: the recursion-scoped paint (or dropping the splice-rescan)
+// leaves `F ( 3 )` and the exact-token check fails.
+TEST(Preprocessor, HideSetCrossBoundaryFunctionNameThenParenExpands) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define A(x) x\n#define F(x) ((x)+100)\nint v = A(F)(3);\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "the cross-boundary re-pairing must expand cleanly (no parser-bound "
+           "literal F)";
+    // int v = ( ( 3 ) + 100 ) ;
+    ASSERT_EQ(lexs.size(), 11u) << "expected: int v = ( ( 3 ) + 100 ) ;";
+    EXPECT_EQ(lexs[0], "int");
+    EXPECT_EQ(lexs[1], "v");
+    EXPECT_EQ(lexs[2], "=");
+    EXPECT_EQ(lexs[3], "(");
+    EXPECT_EQ(lexs[4], "(");
+    EXPECT_EQ(lexs[5], "3") << "A(F)(3): F re-pairs with the parent's (3)";
+    EXPECT_EQ(lexs[6], ")");
+    EXPECT_EQ(lexs[7], "+");
+    EXPECT_EQ(lexs[8], "100");
+    EXPECT_EQ(lexs[9], ")");
+    EXPECT_EQ(lexs[10], ";");
+}
+
+// FLIP 2: `#define NAME SQ` + `#define SQ(x) ((x)*(x))` + `NAME(4)`.
+//   NAME -> `SQ` (hide {NAME}); SQ ∉ hide -> SQ re-scans to collect the
+//   parent's `(4)` -> ((4)*(4)). Previously NAME froze to a bare `SQ` (the
+//   object expansion did not re-pair with `(4)`).
+// RED-ON-DISABLE: the recursion-scoped paint leaves a bare `SQ ( 4 )`.
+TEST(Preprocessor, HideSetObjectMacroNamingFunctionMacroExpands) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define NAME SQ\n#define SQ(x) ((x)*(x))\nint v = NAME(4);\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "NAME(4) must re-pair the object-expanded SQ with the parent's (4)";
+    // int v = ( ( 4 ) * ( 4 ) ) ;
+    ASSERT_EQ(lexs.size(), 13u) << "expected: int v = ( ( 4 ) * ( 4 ) ) ;";
+    const char* want[] = {"int","v","=",
+        "(","(","4",")","*","(","4",")",")",";"};
+    for (std::size_t i = 0; i < lexs.size(); ++i) {
+        EXPECT_EQ(lexs[i], want[i]) << "token index " << i;
+    }
+    EXPECT_EQ(lexs[5], "4") << "the object macro NAME -> SQ then collects (4)";
+}
+
+// PRESERVED FREEZE 1: direct object self-reference `#define X X` + `X` stays
+// `X` (M ∈ its own result's hide set). The precise hide set must keep this
+// frozen exactly as the blue-paint did. RED-ON-DISABLE: omitting the invoked
+// macro from the replacement's hide set re-expands X forever (backstop) /
+// changes the output.
+TEST(Preprocessor, HideSetDirectObjectSelfReferenceFreezes) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define X X\nint v = X;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int v = X ;";
+    EXPECT_EQ(lexs[3], "X") << "a direct object self-reference freezes to X";
+}
+
+// PRESERVED FREEZE 2: direct function-like self-reference `#define F(x) F(x)` +
+// `F(1)` stays `F ( 1 )`. The Prosser function-like rule HS' =
+// (hide(name) ∩ hide(close)) ∪ {F}: the rescanned inner `F` AND its `)` both
+// carry {F} (they came from the SAME substitution), so the intersection keeps
+// {F} and the inner F stays frozen. RED-ON-DISABLE: breaking the intersection
+// (e.g. using union, or dropping {F}) either re-expands forever or mis-freezes.
+TEST(Preprocessor, HideSetDirectFunctionSelfReferenceFreezes) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define F(x) F(x)\nint v = F(1);\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int v = F ( 1 ) ;
+    ASSERT_EQ(lexs.size(), 8u) << "expected: int v = F ( 1 ) ;";
+    EXPECT_EQ(lexs[3], "F") << "the self-referential call freezes to its name";
+    EXPECT_EQ(lexs[4], "(");
+    EXPECT_EQ(lexs[5], "1");
+    EXPECT_EQ(lexs[6], ")");
+    EXPECT_EQ(lexs[7], ";");
+}
+
+// PRESERVED FREEZE 3: MUTUAL recursion terminates. `#define P(x) Q(x)` +
+// `#define Q(x) P(x)` + `P(1)`: P(1) -> Q(1) [hide {P}] -> P(1) [hide {P,Q}]
+// -> P ∈ hide -> frozen `P ( 1 )`. The hide set must terminate the cycle (it
+// accretes both names across the two substitutions). RED-ON-DISABLE: a wrong
+// hide-set propagation (not carrying {P} into Q's result) loops to the backstop.
+TEST(Preprocessor, HideSetMutualFunctionRecursionTerminates) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#define P(x) Q(x)\n#define Q(x) P(x)\nint v = P(1);\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "mutual recursion must terminate (no backstop diagnostic)";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "the hide set must bound the P<->Q cycle without the backstop";
+    // int v = P ( 1 ) ;  (or Q(1) -- both are valid frozen forms; C freezes at
+    // the first name that re-enters its own hide set, here P).
+    ASSERT_EQ(lexs.size(), 8u) << "expected: int v = P ( 1 ) ;";
+    EXPECT_TRUE(lexs[3] == "P" || lexs[3] == "Q")
+        << "the mutual cycle freezes to one of the two names";
+    EXPECT_EQ(lexs[4], "(");
+    EXPECT_EQ(lexs[5], "1");
+    EXPECT_EQ(lexs[6], ")");
+    EXPECT_EQ(lexs[7], ";");
+}
+
 // EMPTY argument + ZERO-parameter `()`. A zero-parameter macro M invoked as
 // `M()` collects ZERO arguments (arity 0 == 0, OK). A one-parameter macro G
 // invoked as `G()` collects ONE empty argument, expanding to nothing.
@@ -854,17 +968,19 @@ TEST(Preprocessor, VaArgsNameIsConfigDrivenNotHardcoded) {
     }
 }
 
-// FOLD 3 (RED-on-disable): the pathological-recursion backstop (>256 expansion
-// nesting) FAILS LOUD with a positioned `P_PreprocessorUnsupported` diagnostic
-// instead of silently returning the input verbatim (which previously truncated
-// a deep chain silently, then failed downstream at the parser). We construct a
-// 300-deep object-macro chain (`M0`->`M1`->...->`M300`->0) whose rescan depth
-// exceeds the backstop, and assert the diagnostic is emitted at the PP.
-// RED-ON-DISABLE: removing the emitPP at the backstop makes the deep chain
-// truncate silently with NO P_Preprocessor* diagnostic -> this test fails.
-TEST(Preprocessor, DeepMacroExpansionFailsLoudNotSilent) {
+// FC13 cycle 4 (D-PP-MACRO-HIDESET-PRECISE) -- FLIP of the cycle-2/3
+// `DeepMacroExpansionFailsLoudNotSilent` premise. Under the PRECISE per-token
+// hide set a finite object-macro CHAIN (`M0`->`M1`->...->`M300`->0) expands
+// ITERATIVELY in a single frame (each step splices its replacement back over the
+// cursor and rescans; the recursion `depth` stays flat), so it now TERMINATES
+// CORRECTLY to `0` instead of tripping the >256 recursion backstop. The old
+// fail-loud here was an artifact of the cycle-2 recursive engine (depth ==
+// chain length); a 300-long finite chain is valid C and must expand. RED-ON-
+// DISABLE: reverting to the recursion-scoped engine (depth tracks chain length)
+// re-trips the backstop and leaves `M0` (or a diagnostic) instead of `0`.
+TEST(Preprocessor, DeepFiniteMacroChainExpandsToValue) {
     std::string src;
-    const int chain = 300;  // > the 256 backstop, so the rescan tops out
+    const int chain = 300;  // would have exceeded the old 256 recursion backstop
     for (int n = 0; n < chain; ++n) {
         src += "#define M" + std::to_string(n) + " M" + std::to_string(n + 1)
              + "\n";
@@ -874,10 +990,42 @@ TEST(Preprocessor, DeepMacroExpansionFailsLoudNotSilent) {
 
     PreprocessResult r;
     auto lexs = ppLexemes(src, r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a finite macro chain is valid C and must expand, not fail loud";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "the recursion backstop must NOT fire on a finite (terminating) chain";
+    // int v = 0 ;
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int v = 0 ;";
+    EXPECT_EQ(lexs[0], "int");
+    EXPECT_EQ(lexs[1], "v");
+    EXPECT_EQ(lexs[2], "=");
+    EXPECT_EQ(lexs[3], "0")
+        << "M0 -> M1 -> ... -> M300 -> 0 expands fully under the hide set";
+    EXPECT_EQ(lexs[4], ";");
+}
+
+// FC13 cycle 4: the pathological-NESTING backstop still FAILS LOUD with a
+// positioned `P_PreprocessorUnsupported` diagnostic instead of silently
+// truncating. Under the precise hide set the construct that genuinely recurses
+// is NESTING (argument pre-expansion `expand(arg, depth+1)`), so we nest a
+// function-like call `F(F(F(...F(0)...)))` deeper than the 256 backstop. Each
+// nesting level pre-expands its argument one frame deeper, so the >256 guard
+// trips. RED-ON-DISABLE: removing the emitPP at the backstop makes the deep nest
+// truncate silently with NO P_Preprocessor* diagnostic -> this test fails.
+TEST(Preprocessor, DeepNestedMacroArgumentFailsLoudNotSilent) {
+    const int nest = 300;  // > the 256 nesting backstop
+    std::string src = "#define F(x) (x)\nint v = ";
+    for (int n = 0; n < nest; ++n) src += "F(";
+    src += "0";
+    for (int n = 0; n < nest; ++n) src += ")";
+    src += ";\n";
+
+    PreprocessResult r;
+    auto lexs = ppLexemes(src, r);
     (void)lexs;
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
-        << "a macro-expansion chain deeper than the backstop must fail LOUD at "
-           "the preprocessor (positioned diagnostic), never truncate silently";
+        << "a macro-argument nest deeper than the backstop must fail LOUD at the "
+           "preprocessor (positioned diagnostic), never truncate silently";
 }
 
 // LINE-MAP HEADER ATTRIBUTION: a diagnostic that originates in an included

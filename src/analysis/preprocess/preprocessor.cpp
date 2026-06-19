@@ -6,7 +6,10 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
+#include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -331,6 +334,59 @@ struct SynthBuilder {
     }
 };
 
+// FC13 cycle 4 (D-PP-MACRO-HIDESET-PRECISE): the precise per-token HIDE SET
+// (Prosser's realization of C 6.10.3.4). `Token` is a 16B trivially-copyable POD
+// that cannot itself carry a set, so the macro-expansion WORKING set is a wrapper
+// pairing each token with the set of macro names that must NOT be expanded for
+// THAT token. The hide set PERSISTS through the produced stream (per-token),
+// rather than being scoped to the recursion that produced it -- which is exactly
+// what lets a function-like name and its `(` re-pair when they become adjacent
+// only ACROSS the boundary between a just-expanded replacement and the
+// surrounding parent stream (`A(F)(3)`, `NAME(4)`).
+//
+// Representation: a `shared_ptr<const set<string>>`. The set is IMMUTABLE once
+// built, so copies are a refcount bump (every token in one replacement shares
+// the SAME set object); union/intersect allocate a fresh set only when they
+// actually change the contents. A null pointer is the canonical EMPTY hide set
+// (the common case -- most tokens are hidden by nothing), so the parser-bound
+// body lifts in with `nullptr` and pays no allocation. `std::set` (ordered)
+// makes the hot intersection/union a linear merge.
+using HideSet = std::shared_ptr<std::set<std::string> const>;
+
+struct ExpToken {
+    Token   tok;
+    HideSet hide;  // null == empty
+};
+
+// M is hidden for this token iff M is a member of its hide set.
+inline bool hideContains(HideSet const& hs, std::string const& name) {
+    return hs && hs->count(name) != 0;
+}
+
+// hs ∪ {name}. Returns a set that CONTAINS every element of `hs` plus `name`.
+// Reuses `hs` unchanged when `name` is already present (no allocation).
+inline HideSet hideAdd(HideSet const& hs, std::string const& name) {
+    if (hideContains(hs, name)) return hs;
+    auto next = std::make_shared<std::set<std::string>>();
+    if (hs) *next = *hs;
+    next->insert(name);
+    return next;
+}
+
+// a ∩ b. The Prosser function-like rule intersects the macro NAME's hide set
+// with the CLOSING paren's before adding the invoked macro. An empty operand
+// yields the empty set (null). Reuses an operand verbatim when it is a subset of
+// the other (a very common case: the close paren came from the same stream as
+// the name, so one hide set contains the other) to avoid an allocation.
+inline HideSet hideIntersect(HideSet const& a, HideSet const& b) {
+    if (!a || a->empty() || !b || b->empty()) return nullptr;
+    auto out = std::make_shared<std::set<std::string>>();
+    std::set_intersection(a->begin(), a->end(), b->begin(), b->end(),
+                          std::inserter(*out, out->end()));
+    if (out->empty()) return nullptr;
+    return out;
+}
+
 struct MacroDef {
     std::vector<Token>       replacement;
     std::string              text;
@@ -402,9 +458,19 @@ public:
             ++i;
         }
         // Stream-expand the whole directive-stripped body uniformly (object-
-        // AND function-like macros share one cursor-walking engine).
-        std::unordered_set<std::string> painting;
-        return expand(body, painting, 0);
+        // AND function-like macros share one cursor-walking engine). Lift the
+        // plain tokens into the ExpToken working set (every token starts with an
+        // EMPTY hide set), run the precise per-token hide-set expander
+        // (Prosser's realization of C 6.10.3.4 -- see `expand`), then DROP the
+        // hide sets back to the plain Token stream the parser consumes.
+        std::vector<ExpToken> work;
+        work.reserve(body.size());
+        for (Token const& t : body) work.push_back(ExpToken{t, nullptr});
+        std::vector<ExpToken> expanded = expand(std::move(work), 0);
+        std::vector<Token> out;
+        out.reserve(expanded.size());
+        for (ExpToken const& et : expanded) out.push_back(et.tok);
+        return out;
     }
 
 private:
@@ -691,23 +757,26 @@ private:
     // newlines (`FOO\n(1)` is a valid call: once the directive line itself is
     // stripped, C 6.10.3p10/p11 treat the name and the `(` as adjacent across
     // white space, including line breaks). Returns in.size() if none.
-    static std::size_t nextSignificant(std::span<Token const> in,
+    static std::size_t nextSignificant(std::span<ExpToken const> in,
                                        std::size_t from) {
         std::size_t j = from;
-        while (j < in.size() && (isTrivia(in[j]) || isNewline(in[j]))) ++j;
+        while (j < in.size()
+               && (isTrivia(in[j].tok) || isNewline(in[j].tok))) ++j;
         return j;
     }
 
     // Trim leading + trailing whitespace-trivia (incl. newlines/comments) from
     // an argument token run, in place. Interior trivia is PRESERVED (an
     // argument may legitimately contain spaces, e.g. `a + b`).
-    static void trimArgTrivia(std::vector<Token>& arg) {
+    static void trimArgTrivia(std::vector<ExpToken>& arg) {
         std::size_t a = 0, b = arg.size();
-        while (a < b && (isTrivia(arg[a]) || isNewline(arg[a]))) ++a;
-        while (b > a && (isTrivia(arg[b - 1]) || isNewline(arg[b - 1]))) --b;
+        while (a < b && (isTrivia(arg[a].tok) || isNewline(arg[a].tok))) ++a;
+        while (b > a
+               && (isTrivia(arg[b - 1].tok) || isNewline(arg[b - 1].tok))) --b;
         if (a != 0 || b != arg.size()) {
-            arg = std::vector<Token>(arg.begin() + static_cast<std::ptrdiff_t>(a),
-                                     arg.begin() + static_cast<std::ptrdiff_t>(b));
+            arg = std::vector<ExpToken>(
+                arg.begin() + static_cast<std::ptrdiff_t>(a),
+                arg.begin() + static_cast<std::ptrdiff_t>(b));
         }
     }
 
@@ -715,45 +784,49 @@ private:
     // invocation `(`. Scans tracking PAREN DEPTH (only the configured open/close
     // paren affect depth): a depth-1 comma SEPARATES arguments; the matching
     // depth-0 close ENDS the list. Each argument preserves its interior tokens
-    // (nested parens/commas survive); leading/trailing trivia is trimmed. By the
-    // comma-separated-groups rule, `(x)` is ONE argument and `()` is ONE EMPTY
-    // argument; the special zero-PARAMETER case (`M()` for a 0-arg macro = zero
-    // arguments, C 6.10.3p4) is normalized by the CALLER (which knows
-    // params.size()). The depth-1 SEPARATOR tokens are also recorded into
+    // (nested parens/commas survive) AND their hide sets; leading/trailing trivia
+    // is trimmed. By the comma-separated-groups rule, `(x)` is ONE argument and
+    // `()` is ONE EMPTY argument; the special zero-PARAMETER case (`M()` for a
+    // 0-arg macro = zero arguments, C 6.10.3p4) is normalized by the CALLER (which
+    // knows params.size()). The depth-1 SEPARATOR tokens are also recorded into
     // `separators` (one per top-level comma -> `args.size()-1` entries): a
     // VARIADIC macro re-joins the trailing arguments with the ORIGINAL separator
     // tokens to form `__VA_ARGS__` (preserving the source commas, C 6.10.3p4),
-    // rather than synthesizing one. On success returns the arguments and sets
-    // `past` to the index JUST PAST the matching close. On EOF before the
-    // matching close, emits a fail-loud diagnostic and returns std::nullopt.
-    std::optional<std::vector<std::vector<Token>>>
-    collectArgs(std::span<Token const> in, std::size_t open,
+    // rather than synthesizing one. On success returns the arguments, sets `past`
+    // to the index JUST PAST the matching close, and copies the CLOSING paren's
+    // hide set into `closeHide` (the Prosser function-like rule intersects the
+    // macro NAME's hide set with the CLOSE paren's). On EOF before the matching
+    // close, emits a fail-loud diagnostic and returns std::nullopt.
+    std::optional<std::vector<std::vector<ExpToken>>>
+    collectArgs(std::span<ExpToken const> in, std::size_t open,
                 std::string const& macroName, std::size_t& past,
-                std::vector<Token>& separators) {
-        std::vector<std::vector<Token>> args;
-        std::vector<Token>              cur;
+                std::vector<ExpToken>& separators, HideSet& closeHide) {
+        std::vector<std::vector<ExpToken>> args;
+        std::vector<ExpToken>              cur;
         int depth = 1;                 // start just inside the opening `(`
         std::size_t j = open + 1;
         for (; j < in.size(); ++j) {
-            Token const& t = in[j];
-            if (isParenOpen(t)) {
+            ExpToken const& t = in[j];
+            if (isParenOpen(t.tok)) {
                 ++depth;
                 cur.push_back(t);
                 continue;
             }
-            if (isParenClose(t)) {
+            if (isParenClose(t.tok)) {
                 --depth;
                 if (depth == 0) {
-                    // End of list: flush the final (possibly empty) group.
+                    // End of list: flush the final (possibly empty) group and
+                    // surface the close paren's hide set for the Prosser rule.
                     trimArgTrivia(cur);
                     args.push_back(std::move(cur));
-                    past = j + 1;
+                    past      = j + 1;
+                    closeHide = t.hide;
                     return args;
                 }
                 cur.push_back(t);
                 continue;
             }
-            if (depth == 1 && isArgSeparator(t)) {
+            if (depth == 1 && isArgSeparator(t.tok)) {
                 // Top-level separator: close current argument, start the next.
                 // Record the separator token verbatim (the variadic catch-all
                 // re-joins trailing args with these ORIGINAL commas).
@@ -767,7 +840,7 @@ private:
         }
         // Ran off the end without the matching close -> unterminated.
         emitPP(rep_, DiagnosticCode::P_PreprocessorMacroArgument, synth_->id(),
-               (open < in.size() ? in[open].span : SourceSpan::empty(0)),
+               (open < in.size() ? in[open].tok.span : SourceSpan::empty(0)),
                std::string{"unterminated argument list for function-like "
                            "macro: "}
                    + macroName);
@@ -780,21 +853,37 @@ private:
     // a replacement `Word` whose text == the configured `variadicArgsName`
     // (`__VA_ARGS__`) is replaced by the PRE-EXPANDED, comma-joined trailing
     // arguments (`vaArgs`, possibly EMPTY -> substitutes to nothing, C23); every
-    // other replacement token passes through unchanged. No `#`/`##` handling
-    // (FC15). `expandedArgs[k]` is the fully-expanded argument for `params[k]`.
-    // The `__VA_ARGS__` check precedes the named-parameter scan, but they cannot
-    // collide -- `__VA_ARGS__` is not a valid parameter NAME (it is the catch-all
-    // identifier), and a non-variadic macro that mentions it was already rejected
-    // at definition time.
-    std::vector<Token> substitute(
+    // other replacement token passes through unchanged, stamped with `hs`. No
+    // `#`/`##` handling (FC15). `expandedArgs[k]` is the fully-expanded argument
+    // for `params[k]`.
+    //
+    // HIDE-SET stamping (Prosser, C 6.10.3.4): EVERY token of the substituted
+    // result carries `hs` = (hideset(name) ∩ hideset(close-paren)) ∪ {M}. A
+    // replacement token NOT from an argument is stamped with exactly `hs`. An
+    // argument's tokens already carry their OWN hide sets (accreted while the arg
+    // was pre-expanded in the caller's context); each is UNIONED with `hs` so the
+    // invoked macro (and the surviving intersection) is added without dropping
+    // what the argument expansion already hid. The `__VA_ARGS__` check precedes
+    // the named-parameter scan, but they cannot collide -- `__VA_ARGS__` is not a
+    // valid parameter NAME, and a non-variadic macro that mentions it was already
+    // rejected at definition time.
+    std::vector<ExpToken> substitute(
         MacroDef const& def,
-        std::vector<std::vector<Token>> const& expandedArgs,
-        std::vector<Token> const& vaArgs) {
-        std::vector<Token> outTokens;
+        std::vector<std::vector<ExpToken>> const& expandedArgs,
+        std::vector<ExpToken> const& vaArgs,
+        HideSet const& hs) {
+        std::vector<ExpToken> outTokens;
+        auto appendArg = [&](std::vector<ExpToken> const& a) {
+            for (ExpToken const& e : a) {
+                // An argument token already carries its own (accreted) hide set;
+                // UNION the invocation hide set `hs` on top.
+                outTokens.push_back(ExpToken{e.tok, hideUnionAll(e.hide, hs)});
+            }
+        };
         for (Token const& r : def.replacement) {
             if (def.isVariadic && isWord(r) && !cfg().variadicArgsName.empty()
                 && text(r) == cfg().variadicArgsName) {
-                outTokens.insert(outTokens.end(), vaArgs.begin(), vaArgs.end());
+                appendArg(vaArgs);
                 continue;
             }
             int paramIdx = -1;
@@ -808,71 +897,106 @@ private:
                 }
             }
             if (paramIdx >= 0) {
-                std::vector<Token> const& a =
-                    expandedArgs[static_cast<std::size_t>(paramIdx)];
-                outTokens.insert(outTokens.end(), a.begin(), a.end());
+                appendArg(expandedArgs[static_cast<std::size_t>(paramIdx)]);
             } else {
-                outTokens.push_back(r);
+                // A plain replacement token gets EXACTLY hs (it has no prior
+                // hide set of its own -- it comes straight from the #define).
+                outTokens.push_back(ExpToken{r, hs});
             }
         }
         return outTokens;
     }
 
-    // Stream macro-expander (C 6.10.3): walk a cursor over `in`, expanding
-    // object- AND function-like invocations and rescanning each result under
-    // the shared blue-paint set. Returns the fully-expanded token run.
-    std::vector<Token> expand(std::span<Token const> in,
-                              std::unordered_set<std::string>& painting,
-                              int depth) {
-        std::vector<Token> out;
-        if (depth > 256) {                 // pathological-recursion backstop
+    // Union of an argument token's own (accreted) hide set with the invocation
+    // hide set `hs`. Argument tokens were pre-expanded in the caller's context,
+    // so they may already hide names; we ADD `hs` (the invoked macro plus the
+    // surviving name∩close intersection) on top, never dropping the argument's.
+    static HideSet hideUnionAll(HideSet const& argHide, HideSet const& hs) {
+        if (!hs || hs->empty()) return argHide;
+        if (!argHide || argHide->empty()) return hs;
+        auto out = std::make_shared<std::set<std::string>>(*argHide);
+        out->insert(hs->begin(), hs->end());
+        return out;
+    }
+
+    // Stream macro-expander (C 6.10.3 / 6.10.3.4 via Prosser's PRECISE per-token
+    // hide set). Walks a cursor over the ExpToken working set `in`; on each
+    // expansion it SPLICES the substituted tokens (each carrying its computed
+    // hide set) back over the consumed `[i, past)` region of `in` and RESCANS
+    // from the splice point -- so a function-like name and a `(` that become
+    // adjacent only ACROSS the boundary between a replacement and the surrounding
+    // parent stream are re-paired (`A(F)(3)`, `NAME(4)`). A token whose macro name
+    // is IN its own hide set is frozen (direct self-reference, mutual recursion).
+    // The `depth` backstop is defense-in-depth: a correct hide set already bounds
+    // recursion, but a malformed/over-deep chain still fails LOUD here rather than
+    // downstream at the parser.
+    std::vector<ExpToken> expand(std::vector<ExpToken> in, int depth) {
+        std::vector<ExpToken> out;
+        if (depth > 256) {                 // pathological-NESTING backstop
             // FAIL LOUD (FC13 cycle 2 review fold): emit a positioned
             // diagnostic at the backstop instead of silently returning the
-            // input verbatim. A silently-truncated deep chain otherwise fails
+            // input verbatim. A silently-truncated deep nest otherwise fails
             // DOWNSTREAM at the parser with an inscrutable error; surfacing it
             // HERE attributes the real cause (macro expansion nested too deep)
             // to the PP. Position on the first token of this run (the deepest
             // re-entry's lead token) when available.
+            //
+            // Under the PRECISE hide set a finite macro CHAIN (`M0`->...->`Mn`)
+            // expands ITERATIVELY in one frame (each step splices + rescans,
+            // depth stays flat) and terminates correctly -- so this backstop no
+            // longer fires on a finite chain (that was a cycle-2 artifact of the
+            // recursive engine). What still recurses is NESTING: argument
+            // pre-expansion (`expand(arg, depth+1)`), so a pathological
+            // 256-deep-nested argument (`F(F(F(...F(0)...)))`) trips this guard.
+            // Defense-in-depth: the hide set already bounds macro recursion; this
+            // catches an over-deep nest (or an internal bug) loudly, not silently.
             emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported, synth_->id(),
-                   (in.empty() ? SourceSpan::empty(0) : in.front().span),
+                   (in.empty() ? SourceSpan::empty(0) : in.front().tok.span),
                    "macro expansion nesting too deep (>256)");
-            out.assign(in.begin(), in.end());
-            return out;
+            return in;
         }
         std::size_t i = 0;
         while (i < in.size()) {
-            Token const& t = in[i];
-            if (!isWord(t)) { out.push_back(t); ++i; continue; }
-            const std::string name{text(t)};
+            ExpToken const& t = in[i];
+            if (!isWord(t.tok)) { out.push_back(t); ++i; continue; }
+            const std::string name{text(t.tok)};
             auto it = table_.find(name);
-            if (it == table_.end() || painting.count(name) != 0) {
+            // Not a macro, OR M is in THIS token's hide set (Prosser: M ∉
+            // hideset(T) required to expand) -> emit verbatim.
+            if (it == table_.end() || hideContains(t.hide, name)) {
                 out.push_back(t);
                 ++i;
                 continue;
             }
             MacroDef const& def = it->second;
             if (!def.isFunctionLike) {
-                // OBJECT-like: paint, expand+rescan the replacement, unpaint.
-                painting.insert(name);
-                std::vector<Token> rescanned =
-                    expand(def.replacement, painting, depth + 1);
-                painting.erase(name);
-                out.insert(out.end(), rescanned.begin(), rescanned.end());
-                ++i;
-                continue;
+                // OBJECT-like (Prosser): replace T with M's replacement, each
+                // token carrying hideset(T) ∪ {M}; splice over [i, i+1) and
+                // RESCAN from i (so a function-like name newly exposed at the
+                // replacement's tail re-pairs with the parent's `(`).
+                const HideSet hs = hideAdd(t.hide, name);
+                std::vector<ExpToken> repl;
+                repl.reserve(def.replacement.size());
+                for (Token const& r : def.replacement) {
+                    repl.push_back(ExpToken{r, hs});
+                }
+                spliceOver(in, i, i + 1, repl);
+                continue;          // rescan from i (the first replacement token)
             }
             // FUNCTION-like: an invocation ONLY if the next significant token is
             // the configured `(`. Otherwise emit the name VERBATIM (C 6.10.3p10:
             // a function-like name not followed by `(` is not an invocation).
             std::size_t openIdx = nextSignificant(in, i + 1);
-            if (openIdx >= in.size() || !isParenOpen(in[openIdx])) {
+            if (openIdx >= in.size() || !isParenOpen(in[openIdx].tok)) {
                 out.push_back(t);
                 ++i;
                 continue;
             }
             std::size_t past = 0;
-            std::vector<Token> separators;   // depth-1 commas (for __VA_ARGS__)
-            auto argsOpt = collectArgs(in, openIdx, name, past, separators);
+            std::vector<ExpToken> separators;  // depth-1 commas (for __VA_ARGS__)
+            HideSet closeHide;                 // close-paren hide set (Prosser ∩)
+            auto argsOpt =
+                collectArgs(in, openIdx, name, past, separators, closeHide);
             if (!argsOpt) {
                 // Unterminated invocation already reported: emit the name as-is
                 // and resume after it (do NOT swallow the rest of the stream).
@@ -880,7 +1004,7 @@ private:
                 ++i;
                 continue;
             }
-            std::vector<std::vector<Token>> args = std::move(*argsOpt);
+            std::vector<std::vector<ExpToken>> args = std::move(*argsOpt);
             // Zero-PARAMETER normalization (C 6.10.3p4): a NON-variadic macro that
             // takes NO parameters invoked as `M()` is ZERO arguments, but
             // collectArgs reports it as one EMPTY argument (the general groups
@@ -903,7 +1027,7 @@ private:
                                       : (args.size() != def.params.size());
             if (arityBad) {
                 emitPP(rep_, DiagnosticCode::P_PreprocessorMacroArgument,
-                       synth_->id(), t.span,
+                       synth_->id(), t.tok.span,
                        std::string{"function-like macro "} + name
                            + (def.isVariadic ? " expects at least "
                                              : " expects ")
@@ -914,17 +1038,26 @@ private:
                 i = past;     // skip past the malformed call close paren
                 continue;
             }
+            // The Prosser function-like hide set:
+            //   HS' = (hideset(name) ∩ hideset(close-paren)) ∪ {M}.
+            // Intersecting with the CLOSE paren's hide set is what keeps a
+            // self-reference frozen (`F(x) F(x)`: the rescanned inner `F` and its
+            // `)` both carry {F}, so F stays hidden) WHILE letting a cross-stream
+            // re-pairing expand (`A(F)(3)`: the `(3)` came from the parent with an
+            // EMPTY hide set, so the intersection drops {A} and F is free).
+            const HideSet hs = hideAdd(hideIntersect(t.hide, closeHide), name);
             // PRE-EXPAND each NAMED argument FULLY before substitution
-            // (C 6.10.3.1): arguments expand in the CURRENT paint context, with
-            // the invoked macro NOT yet painted (painted only for the rescan
-            // below). For a variadic macro, only the first `params.size()` args
-            // bind to named params; the rest are gathered into __VA_ARGS__.
+            // (C 6.10.3.1): arguments expand in the CURRENT context (their tokens
+            // keep whatever hide sets they already carry; the invoked macro is NOT
+            // yet added -- that happens at substitution via `hs`). For a variadic
+            // macro, only the first `params.size()` args bind to named params; the
+            // rest are gathered into __VA_ARGS__.
             const std::size_t namedCount =
                 def.isVariadic ? def.params.size() : args.size();
-            std::vector<std::vector<Token>> expandedArgs;
+            std::vector<std::vector<ExpToken>> expandedArgs;
             expandedArgs.reserve(namedCount);
             for (std::size_t k = 0; k < namedCount; ++k) {
-                expandedArgs.push_back(expand(args[k], painting, depth + 1));
+                expandedArgs.push_back(expand(std::move(args[k]), depth + 1));
             }
             // Build the (pre-expanded) __VA_ARGS__ token run from the TRAILING
             // arguments (indices >= params.size()), each pre-expanded like a
@@ -932,7 +1065,7 @@ private:
             // (`separators[k]` separates arg k from arg k+1). EMPTY when the
             // variadic portion is empty (C23). A non-variadic macro passes an
             // empty run (substitute never consults it).
-            std::vector<Token> vaArgs;
+            std::vector<ExpToken> vaArgs;
             if (def.isVariadic) {
                 for (std::size_t k = def.params.size(); k < args.size(); ++k) {
                     if (k > def.params.size()) {
@@ -942,22 +1075,33 @@ private:
                             vaArgs.push_back(separators[k - 1]);
                         }
                     }
-                    std::vector<Token> ex = expand(args[k], painting, depth + 1);
+                    std::vector<ExpToken> ex =
+                        expand(std::move(args[k]), depth + 1);
                     vaArgs.insert(vaArgs.end(), ex.begin(), ex.end());
                 }
             }
-            std::vector<Token> substituted =
-                substitute(def, expandedArgs, vaArgs);
-            // RESCAN the substituted result with the invoked macro painted blue
-            // (C 6.10.3.4: a self-reference in the rescan is frozen).
-            painting.insert(name);
-            std::vector<Token> rescanned =
-                expand(substituted, painting, depth + 1);
-            painting.erase(name);
-            out.insert(out.end(), rescanned.begin(), rescanned.end());
-            i = past;         // resume AFTER the matching close paren
+            std::vector<ExpToken> substituted =
+                substitute(def, expandedArgs, vaArgs, hs);
+            // Splice the substituted result over the WHOLE call `[i, past)` and
+            // RESCAN from i: the invoked macro M is in every substituted token's
+            // hide set, so a self-reference is frozen; a function-like name newly
+            // exposed at the substitution's tail re-pairs with the parent's `(`.
+            spliceOver(in, i, past, substituted);
+            // resume at i (rescan the substitution + the trailing parent stream)
         }
         return out;
+    }
+
+    // Replace `in[from, to)` with `repl` (the freshly produced tokens) and leave
+    // the cursor implicitly at `from` for a rescan. Both regions can be large;
+    // a vector splice (erase + insert) is the textbook realization and the
+    // rewritten-token volume is bounded by the hide set, so this is fine.
+    static void spliceOver(std::vector<ExpToken>& in, std::size_t from,
+                           std::size_t to, std::vector<ExpToken> const& repl) {
+        in.erase(in.begin() + static_cast<std::ptrdiff_t>(from),
+                 in.begin() + static_cast<std::ptrdiff_t>(to));
+        in.insert(in.begin() + static_cast<std::ptrdiff_t>(from),
+                  repl.begin(), repl.end());
     }
 
     std::shared_ptr<SourceBuffer>        synth_;
