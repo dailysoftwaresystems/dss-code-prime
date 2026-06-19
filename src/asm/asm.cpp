@@ -711,21 +711,59 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             continue;
         }
 
-        // Zero-init globals (neither initLiteralIndex nor
-        // initFunc set): semantically belong in `.bss`-style
-        // emission (zero-fill, no on-disk bytes). The current
-        // cycle does not yet wire Bss; emit a loud diagnostic
-        // naming the symbol (same silent-failure rationale as
-        // the runtime-init arm above).
+        // Zero-init globals (neither initLiteralIndex nor initFunc set): a
+        // tentative C global `int g;` — zero-fill, NO on-disk bytes. Emit a
+        // `Bss` AssembledData with EMPTY bytes and the byte SIZE recorded in
+        // `reservedSize` (the wire format reserves the size in the section
+        // header without storing file bytes). A tentative global is ALWAYS
+        // mutable — C requires an initializer for a `const` object — so `.bss`
+        // is unconditionally writable; the const bit is not consulted here.
+        // Closes D-LK4-RODATA-PRODUCER-BSS-EMIT (the former fail-loud anchor).
         if (litIdx == UINT32_MAX) {
-            emit(DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("lowerMirGlobalsToDataItems: global "
-                             "SymbolId={{ {} }} is zero-init (no "
-                             "initializer) — anchored under "
-                             "D-LK4-RODATA-PRODUCER-BSS-EMIT; "
-                             "today's cycle emits no AssembledData "
-                             "for this shape.",
-                             sym.v));
+            TypeKind const zk = interner.kind(ty);
+            // Type byte size: the scalar fast path widths primitives; an
+            // aggregate routes through the target's layout engine (same
+            // `computeLayout` the initialized aggregate arm uses). Absent a
+            // layout for a non-primitive ⇒ fail loud (no sound size to reserve).
+            std::optional<std::uint64_t> sizeOpt;
+            if (auto const pw = primitiveByteSize(zk); pw.has_value()) {
+                sizeOpt = static_cast<std::uint64_t>(*pw);
+            } else if (aggregateLayout.has_value()) {
+                if (auto const lay = computeLayout(ty, interner, *aggregateLayout,
+                                                   dataModel);
+                    lay.has_value()) {
+                    sizeOpt = lay->size;
+                }
+            }
+            if (!sizeOpt.has_value()) {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: zero-init global "
+                                 "SymbolId={{ {} }} has TypeKind={} whose byte "
+                                 "size cannot be computed (non-primitive with no "
+                                 "`aggregateLayout` block, or an un-sizeable "
+                                 "type) — cannot reserve a .bss span "
+                                 "(D-LK4-DATA-PRODUCER).",
+                                 sym.v, static_cast<int>(zk)));
+                continue;
+            }
+            AssembledData z;
+            z.symbol       = sym;
+            z.section      = DataSectionKind::Bss;
+            z.reservedSize = *sizeOpt;        // bytes stays EMPTY (Bss invariant)
+            // Alignment: primitives align to their size (power-of-two in
+            // [1,16]); aggregates carry the layout's align. The walker raises
+            // the section alignment to cover the strictest item.
+            if (auto const pw = primitiveByteSize(zk); pw.has_value()) {
+                z.alignment = Alignment::ofRuntimePow2(
+                    static_cast<std::uint32_t>(*pw));
+            } else if (aggregateLayout.has_value()) {
+                if (auto const lay = computeLayout(ty, interner, *aggregateLayout,
+                                                   dataModel);
+                    lay.has_value()) {
+                    z.alignment = lay->align;
+                }
+            }
+            out.push_back(std::move(z));
             continue;
         }
 
@@ -734,7 +772,16 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
 
         AssembledData d;
         d.symbol  = sym;
-        d.section = DataSectionKind::Rodata;
+        // Section selection for an INITIALIZED global (D-LK4-DATA-PRODUCER-
+        // MUTABLE-GLOBAL): a `const` global is genuinely read-only → `.rodata`;
+        // a mutable one is written at runtime → writable `.data` (a store into
+        // `.rodata` faults — the bug this cycle fixes). Keyed on the config-
+        // driven `MirGlobal.isConst` PROPERTY threaded from the source's
+        // const-qualifier, NOT on any target/format identity. The string-
+        // literal arm below OVERRIDES this back to `.rodata` (a string literal
+        // is const data whatever the global's declared mutability).
+        d.section = mir.globalIsConst(gid) ? DataSectionKind::Rodata
+                                           : DataSectionKind::Data;
 
         // String-literal arm: bytes are the literal's std::string
         // contents. The HIR convention is Array<Char,N+1> where
@@ -760,6 +807,13 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // break the D-LK4-RODATA-PRODUCER-STRING closure path.
         if (std::holds_alternative<std::string>(v.value)) {
             auto const& s = std::get<std::string>(v.value);
+            // A string-literal-promoted global is read-only CONST data
+            // regardless of the enclosing global's declared mutability — its
+            // bytes live in the literal pool and are never written. Force
+            // `.rodata` (overriding the mutable→`.data` selection above) so a
+            // `char *p = "hi";` (mutable POINTER, const POINTED-TO bytes) keeps
+            // the literal bytes in read-only memory.
+            d.section = DataSectionKind::Rodata;
             d.bytes.assign(s.begin(), s.end());
             d.bytes.push_back(0);
             d.alignment = Alignment::of<1>();

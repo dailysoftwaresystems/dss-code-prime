@@ -291,3 +291,61 @@ TEST(MirRebuildHelper, IdentityRoundTripPreservesGlobalAddrLoadStoreReturn) {
     EXPECT_EQ(countOp(dst, MirOpcode::Br),         srcBrCount);
     EXPECT_EQ(countOp(dst, MirOpcode::Return),     srcReturnCount);
 }
+
+// const-ness preservation across the shared rebuild global-clone fns
+// (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL). `MirGlobal.isConst` drives the emitted
+// data section — a CONST global lands in read-only `.rodata`, a MUTABLE one in
+// writable `.data` (asm.cpp). EVERY pass that rebuilds the module's globals must
+// carry the bit, or a const global silently degrades to a writable section under
+// optimization (loss of the read-only-memory protection). This pins the two SHARED
+// rebuild clone fns (`cloneGlobalsVerbatim` — the prune/normalize chokepoint; and
+// `cloneGlobalsOrCarveOut` — the rebuild-pass prelude used by the MirFunctionRebuilder
+// substrate). The OTHER two copy sites have their own standalone loops, pinned
+// separately: DCE (`DceConst.PreservesGlobalConstness`) + merge
+// (`MirMerge.MergePreservesGlobalConstness`). RED-ON-DISABLE: drop the
+// `…globalIsConst(g)` argument at mir_rebuild_helper.cpp:54 / :96 (let it default to
+// false) → the const global's `isConst` flips to false and the `EXPECT_TRUE` fails.
+TEST(MirRebuildHelper, CloneGlobalsPreservesConstness) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32 = interner.primitive(TypeKind::I32);
+
+    MirBuilder mb;
+    MirLiteralValue v; v.value = std::int64_t{5}; v.core = TypeKind::I32;
+    std::uint32_t const lit = mb.literalPoolAdd(v);
+    // global #0 CONST (→ .rodata); global #1 MUTABLE (→ .data).
+    (void)mb.addGlobal(i32, SymbolId{1}, lit, MirFuncId{},
+                       SymbolBinding::Global, SymbolVisibility::Default,
+                       /*isConst=*/true);
+    (void)mb.addGlobal(i32, SymbolId{2}, lit, MirFuncId{},
+                       SymbolBinding::Global, SymbolVisibility::Default,
+                       /*isConst=*/false);
+    Mir src = std::move(mb).finish();
+    ASSERT_EQ(src.moduleGlobalCount(), 2u);
+    ASSERT_TRUE(src.globalIsConst(src.globalAt(0)));
+    ASSERT_FALSE(src.globalIsConst(src.globalAt(1)));
+
+    // (a) cloneGlobalsVerbatim — the rebuild-pass chokepoint.
+    {
+        MirBuilder dst;
+        cloneGlobalsVerbatim(src, dst);
+        Mir out = std::move(dst).finish();
+        ASSERT_EQ(out.moduleGlobalCount(), 2u);
+        EXPECT_TRUE(out.globalIsConst(out.globalAt(0)))
+            << "cloneGlobalsVerbatim must preserve a CONST global's const-ness "
+               "(else it degrades to a writable .data section under a rebuild pass)";
+        EXPECT_FALSE(out.globalIsConst(out.globalAt(1)))
+            << "a mutable global must stay mutable";
+    }
+    // (b) cloneGlobalsOrCarveOut — the DCE / rebuild prelude.
+    {
+        MirBuilder dst;
+        DiagnosticReporter rep;
+        auto const r = cloneGlobalsOrCarveOut(src, dst, rep, "ConstnessTest");
+        ASSERT_EQ(r, GlobalClonePrelude::Cloned);
+        Mir out = std::move(dst).finish();
+        ASSERT_EQ(out.moduleGlobalCount(), 2u);
+        EXPECT_TRUE(out.globalIsConst(out.globalAt(0)))
+            << "cloneGlobalsOrCarveOut must preserve const-ness";
+        EXPECT_FALSE(out.globalIsConst(out.globalAt(1)));
+    }
+}

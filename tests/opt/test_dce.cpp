@@ -284,3 +284,47 @@ TEST(Dce, RuntimeInitGlobalsModuleEmitsXOptPassSkippedInfo) {
            "module with runtime-init globals (mirrors ConstFold's "
            "carve-out signal).";
 }
+
+// const-ness preservation across DCE's standalone global-clone loop
+// (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL). DCE rebuilds the surviving globals
+// (dce.cpp:303) — it MUST carry `MirGlobal.isConst`, or a const global silently
+// degrades to a writable `.data` section after DCE (loss of read-only-memory
+// protection). Both globals have external (Global/Default) linkage → liveness
+// ROOTS, kept regardless of references, isolating the clone-loop field-carry.
+// RED-ON-DISABLE: drop the `mir.globalIsConst(g)` arg at dce.cpp:306 → the const
+// global comes back mutable and `constCount == 1` fails.
+TEST(Dce, PreservesGlobalConstness) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32 = interner.primitive(TypeKind::I32);
+    TypeId const sig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    MirLiteralValue v5; v5.value = std::int64_t{5}; v5.core = TypeKind::I32;
+    MirLiteralValue v7; v7.value = std::int64_t{7}; v7.core = TypeKind::I32;
+    // gc CONST (→ .rodata); gm MUTABLE (→ .data). Both external roots.
+    mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(v5), MirFuncId{},
+                 SymbolBinding::Global, SymbolVisibility::Default, /*isConst=*/true);
+    mb.addGlobal(i32, SymbolId{301}, mb.literalPoolAdd(v7), MirFuncId{},
+                 SymbolBinding::Global, SymbolVisibility::Default, /*isConst=*/false);
+    // A trivial root function so DCE runs its full rebuild path (not a carve-out).
+    mb.addFunction(sig, SymbolId{100});
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runDce(mir, interner, rep);
+    ASSERT_TRUE(r.ok);
+    ASSERT_EQ(mir.moduleGlobalCount(), 2u)
+        << "both externally-visible globals are liveness roots — DCE keeps them";
+    int constCount = 0, mutCount = 0;
+    for (std::uint32_t i = 0; i < mir.moduleGlobalCount(); ++i) {
+        if (mir.globalIsConst(mir.globalAt(i))) ++constCount; else ++mutCount;
+    }
+    EXPECT_EQ(constCount, 1)
+        << "the CONST global must survive DCE as const (else it lands in a "
+           "writable .data section)";
+    EXPECT_EQ(mutCount, 1) << "the mutable global must survive DCE as mutable";
+}

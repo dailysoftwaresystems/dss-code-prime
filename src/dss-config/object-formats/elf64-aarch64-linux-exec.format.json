@@ -20,8 +20,8 @@
   "$externCallDispatchComment": "ELF resolves imports through the PLT: the linker synthesizes a 16-byte ARM64 PLT stub per extern (ADRP+LDR+BR+NOP through the GOT slot) and points the extern symbol's VA at the STUB, so the call site is a PLAIN DIRECT call (BL imm26 to the stub, R_AARCH64_CALL26). No inline ADRP+LDR+BLR macro-op is needed at the call site -- the stub does the GOT indirection. D-FFI-EXTERN-CALL-DISPATCH.",
   "externCallDispatch": "direct-plt",
 
-  "$supportedDataSectionsComment": "D-LK1-ELF-EXEC-DATA-SECTIONS (rodata-only scope): the ELF ET_EXEC walker emits `.rodata` from `AssembledModule.dataItems` items with `section=Rodata`. The linker's pre-walker gate (linker.cpp) consults this set per-item — `Data` and `Bss` remain anchored under D-LK4-RODATA-PRODUCER. Same field + same shared `elf.cpp` code path as the x86_64-ELF exec format; arch differs only via config (pageAlign/machine). Cross-format agnosticism: zero format-name branches in the gate.",
-  "supportedDataSections": ["rodata"],
+  "$supportedDataSectionsComment": "D-LK1-ELF-EXEC-DATA-SECTIONS (rodata) + D-LK4-DATA-PRODUCER (writable `.data` + zero-fill `.bss`): the ELF ET_EXEC walker emits `.rodata`/`.data`/`.bss` from `AssembledModule.dataItems` per item `section`. Same field + same shared `elf.cpp` code path as the x86_64-ELF exec format; arch differs only via config (pageAlign/machine). Cross-format agnosticism: zero format-name branches in the gate.",
+  "supportedDataSections": ["rodata", "data", "bss"],
   "$artifactProfilesComment": "Profiles this format SERVES (plan 06 AP3) — a runnable console executable ⇒ cli (the format-side twin of the language's artifactProfiles[]; driver fails loud D_ArtifactProfileFormatMismatch on a profile not in this set).",
   "artifactProfiles": ["cli"],
 
@@ -66,6 +66,26 @@
       "name": ".rodata",
       "type": 1,
       "flags": 2,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Writable initialized data (mutable primitive/aggregate globals). sh_type=SHT_PROGBITS(1); sh_flags=SHF_ALLOC|SHF_WRITE(3) — readable + WRITABLE. Placed in a SEPARATE R+W PT_LOAD from the R+X text/rodata (W^X). sh_addralign=8. virtualAddress=0 — the writer COMPUTES the `.data` VA. D-LK4-DATA-PRODUCER.",
+      "kind": "data",
+      "name": ".data",
+      "type": 1,
+      "flags": 3,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Zero-initialized data (tentative globals `int g;`). sh_type=SHT_NOBITS(8) — NO file bytes; loader zero-fills sh_size at the section VA. sh_flags=SHF_ALLOC|SHF_WRITE(3). Contributes to the R+W PT_LOAD's p_memsz, not p_filesz. sh_addralign=8. virtualAddress=0 — writer-computed. D-LK4-DATA-PRODUCER.",
+      "kind": "bss",
+      "name": ".bss",
+      "type": 8,
+      "flags": 3,
       "addrAlign": 8,
       "entrySize": 0,
       "virtualAddress": 0

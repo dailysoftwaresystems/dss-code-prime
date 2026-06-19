@@ -154,6 +154,13 @@ lowerToMir(Hir const&               hir,
            // — exactly the pre-linkage behavior. Read here to stamp
            // MirFunc/MirGlobal binding+visibility, the input the optimizer's
            // DCE-protect predicate `isExternallyVisible()` consults.
-           HirLinkageMap const*     linkageMap = nullptr);
+           HirLinkageMap const*     linkageMap = nullptr,
+           // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: native-global const-ness side-
+           // table, populated by the CST→HIR lowerer from each global's bound
+           // symbol `SymbolRecord.isConst`. Optional: nullptr (or a global with
+           // no entry) defaults to mutable — routed to writable `.data`/`.bss`.
+           // Read here to stamp MirGlobal.isConst, the input the assembler's
+           // section selection consults to pick `.rodata` vs `.data`.
+           HirMutabilityMap const*  mutabilityMap = nullptr);
 
 } // namespace dss

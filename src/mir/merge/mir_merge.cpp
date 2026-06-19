@@ -622,7 +622,8 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             }
 
             (void)builder.addGlobal(ty, mergedSym, newInitLit, newInitFunc,
-                                    m.globalBinding(g), m.globalVisibility(g));
+                                    m.globalBinding(g), m.globalVisibility(g),
+                                    m.globalIsConst(g));
         }
     }
 

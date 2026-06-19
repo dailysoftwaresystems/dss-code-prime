@@ -193,6 +193,15 @@ struct Lowerer {
     // `spans`) it cannot be written during lowering. Only NON-default linkage is
     // recorded (absence ⇒ Global/Default ⇒ externally visible), keeping it sparse.
     std::vector<std::pair<HirNodeId, LinkageAttr>>& linkage;
+    // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL (writable data sections cycle): shared
+    // accumulator of (decl HIR node → MutabilityAttr) pairs, populated from the
+    // bound symbol's `SymbolRecord.isConst` at each Global lowering site (where
+    // the record is in hand). Applied to the result's HirMutabilityMap AFTER
+    // finish() — same frozen-hir discipline as `linkage` / `spans`. Only CONST
+    // globals are recorded (absence ⇒ mutable ⇒ writable `.data`/`.bss`), so the
+    // side-table stays sparse and a wrongly-defaulted global fails SAFE (writable
+    // never re-introduces the read-only-store crash).
+    std::vector<std::pair<HirNodeId, MutabilityAttr>>& mutability;
 
     // O(1) lookups.
     std::unordered_map<std::uint32_t, std::size_t> ruleMap_;     // RuleId.v → ruleMappings idx
@@ -555,10 +564,11 @@ struct Lowerer {
             NumberStyle const* ns, DiagnosticReporter& r, HirBuilder& b,
             HirLiteralPool& lits, std::vector<std::pair<HirNodeId, HirSourceLoc>>& sp,
             std::vector<HirExternRecord>& ed,
-            std::vector<std::pair<HirNodeId, LinkageAttr>>& lk)
+            std::vector<std::pair<HirNodeId, LinkageAttr>>& lk,
+            std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
-          linkage(lk) {
+          linkage(lk), mutability(mut) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -761,6 +771,16 @@ struct Lowerer {
         if (attr.binding != SymbolBinding::Global
             || attr.visibility != SymbolVisibility::Default)
             linkage.push_back({node, attr});
+    }
+    // Record const-ness for a lowered Global node from its bound symbol's
+    // `SymbolRecord.isConst` (sparse: only CONST decls are stored; absence ⇒
+    // mutable ⇒ writable `.data`/`.bss`). `sym` must be the global's declared
+    // symbol. D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL.
+    void recordMutability(HirNodeId node, SymbolId sym) {
+        if (!sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->isConst)
+            mutability.push_back({node, MutabilityAttr{/*isConst=*/true}});
     }
 
     [[nodiscard]] bool isExprNode(NodeId n) const {
@@ -3451,9 +3471,15 @@ struct Lowerer {
                     break;
                 }
             }
-            out.push_back(asGlobal
+            HirNodeId const lowered = asGlobal
                 ? track(builder.makeGlobal(type, sym.v, init), d)
-                : track(builder.makeVarDecl(type, sym.v, init), d));
+                : track(builder.makeVarDecl(type, sym.v, init), d);
+            // Carry const-ness from the bound symbol to the Global node so
+            // HIR→MIR can route a const-init global to read-only `.rodata` and a
+            // mutable one to writable `.data` (D-LK4-DATA-PRODUCER-MUTABLE-
+            // GLOBAL). Locals are stack slots — mutability is irrelevant there.
+            if (asGlobal) recordMutability(lowered, sym);
+            out.push_back(lowered);
         }
     }
 
@@ -3511,8 +3537,12 @@ struct Lowerer {
                 break;
             }
         }
-        return asGlobal ? track(builder.makeGlobal(type, sym.v, init), node)
-                        : track(builder.makeVarDecl(type, sym.v, init), node);
+        if (asGlobal) {
+            HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
+            recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
+            return g;
+        }
+        return track(builder.makeVarDecl(type, sym.v, init), node);
     }
 
     HirNodeId lowerVarDecl(NodeId node) { return lowerVarLike(node, /*asGlobal=*/false); }
@@ -3774,6 +3804,7 @@ struct Lowerer {
         }
         HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
         recordLinkage(g, linkAttr);
+        recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
         return g;
     }
 
@@ -4242,6 +4273,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // D-CSUBSET-LINKAGE-SPECIFIERS: shared (decl node → LinkageAttr) accumulator,
     // moved onto result->linkageMap after finish() (see Lowerer::linkage).
     std::vector<std::pair<HirNodeId, LinkageAttr>> linkage;
+    // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: shared (Global node → MutabilityAttr)
+    // accumulator, moved onto result->mutabilityMap after finish().
+    std::vector<std::pair<HirNodeId, MutabilityAttr>> mutability;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -4252,7 +4286,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         if (lowerers.contains(sch.schemaId().v)) continue;
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
-            reporter, builder, literals, spans, externDecls, linkage));
+            reporter, builder, literals, spans, externDecls, linkage,
+            mutability));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -4299,6 +4334,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     auto result = std::make_unique<CstToHirResult>(std::move(hir), std::move(literals));
     for (auto& [id, loc] : spans) result->sourceMap.set(id, loc);
     for (auto& [id, attr] : linkage) result->linkageMap.set(id, attr);
+    for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
     result->externDecls = std::move(externDecls);
 
     // verify-on-load.

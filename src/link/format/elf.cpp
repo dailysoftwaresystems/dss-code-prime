@@ -484,32 +484,72 @@ encodeElfExecDynamic(
         return {};
     }
 
-    // ── (a.5) Build `.rodata` for the dynamic image ────────────────
+    // ── (a.5) Build the data sections for the dynamic image ────────────
     //
-    // D-LK1-ELF-EXEC-DATA-SECTIONS extended to the DYNAMIC-FFI arm
-    // (2026-06-09): a program that passes a rodata constant's address to
-    // a shipped extern (`puts("hello")` → the string literal is a rodata
-    // `AssembledData`, its address `lea`'d for the call's pointer arg)
-    // needs `.rodata` IN the dynamic image — the static ET_EXEC arm had
-    // it, this dynamic arm did not, so the string's `.text` relocation
-    // failed loud (`K_SymbolUndefined`). `.rodata` is read-only → it
-    // folds into the R+X PT_LOAD #1, laid out between `.text` and `.plt`.
-    // Reuses the SAME shared `buildExecRodata` + `addDataSymbolVas`
-    // helpers the static path + Mach-O `__const` writer use — zero copy,
-    // zero `if(format)`. An EMPTY dataItems list yields an empty layout
-    // and a zero-size section (no-op, byte-identical to the prior image
-    // for the no-rodata externs case).
+    // D-LK1-ELF-EXEC-DATA-SECTIONS (rodata) + D-LK4-DATA-PRODUCER
+    // (writable `.data` + zero-fill `.bss`). The producer emits an
+    // `AssembledData` per module global: read-only ones (`const`, string
+    // literals) → `.rodata`; mutable initialized ones → `.data`; tentative
+    // zero-init ones → `.bss`. Each kind is laid out by the SAME shared,
+    // kind-parameterized `buildExecDataSection` helper (zero copy, zero
+    // `if(format)`); the writer places `.rodata` in the R+X PT_LOAD #1
+    // (read-only → W^X preserved) and `.data`+`.bss` in the R+W PT_LOAD #2
+    // (mutable). `.bss` contributes to PT_LOAD #2's p_memsz but NOT its
+    // p_filesz (zero-fill — no file bytes). An EMPTY matching subset yields
+    // an empty layout + zero-size section (no-op, byte-identical to the
+    // prior image for the no-data case).
     ObjectFormatSectionInfo const* secRodataDyn =
         fmt.sectionByKind(SectionKind::Rodata);
+    ObjectFormatSectionInfo const* secDataDyn =
+        fmt.sectionByKind(SectionKind::Data);
+    ObjectFormatSectionInfo const* secBssDyn =
+        fmt.sectionByKind(SectionKind::Bss);
     std::uint64_t const rodataDynAlignFloor =
         secRodataDyn != nullptr ? secRodataDyn->addrAlign : 1;
-    auto const rodataDynLayoutOpt = link::format::buildExecRodata(
-        module.dataItems, rodataDynAlignFloor,
+    std::uint64_t const dataDynAlignFloor =
+        secDataDyn != nullptr ? secDataDyn->addrAlign : 1;
+    std::uint64_t const bssDynAlignFloor =
+        secBssDyn != nullptr ? secBssDyn->addrAlign : 1;
+    auto const rodataDynLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Rodata, rodataDynAlignFloor,
         "elf::encodeElfExecDynamic", reporter);
     if (!rodataDynLayoutOpt.has_value()) return {};
     auto const& rodataDynLayout = *rodataDynLayoutOpt;
-    bool const hasRodataDyn = !module.dataItems.empty();
+    auto const dataDynLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Data, dataDynAlignFloor,
+        "elf::encodeElfExecDynamic", reporter);
+    if (!dataDynLayoutOpt.has_value()) return {};
+    auto const& dataDynLayout = *dataDynLayoutOpt;
+    auto const bssDynLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Bss, bssDynAlignFloor,
+        "elf::encodeElfExecDynamic", reporter);
+    if (!bssDynLayoutOpt.has_value()) return {};
+    auto const& bssDynLayout = *bssDynLayoutOpt;
+    bool const hasRodataDyn = !rodataDynLayout.empty();
+    bool const hasDataDyn   = !dataDynLayout.empty();
+    bool const hasBssDyn    = !bssDynLayout.empty();
+    // Each present section's schema row is MANDATORY (the format JSON must
+    // declare it — fail loud rather than emit an unnamed section header).
+    if (hasRodataDyn && secRodataDyn == nullptr) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "elf::encodeElfExecDynamic: module carries Rodata items but the "
+             "format declares no 'rodata' section row.");
+        return {};
+    }
+    if (hasDataDyn && secDataDyn == nullptr) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "elf::encodeElfExecDynamic: module carries Data items but the "
+             "format declares no 'data' section row (D-LK4-DATA-PRODUCER).");
+        return {};
+    }
+    if (hasBssDyn && secBssDyn == nullptr) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "elf::encodeElfExecDynamic: module carries Bss items but the "
+             "format declares no 'bss' section row (D-LK4-DATA-PRODUCER).");
+        return {};
+    }
     std::vector<std::uint8_t> const& rodataDyn = rodataDynLayout.bytes;
+    std::vector<std::uint8_t> const& dataDynBytes = dataDynLayout.bytes;
 
     // ── (b) Group externs by library (preserve declaration order)
     std::vector<std::string> libraryOrder;
@@ -665,11 +705,26 @@ encodeElfExecDynamic(
 
     std::uint64_t const ptLoad1End = relaDynOff + relaDynSz;
 
-    // PT_LOAD #2 (R+W) — page-aligned in both file + VA.
+    // PT_LOAD #2 (R+W) — page-aligned in both file + VA. Holds the WRITABLE
+    // sections: `.data` (file-backed, mutable initialized globals — D-LK4-
+    // DATA-PRODUCER) first, then .got + .dynamic (the dynamic-linker
+    // writables), then `.bss` (zero-fill — memsz only, NO file bytes) LAST.
+    // Keeping mutable globals OUT of PT_LOAD #1 (R+X) preserves W^X. Within
+    // the segment file offset and VA advance in lock-step (delta constant);
+    // `.bss` is last so its memsz tail extends p_memsz beyond p_filesz
+    // without skewing any file-backed section's VA↔offset congruence.
     std::uint64_t const ptLoad2Start = alignUp(ptLoad1End, pageAlign);
     std::uint64_t const ptLoad2VaStart = baseImageVa + ptLoad2Start;
-    std::uint64_t const gotOff = ptLoad2Start;
-    std::uint64_t const gotVa  = ptLoad2VaStart;
+    // `.data` at the start of PT_LOAD #2, aligned to its layout max.
+    std::uint64_t const dataAlignDyn =
+        hasDataDyn ? dataDynLayout.maxAlign : 1;
+    std::uint64_t const dataOff =
+        hasDataDyn ? alignUp(ptLoad2Start, dataAlignDyn) : ptLoad2Start;
+    std::uint64_t const dataVa  = baseImageVa + dataOff;
+    std::uint64_t const dataSz  = dataDynLayout.spanSize;
+
+    std::uint64_t const gotOff = alignUp(dataOff + dataSz, 8);
+    std::uint64_t const gotVa  = baseImageVa + gotOff;
     std::uint64_t const gotSz  = got.size();
 
     std::uint64_t const dynamicOff = alignUp(gotOff + gotSz, 8);
@@ -727,7 +782,20 @@ encodeElfExecDynamic(
     std::uint64_t const dynamicSz = dynamicSec.size();
 
     std::uint64_t const ptLoad2End = dynamicOff + dynamicSz;
-    std::uint64_t const ptLoad2Size = ptLoad2End - ptLoad2Start;
+    // p_filesz = the FILE-backed span (through .dynamic; `.bss` adds none).
+    std::uint64_t const ptLoad2FileSize = ptLoad2End - ptLoad2Start;
+    // `.bss` (zero-fill) is the LAST thing in PT_LOAD #2: its VA follows
+    // .dynamic, aligned to the bss section alignment, and extends p_memsz
+    // beyond p_filesz. No file bytes are emitted for it. D-LK4-DATA-PRODUCER.
+    std::uint64_t const bssAlignDyn =
+        hasBssDyn ? bssDynLayout.maxAlign : 1;
+    std::uint64_t const bssVa =
+        hasBssDyn ? alignUp(dynamicVa + dynamicSz, bssAlignDyn) : 0;
+    std::uint64_t const bssSz = bssDynLayout.spanSize;
+    // p_memsz = the in-memory span: through `.bss` when present, else == filesz.
+    std::uint64_t const ptLoad2MemSize =
+        hasBssDyn ? ((bssVa + bssSz) - ptLoad2VaStart)
+                  : ptLoad2FileSize;
 
     // Non-loaded .symtab / .strtab / .shstrtab + SHT.
     std::vector<std::uint8_t> symtab;
@@ -768,6 +836,13 @@ encodeElfExecDynamic(
     // the SHT entry below is what's gated on `hasRodataDyn`.
     auto const shsRodata   = shstrtab.add(
         secRodataDyn != nullptr ? std::string{secRodataDyn->name} : std::string{".rodata"});
+    // `.data` / `.bss` names from the schema rows when present (D-LK4-DATA-
+    // PRODUCER) — added unconditionally (a few unused bytes when absent); the
+    // SHT entries below are gated on hasDataDyn / hasBssDyn.
+    auto const shsData     = shstrtab.add(
+        secDataDyn != nullptr ? std::string{secDataDyn->name} : std::string{".data"});
+    auto const shsBss      = shstrtab.add(
+        secBssDyn != nullptr ? std::string{secBssDyn->name} : std::string{".bss"});
     auto const shsPlt      = shstrtab.add(".plt");
     auto const shsDynsym   = shstrtab.add(".dynsym");
     auto const shsDynstr   = shstrtab.add(".dynstr");
@@ -820,18 +895,30 @@ encodeElfExecDynamic(
         symbolVa.emplace(module.functions[i].symbol,
                          textVa + funcTextStart[i]);
     }
-    // D-LK1-ELF-EXEC-DATA-SECTIONS (dynamic arm): each NAMED rodata item
-    // joins symbolVa at `rodataVa + itemOffset[i]` via the SAME shared
-    // `addDataSymbolVas` helper the static path uses, so a `.text`
-    // relocation that targets a rodata SymbolId (the `lea reg,[rip+str]`
-    // for a string-literal pointer arg) resolves through the shared
-    // `applyExecRelocations` kernel. Anonymous items are skipped (M1).
-    if (hasRodataDyn) {
-        if (!link::format::addDataSymbolVas(
-                module.dataItems, rodataVa, rodataDynLayout.itemOffsets,
-                symbolVa, "elf::encodeElfExecDynamic", reporter)) {
-            return {};
-        }
+    // D-LK1-ELF-EXEC-DATA-SECTIONS + D-LK4-DATA-PRODUCER (dynamic arm): each
+    // NAMED data item (rodata / data / bss) joins symbolVa at its section VA +
+    // section-relative offset via the SAME shared `addDataSymbolVas` helper, so
+    // a `.text` relocation that targets a data SymbolId (the `lea reg,[rip+g]`
+    // load/store of a global) resolves through the shared `applyExecRelocations`
+    // kernel. A `.bss` global is reloc-addressable by VA just like a file-backed
+    // one. Anonymous items are skipped (M1).
+    if (hasRodataDyn
+        && !link::format::addDataSymbolVas(
+               module.dataItems, rodataDynLayout, rodataVa,
+               symbolVa, "elf::encodeElfExecDynamic", reporter)) {
+        return {};
+    }
+    if (hasDataDyn
+        && !link::format::addDataSymbolVas(
+               module.dataItems, dataDynLayout, dataVa,
+               symbolVa, "elf::encodeElfExecDynamic", reporter)) {
+        return {};
+    }
+    if (hasBssDyn
+        && !link::format::addDataSymbolVas(
+               module.dataItems, bssDynLayout, bssVa,
+               symbolVa, "elf::encodeElfExecDynamic", reporter)) {
+        return {};
     }
     for (std::size_t i = 0; i < numExterns; ++i) {
         // D-LK6-8: extern symbol VA points at the PLT stub. Stub
@@ -889,9 +976,12 @@ encodeElfExecDynamic(
     //                  + .dynstr + .hash + .rela.dyn
     appendPhdrEntry(PT_LOAD,    PF_X | PF_R, 0,            baseImageVa,
                     ptLoad1End,    ptLoad1End,    pageAlign);
-    // PT_LOAD #2 R+W — .got + .dynamic
+    // PT_LOAD #2 R+W — [.data] + .got + .dynamic + [.bss]. p_filesz covers
+    // the file-backed sections; p_memsz additionally covers `.bss` (zero-fill,
+    // no file bytes) so the loader reserves + zeroes the bss span at load.
+    // D-LK4-DATA-PRODUCER.
     appendPhdrEntry(PT_LOAD,    PF_W | PF_R, ptLoad2Start, ptLoad2VaStart,
-                    ptLoad2Size,   ptLoad2Size,   pageAlign);
+                    ptLoad2FileSize, ptLoad2MemSize, pageAlign);
     appendPhdrEntry(PT_DYNAMIC, PF_W | PF_R, dynamicOff,   dynamicVa,
                     dynamicSz,     dynamicSz,     8);
 
@@ -906,7 +996,11 @@ encodeElfExecDynamic(
     padToOffset(bytes, hashOff);      appendBytes(bytes, hashSec);
     padToOffset(bytes, relaDynOff);   appendBytes(bytes, relaDyn);
     padToOffset(bytes, ptLoad2Start);                                // PT_LOAD #2 boundary
-                                       appendBytes(bytes, got);
+    // `.data` (mutable initialized globals) at the start of PT_LOAD #2.
+    // `.bss` emits NO file bytes (zero-fill) so it is absent from this body
+    // pass — its size lives only in the section header + p_memsz.
+    if (hasDataDyn) { padToOffset(bytes, dataOff); appendBytes(bytes, dataDynBytes); }
+    padToOffset(bytes, gotOff);       appendBytes(bytes, got);
     padToOffset(bytes, dynamicOff);   appendBytes(bytes, dynamicSec);
     padToOffset(bytes, symtabOff);    appendBytes(bytes, symtab);
                                        appendBytes(bytes, strtab.view());
@@ -924,12 +1018,35 @@ encodeElfExecDynamic(
     // it shifts +1, so the cross-reference indices (.link/.info/e_shstrndx)
     // are computed with `rodataShift` (1 when present, 0 when absent) so
     // the no-rodata image is byte-identical to the pre-fix layout.
-    std::uint16_t const rodataShift = hasRodataDyn ? 1 : 0;
-    std::uint16_t const IDX_DYNSYM   = static_cast<std::uint16_t>(4 + rodataShift);
-    std::uint16_t const IDX_DYNSTR   = static_cast<std::uint16_t>(5 + rodataShift);
-    std::uint16_t const IDX_STRTAB   = static_cast<std::uint16_t>(11 + rodataShift);
-    std::uint16_t const IDX_SHSTRTAB = static_cast<std::uint16_t>(12 + rodataShift);
-    std::uint16_t const kNumSections = static_cast<std::uint16_t>(13 + rodataShift);
+    // Section indices are computed INCREMENTALLY from the emit order below so
+    // adding/removing an optional section ([.rodata]/[.data]/[.bss]) keeps every
+    // cross-reference (.link/.info/e_shstrndx) coherent with the actual header
+    // table — no hand-maintained constant per section (the former `rodataShift`
+    // approach did not scale to three optional sections). Emit order (VA order):
+    //   0 NULL, 1 .interp, 2 .text, [.rodata], .plt, .dynsym, .dynstr, .hash,
+    //   .rela.dyn, [.data], .got, .dynamic, [.bss], .symtab, .strtab, .shstrtab
+    std::uint16_t idxCursor = 0;
+    auto nextIdx = [&]() { return idxCursor++; };
+    std::uint16_t const IDX_NULL   = nextIdx();  (void)IDX_NULL;
+    std::uint16_t const IDX_INTERP = nextIdx();  (void)IDX_INTERP;
+    std::uint16_t const IDX_TEXT   = nextIdx();  (void)IDX_TEXT;
+    std::uint16_t const IDX_RODATA = hasRodataDyn ? nextIdx() : std::uint16_t{0};
+    (void)IDX_RODATA;
+    std::uint16_t const IDX_PLT    = nextIdx();  (void)IDX_PLT;
+    std::uint16_t const IDX_DYNSYM = nextIdx();
+    std::uint16_t const IDX_DYNSTR = nextIdx();
+    std::uint16_t const IDX_HASH   = nextIdx();  (void)IDX_HASH;
+    std::uint16_t const IDX_RELADYN = nextIdx(); (void)IDX_RELADYN;
+    std::uint16_t const IDX_DATA   = hasDataDyn ? nextIdx() : std::uint16_t{0};
+    (void)IDX_DATA;
+    std::uint16_t const IDX_GOT    = nextIdx();  (void)IDX_GOT;
+    std::uint16_t const IDX_DYNAMIC = nextIdx(); (void)IDX_DYNAMIC;
+    std::uint16_t const IDX_BSS    = hasBssDyn ? nextIdx() : std::uint16_t{0};
+    (void)IDX_BSS;
+    std::uint16_t const IDX_SYMTAB = nextIdx();  (void)IDX_SYMTAB;
+    std::uint16_t const IDX_STRTAB = nextIdx();
+    std::uint16_t const IDX_SHSTRTAB = nextIdx();
+    std::uint16_t const kNumSections = idxCursor;
 
     // Designated initializers per `SectionHeader` field — type-design
     // #1 + simplifier #3 fold: 10-arg positional pushShdr lambda
@@ -974,6 +1091,19 @@ encodeElfExecDynamic(
         .name_offset = shsRelaDyn, .type = SHT_RELA, .flags = SHF_ALLOC,
         .addr = relaDynVa, .offset = relaDynOff, .size = relaDynSz,
         .link = IDX_DYNSYM, .addr_align = 8, .entry_size = 24});
+    // `.data` (SHF_ALLOC | SHF_WRITE) — mutable initialized globals, file-
+    // backed, in the R+W PT_LOAD #2. sh_type / sh_flags / sh_addralign come
+    // from the SCHEMA ROW (NOT hardcoded — `secDataDyn->type` = SHT_PROGBITS,
+    // `->flags` = SHF_ALLOC|SHF_WRITE), keeping the writer format-agnostic.
+    // D-LK4-DATA-PRODUCER.
+    if (hasDataDyn) {
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsData,
+            .type = secDataDyn->type,
+            .flags = secDataDyn->flags,
+            .addr = dataVa, .offset = dataOff, .size = dataSz,
+            .addr_align = dataAlignDyn});
+    }
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsGot, .type = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_WRITE,
         .addr = gotVa, .offset = gotOff, .size = gotSz,
@@ -982,6 +1112,19 @@ encodeElfExecDynamic(
         .name_offset = shsDynamic, .type = SHT_DYNAMIC, .flags = SHF_ALLOC | SHF_WRITE,
         .addr = dynamicVa, .offset = dynamicOff, .size = dynamicSz,
         .link = IDX_DYNSTR, .addr_align = 8, .entry_size = 16});
+    // `.bss` (SHT_NOBITS, SHF_ALLOC | SHF_WRITE) — zero-fill mutable globals.
+    // sh_type / sh_flags from the SCHEMA ROW (`secBssDyn->type` = SHT_NOBITS).
+    // sh_offset points just past the file-backed data (conventional for NOBITS
+    // — no file bytes are consumed); sh_size is the zero-fill memory extent.
+    // D-LK4-DATA-PRODUCER.
+    if (hasBssDyn) {
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsBss,
+            .type = secBssDyn->type,
+            .flags = secBssDyn->flags,
+            .addr = bssVa, .offset = ptLoad2End, .size = bssSz,
+            .addr_align = bssAlignDyn});
+    }
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsSymtab, .type = SHT_SYMTAB,
         .offset = symtabOff, .size = symtabSz,
@@ -1175,51 +1318,74 @@ encode(AssembledModule const&    module,
     // D-LK1-ELF-EXEC-DATA-SECTIONS.
     std::string const elfDataWriterName =
         isExec ? "elf::encode (ET_EXEC)" : "elf::encode (ET_REL)";
-    // Floor = the schema's `.rodata` addrAlign when the row exists
-    // (peeked WITHOUT a diagnostic; the mandatory fail-loud
-    // `requireSection` on the exec path below is what enforces the row).
+    // Floor = the schema's section addrAlign when the row exists (peeked
+    // WITHOUT a diagnostic; the mandatory fail-loud `requireSection` on the
+    // exec path below is what enforces the row).
     ObjectFormatSectionInfo const* secRodataPeek =
         fmt.sectionByKind(SectionKind::Rodata);
+    ObjectFormatSectionInfo const* secDataPeek =
+        fmt.sectionByKind(SectionKind::Data);
+    ObjectFormatSectionInfo const* secBssPeek =
+        fmt.sectionByKind(SectionKind::Bss);
     std::uint64_t const rodataAlignFloor =
         secRodataPeek != nullptr ? secRodataPeek->addrAlign : 1;
-    auto const rodataLayoutOpt = link::format::buildExecRodata(
-        module.dataItems, rodataAlignFloor, elfDataWriterName, reporter);
+    std::uint64_t const dataAlignFloor =
+        secDataPeek != nullptr ? secDataPeek->addrAlign : 1;
+    std::uint64_t const bssAlignFloor =
+        secBssPeek != nullptr ? secBssPeek->addrAlign : 1;
+    // Lay out each data section kind via the shared kind-parameterized helper
+    // (D-LK1-ELF-EXEC-DATA-SECTIONS for rodata; D-LK4-DATA-PRODUCER for the
+    // writable `.data` + zero-fill `.bss`).
+    auto const rodataLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Rodata, rodataAlignFloor,
+        elfDataWriterName, reporter);
     if (!rodataLayoutOpt.has_value()) return {};
     auto const& rodataLayout = *rodataLayoutOpt;
+    auto const dataLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Data, dataAlignFloor,
+        elfDataWriterName, reporter);
+    if (!dataLayoutOpt.has_value()) return {};
+    auto const& dataLayout = *dataLayoutOpt;
+    auto const bssLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Bss, bssAlignFloor,
+        elfDataWriterName, reporter);
+    if (!bssLayoutOpt.has_value()) return {};
+    auto const& bssLayout = *bssLayoutOpt;
 
-    bool const hasRodata = isExec && !module.dataItems.empty();
+    bool const hasRodata = isExec && !rodataLayout.empty();
+    bool const hasData   = isExec && !dataLayout.empty();
+    bool const hasBss    = isExec && !bssLayout.empty();
     // Reject dataItems on the ET_REL (.o) path loudly — the linker's
     // per-format gate already advertises rodata only on the exec
     // schema, but defend in depth: a hand-built ET_REL module with
-    // dataItems would otherwise silently drop them (no .rodata in .o).
+    // dataItems would otherwise silently drop them (no data sections in .o).
     if (!isExec && !module.dataItems.empty()) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
              "elf::encode (ET_REL): AssembledData items are not "
-             "emitted into relocatable .o output — rodata in a .o "
+             "emitted into relocatable .o output — data in a .o "
              "rides through the symbol+section table, not the "
              "dataItems pipeline. D-LK1-ELF-EXEC-DATA-SECTIONS is "
              "exec-only.");
         return {};
     }
-    // On the exec path the `.rodata` section row is MANDATORY — fail
-    // loud (the format JSON must declare it). `secRodata` also feeds
-    // the section-header sh_type / sh_flags / name below.
+    // On the exec path each PRESENT section's row is MANDATORY — fail loud
+    // (the format JSON must declare it). The rows also feed the section-header
+    // sh_type / sh_flags / name below (all read from the schema, never hardcoded).
     ObjectFormatSectionInfo const* secRodata =
         hasRodata ? requireSection(fmt, SectionKind::Rodata,
                                    "ELF writer", reporter)
                   : nullptr;
     if (hasRodata && secRodata == nullptr) return {};
-    // The H1-raised section alignment + the laid-out bytes + per-item
-    // section-relative offsets (the start of each item's bytes within
-    // the concatenated `.rodata` payload). The offsets extend the
-    // symbolVa map below so a `.text` relocation targeting a rodata
-    // SymbolId resolves to `rodataSectionVa + rodataItemOffsets[i]`.
-    // u64 (ELF sh_size/sh_offset + the symbolVa values these feed are
-    // u64). For the no-rodata case these are empty / 1 → no-op.
+    ObjectFormatSectionInfo const* secData =
+        hasData ? requireSection(fmt, SectionKind::Data, "ELF writer", reporter)
+                : nullptr;
+    if (hasData && secData == nullptr) return {};
+    ObjectFormatSectionInfo const* secBss =
+        hasBss ? requireSection(fmt, SectionKind::Bss, "ELF writer", reporter)
+               : nullptr;
+    if (hasBss && secBss == nullptr) return {};
     std::uint64_t const rodataAlign = hasRodata ? rodataLayout.maxAlign : 1;
     std::vector<std::uint8_t> const& rodataBytes = rodataLayout.bytes;
-    std::vector<std::uint64_t> const& rodataItemOffsets =
-        rodataLayout.itemOffsets;
 
     // ── Build .text + per-function symbols ─────────────────────
     //
@@ -1257,6 +1423,32 @@ encode(AssembledModule const&    module,
             ? secText->virtualAddress + alignUp(text.size(), rodataAlign)
             : 0;
 
+    // Writable data segment (R+W PT_LOAD #2) for `.data` + `.bss` — D-LK4-
+    // DATA-PRODUCER. Kept in a SEPARATE page-aligned segment from the R+X
+    // text/rodata so mutable globals never share a page with executable code
+    // (W^X). The segment starts one page above the end of the read-only
+    // sections' VA span; `.data` (file-backed) first, then `.bss` (zero-fill,
+    // memsz-only) last. VAs are congruent with file offsets (delta == the
+    // read-only span rounded to a page) — the layout pass below asserts it.
+    std::uint64_t const pageAlignStatic = fmt.elf().pageAlign;
+    std::uint64_t const dataAlign = hasData ? dataLayout.maxAlign : 1;
+    std::uint64_t const bssAlign  = hasBss ? bssLayout.maxAlign : 1;
+    std::uint64_t const dataSize  = dataLayout.spanSize;
+    std::uint64_t const bssSize   = bssLayout.spanSize;
+    bool const hasWritableSeg = hasData || hasBss;
+    // End of the read-only VA span (text + optional rodata).
+    std::uint64_t const roSpanEndVa =
+        hasRodata ? rodataSectionVa + rodataBytes.size()
+                  : secText->virtualAddress + text.size();
+    std::uint64_t const writableSegVa =
+        hasWritableSeg ? alignUp(roSpanEndVa, pageAlignStatic) : 0;
+    std::uint64_t const dataSectionVa =
+        hasData ? alignUp(writableSegVa, dataAlign) : 0;
+    std::uint64_t const bssSectionVa =
+        hasBss ? alignUp((hasData ? dataSectionVa + dataSize : writableSegVa),
+                         bssAlign)
+               : 0;
+
     // ── ET_EXEC: apply intra-module relocations in-place ───────
     //
     // Delegated to the shared `applyExecRelocations` kernel in
@@ -1289,12 +1481,25 @@ encode(AssembledModule const&    module,
         // — offset-referenced, never reloc targets). A rodata SymbolId
         // colliding with a function SymbolId is a caller bug
         // (REDEFINITION); the helper emits K_DuplicateDataSymbol.
-        if (hasRodata) {
-            if (!link::format::addDataSymbolVas(
-                    module.dataItems, rodataSectionVa, rodataItemOffsets,
-                    symbolVa, "elf::encode (ET_EXEC)", reporter)) {
-                return {};
-            }
+        if (hasRodata
+            && !link::format::addDataSymbolVas(
+                   module.dataItems, rodataLayout, rodataSectionVa,
+                   symbolVa, "elf::encode (ET_EXEC)", reporter)) {
+            return {};
+        }
+        // D-LK4-DATA-PRODUCER: `.data` + `.bss` globals join symbolVa at their
+        // section VA so a `.text` load/store reloc resolves to the writable VA.
+        if (hasData
+            && !link::format::addDataSymbolVas(
+                   module.dataItems, dataLayout, dataSectionVa,
+                   symbolVa, "elf::encode (ET_EXEC)", reporter)) {
+            return {};
+        }
+        if (hasBss
+            && !link::format::addDataSymbolVas(
+                   module.dataItems, bssLayout, bssSectionVa,
+                   symbolVa, "elf::encode (ET_EXEC)", reporter)) {
+            return {};
         }
         if (!link::format::applyExecRelocations(
                 text, module, funcTextStart, symbolVa,
@@ -1428,6 +1633,8 @@ encode(AssembledModule const&    module,
     SectionHeader hNull{};
     SectionHeader hText{};
     SectionHeader hRodata{};
+    SectionHeader hData{};
+    SectionHeader hBss{};
     SectionHeader hRela{};
     SectionHeader hSymtab{};
     SectionHeader hStrtab{};
@@ -1435,6 +1642,12 @@ encode(AssembledModule const&    module,
     hText.name_offset      = shstrtab.add(secText->name);
     if (hasRodata) {
         hRodata.name_offset = shstrtab.add(secRodata->name);
+    }
+    if (hasData) {
+        hData.name_offset  = shstrtab.add(secData->name);
+    }
+    if (hasBss) {
+        hBss.name_offset   = shstrtab.add(secBss->name);
     }
     if (secRela != nullptr) {
         hRela.name_offset  = shstrtab.add(secRela->name);
@@ -1456,15 +1669,23 @@ encode(AssembledModule const&    module,
     // honest. `.rodata` (D-LK1-ELF-EXEC-DATA-SECTIONS) sits at index
     // 2 when present, shifting the trailing sections +1.
     constexpr std::uint16_t IDX_TEXT     = 1;
-    // `.rodata`, when present, occupies index 2 (see the table above)
-    // and shifts every trailing section +1 via `rodataShift`. There is
-    // no `IDX_RODATA` constant: the header table is built by ordered
-    // `push_back`, not index lookup, so the trailing-section indices
-    // are the only ones that need computing.
-    std::uint16_t const rodataShift  = hasRodata ? 1u : 0u;
-    std::uint16_t const IDX_SYMTAB   = static_cast<std::uint16_t>((isExec ? 2u : 3u) + rodataShift);
-    std::uint16_t const IDX_STRTAB   = static_cast<std::uint16_t>((isExec ? 3u : 4u) + rodataShift);
-    std::uint16_t const IDX_SHSTRTAB = static_cast<std::uint16_t>((isExec ? 4u : 5u) + rodataShift);
+    // Trailing-section indices computed INCREMENTALLY from the emit order so the
+    // optional sections ([.rodata]/[.data]/[.bss] on ET_EXEC; [.rela.text] on
+    // ET_REL) each shift the rest coherently without a hand-maintained per-
+    // section constant. Emit order:
+    //   ET_REL:  0 NULL, 1 .text, 2 .rela.text, .symtab, .strtab, .shstrtab
+    //   ET_EXEC: 0 NULL, 1 .text, [.rodata], [.data], [.bss], .symtab, .strtab,
+    //            .shstrtab
+    // (.data/.bss are exec-only — hasData/hasBss already imply isExec.)
+    std::uint16_t idxCursorS = 2;  // after NULL(0) + .text(1)
+    auto nextIdxS = [&]() { return idxCursorS++; };
+    if (!isExec) { (void)nextIdxS(); }            // .rela.text slot (ET_REL)
+    if (hasRodata) { (void)nextIdxS(); }
+    if (hasData)   { (void)nextIdxS(); }
+    if (hasBss)    { (void)nextIdxS(); }
+    std::uint16_t const IDX_SYMTAB   = nextIdxS();
+    std::uint16_t const IDX_STRTAB   = nextIdxS();
+    std::uint16_t const IDX_SHSTRTAB = nextIdxS();
 
     hText.type       = secText->type;
     hText.flags      = secText->flags;
@@ -1487,6 +1708,28 @@ encode(AssembledModule const&    module,
         hRodata.entry_size = secRodata->entrySize;
         hRodata.size       = rodataBytes.size();
         hRodata.addr       = rodataSectionVa;
+    }
+    // `.data` / `.bss` section headers (D-LK4-DATA-PRODUCER). sh_type /
+    // sh_flags from the SCHEMA ROW (NOT hardcoded — `.data` = SHT_PROGBITS +
+    // SHF_ALLOC|SHF_WRITE; `.bss` = SHT_NOBITS + SHF_ALLOC|SHF_WRITE). sh_addr
+    // = the writable-segment VA computed above; sh_offset is filled by the
+    // layout pass below (`.bss` gets the just-past-data file offset — NOBITS
+    // consumes no file bytes).
+    if (hasData) {
+        hData.type       = secData->type;
+        hData.flags      = secData->flags;
+        hData.addr_align = dataAlign;
+        hData.entry_size = secData->entrySize;
+        hData.size       = dataSize;
+        hData.addr       = dataSectionVa;
+    }
+    if (hasBss) {
+        hBss.type        = secBss->type;
+        hBss.flags       = secBss->flags;
+        hBss.addr_align  = bssAlign;
+        hBss.entry_size  = secBss->entrySize;
+        hBss.size        = bssSize;
+        hBss.addr        = bssSectionVa;
     }
 
     if (secRela != nullptr) {
@@ -1531,7 +1774,11 @@ encode(AssembledModule const&    module,
     //          a seek.
     constexpr std::uint64_t kEhdrSize = 64;
     constexpr std::uint64_t kProgramHeaderSize = 56;  // Elf64_Phdr
-    constexpr std::uint64_t kPtLoadCount = 1;         // cycle-2: just .text
+    // PT_LOAD #1 = R+X (.text [+ .rodata]); PT_LOAD #2 = R+W ([.data] [+ .bss])
+    // when the module has writable globals (D-LK4-DATA-PRODUCER). W^X: the
+    // writable segment is a SEPARATE PT_LOAD so mutable data never shares a page
+    // with executable code.
+    std::uint64_t const kPtLoadCount = 1 + (hasWritableSeg ? 1u : 0u);
     std::uint64_t const phtSize = isExec ? (kPtLoadCount * kProgramHeaderSize) : 0;
 
     std::vector<std::uint8_t> bytes;
@@ -1590,6 +1837,33 @@ encode(AssembledModule const&    module,
             return {};
         }
     }
+    // `.data` + `.bss` (D-LK4-DATA-PRODUCER) — the WRITABLE segment, page-
+    // aligned above the read-only sections so they form a SEPARATE R+W PT_LOAD
+    // (W^X). `.data` is file-backed; `.bss` consumes NO file bytes (its sh_offset
+    // points just past `.data` but the layout pass appends nothing). Each
+    // section's file/VA congruence is asserted fail-loud.
+    if (hasWritableSeg) {
+        padTo(bytes, pageAlign);   // PT_LOAD #2 page boundary (file + VA)
+    }
+    if (hasData) {
+        layoutSection(hData, dataLayout.bytes);
+        std::uint64_t const fileDelta = hData.offset - hText.offset;
+        if (secText->virtualAddress + fileDelta != dataSectionVa) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("elf::encode (ET_EXEC): .data file/VA congruence "
+                             "broken — textVa({}) + fileDelta({}) != "
+                             "dataSectionVa({}). D-LK4-DATA-PRODUCER.",
+                             secText->virtualAddress, fileDelta, dataSectionVa));
+            return {};
+        }
+    }
+    if (hasBss) {
+        // NOBITS: record sh_offset at the current cursor (conventional — points
+        // just past .data) WITHOUT appending bytes; sh_size is the zero-fill
+        // extent. Its sh_addr (set above) is what the loader zero-fills.
+        if (hBss.addr_align > 1) padTo(bytes, hBss.addr_align);
+        hBss.offset = bytes.size();
+    }
     if (secRela != nullptr) layoutSection(hRela, relaText);
     layoutSection(hSymtab, symtab);
     layoutSection(hStrtab, strtab.view());
@@ -1614,6 +1888,10 @@ encode(AssembledModule const&    module,
     // `rodataShift` of the trailing IDX_* coherent with the header
     // table ordering.
     if (hasRodata) headers.push_back(&hRodata);
+    // `.data` / `.bss` (D-LK4-DATA-PRODUCER) follow `.rodata` in the header
+    // table (exec-only) — this push order matches the incremental IDX_* math.
+    if (hasData) headers.push_back(&hData);
+    if (hasBss) headers.push_back(&hBss);
     if (!isExec) headers.push_back(&hRela);
     headers.push_back(&hSymtab);
     headers.push_back(&hStrtab);
@@ -1710,43 +1988,51 @@ encode(AssembledModule const&    module,
     // arrive together with LK6 dynamic linking.
     if (isExec) {
         std::vector<std::uint8_t> phdr;
-        phdr.reserve(kProgramHeaderSize);
-        // The single PT_LOAD covers `.text` and — when present —
-        // `.rodata` (D-LK1-ELF-EXEC-DATA-SECTIONS). Both are
-        // contiguous on disk and in VA (the layout congruence guard
-        // above proves it), so ONE segment maps them. p_flags is the
-        // OR of the segment's sections' mapped permissions (NOT the
-        // old hardcoded 5): .text(R+X) | .rodata(R) = R+X = 5, so the
-        // no-rodata output is byte-identical and the rodata case stays
-        // R+X — strictly no new write permission (W^X preserved).
-        std::uint32_t pFlags = shFlagsToPFlags(secText->flags);
-        if (hasRodata) pFlags |= shFlagsToPFlags(secRodata->flags);
-        // p_filesz / p_memsz span .text through the end of .rodata
-        // when present (file offsets are contiguous post-layout), else
-        // just .text. Derived from the on-disk extent so it tracks the
-        // actual emitted bytes.
-        std::uint64_t const segByteLen =
+        phdr.reserve(kPtLoadCount * kProgramHeaderSize);
+        auto appendPhdr = [&](std::uint32_t pFlags, std::uint64_t pOffset,
+                               std::uint64_t pVaddr, std::uint64_t pFilesz,
+                               std::uint64_t pMemsz) {
+            appendU32LE(phdr, 1);             // p_type = PT_LOAD
+            appendU32LE(phdr, pFlags);
+            appendU64LE(phdr, pOffset);
+            appendU64LE(phdr, pVaddr);
+            appendU64LE(phdr, pVaddr);        // p_paddr
+            appendU64LE(phdr, pFilesz);
+            appendU64LE(phdr, pMemsz);
+            appendU64LE(phdr, pageAlign);     // p_align (kernel congruence)
+        };
+        // PT_LOAD #1 (R+X) covers `.text` and — when present — `.rodata`
+        // (D-LK1-ELF-EXEC-DATA-SECTIONS). Both are contiguous on disk + VA
+        // (the layout congruence guard above proves it). p_flags is the OR of
+        // the segment's sections' mapped permissions: .text(R+X) | .rodata(R)
+        // = R+X (W^X preserved). Span derived from the on-disk extent.
+        std::uint32_t pFlags1 = shFlagsToPFlags(secText->flags);
+        if (hasRodata) pFlags1 |= shFlagsToPFlags(secRodata->flags);
+        std::uint64_t const seg1ByteLen =
             hasRodata ? (hRodata.offset + rodataBytes.size() - hText.offset)
                       : text.size();
-        // p_type = PT_LOAD = 1
-        appendU32LE(phdr, 1);
-        // p_flags — derived above (R / W / X from section sh_flags).
-        appendU32LE(phdr, pFlags);
-        // p_offset = file offset of .text (segment start)
-        appendU64LE(phdr, hText.offset);
-        // p_vaddr / p_paddr = virtual address of .text (segment start)
-        appendU64LE(phdr, secText->virtualAddress);
-        appendU64LE(phdr, secText->virtualAddress);
-        // p_filesz / p_memsz = byte length of the segment (.text [+ .rodata])
-        appendU64LE(phdr, segByteLen);
-        appendU64LE(phdr, segByteLen);
-        // p_align — declared by the format schema per (arch × OS).
-        // See the `padTo(bytes, pageAlign)` call above; both must
-        // use the SAME value or the kernel's congruence check
-        // (p_vaddr % p_align == p_offset % p_align) fails.
-        appendU64LE(phdr, pageAlign);
-        std::memcpy(bytes.data() + kEhdrSize, phdr.data(),
-                    kProgramHeaderSize);
+        appendPhdr(pFlags1, hText.offset, secText->virtualAddress,
+                   seg1ByteLen, seg1ByteLen);
+        // PT_LOAD #2 (R+W) covers `.data` (file-backed) + `.bss` (zero-fill).
+        // p_flags = OR of .data/.bss sh_flags → R+W. p_filesz spans the file-
+        // backed `.data`; p_memsz additionally covers `.bss` so the loader
+        // reserves + zeroes it. D-LK4-DATA-PRODUCER.
+        if (hasWritableSeg) {
+            std::uint32_t pFlags2 = 0;
+            if (hasData) pFlags2 |= shFlagsToPFlags(secData->flags);
+            if (hasBss)  pFlags2 |= shFlagsToPFlags(secBss->flags);
+            std::uint64_t const seg2Off =
+                hasData ? hData.offset : hBss.offset;
+            std::uint64_t const seg2Va = writableSegVa;
+            std::uint64_t const seg2FileSz =
+                hasData ? (hData.offset + dataSize - seg2Off) : 0;
+            std::uint64_t const seg2MemEnd =
+                hasBss ? (bssSectionVa + bssSize)
+                       : (dataSectionVa + dataSize);
+            std::uint64_t const seg2MemSz = seg2MemEnd - seg2Va;
+            appendPhdr(pFlags2, seg2Off, seg2Va, seg2FileSz, seg2MemSz);
+        }
+        std::memcpy(bytes.data() + kEhdrSize, phdr.data(), phdr.size());
     }
 
     return bytes;

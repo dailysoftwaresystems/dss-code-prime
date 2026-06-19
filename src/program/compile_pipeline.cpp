@@ -320,7 +320,7 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,
                           &hir->sourceMap, mirCfg, &ffiMap,
-                          &hir->linkageMap);
+                          &hir->linkageMap, &hir->mutabilityMap);
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;
     }

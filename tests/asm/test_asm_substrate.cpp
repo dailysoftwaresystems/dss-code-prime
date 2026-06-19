@@ -1075,7 +1075,93 @@ struct LoweredAgg {
 // The shipped-target params (natural alignment, 16-byte ISA cap).
 constexpr AggregateLayoutParams kNatural16{ScalarAlignmentRule::Natural, 16};
 
+// Lower ONE scalar (I32) module global through `lowerMirGlobalsToDataItems`
+// with a chosen mutability + init shape, returning the single emitted item +
+// the error count. `init` set ⇒ constant-init; `init` nullopt ⇒ tentative
+// (zero-init). `isConst` threads `MirGlobal.isConst` (the const-vs-mutable
+// signal the section selection keys on). D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL.
+struct LoweredScalar {
+    std::vector<AssembledData> items;
+    std::size_t                errors;
+};
+[[nodiscard]] LoweredScalar lowerOneScalarGlobal(
+        TypeInterner& ti, std::optional<std::int64_t> init, bool isConst) {
+    MirBuilder b;
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    if (init.has_value()) {
+        MirLiteralValue v;
+        v.value = *init;
+        v.core  = TypeKind::I32;
+        std::uint32_t const lit = b.literalPoolAdd(std::move(v));
+        b.addGlobal(i32, SymbolId{1}, lit, {},
+                    SymbolBinding::Global, SymbolVisibility::Default, isConst);
+    } else {
+        b.addGlobal(i32, SymbolId{1}, UINT32_MAX, {},
+                    SymbolBinding::Global, SymbolVisibility::Default, isConst);
+    }
+    Mir const m = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto items = lowerMirGlobalsToDataItems(m, ti, kNatural16,
+                                            DataModel::Lp64, rep);
+    return {std::move(items), rep.errorCount()};
+}
+
 } // namespace
+
+// ── D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: section-selection pins ─────────
+//
+// `lowerMirGlobalsToDataItems` routes an INITIALIZED global to read-only
+// `.rodata` (const) vs writable `.data` (mutable), and a TENTATIVE zero-init
+// global to `.bss` (zero-fill). These are the structural pins the writable-data-
+// sections cycle adds; each is RED on the exact regression named in its comment.
+
+// A MUTABLE initialized global lands in writable `.data` (NOT read-only
+// `.rodata` — a store into `.rodata` faults: the bug this cycle fixed). RED if
+// asm.cpp reverts line ~737 to unconditional `Rodata`.
+TEST(AsmDataSection, MutableInitializedGlobalLowersToData) {
+    TypeInterner ti{CompilationUnitId{1}};
+    auto const r = lowerOneScalarGlobal(ti, /*init=*/std::int64_t{5},
+                                        /*isConst=*/false);
+    ASSERT_EQ(r.errors, 0u);
+    ASSERT_EQ(r.items.size(), 1u);
+    EXPECT_EQ(r.items[0].section, DataSectionKind::Data)
+        << "a mutable initialized global must route to writable .data";
+    std::vector<std::uint8_t> const expect{5, 0, 0, 0};
+    EXPECT_EQ(r.items[0].bytes, expect);
+}
+
+// A CONST initialized global stays read-only `.rodata`. RED if the section
+// selection drops the `isConst` discriminator (routing const to `.data`).
+TEST(AsmDataSection, ConstInitializedGlobalLowersToRodata) {
+    TypeInterner ti{CompilationUnitId{1}};
+    auto const r = lowerOneScalarGlobal(ti, /*init=*/std::int64_t{5},
+                                        /*isConst=*/true);
+    ASSERT_EQ(r.errors, 0u);
+    ASSERT_EQ(r.items.size(), 1u);
+    EXPECT_EQ(r.items[0].section, DataSectionKind::Rodata)
+        << "a const initialized global must stay read-only .rodata";
+    std::vector<std::uint8_t> const expect{5, 0, 0, 0};
+    EXPECT_EQ(r.items[0].bytes, expect);
+}
+
+// A TENTATIVE (zero-init, no initializer) global lowers to `.bss` with EMPTY
+// bytes + a non-zero `reservedSize` (the zero-fill extent). RED if asm.cpp
+// reverts the bss arm to the former fail-loud (D-LK4-RODATA-PRODUCER-BSS-EMIT)
+// or emits file bytes for it.
+TEST(AsmDataSection, TentativeGlobalLowersToBssEmptyBytesNonzeroSize) {
+    TypeInterner ti{CompilationUnitId{1}};
+    auto const r = lowerOneScalarGlobal(ti, /*init=*/std::nullopt,
+                                        /*isConst=*/false);
+    ASSERT_EQ(r.errors, 0u)
+        << "a tentative global must now EMIT a .bss item (was fail-loud)";
+    ASSERT_EQ(r.items.size(), 1u);
+    EXPECT_EQ(r.items[0].section, DataSectionKind::Bss);
+    EXPECT_TRUE(r.items[0].bytes.empty())
+        << ".bss is zero-fill — it carries NO on-disk bytes";
+    EXPECT_EQ(r.items[0].reservedSize, 4u)
+        << ".bss must record the byte SIZE (sizeof(int)=4) for the section header";
+    EXPECT_EQ(r.items[0].sizeInSection(), 4u);
+}
 
 // POSITIVE control: a {char,int} struct (the padding classic) FULLY
 // initialized encodes char@0 + pad[1..3] + int@4 (LE), size 8 — at the unit

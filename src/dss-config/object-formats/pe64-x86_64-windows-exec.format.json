@@ -30,8 +30,8 @@
   "$entryCallingConventionComment": "MS x64 calling convention — status (user fn return value in rax) is moved into argGprs[0] = rcx before the indirect ExitProcess call. Read via `target.callingConventionByName(\"ms_x64\")` at trampoline-build time.",
   "entryCallingConvention": "ms_x64",
 
-  "$supportedDataSectionsComment": "D-LK2-RODATA closure: PE-Exec walker emits `.rdata` from `AssembledModule.dataItems` items with `section=Rodata`. The linker's pre-walker gate (linker.cpp) consults this set per-item — `Data` and `Bss` remain anchored under D-LK4-RODATA-PRODUCER. Cross-format agnosticism: ELF and Mach-O exec formats will declare their own row when D-LK1-RODATA / D-LK3-RODATA close; zero linker source changes.",
-  "supportedDataSections": ["rodata"],
+  "$supportedDataSectionsComment": "D-LK2-RODATA (`.rdata`) + D-LK4-DATA-PRODUCER (writable `.data` + uninitialized `.bss`): the PE-Exec walker emits `.rdata` (read-only), `.data` (mutable initialized globals, MEM_WRITE), and `.bss` (zero-init globals, CNT_UNINITIALIZED_DATA — SizeOfRawData=0) from `AssembledModule.dataItems` per the item's `section`. The linker's pre-walker gate (linker.cpp) consults this set per-item. Cross-format agnosticism: this is the SAME field ELF/Mach-O exec formats declare; zero linker source changes.",
+  "supportedDataSections": ["rodata", "data", "bss"],
   "$artifactProfilesComment": "Profiles this format SERVES (plan 06 AP3) — a runnable console executable ⇒ cli (the format-side twin of the language's artifactProfiles[]; driver fails loud D_ArtifactProfileFormatMismatch on a profile not in this set). A `gui` profile (IMAGE_SUBSYSTEM_WINDOWS_GUI) would be added when gui codegen lands — same format, profile-selected subsystem/entry, zero gate-code change.",
   "artifactProfiles": ["cli"],
 
@@ -76,6 +76,26 @@
       "kind": "rodata",
       "name": ".rdata",
       "type": 1073741888,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Writable initialized data (mutable globals) — D-LK4-DATA-PRODUCER. Emitted by the PE walker after .rdata when AssembledModule.dataItems carries an item with section==Data. virtualAddress=0 is a placeholder — the walker computes the RVA at emit time (contiguous after .rdata). Characteristics (the substrate `type` field) = IMAGE_SCN_CNT_INITIALIZED_DATA (0x00000040) | IMAGE_SCN_MEM_READ (0x40000000) | IMAGE_SCN_MEM_WRITE (0x80000000) = 0xC0000040 = 3221225536 — initialized data, READ + WRITE (the MEM_WRITE bit is what makes a runtime store legal; a .rdata store faults). The walker reads name + characteristics from this row.",
+      "kind": "data",
+      "name": ".data",
+      "type": 3221225536,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Uninitialized data (tentative globals `int g;`) — D-LK4-DATA-PRODUCER. Emitted by the PE walker after .data. SizeOfRawData=0 / PointerToRawData=0 (NO file footprint — the loader zero-fills VirtualSize bytes); contributes to SizeOfUninitializedData. virtualAddress=0 — walker-computed. Characteristics (`type`) = IMAGE_SCN_CNT_UNINITIALIZED_DATA (0x00000080) | IMAGE_SCN_MEM_READ (0x40000000) | IMAGE_SCN_MEM_WRITE (0x80000000) = 0xC0000080 = 3221225600 — uninitialized data, READ + WRITE.",
+      "kind": "bss",
+      "name": ".bss",
+      "type": 3221225600,
       "flags": 0,
       "addrAlign": 0,
       "entrySize": 0,

@@ -220,7 +220,16 @@ struct MirGlobal {
     // with no `static`) MUST survive DCE / unused-symbol elimination.
     SymbolBinding    binding    = SymbolBinding::Global;     // 1
     SymbolVisibility visibility = SymbolVisibility::Default; // 1
-    std::uint16_t _pad          = 0;                         // 2  — explicit padding
+    // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL (writable data sections cycle): true iff
+    // the source declared this global `const`. Read by the assembler's
+    // section selection (`lowerMirGlobalsToDataItems`): an INITIALIZED global
+    // routes to read-only `.rodata` when const, writable `.data` when mutable.
+    // Default `false` (mutable) is the conservative writable default — a global
+    // wrongly stamped mutable still lands in writable memory (never the read-
+    // only-store crash). Consumes one byte of the former 2-byte pad → zero size
+    // growth (the static_assert below still holds).
+    bool             isConst    = false;                    // 1
+    std::uint8_t     _pad       = 0;                         // 1  — explicit padding
 };
 static_assert(sizeof(MirGlobal) <= 32, "detail::MirGlobal grew unexpectedly — review layout");
 static_assert(std::is_trivially_copyable_v<MirGlobal>);

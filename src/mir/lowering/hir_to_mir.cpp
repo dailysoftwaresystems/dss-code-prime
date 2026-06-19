@@ -60,6 +60,9 @@ struct Lowerer {
     HirLinkageMap const*     linkageMap;  // optional — native-decl binding/
                                            // visibility (D-CSUBSET-LINKAGE-
                                            // SPECIFIERS). nullptr ⇒ all Global.
+    HirMutabilityMap const*  mutabilityMap; // optional — native-global const-ness
+                                           // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL).
+                                           // nullptr / no entry ⇒ mutable.
     MirBuilder               mir;
     // Extern symbols extracted during the pre-pass. Each extern's
     // SymbolId is also inserted into `functionSymbols` so a `Ref`
@@ -3549,6 +3552,10 @@ struct Lowerer {
         // Global/Default ⇒ externally visible). Carried so emitGlobals stamps a
         // `static`/`__attribute__` global's linkage onto the MirGlobal.
         LinkageAttr                    linkage{};
+        // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: declared const-ness (default false
+        // ⇒ mutable ⇒ writable `.data`/`.bss`). Stamped onto MirGlobal.isConst so
+        // the assembler routes an initialized const global to read-only `.rodata`.
+        bool                           isConst = false;
     };
     std::vector<PendingGlobal> pendingGlobals;
 
@@ -3615,6 +3622,8 @@ struct Lowerer {
             pg.type   = hir.globalType(decl);
             if (linkageMap != nullptr)
                 if (auto const* p = linkageMap->tryGet(decl)) pg.linkage = *p;
+            if (mutabilityMap != nullptr)
+                if (auto const* p = mutabilityMap->tryGet(decl)) pg.isConst = p->isConst;
             if (auto initN = hir.globalInit(decl); initN.has_value()) {
                 // The resolver covers Refs to sibling globals; literal /
                 // arithmetic / Cast paths still fold per CE1.
@@ -3678,13 +3687,16 @@ struct Lowerer {
             if (pg.constInit.has_value()) {
                 std::uint32_t const idx = mir.literalPoolAdd(*pg.constInit);
                 mir.addGlobal(pg.type, pg.symbol, idx, {},
-                              pg.linkage.binding, pg.linkage.visibility);
+                              pg.linkage.binding, pg.linkage.visibility,
+                              pg.isConst);
             } else if (pg.runtimeInit.valid()) {
                 mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, moduleInitFunc,
-                              pg.linkage.binding, pg.linkage.visibility);
+                              pg.linkage.binding, pg.linkage.visibility,
+                              pg.isConst);
             } else {
                 mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, {},
-                              pg.linkage.binding, pg.linkage.visibility);
+                              pg.linkage.binding, pg.linkage.visibility,
+                              pg.isConst);
             }
         }
         // Step 3: fill the init function's body — Store each runtime
@@ -3803,7 +3815,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           HirSourceMap const*      sourceMap,
                           MirLoweringConfig const& config,
                           HirFfiMap const*         ffiMap,
-                          HirLinkageMap const*     linkageMap) {
+                          HirLinkageMap const*     linkageMap,
+                          HirMutabilityMap const*  mutabilityMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -3818,6 +3831,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .config    = config,
         .ffiMap    = ffiMap,
         .linkageMap = linkageMap,
+        .mutabilityMap = mutabilityMap,
         .mir       = MirBuilder{},
     };
     // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: stamp the module-
