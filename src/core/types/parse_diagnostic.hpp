@@ -57,6 +57,15 @@ enum class DiagnosticCode : std::uint16_t {
     P_UnterminatedComment         = 0x0011,
     P_InvalidEscape               = 0x0012,
 
+    // C-preprocessor pass (FC13; `src/analysis/preprocess/`). The
+    // preprocessor is a config-SELECTED pre-parse phase; its diagnostics
+    // render with the `P` prefix (parse family) since they are pre-parse
+    // source errors, not config-load errors (`C_InvalidPreprocess`).
+    P_PreprocessorDirective       = 0x0013,  // malformed directive (e.g. `#define` with no name)
+    P_PreprocessorMacroRedefinition = 0x0014,  // incompatible `#define` of an existing macro
+    P_PreprocessorUnsupported     = 0x0015,  // a recognised-but-unimplemented directive form (function-like macro def)
+    P_PreprocessorIncludeError    = 0x0016,  // quote-`#include` target not found / unreadable / recursion overflow
+
     // ── P9xxx — builder internal-invariant violations (release-mode rescues) ──
     P_BuilderInvariant            = 0x9000,
     P_TooManyDiagnostics          = 0x9001,
@@ -173,6 +182,13 @@ enum class DiagnosticCode : std::uint16_t {
     // `D-OPT-DIAGNOSTIC-CODE-SPLIT-OOR-VS-FILE` precedent.
     C_InvalidTargetName           = 0xC035,
     C_InvalidFormatName           = 0xC036,
+    // Config-load error in the `preprocess` block (schema v4; FC13). The
+    // language-agnostic C-preprocessor pass is config-SELECTED: a malformed
+    // `preprocess` object, a missing required directive-keyword string, or a
+    // wrong-typed field surfaces here (mirrors `C_InvalidImports`). An
+    // unknown TOKEN-name field still routes to `C_UnknownToken`, a missing
+    // required string to `C_MissingField`.
+    C_InvalidPreprocess           = 0xC037,
 
     // ── S0xxx — semantic analysis (phase #8; see 08.6-semantic-plan §3) ──
     // Emitted by the language-agnostic semantic analyzer

@@ -20,10 +20,12 @@
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/strong_ids.hpp"
+#include "core/types/token.hpp"
 #include "core/types/tree.hpp"
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -65,7 +67,8 @@ public:
                     DiagnosticReporter                   driverDiagnostics,
                     std::vector<CrossTreeRef>            crossRefs,
                     std::vector<std::filesystem::path>   shippedLibDescriptors,
-                    std::uint32_t                        typeNameReparseCount = 0);
+                    std::uint32_t                        typeNameReparseCount = 0,
+                    std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers = {});
 
     ~CompilationUnit();  // out-of-line; mirrors Tree's discipline.
 
@@ -133,6 +136,19 @@ public:
         return typeNameReparseCount_;
     }
 
+    // FC13: auxiliary source buffers that diagnostics may reference but which
+    // are NOT a parsed tree's `source()` -- the C preprocessor's origin
+    // buffers (the original main file + every quote-`#include`'d header). A
+    // header-origin (or post-splice main-origin) diagnostic is remapped onto
+    // one of these by the PP line-map, so the driver MUST register them with
+    // the diagnostic `BufferRegistry` for positioned rendering (otherwise the
+    // remapped diagnostic renders as `--> <unknown-buffer:N>`). Empty for a CU
+    // whose files were not preprocessed. A buffer here is a neutral text
+    // source for attribution, NOT a compiled unit (it yields no `trees()`
+    // entry).
+    [[nodiscard]] std::span<std::shared_ptr<SourceBuffer> const>
+    auxiliaryBuffers() const noexcept;
+
 private:
     CompilationUnitId                    id_;
     std::shared_ptr<GrammarSchema const> schema_;
@@ -141,6 +157,7 @@ private:
     std::vector<CrossTreeRef>            crossRefs_;
     std::vector<std::filesystem::path>   shippedLibDescriptors_;  // FF11 neutral-JSON descriptor paths
     std::uint32_t                        typeNameReparseCount_ = 0;  // FC2 oracle observability
+    std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers_;    // FC13 PP origin buffers (header/main) for diagnostic rendering
 };
 
 // Single-use builder for CompilationUnit. Non-copyable + non-movable, same
@@ -259,6 +276,15 @@ private:
         std::vector<std::string>                globalTypeNames;
         std::shared_ptr<SourceBuffer>           source;   // null for addTree trees
         std::shared_ptr<GrammarSchema const>    schema;   // null for addTree trees
+        // FC13: when the file went through the C preprocessor, `source` is the
+        // SYNTHESIZED buffer and these carry the preprocessed token stream
+        // (Eof-terminated) + the line-map remap closure. The FC2 type-name
+        // oracle's one-shot reparse rebuilds an identical TokenStream from
+        // `ppTokens` (instead of re-tokenizing raw `source`, which would lose
+        // macro expansion) and re-applies `ppRemap` to the reparsed tree's
+        // diagnostics. Empty/null when the file was not preprocessed.
+        std::vector<Token>                              ppTokens;
+        std::function<void(BufferId&, SourceSpan&)>     ppRemap;
     };
 
     CompilationUnitId                    id_;
@@ -273,6 +299,11 @@ private:
     std::vector<std::filesystem::path>   includeDirs_;
     std::vector<std::filesystem::path>   systemDirs_;   // FF11 angle-include search path
     std::vector<TreeParseSidecar>        sidecars_;     // FC2; parallel to trees_
+    // FC13: the C preprocessor's origin buffers (original main + every spliced
+    // header), accumulated across every preprocessed file, handed to the CU as
+    // `auxiliaryBuffers()` so the driver can register them for diagnostic
+    // rendering (a remapped header/main diagnostic resolves to a real buffer).
+    std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers_;
     bool                                 finished_ = false;
 };
 

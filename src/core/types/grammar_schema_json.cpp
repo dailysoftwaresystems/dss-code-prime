@@ -1863,13 +1863,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 continue;
             }
             // Mode operations and string-style descriptors belong on
-            // `tokens` entries — keywords resolve contextually (soft-
+            // `tokens` entries; keywords resolve contextually (soft-
             // keyword demotion), a distinct mechanism from mode
             // switching or delimited-string opening. Reject loudly.
             if (kw.contains("modeOp") || kw.contains("modeArg")) {
                 coll.emit(DiagnosticCode::C_ConflictingField, kwPath,
                           "mode operations belong on 'tokens' entries; keywords "
-                          "cannot switch lexer modes — move the entry to "
+                          "cannot switch lexer modes; move the entry to "
                           "'tokens' or drop the mode fields");
                 continue;
             }
@@ -3386,6 +3386,106 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             }
 
             data.imports = std::move(cfg);
+        }
+    }
+
+    // preprocess -- config-driven C-preprocessor vocabulary (schema v4
+    // `preprocess` block; FC13). The whole preprocessor pass is config-
+    // SELECTED: a block with `enabled: true` opts the language in and
+    // declares the directive vocabulary; a config that omits the block (or
+    // sets `enabled: false`) gets a strict NO-OP pass. Mirrors the `imports`
+    // loader's validation style: TOKEN-name fields are checked against the
+    // interned token kinds (`C_UnknownToken`); directive-keyword strings are
+    // checked non-empty (`C_MissingField`); a structurally-malformed block
+    // is `C_InvalidPreprocess`. Parsed AFTER `tokens`/`keywords` populated
+    // the token interner so the token-name checks resolve.
+    if (doc.contains("preprocess")) {
+        json const& pp = doc.at("preprocess");
+        if (!pp.is_object()) {
+            coll.emit(DiagnosticCode::C_InvalidPreprocess, "/preprocess",
+                      "'preprocess' must be an object");
+        } else {
+            // Read a REQUIRED string field. Missing -> C_MissingField;
+            // present-but-wrong-type -> C_InvalidPreprocess; empty string ->
+            // C_MissingField (an empty directive word/token name names
+            // nothing).
+            auto const readField = [&](char const* key, std::string& out) {
+                const auto fpath = std::format("/preprocess/{}", key);
+                if (!pp.contains(key)) {
+                    coll.emit(DiagnosticCode::C_MissingField, fpath,
+                              std::format("'preprocess.{}' is required", key));
+                    return;
+                }
+                if (!pp.at(key).is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess, fpath,
+                              std::format("'preprocess.{}' must be a string", key));
+                    return;
+                }
+                out = pp.at(key).get<std::string>();
+                if (out.empty()) {
+                    coll.emit(DiagnosticCode::C_MissingField, fpath,
+                              std::format("'preprocess.{}' must be non-empty", key));
+                }
+            };
+            // Validate a declared TOKEN-name field resolves to a known token
+            // kind (skip the empty case -- readField already flagged it).
+            auto const checkToken = [&](std::string const& name, char const* key) {
+                if (!name.empty() && !data.schemaTokens->contains(name)) {
+                    coll.emit(DiagnosticCode::C_UnknownToken,
+                              std::format("/preprocess/{}", key),
+                              std::format("'preprocess.{}' references unknown token '{}'",
+                                          key, name));
+                }
+            };
+
+            PreprocessConfig cfg;
+            // `enabled` is OPTIONAL and defaults to true WHEN the block is
+            // present (declaring the block is itself the opt-in); an explicit
+            // `false` keeps the pass a no-op while still validating the
+            // vocabulary, which is useful for staging.
+            cfg.enabled = true;
+            if (pp.contains("enabled")) {
+                if (!pp.at("enabled").is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/enabled",
+                              "'preprocess.enabled' must be a boolean");
+                } else {
+                    cfg.enabled = pp.at("enabled").get<bool>();
+                }
+            }
+
+            readField("directiveIntroToken",  cfg.directiveIntroToken);
+            readField("defineDirective",      cfg.defineDirective);
+            readField("undefDirective",       cfg.undefDirective);
+            readField("includeDirective",     cfg.includeDirective);
+            readField("quoteIncludeToken",    cfg.quoteIncludeToken);
+            // `functionLikeOpenToken` (C's `(`) is REQUIRED + validated: the
+            // macro engine reads it to tell `#define F(x)` (function-like, the
+            // `(` is adjacent to the name) from `#define F (x)` (object-like).
+            // `(` is a per-language CONFIG lexeme, NOT a core/builtin kind, so
+            // an opt-in language must always declare it (same fail-loud as
+            // quoteIncludeToken: missing -> C_MissingField, unknown name ->
+            // C_UnknownToken). Required, so the engine never hard-codes "(".
+            readField("functionLikeOpenToken", cfg.functionLikeOpenToken);
+            checkToken(cfg.directiveIntroToken,   "directiveIntroToken");
+            checkToken(cfg.quoteIncludeToken,     "quoteIncludeToken");
+            checkToken(cfg.functionLikeOpenToken, "functionLikeOpenToken");
+            // `angleIncludeToken` is OPTIONAL: a language with only a quote
+            // include form declares none. Present-but-wrong-type ->
+            // C_InvalidPreprocess; an unknown kind -> C_UnknownToken.
+            if (pp.contains("angleIncludeToken")) {
+                if (!pp.at("angleIncludeToken").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/angleIncludeToken",
+                              "'preprocess.angleIncludeToken' must be a string");
+                } else {
+                    cfg.angleIncludeToken =
+                        pp.at("angleIncludeToken").get<std::string>();
+                    checkToken(cfg.angleIncludeToken, "angleIncludeToken");
+                }
+            }
+
+            data.preprocess = std::move(cfg);
         }
     }
 

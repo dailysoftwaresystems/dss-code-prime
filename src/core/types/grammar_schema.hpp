@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/compiled_shape.hpp"
 #include "core/types/import_config.hpp"
+#include "core/types/preprocess_config.hpp"
 #include "core/types/lexer_mode.hpp"
 #include "core/types/type_lattice/core_type.hpp"  // TypeExtensionDescriptor
 #include "core/types/number_style.hpp"
@@ -296,6 +297,14 @@ struct DSS_EXPORT GrammarSchemaData {
     // the single language-agnostic import engine.
     ImportConfig                                      imports;
 
+    // Config-driven C-preprocessor (schema v4 `preprocess` block; FC13).
+    // Default `enabled == false` (no block) -> the preprocess pass is a
+    // strict identity. A block with `enabled: true` opts the language in and
+    // declares the directive vocabulary. Consumed by the single language-
+    // agnostic preprocessor pass -- NO engine code branches on the language
+    // name.
+    PreprocessConfig                                  preprocess;
+
     // Pratt-walker wrapper rule ids per `expr` shape (08.55 cleanup;
     // schema v4 `expr.wrapperRules`). Keyed by the expr rule's RuleId
     // value. The loader populates this BEFORE shape compile so the
@@ -562,6 +571,12 @@ public:
     // chooseResolver/ConfigDrivenImportResolver — the single language-agnostic
     // import engine; NO engine code branches on the language name.
     [[nodiscard]] ImportConfig const& imports() const noexcept;
+
+    // Config-driven C-preprocessor (schema v4 `preprocess` block). Default
+    // `enabled == false` when the config omits the block. Consumed by the
+    // single language-agnostic preprocessor pass; NO engine code branches on
+    // the language name.
+    [[nodiscard]] PreprocessConfig const& preprocess() const noexcept;
 
     // `expr`-shape introspection. `isExprRule` is true when the rule's
     // body was declared as `{ "expr": { "atom": ..., "minPrecedence": ... } }`.

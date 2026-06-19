@@ -376,6 +376,10 @@ ImportConfig const& GrammarSchema::imports() const noexcept {
     return d_.imports;
 }
 
+PreprocessConfig const& GrammarSchema::preprocess() const noexcept {
+    return d_.preprocess;
+}
+
 bool GrammarSchema::isNullable(RuleId rule) const noexcept {
     auto it = d_.compiledRules.find(rule.v);
     if (it == d_.compiledRules.end()) return false;

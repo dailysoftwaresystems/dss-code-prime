@@ -97,7 +97,18 @@ TEST(ImportResolver, ToyProducesNoCrossRefs) {
 
 // ── c-subset: #include following ─────────────────────────────────────────────
 
-TEST(ImportResolver, CSubsetIncludeLoadsTargetAndLinksIt) {
+TEST(ImportResolver, CSubsetQuoteIncludeIsInlinedByPreprocessor) {
+    // FC13: a QUOTE `#include "h"` is now owned by the config-selected C
+    // preprocessor, which splices the header TEXT into ONE synthesized buffer
+    // BEFORE parsing (so a header `#define` could reach the includer). The
+    // post-parse include-following arm is RETIRED for C quote includes: there
+    // is exactly ONE tree (no separate header tree) and ZERO cross-refs (the
+    // include is textual, not a cross-tree edge). The header's symbol is
+    // physically present in the single tree's (synthesized) source.
+    //
+    // RED-ON-DISABLE: reverting the `if (schema->preprocess().enabled)` gate in
+    // compilation_unit.cpp parseAndAdd_ makes the old post-parse arm run again
+    // -> trees().size()==2 and crossRefs().size()==1, flipping these asserts.
     TempDir dir;
     auto main = dir.write("main.c", "#include \"helper.h\"\nint main() { return helper(); }\n");
     dir.write("helper.h", "int helper() { return 1; }\n");
@@ -106,30 +117,21 @@ TEST(ImportResolver, CSubsetIncludeLoadsTargetAndLinksIt) {
     b.addFile(main);
     auto cu = std::move(b).finish();
 
-    // helper.h was discovered + loaded by following the directive.
-    ASSERT_EQ(cu.trees().size(), 2u);
-    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors());   // main.c parses clean
-    EXPECT_FALSE(cu.trees()[1].diagnostics().hasErrors());   // helper.h parses clean
+    ASSERT_EQ(cu.trees().size(), 1u);              // header inlined, not a 2nd tree
+    EXPECT_TRUE(cu.crossRefs().empty());           // textual include -> no edge
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors());
     EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport));
-
-    ASSERT_EQ(cu.crossRefs().size(), 1u);
-    auto const& ref = cu.crossRefs()[0];
-    Tree const& mainTree = cu.trees()[0];
-    EXPECT_EQ(ref.sourceTree, mainTree.id());                // edge from main.c
-    EXPECT_EQ(ref.targetTree, cu.trees()[1].id());           // to helper.h
-    EXPECT_EQ(ref.targetNode, cu.trees()[1].root());         // targets the included tree root
-
-    // sourceNode is the includeDirective node, and importSpan is exactly that
-    // directive's span (which begins the file).
-    ASSERT_TRUE(ref.sourceNode.valid());
-    EXPECT_EQ(mainTree.kind(ref.sourceNode), NodeKind::Internal);
-    EXPECT_EQ(mainTree.rule(ref.sourceNode), mainTree.rules().find("includeDirective"));
-    ASSERT_TRUE(ref.importSpan.has_value());
-    EXPECT_EQ(*ref.importSpan, mainTree.span(ref.sourceNode));
-    EXPECT_EQ(ref.importSpan->start(), 0u);
+    // The header's declaration is physically spliced into the synthesized
+    // source the single tree was parsed from.
+    EXPECT_NE(std::string{cu.trees()[0].source().text()}.find("int helper()"),
+              std::string::npos)
+        << "preprocessor must splice the quote-included header text inline";
 }
 
-TEST(ImportResolver, CSubsetTransitiveIncludeLoadsChain) {
+TEST(ImportResolver, CSubsetTransitiveQuoteIncludeInlinesChain) {
+    // FC13: a quote include WITHIN a quote-included header is inlined
+    // recursively into the SAME synthesized buffer -> still one tree, zero
+    // cross-refs, and every transitively-included symbol present.
     TempDir dir;
     auto a = dir.write("a.c", "#include \"b.h\"\nint a() { return 0; }\n");
     dir.write("b.h", "#include \"c.h\"\nint b() { return 0; }\n");
@@ -139,12 +141,23 @@ TEST(ImportResolver, CSubsetTransitiveIncludeLoadsChain) {
     builder.addFile(a);
     auto cu = std::move(builder).finish();
 
-    EXPECT_EQ(cu.trees().size(), 3u);        // a.c, b.h, c.h
-    EXPECT_EQ(cu.crossRefs().size(), 2u);    // a->b, b->c
-    EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport));
+    ASSERT_EQ(cu.trees().size(), 1u);
+    EXPECT_TRUE(cu.crossRefs().empty());
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors());
+    std::string const text{cu.trees()[0].source().text()};
+    EXPECT_NE(text.find("int b()"), std::string::npos);
+    EXPECT_NE(text.find("int c()"), std::string::npos)   // transitive splice
+        << "transitive quote include must be recursively inlined";
 }
 
-TEST(ImportResolver, CSubsetIncludeCycleTerminates) {
+TEST(ImportResolver, CSubsetQuoteIncludeCycleTerminates) {
+    // FC13: a circular quote-`#include` chain is broken by the preprocessor's
+    // include-stack guard, which emits P_PreprocessorIncludeError on the
+    // back-edge instead of looping forever. The parse still produces one tree.
+    //
+    // RED-ON-DISABLE: removing the `std::find(includeStack...)` cycle guard in
+    // preprocessor.cpp SynthBuilder::build either hangs (infinite recursion) or
+    // overflows the depth guard -- either way this test stops passing cleanly.
     TempDir dir;
     auto a = dir.write("a.h", "#include \"b.h\"\nint a() { return 0; }\n");
     dir.write("b.h", "#include \"a.h\"\nint b() { return 0; }\n");
@@ -153,12 +166,21 @@ TEST(ImportResolver, CSubsetIncludeCycleTerminates) {
     builder.addFile(a);
     auto cu = std::move(builder).finish();
 
-    // Each file loaded exactly once (dedup by canonical path breaks the cycle).
-    EXPECT_EQ(cu.trees().size(), 2u);
-    EXPECT_EQ(cu.crossRefs().size(), 2u);    // a->b and b->a, no infinite loop
+    ASSERT_EQ(cu.trees().size(), 1u);              // terminates, one tree
+    // The back-edge of the cycle is reported (on the tree's reporter, remapped
+    // to the originating header).
+    bool sawCycleDiag = false;
+    for (auto const& d : cu.trees()[0].diagnostics().all()) {
+        if (d.code == DiagnosticCode::P_PreprocessorIncludeError) sawCycleDiag = true;
+    }
+    EXPECT_TRUE(sawCycleDiag)
+        << "a circular quote-include must emit P_PreprocessorIncludeError";
 }
 
-TEST(ImportResolver, CSubsetMissingIncludeEmitsDiagnosticAndContinues) {
+TEST(ImportResolver, CSubsetMissingQuoteIncludeEmitsDiagnosticAndContinues) {
+    // FC13: a missing quote-`#include` target is reported by the preprocessor
+    // (P_PreprocessorIncludeError) and the rest of the file still parses (the
+    // directive's bytes are left verbatim). Still one tree, no cross-refs.
     TempDir dir;
     auto main = dir.write("main.c", "#include \"ghost.h\"\nint main() { return 0; }\n");
 
@@ -166,25 +188,44 @@ TEST(ImportResolver, CSubsetMissingIncludeEmitsDiagnosticAndContinues) {
     builder.addFile(main);
     auto cu = std::move(builder).finish();
 
-    EXPECT_EQ(cu.trees().size(), 1u);                // only main.c — nothing loaded
-    EXPECT_TRUE(cu.crossRefs().empty());             // no edge for an unresolved include
-    EXPECT_EQ(countCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport), 1u);
+    ASSERT_EQ(cu.trees().size(), 1u);
+    EXPECT_TRUE(cu.crossRefs().empty());
+    bool sawMissingDiag = false;
+    for (auto const& d : cu.trees()[0].diagnostics().all()) {
+        if (d.code == DiagnosticCode::P_PreprocessorIncludeError) sawMissingDiag = true;
+    }
+    EXPECT_TRUE(sawMissingDiag)
+        << "a missing quote include must emit P_PreprocessorIncludeError";
+    // FC13 co-existence (Fix 3): the PP OWNS the (failed) quote include and is
+    // the SOLE reporter -- the post-parse import resolver must NOT also report
+    // it as D_UnresolvedImport. Exactly one root cause, exactly one diagnostic
+    // class (P_PreprocessorIncludeError above). RED-ON-DISABLE: reverting the
+    // resolver's `if (ppEnabled) return;` quote-skip makes the resolver
+    // double-report -> this count becomes 1.
+    EXPECT_EQ(countCode(cu.driverDiagnostics(),
+                        DiagnosticCode::D_UnresolvedImport), 0u)
+        << "the resolver must not double-report a PP-owned failed quote include";
 }
 
-TEST(ImportResolver, CSubsetIncludeDirResolvesAcrossDirectories) {
+TEST(ImportResolver, CSubsetQuoteIncludeResolvesAcrossDirectories) {
+    // FC13: the preprocessor's quote-include search honors declared include
+    // dirs (addIncludeDir), mirroring the import resolver's resolveIncludePath.
     TempDir srcDir;
     TempDir incDir;
-    auto main = srcDir.write("main.c", "#include \"shared.h\"\nint main() { return 0; }\n");
+    auto main = srcDir.write("main.c", "#include \"shared.h\"\nint main() { return shared(); }\n");
     incDir.write("shared.h", "int shared() { return 0; }\n");
 
     UnitBuilder builder{loadShippedSchema("c-subset")};
-    builder.addIncludeDir(incDir.path());   // declared include dir
+    builder.addIncludeDir(incDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
 
-    EXPECT_EQ(cu.trees().size(), 2u);
-    ASSERT_EQ(cu.crossRefs().size(), 1u);
-    EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport));
+    ASSERT_EQ(cu.trees().size(), 1u);
+    EXPECT_TRUE(cu.crossRefs().empty());
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors());
+    EXPECT_NE(std::string{cu.trees()[0].source().text()}.find("int shared()"),
+              std::string::npos)
+        << "include-dir-resolved header must be spliced inline";
 }
 
 // ── FF11: angle-form `#include <h>` system-path resolution ───────────────────
@@ -262,7 +303,11 @@ TEST(ImportResolver, CSubsetAngleAndQuotePathsAreDistinct) {
     TempDir srcDir;
     TempDir sysDir;
     // The header lives ONLY on the system dir. A QUOTE include of the same
-    // name must NOT find it there → soft D_UnresolvedImport, no hard error.
+    // name must NOT find it there → it fails to resolve. FC13 (Fix 3): the
+    // PREPROCESSOR owns the (failed) quote include and reports
+    // P_PreprocessorIncludeError; the post-parse resolver SKIPS the quote form
+    // (no D_UnresolvedImport double-report). Either way it must NOT be the
+    // angle-form hard error -- the two search paths stay distinct.
     auto main = srcDir.write("main.c",
         "#include \"sysonly.h\"\nint main() { return 0; }\n");
     sysDir.write("sysonly.h", "extern int s();\n");
@@ -273,7 +318,16 @@ TEST(ImportResolver, CSubsetAngleAndQuotePathsAreDistinct) {
     auto cu = std::move(builder).finish();
 
     EXPECT_EQ(cu.trees().size(), 1u);      // quote form did not reach the system dir
-    EXPECT_EQ(countCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport), 1u);
+    // The quote-include failure is reported ONCE, by the preprocessor.
+    bool sawPPInclude = false;
+    for (auto const& d : cu.trees()[0].diagnostics().all()) {
+        if (d.code == DiagnosticCode::P_PreprocessorIncludeError) sawPPInclude = true;
+    }
+    EXPECT_TRUE(sawPPInclude)
+        << "a quote include not found on the (quote) search path must emit "
+           "P_PreprocessorIncludeError";
+    // Not double-reported by the resolver, and NOT the angle-form hard error.
+    EXPECT_EQ(countCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport), 0u);
     EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::F_ShippedHeaderNotFound));
 }
 
@@ -352,18 +406,25 @@ TEST(ImportResolver, TsqlInsertAndUpdateAreTablePositions) {
 
 TEST(ImportResolver, CSubsetEmptyIncludePathIsReported) {
     TempDir dir;
-    // `#include ""` parses as a well-formed directive with an empty filename —
-    // it resolves to nothing and must surface as D_UnresolvedImport, not a
-    // silent skip.
+    // FC13: `#include ""` is a well-formed directive with an EMPTY filename.
+    // The preprocessor resolves it to nothing and reports
+    // P_PreprocessorIncludeError (it must NOT crash trying to open the
+    // including directory -- the empty/`is_regular_file` guard in
+    // SynthBuilder::resolveQuote). The directive bytes are left verbatim, so
+    // one tree results.
     auto main = dir.write("main.c", "#include \"\"\nint main() { return 0; }\n");
 
     UnitBuilder builder{loadShippedSchema("c-subset")};
     builder.addFile(main);
     auto cu = std::move(builder).finish();
 
-    EXPECT_EQ(cu.trees().size(), 1u);
-    EXPECT_TRUE(cu.crossRefs().empty());
-    EXPECT_EQ(countCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport), 1u);
+    ASSERT_EQ(cu.trees().size(), 1u);
+    bool sawDiag = false;
+    for (auto const& d : cu.trees()[0].diagnostics().all()) {
+        if (d.code == DiagnosticCode::P_PreprocessorIncludeError) sawDiag = true;
+    }
+    EXPECT_TRUE(sawDiag)
+        << "an empty quote include must be reported, never a silent skip";
 }
 
 TEST(ImportResolver, CSubsetExplicitlyAddedIncludeTargetIsNotReloaded) {
@@ -373,15 +434,20 @@ TEST(ImportResolver, CSubsetExplicitlyAddedIncludeTargetIsNotReloaded) {
 
     UnitBuilder builder{loadShippedSchema("c-subset")};
     builder.addFile(main);
-    builder.addFile(helper);   // also added explicitly — must dedup, not double-load
+    builder.addFile(helper);   // also added explicitly
     auto cu = std::move(builder).finish();
 
-    EXPECT_EQ(cu.trees().size(), 2u);          // not 3 — the include reuses helper.h's tree
-    ASSERT_EQ(cu.crossRefs().size(), 1u);
-    EXPECT_EQ(cu.crossRefs()[0].targetTree, cu.trees()[1].id());
+    // FC13: main.c's quote include is INLINED by the preprocessor (no edge),
+    // and the explicitly-added helper.h is its own (separately parsed) tree.
+    // So there are TWO trees but ZERO cross-refs -- the include is textual.
+    EXPECT_EQ(cu.trees().size(), 2u);
+    EXPECT_TRUE(cu.crossRefs().empty());
+    // main.c's tree carries the inlined helper text.
+    EXPECT_NE(std::string{cu.trees()[0].source().text()}.find("int helper()"),
+              std::string::npos);
 }
 
-TEST(ImportResolver, CSubsetSharedHeaderLoadedOnceWithTwoEdges) {
+TEST(ImportResolver, CSubsetSharedHeaderIsInlinedIntoEachIncluder) {
     TempDir dir;
     auto a = dir.write("a.c", "#include \"common.h\"\nint a() { return 0; }\n");
     auto b = dir.write("b.c", "#include \"common.h\"\nint b() { return 0; }\n");
@@ -392,26 +458,34 @@ TEST(ImportResolver, CSubsetSharedHeaderLoadedOnceWithTwoEdges) {
     builder.addFile(b);
     auto cu = std::move(builder).finish();
 
-    EXPECT_EQ(cu.trees().size(), 3u);          // a.c, b.c, common.h (loaded once)
-    ASSERT_EQ(cu.crossRefs().size(), 2u);      // a->common and b->common
-    EXPECT_EQ(cu.crossRefs()[0].targetTree, cu.crossRefs()[1].targetTree);  // same header
-    EXPECT_NE(cu.crossRefs()[0].sourceTree, cu.crossRefs()[1].sourceTree);  // distinct includers
+    // FC13: each TU inlines its own copy of common.h. Two trees (a.c, b.c),
+    // zero cross-refs, and BOTH trees carry the header text. (A shared header
+    // is recompiled per TU -- standard C textual-include semantics.)
+    EXPECT_EQ(cu.trees().size(), 2u);
+    EXPECT_TRUE(cu.crossRefs().empty());
+    EXPECT_NE(std::string{cu.trees()[0].source().text()}.find("int common()"),
+              std::string::npos);
+    EXPECT_NE(std::string{cu.trees()[1].source().text()}.find("int common()"),
+              std::string::npos);
 }
 
 TEST(ImportResolver, CSubsetInMemoryIncludeResolvesViaIncludeDir) {
     TempDir incDir;
     incDir.write("dep.h", "int dep() { return 0; }\n");
 
-    // An in-memory source has a label, not a path, so same-directory resolution
-    // can't apply — only declared include dirs can satisfy the #include.
+    // FC13: an in-memory source's quote include is resolved by the
+    // preprocessor against declared include dirs and INLINED -> one tree,
+    // zero cross-refs, header text present.
     UnitBuilder builder{loadShippedSchema("c-subset")};
     builder.addIncludeDir(incDir.path());
-    builder.addInMemory("#include \"dep.h\"\nint main() { return 0; }\n", "main.c");
+    builder.addInMemory("#include \"dep.h\"\nint main() { return dep(); }\n", "main.c");
     auto cu = std::move(builder).finish();
 
-    EXPECT_EQ(cu.trees().size(), 2u);
-    EXPECT_EQ(cu.crossRefs().size(), 1u);
+    ASSERT_EQ(cu.trees().size(), 1u);
+    EXPECT_TRUE(cu.crossRefs().empty());
     EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport));
+    EXPECT_NE(std::string{cu.trees()[0].source().text()}.find("int dep()"),
+              std::string::npos);
 }
 
 TEST(ImportResolver, CSubsetInMemoryIncludeWithoutIncludeDirIsUnresolved) {
@@ -421,55 +495,50 @@ TEST(ImportResolver, CSubsetInMemoryIncludeWithoutIncludeDirIsUnresolved) {
 
     EXPECT_EQ(cu.trees().size(), 1u);
     EXPECT_TRUE(cu.crossRefs().empty());
-    EXPECT_EQ(countCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport), 1u);
+    // FC13 (Fix 3): with no include dir, `dep.h` cannot be resolved. The
+    // PREPROCESSOR owns the failed quote include and reports it ONCE as
+    // P_PreprocessorIncludeError; the post-parse resolver SKIPS the quote form,
+    // so there is NO D_UnresolvedImport double-report.
+    bool sawPPInclude = false;
+    for (auto const& d : cu.trees()[0].diagnostics().all()) {
+        if (d.code == DiagnosticCode::P_PreprocessorIncludeError) sawPPInclude = true;
+    }
+    EXPECT_TRUE(sawPPInclude)
+        << "an unresolvable in-memory quote include must emit "
+           "P_PreprocessorIncludeError";
+    EXPECT_EQ(countCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport), 0u)
+        << "the resolver must not double-report a PP-owned failed quote include";
 }
 
-// GAP E: an in-memory source whose LABEL equals a real on-disk path an
-// #include later follows must NOT be loaded twice. We register `helper.h`
-// in memory under its real absolute path, then add a `main.c` that
-// `#include "helper.h"`s it. Include-following must dedup against the
-// in-memory tree (by weakly-canonical path) instead of re-parsing the file
-// from disk — so the CU has exactly TWO trees (main + the in-memory helper),
-// not three, and one cross-ref edge to the in-memory tree.
-TEST(ImportResolver, CSubsetInMemoryLabelDedupsAgainstIncludedPath) {
+// FC13: a quote `#include` is a TEXTUAL splice performed by the preprocessor,
+// which reads the target from DISK (not the in-memory tree registry). So an
+// in-memory source registered under a path that an `#include` also names does
+// NOT dedup against the include -- the preprocessor inlines the on-disk file
+// text, and the in-memory source remains its own separately-parsed tree. Two
+// trees, zero cross-refs; main.c's inlined text is the ON-DISK content.
+// (The pre-FC13 post-parse dedup-by-label applied only to the cross-tree
+// include-following arm, which is retired for C quote includes.)
+TEST(ImportResolver, CSubsetInMemoryLabelDoesNotDedupAgainstTextualInclude) {
     TempDir dir;
-    // helper.h exists on disk too (its content differs so a double-load
-    // would be observable), but the in-memory label claims the same path.
     auto helperPath = dir.write("helper.h", "int disk_helper() { return 9; }\n");
     auto mainPath   = dir.write("main.c",
         "#include \"helper.h\"\nint main() { return 0; }\n");
 
     UnitBuilder builder{loadShippedSchema("c-subset")};
-    // Register the helper in memory under its REAL canonical path label.
     builder.addInMemory("int mem_helper() { return 1; }\n", helperPath.string());
     builder.addFile(mainPath);
     auto cu = std::move(builder).finish();
 
-    // Two trees only — the include reused the in-memory helper tree.
-    EXPECT_EQ(cu.trees().size(), 2u)
-        << "an #include matching an in-memory label must not double-load";
-    ASSERT_EQ(cu.crossRefs().size(), 1u);
-    // The edge targets the in-memory helper tree (index 0), not a third tree.
-    EXPECT_EQ(cu.crossRefs()[0].targetTree, cu.trees()[0].id());
-    EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport));
-
-    // FIX 9: actually OBSERVE that the surviving helper tree is the IN-MEMORY
-    // one, not a disk re-parse. The in-memory body declares `mem_helper`; the
-    // on-disk file declares `disk_helper`. If the dedup had silently re-loaded
-    // from disk, the surviving tree would carry `disk_helper`. Scan the helper
-    // tree's tokens: the in-memory name MUST be present and the disk name MUST
-    // be absent — turning the stated tripwire into a real assertion.
-    Tree const& helperTree = cu.trees()[0];
-    bool sawMem = false, sawDisk = false;
-    walkPreOrder(helperTree, [&](TreeCursor const& cursor) {
-        NodeId const n = cursor.current();
-        if (helperTree.kind(n) != NodeKind::Token) return;
-        auto const text = helperTree.text(n);
-        if (text == "mem_helper")  sawMem  = true;
-        if (text == "disk_helper") sawDisk = true;
-    });
-    EXPECT_TRUE(sawMem)   << "the surviving helper tree must carry the in-memory content";
-    EXPECT_FALSE(sawDisk) << "the disk file must NOT have been re-parsed over the in-memory tree";
+    EXPECT_EQ(cu.trees().size(), 2u);
+    EXPECT_TRUE(cu.crossRefs().empty());
+    // main.c is tree[1] (the in-memory helper was added first as tree[0]). Its
+    // inlined include text is the ON-DISK helper, proving the preprocessor
+    // reads from disk for a textual splice.
+    std::string const mainText{cu.trees()[1].source().text()};
+    EXPECT_NE(mainText.find("disk_helper"), std::string::npos)
+        << "the preprocessor splices the on-disk header text";
+    EXPECT_EQ(mainText.find("mem_helper"), std::string::npos)
+        << "the in-memory tree is not consulted for a textual include";
 }
 
 // ── genericity: resolution is driven by the `imports` block, not the name ─────
@@ -479,9 +548,16 @@ TEST(ImportResolver, CSubsetInMemoryLabelDedupsAgainstIncludedPath) {
 // If any resolver code branched on the language name, the include would be
 // silently dropped under the made-up name; instead the schema's `imports` block
 // drives resolution, so the cross-ref appears exactly as for "CSubset".
-TEST(ImportResolver, IncludeFollowingIsDrivenByConfigNotLanguageName) {
+// Load the shipped c-subset schema TEXT, rename the language to something the
+// engine has never heard of, and confirm the config-SELECTED preprocessor
+// STILL inlines the quote `#include`. If any pass branched on the language
+// name, the include would not be inlined under the made-up name; instead the
+// schema's `preprocess` block drives it, so the header text appears inline
+// exactly as for "CSubset". (Pre-FC13 this asserted the post-parse
+// include-following arm; FC13 retired that arm for C quote includes in favor
+// of the equally config-driven preprocessor splice.)
+TEST(ImportResolver, QuoteIncludeInliningIsDrivenByConfigNotLanguageName) {
     std::string text = readShippedConfigText("c-subset");
-    // Rename the language. The shipped config declares `"name": "CSubset"`.
     auto const pos = text.find("\"CSubset\"");
     ASSERT_NE(pos, std::string::npos) << "shipped c-subset config no longer names CSubset";
     text.replace(pos, std::string_view{"\"CSubset\""}.size(), "\"MadeUpLang\"");
@@ -492,8 +568,8 @@ TEST(ImportResolver, IncludeFollowingIsDrivenByConfigNotLanguageName) {
         << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
     std::shared_ptr<GrammarSchema const> schema = *loaded;
     EXPECT_EQ(schema->name(), "MadeUpLang");
-    // Sanity: the config-driven block survived the rename intact.
-    EXPECT_EQ(schema->imports().strategy, ImportStrategy::IncludeFollowing);
+    // Sanity: the config-driven preprocess block survived the rename intact.
+    EXPECT_TRUE(schema->preprocess().enabled);
 
     TempDir dir;
     auto main = dir.write("main.c", "#include \"helper.h\"\nint main() { return helper(); }\n");
@@ -503,12 +579,12 @@ TEST(ImportResolver, IncludeFollowingIsDrivenByConfigNotLanguageName) {
     builder.addFile(main);
     auto cu = std::move(builder).finish();
 
-    // helper.h was discovered + loaded by following the directive — under a
-    // language name no resolver could possibly special-case.
-    ASSERT_EQ(cu.trees().size(), 2u);
-    ASSERT_EQ(cu.crossRefs().size(), 1u);
-    EXPECT_EQ(cu.crossRefs()[0].sourceTree, cu.trees()[0].id());
-    EXPECT_EQ(cu.crossRefs()[0].targetTree, cu.trees()[1].id());
+    // The header was inlined by the preprocessor -- under a language name no
+    // pass could possibly special-case. One tree, zero cross-refs, text present.
+    ASSERT_EQ(cu.trees().size(), 1u);
+    EXPECT_TRUE(cu.crossRefs().empty());
+    EXPECT_NE(std::string{cu.trees()[0].source().text()}.find("int helper()"),
+              std::string::npos);
     EXPECT_EQ(countCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport), 0u);
 }
 

@@ -107,6 +107,15 @@ namespace {
     for (auto const& tree : cu->trees()) {
         if (auto s = tree.sourceShared()) bufs.add(std::move(s));
     }
+    // FC13: a preprocessed CU (c-subset) remaps a diagnostic off the synth
+    // buffer onto its real origin buffer (the original main file / a spliced
+    // header), which lives on `auxiliaryBuffers()`, NOT in `trees()`. Register
+    // those too so the remapped buffer resolves to line:col instead of the
+    // `<unregistered-buffer>` sentinel. Mirrors the driver's
+    // `runCusToTargets` registry build.
+    for (auto const& b : cu->auxiliaryBuffers()) {
+        if (b) bufs.add(b);
+    }
 
     std::vector<std::string> lines;
     for (auto const& tree : cu->trees()) {

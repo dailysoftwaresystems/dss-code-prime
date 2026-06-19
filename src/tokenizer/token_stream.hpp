@@ -40,6 +40,22 @@ public:
     TokenStream(TokenStream&& other) noexcept;
     TokenStream& operator=(TokenStream&& other) noexcept;
 
+    // Factory: build a stream DIRECTLY from a token vector that did NOT
+    // come from `Tokenizer::tokenize()`. The C preprocessor pass
+    // (`src/analysis/preprocess/`) is the first consumer -- it tokenizes a
+    // synthesized buffer ONCE, runs the object-macro pass over the resulting
+    // tokens (splicing/removing/rescanning, all within that ONE buffer so
+    // every span stays valid), then re-packages the surviving tokens into a
+    // fresh stream for the parser. Keeping this a named factory (not a public
+    // ctor) preserves the "only Tokenizer makes one normally" discipline
+    // while giving the PP a sanctioned, single seam.
+    //
+    // Preconditions (fatal-asserted, same as the Tokenizer ctor): `tokens`
+    // must be non-empty and its LAST element must be a `CoreTokenKind::Eof`
+    // token. The factory mints its own unique instance id so bookmarks from
+    // this stream never collide with another's.
+    [[nodiscard]] static TokenStream fromTokens(std::vector<Token> tokens);
+
     // ── peek / advance ──
     //
     // `peek(0)` is the next token to be consumed (the same Eof appears

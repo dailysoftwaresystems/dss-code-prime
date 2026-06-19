@@ -1,6 +1,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 
 #include "analysis/compilation_unit/import_resolver.hpp"
+#include "analysis/preprocess/preprocessor.hpp"
 #include "analysis/syntactic/parser.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -64,14 +65,16 @@ CompilationUnit::CompilationUnit(PrivateTag,
                                  DiagnosticReporter                   driverDiagnostics,
                                  std::vector<CrossTreeRef>            crossRefs,
                                  std::vector<std::filesystem::path>   shippedLibDescriptors,
-                                 std::uint32_t                        typeNameReparseCount)
+                                 std::uint32_t                        typeNameReparseCount,
+                                 std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers)
     : id_(id)
     , schema_(std::move(schema))
     , trees_(std::move(trees))
     , driverDiagnostics_(std::move(driverDiagnostics))
     , crossRefs_(std::move(crossRefs))
     , shippedLibDescriptors_(std::move(shippedLibDescriptors))
-    , typeNameReparseCount_(typeNameReparseCount) {}
+    , typeNameReparseCount_(typeNameReparseCount)
+    , auxiliaryBuffers_(std::move(auxiliaryBuffers)) {}
 
 CompilationUnit::~CompilationUnit()                                            = default;
 CompilationUnit::CompilationUnit(CompilationUnit&&) noexcept                   = default;
@@ -84,6 +87,8 @@ DiagnosticReporter const&     CompilationUnit::driverDiagnostics() const noexcep
 std::span<CrossTreeRef const> CompilationUnit::crossRefs()         const noexcept { return crossRefs_; }
 std::span<std::filesystem::path const>
 CompilationUnit::shippedLibDescriptors() const noexcept { return shippedLibDescriptors_; }
+std::span<std::shared_ptr<SourceBuffer> const>
+CompilationUnit::auxiliaryBuffers() const noexcept { return auxiliaryBuffers_; }
 
 std::string CompilationUnit::compositeSourceLanguage() const {
     std::string out;
@@ -194,6 +199,49 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
     // Tree's reporter (§2.6 C2-L1), so the finished Tree owns lexer + parser
     // diagnostics in one stream — and the Tree carries `schema` for the
     // downstream per-tree semantic + lowering dispatch.
+    // FC13: config-SELECTED C preprocessor. When the file's schema opts in
+    // (preprocess().enabled), run the preprocessor BETWEEN tokenize and
+    // parse: it builds ONE synthesized buffer (recursively splicing quote
+    // #include'd headers' text), tokenizes it once, runs the object-macro
+    // pass (define/undef/expand/rescan, directives removed), and hands the
+    // resulting tokens to the parser. The synthesized buffer becomes the
+    // parsed tree's source() (every token span is in its coordinates); the
+    // line-map remaps diagnostics back onto the real header/main file. A
+    // language WITHOUT a preprocess block (toy / tsql) takes the unchanged
+    // tokenize->parse path below. These two are the ONLY .tokenize() sites
+    // in src/ that consume C source.
+    if (schema->preprocess().enabled) {
+        PreprocessResult pp = preprocess(src, schema, includeDirs_);
+        auto remap = pp.makeRemap();
+        std::shared_ptr<SourceBuffer> synth = pp.synthBuffer;
+        // The parser consumes a stream built from a COPY of the preprocessed
+        // tokens; the vector is retained in the sidecar for the FC2 oracle
+        // reparse. The synthesized buffer is the parse source.
+        TokenStream stream = TokenStream::fromTokens(pp.tokens);
+        Parser p{synth, schema, std::move(stream), {},
+                 std::move(pp.diagnostics)};
+        ParseResult result = std::move(p).parse();
+        // Remap the produced tree's diagnostics off the synth buffer onto the
+        // origin file(s) before ingest, so a header-origin (and post-splice
+        // main-origin) diagnostic is attributed to its real file.
+        result.tree.remapDiagnostics(remap);
+        // Retain the PP's origin buffers (original main + every spliced header)
+        // so the driver can register them for diagnostic rendering -- a
+        // remapped diagnostic now references one of these buffers, not the
+        // tree's synth `source()`.
+        for (auto& ob : pp.originBuffers) {
+            if (ob) auxiliaryBuffers_.push_back(std::move(ob));
+        }
+        addTree(std::move(result.tree));
+        auto& sidecar           = sidecars_.back();
+        sidecar.candidates      = std::move(result.typeNameCandidates);
+        sidecar.globalTypeNames = std::move(result.globalTypeNames);
+        sidecar.source          = std::move(synth);
+        sidecar.schema          = std::move(schema);
+        sidecar.ppTokens        = std::move(pp.tokens);
+        sidecar.ppRemap         = std::move(remap);
+        return trees_.back().id();
+    }
     Tokenizer tk{src, schema};
     auto [stream, lexDiags] = std::move(tk).tokenize();
     Parser p{src, schema, std::move(stream), {}, std::move(lexDiags)};
@@ -460,13 +508,31 @@ CompilationUnit UnitBuilder::finish() && {
                     cuFatal("UnitBuilder::finish: type-name candidates on "
                             "a tree with no reparse handles");
                 }
-                Tokenizer tk{sc.source, sc.schema};
-                auto [stream, lexDiags] = std::move(tk).tokenize();
                 ParserConfig cfg;
                 cfg.seedGlobalTypeNames = std::move(seeds);
-                Parser p{sc.source, sc.schema, std::move(stream),
-                         std::move(cfg), std::move(lexDiags)};
-                ParseResult result = std::move(p).parse();
+                // Build the reparse result. When this tree was preprocessed
+                // (FC13), `sc.source` is the synthesized buffer and
+                // re-tokenizing it would lose macro expansion + leave
+                // directives in -- so rebuild an identical stream from the
+                // retained preprocessed tokens, reparse with the type-name
+                // seed, and re-apply the line-map remap so the reparsed tree's
+                // diagnostics still attribute to the origin header/main file.
+                ParseResult result = [&] {
+                    if (!sc.ppTokens.empty()) {
+                        TokenStream stream =
+                            TokenStream::fromTokens(sc.ppTokens);
+                        Parser p{sc.source, sc.schema, std::move(stream),
+                                 std::move(cfg), nullptr};
+                        ParseResult r = std::move(p).parse();
+                        if (sc.ppRemap) r.tree.remapDiagnostics(sc.ppRemap);
+                        return r;
+                    }
+                    Tokenizer tk{sc.source, sc.schema};
+                    auto [stream, lexDiags] = std::move(tk).tokenize();
+                    Parser p{sc.source, sc.schema, std::move(stream),
+                             std::move(cfg), std::move(lexDiags)};
+                    return std::move(p).parse();
+                }();
                 trees_[i]          = std::move(result.tree);
                 sc.candidates      = std::move(result.typeNameCandidates);
                 sc.globalTypeNames = std::move(result.globalTypeNames);
@@ -520,6 +586,7 @@ CompilationUnit UnitBuilder::finish() && {
         std::move(crossRefs),
         std::move(shippedLibDescriptors),
         typeNameReparseCount,
+        std::move(auxiliaryBuffers_),
     };
 }
 

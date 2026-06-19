@@ -233,6 +233,17 @@ private:
     void resolveIncludeFollowing(ResolutionContext& context) const {
         RuleId const includeRule = schema_->rules().find(config_.directiveRule);
         if (!includeRule.valid()) return;
+        // FC13 co-existence: when the config-SELECTED C preprocessor is enabled
+        // it OWNS quote-`#include` end to end -- on success it removes the
+        // directive (it never reaches the parser), and on FAILURE it leaves the
+        // directive bytes AND already reported `P_PreprocessorIncludeError`. So
+        // a quote include the parser still sees here is a PP-diagnosed failure;
+        // re-reporting it as `D_UnresolvedImport` would double-diagnose one root
+        // cause. We therefore SKIP the quote form when the PP is enabled. The
+        // ANGLE form (systemKind, FF11 descriptors) is untouched -- the PP
+        // passes angle includes through for THIS post-parse resolver to own.
+        // Config-driven (a `preprocess().enabled` flag, never a language name).
+        const bool ppEnabled = schema_->preprocess().enabled;
         SchemaTokenId const stringKind = schema_->schemaTokens().find(config_.pathToken);
         SchemaTokenId const systemKind = config_.systemPathToken.empty()
             ? SchemaTokenId{}
@@ -269,6 +280,10 @@ private:
                         stringKind.valid() ? firstDescendantOfKind(tree, node, stringKind)
                                            : InvalidNode;
                     if (strNode.valid()) {
+                        // PP-enabled: the preprocessor already owns + diagnosed
+                        // this quote include (a failed one left its bytes here).
+                        // Skipping avoids the D_UnresolvedImport double-report.
+                        if (ppEnabled) return;
                         directives.push_back({node, tree.span(node),
                                               extractQuotedFilename(tree, strNode), false});
                         return;

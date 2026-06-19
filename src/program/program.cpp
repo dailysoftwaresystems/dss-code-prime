@@ -480,6 +480,15 @@ int runCusToTargets(std::span<CompilationUnit const>            cus,
                 bufs.add(std::move(src));
             }
         }
+        // FC13: also register the CU's auxiliary buffers -- the C
+        // preprocessor's origin buffers (the original main file + every
+        // quote-`#include`'d header). A header-origin (or post-splice
+        // main-origin) diagnostic was remapped onto one of these by the PP
+        // line-map, so without this it would render as `--> <unknown-buffer>`.
+        // `BufferRegistry::add` is idempotent on duplicate ids.
+        for (auto const& b : cu.auxiliaryBuffers()) {
+            if (b) bufs.add(b);
+        }
     }
     // If parsing already failed, the per-target loop would only produce derivative noise.
     if (rep.hasErrors()) {

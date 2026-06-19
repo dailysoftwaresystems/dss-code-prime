@@ -112,6 +112,21 @@ public:
     // explicit filtering choices. Per-code counters still increment.
     void forceReport(ParseDiagnostic d);
 
+    // Rewrite the (buffer, span) of EVERY accumulated diagnostic through
+    // `fn`. The C preprocessor pass (FC13) uses this to remap diagnostics
+    // off the synthesized buffer back onto the real header/main file via its
+    // line-map: `fn` inspects the buffer id and, when it is the synth buffer,
+    // overwrites both the buffer id and the span with the resolved origin.
+    // `fn` is invoked once per diagnostic with mutable references; a no-op
+    // `fn` (or one that leaves non-synth diagnostics untouched) is harmless.
+    // Only `buffer`/`span` are mutable -- code/severity/message are
+    // unchanged. The recent-duplicate hash window is NOT rebuilt (it tracks
+    // already-admitted diagnostics; remap runs after admission).
+    template <class F>
+    void remapBuffers(F&& fn) {
+        for (ParseDiagnostic& d : all_) fn(d.buffer, d.span);
+    }
+
     // Pretty-printers. The registry resolves BufferId → SourceBuffer so
     // multi-file diagnostics (related-locations spanning includes, future)
     // format correctly.

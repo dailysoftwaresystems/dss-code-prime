@@ -14,6 +14,16 @@
 // stands), the transitive-include harvest, and the crossRefs id
 // refresh after replacement.
 
+// FC13 UPDATE (D-PP-FC2-ORACLE-RETIRE): the config-selected C preprocessor now
+// splices a quote-`#include`d header's TEXT inline BEFORE parsing, so a header
+// typedef is visible during the includer's FIRST parse -- the cross-file cast
+// commits immediately and the type-name ORACLE no longer fires for C quote
+// includes (reparse count 0, one tree). The oracle MACHINERY is retained (it
+// is language-agnostic; a future non-preprocessed-include language could
+// exercise it), but these tests now pin the INLINE resolution that supersedes
+// it for C. The examples/c-subset/include_typedef_cast corpus likewise now
+// commits the cast inline.
+
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -85,7 +95,7 @@ private:
 // The headline cross-file case: the typedef lives in the header, the
 // ambiguous cast in the includer. The oracle must resolve `MyT` from the
 // header's export surface and the reparse must produce the CAST parse.
-TEST(TypeNameOracle, CrossFileTypedefCastResolvesViaReparse) {
+TEST(TypeNameOracle, CrossFileTypedefCastResolvesInline) {
     TempDir dir;
     auto main = dir.write(
         "main.c",
@@ -97,22 +107,14 @@ TEST(TypeNameOracle, CrossFileTypedefCastResolvesViaReparse) {
     b.addFile(main);
     auto cu = std::move(b).finish();
 
-    ASSERT_EQ(cu.trees().size(), 2u);
+    ASSERT_EQ(cu.trees().size(), 1u);
     Tree const& mainTree = cu.trees()[0];
-    // POSITIVE outcome: the final main tree parses clean AND contains the
-    // castExpr subtree — the value reading (parenExpr + minus) is gone.
     EXPECT_FALSE(mainTree.diagnostics().hasErrors());
-    EXPECT_TRUE(treeHasRule(mainTree, "castExpr"));
+    EXPECT_TRUE(treeHasRule(mainTree, "castExpr"))
+        << "the inlined typedef must let the cast commit on the first parse";
     EXPECT_FALSE(treeHasRule(mainTree, "parenExpr"));
-    // Exactly ONE tree was reparsed (the includer; the header had no
-    // candidates).
-    EXPECT_EQ(cu.typeNameReparseCount(), 1u);
-    // The crossRefs edge was REBUILT against the replacement tree's NEW
-    // TreeId — a stale edge would still carry the first parse's id and
-    // the semantic cross-tree injection would silently miss.
-    ASSERT_EQ(cu.crossRefs().size(), 1u);
-    EXPECT_EQ(cu.crossRefs()[0].sourceTree, mainTree.id());
-    EXPECT_EQ(cu.crossRefs()[0].targetTree, cu.trees()[1].id());
+    EXPECT_EQ(cu.typeNameReparseCount(), 0u);
+    EXPECT_TRUE(cu.crossRefs().empty());
     EXPECT_FALSE(hasCode(cu.driverDiagnostics(),
                          DiagnosticCode::D_UnresolvedImport));
 }
@@ -132,9 +134,7 @@ TEST(TypeNameOracle, NoCandidatesMeansNoReparse) {
     b.addFile(main);
     auto cu = std::move(b).finish();
 
-    // `(MyT)1` has a NON-operator follower (`1`), so triage rule 4
-    // committed the cast on the FIRST parse — no candidate, no reparse.
-    ASSERT_EQ(cu.trees().size(), 2u);
+    ASSERT_EQ(cu.trees().size(), 1u);
     EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors());
     EXPECT_TRUE(treeHasRule(cu.trees()[0], "castExpr"));
     EXPECT_EQ(cu.typeNameReparseCount(), 0u);
@@ -165,7 +165,7 @@ TEST(TypeNameOracle, UnresolvedCandidateKeepsValueReading) {
 // (This is deliberately MORE generous than the semantic injection's
 // per-edge propagation — see the probe note in the implementation
 // report; the harvest union covers the transitive case by design.)
-TEST(TypeNameOracle, TransitiveIncludeTypedefResolves) {
+TEST(TypeNameOracle, TransitiveIncludeTypedefResolvesInline) {
     TempDir dir;
     auto main = dir.write(
         "main.c",
@@ -178,16 +178,21 @@ TEST(TypeNameOracle, TransitiveIncludeTypedefResolves) {
     b.addFile(main);
     auto cu = std::move(b).finish();
 
-    ASSERT_EQ(cu.trees().size(), 3u);
+    ASSERT_EQ(cu.trees().size(), 1u);
     EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors());
     EXPECT_TRUE(treeHasRule(cu.trees()[0], "castExpr"));
-    EXPECT_EQ(cu.typeNameReparseCount(), 1u);
+    EXPECT_EQ(cu.typeNameReparseCount(), 0u);
 }
 
-// Both files ambiguous: the header itself uses a cast whose typedef
-// lives in the MAIN file — each direction resolves from the union, and
-// BOTH trees reparse exactly once.
-TEST(TypeNameOracle, BothDirectionsReparseIndependently) {
+// Both casts ambiguous: helper.h (defines HelpT, casts to MainT) is inlined
+// into main.c (defines MainT). After the splice, helper.h's `(MainT)-v` cast
+// appears in the buffer BEFORE `typedef int MainT;` (the includer's own line),
+// so on the FIRST parse `MainT` is a forward reference -> the oracle DOES fire
+// here (one reparse) to resolve it from the union of in-buffer type names.
+// This is the residual case where the FC2 oracle still earns its keep AFTER
+// FC13: an in-buffer FORWARD reference across an inline-include boundary. One
+// tree, exactly one reparse, both casts resolved.
+TEST(TypeNameOracle, BothDirectionsResolveInlineInOneBuffer) {
     TempDir dir;
     auto main = dir.write(
         "main.c",
@@ -202,10 +207,10 @@ TEST(TypeNameOracle, BothDirectionsReparseIndependently) {
     b.addFile(main);
     auto cu = std::move(b).finish();
 
-    ASSERT_EQ(cu.trees().size(), 2u);
+    ASSERT_EQ(cu.trees().size(), 1u);
     EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors());
-    EXPECT_FALSE(cu.trees()[1].diagnostics().hasErrors());
     EXPECT_TRUE(treeHasRule(cu.trees()[0], "castExpr"));
-    EXPECT_TRUE(treeHasRule(cu.trees()[1], "castExpr"));
-    EXPECT_EQ(cu.typeNameReparseCount(), 2u);
+    EXPECT_EQ(cu.typeNameReparseCount(), 1u)
+        << "an in-buffer forward reference across an inline-include boundary"
+           " still uses the oracle";
 }
