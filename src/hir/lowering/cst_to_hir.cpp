@@ -971,6 +971,22 @@ struct Lowerer {
              && tree().rule(c).v == cfg.sizeofRule.v) {
                 return lowerSizeof(c);
             }
+            // FC12a-core: the three variadic intrinsics route to their dedicated
+            // lowerings (their type child must NOT be lowered as an expression,
+            // exactly like sizeof/cast). Config-driven by rule id — a language
+            // without a `va_arg` surface leaves these invalid and skips them.
+            if (cfg.vaStartRule.valid()
+             && tree().rule(c).v == cfg.vaStartRule.v) {
+                return lowerVaStart(c);
+            }
+            if (cfg.vaArgRule.valid()
+             && tree().rule(c).v == cfg.vaArgRule.v) {
+                return lowerVaArg(c);
+            }
+            if (cfg.vaEndRule.valid()
+             && tree().rule(c).v == cfg.vaEndRule.v) {
+                return lowerVaEnd(c);
+            }
         }
         for (NodeId c : visible(node)) {
             if (tree().kind(c) == NodeKind::Internal) return lowerExpr(c);  // paren-wrapped
@@ -2318,6 +2334,74 @@ struct Lowerer {
         HirNodeId const tref = track(builder.makeTypeRef(sized), node);
         TypeId const u64 = interner.primitive(TypeKind::U64);
         return {track(builder.makeSizeOf(tref, u64), node), u64};
+    }
+
+    // FC12a-core: `va_start ( ap, last )` → core `HirKind::VaStart`. The grammar
+    // (`vaStartExpr = VaStartKeyword '(' assignExpr [',' assignExpr] ')'`) carries
+    // the `va_list` lvalue `ap` as the FIRST internal child; the optional `last`
+    // (the last fixed param) is UNUSED in the SysV model (gp/fp offsets derive from
+    // the FnSig at MIR time, not from `last`) so it is not lowered — only `ap`
+    // reaches the node. Result type is `void` (the void-returning-call convention:
+    // a valid TypeId, so the HIR verifier's required-type rule is satisfied).
+    [[nodiscard]] E lowerVaStart(NodeId node) {
+        NodeId apN{};
+        for (NodeId c : visible(node)) {
+            if (tree().kind(c) == NodeKind::Internal) { apN = c; break; }
+        }
+        if (!apN.valid()) {
+            return exprError(node, "va_start is missing its va_list operand");
+        }
+        E ap = lowerExpr(apN);
+        if (!ap.type.valid()) return ap;   // diagnostic already emitted
+        TypeId const voidTy = interner.primitive(TypeKind::Void);
+        return {track(builder.makeVaStart(ap.id, voidTy), node), voidTy};
+    }
+
+    // FC12a-core: `va_end ( ap )` → core `HirKind::VaEnd`. A no-op in the SysV
+    // model (the MIR lowering emits nothing); the node exists so the source
+    // construct round-trips and so a future ABI that DOES need teardown has the
+    // hook. Carries `ap` (the FIRST internal child); result `void`.
+    [[nodiscard]] E lowerVaEnd(NodeId node) {
+        NodeId apN{};
+        for (NodeId c : visible(node)) {
+            if (tree().kind(c) == NodeKind::Internal) { apN = c; break; }
+        }
+        if (!apN.valid()) {
+            return exprError(node, "va_end is missing its va_list operand");
+        }
+        E ap = lowerExpr(apN);
+        if (!ap.type.valid()) return ap;
+        TypeId const voidTy = interner.primitive(TypeKind::Void);
+        return {track(builder.makeVaEnd(ap.id, voidTy), node), voidTy};
+    }
+
+    // FC12a-core: `va_arg ( ap, T )` → core `HirKind::VaArg`, result type T. The
+    // grammar (`vaArgExpr = VaArgKeyword '(' assignExpr ',' castTypeRef ')'`)
+    // carries the `va_list` lvalue `ap` as the FIRST internal child (value-lowered
+    // to its address) and the read TYPE `T` as the SECOND (a `castTypeRef` that is
+    // NEVER value-lowered — the SizeOf precedent: `resolveStampedTypeBelow`
+    // recovers T from the semantic phase's per-node stamp). Mirrors `lowerCast`'s
+    // type-child/operand-child split, just in the opposite order (cast = type
+    // first; va_arg = operand first).
+    [[nodiscard]] E lowerVaArg(NodeId node) {
+        NodeId apN{}, typeRefN{};
+        for (NodeId c : visible(node)) {
+            if (isToken(c)) continue;
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (!apN.valid())            apN      = c;
+            else if (!typeRefN.valid()) { typeRefN = c; break; }
+        }
+        if (!apN.valid() || !typeRefN.valid()) {
+            return exprError(node, "va_arg is missing its va_list operand or type");
+        }
+        TypeId const argTy = resolveStampedTypeBelow(typeRefN);
+        if (!argTy.valid()) {
+            return exprError(node, "va_arg type did not resolve to a type");
+        }
+        E ap = lowerExpr(apN);
+        if (!ap.type.valid()) return ap;   // diagnostic already emitted
+        HirNodeId const tref = track(builder.makeTypeRef(argTy), node);
+        return {track(builder.makeVaArg(ap.id, tref, argTy), node), argTy};
     }
 
     // FC2: explicit cast `(T)expr` (`hirLowering.castRule`). The grammar

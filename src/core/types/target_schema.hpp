@@ -381,6 +381,60 @@ struct DSS_EXPORT TargetRegisterClassOps {
     }
 };
 
+// FC12a-core variadic CALLEE ABI (D-FC12A-VARIADIC-CALLEE): the layout of this
+// CC's `__va_list_tag` PLUS the register-save-area geometry a `va_start`/`va_arg`
+// walk needs. A target WITHOUT this block fails loud at the variadic-callee site
+// (mirrors `variadicVectorCountReg.has_value()` / `indirectResultRegister.has_value()`
+// — an un-built CC is never silently mis-walked). All facts are CONFIG; the per-CC
+// algorithm (semantic `__va_list_tag` injection, HIR→MIR `va_arg` diamond, LIR
+// prologue spill) reads them, never branching on cc.name / arch / format.
+//
+// SysV AMD64 (§3.5.7): `__va_list_tag` = `{u32 gp_offset; u32 fp_offset;
+// void* overflow_arg_area; void* reg_save_area;}` (24B). The callee prologue of a
+// variadic function spills the 6 integer arg regs (rdi..r9) + the al-gated 8 SSE
+// arg regs (xmm0..xmm7) into a register-save-area; `va_arg` reads the next slot of
+// the right class from there until the per-class offset hits its limit, then walks
+// the overflow (incoming stack-arg) area.
+struct VaListLayout {
+    // One field of the `__va_list_tag` struct: its byte offset within the tag and
+    // its width (the four SysV fields are gp_offset@0/w4, fp_offset@4/w4,
+    // overflow_arg_area@8/w8, reg_save_area@16/w8). Offset/width are CONFIG so a CC
+    // with a different tag shape (or field order) needs no substrate change.
+    struct Field {
+        std::uint32_t byteOffset = 0;
+        std::uint32_t widthBytes = 0;
+    };
+
+    // NOTE: the `__va_list_tag` TOTAL size is NOT carried here — the sema-injected
+    // builtin struct {u32,u32,void*,void*} sizes the `ap` local; these field offsets
+    // + the save-area shape below are what codegen reads.
+    Field gpOffsetField{};            // current GPR byte-cursor into the save area
+    Field fpOffsetField{};            // current SSE byte-cursor into the save area
+    Field overflowArgAreaField{};     // pointer to the next incoming STACK arg
+    Field regSaveAreaField{};         // pointer to the spilled register-save-area
+
+    // Register-save-area geometry. The prologue spills `gpSaveCount` integer arg
+    // regs at `gpSlotBytes` stride, then `fpSaveCount` SSE arg regs at `fpSlotBytes`
+    // stride (the SSE block follows the GPR block). For SysV: 6×8 then 8×16 = 176B.
+    std::uint32_t gpSaveCount = 0;    // integer arg regs spilled (SysV: 6)
+    std::uint32_t gpSlotBytes = 0;    // bytes per integer save slot (SysV: 8)
+    std::uint32_t fpSaveCount = 0;    // SSE arg regs spilled (SysV: 8)
+    std::uint32_t fpSlotBytes = 0;    // bytes per SSE save slot (SysV: 16)
+
+    // `va_arg` reg-vs-overflow thresholds. gp_offset < gpOffsetLimit ⇒ read from
+    // the save area (SysV: 48 = 6×8); fp_offset < fpOffsetLimit ⇒ likewise
+    // (SysV: 176 = 48 + 8×16). These are CONFIG because they are a function of the
+    // save-area geometry the ABI fixes, not anything the substrate may infer.
+    std::uint32_t gpOffsetLimit = 0;  // SysV: 48
+    std::uint32_t fpOffsetLimit = 0;  // SysV: 176
+
+    // Total register-save-area size the prologue reserves = gpSaveCount*gpSlotBytes
+    // + fpSaveCount*fpSlotBytes (derived; the layout pass uses it to size the zone).
+    [[nodiscard]] constexpr std::uint32_t regSaveAreaBytes() const noexcept {
+        return gpSaveCount * gpSlotBytes + fpSaveCount * fpSlotBytes;
+    }
+};
+
 // One calling convention. A target may declare multiple (SysV AMD64,
 // Microsoft x64, fastcall, ...); the front-end picks one via attribute /
 // driver flag. The `argGprs` / `argFprs` ordering is significant — the
@@ -576,6 +630,15 @@ struct DSS_EXPORT TargetCallingConvention {
     // (consuming argGprs[0]) returned in returnGprs[0]. This one field selects
     // between the two sret mechanisms agnostically — no per-CC branch.
     std::optional<NamedRegisterRef> indirectResultRegister;
+
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the `__va_list_tag` layout + register-
+    // save-area geometry for `va_start`/`va_arg`/`va_end` in a variadic CALLEE.
+    // ENGAGED (SysV AMD64) ⇒ the semantic phase injects `__va_list_tag`, HIR→MIR
+    // lowers the va_arg diamond, and the LIR prologue spills the arg registers.
+    // ABSENT (Win64 / AAPCS64 this cycle — a different variadic ABI) ⇒ a variadic
+    // function body using va_start fails LOUD ("variadic callee unsupported for
+    // this CC"), never silently mis-walked. One field selects support agnostically.
+    std::optional<VaListLayout> vaListLayout;
 };
 
 // Discriminates the byte-encoding shape an opcode commits to (plan 13

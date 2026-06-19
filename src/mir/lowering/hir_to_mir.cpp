@@ -132,6 +132,15 @@ struct Lowerer {
     };
     std::vector<BranchFrame> branchStack;
 
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the enclosing function's count of FIXED
+    // (non-variadic) params that consumed an integer / SSE arg register. `va_start`
+    // initializes gp_offset = fixedGpr*gpSlotBytes and fp_offset = gpOffsetLimit +
+    // fixedSse*fpSlotBytes from these (the SysV cursor past the fixed args into the
+    // register-save-area). Set by the function-lowering method BEFORE the body is
+    // lowered (so a body `va_start` reads the right counts); reset per function.
+    std::uint32_t currentFnFixedGpr_ = 0;
+    std::uint32_t currentFnFixedFpr_ = 0;
+
     // FC5: per-function `goto`/label lowering. A LabelStmt and its goto(s) share a
     // per-function ordinal (HIR payload); this maps the ordinal → its MIR block.
     // `getOrCreateLabelBlock` is lazy so a FORWARD goto (`goto end;` before `end:`)
@@ -442,6 +451,9 @@ struct Lowerer {
                 lit.core  = TypeKind::U64;
                 return mir.addConst(std::move(lit), t);
             }
+            case HirKind::VaStart: return lowerVaStart(node);
+            case HirKind::VaArg:   return lowerVaArg(node);
+            case HirKind::VaEnd:   return lowerVaEnd(node);
             case HirKind::Ref: {
                 // Resolution order:
                 //   1. Addressable local (slot-backed: body-VarDecl or address-
@@ -2596,6 +2608,247 @@ struct Lowerer {
         return lowerExpr(expr).valid();
     }
 
+    // ── FC12a-core variadic CALLEE lowering (D-FC12A-VARIADIC-CALLEE) ────────────
+    //
+    // SysV AMD64 §3.5.7. `va_list` is `__va_list_tag[1]`; its lvalue ADDRESS is the
+    // tag base. All four field offsets + the reg-save geometry + the reg-vs-overflow
+    // thresholds come from `config.vaListLayout` (CONFIG, agnostic) — this code
+    // never branches on cc.name/arch/format. The two FRAME addresses (reg-save-area,
+    // incoming-overflow-area) are emitted as the leaf opcodes VaRegSaveAreaAddr /
+    // VaOverflowArgAreaAddr that the LIR callconv pass fills in once it owns the
+    // frame layout (the ReadIndirectResult precedent).
+
+    // The `__va_list_tag*` base address of a va_list lvalue `apChild`. `ap` is
+    // `__va_list_tag[1]`, so its lvalue address IS the address of its first (only)
+    // tag element — the base every field-Gep indexes from.
+    [[nodiscard]] MirInstId vaTagBase(HirNodeId apChild) {
+        return lowerLvalueAddress(apChild);
+    }
+
+    // `&tag.<field>` as a pointer to the field — a base+disp Gep (the FC7 member-
+    // address pattern). `fieldPtrType` is the pointer-to-field type for the Store/Load.
+    [[nodiscard]] MirInstId vaFieldPtr(MirInstId tagBase,
+                                       VaListLayout::Field const& f,
+                                       TypeId fieldPtrType) {
+        MirInstId const off = constInt(static_cast<std::int64_t>(f.byteOffset));
+        if (!off.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> ops{tagBase, off};
+        return mir.addInst(MirOpcode::Gep, ops, fieldPtrType);
+    }
+
+    // `va_start(ap, last)` → 4 field Stores into the tag. gp_offset = fixedGpr *
+    // gpSlotBytes; fp_offset = gpOffsetLimit + fixedFpr * fpSlotBytes (the SysV
+    // cursor PAST the fixed args, into the SSE block of the save area);
+    // reg_save_area = &save (VaRegSaveAreaAddr); overflow_arg_area = &incoming-stack
+    // (VaOverflowArgAreaAddr). Returns the last Store's id (a valid inst the discard
+    // chokepoint accepts — va_start is a void expression). Fail loud if the CC
+    // declared no vaListLayout.
+    [[nodiscard]] MirInstId lowerVaStart(HirNodeId node) {
+        if (!config.vaListLayout.has_value()) {
+            unsupported(node, "variadic callee (va_start) is unsupported for this "
+                              "target's calling convention — it declares no "
+                              "'vaListLayout' (D-FC12A-VARIADIC-CALLEE)");
+            return InvalidMirInst;
+        }
+        VaListLayout const& vl = *config.vaListLayout;
+        auto kids = hir.children(node);
+        if (kids.size() != 1) {
+            unsupported(node, "malformed VaStart (expect 1 child)");
+            return InvalidMirInst;
+        }
+        // FAIL-LOUD (no silent miscompile): a variadic callee with MORE fixed
+        // params than the register-save area holds (fixedGpr > gpSaveCount, or
+        // fixedFpr > fpSaveCount) has a fixed param passed ON THE STACK. SysV
+        // §3.5.7 then requires overflow_arg_area to point PAST those named stack
+        // args — a fixed-stack-arg displacement this cycle does NOT yet thread
+        // (VaOverflowArgAreaAddr emits a constant slot-0 offset). Reject loudly
+        // rather than silently read a fixed param as the first vararg.
+        if (currentFnFixedGpr_ > vl.gpSaveCount
+            || currentFnFixedFpr_ > vl.fpSaveCount) {
+            unsupported(node,
+                "variadic callee whose fixed parameters overflow to the stack "
+                "(more fixed integer/SSE params than the register-save area "
+                "holds) is not yet supported — overflow_arg_area must skip the "
+                "named stack args (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)");
+            return InvalidMirInst;
+        }
+        MirInstId const tagBase = vaTagBase(kids[0]);
+        if (!tagBase.valid()) return InvalidMirInst;
+
+        TypeId const u32      = interner.primitive(TypeKind::U32);
+        TypeId const u32Ptr   = interner.pointer(u32);
+        TypeId const voidPtr  = interner.pointer(interner.primitive(TypeKind::Void));
+        TypeId const voidPtrPtr = interner.pointer(voidPtr);
+
+        // gp_offset = fixedGpr * gpSlotBytes.
+        std::uint32_t const gpInit = currentFnFixedGpr_ * vl.gpSlotBytes;
+        // fp_offset = gpOffsetLimit + fixedFpr * fpSlotBytes (SSE block follows GPR).
+        std::uint32_t const fpInit = vl.gpOffsetLimit + currentFnFixedFpr_ * vl.fpSlotBytes;
+
+        MirInstId const gpField = vaFieldPtr(tagBase, vl.gpOffsetField, u32Ptr);
+        if (!gpField.valid()) return InvalidMirInst;
+        {
+            std::array<MirInstId, 2> st{constIntOfType(gpInit, u32), gpField};
+            mir.addInst(MirOpcode::Store, st);
+        }
+        MirInstId const fpField = vaFieldPtr(tagBase, vl.fpOffsetField, u32Ptr);
+        if (!fpField.valid()) return InvalidMirInst;
+        {
+            std::array<MirInstId, 2> st{constIntOfType(fpInit, u32), fpField};
+            mir.addInst(MirOpcode::Store, st);
+        }
+        // reg_save_area = &save.
+        MirInstId const rsaField = vaFieldPtr(tagBase, vl.regSaveAreaField, voidPtrPtr);
+        if (!rsaField.valid()) return InvalidMirInst;
+        MirInstId const rsaVal =
+            mir.addInst(MirOpcode::VaRegSaveAreaAddr, {}, voidPtr);
+        {
+            std::array<MirInstId, 2> st{rsaVal, rsaField};
+            mir.addInst(MirOpcode::Store, st);
+        }
+        // overflow_arg_area = &incoming-stack-args.
+        MirInstId const ovfField = vaFieldPtr(tagBase, vl.overflowArgAreaField, voidPtrPtr);
+        if (!ovfField.valid()) return InvalidMirInst;
+        MirInstId const ovfVal =
+            mir.addInst(MirOpcode::VaOverflowArgAreaAddr, {}, voidPtr);
+        std::array<MirInstId, 2> st{ovfVal, ovfField};
+        return mir.addInst(MirOpcode::Store, st);   // last Store — a valid void inst
+    }
+
+    // `va_end(ap)` → nothing (SysV teardown is a no-op). A valid placeholder value
+    // for the discard chokepoint; DCE drops it. (The node + opcode-less lowering
+    // are the hook a future ABI needing real teardown would fill.)
+    [[nodiscard]] MirInstId lowerVaEnd(HirNodeId node) {
+        if (!config.vaListLayout.has_value()) {
+            unsupported(node, "variadic callee (va_end) is unsupported for this "
+                              "target's calling convention — it declares no "
+                              "'vaListLayout' (D-FC12A-VARIADIC-CALLEE)");
+            return InvalidMirInst;
+        }
+        return constInt(0);
+    }
+
+    // `va_arg(ap, T)` for a SCALAR T → the reg-vs-overflow diamond (SysV §3.5.7).
+    // STRUCT/UNION T STAYS FAIL-LOUD this cycle (the FC12a-struct boundary). The
+    // diamond mirrors the Ternary value-diamond: classify T (GPR vs SSE) → pick the
+    // gp_offset/fp_offset cursor → if cursor < limit, read reg_save_area+cursor &
+    // bump the cursor by the slot stride; else read overflow_arg_area & bump it by a
+    // stack slot → Phi the two address arms → Load the value.
+    [[nodiscard]] MirInstId lowerVaArg(HirNodeId node) {
+        if (!config.vaListLayout.has_value()) {
+            unsupported(node, "variadic callee (va_arg) is unsupported for this "
+                              "target's calling convention — it declares no "
+                              "'vaListLayout' (D-FC12A-VARIADIC-CALLEE)");
+            return InvalidMirInst;
+        }
+        VaListLayout const& vl = *config.vaListLayout;
+        TypeId const t = hir.typeId(node);   // the read type T (the node's result)
+        if (!t.valid()) {
+            unsupported(node, "VaArg has no result type");
+            return InvalidMirInst;
+        }
+        // FC12a-struct boundary: a by-value struct/union va_arg is NOT implemented
+        // this cycle — fail loud rather than mis-read (the eightbyte-classified
+        // multi-register/overflow split is the follow-on).
+        TypeKind const tk = interner.kind(t);
+        if (tk == TypeKind::Struct || tk == TypeKind::Union) {
+            unsupported(node, "va_arg of a struct/union BY VALUE is not yet "
+                              "supported (FC12a-struct follow-on) "
+                              "(D-FC12A-VARIADIC-CALLEE)");
+            return InvalidMirInst;
+        }
+        auto kids = hir.children(node);
+        if (kids.size() != 2) {
+            unsupported(node, "malformed VaArg (expect [apExpr, TypeRef])");
+            return InvalidMirInst;
+        }
+        MirInstId const tagBase = vaTagBase(kids[0]);   // child 1 (TypeRef) NEVER lowered
+        if (!tagBase.valid()) return InvalidMirInst;
+
+        // Classify the SCALAR: SSE (FPR) reads the fp cursor; INTEGER (GPR) the gp
+        // cursor. (A scalar isn't an aggregate; `scalarArgClass` is the direct
+        // equivalent of the eightbyte INTEGER/SSE split for one register.)
+        bool const isSse = (scalarArgClass(t) == AbiPieceClass::Fpr);
+        VaListLayout::Field const& offField =
+            isSse ? vl.fpOffsetField : vl.gpOffsetField;
+        std::uint32_t const offLimit = isSse ? vl.fpOffsetLimit : vl.gpOffsetLimit;
+        std::uint32_t const regSlotBytes = isSse ? vl.fpSlotBytes : vl.gpSlotBytes;
+
+        TypeId const u32      = interner.primitive(TypeKind::U32);
+        TypeId const u32Ptr   = interner.pointer(u32);
+        TypeId const voidPtr  = interner.pointer(interner.primitive(TypeKind::Void));
+        TypeId const voidPtrPtr = interner.pointer(voidPtr);
+
+        // Load the current per-class offset cursor.
+        MirInstId const offPtr = vaFieldPtr(tagBase, offField, u32Ptr);
+        if (!offPtr.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> loadOffOps{offPtr};
+        MirInstId const curOff = mir.addInst(MirOpcode::Load, loadOffOps, u32);
+
+        // inReg = curOff < offLimit.
+        MirInstId const limitK = constIntOfType(offLimit, u32);
+        std::array<MirInstId, 2> cmpOps{curOff, limitK};
+        MirInstId const inReg = mir.addInst(MirOpcode::ICmpUlt, cmpOps,
+                                            interner.primitive(TypeKind::Bool));
+
+        MirBlockId const regBB = mir.createBlock(StructCfMarker::IfThen);
+        MirBlockId const ovfBB = mir.createBlock(StructCfMarker::IfElse);
+        MirBlockId const joinBB = mir.createBlock(StructCfMarker::IfJoin);
+        mir.addCondBr(inReg, regBB, ovfBB);
+
+        // The argument's ADDRESS is carried through the diamond as a `void*` (every
+        // arm produces a byte address; the join Phi unifies them and the final Load
+        // reads T from it). Keeping the address `void*` (not `T*`) avoids minting a
+        // per-T pointer type for the carrier — the Load's result type is what selects
+        // the load width, agnostic to the address operand's pointee.
+
+        // ── register arm: addr = reg_save_area + curOff; cursor += regSlotBytes. ──
+        mir.beginBlock(regBB);
+        MirInstId const rsaField = vaFieldPtr(tagBase, vl.regSaveAreaField, voidPtrPtr);
+        if (!rsaField.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> loadRsaOps{rsaField};
+        MirInstId const rsa = mir.addInst(MirOpcode::Load, loadRsaOps, voidPtr);
+        std::array<MirInstId, 2> regGepOps{rsa, curOff};   // byte-offset index
+        MirInstId const regAddr = mir.addInst(MirOpcode::Gep, regGepOps, voidPtr);
+        // bump cursor: store curOff + regSlotBytes back.
+        MirInstId const slotK = constIntOfType(static_cast<std::int64_t>(regSlotBytes), u32);
+        std::array<MirInstId, 2> addOps{curOff, slotK};
+        MirInstId const bumped = mir.addInst(MirOpcode::Add, addOps, u32);
+        std::array<MirInstId, 2> bumpStore{bumped, offPtr};
+        mir.addInst(MirOpcode::Store, bumpStore);
+        MirBlockId const regPred = mir.currentlyOpenBlock();
+        mir.addBr(joinBB);
+
+        // ── overflow arm: addr = overflow_arg_area; overflow += one stack slot. ──
+        mir.beginBlock(ovfBB);
+        MirInstId const ovfPtr = vaFieldPtr(tagBase, vl.overflowArgAreaField, voidPtrPtr);
+        if (!ovfPtr.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> loadOvfOps{ovfPtr};
+        MirInstId const ovfArea = mir.addInst(MirOpcode::Load, loadOvfOps, voidPtr);
+        // SysV rounds each stack vararg up to one 8-byte (pointer-width) slot; a
+        // scalar (≤8B) consumes exactly one. Bump overflow_arg_area by gpSlotBytes
+        // (= pointer width = the stack-arg stride) via a base+disp Gep.
+        MirInstId const stepK =
+            constInt(static_cast<std::int64_t>(vl.gpSlotBytes));
+        if (!stepK.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> ovfStepOps{ovfArea, stepK};
+        MirInstId const ovfNext = mir.addInst(MirOpcode::Gep, ovfStepOps, voidPtr);
+        std::array<MirInstId, 2> ovfStore{ovfNext, ovfPtr};
+        mir.addInst(MirOpcode::Store, ovfStore);
+        MirBlockId const ovfPred = mir.currentlyOpenBlock();
+        mir.addBr(joinBB);
+
+        // ── join: pick the address, then Load the value. ──
+        mir.beginBlock(joinBB);
+        std::array<MirPhiIncoming, 2> incomings{
+            MirPhiIncoming{regAddr, regPred},
+            MirPhiIncoming{ovfArea, ovfPred},
+        };
+        MirInstId const argPtr = mir.addPhi(voidPtr, incomings);
+        std::array<MirInstId, 1> finalLoad{argPtr};
+        return mir.addInst(MirOpcode::Load, finalLoad, t);
+    }
+
     // Lower a single HIR statement in the currently-open MIR block.
     // Returns true on success, false on a hard error (caller bails).
     bool lowerStmt(HirNodeId node) {
@@ -3347,6 +3600,17 @@ struct Lowerer {
                 symbolToValue[sym.v] = arg;
             }
         }
+        // FC12a-core (D-FC12A-VARIADIC-CALLEE): after every FIXED param is placed,
+        // `argCtr.gpr`/`.fpr` hold the count of fixed params that consumed an
+        // integer / SSE arg register (the sret hidden GPR, if any, is already
+        // included — argCtr is the single source). A body `va_start` reads these to
+        // initialize gp_offset/fp_offset past the fixed args. (The only CC with a
+        // vaListLayout — SysV — is `slotAligned=false`, so `gpr`/`fpr` are the
+        // per-class fixed counts; a future slot-aligned variadic CC would thread
+        // `flat` instead, but none exists this cycle and one would arrive with its
+        // own vaListLayout + this site revisited.)
+        currentFnFixedGpr_ = argCtr.gpr;
+        currentFnFixedFpr_ = argCtr.fpr;
         // Body: a single Block of statements.
         if (!lowerStmt(body)) {
             // Failed mid-body — seal the block so finish() can complete and

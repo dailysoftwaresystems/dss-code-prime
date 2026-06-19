@@ -316,6 +316,9 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
         mirCfg.aggregateMaxRegBytes     = cc->aggregateMaxRegBytes;
         mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
         mirCfg.argSlotAligned           = cc->slotAligned;
+        // FC12a-core (D-FC12A-VARIADIC-CALLEE): thread the active CC's va_list layout
+        // so HIR→MIR can lower va_start/va_arg (or fail loud when the CC omits it).
+        mirCfg.vaListLayout             = cc->vaListLayout;
     }
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,

@@ -52,16 +52,29 @@ lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target) {
     auto model = analyze(cu);
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
-    DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
-    HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
-                                    model.lattice().interner(), mirReporter,
-                                    &hir->sourceMap, mirCfg);
     if (target == nullptr) {
         ADD_FAILURE() << "lowerCSubsetToLir: null target schema";
         std::abort();
     }
+    DiagnosticReporter mirReporter;
+    MirLoweringConfig mirCfg;
+    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    // Thread the active CC's by-value aggregate + FC12a-core va_list params into MIR
+    // lowering, mirroring compile_pipeline.cpp — so a struct-by-value OR a
+    // variadic-callee (va_start/va_arg) source lowers through THIS fixture too (cc 0
+    // is the target's primary convention: sysv_amd64 on x86_64, aapcs64 on arm64).
+    if (auto const* cc = target->callingConvention(0)) {
+        mirCfg.aggregateLayout           = target->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded     = target->aggregateLayoutLoaded();
+        mirCfg.aggregateClassification   = cc->aggregateClassification;
+        mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
+        mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
+        mirCfg.argSlotAligned            = cc->slotAligned;
+        mirCfg.vaListLayout              = cc->vaListLayout;
+    }
+    HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
+                                    model.lattice().interner(), mirReporter,
+                                    &hir->sourceMap, mirCfg);
     DiagnosticReporter lirReporter;
     MirToLirResult lir = lowerToLir(mir.mir, *target,
                                     model.lattice().interner(),

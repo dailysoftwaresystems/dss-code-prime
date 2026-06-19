@@ -80,6 +80,9 @@ struct Lowered {
             mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
             mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
             mirCfg.argSlotAligned            = cc->slotAligned;
+            // FC12a-core (D-FC12A-VARIADIC-CALLEE): thread the CC's va_list layout so
+            // va_start/va_arg lower (or fail loud when the CC omits it).
+            mirCfg.vaListLayout              = cc->vaListLayout;
         }
     }
     // D-CSUBSET-LINKAGE-SPECIFIERS: thread the native-decl linkage side-table
@@ -3945,4 +3948,118 @@ TEST(MirLoweringCSubset, ForUpdateAggregateTernaryRoutesThroughSlotNoPhi) {
         << "the for-update ternary routes through a slot — NEVER a phi-of-aggregate";
     EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
         << "memory-based — no SSA-aggregate chain";
+}
+
+// ── FC12a-core (D-FC12A-VARIADIC-CALLEE): va_start / va_arg MIR-shape pins ────
+//
+// `va_start(ap,n)` lowers to FOUR field Stores into the __va_list_tag (gp_offset,
+// fp_offset, reg_save_area, overflow_arg_area) PLUS the two frame-address leaves
+// (VaRegSaveAreaAddr / VaOverflowArgAreaAddr). `va_arg(ap,int)` lowers to the reg-
+// vs-overflow diamond: a Load of the gp_offset cursor → an ICmpUlt against the gp
+// limit → a CondBr → a Phi joining the two address arms → a final Load of the value.
+// A `va_arg(ap, struct S)` STAYS FAIL-LOUD (the FC12a-struct boundary). RED-ON-
+// DISABLE: half-implementing the struct path (returning a value instead of
+// unsupported) flips the fail-loud assertion.
+
+namespace {
+// The function index whose body contains a VaRegSaveAreaAddr (i.e. called va_start).
+[[nodiscard]] std::uint32_t funcWithVaStart(Mir const& m) {
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi)
+        if (countOpcodeAllBlocks(m, fi, MirOpcode::VaRegSaveAreaAddr) > 0) return fi;
+    return 0;
+}
+} // namespace
+
+TEST(MirLoweringCSubset, VaStartEmitsFourFieldStoresPlusFrameAddrs) {
+    auto L = lowerCSubset(
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  va_end(ap);\n"
+        "  return n;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok) << "variadic-callee va_start MIR lowering must succeed";
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // The two frame-address leaves (reg-save-area + overflow-arg-area).
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::VaRegSaveAreaAddr), 1u);
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::VaOverflowArgAreaAddr), 1u);
+    // va_start writes all FOUR __va_list_tag fields (4 Stores via Gep+Store). va_end
+    // is a no-op, so these are the only Stores in this body.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Store), 4u)
+        << "va_start must Store gp_offset + fp_offset + reg_save_area + "
+           "overflow_arg_area into the __va_list_tag";
+    // 4 field Geps for the tag fields (one per Store).
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Gep), 4u);
+}
+
+TEST(MirLoweringCSubset, VaArgIntLowersToRegVsOverflowDiamond) {
+    auto L = lowerCSubset(
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // The reg-vs-overflow diamond: an ICmpUlt (cursor < limit) feeding a CondBr,
+    // a Phi joining the reg-arm + overflow-arm addresses, and Loads (the cursor +
+    // the reg_save_area pointer + the final value).
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUlt), 1u)
+        << "va_arg compares the per-class offset cursor against its limit";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 1u)
+        << "va_arg branches reg-vs-overflow";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Phi), 1u)
+        << "va_arg joins the two address arms with a Phi (of a POINTER — scalar)";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Load), 3u)
+        << "va_arg Loads the cursor, the reg_save_area pointer, AND the final value";
+}
+
+TEST(MirLoweringCSubset, VaArgStructStaysFailLoud) {
+    // va_arg of a struct BY VALUE is the FC12a-struct follow-on — it MUST fail loud
+    // this cycle (never half-implemented). A struct-typed va_arg reaches HIR→MIR and
+    // the lowering emits H_UnsupportedLoweringForKind.
+    auto L = lowerCSubset(
+        "struct S { int a; int b; };\n"
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct S s = va_arg(ap, struct S);\n"
+        "  va_end(ap);\n"
+        "  return s.a;\n"
+        "}\n");
+    // Sema + HIR may succeed (the type is well-formed); the WALL is at HIR→MIR.
+    EXPECT_FALSE(L.mir.ok)
+        << "va_arg of a struct BY VALUE must FAIL LOUD (the FC12a-struct boundary)";
+}
+
+// A variadic callee whose FIXED params overflow to the stack (more fixed integer
+// params than the 6 SysV integer arg registers) MUST fail loud at va_start —
+// `overflow_arg_area` would otherwise point at a fixed STACK param, not the first
+// vararg (SysV §3.5.7), a silent miscompile this cycle's constant slot-0 overflow
+// offset cannot avoid (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS, deferred).
+// RED-ON-DISABLE: remove the `currentFnFixedGpr_ > vl.gpSaveCount` guard in
+// lowerVaStart → mir.ok goes true (the function lowers with a wrong overflow base).
+TEST(MirLoweringCSubset, VaStartFixedParamsOverflowToStackFailsLoud) {
+    // 7 fixed int params (a..g): SysV has 6 integer arg registers, so `g` is passed
+    // ON THE STACK; the fixed-stack-arg displacement for overflow_arg_area is not
+    // yet threaded, so this must reject loudly rather than silently miscompile.
+    auto L = lowerCSubset(
+        "int pick(int a, int b, int c, int d, int e, int f, int g, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, g);\n"
+        "  int v = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return a + g + v;\n"
+        "}\n");
+    EXPECT_FALSE(L.mir.ok)
+        << "a variadic callee whose fixed params overflow to the stack must FAIL "
+           "LOUD at va_start (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)";
 }

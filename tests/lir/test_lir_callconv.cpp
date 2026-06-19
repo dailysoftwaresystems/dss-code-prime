@@ -2440,3 +2440,99 @@ TEST(LirCallconvAbi,
            "would pass `EXPECT_FALSE(result.ok())` but fail this "
            "specificity pin, making the regression cause attributable.";
 }
+
+// ── FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-callee prologue spill ──────
+//
+// A function that calls va_start must, in its prologue, (a) reserve a register-
+// save-area sized by the CC's vaListLayout and (b) spill the integer + SSE arg
+// registers into it, so va_start's reg_save_area points at live values. Pins both
+// the FrameLayout zone size AND the spill-store count. RED-ON-DISABLE: stub the
+// `emitVariadicRegSaveSpill` call in lir_callconv.cpp → the store-count assertion
+// fails (0 saved-area stores instead of gpSaveCount + fpSaveCount).
+TEST(LirCallconvVariadic, VaStartFunctionPrologueSpillsArgRegsIntoSaveArea) {
+    auto bundle = lowerThroughRewrite(
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = 0;\n"
+        "  for (int i = 0; i < n; i = i + 1) { t = t + va_arg(ap, int); }\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n");
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "c-subset → LIR failed";
+    ASSERT_TRUE(bundle.rewritten.ok) << "regalloc rewrite failed";
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok()) << "callconv materialize failed";
+    ASSERT_EQ(result.perFunc.size(), 1u);
+
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->vaListLayout.has_value())
+        << "SysV cc must declare a vaListLayout for variadic-callee support";
+    auto const& vl = *cc->vaListLayout;
+
+    // (a) the FrameLayout reserves the full register-save-area (6*8 + 8*16 = 176).
+    auto const& layout = result.perFunc[0];
+    EXPECT_EQ(layout.vaRegSaveAreaSize, vl.regSaveAreaBytes())
+        << "the prologue must reserve a vaListLayout-sized register-save-area";
+    EXPECT_GT(layout.vaRegSaveAreaSize, 0u);
+
+    // (b) the prologue spills gpSaveCount integer + fpSaveCount SSE arg regs into
+    // the save area. Count `store` insts whose SP-relative MemOffset lands in the
+    // save-area byte range [vaRegSaveAreaOffset, +regSaveAreaBytes). A stubbed spill
+    // emits zero of these.
+    // Count store-shaped insts (a Reg source + a SP-relative MemOffset) whose
+    // offset lands in the save-area byte range — across BOTH register classes: the
+    // GPR spill uses `store`, the FPR spill `movsd_store` (the registerClassOps
+    // FPR store), so we match by the store SHAPE, not one mnemonic.
+    std::uint32_t const lo = layout.vaRegSaveAreaOffset();
+    std::uint32_t const hi = lo + vl.regSaveAreaBytes();
+    Lir const& dst = result.lir;
+    LirFuncId const fn = dst.funcAt(0);
+    std::uint32_t saveAreaStores = 0;
+    for (std::uint32_t bi = 0; bi < dst.funcBlockCount(fn); ++bi) {
+        LirBlockId const b = dst.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < dst.blockInstCount(b); ++i) {
+            LirInstId const inst = dst.blockInstAt(b, i);
+            bool hasRegSrc = false, inRange = false;
+            for (auto const& op : dst.instOperands(inst)) {
+                if (op.kind == LirOperandKind::Reg) hasRegSrc = true;
+                if (op.kind == LirOperandKind::MemOffset) {
+                    auto const off = static_cast<std::int64_t>(op.offset);
+                    if (off >= static_cast<std::int64_t>(lo)
+                        && off < static_cast<std::int64_t>(hi))
+                        inRange = true;
+                }
+            }
+            if (hasRegSrc && inRange) ++saveAreaStores;
+        }
+    }
+    // The prologue spills all 6 GPR (rdi..r9) + 8 SSE (xmm0..7) = gpSaveCount +
+    // fpSaveCount registers into the save area (≥, not ==: a later for-loop/cursor
+    // spill could incidentally also land a store in the zone; the load-bearing pin
+    // is that EVERY arg register is spilled — a stubbed/absent spill emits 0, far
+    // below 14, so the red-on-disable holds).
+    EXPECT_GE(saveAreaStores, vl.gpSaveCount + vl.fpSaveCount)
+        << "the variadic prologue must spill all " << vl.gpSaveCount
+        << " integer + " << vl.fpSaveCount << " SSE arg registers into the "
+           "register-save-area (a stubbed/absent spill emits 0 — the red-on-disable)";
+}
+
+// FC12a-core: a NON-variadic function must NOT reserve a register-save-area or
+// spill — the zone is keyed precisely on calling va_start, not on every function.
+TEST(LirCallconvVariadic, NonVariadicFunctionHasNoRegisterSaveArea) {
+    auto bundle = lowerThroughRewrite("int add(int a, int b) { return a + b; }");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(result.perFunc.size(), 1u);
+    EXPECT_EQ(result.perFunc[0].vaRegSaveAreaSize, 0u)
+        << "a function that never calls va_start must reserve NO save area";
+}

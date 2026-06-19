@@ -766,6 +766,9 @@ private:
             case HirKind::LogicalAnd:         typedCall("logical_and"); return;
             case HirKind::LogicalOr:          typedCall("logical_or"); return;
             case HirKind::SizeOf:             typedCall("sizeof"); return;
+            case HirKind::VaStart:            typedCall("va_start"); return;
+            case HirKind::VaArg:              typedCall("va_arg"); return;
+            case HirKind::VaEnd:              typedCall("va_end"); return;
             case HirKind::AddressOf:          typedCall("addressof"); return;
             case HirKind::Deref:              typedCall("deref"); return;
             case HirKind::SeqExpr: {
@@ -1514,6 +1517,7 @@ private:
             {"construct", HirKind::ConstructAggregate}, {"ternary", HirKind::Ternary},
             {"logical_and", HirKind::LogicalAnd}, {"logical_or", HirKind::LogicalOr},
             {"sizeof", HirKind::SizeOf}, {"addressof", HirKind::AddressOf}, {"deref", HirKind::Deref},
+            {"va_start", HirKind::VaStart}, {"va_arg", HirKind::VaArg}, {"va_end", HirKind::VaEnd},
         };
         for (auto const& [k, kind] : kTypedExprs)
             if (kw == k) { TypeId t = parseTypeAnnot(); auto ops = parseParenOperands();

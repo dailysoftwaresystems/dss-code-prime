@@ -37,7 +37,11 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    ASSERT_EQ(model.symbols().size() - 1, 2u) << "main (function) + x (variable)";
+    // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
+    // (`__va_list_tag` + `va_list`) injected into every c-subset CU's builtin scope
+    // (D-FC12A-VARIADIC-CALLEE — gated on the schema declaring `vaArgRule`).
+    ASSERT_EQ(model.symbols().size() - 1, 4u)
+        << "main (function) + x (variable) + __va_list_tag + va_list";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -729,8 +733,9 @@ TEST(SemanticAnalyzerCSubset, NestedBlocksShadowWithoutRedecl) {
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
         << "different blocks → different scopes → no shadow redecl";
-    // main (function) + two distinct `x` symbols (one per block scope).
-    EXPECT_EQ(model.symbols().size() - 1, 3u);
+    // main (function) + two distinct `x` symbols (one per block scope) + the 2
+    // FC12a-core builtin TYPES (__va_list_tag + va_list).
+    EXPECT_EQ(model.symbols().size() - 1, 5u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -745,8 +750,9 @@ TEST(SemanticAnalyzerCSubset, ForwardReferenceWithinBlock) {
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 
-    // main (function) + x (variable). Find x by name.
-    ASSERT_EQ(model.symbols().size() - 1, 2u);
+    // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
+    // (__va_list_tag + va_list). Find x by name.
+    ASSERT_EQ(model.symbols().size() - 1, 4u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -2075,8 +2081,10 @@ TEST(SemanticAnalyzerCSubset, ValueStarValueStaysExpressionStatement) {
         "int main() { int a = 2; int b = 3; a * b; return a; }\n",
     });
     EXPECT_FALSE(model.hasErrors());
-    EXPECT_EQ(model.symbols().size() - 1, 3u)
-        << "main + a + b — the multiplication must mint NO symbol";
+    // main + a + b + the 2 FC12a-core builtin TYPES (__va_list_tag + va_list) — the
+    // multiplication must mint NO symbol.
+    EXPECT_EQ(model.symbols().size() - 1, 5u)
+        << "main + a + b + __va_list_tag + va_list — the multiplication mints none";
 }
 
 // UNKNOWN `u * v;` (no `u` anywhere, single file) — the oracle-candidate
@@ -2253,4 +2261,76 @@ TEST(SemanticAnalyzerCSubset, DerefFnPtrCalleeTypesAndChecks) {
     EXPECT_FALSE(derefDesignator.hasErrors())
         << "deref of a function designator decays right back (C "
            "6.5.3.2p4) — must be clean";
+}
+
+// ── FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing pins ──────
+
+// `va_list ap;` resolves the injected builtin typedef; va_start/va_arg/va_end of a
+// proper va_list with a BUILTIN-int type arg are clean; va_arg's node types as int.
+TEST(SemanticAnalyzerCSubset, VaArgWithBuiltinIntTypesClean) {
+    auto model = analyzeShipped("c-subset", {
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "va_list / va_start / va_arg(ap,int) / va_end must type cleanly";
+}
+
+// `va_arg(ap, T)` with T a TYPEDEF name commits the type position as a type (the
+// shared castTypeRef + commitRequiresTypeName triage) and types the node as T.
+TEST(SemanticAnalyzerCSubset, VaArgWithTypedefTypeResolves) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int MyInt;\n"
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  MyInt t = va_arg(ap, MyInt);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "va_arg(ap, MyInt) — a typedef in the type position — must resolve";
+}
+
+// `va_arg(ap, x)` where `x` is a VALUE (not a type) must FAIL LOUD: the type
+// position resolves through the same resolver casts use, which emits S_UnknownType
+// for a non-type name. (The red-on-disable guard against silently treating a value
+// as a type — a wrong va_arg width would be a silent garbage read.)
+TEST(SemanticAnalyzerCSubset, VaArgWithValueInTypePositionFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int x = 7;\n"
+        "  int t = va_arg(ap, x);\n"   // x is a VALUE, not a type
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "va_arg(ap, x) for a VALUE x must fail loud — never treat a value as a type";
+    EXPECT_GT(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "the failure must be S_UnknownType at the type position (attributable)";
+}
+
+// `va_start(ap, n)` where `ap` is NOT a va_list (a bare int) must fail loud with a
+// type mismatch — the first arg must be a va_list.
+TEST(SemanticAnalyzerCSubset, VaStartWithNonVaListFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int sum(int n, ...) {\n"
+        "  int notAList;\n"
+        "  va_start(notAList, n);\n"
+        "  return 0;\n"
+        "}\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "va_start of a non-va_list first arg must fail loud";
+    EXPECT_GT(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "the failure must be S_TypeMismatch on the ap operand";
 }

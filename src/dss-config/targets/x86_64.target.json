@@ -51,6 +51,26 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (FC12a-core, D-FC12A-VARIADIC-CALLEE): 'this LirReg is the ADDRESS of the variadic register-save-area' — the frame zone a variadic callee's prologue spills rdi..r9 + the al-gated xmm0..7 into. lir_callconv reserves the zone (sized by the cc's vaListLayout.regSaveAreaBytes) + materializes this op into `lea result, [sp + offset]` once the frame layout is known. The PRESENCE of this op in a function is also lir_callconv's signal that the function called va_start (→ emit the spill). No encoding (materialized away).",
+      "mnemonic":      "va_reg_save_area",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Virtual-ISA pseudo-op (FC12a-core, D-FC12A-VARIADIC-CALLEE): 'this LirReg is the ADDRESS of the incoming overflow stack args' — where varargs that didn't fit in registers live (the caller's outgoing-args area, above this frame). lir_callconv materializes it into `lea result, [sp + totalFrameSize + callPushBytes]` (the same geometry the stack-resident `arg` read uses). No encoding (materialized away).",
+      "mnemonic":      "va_overflow_arg_area",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "2-operand-shape mov: destination = result vreg, source = operands[0]. AS2 cycle 2 wires this to two encoding variants: REX.W 0x8B /r (mov r64, r64) when source is a register; REX.W 0xC7 /0 imm32 (mov r/m64, imm32 SIGN-extended to 64-bit) when source is an immediate. FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): both shapes gain explicit `width` keys + 32-bit siblings (same opcodes WITHOUT REX.W, Intel SDM Vol. 2B MOV) — a 32-bit register write auto-zero-extends to the full 64-bit register, and the 32-bit imm32 form is EXACT (not sign-extending), the difference that matters for an `unsigned int` 0xFFFFFFFF. Plumbing movs (phi/copy/capture/spill) are emitted width-default (64) — full-register copies are value-correct for every type. FC8 (D-CSUBSET-BITFIELD-WIDE-UNIT): a fifth variant materializes a FULL 64-bit immediate — REX.W B8+rd io (mov r64, imm64) — selected by the `imm64` operand-kind (a `LiteralIndex` LIR operand: the wide value lives in the LIR literal pool, since it does not fit the inline imm32 path). This is the ONLY x86-64 form that loads a >imm32 constant into a register; its destination rides the opcode byte (B8+rd), not ModR/M, so it uses the `opcode.reg` result slot.",
       "mnemonic":      "mov",
       "result":        "value",
@@ -1494,7 +1514,20 @@
       "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: x86_64 `call` instruction pushes the 8-byte return address. ML7 `computeFrameLayout` consumes this as the bias for non-leaf functions so their prologue `sub rsp, N` produces RSP ≡ 0 mod 16 at the next call site. SysV's entry bias is 0 (kernel JMP) but this in-program call-push is 8 — the two distinct facts coincide on Win64 (both 8) and diverge here. Without this wired, the user-fn → extern-call shadow-space + alignment violation reappears one stack frame below the trampoline (the same 0xC0000005 class as D-LK10-ENTRY-TRAMP-PROLOGUE, now recurring at the user-fn boundary).",
       "callPushBytes": 8,
       "$variadicVectorCountRegComment": "D-LANG-VARIADIC (step 13.4, 2026-06-02): SysV AMD64 §3.5.7 — the caller MUST set AL to the number of vector (XMM) registers used to pass variadic arguments before any call to a function with `...`. printf reads %al to know whether to consult the XMM save area in its va_list walk; passing AL uninitialized yields garbage formatting and (on hardened glibcs) an abort. C-subset has no float type today, so every variadic call from c-subset stamps the count as 0; the count-of-FPRs logic in ML7 materialize is data-driven via this field — future float support (in c-subset or any other source language) lights up the same code path with zero substrate change. The field names `rax` (the register table's canonical full-width name) rather than `al` (the ABI document's low-byte alias) because the register table does NOT yet model the x86 subregister aliases (al / ax / eax for the low-byte / low-word / low-dword of rax); anchored D-TARGET-SUBREGISTER-ALIASES. Writing rax = count is ABI-equivalent: a `mov rax, <count<=8>` sets AL to the same byte and the upper bits are irrelevant to printf's ABI contract.",
-      "variadicVectorCountReg": "rax"
+      "variadicVectorCountReg": "rax",
+      "$vaListLayoutComment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): System V AMD64 §3.5.7 variadic-CALLEE layout. `__va_list_tag` = {u32 gp_offset@0; u32 fp_offset@4; void* overflow_arg_area@8; void* reg_save_area@16;} = 24B. A variadic callee's prologue spills the 6 integer arg regs (rdi..r9, 8B each = 48B) then the al-gated 8 SSE arg regs (xmm0..xmm7, 16B each = 128B) into a 176B register-save-area. va_start sets gp_offset = fixedGPR*8, fp_offset = 48 + fixedSSE*16, reg_save_area = &save, overflow_arg_area = &(incoming stack args). va_arg(T) of an INTEGER reads reg_save_area+gp_offset (bump +8) while gp_offset < gpOffsetLimit(48), else overflow; an SSE arg reads reg_save_area+fp_offset (bump +16) while fp_offset < fpOffsetLimit(176), else overflow. Every fact is config — the HIR→MIR diamond + LIR prologue spill read these, never branching on cc.name/arch/format. Win64/AAPCS64 omit this block (different variadic ABI) and fail loud at the va_start site.",
+      "vaListLayout": {
+        "gpOffsetField":        { "byteOffset": 0,  "widthBytes": 4 },
+        "fpOffsetField":        { "byteOffset": 4,  "widthBytes": 4 },
+        "overflowArgAreaField": { "byteOffset": 8,  "widthBytes": 8 },
+        "regSaveAreaField":     { "byteOffset": 16, "widthBytes": 8 },
+        "gpSaveCount": 6,
+        "gpSlotBytes": 8,
+        "fpSaveCount": 8,
+        "fpSlotBytes": 16,
+        "gpOffsetLimit": 48,
+        "fpOffsetLimit": 176
+      }
     },
     {
       "name": "ms_x64",

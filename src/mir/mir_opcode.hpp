@@ -81,6 +81,20 @@ enum class MirOpcode : std::uint16_t {
     // Call operand routed to the IRR by the `call_payload::kIndirectResultBit`
     // flag — see the IRR-reroute design in lir_callconv. No WriteIndirectResult.)
     ReadIndirectResult,
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the two FRAME-relative address value-
+    // origins a `va_start` writes into the `__va_list_tag`. Both are leaves (like
+    // `Arg`/`ReadIndirectResult`): the concrete byte offset is unknown until the
+    // LIR callconv pass owns the frame layout, so they survive to LIR as virtual
+    // ops that materialize into `lea reg, [sp + offset]`. Result = a pointer; side-
+    // effecting so DCE can't drop them and no pass hoists them off their function.
+    //   VaRegSaveAreaAddr:     &(the register-save-area the variadic prologue spills
+    //                          rdi..r9 + al-gated xmm0..7 into).
+    //   VaOverflowArgAreaAddr: &(the incoming STACK args — where overflow varargs
+    //                          live; geometry mirrors the stack-resident `arg` read).
+    // The PRESENCE of a VaRegSaveAreaAddr in a function is ALSO the LIR pass's
+    // signal that the function called va_start and so needs the save-area reserved +
+    // the prologue spill (self-contained — no FnSig lookup, no threaded flag).
+    VaRegSaveAreaAddr, VaOverflowArgAreaAddr,
     // ── SSA join ──
     Phi,           // operand range addresses the PHI pool, not the operand pool
     // ── terminators (exactly one, last in a block; successors live in succ pool) ──
@@ -251,6 +265,10 @@ struct MirOpcodeInfo {
         // ReadIndirectResult: a leaf value-origin (reads x8 at entry) — mirror of
         // Arg; side-effecting so it pins to entry and DCE can't drop it.
         case MirOpcode::ReadIndirectResult:  return {0, 0, 0, 0, R::Value, false, true, false, "readindirectresult"};
+        // FC12a-core: frame-relative va_list address leaves (mirror ReadIndirectResult:
+        // 0 operands, value result, side-effecting so they pin to their function).
+        case MirOpcode::VaRegSaveAreaAddr:     return {0, 0, 0, 0, R::Value, false, true, false, "varegsavearea"};
+        case MirOpcode::VaOverflowArgAreaAddr: return {0, 0, 0, 0, R::Value, false, true, false, "vaoverflowargarea"};
 
         // phi — operand range addresses the PHI pool (incoming value/block pairs).
         case MirOpcode::Phi: return {0, N, 0, 0, R::Value, false, false, true, "phi"};

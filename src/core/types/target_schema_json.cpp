@@ -1612,6 +1612,71 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         }
                     }
                 }
+                // FC12a-core (D-FC12A-VARIADIC-CALLEE): the optional `__va_list_tag`
+                // layout + register-save-area geometry for variadic-callee support.
+                // Present on SysV AMD64; omitted by Win64 / AAPCS64 (their variadic
+                // ABI differs — those CCs fail loud at the va_start site). Mirrors
+                // the optional `variadicVectorCountReg` / `indirectResultRegister`
+                // shape above: a present-but-malformed block emits and skips
+                // (leaving the optional unengaged), so the consumer's
+                // has_value() guard fails loud rather than mis-walking a half-set layout.
+                if (c.contains("vaListLayout")) {
+                    if (!c.at("vaListLayout").is_object()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/vaListLayout", ccPath),
+                                  "must be an object");
+                    } else {
+                        auto const& vl = c.at("vaListLayout");
+                        VaListLayout layout;
+                        bool vlOk = true;
+                        // Read a required non-negative u32 scalar; emit + clear vlOk on miss.
+                        auto readU32 = [&](char const* key, std::uint32_t& out) {
+                            if (!vl.contains(key) || !vl.at(key).is_number_unsigned()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/vaListLayout/{}", ccPath, key),
+                                          std::format("'{}' is required and must be a "
+                                                      "non-negative integer", key));
+                                vlOk = false;
+                                return;
+                            }
+                            out = vl.at(key).get<std::uint32_t>();
+                        };
+                        // Read a {byteOffset,widthBytes} field object.
+                        auto readField = [&](char const* key, VaListLayout::Field& out) {
+                            if (!vl.contains(key) || !vl.at(key).is_object()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/vaListLayout/{}", ccPath, key),
+                                          std::format("'{}' is required and must be an "
+                                                      "object {{byteOffset,widthBytes}}", key));
+                                vlOk = false;
+                                return;
+                            }
+                            auto const& f = vl.at(key);
+                            if (!f.contains("byteOffset") || !f.at("byteOffset").is_number_unsigned()
+                             || !f.contains("widthBytes") || !f.at("widthBytes").is_number_unsigned()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/vaListLayout/{}", ccPath, key),
+                                          "field must declare non-negative 'byteOffset' "
+                                          "and 'widthBytes'");
+                                vlOk = false;
+                                return;
+                            }
+                            out.byteOffset = f.at("byteOffset").get<std::uint32_t>();
+                            out.widthBytes = f.at("widthBytes").get<std::uint32_t>();
+                        };
+                        readField("gpOffsetField",       layout.gpOffsetField);
+                        readField("fpOffsetField",       layout.fpOffsetField);
+                        readField("overflowArgAreaField", layout.overflowArgAreaField);
+                        readField("regSaveAreaField",    layout.regSaveAreaField);
+                        readU32("gpSaveCount",   layout.gpSaveCount);
+                        readU32("gpSlotBytes",   layout.gpSlotBytes);
+                        readU32("fpSaveCount",   layout.fpSaveCount);
+                        readU32("fpSlotBytes",   layout.fpSlotBytes);
+                        readU32("gpOffsetLimit", layout.gpOffsetLimit);
+                        readU32("fpOffsetLimit", layout.fpOffsetLimit);
+                        if (vlOk) cc.vaListLayout = layout;
+                    }
+                }
 
                 std::uint16_t const idx =
                     static_cast<std::uint16_t>(data.callingConventions.size());

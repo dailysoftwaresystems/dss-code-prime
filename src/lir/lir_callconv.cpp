@@ -169,6 +169,9 @@ computeFrameLayout(LirFuncAllocation const& alloc,
                    bool hasCalls,
                    std::uint32_t outgoingArgSlots,
                    std::vector<std::uint32_t> const& allocaPayloads,
+                   // FC12a-core (D-FC12A-VARIADIC-CALLEE): bytes for the variadic
+                   // register-save-area (0 unless this function calls va_start).
+                   std::uint32_t vaRegSaveAreaBytes,
                    DiagnosticReporter& reporter) {
     std::uint32_t const slotWidth = std::max(widthForClass(schema, LirRegClass::GPR),
                                              widthForClass(schema, LirRegClass::FPR));
@@ -223,6 +226,10 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     for (std::uint32_t const p : allocaPayloads)
         totalLocalSlots += allocaSlotCount(p, slotWidth);
     layout.localAreaSize       = totalLocalSlots * slotWidth;
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the variadic register-save-area is the
+    // TOPMOST frame zone (above local allocas). Sized by the CC's vaListLayout, it
+    // is 0 unless this function calls va_start (the caller passes its byte count).
+    layout.vaRegSaveAreaSize   = vaRegSaveAreaBytes;
     layout.hasCalls            = hasCalls;
     // Frame zones stack from SP+0 upward: outgoing-args, saved regs,
     // spill slots, then local-alloca slots. Caller-side `frame_store
@@ -239,7 +246,8 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     // emits `lea result, [sp + offset]` for each `alloca` opcode.
     std::uint32_t const rawPreShadow =
         layout.outgoingArgAreaSize + layout.savedRegAreaSize
-        + layout.spillAreaSize    + layout.localAreaSize;
+        + layout.spillAreaSize    + layout.localAreaSize
+        + layout.vaRegSaveAreaSize;
     std::uint32_t const align = (cc.stackAlignment > 0) ? cc.stackAlignment : 1u;
     if (hasCalls) {
         // Non-leaf: alignedSizeWithBias with callPushBytes as the
@@ -284,6 +292,30 @@ functionHasCalls(Lir const& src, LirFuncId fn,
             std::uint16_t const op = src.instOpcode(inst);
             auto const* info = schema.opcodeInfo(op);
             if (info != nullptr && info->isCall) return true;
+        }
+    }
+    return false;
+}
+
+// FC12a-core (D-FC12A-VARIADIC-CALLEE): does function `fn` call va_start? Detected
+// by the presence of a `va_reg_save_area` virtual op (HIR→MIR emits it inside the
+// va_start lowering, MIR→LIR lowers it to this opcode). The presence — NOT the
+// FnSig's isVariadic bit — is the precise signal: a variadic function that NEVER
+// calls va_start needs no register-save-area (it never reads the varargs), so the
+// op-presence test reserves the zone + spills the arg regs exactly when needed.
+// `vaRegSaveAreaOp == 0` (a CC without a vaListLayout — the optional handle) ⇒ the
+// op never matches, so every non-variadic-callee target answers false uniformly.
+[[nodiscard]] bool
+functionUsesVaStart(Lir const& src, LirFuncId fn,
+                    std::uint16_t vaRegSaveAreaOp) noexcept {
+    if (vaRegSaveAreaOp == 0) return false;
+    std::uint32_t const blockCount = src.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+        LirBlockId const blk = src.funcBlockAt(fn, bi);
+        std::uint32_t const instN = src.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < instN; ++i) {
+            if (src.instOpcode(src.blockInstAt(blk, i)) == vaRegSaveAreaOp)
+                return true;
         }
     }
     return false;
@@ -552,6 +584,13 @@ struct OpcodeHandles {
     // rejects loud if either is missing AND `alloca` is exercised.
     std::uint16_t alloca_;
     std::uint16_t lea;
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the two frame-relative va_list address
+    // virtual ops, materialized by this pass into `lea result, [sp + offset]`.
+    // Optional — only a CC declaring a `vaListLayout` emits them; absent ⇒ field 0,
+    // `op == h.vaRegSaveArea` never matches. The PRESENCE of a `va_reg_save_area`
+    // inst in a function is also this pass's "function called va_start" signal.
+    std::uint16_t vaRegSaveArea;
+    std::uint16_t vaOverflowArgArea;
 };
 
 // FC2 Part B: resolve the class-correct opcode for a register-data-
@@ -629,6 +668,73 @@ void emitEpilogue(LirBuilder& b, FrameLayout const& layout,
     }
     emitSpAdjust(b, addOp, sp, layout.totalFrameSize);
     ok = true;
+}
+
+// Resolve a cc register-name reference to a typed `LirReg` (forward decl — the
+// definition follows; the variadic spill below uses it to turn argGprs/argFprs
+// names into physical LirRegs).
+[[nodiscard]] std::optional<LirReg>
+resolveCcReg(TargetSchema const& schema, std::string_view name, LirRegClass cls,
+             std::string_view contextLabel, DiagnosticReporter& reporter);
+
+// FC12a-core (D-FC12A-VARIADIC-CALLEE): emit the variadic register-save-area spill
+// in the prologue of a function that calls va_start. SysV §3.5.7: spill the integer
+// arg regs (rdi..r9, `gpSaveCount` of them at `gpSlotBytes` stride) then the SSE arg
+// regs (xmm0..7, `fpSaveCount` at `fpSlotBytes` stride, the SSE block AFTER the GPR
+// block) into the save area at `vaRegSaveAreaOffset()`. `va_start` later sets
+// reg_save_area = &this zone and reads slots via gp_offset/fp_offset.
+//
+// The SSE block is spilled UNCONDITIONALLY (all `fpSaveCount` registers), which is
+// byte-correct: va_arg only ever reads an fp slot whose fp_offset cursor is below
+// the SSE limit AND that the source actually consumed, so spilling caller-garbage
+// into unused slots is never observed. The SysV `al`-GATED form (skip the SSE block
+// when al==0) is a SIZE optimization that needs conditional-branch emission in this
+// otherwise straight-line callconv pass — anchored D-FC12A-VARIADIC-AL-GATED-SPILL
+// (trigger: the callconv pass gains branch/cmp emission, or a profile shows the
+// 128-byte spill matters). Correctness does not depend on it.
+[[nodiscard]] bool
+emitVariadicRegSaveSpill(LirBuilder& b, FrameLayout const& layout,
+                         TargetSchema const& schema,
+                         TargetCallingConvention const& cc, LirReg sp,
+                         DiagnosticReporter& reporter) {
+    if (!cc.vaListLayout.has_value()) return true;   // guarded by caller, defensive
+    VaListLayout const& vl = *cc.vaListLayout;
+    std::uint32_t const base = layout.vaRegSaveAreaOffset();
+
+    // Integer arg regs → [sp + base + i*gpSlotBytes]. Spill min(gpSaveCount,
+    // argGprs.size()) — the geometry assumes they agree (SysV: 6 == 6), but the min
+    // keeps it safe against a misconfigured CC declaring fewer arg regs than slots.
+    auto const gpStore = classOpHandle(schema, LirRegClass::GPR, RegClassOp::Store,
+                                       "callconv: variadic GPR save spill", reporter);
+    if (!gpStore.has_value()) return false;
+    std::uint32_t const gpN =
+        std::min<std::uint32_t>(vl.gpSaveCount,
+                                static_cast<std::uint32_t>(cc.argGprs.size()));
+    for (std::uint32_t i = 0; i < gpN; ++i) {
+        auto const reg = resolveCcReg(schema, cc.argGprs[i], LirRegClass::GPR,
+                                      "callconv: variadic GPR save spill", reporter);
+        if (!reg.has_value()) return false;
+        emitFrameStore(b, *gpStore, *reg, sp,
+                       static_cast<std::int32_t>(base + i * vl.gpSlotBytes));
+    }
+
+    // SSE arg regs → [sp + base + gpSaveCount*gpSlotBytes + i*fpSlotBytes] (the SSE
+    // block follows the full GPR block, matching va_start's fp_offset = 48 + ...).
+    std::uint32_t const fpBase = base + vl.gpSaveCount * vl.gpSlotBytes;
+    auto const fpStore = classOpHandle(schema, LirRegClass::FPR, RegClassOp::Store,
+                                       "callconv: variadic SSE save spill", reporter);
+    if (!fpStore.has_value()) return false;
+    std::uint32_t const fpN =
+        std::min<std::uint32_t>(vl.fpSaveCount,
+                                static_cast<std::uint32_t>(cc.argFprs.size()));
+    for (std::uint32_t i = 0; i < fpN; ++i) {
+        auto const reg = resolveCcReg(schema, cc.argFprs[i], LirRegClass::FPR,
+                                      "callconv: variadic SSE save spill", reporter);
+        if (!reg.has_value()) return false;
+        emitFrameStore(b, *fpStore, *reg, sp,
+                       static_cast<std::int32_t>(fpBase + i * vl.fpSlotBytes));
+    }
+    return true;
 }
 
 // Resolve a cc register-name reference to a typed `LirReg`. Returns
@@ -878,7 +984,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 14> const table{{
+    std::array<Entry, 16> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -915,6 +1021,12 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // handle resolved.
         {&OpcodeHandles::alloca_,    "alloca",     true},
         {&OpcodeHandles::lea,        "lea",        true},
+        // FC12a-core (D-FC12A-VARIADIC-CALLEE): optional — only a CC with a
+        // `vaListLayout` emits these. Materialized into `lea [sp + offset]`; both
+        // need `lea` (guaranteed present on any register-machine target that also
+        // declares them). Absent ⇒ field 0; never matches a real input opcode.
+        {&OpcodeHandles::vaRegSaveArea,     "va_reg_save_area",     true},
+        {&OpcodeHandles::vaOverflowArgArea, "va_overflow_arg_area", true},
     }};
     for (auto const& [field, mnem, optional] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
@@ -999,10 +1111,20 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     // i to the same alloca as the count pre-scan visited.
     std::vector<std::uint32_t> const localAllocaPayloads =
         functionLocalAllocaPayloads(src, fn, h.alloca_);
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): does this function call va_start? If so
+    // (and the CC declares a vaListLayout), reserve the register-save-area zone the
+    // prologue spills the arg regs into. The op-presence test + the CC's
+    // has_value() guard together keep this fully config-driven + fail-safe: a CC
+    // with no vaListLayout never reserves the zone (vaRegSaveAreaOp stays 0).
+    bool const usesVaStart =
+        functionUsesVaStart(src, fn, h.vaRegSaveArea) && cc.vaListLayout.has_value();
+    std::uint32_t const vaRegSaveAreaBytes =
+        usesVaStart ? cc.vaListLayout->regSaveAreaBytes() : 0u;
     auto layoutOpt = computeFrameLayout(alloc, schema, cc,
                                         std::move(usedSaved),
                                         hasCalls, outgoingArgSlots,
                                         localAllocaPayloads,
+                                        vaRegSaveAreaBytes,
                                         reporter);
     if (!layoutOpt.has_value()) return false;
     outLayout = std::move(*layoutOpt);
@@ -1044,6 +1166,13 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             emitPrologue(b, outLayout, schema, sp, h.sub, reporter,
                          prologueOk);
             if (!prologueOk) return false;
+            // FC12a-core (D-FC12A-VARIADIC-CALLEE): a function that calls va_start
+            // spills its arg registers into the register-save-area immediately after
+            // the prologue's SP-adjust + saved-reg stores (so reg_save_area, set by
+            // va_start, points at live values). Straight-line stores — no CFG.
+            if (usesVaStart
+                && !emitVariadicRegSaveSpill(b, outLayout, schema, cc, sp, reporter))
+                return false;
         }
 
         std::uint32_t const instN = src.blockInstCount(srcBlock);
@@ -1241,6 +1370,41 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     allocaSlotCount(payload, outLayout.slotSize)
                     * outLayout.slotSize;
                 emitFrameAddr(b, h.lea, result, sp, offset);
+                continue;
+            }
+
+            // FC12a-core (D-FC12A-VARIADIC-CALLEE): materialize the two va_list
+            // address virtual ops into `lea result, [sp + offset]` (the alloca
+            // precedent). The register-save-area is the topmost frame zone
+            // (`vaRegSaveAreaOffset()`); the overflow-arg area is the caller's
+            // incoming stack args — the SAME geometry the stack-resident `arg` read
+            // uses (`totalFrameSize + callPushBytes + shadowSpaceBytes`, i.e. the
+            // FIRST incoming overflow slot). `va_arg` then walks forward from there.
+            if (h.vaRegSaveArea != 0 && op == h.vaRegSaveArea) {
+                if (h.lea == 0 || !result.valid() || result.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                           DiagnosticSeverity::Error,
+                           "callconv: va_reg_save_area materialization needs 'lea' "
+                           "+ a physical-reg result (D-FC12A-VARIADIC-CALLEE)");
+                    return false;
+                }
+                emitFrameAddr(b, h.lea, result, sp,
+                              static_cast<std::int32_t>(outLayout.vaRegSaveAreaOffset()));
+                continue;
+            }
+            if (h.vaOverflowArgArea != 0 && op == h.vaOverflowArgArea) {
+                if (h.lea == 0 || !result.valid() || result.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                           DiagnosticSeverity::Error,
+                           "callconv: va_overflow_arg_area materialization needs "
+                           "'lea' + a physical-reg result (D-FC12A-VARIADIC-CALLEE)");
+                    return false;
+                }
+                std::int32_t const ovfOffset = static_cast<std::int32_t>(
+                    outLayout.totalFrameSize
+                    + static_cast<std::uint32_t>(cc.callPushBytes)
+                    + static_cast<std::uint32_t>(cc.shadowSpaceBytes));
+                emitFrameAddr(b, h.lea, result, sp, ovfOffset);
                 continue;
             }
 

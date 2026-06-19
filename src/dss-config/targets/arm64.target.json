@@ -51,6 +51,26 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (FC12a-core, D-FC12A-VARIADIC-CALLEE): the variadic register-save-area address. Declared for substrate uniformity (like read_indirect_result); AArch64's variadic ABI differs (no SysV-style register-save-area / vaListLayout this cycle), so its sysv-less CC never EMITS this op — it is materialized away by lir_callconv only for a CC that declares a vaListLayout. No encoding.",
+      "mnemonic":      "va_reg_save_area",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Virtual-ISA pseudo-op (FC12a-core, D-FC12A-VARIADIC-CALLEE): the incoming overflow-stack-args address. Declared for substrate uniformity; never emitted on a CC without a vaListLayout. No encoding (materialized away by lir_callconv).",
+      "mnemonic":      "va_overflow_arg_area",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "AAPCS64 has no native `mov reg, reg` instruction — the canonical encoding is `ORR Xd, XZR, Xm` (32-bit fixed word 0xAA0003E0 = base + Rn=XZR=31; Rd and Rm via slots). LIR's `mov` is 2-operand (result + 1 source); 3-address natively (no requires2Address).",
       "mnemonic":      "mov",
       "result":        "value",

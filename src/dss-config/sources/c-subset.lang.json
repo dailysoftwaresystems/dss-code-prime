@@ -223,6 +223,10 @@
     { "word": "goto",     "kind": "GotoKeyword"     },
     { "word": "sizeof",   "kind": "SizeofKeyword"   },
 
+    { "word": "va_start", "kind": "VaStartKeyword" },
+    { "word": "va_arg",   "kind": "VaArgKeyword"   },
+    { "word": "va_end",   "kind": "VaEndKeyword"   },
+
     { "word": "extern",  "kind": "ExternKeyword"  },
 
     { "word": "static",        "kind": "StaticKeyword"    },
@@ -799,6 +803,9 @@
         "charLiteralExpr",
         "compoundLiteralExpr",
         "sizeofExpr",
+        "vaStartExpr",
+        "vaArgExpr",
+        "vaEndExpr",
         "castExpr",
         "parenExpr"
       ],
@@ -831,6 +838,24 @@
     },
     "sizeofValue": {
       "sequence": [ "SizeofKeyword", "castOperand" ]
+    },
+
+    "vaStartExpr": {
+      "$comment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): `va_start(ap, last)`. Takes the `va_list` lvalue (assignmentExpr — the comma-free, non-comma-operator form) and an OPTIONAL second `last` arg that is parsed-and-ignored (the SysV gp/fp offsets derive from the FnSig, not from `last`). A leaf form in the operand alternative list, parallel to sizeofExpr.",
+      "sequence": [
+        "VaStartKeyword", "ParenOpen", "assignmentExpr",
+        { "optional": { "sequence": [ "Comma", "assignmentExpr" ] } },
+        "ParenClose"
+      ]
+    },
+    "vaArgExpr": {
+      "$comment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): `va_arg(ap, T)`. The SECOND argument is a TYPE — it reuses FC2's shared `castTypeRef` rule + `commitRequiresTypeName` binder triage so `va_arg(ap, int)` / `va_arg(ap, MyTypedef)` commit the type position as a type (and `va_arg(ap, x)` for a VALUE x fails loud at the type-resolve, never silently treating a value as a type). The dedicated HIR lowering recovers T from the semantic stamp, exactly like sizeof.",
+      "sequence": [ "VaArgKeyword", "ParenOpen", "assignmentExpr", "Comma", "castTypeRef", "ParenClose" ],
+      "commitRequiresTypeName": "castTypeRef"
+    },
+    "vaEndExpr": {
+      "$comment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): `va_end(ap)`. Takes the `va_list` lvalue; a no-op teardown in the SysV model.",
+      "sequence": [ "VaEndKeyword", "ParenOpen", "assignmentExpr", "ParenClose" ]
     },
 
     "castTypeBase": {
@@ -934,6 +959,7 @@
       "nameToken":          "Identifier",
       "fnSuffixRule":       "fnSuffix",
       "fnSuffixParamsRule": "paramList",
+      "variadicMarker":     "EllipsisOp",
       "arraySuffixRule":    "arrayDeclSuffix",
       "initDeclaratorRule": "initDeclarator",
       "listRule":           "initDeclaratorList"
@@ -1055,6 +1081,12 @@
     ],
     "$sizeofComment": "FC6: sizeof typing. sizeofType = [ SizeofKeyword, '(', castTypeRef, ')' ] → typeChild 2 is the castTypeRef (resolved + stamped through the SAME type resolver casts use). sizeofValue = [ SizeofKeyword, castOperand ] (the operand is typed normally). Both forms are stamped size_t (U64).",
     "sizeof": { "typeRule": "sizeofType", "typeChild": 2, "valueRule": "sizeofValue" },
+    "$variadicComment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. vaArgExpr = [ VaArgKeyword, '(', assignmentExpr(apChild 2), ',', castTypeRef(typeChild 4), ')' ] → pass 2 resolves+stamps the castTypeRef through the SAME resolver casts use (so the HIR lowering recovers the read type T) and stamps the node T; it type-checks `ap` is a va_list. vaStartExpr/vaEndExpr = [ kw, '(', assignmentExpr(apChild 2), ... ] → node stamped `void`; ap type-checked va_list; vaStart also flips the enclosing function's uses-va-start attribute so the LIR prologue spills the arg registers.",
+    "variadic": {
+      "vaArgRule":   "vaArgExpr",   "vaArgApChild":   2, "vaArgTypeChild": 4,
+      "vaStartRule": "vaStartExpr", "vaStartApChild": 2,
+      "vaEndRule":   "vaEndExpr",   "vaEndApChild":   2
+    },
     "$compoundLiteralsComment": "FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF): the compound-literal type position resolves + stamps through the SAME type-position resolver casts use (typedefs included). typeChild is the visible-child index into compoundLiteralExpr = [ '(' , castTypeRef , ')' , braceInitList ]. NO operandChild / cast-matrix validation — a compound literal is C 6.5.2.5 postfix syntax, not a conversion.",
     "compoundLiterals": [
       { "rule": "compoundLiteralExpr", "typeChild": 1 }
@@ -1193,6 +1225,9 @@
     "compoundLiteralRule": "compoundLiteralExpr",
     "castRule":            "castExpr",
     "sizeofRule":          "sizeofExpr",
+    "vaStartRule":         "vaStartExpr",
+    "vaArgRule":           "vaArgExpr",
+    "vaEndRule":           "vaEndExpr",
 
     "globalsConstEval": { "allowFloat": true },
 

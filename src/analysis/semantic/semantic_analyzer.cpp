@@ -1197,6 +1197,23 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                 collectParamTypes(s, cfg, tree, paramsList, scope, params,
                                   emitOnMiss);
             }
+            // FC12a-core (D-FC12A-VARIADIC-CALLEE): a `...` in this param list makes
+            // the FnSig C-style variadic. This SHARED suffix resolver is the path a
+            // function DEFINITION (`T f(int n, ...) {...}`) + a fn-pointer type take —
+            // the legacy decl-only path scanned its per-rule marker but this one did
+            // NOT, so a variadic DEFINITION built a non-variadic FnSig and every call
+            // to it tripped S_ArgCountMismatch. Scan here (stopping at nested decl
+            // rules, like the legacy path) so the def + decl agree on variadic-ness.
+            if (paramsList.valid() && dc.variadicMarker.has_value()
+                && subtreeContainsToken(tree, paramsList, *dc.variadicMarker,
+                                        &s.idx().declByRule)) {
+                normalizeSoleVoidParams(s, cfg, tree, params, emitOnMiss);
+                std::vector<TypeId> vt;
+                vt.reserve(params.size());
+                for (auto const& [pNode, pTy] : params) vt.push_back(pTy);
+                return s.lattice.interner().fnSig(vt, inner, CallConv::CcSysV,
+                                                  /*isVariadic=*/true);
+            }
         }
         // C 6.7.6.3p10 `(void)` normalization — the same call the legacy
         // function-decl FnSig build applies (ONE convention, two paths).
@@ -2608,6 +2625,64 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         }
         if (cfg.sizeofValueRule.valid() && rule.v == cfg.sizeofValueRule.v) {
             s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
+        }
+
+        // FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. va_arg(ap,T)
+        // resolves+stamps its castTypeRef type child (so the HIR lowering recovers T —
+        // a VALUE in the type position fails loud at resolveTypeNode's S_UnknownType)
+        // + stamps the node T; va_start/va_end stamp the node `void`. ALL THREE check
+        // the `ap` operand is a va_list (an Array of, or Ptr to, `__va_list_tag` — the
+        // injected builtin; array-decay makes both shapes legitimate). A wrong `ap`
+        // (e.g. an int) is S_TypeMismatch. The check shares ONE helper across the three.
+        {
+            auto& in = s.lattice.interner();
+            // True iff `ty` is a va_list: Array<__va_list_tag> or Ptr<__va_list_tag>.
+            auto isVaList = [&](TypeId ty) -> bool {
+                if (!ty.valid()) return false;
+                TypeKind const k = in.kind(ty);
+                if (k != TypeKind::Array && k != TypeKind::Ptr) return false;
+                auto const ops = in.operands(ty);
+                if (ops.empty()) return false;
+                TypeId const inner = ops[0];
+                return inner.valid() && in.kind(inner) == TypeKind::Struct
+                    && in.name(inner) == "__va_list_tag";
+            };
+            // Emit S_TypeMismatch at `apNode` when its type is not a va_list.
+            auto checkAp = [&](NodeId apNode) {
+                TypeId const apTy = subtreeType(s, tree, apNode);
+                if (isVaList(apTy)) return;
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_TypeMismatch;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(apNode);
+                d.actual   = std::string{tree.text(apNode)};
+                s.reporter.report(std::move(d));
+            };
+            if (cfg.vaArgRule.valid() && rule.v == cfg.vaArgRule.v) {
+                auto kids = visibleChildren(tree, node);
+                TypeId argTy = InvalidType;
+                if (cfg.vaArgTypeChild < kids.size()) {
+                    NodeId const typeNode = kids[cfg.vaArgTypeChild];
+                    argTy = resolveTypeNode(s, cfg, tree, typeNode, here);
+                    if (argTy.valid()) s.nodeToType.set(typeNode, argTy);
+                    // argTy invalid ⇒ resolveTypeNode emitted S_UnknownType (the
+                    // `va_arg(ap, x)` for a VALUE x fail-loud).
+                }
+                if (cfg.vaArgApChild < kids.size()) checkAp(kids[cfg.vaArgApChild]);
+                // The node's RESULT type is the read type T (invalid cascades-suppress).
+                if (argTy.valid()) s.nodeToType.set(node, argTy);
+            }
+            if (cfg.vaStartRule.valid() && rule.v == cfg.vaStartRule.v) {
+                auto kids = visibleChildren(tree, node);
+                if (cfg.vaStartApChild < kids.size()) checkAp(kids[cfg.vaStartApChild]);
+                s.nodeToType.set(node, in.primitive(TypeKind::Void));
+            }
+            if (cfg.vaEndRule.valid() && rule.v == cfg.vaEndRule.v) {
+                auto kids = visibleChildren(tree, node);
+                if (cfg.vaEndApChild < kids.size()) checkAp(kids[cfg.vaEndApChild]);
+                s.nodeToType.set(node, in.primitive(TypeKind::Void));
+            }
         }
 
         // FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF):
@@ -4085,6 +4160,44 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
             rec.variadicBuiltin = bf.variadic;
             SymbolId const id = s.symbols.mint(rec);
             s.scopes.injectBinding(builtinScope, bf.name, id);
+        }
+        // FC12a-core (D-FC12A-VARIADIC-CALLEE): inject the `__va_list_tag` builtin
+        // struct + the `va_list` typedef iff this language declares a va_arg surface
+        // (config-driven: `vaArgRule` valid). `va_list` = `__va_list_tag[1]` (the C
+        // ABI definition; it array-decays to `__va_list_tag*` when passed to
+        // va_start/va_arg/va_end). The FIELD shape {u32, u32, void*, void*} is the
+        // SysV-family C-ABI standard; the per-field BYTE OFFSETS at codegen come from
+        // the TARGET's `vaListLayout` config (the semantic struct is only for making
+        // the type resolvable by name + sizing the `ap` local). A language without
+        // the surface injects nothing — no leak, no cross-language pollution.
+        if (sch->semantics().vaArgRule.valid()) {
+            auto& in = s.lattice.interner();
+            TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+            std::array<TypeId, 4> tagFields{
+                in.primitive(TypeKind::U32),  // gp_offset
+                in.primitive(TypeKind::U32),  // fp_offset
+                voidPtr,                      // overflow_arg_area
+                voidPtr,                      // reg_save_area
+            };
+            TypeId const tagTy = in.structType("__va_list_tag", tagFields);
+            SymbolRecord tagRec;
+            tagRec.name  = "__va_list_tag";
+            tagRec.scope = builtinScope;
+            tagRec.tree  = InvalidTree;
+            tagRec.kind  = DeclarationKind::Type;
+            tagRec.type  = tagTy;
+            SymbolId const tagId = s.symbols.mint(tagRec);
+            s.scopes.injectBinding(builtinScope, "__va_list_tag", tagId);
+
+            TypeId const vaListTy = in.array(tagTy, 1);
+            SymbolRecord vaRec;
+            vaRec.name  = "va_list";
+            vaRec.scope = builtinScope;
+            vaRec.tree  = InvalidTree;
+            vaRec.kind  = DeclarationKind::Type;
+            vaRec.type  = vaListTy;
+            SymbolId const vaId = s.symbols.mint(vaRec);
+            s.scopes.injectBinding(builtinScope, "va_list", vaId);
         }
     }
 

@@ -180,6 +180,12 @@ enum class MnemonicSlot : std::uint8_t {
     // register. Like `RetPiece`/`arg`, materialized away by lir_callconv (a
     // mov-from-indirectResultRegister) — never encoded. Declared in every schema.
     ReadIndirectResult,
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the two FRAME-relative va_list address
+    // virtual ops. Like `arg`/`alloca`, materialized away by lir_callconv into a
+    // `lea result, [sp + offset]` once the frame layout is known — never encoded.
+    // VaRegSaveArea = &(the variadic prologue's register-save-area); VaOverflowArgArea
+    // = &(the incoming overflow stack args). Declared in every schema for uniformity.
+    VaRegSaveArea, VaOverflowArgArea,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -268,6 +274,8 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::MovkLsl48,     "movk_lsl48"},
     {MnemonicSlot::RetPiece,      "ret_piece"},
     {MnemonicSlot::ReadIndirectResult, "read_indirect_result"},
+    {MnemonicSlot::VaRegSaveArea,      "va_reg_save_area"},
+    {MnemonicSlot::VaOverflowArgArea,  "va_overflow_arg_area"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -1098,6 +1106,12 @@ struct Lowerer {
             case MirOpcode::Arg:    return lowerArg(id);
             case MirOpcode::ReturnPiece: return lowerReturnPiece(id);
             case MirOpcode::ReadIndirectResult: return lowerReadIndirectResult(id);
+            case MirOpcode::VaRegSaveAreaAddr:
+                return lowerVaFrameAddr(id, MnemonicSlot::VaRegSaveArea,
+                                        "MIR VaRegSaveAreaAddr");
+            case MirOpcode::VaOverflowArgAreaAddr:
+                return lowerVaFrameAddr(id, MnemonicSlot::VaOverflowArgArea,
+                                        "MIR VaOverflowArgAreaAddr");
             case MirOpcode::Const:  return lowerConst(id);
             case MirOpcode::Add:    return lowerBinaryOp(id, MnemonicSlot::Add);
             case MirOpcode::Sub:    return lowerBinaryOp(id, MnemonicSlot::Sub);
@@ -1335,6 +1349,21 @@ struct Lowerer {
         LirReg const result = lir.newVReg(regClassFor(id));
         emitInst(*opcode(MnemonicSlot::ReadIndirectResult), result,
                  std::span<LirOperand const>{}, /*payload=*/0);
+        defineValue(id, result);
+    }
+
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the two frame-relative va_list address
+    // leaves (VaRegSaveAreaAddr / VaOverflowArgAreaAddr) lower to their virtual LIR
+    // op (no operands, GPR-class pointer result). lir_callconv materializes each into
+    // a `lea result, [sp + offset]` once it owns the frame layout — the `alloca`/
+    // `read_indirect_result` precedent. Fail loud if the schema lacks the opcode.
+    void lowerVaFrameAddr(MirInstId id, MnemonicSlot slot, char const* what) {
+        if (!opcode(slot).has_value()) {
+            reportMissingOpcode(slot, what);
+            return;
+        }
+        LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
+        emitInst(*opcode(slot), result, std::span<LirOperand const>{}, /*payload=*/0);
         defineValue(id, result);
     }
 

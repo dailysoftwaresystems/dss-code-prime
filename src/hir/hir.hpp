@@ -383,6 +383,15 @@ public:
                             HirFlags flags = HirFlags::None);
     // sizeof a type, given as a [TypeRef] child; `type` is the size's type.
     HirNodeId makeSizeOf(HirNodeId typeRef, TypeId type, HirFlags flags = HirFlags::None);
+    // FC12a-core variadic intrinsics. `makeVaArg` children are [apExpr, TypeRef]:
+    // the `va_list` lvalue (value-lowered to its address) PLUS the read TYPE on a
+    // SizeOf-style TypeRef child that is NEVER value-lowered; `type` is that read
+    // type T (the node's result). `makeVaStart`/`makeVaEnd` take just the `va_list`
+    // lvalue [apExpr] child; `type` is `void` (the void-returning-call convention).
+    HirNodeId makeVaStart(HirNodeId apExpr, TypeId type, HirFlags flags = HirFlags::None);
+    HirNodeId makeVaArg(HirNodeId apExpr, HirNodeId typeRef, TypeId type,
+                        HirFlags flags = HirFlags::None);
+    HirNodeId makeVaEnd(HirNodeId apExpr, TypeId type, HirFlags flags = HirFlags::None);
     // Address-of [operand]; `type` is the resulting pointer type.
     HirNodeId makeAddressOf(HirNodeId operand, TypeId type, HirFlags flags = HirFlags::None);
     // Pointer dereference of [operand]; `type` is the pointee type.
