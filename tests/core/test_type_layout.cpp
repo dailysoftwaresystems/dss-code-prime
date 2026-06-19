@@ -333,3 +333,236 @@ TEST(TypeLayout, InternerFieldBitWidthRoundTripAndIdentity) {
     std::array<std::int64_t, 2> const none{kNotBitfield, kNotBitfield};
     EXPECT_EQ(ti.structType("T", fields, none).v, ti.structType("T", fields).v);
 }
+
+// ── D-CSUBSET-BITFIELD-ABI-EXACT: per-ABI byte-exact bit-field layout ──────────
+//
+// The conformance witness (hermetic half). `computeLayout` under EACH strategy is
+// pinned to the values DERIVED FROM the native compiler — `cl.exe` 14.51 for
+// MsvcStraddle, `gcc` 11.4 for GnuPacked (the exact sizeof + set-one-field byte
+// probe measured during this cycle; see aggregate_layout.hpp). The two strategies
+// DIVERGE on the same struct, so flipping the strategy makes these goldens go RED
+// (red-on-disable for the WHOLE per-ABI feature). The CI cross-compile-compare
+// step (examples runner / a gated tool) re-derives the goldens from the native
+// compiler where present, so the constants below can never silently drift from the
+// real ABI.
+
+// The MSVC x64 (PE) params: identical to kGnu16 but with the MS straddling rule.
+constexpr AggregateLayoutParams kMsvc16{
+    ScalarAlignmentRule::Natural, 16, BitFieldStrategy::MsvcStraddle};
+
+// Struct A = `{int a:1; char b:1;}`. The headline divergence:
+//   gcc  : sizeof 4 — b packs into a's int unit at bit 1.
+//   cl.exe: sizeof 8 — b is a `char` (size 1 ≠ int 4) → a NEW unit at byte 4.
+TEST(TypeLayout, BitFieldAbiExact_A_IntThenChar) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::I32), ti.primitive(TypeKind::Char)};
+    std::array<std::int64_t, 2> const widths{1, 1};
+    TypeId const s = ti.structType("A", fields, widths);
+
+    // gnu_packed (gcc golden): a@byte0 bit0, b@byte0 bit1, size 4.
+    auto const g = layoutOf(s, ti, kGnu16);
+    EXPECT_EQ(g.size, 4u);
+    EXPECT_EQ(g.fieldOffsets[0], 0u);
+    EXPECT_EQ(g.bitFields[0].bitOffset, 0u);
+    EXPECT_EQ(g.fieldOffsets[1], 0u);
+    EXPECT_EQ(g.bitFields[1].bitOffset, 1u);
+
+    // msvc_straddle (cl.exe golden): a@byte0 bit0, b@byte4 bit0, size 8, align 4.
+    auto const m = layoutOf(s, ti, kMsvc16);
+    EXPECT_EQ(m.size, 8u);
+    EXPECT_EQ(m.align.bytes(), 4u);
+    EXPECT_EQ(m.fieldOffsets[0], 0u);
+    EXPECT_EQ(m.bitFields[0].bitOffset, 0u);
+    EXPECT_EQ(m.bitFields[0].unitBytes, 4u);   // a's unit is an int
+    EXPECT_EQ(m.fieldOffsets[1], 4u);          // b starts a NEW unit at byte 4
+    EXPECT_EQ(m.bitFields[1].bitOffset, 0u);
+    EXPECT_EQ(m.bitFields[1].unitBytes, 1u);   // b's unit is a char
+}
+
+// Struct B = `{char a:7; int b:25;}`.
+//   gcc  : sizeof 4 — a bits 0..6, b bits 7..31 (one int unit).
+//   cl.exe: sizeof 8 — a in a char unit at byte0, b (int ≠ char) → byte 4.
+TEST(TypeLayout, BitFieldAbiExact_B_CharThenInt) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::Char), ti.primitive(TypeKind::I32)};
+    std::array<std::int64_t, 2> const widths{7, 25};
+    TypeId const s = ti.structType("B", fields, widths);
+
+    auto const g = layoutOf(s, ti, kGnu16);
+    EXPECT_EQ(g.size, 4u);
+    EXPECT_EQ(g.fieldOffsets[0], 0u);
+    EXPECT_EQ(g.bitFields[0].bitOffset, 0u);
+    EXPECT_EQ(g.fieldOffsets[1], 0u);          // same unit
+    EXPECT_EQ(g.bitFields[1].bitOffset, 7u);   // b right after a
+
+    auto const m = layoutOf(s, ti, kMsvc16);
+    EXPECT_EQ(m.size, 8u);
+    EXPECT_EQ(m.fieldOffsets[0], 0u);
+    EXPECT_EQ(m.bitFields[0].unitBytes, 1u);   // char unit
+    EXPECT_EQ(m.fieldOffsets[1], 4u);          // int unit at byte 4
+    EXPECT_EQ(m.bitFields[1].bitOffset, 0u);
+    EXPECT_EQ(m.bitFields[1].unitBytes, 4u);
+}
+
+// Struct F = `{char a:1; int b:1;}`.
+//   gcc  : sizeof 4 — a bit0, b bit1 (a's natural unit window holds both).
+//   cl.exe: sizeof 8 — b (int ≠ char) starts a fresh unit at byte 4.
+TEST(TypeLayout, BitFieldAbiExact_F_CharThenIntBoth1) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::Char), ti.primitive(TypeKind::I32)};
+    std::array<std::int64_t, 2> const widths{1, 1};
+    TypeId const s = ti.structType("F", fields, widths);
+
+    auto const g = layoutOf(s, ti, kGnu16);
+    EXPECT_EQ(g.size, 4u);
+    EXPECT_EQ(g.bitFields[1].bitOffset, 1u);
+
+    auto const m = layoutOf(s, ti, kMsvc16);
+    EXPECT_EQ(m.size, 8u);
+    EXPECT_EQ(m.fieldOffsets[1], 4u);
+    EXPECT_EQ(m.bitFields[1].bitOffset, 0u);
+}
+
+// Same-type CONTROL `{int a:3; int b:5;}` — both ABIs AGREE (sizeof 4, packed).
+// This proves msvc_straddle does NOT gratuitously split SAME-typed bit-fields:
+// the divergence is specifically about a declared-type SIZE change.
+TEST(TypeLayout, BitFieldAbiExact_SameTypeControlAgrees) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::I32), ti.primitive(TypeKind::I32)};
+    std::array<std::int64_t, 2> const widths{3, 5};
+    TypeId const s = ti.structType("C", fields, widths);
+    for (auto const p : {kGnu16, kMsvc16}) {
+        auto const l = layoutOf(s, ti, p);
+        EXPECT_EQ(l.size, 4u);
+        EXPECT_EQ(l.fieldOffsets[0], 0u);
+        EXPECT_EQ(l.fieldOffsets[1], 0u);
+        EXPECT_EQ(l.bitFields[0].bitOffset, 0u);
+        EXPECT_EQ(l.bitFields[1].bitOffset, 3u);
+    }
+}
+
+// MSVC: two SAME-typed bit-fields after a type transition SHARE the new unit
+// (`{int a:1; char b:1; char c:1;}` → b+c in one char unit at byte4, size 8).
+// gcc packs all three into the int unit (size 4). Proves the MS rule reuses a
+// unit when the type size matches, not blindly one-unit-per-field.
+TEST(TypeLayout, BitFieldAbiExact_MsvcReusesUnitForSameType) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 3> const fields{
+        ti.primitive(TypeKind::I32), ti.primitive(TypeKind::Char),
+        ti.primitive(TypeKind::Char)};
+    std::array<std::int64_t, 3> const widths{1, 1, 1};
+    TypeId const s = ti.structType("O", fields, widths);
+
+    auto const g = layoutOf(s, ti, kGnu16);
+    EXPECT_EQ(g.size, 4u);
+
+    auto const m = layoutOf(s, ti, kMsvc16);
+    EXPECT_EQ(m.size, 8u);
+    EXPECT_EQ(m.fieldOffsets[1], 4u);          // b: new char unit at byte4
+    EXPECT_EQ(m.bitFields[1].bitOffset, 0u);
+    EXPECT_EQ(m.fieldOffsets[2], 4u);          // c: SAME char unit
+    EXPECT_EQ(m.bitFields[2].bitOffset, 1u);
+}
+
+// MSVC: an ordinary field between/around bit-fields forces the bit-field to its
+// own type-aligned unit (`{char x; int a:3;}` → a@byte4, size 8) — gcc packs a
+// into the int window overlapping x (a@byte1, size 4). Proves the ordinary-field
+// boundary participates in the MS rule, not only adjacent-bit-field type changes.
+TEST(TypeLayout, BitFieldAbiExact_MsvcOrdinaryFieldForcesUnit) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::Char), ti.primitive(TypeKind::I32)};
+    std::array<std::int64_t, 2> const widths{kNotBitfield, 3};
+    TypeId const s = ti.structType("J", fields, widths);
+
+    auto const g = layoutOf(s, ti, kGnu16);
+    EXPECT_EQ(g.size, 4u);
+    EXPECT_EQ(g.fieldOffsets[0], 0u);          // x@byte0
+    EXPECT_EQ(g.fieldOffsets[1], 0u);          // a's int unit at byte0 (overlaps x window)
+    EXPECT_EQ(g.bitFields[1].bitOffset, 8u);   // a at bit8 = byte1
+
+    auto const m = layoutOf(s, ti, kMsvc16);
+    EXPECT_EQ(m.size, 8u);
+    EXPECT_EQ(m.fieldOffsets[0], 0u);          // x@byte0
+    EXPECT_EQ(m.fieldOffsets[1], 4u);          // a's int unit at byte4
+    EXPECT_EQ(m.bitFields[1].bitOffset, 0u);
+}
+
+// MSVC sizes the LAST unit to its FULL declared-type width even with no other
+// field forcing alignment: `{int a:1;}` → 4, `{char a:1; char b:1;}` → 1. Both
+// ABIs agree here (these have no type transition), but it pins the MS sizing rule
+// so a regression to "bits-used rounding" for a lone wide unit is caught.
+TEST(TypeLayout, BitFieldAbiExact_MsvcSizesLastUnitToTypeWidth) {
+    auto ti = makeInterner(1);
+    {   // single int:1 → size 4 under both
+        std::array<TypeId, 1> const fields{ti.primitive(TypeKind::I32)};
+        std::array<std::int64_t, 1> const widths{1};
+        TypeId const s = ti.structType("M", fields, widths);
+        EXPECT_EQ(layoutOf(s, ti, kMsvc16).size, 4u);
+        EXPECT_EQ(layoutOf(s, ti, kGnu16).size, 4u);
+    }
+    {   // two char:1 → size 1 under both
+        std::array<TypeId, 2> const fields{
+            ti.primitive(TypeKind::Char), ti.primitive(TypeKind::Char)};
+        std::array<std::int64_t, 2> const widths{1, 1};
+        TypeId const s = ti.structType("N", fields, widths);
+        EXPECT_EQ(layoutOf(s, ti, kMsvc16).size, 1u);
+        EXPECT_EQ(layoutOf(s, ti, kGnu16).size, 1u);
+    }
+    {   // char,int,char → MSVC never reopens the byte0 char unit: c@byte8, size 12
+        std::array<TypeId, 3> const fields{
+            ti.primitive(TypeKind::Char), ti.primitive(TypeKind::I32),
+            ti.primitive(TypeKind::Char)};
+        std::array<std::int64_t, 3> const widths{1, 1, 1};
+        TypeId const s = ti.structType("P", fields, widths);
+        auto const m = layoutOf(s, ti, kMsvc16);
+        EXPECT_EQ(m.size, 12u);
+        EXPECT_EQ(m.fieldOffsets[0], 0u);
+        EXPECT_EQ(m.fieldOffsets[1], 4u);
+        EXPECT_EQ(m.fieldOffsets[2], 8u);
+        EXPECT_EQ(layoutOf(s, ti, kGnu16).size, 4u);  // gcc packs all into one int unit
+    }
+}
+
+// A union bit-field member is placed IDENTICALLY under both realized strategies
+// (a lone member never straddles / has a type-transition neighbour), and BOTH
+// must still reject an undeclared strategy (None) — the fail-loud gate.
+TEST(TypeLayout, BitFieldAbiExact_UnionAgreesAndFailsLoudOnNone) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::Char), ti.primitive(TypeKind::I32)};
+    std::array<std::int64_t, 2> const widths{7, 25};
+    TypeId const u = ti.unionType("U", fields, widths);
+    for (auto const p : {kGnu16, kMsvc16}) {
+        auto const l = layoutOf(u, ti, p);
+        EXPECT_EQ(l.fieldOffsets[0], 0u);
+        EXPECT_EQ(l.fieldOffsets[1], 0u);
+        EXPECT_EQ(l.bitFields[0].bitOffset, 0u);
+        EXPECT_EQ(l.bitFields[1].bitOffset, 0u);
+        EXPECT_EQ(l.size, 4u);   // max(char-unit 1, int-unit 4), aligned 4
+    }
+    // None (kNatural16) → fail loud.
+    EXPECT_FALSE(
+        computeLayout(u, ti, kNatural16, DataModel::Lp64).has_value());
+}
+
+// Explicit RED-ON-DISABLE marker for the per-ABI feature: the SAME struct under
+// the two strategies must produce DIFFERENT sizes. If a regression makes
+// MsvcStraddle fall back to the gnu_packed loop (or vice versa), this fails.
+TEST(TypeLayout, BitFieldAbiExact_StrategiesDivergeRedOnDisable) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::I32), ti.primitive(TypeKind::Char)};
+    std::array<std::int64_t, 2> const widths{1, 1};
+    TypeId const s = ti.structType("A", fields, widths);
+    auto const g = layoutOf(s, ti, kGnu16);
+    auto const m = layoutOf(s, ti, kMsvc16);
+    EXPECT_NE(g.size, m.size) << "gnu_packed and msvc_straddle MUST diverge on "
+                                 "{int a:1; char b:1;} (4 vs 8)";
+    EXPECT_EQ(g.size, 4u);
+    EXPECT_EQ(m.size, 8u);
+}

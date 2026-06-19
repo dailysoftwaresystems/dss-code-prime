@@ -12,6 +12,9 @@
   "$dataModelComment": "FC3 c1: 64-bit Windows is LLP64 (int 32, long 32, long long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I32 here, the literal ladder + descriptor signatureByDataModel resolve their LLP64 arms. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
   "dataModel": "LLP64",
 
+  "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: MSVC x64 bit-field packing (byte-ABI-exact to cl.exe). The strategy is OS/format-determined (x86_64 serves both PE and ELF), so it lives on the format, not the target. See pe64-x86_64-windows-exec for the full rule.",
+  "bitFieldStrategy": "msvc_straddle",
+
   "pe": {
     "$comment": "IMAGE_FILE_HEADER identity. machine = IMAGE_FILE_MACHINE_AMD64 (0x8664). characteristics = 0 — relocatable .obj carries no file-level flags (link.exe sets image-level flags when producing the .exe/.dll).",
     "machine": 34404,

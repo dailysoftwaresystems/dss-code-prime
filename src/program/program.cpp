@@ -428,8 +428,12 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // D-FFI-EXTERN-CALL-DISPATCH: the merged module compiles to ONE
     // (target, format); pass that format's extern-call shape so MIR→LIR
     // selects the right call-site opcode for any surviving extern import.
+    // D-CSUBSET-BITFIELD-ABI-EXACT: resolve + pass the FORMAT-determined bit-field
+    // strategy (gnu_packed / msvc_straddle) so a bit-field global in the merged
+    // whole-program image is laid out byte-ABI-exact for the active format.
     auto mod = lowerMergedToAssembly(*merged, grammar, **targetR,
                                      (*formatR)->dataModel(),
+                                     effectiveBitFieldStrategy(**targetR, **formatR),
                                      ccIndex, cuMirs[0].cuId,
                                      (*formatR)->externCallDispatch(),
                                      reporter);

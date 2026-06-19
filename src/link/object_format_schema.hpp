@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/substrate/transparent_string_hash.hpp"
+#include "core/types/aggregate_layout.hpp"    // BitFieldStrategy (D-CSUBSET-BITFIELD-ABI-EXACT — the per-ABI bit-field rule, FORMAT-determined)
 #include "core/types/data_model.hpp"          // DataModel (FC3 c1 — the per-OS width triple)
 #include "core/types/grammar_schema.hpp"      // ConfigDiagnostic + LoadResult
 #include "core/types/object_format_kind.hpp"  // ObjectFormatKind + kObjectFormatKindTable
@@ -652,6 +653,24 @@ struct DSS_EXPORT ObjectFormatData {
     // validate() (the loader path always sets it or fails).
     DataModel            dataModel{};
 
+    // ── D-CSUBSET-BITFIELD-ABI-EXACT: the per-ABI bit-field PACKING strategy ──
+    //
+    // C bit-field allocation is genuinely ABI-defined and is determined by the
+    // OBJECT FORMAT / OS, not the CPU (one CPU target — x86_64 — serves BOTH
+    // ELF-SysV `gnu_packed` AND PE-MS `msvc_straddle`), so the strategy lives on
+    // the FORMAT schema, exactly like `dataModel`. OPTIONAL top-level
+    // `"bitFieldStrategy"` ("gnu_packed" / "msvc_straddle"; closed enum, loader
+    // fails loud on an unknown spelling). Absent ⇒ `None` (the INVALID sentinel
+    // here): the layout params then fall back to the TARGET's declared
+    // `aggregateLayout.bitFieldStrategy` (back-compat for direct-API / test
+    // callers + targets that predate the format-side field) via
+    // `effectiveBitFieldStrategy(target, format)`. A format that never lays out a
+    // C aggregate (wasm / spirv skeletons) may omit it; the consumer fails loud
+    // only when a bit-field is actually laid out under a `None` effective
+    // strategy. ELF → gnu_packed, PE → msvc_straddle, Mach-O → gnu_packed (Apple
+    // arm64 does NOT diverge from generic AAPCS64 on bit-field packing).
+    BitFieldStrategy     bitFieldStrategy = BitFieldStrategy::None;
+
     // Relocations row — same shape as `TargetSchema::relocations[]`
     // so the reloc-taxonomy unifier (plan 13 §2.6) is symmetric.
     std::vector<ObjectFormatRelocationInfo> relocations;
@@ -818,6 +837,13 @@ public:
     // Always a valid member for a loader-produced schema (the field is
     // REQUIRED + closed-enum at load).
     [[nodiscard]] DataModel            dataModel() const noexcept { return d_.dataModel; }
+    // D-CSUBSET-BITFIELD-ABI-EXACT: the format's declared bit-field strategy, or
+    // `None` if it declared none (the caller falls back to the target's value via
+    // `effectiveBitFieldStrategy`). Read by the driver when resolving the
+    // `AggregateLayoutParams` it threads into the layout engine.
+    [[nodiscard]] BitFieldStrategy     bitFieldStrategy() const noexcept {
+        return d_.bitFieldStrategy;
+    }
 
     // Relocation accessors — symmetric with TargetSchema's. The
     // linker calls `relocationByKind(kind)` to find which

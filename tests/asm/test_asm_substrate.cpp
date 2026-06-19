@@ -1124,6 +1124,37 @@ TEST(AsmAggregateGlobal, BitFieldStructInitPacksIntoUnitByteExact) {
     EXPECT_EQ(r.items[0].bytes, expect);
 }
 
+// D-CSUBSET-BITFIELD-ABI-EXACT: the static-data encoder packs a bit-field GLOBAL
+// into the MsvcStraddle layout (the PE byte path) — proving the per-ABI strategy
+// reaches the codegen byte encoder, not only `computeLayout`. `struct {char a:7;
+// int b:25;}` init {0x7F, 0x1FFFFFF} under msvc_straddle: a in a CHAR unit @byte0
+// = 0x7F; b is an int (≠char) → a NEW int unit @byte4 → bits 0..24 set =
+// FF FF FF 01 in bytes [4,8); size 8. (Under gnu_packed the SAME struct is size 4
+// with b packed into a's unit at bit 7 — see test_type_layout B; this byte buffer
+// is the MS-distinct golden, byte-for-byte what cl.exe lays B.b out as.)
+// Red-on-disable: flip the strategy to gnu_packed → b packs at bit 7 of a 4-byte
+// unit and the buffer (+size) differs.
+TEST(AsmAggregateGlobal, BitFieldStructInitMsvcStraddleByteExact) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i8  = ti.primitive(TypeKind::I8);   // `char a:7`
+    TypeId const i32 = ti.primitive(TypeKind::I32);  // `int b:25`
+    std::array<TypeId, 2> const f{i8, i32};
+    std::array<std::int64_t, 2> const widths{7, 25};
+    TypeId const s = ti.structType("B", f, widths);
+    AggregateLayoutParams msvc{ScalarAlignmentRule::Natural, 16};
+    msvc.bitFieldStrategy = BitFieldStrategy::MsvcStraddle;
+    auto const r = lowerOneAggGlobal(
+        ti, s,
+        aggOf({intField(0x7F, TypeKind::I8), intField(0x1FFFFFF, TypeKind::U32)},
+              TypeKind::Struct),
+        msvc, DataModel::Lp64);
+    ASSERT_EQ(r.errors, 0u);
+    ASSERT_EQ(r.items.size(), 1u);
+    // a@byte0 = 0x7F (char unit); b@byte4 = 0x01FFFFFF (int unit), LE → FF FF FF 01.
+    std::vector<std::uint8_t> const expect{0x7F, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0x01};
+    EXPECT_EQ(r.items[0].bytes, expect);
+}
+
 // F1 (review-caught): an ORDINARY field that shares a bit-field's allocation
 // unit must survive the pack. `struct { char x; unsigned a:3; }` puts x at byte
 // 0 and a's u32 unit at bytes [0,4) — overlapping. The static-data encoder

@@ -237,6 +237,38 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
+    // ── D-CSUBSET-BITFIELD-ABI-EXACT: OPTIONAL `bitFieldStrategy` ────
+    //
+    // The per-ABI C bit-field packing rule ("gnu_packed" / "msvc_straddle").
+    // Determined by the OBJECT FORMAT / OS, not the CPU (x86_64 serves BOTH
+    // ELF-SysV gnu_packed and PE-MS msvc_straddle), so it lives here next to
+    // `dataModel`. OPTIONAL: absent ⇒ BitFieldStrategy::None and the driver
+    // falls back to the TARGET's declared `aggregateLayout.bitFieldStrategy`
+    // (back-compat). A wrong spelling is a HARD error — a typo can never
+    // silently fall back to a wrong rule (the dataModel discipline).
+    if (doc.contains("bitFieldStrategy")) {
+        if (!doc.at("bitFieldStrategy").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/bitFieldStrategy",
+                      "'bitFieldStrategy' must be a string ('gnu_packed' or "
+                      "'msvc_straddle')");
+        } else {
+            auto const s = doc.at("bitFieldStrategy").get<std::string>();
+            auto const bs = bitFieldStrategyFromName(s);
+            if (!bs) {
+                coll.emit(DiagnosticCode::C_MalformedJson, "/bitFieldStrategy",
+                          std::format("unknown bitFieldStrategy '{}' — expected "
+                                      "'gnu_packed' or 'msvc_straddle'", s));
+            } else if (*bs == BitFieldStrategy::None) {
+                // "none" is the sentinel, not a selectable strategy on a format.
+                coll.emit(DiagnosticCode::C_MalformedJson, "/bitFieldStrategy",
+                          "bitFieldStrategy 'none' is not selectable — omit the "
+                          "field to leave it unset (the target's value is used)");
+            } else {
+                data.bitFieldStrategy = *bs;
+            }
+        }
+    }
+
     // Top-level `entryPoint` — universal entry-symbol name for
     // executable artifacts (e.g. "_start" / "main" / Mach-O's
     // LC_MAIN target). Empty for relocatable artifacts. The walker

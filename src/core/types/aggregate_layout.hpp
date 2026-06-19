@@ -96,40 +96,69 @@ aggregateClassKindFromName(std::string_view s) noexcept {
     return std::nullopt;
 }
 
-// FC8 bitfields (D-CSUBSET-BITFIELD): the per-ABI bit-field PACKING strategy. A
-// CLOSED, config-declared enum — the layout engine switches on THIS, never on a
-// target name (the `ScalarAlignmentRule` / `AggregateClassKind` precedent). C
-// bit-field allocation is genuinely ABI-defined (notably MS straddling vs GNU/
-// SysV), so the rule is declared in `.target.json`, never hardcoded. `None` ⇒
-// the target declares no strategy ⇒ a struct WITH a bit-field FAILS LOUD at
-// layout (so a missing rule can never silently bake a wrong bit placement); a
-// struct with no bit-field never consults it (every pre-bitfield layout is
-// unchanged). `GnuPacked` is the one realized rule (all four current targets
-// declare it); a future MS-straddle ABI is a new arm + config value, never an
-// engine identity branch. Per D-CSUBSET-BITFIELD-ABI-EXACT, GnuPacked is
-// SELF-CONSISTENT (write+read use the same rule) but is NOT byte-ABI-exact to
-// every platform's native compiler — that divergence is trigger-gated.
+// FC8 bitfields (D-CSUBSET-BITFIELD / D-CSUBSET-BITFIELD-ABI-EXACT): the per-ABI
+// bit-field PACKING strategy. A CLOSED, config-declared enum — the layout engine
+// switches on THIS, never on a target/format name (the `ScalarAlignmentRule` /
+// `AggregateClassKind` precedent). C bit-field allocation is genuinely ABI-defined
+// (notably MS straddling vs GNU/SysV), so the rule is config-declared, never
+// hardcoded. The strategy is FORMAT/ABI-determined (one CPU target — x86_64 —
+// serves BOTH ELF-SysV and PE-MS), so it is selected from the active object
+// FORMAT (ELF → gnu_packed, PE → msvc_straddle, Mach-O → gnu_packed) with the
+// TARGET's value as the back-compat fallback for direct-API / test callers that
+// have no format in scope. `None` ⇒ neither declared a strategy ⇒ a struct WITH
+// a bit-field FAILS LOUD at layout (so a missing rule can never silently bake a
+// wrong bit placement); a struct with no bit-field never consults it (every
+// pre-bitfield layout is unchanged).
+//
+// D-CSUBSET-BITFIELD-ABI-EXACT (this cycle): both realized strategies are now
+// byte-ABI-EXACT to their platform's native compiler, verified by a structural
+// conformance witness (dss's computed sizeof/bit-offsets == the native
+// compiler's — cl.exe for MSVC, gcc for SysV, clang for Apple via the macOS leg):
+//   * GnuPacked   — SysV/Itanium/GNU/AAPCS64/Apple little-endian. (Apple arm64
+//     does NOT diverge from generic AAPCS64 on bit-field PACKING — Apple's
+//     enumerated arm64 divergences are char/wchar_t signedness, long double=double,
+//     va_list, the red zone, stack argument area, and empty-struct handling, NOT
+//     bit-field allocation; so Mach-O uses gnu_packed and the macOS clang leg
+//     CONFIRMS it — no separate Apple strategy is needed.)
+//   * MsvcStraddle — Microsoft x64 (PE). MSVC starts a NEW allocation unit, aligned
+//     to the new field's declared-type natural alignment, whenever the next
+//     bit-field's declared-type SIZE differs from the current open unit's type size
+//     (it does NOT pack different-sized declared types into one unit), AND whenever
+//     an ordinary field or a zero-width field intervenes. The struct size covers
+//     the LAST unit's full declared-type width. Derived empirically from cl.exe
+//     14.51 (e.g. `{int a:1; char b:1;}` is sizeof 8 with b@byte4, vs gnu_packed's
+//     4 with b@bit1; `{char a:7; int b:25;}` is sizeof 8 with b@byte4 vs 4).
 enum class BitFieldStrategy : std::uint8_t {
-    None      = 0,  // not declared → fail-loud when a bit-field is laid out
-    GnuPacked = 1,  // SysV/Itanium/GNU little-endian: LSB-first packing into the
-                    // field's declared-type storage unit; a field that would
-                    // cross its type's unit boundary starts at the next aligned
-                    // unit; a zero-width unnamed field forces the next field to
-                    // the unit boundary.
+    None         = 0,  // not declared → fail-loud when a bit-field is laid out
+    GnuPacked    = 1,  // SysV/Itanium/GNU/AAPCS64/Apple little-endian: LSB-first
+                       // packing into the field's declared-type storage unit; a
+                       // field that would cross its type's unit boundary starts at
+                       // the next aligned unit; a zero-width unnamed field forces
+                       // the next field to the unit boundary. Different-typed
+                       // adjacent bit-fields may SHARE a unit.
+    MsvcStraddle = 2,  // Microsoft x64 (PE): each bit-field allocation unit is
+                       // aligned to its declared-type natural alignment; a unit is
+                       // shared with the previous bit-field ONLY when the declared-
+                       // type size matches AND the bits fit; any type-size change,
+                       // intervening ordinary field, zero-width field, or straddle
+                       // opens a FRESH type-aligned unit at the high-water mark; the
+                       // struct size covers the last unit's full declared-type width.
 };
 
 [[nodiscard]] constexpr std::string_view
 bitFieldStrategyName(BitFieldStrategy s) noexcept {
     switch (s) {
-        case BitFieldStrategy::None:      return "none";
-        case BitFieldStrategy::GnuPacked: return "gnu_packed";
+        case BitFieldStrategy::None:         return "none";
+        case BitFieldStrategy::GnuPacked:    return "gnu_packed";
+        case BitFieldStrategy::MsvcStraddle: return "msvc_straddle";
     }
     return {};
 }
 [[nodiscard]] constexpr std::optional<BitFieldStrategy>
 bitFieldStrategyFromName(std::string_view s) noexcept {
-    if (s == "none")       return BitFieldStrategy::None;
-    if (s == "gnu_packed") return BitFieldStrategy::GnuPacked;
+    if (s == "none")          return BitFieldStrategy::None;
+    if (s == "gnu_packed")    return BitFieldStrategy::GnuPacked;
+    if (s == "msvc_straddle") return BitFieldStrategy::MsvcStraddle;
     return std::nullopt;
 }
 
