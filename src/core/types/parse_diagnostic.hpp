@@ -63,8 +63,9 @@ enum class DiagnosticCode : std::uint16_t {
     // source errors, not config-load errors (`C_InvalidPreprocess`).
     P_PreprocessorDirective       = 0x0013,  // malformed directive (e.g. `#define` with no name)
     P_PreprocessorMacroRedefinition = 0x0014,  // incompatible `#define` of an existing macro
-    P_PreprocessorUnsupported     = 0x0015,  // a recognised-but-unimplemented directive form (function-like macro def)
+    P_PreprocessorUnsupported     = 0x0015,  // a recognised-but-unimplemented directive form (variadic macro def)
     P_PreprocessorIncludeError    = 0x0016,  // quote-`#include` target not found / unreadable / recursion overflow
+    P_PreprocessorMacroArgument   = 0x0017,  // function-like macro INVOCATION error (arity mismatch / unterminated arg list)
 
     // ── P9xxx — builder internal-invariant violations (release-mode rescues) ──
     P_BuilderInvariant            = 0x9000,

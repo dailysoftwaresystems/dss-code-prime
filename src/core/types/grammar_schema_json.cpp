@@ -3467,9 +3467,26 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // quoteIncludeToken: missing -> C_MissingField, unknown name ->
             // C_UnknownToken). Required, so the engine never hard-codes "(".
             readField("functionLikeOpenToken", cfg.functionLikeOpenToken);
-            checkToken(cfg.directiveIntroToken,   "directiveIntroToken");
-            checkToken(cfg.quoteIncludeToken,     "quoteIncludeToken");
-            checkToken(cfg.functionLikeOpenToken, "functionLikeOpenToken");
+            // `functionLikeCloseToken` (C's `)`) is REQUIRED + validated for
+            // the SAME reason as the opener: the macro engine balance-tracks a
+            // function-like call's argument list on it (a nested `(` increments
+            // depth, this token decrements; the matching depth-0 close ends the
+            // list) AND terminates the parameter-list parse. `)` lexes as core
+            // `Punctuation` (indistinguishable from `,`/`;` by core kind), so
+            // it MUST come from config, never a hard-coded name. (FC13 cycle 2.)
+            readField("functionLikeCloseToken", cfg.functionLikeCloseToken);
+            // `functionLikeArgSeparatorToken` (C's `,`) is REQUIRED + validated:
+            // the macro engine splits parameter lists AND call arguments on it.
+            // `,` lexes as core `Punctuation`, so it must come from config like
+            // the parens, never a hard-coded name. (FC13 cycle 2.)
+            readField("functionLikeArgSeparatorToken",
+                      cfg.functionLikeArgSeparatorToken);
+            checkToken(cfg.directiveIntroToken,    "directiveIntroToken");
+            checkToken(cfg.quoteIncludeToken,      "quoteIncludeToken");
+            checkToken(cfg.functionLikeOpenToken,  "functionLikeOpenToken");
+            checkToken(cfg.functionLikeCloseToken, "functionLikeCloseToken");
+            checkToken(cfg.functionLikeArgSeparatorToken,
+                       "functionLikeArgSeparatorToken");
             // `angleIncludeToken` is OPTIONAL: a language with only a quote
             // include form declares none. Present-but-wrong-type ->
             // C_InvalidPreprocess; an unknown kind -> C_UnknownToken.
@@ -3482,6 +3499,25 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     cfg.angleIncludeToken =
                         pp.at("angleIncludeToken").get<std::string>();
                     checkToken(cfg.angleIncludeToken, "angleIncludeToken");
+                }
+            }
+            // `variadicMarkerToken` (C's `...` -> "EllipsisOp") is OPTIONAL:
+            // empty means the language declares NO variadic macro form. The
+            // macro engine reads it to RECOGNISE `#define V(...)` by token KIND
+            // rather than by the hard-coded `...` lexeme -- a second
+            // preprocess-opting language whose variadic marker is spelled
+            // differently is then parsed correctly (agnosticism). Validated like
+            // the other token-name fields when present. (FC13 cycle 2 review
+            // fold.)
+            if (pp.contains("variadicMarkerToken")) {
+                if (!pp.at("variadicMarkerToken").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/variadicMarkerToken",
+                              "'preprocess.variadicMarkerToken' must be a string");
+                } else {
+                    cfg.variadicMarkerToken =
+                        pp.at("variadicMarkerToken").get<std::string>();
+                    checkToken(cfg.variadicMarkerToken, "variadicMarkerToken");
                 }
             }
 

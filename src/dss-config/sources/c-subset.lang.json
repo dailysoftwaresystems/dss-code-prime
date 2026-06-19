@@ -25,7 +25,10 @@
     "includeDirective":    "include",
     "quoteIncludeToken":   "StringStart",
     "angleIncludeToken":   "HeaderStart",
-    "functionLikeOpenToken": "ParenOpen"
+    "functionLikeOpenToken": "ParenOpen",
+    "functionLikeCloseToken": "ParenClose",
+    "functionLikeArgSeparatorToken": "Comma",
+    "variadicMarkerToken": "EllipsisOp"
   },
 
   "lexerModes": {

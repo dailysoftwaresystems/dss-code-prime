@@ -20,19 +20,21 @@
 //      diagnostic on the synth buffer remaps to the real header:line.
 //   2. Tokenizes the synth buffer ONCE -- every token's span is valid in that
 //      single buffer.
-//   3. Runs the object-macro pass: builds the table from `#define`/`#undef`,
-//      expands object-macro invocations by splicing the replacement tokens'
-//      spans (valid in the SAME buffer -- the `#define` line is physically
-//      present), RESCANS, applies the blue-paint self-reference guard, and
-//      removes directive-line tokens.
+//   3. Runs the macro pass: builds the table from `#define`/`#undef` (OBJECT-
+//      and FUNCTION-like, FC13 cycle 2), then stream-expands invocations by
+//      splicing the replacement tokens' spans (valid in the SAME buffer -- the
+//      `#define` line is physically present). A function-like call collects its
+//      paren-balanced arguments, pre-expands each, substitutes them into the
+//      replacement, then RESCANS. The blue-paint self-reference guard and
+//      directive-line removal apply uniformly. (No `#`/`##` operators yet.)
 //   4. Re-packages the surviving tokens into a fresh TokenStream.
 //
-// FAIL-LOUD on every unsupported construct (function-like macro DEFINITION,
-// incompatible redefinition, missing quote include, include recursion
-// overflow) -- never a silent pass-through or miscompile. Out of cycle-1
-// scope (pinned, not built): `#if`/`#ifdef`/`defined` (FC14); `##`/`#`/
-// predefined macros (FC15); function-like macros (D-PP-FUNCTION-LIKE-MACRO,
-// cycle 2).
+// FAIL-LOUD on every unsupported construct (function-like macro arity mismatch,
+// unterminated invocation, variadic/duplicate-parameter/malformed parameter
+// list, incompatible redefinition, missing quote include, include recursion
+// overflow) -- never a silent pass-through or miscompile. Out of scope (pinned,
+// not built): `#if`/`#ifdef`/`defined` (FC14); `##`/`#`/predefined macros +
+// VARIADIC macros (D-PP-VARIADIC-MACRO, FC15-area).
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
@@ -124,7 +126,8 @@ struct DSS_EXPORT PreprocessResult {
     // line rather than a splice-shifted synth line.
     BufferId mainSourceId{};
 
-    // PP-phase diagnostics (missing quote include, function-like macro def,
+    // PP-phase diagnostics (missing quote include, macro arity mismatch /
+    // unterminated invocation / malformed-or-variadic parameter list,
     // incompatible redefinition, recursion overflow, malformed directive).
     // Owned here; the caller folds them into the tree's reporter.
     std::unique_ptr<DiagnosticReporter> diagnostics;

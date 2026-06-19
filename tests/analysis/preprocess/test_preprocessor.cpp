@@ -60,6 +60,30 @@ using namespace dss;
     return false;
 }
 
+// Read the shipped c-subset config TEXT (walk up to src/dss-config/sources) so
+// a test can REBIND a single config field and reload, proving the engine reads
+// that field from config rather than hard-coding a lexeme. Returns "" if not
+// found (the caller asserts). Mirrors the inline walk in
+// FunctionLikeOpenTokenIsConfigDrivenNotHardcoded.
+[[nodiscard]] std::string loadShippedCSubsetText() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path here = fs::current_path(ec);
+    for (int i = 0; i < 8 && !here.empty(); ++i) {
+        fs::path const cand =
+            here / "src" / "dss-config" / "sources" / "c-subset.lang.json";
+        if (fs::exists(cand, ec)) {
+            std::ifstream in(cand, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>());
+        }
+        fs::path const parent = here.parent_path();
+        if (parent == here) break;
+        here = parent;
+    }
+    return {};
+}
+
 } // namespace
 
 TEST(Preprocessor, ObjectMacroExpandsAndDirectiveRemoved) {
@@ -124,11 +148,176 @@ TEST(Preprocessor, IdenticalRedefinitionIsBenign) {
     EXPECT_EQ(lexs[3], "1");
 }
 
-TEST(Preprocessor, FunctionLikeMacroDefinitionFailsLoud) {
+// FC13 cycle 2 (D-PP-FUNCTION-LIKE-MACRO): a function-like macro DEFINITION
+// now PARSES (parameter list) and a simple invocation EXPANDS. This is the
+// FLIP of the cycle-1 `FunctionLikeMacroDefinitionFailsLoud` guard (which
+// pinned the now-removed P_PreprocessorUnsupported fail-loud). RED-ON-DISABLE:
+// reverting the lookahead/substitution in `expand()` (so the call is not
+// expanded) leaves `ADD ( 2 , 3 )` in the stream and this exact-token check
+// fails.
+TEST(Preprocessor, FunctionLikeMacroSimpleInvocationExpands) {
     PreprocessResult r;
-    auto lexs = ppLexemes("#define F(x) ((x)+1)\nint v = 0;\n", r);
+    auto lexs = ppLexemes("#define ADD(a,b) ((a)+(b))\nint v = ADD(2,3);\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a well-formed function-like macro must not error";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "a function-like macro definition must now be ACCEPTED";
+    // int v = ( ( 2 ) + ( 3 ) ) ;
+    ASSERT_EQ(lexs.size(), 13u) << "expected: int v = ( ( 2 ) + ( 3 ) ) ;";
+    EXPECT_EQ(lexs[0], "int");
+    EXPECT_EQ(lexs[1], "v");
+    EXPECT_EQ(lexs[2], "=");
+    EXPECT_EQ(lexs[3], "(");
+    EXPECT_EQ(lexs[4], "(");
+    EXPECT_EQ(lexs[5], "2");
+    EXPECT_EQ(lexs[6], ")");
+    EXPECT_EQ(lexs[7], "+");
+    EXPECT_EQ(lexs[8], "(");
+    EXPECT_EQ(lexs[9], "3");
+    EXPECT_EQ(lexs[10], ")");
+    EXPECT_EQ(lexs[11], ")");
+    EXPECT_EQ(lexs[12], ";");
+}
+
+// NESTED invocation: ADD(ADD(1,2),3). The inner ADD is an ARGUMENT, so it is
+// pre-expanded (C 6.10.3.1) to ((1)+(2)) before the outer substitution. Outer
+// a = ((1)+(2)), b = 3 -> ( (((1)+(2))) + (3) ). RED-ON-DISABLE: dropping
+// argument pre-expansion leaves the inner `ADD ( 1 , 2 )` tokens unexpanded.
+TEST(Preprocessor, FunctionLikeMacroNestedInvocationExpands) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#define ADD(a,b) ((a)+(b))\nint v = ADD(ADD(1,2),3);\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int v = ( ( ( ( 1 ) + ( 2 ) ) ) + ( 3 ) ) ;
+    ASSERT_EQ(lexs.size(), 21u);
+    const char* want[] = {"int","v","=",
+        "(","(","(","(","1",")","+","(","2",")",")",")","+","(","3",")",")",";"};
+    for (std::size_t i = 0; i < lexs.size(); ++i) {
+        EXPECT_EQ(lexs[i], want[i]) << "token index " << i;
+    }
+}
+
+// ARGUMENT THAT IS A MACRO (pre-expansion): an object macro X used as an
+// argument is fully expanded BEFORE substitution. #define X 5 + ADD(X,1) must
+// give ((5)+(1)), NOT ((X)+(1)). RED-ON-DISABLE: skipping the per-argument
+// expand() call yields an `X` token in the output and lexs[5] != "5".
+TEST(Preprocessor, FunctionLikeMacroArgumentIsMacroPreExpanded) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#define X 5\n#define ADD(a,b) ((a)+(b))\nint v = ADD(X,1);\n",
+                  r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int v = ( ( 5 ) + ( 1 ) ) ;
+    ASSERT_EQ(lexs.size(), 13u);
+    EXPECT_EQ(lexs[5], "5") << "the macro argument X must be pre-expanded to 5";
+    EXPECT_EQ(lexs[9], "1");
+}
+
+// ARITY MISMATCH fails loud (C 6.10.3p4): ADD expects 2 args, called with 1.
+// The diagnostic fires (P_PreprocessorMacroArgument) and the name is emitted
+// verbatim. RED-ON-DISABLE: removing the arity check silently mis-substitutes.
+TEST(Preprocessor, FunctionLikeMacroArityMismatchFailsLoud) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define ADD(a,b) ((a)+(b))\nint v = ADD(2);\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroArgument))
+        << "calling a 2-parameter macro with 1 argument must fail loud";
+    (void)lexs;
+}
+
+// A function-like macro NAME not followed by `(` is NOT an invocation
+// (C 6.10.3p10) -- it is emitted VERBATIM. #define F(x) x then `F;` -> `F ;`.
+// RED-ON-DISABLE: a lookahead that treats the name as a call (or expands it
+// object-like) would drop or mis-handle the bare `F`.
+TEST(Preprocessor, FunctionLikeMacroNameWithoutParenIsVerbatim) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define F(x) x\nF;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 2u) << "expected the bare name then `;`: F ;";
+    EXPECT_EQ(lexs[0], "F") << "a function-like name with no `(` stays verbatim";
+    EXPECT_EQ(lexs[1], ";");
+}
+
+// OBJECT + FUNCTION-like MIXING in one TU: both kinds coexist in the table and
+// expand correctly in the same stream.
+TEST(Preprocessor, FunctionLikeAndObjectMacrosMix) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define TWO 2\n#define DBL(x) ((x)+(x))\nint v = DBL(TWO);\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int v = ( ( 2 ) + ( 2 ) ) ;
+    ASSERT_EQ(lexs.size(), 13u);
+    EXPECT_EQ(lexs[5], "2") << "the object macro TWO must expand inside the arg";
+    EXPECT_EQ(lexs[9], "2");
+}
+
+// RECURSIVE function-like macro (blue-paint, C 6.10.3.4): #define F(x) F(x)
+// then F(1). During the rescan of the substituted body `F(1)`, F is painted,
+// so the inner F is FROZEN -> the result is the literal `F ( 1 )` (no infinite
+// loop). RED-ON-DISABLE: failing to paint the macro name around the rescan
+// recurses until the depth backstop and changes the output.
+TEST(Preprocessor, RecursiveFunctionLikeMacroFreezes) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define F(x) F(x)\nint v = F(1);\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // F(1) -> (substitute x=1) F(1) -> (rescan, F painted) frozen `F ( 1 )`.
+    // int v = F ( 1 ) ;  (8 tokens: the self-call freezes to its own form).
+    ASSERT_EQ(lexs.size(), 8u) << "expected: int v = F ( 1 ) ;";
+    EXPECT_EQ(lexs[3], "F") << "the self-referential call freezes to its name";
+    EXPECT_EQ(lexs[4], "(");
+    EXPECT_EQ(lexs[5], "1");
+    EXPECT_EQ(lexs[6], ")");
+    EXPECT_EQ(lexs[7], ";");
+}
+
+// EMPTY argument + ZERO-parameter `()`. A zero-parameter macro M invoked as
+// `M()` collects ZERO arguments (arity 0 == 0, OK). A one-parameter macro G
+// invoked as `G()` collects ONE empty argument, expanding to nothing.
+TEST(Preprocessor, FunctionLikeMacroEmptyAndZeroParen) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#define M() 7\nint v = M();\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        // int v = 7 ;
+        ASSERT_EQ(lexs.size(), 5u);
+        EXPECT_EQ(lexs[3], "7") << "a zero-parameter macro M() expands to 7";
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#define G(x) [x]\nint v = G();\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        // The single EMPTY argument substitutes to nothing: int v = [ ] ;
+        ASSERT_EQ(lexs.size(), 6u) << "expected: int v = [ ] ;";
+        EXPECT_EQ(lexs[3], "[");
+        EXPECT_EQ(lexs[4], "]") << "an empty argument substitutes to no tokens";
+        EXPECT_EQ(lexs[5], ";");
+    }
+}
+
+// VARIADIC `#define V(...)` is recognized but DEFERRED (D-PP-VARIADIC-MACRO):
+// it must fail loud (P_PreprocessorUnsupported), never be silently accepted.
+TEST(Preprocessor, VariadicMacroDefinitionFailsLoud) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define V(...) 0\nint v = 0;\n", r);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
-        << "a function-like macro definition must be reported, not accepted";
+        << "a variadic macro must fail loud (deferred to FC15-area)";
+    (void)lexs;
+}
+
+// DUPLICATE parameter name fails loud (C 6.10.3p6): #define F(a,a) ...
+TEST(Preprocessor, DuplicateMacroParameterFailsLoud) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define F(a,a) ((a))\nint v = 0;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "a duplicate macro parameter name must fail loud";
+    (void)lexs;
+}
+
+// UNTERMINATED invocation (EOF before the matching `)`) fails loud.
+TEST(Preprocessor, FunctionLikeMacroUnterminatedInvocationFailsLoud) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define ADD(a,b) ((a)+(b))\nint v = ADD(1,2;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroArgument))
+        << "an argument list with no closing paren must fail loud";
     (void)lexs;
 }
 
@@ -258,6 +447,177 @@ TEST(Preprocessor, FunctionLikeOpenTokenIsConfigDrivenNotHardcoded) {
         << "with the `(` opener rebound away, `#define F(x)` must be treated "
            "as object-like -- proving the opener is read from config, not "
            "hard-coded as ParenOpen";
+}
+
+// FOLD 1 (RED-on-disable): the VARIADIC marker (`...`) is CONFIG-DRIVEN
+// (`preprocess.variadicMarkerToken`), NOT a hard-coded `...` lexeme. We prove it
+// by rebinding `variadicMarkerToken` from `EllipsisOp` to a DIFFERENT real token
+// (`TildeOp` = `~`) and reloading. Now `...` in `#define V(...)` is NO LONGER
+// the configured variadic marker, so the engine must NOT trip the variadic
+// fail-loud (`P_PreprocessorUnsupported`) via the `...` SPELLING -- it instead
+// hits the generic "expected a parameter name" guard (`P_PreprocessorDirective`,
+// since `...` is not a Word). RED-ON-DISABLE: reverting the detection to
+// `text(in[q]) == "..."` makes it match by TEXT regardless of the rebound
+// config -> `P_PreprocessorUnsupported` fires again -> this test fails.
+// (Agnosticism: a second preprocess-opting language whose variadic marker is
+// spelled differently is parsed by config kind, not the C `...` text.)
+TEST(Preprocessor, VariadicMarkerIsConfigDrivenNotHardcoded) {
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty()) << "could not locate shipped c-subset config";
+    // Rebind ONLY the variadic marker to `TildeOp` (a real, declared c-subset
+    // token that is NOT `...`). Still a well-formed schema -- just one where the
+    // ellipsis is no longer the variadic marker.
+    const std::string from = "\"variadicMarkerToken\": \"EllipsisOp\"";
+    const std::string to   = "\"variadicMarkerToken\": \"TildeOp\"";
+    auto const pos = text.find(from);
+    ASSERT_NE(pos, std::string::npos)
+        << "shipped c-subset config no longer carries variadicMarkerToken=EllipsisOp";
+    text.replace(pos, from.size(), to);
+
+    auto loaded =
+        GrammarSchema::loadFromText(text, "<rebound-variadic-c-subset>");
+    ASSERT_TRUE(loaded.has_value())
+        << "rebound schema should still load: "
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    ASSERT_EQ(schema->preprocess().variadicMarkerToken, "TildeOp");
+
+    // `#define V(...)` under the rebound marker: the `...` is NOT the configured
+    // variadic marker, so the variadic-specific fail-loud must NOT fire.
+    namespace fs = std::filesystem;
+    auto buf = SourceBuffer::fromString(
+        std::string{"#define V(...) 0\nint v = 0;\n"}, "main.c");
+    std::vector<fs::path> noDirs;
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "with the variadic marker rebound off `...`, a `#define V(...)` must "
+           "NOT trip the variadic fail-loud via the `...` spelling -- proving "
+           "the marker is read from config kind, not hard-coded text";
+    // Positive pin: `...` now hits the generic non-parameter-name guard, so the
+    // define still fails loud (just via a DIFFERENT code) -- it is never
+    // silently accepted as a named parameter.
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "an unrecognized `...` in parameter position must still fail loud as "
+           "a malformed parameter list (not be accepted as a named parameter)";
+}
+
+// FOLD 2 (RED-on-disable): the function-like CLOSE token + ARG SEPARATOR are
+// CONFIG-DRIVEN (`preprocess.functionLikeCloseToken` /
+// `functionLikeArgSeparatorToken`), NOT hard-coded `find("ParenClose")` /
+// `find("Comma")`. The open-paren already has its own pin
+// (FunctionLikeOpenTokenIsConfigDrivenNotHardcoded); this closes the gap for the
+// other two. Each sub-case rebinds ONE token to a different real punctuation
+// token and asserts the macro machinery changes behavior accordingly.
+//
+// Helper: load the shipped c-subset text with ONE `from`->`to` field rebind.
+namespace {
+[[nodiscard]] std::shared_ptr<GrammarSchema const>
+reboundCSubset(std::string const& from, std::string const& to,
+               std::string const& label) {
+    std::string text = loadShippedCSubsetText();
+    if (text.empty()) {
+        ADD_FAILURE() << "could not locate shipped c-subset config";
+        return nullptr;
+    }
+    auto const pos = text.find(from);
+    if (pos == std::string::npos) {
+        ADD_FAILURE() << "shipped c-subset config no longer carries: " << from;
+        return nullptr;
+    }
+    text.replace(pos, from.size(), to);
+    auto loaded = GrammarSchema::loadFromText(text, label);
+    if (!loaded.has_value()) {
+        ADD_FAILURE() << "rebound schema should still load: "
+                      << (loaded.error().empty() ? "<no diagnostics>"
+                                                  : loaded.error()[0].message);
+        return nullptr;
+    }
+    return *loaded;
+}
+} // namespace
+
+TEST(Preprocessor, FunctionLikeCloseAndSeparatorAreConfigDrivenNotHardcoded) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+
+    // (1) CLOSE token rebound off `ParenClose` (-> `BracketClose` = `]`). The
+    // parameter-list parser terminates on the configured close; with `)` no
+    // longer the close token, `#define F(a,b) ...` can no longer find the end
+    // of its parameter list -> fail loud (`P_PreprocessorDirective`). The
+    // baseline config parses this define cleanly, so the diagnostic is caused
+    // solely by the rebind -- proving the close is read from config.
+    // RED-ON-DISABLE: hard-coding the close as `find("ParenClose")` ignores the
+    // rebind, the define parses, NO diagnostic fires, and this EXPECT fails.
+    {
+        auto schema = reboundCSubset(
+            "\"functionLikeCloseToken\": \"ParenClose\"",
+            "\"functionLikeCloseToken\": \"BracketClose\"",
+            "<rebound-close-c-subset>");
+        ASSERT_NE(schema, nullptr);
+        ASSERT_EQ(schema->preprocess().functionLikeCloseToken, "BracketClose");
+        auto buf = SourceBuffer::fromString(
+            std::string{"#define F(a,b) ((a)+(b))\nint v = F(1,2);\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(r.diagnostics->hasErrors())
+            << "with the `)` close token rebound away, a function-like define's "
+               "parameter list cannot terminate -- it must fail loud";
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "the parameter-list terminator is read from config; rebinding it "
+               "off `)` must surface a malformed-parameter-list diagnostic";
+    }
+
+    // (2) SEPARATOR rebound off `Comma` (-> `Colon` = `:`). The call-site
+    // argument collector (`collectArgs`) splits arguments on the configured
+    // separator. We define a ONE-parameter macro (no comma in the params, so
+    // the define still parses under the rebind) and INVOKE it with a comma:
+    // `CNT(a,b)`. Baseline (separator=Comma): the `,` splits -> TWO arguments
+    // -> arity mismatch (2 != 1) -> `P_PreprocessorMacroArgument`. Rebound
+    // (separator=Colon): the `,` is an ordinary token -> ONE argument `a , b`
+    // -> arity 1 == 1 -> NO arity error. So the absence of the arity error
+    // proves the separator is read from config. RED-ON-DISABLE: hard-coding the
+    // separator as `find("Comma")` ignores the rebind, the `,` still splits
+    // into two args, the arity error fires, and this EXPECT_FALSE fails.
+    {
+        auto schema = reboundCSubset(
+            "\"functionLikeArgSeparatorToken\": \"Comma\"",
+            "\"functionLikeArgSeparatorToken\": \"Colon\"",
+            "<rebound-separator-c-subset>");
+        ASSERT_NE(schema, nullptr);
+        ASSERT_EQ(schema->preprocess().functionLikeArgSeparatorToken, "Colon");
+        auto buf = SourceBuffer::fromString(
+            std::string{"#define CNT(x) 1\nint v = CNT(a,b);\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroArgument))
+            << "with the `,` separator rebound away, `CNT(a,b)` collects ONE "
+               "argument (no arity error) -- proving the separator is read from "
+               "config, not hard-coded as Comma";
+    }
+}
+
+// FOLD 3 (RED-on-disable): the pathological-recursion backstop (>256 expansion
+// nesting) FAILS LOUD with a positioned `P_PreprocessorUnsupported` diagnostic
+// instead of silently returning the input verbatim (which previously truncated
+// a deep chain silently, then failed downstream at the parser). We construct a
+// 300-deep object-macro chain (`M0`->`M1`->...->`M300`->0) whose rescan depth
+// exceeds the backstop, and assert the diagnostic is emitted at the PP.
+// RED-ON-DISABLE: removing the emitPP at the backstop makes the deep chain
+// truncate silently with NO P_Preprocessor* diagnostic -> this test fails.
+TEST(Preprocessor, DeepMacroExpansionFailsLoudNotSilent) {
+    std::string src;
+    const int chain = 300;  // > the 256 backstop, so the rescan tops out
+    for (int n = 0; n < chain; ++n) {
+        src += "#define M" + std::to_string(n) + " M" + std::to_string(n + 1)
+             + "\n";
+    }
+    src += "#define M" + std::to_string(chain) + " 0\n";
+    src += "int v = M0;\n";
+
+    PreprocessResult r;
+    auto lexs = ppLexemes(src, r);
+    (void)lexs;
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "a macro-expansion chain deeper than the backstop must fail LOUD at "
+           "the preprocessor (positioned diagnostic), never truncate silently";
 }
 
 // LINE-MAP HEADER ATTRIBUTION: a diagnostic that originates in an included

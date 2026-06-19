@@ -74,6 +74,44 @@ struct DSS_EXPORT PreprocessConfig {
     // function-like define as an object macro (a silent miscompile). REQUIRED
     // + validated at load (mirrors quoteIncludeToken).
     std::string functionLikeOpenToken;
+
+    // The token kind that CLOSES a function-like macro's parameter list AND its
+    // call-site argument list (C's `)` -> "ParenClose"). The macro engine reads
+    // this to (a) terminate the parameter-list parse in a function-like
+    // `#define F(a,b) ...`, and (b) balance-track a call's argument list
+    // (`F(x, g(y))` -- a nested `(` increments depth, this token decrements;
+    // the matching depth-0 close ENDS the list). Like the opener, `)` is NOT a
+    // core/builtin token kind (it lexes as core `Punctuation`, indistinguishable
+    // from `,`/`;`), so it MUST come from config -- a language whose close-paren
+    // is named differently would otherwise never find the list's end. REQUIRED
+    // + validated at load (mirrors functionLikeOpenToken). Object-only-macro
+    // languages still set it; it is unused unless a function-like define
+    // appears.
+    std::string functionLikeCloseToken;
+
+    // The token kind that SEPARATES function-like macro parameters AND call-
+    // site arguments (C's `,` -> "Comma"). The macro engine reads it to split
+    // `#define F(a,b)` parameters and to split a call's top-level arguments
+    // (`F(x, g(y))`). A `,` lexes as core `Punctuation` (indistinguishable from
+    // `)`/`;` by core kind), so -- like the parens -- it MUST come from config:
+    // a language whose argument separator is named differently would otherwise
+    // mis-split (or never split) its argument lists. REQUIRED + validated at
+    // load (mirrors functionLikeOpenToken). (FC13 cycle 2.)
+    std::string functionLikeArgSeparatorToken;
+
+    // The token kind that marks a VARIADIC function-like macro's
+    // catch-all parameter (C's `...` -> "EllipsisOp"). The macro engine reads
+    // it to RECOGNISE `#define V(...)` in parameter position (today: fail loud,
+    // D-PP-VARIADIC-MACRO -- the `__VA_ARGS__` substitution is FC15-area). Like
+    // every other PP-vocabulary token this is a per-language CONFIG lexeme, NOT
+    // a hard-coded `...`: a second preprocess-opting language whose variadic
+    // marker is spelled differently would otherwise have a word-like marker
+    // silently accepted as a NAMED parameter (a silent mis-parse). OPTIONAL --
+    // an empty string means the language declares NO variadic form (the engine's
+    // `.valid()` guard then never treats any token as the marker). When present
+    // it is `checkToken`-validated at load (C_UnknownToken) like the other
+    // tokens. (FC13 cycle 2 review fold.)
+    std::string variadicMarkerToken;
 };
 
 } // namespace dss

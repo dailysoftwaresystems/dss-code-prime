@@ -3,9 +3,11 @@
 #include "tokenizer/tokenizer.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -330,8 +332,16 @@ struct SynthBuilder {
 };
 
 struct MacroDef {
-    std::vector<Token> replacement;
-    std::string        text;
+    std::vector<Token>       replacement;
+    std::string              text;
+    // FC13 cycle 2 (D-PP-FUNCTION-LIKE-MACRO): function-like macros. An
+    // object-like macro keeps isFunctionLike=false + an empty params; a
+    // function-like one records its parameter NAMES in declared order (used to
+    // map a call's argument list onto the replacement). C11/C23 6.10.3p4: a
+    // redefinition must agree on BOTH the kind (object vs function-like) AND
+    // the parameter spelling, not just the replacement text.
+    bool                     isFunctionLike = false;
+    std::vector<std::string> params;
 };
 
 class MacroExpander {
@@ -348,6 +358,27 @@ public:
         // for any opt-in language; the `.valid()` guard at the use site is
         // defense-in-depth.
         parenOpen_ = schema_->schemaTokens().find(cfg().functionLikeOpenToken);
+        // The function-like-macro `)` is ALSO a CONFIG lexeme (FC13 cycle 2):
+        // it terminates the parameter-list parse AND balance-tracks a call's
+        // argument list. `)` lexes as core `Punctuation` (not a distinct core
+        // kind), so it must be resolved from config like the opener -- never
+        // hard-coded. The loader REQUIRES + validates `functionLikeCloseToken`,
+        // so this resolves for any opt-in language; the `.valid()` guard at the
+        // use site is defense-in-depth.
+        parenClose_ = schema_->schemaTokens().find(cfg().functionLikeCloseToken);
+        // The argument/parameter SEPARATOR (C's `,`) is likewise a CONFIG lexeme
+        // (FC13 cycle 2): a `,` lexes as core `Punctuation`, so it is resolved
+        // from `functionLikeArgSeparatorToken` rather than a hard-coded name.
+        argSep_ = schema_->schemaTokens().find(cfg().functionLikeArgSeparatorToken);
+        // The VARIADIC marker (C's `...`) is ALSO a CONFIG lexeme (FC13 cycle 2
+        // review fold): `parseParamList` detects `#define V(...)` by this token
+        // KIND, never by the hard-coded `...` lexeme -- a second
+        // preprocess-opting language whose variadic marker is spelled differently
+        // is then parsed correctly. OPTIONAL: when the language declares none,
+        // `variadicMarkerToken` is empty and this stays InvalidSchemaToken, so
+        // the `.valid()` guard never treats any token as the marker.
+        variadicMarker_ =
+            schema_->schemaTokens().find(cfg().variadicMarkerToken);
     }
 
     std::vector<Token> run(std::vector<Token> const& in) {
@@ -361,13 +392,10 @@ public:
             body.push_back(in[i]);
             ++i;
         }
-        std::vector<Token> out;
-        out.reserve(body.size());
+        // Stream-expand the whole directive-stripped body uniformly (object-
+        // AND function-like macros share one cursor-walking engine).
         std::unordered_set<std::string> painting;
-        for (std::size_t k = 0; k < body.size(); ++k) {
-            expandInto(body[k], out, painting, 0);
-        }
-        return out;
+        return expand(body, painting, 0);
     }
 
 private:
@@ -428,6 +456,19 @@ private:
         return end;
     }
 
+    bool isParenOpen(Token const& t) const {
+        return parenOpen_.valid() && t.schemaKind == parenOpen_;
+    }
+    bool isParenClose(Token const& t) const {
+        return parenClose_.valid() && t.schemaKind == parenClose_;
+    }
+    bool isArgSeparator(Token const& t) const {
+        return argSep_.valid() && t.schemaKind == argSep_;
+    }
+    bool isVariadicMarker(Token const& t) const {
+        return variadicMarker_.valid() && t.schemaKind == variadicMarker_;
+    }
+
     void handleDefine(std::vector<Token> const& in, std::size_t p,
                       std::size_t end) {
         const char space = static_cast<char>(0x20);
@@ -441,16 +482,23 @@ private:
         const std::string name{text(in[p])};
         const std::size_t nameIdx = p;
         ++p;
-        if (p < end && parenOpen_.valid() && in[p].schemaKind == parenOpen_
-            && in[p].span.start() == in[nameIdx].span.end()) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported,
-                   synth_->id(), in[nameIdx].span,
-                   std::string{"function-like macro is not supported yet "
-                               "(FC13 cycle 2; D-PP-FUNCTION-LIKE-MACRO): "}
-                       + name);
-            return;
-        }
+
         MacroDef def;
+        // FUNCTION-like iff the configured open-paren is IMMEDIATELY ADJACENT
+        // to the macro name (C 6.10.3p3: no white space between the name and
+        // the `(`). `#define F (x)` -- a space before `(` -- is OBJECT-like
+        // (the `(x)` is part of the replacement list). We test adjacency on the
+        // raw spans (NO skipTrivia) so a single intervening space disqualifies.
+        if (p < end && isParenOpen(in[p])
+            && in[p].span.start() == in[nameIdx].span.end()) {
+            def.isFunctionLike = true;
+            if (!parseParamList(in, p, end, name, def.params)) {
+                return;  // parseParamList already emitted a fail-loud diagnostic
+            }
+            // After the parameter list, `p` indexes the token just past `)`;
+            // the rest of the line is the replacement list (collected below).
+        }
+
         std::string repText;
         for (std::size_t q = skipTrivia(in, p); q < end;
              q = skipTrivia(in, q + 1)) {
@@ -459,15 +507,110 @@ private:
             if (!repText.empty()) repText.push_back(space);
             repText.append(text(in[q]));
         }
-        def.text = repText;
+        def.text = std::move(repText);
+
         auto it = table_.find(name);
-        if (it != table_.end() && it->second.text != def.text) {
+        if (it != table_.end() && !sameDefinition(it->second, def)) {
             emitPP(rep_, DiagnosticCode::P_PreprocessorMacroRedefinition,
                    synth_->id(), in[nameIdx].span,
                    std::string{"incompatible redefinition of macro: "} + name);
             return;
         }
         table_[name] = std::move(def);
+    }
+
+    // Two `#define`s of the same name are COMPATIBLE (C 6.10.3p1/p2) only when
+    // they agree on EVERY axis: object-vs-function-like, the parameter spelling
+    // (in order), AND the replacement-token spelling. We compare the
+    // whitespace-normalized replacement TEXT (the cycle-1 contract) plus the
+    // kind + parameter names. A mismatch on any axis is an incompatible
+    // redefinition (fail-loud at the call site).
+    static bool sameDefinition(MacroDef const& a, MacroDef const& b) {
+        return a.isFunctionLike == b.isFunctionLike
+            && a.params == b.params
+            && a.text == b.text;
+    }
+
+    // Parse a function-like macro's parameter list, starting at `open` (the
+    // index of the adjacent `(`). On success fills `out` with the parameter
+    // NAMES in order, advances `open` PAST the closing `)`, and returns true.
+    // On any malformed input emits a fail-loud diagnostic and returns false.
+    // Grammar (C 6.10.3, no variadic in cycle 2):
+    //   ( )                        -> zero parameters
+    //   ( id ( , id )* )           -> named parameters, comma-separated
+    // FAIL-LOUD on: a `...` (variadic -- D-PP-VARIADIC-MACRO, out of scope), a
+    // duplicate parameter name, a non-identifier where a parameter is expected,
+    // a missing comma between parameters, or no closing `)` before line end.
+    bool parseParamList(std::vector<Token> const& in, std::size_t& open,
+                        std::size_t end, std::string const& macroName,
+                        std::vector<std::string>& out) {
+        std::size_t q = skipTrivia(in, open + 1);  // first token after `(`
+        // Empty list `()` -> zero parameters.
+        if (q < end && isParenClose(in[q])) {
+            open = q + 1;
+            return true;
+        }
+        while (true) {
+            if (q >= end || isNewline(in[q])) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(),
+                       (q < end ? in[q].span : SourceSpan::empty(0)),
+                       std::string{"unterminated macro parameter list: "}
+                           + macroName);
+                return false;
+            }
+            // A variadic marker (C's `...`) in parameter position is a VARIADIC
+            // macro -- recognized but deferred (D-PP-VARIADIC-MACRO, FC15-area).
+            // Detect it by the CONFIGURED token KIND (`variadicMarkerToken`),
+            // NOT by the hard-coded `...` lexeme: a second preprocess-opting
+            // language whose variadic marker is spelled differently would
+            // otherwise have a word-like marker silently accepted as a named
+            // parameter. The `.valid()` guard means a language that declares no
+            // variadic form simply never matches here (the marker falls through
+            // to the not-a-Word fail-loud below).
+            if (isVariadicMarker(in[q])) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported,
+                       synth_->id(), in[q].span,
+                       std::string{"variadic macro is not supported "
+                                   "(D-PP-VARIADIC-MACRO): "}
+                           + macroName);
+                return false;
+            }
+            if (!isWord(in[q])) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(), in[q].span,
+                       std::string{"expected a parameter name in macro "
+                                   "parameter list: "}
+                           + macroName);
+                return false;
+            }
+            std::string param{text(in[q])};
+            for (std::string const& seen : out) {
+                if (seen == param) {
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                           synth_->id(), in[q].span,
+                           std::string{"duplicate macro parameter '"} + param
+                               + "' in macro: " + macroName);
+                    return false;
+                }
+            }
+            out.push_back(std::move(param));
+            q = skipTrivia(in, q + 1);  // token after the parameter name
+            if (q < end && isParenClose(in[q])) {
+                open = q + 1;
+                return true;
+            }
+            if (q >= end || isNewline(in[q]) || !isArgSeparator(in[q])) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(),
+                       (q < end ? in[q].span : SourceSpan::empty(0)),
+                       std::string{"expected ',' or ')' in macro parameter "
+                                   "list: "}
+                           + macroName);
+                return false;
+            }
+            q = skipTrivia(in, q + 1);  // token after the comma -> next param
+        }
     }
 
     void handleUndef(std::vector<Token> const& in, std::size_t p,
@@ -482,21 +625,223 @@ private:
         table_.erase(std::string{text(in[p])});
     }
 
-    void expandInto(Token const& t, std::vector<Token>& out,
-                    std::unordered_set<std::string>& painting, int depth) {
-        if (depth > 256) { out.push_back(t); return; }
-        if (!isWord(t)) { out.push_back(t); return; }
-        const std::string name{text(t)};
-        auto it = table_.find(name);
-        if (it == table_.end() || painting.count(name) != 0) {
-            out.push_back(t);
-            return;
+    // Index of the next non-trivia / non-newline token from the cursor. A
+    // function-like invocation lookahead PEEKS past intervening whitespace AND
+    // newlines (`FOO\n(1)` is a valid call: once the directive line itself is
+    // stripped, C 6.10.3p10/p11 treat the name and the `(` as adjacent across
+    // white space, including line breaks). Returns in.size() if none.
+    static std::size_t nextSignificant(std::span<Token const> in,
+                                       std::size_t from) {
+        std::size_t j = from;
+        while (j < in.size() && (isTrivia(in[j]) || isNewline(in[j]))) ++j;
+        return j;
+    }
+
+    // Trim leading + trailing whitespace-trivia (incl. newlines/comments) from
+    // an argument token run, in place. Interior trivia is PRESERVED (an
+    // argument may legitimately contain spaces, e.g. `a + b`).
+    static void trimArgTrivia(std::vector<Token>& arg) {
+        std::size_t a = 0, b = arg.size();
+        while (a < b && (isTrivia(arg[a]) || isNewline(arg[a]))) ++a;
+        while (b > a && (isTrivia(arg[b - 1]) || isNewline(arg[b - 1]))) --b;
+        if (a != 0 || b != arg.size()) {
+            arg = std::vector<Token>(arg.begin() + static_cast<std::ptrdiff_t>(a),
+                                     arg.begin() + static_cast<std::ptrdiff_t>(b));
         }
-        painting.insert(name);
-        for (Token const& r : it->second.replacement) {
-            expandInto(r, out, painting, depth + 1);
+    }
+
+    // Collect a function-like macro call argument list. `in[open]` is the
+    // invocation `(`. Scans tracking PAREN DEPTH (only the configured open/close
+    // paren affect depth): a depth-1 comma SEPARATES arguments; the matching
+    // depth-0 close ENDS the list. Each argument preserves its interior tokens
+    // (nested parens/commas survive); leading/trailing trivia is trimmed. By the
+    // comma-separated-groups rule, `(x)` is ONE argument and `()` is ONE EMPTY
+    // argument; the special zero-PARAMETER case (`M()` for a 0-arg macro = zero
+    // arguments, C 6.10.3p4) is normalized by the CALLER (which knows
+    // params.size()). On success returns the arguments and sets `past` to the
+    // index JUST PAST the matching close. On EOF before the matching close,
+    // emits a fail-loud diagnostic and returns std::nullopt.
+    std::optional<std::vector<std::vector<Token>>>
+    collectArgs(std::span<Token const> in, std::size_t open,
+                std::string const& macroName, std::size_t& past) {
+        std::vector<std::vector<Token>> args;
+        std::vector<Token>              cur;
+        int depth = 1;                 // start just inside the opening `(`
+        std::size_t j = open + 1;
+        for (; j < in.size(); ++j) {
+            Token const& t = in[j];
+            if (isParenOpen(t)) {
+                ++depth;
+                cur.push_back(t);
+                continue;
+            }
+            if (isParenClose(t)) {
+                --depth;
+                if (depth == 0) {
+                    // End of list: flush the final (possibly empty) group.
+                    trimArgTrivia(cur);
+                    args.push_back(std::move(cur));
+                    past = j + 1;
+                    return args;
+                }
+                cur.push_back(t);
+                continue;
+            }
+            if (depth == 1 && isArgSeparator(t)) {
+                // Top-level separator: close current argument, start the next.
+                trimArgTrivia(cur);
+                args.push_back(std::move(cur));
+                cur.clear();
+                continue;
+            }
+            cur.push_back(t);
         }
-        painting.erase(name);
+        // Ran off the end without the matching close -> unterminated.
+        emitPP(rep_, DiagnosticCode::P_PreprocessorMacroArgument, synth_->id(),
+               (open < in.size() ? in[open].span : SourceSpan::empty(0)),
+               std::string{"unterminated argument list for function-like "
+                           "macro: "}
+                   + macroName);
+        return std::nullopt;
+    }
+
+    // Build the substituted replacement list for a function-like call: each
+    // replacement token that IS a parameter name is replaced by that
+    // parameter PRE-EXPANDED argument tokens (C 6.10.3.1); every other
+    // replacement token passes through unchanged. No `#`/`##` handling (FC15).
+    // `expandedArgs[k]` is the fully-expanded argument for `params[k]`.
+    std::vector<Token> substitute(
+        MacroDef const& def,
+        std::vector<std::vector<Token>> const& expandedArgs) {
+        std::vector<Token> outTokens;
+        for (Token const& r : def.replacement) {
+            int paramIdx = -1;
+            if (isWord(r)) {
+                std::string_view rt = text(r);
+                for (std::size_t k = 0; k < def.params.size(); ++k) {
+                    if (def.params[k] == rt) {
+                        paramIdx = static_cast<int>(k);
+                        break;
+                    }
+                }
+            }
+            if (paramIdx >= 0) {
+                std::vector<Token> const& a =
+                    expandedArgs[static_cast<std::size_t>(paramIdx)];
+                outTokens.insert(outTokens.end(), a.begin(), a.end());
+            } else {
+                outTokens.push_back(r);
+            }
+        }
+        return outTokens;
+    }
+
+    // Stream macro-expander (C 6.10.3): walk a cursor over `in`, expanding
+    // object- AND function-like invocations and rescanning each result under
+    // the shared blue-paint set. Returns the fully-expanded token run.
+    std::vector<Token> expand(std::span<Token const> in,
+                              std::unordered_set<std::string>& painting,
+                              int depth) {
+        std::vector<Token> out;
+        if (depth > 256) {                 // pathological-recursion backstop
+            // FAIL LOUD (FC13 cycle 2 review fold): emit a positioned
+            // diagnostic at the backstop instead of silently returning the
+            // input verbatim. A silently-truncated deep chain otherwise fails
+            // DOWNSTREAM at the parser with an inscrutable error; surfacing it
+            // HERE attributes the real cause (macro expansion nested too deep)
+            // to the PP. Position on the first token of this run (the deepest
+            // re-entry's lead token) when available.
+            emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported, synth_->id(),
+                   (in.empty() ? SourceSpan::empty(0) : in.front().span),
+                   "macro expansion nesting too deep (>256)");
+            out.assign(in.begin(), in.end());
+            return out;
+        }
+        std::size_t i = 0;
+        while (i < in.size()) {
+            Token const& t = in[i];
+            if (!isWord(t)) { out.push_back(t); ++i; continue; }
+            const std::string name{text(t)};
+            auto it = table_.find(name);
+            if (it == table_.end() || painting.count(name) != 0) {
+                out.push_back(t);
+                ++i;
+                continue;
+            }
+            MacroDef const& def = it->second;
+            if (!def.isFunctionLike) {
+                // OBJECT-like: paint, expand+rescan the replacement, unpaint.
+                painting.insert(name);
+                std::vector<Token> rescanned =
+                    expand(def.replacement, painting, depth + 1);
+                painting.erase(name);
+                out.insert(out.end(), rescanned.begin(), rescanned.end());
+                ++i;
+                continue;
+            }
+            // FUNCTION-like: an invocation ONLY if the next significant token is
+            // the configured `(`. Otherwise emit the name VERBATIM (C 6.10.3p10:
+            // a function-like name not followed by `(` is not an invocation).
+            std::size_t openIdx = nextSignificant(in, i + 1);
+            if (openIdx >= in.size() || !isParenOpen(in[openIdx])) {
+                out.push_back(t);
+                ++i;
+                continue;
+            }
+            std::size_t past = 0;
+            auto argsOpt = collectArgs(in, openIdx, name, past);
+            if (!argsOpt) {
+                // Unterminated invocation already reported: emit the name as-is
+                // and resume after it (do NOT swallow the rest of the stream).
+                out.push_back(t);
+                ++i;
+                continue;
+            }
+            std::vector<std::vector<Token>> args = std::move(*argsOpt);
+            // Zero-PARAMETER normalization (C 6.10.3p4): `M()` for a macro that
+            // takes NO parameters is ZERO arguments, but collectArgs reports it
+            // as one EMPTY argument (the general groups rule). Collapse that one
+            // empty group to zero args ONLY when the macro declares no
+            // parameters, so `M()` matches arity 0 while a one-parameter `G()`
+            // keeps its single empty argument.
+            if (def.params.empty() && args.size() == 1 && args[0].empty()) {
+                args.clear();
+            }
+            // ARITY check (C 6.10.3p4). A zero-parameter macro invoked as `M()`
+            // collects zero arguments (normalized just above); a one-parameter
+            // macro invoked as `G()` collects one EMPTY argument. Mismatch ->
+            // fail loud, emit the name verbatim, skip the whole call.
+            if (args.size() != def.params.size()) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorMacroArgument,
+                       synth_->id(), t.span,
+                       std::string{"function-like macro "} + name
+                           + " expects "
+                           + std::to_string(def.params.size())
+                           + " argument(s) but got "
+                           + std::to_string(args.size()));
+                out.push_back(t);
+                i = past;     // skip past the malformed call close paren
+                continue;
+            }
+            // PRE-EXPAND each argument FULLY before substitution (C 6.10.3.1):
+            // arguments expand in the CURRENT paint context, with the invoked
+            // macro NOT yet painted (painted only for the rescan below).
+            std::vector<std::vector<Token>> expandedArgs;
+            expandedArgs.reserve(args.size());
+            for (std::vector<Token> const& a : args) {
+                expandedArgs.push_back(expand(a, painting, depth + 1));
+            }
+            std::vector<Token> substituted = substitute(def, expandedArgs);
+            // RESCAN the substituted result with the invoked macro painted blue
+            // (C 6.10.3.4: a self-reference in the rescan is frozen).
+            painting.insert(name);
+            std::vector<Token> rescanned =
+                expand(substituted, painting, depth + 1);
+            painting.erase(name);
+            out.insert(out.end(), rescanned.begin(), rescanned.end());
+            i = past;         // resume AFTER the matching close paren
+        }
+        return out;
     }
 
     std::shared_ptr<SourceBuffer>        synth_;
@@ -504,6 +849,9 @@ private:
     DiagnosticReporter&                  rep_;
     SchemaTokenId                        hashKind_{};
     SchemaTokenId                        parenOpen_{};
+    SchemaTokenId                        parenClose_{};
+    SchemaTokenId                        argSep_{};
+    SchemaTokenId                        variadicMarker_{};
     std::unordered_map<std::string, MacroDef> table_;
 };
 
