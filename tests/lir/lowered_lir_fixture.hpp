@@ -20,6 +20,7 @@
 
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -43,27 +44,39 @@ struct LoweredLir {
 // HIR → MIR half of the pipeline is target-independent, so only the
 // MIR→LIR step consumes it.
 [[nodiscard]] inline LoweredLir
-lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target) {
+lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target,
+                  std::uint16_t mirCcIndex = 0) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
     UnitBuilder builder{*loaded};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    auto model = analyze(cu);
-    DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
     if (target == nullptr) {
         ADD_FAILURE() << "lowerCSubsetToLir: null target schema";
         std::abort();
     }
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): thread the SELECTED CC's va_list
+    // strategy into analyze() so the `va_list` TYPE matches the ABI (SysV
+    // __va_list_tag[1] vs Win64 char*) — mirrors compile_pipeline.cpp. `mirCcIndex`
+    // selects which CC drives BOTH the analyze() strategy AND the MIR config below,
+    // so a test can lower a variadic source under ms_x64 (cc 1) end-to-end.
+    std::optional<VaListStrategy> vaStrategy;
+    if (auto const* cc = target->callingConvention(mirCcIndex);
+        cc != nullptr && cc->vaListLayout.has_value()) {
+        vaStrategy = cc->vaListLayout->strategy;
+    }
+    auto model = analyze(cu, DataModel::Lp64, std::nullopt, vaStrategy);
+    DiagnosticReporter hirReporter;
+    auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg;
     mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
-    // Thread the active CC's by-value aggregate + FC12a-core va_list params into MIR
+    // Thread the SELECTED CC's by-value aggregate + va_list params into MIR
     // lowering, mirroring compile_pipeline.cpp — so a struct-by-value OR a
-    // variadic-callee (va_start/va_arg) source lowers through THIS fixture too (cc 0
-    // is the target's primary convention: sysv_amd64 on x86_64, aapcs64 on arm64).
-    if (auto const* cc = target->callingConvention(0)) {
+    // variadic-callee (va_start/va_arg) source lowers through THIS fixture too
+    // (mirCcIndex 0 = the target's primary convention: sysv_amd64 on x86_64,
+    // aapcs64 on arm64; 1 = ms_x64 on x86_64 for the Win64 variadic pins).
+    if (auto const* cc = target->callingConvention(mirCcIndex)) {
         mirCfg.aggregateLayout           = target->aggregateLayout();
         mirCfg.aggregateLayoutLoaded     = target->aggregateLayoutLoaded();
         mirCfg.aggregateClassification   = cc->aggregateClassification;
@@ -90,13 +103,14 @@ lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target) {
 // AAPCS64 link-register frame discipline) passes the target name
 // explicitly; the whole lower->LIR pipeline is target-parameterized.
 [[nodiscard]] inline LoweredLir
-lowerCSubsetToLir(std::string src, std::string targetName = "x86_64") {
+lowerCSubsetToLir(std::string src, std::string targetName = "x86_64",
+                  std::uint16_t mirCcIndex = 0) {
     auto target = TargetSchema::loadShipped(targetName);
     if (!target) {
         ADD_FAILURE() << "loadShipped(" << targetName << ") failed";
         std::abort();
     }
-    return lowerCSubsetToLir(std::move(src), std::move(*target));
+    return lowerCSubsetToLir(std::move(src), std::move(*target), mirCcIndex);
 }
 
 } // namespace dss::test_support

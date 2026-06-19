@@ -685,6 +685,78 @@ TEST(SemanticAnalyzerCSubset, BadFieldSizeofArrayDimensionRejected) {
         << "sizeof(s.nope) — no such field — must fail loud, never fold a guess";
 }
 
+// FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2) sizeof(va_list) pin: the injected
+// `va_list` TYPE is strategy-selected, so its size differs per ABI — 24B under SysV
+// (`__va_list_tag[1]` = {u32,u32,void*,void*}) vs 8B under Win64 (`char*`). A wrong
+// size mis-sizes the `ap` local → stack corruption. Fold sizeof(va_list) into an
+// array dimension (the established sizeof-folding probe) and read it back. RED-ON-
+// DISABLE: a regression injecting the SysV tag under Win64 (or vice versa) flips the
+// dimension.
+TEST(SemanticAnalyzerCSubset, SizeofVaListIs24UnderSysV) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int a[sizeof(va_list)];\n",
+    });
+    assertNoBuilderErrors(*cu);
+    // SysVRegisterSave (the default/absent strategy): va_list = __va_list_tag[1].
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                         VaListStrategy::SysVRegisterSave);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_TRUE(aRec->type.valid());
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    ASSERT_EQ(ti.scalars(aRec->type).size(), 1u);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 24)
+        << "sizeof(va_list) under SysV = sizeof(__va_list_tag[1]) = 24";
+}
+
+TEST(SemanticAnalyzerCSubset, SizeofVaListIs8UnderWin64) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int a[sizeof(va_list)];\n",
+    });
+    assertNoBuilderErrors(*cu);
+    // HomogeneousPointer (Win64): va_list = char* (one pointer = 8B).
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                         VaListStrategy::HomogeneousPointer);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_TRUE(aRec->type.valid());
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    ASSERT_EQ(ti.scalars(aRec->type).size(), 1u);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 8)
+        << "sizeof(va_list) under Win64 = sizeof(char*) = 8";
+}
+
+// FC12b (D-FC12B-WIN64-VARIADIC-CALLEE) Aapcs64 fail-loud (type-injection seam): the
+// Aapcs64DualCursor strategy is declared-but-not-realized (FC12c). Injecting a
+// `va_list` under it FAILS LOUD (S_VariadicCalleeUnsupported) rather than inject a
+// wrong-sized type. RED-ON-DISABLE: realizing the seam without the diagnostic would
+// silently inject a (wrong) type. The source merely NAMES va_list so the injection
+// runs (the c-subset `vaArgRule` gates it).
+TEST(SemanticAnalyzerCSubset, Aapcs64VaListStrategyFailsLoudAtInjection) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(int n, ...) { va_list ap; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                         VaListStrategy::Aapcs64DualCursor);
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_VariadicCalleeUnsupported), 1u)
+        << "an Aapcs64DualCursor va_list must fail loud at injection (FC12c)";
+}
+
 // SE-pointers (G5): a pointer parameter types as Ptr in the FnSig.
 TEST(SemanticAnalyzerCSubset, PointerParamInFnSig) {
     auto cu = buildShippedUnit("c-subset", { "void f(int *p) {}\n" });

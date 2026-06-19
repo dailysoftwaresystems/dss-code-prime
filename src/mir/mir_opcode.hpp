@@ -94,7 +94,17 @@ enum class MirOpcode : std::uint16_t {
     // The PRESENCE of a VaRegSaveAreaAddr in a function is ALSO the LIR pass's
     // signal that the function called va_start and so needs the save-area reserved +
     // the prologue spill (self-contained — no FnSig lookup, no threaded flag).
-    VaRegSaveAreaAddr, VaOverflowArgAreaAddr,
+    //
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start
+    // leaf. Win64's named-arg HOME space (rcx/rdx/r8/r9 slots) and the stack overflow
+    // are CONTIGUOUS in the caller's outgoing area, so a single base address +
+    // namedArgCount slots positions `ap` past ALL named args (home or stack). Carries
+    // the NAMED-ARG SLOT COUNT as its PAYLOAD; lir_callconv materializes it to
+    // `lea result, [sp + totalFrameSize + callPushBytes + payload*outgoingSlotSize]`
+    // — the SAME base as the va-overflow leaf MINUS shadowSpaceBytes (the home space
+    // IS the shadow space). Its PRESENCE is also the Win64 prologue-spill signal.
+    //   VaHomeArgAreaAddr:     &(home[namedArgCount]) — the first vararg under Win64.
+    VaRegSaveAreaAddr, VaOverflowArgAreaAddr, VaHomeArgAreaAddr,
     // ── SSA join ──
     Phi,           // operand range addresses the PHI pool, not the operand pool
     // ── terminators (exactly one, last in a block; successors live in succ pool) ──
@@ -269,6 +279,10 @@ struct MirOpcodeInfo {
         // 0 operands, value result, side-effecting so they pin to their function).
         case MirOpcode::VaRegSaveAreaAddr:     return {0, 0, 0, 0, R::Value, false, true, false, "varegsavearea"};
         case MirOpcode::VaOverflowArgAreaAddr: return {0, 0, 0, 0, R::Value, false, true, false, "vaoverflowargarea"};
+        // FC12b: like VaOverflowArgAreaAddr but PAYLOAD-carrying (the named-arg slot
+        // count) — a value leaf, side-effecting so it pins to its function + DCE
+        // can't drop it; lir_callconv reads the payload for the contiguous offset.
+        case MirOpcode::VaHomeArgAreaAddr:     return {0, 0, 0, 0, R::Value, false, true, false, "vahomeargarea"};
 
         // phi — operand range addresses the PHI pool (incoming value/block pairs).
         case MirOpcode::Phi: return {0, N, 0, 0, R::Value, false, false, true, "phi"};

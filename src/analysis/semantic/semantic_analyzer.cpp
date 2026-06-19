@@ -169,6 +169,12 @@ struct EngineState {
     // dimension fails loud rather than folding a wrong size. Read by
     // `constIntExpr`'s sizeof-folding closure (array-dimension const-context).
     std::optional<AggregateLayoutParams> aggregateLayout;
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the active CC's va_list lowering
+    // strategy (`analyze()`'s parameter). Selects the injected `va_list` TYPE AND
+    // the `va_start`/`va_arg`/`va_end` `ap`-operand type check: SysVRegisterSave (or
+    // nullopt) ⇒ `ap` is `__va_list_tag[1]`/`*`; HomogeneousPointer (Win64) ⇒ `ap`
+    // is `char*`. `nullopt` ⇒ the SysV-family default (back-compat).
+    std::optional<VaListStrategy> vaListStrategy;
     // HR11: per-schema index bundles, keyed by SchemaId.v; `active_` is the
     // bundle for the tree currently being processed (set via `activate`).
     std::unordered_map<std::uint32_t, SchemaIndexes> schemaIndexes;
@@ -2627,19 +2633,36 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
         }
 
-        // FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. va_arg(ap,T)
-        // resolves+stamps its castTypeRef type child (so the HIR lowering recovers T —
-        // a VALUE in the type position fails loud at resolveTypeNode's S_UnknownType)
-        // + stamps the node T; va_start/va_end stamp the node `void`. ALL THREE check
-        // the `ap` operand is a va_list (an Array of, or Ptr to, `__va_list_tag` — the
-        // injected builtin; array-decay makes both shapes legitimate). A wrong `ap`
-        // (e.g. an int) is S_TypeMismatch. The check shares ONE helper across the three.
+        // FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-CALLEE):
+        // variadic-intrinsic typing. va_arg(ap,T) resolves+stamps its castTypeRef type
+        // child (so the HIR lowering recovers T — a VALUE in the type position fails
+        // loud at resolveTypeNode's S_UnknownType) + stamps the node T; va_start/va_end
+        // stamp the node `void`. ALL THREE check the `ap` operand is a va_list. The
+        // SHAPE of a va_list is STRATEGY-dependent (matching the injected type):
+        //   * SysVRegisterSave (or nullopt): Array<__va_list_tag> or Ptr<__va_list_tag>
+        //     (array-decay makes both shapes legitimate).
+        //   * HomogeneousPointer (Win64): `char*` = Ptr<I8> (the injected `va_list`).
+        // A wrong `ap` (e.g. an int) is S_TypeMismatch. The check shares ONE helper.
         {
             auto& in = s.lattice.interner();
-            // True iff `ty` is a va_list: Array<__va_list_tag> or Ptr<__va_list_tag>.
+            bool const homogeneousVaList =
+                s.vaListStrategy.has_value()
+                && *s.vaListStrategy == VaListStrategy::HomogeneousPointer;
+            // True iff `ty` is a va_list for the active strategy.
             auto isVaList = [&](TypeId ty) -> bool {
                 if (!ty.valid()) return false;
                 TypeKind const k = in.kind(ty);
+                if (homogeneousVaList) {
+                    // Win64: `va_list` is `char*` (Ptr<I8>). Accept any Ptr-to-char
+                    // (the injected type) — its element width is what the linear
+                    // va_arg walk reads, so a Ptr<I8> is the precise shape.
+                    if (k != TypeKind::Ptr) return false;
+                    auto const ops = in.operands(ty);
+                    if (ops.empty()) return false;
+                    TypeId const inner = ops[0];
+                    return inner.valid() && in.kind(inner) == TypeKind::I8;
+                }
+                // SysV family: Array<__va_list_tag> or Ptr<__va_list_tag>.
                 if (k != TypeKind::Array && k != TypeKind::Ptr) return false;
                 auto const ops = in.operands(ty);
                 if (ops.empty()) return false;
@@ -4078,7 +4101,8 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 
 SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       DataModel dataModel,
-                      std::optional<AggregateLayoutParams> aggregateLayout) {
+                      std::optional<AggregateLayoutParams> aggregateLayout,
+                      std::optional<VaListStrategy> vaListStrategy) {
     if (!cu) {
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();
@@ -4086,6 +4110,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
     EngineState s{*cu};
     s.dataModel = dataModel;
     s.aggregateLayout = aggregateLayout;
+    s.vaListStrategy = vaListStrategy;
 
     // FC3 c1: ILP32 is DECLARED-ONLY (the wasm/spirv skeleton formats
     // carry it for honesty) — no exercised 32-bit width path exists, so
@@ -4161,43 +4186,83 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
             SymbolId const id = s.symbols.mint(rec);
             s.scopes.injectBinding(builtinScope, bf.name, id);
         }
-        // FC12a-core (D-FC12A-VARIADIC-CALLEE): inject the `__va_list_tag` builtin
-        // struct + the `va_list` typedef iff this language declares a va_arg surface
-        // (config-driven: `vaArgRule` valid). `va_list` = `__va_list_tag[1]` (the C
-        // ABI definition; it array-decays to `__va_list_tag*` when passed to
-        // va_start/va_arg/va_end). The FIELD shape {u32, u32, void*, void*} is the
-        // SysV-family C-ABI standard; the per-field BYTE OFFSETS at codegen come from
-        // the TARGET's `vaListLayout` config (the semantic struct is only for making
-        // the type resolvable by name + sizing the `ap` local). A language without
-        // the surface injects nothing — no leak, no cross-language pollution.
+        // FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-CALLEE):
+        // inject the `va_list` type iff this language declares a va_arg surface
+        // (config-driven: `vaArgRule` valid). The CONCRETE va_list TYPE is selected
+        // by the active CC's `vaListStrategy` (BLOCKER-2: threaded into analyze() so
+        // sizeof(va_list) is right per ABI — a wrong size mis-sizes the `ap` local
+        // and corrupts the stack). Switch on the closed strategy (never cc.name /
+        // arch / format), with a fail-loud default for an un-realized ABI:
+        //   * SysVRegisterSave (or ABSENT — direct-API/back-compat) → `__va_list_tag`
+        //     {u32,u32,void*,void*} + `va_list = __va_list_tag[1]` (24B). The C ABI
+        //     definition; it array-decays to `__va_list_tag*` when passed to
+        //     va_start/va_arg/va_end. The per-field BYTE OFFSETS at codegen come from
+        //     the target's `vaListLayout`; this struct only makes the type resolvable
+        //     by name + sizes `ap`.
+        //   * HomogeneousPointer (Win64) → `va_list = char*` (a pointer to I8). NO
+        //     __va_list_tag struct: sizeof(va_list)==8 sizes `ap` as one pointer.
+        //   * Aapcs64DualCursor → fail loud (realized in FC12c).
+        // A language without the surface injects nothing — no leak, no pollution.
         if (sch->semantics().vaArgRule.valid()) {
             auto& in = s.lattice.interner();
-            TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
-            std::array<TypeId, 4> tagFields{
-                in.primitive(TypeKind::U32),  // gp_offset
-                in.primitive(TypeKind::U32),  // fp_offset
-                voidPtr,                      // overflow_arg_area
-                voidPtr,                      // reg_save_area
-            };
-            TypeId const tagTy = in.structType("__va_list_tag", tagFields);
-            SymbolRecord tagRec;
-            tagRec.name  = "__va_list_tag";
-            tagRec.scope = builtinScope;
-            tagRec.tree  = InvalidTree;
-            tagRec.kind  = DeclarationKind::Type;
-            tagRec.type  = tagTy;
-            SymbolId const tagId = s.symbols.mint(tagRec);
-            s.scopes.injectBinding(builtinScope, "__va_list_tag", tagId);
+            VaListStrategy const strat =
+                vaListStrategy.value_or(VaListStrategy::SysVRegisterSave);
+            if (strat == VaListStrategy::Aapcs64DualCursor) {
+                // No artifact: emit a positioned diagnostic at the tree root (this
+                // injection covers the whole CU). Analysis continues collect-all,
+                // but the error fails the compile.
+                ParseDiagnostic d;
+                d.code       = DiagnosticCode::S_VariadicCalleeUnsupported;
+                d.severity   = DiagnosticSeverity::Error;
+                d.actual     = std::string{vaListStrategyName(strat)};
+                d.suggestion = "Aapcs64DualCursor va_list not realized (FC12c)";
+                for (Tree const& tree : cu->trees()) {
+                    if (!tree.root().valid()) continue;
+                    d.buffer = tree.source().id();
+                    d.span   = tree.span(tree.root());
+                    break;
+                }
+                s.reporter.report(std::move(d));
+            } else if (strat == VaListStrategy::HomogeneousPointer) {
+                // Win64: `va_list` is a plain `char*` (pointer to I8) — sizeof 8.
+                TypeId const charPtr = in.pointer(in.primitive(TypeKind::I8));
+                SymbolRecord vaRec;
+                vaRec.name  = "va_list";
+                vaRec.scope = builtinScope;
+                vaRec.tree  = InvalidTree;
+                vaRec.kind  = DeclarationKind::Type;
+                vaRec.type  = charPtr;
+                SymbolId const vaId = s.symbols.mint(vaRec);
+                s.scopes.injectBinding(builtinScope, "va_list", vaId);
+            } else {
+                // SysVRegisterSave (or absent): __va_list_tag[1].
+                TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+                std::array<TypeId, 4> tagFields{
+                    in.primitive(TypeKind::U32),  // gp_offset
+                    in.primitive(TypeKind::U32),  // fp_offset
+                    voidPtr,                      // overflow_arg_area
+                    voidPtr,                      // reg_save_area
+                };
+                TypeId const tagTy = in.structType("__va_list_tag", tagFields);
+                SymbolRecord tagRec;
+                tagRec.name  = "__va_list_tag";
+                tagRec.scope = builtinScope;
+                tagRec.tree  = InvalidTree;
+                tagRec.kind  = DeclarationKind::Type;
+                tagRec.type  = tagTy;
+                SymbolId const tagId = s.symbols.mint(tagRec);
+                s.scopes.injectBinding(builtinScope, "__va_list_tag", tagId);
 
-            TypeId const vaListTy = in.array(tagTy, 1);
-            SymbolRecord vaRec;
-            vaRec.name  = "va_list";
-            vaRec.scope = builtinScope;
-            vaRec.tree  = InvalidTree;
-            vaRec.kind  = DeclarationKind::Type;
-            vaRec.type  = vaListTy;
-            SymbolId const vaId = s.symbols.mint(vaRec);
-            s.scopes.injectBinding(builtinScope, "va_list", vaId);
+                TypeId const vaListTy = in.array(tagTy, 1);
+                SymbolRecord vaRec;
+                vaRec.name  = "va_list";
+                vaRec.scope = builtinScope;
+                vaRec.tree  = InvalidTree;
+                vaRec.kind  = DeclarationKind::Type;
+                vaRec.type  = vaListTy;
+                SymbolId const vaId = s.symbols.mint(vaRec);
+                s.scopes.injectBinding(builtinScope, "va_list", vaId);
+            }
         }
     }
 

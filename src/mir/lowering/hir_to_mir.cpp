@@ -140,6 +140,13 @@ struct Lowerer {
     // lowered (so a body `va_start` reads the right counts); reset per function.
     std::uint32_t currentFnFixedGpr_ = 0;
     std::uint32_t currentFnFixedFpr_ = 0;
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the enclosing function's count of FIXED
+    // named-arg SLOTS under a slot-aligned CC (Win64). The HomogeneousPointer
+    // va_start sets ap = &home[currentFnFixedFlat_] — the slot count positions past
+    // ALL named args (int OR float, each one slot). Equal to currentFnFixedGpr_ for
+    // an int-only-named-param fn; differs only when a named param is FP (each still
+    // one slot). Set alongside the per-class counts before the body is lowered.
+    std::uint32_t currentFnFixedFlat_ = 0;
 
     // FC5: per-function `goto`/label lowering. A LabelStmt and its goto(s) share a
     // per-function ordinal (HIR payload); this maps the ordinal → its MIR block.
@@ -724,6 +731,32 @@ struct Lowerer {
                                         return InvalidMirInst;
                                     }
                                     VaListLayout const& vl = *config.vaListLayout;
+                                    // FC12b: a by-value struct passed to a Win64
+                                    // (HomogeneousPointer) variadic callee is DEFERRED
+                                    // — the atomic-fit/placement below is SysV-shaped
+                                    // (reads gpSaveCount/fpSaveCount, which Win64 does
+                                    // not declare). Fail loud with the Win64 anchor
+                                    // BEFORE the SysV-shaped checks run on zeroed
+                                    // fields (which would mis-message).
+                                    if (vl.strategy
+                                        == VaListStrategy::HomogeneousPointer) {
+                                        unsupported(kids[i],
+                                            "passing a struct/union BY VALUE to a "
+                                            "Win64 ms_x64 variadic function is not yet "
+                                            "supported — the homogeneous struct-vararg "
+                                            "caller placement is the FC12b-struct "
+                                            "follow-on (D-FC12B-WIN64-STRUCT-VARARG)");
+                                        return InvalidMirInst;
+                                    }
+                                    if (vl.strategy
+                                        != VaListStrategy::SysVRegisterSave) {
+                                        unsupported(kids[i],
+                                            "passing a struct/union BY VALUE to a "
+                                            "variadic function under this va_list "
+                                            "strategy is not realized "
+                                            "(D-FC12B-WIN64-VARIADIC-CALLEE / FC12c)");
+                                        return InvalidMirInst;
+                                    }
                                     if (runGpr + numGp > vl.gpSaveCount
                                         || runFpr + numFp > vl.fpSaveCount) {
                                         unsupported(kids[i],
@@ -2796,68 +2829,96 @@ struct Lowerer {
             unsupported(node, "malformed VaStart (expect 1 child)");
             return InvalidMirInst;
         }
-        // FAIL-LOUD (no silent miscompile): a variadic callee with MORE fixed
-        // params than the register-save area holds (fixedGpr > gpSaveCount, or
-        // fixedFpr > fpSaveCount) has a fixed param passed ON THE STACK. SysV
-        // §3.5.7 then requires overflow_arg_area to point PAST those named stack
-        // args — a fixed-stack-arg displacement this cycle does NOT yet thread
-        // (VaOverflowArgAreaAddr emits a constant slot-0 offset). Reject loudly
-        // rather than silently read a fixed param as the first vararg.
-        if (currentFnFixedGpr_ > vl.gpSaveCount
-            || currentFnFixedFpr_ > vl.fpSaveCount) {
+        // FC12b: strategy-dispatch with a fail-loud default so no site half-migrates
+        // and silently runs the SysV path on a Win64 (or unknown) layout.
+        switch (vl.strategy) {
+        case VaListStrategy::SysVRegisterSave: {
+            // FAIL-LOUD (no silent miscompile): a variadic callee with MORE fixed
+            // params than the register-save area holds (fixedGpr > gpSaveCount, or
+            // fixedFpr > fpSaveCount) has a fixed param passed ON THE STACK. SysV
+            // §3.5.7 then requires overflow_arg_area to point PAST those named stack
+            // args — a fixed-stack-arg displacement this cycle does NOT yet thread
+            // (VaOverflowArgAreaAddr emits a constant slot-0 offset). Reject loudly
+            // rather than silently read a fixed param as the first vararg.
+            if (currentFnFixedGpr_ > vl.gpSaveCount
+                || currentFnFixedFpr_ > vl.fpSaveCount) {
+                unsupported(node,
+                    "variadic callee whose fixed parameters overflow to the stack "
+                    "(more fixed integer/SSE params than the register-save area "
+                    "holds) is not yet supported — overflow_arg_area must skip the "
+                    "named stack args (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)");
+                return InvalidMirInst;
+            }
+            MirInstId const tagBase = vaTagBase(kids[0]);
+            if (!tagBase.valid()) return InvalidMirInst;
+
+            TypeId const u32      = interner.primitive(TypeKind::U32);
+            TypeId const u32Ptr   = interner.pointer(u32);
+            TypeId const voidPtr  = interner.pointer(interner.primitive(TypeKind::Void));
+            TypeId const voidPtrPtr = interner.pointer(voidPtr);
+
+            // gp_offset = fixedGpr * gpSlotBytes.
+            std::uint32_t const gpInit = currentFnFixedGpr_ * vl.gpSlotBytes;
+            // fp_offset = gpOffsetLimit + fixedFpr * fpSlotBytes (SSE block follows GPR).
+            std::uint32_t const fpInit = vl.gpOffsetLimit + currentFnFixedFpr_ * vl.fpSlotBytes;
+
+            MirInstId const gpField = vaFieldPtr(tagBase, vl.gpOffsetField, u32Ptr);
+            if (!gpField.valid()) return InvalidMirInst;
+            {
+                std::array<MirInstId, 2> st{constIntOfType(gpInit, u32), gpField};
+                mir.addInst(MirOpcode::Store, st);
+            }
+            MirInstId const fpField = vaFieldPtr(tagBase, vl.fpOffsetField, u32Ptr);
+            if (!fpField.valid()) return InvalidMirInst;
+            {
+                std::array<MirInstId, 2> st{constIntOfType(fpInit, u32), fpField};
+                mir.addInst(MirOpcode::Store, st);
+            }
+            // reg_save_area = &save.
+            MirInstId const rsaField = vaFieldPtr(tagBase, vl.regSaveAreaField, voidPtrPtr);
+            if (!rsaField.valid()) return InvalidMirInst;
+            MirInstId const rsaVal =
+                mir.addInst(MirOpcode::VaRegSaveAreaAddr, {}, voidPtr);
+            {
+                std::array<MirInstId, 2> st{rsaVal, rsaField};
+                mir.addInst(MirOpcode::Store, st);
+            }
+            // overflow_arg_area = &incoming-stack-args.
+            MirInstId const ovfField = vaFieldPtr(tagBase, vl.overflowArgAreaField, voidPtrPtr);
+            if (!ovfField.valid()) return InvalidMirInst;
+            MirInstId const ovfVal =
+                mir.addInst(MirOpcode::VaOverflowArgAreaAddr, {}, voidPtr);
+            std::array<MirInstId, 2> st{ovfVal, ovfField};
+            return mir.addInst(MirOpcode::Store, st);   // last Store — a valid void inst
+        }
+        case VaListStrategy::HomogeneousPointer: {
+            // Win64: `va_list` is a `char*` (a single pointer, NOT a tag struct), so
+            // its lvalue ADDRESS is a `char**` slot we store the start pointer into.
+            // The start = &home[namedArgSlotCount] (VaHomeArgAreaAddr, payload = the
+            // slot-aligned named-arg count) — the first vararg in the contiguous
+            // home+overflow area. `va_arg` linearly bumps that pointer.
+            MirInstId const apPtr = lowerLvalueAddress(kids[0]);
+            if (!apPtr.valid()) return InvalidMirInst;
+            TypeId const voidPtr = interner.pointer(interner.primitive(TypeKind::Void));
+            MirInstId const first =
+                mir.addInst(MirOpcode::VaHomeArgAreaAddr, {}, voidPtr,
+                            /*payload=*/currentFnFixedFlat_);
+            std::array<MirInstId, 2> st{first, apPtr};
+            return mir.addInst(MirOpcode::Store, st);
+        }
+        case VaListStrategy::Aapcs64DualCursor:
             unsupported(node,
-                "variadic callee whose fixed parameters overflow to the stack "
-                "(more fixed integer/SSE params than the register-save area "
-                "holds) is not yet supported — overflow_arg_area must skip the "
-                "named stack args (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)");
+                "Aapcs64DualCursor va_list (va_start) not realized (FC12c) "
+                "(D-FC12B-WIN64-VARIADIC-CALLEE)");
             return InvalidMirInst;
         }
-        MirInstId const tagBase = vaTagBase(kids[0]);
-        if (!tagBase.valid()) return InvalidMirInst;
-
-        TypeId const u32      = interner.primitive(TypeKind::U32);
-        TypeId const u32Ptr   = interner.pointer(u32);
-        TypeId const voidPtr  = interner.pointer(interner.primitive(TypeKind::Void));
-        TypeId const voidPtrPtr = interner.pointer(voidPtr);
-
-        // gp_offset = fixedGpr * gpSlotBytes.
-        std::uint32_t const gpInit = currentFnFixedGpr_ * vl.gpSlotBytes;
-        // fp_offset = gpOffsetLimit + fixedFpr * fpSlotBytes (SSE block follows GPR).
-        std::uint32_t const fpInit = vl.gpOffsetLimit + currentFnFixedFpr_ * vl.fpSlotBytes;
-
-        MirInstId const gpField = vaFieldPtr(tagBase, vl.gpOffsetField, u32Ptr);
-        if (!gpField.valid()) return InvalidMirInst;
-        {
-            std::array<MirInstId, 2> st{constIntOfType(gpInit, u32), gpField};
-            mir.addInst(MirOpcode::Store, st);
-        }
-        MirInstId const fpField = vaFieldPtr(tagBase, vl.fpOffsetField, u32Ptr);
-        if (!fpField.valid()) return InvalidMirInst;
-        {
-            std::array<MirInstId, 2> st{constIntOfType(fpInit, u32), fpField};
-            mir.addInst(MirOpcode::Store, st);
-        }
-        // reg_save_area = &save.
-        MirInstId const rsaField = vaFieldPtr(tagBase, vl.regSaveAreaField, voidPtrPtr);
-        if (!rsaField.valid()) return InvalidMirInst;
-        MirInstId const rsaVal =
-            mir.addInst(MirOpcode::VaRegSaveAreaAddr, {}, voidPtr);
-        {
-            std::array<MirInstId, 2> st{rsaVal, rsaField};
-            mir.addInst(MirOpcode::Store, st);
-        }
-        // overflow_arg_area = &incoming-stack-args.
-        MirInstId const ovfField = vaFieldPtr(tagBase, vl.overflowArgAreaField, voidPtrPtr);
-        if (!ovfField.valid()) return InvalidMirInst;
-        MirInstId const ovfVal =
-            mir.addInst(MirOpcode::VaOverflowArgAreaAddr, {}, voidPtr);
-        std::array<MirInstId, 2> st{ovfVal, ovfField};
-        return mir.addInst(MirOpcode::Store, st);   // last Store — a valid void inst
+        unsupported(node, "internal: unknown VaListStrategy in va_start");
+        return InvalidMirInst;
     }
 
-    // `va_end(ap)` → nothing (SysV teardown is a no-op). A valid placeholder value
-    // for the discard chokepoint; DCE drops it. (The node + opcode-less lowering
-    // are the hook a future ABI needing real teardown would fill.)
+    // `va_end(ap)` → nothing (SysV + Win64 teardown is a no-op). A valid placeholder
+    // value for the discard chokepoint; DCE drops it. (The node + opcode-less
+    // lowering are the hook a future ABI needing real teardown would fill.)
     [[nodiscard]] MirInstId lowerVaEnd(HirNodeId node) {
         if (!config.vaListLayout.has_value()) {
             unsupported(node, "variadic callee (va_end) is unsupported for this "
@@ -2865,7 +2926,19 @@ struct Lowerer {
                               "'vaListLayout' (D-FC12A-VARIADIC-CALLEE)");
             return InvalidMirInst;
         }
-        return constInt(0);
+        // FC12b: strategy-dispatch with a fail-loud default.
+        switch (config.vaListLayout->strategy) {
+        case VaListStrategy::SysVRegisterSave:
+        case VaListStrategy::HomogeneousPointer:
+            return constInt(0);   // no teardown on either realized ABI
+        case VaListStrategy::Aapcs64DualCursor:
+            unsupported(node,
+                "Aapcs64DualCursor va_list (va_end) not realized (FC12c) "
+                "(D-FC12B-WIN64-VARIADIC-CALLEE)");
+            return InvalidMirInst;
+        }
+        unsupported(node, "internal: unknown VaListStrategy in va_end");
+        return InvalidMirInst;
     }
 
     // `va_arg(ap, T)` for a SCALAR T → the reg-vs-overflow diamond (SysV §3.5.7).
@@ -2912,6 +2985,42 @@ struct Lowerer {
         MirInstId const tagBase = vaTagBase(kids[0]);   // child 1 (TypeRef) NEVER lowered
         if (!tagBase.valid()) return InvalidMirInst;
 
+        // FC12b: strategy-dispatch. The Win64 HomogeneousPointer path is LINEAR (no
+        // diamond) and returns here; the Aapcs64 path fails loud; SysVRegisterSave
+        // falls through to the reg-vs-overflow diamond below. A fail-loud default
+        // guards against a half-migrated site silently running the SysV diamond on a
+        // non-SysV layout.
+        if (vl.strategy == VaListStrategy::HomogeneousPointer) {
+            // `va_list` is a `char*`: tagBase is its lvalue address (a `char**`).
+            // Load the current cursor, Load T from it, bump by namedArgSlotBytes,
+            // store the bumped cursor back. Crosses home→overflow uniformly because
+            // they are contiguous from the va_start base.
+            TypeId const voidPtr = interner.pointer(interner.primitive(TypeKind::Void));
+            std::array<MirInstId, 1> loadApOps{tagBase};
+            MirInstId const apVal = mir.addInst(MirOpcode::Load, loadApOps, voidPtr);
+            std::array<MirInstId, 1> loadValOps{apVal};
+            MirInstId const result = mir.addInst(MirOpcode::Load, loadValOps, t);
+            MirInstId const stepK =
+                constInt(static_cast<std::int64_t>(vl.namedArgSlotBytes));
+            if (!stepK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> gepOps{apVal, stepK};
+            MirInstId const apNext = mir.addInst(MirOpcode::Gep, gepOps, voidPtr);
+            std::array<MirInstId, 2> st{apNext, tagBase};
+            mir.addInst(MirOpcode::Store, st);
+            return result;
+        }
+        if (vl.strategy == VaListStrategy::Aapcs64DualCursor) {
+            unsupported(node,
+                "Aapcs64DualCursor va_list (va_arg) not realized (FC12c) "
+                "(D-FC12B-WIN64-VARIADIC-CALLEE)");
+            return InvalidMirInst;
+        }
+        if (vl.strategy != VaListStrategy::SysVRegisterSave) {
+            unsupported(node, "internal: unknown VaListStrategy in va_arg");
+            return InvalidMirInst;
+        }
+
+        // ── SysVRegisterSave: the reg-vs-overflow diamond (SysV §3.5.7) ──
         // Classify the SCALAR: SSE (FPR) reads the fp cursor; INTEGER (GPR) the gp
         // cursor. (A scalar isn't an aggregate; `scalarArgClass` is the direct
         // equivalent of the eightbyte INTEGER/SSE split for one register.)
@@ -3021,6 +3130,28 @@ struct Lowerer {
             return InvalidMirInst;
         }
         VaListLayout const& vl = *config.vaListLayout;
+        // FC12b: strategy-dispatch. The SysV eightbyte gather is below; Win64 struct
+        // varargs are DEFERRED (the caller-side atomic-fit/placement is SysV-shaped
+        // and needs a Win64 homogeneous analog — the FC12b-struct follow-on); AAPCS64
+        // is FC12c. Fail loud rather than fall through to the SysV by-value gather on
+        // a non-SysV layout (a silent wrong-ABI struct read).
+        if (vl.strategy == VaListStrategy::HomogeneousPointer) {
+            unsupported(node,
+                "va_arg of a struct/union under the Win64 ms_x64 ABI is not yet "
+                "supported — the homogeneous-pointer struct-vararg walk is the "
+                "FC12b-struct follow-on (D-FC12B-WIN64-STRUCT-VARARG)");
+            return InvalidMirInst;
+        }
+        if (vl.strategy == VaListStrategy::Aapcs64DualCursor) {
+            unsupported(node,
+                "Aapcs64DualCursor va_list (va_arg of a struct/union) not realized "
+                "(FC12c) (D-FC12B-WIN64-VARIADIC-CALLEE)");
+            return InvalidMirInst;
+        }
+        if (vl.strategy != VaListStrategy::SysVRegisterSave) {
+            unsupported(node, "internal: unknown VaListStrategy in va_arg(struct)");
+            return InvalidMirInst;
+        }
         TypeId const t = hir.typeId(node);
         if (!t.valid()) {
             unsupported(node, "VaArg has no result type");
@@ -3949,14 +4080,15 @@ struct Lowerer {
         // FC12a-core (D-FC12A-VARIADIC-CALLEE): after every FIXED param is placed,
         // `argCtr.gpr`/`.fpr` hold the count of fixed params that consumed an
         // integer / SSE arg register (the sret hidden GPR, if any, is already
-        // included — argCtr is the single source). A body `va_start` reads these to
-        // initialize gp_offset/fp_offset past the fixed args. (The only CC with a
-        // vaListLayout — SysV — is `slotAligned=false`, so `gpr`/`fpr` are the
-        // per-class fixed counts; a future slot-aligned variadic CC would thread
-        // `flat` instead, but none exists this cycle and one would arrive with its
-        // own vaListLayout + this site revisited.)
-        currentFnFixedGpr_ = argCtr.gpr;
-        currentFnFixedFpr_ = argCtr.fpr;
+        // included — argCtr is the single source). A SysVRegisterSave body `va_start`
+        // reads these to initialize gp_offset/fp_offset past the fixed args.
+        // FC12b: `argCtr.flat` is the slot-aligned named-arg SLOT count (Win64); a
+        // HomogeneousPointer `va_start` reads it to set ap = &home[flat], past ALL
+        // named slots (int OR float). For SysV (`slotAligned=false`) `flat` stays 0
+        // and is unused; for Win64 `gpr`/`fpr` stay 0 and `flat` is the live count.
+        currentFnFixedGpr_  = argCtr.gpr;
+        currentFnFixedFpr_  = argCtr.fpr;
+        currentFnFixedFlat_ = argCtr.flat;
         // Body: a single Block of statements.
         if (!lowerStmt(body)) {
             // Failed mid-body — seal the block so finish() can complete and

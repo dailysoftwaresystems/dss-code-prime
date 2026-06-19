@@ -22,6 +22,7 @@
 
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -49,7 +50,17 @@ struct Lowered {
     UnitBuilder builder{*loaded};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    auto model = analyze(cu);
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): thread the selected CC's va_list
+    // strategy into analyze() so a Win64 (ms_x64) variadic source gets the `char*`
+    // `va_list` type (not SysV's __va_list_tag[1]) — mirrors compile_pipeline.cpp.
+    std::optional<VaListStrategy> vaStrategy;
+    if (auto t = TargetSchema::loadShipped(targetName); t.has_value()) {
+        if (auto const* cc = (*t)->callingConventionByName(ccName);
+            cc != nullptr && cc->vaListLayout.has_value()) {
+            vaStrategy = cc->vaListLayout->strategy;
+        }
+    }
+    auto model = analyze(cu, DataModel::Lp64, std::nullopt, vaStrategy);
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
@@ -4022,6 +4033,68 @@ TEST(MirLoweringCSubset, VaArgIntLowersToRegVsOverflowDiamond) {
         << "va_arg Loads the cursor, the reg_save_area pointer, AND the final value";
 }
 
+// FC12b (D-FC12B-WIN64-VARIADIC-CALLEE) MIR pin: the SAME `va_arg(ap, int)` source
+// lowers DIFFERENTLY by strategy — a reg-vs-overflow DIAMOND under SysV (cc 0) vs a
+// LINEAR pointer bump (NO diamond) under Win64 (ms_x64). This is the strategy-
+// dispatch witness: same source, two shapes, selected only by the CC's vaListLayout
+// strategy. RED-ON-DISABLE: if the Win64 va_arg seam fell through to the SysV diamond
+// (a half-migrated dispatch), the CondBr-count assertion below flips.
+TEST(MirLoweringCSubset, Win64VaArgIntLowersLinearNotDiamond) {
+    char const* src =
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n";
+    // Win64 (ms_x64) lowering.
+    auto W = lowerCSubset(src, "x86_64", "ms_x64");
+    ASSERT_FALSE(W.model.hasErrors())
+        << "Win64 variadic callee must type-check (va_list = char*)";
+    ASSERT_TRUE(W.hir->ok);
+    ASSERT_TRUE(W.mir.ok);
+    Mir const& wm = W.mir.mir;
+    // The Win64 va_start emits VaHomeArgAreaAddr (NOT VaRegSaveAreaAddr).
+    std::uint32_t wfi = 0;
+    bool foundW = false;
+    for (std::uint32_t fi = 0; fi < wm.moduleFuncCount(); ++fi) {
+        if (countOpcodeAllBlocks(wm, fi, MirOpcode::VaHomeArgAreaAddr) > 0) {
+            wfi = fi; foundW = true; break;
+        }
+    }
+    ASSERT_TRUE(foundW) << "Win64 va_start must emit a VaHomeArgAreaAddr leaf";
+    EXPECT_EQ(countOpcodeAllBlocks(wm, wfi, MirOpcode::VaHomeArgAreaAddr), 1u);
+    EXPECT_EQ(countOpcodeAllBlocks(wm, wfi, MirOpcode::VaRegSaveAreaAddr), 0u)
+        << "Win64 does NOT use the SysV register-save-area leaf";
+    // The LINEAR walk: NO reg-vs-overflow diamond. The scalar va_arg adds NO CondBr
+    // (and no ICmpUlt/Phi). The loop's own CondBr is the baseline; this body has the
+    // `while (i<n)` loop (1 CondBr) but the va_arg adds ZERO extra — so total CondBr
+    // here (a straight body with one va_arg, NO loop) is 0. Pin exactly 0.
+    EXPECT_EQ(countOpcodeAllBlocks(wm, wfi, MirOpcode::CondBr), 0u)
+        << "Win64 va_arg is a LINEAR pointer bump — no reg-vs-overflow diamond";
+    EXPECT_EQ(countOpcodeAllBlocks(wm, wfi, MirOpcode::ICmpUlt), 0u)
+        << "Win64 va_arg compares nothing (no per-class limit check)";
+    EXPECT_EQ(countOpcodeAllBlocks(wm, wfi, MirOpcode::Phi), 0u)
+        << "Win64 va_arg joins nothing (single linear arm)";
+
+    // SysV (sysv_amd64) lowering of the SAME source → the DIAMOND (the contrast).
+    auto S = lowerCSubset(src, "x86_64", "sysv_amd64");
+    ASSERT_TRUE(S.mir.ok);
+    Mir const& sm = S.mir.mir;
+    std::uint32_t sfi = 0;
+    for (std::uint32_t fi = 0; fi < sm.moduleFuncCount(); ++fi) {
+        if (countOpcodeAllBlocks(sm, fi, MirOpcode::VaRegSaveAreaAddr) > 0) {
+            sfi = fi; break;
+        }
+    }
+    EXPECT_GE(countOpcodeAllBlocks(sm, sfi, MirOpcode::CondBr), 1u)
+        << "SysV va_arg of the SAME source emits the reg-vs-overflow diamond "
+           "(CondBr) — the strategy dispatch distinguishes the two shapes";
+    EXPECT_EQ(countOpcodeAllBlocks(sm, sfi, MirOpcode::VaHomeArgAreaAddr), 0u)
+        << "SysV does NOT use the Win64 home-area leaf";
+}
+
 // FC12a-struct: `va_arg(ap, struct {long; double})` (a mixed GPR+SSE 16B aggregate,
 // InRegisters under SysV) lowers to the ATOMIC register-gather diamond — BY ADDRESS,
 // never as a bare aggregate value. RED-ON-DISABLE: reverting lowerVaArgAggregate to
@@ -4087,6 +4160,59 @@ TEST(MirLoweringCSubset, VaArgStructOver16BFailsLoud) {
                   "D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT"),
               std::string::npos)
         << "actual: " << L.mirReporter.all()[0].actual;
+}
+
+// Helper: does ANY diagnostic in `r` carry `anchor` in its `actual` text? (The
+// `unsupported()` lowering helper routes its message into `.actual`.)
+[[nodiscard]] inline bool
+anyDiagActualContains(DiagnosticReporter const& r, std::string_view anchor) {
+    for (auto const& d : r.all()) {
+        if (d.actual.find(anchor) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// FC12b (D-FC12B-WIN64-STRUCT-VARARG) fail-loud: `va_arg(ap, struct)` under the
+// Win64 (ms_x64) HomogeneousPointer strategy is DEFERRED — the homogeneous struct
+// gather is the FC12b-struct follow-on. RED-ON-DISABLE: removing the Win64 arm in
+// lowerVaArgAggregate would let it fall through to the SysV by-value gather (a silent
+// wrong-ABI struct read) and flip mir.ok true.
+TEST(MirLoweringCSubset, Win64VaArgStructFailsLoud) {
+    auto L = lowerCSubset(
+        "struct Pt { int a; int b; };\n"   // 8B, would be InRegisters under SysV
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct Pt p = va_arg(ap, struct Pt);\n"
+        "  va_end(ap);\n"
+        "  return p.a + p.b;\n"
+        "}\n",
+        "x86_64", "ms_x64");
+    EXPECT_FALSE(L.mir.ok)
+        << "va_arg of a struct under Win64 must FAIL LOUD (D-FC12B-WIN64-STRUCT-VARARG)";
+    EXPECT_TRUE(anyDiagActualContains(L.mirReporter, "D-FC12B-WIN64-STRUCT-VARARG"))
+        << "the fail-loud must cite the Win64 struct-vararg anchor";
+}
+
+// FC12b (D-FC12B-WIN64-STRUCT-VARARG) fail-loud: passing a struct BY VALUE to a
+// Win64 (ms_x64) variadic CALLEE is DEFERRED — the caller-side homogeneous
+// placement is the FC12b-struct follow-on. RED-ON-DISABLE: removing the Win64 arm
+// in the Call arg loop lets the SysV-shaped gpSaveCount fit-check run on Win64's
+// zeroed save-counts (mis-message at best, silent split at worst).
+TEST(MirLoweringCSubset, Win64StructByValueVarargCallFailsLoud) {
+    auto L = lowerCSubset(
+        "struct Pt { int a; int b; };\n"
+        "int sink(int n, ...);\n"
+        "int main(void) {\n"
+        "  struct Pt p; p.a = 1; p.b = 2;\n"
+        "  return sink(1, p);\n"          // struct BY VALUE to a Win64 variadic fn
+        "}\n",
+        "x86_64", "ms_x64");
+    EXPECT_FALSE(L.mir.ok)
+        << "a struct-by-value vararg to a Win64 variadic fn must FAIL LOUD "
+           "(D-FC12B-WIN64-STRUCT-VARARG)";
+    EXPECT_TRUE(anyDiagActualContains(L.mirReporter, "D-FC12B-WIN64-STRUCT-VARARG"))
+        << "the caller-side fail-loud must cite the Win64 struct-vararg anchor";
 }
 
 // A variadic callee whose FIXED params overflow to the stack (more fixed integer

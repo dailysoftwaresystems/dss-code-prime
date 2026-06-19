@@ -177,8 +177,20 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
         analyzeLayout = target.aggregateLayout();
         analyzeLayout->bitFieldStrategy = effectiveBfStrategy;
     }
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2): thread the RESOLVED CC's
+    // va_list lowering strategy so the semantic `va_list`-type injection sizes the
+    // `ap` local per ABI (SysV __va_list_tag[1]=24B vs Win64 char*=8B). Read from
+    // the SAME resolved CC the MirLoweringConfig reads its `vaListLayout` from
+    // (below); `nullopt` when the CC declares no variadic-callee ABI ⇒ the
+    // SysV-family default (a CC with no vaListLayout has no variadic-callee surface
+    // anyway, so the injected type is inert).
+    std::optional<VaListStrategy> analyzeVaStrategy;
+    if (auto const* cc = target.callingConvention(callingConventionIndex);
+        cc != nullptr && cc->vaListLayout.has_value()) {
+        analyzeVaStrategy = cc->vaListLayout->strategy;
+    }
     auto model = analyze(
-        std::move(borrowed), format.dataModel(), analyzeLayout);
+        std::move(borrowed), format.dataModel(), analyzeLayout, analyzeVaStrategy);
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
         return std::nullopt;

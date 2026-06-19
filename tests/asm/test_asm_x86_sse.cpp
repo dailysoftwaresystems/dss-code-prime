@@ -123,6 +123,35 @@ buildLegalizeAssemble(SseFixture const& f, DiagnosticReporter& rep,
 
 // ── ADDSD xmm0, xmm1 (in-place: result==op[0]==xmm0) ──────────────
 
+// ── FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): MOVQ r64, xmm (the FP-vararg dup) ──
+TEST(X86Sse, MovqXmmToGprEmits_66_48_0F_7E_CA) {
+    // FC12b PART 5 byte-pin: `movq_xmm_to_gpr rdx, xmm1` (the Win64 FP-vararg
+    // duplication into the home integer reg) — MOVQ r/m64, xmm = 66 REX.W 0F 7E /r.
+    //   66 (mandatory operand-size prefix), 48 (REX.W=1, no R/B — both regs < 8),
+    //   0F 7E (opcode), ModR/M mod=3 reg=xmm1(1) rm=rdx(2) → 0b11_001_010 = 0xCA.
+    // The xmm SOURCE rides ModR/M.reg (the wired operand); the r64 DESTINATION rides
+    // ModR/M.rm (the result slot). A wrong opcode/direction (e.g. 0F 6E, the
+    // r64→xmm form) would copy the wrong way → the callee reads garbage.
+    auto f = loadSse();
+    auto const movqOp = f.schema->opcodeByMnemonic("movq_xmm_to_gpr");
+    ASSERT_TRUE(movqOp.has_value());
+    LirReg const rdx  = physReg(*f.schema, "rdx",  LirRegClass::GPR);
+    LirReg const xmm1 = physReg(*f.schema, "xmm1", LirRegClass::FPR);
+    DiagnosticReporter rep;
+    auto bytes = buildLegalizeAssemble(f, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = { LirOperand::makeReg(xmm1) };
+        (void)b.addInst(*movqOp, rdx, ops);
+    });
+    EXPECT_EQ(rep.errorCount(), 0u);
+    if (rep.errorCount() != 0u) dumpDiagnostics(rep);
+    ASSERT_GE(bytes.size(), 5u);
+    EXPECT_EQ(bytes[0], 0x66);
+    EXPECT_EQ(bytes[1], 0x48);
+    EXPECT_EQ(bytes[2], 0x0F);
+    EXPECT_EQ(bytes[3], 0x7E);
+    EXPECT_EQ(bytes[4], 0xCA);
+}
+
 TEST(X86Sse, AddsdXmm0Xmm1Emits_F2_0F_58_C1) {
     // fadd xmm0, xmm0, xmm1 → ADDSD xmm0, xmm1:
     //   F2 (mandatory prefix) 0F 58 (opcode)

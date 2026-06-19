@@ -66,7 +66,11 @@ struct RewrittenBundle {
 [[nodiscard]] RewrittenBundle
 lowerThroughRewrite(std::string src, std::uint16_t ccIndex = 0,
                     std::string targetName = "x86_64") {
-    RewrittenBundle out{lowerCSubsetToLir(std::move(src), std::move(targetName))};
+    // FC12b: the MIR config + analyze() va_list strategy must come from the SAME CC
+    // the regalloc uses (ccIndex) — otherwise a ccIndex=1 (ms_x64) regalloc would run
+    // over MIR lowered for cc0 (SysV), mixing ABIs. Thread ccIndex into the fixture.
+    RewrittenBundle out{lowerCSubsetToLir(std::move(src), std::move(targetName),
+                                          ccIndex)};
     if (!out.lowered.lir.ok) return out;
     out.liveness = analyzeLiveness(out.lowered.lir.lir);
     out.alloc = allocateRegisters(out.lowered.lir.lir, *out.lowered.target,
@@ -894,6 +898,205 @@ TEST(LirCallconvAbi, SysVCcDeclaresVariadicVectorCountReg) {
         << cc->variadicVectorCountReg->name
         << "' must resolve in the target's register table.";
     EXPECT_EQ(*ord, cc->variadicVectorCountReg->ordinal);
+}
+
+TEST(LirCallconvAbi, MsX64VaListLayoutIsHomogeneousPointer) {
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE) config pin: the ms_x64 CC declares the
+    // HomogeneousPointer va_list strategy with an 8-byte slot stride, and — because
+    // Win64 spills into the caller's home space (no callee-local register-save-area)
+    // — its regSaveAreaBytes() is 0. A regression that pasted SysV's register-save
+    // geometry (gpSaveCount/fpSaveCount) onto ms_x64 would size a phantom 176-byte
+    // zone into every Win64 variadic frame; this pin catches it red-on-disable.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const* msX64 = (*target)->callingConventionByName("ms_x64");
+    ASSERT_NE(msX64, nullptr) << "x86_64 must declare 'ms_x64'";
+    ASSERT_TRUE(msX64->vaListLayout.has_value())
+        << "ms_x64 must declare a vaListLayout (the Win64 variadic-callee ABI)";
+    EXPECT_EQ(msX64->vaListLayout->strategy, VaListStrategy::HomogeneousPointer);
+    EXPECT_EQ(msX64->vaListLayout->namedArgSlotBytes, 8u);
+    EXPECT_EQ(msX64->vaListLayout->regSaveAreaBytes(), 0u)
+        << "Win64 HomogeneousPointer has NO callee-local register-save-area — it "
+           "spills into the caller's home space; regSaveAreaBytes() MUST be 0.";
+}
+
+TEST(LirCallconvAbi, SysVVaListLayoutUntouchedBySysVRegisterSave) {
+    // FC12b SysV-untouched guard: the FC12b strategy tagging must NOT perturb the
+    // SysV vaListLayout — it stays SysVRegisterSave with the §3.5.7 geometry
+    // (6 GPR + 8 SSE save slots = 176B). A regression flipping the SysV strategy or
+    // dropping its save-counts would silently break the (still-shipping) SysV
+    // varargs path; this pin keeps them byte-stable.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const* sysv = (*target)->callingConventionByName("sysv_amd64");
+    ASSERT_NE(sysv, nullptr) << "x86_64 must declare 'sysv_amd64'";
+    ASSERT_TRUE(sysv->vaListLayout.has_value());
+    EXPECT_EQ(sysv->vaListLayout->strategy, VaListStrategy::SysVRegisterSave);
+    EXPECT_EQ(sysv->vaListLayout->gpSaveCount, 6u);
+    EXPECT_EQ(sysv->vaListLayout->fpSaveCount, 8u);
+    EXPECT_EQ(sysv->vaListLayout->regSaveAreaBytes(), 176u);
+    // namedArgSlotBytes is additive (== gpSlotBytes on SysV) and behavior-identical.
+    EXPECT_EQ(sysv->vaListLayout->namedArgSlotBytes, 8u);
+}
+
+TEST(LirCallconvAbi, Win64VariadicCalleeHomeBaseCongruenceNoShadow) {
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-1) CONGRUENCE PIN (red-on-
+    // disable). Lower a Win64 (ms_x64, cc index 1) variadic CALLEE end-to-end and
+    // assert that BOTH the `va_home_arg_area` materialization (the `lea` va_start
+    // base) AND the prologue home-spill stores use the byte-identical NO-SHADOW base
+    // `totalFrameSize + callPushBytes` — never `+ shadowSpaceBytes`. If anyone adds
+    // shadowSpaceBytes to either, the va_start base and/or every home-spill target
+    // jumps 32 bytes past the home space → va_arg reads garbage. Also pins
+    // vaRegSaveAreaSize == 0 (Win64 has no callee-local register-save zone).
+    auto bundle = lowerThroughRewrite(
+        "int sum(int n, ...) {\n"
+        "    va_list ap; va_start(ap, n);\n"
+        "    int t = va_arg(ap, int);\n"
+        "    va_end(ap);\n"
+        "    return t;\n"
+        "}\n",
+        /*ccIndex=*/1);
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "Win64 variadic callee failed to lower";
+    ASSERT_TRUE(bundle.alloc.ok());
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* cc = bundle.lowered.target->callingConventionByName("ms_x64");
+    ASSERT_NE(cc, nullptr);
+    ASSERT_GT(cc->shadowSpaceBytes, 0u) << "ms_x64 must declare shadow space for the "
+                                           "no-shadow pin to be meaningful";
+
+    // `sum` is function 0. Its FrameLayout: vaRegSaveAreaSize MUST be 0 (Win64).
+    auto const* layout = result.forFuncByIndex(0);
+    ASSERT_NE(layout, nullptr);
+    EXPECT_EQ(layout->vaRegSaveAreaSize, 0u)
+        << "Win64 HomogeneousPointer reserves NO callee-local register-save-area";
+
+    std::uint32_t const noShadowBase =
+        layout->totalFrameSize + static_cast<std::uint32_t>(cc->callPushBytes);
+    std::uint32_t const withShadowBase =
+        noShadowBase + static_cast<std::uint32_t>(cc->shadowSpaceBytes);
+
+    // Resolve the lea opcode (va_home materializes to lea) + the GPR store opcode
+    // (home spill) + the first integer arg reg ordinal (rcx) for the spill check.
+    auto const leaOp = bundle.lowered.target->opcodeByMnemonic("lea");
+    ASSERT_TRUE(leaOp.has_value());
+    auto const storeOp = bundle.lowered.target->opcodeByMnemonic("store");
+    ASSERT_TRUE(storeOp.has_value());
+    ASSERT_FALSE(cc->argGprs.empty());
+    auto const rcxOrd = bundle.lowered.target->registerByName(cc->argGprs[0]);
+    ASSERT_TRUE(rcxOrd.has_value());
+
+    // Helper: the MemOffset operand value of an inst (the [sp + disp] disp), or
+    // nullopt if the inst has no MemOffset operand.
+    auto memOffsetOf = [](Lir const& lir, LirInstId inst) -> std::optional<std::int32_t> {
+        for (auto const& op : lir.instOperands(inst)) {
+            if (op.kind == LirOperandKind::MemOffset) return op.offset;
+        }
+        return std::nullopt;
+    };
+
+    // Scan function 0's blocks. The va_home base is the EXPECTED no-shadow value
+    // `noShadowBase + namedArgCount*8`; namedArgCount = 1 (the single fixed `n`).
+    std::uint32_t const expectedHomeBase = noShadowBase + 1u * layout->outgoingSlotSize;
+    bool sawVaHomeLeaAtNoShadow = false;
+    bool sawHomeSpillRcxAtNoShadow = false;
+    LirFuncId const fn = result.lir.funcAt(0);
+    for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+        LirBlockId const blk = result.lir.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < result.lir.blockInstCount(blk); ++i) {
+            LirInstId const inst = result.lir.blockInstAt(blk, i);
+            std::uint16_t const op = result.lir.instOpcode(inst);
+            auto const off = memOffsetOf(result.lir, inst);
+            if (!off.has_value()) continue;
+            if (op == *leaOp
+                && static_cast<std::uint32_t>(*off) == expectedHomeBase) {
+                sawVaHomeLeaAtNoShadow = true;
+            }
+            // The home spill of rcx (arg reg 0) targets the no-shadow base + 0.
+            if (op == *storeOp
+                && static_cast<std::uint32_t>(*off) == noShadowBase) {
+                for (auto const& o : result.lir.instOperands(inst)) {
+                    if (o.kind == LirOperandKind::Reg && o.reg.isPhysical != 0
+                        && o.reg.id == *rcxOrd) {
+                        sawHomeSpillRcxAtNoShadow = true;
+                    }
+                }
+            }
+            // Anti-pin: NO va-related lea/store may sit at the WITH-shadow base
+            // (would mean shadowSpaceBytes leaked into the home geometry).
+            EXPECT_NE(static_cast<std::uint32_t>(*off), withShadowBase)
+                << "a va_home/home-spill at the WITH-shadow base "
+                << withShadowBase << " means shadowSpaceBytes leaked into the Win64 "
+                   "home geometry (BLOCKER-1 violated) — every va_arg reads garbage";
+        }
+    }
+    EXPECT_TRUE(sawVaHomeLeaAtNoShadow)
+        << "the va_start home base (lea) must be totalFrameSize + callPushBytes + "
+           "namedArgCount*slot = " << expectedHomeBase << " (NO shadowSpaceBytes)";
+    EXPECT_TRUE(sawHomeSpillRcxAtNoShadow)
+        << "the named int reg (rcx) home spill must target totalFrameSize + "
+           "callPushBytes = " << noShadowBase << " (== the va_arg-read base; the "
+           "spill-target == va_arg-read-target congruence)";
+}
+
+TEST(LirCallconvAbi, Win64VariadicCallDupsFpVarargIntoHomeGpr) {
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, PART 5) FP-dup callconv pin: a Win64
+    // (ms_x64, cc index 1) variadic CALL with a register-resident FP vararg must
+    // emit a `movq_xmm_to_gpr` duplicating the FP vararg into its matching home
+    // integer register. Without the dup, the callee's va_arg(double) reads an
+    // uninitialized home GPR slot → garbage. RED-ON-DISABLE: deleting the FP-dup
+    // emission removes the only `movq_xmm_to_gpr` in the call sequence.
+    auto bundle = lowerThroughRewrite(
+        "double take(int n, ...);\n"
+        "int main(void) {\n"
+        "  return (int)take(1, 2.5);\n"   // one int fixed arg + one double vararg
+        "}\n",
+        /*ccIndex=*/1);
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.alloc.ok());
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const movqOp =
+        bundle.lowered.target->opcodeByMnemonic("movq_xmm_to_gpr");
+    ASSERT_TRUE(movqOp.has_value());
+    auto const* cc = bundle.lowered.target->callingConventionByName("ms_x64");
+    ASSERT_NE(cc, nullptr);
+    ASSERT_GE(cc->argGprs.size(), 2u);
+    // The double vararg is slot 1 (slot 0 = the fixed int `n`); its home GPR is
+    // argGprs[1] (rdx). The dup writes that GPR.
+    auto const homeGprOrd =
+        bundle.lowered.target->registerByName(cc->argGprs[1]);
+    ASSERT_TRUE(homeGprOrd.has_value());
+
+    bool sawDupIntoHomeGpr = false;
+    for (std::uint32_t fi = 0; fi < result.lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = result.lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < result.lir.blockInstCount(blk); ++i) {
+                LirInstId const inst = result.lir.blockInstAt(blk, i);
+                if (result.lir.instOpcode(inst) != *movqOp) continue;
+                LirReg const r = result.lir.instResult(inst);
+                if (r.valid() && r.isPhysical != 0 && r.id == *homeGprOrd)
+                    sawDupIntoHomeGpr = true;
+            }
+        }
+    }
+    EXPECT_TRUE(sawDupIntoHomeGpr)
+        << "a Win64 variadic call with an FP vararg must emit `movq_xmm_to_gpr` "
+           "duplicating the FP vararg into its home GPR (" << cc->argGprs[1] << ")";
 }
 
 TEST(CallPayload, EncodeDecodeRoundtripsVariadicAndFixedCount) {

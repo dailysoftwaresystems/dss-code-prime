@@ -186,6 +186,12 @@ enum class MnemonicSlot : std::uint8_t {
     // VaRegSaveArea = &(the variadic prologue's register-save-area); VaOverflowArgArea
     // = &(the incoming overflow stack args). Declared in every schema for uniformity.
     VaRegSaveArea, VaOverflowArgArea,
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start
+    // base. Like the two above but PAYLOAD-carrying (the named-arg slot count);
+    // lir_callconv materializes it to `lea result, [sp + totalFrameSize +
+    // callPushBytes + payload*outgoingSlotSize]` — the NO-SHADOW contiguous home
+    // base (BLOCKER-1). Its presence ALSO triggers the Win64 prologue home-spill.
+    VaHomeArgArea,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -276,6 +282,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::ReadIndirectResult, "read_indirect_result"},
     {MnemonicSlot::VaRegSaveArea,      "va_reg_save_area"},
     {MnemonicSlot::VaOverflowArgArea,  "va_overflow_arg_area"},
+    {MnemonicSlot::VaHomeArgArea,      "va_home_arg_area"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -1112,6 +1119,8 @@ struct Lowerer {
             case MirOpcode::VaOverflowArgAreaAddr:
                 return lowerVaFrameAddr(id, MnemonicSlot::VaOverflowArgArea,
                                         "MIR VaOverflowArgAreaAddr");
+            case MirOpcode::VaHomeArgAreaAddr:
+                return lowerVaHomeArgArea(id);
             case MirOpcode::Const:  return lowerConst(id);
             case MirOpcode::Add:    return lowerBinaryOp(id, MnemonicSlot::Add);
             case MirOpcode::Sub:    return lowerBinaryOp(id, MnemonicSlot::Sub);
@@ -1364,6 +1373,21 @@ struct Lowerer {
         }
         LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
         emitInst(*opcode(slot), result, std::span<LirOperand const>{}, /*payload=*/0);
+        defineValue(id, result);
+    }
+
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start
+    // base. Like lowerVaFrameAddr but THREADS the MIR payload (the named-arg slot
+    // count) into the LIR op — lir_callconv reads it to compute the contiguous home
+    // offset `totalFrameSize + callPushBytes + payload*outgoingSlotSize`.
+    void lowerVaHomeArgArea(MirInstId id) {
+        if (!opcode(MnemonicSlot::VaHomeArgArea).has_value()) {
+            reportMissingOpcode(MnemonicSlot::VaHomeArgArea, "MIR VaHomeArgAreaAddr");
+            return;
+        }
+        LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
+        emitInst(*opcode(MnemonicSlot::VaHomeArgArea), result,
+                 std::span<LirOperand const>{}, /*payload=*/mir.instPayload(id));
         defineValue(id, result);
     }
 

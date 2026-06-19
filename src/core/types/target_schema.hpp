@@ -395,7 +395,25 @@ struct DSS_EXPORT TargetRegisterClassOps {
 // arg regs (xmm0..xmm7) into a register-save-area; `va_arg` reads the next slot of
 // the right class from there until the per-class offset hits its limit, then walks
 // the overflow (incoming stack-arg) area.
+//
+// FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the `VaListStrategy` closed enum that
+// keys every va seam lives in `aggregate_layout.hpp` (included above) — the same
+// link/target-substrate-free home as `AggregateClassKind`/`BitFieldStrategy`, so
+// the SEMANTIC `va_list`-type injection can read the strategy without pulling this
+// target/link substrate (the layering precedent `AggregateLayoutParams` set).
 struct VaListLayout {
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the lowering strategy — the FIRST field
+    // so every consumer reads it before any strategy-specific field. Defaults to
+    // SysVRegisterSave for back-compat (a `vaListLayout` block that omits "strategy"
+    // is the pre-FC12b SysV shape).
+    VaListStrategy strategy = VaListStrategy::SysVRegisterSave;
+
+    // The stride one named/variadic arg slot occupies when walking the contiguous
+    // home+overflow area (HomogeneousPointer) OR — on SysVRegisterSave — the GPR
+    // slot stride (== gpSlotBytes; the overflow walk's per-slot quantum). Win64 = 8.
+    // Read on BOTH arms; the SysV arm uses it as the stack-arg stride, the Win64 arm
+    // as the uniform va_arg bump.
+    std::uint32_t namedArgSlotBytes = 0;
     // One field of the `__va_list_tag` struct: its byte offset within the tag and
     // its width (the four SysV fields are gp_offset@0/w4, fp_offset@4/w4,
     // overflow_arg_area@8/w8, reg_save_area@16/w8). Offset/width are CONFIG so a CC

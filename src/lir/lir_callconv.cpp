@@ -297,24 +297,29 @@ functionHasCalls(Lir const& src, LirFuncId fn,
     return false;
 }
 
-// FC12a-core (D-FC12A-VARIADIC-CALLEE): does function `fn` call va_start? Detected
-// by the presence of a `va_reg_save_area` virtual op (HIR→MIR emits it inside the
-// va_start lowering, MIR→LIR lowers it to this opcode). The presence — NOT the
-// FnSig's isVariadic bit — is the precise signal: a variadic function that NEVER
-// calls va_start needs no register-save-area (it never reads the varargs), so the
-// op-presence test reserves the zone + spills the arg regs exactly when needed.
-// `vaRegSaveAreaOp == 0` (a CC without a vaListLayout — the optional handle) ⇒ the
-// op never matches, so every non-variadic-callee target answers false uniformly.
+// FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): does
+// function `fn` call va_start? Detected by the presence of the CC's va_start BASE op
+// — `va_reg_save_area` on SysVRegisterSave (the prologue spills the arg regs into a
+// save-area) OR `va_home_arg_area` on Win64 HomogeneousPointer (the prologue spills
+// the named int regs into the home slots). HIR→MIR emits one of these inside the
+// va_start lowering. The presence — NOT the FnSig's isVariadic bit — is the precise
+// signal: a variadic function that NEVER calls va_start needs neither spill (it never
+// reads the varargs), so the op-presence test triggers the prologue spill exactly
+// when needed. A `0` op handle (a CC that does not declare that strategy's op) never
+// matches, so a non-variadic-callee target answers false uniformly.
 [[nodiscard]] bool
 functionUsesVaStart(Lir const& src, LirFuncId fn,
-                    std::uint16_t vaRegSaveAreaOp) noexcept {
-    if (vaRegSaveAreaOp == 0) return false;
+                    std::uint16_t vaRegSaveAreaOp,
+                    std::uint16_t vaHomeArgAreaOp) noexcept {
+    if (vaRegSaveAreaOp == 0 && vaHomeArgAreaOp == 0) return false;
     std::uint32_t const blockCount = src.funcBlockCount(fn);
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
         LirBlockId const blk = src.funcBlockAt(fn, bi);
         std::uint32_t const instN = src.blockInstCount(blk);
         for (std::uint32_t i = 0; i < instN; ++i) {
-            if (src.instOpcode(src.blockInstAt(blk, i)) == vaRegSaveAreaOp)
+            std::uint16_t const op = src.instOpcode(src.blockInstAt(blk, i));
+            if ((vaRegSaveAreaOp != 0 && op == vaRegSaveAreaOp)
+                || (vaHomeArgAreaOp != 0 && op == vaHomeArgAreaOp))
                 return true;
         }
     }
@@ -591,6 +596,18 @@ struct OpcodeHandles {
     // inst in a function is also this pass's "function called va_start" signal.
     std::uint16_t vaRegSaveArea;
     std::uint16_t vaOverflowArgArea;
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start
+    // base, materialized into `lea result, [sp + totalFrameSize + callPushBytes +
+    // payload*outgoingSlotSize]` (NO shadow — BLOCKER-1). Optional (only the Win64
+    // CC's lowering emits it); absent ⇒ field 0, never matches. Its presence is also
+    // the Win64 prologue home-spill signal (functionUsesVaStart detects it too).
+    std::uint16_t vaHomeArgArea;
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the xmm→r64 bit-copy (`movq_xmm_to_gpr`)
+    // the caller emits to DUPLICATE each Win64 FP vararg into its matching integer
+    // (home) register. Optional (x86_64 declares it; arm64 does not — AAPCS64 passes
+    // FP varargs differently). Absent ⇒ 0; the FP-dup path requires it and fails loud
+    // if a HomogeneousPointer CC reaches the dup with the opcode missing.
+    std::uint16_t movqXmmToGpr;
 };
 
 // FC2 Part B: resolve the class-correct opcode for a register-data-
@@ -677,28 +694,85 @@ void emitEpilogue(LirBuilder& b, FrameLayout const& layout,
 resolveCcReg(TargetSchema const& schema, std::string_view name, LirRegClass cls,
              std::string_view contextLabel, DiagnosticReporter& reporter);
 
-// FC12a-core (D-FC12A-VARIADIC-CALLEE): emit the variadic register-save-area spill
-// in the prologue of a function that calls va_start. SysV §3.5.7: spill the integer
-// arg regs (rdi..r9, `gpSaveCount` of them at `gpSlotBytes` stride) then the SSE arg
-// regs (xmm0..7, `fpSaveCount` at `fpSlotBytes` stride, the SSE block AFTER the GPR
-// block) into the save area at `vaRegSaveAreaOffset()`. `va_start` later sets
-// reg_save_area = &this zone and reads slots via gp_offset/fp_offset.
+// FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): emit
+// the variadic prologue arg-register spill, STRATEGY-DISPATCHED on the CC's
+// vaListLayout.
 //
-// The SSE block is spilled UNCONDITIONALLY (all `fpSaveCount` registers), which is
-// byte-correct: va_arg only ever reads an fp slot whose fp_offset cursor is below
-// the SSE limit AND that the source actually consumed, so spilling caller-garbage
-// into unused slots is never observed. The SysV `al`-GATED form (skip the SSE block
-// when al==0) is a SIZE optimization that needs conditional-branch emission in this
-// otherwise straight-line callconv pass — anchored D-FC12A-VARIADIC-AL-GATED-SPILL
-// (trigger: the callconv pass gains branch/cmp emission, or a profile shows the
-// 128-byte spill matters). Correctness does not depend on it.
+//   * SysVRegisterSave (SysV §3.5.7): spill the integer arg regs (rdi..r9,
+//     `gpSaveCount` at `gpSlotBytes` stride) then the SSE arg regs (xmm0..7,
+//     `fpSaveCount` at `fpSlotBytes` stride, the SSE block AFTER the GPR block) into
+//     the register-save-area at `vaRegSaveAreaOffset()`. `va_start` sets
+//     reg_save_area = &this zone and reads slots via gp_offset/fp_offset. The SSE
+//     block is spilled UNCONDITIONALLY (al-gated skip is anchored
+//     D-FC12A-VARIADIC-AL-GATED-SPILL; correctness does not depend on it).
+//   * HomogeneousPointer (Win64): spill the FULL integer home register pool
+//     (argGprs[0..min(4,argGprs)-1] = rcx/rdx/r8/r9; NOT named-arg-count-bounded —
+//     the VARARG home slots must be initialized too) into their HOME slots at the CONTIGUOUS
+//     no-shadow base `totalFrameSize + callPushBytes + i*outgoingSlotSize` — the
+//     SAME base the va_home_arg_area leaf materializes (BLOCKER-1 congruence), so
+//     spill-target == va_arg-read-target. NO register-save-area (vaRegSaveAreaSize
+//     stays 0). NO SSE spill: an FP vararg is duplicated into its home GPR slot by
+//     the CALLER (the FP-dup in the variadic-call path), and a named FP arg is read
+//     by name (never via va_arg), so the callee spills no XMMs here.
+//   * Aapcs64DualCursor: fail loud (realized in FC12c).
 [[nodiscard]] bool
-emitVariadicRegSaveSpill(LirBuilder& b, FrameLayout const& layout,
-                         TargetSchema const& schema,
-                         TargetCallingConvention const& cc, LirReg sp,
-                         DiagnosticReporter& reporter) {
+emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
+                          TargetSchema const& schema,
+                          TargetCallingConvention const& cc, LirReg sp,
+                          DiagnosticReporter& reporter) {
     if (!cc.vaListLayout.has_value()) return true;   // guarded by caller, defensive
     VaListLayout const& vl = *cc.vaListLayout;
+
+    if (vl.strategy == VaListStrategy::HomogeneousPointer) {
+        // Win64 home spill: store the integer home registers (rcx/rdx/r8/r9) into
+        // their home slots at the contiguous no-shadow base. CRITICAL: spill ALL
+        // `min(4, argGprs)` of them, NOT just the `namedArgCount` named ones — the
+        // VARARG home slots (slots namedArgCount..3) carry varargs the caller passed
+        // in registers (rdx/r8/r9), and `va_arg` reads them FROM THE HOME SLOTS, so a
+        // named-only spill would leave the vararg slots uninitialized → va_arg reads
+        // garbage (the exact bug a named-only bound caused). The named slots
+        // (the named ones, not the varargs) are redundantly spilled — harmless (the
+        // body reads its named params via the `arg` SSA values from the same
+        // registers). This is the standard MSVC variadic prologue (spill the full
+        // integer home space). FP varargs ride the matching home GPR via the caller's
+        // FP-dup, so spilling the GPRs alone covers both int AND fp varargs — no XMM
+        // spill here. The home base is byte-identical to the va_home_arg_area
+        // materialization (BLOCKER-1); the congruence pin asserts the two base
+        // expressions match. (The va_home base multiplier — the named-arg slot count —
+        // rides the VaHomeArgAreaAddr MIR payload, NOT this spill, which
+        // unconditionally covers the full integer home pool.)
+        std::uint32_t const homeBase =
+            layout.totalFrameSize
+            + static_cast<std::uint32_t>(cc.callPushBytes);
+        auto const gpStore = classOpHandle(schema, LirRegClass::GPR, RegClassOp::Store,
+                                           "callconv: Win64 home GPR spill", reporter);
+        if (!gpStore.has_value()) return false;
+        // The home space holds exactly the integer arg-register pool (4 on Win64).
+        std::uint32_t const gpN =
+            static_cast<std::uint32_t>(cc.argGprs.size());
+        for (std::uint32_t i = 0; i < gpN; ++i) {
+            auto const reg = resolveCcReg(schema, cc.argGprs[i], LirRegClass::GPR,
+                                          "callconv: Win64 home GPR spill", reporter);
+            if (!reg.has_value()) return false;
+            emitFrameStore(b, *gpStore, *reg, sp,
+                           static_cast<std::int32_t>(
+                               homeBase + i * layout.outgoingSlotSize));
+        }
+        return true;
+    }
+
+    if (vl.strategy != VaListStrategy::SysVRegisterSave) {
+        // Aapcs64DualCursor (or any future un-handled strategy): fail loud rather
+        // than silently run the SysV spill on a layout it does not describe.
+        report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+               DiagnosticSeverity::Error,
+               std::format("callconv: variadic prologue spill for va_list strategy "
+                           "'{}' is not realized (D-FC12B-WIN64-VARIADIC-CALLEE / "
+                           "FC12c)", vaListStrategyName(vl.strategy)));
+        return false;
+    }
+
+    // ── SysVRegisterSave ──
     std::uint32_t const base = layout.vaRegSaveAreaOffset();
 
     // Integer arg regs → [sp + base + i*gpSlotBytes]. Spill min(gpSaveCount,
@@ -984,7 +1058,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 16> const table{{
+    std::array<Entry, 18> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -1027,6 +1101,8 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // declares them). Absent ⇒ field 0; never matches a real input opcode.
         {&OpcodeHandles::vaRegSaveArea,     "va_reg_save_area",     true},
         {&OpcodeHandles::vaOverflowArgArea, "va_overflow_arg_area", true},
+        {&OpcodeHandles::vaHomeArgArea,     "va_home_arg_area",     true},
+        {&OpcodeHandles::movqXmmToGpr,      "movq_xmm_to_gpr",      true},
     }};
     for (auto const& [field, mnem, optional] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
@@ -1111,15 +1187,22 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     // i to the same alloca as the count pre-scan visited.
     std::vector<std::uint32_t> const localAllocaPayloads =
         functionLocalAllocaPayloads(src, fn, h.alloca_);
-    // FC12a-core (D-FC12A-VARIADIC-CALLEE): does this function call va_start? If so
-    // (and the CC declares a vaListLayout), reserve the register-save-area zone the
-    // prologue spills the arg regs into. The op-presence test + the CC's
-    // has_value() guard together keep this fully config-driven + fail-safe: a CC
-    // with no vaListLayout never reserves the zone (vaRegSaveAreaOp stays 0).
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-CALLEE):
+    // does this function call va_start? Detected by the presence of EITHER va_start
+    // base op — `va_reg_save_area` (SysV) or `va_home_arg_area` (Win64). The op-
+    // presence test + the CC's has_value() guard keep this fully config-driven +
+    // fail-safe: a CC with no vaListLayout declares neither op (handles stay 0).
     bool const usesVaStart =
-        functionUsesVaStart(src, fn, h.vaRegSaveArea) && cc.vaListLayout.has_value();
+        functionUsesVaStart(src, fn, h.vaRegSaveArea, h.vaHomeArgArea)
+        && cc.vaListLayout.has_value();
+    // FC12b: the register-save-area zone is a SysVRegisterSave construct ONLY. Win64
+    // HomogeneousPointer spills into the caller's home space (no callee-local zone),
+    // so vaRegSaveAreaSize stays 0 there (gated on the strategy, not just presence).
+    bool const usesSysVRegSave =
+        usesVaStart
+        && cc.vaListLayout->strategy == VaListStrategy::SysVRegisterSave;
     std::uint32_t const vaRegSaveAreaBytes =
-        usesVaStart ? cc.vaListLayout->regSaveAreaBytes() : 0u;
+        usesSysVRegSave ? cc.vaListLayout->regSaveAreaBytes() : 0u;
     auto layoutOpt = computeFrameLayout(alloc, schema, cc,
                                         std::move(usedSaved),
                                         hasCalls, outgoingArgSlots,
@@ -1166,12 +1249,15 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             emitPrologue(b, outLayout, schema, sp, h.sub, reporter,
                          prologueOk);
             if (!prologueOk) return false;
-            // FC12a-core (D-FC12A-VARIADIC-CALLEE): a function that calls va_start
-            // spills its arg registers into the register-save-area immediately after
-            // the prologue's SP-adjust + saved-reg stores (so reg_save_area, set by
-            // va_start, points at live values). Straight-line stores — no CFG.
+            // FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-
+            // CALLEE): a function that calls va_start spills its arg registers
+            // immediately after the prologue's SP-adjust + saved-reg stores (so the
+            // save-area / home space, addressed by va_start, points at live values).
+            // The spill is strategy-dispatched (SysV register-save vs Win64 home);
+            // straight-line stores — no CFG.
             if (usesVaStart
-                && !emitVariadicRegSaveSpill(b, outLayout, schema, cc, sp, reporter))
+                && !emitVariadicPrologueSpill(b, outLayout, schema, cc, sp,
+                                              reporter))
                 return false;
         }
 
@@ -1400,11 +1486,47 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                            "'lea' + a physical-reg result (D-FC12A-VARIADIC-CALLEE)");
                     return false;
                 }
+                // FC12b (BLOCKER-1) WARNING: this `totalFrameSize + callPushBytes`
+                // base ALSO equals the Win64 va_home_arg_area home base — BUT the
+                // Win64 home base must NOT include `shadowSpaceBytes` (the home space
+                // IS the caller's shadow space, so adding shadow would skip it). The
+                // Win64 home is a SEPARATE op (`va_home_arg_area`, materialized below
+                // WITHOUT the shadow term). Do NOT remove the shadow term here to
+                // "share" with Win64, and do NOT add a shadow term to the Win64 arm
+                // without revisiting the entire Win64 va_arg walk — every va_arg
+                // would then read one home-slot too far (a silent miscompile the
+                // congruence pin in test_lir_callconv guards).
                 std::int32_t const ovfOffset = static_cast<std::int32_t>(
                     outLayout.totalFrameSize
                     + static_cast<std::uint32_t>(cc.callPushBytes)
                     + static_cast<std::uint32_t>(cc.shadowSpaceBytes));
                 emitFrameAddr(b, h.lea, result, sp, ovfOffset);
+                continue;
+            }
+            // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-1): the Win64
+            // HomogeneousPointer va_start base. The named-arg home space
+            // (rcx/rdx/r8/r9 slots, = the caller's shadow space) and the 5th+ stack
+            // args are CONTIGUOUS from `totalFrameSize + callPushBytes` (NO
+            // shadowSpaceBytes — the home space IS the shadow space). `ap` =
+            // base + namedArgCount*outgoingSlotSize positions past ALL named args
+            // (home OR stack), so the linear va_arg walk crosses home→overflow
+            // correctly. The named-arg slot count rides the MIR payload. This base is
+            // byte-identical to the prologue home-spill target (emitVariadicPrologue
+            // Spill) — the congruence pin asserts that symmetry.
+            if (h.vaHomeArgArea != 0 && op == h.vaHomeArgArea) {
+                if (h.lea == 0 || !result.valid() || result.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                           DiagnosticSeverity::Error,
+                           "callconv: va_home_arg_area materialization needs 'lea' "
+                           "+ a physical-reg result (D-FC12B-WIN64-VARIADIC-CALLEE)");
+                    return false;
+                }
+                std::uint32_t const namedArgCount = src.instPayload(inst);
+                std::int32_t const homeOffset = static_cast<std::int32_t>(
+                    outLayout.totalFrameSize
+                    + static_cast<std::uint32_t>(cc.callPushBytes)
+                    + namedArgCount * outLayout.outgoingSlotSize);
+                emitFrameAddr(b, h.lea, result, sp, homeOffset);
                 continue;
             }
 
@@ -1511,6 +1633,24 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 std::vector<ArgMove> argMoves;
                 std::vector<StackArgStore> stackStores;
                 argMoves.reserve(ops.size());
+                // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, PART 5): Win64 passes each FP
+                // VARARG in BOTH the XMM and the matching integer (home) register; the
+                // callee's va_arg(double) reads the home (GPR) slot. So the CALLER
+                // DUPLICATES each register-resident FP vararg into argGprs[slot] via
+                // `movq_xmm_to_gpr`. DERIVED from the strategy (no free-floating bool):
+                // the dup fires only for a variadic call under HomogeneousPointer.
+                // Fixed FP params + overflow (stack) FP args are NOT duplicated.
+                bool const win64FpDup =
+                    ::dss::call_payload::isVariadic(payload)
+                    && cc.vaListLayout.has_value()
+                    && cc.vaListLayout->strategy
+                           == VaListStrategy::HomogeneousPointer;
+                std::uint32_t const fixedOperandCnt =
+                    ::dss::call_payload::fixedOperandCount(payload);
+                // Each dup: store the FP vararg's home GPR (dest) ← its xmm dest reg
+                // (src). Emitted AFTER the arg moves (the xmm holds the value by then)
+                // — the home GPR is the vararg slot's GPR, read by no other arg move.
+                std::vector<ArgMove> fpDupMoves;
                 // FC7 C3 (AAPCS64/Apple x8 sret): a `hasIndirectResult` call
                 // PREPENDS the sret pointer at ops[1] (right after the callee at
                 // ops[0]). It is routed to the cc's indirect-result register (x8),
@@ -1576,6 +1716,24 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                           "materializeOneFunc: call", reporter);
                         if (!destReg.has_value()) return false;
                         argMoves.push_back({*destReg, srcReg});
+                        // FC12b PART 5: a register-resident FP VARARG under Win64 also
+                        // duplicates into its home integer reg argGprs[slot]. Win64 is
+                        // slot-aligned so `argIndex` IS the slot index; argGprs[slot]
+                        // pairs with argFprs[slot]. Only the VARARG region (operand
+                        // index past the fixed operands) is duplicated.
+                        std::size_t const argRegionIdx = i - firstArgIdx;
+                        if (win64FpDup && cls == LirRegClass::FPR
+                            && argRegionIdx >= fixedOperandCnt
+                            && argIndex
+                                   < static_cast<std::uint32_t>(cc.argGprs.size())) {
+                            auto const homeGpr = resolveCcReg(
+                                schema, cc.argGprs[argIndex], LirRegClass::GPR,
+                                "materializeOneFunc: Win64 FP-vararg dup", reporter);
+                            if (!homeGpr.has_value()) return false;
+                            // dest = home GPR, src = the xmm dest (filled by the arg
+                            // move). Stored in fpDupMoves; emitted after arg moves.
+                            fpDupMoves.push_back({*homeGpr, *destReg});
+                        }
                     } else {
                         // D-ML7-2.2 stack-arg overflow: spill srcReg
                         // into THIS fn's outgoing-args area at
@@ -1735,6 +1893,30 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                    static_cast<unsigned>(calleeOp.reg.id)));
                         return false;
                     }
+                    // FC12b PART 5: a Win64 FP-vararg dup writes a home GPR
+                    // (argGprs[slot]); if an indirect callee was parked there it would
+                    // be clobbered before the call. The regalloc indirect-callee
+                    // arg-reg exclusion already keeps the callee out of argGprs, so
+                    // this is a backstop converting any regression into a loud error
+                    // (never a silent jump-through-a-duplicated-vararg).
+                    for (auto const& m : fpDupMoves) {
+                        if (m.dest.id == calleeOp.reg.id) {
+                            report(reporter,
+                                   DiagnosticCode::
+                                       L_IndirectCalleeClobberedByArgSetup,
+                                   DiagnosticSeverity::Error,
+                                   std::format(
+                                       "callconv: Win64 variadic call inst {}'s Reg "
+                                       "callee (reg #{}) is the home integer register "
+                                       "of an FP vararg — the FP-dup would overwrite "
+                                       "the callee before the call consumes it "
+                                       "(regalloc indirect-callee arg-reg exclusion "
+                                       "invariant violated upstream)",
+                                       inst.v,
+                                       static_cast<unsigned>(calleeOp.reg.id)));
+                            return false;
+                        }
+                    }
                 }
                 // D-ML7-2.2 (closed 2026-06-02): emit stack-arg
                 // stores FIRST, before any register move. The
@@ -1766,6 +1948,29 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         reporter);
                     if (!argMov.has_value()) return false;
                     maybeMov(b, *argMov, m.dest, m.src);
+                }
+                // FC12b PART 5: emit the Win64 FP-vararg GPR duplications AFTER the
+                // arg moves (the xmm dest now holds the value). Each is `movq_xmm_to_
+                // gpr homeGpr, xmm` — a cross-class bit-copy of the FP vararg into its
+                // home integer register so the callee's va_arg(double) reads it from
+                // the home slot. The home GPR is the vararg slot's GPR (read by no arg
+                // move), so emitting last is safe. Fail loud if the opcode is missing.
+                if (!fpDupMoves.empty()) {
+                    if (h.movqXmmToGpr == 0) {
+                        report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                               DiagnosticSeverity::Error,
+                               std::format("callconv: Win64 variadic call inst {} needs "
+                                           "'movq_xmm_to_gpr' to duplicate an FP vararg "
+                                           "into its home integer register, but the "
+                                           "target schema does not declare it "
+                                           "(D-FC12B-WIN64-VARIADIC-CALLEE)", inst.v));
+                        return false;
+                    }
+                    for (auto const& m : fpDupMoves) {
+                        // dest = home GPR (result slot), src = the xmm (wired operand).
+                        std::array<LirOperand, 1> dupOps{LirOperand::makeReg(m.src)};
+                        b.addInst(h.movqXmmToGpr, m.dest, dupOps);
+                    }
                 }
                 // D-LANG-VARIADIC (step 13.4): when the call is
                 // variadic AND the cc declares a vector-arg count

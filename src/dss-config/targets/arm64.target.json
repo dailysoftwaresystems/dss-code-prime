@@ -71,6 +71,16 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (FC12b, D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start base (&home[namedArgCount]). Declared for substrate uniformity; AAPCS64 uses the dual-cursor strategy (FC12c) and never emits this op. No encoding (materialized away by lir_callconv).",
+      "mnemonic":      "va_home_arg_area",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "AAPCS64 has no native `mov reg, reg` instruction — the canonical encoding is `ORR Xd, XZR, Xm` (32-bit fixed word 0xAA0003E0 = base + Rn=XZR=31; Rd and Rm via slots). LIR's `mov` is 2-operand (result + 1 source); 3-address natively (no requires2Address).",
       "mnemonic":      "mov",
       "result":        "value",

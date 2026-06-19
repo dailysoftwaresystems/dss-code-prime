@@ -1664,16 +1664,61 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                             out.byteOffset = f.at("byteOffset").get<std::uint32_t>();
                             out.widthBytes = f.at("widthBytes").get<std::uint32_t>();
                         };
-                        readField("gpOffsetField",       layout.gpOffsetField);
-                        readField("fpOffsetField",       layout.fpOffsetField);
-                        readField("overflowArgAreaField", layout.overflowArgAreaField);
-                        readField("regSaveAreaField",    layout.regSaveAreaField);
-                        readU32("gpSaveCount",   layout.gpSaveCount);
-                        readU32("gpSlotBytes",   layout.gpSlotBytes);
-                        readU32("fpSaveCount",   layout.fpSaveCount);
-                        readU32("fpSlotBytes",   layout.fpSlotBytes);
-                        readU32("gpOffsetLimit", layout.gpOffsetLimit);
-                        readU32("fpOffsetLimit", layout.fpOffsetLimit);
+                        // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the lowering
+                        // strategy gates WHICH fields are required. ABSENT defaults
+                        // to SysVRegisterSave (the pre-FC12b shape — back-compat).
+                        if (vl.contains("strategy")) {
+                            if (!vl.at("strategy").is_string()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/vaListLayout/strategy", ccPath),
+                                          "'strategy' must be a string");
+                                vlOk = false;
+                            } else {
+                                auto const sname =
+                                    vl.at("strategy").get<std::string>();
+                                auto const s = vaListStrategyFromName(sname);
+                                if (!s.has_value()) {
+                                    coll.emit(DiagnosticCode::C_MalformedJson,
+                                              std::format("{}/vaListLayout/strategy", ccPath),
+                                              std::format("unknown va_list strategy '{}' "
+                                                          "(sysv_register_save / "
+                                                          "homogeneous_pointer / "
+                                                          "aapcs64_dual_cursor)", sname));
+                                    vlOk = false;
+                                } else {
+                                    layout.strategy = *s;
+                                }
+                            }
+                        }
+                        // Branch the remaining parse on the strategy. SysVRegisterSave
+                        // requires the full register-save geometry; HomogeneousPointer
+                        // requires only namedArgSlotBytes; Aapcs64DualCursor accepts
+                        // the block (consumers fail loud until FC12c). namedArgSlotBytes
+                        // is required on every realized arm.
+                        switch (layout.strategy) {
+                            case VaListStrategy::SysVRegisterSave:
+                                readField("gpOffsetField",        layout.gpOffsetField);
+                                readField("fpOffsetField",        layout.fpOffsetField);
+                                readField("overflowArgAreaField", layout.overflowArgAreaField);
+                                readField("regSaveAreaField",     layout.regSaveAreaField);
+                                readU32("gpSaveCount",   layout.gpSaveCount);
+                                readU32("gpSlotBytes",   layout.gpSlotBytes);
+                                readU32("fpSaveCount",   layout.fpSaveCount);
+                                readU32("fpSlotBytes",   layout.fpSlotBytes);
+                                readU32("gpOffsetLimit", layout.gpOffsetLimit);
+                                readU32("fpOffsetLimit", layout.fpOffsetLimit);
+                                readU32("namedArgSlotBytes", layout.namedArgSlotBytes);
+                                break;
+                            case VaListStrategy::HomogeneousPointer:
+                                readU32("namedArgSlotBytes", layout.namedArgSlotBytes);
+                                break;
+                            case VaListStrategy::Aapcs64DualCursor:
+                                // Declared-but-not-realized: accept any block (the
+                                // consumers fail loud). Still require namedArgSlotBytes
+                                // so a future FC12c finds a sane slot stride.
+                                readU32("namedArgSlotBytes", layout.namedArgSlotBytes);
+                                break;
+                        }
                         if (vlOk) cc.vaListLayout = layout;
                     }
                 }

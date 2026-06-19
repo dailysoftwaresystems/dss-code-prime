@@ -162,6 +162,51 @@ bitFieldStrategyFromName(std::string_view s) noexcept {
     return std::nullopt;
 }
 
+// FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the per-CC va_list TYPE + va_start/va_arg/
+// va_end lowering STRATEGY. A CLOSED, config-declared enum — every va seam
+// (semantic `va_list` type injection, HIR→MIR lowering, LIR prologue spill)
+// switches on THIS, never on cc.name / arch / format identity (the established
+// `AggregateClassKind` / `BitFieldStrategy` precedent). Lives HERE (NOT
+// target_schema.hpp) for the same layering reason `AggregateClassKind` does: the
+// SEMANTIC va_list-type injection reads the strategy to size the `ap` local WITHOUT
+// pulling the link/target substrate. The geometry FIELDS the strategy gates live on
+// `VaListLayout` (target_schema.hpp); the SysV arm reads them, Win64 reads only
+// `namedArgSlotBytes`, AAPCS64 is fail-loud-until-FC12c.
+//
+//   * SysVRegisterSave   — SysV AMD64 §3.5.7: `__va_list_tag[1]` (24B), a
+//     register-save-area the prologue spills the arg regs into, and a per-class
+//     gp_offset/fp_offset reg-vs-overflow walk.
+//   * HomogeneousPointer — Microsoft x64: `va_list` is a plain `char*` (8B). The
+//     named args' home space (rcx/rdx/r8/r9 slots) and the stack overflow are
+//     CONTIGUOUS in the caller's outgoing area, so `va_arg` is a LINEAR pointer bump
+//     by `namedArgSlotBytes` (8) — no register-save-area, no diamond. The callee
+//     prologue spills the named integer arg regs into the home slots. FP varargs
+//     are read from the home (GPR) slot, so the CALLER duplicates each FP vararg
+//     into the matching integer register (lir_callconv, strategy-gated).
+//   * Aapcs64DualCursor  — AAPCS64/Apple: the dual gr/vr cursor `__va_list` (FC12c).
+enum class VaListStrategy : std::uint8_t {
+    SysVRegisterSave   = 0,  // SysV AMD64 §3.5.7 register-save-area + per-class walk
+    HomogeneousPointer = 1,  // Win64: a `char*` into the contiguous home+overflow area
+    Aapcs64DualCursor  = 2,  // AAPCS64/Apple dual-cursor (declared; realized in FC12c)
+};
+
+[[nodiscard]] constexpr std::string_view
+vaListStrategyName(VaListStrategy s) noexcept {
+    switch (s) {
+        case VaListStrategy::SysVRegisterSave:   return "sysv_register_save";
+        case VaListStrategy::HomogeneousPointer: return "homogeneous_pointer";
+        case VaListStrategy::Aapcs64DualCursor:  return "aapcs64_dual_cursor";
+    }
+    return {};
+}
+[[nodiscard]] constexpr std::optional<VaListStrategy>
+vaListStrategyFromName(std::string_view s) noexcept {
+    if (s == "sysv_register_save")  return VaListStrategy::SysVRegisterSave;
+    if (s == "homogeneous_pointer") return VaListStrategy::HomogeneousPointer;
+    if (s == "aapcs64_dual_cursor") return VaListStrategy::Aapcs64DualCursor;
+    return std::nullopt;
+}
+
 // The per-ABI aggregate-layout parameter block parsed from `.target.json`. A
 // default-constructed value is NOT valid (scalarAlignment 0 / maxAlignment 0 —
 // the loader requires both; validate() rejects a zero/non-pow2 maxAlignment).
