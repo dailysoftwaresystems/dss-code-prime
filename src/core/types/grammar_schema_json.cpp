@@ -3520,6 +3520,32 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     checkToken(cfg.variadicMarkerToken, "variadicMarkerToken");
                 }
             }
+            // `variadicArgsName` (C's `__VA_ARGS__`) is OPTIONAL and only
+            // meaningful alongside `variadicMarkerToken`: it is the IDENTIFIER
+            // that, inside a variadic macro's replacement, expands to the
+            // trailing arguments. It is matched by LEXEME TEXT in the replacement
+            // (an ordinary identifier, NOT a token kind -- like the directive
+            // WORDS define/undef/include), so it is validated only as a NON-EMPTY
+            // string when present (no `checkToken` -- there is no token kind to
+            // resolve). Absent -> the language declares no variadic catch-all
+            // identifier. (FC13 cycle 3 -- D-PP-VARIADIC-MACRO.)
+            if (pp.contains("variadicArgsName")) {
+                if (!pp.at("variadicArgsName").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/variadicArgsName",
+                              "'preprocess.variadicArgsName' must be a string");
+                } else {
+                    cfg.variadicArgsName =
+                        pp.at("variadicArgsName").get<std::string>();
+                    if (cfg.variadicArgsName.empty()) {
+                        coll.emit(
+                            DiagnosticCode::C_InvalidPreprocess,
+                            "/preprocess/variadicArgsName",
+                            "'preprocess.variadicArgsName' must be a non-empty "
+                            "string when present");
+                    }
+                }
+            }
 
             data.preprocess = std::move(cfg);
         }

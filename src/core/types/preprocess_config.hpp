@@ -112,6 +112,22 @@ struct DSS_EXPORT PreprocessConfig {
     // it is `checkToken`-validated at load (C_UnknownToken) like the other
     // tokens. (FC13 cycle 2 review fold.)
     std::string variadicMarkerToken;
+
+    // The IDENTIFIER that, inside a VARIADIC macro's replacement list, expands to
+    // the trailing (un-named) arguments (C's `__VA_ARGS__` -> matched by TEXT,
+    // like the directive WORDS define/undef/include, because it is an ordinary
+    // identifier in the replacement, NOT a distinct token kind). The macro engine
+    // substitutes a replacement `Word` whose text == this for the comma-joined
+    // trailing-argument token sequence; the SAME identifier appearing in a
+    // NON-variadic macro is a constraint violation (fail loud). Like the variadic
+    // marker this is a per-language CONFIG spelling, NOT a hard-coded
+    // `__VA_ARGS__`: a second preprocess-opting language whose catch-all
+    // identifier differs is then substituted correctly (agnosticism). OPTIONAL
+    // and only meaningful alongside `variadicMarkerToken`; empty means the
+    // language declares no variadic catch-all identifier. When present it is
+    // validated as a NON-EMPTY string at load (C_InvalidPreprocess). (FC13
+    // cycle 3 -- D-PP-VARIADIC-MACRO.)
+    std::string variadicArgsName;
 };
 
 } // namespace dss

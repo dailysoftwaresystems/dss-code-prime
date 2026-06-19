@@ -28,7 +28,8 @@
     "functionLikeOpenToken": "ParenOpen",
     "functionLikeCloseToken": "ParenClose",
     "functionLikeArgSeparatorToken": "Comma",
-    "variadicMarkerToken": "EllipsisOp"
+    "variadicMarkerToken": "EllipsisOp",
+    "variadicArgsName": "__VA_ARGS__"
   },
 
   "lexerModes": {

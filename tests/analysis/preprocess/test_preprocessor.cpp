@@ -293,14 +293,216 @@ TEST(Preprocessor, FunctionLikeMacroEmptyAndZeroParen) {
     }
 }
 
-// VARIADIC `#define V(...)` is recognized but DEFERRED (D-PP-VARIADIC-MACRO):
-// it must fail loud (P_PreprocessorUnsupported), never be silently accepted.
-TEST(Preprocessor, VariadicMacroDefinitionFailsLoud) {
+// FC13 cycle 3 (D-PP-VARIADIC-MACRO): variadic `__VA_ARGS__` macros now WORK.
+// This is the FLIP of the cycle-2 `VariadicMacroDefinitionFailsLoud` guard
+// (which pinned the now-removed P_PreprocessorUnsupported fail-loud for a
+// `#define V(...)`). The case (a) witness: a named-param-PLUS-variadic macro
+// substitutes both the named arg AND the trailing args at `__VA_ARGS__`.
+// RED-ON-DISABLE: reverting the `__VA_ARGS__` arm in `substitute` (so the
+// catch-all is not replaced) leaves `__VA_ARGS__` literally in the stream and
+// this exact-token check fails; reverting the parseParamList accept (so `...`
+// fails loud again) makes the define error and lexs is wrong.
+TEST(Preprocessor, VariadicMacroNamedPlusVaArgsExpands) {
     PreprocessResult r;
-    auto lexs = ppLexemes("#define V(...) 0\nint v = 0;\n", r);
-    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
-        << "a variadic macro must fail loud (deferred to FC15-area)";
+    auto lexs =
+        ppLexemes("#define LOG(fmt, ...) f(fmt, __VA_ARGS__)\n"
+                  "int v = LOG(7, 1, 2);\n",
+                  r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a well-formed variadic macro must not error";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "a variadic macro definition must now be ACCEPTED";
+    // int v = f ( 7 , 1 , 2 ) ;
+    ASSERT_EQ(lexs.size(), 12u) << "expected: int v = f ( 7 , 1 , 2 ) ;";
+    EXPECT_EQ(lexs[0], "int");
+    EXPECT_EQ(lexs[1], "v");
+    EXPECT_EQ(lexs[2], "=");
+    EXPECT_EQ(lexs[3], "f");
+    EXPECT_EQ(lexs[4], "(");
+    EXPECT_EQ(lexs[5], "7") << "the named fmt arg substitutes";
+    EXPECT_EQ(lexs[6], ",") << "the original separator comma is preserved";
+    EXPECT_EQ(lexs[7], "1") << "__VA_ARGS__ substitutes the first trailing arg";
+    EXPECT_EQ(lexs[8], ",") << "the trailing args keep their original commas";
+    EXPECT_EQ(lexs[9], "2");
+    EXPECT_EQ(lexs[10], ")");
+    EXPECT_EQ(lexs[11], ";");
+}
+
+// CASE (b): a ZERO-NAMED variadic macro `#define V(...) g(__VA_ARGS__)`. Every
+// argument is a trailing arg -> the whole list rides __VA_ARGS__ (commas
+// preserved). RED-ON-DISABLE: a wrong named-count split (e.g. binding the first
+// arg to a non-existent named param) drops or misplaces an argument.
+TEST(Preprocessor, VariadicMacroZeroNamedAllArgsAreVaArgs) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define V(...) g(__VA_ARGS__)\nint v = V(1,2,3);\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int v = g ( 1 , 2 , 3 ) ;
+    ASSERT_EQ(lexs.size(), 12u) << "expected: int v = g ( 1 , 2 , 3 ) ;";
+    EXPECT_EQ(lexs[3], "g");
+    EXPECT_EQ(lexs[4], "(");
+    EXPECT_EQ(lexs[5], "1");
+    EXPECT_EQ(lexs[6], ",");
+    EXPECT_EQ(lexs[7], "2");
+    EXPECT_EQ(lexs[8], ",");
+    EXPECT_EQ(lexs[9], "3");
+    EXPECT_EQ(lexs[10], ")");
+    EXPECT_EQ(lexs[11], ";");
+}
+
+// CASE (c): EMPTY variadic part (C23 6.10.3p4 allows the `...` to match zero
+// arguments). `LOG("x")` supplies the named `fmt` but NO trailing args, so
+// `__VA_ARGS__` substitutes to NOTHING. RED-ON-DISABLE: requiring >= 1 trailing
+// arg (a pre-C23 arity floor) would fail loud here; an unsubstituted
+// `__VA_ARGS__` would leave the identifier in the stream.
+TEST(Preprocessor, VariadicMacroEmptyVaArgsIsC23Allowed) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define LOG(fmt, ...) f(fmt, __VA_ARGS__)\n"
+                          "int v = LOG(7);\n",
+                          r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "an empty variadic part is allowed (C23) -- must NOT fail loud";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroArgument))
+        << "an empty __VA_ARGS__ must not trip the arity floor";
+    // int v = f ( 7 , ) ;  -- __VA_ARGS__ vanished; the literal comma between
+    // fmt and __VA_ARGS__ in the replacement remains (no GNU comma-elision in
+    // this cycle -- that is FC15's `,##__VA_ARGS__`).
+    ASSERT_EQ(lexs.size(), 9u) << "expected: int v = f ( 7 , ) ;";
+    EXPECT_EQ(lexs[3], "f");
+    EXPECT_EQ(lexs[4], "(");
+    EXPECT_EQ(lexs[5], "7");
+    EXPECT_EQ(lexs[6], ",") << "the replacement's literal comma stays (no GNU "
+                               "comma-elision in this cycle)";
+    EXPECT_EQ(lexs[7], ")") << "__VA_ARGS__ with no trailing args is empty";
+    EXPECT_EQ(lexs[8], ";");
+}
+
+// CASE (d): a TRAILING arg that is itself a MACRO is PRE-EXPANDED (C 6.10.3.1)
+// before it is gathered into __VA_ARGS__, exactly like a named arg.
+// `#define N 7` then `V(N, N)` -> the __VA_ARGS__ run is `7 , 7`, not `N , N`.
+// RED-ON-DISABLE: skipping the per-trailing-arg `expand()` leaves `N` tokens.
+TEST(Preprocessor, VariadicMacroTrailingArgIsMacroPreExpanded) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#define N 7\n#define V(...) g(__VA_ARGS__)\nint v = V(N,N);\n",
+                  r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int v = g ( 7 , 7 ) ;
+    ASSERT_EQ(lexs.size(), 10u) << "expected: int v = g ( 7 , 7 ) ;";
+    EXPECT_EQ(lexs[3], "g");
+    EXPECT_EQ(lexs[5], "7") << "a trailing macro arg must be pre-expanded";
+    EXPECT_EQ(lexs[6], ",");
+    EXPECT_EQ(lexs[7], "7");
+    EXPECT_EQ(lexs[8], ")");
+    EXPECT_EQ(lexs[9], ";");
+}
+
+// I1 (review fold): C 6.10.3p6 -- the catch-all identifier `__VA_ARGS__` may NOT
+// be used as a parameter NAME. RED-ON-DISABLE: removing the parseParamList guard
+// accepts the name (in a variadic macro the catch-all silently shadows it; in a
+// non-variadic one it binds with no diagnostic).
+TEST(Preprocessor, VaArgsNameAsParameterNameFailsLoud) {
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#define F(__VA_ARGS__) F\nint v = 0;\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "__VA_ARGS__ as a sole parameter name must fail loud";
+    }
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#define G(a, __VA_ARGS__) a\nint v = 0;\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "__VA_ARGS__ as a named parameter (alongside others) must fail loud";
+    }
+}
+
+// T1 (review fold): a parenthesized comma in a TRAILING arg is PROTECTED --
+// `J((1,2),3)` is TWO trailing args `(1,2)` and `3` (the inner depth-2 comma is
+// not a separator). RED-ON-DISABLE: depth-blind splitting yields three args.
+TEST(Preprocessor, VariadicParenthesizedCommaTrailingArgIsOneArg) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#define J(...) g(__VA_ARGS__)\nint v = J((1,2),3);\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int v = g ( ( 1 , 2 ) , 3 ) ;
+    ASSERT_EQ(lexs.size(), 14u) << "expected: int v = g ( ( 1 , 2 ) , 3 ) ;";
+    EXPECT_EQ(lexs[3], "g");
+    EXPECT_EQ(lexs[4], "(");
+    EXPECT_EQ(lexs[5], "(");
+    EXPECT_EQ(lexs[6], "1");
+    EXPECT_EQ(lexs[7], ",") << "the inner (depth-2) comma is protected";
+    EXPECT_EQ(lexs[8], "2");
+    EXPECT_EQ(lexs[9], ")");
+    EXPECT_EQ(lexs[10], ",") << "the depth-1 comma separates the two trailing args";
+    EXPECT_EQ(lexs[11], "3");
+    EXPECT_EQ(lexs[12], ")");
+    EXPECT_EQ(lexs[13], ";");
+}
+
+// T1 (review fold): `__VA_ARGS__` used MULTIPLE times in one replacement --
+// every occurrence substitutes (no consume-once state). RED-ON-DISABLE: a
+// stateful single-use substitution would drop the second copy.
+TEST(Preprocessor, VaArgsUsedTwiceExpandsBoth) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#define D(...) __VA_ARGS__ __VA_ARGS__\nint v = D(7);\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int v = 7 7 ;
+    ASSERT_EQ(lexs.size(), 6u) << "expected: int v = 7 7 ;";
+    EXPECT_EQ(lexs[3], "7");
+    EXPECT_EQ(lexs[4], "7") << "__VA_ARGS__ used twice substitutes twice";
+    EXPECT_EQ(lexs[5], ";");
+}
+
+// CASE (e): a `...` that is NOT last in the parameter list fails loud
+// (`#define BAD(a, ..., b)`). RED-ON-DISABLE: accepting a mid-list `...` (no
+// last-element check) would silently mis-define the macro.
+TEST(Preprocessor, VariadicMarkerNotLastFailsLoud) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define BAD(a, ..., b) 0\nint v = 0;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "a `...` that is not the last parameter must fail loud";
     (void)lexs;
+}
+
+// CASE (f): too FEW arguments (fewer than the NAMED count) fails loud. `P` has
+// TWO named params + variadic; `P(1)` supplies only ONE argument (< 2 named).
+// (Note `P(1)`/`P(1,2)` collect 1/2 argument GROUPS; the variadic floor is the
+// NAMED count, so 1 < 2 is too few but 2 >= 2 -- with an empty variadic part --
+// is fine, C23.) RED-ON-DISABLE: dropping the `args.size() < params.size()`
+// floor mis-substitutes a named param from an absent argument with no error.
+TEST(Preprocessor, VariadicMacroTooFewArgsFailsLoud) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define P(a, b, ...) f(a, b, __VA_ARGS__)\n"
+                          "int v = P(1);\n",
+                          r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroArgument))
+        << "a variadic macro invoked with fewer than its named-param count "
+           "must fail loud";
+    (void)lexs;
+}
+
+// CASE (g): `__VA_ARGS__` in a NON-variadic macro is a constraint violation
+// (C 6.10.3p5) -- fail loud at DEFINITION. RED-ON-DISABLE: removing the
+// definition-time guard lets `__VA_ARGS__` leak as a plain identifier (or be
+// mis-handled) with no diagnostic.
+TEST(Preprocessor, VaArgsInNonVariadicMacroFailsLoud) {
+    {
+        // Object-like macro.
+        PreprocessResult r;
+        auto lexs = ppLexemes("#define OBJ __VA_ARGS__\nint v = 0;\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "__VA_ARGS__ in an object-like macro must fail loud";
+        (void)lexs;
+    }
+    {
+        // Non-variadic function-like macro.
+        PreprocessResult r;
+        auto lexs =
+            ppLexemes("#define F(a) g(a, __VA_ARGS__)\nint v = 0;\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "__VA_ARGS__ in a non-variadic function-like macro must fail loud";
+        (void)lexs;
+    }
 }
 
 // DUPLICATE parameter name fails loud (C 6.10.3p6): #define F(a,a) ...
@@ -591,6 +793,64 @@ TEST(Preprocessor, FunctionLikeCloseAndSeparatorAreConfigDrivenNotHardcoded) {
             << "with the `,` separator rebound away, `CNT(a,b)` collects ONE "
                "argument (no arity error) -- proving the separator is read from "
                "config, not hard-coded as Comma";
+    }
+}
+
+// RED-ON-DISABLE: `__VA_ARGS__` is CONFIG-DRIVEN (`preprocess.variadicArgsName`),
+// NOT a hard-coded `__VA_ARGS__` lexeme. We rebind `variadicArgsName` from
+// `__VA_ARGS__` to a DIFFERENT identifier (`__REST__`) and reload. Now (1) a
+// macro using `__REST__` as the catch-all expands correctly, and (2) the OLD
+// spelling `__VA_ARGS__` is just an ordinary identifier -- so it does NOT
+// substitute (it passes through verbatim, and in a non-variadic context does
+// NOT trip the misuse guard, which keys on the configured name). RED-ON-DISABLE:
+// hard-coding the catch-all as the literal "__VA_ARGS__" ignores the rebind ->
+// `__REST__` would not substitute (test fails) AND `__VA_ARGS__` would wrongly
+// be treated as the catch-all.
+TEST(Preprocessor, VaArgsNameIsConfigDrivenNotHardcoded) {
+    auto schema =
+        reboundCSubset("\"variadicArgsName\": \"__VA_ARGS__\"",
+                       "\"variadicArgsName\": \"__REST__\"",
+                       "<rebound-vaargs-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->preprocess().variadicArgsName, "__REST__");
+
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+
+    // (1) The REBOUND catch-all `__REST__` substitutes the trailing args.
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"#define V(...) g(__REST__)\nint v = V(1,2);\n"},
+            "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        std::vector<std::string> lexs;
+        for (Token const& t : r.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof) continue;
+            if (t.coreKind == CoreTokenKind::Whitespace) continue;
+            if (t.coreKind == CoreTokenKind::Newline) continue;
+            lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+        }
+        // int v = g ( 1 , 2 ) ;
+        ASSERT_EQ(lexs.size(), 10u) << "expected: int v = g ( 1 , 2 ) ;";
+        EXPECT_EQ(lexs[3], "g");
+        EXPECT_EQ(lexs[5], "1");
+        EXPECT_EQ(lexs[6], ",");
+        EXPECT_EQ(lexs[7], "2")
+            << "the REBOUND catch-all __REST__ must substitute the trailing args";
+        EXPECT_EQ(lexs[8], ")");
+        EXPECT_EQ(lexs[9], ";");
+    }
+    // (2) The OLD spelling `__VA_ARGS__` is now an ordinary identifier: in an
+    // object-like macro it does NOT trip the (rebound-name) misuse guard.
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"#define OBJ __VA_ARGS__\nint v = 0;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "with the catch-all rebound to __REST__, the literal __VA_ARGS__ "
+               "is an ordinary identifier and must NOT trip the misuse guard -- "
+               "proving the catch-all name is read from config, not hard-coded";
     }
 }
 

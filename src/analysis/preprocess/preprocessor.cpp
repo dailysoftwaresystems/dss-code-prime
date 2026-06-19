@@ -342,6 +342,15 @@ struct MacroDef {
     // the parameter spelling, not just the replacement text.
     bool                     isFunctionLike = false;
     std::vector<std::string> params;
+    // FC13 cycle 3 (D-PP-VARIADIC-MACRO): a VARIADIC function-like macro
+    // (`#define V(a, ...) ...` or `#define V(...) ...`). `params` still holds the
+    // NAMED parameters declared BEFORE the `...`; `isVariadic` marks that a
+    // trailing `...` catch-all is present, so an invocation binds the first
+    // `params.size()` arguments to the named params and gathers the REST (which
+    // may be empty, C23) into the configured `variadicArgsName` (`__VA_ARGS__`)
+    // catch-all. A non-variadic macro keeps isVariadic=false; `__VA_ARGS__` in
+    // its replacement is then a constraint violation (fail loud).
+    bool                     isVariadic = false;
 };
 
 class MacroExpander {
@@ -492,7 +501,7 @@ private:
         if (p < end && isParenOpen(in[p])
             && in[p].span.start() == in[nameIdx].span.end()) {
             def.isFunctionLike = true;
-            if (!parseParamList(in, p, end, name, def.params)) {
+            if (!parseParamList(in, p, end, name, def.params, def.isVariadic)) {
                 return;  // parseParamList already emitted a fail-loud diagnostic
             }
             // After the parameter list, `p` indexes the token just past `)`;
@@ -508,6 +517,28 @@ private:
             repText.append(text(in[q]));
         }
         def.text = std::move(repText);
+
+        // The variadic catch-all identifier (`__VA_ARGS__`) is valid ONLY inside
+        // a VARIADIC macro's replacement (C 6.10.3p5 / 6.10.3.1p2 constraint:
+        // the identifier `__VA_ARGS__` shall occur only in the replacement-list
+        // of a function-like macro that uses the ellipsis notation). Reject it
+        // HERE, at definition time, in an object-like OR a non-variadic
+        // function-like macro -- catching the misuse where it is DECLARED rather
+        // than waiting for a (possibly absent) invocation. Matched by TEXT (it is
+        // an ordinary identifier), and only when the language actually declares a
+        // catch-all spelling (`variadicArgsName` non-empty).
+        if (!def.isVariadic && !cfg().variadicArgsName.empty()) {
+            for (Token const& r : def.replacement) {
+                if (isWord(r) && text(r) == cfg().variadicArgsName) {
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                           synth_->id(), r.span,
+                           std::string{"'"} + cfg().variadicArgsName
+                               + "' may appear only in a variadic macro's "
+                                 "replacement: " + name);
+                    return;
+                }
+            }
+        }
 
         auto it = table_.find(name);
         if (it != table_.end() && !sameDefinition(it->second, def)) {
@@ -527,23 +558,30 @@ private:
     // redefinition (fail-loud at the call site).
     static bool sameDefinition(MacroDef const& a, MacroDef const& b) {
         return a.isFunctionLike == b.isFunctionLike
+            && a.isVariadic == b.isVariadic
             && a.params == b.params
             && a.text == b.text;
     }
 
     // Parse a function-like macro's parameter list, starting at `open` (the
-    // index of the adjacent `(`). On success fills `out` with the parameter
-    // NAMES in order, advances `open` PAST the closing `)`, and returns true.
-    // On any malformed input emits a fail-loud diagnostic and returns false.
-    // Grammar (C 6.10.3, no variadic in cycle 2):
+    // index of the adjacent `(`). On success fills `out` with the NAMED
+    // parameter names in order, sets `isVariadic` iff a trailing `...` catch-all
+    // is present, advances `open` PAST the closing `)`, and returns true. On any
+    // malformed input emits a fail-loud diagnostic and returns false.
+    // Grammar (C 6.10.3, FC13 cycle 3 -- plain variadic, no `#`/`##`):
     //   ( )                        -> zero parameters
     //   ( id ( , id )* )           -> named parameters, comma-separated
-    // FAIL-LOUD on: a `...` (variadic -- D-PP-VARIADIC-MACRO, out of scope), a
-    // duplicate parameter name, a non-identifier where a parameter is expected,
-    // a missing comma between parameters, or no closing `)` before line end.
+    //   ( ... )                    -> zero named + a variadic catch-all
+    //   ( id ( , id )* , ... )     -> named parameters + a variadic catch-all
+    // The `...` (when the language declares one) must be the LAST element before
+    // `)`; it is accepted (sets isVariadic), NOT a fail-loud as in cycle 2.
+    // FAIL-LOUD on: a `...` that is NOT last (`(a, ..., b)` / a token after the
+    // `...` other than `)`), a duplicate parameter name, a non-identifier where a
+    // parameter is expected, a missing comma between parameters, or no closing
+    // `)` before line end.
     bool parseParamList(std::vector<Token> const& in, std::size_t& open,
                         std::size_t end, std::string const& macroName,
-                        std::vector<std::string>& out) {
+                        std::vector<std::string>& out, bool& isVariadic) {
         std::size_t q = skipTrivia(in, open + 1);  // first token after `(`
         // Empty list `()` -> zero parameters.
         if (q < end && isParenClose(in[q])) {
@@ -559,20 +597,29 @@ private:
                            + macroName);
                 return false;
             }
-            // A variadic marker (C's `...`) in parameter position is a VARIADIC
-            // macro -- recognized but deferred (D-PP-VARIADIC-MACRO, FC15-area).
-            // Detect it by the CONFIGURED token KIND (`variadicMarkerToken`),
-            // NOT by the hard-coded `...` lexeme: a second preprocess-opting
-            // language whose variadic marker is spelled differently would
-            // otherwise have a word-like marker silently accepted as a named
-            // parameter. The `.valid()` guard means a language that declares no
-            // variadic form simply never matches here (the marker falls through
-            // to the not-a-Word fail-loud below).
+            // A variadic marker (C's `...`) in parameter position makes this a
+            // VARIADIC macro (C 6.10.3p4). Detected by the CONFIGURED token KIND
+            // (`variadicMarkerToken`), NOT the hard-coded `...` lexeme: a second
+            // preprocess-opting language whose variadic marker is spelled
+            // differently is parsed correctly (the `.valid()` guard means a
+            // language declaring no variadic form never matches here -- the
+            // marker then falls through to the not-a-Word fail-loud below). The
+            // `...` must be LAST: the only thing allowed after it is the closing
+            // `)`. We reach this arm at the START of the list (`(...)`) and after
+            // each comma (`(a, ...)`), so requiring `)` next rejects the mid-list
+            // form `(a, ..., b)` and a stray token after `...`.
             if (isVariadicMarker(in[q])) {
-                emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported,
-                       synth_->id(), in[q].span,
-                       std::string{"variadic macro is not supported "
-                                   "(D-PP-VARIADIC-MACRO): "}
+                std::size_t r = skipTrivia(in, q + 1);
+                if (r < end && isParenClose(in[r])) {
+                    isVariadic = true;
+                    open = r + 1;
+                    return true;
+                }
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(),
+                       (r < end ? in[r].span : in[q].span),
+                       std::string{"variadic '...' must be the last element of "
+                                   "the macro parameter list: "}
                            + macroName);
                 return false;
             }
@@ -585,6 +632,20 @@ private:
                 return false;
             }
             std::string param{text(in[q])};
+            // C 6.10.3p6: the configured catch-all identifier (`__VA_ARGS__`)
+            // shall NOT be used as a parameter NAME. Reject it loudly so the
+            // substitute() invariant ("`__VA_ARGS__` is not a valid parameter
+            // name") actually holds -- otherwise `#define F(__VA_ARGS__) ...`
+            // silently binds a parameter the variadic catch-all later shadows.
+            if (!cfg().variadicArgsName.empty()
+                && param == cfg().variadicArgsName) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(), in[q].span,
+                       std::string{"'"} + cfg().variadicArgsName
+                           + "' may not be used as a macro parameter name: "
+                           + macroName);
+                return false;
+            }
             for (std::string const& seen : out) {
                 if (seen == param) {
                     emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
@@ -658,12 +719,17 @@ private:
     // comma-separated-groups rule, `(x)` is ONE argument and `()` is ONE EMPTY
     // argument; the special zero-PARAMETER case (`M()` for a 0-arg macro = zero
     // arguments, C 6.10.3p4) is normalized by the CALLER (which knows
-    // params.size()). On success returns the arguments and sets `past` to the
-    // index JUST PAST the matching close. On EOF before the matching close,
-    // emits a fail-loud diagnostic and returns std::nullopt.
+    // params.size()). The depth-1 SEPARATOR tokens are also recorded into
+    // `separators` (one per top-level comma -> `args.size()-1` entries): a
+    // VARIADIC macro re-joins the trailing arguments with the ORIGINAL separator
+    // tokens to form `__VA_ARGS__` (preserving the source commas, C 6.10.3p4),
+    // rather than synthesizing one. On success returns the arguments and sets
+    // `past` to the index JUST PAST the matching close. On EOF before the
+    // matching close, emits a fail-loud diagnostic and returns std::nullopt.
     std::optional<std::vector<std::vector<Token>>>
     collectArgs(std::span<Token const> in, std::size_t open,
-                std::string const& macroName, std::size_t& past) {
+                std::string const& macroName, std::size_t& past,
+                std::vector<Token>& separators) {
         std::vector<std::vector<Token>> args;
         std::vector<Token>              cur;
         int depth = 1;                 // start just inside the opening `(`
@@ -689,9 +755,12 @@ private:
             }
             if (depth == 1 && isArgSeparator(t)) {
                 // Top-level separator: close current argument, start the next.
+                // Record the separator token verbatim (the variadic catch-all
+                // re-joins trailing args with these ORIGINAL commas).
                 trimArgTrivia(cur);
                 args.push_back(std::move(cur));
                 cur.clear();
+                separators.push_back(t);
                 continue;
             }
             cur.push_back(t);
@@ -706,15 +775,28 @@ private:
     }
 
     // Build the substituted replacement list for a function-like call: each
-    // replacement token that IS a parameter name is replaced by that
-    // parameter PRE-EXPANDED argument tokens (C 6.10.3.1); every other
-    // replacement token passes through unchanged. No `#`/`##` handling (FC15).
-    // `expandedArgs[k]` is the fully-expanded argument for `params[k]`.
+    // replacement token that IS a NAMED parameter is replaced by that
+    // parameter's PRE-EXPANDED argument tokens (C 6.10.3.1); in a VARIADIC macro,
+    // a replacement `Word` whose text == the configured `variadicArgsName`
+    // (`__VA_ARGS__`) is replaced by the PRE-EXPANDED, comma-joined trailing
+    // arguments (`vaArgs`, possibly EMPTY -> substitutes to nothing, C23); every
+    // other replacement token passes through unchanged. No `#`/`##` handling
+    // (FC15). `expandedArgs[k]` is the fully-expanded argument for `params[k]`.
+    // The `__VA_ARGS__` check precedes the named-parameter scan, but they cannot
+    // collide -- `__VA_ARGS__` is not a valid parameter NAME (it is the catch-all
+    // identifier), and a non-variadic macro that mentions it was already rejected
+    // at definition time.
     std::vector<Token> substitute(
         MacroDef const& def,
-        std::vector<std::vector<Token>> const& expandedArgs) {
+        std::vector<std::vector<Token>> const& expandedArgs,
+        std::vector<Token> const& vaArgs) {
         std::vector<Token> outTokens;
         for (Token const& r : def.replacement) {
+            if (def.isVariadic && isWord(r) && !cfg().variadicArgsName.empty()
+                && text(r) == cfg().variadicArgsName) {
+                outTokens.insert(outTokens.end(), vaArgs.begin(), vaArgs.end());
+                continue;
+            }
             int paramIdx = -1;
             if (isWord(r)) {
                 std::string_view rt = text(r);
@@ -789,7 +871,8 @@ private:
                 continue;
             }
             std::size_t past = 0;
-            auto argsOpt = collectArgs(in, openIdx, name, past);
+            std::vector<Token> separators;   // depth-1 commas (for __VA_ARGS__)
+            auto argsOpt = collectArgs(in, openIdx, name, past, separators);
             if (!argsOpt) {
                 // Unterminated invocation already reported: emit the name as-is
                 // and resume after it (do NOT swallow the rest of the stream).
@@ -798,24 +881,32 @@ private:
                 continue;
             }
             std::vector<std::vector<Token>> args = std::move(*argsOpt);
-            // Zero-PARAMETER normalization (C 6.10.3p4): `M()` for a macro that
-            // takes NO parameters is ZERO arguments, but collectArgs reports it
-            // as one EMPTY argument (the general groups rule). Collapse that one
-            // empty group to zero args ONLY when the macro declares no
-            // parameters, so `M()` matches arity 0 while a one-parameter `G()`
-            // keeps its single empty argument.
+            // Zero-PARAMETER normalization (C 6.10.3p4): a NON-variadic macro that
+            // takes NO parameters invoked as `M()` is ZERO arguments, but
+            // collectArgs reports it as one EMPTY argument (the general groups
+            // rule). Collapse that one empty group to zero args ONLY when the
+            // macro declares no parameters, so `M()` matches arity 0 while a
+            // one-parameter `G()` keeps its single empty argument. For a VARIADIC
+            // macro with zero NAMED params (`V(...)`) invoked as `V()`, the same
+            // collapse yields zero arguments -> an EMPTY variadic portion (C23 ok)
+            // -- so the named-arity floor (0) is met and __VA_ARGS__ is empty.
             if (def.params.empty() && args.size() == 1 && args[0].empty()) {
                 args.clear();
             }
-            // ARITY check (C 6.10.3p4). A zero-parameter macro invoked as `M()`
-            // collects zero arguments (normalized just above); a one-parameter
-            // macro invoked as `G()` collects one EMPTY argument. Mismatch ->
-            // fail loud, emit the name verbatim, skip the whole call.
-            if (args.size() != def.params.size()) {
+            // ARITY check (C 6.10.3p4). NON-variadic: exact match. VARIADIC: at
+            // least `params.size()` arguments (the named params); the rest --
+            // possibly NONE (C23 allows an empty variadic part) -- form
+            // __VA_ARGS__. Mismatch -> fail loud, emit the name verbatim, skip
+            // the whole call.
+            const bool arityBad = def.isVariadic
+                                      ? (args.size() < def.params.size())
+                                      : (args.size() != def.params.size());
+            if (arityBad) {
                 emitPP(rep_, DiagnosticCode::P_PreprocessorMacroArgument,
                        synth_->id(), t.span,
                        std::string{"function-like macro "} + name
-                           + " expects "
+                           + (def.isVariadic ? " expects at least "
+                                             : " expects ")
                            + std::to_string(def.params.size())
                            + " argument(s) but got "
                            + std::to_string(args.size()));
@@ -823,15 +914,40 @@ private:
                 i = past;     // skip past the malformed call close paren
                 continue;
             }
-            // PRE-EXPAND each argument FULLY before substitution (C 6.10.3.1):
-            // arguments expand in the CURRENT paint context, with the invoked
-            // macro NOT yet painted (painted only for the rescan below).
+            // PRE-EXPAND each NAMED argument FULLY before substitution
+            // (C 6.10.3.1): arguments expand in the CURRENT paint context, with
+            // the invoked macro NOT yet painted (painted only for the rescan
+            // below). For a variadic macro, only the first `params.size()` args
+            // bind to named params; the rest are gathered into __VA_ARGS__.
+            const std::size_t namedCount =
+                def.isVariadic ? def.params.size() : args.size();
             std::vector<std::vector<Token>> expandedArgs;
-            expandedArgs.reserve(args.size());
-            for (std::vector<Token> const& a : args) {
-                expandedArgs.push_back(expand(a, painting, depth + 1));
+            expandedArgs.reserve(namedCount);
+            for (std::size_t k = 0; k < namedCount; ++k) {
+                expandedArgs.push_back(expand(args[k], painting, depth + 1));
             }
-            std::vector<Token> substituted = substitute(def, expandedArgs);
+            // Build the (pre-expanded) __VA_ARGS__ token run from the TRAILING
+            // arguments (indices >= params.size()), each pre-expanded like a
+            // named arg, re-joined with the ORIGINAL source separator commas
+            // (`separators[k]` separates arg k from arg k+1). EMPTY when the
+            // variadic portion is empty (C23). A non-variadic macro passes an
+            // empty run (substitute never consults it).
+            std::vector<Token> vaArgs;
+            if (def.isVariadic) {
+                for (std::size_t k = def.params.size(); k < args.size(); ++k) {
+                    if (k > def.params.size()) {
+                        // The separator BEFORE this trailing arg is the comma
+                        // between arg (k-1) and arg k == separators[k-1].
+                        if (k - 1 < separators.size()) {
+                            vaArgs.push_back(separators[k - 1]);
+                        }
+                    }
+                    std::vector<Token> ex = expand(args[k], painting, depth + 1);
+                    vaArgs.insert(vaArgs.end(), ex.begin(), ex.end());
+                }
+            }
+            std::vector<Token> substituted =
+                substitute(def, expandedArgs, vaArgs);
             // RESCAN the substituted result with the invoked macro painted blue
             // (C 6.10.3.4: a self-reference in the rescan is frozen).
             painting.insert(name);
