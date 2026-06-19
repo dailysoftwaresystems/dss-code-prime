@@ -2203,7 +2203,7 @@ struct Lowerer {
         bool const isVoid = !resultTy.valid()
                          || interner.kind(resultTy) == TypeKind::Void;
         // D-LANG-VARIADIC (step 13.4): forward the MIR Call's
-        // variadic-payload bits (isVariadic + fixedArgCount) to the
+        // variadic-payload bits (isVariadic + fixedOperandCount) to the
         // LIR Call so the post-regalloc ML7 materialize pass can
         // emit the platform's variadic-call setup (SysV `mov al,
         // <xmm-arg-count>` etc.). Non-variadic calls keep payload=0.

@@ -617,22 +617,58 @@ struct Lowerer {
                     if (structRetAbi->kind == AbiPassing::Kind::ByReference)
                         operands.push_back(structRetSlot);  // hidden sret pointer
                 }
+                // FC12a-struct: the OPERAND-unit boundary for the variadic payload.
+                // `operandsBeforeArgs` is the operand count BEFORE the first arg.
+                // We snapshot `fixedOperandCount` = (operands.size() -
+                // operandsBeforeArgs) the instant the LAST FIXED arg's operands are
+                // appended (a by-value struct fixed param expands to several scalar
+                // operands, so this is NOT the param count — see call_payload.hpp).
+                //
+                // Mirror lir_callconv's firstArgIdx: callee is always leading; a
+                // ByReference sret pointer is a real ARG (argIdx 0) for the hidden-arg
+                // convention (counted in fixedOperandCount, firstArgIdx == 1), but is
+                // routed to the indirect-result register (x8) for the x8-IRR convention
+                // (NOT an arg → excluded, firstArgIdx == 2). config.aggregateSretViaHiddenArg
+                // distinguishes them. Capturing operands.size() here (post-sret-push)
+                // would WRONGLY exclude the hidden-arg sret pointer from fixedOperandCount,
+                // making it one too small → the last fixed operand misclassified as the
+                // first vararg → AL set one too high (silent miscompile).
+                std::size_t const operandsBeforeArgs =
+                    1 /*callee*/
+                  + ((structRetAbi.has_value()
+                      && structRetAbi->kind == AbiPassing::Kind::ByReference
+                      && !config.aggregateSretViaHiddenArg) ? 1u : 0u);
+                // The number of FIXED params of the callee (0 if the callee is not a
+                // resolvable FnSig). `byvalCalleeSig` was already dereferenced
+                // through one Ptr wrapper above.
+                std::size_t const fnParamsSize =
+                    (byvalCalleeSig.valid()
+                     && interner.kind(byvalCalleeSig) == TypeKind::FnSig)
+                        ? interner.fnParams(byvalCalleeSig).size()
+                        : 0;
+                std::size_t fixedOperandCount = 0;
+                bool fixedOperandCountStamped = false;
+                // Running per-class register-passed-operand counts for the WHOLE
+                // call, in operand order — predicts lir_callconv's per-class
+                // assignment so a struct vararg's eightbyte pieces can be checked
+                // against the remaining arg registers (the atomic-fit check). A
+                // ByReference sret hidden pointer (x86 hidden-arg convention)
+                // consumes arg GPR 0; an x8-indirect-result sret consumes NO arg GPR
+                // (it rides the dedicated IRR). Maintained for EVERY call so the
+                // bookkeeping is uniform; only the variadic checks below consult it.
+                std::uint32_t runGpr = 0, runFpr = 0;
+                if (structRetAbi.has_value()
+                    && structRetAbi->kind == AbiPassing::Kind::ByReference
+                    && config.aggregateSretViaHiddenArg)
+                    runGpr = 1;
                 for (std::size_t i = 1; i < kids.size(); ++i) {
                     TypeId const argTy = hir.typeId(kids[i]);
                     if (argTy.valid()) {
                         TypeKind const ak = interner.kind(argTy);
                         if (ak == TypeKind::Struct || ak == TypeKind::Union) {
-                            // Classify + synthesize the by-value struct arg into
-                            // register pieces / a by-ref pointer. Variadic or an
-                            // unimplemented CC strategy ⇒ fail loud (never a
-                            // silent wrong-ABI pass).
-                            if (calleeVariadic) {
-                                unsupported(kids[i],
-                                    "passing a struct/union BY VALUE to a "
-                                    "variadic function is not yet supported "
-                                    "(D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
-                                return InvalidMirInst;
-                            }
+                            // Classify the by-value struct/union arg. An
+                            // unimplemented CC strategy ⇒ fail loud (never a silent
+                            // wrong-ABI pass).
                             auto const abi = byValueClassify(argTy);
                             if (!abi.has_value()) {
                                 unsupported(kids[i],
@@ -641,21 +677,105 @@ struct Lowerer {
                                     "convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
                                 return InvalidMirInst;
                             }
-                            // FC7 C1b: the caller pushes each eightbyte piece as
-                            // a scalar Call operand IN ORDER; lir_callconv assigns
-                            // them to consecutive per-class arg registers. No
-                            // multi-register guard — the callee's per-class Arg
-                            // counter + the verifier's physical-arg-count bound
-                            // (D-FC7-SYSV-STRUCT-ARG-MULTIREG) now handle >1 piece.
-                            if (!appendByValueArg(operands, kids[i], argTy, *abi))
-                                return InvalidMirInst;
+                            if (abi->kind == AbiPassing::Kind::ByReference) {
+                                // MEMORY class (>16B / empty): the SysV variadic ABI
+                                // requires it BY VALUE in the overflow area, which
+                                // needs the by-value stack-arg mechanism (not yet
+                                // built). The non-variadic ByReference path keeps the
+                                // existing hidden-pointer convention via
+                                // appendByValueArg (a single GPR pointer operand).
+                                if (calleeVariadic) {
+                                    unsupported(kids[i],
+                                        "passing a struct/union >16B (MEMORY class) "
+                                        "BY VALUE to a variadic function is not yet "
+                                        "supported — SysV requires it by value in the "
+                                        "overflow area, which needs the by-value "
+                                        "stack-arg mechanism "
+                                        "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+                                    return InvalidMirInst;
+                                }
+                                if (!appendByValueArg(operands, kids[i], argTy, *abi))
+                                    return InvalidMirInst;
+                                runGpr += 1;   // the pointer operand is GPR-class
+                            } else {
+                                // InRegisters: count the eightbyte pieces per class.
+                                std::uint32_t numGp = 0, numFp = 0;
+                                for (AbiPiece const& p : abi->pieces) {
+                                    if (p.cls == AbiPieceClass::Fpr) ++numFp;
+                                    else ++numGp;
+                                }
+                                if (calleeVariadic) {
+                                    // ATOMIC-FIT CHECK: SysV §3.5.7 — if the whole
+                                    // aggregate's pieces do not ALL fit in the
+                                    // remaining arg registers, it goes by value in
+                                    // MEMORY (no register/stack split). We can only
+                                    // express that with the by-value stack-arg
+                                    // mechanism. The vaListLayout MUST be present for
+                                    // a variadic callee (it is the gp/fp save-count
+                                    // source); absent ⇒ struct varargs are impossible
+                                    // on this CC.
+                                    if (!config.vaListLayout.has_value()) {
+                                        unsupported(kids[i],
+                                            "passing a struct/union BY VALUE to a "
+                                            "variadic function requires the CC's "
+                                            "'vaListLayout' (register-save geometry) "
+                                            "which this target does not declare "
+                                            "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+                                        return InvalidMirInst;
+                                    }
+                                    VaListLayout const& vl = *config.vaListLayout;
+                                    if (runGpr + numGp > vl.gpSaveCount
+                                        || runFpr + numFp > vl.fpSaveCount) {
+                                        unsupported(kids[i],
+                                            "a struct/union vararg whose eightbyte "
+                                            "pieces do not all fit in the remaining "
+                                            "argument registers would be split across "
+                                            "registers and the stack; SysV requires "
+                                            "the whole aggregate in memory, which "
+                                            "needs the by-value stack-arg mechanism "
+                                            "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+                                        return InvalidMirInst;
+                                    }
+                                }
+                                // FC7 C1b / FC12a-struct: push each eightbyte piece
+                                // as a scalar Call operand IN ORDER; lir_callconv
+                                // assigns them to consecutive per-class arg
+                                // registers. Then advance the running per-class
+                                // counts (after a SUCCESSFUL append, AFTER the
+                                // fit-check above).
+                                if (!appendByValueArg(operands, kids[i], argTy, *abi))
+                                    return InvalidMirInst;
+                                runGpr += numGp;
+                                runFpr += numFp;
+                            }
+                            if (i == fnParamsSize) {
+                                fixedOperandCount =
+                                    operands.size() - operandsBeforeArgs;
+                                fixedOperandCountStamped = true;
+                            }
                             continue;
                         }
                     }
                     MirInstId const arg = lowerExpr(kids[i]);
                     if (!arg.valid()) return InvalidMirInst;
                     operands.push_back(arg);
+                    // A scalar arg consumes exactly one register of its class.
+                    if (argTy.valid()) {
+                        if (scalarArgClass(argTy) == AbiPieceClass::Fpr) ++runFpr;
+                        else ++runGpr;
+                    } else {
+                        ++runGpr;   // typeless fallback: treat as GPR
+                    }
+                    if (i == fnParamsSize) {
+                        fixedOperandCount = operands.size() - operandsBeforeArgs;
+                        fixedOperandCountStamped = true;
+                    }
                 }
+                // Edge: a variadic callee with 0 fixed params (fnParamsSize == 0),
+                // or a call with fewer kids than fnParamsSize+1 — the loop never
+                // hit `i == fnParamsSize`. fixedOperandCount stays 0 (no fixed
+                // operands), which is correct for both shapes.
+                (void)fixedOperandCountStamped;
                 // D-LANG-VARIADIC (step 13.4): stamp the MIR Call's
                 // payload with the callee's variadic-shape bits. The
                 // callee HIR node's TypeId is its FnSig (for direct
@@ -687,23 +807,24 @@ struct Lowerer {
                 if (calleeTy.valid()
                     && interner.kind(calleeTy) == TypeKind::FnSig
                     && interner.fnIsVariadic(calleeTy)) {
-                    auto const fixedSz = interner.fnParams(calleeTy).size();
-                    // Post-13.4 audit-fold (HIGH-3): the call_payload
-                    // u32 encodes fixedArgCount in bits 0..30 (mask
-                    // 0x7FFF_FFFF). A FnSig with >= 2^31 params
-                    // would silently truncate AND collide with the
-                    // isVariadic bit. Practically unreachable (no
-                    // function has 2-billion fixed params) but pin
-                    // the contract so a future builder bypass can't
-                    // silently corrupt the payload.
-                    if (fixedSz > ::dss::call_payload::kFixedArgMask) {
+                    // FC12a-struct: the payload's fixed count is now in OPERAND
+                    // units (the snapshot taken after the last fixed arg's operands
+                    // were appended), NOT the param count — a by-value struct fixed
+                    // param expands to several scalar register-piece operands.
+                    // The call_payload u32 encodes fixedOperandCount in bits 0..29
+                    // (mask 0x3FFF_FFFF). A count exceeding the 30-bit field would
+                    // silently truncate AND collide with the isVariadic bit;
+                    // practically unreachable (no call has 2^30 operands) but pin
+                    // the contract so a future bypass can't corrupt the payload.
+                    if (fixedOperandCount
+                        > ::dss::call_payload::kFixedOperandMask) {
                         unsupported(node,
-                            "Call payload: fixed-arg count exceeds 31-bit "
+                            "Call payload: fixed-operand count exceeds 30-bit "
                             "encoding limit");
                         return InvalidMirInst;
                     }
                     callPayload = ::dss::call_payload::encode(
-                        true, static_cast<std::uint32_t>(fixedSz));
+                        true, static_cast<std::uint32_t>(fixedOperandCount));
                 }
                 // FC7 C3 (AAPCS64/Apple x8 sret): when the by-value aggregate
                 // RETURN is class-MEMORY (ByReference) AND this CC carries the
@@ -1660,6 +1781,25 @@ struct Lowerer {
                 if (!lowerStmt(stmt)) return InvalidMirInst;
             }
             return lowerLvalueAddress(hir.seqExprResult(node));
+        }
+        if (k == HirKind::VaArg) {
+            // FC12a-struct (D-FC12A-VARIADIC-CALLEE): an aggregate-typed
+            // `va_arg(ap, struct S)` is realized BY ADDRESS — the eightbyte pieces
+            // are gathered from the register-save-area (or the struct is read by
+            // value from the overflow area) into a fresh temp whose ADDRESS is the
+            // result. A SCALAR va_arg never reaches here (it lowers as an rvalue in
+            // lowerExpr); reaching here with a non-aggregate type is an internal
+            // invariant violation.
+            TypeId const at = hir.typeId(node);
+            TypeKind const ak = at.valid() ? interner.kind(at) : TypeKind::Void;
+            if (ak == TypeKind::Struct || ak == TypeKind::Union) {
+                return lowerVaArgAggregate(node);
+            }
+            unsupported(node,
+                "internal: a non-aggregate va_arg reached lowerLvalueAddress — a "
+                "scalar va_arg is an rvalue lowered via lowerExpr "
+                "(D-FC12A-VARIADIC-CALLEE)");
+            return InvalidMirInst;
         }
         // Any OTHER lvalue kind is still unsupported — fail loud (the
         // aggregate-valued Ternary/SeqExpr carriers above are
@@ -2747,14 +2887,21 @@ struct Lowerer {
             unsupported(node, "VaArg has no result type");
             return InvalidMirInst;
         }
-        // FC12a-struct boundary: a by-value struct/union va_arg is NOT implemented
-        // this cycle — fail loud rather than mis-read (the eightbyte-classified
-        // multi-register/overflow split is the follow-on).
+        // FC12a-struct: an AGGREGATE-typed va_arg has NO aggregate-width SSA value
+        // (the compiler's aggregate model is MEMORY-based). It MUST be lowered BY
+        // ADDRESS via lowerLvalueAddress's VaArg arm (→ lowerVaArgAggregate), exactly
+        // like the aggregate Ternary/SeqExpr carriers; every consumer (VarDecl init /
+        // AssignStmt / discard) reaches it that way. Reaching here with an aggregate
+        // type means a NEW consumer lowered an aggregate va_arg as a bare rvalue —
+        // fail loud rather than synthesize a Phi-of-aggregate / aggregate-width Load
+        // (a latent miscompile), mirroring the Ternary anti-resurrection guard.
         TypeKind const tk = interner.kind(t);
         if (tk == TypeKind::Struct || tk == TypeKind::Union) {
-            unsupported(node, "va_arg of a struct/union BY VALUE is not yet "
-                              "supported (FC12a-struct follow-on) "
-                              "(D-FC12A-VARIADIC-CALLEE)");
+            unsupported(node,
+                "internal: an aggregate-typed va_arg must be lowered by ADDRESS via "
+                "lowerLvalueAddress, never as a bare SSA rvalue — the MIR has no "
+                "aggregate-width value (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR / "
+                "D-FC12A-VARIADIC-CALLEE)");
             return InvalidMirInst;
         }
         auto kids = hir.children(node);
@@ -2847,6 +2994,195 @@ struct Lowerer {
         MirInstId const argPtr = mir.addPhi(voidPtr, incomings);
         std::array<MirInstId, 1> finalLoad{argPtr};
         return mir.addInst(MirOpcode::Load, finalLoad, t);
+    }
+
+    // `va_arg(ap, T)` for an AGGREGATE T (struct/union) → the struct's ADDRESS
+    // (SysV §3.5.7). AGNOSTIC: the field offsets / save-area geometry come from
+    // `config.vaListLayout`, the eightbyte CLASSIFICATION from `classifyAggregate`
+    // (never a target/format/cc identity branch). Algorithm:
+    //   * Classify T. MEMORY class (>16B / empty) ⇒ fail loud (needs the by-value
+    //     stack-arg overflow mechanism — symmetric with the caller-side wall 1).
+    //   * InRegisters (1-2 eightbyte pieces): the ATOMIC reg-vs-overflow decision —
+    //     ALL pieces' classes must fit in the remaining save-area slots
+    //     (gp_offset + num_gp*gpSlot <= gpLimit AND fp_offset + num_fp*fpSlot <=
+    //     fpLimit), else the whole aggregate sits in the overflow area by value.
+    //     - register arm: copy each piece from reg_save_area+cursor into a fresh
+    //       temp at piece.byteOffset, bumping that CLASS's cursor per piece; store
+    //       the final cursors back. The temp's address is the result.
+    //     - overflow arm: the struct sits by value at overflow_arg_area; that
+    //       pointer IS the result; bump overflow_arg_area by roundUp(sizeof T, 8)
+    //       (distinct from the scalar arm's one-slot bump).
+    //     - join: Phi the two addresses (a void*). NO Load — aggregates by address.
+    [[nodiscard]] MirInstId lowerVaArgAggregate(HirNodeId node) {
+        if (!config.vaListLayout.has_value()) {
+            unsupported(node, "variadic callee (va_arg) is unsupported for this "
+                              "target's calling convention — it declares no "
+                              "'vaListLayout' (D-FC12A-VARIADIC-CALLEE)");
+            return InvalidMirInst;
+        }
+        VaListLayout const& vl = *config.vaListLayout;
+        TypeId const t = hir.typeId(node);
+        if (!t.valid()) {
+            unsupported(node, "VaArg has no result type");
+            return InvalidMirInst;
+        }
+        auto const abi = byValueClassify(t);
+        if (!abi.has_value() || abi->kind == AbiPassing::Kind::ByReference) {
+            unsupported(node,
+                "va_arg of a struct/union >16B (MEMORY class) is not yet supported "
+                "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+            return InvalidMirInst;
+        }
+        StructLayout const* layout = cachedLayout(t);
+        if (layout == nullptr) {
+            unsupported(node, "va_arg of a struct/union requires a sizeable layout "
+                              "(target 'aggregateLayout' / complete type)");
+            return InvalidMirInst;
+        }
+        // Count the eightbyte pieces per class (1-2 total for SysV).
+        std::uint32_t numGp = 0, numFp = 0;
+        for (AbiPiece const& p : abi->pieces) {
+            if (p.cls == AbiPieceClass::Fpr) ++numFp; else ++numGp;
+        }
+
+        auto kids = hir.children(node);
+        if (kids.size() != 2) {
+            unsupported(node, "malformed VaArg (expect [apExpr, TypeRef])");
+            return InvalidMirInst;
+        }
+        MirInstId const tagBase = vaTagBase(kids[0]);   // child 1 (TypeRef) NEVER lowered
+        if (!tagBase.valid()) return InvalidMirInst;
+
+        TypeId const u32       = interner.primitive(TypeKind::U32);
+        TypeId const u32Ptr    = interner.pointer(u32);
+        TypeId const voidPtr   = interner.pointer(interner.primitive(TypeKind::Void));
+        TypeId const voidPtrPtr = interner.pointer(voidPtr);
+        TypeId const boolTy    = interner.primitive(TypeKind::Bool);
+
+        // Load both class cursors up front (the atomic decision needs both).
+        MirInstId const gpOffPtr = vaFieldPtr(tagBase, vl.gpOffsetField, u32Ptr);
+        if (!gpOffPtr.valid()) return InvalidMirInst;
+        MirInstId const fpOffPtr = vaFieldPtr(tagBase, vl.fpOffsetField, u32Ptr);
+        if (!fpOffPtr.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> loadGpOps{gpOffPtr};
+        MirInstId const gpOff = mir.addInst(MirOpcode::Load, loadGpOps, u32);
+        std::array<MirInstId, 1> loadFpOps{fpOffPtr};
+        MirInstId const fpOff = mir.addInst(MirOpcode::Load, loadFpOps, u32);
+
+        // Per-class fit thresholds, folded to constants (limits & counts are known):
+        // a class fits iff cursor <= limit - num*slot. With num==0 the RHS is the
+        // limit (always satisfiable since cursor<=limit by construction), so a
+        // single-class aggregate's other-class check is a tautology — harmless.
+        std::uint32_t const gpThresh =
+            vl.gpOffsetLimit - numGp * vl.gpSlotBytes;
+        std::uint32_t const fpThresh =
+            vl.fpOffsetLimit - numFp * vl.fpSlotBytes;
+        MirInstId const gpThreshK = constIntOfType(gpThresh, u32);
+        MirInstId const fpThreshK = constIntOfType(fpThresh, u32);
+        std::array<MirInstId, 2> gpCmpOps{gpOff, gpThreshK};
+        MirInstId const gpFits = mir.addInst(MirOpcode::ICmpUle, gpCmpOps, boolTy);
+        std::array<MirInstId, 2> fpCmpOps{fpOff, fpThreshK};
+        MirInstId const fpFits = mir.addInst(MirOpcode::ICmpUle, fpCmpOps, boolTy);
+
+        // ATOMIC decision via NESTED CondBr (both classes must fit): check gp first
+        // → if ok check fp → regBB, else ovfBB. (Mirrors the canonical `&&` short-
+        // circuit topology the StructCfMarker derivation recognizes; the final
+        // rederive at lowering finish stamps the markers, so the creation-time
+        // markers below are placeholders.) ovfBB has two CFG predecessors (the gp-
+        // fail edge and the fp-fail edge); its overflow read/bump runs exactly once.
+        MirBlockId const fpChkBB = mir.createBlock(StructCfMarker::IfThen);
+        MirBlockId const regBB   = mir.createBlock(StructCfMarker::IfThen);
+        MirBlockId const ovfBB   = mir.createBlock(StructCfMarker::IfElse);
+        MirBlockId const joinBB  = mir.createBlock(StructCfMarker::IfJoin);
+        mir.addCondBr(gpFits, fpChkBB, ovfBB);
+        mir.beginBlock(fpChkBB);
+        mir.addCondBr(fpFits, regBB, ovfBB);
+
+        // ── register arm: gather each piece from reg_save_area + per-class cursor
+        // into a fresh temp at piece.byteOffset; bump that class's cursor per piece;
+        // store the final cursors back. The temp's address is this arm's result. ──
+        mir.beginBlock(regBB);
+        MirInstId const temp = freshAggregateTemp(t);
+        if (!temp.valid()) {
+            unsupported(node, "va_arg of a struct/union requires a sizeable layout "
+                              "(target 'aggregateLayout' / complete type)");
+            return InvalidMirInst;
+        }
+        MirInstId const rsaField = vaFieldPtr(tagBase, vl.regSaveAreaField, voidPtrPtr);
+        if (!rsaField.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> loadRsaOps{rsaField};
+        MirInstId const rsa = mir.addInst(MirOpcode::Load, loadRsaOps, voidPtr);
+        // Local per-class cursors, bumped as pieces are consumed (so a 2-GPR struct
+        // reads consecutive save-area slots). Initialized to the loaded offsets.
+        MirInstId gpCursor = gpOff;
+        MirInstId fpCursor = fpOff;
+        for (AbiPiece const& p : abi->pieces) {
+            bool const isFp = (p.cls == AbiPieceClass::Fpr);
+            MirInstId const cursor = isFp ? fpCursor : gpCursor;
+            // src = reg_save_area + cursor (byte-offset Gep).
+            std::array<MirInstId, 2> srcGepOps{rsa, cursor};
+            MirInstId const srcAddr = mir.addInst(MirOpcode::Gep, srcGepOps, voidPtr);
+            TypeId const pty = pieceType(p);
+            std::array<MirInstId, 1> loadPieceOps{srcAddr};
+            MirInstId const pieceVal = mir.addInst(MirOpcode::Load, loadPieceOps, pty);
+            // dst = temp + piece.byteOffset.
+            MirInstId const offK =
+                constInt(static_cast<std::int64_t>(p.byteOffset));
+            if (!offK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> dstGepOps{temp, offK};
+            MirInstId const dstAddr =
+                mir.addInst(MirOpcode::Gep, dstGepOps, interner.pointer(pty));
+            std::array<MirInstId, 2> stOps{pieceVal, dstAddr};
+            mir.addInst(MirOpcode::Store, stOps);
+            // Bump this class's cursor by its slot stride.
+            std::uint32_t const slot = isFp ? vl.fpSlotBytes : vl.gpSlotBytes;
+            MirInstId const slotK = constIntOfType(slot, u32);
+            std::array<MirInstId, 2> addOps{cursor, slotK};
+            MirInstId const bumped = mir.addInst(MirOpcode::Add, addOps, u32);
+            if (isFp) fpCursor = bumped; else gpCursor = bumped;
+        }
+        // Store the final cursors back into the tag.
+        {
+            std::array<MirInstId, 2> gpSt{gpCursor, gpOffPtr};
+            mir.addInst(MirOpcode::Store, gpSt);
+            std::array<MirInstId, 2> fpSt{fpCursor, fpOffPtr};
+            mir.addInst(MirOpcode::Store, fpSt);
+        }
+        MirInstId const regAddr = temp;
+        MirBlockId const regPred = mir.currentlyOpenBlock();
+        mir.addBr(joinBB);
+
+        // ── overflow arm: the struct sits BY VALUE at overflow_arg_area; that
+        // pointer is this arm's result. Bump overflow_arg_area by roundUp(size,8)
+        // (NOT one slot — a >8B struct occupies multiple stack eightbytes). ──
+        mir.beginBlock(ovfBB);
+        MirInstId const ovfPtr = vaFieldPtr(tagBase, vl.overflowArgAreaField, voidPtrPtr);
+        if (!ovfPtr.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> loadOvfOps{ovfPtr};
+        MirInstId const ovfArea = mir.addInst(MirOpcode::Load, loadOvfOps, voidPtr);
+        // Round the struct up to a whole stack slot. The stack-slot quantum is the
+        // CC's pointer-width arg slot — `vl.gpSlotBytes` (the same field the scalar
+        // overflow arm bumps by) — read from config, never a hardcoded 8 (agnostic).
+        std::uint64_t const slotQ = static_cast<std::uint64_t>(vl.gpSlotBytes);
+        std::uint64_t const roundedSize = ((layout->size + slotQ - 1u) / slotQ) * slotQ;
+        MirInstId const stepK =
+            constInt(static_cast<std::int64_t>(roundedSize));
+        if (!stepK.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> ovfStepOps{ovfArea, stepK};
+        MirInstId const ovfNext = mir.addInst(MirOpcode::Gep, ovfStepOps, voidPtr);
+        std::array<MirInstId, 2> ovfStore{ovfNext, ovfPtr};
+        mir.addInst(MirOpcode::Store, ovfStore);
+        MirInstId const ovfAddr = ovfArea;
+        MirBlockId const ovfPred = mir.currentlyOpenBlock();
+        mir.addBr(joinBB);
+
+        // ── join: pick the struct's address (NO Load — aggregates by address). ──
+        mir.beginBlock(joinBB);
+        std::array<MirPhiIncoming, 2> incomings{
+            MirPhiIncoming{regAddr, regPred},
+            MirPhiIncoming{ovfAddr, ovfPred},
+        };
+        return mir.addPhi(voidPtr, incomings);
     }
 
     // Lower a single HIR statement in the currently-open MIR block.
@@ -3563,18 +3899,28 @@ struct Lowerer {
             TypeId const ty = paramTypes[i];
             TypeKind const pk = interner.kind(ty);
             if (pk == TypeKind::Struct || pk == TypeKind::Union) {
-                if (fnVariadic) {
-                    unsupported(p, "a by-value struct/union parameter in a "
-                                   "variadic function is not yet supported "
-                                   "(D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
-                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
-                    return false;
-                }
+                // Classify FIRST (FC12a-struct): the variadic check now keys on the
+                // ABI kind, not the type kind. An InRegisters fixed struct param in
+                // a variadic function is fine — receiveByValueParam advances argCtr
+                // per-class per piece, so currentFnFixedGpr_/Fpr_ (stamped below)
+                // include the struct's pieces and va_start's cursors reflect them.
                 auto const abi = byValueClassify(ty);
                 if (!abi.has_value()) {
                     unsupported(p, "a by-value struct/union parameter is not "
                                    "supported by this target's calling "
                                    "convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                // A ByReference (MEMORY class, >16B) fixed param uses the hidden-
+                // pointer convention, which the variadic cursor model does not yet
+                // thread (the fixed-stack/overflow geometry is the deferred piece).
+                // Fail loud rather than mis-account.
+                if (fnVariadic && abi->kind == AbiPassing::Kind::ByReference) {
+                    unsupported(p, "a by-value struct/union >16B (MEMORY class) "
+                                   "parameter in a variadic function is not yet "
+                                   "supported "
+                                   "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
                 }

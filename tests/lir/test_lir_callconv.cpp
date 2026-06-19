@@ -898,11 +898,11 @@ TEST(LirCallconvAbi, SysVCcDeclaresVariadicVectorCountReg) {
 
 TEST(CallPayload, EncodeDecodeRoundtripsVariadicAndFixedCount) {
     // D-LANG-VARIADIC (step 13.4) substrate pin: the shared MIR/LIR
-    // Call payload encoding (bit 31 = isVariadic; bits 0..30 =
-    // fixedArgCount) round-trips for both the non-variadic and
+    // Call payload encoding (bit 31 = isVariadic; bits 0..29 =
+    // fixedOperandCount) round-trips for both the non-variadic and
     // variadic cases. The ML7 materialize call arm reads these bits
     // off every call inst; an off-by-one in the mask would either
-    // truncate fixedArgCount or silently flip the variadic bit, both
+    // truncate fixedOperandCount or silently flip the variadic bit, both
     // of which would corrupt the count-mov emission for variadic
     // calls (and falsely trigger it for non-variadic calls).
     using namespace dss::call_payload;
@@ -910,47 +910,47 @@ TEST(CallPayload, EncodeDecodeRoundtripsVariadicAndFixedCount) {
     // default for every pre-13.4 call site).
     EXPECT_EQ(encode(false, 0u), 0u);
     EXPECT_FALSE(isVariadic(encode(false, 0u)));
-    // The high bit alone flips isVariadic; fixedArgCount=0 round-
+    // The high bit alone flips isVariadic; fixedOperandCount=0 round-
     // trips (a hypothetical thunk-style vararg-only function).
     EXPECT_TRUE(isVariadic(encode(true, 0u)));
-    EXPECT_EQ(fixedArgCount(encode(true, 0u)), 0u);
-    // Typical printf shape: 1 fixed param + vararg.
+    EXPECT_EQ(fixedOperandCount(encode(true, 0u)), 0u);
+    // Typical printf shape: 1 fixed param contributing 1 operand + vararg.
     EXPECT_TRUE(isVariadic(encode(true, 1u)));
-    EXPECT_EQ(fixedArgCount(encode(true, 1u)), 1u);
-    // Round-trip at the high edge of the fixed-arg field. If the
-    // mask boundary regresses, fixedArgCount(kFixedArgMask) returns
+    EXPECT_EQ(fixedOperandCount(encode(true, 1u)), 1u);
+    // Round-trip at the high edge of the fixed-operand field. If the
+    // mask boundary regresses, fixedOperandCount(kFixedOperandMask) returns
     // a different value here — pins the contract.
-    EXPECT_EQ(fixedArgCount(encode(true, kFixedArgMask)),
-              kFixedArgMask);
-    EXPECT_TRUE(isVariadic(encode(true, kFixedArgMask)));
-    // A non-variadic encoding with a fixed-arg count carries the
-    // fixedArgCount through but reports isVariadic=false — the
+    EXPECT_EQ(fixedOperandCount(encode(true, kFixedOperandMask)),
+              kFixedOperandMask);
+    EXPECT_TRUE(isVariadic(encode(true, kFixedOperandMask)));
+    // A non-variadic encoding with a fixed-operand count carries the
+    // fixedOperandCount through but reports isVariadic=false — the
     // accessor never spuriously reports variadic just because
-    // fixedArgCount is non-zero.
+    // fixedOperandCount is non-zero.
     EXPECT_FALSE(isVariadic(encode(false, 42u)));
-    EXPECT_EQ(fixedArgCount(encode(false, 42u)), 42u);
+    EXPECT_EQ(fixedOperandCount(encode(false, 42u)), 42u);
 
     // FC7 C3 (AAPCS64/Apple x8 sret): bit 30 = hasIndirectResult, the flag
     // lir_callconv reads to route the prepended sret-pointer operand to the cc's
     // indirect-result register (x8) instead of arg0. It is INDEPENDENT of the
-    // variadic bit (31) and the fixedArgCount field (0..29) — a flip of any one must
-    // not perturb the others (else an x8-sret call would mis-route args or mis-stamp
-    // the variadic count).
+    // variadic bit (31) and the fixedOperandCount field (0..29) — a flip of any one
+    // must not perturb the others (else an x8-sret call would mis-route args or
+    // mis-stamp the variadic count).
     EXPECT_FALSE(hasIndirectResult(encode(false, 0u)));
     EXPECT_TRUE(hasIndirectResult(encode(false, 0u, /*hasIndirectResult=*/true)));
-    // Independent of fixedArgCount: an x8-sret call to a 3-fixed-param fn.
+    // Independent of fixedOperandCount: an x8-sret call to a 3-fixed-operand fn.
     {
         std::uint32_t const p = encode(false, 3u, true);
         EXPECT_TRUE(hasIndirectResult(p));
         EXPECT_FALSE(isVariadic(p));
-        EXPECT_EQ(fixedArgCount(p), 3u);
+        EXPECT_EQ(fixedOperandCount(p), 3u);
     }
     // Independent of variadic: all three bits coexist.
     {
         std::uint32_t const p = encode(true, 7u, true);
         EXPECT_TRUE(isVariadic(p));
         EXPECT_TRUE(hasIndirectResult(p));
-        EXPECT_EQ(fixedArgCount(p), 7u);
+        EXPECT_EQ(fixedOperandCount(p), 7u);
     }
     // Default (2-arg encode) never sets the IRR bit — every pre-C3 call site stays
     // non-sret.

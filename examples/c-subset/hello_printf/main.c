@@ -23,7 +23,7 @@
 //     by sibling example `printf_int/`.
 //
 //   * D-LANG-VARIADIC ABI — MIR Call's payload carries
-//     (isVariadic=true, fixedArgCount=1). This binary runs on Win64
+//     (isVariadic=true, fixedOperandCount=1). This binary runs on Win64
 //     (per `expected.json` runOn=windows), so the ms_x64 cc applies
 //     and `variadicVectorCountReg` is empty — the count-mov is
 //     skipped. SysV runs (Linux/macOS) would emit `mov rax, 0`

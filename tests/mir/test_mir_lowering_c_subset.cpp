@@ -4022,22 +4022,71 @@ TEST(MirLoweringCSubset, VaArgIntLowersToRegVsOverflowDiamond) {
         << "va_arg Loads the cursor, the reg_save_area pointer, AND the final value";
 }
 
-TEST(MirLoweringCSubset, VaArgStructStaysFailLoud) {
-    // va_arg of a struct BY VALUE is the FC12a-struct follow-on — it MUST fail loud
-    // this cycle (never half-implemented). A struct-typed va_arg reaches HIR→MIR and
-    // the lowering emits H_UnsupportedLoweringForKind.
+// FC12a-struct: `va_arg(ap, struct {long; double})` (a mixed GPR+SSE 16B aggregate,
+// InRegisters under SysV) lowers to the ATOMIC register-gather diamond — BY ADDRESS,
+// never as a bare aggregate value. RED-ON-DISABLE: reverting lowerVaArgAggregate to
+// the old fail-loud flips mir.ok to false; reverting the gather to a single-class
+// bump or a Load-of-aggregate breaks the structural assertions below.
+TEST(MirLoweringCSubset, VaArgStructMixedLowersToAtomicRegisterGather) {
     auto L = lowerCSubset(
-        "struct S { int a; int b; };\n"
-        "int sum(int n, ...) {\n"
+        "struct Pt { long a; double b; };\n"
+        "long sum(int n, ...) {\n"
         "  va_list ap;\n"
         "  va_start(ap, n);\n"
-        "  struct S s = va_arg(ap, struct S);\n"
+        "  struct Pt p = va_arg(ap, struct Pt);\n"
+        "  va_end(ap);\n"
+        "  return p.a + (long)p.b;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "an InRegisters (<=16B) struct va_arg must lower (the FC12a-struct gather)";
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // A fresh Alloca for the gathered struct (the result-by-address temp). The `ap`
+    // local + the `p` local also Alloca, so >= 1 is the floor that the gather adds.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Alloca), 1u)
+        << "the gather copies the pieces into a fresh aggregate temp";
+    // The ATOMIC decision is TWO ICmpUle (gp fits AND fp fits) feeding nested CondBr.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUle), 2u)
+        << "the atomic gather compares BOTH class cursors against their folded limits";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 2u)
+        << "nested CondBr: gp-fits? -> fp-fits? -> regBB, else ovfBB";
+    // The result is an ADDRESS Phi (a void* pointer) — NOT a Phi of the aggregate.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Phi), 1u)
+        << "the two address arms join with a Phi of the struct's ADDRESS";
+    EXPECT_FALSE(hasAggregatePhi(m, L.model.lattice().interner(), fi))
+        << "the gather must NEVER produce a Phi of an aggregate-width value";
+    // Both class cursors are bumped (the register arm: gp += 8, fp += 16) — two Adds
+    // on the cursors, plus the per-class Stores writing them back (4 reg-arm Stores:
+    // 2 piece-stores into temp + 2 cursor write-backs). va_start adds 4 Stores; so
+    // the body Stores are well above the scalar-arm count. Pin the cursor Adds.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Add), 2u)
+        << "the register arm bumps BOTH per-class cursors (gp by 8, fp by 16)";
+}
+
+// FC12a-struct fail-loud: `va_arg(ap, >16B struct)` is MEMORY class — it requires
+// the by-value overflow mechanism not built this cycle. RED-ON-DISABLE: removing the
+// ByReference guard in lowerVaArgAggregate lets a wrong gather lower (mir.ok true).
+TEST(MirLoweringCSubset, VaArgStructOver16BFailsLoud) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"   // 24B → MEMORY class
+        "long sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct Big s = va_arg(ap, struct Big);\n"
         "  va_end(ap);\n"
         "  return s.a;\n"
         "}\n");
-    // Sema + HIR may succeed (the type is well-formed); the WALL is at HIR→MIR.
     EXPECT_FALSE(L.mir.ok)
-        << "va_arg of a struct BY VALUE must FAIL LOUD (the FC12a-struct boundary)";
+        << "va_arg of a >16B (MEMORY class) struct must FAIL LOUD "
+           "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)";
+    // Pin the anchor so the fail-loud is the STRUCT guard, not an unrelated failure.
+    ASSERT_FALSE(L.mirReporter.all().empty());
+    EXPECT_NE(L.mirReporter.all()[0].actual.find(
+                  "D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT"),
+              std::string::npos)
+        << "actual: " << L.mirReporter.all()[0].actual;
 }
 
 // A variadic callee whose FIXED params overflow to the stack (more fixed integer
@@ -4062,4 +4111,336 @@ TEST(MirLoweringCSubset, VaStartFixedParamsOverflowToStackFailsLoud) {
     EXPECT_FALSE(L.mir.ok)
         << "a variadic callee whose fixed params overflow to the stack must FAIL "
            "LOUD at va_start (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)";
+}
+
+namespace {
+// Find the FIRST Call inst in function `fi` and return its payload (0 if none).
+[[nodiscard]] std::uint32_t firstCallPayload(Mir const& m, std::uint32_t fi) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) == MirOpcode::Call) return m.instPayload(ix);
+        }
+    }
+    return 0;
+}
+// True iff function `fi` contains a `Const` inst whose integer value == `value`.
+[[nodiscard]] bool funcHasConstInt(Mir const& m, std::uint32_t fi,
+                                   std::int64_t value) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Const) continue;
+            auto const& lit = m.literalValue(m.constLiteralIndex(ix));
+            if (std::holds_alternative<std::int64_t>(lit.value)
+                && std::get<std::int64_t>(lit.value) == value)
+                return true;
+        }
+    }
+    return false;
+}
+// FOLD 2 (va_arg same-class cursor threading): true iff some `Gep` in function `fi`
+// has its INDEX operand (operand[1]) equal to the result of an `Add` instruction.
+// In lowerVaArgAggregate's register arm, the SOURCE read of each eightbyte is
+// `Gep(reg_save_area, cursor)`. The FIRST piece's cursor is the loaded gp/fp_offset;
+// every SUBSEQUENT same-class piece's cursor is the PRIOR cursor + stride — an `Add`
+// result. So a multi-piece SAME-class gather ALWAYS produces a Gep indexed off an Add.
+// The threading regression (re-reading the ORIGINAL Load cursor for the 2nd piece)
+// would make BOTH source Geps index off the Load, never off an Add → this returns
+// false. (The DST Gep `Gep(temp, constOffset)` and the overflow-arm Gep both index
+// off a `Const`, never an `Add`; the loop counter's `Add` feeds the compare/store,
+// not a Gep index — so an Add-indexed Gep is unambiguously the threaded cursor read.)
+[[nodiscard]] bool gepIndexesOffBumpedCursor(Mir const& m, std::uint32_t fi) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Gep) continue;
+            auto const ops = m.instOperands(ix);
+            if (ops.size() < 2) continue;
+            MirInstId const idxOperand = ops[1];
+            if (idxOperand.valid()
+                && m.instOpcode(idxOperand) == MirOpcode::Add)
+                return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+// FC12a-struct (operand-count stamp): a variadic call that passes a FIXED by-value
+// struct AND a struct vararg in ONE call stamps fixedOperandCount in OPERAND units —
+// NOT param units. `combine(struct Pt base, int n, ...)` with one `struct Pt` vararg:
+//   fixed params = {base (1 GPR + 1 FPR = 2 operands), n (1 operand)} → 3 operands;
+//   the struct vararg adds 2 more (1 GPR + 1 FPR). So fixedOperandCount must be 3.
+// RED-ON-DISABLE: reverting the snapshot to fnParams().size() (=2) makes the
+// lir_callconv vararg loop treat operand index 2 (base's FPR piece) as a vararg FPR,
+// over-counting the SysV AL by one — here pinned at MIR as fixedOperandCount==3.
+TEST(MirLoweringCSubset, VariadicCallWithStructStampsFixedOperandCount) {
+    using namespace dss::call_payload;
+    // `combine` is DEFINED in-TU (not extern) so its symbol binds in the MIR-tier
+    // driver (which fails loud on unbound symbols — extern symbols resolve only in
+    // the full link pipeline). The body is minimal; `use` is the function under test.
+    auto L = lowerCSubset(
+        "struct Pt { long a; double b; };\n"
+        "long combine(struct Pt base, int n, ...) { return base.a + n; }\n"
+        "long use(void) {\n"
+        "  struct Pt base = {1, 2.0};\n"
+        "  struct Pt v = {3, 4.0};\n"
+        "  return combine(base, 1, v);\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "the variadic call with a struct vararg must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // `use` is the caller — the function whose Call is variadic. (combine also
+    // exists; pick the function that CONTAINS the variadic Call.)
+    std::uint32_t fi = 0;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        if (dss::call_payload::isVariadic(firstCallPayload(m, f))) { fi = f; break; }
+    }
+    std::uint32_t const payload = firstCallPayload(m, fi);
+    EXPECT_TRUE(isVariadic(payload)) << "the call to a variadic callee is variadic";
+    EXPECT_EQ(fixedOperandCount(payload), 3u)
+        << "fixedOperandCount is in OPERAND units: base (2 pieces) + n (1) = 3 — "
+           "NOT the param count (2)";
+}
+
+// FC12a-struct (FOLD 1 — hidden-arg sret in fixedOperandCount): a VARIADIC call to a
+// callee that RETURNS a >16B struct BY VALUE (SysV hidden-arg sret) with a trailing
+// FIXED `double` param. SysV routes the sret pointer as a REAL arg in rdi (argIdx 0,
+// firstArgIdx==1 in lir_callconv — NOT the x8-IRR convention), so `operandsBeforeArgs`
+// must COUNT it: operands = [callee, sretPtr, 2.5(fixed double), 1(vararg), 2(vararg)];
+// at the stamp point (after the fixed double) operands.size()==3 and
+// operandsBeforeArgs==1 (callee only — the hidden-arg sret is INSIDE fixedOperandCount),
+// so fixedOperandCount == 2 (sret@argIdx0 + double@argIdx1 are both fixed; varargs start
+// at argIdx 2 → AL vector count EXCLUDES the fixed double's FPR).
+//
+// RED-ON-DISABLE: reverting `operandsBeforeArgs` to `operands.size()` (the post-sret-push
+// capture) makes it 2, so fixedOperandCount == 3-2 == 1. Then lir_callconv's vararg loop
+// (firstArgIdx==1) sees the fixed double at argIdx 1 >= fixedCount(1) → misclassifies it
+// as the FIRST vararg, an FPR → AL set one too high → silent miscompile. The EXPECT below
+// goes red (sees 1, expects 2). Verified by temp-reverting the capture and confirming red.
+//
+// `vsret` is DEFINED in-TU so its symbol binds in the MIR-tier driver (extern symbols
+// resolve only in the full link pipeline), mirroring the other call-site fixtures.
+TEST(MirLoweringCSubset, VariadicCallSretHiddenArgCountedInFixedOperandCount) {
+    using namespace dss::call_payload;
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"   // 24B → MEMORY class → hidden-arg sret
+        "struct Big vsret(double d, ...) {\n"
+        "  struct Big r = {0, 0, 0};\n"
+        "  return r;\n"
+        "}\n"
+        "long use(void) {\n"
+        "  struct Big r = vsret(2.5, 1, 2);\n"
+        "  return r.a;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a variadic call returning a >16B struct (hidden-arg sret) with a trailing "
+           "fixed double must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // `use` is the caller — the function whose Call is variadic. (`vsret` is also
+    // variadic-typed but contains NO Call; pick the function that CONTAINS the call.)
+    std::uint32_t fi = 0;
+    bool found = false;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        if (isVariadic(firstCallPayload(m, f))) { fi = f; found = true; break; }
+    }
+    ASSERT_TRUE(found) << "the variadic call must be present in some function";
+    std::uint32_t const payload = firstCallPayload(m, fi);
+    EXPECT_TRUE(isVariadic(payload)) << "the call to a variadic callee is variadic";
+    EXPECT_TRUE(hasIndirectResult(payload) == false)
+        << "SysV (no indirectResultRegister) uses the hidden-ARG sret convention, "
+           "NOT the x8-IRR bit — the sret pointer is a real arg, not routed to x8";
+    EXPECT_EQ(fixedOperandCount(payload), 2u)
+        << "fixedOperandCount MUST count the hidden-arg sret pointer (argIdx 0) AND the "
+           "fixed double (argIdx 1) = 2. Reverting operandsBeforeArgs to operands.size() "
+           "(post-sret-push) yields 1, mis-binning the fixed double as the first vararg "
+           "and over-counting the SysV AL by one.";
+}
+
+// FC12a-struct (wall 3): a variadic fn with a FIXED InRegisters `{long; double}`
+// param LOWERS (no longer fail-loud) and its va_start initializes gp_offset/fp_offset
+// PAST the struct's pieces (1 GPR + 1 FPR). For SysV: gp_offset = 1*8 = 8;
+// fp_offset = gpOffsetLimit(48) + 1*16 = 64. RED-ON-DISABLE: reverting wall-3 to
+// fail-loud makes mir.ok false; reverting receiveByValueParam's per-class advance
+// (so the FPR piece is not counted) makes fp_offset 48 (no Const 64) → red.
+TEST(MirLoweringCSubset, VariadicFnFixedStructParamThreadsBothClassCursors) {
+    auto L = lowerCSubset(
+        "struct Pt { long a; double b; };\n"
+        "long sum(struct Pt base, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, base);\n"
+        "  va_end(ap);\n"
+        "  return base.a;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a variadic fn with a fixed InRegisters struct param must LOWER (wall-3 "
+           "now classifies before the variadic check)";
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // gp_offset init = fixedGpr(1) * gpSlotBytes(8) = 8 (the struct's 1 GPR piece).
+    EXPECT_TRUE(funcHasConstInt(m, fi, 8))
+        << "va_start gp_offset must start PAST the struct's 1 GPR piece (1*8=8)";
+    // fp_offset init = gpOffsetLimit(48) + fixedFpr(1) * fpSlotBytes(16) = 64.
+    EXPECT_TRUE(funcHasConstInt(m, fi, 64))
+        << "va_start fp_offset must start PAST the struct's 1 FPR piece "
+           "(48 + 1*16 = 64) — pins the per-class accounting through the struct";
+}
+
+// FC12a-struct (wall 1): passing a >16B (MEMORY class) struct BY VALUE to a variadic
+// callee must FAIL LOUD (the by-value overflow stack-arg mechanism is not built).
+// RED-ON-DISABLE: removing the ByReference-variadic guard lets a wrong call lower.
+TEST(MirLoweringCSubset, VariadicCallStructOver16BByValueFailsLoud) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"   // 24B → MEMORY class
+        "long combine(int n, ...) { return n; }\n"    // DEFINED so the symbol binds
+        "long use(void) {\n"
+        "  struct Big b = {1, 2, 3};\n"
+        "  return combine(1, b);\n"
+        "}\n");
+    EXPECT_FALSE(L.mir.ok)
+        << "a >16B (MEMORY class) struct vararg must FAIL LOUD "
+           "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)";
+    // Pin the anchor/message so the fail-loud is the STRUCT guard (not some unrelated
+    // failure): the diagnostic must cite D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT.
+    ASSERT_FALSE(L.mirReporter.all().empty());
+    EXPECT_NE(L.mirReporter.all()[0].actual.find(
+                  "D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT"),
+              std::string::npos)
+        << "actual: " << L.mirReporter.all()[0].actual;
+}
+
+// FC12a-struct (wall 3, MEMORY class): a >16B by-value struct FIXED param in a
+// variadic fn must FAIL LOUD (the hidden-pointer convention is not threaded into the
+// variadic cursor model). RED-ON-DISABLE: removing the ByReference guard in the
+// param loop lets it lower with a mis-accounted cursor.
+TEST(MirLoweringCSubset, VariadicFnFixedStructOver16BParamFailsLoud) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"   // 24B → MEMORY class
+        "long sum(struct Big base, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, base);\n"
+        "  va_end(ap);\n"
+        "  return base.a;\n"
+        "}\n");
+    EXPECT_FALSE(L.mir.ok)
+        << "a >16B (MEMORY class) fixed struct param in a variadic fn must FAIL LOUD "
+           "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)";
+    // Pin the anchor so the fail-loud is the STRUCT guard, not an unrelated failure.
+    ASSERT_FALSE(L.mirReporter.all().empty());
+    EXPECT_NE(L.mirReporter.all()[0].actual.find(
+                  "D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT"),
+              std::string::npos)
+        << "actual: " << L.mirReporter.all()[0].actual;
+}
+
+// FC12a-struct (atomic-exhaustion split): a variadic call where enough prior GPR
+// args have been consumed that a `{long, long}` (2-GPR) struct vararg cannot fit
+// wholly in registers must FAIL LOUD — SysV forbids the register/stack split. Here:
+// `combine(int n, ...)` with 1 fixed int (GPR 0) + 5 long varargs (GPRs 1..5) means
+// only 1 arg GPR remains, but the `{long,long}` vararg needs 2 → split → fail loud.
+// RED-ON-DISABLE: removing the atomic-fit check lets the split call lower silently.
+TEST(MirLoweringCSubset, VariadicCallStructRegisterExhaustionSplitFailsLoud) {
+    auto L = lowerCSubset(
+        "struct LL { long a; long b; };\n"
+        "long combine(int n, ...) { return n; }\n"    // DEFINED so the symbol binds
+        "long use(void) {\n"
+        "  struct LL p = {7, 8};\n"
+        "  return combine(1, 100L, 200L, 300L, 400L, 500L, p);\n"
+        "}\n");
+    EXPECT_FALSE(L.mir.ok)
+        << "a struct vararg that would split across registers and the stack must "
+           "FAIL LOUD (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)";
+    // Pin the anchor: the fail-loud must be the atomic-exhaustion SPLIT guard.
+    ASSERT_FALSE(L.mirReporter.all().empty());
+    EXPECT_NE(L.mirReporter.all()[0].actual.find(
+                  "D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT"),
+              std::string::npos)
+        << "actual: " << L.mirReporter.all()[0].actual;
+}
+
+// FC12a-struct (anti-resurrection / by-address routing): a DISCARDED aggregate
+// va_arg (`va_arg(ap, struct Pt);` as a bare ExprStmt — side effect only) MUST
+// route through lowerLvalueAddress's VaArg arm (→ lowerVaArgAggregate), running the
+// gather BY ADDRESS so the cursor side-effect happens, and MUST NOT synthesize a
+// Phi-of-aggregate / aggregate-width value. The lowerExpr VaArg arm is a fail-loud
+// anti-resurrection backstop (no C-subset source reaches it — every aggregate
+// va_arg consumer keys on type-kind → by address). RED-ON-DISABLE: removing the
+// lowerLvalueAddress VaArg arm makes the discard fall to lowerLvalueAddress's final
+// fail-loud (mir.ok false); a regression that synthesized an aggregate Phi trips the
+// hasAggregatePhi assertion.
+TEST(MirLoweringCSubset, DiscardedAggregateVaArgRoutesByAddressNoAggregatePhi) {
+    auto L = lowerCSubset(
+        "struct Pt { long a; double b; };\n"
+        "long sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  va_arg(ap, struct Pt);\n"   // DISCARDED aggregate va_arg (side effect only)
+        "  va_end(ap);\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "a discarded aggregate va_arg routes BY ADDRESS via lowerLvalueAddress's "
+           "VaArg arm (the gather's cursor bump is the side effect) — it must lower";
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // The gather ran (the atomic decision's ICmpUle pair is present), confirming the
+    // by-address arm — not the scalar lowerExpr path (which would fail loud).
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUle), 2u)
+        << "the discarded aggregate va_arg lowered via the atomic register-gather";
+    EXPECT_FALSE(hasAggregatePhi(m, L.model.lattice().interner(), fi))
+        << "an aggregate va_arg must NEVER produce a Phi of an aggregate value — it "
+           "is lowered BY ADDRESS (the lowerExpr bare-rvalue path is fail-loud)";
+}
+
+// FOLD 2 (va_arg SAME-class cursor threading — MIR pin paired with the run-witnessed
+// varargs_struct corpus): a `va_arg(ap, struct LL)` where `struct LL {long a; long b;}`
+// gathers TWO GPR eightbytes. lowerVaArgAggregate must thread the cursor: piece 0 reads
+// `Gep(reg_save_area, gp_offset)`; piece 1 reads `Gep(reg_save_area, gp_offset + 8)` —
+// the BUMPED cursor (an `Add` result). The MIR therefore contains a source Gep whose
+// INDEX operand is an `Add`. RED-ON-DISABLE: if the 2nd-piece read re-used the ORIGINAL
+// `gp_offset` Load (the threading regression — `b` aliases `a`'s slot), NO Gep would
+// index off an Add, and `gepIndexesOffBumpedCursor` returns false → this EXPECT goes
+// red. The runtime corpus is the primary lever (it witnesses a WRONG exit code); this
+// pin localizes the same regression to the MIR shape for a fast, host-independent fail.
+TEST(MirLoweringCSubset, VaArgTwoSameClassStructThreadsCursorThroughAdd) {
+    auto L = lowerCSubset(
+        "struct LL { long a; long b; };\n"
+        "long sumLL(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct LL p = va_arg(ap, struct LL);\n"
+        "  va_end(ap);\n"
+        "  return p.a + p.b;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a 2-GPR struct va_arg must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // The atomic register-gather ran (the by-address arm, not the fail-loud rvalue path).
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUle), 2u)
+        << "the aggregate va_arg lowered via the atomic register-gather";
+    // The 2nd GPR piece's source Gep indexes off the BUMPED cursor (an Add), proving
+    // the cursor was threaded rather than re-read from the original gp_offset Load.
+    EXPECT_TRUE(gepIndexesOffBumpedCursor(m, fi))
+        << "the 2nd same-class eightbyte must read reg_save_area + the BUMPED cursor "
+           "(a Gep indexed off an Add); a Gep indexed only off the original gp_offset "
+           "Load for both pieces is the threading regression (b aliases a's slot)";
 }

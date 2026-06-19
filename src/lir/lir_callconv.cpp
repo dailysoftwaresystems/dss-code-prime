@@ -1787,12 +1787,16 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 if (::dss::call_payload::isVariadic(payload)
                     && cc.variadicVectorCountReg.has_value()) {
                     std::uint32_t const fixedCount =
-                        ::dss::call_payload::fixedArgCount(payload);
+                        ::dss::call_payload::fixedOperandCount(payload);
                     std::uint32_t vectorArgsInVararg = 0;
                     for (std::size_t i = firstArgIdx; i < ops.size(); ++i) {
                         // ops[0] is the callee; an x8-sret call also has the sret
-                        // pointer at ops[1] (firstArgIdx==2) — skip it so the vararg
-                        // index counts only real args.
+                        // pointer at ops[1] (firstArgIdx==2) — skip it so the
+                        // operand index counts only arg-region operands. `fixedCount`
+                        // is in OPERAND units (a by-value struct fixed param expands
+                        // to several scalar register-piece operands — FC12a-struct),
+                        // so this boundary is the count of operands the FIXED params
+                        // produced, not the param count.
                         std::size_t const argIdx = i - firstArgIdx;
                         if (argIdx < fixedCount) continue;
                         if (ops[i].kind != LirOperandKind::Reg) continue;

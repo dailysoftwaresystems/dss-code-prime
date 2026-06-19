@@ -539,7 +539,7 @@ TEST(LirRewrite, SpilledVariadicIndirectCalleeReloadScratchSkipsArgAndCountRegs)
 
     // Hand-build (mirrors VerifierFiresOnFrameOpWithZeroSlotPayload):
     // one function, one block, one VARIADIC indirect call
-    // `vr1(vr2, vr3)` — fixedArgCount 1, so vr2 is the fixed arg and
+    // `vr1(vr2, vr3)` — fixedOperandCount 1, so vr2 is the fixed arg and
     // vr3 rides the vararg region (printf-shaped).
     LirBuilder b{sch};
     b.addFunction(SymbolId{1});

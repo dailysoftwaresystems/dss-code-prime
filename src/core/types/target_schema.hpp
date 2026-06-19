@@ -617,8 +617,8 @@ struct DSS_EXPORT TargetCallingConvention {
     // pass on the stack, no count register). Empty optional ⇒ this
     // CC requires no caller-side vector-count register for variadic
     // calls. When engaged, ML7 materialize for a Call with
-    // payload `isVariadic=true` counts FPR args in
-    // [fixedArgCount..N) and emits a `mov <reg>, <count>` before
+    // payload `isVariadic=true` counts FPR-class arg operands in
+    // [fixedOperandCount..N) and emits a `mov <reg>, <count>` before
     // the call instruction.
     std::optional<NamedRegisterRef> variadicVectorCountReg;
 
