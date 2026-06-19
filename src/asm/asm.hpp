@@ -156,6 +156,23 @@ struct DSS_EXPORT AssembledData {
     std::vector<std::uint8_t> bytes;
     Alignment                 alignment;  // default = 1-byte
     std::vector<Relocation>   relocations;
+    // `reservedSize` — the in-memory byte size for a `Bss` (zero-fill) item,
+    // where `bytes` is EMPTY by invariant (the wire format reserves the size in
+    // the section header without storing file bytes). For `Rodata`/`Data` items
+    // the on-disk + in-memory size is `bytes.size()` and this field is unused
+    // (0). A tentative global `int g;` produces a `Bss` item with `bytes.empty()`
+    // and `reservedSize == sizeof(int)`. D-LK4-DATA-PRODUCER (BSS arm).
+    std::uint64_t             reservedSize = 0;
+
+    // The number of bytes this item occupies in its section / VA span — the
+    // file-backed `bytes.size()` for Rodata/Data, the zero-fill `reservedSize`
+    // for Bss. The single chokepoint every walker uses to advance section
+    // layout offsets so the Bss/non-Bss split lives in ONE place.
+    [[nodiscard]] std::uint64_t sizeInSection() const noexcept {
+        return section == DataSectionKind::Bss
+                   ? reservedSize
+                   : static_cast<std::uint64_t>(bytes.size());
+    }
 };
 
 // Validate a span of `AssembledData` items against the substrate

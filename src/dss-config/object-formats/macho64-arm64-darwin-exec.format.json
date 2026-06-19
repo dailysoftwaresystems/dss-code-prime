@@ -12,13 +12,16 @@
   "$dataModelComment": "FC3 c1: 64-bit linux/darwin are LP64 (int 32, long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I64 here. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
   "dataModel": "LP64",
 
+  "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: Apple arm64 (Apple Silicon) generic LSB-first bit-field allocation == AAPCS64 == gnu_packed. Apple's documented arm64 ABI divergences do NOT include bit-field packing (they cover char/wchar_t signedness, long double=double, va_list, red zone, stack args, empty structs). This is the ONLY ABI in the trio with no LOCAL runtime witness (no Mac/emulator here); the macOS CI leg (clang) is the runtime confirm + the documentation positively supports gnu_packed.",
+  "bitFieldStrategy": "gnu_packed",
+
   "$entryPointComment": "Empty defaults to module.functions[0] (cycle-2 convention). LC_MAIN.entryoff is computed as (entry_function_offset_in_.text) — relative to the __TEXT segment start.",
   "entryPoint": "",
   "$externCallDispatchComment": "DIRECT-PLT. Mach-O points each extern symbol's VA at its __stubs STUB (code) — `symbolVa[extern] = stubVa` in macho.cpp — and the stub does the __got indirection internally (ARM64: ADRP x16, page → LDR x16,[x16,#lo12] → BR x16). The call site is therefore a PLAIN DIRECT call (ARM64 `BL imm26`, R_*/ARM64_RELOC_BRANCH26) to the stub, NOT a deref-the-stub-as-pointer. This is the SAME direct-plt model ELF uses; it matches what the trampoline + MIR→LIR `lowerCall` emit (both via `externCallUsesIndirectShape`). ARM64 has no `call_indirect_via_extern` opcode, so direct-plt is also the only lowerable shape. D-FFI-EXTERN-CALL-DISPATCH.",
   "externCallDispatch": "direct-plt",
 
   "$supportedDataSectionsComment": "the exec read-only data-section arm, mirrors ELF D-LK1-ELF-EXEC-DATA-SECTIONS (rodata-only scope): the Mach-O MH_EXECUTE walker emits a loadable `__TEXT,__const` from `AssembledModule.dataItems` items with `section=Rodata` (the parallel of the ELF `.rodata` arm, commit 8040410). The linker's pre-walker gate (linker.cpp) consults this set per-item — `Data`/`Bss` remain anchored under D-LK4-RODATA-PRODUCER. Cross-format agnosticism: this is the SAME field ELF + PE exec formats declare; the gate has ZERO format-name branches, and the validation+layout reuses the shared `exec_data_section.hpp` substrate (`buildExecRodata`/`addDataSymbolVas`) used by elf.cpp. macho64-x86_64-darwin-exec deliberately does NOT declare it yet (no macOS-x86_64 CI leg to runtime-prove it).",
-  "supportedDataSections": ["rodata"],
+  "supportedDataSections": ["rodata", "data", "bss"],
   "$artifactProfilesComment": "Profiles this format SERVES (plan 06 AP3) — a runnable console executable ⇒ cli (the format-side twin of the language's artifactProfiles[]; driver fails loud D_ArtifactProfileFormatMismatch on a profile not in this set). macho64-x86_64-darwin-exec deliberately does NOT declare it (its processExit / exit spine is deferred → it cannot emit a runnable cli yet).",
   "artifactProfiles": ["cli"],
 
@@ -80,6 +83,28 @@
       "name": "__const",
       "segment": "__TEXT",
       "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "__data within __DATA — writable initialized globals (D-LK4-DATA-PRODUCER). Lives in a SEPARATE writable __DATA segment (maxprot/initprot rw-, VM_PROT 3) placed after __DATA_CONST, NOT in the r-x __TEXT (a store into __TEXT faults — the bug this closes). `type` (the substrate section_64.flags field) = S_REGULAR = 0 (plain regular data). virtualAddress=0 — the walker COMPUTES the __data VA from the __DATA segment layout (after __DATA_CONST/__got). addrAlign=8 is the FLOOR; the walker raises it (H1) to the strictest item, then writes the section_64.align as log2.",
+      "kind": "data",
+      "name": "__data",
+      "segment": "__DATA",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "__bss within __DATA — zero-init globals (tentative `int g;`). `type` (section_64.flags) = S_ZEROFILL = 1: the section occupies VM (contributes to __DATA.vmsize) but NO file bytes (section_64.offset = 0; __DATA.filesize excludes it) and MUST be the last section in __DATA. virtualAddress=0 — walker-computed (after __data). addrAlign=8 floor, H1-raised, written as log2. D-LK4-DATA-PRODUCER.",
+      "kind": "bss",
+      "name": "__bss",
+      "segment": "__DATA",
+      "type": 1,
       "flags": 0,
       "addrAlign": 8,
       "entrySize": 0,

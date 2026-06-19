@@ -17,6 +17,7 @@
 #include <format>
 #include <span>
 #include <string_view>
+#include <variant>
 
 namespace dss::test_support::asm_ {
 
@@ -209,11 +210,36 @@ roundTripVerify(TargetSchema const&            schema,
                     return false;
                 }
                 continue;  // skip the value-comparison checkSlot below
+            case LirOperandKind::LiteralIndex: {
+                // D-CSUBSET-BITFIELD-WIDE-UNIT: the wide pool literal of
+                // `mov r64, imm64`. The VALUE lives in `LirLiteralPool`
+                // (the 8-byte POD can't inline it); the disasm recovers
+                // it as the raw int64 bit pattern from the io field. The
+                // expected value is the pool's integer literal — fail
+                // loud on a non-integer pool arm (floats route to rodata,
+                // never reaching the encoder as a Const LiteralIndex).
+                auto const& lit = lir.literalValue(srcOp.litIndex);
+                if (auto const* i = std::get_if<std::int64_t>(&lit.value)) {
+                    expected = *i;
+                } else if (auto const* u =
+                               std::get_if<std::uint64_t>(&lit.value)) {
+                    expected = static_cast<std::int64_t>(*u);
+                } else {
+                    report(reporter, DiagnosticCode::A_RoundTripMismatch,
+                           DiagnosticSeverity::Error,
+                           std::format("round-trip: opcode '{}' wire {} "
+                                       "LiteralIndex pool slot {} is not an "
+                                       "integer literal",
+                                       info->mnemonic, wire.index,
+                                       srcOp.litIndex));
+                    return false;
+                }
+                break;
+            }
             case LirOperandKind::None:
             case LirOperandKind::BlockRef:
             case LirOperandKind::MemBase:
             case LirOperandKind::MemOffset:
-            case LirOperandKind::LiteralIndex:
                 report(reporter, DiagnosticCode::A_RoundTripMismatch,
                        DiagnosticSeverity::Error,
                        std::format("round-trip: opcode '{}' wire {} "

@@ -39,6 +39,18 @@ void copyDiagnostics(DiagnosticReporter const& src,
     for (auto const& d : src.all()) dst.report(d);
 }
 
+BitFieldStrategy
+effectiveBitFieldStrategy(TargetSchema const&       target,
+                          ObjectFormatSchema const& format) noexcept {
+    // FORMAT wins (the strategy is OS/format-determined); fall back to the
+    // target's declared value when the format declared none. Selects on the
+    // config-declared enum only — no target/format identity branch.
+    if (format.bitFieldStrategy() != BitFieldStrategy::None) {
+        return format.bitFieldStrategy();
+    }
+    return target.aggregateLayout().bitFieldStrategy;
+}
+
 namespace {
 
 // Snapshot-vs-current `errorCount` gate. Each tier shares `reporter`,
@@ -155,11 +167,18 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
     // `sizeof` in an array-dimension const-expression (`int a[sizeof(T)]`) folds
     // through the same `computeLayout` engine MIR uses — `nullopt` when the
     // target declared no block (the fold then fails loud, never a wrong size).
+    // D-CSUBSET-BITFIELD-ABI-EXACT: overlay the FORMAT-resolved bit-field strategy
+    // onto the target's params (the strategy is OS/format-determined; the target
+    // supplies only the alignment rule). A `sizeof` over a bit-field struct in an
+    // array dimension then folds with the byte-ABI-exact layout.
+    auto const effectiveBfStrategy = effectiveBitFieldStrategy(target, format);
+    std::optional<AggregateLayoutParams> analyzeLayout;
+    if (target.aggregateLayoutLoaded()) {
+        analyzeLayout = target.aggregateLayout();
+        analyzeLayout->bitFieldStrategy = effectiveBfStrategy;
+    }
     auto model = analyze(
-        std::move(borrowed), format.dataModel(),
-        target.aggregateLayoutLoaded()
-            ? std::optional<AggregateLayoutParams>{target.aggregateLayout()}
-            : std::nullopt);
+        std::move(borrowed), format.dataModel(), analyzeLayout);
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
         return std::nullopt;
@@ -279,7 +298,12 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
     // FC6: thread the active target's aggregate-layout params + the format's data
     // model so HIR→MIR can fold `sizeof(T)` to T's byte size via the type_layout
     // engine. The target supplies the alignment rule, the format the pointer width.
+    // D-CSUBSET-BITFIELD-ABI-EXACT: the bit-field strategy is FORMAT-determined —
+    // overlay the resolved value so bit-field member-access/init lowers byte-ABI-
+    // exact for the active object format (PE → msvc_straddle, ELF/Mach-O →
+    // gnu_packed), not just whatever the target declared.
     mirCfg.aggregateLayout       = target.aggregateLayout();
+    mirCfg.aggregateLayout.bitFieldStrategy = effectiveBfStrategy;
     mirCfg.aggregateLayoutLoaded = target.aggregateLayoutLoaded();
     mirCfg.dataModel             = format.dataModel();
     // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the RESOLVED calling
@@ -296,7 +320,7 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,
                           &hir->sourceMap, mirCfg, &ffiMap,
-                          &hir->linkageMap);
+                          &hir->linkageMap, &hir->mutabilityMap);
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;
     }
@@ -328,6 +352,9 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
         // model now, for the same reason — the aggregate-global rodata encoder
         // (in the LOWER half) needs the pointer width to compute byte layout.
         format.dataModel(),
+        // D-CSUBSET-BITFIELD-ABI-EXACT: capture the FORMAT-resolved bit-field
+        // strategy so the LOWER half lays out bit-field globals byte-ABI-exact.
+        effectiveBfStrategy,
     };
     return cuMir;
 }
@@ -364,6 +391,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          std::optional<SymbolId>                     userEntrySymbol,
                          TargetSchema const&                         target,
                          DataModel                                   dataModel,
+                         BitFieldStrategy                            bitFieldStrategy,
                          std::uint16_t                               callingConventionIndex,
                          CompilationUnitId                           cuId,
                          std::optional<ExternCallDispatch>           externCallDispatch,
@@ -459,12 +487,16 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // data model (the pointer width) so a const-init aggregate global
     // (`struct P { int x; int y; } v = { 20, 22 };`) reaches `.rodata`
     // byte-exact via the shared `type_layout` engine.
+    // D-CSUBSET-BITFIELD-ABI-EXACT: overlay the FORMAT-resolved bit-field strategy
+    // (threaded in as `bitFieldStrategy`) so a const-init BIT-FIELD global packs
+    // byte-ABI-exact for the active object format.
+    std::optional<AggregateLayoutParams> globalsLayout;
+    if (target.aggregateLayoutLoaded()) {
+        globalsLayout = target.aggregateLayout();
+        globalsLayout->bitFieldStrategy = bitFieldStrategy;
+    }
     auto dataItems = lowerMirGlobalsToDataItems(
-        mir, interner,
-        target.aggregateLayoutLoaded()
-            ? std::optional<AggregateLayoutParams>{target.aggregateLayout()}
-            : std::nullopt,
-        dataModel, reporter);
+        mir, interner, globalsLayout, dataModel, reporter);
     if (!tierClean(reporter, asmEntry)) {
         // Any per-global encoding error already raised a loud
         // diagnostic via the function's internal `emit`.
@@ -633,7 +665,8 @@ lowerCuMirToAssembly(CuMirModule& cuMir, DiagnosticReporter& reporter) {
     return lowerMirModuleToAssembly(
         cuMir.mir, model.lattice().interner(), nameOf,
         std::move(cuMir.externImports), userEntry, *cuMir.target,
-        cuMir.dataModel, cuMir.callingConventionIndex, cuMir.cuId,
+        cuMir.dataModel, cuMir.bitFieldStrategy,
+        cuMir.callingConventionIndex, cuMir.cuId,
         cuMir.externCallDispatch, reporter);
 }
 
@@ -655,6 +688,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       GrammarSchema const& /*grammar*/,
                       TargetSchema const& target,
                       DataModel           dataModel,
+                      BitFieldStrategy    bitFieldStrategy,
                       std::uint16_t       callingConventionIndex,
                       CompilationUnitId   cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
@@ -670,7 +704,8 @@ lowerMergedToAssembly(MergedMirModule&    merged,
     return lowerMirModuleToAssembly(
         merged.mir, merged.host.interner(), nameOf,
         std::move(merged.externImports), merged.userEntrySymbol, target,
-        dataModel, callingConventionIndex, cuId, externCallDispatch, reporter);
+        dataModel, bitFieldStrategy, callingConventionIndex, cuId,
+        externCallDispatch, reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU

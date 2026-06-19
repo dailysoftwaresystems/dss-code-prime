@@ -986,6 +986,31 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         static_cast<std::uint32_t>(v);
                 }
             }
+            // FC8 bitfields (D-CSUBSET-BITFIELD): OPTIONAL bit-field packing
+            // strategy. Absent → BitFieldStrategy::None (the layout engine then
+            // FAILS LOUD only if a struct with a bit-field is laid out — a
+            // bitfield-free target is unaffected). A wrong spelling is a hard
+            // error (a typo can't silently fall back to a wrong rule).
+            if (al.contains("bitFieldStrategy")) {
+                if (!al.at("bitFieldStrategy").is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/aggregateLayout/bitFieldStrategy",
+                              "must be a string (e.g. \"gnu_packed\")");
+                    ok = false;
+                } else {
+                    auto const name = al.at("bitFieldStrategy").get<std::string>();
+                    auto const strat = bitFieldStrategyFromName(name);
+                    if (!strat) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/aggregateLayout/bitFieldStrategy",
+                                  std::format("unknown bitFieldStrategy '{}' "
+                                              "(expected \"gnu_packed\")", name));
+                        ok = false;
+                    } else {
+                        data.aggregateLayout.bitFieldStrategy = *strat;
+                    }
+                }
+            }
             if (ok) data.aggregateLayoutLoaded = true;
         }
     }

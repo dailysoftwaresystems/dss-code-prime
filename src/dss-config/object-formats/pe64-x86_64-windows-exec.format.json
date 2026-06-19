@@ -12,6 +12,9 @@
   "$dataModelComment": "FC3 c1: 64-bit Windows is LLP64 (int 32, long 32, long long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I32 here, the literal ladder + descriptor signatureByDataModel resolve their LLP64 arms. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
   "dataModel": "LLP64",
 
+  "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: C bit-field allocation is OS/format-determined (the x86_64 CPU target serves BOTH this PE format and ELF-SysV), so the strategy lives here, not on the target. MSVC's x64 ABI starts a NEW allocation unit — aligned to the field's declared-type natural alignment — whenever an adjacent bit-field's declared-type SIZE differs from the current unit's type size (it never packs different-sized declared types into one unit), and the struct size covers the last unit's full declared-type width. Byte-ABI-exact to cl.exe (verified by the conformance witness): e.g. `{int a:1; char b:1;}` is sizeof 8 with b@byte4, vs gnu_packed's 4 with b@bit1.",
+  "bitFieldStrategy": "msvc_straddle",
+
   "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention — same as LK1 ELF ET_EXEC). Real-name resolution closes with D-LK1-1 (HIR→LIR symbol-name thread). D-LK10-ENTRY Slice C (CLOSED 2026-06-02, commit 1a0b414): the linker prepends a synthetic `_start` trampoline as module.functions[0]; the schema's empty entryPoint resolves to functions[0] = the trampoline, which then calls the USER fn (the post-prepend functions[1+]). See plan 14 §2.13 — Stage 1 closed.",
   "entryPoint": "",
   "$externCallDispatchComment": "PE resolves imports through the IAT: the linker points each extern symbol's VA at an .idata POINTER slot, and the call site dereferences it (x86_64 FF 15 disp32 = call [RIP+disp32]). D-FFI-EXTERN-CALL-DISPATCH.",
@@ -27,8 +30,8 @@
   "$entryCallingConventionComment": "MS x64 calling convention — status (user fn return value in rax) is moved into argGprs[0] = rcx before the indirect ExitProcess call. Read via `target.callingConventionByName(\"ms_x64\")` at trampoline-build time.",
   "entryCallingConvention": "ms_x64",
 
-  "$supportedDataSectionsComment": "D-LK2-RODATA closure: PE-Exec walker emits `.rdata` from `AssembledModule.dataItems` items with `section=Rodata`. The linker's pre-walker gate (linker.cpp) consults this set per-item — `Data` and `Bss` remain anchored under D-LK4-RODATA-PRODUCER. Cross-format agnosticism: ELF and Mach-O exec formats will declare their own row when D-LK1-RODATA / D-LK3-RODATA close; zero linker source changes.",
-  "supportedDataSections": ["rodata"],
+  "$supportedDataSectionsComment": "D-LK2-RODATA (`.rdata`) + D-LK4-DATA-PRODUCER (writable `.data` + uninitialized `.bss`): the PE-Exec walker emits `.rdata` (read-only), `.data` (mutable initialized globals, MEM_WRITE), and `.bss` (zero-init globals, CNT_UNINITIALIZED_DATA — SizeOfRawData=0) from `AssembledModule.dataItems` per the item's `section`. The linker's pre-walker gate (linker.cpp) consults this set per-item. Cross-format agnosticism: this is the SAME field ELF/Mach-O exec formats declare; zero linker source changes.",
+  "supportedDataSections": ["rodata", "data", "bss"],
   "$artifactProfilesComment": "Profiles this format SERVES (plan 06 AP3) — a runnable console executable ⇒ cli (the format-side twin of the language's artifactProfiles[]; driver fails loud D_ArtifactProfileFormatMismatch on a profile not in this set). A `gui` profile (IMAGE_SUBSYSTEM_WINDOWS_GUI) would be added when gui codegen lands — same format, profile-selected subsystem/entry, zero gate-code change.",
   "artifactProfiles": ["cli"],
 
@@ -73,6 +76,26 @@
       "kind": "rodata",
       "name": ".rdata",
       "type": 1073741888,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Writable initialized data (mutable globals) — D-LK4-DATA-PRODUCER. Emitted by the PE walker after .rdata when AssembledModule.dataItems carries an item with section==Data. virtualAddress=0 is a placeholder — the walker computes the RVA at emit time (contiguous after .rdata). Characteristics (the substrate `type` field) = IMAGE_SCN_CNT_INITIALIZED_DATA (0x00000040) | IMAGE_SCN_MEM_READ (0x40000000) | IMAGE_SCN_MEM_WRITE (0x80000000) = 0xC0000040 = 3221225536 — initialized data, READ + WRITE (the MEM_WRITE bit is what makes a runtime store legal; a .rdata store faults). The walker reads name + characteristics from this row.",
+      "kind": "data",
+      "name": ".data",
+      "type": 3221225536,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Uninitialized data (tentative globals `int g;`) — D-LK4-DATA-PRODUCER. Emitted by the PE walker after .data. SizeOfRawData=0 / PointerToRawData=0 (NO file footprint — the loader zero-fills VirtualSize bytes); contributes to SizeOfUninitializedData. virtualAddress=0 — walker-computed. Characteristics (`type`) = IMAGE_SCN_CNT_UNINITIALIZED_DATA (0x00000080) | IMAGE_SCN_MEM_READ (0x40000000) | IMAGE_SCN_MEM_WRITE (0x80000000) = 0xC0000080 = 3221225600 — uninitialized data, READ + WRITE.",
+      "kind": "bss",
+      "name": ".bss",
+      "type": 3221225600,
       "flags": 0,
       "addrAlign": 0,
       "entrySize": 0,

@@ -1439,23 +1439,57 @@ encodeExecDynamic(AssembledModule const&    module,
     // change below is gated on `hasConst` so an empty `dataItems`
     // leaves the output byte-identical to the no-data path (the
     // mandatory control).
-    bool const hasConst = !module.dataItems.empty();
-    // The schema's __const section row is MANDATORY when data globals
-    // are present — fail loud (the format JSON must declare it). Its
-    // addrAlign is the alignment FLOOR (H1 raises it to the strictest
-    // item). secConst also feeds the section_64 record below.
+    // Read-only globals → __TEXT,__const (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O
+    // mirror). Mutable initialized → __DATA,__data; zero-init → __DATA,__bss
+    // (S_ZEROFILL) — D-LK4-DATA-PRODUCER. Each kind laid out by the SAME shared
+    // kind-parameterized helper the ELF writer uses (single-sourced, format-
+    // neutral). The `__const` arm is gated on `hasConst`, the writable arms on
+    // `hasData`/`hasBss`, so an empty `dataItems` is byte-identical to the
+    // no-data path (the mandatory control).
     ObjectFormatSectionInfo const* secConst =
-        hasConst ? requireSection(fmt, SectionKind::Rodata,
-                                  "macho::encodeExecDynamic", reporter)
-                 : nullptr;
-    if (hasConst && secConst == nullptr) return {};
-    auto const constLayoutOpt = link::format::buildExecRodata(
-        module.dataItems,
+        fmt.sectionByKind(SectionKind::Rodata);
+    ObjectFormatSectionInfo const* secData =
+        fmt.sectionByKind(SectionKind::Data);
+    ObjectFormatSectionInfo const* secBss =
+        fmt.sectionByKind(SectionKind::Bss);
+    auto const constLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Rodata,
         secConst != nullptr ? secConst->addrAlign : 1,
         "macho::encodeExecDynamic", reporter);
     if (!constLayoutOpt.has_value()) return {};
     auto const& constLayout = *constLayoutOpt;
-    std::uint64_t const constSize = constLayout.bytes.size();
+    auto const dataLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Data,
+        secData != nullptr ? secData->addrAlign : 1,
+        "macho::encodeExecDynamic", reporter);
+    if (!dataLayoutOpt.has_value()) return {};
+    auto const& dataLayout = *dataLayoutOpt;
+    auto const bssLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Bss,
+        secBss != nullptr ? secBss->addrAlign : 1,
+        "macho::encodeExecDynamic", reporter);
+    if (!bssLayoutOpt.has_value()) return {};
+    auto const& bssLayout = *bssLayoutOpt;
+    bool const hasConst = !constLayout.empty();
+    bool const hasData  = !dataLayout.empty();
+    bool const hasBss   = !bssLayout.empty();
+    bool const hasDataSeg = hasData || hasBss;   // needs a __DATA segment
+    std::uint64_t const constSize = constLayout.spanSize;
+    // Each present section's schema row is MANDATORY — fail loud (the format
+    // JSON must declare it). The rows feed the section_64 records below.
+    if (hasConst && secConst == nullptr) return {};
+    if (hasData && secData == nullptr) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "macho::encodeExecDynamic: module carries Data items but the "
+             "format declares no 'data' section row (D-LK4-DATA-PRODUCER).");
+        return {};
+    }
+    if (hasBss && secBss == nullptr) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "macho::encodeExecDynamic: module carries Bss items but the "
+             "format declares no 'bss' section row (D-LK4-DATA-PRODUCER).");
+        return {};
+    }
     // __stubs occupies `numExterns * stubSize` bytes contiguously
     // after __text; __const starts at the H1-aligned VA above them.
     std::uint64_t const stubsBytes =
@@ -1464,15 +1498,55 @@ encodeExecDynamic(AssembledModule const&    module,
         hasConst
             ? alignUp(stubsVa + stubsBytes, constLayout.maxAlign)
             : 0;
-    // Each NAMED data item joins symbolVa at `constSectionVa +
-    // itemOffsets[i]` (anonymous SymbolId{} items skipped — M1). A
-    // duplicate symbol fails loud (K_DuplicateDataSymbol).
-    if (hasConst) {
-        if (!link::format::addDataSymbolVas(
-                module.dataItems, constSectionVa, constLayout.itemOffsets,
-                symbolVa, "macho::encodeExecDynamic", reporter)) {
-            return {};
-        }
+    // Each NAMED __const item joins symbolVa at `constSectionVa +
+    // itemOffsets[j]` (anonymous SymbolId{} items skipped — M1). A
+    // duplicate symbol fails loud (K_DuplicateDataSymbol). __data/__bss item
+    // VAs are registered later (their VAs derive from the __DATA segment
+    // layout, computed after __DATA_CONST).
+    if (hasConst
+        && !link::format::addDataSymbolVas(
+               module.dataItems, constLayout, constSectionVa,
+               symbolVa, "macho::encodeExecDynamic", reporter)) {
+        return {};
+    }
+    // __data / __bss VAs (D-LK4-DATA-PRODUCER) — computed EARLY so a `.text`
+    // load/store of a mutable global resolves through `applyExecRelocations`
+    // below (a global access lowers to ADRP+ADD / lea against the global's
+    // SymbolId). They live in a NEW writable `__DATA` segment placed after
+    // `__DATA_CONST` (the GOT); both `__DATA_CONST` and `__DATA` are page-
+    // aligned segments (dyld maps each independently), so the VAs derive from
+    // the same page-aligned chain the LATE layout recomputes via file-offset
+    // deltas — the LATE layout asserts congruence (a self-check that fires
+    // fail-loud if this early arithmetic ever diverges). `__bss` is S_ZEROFILL:
+    // it occupies VM (vmsize) but NO file bytes, and is the LAST section in
+    // `__DATA`. Sizes: __got = numExterns*8 (one page-aligned segment).
+    std::uint64_t const gotBytesEarly =
+        static_cast<std::uint64_t>(numExterns) * kGotSlotSize;
+    std::uint64_t const dataConstEndVaEarly =
+        alignUp((hasConst ? constSectionVa + constSize
+                          : stubsVa + stubsBytes),
+                kPageSize)            // __DATA_CONST.vmaddr (page boundary)
+        + gotBytesEarly;             // + __got contents
+    std::uint64_t const dataSegVaEarly =
+        hasDataSeg ? alignUp(dataConstEndVaEarly, kPageSize) : 0;
+    std::uint64_t const dataSecVa =
+        hasData ? alignUp(dataSegVaEarly, dataLayout.maxAlign) : 0;
+    std::uint64_t const bssSecVa =
+        hasBss ? alignUp((hasData ? dataSecVa + dataLayout.spanSize
+                                  : dataSegVaEarly),
+                         bssLayout.maxAlign)
+               : 0;
+    if (hasData
+        && !link::format::addDataSymbolVas(
+               module.dataItems, dataLayout, dataSecVa,
+               symbolVa, "macho::encodeExecDynamic", reporter)) {
+        return {};
+    }
+    if (hasBss
+        && !link::format::addDataSymbolVas(
+               module.dataItems, bssLayout, bssSecVa,
+               symbolVa, "macho::encodeExecDynamic", reporter)) {
+        return {};
     }
 
     // ── (f) Apply intra-module relocations in-place ─────────────
@@ -1744,6 +1818,15 @@ encodeExecDynamic(AssembledModule const&    module,
         kSegmentCommand64Size + kSection64Size * (hasConst ? 3u : 2u);
     constexpr std::size_t kSegCmdDataConstSize =
         kSegmentCommand64Size + kSection64Size;      // __got
+    // __DATA segment (D-LK4-DATA-PRODUCER) — one LC_SEGMENT_64 + a section_64
+    // per present writable section (__data and/or __bss). Absent when the module
+    // has no writable globals (byte-identical to the pre-data image).
+    std::uint32_t const dataSegNsects =
+        (hasData ? 1u : 0u) + (hasBss ? 1u : 0u);
+    std::size_t const kSegCmdDataSize =
+        hasDataSeg
+            ? kSegmentCommand64Size + kSection64Size * dataSegNsects
+            : 0u;
     constexpr std::size_t kSegCmdLinkeditSize = kSegmentCommand64Size;
     constexpr std::size_t kLcMainSize         = 24;
 
@@ -1776,8 +1859,11 @@ encodeExecDynamic(AssembledModule const&    module,
     //       pointers in __got encode the import ordinal directly, so
     //       the indirect symbol table is redundant) + LC_CODE_SIGNATURE
     //       when emitCodeSig + LC_BUILD_VERSION when emitBuildVersion.
+    // Segment count: __PAGEZERO + __TEXT + __DATA_CONST + __LINKEDIT = 4, plus
+    // __DATA when the module has writable globals (D-LK4-DATA-PRODUCER).
+    std::uint32_t const segCount = 4u + (hasDataSeg ? 1u : 0u);
     std::uint32_t const ncmds = static_cast<std::uint32_t>(
-        4u + 1u + 1u + 1u + im.loadDylibs.size() + 1u
+        segCount + 1u + 1u + 1u + im.loadDylibs.size() + 1u
         + (useChainedFixups ? 0u : 1u)
         + (emitCodeSig ? 1u : 0u)
         + (emitBuildVersion ? 1u : 0u));
@@ -1789,8 +1875,9 @@ encodeExecDynamic(AssembledModule const&    module,
         : kDyldInfoCommandSize;
     std::size_t const sizeofcmds =
         kSegCmdPageZeroSize + kSegCmdTextSize + kSegCmdDataConstSize +
-        kSegCmdLinkeditSize + dyldBindCmdSize + dylinkerCmdSize +
-        kLcMainSize + totalDylibCmdSize + kSymtabCommandSize +
+        kSegCmdDataSize + kSegCmdLinkeditSize + dyldBindCmdSize +
+        dylinkerCmdSize + kLcMainSize + totalDylibCmdSize +
+        kSymtabCommandSize +
         (useChainedFixups ? 0u : kDysymtabCommandSize) +
         (emitCodeSig ? kCodeSigCommandSize : 0u) +
         (emitBuildVersion ? kBuildVersionCommandSize : 0u);
@@ -1855,6 +1942,52 @@ encodeExecDynamic(AssembledModule const&    module,
     // segment-anchored form (code-architect MEDIUM, LK6 cycle 2c).
     std::uint64_t const gotVa =
         sectionVa + (gotFileOff - textFileOff);
+
+    // __DATA segment (D-LK4-DATA-PRODUCER) — writable (rw-), placed on a page
+    // boundary after __DATA_CONST (the GOT). Holds __data (file-backed, mutable
+    // initialized globals) then __bss (S_ZEROFILL, last — VM only, no file
+    // bytes). VAs derive from file-offset deltas (same `sectionVa + (off -
+    // textFileOff)` identity the GOT uses); the EARLY VAs registered in symbolVa
+    // above must match — asserted fail-loud below.
+    std::uint64_t const dataSegFileOff =
+        hasDataSeg ? alignUp(gotFileOff + gotFileSize, kPageSize) : 0;
+    std::uint64_t const dataSecFileOff =
+        hasData ? alignUp(dataSegFileOff, dataLayout.maxAlign) : 0;
+    std::uint64_t const dataSecFileSize = dataLayout.spanSize;
+    std::uint64_t const dataSecVaLate =
+        hasData ? sectionVa + (dataSecFileOff - textFileOff) : 0;
+    // __bss VA follows __data in VM (zero-fill — no file bytes consumed).
+    std::uint64_t const bssSecVaLate =
+        hasBss ? alignUp((hasData ? dataSecVaLate + dataSecFileSize
+                                  : sectionVa + (dataSegFileOff - textFileOff)),
+                         bssLayout.maxAlign)
+               : 0;
+    std::uint64_t const bssSecSize = bssLayout.spanSize;
+    // Congruence self-check: the EARLY VAs (used for reloc resolution) MUST
+    // equal the LATE layout VAs (used in the section_64 records). A mismatch
+    // would silently place a global's bytes at a different VA than the address
+    // a `.text` reloc was resolved to → wrong runtime value. Fail loud.
+    if ((hasData && dataSecVa != dataSecVaLate)
+        || (hasBss && bssSecVa != bssSecVaLate)) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: __DATA VA congruence "
+                         "broken — early/late mismatch (data early=0x{:x} "
+                         "late=0x{:x}; bss early=0x{:x} late=0x{:x}). The "
+                         "reloc-time and section-record VAs must agree "
+                         "(D-LK4-DATA-PRODUCER).",
+                         dataSecVa, dataSecVaLate, bssSecVa, bssSecVaLate));
+        return {};
+    }
+    // __DATA segment VM/file extents. filesize covers __data only (__bss adds
+    // none); vmsize covers __data + __bss, page-rounded.
+    std::uint64_t const dataSegVmaddr =
+        hasDataSeg ? sectionVa + (dataSegFileOff - textFileOff) : 0;
+    std::uint64_t const dataSegFileSize = hasData ? dataSecFileSize : 0;
+    std::uint64_t const dataSegVmEnd =
+        hasBss ? (bssSecVaLate + bssSecSize)
+               : (hasData ? dataSecVaLate + dataSecFileSize : dataSegVmaddr);
+    std::uint64_t const dataSegVmsize =
+        hasDataSeg ? alignUp(dataSegVmEnd - dataSegVmaddr, kPageSize) : 0;
 
     // Build the __stubs body: one per-cputype stub per extern, each
     // pointing at its __got slot. The per-cputype emitter (x86_64
@@ -1969,9 +2102,14 @@ encodeExecDynamic(AssembledModule const&    module,
         }
     }
 
-    // __LINKEDIT contents.
+    // __LINKEDIT contents — page-aligned after the last loaded segment: __DATA
+    // (when present, D-LK4-DATA-PRODUCER) else __DATA_CONST (the GOT). __bss is
+    // S_ZEROFILL so it consumes NO file bytes; __LINKEDIT's file offset follows
+    // __data's file end (+ the GOT/data file extent), NOT the bss vm extent.
     std::uint64_t const linkeditFileOff =
-        alignUp(gotFileOff + gotFileSize, kPageSize);
+        hasDataSeg
+            ? alignUp(dataSecFileOff + dataSecFileSize, kPageSize)
+            : alignUp(gotFileOff + gotFileSize, kPageSize);
     std::uint64_t const bindOff = linkeditFileOff;
     std::uint64_t const bindSize = dyldBindBlob.size();
     std::uint64_t const indirectSymtabOff = bindOff + bindSize;
@@ -2048,8 +2186,11 @@ encodeExecDynamic(AssembledModule const&    module,
         alignUp(gotFileSize, kPageSize);
     std::uint64_t const dataConstSegFileSize = gotFileSize;
 
+    // __LINKEDIT VM address follows the last loaded data segment: __DATA when
+    // present (its vmsize covers __data + __bss), else __DATA_CONST.
     std::uint64_t const linkeditSegVmaddr =
-        dataConstSegVmaddr + dataConstSegVmsize;
+        hasDataSeg ? (dataSegVmaddr + dataSegVmsize)
+                   : (dataConstSegVmaddr + dataConstSegVmsize);
     std::uint64_t const linkeditSegVmsize =
         alignUp(linkeditFileSize, kPageSize);
 
@@ -2183,6 +2324,63 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, kGotReserved1);    // index of first indirect sym
     appendU32LE(bytes, 0);
     appendU32LE(bytes, 0);
+
+    // LC_SEGMENT_64 __DATA (D-LK4-DATA-PRODUCER) — writable (rw-) segment with
+    // __data (file-backed mutable globals) and/or __bss (S_ZEROFILL zero-fill,
+    // LAST). Emitted between __DATA_CONST and __LINKEDIT. Section flags come
+    // from the SCHEMA ROW (`secData->type` = S_REGULAR; `secBss->type` =
+    // S_ZEROFILL) — never hardcoded, keeping the writer agnostic. filesize
+    // covers __data only (__bss is zero-fill); vmsize covers both.
+    if (hasDataSeg) {
+        appendU32LE(bytes, LC_SEGMENT_64);
+        appendU32LE(bytes, static_cast<std::uint32_t>(kSegCmdDataSize));
+        appendName16(bytes,
+                     secData != nullptr ? secData->segment
+                     : (secBss != nullptr ? secBss->segment
+                                          : std::string{"__DATA"}));
+        appendU64LE(bytes, dataSegVmaddr);
+        appendU64LE(bytes, dataSegVmsize);
+        appendU64LE(bytes, hasData ? dataSecFileOff : linkeditFileOff);
+        appendU64LE(bytes, dataSegFileSize);
+        appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRw));
+        appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRw));
+        appendU32LE(bytes, dataSegNsects);
+        appendU32LE(bytes, 0);
+        // section_64 __data (file-backed). flags from schema (S_REGULAR).
+        if (hasData) {
+            appendName16(bytes, secData->name);
+            appendName16(bytes, secData->segment);
+            appendU64LE(bytes, dataSecVaLate);
+            appendU64LE(bytes, dataSecFileSize);
+            appendU32LE(bytes, static_cast<std::uint32_t>(dataSecFileOff));
+            appendU32LE(bytes, static_cast<std::uint32_t>(
+                                   std::countr_zero(dataLayout.maxAlign)));
+            appendU32LE(bytes, 0);                 // reloff
+            appendU32LE(bytes, 0);                 // nreloc
+            appendU32LE(bytes, secData->type);     // flags (S_REGULAR) from schema
+            appendU32LE(bytes, 0);                 // reserved1
+            appendU32LE(bytes, 0);                 // reserved2
+            appendU32LE(bytes, 0);                 // reserved3
+        }
+        // section_64 __bss (S_ZEROFILL — offset 0, no file bytes; LAST in
+        // __DATA so its zero-fill span tails the segment's vmsize). flags from
+        // schema (S_ZEROFILL = 1).
+        if (hasBss) {
+            appendName16(bytes, secBss->name);
+            appendName16(bytes, secBss->segment);
+            appendU64LE(bytes, bssSecVaLate);
+            appendU64LE(bytes, bssSecSize);
+            appendU32LE(bytes, 0);                 // offset = 0 (S_ZEROFILL)
+            appendU32LE(bytes, static_cast<std::uint32_t>(
+                                   std::countr_zero(bssLayout.maxAlign)));
+            appendU32LE(bytes, 0);                 // reloff
+            appendU32LE(bytes, 0);                 // nreloc
+            appendU32LE(bytes, secBss->type);      // flags (S_ZEROFILL) from schema
+            appendU32LE(bytes, 0);                 // reserved1
+            appendU32LE(bytes, 0);                 // reserved2
+            appendU32LE(bytes, 0);                 // reserved3
+        }
+    }
 
     // LC_SEGMENT_64 __LINKEDIT (no sections)
     appendU32LE(bytes, LC_SEGMENT_64);
@@ -2353,6 +2551,15 @@ encodeExecDynamic(AssembledModule const&    module,
 
     // __got body (zeroes — dyld fills at load via bind opcodes)
     bytes.insert(bytes.end(), gotBody.begin(), gotBody.end());
+
+    // __DATA,__data body (D-LK4-DATA-PRODUCER) — file-backed mutable globals.
+    // __bss is S_ZEROFILL: it emits NO file bytes (the loader zero-fills it),
+    // so only __data contributes to the file here.
+    if (hasData) {
+        while (bytes.size() < dataSecFileOff) bytes.push_back(0);
+        bytes.insert(bytes.end(), dataLayout.bytes.begin(),
+                     dataLayout.bytes.end());
+    }
 
     // Pad to linkeditFileOff
     while (bytes.size() < linkeditFileOff) bytes.push_back(0);

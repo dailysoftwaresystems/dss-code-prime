@@ -59,6 +59,10 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::RipRelDisp32:
         case EncodingSlotKind::CondCodeNibble:
         case EncodingSlotKind::BlockRel32:
+        // D-CSUBSET-BITFIELD-WIDE-UNIT: `mov r64, imm64` x86-variable
+        // slots never appear on a fixed32 variant.
+        case EncodingSlotKind::OpcodePlusReg:
+        case EncodingSlotKind::Imm64:
         case EncodingSlotKind::Imm9:
         case EncodingSlotKind::MemBaseNoScale:
         case EncodingSlotKind::MemOffsetZero:

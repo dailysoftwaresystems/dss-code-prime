@@ -636,6 +636,49 @@ TEST(MirMerge, MergeRemapsGlobalInitFunc) {
     EXPECT_TRUE(verifier.verify(rep));
 }
 
+// const-ness preservation across the cross-CU merge global-clone site
+// (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL). `mergeCuMirs` rebuilds every CU's globals
+// into the merged module (mir_merge.cpp:625); it MUST carry `MirGlobal.isConst`,
+// or a const global silently degrades to a writable `.data` section after a
+// cross-CU link (loss of read-only-memory protection). Order-independent counts
+// keep this robust to any merge reordering. RED-ON-DISABLE: drop the
+// `m.globalIsConst(g)` argument at mir_merge.cpp:625 → both globals come back
+// mutable and the `constCount == 1` expectation fails.
+TEST(MirMerge, MergePreservesGlobalConstness) {
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32 = in0.primitive(TypeKind::I32);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        // gc (sym 300) CONST init 5 → .rodata; gm (sym 301) MUTABLE init 7 → .data
+        (void)mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(i32Lit(5)),
+                           MirFuncId{}, SymbolBinding::Global,
+                           SymbolVisibility::Default, /*isConst=*/true);
+        (void)mb.addGlobal(i32, SymbolId{301}, mb.literalPoolAdd(i32Lit(7)),
+                           MirFuncId{}, SymbolBinding::Global,
+                           SymbolVisibility::Default, /*isConst=*/false);
+        mir0 = std::move(mb).finish();
+    }
+    std::vector<MergeCuInput> cus = {
+        MergeCuInput{&mir0, &in0, namerOf({{300, "gc"}, {301, "gm"}}), {}},
+    };
+    std::vector<std::string> const entries = {"main"};
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+
+    Mir const& mm = merged->mir;
+    ASSERT_EQ(mm.moduleGlobalCount(), 2u);
+    int constCount = 0, mutCount = 0;
+    for (std::uint32_t i = 0; i < mm.moduleGlobalCount(); ++i) {
+        if (mm.globalIsConst(mm.globalAt(i))) ++constCount; else ++mutCount;
+    }
+    EXPECT_EQ(constCount, 1)
+        << "the CONST global must survive cross-CU merge as const (else it lands "
+           "in a writable .data section)";
+    EXPECT_EQ(mutCount, 1) << "the mutable global must survive merge as mutable";
+}
+
 // ── Two strong definitions report a conflict ───────────────────────
 // CU0 strong f + CU1 strong f → exactly one K_SymbolRedefinedAcrossUnits.
 TEST(MirMerge, MergeReportsTwoStrongConflict) {

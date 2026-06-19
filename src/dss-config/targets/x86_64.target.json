@@ -7,8 +7,8 @@
     "description": "x86_64 opcode set + physical register file + SysV AMD64 / Microsoft x64 calling conventions. Cycle 2b: regfile/ABI added. Cycle 3 (instruction selection) expands the opcode set to full c-subset corpus coverage.",
     "$reservedFields": "The per-opcode minOperands/maxOperands fields are documented in the JSON for completeness but are NOT yet fully enforced by the substrate. Terminator-ness derives from `terminatorKind` (Br/CondBr/Switch/Return/Unreachable; default `none` = non-terminator); the parser's `parseInst` and `LirVerifier` consult it directly. Per-kind successor-count is enforced by `TargetSchemaData::validate()` via the shared `kTargetTerminatorShapes` table."
   },
-  "$aggregateLayoutComment": "FC6 (D-FF3-1): per-ABI struct/union/array layout params the generic type_layout engine reads. `natural` = scalar alignment equals its byte size (capped at maxAlignment) — the rule all four current C ABIs (SysV/Win64/AAPCS64/Apple) share; the format's dataModel supplies the OS-dependent pointer width. maxAlignment 16 = the x86_64 max fundamental alignment (__int128/long double/max_align_t).",
-  "aggregateLayout": { "scalarAlignment": "natural", "maxAlignment": 16 },
+  "$aggregateLayoutComment": "FC6 (D-FF3-1): per-ABI struct/union/array layout params the generic type_layout engine reads. `natural` = scalar alignment equals its byte size (capped at maxAlignment) — the rule all four current C ABIs (SysV/Win64/AAPCS64/Apple) share; the format's dataModel supplies the OS-dependent pointer width. maxAlignment 16 = the x86_64 max fundamental alignment (__int128/long double/max_align_t). D-CSUBSET-BITFIELD-ABI-EXACT: `bitFieldStrategy` here is the BACK-COMPAT FALLBACK only — C bit-field packing is OS/format-determined (this CPU serves BOTH ELF-SysV gnu_packed AND PE-MS msvc_straddle), so the ACTIVE strategy is resolved from the object FORMAT (effectiveBitFieldStrategy). The fallback is used only by direct-API / test callers with no format in scope.",
+  "aggregateLayout": { "scalarAlignment": "natural", "maxAlignment": 16, "bitFieldStrategy": "gnu_packed" },
   "opcodes": [
     {
       "$comment": "Slot 0 = the Invalid sentinel. Every target must declare it as the first opcode so the substrate's `opcode == 0` check (in LirBuilder::addInst) catches default-constructed insts loudly.",
@@ -51,7 +51,7 @@
       "maxSuccessors": 0
     },
     {
-      "$comment": "2-operand-shape mov: destination = result vreg, source = operands[0]. AS2 cycle 2 wires this to two encoding variants: REX.W 0x8B /r (mov r64, r64) when source is a register; REX.W 0xC7 /0 imm32 (mov r/m64, imm32 SIGN-extended to 64-bit) when source is an immediate. FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): both shapes gain explicit `width` keys + 32-bit siblings (same opcodes WITHOUT REX.W, Intel SDM Vol. 2B MOV) — a 32-bit register write auto-zero-extends to the full 64-bit register, and the 32-bit imm32 form is EXACT (not sign-extending), the difference that matters for an `unsigned int` 0xFFFFFFFF. Plumbing movs (phi/copy/capture/spill) are emitted width-default (64) — full-register copies are value-correct for every type.",
+      "$comment": "2-operand-shape mov: destination = result vreg, source = operands[0]. AS2 cycle 2 wires this to two encoding variants: REX.W 0x8B /r (mov r64, r64) when source is a register; REX.W 0xC7 /0 imm32 (mov r/m64, imm32 SIGN-extended to 64-bit) when source is an immediate. FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): both shapes gain explicit `width` keys + 32-bit siblings (same opcodes WITHOUT REX.W, Intel SDM Vol. 2B MOV) — a 32-bit register write auto-zero-extends to the full 64-bit register, and the 32-bit imm32 form is EXACT (not sign-extending), the difference that matters for an `unsigned int` 0xFFFFFFFF. Plumbing movs (phi/copy/capture/spill) are emitted width-default (64) — full-register copies are value-correct for every type. FC8 (D-CSUBSET-BITFIELD-WIDE-UNIT): a fifth variant materializes a FULL 64-bit immediate — REX.W B8+rd io (mov r64, imm64) — selected by the `imm64` operand-kind (a `LiteralIndex` LIR operand: the wide value lives in the LIR literal pool, since it does not fit the inline imm32 path). This is the ONLY x86-64 form that loads a >imm32 constant into a register; its destination rides the opcode byte (B8+rd), not ModR/M, so it uses the `opcode.reg` result slot.",
       "mnemonic":      "mov",
       "result":        "value",
       "hasSideEffects": false,
@@ -87,6 +87,13 @@
             "template":   { "opcode": [199], "modrmRegExt": 0 },
             "resultSlot": "modrm.rm",
             "wires":      [{ "index": 0, "slotKind": "imm32" }]
+          },
+          {
+            "$comment": "FC8 (D-CSUBSET-BITFIELD-WIDE-UNIT): mov r64, imm64 — REX.W (0x48) + B8+rd + 8-byte LE immediate (Intel SDM Vol. 2B MOV, REX.W B8+rd io). The destination register's low 3 bits ride the opcode byte (B8+rd) via the `opcode.reg` result slot; its high bit drives REX.B. The `imm64` operand-kind is a `LirOperand{kind==LiteralIndex}` — the wide value lives in the LIR literal pool (the 8-byte operand POD cannot inline a 64-bit immediate), and the encoder reads it back to emit the 8 LE bytes of the `io` field. width:64 keys it to 64-bit constants only; there is no 32-bit imm64 form (a 32-bit-typed wide constant uses the imm32 forms above).",
+            "guard":      { "operandKinds": ["imm64"], "width": 64 },
+            "template":   { "rexW": true, "opcode": [184] },
+            "resultSlot": "opcode.reg",
+            "wires":      [{ "index": 0, "slotKind": "imm64" }]
           }
         ]
       }

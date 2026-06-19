@@ -12,13 +12,16 @@
   "$dataModelComment": "FC3 c1: 64-bit linux/darwin are LP64 (int 32, long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I64 here. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
   "dataModel": "LP64",
 
+  "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: SysV/GNU LSB-first bit-field packing (byte-ABI-exact to gcc). OS/format-determined (x86_64 serves both ELF and PE), so on the format not the target. See elf64-x86_64-linux for the full rule.",
+  "bitFieldStrategy": "gnu_packed",
+
   "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention). Once D-LK1-1 closes (real symbol-name thread through HIR→LIR→AssembledFunction), this field will name the entry symbol (e.g. '_start' for Linux/glibc, 'main' for hand-rolled execs) and the walker will resolve it by name. When D-LK10-ENTRY Slice C lands, the linker prepends a synthetic `_start` trampoline as module.functions[0] and the schema's entryPoint names the USER fn (the trampoline's call target).",
   "entryPoint": "",
   "$externCallDispatchComment": "ELF resolves imports through the PLT: the linker synthesizes a PLT stub per extern (jmp through the GOT slot) and points the extern symbol's VA at the STUB, so the call site is a PLAIN DIRECT call (E8 disp32 = call rel32 to the stub). An indirect-slot (FF 15) call site would dereference the stub's CODE bytes as a pointer -> SIGSEGV. D-FFI-EXTERN-CALL-DISPATCH.",
   "externCallDispatch": "direct-plt",
 
-  "$supportedDataSectionsComment": "D-LK1-ELF-EXEC-DATA-SECTIONS (rodata-only scope): the ELF ET_EXEC walker emits `.rodata` from `AssembledModule.dataItems` items with `section=Rodata`. The linker's pre-walker gate (linker.cpp) consults this set per-item — `Data` and `Bss` remain anchored under D-LK4-RODATA-PRODUCER. Mirrors the PE walker's `.rdata` arm (D-LK2-RODATA). Cross-format agnosticism: this is the SAME field PE/Mach-O exec formats declare; the gate has zero format-name branches.",
-  "supportedDataSections": ["rodata"],
+  "$supportedDataSectionsComment": "D-LK1-ELF-EXEC-DATA-SECTIONS (rodata) + D-LK4-DATA-PRODUCER (writable `.data` + zero-fill `.bss`): the ELF ET_EXEC walker emits `.rodata` (read-only, R+X PT_LOAD), `.data` (mutable initialized globals, R+W PT_LOAD), and `.bss` (zero-init globals, R+W PT_LOAD, NOBITS) from `AssembledModule.dataItems` per the item's `section`. The linker's pre-walker gate (linker.cpp) consults this set per-item. Cross-format agnosticism: this is the SAME field PE/Mach-O exec formats declare; the gate has zero format-name branches.",
+  "supportedDataSections": ["rodata", "data", "bss"],
   "$artifactProfilesComment": "Profiles this format SERVES (plan 06 AP3) — a runnable console executable ⇒ cli. The format-side twin of the language's artifactProfiles[] (AP1): the driver fails loud (D_ArtifactProfileFormatMismatch) if a project's profile isn't in this set. A future shared-library format would declare [\"lib\"] with ZERO gate-code change — the gate is a generic set-membership, never a format-name branch.",
   "artifactProfiles": ["cli"],
 
@@ -63,6 +66,26 @@
       "name": ".rodata",
       "type": 1,
       "flags": 2,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Writable initialized data (mutable primitive/aggregate globals). sh_type=SHT_PROGBITS(1); sh_flags=SHF_ALLOC|SHF_WRITE(3) — readable + WRITABLE (a store into it must not fault). Placed in a SEPARATE R+W PT_LOAD from the R+X text/rodata so mutable data never shares a page with code (W^X). sh_addralign=8. virtualAddress=0 — the writer COMPUTES the `.data` VA (page-aligned writable segment after the read-only sections). D-LK4-DATA-PRODUCER.",
+      "kind": "data",
+      "name": ".data",
+      "type": 1,
+      "flags": 3,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Zero-initialized data (tentative globals `int g;`). sh_type=SHT_NOBITS(8) — occupies NO file bytes; the loader zero-fills sh_size bytes at the section VA. sh_flags=SHF_ALLOC|SHF_WRITE(3) — readable + writable. Contributes to the R+W PT_LOAD's p_memsz but NOT its p_filesz. sh_addralign=8. virtualAddress=0 — the writer COMPUTES the `.bss` VA (last in the writable segment). D-LK4-DATA-PRODUCER.",
+      "kind": "bss",
+      "name": ".bss",
+      "type": 8,
+      "flags": 3,
       "addrAlign": 8,
       "entrySize": 0,
       "virtualAddress": 0

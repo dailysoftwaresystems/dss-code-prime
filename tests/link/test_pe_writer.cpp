@@ -1544,45 +1544,88 @@ TEST(LinkerEndToEnd, MachORejectsDataItemsUntilD_LK3_RODATA) {
            "until D-LK3-RODATA closes";
 }
 
-TEST(PeExecWriter, RejectsDataKindDataItemUntilD_LK4_RODATA_PRODUCER) {
-    // PE-Exec walker accepts ONLY Rodata. Data items must fail
-    // loud at the walker's pre-loop scan (the schema-declared
-    // capability gate stops Bss-only-walker formats earlier; the
-    // walker's own pre-loop scan stops Data/Bss items even when
-    // the format advertises Rodata).
+// D-LK4-DATA-PRODUCER writer pin (was RejectsDataKindDataItem… — flipped when
+// the writable-data-sections cycle CLOSED the former fail-loud). A Data item now
+// lands in a `.data` section whose Characteristics carry IMAGE_SCN_MEM_WRITE —
+// the bit that makes a runtime store legal (a `.rdata` store faults). RED if the
+// PE writer reverts to rejecting Data items, or emits `.data` without MEM_WRITE.
+TEST(PeExecWriter, DataSectionEmittedWritable) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     AssembledData d;
-    d.symbol  = SymbolId{42};
-    d.section = DataSectionKind::Data;
-    d.bytes   = {0x11};
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {0x07, 0x00, 0x00, 0x00};   // int = 7
+    d.alignment = Alignment::of<4>();
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    // Bypass the linker (whose schema gate would also reject) to
-    // exercise the walker's OWN guard.
     auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
-    EXPECT_EQ(::dss::test_support::countCode(rep,
-                  DiagnosticCode::K_NoMatchingObjectFormat),
-              1u);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "PE writer must ACCEPT a Data item now that D-LK4-DATA-PRODUCER "
+           "closed (it was fail-loud before)";
+    ASSERT_FALSE(bytes.empty());
+    // 2 sections: .text + .data (no .idata — no externs).
+    EXPECT_EQ(readU16LE(bytes, 0x86), 2u) << ".text + .data";
+    constexpr std::size_t kSecHdrTable = 0x188;
+    constexpr std::size_t kSecHdrSize  = 40;
+    constexpr std::size_t kDataHdr     = kSecHdrTable + kSecHdrSize;  // [1]
+    // Section name ".data\0\0\0".
+    EXPECT_EQ(bytes[kDataHdr + 0], '.');
+    EXPECT_EQ(bytes[kDataHdr + 1], 'd');
+    EXPECT_EQ(bytes[kDataHdr + 2], 'a');
+    EXPECT_EQ(bytes[kDataHdr + 3], 't');
+    EXPECT_EQ(bytes[kDataHdr + 4], 'a');
+    // Characteristics @ +36 carry IMAGE_SCN_MEM_WRITE (0x80000000). THE pin:
+    // a mutable global's section MUST be writable.
+    constexpr std::uint32_t kImageScnMemWrite = 0x80000000u;
+    std::uint32_t const chars = readU32LE(bytes, kDataHdr + 36);
+    EXPECT_NE(chars & kImageScnMemWrite, 0u)
+        << ".data Characteristics must carry IMAGE_SCN_MEM_WRITE so a runtime "
+           "store does not fault (D-LK4-DATA-PRODUCER); got 0x"
+        << std::hex << chars;
+    // The 4 data bytes are present on disk at PointerToRawData.
+    std::uint32_t const dataFileOff = readU32LE(bytes, kDataHdr + 20);
+    ASSERT_GE(bytes.size(), dataFileOff + 4u);
+    EXPECT_EQ(bytes[dataFileOff + 0], 0x07u);
 }
 
-TEST(PeExecWriter, RejectsBssDataItemViaLinkerSchemaGate) {
-    // Bss items are rejected by the linker's schema-declared
-    // capability gate (PE-Exec advertises only Rodata) BEFORE
-    // reaching the walker. `validateAssembledData` runs FIRST and
-    // accepts Bss-with-empty-bytes; the schema gate then fires
-    // K_NoMatchingObjectFormat. Ordering is load-bearing — flipping
-    // these two blocks would surface the wrong diagnostic class.
+// D-LK4-DATA-PRODUCER writer pin: a Bss (zero-init) item lands in a `.bss`
+// section that is WRITABLE, NOBITS (SizeOfRawData == 0, no file footprint), and
+// carries a non-zero VirtualSize (the zero-fill memory extent). RED if the
+// writer reverts to rejecting Bss, or writes file bytes for it.
+TEST(PeExecWriter, BssSectionEmittedNobitsWritable) {
     auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledData d;
+    d.symbol       = SymbolId{43};
+    d.section      = DataSectionKind::Bss;
+    d.reservedSize = 4;                       // int g; → 4 zero-fill bytes
+    d.alignment    = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    LinkedImage img = runLinkerWithRodataItem(
-        *loaded.target, *loaded.format, rep,
-        DataSectionKind::Bss);
-    EXPECT_FALSE(img.ok());
-    EXPECT_EQ(::dss::test_support::countCode(rep,
-                  DiagnosticCode::K_NoMatchingObjectFormat),
-              1u);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "PE writer must ACCEPT a Bss item now that D-LK4-DATA-PRODUCER closed";
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_EQ(readU16LE(bytes, 0x86), 2u) << ".text + .bss";
+    constexpr std::size_t kSecHdrTable = 0x188;
+    constexpr std::size_t kSecHdrSize  = 40;
+    constexpr std::size_t kBssHdr      = kSecHdrTable + kSecHdrSize;  // [1]
+    EXPECT_EQ(bytes[kBssHdr + 0], '.');
+    EXPECT_EQ(bytes[kBssHdr + 1], 'b');
+    EXPECT_EQ(bytes[kBssHdr + 2], 's');
+    EXPECT_EQ(bytes[kBssHdr + 3], 's');
+    // VirtualSize @ +8 = 4 (the zero-fill extent — nonzero).
+    EXPECT_EQ(readU32LE(bytes, kBssHdr + 8), 4u);
+    // SizeOfRawData @ +16 = 0; PointerToRawData @ +20 = 0 (NOBITS — no file
+    // footprint).
+    EXPECT_EQ(readU32LE(bytes, kBssHdr + 16), 0u)
+        << ".bss must have SizeOfRawData == 0 (no file bytes)";
+    EXPECT_EQ(readU32LE(bytes, kBssHdr + 20), 0u)
+        << ".bss must have PointerToRawData == 0 (no file footprint)";
+    // Characteristics @ +36 carry MEM_WRITE.
+    EXPECT_NE(readU32LE(bytes, kBssHdr + 36) & 0x80000000u, 0u)
+        << ".bss Characteristics must carry IMAGE_SCN_MEM_WRITE";
 }
 
 TEST(PeExecWriter, RequireSectionRodataFailsLoudWhenSchemaOmitsRow) {

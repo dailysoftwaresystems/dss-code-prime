@@ -193,6 +193,15 @@ struct Lowerer {
     // `spans`) it cannot be written during lowering. Only NON-default linkage is
     // recorded (absence ⇒ Global/Default ⇒ externally visible), keeping it sparse.
     std::vector<std::pair<HirNodeId, LinkageAttr>>& linkage;
+    // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL (writable data sections cycle): shared
+    // accumulator of (decl HIR node → MutabilityAttr) pairs, populated from the
+    // bound symbol's `SymbolRecord.isConst` at each Global lowering site (where
+    // the record is in hand). Applied to the result's HirMutabilityMap AFTER
+    // finish() — same frozen-hir discipline as `linkage` / `spans`. Only CONST
+    // globals are recorded (absence ⇒ mutable ⇒ writable `.data`/`.bss`), so the
+    // side-table stays sparse and a wrongly-defaulted global fails SAFE (writable
+    // never re-introduces the read-only-store crash).
+    std::vector<std::pair<HirNodeId, MutabilityAttr>>& mutability;
 
     // O(1) lookups.
     std::unordered_map<std::uint32_t, std::size_t> ruleMap_;     // RuleId.v → ruleMappings idx
@@ -225,6 +234,26 @@ struct Lowerer {
             return usualArithmeticCommonType(interner, a, b, *arith_);
         }
         return interner.commonType(a, b);
+    }
+
+    // The arithmetic type for a read-modify-write of an lvalue of type `t`
+    // (++/--). C 6.7.2.2: an enum has NO arithmetic of its own — `x++` on an
+    // enum computes `x + 1` at the underlying integer, then converts back to
+    // the enum for the store (coerce() materializes both casts). Every other
+    // type operates as itself. Without this, ++/-- would mint an Enum-typed
+    // BinaryOp that reaches MIR's ALU/width tier AS an enum — correct only by
+    // luck of Add/Sub being signedness-agnostic (the FC8 review residue);
+    // resolving here keeps the codegen MIR int-typed and consistent with
+    // lowerCompoundAssign. Non-enum types are returned unchanged, so coerce()
+    // becomes a no-op (its equal-type early return) — byte-identical for all
+    // pre-enum code.
+    [[nodiscard]] TypeId incDecArithType(TypeId t) const {
+        if (t.valid() && interner.kind(t) == TypeKind::Enum) {
+            auto const sc = interner.scalars(t);
+            if (!sc.empty())
+                return interner.primitive(static_cast<TypeKind>(sc[0]));
+        }
+        return t;
     }
 
     // The enclosing function's declared return type, threaded into `lowerReturn`
@@ -409,6 +438,29 @@ struct Lowerer {
                 return {cast, target};
             }
         }
+        // C 6.7.2.2 enum ↔ int implicit conversion (D-CSUBSET-ENUM-INT-
+        // CONVERSION): an enum HAS an integer type, so a context that mixes
+        // an enum value with an int (`int x = BLUE;`, `enum Color c = 1;`,
+        // a `c += 1` write-back, an enum arg to an int param) materializes
+        // a synthetic Cast so the MIR-tier sees a width-exact int↔int move.
+        // `isArithmeticCore` excludes Enum (it is not in the arith-core
+        // kinds), so this arm runs BEFORE the gate below — which would
+        // otherwise pass an enum-typed mismatch straight through uncoerced.
+        // The semantic tier already admitted the assignment (isAssignable's
+        // enum arm); coerce only realizes it. Different-enum mismatches
+        // never reach here as a coerce target (semantic rejects them).
+        if ((ck == TypeKind::Enum && isArithmeticCore(tk))
+            || (tk == TypeKind::Enum && isArithmeticCore(ck))) {
+            HirNodeId const cast =
+                builder.makeCast(child.id, target, HirFlags::Synthetic);
+            for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                if (it->first == child.id) {
+                    spans.push_back({cast, it->second});
+                    break;
+                }
+            }
+            return {cast, target};
+        }
         // Pointers, structs, FnSig are not coerced implicitly; let the
         // caller decide whether the mismatch is a diagnostic. Arithmetic
         // (int + float kinds — file-scope `isArithmeticCore`) is the
@@ -512,10 +564,11 @@ struct Lowerer {
             NumberStyle const* ns, DiagnosticReporter& r, HirBuilder& b,
             HirLiteralPool& lits, std::vector<std::pair<HirNodeId, HirSourceLoc>>& sp,
             std::vector<HirExternRecord>& ed,
-            std::vector<std::pair<HirNodeId, LinkageAttr>>& lk)
+            std::vector<std::pair<HirNodeId, LinkageAttr>>& lk,
+            std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
-          linkage(lk) {
+          linkage(lk), mutability(mut) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -719,6 +772,16 @@ struct Lowerer {
             || attr.visibility != SymbolVisibility::Default)
             linkage.push_back({node, attr});
     }
+    // Record const-ness for a lowered Global node from its bound symbol's
+    // `SymbolRecord.isConst` (sparse: only CONST decls are stored; absence ⇒
+    // mutable ⇒ writable `.data`/`.bss`). `sym` must be the global's declared
+    // symbol. D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL.
+    void recordMutability(HirNodeId node, SymbolId sym) {
+        if (!sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->isConst)
+            mutability.push_back({node, MutabilityAttr{/*isConst=*/true}});
+    }
 
     [[nodiscard]] bool isExprNode(NodeId n) const {
         if (tree().kind(n) != NodeKind::Internal) return false;
@@ -918,6 +981,35 @@ struct Lowerer {
             if (sem.identifierToken.valid() && tk.v == sem.identifierToken.v) {
                 TypeId const type = typeAtOr(node, InvalidType);
                 SymbolId const sym = model.symbolAt(c);
+                // C 6.7.2.2 (D-CSUBSET-ENUM-INT-CONVERSION): an enumerator
+                // name is a CONSTANT, not a storage location — fold the Ref
+                // to its integer value at lowering. `isEnumerator` (set by
+                // semantic analysis only for a symbol bound under a
+                // `compositeKind:"enum"` decl) distinguishes it from a
+                // storage-backed `enum E e;` local that ALSO carries
+                // type.kind == Enum — folding THAT would drop its load and
+                // silently miscompile. The literal's core is the enum's
+                // underlying integer (scalars[0], default I32); the node keeps
+                // the enum `type` so downstream coerce / UAC see the enum and
+                // resolve it via enumUnderlyingOrSelf. The makeRef below is the
+                // fallback for every non-enumerator identifier.
+                if (auto const* erec = model.recordFor(sym);
+                    erec != nullptr && erec->isEnumerator) {
+                    TypeKind core = TypeKind::I32;
+                    if (type.valid() && interner.kind(type) == TypeKind::Enum) {
+                        auto const sc = interner.scalars(type);
+                        if (!sc.empty()) core = static_cast<TypeKind>(sc[0]);
+                    }
+                    HirLiteralValue lv;
+                    lv.core = core;
+                    if (isSignedCore(core))
+                        lv.value = static_cast<std::int64_t>(erec->enumValue);
+                    else
+                        lv.value = static_cast<std::uint64_t>(erec->enumValue);
+                    return {track(builder.makeLiteral(
+                                      type, literals.add(std::move(lv))), node),
+                            type};
+                }
                 return {track(builder.makeRef(type, sym.v), node), type};
             }
             auto lit = litType_.find(tk.v);
@@ -1680,10 +1772,13 @@ struct Lowerer {
             SymbolId const tmp = freshSymbol();
             std::vector<HirNodeId> stmts = lv->prep;
             stmts.push_back(builder.makeVarDecl(lv->type, tmp.v, lvRead(*lv), HirFlags::Synthetic));
-            HirNodeId one = synthOne(lv->type);
-            HirNodeId inc = builder.addParent(HirKind::BinaryOp, std::array{lvRead(*lv), one}, lv->type,
+            TypeId const opType = incDecArithType(lv->type);   // enum → underlying int
+            HirNodeId one = synthOne(opType);
+            HirNodeId lhs = coerce(E{lvRead(*lv), lv->type}, opType).id;   // no-op if non-enum
+            HirNodeId sum = builder.addParent(HirKind::BinaryOp, std::array{lhs, one}, opType,
                                               encodeOp(e.target == "PostInc" ? HirOpKind::Add
                                                                              : HirOpKind::Sub));
+            HirNodeId inc = coerce(E{sum, opType}, lv->type).id;          // int → enum write-back
             stmts.push_back(lvWrite(*lv, inc));
             HirNodeId yield = builder.makeRef(lv->type, tmp.v);
             return {track(builder.makeSeqExpr(stmts, yield, lv->type, HirFlags::Synthetic), node),
@@ -2657,6 +2752,49 @@ struct Lowerer {
             return isStruct ? structFields[i] : elemTypeForArray;
         };
 
+        // FC8 D-CSUBSET-BITFIELD-INIT (C 6.7.9): an UNNAMED bit-field
+        // (`unsigned : 0;` packing break, or `unsigned : 3;`) is NOT initialized
+        // by a POSITIONAL initializer — the cursor skips it (only NAMED fields
+        // consume a positional slot). It still occupies a type-field slot (so the
+        // packed layout is right), so without this skip a `{a,b,c}` whose struct
+        // has an interior anonymous bit-field would land `c` on the anon slot and
+        // zero-fill the real next field — a silent miscompile. A DESIGNATED write
+        // is unaffected: anon fields carry synthetic `<anon:…>` names no user
+        // designator can name. `positionallySkippable[i]` is true for an anon
+        // bit-field field; ordinary fields + named bit-fields are initializable.
+        std::vector<bool> positionallySkippable(slotCount, false);
+        if (isStruct) {
+            // A field index is NAMED iff the composite's scope binds a real
+            // (non-synthetic) name to it. Anonymous fields bind under `<anon:…>`.
+            ScopeId const sscope = model.compositeScopeFor(contextType);
+            // Only classify when the composite scope is resolvable — otherwise we
+            // can't tell named from anonymous, so skip NOTHING (never mis-skip a
+            // named bit-field; the worst case degrades to the prior behaviour).
+            if (sscope.valid()) {
+                std::vector<bool> named(slotCount, false);
+                for (auto const& [bname, bsym] : model.scopeRecord(sscope).bindings) {
+                    if (bname.rfind("<anon:", 0) == 0) continue;   // synthetic anon name
+                    auto const* brec = model.recordFor(bsym);
+                    if (brec == nullptr || brec->kind != DeclarationKind::Variable)
+                        continue;
+                    if (brec->fieldIndex < slotCount) named[brec->fieldIndex] = true;
+                }
+                for (std::uint32_t i = 0; i < slotCount; ++i) {
+                    // Only an UNNAMED bit-field is skippable; an ordinary unnamed
+                    // field cannot occur in C (a declarator with no name declares
+                    // nothing — rejected at semantic), so keying on `fieldBitWidth`
+                    // present is exact for the skippable case.
+                    if (!named[i] && interner.fieldBitWidth(contextType, i).has_value())
+                        positionallySkippable[i] = true;
+                }
+            }
+        }
+        // Advance `slot` past any positionally-skippable (anon bit-field) field.
+        auto skipAnon = [&](std::uint32_t slot) -> std::uint32_t {
+            while (slot < slotCount && positionallySkippable[slot]) ++slot;
+            return slot;
+        };
+
         // Root level of the InitSlot tree — one slot per top-level
         // field/element. Single-designator writes have empty residual
         // path (store directly at the slot); dot-chained writes have
@@ -2789,8 +2927,11 @@ struct Lowerer {
             }
 
             // Determine the OUTER target slot index + the residual path
-            // for nested writes.
-            std::uint32_t target = cursor;
+            // for nested writes. FC8 D-CSUBSET-BITFIELD-INIT: a POSITIONAL
+            // element skips any anonymous bit-field at the cursor (C 6.7.9);
+            // a DESIGNATED element targets its named field directly (anon
+            // fields are unnameable), so the skip applies only to positional.
+            std::uint32_t target = skipAnon(cursor);
             std::span<std::uint32_t const> residualPath;
             if (!designatorPath.empty()) {
                 target = designatorPath[0];
@@ -2943,11 +3084,14 @@ struct Lowerer {
         for (NodeId c : visible(postfixNode)) { if (!isToken(c)) { baseN = c; break; } }
         auto lv = baseN.valid() ? classifyLvalue(baseN) : std::nullopt;
         if (!lv) return reportedError(postfixNode, "++/-- needs an lvalue operand");
-        HirNodeId one = synthOne(lv->type);
-        HirNodeId value = track(builder.addParent(HirKind::BinaryOp, std::array{lvRead(*lv), one},
-                                                  lv->type,
-                                                  encodeOp(isInc ? HirOpKind::Add : HirOpKind::Sub)),
-                                postfixNode);
+        TypeId const opType = incDecArithType(lv->type);   // enum → underlying int
+        HirNodeId one = synthOne(opType);
+        HirNodeId lhs = coerce(E{lvRead(*lv), lv->type}, opType).id;   // no-op if non-enum
+        HirNodeId sum = track(builder.addParent(HirKind::BinaryOp, std::array{lhs, one},
+                                                opType,
+                                                encodeOp(isInc ? HirOpKind::Add : HirOpKind::Sub)),
+                              postfixNode);
+        HirNodeId value = coerce(E{sum, opType}, lv->type).id;         // int → enum write-back
         return asStmt(*lv, lvWrite(*lv, value), postfixNode);
     }
 
@@ -3327,9 +3471,15 @@ struct Lowerer {
                     break;
                 }
             }
-            out.push_back(asGlobal
+            HirNodeId const lowered = asGlobal
                 ? track(builder.makeGlobal(type, sym.v, init), d)
-                : track(builder.makeVarDecl(type, sym.v, init), d));
+                : track(builder.makeVarDecl(type, sym.v, init), d);
+            // Carry const-ness from the bound symbol to the Global node so
+            // HIR→MIR can route a const-init global to read-only `.rodata` and a
+            // mutable one to writable `.data` (D-LK4-DATA-PRODUCER-MUTABLE-
+            // GLOBAL). Locals are stack slots — mutability is irrelevant there.
+            if (asGlobal) recordMutability(lowered, sym);
+            out.push_back(lowered);
         }
     }
 
@@ -3387,8 +3537,12 @@ struct Lowerer {
                 break;
             }
         }
-        return asGlobal ? track(builder.makeGlobal(type, sym.v, init), node)
-                        : track(builder.makeVarDecl(type, sym.v, init), node);
+        if (asGlobal) {
+            HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
+            recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
+            return g;
+        }
+        return track(builder.makeVarDecl(type, sym.v, init), node);
     }
 
     HirNodeId lowerVarDecl(NodeId node) { return lowerVarLike(node, /*asGlobal=*/false); }
@@ -3650,6 +3804,7 @@ struct Lowerer {
         }
         HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
         recordLinkage(g, linkAttr);
+        recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
         return g;
     }
 
@@ -4118,6 +4273,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // D-CSUBSET-LINKAGE-SPECIFIERS: shared (decl node → LinkageAttr) accumulator,
     // moved onto result->linkageMap after finish() (see Lowerer::linkage).
     std::vector<std::pair<HirNodeId, LinkageAttr>> linkage;
+    // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: shared (Global node → MutabilityAttr)
+    // accumulator, moved onto result->mutabilityMap after finish().
+    std::vector<std::pair<HirNodeId, MutabilityAttr>> mutability;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -4128,7 +4286,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         if (lowerers.contains(sch.schemaId().v)) continue;
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
-            reporter, builder, literals, spans, externDecls, linkage));
+            reporter, builder, literals, spans, externDecls, linkage,
+            mutability));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -4175,6 +4334,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     auto result = std::make_unique<CstToHirResult>(std::move(hir), std::move(literals));
     for (auto& [id, loc] : spans) result->sourceMap.set(id, loc);
     for (auto& [id, attr] : linkage) result->linkageMap.set(id, attr);
+    for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
     result->externDecls = std::move(externDecls);
 
     // verify-on-load.

@@ -1824,30 +1824,132 @@ TEST(ElfExecWriter, RodataAlsoEmittedOnArm64SharedCodePath) {
     EXPECT_EQ(readU32LE(bytes, 64 + 4), 5u);
 }
 
-TEST(ElfExecWriter, NonRodataDataItemFailsLoud) {
-    // Fail-loud: a Data/Bss item is rejected (only Rodata closes this
-    // cycle). The non-Rodata scan runs UNCONDITIONALLY so a module
-    // carrying ONLY non-Rodata items can't slip past.
+// D-LK4-DATA-PRODUCER writer pin (was NonRodataDataItemFailsLoud — flipped when
+// the writable-data-sections cycle CLOSED the former fail-loud). A Data item now
+// lands in a `.data` section whose sh_flags carry SHF_WRITE (3 = SHF_ALLOC |
+// SHF_WRITE) — the bit that makes a runtime store legal — AND it sits in a
+// SEPARATE R+W PT_LOAD from the R+X text (W^X). RED if the ELF writer reverts to
+// rejecting Data items, drops SHF_WRITE, or folds .data into the R+X segment.
+TEST(ElfExecWriter, DataSectionEmittedWritableInSeparateLoadSegment) {
     auto loaded = loadShipped();
-    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);  // ret
     AssembledData d;
     d.symbol    = SymbolId{42};
-    d.section   = DataSectionKind::Data;       // NOT Rodata
-    d.bytes     = {1, 2, 3, 4};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {7, 0, 0, 0};                 // int = 7
     d.alignment = Alignment::of<4>();
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
     auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
-    bool sawCode = false;
-    for (auto const& diag : rep.all()) {
-        if (diag.code == DiagnosticCode::K_NoMatchingObjectFormat
-         && diag.actual.find("D-LK4-RODATA-PRODUCER") != std::string::npos) {
-            sawCode = true;
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "ELF writer must ACCEPT a Data item now that D-LK4-DATA-PRODUCER "
+           "closed (it was fail-loud before)";
+    ASSERT_FALSE(bytes.empty());
+    // Scan the section-header table for a SHT_PROGBITS section whose sh_flags
+    // carry SHF_WRITE (the .data section). sh_flags(u64)@8.
+    constexpr std::uint64_t kShfWrite = 0x1ull;   // SHF_WRITE
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    std::uint16_t const shnum = readU16LE(bytes, 60);
+    bool sawWritableData = false;
+    std::uint64_t dataVa = 0;
+    for (std::uint16_t i = 1; i < shnum; ++i) {
+        std::size_t const off = static_cast<std::size_t>(shoff)
+                              + static_cast<std::size_t>(i) * kShdrSize;
+        std::uint32_t const shType  = readU32LE(bytes, off + 4);
+        std::uint64_t const shFlags = readU64LE(bytes, off + 8);
+        std::uint64_t const shSize  = readU64LE(bytes, off + 32);
+        if (shType == 1u /*SHT_PROGBITS*/ && (shFlags & kShfWrite)
+            && shSize == 4u) {
+            sawWritableData = true;
+            dataVa = readU64LE(bytes, off + 16);
+            break;
         }
     }
-    EXPECT_TRUE(sawCode)
-        << "Data/Bss dataItem must fail loud citing D-LK4-RODATA-PRODUCER";
+    ASSERT_TRUE(sawWritableData)
+        << ".data must be a SHT_PROGBITS section carrying SHF_WRITE (a mutable "
+           "global's store must not fault) — D-LK4-DATA-PRODUCER";
+    // W^X: the writable segment must be a SEPARATE PT_LOAD with PF_W set, NOT
+    // the R+X text segment. Walk the program headers (e_phoff@32, e_phnum@56,
+    // 56-byte entries: p_type@0, p_flags@4, p_vaddr@16, p_memsz@40) and find
+    // the PT_LOAD whose VA range covers dataVa; assert PF_W (2) is set, PF_X (1)
+    // is NOT.
+    std::uint64_t const phoff = readU64LE(bytes, 32);
+    std::uint16_t const phnum = readU16LE(bytes, 56);
+    bool sawWritableSeg = false;
+    for (std::uint16_t i = 0; i < phnum; ++i) {
+        std::size_t const po = static_cast<std::size_t>(phoff) + i * 56u;
+        if (readU32LE(bytes, po + 0) != 1u) continue;   // PT_LOAD
+        std::uint32_t const pFlags = readU32LE(bytes, po + 4);
+        std::uint64_t const pVaddr = readU64LE(bytes, po + 16);
+        std::uint64_t const pMemsz = readU64LE(bytes, po + 40);
+        if (dataVa >= pVaddr && dataVa < pVaddr + pMemsz) {
+            sawWritableSeg = (pFlags & 0x2u) != 0u    // PF_W set
+                          && (pFlags & 0x1u) == 0u;   // PF_X NOT set (W^X)
+            break;
+        }
+    }
+    EXPECT_TRUE(sawWritableSeg)
+        << ".data must live in a PT_LOAD with PF_W and WITHOUT PF_X (W^X — a "
+           "mutable global must never share a page with executable code)";
+}
+
+// D-LK4-DATA-PRODUCER writer pin: a Bss (zero-init) item lands in a SHT_NOBITS
+// section that is writable (SHF_WRITE) and carries a non-zero sh_size (the
+// zero-fill extent). The R+W PT_LOAD's p_memsz must exceed its p_filesz (bss
+// adds memory but no file bytes). RED if the writer rejects Bss or emits it as
+// SHT_PROGBITS / inflates p_filesz to cover it.
+TEST(ElfExecWriter, BssSectionEmittedNobitsWritable) {
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledData d;
+    d.symbol       = SymbolId{43};
+    d.section      = DataSectionKind::Bss;
+    d.reservedSize = 4;                          // int g; → 4 zero-fill bytes
+    d.alignment    = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "ELF writer must ACCEPT a Bss item now that D-LK4-DATA-PRODUCER closed";
+    ASSERT_FALSE(bytes.empty());
+    // Find the SHT_NOBITS(8) section with SHF_WRITE + sh_size 4.
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    std::uint16_t const shnum = readU16LE(bytes, 60);
+    bool sawNobits = false;
+    std::uint64_t bssVa = 0;
+    for (std::uint16_t i = 1; i < shnum; ++i) {
+        std::size_t const off = static_cast<std::size_t>(shoff)
+                              + static_cast<std::size_t>(i) * kShdrSize;
+        if (readU32LE(bytes, off + 4) == 8u /*SHT_NOBITS*/
+            && (readU64LE(bytes, off + 8) & 0x1ull) /*SHF_WRITE*/
+            && readU64LE(bytes, off + 32) == 4u /*sh_size*/) {
+            sawNobits = true;
+            bssVa = readU64LE(bytes, off + 16);
+            break;
+        }
+    }
+    ASSERT_TRUE(sawNobits)
+        << ".bss must be SHT_NOBITS + SHF_WRITE with sh_size == 4 "
+           "(D-LK4-DATA-PRODUCER)";
+    // The PT_LOAD covering bssVa must have p_memsz > p_filesz (the bss extent is
+    // in memory but not in the file).
+    std::uint64_t const phoff = readU64LE(bytes, 32);
+    std::uint16_t const phnum = readU16LE(bytes, 56);
+    bool sawMemGtFile = false;
+    for (std::uint16_t i = 0; i < phnum; ++i) {
+        std::size_t const po = static_cast<std::size_t>(phoff) + i * 56u;
+        if (readU32LE(bytes, po + 0) != 1u) continue;   // PT_LOAD
+        std::uint64_t const pVaddr  = readU64LE(bytes, po + 16);
+        std::uint64_t const pFilesz = readU64LE(bytes, po + 32);
+        std::uint64_t const pMemsz  = readU64LE(bytes, po + 40);
+        if (bssVa >= pVaddr && bssVa < pVaddr + pMemsz) {
+            sawMemGtFile = pMemsz > pFilesz;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawMemGtFile)
+        << "the .bss PT_LOAD must have p_memsz > p_filesz (zero-fill adds "
+           "memory, not file bytes)";
 }
 
 TEST(ElfExecWriter, RodataDataItemWithRelocationFailsLoud) {

@@ -1,0 +1,13 @@
+{
+  "$comment": "D-LK4-DATA-PRODUCER (writable data sections) RUNTIME witness: a mutable initialized global (gd=5 -> .data) and a tentative zero-init global (gz -> .bss) are each WRITTEN at runtime (gd=gd+2; gz=35) then READ back into the exit code (7 + 35 = 42). Before this cycle the store to gd faulted (SIGSEGV / exit 139) because asm.cpp routed every initialized global to read-only .rodata; now mutable -> writable .data, tentative -> writable .bss (zero-fill). The reads are real runtime global LOADs (a store-then-reload the optimizer cannot fold away), so the stores genuinely execute on every target. The release optimizedPipelines arm proves optimized==baseline. PE runs on windows; ELF on linux; arm64-ELF under qemu-aarch64; arm64-macho on the macos-latest (Apple Silicon) CI leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [ {"label": "release", "shippedPipeline": "release"} ]
+}

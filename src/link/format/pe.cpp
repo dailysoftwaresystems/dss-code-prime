@@ -2,6 +2,7 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
+#include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -644,82 +645,126 @@ encodeExec(AssembledModule const&    module,
     // OFFSET (no producer emits such relocations yet — see plan
     // §3.1 anchor row).
     //
-    // Discipline pin (multi-agent audit fold convergence): the
-    // non-Rodata fail-loud below runs UNCONDITIONALLY across
-    // `module.dataItems` (NOT guarded by `rdata.has_value()` or a
-    // hasRodata bool), so a module carrying ONLY Data/Bss items
-    // cannot slip past the gate via a dropped scan. The Data and
-    // Bss arms are anchored under D-LK4-RODATA-PRODUCER until
-    // walker support lands.
+    // D-LK2-RODATA (`.rdata`) + D-LK4-DATA-PRODUCER (writable `.data` +
+    // zero-fill `.bss`): each `AssembledData` kind is laid out by the SAME
+    // shared, kind-parameterized `buildExecDataSection` helper the ELF/Mach-O
+    // writers use (single-sourced byte layout). `.data` carries MEM_WRITE in
+    // its Characteristics (read from the schema row — a store must not fault);
+    // `.bss` is uninitialized (SizeOfRawData=0, PointerToRawData=0 — NO file
+    // bytes, the loader zero-fills VirtualSize bytes). Section VA/file RVAs
+    // chain text → rdata → data → bss → idata → reloc.
     using link::format::detail::alignUp;
-    for (auto const& d : module.dataItems) {
-        if (d.section != DataSectionKind::Rodata) {
+    // `allowItemRelocations=true`: PE patches data-item (data→data) relocations
+    // — its cross-CU thunk-slot feature — into the laid-out bytes below.
+    auto const rdataLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Rodata,
+        /*alignFloor=*/1, "pe::encodeExec", reporter,
+        /*allowItemRelocations=*/true);
+    if (!rdataLayoutOpt.has_value()) return {};
+    auto const& rdataDataLayout = *rdataLayoutOpt;
+    auto const dataLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Data,
+        /*alignFloor=*/1, "pe::encodeExec", reporter,
+        /*allowItemRelocations=*/true);
+    if (!dataLayoutOpt.has_value()) return {};
+    auto const& dataDataLayout = *dataLayoutOpt;
+    auto const bssLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Bss,
+        /*alignFloor=*/1, "pe::encodeExec", reporter,
+        /*allowItemRelocations=*/true);
+    if (!bssLayoutOpt.has_value()) return {};
+    auto const& bssDataLayout = *bssLayoutOpt;
+    bool const hasRdata = !rdataDataLayout.empty();
+    bool const hasData  = !dataDataLayout.empty();
+    bool const hasBss   = !bssDataLayout.empty();
+    // u32 overflow guard (PE/COFF SizeOfImage / virtualSize / sizeOfRawData are
+    // u32 wire fields). A producer that lands > 4 GiB in any section would
+    // silently truncate at the narrowing casts below; surface it loud.
+    auto const checkU32Span = [&](char const* kindName,
+                                   std::uint64_t span) -> bool {
+        if (span > std::numeric_limits<std::uint32_t>::max()) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("pe::encodeExec: AssembledData with "
-                             "section={} not yet supported by the "
-                             "PE walker — only Rodata closes at "
-                             "D-LK2-RODATA; Data/Bss arms remain "
-                             "anchored under D-LK4-RODATA-PRODUCER.",
-                             dataSectionKindName(d.section)));
-            return {};
+                 std::format("pe::encodeExec: .{} size {} bytes exceeds PE/COFF "
+                             "u32 wire limit (2^32-1); the format cannot "
+                             "represent this image.",
+                             kindName, span));
+            return false;
         }
+        return true;
+    };
+    if (!checkU32Span("rdata", rdataDataLayout.spanSize)
+        || !checkU32Span("data", dataDataLayout.spanSize)
+        || !checkU32Span("bss", bssDataLayout.spanSize)) {
+        return {};
     }
-    std::vector<std::uint8_t> rdataBytes;
-    std::optional<DataSectionLayout> rdata;
+    // `.rdata` bytes are MUTABLE here because PE patches data-item (cross-CU
+    // thunk-slot) relocations into them post-layout (below). `.data` bytes are
+    // const (the C frontend's mutable globals carry no data→data relocs).
+    std::vector<std::uint8_t> rdataBytes = rdataDataLayout.bytes;
+    std::vector<std::uint8_t> const& dataBytes  = dataDataLayout.bytes;
+    // Original-dataItems-index → `.rdata` section-relative offset, for the
+    // data-item-relocation patch loop below (the layout records these for the
+    // items it placed; reloc-bearing thunk slots are rodata).
+    std::unordered_map<std::size_t, std::uint64_t> rdataOffsetByIndex;
+    for (std::size_t j = 0; j < rdataDataLayout.itemIndices.size(); ++j) {
+        rdataOffsetByIndex.emplace(rdataDataLayout.itemIndices[j],
+                                   rdataDataLayout.itemOffsets[j]);
+    }
     ObjectFormatSectionInfo const* secRodata = nullptr;
-    // Per-dataItems index → section-relative byte offset (the
-    // start of that item's bytes within the concatenated .rdata
-    // payload). Used below to extend the linker's symbolVa map
-    // so .text relocations targeting a rodata SymbolId can
-    // resolve to `imageBase + rdata->rva + offsetInSection`.
-    // D-LK4-RODATA-WALKER-RELOC-BASE-OFFSET (closed 2026-06-02).
-    std::vector<std::uint32_t> rdataItemOffsets;
-    rdataItemOffsets.reserve(module.dataItems.size());
-    if (!module.dataItems.empty()) {
+    ObjectFormatSectionInfo const* secData   = nullptr;
+    ObjectFormatSectionInfo const* secBss    = nullptr;
+    if (hasRdata) {
         secRodata = link::format::detail::requireSection(
             fmt, SectionKind::Rodata, "pe::encodeExec", reporter);
         if (secRodata == nullptr) return {};
-        for (auto const& d : module.dataItems) {
-            std::uint64_t const aligned = d.alignment.alignUp(
-                static_cast<std::uint64_t>(rdataBytes.size()));
-            while (rdataBytes.size() < aligned) rdataBytes.push_back(0);
-            rdataItemOffsets.push_back(
-                static_cast<std::uint32_t>(rdataBytes.size()));
-            rdataBytes.insert(rdataBytes.end(),
-                              d.bytes.begin(), d.bytes.end());
-        }
-        // u32 overflow guard (silent-failure audit fold): PE/COFF
-        // SizeOfImage / virtualSize / sizeOfRawData are all u32
-        // wire fields. A producer that lands > 4 GiB of rodata
-        // would silently truncate at the narrowing cast below;
-        // surface it as a loud diagnostic instead.
-        if (rdataBytes.size() >
-            std::numeric_limits<std::uint32_t>::max()) {
-            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("pe::encodeExec: .rdata size {} bytes "
-                             "exceeds PE/COFF u32 wire limit "
-                             "(2^32-1); the format cannot represent "
-                             "this image.",
-                             rdataBytes.size()));
-            return {};
-        }
-        DataSectionLayout layout;
-        layout.rva = static_cast<std::uint32_t>(secText.virtualAddress)
-                     + textVirtualSizeE;
-        layout.virtualSize = static_cast<std::uint32_t>(
-            alignUp(rdataBytes.size(), sectionAlignE));
-        // rawSize / rawPointer / headerIndex filled below once
-        // fileAlign + textRawSize + sectionHeaders are known.
-        rdata = layout;
     }
-    std::size_t const rdataSize = rdataBytes.size();
-    std::uint32_t const idataRva =
-        hasImports
-            ? (rdata.has_value()
-                   ? rdata->rva + rdata->virtualSize
-                   : static_cast<std::uint32_t>(secText.virtualAddress)
-                       + textVirtualSizeE)
-            : 0u;
+    if (hasData) {
+        secData = link::format::detail::requireSection(
+            fmt, SectionKind::Data, "pe::encodeExec", reporter);
+        if (secData == nullptr) return {};
+    }
+    if (hasBss) {
+        secBss = link::format::detail::requireSection(
+            fmt, SectionKind::Bss, "pe::encodeExec", reporter);
+        if (secBss == nullptr) return {};
+    }
+    // Section RVAs chain contiguously (each section-aligned). `.rdata` after
+    // `.text`; `.data` after `.rdata`; `.bss` after `.data`. virtualSize is
+    // section-aligned; for `.bss` it is the zero-fill memory extent.
+    std::optional<DataSectionLayout> rdata;
+    std::optional<DataSectionLayout> data;
+    std::optional<DataSectionLayout> bss;
+    std::uint32_t dataChainRva =
+        static_cast<std::uint32_t>(secText.virtualAddress) + textVirtualSizeE;
+    if (hasRdata) {
+        DataSectionLayout layout;
+        layout.rva = dataChainRva;
+        layout.virtualSize = static_cast<std::uint32_t>(
+            alignUp(rdataDataLayout.spanSize, sectionAlignE));
+        rdata = layout;
+        dataChainRva += layout.virtualSize;
+    }
+    if (hasData) {
+        DataSectionLayout layout;
+        layout.rva = dataChainRva;
+        layout.virtualSize = static_cast<std::uint32_t>(
+            alignUp(dataDataLayout.spanSize, sectionAlignE));
+        data = layout;
+        dataChainRva += layout.virtualSize;
+    }
+    if (hasBss) {
+        DataSectionLayout layout;
+        layout.rva = dataChainRva;
+        layout.virtualSize = static_cast<std::uint32_t>(
+            alignUp(bssDataLayout.spanSize, sectionAlignE));
+        bss = layout;
+        dataChainRva += layout.virtualSize;
+    }
+    std::size_t const rdataSize = rdataDataLayout.spanSize;
+    std::size_t const dataSize  = dataDataLayout.spanSize;
+    // `.idata` follows the LAST data section (`dataChainRva` was advanced past
+    // .rdata/.data/.bss above), else immediately after `.text`.
+    std::uint32_t const idataRva = hasImports ? dataChainRva : 0u;
 
     // Lay out .idata bytes (synthesized, NOT raw-data padded yet):
     //   [0]               ImageImportDescriptor[N+1]
@@ -865,39 +910,30 @@ encodeExec(AssembledModule const&    module,
             return {};
         }
     }
-    // D-LK4-RODATA-WALKER-RELOC-BASE-OFFSET (closed 2026-06-02):
-    // each rodata `AssembledData` item joins the symbolVa map
-    // at `imageBase + rdata->rva + Σ aligned_size(items[0..i-1])`
-    // (Σ pre-computed as `rdataItemOffsets[i]` above). REL32 (and
-    // future ABS64) relocations in .text that target a rodata
-    // SymbolId now resolve correctly through the shared
-    // `applyExecRelocations` kernel.
-    if (rdata.has_value()) {
-        std::uint64_t const rdataSectionVa =
-            oh.imageBase + rdata->rva;
-        for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
-            auto const& di = module.dataItems[i];
-            std::uint64_t const va =
-                rdataSectionVa + rdataItemOffsets[i];
-            // A rodata SymbolId colliding with a function or
-            // extern slot is a REDEFINITION (the same SymbolId
-            // was already populated in this map), NOT an
-            // undefined symbol. Use the semantically-correct
-            // `K_DuplicateDataSymbol` code so test pins via
-            // `countCode(rep, K_DuplicateDataSymbol)` won't be
-            // silently satisfied by an UNRELATED undefined-symbol
-            // regression elsewhere in the link path.
-            // (silent-failure HIGH-3 audit fold 2026-06-02.)
-            if (!symbolVa.emplace(di.symbol, va).second) {
-                emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
-                     std::string{"pe::encodeExec: rodata SymbolId #"}
-                     + std::to_string(di.symbol.v)
-                     + " collides with another symbol — caller must "
-                       "give each data item a unique SymbolId "
-                       "distinct from function/extern ids.");
-                return {};
-            }
-        }
+    // D-LK4-RODATA-WALKER-RELOC-BASE-OFFSET + D-LK4-DATA-PRODUCER: each NAMED
+    // data item (rdata / data / bss) joins the symbolVa map at its section's
+    // absolute VA (`imageBase + section RVA` + the item's section-relative
+    // offset) via the SAME shared `addDataSymbolVas` helper the ELF/Mach-O
+    // writers use. A REL32/ABS64 reloc in `.text` that targets a data SymbolId
+    // (a global load/store) resolves through the shared `applyExecRelocations`
+    // kernel. A `.bss` global is reloc-addressable by VA just like file-backed.
+    if (hasRdata
+        && !link::format::addDataSymbolVas(
+               module.dataItems, rdataDataLayout, oh.imageBase + rdata->rva,
+               symbolVa, "pe::encodeExec", reporter)) {
+        return {};
+    }
+    if (hasData
+        && !link::format::addDataSymbolVas(
+               module.dataItems, dataDataLayout, oh.imageBase + data->rva,
+               symbolVa, "pe::encodeExec", reporter)) {
+        return {};
+    }
+    if (hasBss
+        && !link::format::addDataSymbolVas(
+               module.dataItems, bssDataLayout, oh.imageBase + bss->rva,
+               symbolVa, "pe::encodeExec", reporter)) {
+        return {};
     }
     if (!link::format::applyExecRelocations(
             text, module, funcTextStart, symbolVa, targetSchema,
@@ -929,6 +965,23 @@ encodeExec(AssembledModule const&    module,
     std::vector<std::uint32_t> baseRelocSiteRvas;
     for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
         auto const& di = module.dataItems[i];
+        if (di.relocations.empty()) continue;
+        // Data-item relocations are supported only on `.rdata` items (the
+        // cross-CU thunk slot is a rodata pointer). A reloc-bearing `.data`/
+        // `.bss` item is out of scope — fail loud rather than leave it
+        // unpatched (`addDataSymbolVas` placed it, but no patch site exists).
+        auto const offIt = rdataOffsetByIndex.find(i);
+        if (offIt == rdataOffsetByIndex.end()) {
+            emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                 std::string{"pe::encodeExec: data-item SymbolId #"}
+                 + std::to_string(di.symbol.v)
+                 + " carries relocations but is not a .rdata item — data-item "
+                   "relocations are supported only for read-only (.rdata) "
+                   "cross-CU thunk slots.");
+            return {};
+        }
+        std::size_t const itemBaseOff =
+            static_cast<std::size_t>(offIt->second);
         for (auto const& rel : di.relocations) {
             auto const sIt = symbolVa.find(rel.target);
             if (sIt == symbolVa.end()) {
@@ -958,7 +1011,7 @@ encodeExec(AssembledModule const&    module,
                        "absolute fixup with a concrete write width.");
                 return {};
             }
-            std::size_t const itemBase = rdataItemOffsets[i];
+            std::size_t const itemBase = itemBaseOff;
             std::size_t const patchOff = itemBase + rel.offset;
             if (patchOff + tri->widthBytes > itemBase + di.bytes.size()) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
@@ -1114,6 +1167,45 @@ encodeExec(AssembledModule const&    module,
         rdata->headerIndex = sectionHeaders.size();
         sectionHeaders.push_back(hRData);
     }
+    // .data section header (D-LK4-DATA-PRODUCER) — mutable initialized globals.
+    // Characteristics from the SCHEMA ROW (`secData->type` = IMAGE_SCN_CNT_
+    // INITIALIZED_DATA | MEM_READ | MEM_WRITE = 0xC0000040 — the MEM_WRITE bit
+    // is what makes a runtime store legal; a `.rdata` store would fault).
+    // sizeOfRawData / pointerToRawData filled below (file-backed).
+    if (data.has_value()) {
+        PeSectionHeader hData{};
+        hData.name                  = encodeSectionName(secData->name, 0);
+        hData.virtualSize           = static_cast<std::uint32_t>(dataSize);
+        hData.virtualAddress        = data->rva;
+        hData.pointerToRelocations  = 0;
+        hData.pointerToLinenumbers  = 0;
+        hData.numberOfRelocations   = 0;
+        hData.numberOfLinenumbers   = 0;
+        hData.characteristics       = secData->type;
+        data->headerIndex = sectionHeaders.size();
+        sectionHeaders.push_back(hData);
+    }
+    // .bss section header (D-LK4-DATA-PRODUCER) — zero-init globals. Uninitial-
+    // ized data: SizeOfRawData = 0 and PointerToRawData = 0 (NO file bytes — the
+    // loader zero-fills VirtualSize bytes). Characteristics from the SCHEMA ROW
+    // (`secBss->type` = IMAGE_SCN_CNT_UNINITIALIZED_DATA | MEM_READ | MEM_WRITE
+    // = 0xC0000080).
+    if (bss.has_value()) {
+        PeSectionHeader hBss{};
+        hBss.name                  = encodeSectionName(secBss->name, 0);
+        hBss.virtualSize           = static_cast<std::uint32_t>(
+                                         bssDataLayout.spanSize);
+        hBss.virtualAddress        = bss->rva;
+        hBss.sizeOfRawData         = 0;   // NOBITS — no file footprint
+        hBss.pointerToRawData      = 0;
+        hBss.pointerToRelocations  = 0;
+        hBss.pointerToLinenumbers  = 0;
+        hBss.numberOfRelocations   = 0;
+        hBss.numberOfLinenumbers   = 0;
+        hBss.characteristics       = secBss->type;
+        bss->headerIndex = sectionHeaders.size();
+        sectionHeaders.push_back(hBss);
+    }
     // .idata section header (when externImports non-empty).
     // Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA (0x40) |
     //                   IMAGE_SCN_MEM_READ (0x40000000) |
@@ -1149,10 +1241,12 @@ encodeExec(AssembledModule const&    module,
     constexpr std::uint32_t kRelocCharacteristics = 0x42000040u;
     std::optional<DataSectionLayout> reloc;
     if (hasBaseRelocs) {
+        // `.reloc` follows everything: .idata end when present, else the end of
+        // the data-section chain (`dataChainRva` was advanced past .rdata/.data/
+        // .bss; it equals text-end when no data sections exist).
         std::uint32_t const prevVaEnd =
             idata.has_value() ? idata->rva + idata->virtualSize
-          : rdata.has_value() ? rdata->rva + rdata->virtualSize
-          : static_cast<std::uint32_t>(secText.virtualAddress) + textVirtualSizeE;
+                              : dataChainRva;
         std::uint32_t const relocRva =
             static_cast<std::uint32_t>(alignUp(prevVaEnd, sectionAlign));
         PeSectionHeader hReloc{};
@@ -1190,39 +1284,45 @@ encodeExec(AssembledModule const&    module,
     // placed immediately after .text. Indices captured at push
     // time (DataSectionLayout::headerIndex) — no magic-arithmetic
     // index derivation.
+    // File-pointer chain: text → rdata → data → (bss: NO raw) → idata → reloc.
+    // `nextRawPointer` tracks the running file offset of the next file-backed
+    // section. `.bss` is NOBITS — it does NOT advance the file pointer.
+    std::uint32_t nextRawPointer = textRawPointer + textRawSize;
     if (rdata.has_value()) {
         rdata->rawSize = static_cast<std::uint32_t>(
             alignUp(rdataSize, fileAlign));
-        rdata->rawPointer = textRawPointer + textRawSize;
-        sectionHeaders[rdata->headerIndex].sizeOfRawData =
-            rdata->rawSize;
-        sectionHeaders[rdata->headerIndex].pointerToRawData =
-            rdata->rawPointer;
+        rdata->rawPointer = nextRawPointer;
+        sectionHeaders[rdata->headerIndex].sizeOfRawData = rdata->rawSize;
+        sectionHeaders[rdata->headerIndex].pointerToRawData = rdata->rawPointer;
+        nextRawPointer += rdata->rawSize;
     }
+    if (data.has_value()) {
+        data->rawSize = static_cast<std::uint32_t>(
+            alignUp(dataSize, fileAlign));
+        data->rawPointer = nextRawPointer;
+        sectionHeaders[data->headerIndex].sizeOfRawData = data->rawSize;
+        sectionHeaders[data->headerIndex].pointerToRawData = data->rawPointer;
+        nextRawPointer += data->rawSize;
+    }
+    // .bss is NOBITS: sizeOfRawData / pointerToRawData stay 0 (set at header
+    // construction); it consumes no file bytes, so `nextRawPointer` is unchanged.
     if (idata.has_value()) {
         idata->rawSize = static_cast<std::uint32_t>(
             alignUp(idataSize, fileAlign));
-        idata->rawPointer = rdata.has_value()
-            ? rdata->rawPointer + rdata->rawSize
-            : textRawPointer + textRawSize;
-        sectionHeaders[idata->headerIndex].sizeOfRawData =
-            idata->rawSize;
-        sectionHeaders[idata->headerIndex].pointerToRawData =
-            idata->rawPointer;
+        idata->rawPointer = nextRawPointer;
+        sectionHeaders[idata->headerIndex].sizeOfRawData = idata->rawSize;
+        sectionHeaders[idata->headerIndex].pointerToRawData = idata->rawPointer;
+        nextRawPointer += idata->rawSize;
     }
-    // .reloc raw size + file pointer: file-aligned, placed immediately after the last
-    // prior section's raw data (.idata, else .rdata, else .text).
+    // .reloc raw size + file pointer: file-aligned, immediately after the last
+    // prior file-backed section.
     if (reloc.has_value()) {
         reloc->rawSize = static_cast<std::uint32_t>(
             alignUp(relocBytes.size(), fileAlign));
-        reloc->rawPointer =
-            idata.has_value() ? idata->rawPointer + idata->rawSize
-          : rdata.has_value() ? rdata->rawPointer + rdata->rawSize
-          : textRawPointer + textRawSize;
-        sectionHeaders[reloc->headerIndex].sizeOfRawData =
-            reloc->rawSize;
-        sectionHeaders[reloc->headerIndex].pointerToRawData =
-            reloc->rawPointer;
+        reloc->rawPointer = nextRawPointer;
+        sectionHeaders[reloc->headerIndex].sizeOfRawData = reloc->rawSize;
+        sectionHeaders[reloc->headerIndex].pointerToRawData = reloc->rawPointer;
+        nextRawPointer += reloc->rawSize;
     }
     // SizeOfImage = alignUp(highest_section_va + virtualSize,
     // sectionAlignment) per PE/COFF §3.4. The highest VA-extent
@@ -1235,6 +1335,14 @@ encodeExec(AssembledModule const&    module,
         + textVirtualSize;
     if (rdata.has_value()) {
         lastSectionVaEnd = rdata->rva + rdata->virtualSize;
+    }
+    if (data.has_value()) {
+        lastSectionVaEnd = data->rva + data->virtualSize;
+    }
+    if (bss.has_value()) {
+        // .bss contributes to the image's MEMORY extent (VirtualSize) even
+        // though it has zero file footprint — the loader reserves it.
+        lastSectionVaEnd = bss->rva + bss->virtualSize;
     }
     if (idata.has_value()) {
         lastSectionVaEnd = idata->rva + idata->virtualSize;
@@ -1295,12 +1403,20 @@ encodeExec(AssembledModule const&    module,
     // `.rdata` (D-LK2-RODATA), `.idata`, AND `.reloc` all carry that
     // flag (.reloc's 0x42000040 sets CNT_INITIALIZED_DATA; its
     // MEM_DISCARDABLE bit does not exempt it from the §3.4 sum).
+    // `.data` (D-LK4-DATA-PRODUCER) carries CNT_INITIALIZED_DATA → joins the
+    // sum; `.bss` carries CNT_UNINITIALIZED_DATA → goes to SizeOfUninitializedData.
     std::uint32_t const sizeOfInitializedData =
         (rdata.has_value() ? rdata->rawSize : 0u)
+        + (data.has_value() ? data->rawSize : 0u)
         + (idata.has_value() ? idata->rawSize : 0u)
         + (reloc.has_value() ? reloc->rawSize : 0u);
+    std::uint32_t const sizeOfUninitializedData =
+        bss.has_value()
+            ? static_cast<std::uint32_t>(alignUp(bssDataLayout.spanSize,
+                                                 fileAlign))
+            : 0u;
     appendU32LE(bytes, sizeOfInitializedData);
-    appendU32LE(bytes, 0);                     // SizeOfUninitializedData
+    appendU32LE(bytes, sizeOfUninitializedData);   // SizeOfUninitializedData
     appendU32LE(bytes, addressOfEntryPoint);   // AddressOfEntryPoint
     appendU32LE(bytes, baseOfCode);            // BaseOfCode
     // (PE32+ omits BaseOfData)
@@ -1373,6 +1489,13 @@ encodeExec(AssembledModule const&    module,
         sectionsEndFileOff =
             static_cast<std::uint64_t>(rdata->rawPointer)
             + rdata->rawSize;
+    }
+    // `.data` is file-backed (D-LK4-DATA-PRODUCER); `.bss` is NOBITS (no file
+    // bytes) so it does NOT extend the on-disk section end.
+    if (data.has_value()) {
+        sectionsEndFileOff =
+            static_cast<std::uint64_t>(data->rawPointer)
+            + data->rawSize;
     }
     if (idata.has_value()) {
         sectionsEndFileOff =
@@ -1459,6 +1582,18 @@ encodeExec(AssembledModule const&    module,
         while (bytes.size()
                 < static_cast<std::size_t>(rdata->rawPointer)
                     + rdata->rawSize) {
+            bytes.push_back(0);
+        }
+    }
+
+    // .data body (D-LK4-DATA-PRODUCER) — mutable initialized globals, file-
+    // backed, padded to fileAlignment. `.bss` is NOBITS: it emits NO file bytes
+    // (the loader zero-fills it at load), so there is no `.bss` body pass.
+    if (data.has_value()) {
+        bytes.insert(bytes.end(), dataBytes.begin(), dataBytes.end());
+        while (bytes.size()
+                < static_cast<std::size_t>(data->rawPointer)
+                    + data->rawSize) {
             bytes.push_back(0);
         }
     }

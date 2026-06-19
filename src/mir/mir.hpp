@@ -216,6 +216,13 @@ public:
     [[nodiscard]] SymbolVisibility globalVisibility(MirGlobalId id) const {
         return globalArena_.at(id).visibility;
     }
+    // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: true iff the source declared this
+    // global `const`. The assembler's section selection routes an INITIALIZED
+    // const global to read-only `.rodata` and a mutable one to writable
+    // `.data`. Default `false` (mutable) — the conservative writable default.
+    [[nodiscard]] bool globalIsConst(MirGlobalId id) const {
+        return globalArena_.at(id).isConst;
+    }
 
     // ── module-level iteration ──
     // The number of real functions and the i-th one (0-based; maps to arena slot
@@ -350,7 +357,8 @@ public:
                           std::uint32_t initLiteralIndex = UINT32_MAX,
                           MirFuncId     initFunc         = {},
                           SymbolBinding    binding       = SymbolBinding::Global,
-                          SymbolVisibility visibility    = SymbolVisibility::Default);
+                          SymbolVisibility visibility    = SymbolVisibility::Default,
+                          bool             isConst       = false);
 
     // Reserve a basic block in the current function WITHOUT opening it, returning
     // its id so terminators can target it before it is filled (forward branches).

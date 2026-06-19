@@ -50,7 +50,8 @@ cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
         }
         builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
                           newInitIdx, MirFuncId{},
-                          mir.globalBinding(g), mir.globalVisibility(g));
+                          mir.globalBinding(g), mir.globalVisibility(g),
+                          mir.globalIsConst(g));
     }
     return GlobalClonePrelude::Cloned;
 }
@@ -91,7 +92,8 @@ void cloneGlobalsVerbatim(Mir const& mir, MirBuilder& builder) {
             : MirFuncId{};
         builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
                           newInitIdx, newInitFunc,
-                          mir.globalBinding(g), mir.globalVisibility(g));
+                          mir.globalBinding(g), mir.globalVisibility(g),
+                          mir.globalIsConst(g));
     }
 }
 

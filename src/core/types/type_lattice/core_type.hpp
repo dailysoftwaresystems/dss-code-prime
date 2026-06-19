@@ -61,6 +61,15 @@ inline constexpr std::uint32_t kFirstExtensionKind = 256;
 // can never collide with a user-written array length).
 inline constexpr std::int64_t kIncompleteArrayLength = -1;
 
+// FC8 bitfields (D-CSUBSET-BITFIELD): the per-field bitfield-width sentinel
+// marking an ORDINARY (non-bitfield) struct field in `structType`'s
+// `fieldBitWidths` argument. A bitfield passes its declared width in [0, 64]
+// (0 = a zero-width unnamed packing-break marker); a non-bitfield passes this.
+// The widths are stored in the struct's scalar pool as (width + 1), so 0 in the
+// pool = non-bitfield and a struct with NO bitfields interns with EMPTY scalars
+// (bit-identical to a pre-bitfield struct — no TypeId churn).
+inline constexpr std::int64_t kNotBitfield = -1;
+
 // Calling conventions are machine-shaped (not language-shaped) — core lattice
 // members, attached to FnSig and consumed by the FFI plan. Stored in a
 // TypeRecord's scalar pool as the underlying integer.

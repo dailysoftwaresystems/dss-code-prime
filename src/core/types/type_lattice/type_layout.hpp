@@ -32,6 +32,20 @@
 
 namespace dss {
 
+// FC8 bitfields (D-CSUBSET-BITFIELD): the bit placement of one struct field. A
+// field is a bit-field iff `unitBytes != 0`. For a bit-field, the access is a
+// `unitBytes`-byte integer load/store at the field's `fieldOffsets[i]`, and the
+// field occupies `bitWidth` bits starting at bit `bitOffset` within that unit
+// (LSB-first; both shipped targets are little-endian). An ordinary field has
+// `unitBytes == 0` (use `fieldOffsets[i]` + the field's own type for the access).
+struct BitFieldPlacement {
+    std::uint32_t unitBytes = 0;   // 0 = ordinary field; else the load/store width
+    std::uint32_t bitOffset = 0;   // bit offset within the unit
+    std::uint32_t bitWidth  = 0;   // declared width (a zero-width bitfield is a
+                                   // layout-only break — it never appears here as
+                                   // an addressable field)
+};
+
 // The computed layout of a complete type. For a scalar/pointer/array the
 // `fieldOffsets` are empty; for a struct/union there is one offset per field
 // (declaration order). `size` excludes a flexible-array-member's unsized tail.
@@ -40,6 +54,12 @@ struct StructLayout {
     Alignment                  align{};        // alignment requirement (pow2)
     std::vector<std::uint64_t> fieldOffsets;   // byte offset per field (struct/union)
     bool                       hasFlexibleArrayMember = false;
+    // FC8 bitfields: per-field bit placement, parallel to `fieldOffsets`. EMPTY
+    // when the struct has NO bit-field (every existing layout is byte-identical).
+    // When non-empty there is one entry per field; an ordinary field's entry has
+    // `unitBytes == 0`. A zero-width bit-field is a packing break only — it gets a
+    // `fieldOffsets` slot (so indices stay parallel) with `unitBytes == 0`.
+    std::vector<BitFieldPlacement> bitFields;
 };
 
 // Side-table keyed by TypeId — the per-CU memoized layout table FC7 reads.

@@ -12,6 +12,9 @@
   "$dataModelComment": "FC3 c1: 64-bit linux/darwin are LP64 (int 32, long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I64 here. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
   "dataModel": "LP64",
 
+  "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: Linux arm64 (AAPCS64) uses the generic LSB-first bit-field allocation — identical to SysV/GNU gnu_packed for little-endian — so it shares the strategy. Byte-ABI-exact (the qemu arm64-ELF corpus is self-consistent under it; the CI cross-compile-compare confirms against the native compiler).",
+  "bitFieldStrategy": "gnu_packed",
+
   "elf": {
     "$comment": "Elf64_Ehdr identity fields. `class` = ELFCLASS64; `data` = ELFDATA2LSB (little-endian — AArch64 is little-endian by convention on Linux); `osabi` = ELFOSABI_NONE (SysV); `machine` = EM_AARCH64 (183).",
     "class": "elf64",

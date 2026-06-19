@@ -581,10 +581,43 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         auto const ops = in.operands(ty);
         if (ops.size() != lay->fieldOffsets.size()) return false;
         if (agg.fields.size() > ops.size()) return false;   // too many inits → fail loud
-        for (std::size_t i = 0; i < agg.fields.size(); ++i)
-            if (!encodeAggregateValue(ops[i], agg.fields[i], in, lp, dm, buf,
-                                      base + lay->fieldOffsets[i]))
-                return false;
+        // FC8 D-CSUBSET-BITFIELD-INIT: a struct/union WITH bit-fields packs each
+        // bit-field's value into its allocation unit (`buf` is pre-zeroed, so the
+        // OR is correct + leaves un-covered bits / omitted fields at 0). Fields
+        // sharing a unit share `fieldOffsets[i]`, so OR-ing each one in at its
+        // `bitOffset` accumulates into the same bytes. Ordinary fields among the
+        // bit-fields (`unitBytes == 0`) recurse normally. `bitFields` non-empty
+        // ⇔ the struct has a bit-field (the layout authority's invariant); the
+        // byte path below is byte-identical for a bit-field-free composite.
+        for (std::size_t i = 0; i < agg.fields.size(); ++i) {
+            bool const isBitfield =
+                i < lay->bitFields.size() && lay->bitFields[i].unitBytes != 0;
+            if (!isBitfield) {
+                // A zero-width bit-field marker (`unsigned : 0;`) has no storage
+                // (`unitBytes == 0` AND `fieldBitWidth` present); its `fieldOffsets`
+                // entry aliases the NEXT unit, so a full-width write here would
+                // touch that neighbour unit. Skip it (its synthetic child is 0).
+                if (in.fieldBitWidth(ty, i).has_value()) continue;
+                if (!encodeAggregateValue(ops[i], agg.fields[i], in, lp, dm, buf,
+                                          base + lay->fieldOffsets[i]))
+                    return false;
+                continue;
+            }
+            // Pack one bit-field: read its scalar value, mask to width, shift to
+            // bitOffset, OR into the unit at `base + fieldOffsets[i]`. The unit
+            // load/store width is `unitBytes` (little-endian, matching the MIR
+            // read-modify-write codegen + the layout's LSB-first packing).
+            BitFieldPlacement const& p = lay->bitFields[i];
+            auto const bitsOpt = decodeScalarLiteralBits(agg.fields[i], in.kind(ops[i]));
+            if (!bitsOpt.has_value()) return false;   // non-int bit-field leaf → fail loud
+            std::uint64_t const mask =
+                p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
+            std::uint64_t const placed = (*bitsOpt & mask) << p.bitOffset;
+            std::uint64_t const unitBase = base + lay->fieldOffsets[i];
+            if (unitBase + p.unitBytes > buf.size()) return false;  // layout↔buf disagreement
+            for (std::uint32_t j = 0; j < p.unitBytes; ++j)
+                buf[unitBase + j] |= static_cast<std::uint8_t>((placed >> (j * 8)) & 0xFFu);
+        }
         return true;
     }
 
@@ -678,21 +711,59 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             continue;
         }
 
-        // Zero-init globals (neither initLiteralIndex nor
-        // initFunc set): semantically belong in `.bss`-style
-        // emission (zero-fill, no on-disk bytes). The current
-        // cycle does not yet wire Bss; emit a loud diagnostic
-        // naming the symbol (same silent-failure rationale as
-        // the runtime-init arm above).
+        // Zero-init globals (neither initLiteralIndex nor initFunc set): a
+        // tentative C global `int g;` — zero-fill, NO on-disk bytes. Emit a
+        // `Bss` AssembledData with EMPTY bytes and the byte SIZE recorded in
+        // `reservedSize` (the wire format reserves the size in the section
+        // header without storing file bytes). A tentative global is ALWAYS
+        // mutable — C requires an initializer for a `const` object — so `.bss`
+        // is unconditionally writable; the const bit is not consulted here.
+        // Closes D-LK4-RODATA-PRODUCER-BSS-EMIT (the former fail-loud anchor).
         if (litIdx == UINT32_MAX) {
-            emit(DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("lowerMirGlobalsToDataItems: global "
-                             "SymbolId={{ {} }} is zero-init (no "
-                             "initializer) — anchored under "
-                             "D-LK4-RODATA-PRODUCER-BSS-EMIT; "
-                             "today's cycle emits no AssembledData "
-                             "for this shape.",
-                             sym.v));
+            TypeKind const zk = interner.kind(ty);
+            // Type byte size: the scalar fast path widths primitives; an
+            // aggregate routes through the target's layout engine (same
+            // `computeLayout` the initialized aggregate arm uses). Absent a
+            // layout for a non-primitive ⇒ fail loud (no sound size to reserve).
+            std::optional<std::uint64_t> sizeOpt;
+            if (auto const pw = primitiveByteSize(zk); pw.has_value()) {
+                sizeOpt = static_cast<std::uint64_t>(*pw);
+            } else if (aggregateLayout.has_value()) {
+                if (auto const lay = computeLayout(ty, interner, *aggregateLayout,
+                                                   dataModel);
+                    lay.has_value()) {
+                    sizeOpt = lay->size;
+                }
+            }
+            if (!sizeOpt.has_value()) {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: zero-init global "
+                                 "SymbolId={{ {} }} has TypeKind={} whose byte "
+                                 "size cannot be computed (non-primitive with no "
+                                 "`aggregateLayout` block, or an un-sizeable "
+                                 "type) — cannot reserve a .bss span "
+                                 "(D-LK4-DATA-PRODUCER).",
+                                 sym.v, static_cast<int>(zk)));
+                continue;
+            }
+            AssembledData z;
+            z.symbol       = sym;
+            z.section      = DataSectionKind::Bss;
+            z.reservedSize = *sizeOpt;        // bytes stays EMPTY (Bss invariant)
+            // Alignment: primitives align to their size (power-of-two in
+            // [1,16]); aggregates carry the layout's align. The walker raises
+            // the section alignment to cover the strictest item.
+            if (auto const pw = primitiveByteSize(zk); pw.has_value()) {
+                z.alignment = Alignment::ofRuntimePow2(
+                    static_cast<std::uint32_t>(*pw));
+            } else if (aggregateLayout.has_value()) {
+                if (auto const lay = computeLayout(ty, interner, *aggregateLayout,
+                                                   dataModel);
+                    lay.has_value()) {
+                    z.alignment = lay->align;
+                }
+            }
+            out.push_back(std::move(z));
             continue;
         }
 
@@ -701,7 +772,16 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
 
         AssembledData d;
         d.symbol  = sym;
-        d.section = DataSectionKind::Rodata;
+        // Section selection for an INITIALIZED global (D-LK4-DATA-PRODUCER-
+        // MUTABLE-GLOBAL): a `const` global is genuinely read-only → `.rodata`;
+        // a mutable one is written at runtime → writable `.data` (a store into
+        // `.rodata` faults — the bug this cycle fixes). Keyed on the config-
+        // driven `MirGlobal.isConst` PROPERTY threaded from the source's
+        // const-qualifier, NOT on any target/format identity. The string-
+        // literal arm below OVERRIDES this back to `.rodata` (a string literal
+        // is const data whatever the global's declared mutability).
+        d.section = mir.globalIsConst(gid) ? DataSectionKind::Rodata
+                                           : DataSectionKind::Data;
 
         // String-literal arm: bytes are the literal's std::string
         // contents. The HIR convention is Array<Char,N+1> where
@@ -727,6 +807,13 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // break the D-LK4-RODATA-PRODUCER-STRING closure path.
         if (std::holds_alternative<std::string>(v.value)) {
             auto const& s = std::get<std::string>(v.value);
+            // A string-literal-promoted global is read-only CONST data
+            // regardless of the enclosing global's declared mutability — its
+            // bytes live in the literal pool and are never written. Force
+            // `.rodata` (overriding the mutable→`.data` selection above) so a
+            // `char *p = "hi";` (mutable POINTER, const POINTED-TO bytes) keeps
+            // the literal bytes in read-only memory.
+            d.section = DataSectionKind::Rodata;
             d.bytes.assign(s.begin(), s.end());
             d.bytes.push_back(0);
             d.alignment = Alignment::of<1>();

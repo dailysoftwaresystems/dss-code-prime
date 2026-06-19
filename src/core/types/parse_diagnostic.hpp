@@ -324,6 +324,15 @@ enum class DiagnosticCode : std::uint16_t {
     // (C99 §6.7.2.1p18 — a structure containing a FAM shall not be a member of a
     // structure or an element of an array). Positioned at the embedding field.
     S_FlexibleArrayInAggregate    = 0xE01D,
+    // FC8 D-CSUBSET-BITFIELD: a bit-field (`T x : W`) whose base type T is NOT an
+    // integer type (C 6.7.2.1p5 — a bit-field's type shall be _Bool / signed int
+    // / unsigned int / an implementation-defined integer type). A `float`/pointer/
+    // struct/enum base fails loud here rather than silently mis-sizing the unit.
+    S_BitFieldNonIntegerType      = 0xE01E,
+    // FC8 D-CSUBSET-BITFIELD: a bit-field width that is negative, exceeds the base
+    // type's bit-size (C 6.7.2.1p4), or is zero on a NAMED field (C 6.7.2.1p3 — a
+    // zero-width bit-field shall have no declarator, i.e. be anonymous).
+    S_BitFieldWidthOutOfRange     = 0xE01F,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

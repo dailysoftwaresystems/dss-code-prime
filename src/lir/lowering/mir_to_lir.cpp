@@ -570,6 +570,39 @@ struct Lowerer {
         return cache_[static_cast<std::size_t>(s)].id;
     }
 
+    // D-CSUBSET-BITFIELD-WIDE-UNIT: does the target declare a `mov`
+    // variant that accepts a single `imm64` (LiteralIndex) operand?
+    // Capability probe — the SANCTIONED selection pattern (probe the
+    // declared variant vocabulary, NEVER `if (arch == ...)`). True for
+    // x86_64 (the `mov r64, imm64` = B8+rd io variant); false for arm64
+    // (which materializes wide constants via the MOVZ/MOVK ladder
+    // instead — probed separately by the movk_lsl* mnemonic family).
+    [[nodiscard]] bool targetHasMovImm64() const {
+        auto const movId = opcode(MnemonicSlot::Mov);
+        if (!movId.has_value()) return false;
+        auto const* info = target.opcodeInfo(*movId);
+        if (info == nullptr) return false;
+        for (auto const& v : info->encoding.variants) {
+            if (v.operandKinds.size() == 1
+                && v.operandKinds[0] == OperandKindFilter::LiteralIndex) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // D-CSUBSET-BITFIELD-WIDE-UNIT: does the target declare the MOVZ/MOVK
+    // wide-immediate ladder (all three movk_lsl* shift slots)? Capability
+    // probe by mnemonic presence — the established pattern (see
+    // `materializeInlineIntConst`). True for arm64; false for x86_64.
+    // ALL-OR-NOTHING: a half-declared family never silently emits a
+    // partial constant.
+    [[nodiscard]] bool targetHasMovkLadder() const {
+        return opcode(MnemonicSlot::MovkLsl16).has_value()
+            && opcode(MnemonicSlot::MovkLsl32).has_value()
+            && opcode(MnemonicSlot::MovkLsl48).has_value();
+    }
+
     // FC2 Part B: the opcode that performs `op` on a value of register
     // class `cls` (the registerClassOps resolution). GPR resolves to
     // the universal mov/load/store; a class with no declared operation
@@ -892,9 +925,34 @@ struct Lowerer {
     // register; the low 4 bytes — the F32 value — ride along), and
     // regalloc spill/reload uses the width-default 8-byte forms over
     // 8-byte slots (value-preserving for both float widths).
+    // C 6.7.2.2: an enum has NO representation of its own — it IS its
+    // underlying integer type (scalars[0], default I32). Every width decision
+    // below MUST see that underlying scalar, never the `Enum` wrapper: a raw
+    // `interner.kind()` on an enum falls to the `default` (64-bit) arm and
+    // emits an OVER-WIDE access of a PACKED enum struct-field / array-element
+    // — the D-LIR-INT-MEMORY-WIDTH-EXACT clobber class (a scalar enum local
+    // sits in its own ≥8-byte slot, so it MASKS this — caught in the FC8
+    // enum review). This is the single enum→underlying resolve point for the
+    // width tier: `widthFlagsForType` + `memAccessWidthFlags` (and, via the
+    // former, `registerOpWidthFlags`) all switch on `reprKind(ty)`, so the
+    // projection is by-construction at every width site. `regClassForType`
+    // needs no change — `regClassForCoreType` already maps Enum → GPR; and the
+    // layout authority (`computeLayout`) already sizes an enum as its
+    // underlying, so field offsets and this access width can never disagree.
+    // Aggregates (Struct/Union/Array) keep their own kind — they are not
+    // scalars and route through the multi-leaf memory path, not these switches.
+    [[nodiscard]] TypeKind reprKind(TypeId ty) const {
+        TypeKind const k = interner.kind(ty);
+        if (k == TypeKind::Enum) {
+            auto const sc = interner.scalars(ty);
+            if (!sc.empty()) return static_cast<TypeKind>(sc[0]);
+        }
+        return k;
+    }
+
     [[nodiscard]] std::uint8_t widthFlagsForType(TypeId ty) const {
         if (!ty.valid()) return 0;
-        switch (interner.kind(ty)) {
+        switch (reprKind(ty)) {
             case TypeKind::I32: case TypeKind::U32: case TypeKind::F32:
                 return kLirInstFlagWidth32;
             // C 6.2.5: `char` is a single byte. D-CSUBSET-CHAR-STRING-VALUE-CODEGEN:
@@ -921,7 +979,7 @@ struct Lowerer {
     [[nodiscard]] std::uint8_t memAccessWidthFlags(TypeId ty, LirRegClass cls) const {
         if (cls == LirRegClass::FPR) return widthFlagsForType(ty);
         if (!ty.valid()) return 0;
-        switch (interner.kind(ty)) {
+        switch (reprKind(ty)) {   // enum → underlying int (see reprKind)
             // 1-byte integers (Char already required byte-exactness;
             // I8/U8/Bool/Byte join it — a packed signed/unsigned-char or bool
             // element must be 1-byte-exact too).
@@ -1359,22 +1417,36 @@ struct Lowerer {
         for (std::size_t k = 1; k < nChunks; ++k) {
             if (chunks[k] != 0) { needsChain = true; break; }
         }
-        // The ladder slots, positionally chunk index 1..3.
-        static constexpr std::array<MnemonicSlot, 3> kMovkSlots{
-            MnemonicSlot::MovkLsl16, MnemonicSlot::MovkLsl32,
-            MnemonicSlot::MovkLsl48};
-        bool ladderDeclared = needsChain;
-        for (std::size_t k = 1; k < nChunks && ladderDeclared; ++k) {
-            if (chunks[k] != 0
-                && !opcode(kMovkSlots[k - 1]).has_value()) {
-                ladderDeclared = false;
-            }
-        }
+        bool const ladderDeclared = needsChain && targetHasMovkLadder();
         if (!needsChain || !ladderDeclared) {
             emitMovToFresh(id, LirOperand::makeImmInt32(imm32),
                            LirRegClass::GPR, widthFlags);
             return;
         }
+        materializeViaMovkLadder(id, pattern, widthFlags);
+    }
+
+    // D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE / D-CSUBSET-BITFIELD-WIDE-UNIT:
+    // emit the MOVZ + MOVK ladder for the full 64-bit `pattern`. Seeds
+    // chunk0 with a mov-imm (arm64 MOVZ zeroes the whole register), then
+    // one `movk_lslN` per NONZERO higher 16-bit chunk — the MINIMAL
+    // chain. `widthFlags` of 32 truncates to the low 2 chunks (the
+    // 32-bit write zero-extends; chunks 2/3 never exist); width 64 walks
+    // all 4. Caller has verified the ladder is declared
+    // (`targetHasMovkLadder()`); a chunk needing an undeclared slot is a
+    // fail-loud `reportMissingOpcode` (never a silent partial constant).
+    void materializeViaMovkLadder(MirInstId id, std::uint64_t pattern,
+                                  std::uint8_t widthFlags) {
+        bool const is32 = lirInstWidthBits(widthFlags) == 32;
+        std::size_t const nChunks = is32 ? 2 : 4;
+        std::array<std::uint16_t, 4> chunks{};
+        for (std::size_t k = 0; k < 4; ++k) {
+            chunks[k] = static_cast<std::uint16_t>(pattern >> (16 * k));
+        }
+        // The ladder slots, positionally chunk index 1..3.
+        static constexpr std::array<MnemonicSlot, 3> kMovkSlots{
+            MnemonicSlot::MovkLsl16, MnemonicSlot::MovkLsl32,
+            MnemonicSlot::MovkLsl48};
         LirReg const r = emitMovToFresh(
             id,
             LirOperand::makeImmInt32(
@@ -1382,12 +1454,17 @@ struct Lowerer {
             LirRegClass::GPR, widthFlags);
         for (std::size_t k = 1; k < nChunks; ++k) {
             if (chunks[k] == 0) continue;
+            auto const slotOp = opcode(kMovkSlots[k - 1]);
+            if (!slotOp.has_value()) {
+                reportMissingOpcode(kMovkSlots[k - 1],
+                                    "MIR Const wide-immediate ladder");
+                return;
+            }
             std::array<LirOperand, 2> const movkOps{
                 LirOperand::makeReg(r),
                 LirOperand::makeImmInt32(
                     static_cast<std::int32_t>(chunks[k]))};
-            emitInst(*opcode(kMovkSlots[k - 1]), r, movkOps,
-                     /*payload=*/0, widthFlags);
+            emitInst(*slotOp, r, movkOps, /*payload=*/0, widthFlags);
         }
     }
 
@@ -1464,12 +1541,15 @@ struct Lowerer {
             return;
         }
 
-        // ── wide-literal path: route through LirLiteralPool ──
+        // ── wide-literal path ──
         //
-        // Routing: int32-fits → ImmInt (above); int64/uint64/string →
-        // pool with GPR-class result; monostate / aggregate →
+        // Routing: int32-fits → ImmInt (above); wide int64/uint64 →
+        // capability-probed (below, D-CSUBSET-BITFIELD-WIDE-UNIT);
+        // string → pool with GPR-class result; monostate / aggregate →
         // unsupported + poison so dependent uses surface ONE root-cause
         // diagnostic rather than a cascade of "used before definition".
+        // The float fail-loud runs FIRST (it must precede any pool
+        // routing — a double must never reach the LiteralIndex path).
         //
         // FC2 Part B (F64 constant materialization): float (FPR-class)
         // constants must NOT reach MIR→LIR as `Const` — HIR→MIR
@@ -1498,12 +1578,88 @@ struct Lowerer {
             poisonValue(id);
             return;
         }
+        // ── wide INTEGER constant (D-CSUBSET-BITFIELD-WIDE-UNIT) ──
+        //
+        // A >imm32 integer reaches here (e.g. a 40-bit bit-field mask, or
+        // `unsigned long long x = 0xFFFFFFFF'FF`). It materializes at
+        // width-64 by TARGET CAPABILITY — the sanctioned probe pattern
+        // (declared variant/mnemonic vocabulary, NEVER `if (arch==...)`):
+        //   * `mov r64, imm64` declared (x86_64) → keep the LiteralPool
+        //     carrier (the wide value can't ride the 8-byte LirOperand
+        //     POD inline) and emit ONE `mov r64, imm64` (B8+rd io). The
+        //     encoder reads the value back from the pool.
+        //   * the MOVZ/MOVK ladder declared (arm64) → emit the minimal
+        //     MOVZ #chunk0 + MOVK-per-nonzero-chunk inline chain (no pool
+        //     entry needed — each chunk rides an imm32 operand).
+        //   * neither → fail loud (a target with no wide-const form).
+        // Float literals are handled above (rodata promotion); strings
+        // fall through to the pool path below. The SIGN/ZERO extension to
+        // 64 bits matches what every 64-bit consumer was lowered against.
+        {
+            bool isWideInt = false;
+            std::uint64_t value64 = 0;
+            // Preserve the ORIGINAL variant arm (int64 vs uint64) for the
+            // pool entry — the bit pattern is identical either way (the
+            // encoder reads both via the same Imm64 path), but keeping the
+            // arm avoids a surprising signedness flip for any pool
+            // inspector. `value64` is the bit pattern, used by the ladder.
+            LirLiteralValue lirLit;
+            lirLit.core = lit.core;
+            if (auto const* i = std::get_if<std::int64_t>(&lit.value)) {
+                value64      = static_cast<std::uint64_t>(*i);
+                lirLit.value = *i;
+                isWideInt    = true;
+            } else if (auto const* u =
+                           std::get_if<std::uint64_t>(&lit.value)) {
+                value64      = *u;
+                lirLit.value = *u;
+                isWideInt    = true;
+            }
+            if (isWideInt) {
+                if (targetHasMovImm64()) {
+                    std::uint32_t const lirLitIdx =
+                        lir.literalPoolAdd(std::move(lirLit));
+                    // width-default flags (0) = 64 bits — the imm64
+                    // variant is width-64-keyed, and 64 is the
+                    // `lirInstWidthBits` default (there is no explicit
+                    // Width64 flag; the absent-flag state IS 64-bit).
+                    emitMovToFresh(id,
+                                   LirOperand::makeLiteralIndex(lirLitIdx),
+                                   LirRegClass::GPR,
+                                   /*flags=*/0);
+                    return;
+                }
+                if (targetHasMovkLadder()) {
+                    // width-default (0) = 64-bit ladder (all 4 chunks).
+                    materializeViaMovkLadder(id, value64, /*flags=*/0);
+                    return;
+                }
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format(
+                        "MIR Const %{} is a 64-bit integer literal wider "
+                        "than imm32, but the target declares neither a "
+                        "`mov r64, imm64` variant nor the MOVZ/MOVK wide-"
+                        "immediate ladder — it has no way to materialize a "
+                        "wide constant (D-CSUBSET-BITFIELD-WIDE-UNIT)",
+                        id.v));
+                poisonValue(id);
+                return;
+            }
+        }
+
+        // ── remaining pool-routed literals (strings) ──
+        //
+        // Routing: int32-fits → ImmInt (above); wide int → capability
+        // (above); string → pool with GPR-class result; monostate /
+        // aggregate → unsupported + poison so dependent uses surface ONE
+        // root-cause diagnostic rather than a cascade of "used before
+        // definition".
         LirLiteralValue lirLit;
         lirLit.core = lit.core;
         bool unsupportedVariant = false;
-        if (auto const* i = std::get_if<std::int64_t>(&lit.value))       lirLit.value = *i;
-        else if (auto const* u = std::get_if<std::uint64_t>(&lit.value)) lirLit.value = *u;
-        else if (auto const* s = std::get_if<std::string>(&lit.value))   lirLit.value = *s;
+        if (auto const* s = std::get_if<std::string>(&lit.value))   lirLit.value = *s;
         else {
             // monostate (malformed-source recovery), aggregate (cycle
             // 3e), or any future variant arm: fail loud + poison.

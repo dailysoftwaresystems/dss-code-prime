@@ -5,6 +5,7 @@
 #include "hir/attributes/diagnostic_info.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/attributes/linkage_attr.hpp"
+#include "hir/attributes/mutability_attr.hpp"
 #include "hir/attributes/shader_intrinsic.hpp"
 #include "hir/attributes/source_span.hpp"
 #include "hir/attributes/transpile_hints.hpp"
@@ -39,6 +40,13 @@ using HirFfiMap = HirAttribute<FfiMetadata>;
 // lowering to stamp `MirFunc`/`MirGlobal` binding+visibility — the input the
 // optimizer's DCE-protect predicate `isExternallyVisible()` consults.
 using HirLinkageMap = HirAttribute<LinkageAttr>;
+
+// Native-declaration mutability (const vs writable) for globals that carried a
+// source CONST qualifier. Populated by CST→HIR lowering from the bound symbol's
+// `SymbolRecord.isConst`; read by HIR→MIR lowering to stamp `MirGlobal.isConst`
+// — the input the assembler's section selection consults to route an
+// initialized global to read-only `.rodata` (const) vs writable `.data`.
+using HirMutabilityMap = HirAttribute<MutabilityAttr>;
 
 // Shader stage / built-in / workgroup / binding data. Populated by shader-shape
 // lowering (plan 17); read by SPIR-V codegen.

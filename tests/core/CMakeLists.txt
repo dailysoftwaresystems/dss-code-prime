@@ -55,3 +55,8 @@ dss_add_test(NAME core/type_lattice/test_type_registry SOURCES type_lattice/test
 dss_add_test(NAME core/type_lattice/test_type_reintern SOURCES type_lattice/test_type_reintern.cpp)
 dss_add_test(NAME core/test_type_layout                SOURCES test_type_layout.cpp)
 dss_add_test(NAME core/test_aggregate_abi              SOURCES test_aggregate_abi.cpp)
+# D-CSUBSET-BITFIELD-ABI-EXACT: the CI cross-compile-COMPARE witness — builds the
+# struct battery with the host's NATIVE C compiler (cl.exe / gcc / clang) and
+# asserts dss's computeLayout (host-ABI strategy) is byte-identical. Skips when no
+# toolchain. (The macOS leg is the only runtime witness for Apple-arm64.)
+dss_add_test(NAME core/test_bitfield_abi_conformance   SOURCES test_bitfield_abi_conformance.cpp)

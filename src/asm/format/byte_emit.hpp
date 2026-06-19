@@ -34,6 +34,17 @@ inline void appendImm32LE(std::vector<std::uint8_t>& out, std::int32_t v) noexce
     appendU32LE(out, static_cast<std::uint32_t>(v));
 }
 
+// D-CSUBSET-BITFIELD-WIDE-UNIT (v0.0.2 FC8): append 8 little-endian
+// bytes — the `io` immediate of x86 `mov r64, imm64` (REX.W B8+rd io).
+// The FIRST 64-bit immediate any walker emits. Generic over the
+// 8-byte-immediate forms of any ISA (no x86-specific behavior), so it
+// lives in the shared byte-emit substrate alongside `appendU32LE`.
+inline void appendU64LE(std::vector<std::uint8_t>& out, std::uint64_t v) noexcept {
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+        out.push_back(static_cast<std::uint8_t>((v >> shift) & 0xFFu));
+    }
+}
+
 // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03):
 // in-place 4-byte LE write at a known offset. Used by asm.cpp's
 // per-function patch-resolve loop to overwrite BlockRel32 placeholder

@@ -62,4 +62,19 @@ emitTerminator(LirBuilder& b, std::uint16_t op,
                std::string_view passName,
                DiagnosticReporter& reporter);
 
+// D-CSUBSET-BITFIELD-WIDE-UNIT: copy the source module's wide-literal
+// pool into the destination builder, PRESERVING indices. Every pass
+// that walks an input `Lir` and builds a fresh one copies `LiteralIndex`
+// OPERANDS verbatim (the index is an opaque module-level reference), so
+// the new builder's pool MUST hold the same entries at the same indices
+// or those operands dangle (LirLiteralPool::at out-of-range at encode
+// time). The destination builder MUST be freshly constructed (empty
+// pool) so appending entries 0..N-1 in order reproduces the source
+// indices exactly. Call once, right after `LirBuilder b{schema}`,
+// before any `addInst`. (Before FC8 no real value rode `LiteralIndex`
+// to the encoder — strings/floats never reached it — so this latent
+// rebuild gap was invisible; the `mov r64, imm64` carrier exposes it.)
+DSS_EXPORT void
+copyLiteralPool(Lir const& src, LirBuilder& dst);
+
 } // namespace dss::lir_pass_util

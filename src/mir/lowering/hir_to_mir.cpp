@@ -60,6 +60,9 @@ struct Lowerer {
     HirLinkageMap const*     linkageMap;  // optional — native-decl binding/
                                            // visibility (D-CSUBSET-LINKAGE-
                                            // SPECIFIERS). nullptr ⇒ all Global.
+    HirMutabilityMap const*  mutabilityMap; // optional — native-global const-ness
+                                           // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL).
+                                           // nullptr / no entry ⇒ mutable.
     MirBuilder               mir;
     // Extern symbols extracted during the pre-pass. Each extern's
     // SymbolId is also inserted into `functionSymbols` so a `Ref`
@@ -732,6 +735,34 @@ struct Lowerer {
                 // own block, branches to the join, and the phi at the join
                 // takes the two incoming values keyed by their predecessor
                 // blocks.
+                //
+                // INVARIANT (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): a phi of
+                // an AGGREGATE type is forbidden — the aggregate model is
+                // MEMORY-based (no LIR aggregate-width SSA value, and a bit-field
+                // packs only by read-modify-write into its allocation unit). An
+                // aggregate-typed ternary is therefore NEVER lowered as a bare
+                // rvalue here; every consumer reaches it by ADDRESS via
+                // lowerLvalueAddress's Ternary arm (a CFG diamond into ONE common
+                // slot — no phi), and the discard position routes through it too
+                // (the ExprStmt chokepoint). Reaching here with an aggregate type
+                // means a NEW consumer lowered an aggregate ternary by value
+                // instead of by address — fail loud rather than silently
+                // synthesizing a phi-of-aggregate (plus aggregate-width arm
+                // Loads) that flows to LIR as a latent miscompile.
+                if (t.valid()) {
+                    TypeKind const tk = interner.kind(t);
+                    if (tk == TypeKind::Struct || tk == TypeKind::Union
+                        || tk == TypeKind::Array) {
+                        unsupported(node,
+                            "internal: an aggregate-typed ternary must be lowered "
+                            "into a slot by ADDRESS (lowerLvalueAddress — a CFG "
+                            "diamond into one common slot), never as a bare SSA "
+                            "rvalue — the MIR has no aggregate-width value and a "
+                            "phi-of-aggregate cannot pack bit-fields "
+                            "(D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR)");
+                        return InvalidMirInst;
+                    }
+                }
                 auto kids = hir.children(node);
                 if (kids.size() != 3) {
                     unsupported(node, "malformed Ternary (expect 3 children)");
@@ -889,6 +920,15 @@ struct Lowerer {
                 // address via the shared lvalue path, then emit `Load`.
                 MirInstId const ptr = lowerLvalueAddress(node);
                 if (!ptr.valid()) return InvalidMirInst;
+                // FC8 D-CSUBSET-BITFIELD: a bit-field read loads the whole
+                // allocation unit (the Gep already targets the unit), then
+                // extracts the field's bits (shift + mask / sign-extend).
+                if (BitFieldPlacement const* bf = bitfieldPlacementOf(node)) {
+                    std::array<MirInstId, 1> lo{ptr};
+                    MirInstId const unit = mir.addInst(MirOpcode::Load, lo, t);
+                    if (!unit.valid()) return InvalidMirInst;
+                    return emitBitfieldExtract(unit, *bf, t);
+                }
                 std::array<MirInstId, 1> ops{ptr};
                 return mir.addInst(MirOpcode::Load, ops, t);
             }
@@ -926,15 +966,24 @@ struct Lowerer {
                 // Both fail loud here so a future producer can't slip
                 // a silent miscompile through this arm.
                 if (fromK == TypeKind::Array && toK == TypeKind::Ptr) {
+                    // FC8: NON-string-literal array→pointer DECAY (C 6.3.2.1) —
+                    // the decayed pointer is the address of the array's FIRST
+                    // ELEMENT. Any array LVALUE (a local alloca, a module global
+                    // whose bytes the aggregate-global producer already emits to
+                    // rodata, a struct field, an indexed sub-array) yields its
+                    // base address via `lowerLvalueAddress`; a byte-offset-0 Gep
+                    // re-types it as `Ptr<elem>` (`t`) — the C-standard `&arr[0]`
+                    // (array base == first-element address). Closes
+                    // D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY +
+                    // D-LK4-RODATA-PRODUCER-NONSTRING-GLOBAL-ARRAY-DECAY. A string
+                    // literal is an RVALUE (no lvalue address) → it keeps the
+                    // synthesize-a-rodata-global path below.
                     if (hir.kind(kids[0]) != HirKind::Literal) {
-                        unsupported(node,
-                            "Array→Pointer decay supported only on "
-                            "string-literal operands today (local + "
-                            "non-string-global arrays anchored "
-                            "D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY "
-                            "/ D-LK4-RODATA-PRODUCER-NONSTRING-GLOBAL-"
-                            "ARRAY-DECAY)");
-                        return InvalidMirInst;
+                        MirInstId const arrAddr = lowerLvalueAddress(kids[0]);
+                        if (!arrAddr.valid()) return InvalidMirInst;
+                        MirInstId const zero = constInt(0);
+                        std::array<MirInstId, 2> gep{arrAddr, zero};
+                        return mir.addInst(MirOpcode::Gep, gep, t);
                     }
                     std::uint32_t const litIdx0 = hir.payload(kids[0]);
                     HirLiteralValue const& src = literals.at(litIdx0);
@@ -980,7 +1029,20 @@ struct Lowerer {
                 }
                 MirInstId const operand = lowerExpr(kids[0]);
                 if (!operand.valid()) return InvalidMirInst;
-                MirOpcode const mop = mapCast(fromK, toK);
+                // C 6.7.2.2: an enum casts AS its underlying integer (the kind in
+                // the enum TypeId's `scalars[0]`). Resolve here so `mapCast`
+                // (TypeKind-only, can't read the interner) sees the real width —
+                // NO I32 assumption: a non-I32-underlying enum lowers via its
+                // declared kind. The Cast's RESULT type stays `t` (enum-typed for
+                // an int→enum cast). D-CSUBSET-ENUM-INT-CONVERSION.
+                auto const enumUnderlying =
+                    [&](TypeId ty, TypeKind k) noexcept -> TypeKind {
+                        if (k != TypeKind::Enum || !ty.valid()) return k;
+                        auto const sc = interner.scalars(ty);
+                        return sc.empty() ? k : static_cast<TypeKind>(sc[0]);
+                    };
+                MirOpcode const mop = mapCast(enumUnderlying(fromTy, fromK),
+                                              enumUnderlying(t, toK));
                 if (mop == MirOpcode::Invalid) {
                     unsupported(node, std::format(
                         "Cast from TypeKind {} to {} has no MIR opcode",
@@ -995,22 +1057,62 @@ struct Lowerer {
                 // Lower the side-effect statements in order, then lower the
                 // result expression. The result's value IS the SeqExpr's
                 // value; the typeId on the SeqExpr equals the result's type.
+                //
+                // INVARIANT (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): an
+                // aggregate-typed comma/SeqExpr has no SSA rvalue (memory-based
+                // model) — its consumers reach it by ADDRESS via
+                // lowerLvalueAddress's SeqExpr arm (run the side effects, then
+                // recurse to the result's lvalue), and the discard position
+                // routes through it too. Reaching here with an aggregate type is
+                // a misroute — fail loud rather than running the side effects and
+                // then producing an aggregate-width rvalue of the result.
+                if (t.valid()) {
+                    TypeKind const tk = interner.kind(t);
+                    if (tk == TypeKind::Struct || tk == TypeKind::Union
+                        || tk == TypeKind::Array) {
+                        unsupported(node,
+                            "internal: an aggregate-typed comma/SeqExpr must be "
+                            "lowered by ADDRESS (lowerLvalueAddress), never as a "
+                            "bare SSA rvalue (D-CSUBSET-AGGREGATE-VALUED-CONTROL-"
+                            "EXPR)");
+                        return InvalidMirInst;
+                    }
+                }
                 for (HirNodeId stmt : hir.seqExprStmts(node)) {
                     if (!lowerStmt(stmt)) return InvalidMirInst;
                 }
                 return lowerExpr(hir.seqExprResult(node));
             }
             case HirKind::ConstructAggregate: {
-                // ML2 cycle 6: lower an aggregate constructor to a chain
-                // of MIR InsertValue starting from a synth-zero base.
-                // The HIR producer (lowerBraceInit + synthZeroOrError)
-                // guarantees every slot of the aggregate has a child —
-                // explicit value or zero-fill. Children are lowered as
-                // ordinary expressions and inserted at their positional
-                // index. Result is an SSA value of the aggregate type,
-                // suitable for Store-into-alloca at the VarDecl site or
-                // any other consumer.
-                return lowerConstructAggregate(node, t);
+                // INVARIANT (D-CSUBSET-BITFIELD-RVALUE-RUNTIME): the compiler's
+                // aggregate model is MEMORY-based — there is no LIR aggregate-
+                // width SSA value, and a bit-field can only be packed by a
+                // read-modify-write into its allocation unit (impossible on an
+                // SSA aggregate). So an aggregate `ConstructAggregate` is NEVER
+                // lowered as a bare rvalue here; every consumer reaches it by
+                // ADDRESS:
+                //   - a LOCAL `= {…}` init   → lowerAggregateInitIntoSlot /
+                //                               lowerArrayInitIntoSlot (VarDecl);
+                //   - a GLOBAL `= {…}` init  → evaluateConstant + the static-data
+                //                               byte encoder (emitGlobals_);
+                //   - a by-value RVALUE      → lowerLvalueAddress's compound-
+                //     (arg/return/assign/        literal arm materializes a slot,
+                //      member-of-literal)        inits in place, returns its addr.
+                // The former SSA-aggregate path (a `Const(zero)` seed + an
+                // `InsertValue` chain) is removed: LIR realized only a zero-index
+                // InsertValue and could not pack bit-fields — a latent silent
+                // miscompile. Reaching here means a NEW consumer lowered an
+                // aggregate ConstructAggregate as a bare rvalue instead of by
+                // address — fail loud so it routes through the slot model rather
+                // than silently resurrecting the SSA-aggregate chain.
+                unsupported(node,
+                    "internal: an aggregate compound-literal/initializer must be "
+                    "lowered into a slot by ADDRESS (lowerLvalueAddress / "
+                    "lowerAggregateInitIntoSlot), never as a bare SSA-aggregate "
+                    "rvalue — the MIR has no aggregate-width value and cannot "
+                    "pack bit-fields in a register (D-CSUBSET-BITFIELD-RVALUE-"
+                    "RUNTIME)");
+                return InvalidMirInst;
             }
             default: break;
         }
@@ -1137,6 +1239,115 @@ struct Lowerer {
         StructLayout const* layout = cachedLayout(elemTy);
         if (layout == nullptr) return std::nullopt;
         return layout->size;
+    }
+
+    // FC8 D-CSUBSET-BITFIELD: the bit placement of a `MemberAccess` node IFF it
+    // names a bit-field, else nullptr. The aggregate's cached layout carries one
+    // `BitFieldPlacement` per field (empty unless the struct/union has a
+    // bit-field); a placement with `unitBytes != 0` is a bit-field. The returned
+    // pointer is stable (it lives in the memoized `layoutCache_`).
+    [[nodiscard]] BitFieldPlacement const* bitfieldPlacementOf(HirNodeId node) {
+        if (hir.kind(node) != HirKind::MemberAccess) return nullptr;
+        auto kids = hir.children(node);
+        if (kids.size() != 1) return nullptr;
+        TypeId const aggTy = hir.typeId(kids[0]);
+        if (!aggTy.valid()) return nullptr;
+        StructLayout const* layout = cachedLayout(aggTy);
+        if (layout == nullptr) return nullptr;
+        std::uint32_t const fieldIdx = hir.payload(node);
+        if (fieldIdx >= layout->bitFields.size()) return nullptr;
+        BitFieldPlacement const& p = layout->bitFields[fieldIdx];
+        return p.unitBytes != 0 ? &p : nullptr;
+    }
+
+    // True iff `k` is a SIGNED integer kind (so a bit-field extract must
+    // sign-extend). U*/Char/Bool extract zero-extended (char bit-field signedness
+    // is implementation-defined — we choose unsigned, self-consistently).
+    [[nodiscard]] static bool bitfieldIsSigned(TypeKind k) noexcept {
+        switch (k) {
+            case TypeKind::I8: case TypeKind::I16: case TypeKind::I32:
+            case TypeKind::I64: case TypeKind::I128: return true;
+            default:                                 return false;
+        }
+    }
+
+    // FC8 D-CSUBSET-ENUM-BITFIELD: an enum-typed bit-field's allocation unit IS
+    // its underlying integer (C 6.7.2.1 + the enum-behaves-as-underlying rule,
+    // D-CSUBSET-ENUM-INT-CONVERSION). Resolve Enum→underlying so the unit's
+    // load/store width, shift/mask constants, signedness, and op result types
+    // all run at the real integer type; a non-enum type passes through
+    // unchanged. Kept local (mirrors detail::type_rules::enumUnderlyingOrSelf)
+    // to avoid a MIR→semantic-layer header dependency.
+    [[nodiscard]] TypeId enumReprType(TypeId t) {
+        if (!t.valid() || interner.kind(t) != TypeKind::Enum) return t;
+        auto const sc = interner.scalars(t);
+        return sc.empty() ? t : interner.primitive(static_cast<TypeKind>(sc[0]));
+    }
+
+    // FC8 D-CSUBSET-BITFIELD: extract a bit-field value from a loaded allocation
+    // unit. Unsigned: `(unit >> bitOffset) & ((1<<W)-1)`. Signed: sign-extend via
+    // `(unit << (B - bitOffset - W)) >>arith (B - W)` (B = unit bits). All ops are
+    // computed at the field's (unit) type — reuses the existing MIR shift/and ops.
+    [[nodiscard]] MirInstId
+    emitBitfieldExtract(MirInstId unitVal, BitFieldPlacement const& p, TypeId fieldTy) {
+        fieldTy = enumReprType(fieldTy);   // enum bit-field → underlying integer
+        std::uint32_t const B = p.unitBytes * 8;
+        // Shift/mask constants MUST be the field/unit type, NOT I32 — a 64-bit-
+        // unit bit-field (`unsigned long long x:40`) with an I32 const operand is
+        // a mixed-width op the verifier doesn't catch (silent miscompile); see
+        // constIntOfType. (Unit widths >64 are rejected at semantic, so the mask
+        // fits in u64.)
+        auto shiftBy = [&](MirInstId v, MirOpcode op, std::uint32_t amt) -> MirInstId {
+            if (amt == 0) return v;
+            MirInstId const sh = constIntOfType(static_cast<std::int64_t>(amt), fieldTy);
+            std::array<MirInstId, 2> ops{v, sh};
+            return mir.addInst(op, ops, fieldTy);
+        };
+        if (bitfieldIsSigned(interner.kind(fieldTy))) {
+            MirInstId v = shiftBy(unitVal, MirOpcode::Shl, B - p.bitOffset - p.bitWidth);
+            return shiftBy(v, MirOpcode::AShr, B - p.bitWidth);
+        }
+        MirInstId v = shiftBy(unitVal, MirOpcode::LShr, p.bitOffset);
+        if (p.bitWidth < B) {
+            std::uint64_t const mask =
+                p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
+            MirInstId const m = constIntOfType(static_cast<std::int64_t>(mask), fieldTy);
+            std::array<MirInstId, 2> ops{v, m};
+            v = mir.addInst(MirOpcode::And, ops, fieldTy);
+        }
+        return v;
+    }
+
+    // FC8 D-CSUBSET-BITFIELD: read-modify-write a bit-field at unit address
+    // `unitPtr` with `rhsVal`: `unit = (unit & ~(mask<<off)) | ((rhs & mask)<<off)`
+    // then store back. The RMW preserves every OTHER bit in the unit (incl. a
+    // neighbour field packed into the same unit). Computed at the field/unit type.
+    [[nodiscard]] bool
+    emitBitfieldInsert(MirInstId unitPtr, MirInstId rhsVal,
+                       BitFieldPlacement const& p, TypeId fieldTy) {
+        fieldTy = enumReprType(fieldTy);   // enum bit-field → underlying integer
+        std::uint64_t const mask =
+            p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
+        std::uint64_t const fieldMask = mask << p.bitOffset;
+        std::array<MirInstId, 1> lo{unitPtr};
+        MirInstId const unit = mir.addInst(MirOpcode::Load, lo, fieldTy);
+        if (!unit.valid()) return false;
+        MirInstId const clrK = constIntOfType(static_cast<std::int64_t>(~fieldMask), fieldTy);
+        std::array<MirInstId, 2> ca{unit, clrK};
+        MirInstId const cleared = mir.addInst(MirOpcode::And, ca, fieldTy);
+        MirInstId const mK = constIntOfType(static_cast<std::int64_t>(mask), fieldTy);
+        std::array<MirInstId, 2> ma{rhsVal, mK};
+        MirInstId masked = mir.addInst(MirOpcode::And, ma, fieldTy);
+        if (p.bitOffset != 0) {
+            MirInstId const sh = constIntOfType(static_cast<std::int64_t>(p.bitOffset), fieldTy);
+            std::array<MirInstId, 2> sa{masked, sh};
+            masked = mir.addInst(MirOpcode::Shl, sa, fieldTy);
+        }
+        std::array<MirInstId, 2> oa{cleared, masked};
+        MirInstId const merged = mir.addInst(MirOpcode::Or, oa, fieldTy);
+        std::array<MirInstId, 2> st{merged, unitPtr};
+        mir.addInst(MirOpcode::Store, st);
+        return true;
     }
 
     // Resolve the ADDRESS of an lvalue expression — the pointer value a
@@ -1309,11 +1520,179 @@ struct Lowerer {
             std::array<MirInstId, 2> ops{basePtr, byteIdx};
             return mir.addInst(MirOpcode::Gep, ops, resTy);
         }
+        if (k == HirKind::ConstructAggregate) {
+            // D-CSUBSET-BITFIELD-RVALUE-RUNTIME (the GENERAL aggregate-rvalue
+            // carrier): a compound literal `(struct S){…}` / `(int[]){…}` IS an
+            // lvalue (C11 6.5.2.5p4) — its storage is a unique unnamed object.
+            // The compiler's aggregate model is memory-based (no LIR aggregate-
+            // width value: every by-value consumer — by-value arg, by-value
+            // return, assign-from-rvalue, member-of-literal — takes the
+            // aggregate's ADDRESS through this very function), so the literal's
+            // lvalue address is a synthesized SLOT we materialize here and
+            // initialize IN PLACE, exactly as a named local's `= {…}` init does.
+            // This covers struct/union/array AND bit-field/non-bit-field by
+            // construction: the struct/union arm routes through
+            // lowerAggregateInitIntoSlot, which already dispatches a bit-field
+            // type to the per-allocation-unit packer
+            // (lowerBitfieldAggregateInitIntoSlot — the cycle-4 packing
+            // chokepoint), so a runtime bit-field literal packs correctly here.
+            // Keys ONLY on HirKind + the type's kind (Struct/Union/Array) and
+            // reuses the config-driven layout — no target/arch/format identity.
+            TypeId const at = hir.typeId(node);
+            if (!at.valid()) {
+                unsupported(node, "ConstructAggregate rvalue has no type "
+                                   "(HIR verifier should have flagged)");
+                return InvalidMirInst;
+            }
+            TypeKind const ak = interner.kind(at);
+            if (ak == TypeKind::Struct || ak == TypeKind::Union
+                || ak == TypeKind::Array) {
+                MirInstId const slot = freshAggregateTemp(at);
+                if (!slot.valid()) {
+                    unsupported(node, "aggregate compound-literal rvalue requires "
+                                       "a sizeable layout (un-sizeable type or the "
+                                       "target declared no aggregateLayout)");
+                    return InvalidMirInst;
+                }
+                bool const ok = (ak == TypeKind::Array)
+                    ? lowerArrayInitIntoSlot(node, slot, at)
+                    : lowerAggregateInitIntoSlot(node, slot, at);
+                if (!ok) return InvalidMirInst;   // fail-loud already reported
+                return slot;
+            }
+            // A non-aggregate ConstructAggregate is a front-end invariant
+            // violation (the brace-init target-type check rejects scalar
+            // targets) — fall through to the fail-loud.
+        }
+        if (k == HirKind::Ternary) {
+            // D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR: an AGGREGATE-typed
+            // ternary `cond ? A : B` (A/B aggregate rvalues — compound
+            // literals, named lvalues, calls, or nested ternaries) used BY
+            // VALUE. Unlike the compound-literal arm above (one slot inited in
+            // place), the VALUE is control-flow-dependent — so we materialize
+            // each arm into ONE COMMON slot under a CFG diamond and return the
+            // slot. There is NO Phi of the aggregate: the compiler's aggregate
+            // model is memory-based (no LIR aggregate-width SSA value), so the
+            // "merge" is a shared memory location, not an SSA Phi (a scalar
+            // ternary in lowerExpr uses a Phi; an aggregate one cannot). Keys
+            // ONLY on HirKind + the type's kind (Struct/Union/Array) + the
+            // config-driven layout — no target/arch/format identity.
+            TypeId const at = hir.typeId(node);
+            TypeKind const ak = at.valid() ? interner.kind(at) : TypeKind::Void;
+            if (ak == TypeKind::Struct || ak == TypeKind::Union
+                || ak == TypeKind::Array) {
+                auto kids = hir.children(node);
+                if (kids.size() != 3) {
+                    unsupported(node, "malformed Ternary (expect 3 children)");
+                    return InvalidMirInst;
+                }
+                // The common result slot is allocated ONCE, BEFORE the branch,
+                // so both arms write the same storage and the join reads it.
+                MirInstId const slot = freshAggregateTemp(at);
+                if (!slot.valid()) {
+                    unsupported(node, "aggregate-valued ternary requires a "
+                                       "sizeable layout (un-sizeable type or the "
+                                       "target declared no aggregateLayout)");
+                    return InvalidMirInst;
+                }
+                MirInstId const cond = lowerExpr(kids[0]);
+                if (!cond.valid()) return InvalidMirInst;
+                // Mirror the scalar-ternary diamond's StructCfMarker usage
+                // (IfThen/IfElse/IfJoin) so the verifier's count-pairing
+                // invariant holds (markers pair by count, not edge polarity).
+                MirBlockId const thenBB =
+                    mir.createBlock(StructCfMarker::IfThen);
+                MirBlockId const elseBB =
+                    mir.createBlock(StructCfMarker::IfElse);
+                MirBlockId const joinBB =
+                    mir.createBlock(StructCfMarker::IfJoin);
+                mir.addCondBr(cond, thenBB, elseBB);
+
+                mir.beginBlock(thenBB);
+                if (!materializeAggregateArmIntoSlot(kids[1], slot, at)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(elseBB);
+                    sealCreatedAsUnreachable(joinBB);
+                    return InvalidMirInst;   // fail-loud already reported
+                }
+                mir.addBr(joinBB);
+
+                mir.beginBlock(elseBB);
+                if (!materializeAggregateArmIntoSlot(kids[2], slot, at)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(joinBB);
+                    return InvalidMirInst;   // fail-loud already reported
+                }
+                mir.addBr(joinBB);
+
+                // The slot IS the result — NO Phi, no SSA aggregate value. The
+                // by-value caller consumes the addr in the (now open) joinBB.
+                mir.beginBlock(joinBB);
+                return slot;
+            }
+            // A scalar-typed Ternary is not an lvalue → fall through to the
+            // fail-loud (a scalar ternary lowers as an rvalue via lowerExpr).
+        }
+        if (k == HirKind::SeqExpr) {
+            // D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR (comma operator): the
+            // VALUE of a comma/SeqExpr is its result expression's value; when
+            // that result is an aggregate used by value, its lvalue address is
+            // the result expression's lvalue address. Run the side-effect
+            // statements (exactly as the lowerExpr SeqExpr arm does), then
+            // recurse — the aggregate result reaches the compound-literal /
+            // ternary / named-lvalue arms. (A scalar SeqExpr is handled in
+            // lowerExpr; here we only need the aggregate-by-address path, but
+            // the recursion's own kind dispatch + fail-loud guards any
+            // non-lvalue result.)
+            for (HirNodeId stmt : hir.seqExprStmts(node)) {
+                if (!lowerStmt(stmt)) return InvalidMirInst;
+            }
+            return lowerLvalueAddress(hir.seqExprResult(node));
+        }
+        // Any OTHER lvalue kind is still unsupported — fail loud (the
+        // aggregate-valued Ternary/SeqExpr carriers above are
+        // D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR; the compound-literal carrier
+        // is the ConstructAggregate arm — D-CSUBSET-BITFIELD-RVALUE-RUNTIME).
         unsupported(node, std::format(
             "lvalue kind ordinal {} not supported by this lowering "
-            "(only Ref-to-addressable-local, Deref, MemberAccess, Index)",
+            "(only Ref-to-addressable-local, Deref, MemberAccess, Index, "
+            "compound-literal ConstructAggregate, aggregate Ternary/SeqExpr)",
             static_cast<unsigned>(k)));
         return InvalidMirInst;
+    }
+
+    // D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR: materialize an aggregate ternary
+    // ARM (`armNode`, of the ternary's type `aggTy`) INTO the common result
+    // `slot`. A compound-literal arm is initialized in place (optimization: no
+    // intermediate slot + copy — the same per-field/per-unit init a named
+    // local's `= {…}` uses, which already routes a bit-field type through the
+    // per-allocation-unit packer, so a bit-field literal arm packs correctly).
+    // Any other aggregate arm (named lvalue, call, NESTED ternary, comma) is
+    // resolved to an ADDRESS via lowerLvalueAddress (recursion handles the
+    // nested cases) and COPIED into the slot — Struct/Union field/byte-wise,
+    // Array byte-wise (consistent with lowerArrayInitIntoSlot's element copy).
+    // Returns false (fail-loud already reported) on any failure.
+    [[nodiscard]] bool materializeAggregateArmIntoSlot(HirNodeId armNode,
+                                                       MirInstId slot,
+                                                       TypeId aggTy) {
+        TypeKind const ak = interner.kind(aggTy);
+        if (hir.kind(armNode) == HirKind::ConstructAggregate) {
+            return (ak == TypeKind::Array)
+                ? lowerArrayInitIntoSlot(armNode, slot, aggTy)
+                : lowerAggregateInitIntoSlot(armNode, slot, aggTy);
+        }
+        MirInstId const srcPtr = lowerLvalueAddress(armNode);
+        if (!srcPtr.valid()) return false;
+        if (ak == TypeKind::Array) {
+            auto const sz = aggregateByteSize(aggTy);
+            if (!sz.has_value()) {
+                unsupported(armNode, "aggregate-valued ternary array arm "
+                                      "requires a sizeable layout");
+                return false;
+            }
+            return lowerByteWiseCopy(srcPtr, slot, *sz);
+        }
+        return lowerAggregateCopy(armNode, srcPtr, slot, aggTy);
     }
 
     // Emit a 32-bit integer constant for use as a GEP index operand or
@@ -1336,6 +1715,12 @@ struct Lowerer {
     // does not catch. `ty` must be an integer type (an array subscript is
     // integer per the front-end); falls back to I32 if absent.
     [[nodiscard]] MirInstId constIntOfType(std::int64_t v, TypeId ty) {
+        // An enum-typed operand's constant IS its underlying integer value
+        // (D-CSUBSET-ENUM-INT-CONVERSION) — resolve Enum→underlying so the
+        // const is a real primitive (interner.primitive(Enum) is not valid).
+        // This is the single chokepoint that also widths the enum-bit-field
+        // init zero-store (D-CSUBSET-ENUM-BITFIELD).
+        ty = enumReprType(ty);
         TypeKind const k = ty.valid() ? interner.kind(ty) : TypeKind::I32;
         MirLiteralValue lit;
         lit.value = v;
@@ -1379,196 +1764,173 @@ struct Lowerer {
         return mir.addInst(MirOpcode::Mul, ops, indexTy);
     }
 
-    // ML2 cycle 6: build a zero MirLiteralValue matching `type`'s shape.
-    // Recurses into Struct/Union/Array to produce a nested
-    // MirAggregateValue; scalar leaves get a typed zero. Used to seed
-    // the `InsertValue` chain in `lowerConstructAggregate` so the
-    // initial base carries the right type and shape for downstream
-    // verifiers / consumers. A FUTURE MIR optimizer pass (not yet
-    // implemented) could fold trivially-zero leaves back into the Const
-    // when every child happens to be zero — that's a downstream
-    // optimization, not a v1 contract.
-    // Anchor: provided for diagnostic spans when zeroLiteralOf hits a
-    // malformed type. The HIR ConstructAggregate node IS the natural
-    // span; passed in so the helper can emit `unsupported(at, ...)`.
-    // Recursive zero-literal builder. For Union, the optional
-    // `activeUnionVariant` selects which variant the seed is typed
-    // against — this matters because the subsequent InsertValue chain
-    // writes a value whose type IS the active variant, so the seed's
-    // slot must match. Without an active variant supplied, the helper
-    // falls back to `variants[0]` per C99 §6.7.8p18+p21 (union default-
-    // init). `activeUnionVariant` is ignored for non-Union types.
-    // Diagnostics are emitted via `unsupported(at, ...)`; the caller
-    // MUST snapshot `reporter.errorCount()` and bail if it grew —
-    // diagnostic emission does NOT abort recursion (we want a single
-    // top-level error rather than a cascade).
-    [[nodiscard]] MirLiteralValue zeroLiteralOf(
-            HirNodeId at, TypeId type,
-            std::optional<TypeId> activeUnionVariant = std::nullopt) {
-        TypeKind const core = type.valid() ? interner.kind(type) : TypeKind::I32;
-        MirLiteralValue lv;
-        lv.core = core;
-        if (core == TypeKind::Struct) {
-            auto const fields = interner.operands(type);
-            MirAggregateValue agg;
-            agg.fields.reserve(fields.size());
-            for (TypeId ft : fields) agg.fields.push_back(zeroLiteralOf(at, ft));
-            lv.value = std::move(agg);
-            return lv;
-        }
-        if (core == TypeKind::Union) {
-            // C99 §6.7.8p18+p21: union zero-init = active-variant zero
-            // (or variants[0] if no active variant is supplied).
-            auto const variants = interner.operands(type);
-            if (variants.empty()) {
-                unsupported(at, "zeroLiteralOf reached a Union type with "
-                                "no variants (HIR verifier should have "
-                                "flagged this upstream)");
-                lv.value = MirAggregateValue{};
-                return lv;
-            }
-            TypeId variantTy = variants[0];
-            if (activeUnionVariant.has_value()) {
-                TypeId const requested = *activeUnionVariant;
-                if (!requested.valid()) {
-                    unsupported(at, "zeroLiteralOf received an invalid "
-                                    "active-variant TypeId for a Union "
-                                    "(HIR verifier should have flagged)");
-                    lv.value = MirAggregateValue{};
-                    return lv;
-                }
-                bool matched = false;
-                for (TypeId v : variants) {
-                    if (v == requested) { matched = true; break; }
-                }
-                if (!matched) {
-                    unsupported(at, std::format(
-                        "zeroLiteralOf active-variant TypeId {} is not "
-                        "among the Union's declared variants — variant "
-                        "identity is broken upstream",
-                        requested.v));
-                    lv.value = MirAggregateValue{};
-                    return lv;
-                }
-                variantTy = requested;
-            }
-            MirAggregateValue agg;
-            agg.fields.push_back(zeroLiteralOf(at, variantTy));
-            lv.value = std::move(agg);
-            return lv;
-        }
-        if (core == TypeKind::Array) {
-            auto const ops   = interner.operands(type);
-            auto const scals = interner.scalars(type);
-            if (ops.empty() || scals.empty()) {
-                unsupported(at, "zeroLiteralOf reached a malformed Array "
-                                "type (missing element type or length)");
-                lv.value = MirAggregateValue{};
-                return lv;
-            }
-            MirAggregateValue agg;
-            agg.fields.reserve(static_cast<std::size_t>(scals[0]));
-            for (std::int64_t i = 0; i < scals[0]; ++i) {
-                agg.fields.push_back(zeroLiteralOf(at, ops[0]));
-            }
-            lv.value = std::move(agg);
-            return lv;
-        }
-        // Scalar leaf — pick the typed zero from the core's arm.
-        // Float/Bool/Signed-int/Unsigned-int + pointer (zero=null) all
-        // have a well-defined zero; anything else (Extension/FnSig/...) is
-        // not legitimately a child of a runtime-built aggregate and is
-        // diagnosed loud.
-        bool const isFloat = (core == TypeKind::F16 || core == TypeKind::F32
-                           || core == TypeKind::F64 || core == TypeKind::F128);
-        bool const isSignedInt = (core == TypeKind::I8 || core == TypeKind::I16
-                               || core == TypeKind::I32 || core == TypeKind::I64
-                               || core == TypeKind::I128);
-        if (isFloat)                     lv.value = 0.0;
-        else if (core == TypeKind::Bool) lv.value = false;
-        else if (isSignedInt)            lv.value = std::int64_t{0};
-        else if (core == TypeKind::U8 || core == TypeKind::U16
-              || core == TypeKind::U32 || core == TypeKind::U64
-              || core == TypeKind::U128 || core == TypeKind::Char
-              || core == TypeKind::Byte || core == TypeKind::Enum
-              || core == TypeKind::Ptr || core == TypeKind::FnPtr
-              || core == TypeKind::Ref || core == TypeKind::Nullable
-              || core == TypeKind::Optional) {
-            // Pointer-shaped kinds zero = null. Enum zero = underlying-0.
-            lv.value = std::uint64_t{0};
-        } else {
-            unsupported(at, std::format(
-                "zeroLiteralOf cannot zero a {} (TypeKind ordinal {}) — "
-                "not a legitimate runtime-aggregate child kind",
-                core == TypeKind::Void ? "Void" : "extension/fn-sig type",
-                static_cast<unsigned>(core)));
-            lv.value = std::uint64_t{0};
-        }
-        return lv;
+    // (Removed — D-CSUBSET-BITFIELD-RVALUE-RUNTIME) The former
+    // `lowerConstructAggregate` (a `Const(zero)` seed + an `InsertValue` chain)
+    // and its recursive `zeroLiteralOf` seed-builder are gone. The aggregate
+    // model is MEMORY-based: there is no LIR aggregate-width SSA value, and a
+    // bit-field packs only via a unit read-modify-write (impossible on an SSA
+    // aggregate). Every aggregate ConstructAggregate is now lowered into a SLOT
+    // by ADDRESS — a LOCAL `= {…}` init via lowerAggregateInitIntoSlot/
+    // lowerArrayInitIntoSlot, a GLOBAL `= {…}` init via evaluateConstant + the
+    // static-data byte encoder (emitGlobals_), and a by-value RVALUE (a compound
+    // literal in arg/return/assign/member-of-literal position) via the
+    // lowerLvalueAddress compound-literal arm. The lowerExpr ConstructAggregate
+    // dispatch arm now fails loud against any attempt to lower an aggregate as a
+    // bare SSA rvalue (anti-resurrection invariant). `evaluateConstant`/
+    // `toMirLiteral` survive — globals still fold through them.
+
+    // FC8 D-CSUBSET-BITFIELD: true iff `ty` is a struct/union WITH a bit-field
+    // (non-empty scalars under the structType encoding). Aggregate INITIALIZATION
+    // of such a type is bit-field-AWARE (D-CSUBSET-BITFIELD-INIT): a local slot
+    // init packs per allocation unit (lowerBitfieldAggregateInitIntoSlot), a
+    // const global folds to raw per-field values that the static-data byte
+    // encoder packs, and a by-value RVALUE literal (a compound literal with
+    // runtime operands) materializes a slot and packs the SAME way via the
+    // lowerLvalueAddress compound-literal arm (D-CSUBSET-BITFIELD-RVALUE-RUNTIME).
+    [[nodiscard]] bool hasBitfieldMember(TypeId ty) const {
+        if (!ty.valid()) return false;
+        TypeKind const k = interner.kind(ty);
+        return (k == TypeKind::Struct || k == TypeKind::Union)
+               && !interner.scalars(ty).empty();
     }
 
-    // ML2 cycle 6: lower a HIR ConstructAggregate to MIR. Strategy:
-    //   1. If the whole subtree const-folds (every child is a literal
-    //      / fold-able expr), emit ONE `Const(MirAggregateValue, ty)`.
-    //   2. Otherwise, emit a `Const(zero, ty)` base + chain of
-    //      `InsertValue(prev, child, [i])` for each child. A future
-    //      MIR optimizer (not yet built) could fold a fully-constant
-    //      chain back to a single Const.
-    // Either way, the result is an SSA value of the aggregate type.
-    // Union: the HIR child's TYPE identifies the active variant; pass
-    // it to zeroLiteralOf so the seed's slot matches the InsertValue's
-    // child type — otherwise variant identity is erased between seed
-    // and chain.
-    [[nodiscard]] MirInstId lowerConstructAggregate(HirNodeId node, TypeId aggTy) {
-        if (!aggTy.valid()) {
-            unsupported(node, "ConstructAggregate with invalid result type "
-                              "(HIR verifier should have flagged)");
-            return InvalidMirInst;
+    // FC8 D-CSUBSET-BITFIELD-INIT: lower a struct/union aggregate initializer
+    // whose type HAS bit-fields into the slot at `allocaPtr`. A bit-field shares
+    // its allocation UNIT with co-resident neighbours, so a plain full-width
+    // Store would clobber them — instead each unit is packed: zeroed ONCE (so
+    // un-covered bits + omitted fields are zero-filled, matching C aggregate
+    // init), then each bit-field's value is OR-ed in via the SAME read-modify-
+    // write `emitBitfieldInsert` the field-by-field assignment path uses (the
+    // single packing chokepoint — write+read stay self-consistent on every
+    // target). Ordinary fields among the bit-fields lower normally (Gep+Store,
+    // or nested aggregate recurse). `lowerBraceInit` has zero-filled unspecified
+    // fields, so `kids` is positional + complete; a zero-width bit-field marker
+    // (`bitFields[i].unitBytes == 0` AND not an ordinary field) carries no value
+    // child, so it is skipped by the parallel walk. Source/target-agnostic: keys
+    // only on the config-driven layout's `bitFields[]` + `fieldOffsets[]`.
+    [[nodiscard]] bool lowerBitfieldAggregateInitIntoSlot(HirNodeId aggNode,
+                                                          MirInstId allocaPtr,
+                                                          TypeId aggTy) {
+        StructLayout const* layout = cachedLayout(aggTy);
+        if (layout == nullptr) {
+            unsupported(aggNode, "bit-field aggregate initializer: layout "
+                                 "unavailable (un-sizeable type or the target "
+                                 "declared no aggregateLayout)");
+            return false;
         }
-        // Try the constant-fold path first. `emptyEnv` is deliberate:
-        // function-body ConstructAggregate doesn't need the MIR-globals
-        // sibling-resolver — a `Ref` to a fold-able global silently
-        // falls back to the runtime InsertValue chain here, which a
-        // future optimizer can re-fold. The HIR semantic pre-pass has
-        // already resolved symbol Refs into their HIR literal values,
-        // so no const-symbol callback is needed here.
-        EvalEnvironment emptyEnv;
-        EvalOptions     evalOpts;
-        evalOpts.allowFloat      = config.globalsAllowFloat;
-        evalOpts.refuseOnOverflow = false;
-        ConstEvalResult const folded = evaluateConstant(
-            hir, interner, literals, node, emptyEnv, evalOpts);
-        if (folded.value.has_value()) {
-            return mir.addConst(toMirLiteral(*folded.value), aggTy);
+        auto kids = hir.children(aggNode);
+        // `lowerBraceInit` emits ONE positional child per struct field (omitted
+        // slots already zero-filled), so `kids[f]` ↔ field `f` directly — INCLUDING
+        // a zero-width bit-field (`unsigned : 0;`), which is a layout-only packing
+        // break carrying a synthetic zero child. A zero-width marker has no storage
+        // (`bitFields[f].unitBytes == 0` AND `fieldBitWidth(f)` present), so it is
+        // skipped: it touches no unit and its child is an unwritten zero.
+        std::size_t const fieldCount = layout->fieldOffsets.size() < kids.size()
+                                           ? layout->fieldOffsets.size()
+                                           : kids.size();
+        // PASS 1 — zero every bit-field allocation unit BEFORE any field value is
+        // written. A non-bit-field member can share an allocation unit's byte
+        // range with a bit-field (C/GNU packing: `struct { char x; int a:3; }`
+        // puts `x` at byte 0 and `a`'s int unit at bytes [0,4)), so zeroing a
+        // unit lazily in declaration order would clobber an ordinary field
+        // already stored into the same bytes — AND diverge from the static-data
+        // encoder, which pre-zeroes the whole buffer once (`asm.cpp`). Hoisting
+        // all unit-zeroes ahead of all value writes makes the result
+        // order-independent: ordinary Stores and bit-field read-modify-writes
+        // then all land on already-zeroed bytes (the RMW preserves the zero in
+        // the bits it does not set, ordinary fields occupy disjoint bytes). Dedup
+        // on (offset, unitBytes) so a unit is zeroed once, yet mixed-width
+        // bit-fields sharing an offset (`char a:3; int b:4;` → both at offset 0,
+        // units 1 and 4 bytes) each get their full unit covered.
+        std::unordered_set<std::uint64_t> zeroedUnits;
+        for (std::size_t f = 0; f < fieldCount; ++f) {
+            bool const isBitfield =
+                f < layout->bitFields.size() && layout->bitFields[f].unitBytes != 0;
+            if (!isBitfield) continue;
+            auto const          off       = layout->fieldOffsets[f];
+            std::uint32_t const unitBytes = layout->bitFields[f].unitBytes;
+            // off is a byte offset within a composite (« 4 GiB) — pack
+            // (off, unitBytes) into one key so a wider unit at the same offset is
+            // not skipped by a narrower one's earlier zero.
+            if (!zeroedUnits.insert((off << 32) | unitBytes).second) continue;
+            TypeId const    fieldTy = hir.typeId(kids[f]);
+            MirInstId const offK    = constInt(static_cast<std::int64_t>(off));
+            if (!offK.valid()) return false;
+            std::array<MirInstId, 2> gepOps{allocaPtr, offK};
+            MirInstId const          unitPtr =
+                mir.addInst(MirOpcode::Gep, gepOps, interner.pointer(fieldTy));
+            if (!unitPtr.valid()) return false;
+            MirInstId const zero = constIntOfType(0, fieldTy);
+            if (!zero.valid()) return false;
+            std::array<MirInstId, 2> zst{zero, unitPtr};
+            mir.addInst(MirOpcode::Store, zst);
         }
-        // Fall back to the InsertValue chain. Snapshot the error count
-        // so we can refuse to emit a malformed seed → chain if
-        // zeroLiteralOf diagnosed anything (closes the silent-failure
-        // gap where unsupported() reported but the bogus literal
-        // still flowed into addConst + InsertValue).
-        std::size_t const errorsBefore = reporter.errorCount();
-        auto kids = hir.children(node);
-        TypeKind const aggCore = interner.kind(aggTy);
-        std::optional<TypeId> activeVariant;
-        if (aggCore == TypeKind::Union && !kids.empty()) {
-            activeVariant = hir.typeId(kids[0]);
+        // PASS 2 — write every field. Bit-fields read-modify-write their (now
+        // zeroed) unit; ordinary fields store/recurse; zero-width markers carry
+        // no storage. All zeroing is done, so no write can clobber another.
+        for (std::size_t f = 0; f < fieldCount; ++f) {
+            bool const isBitfield =
+                f < layout->bitFields.size() && layout->bitFields[f].unitBytes != 0;
+            bool const isZeroWidthMarker =
+                !isBitfield && interner.fieldBitWidth(aggTy, f).has_value();
+            if (isZeroWidthMarker) continue;   // no storage; child is a zero-fill
+            HirNodeId const child = kids[f];
+            auto const off = layout->fieldOffsets[f];
+            MirInstId const offK = constInt(static_cast<std::int64_t>(off));
+            if (!offK.valid()) return false;
+            TypeId const fieldTy = hir.typeId(child);
+            if (!isBitfield) {
+                // Ordinary field: Gep to its byte offset, then store/recurse
+                // exactly as the non-bit-field path does (a struct/union/array
+                // field recurses; a scalar field is a plain Store).
+                std::array<MirInstId, 2> gepOps{allocaPtr, offK};
+                MirInstId const fieldPtr = mir.addInst(
+                    MirOpcode::Gep, gepOps, interner.pointer(fieldTy));
+                if (!fieldPtr.valid()) return false;
+                TypeKind const fk = interner.kind(fieldTy);
+                if (fk == TypeKind::Struct || fk == TypeKind::Union) {
+                    if (hir.kind(child) == HirKind::ConstructAggregate) {
+                        if (!lowerAggregateInitIntoSlot(child, fieldPtr, fieldTy))
+                            return false;
+                    } else {
+                        MirInstId const srcPtr = lowerLvalueAddress(child);
+                        if (!srcPtr.valid()) return false;
+                        if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                            return false;
+                    }
+                    continue;
+                }
+                if (fk == TypeKind::Array) {
+                    if (hir.kind(child) == HirKind::ConstructAggregate) {
+                        if (!lowerArrayInitIntoSlot(child, fieldPtr, fieldTy))
+                            return false;
+                    } else {
+                        MirInstId const srcPtr = lowerLvalueAddress(child);
+                        if (!srcPtr.valid()) return false;
+                        if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                            return false;
+                    }
+                    continue;
+                }
+                MirInstId const v = lowerExpr(child);
+                if (!v.valid()) return false;
+                std::array<MirInstId, 2> stOps{v, fieldPtr};
+                mir.addInst(MirOpcode::Store, stOps);
+                continue;
+            }
+            // Bit-field: Gep to the UNIT (already zeroed in pass 1), then RMW the
+            // value in. The Gep width follows the field type = the unit width,
+            // matching emitBitfieldInsert's load/store width.
+            std::array<MirInstId, 2> gepOps{allocaPtr, offK};
+            MirInstId const unitPtr = mir.addInst(
+                MirOpcode::Gep, gepOps, interner.pointer(fieldTy));
+            if (!unitPtr.valid()) return false;
+            MirInstId const v = lowerExpr(child);
+            if (!v.valid()) return false;
+            if (!emitBitfieldInsert(unitPtr, v, layout->bitFields[f], fieldTy))
+                return false;
         }
-        MirLiteralValue baseLit = zeroLiteralOf(node, aggTy, activeVariant);
-        if (reporter.errorCount() != errorsBefore) return InvalidMirInst;
-        MirInstId acc = mir.addConst(std::move(baseLit), aggTy);
-        if (!acc.valid()) return InvalidMirInst;
-        TypeId const i32 = interner.primitive(TypeKind::I32);
-        // Union ConstructAggregate carries exactly one child (the active
-        // variant); insert it at index 0. Struct = N children → insert
-        // at each slot. Array = same as Struct positionally.
-        for (std::size_t i = 0; i < kids.size(); ++i) {
-            MirInstId const v = lowerExpr(kids[i]);
-            if (!v.valid()) return InvalidMirInst;
-            std::uint32_t const idx[1] = { static_cast<std::uint32_t>(i) };
-            acc = mir.addInsertValue(acc, v, idx, aggTy, i32);
-            if (!acc.valid()) return InvalidMirInst;
-        }
-        return acc;
+        return true;
     }
 
     // FC7 (D-FC7-MEMBER-ACCESS): lower a struct/union ConstructAggregate
@@ -1582,6 +1944,13 @@ struct Lowerer {
     [[nodiscard]] bool lowerAggregateInitIntoSlot(HirNodeId aggNode,
                                                   MirInstId allocaPtr,
                                                   TypeId aggTy) {
+        // FC8 D-CSUBSET-BITFIELD-INIT: a struct/union initializer whose type has
+        // bit-fields packs per allocation unit — a plain field-wise Store would
+        // write each bit-field full-width into the shared unit, clobbering its
+        // co-resident neighbours. Routed to the unit-aware initializer.
+        if (hasBitfieldMember(aggTy)) {
+            return lowerBitfieldAggregateInitIntoSlot(aggNode, allocaPtr, aggTy);
+        }
         auto kids = hir.children(aggNode);
         for (std::size_t i = 0; i < kids.size(); ++i) {
             auto const off =
@@ -2187,8 +2556,44 @@ struct Lowerer {
             case HirKind::Block:
                 return lowerStmt(node);
             default:
-                return lowerExpr(node).valid();
+                // A bare for-init / for-update expression is a DISCARD position
+                // too (its value is unused) — share the ExprStmt aggregate
+                // chokepoint (lowerDiscardedExpr) so an aggregate ternary/comma
+                // in a for-clause routes through the carrier, not lowerExpr's
+                // anti-resurrection fail-loud (D-CSUBSET-AGGREGATE-VALUED-
+                // CONTROL-EXPR).
+                return lowerDiscardedExpr(node);
         }
+    }
+
+    // Lower an expression whose VALUE is DISCARDED — an `ExprStmt`, or a bare
+    // for-init / for-update clause — emitted for its SIDE EFFECTS only. An
+    // AGGREGATE-typed discarded expression (a compound literal
+    // `(struct S){f(),g()};`, an aggregate ternary `(cond ? a : b);`, a comma/
+    // SeqExpr `(f(), s);`, a struct-returning call `g();`, or a bare aggregate
+    // lvalue) has NO SSA rvalue under the memory-based aggregate model — there is
+    // no aggregate-width value to produce-and-drop. Route EVERY aggregate-typed
+    // discard through ONE chokepoint — `lowerLvalueAddress` — so coverage is by
+    // construction with NO per-kind AND NO per-POSITION miss (both the ExprStmt
+    // site and the for-clause site funnel HERE): it resolves the value's ADDRESS
+    // (materializing a slot + running operand/arm side effects for an rvalue
+    // carrier; returning the existing storage for a named lvalue) and drops it.
+    // This completes the by-value aggregate-rvalue carriers across BOTH discard
+    // positions — the compound-literal slot (D-CSUBSET-BITFIELD-RVALUE-RUNTIME)
+    // AND the aggregate Ternary / comma-SeqExpr control-expr carrier
+    // (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR) — and keeps `lowerExpr`'s per-kind
+    // anti-resurrection fail-louds (ConstructAggregate / Ternary / SeqExpr)
+    // reachable ONLY by genuine internal misrouting (unreachable from user code).
+    // A scalar discard lowers as an ordinary rvalue via `lowerExpr`.
+    [[nodiscard]] bool lowerDiscardedExpr(HirNodeId expr) {
+        if (TypeId const et = hir.typeId(expr); et.valid()) {
+            TypeKind const ek = interner.kind(et);
+            if (ek == TypeKind::Struct || ek == TypeKind::Union
+                || ek == TypeKind::Array) {
+                return lowerLvalueAddress(expr).valid();
+            }
+        }
+        return lowerExpr(expr).valid();
     }
 
     // Lower a single HIR statement in the currently-open MIR block.
@@ -2254,10 +2659,10 @@ struct Lowerer {
                 return true;
             }
             case HirKind::ExprStmt: {
-                // Discard the value; emit for side effects.
-                HirNodeId const expr = hir.exprStmtExpr(node);
-                MirInstId const v = lowerExpr(expr);
-                return v.valid();
+                // Discard the value; emit for side effects. The aggregate-discard
+                // chokepoint is shared with the for-clause site — see
+                // lowerDiscardedExpr (one funnel, no per-kind/per-position miss).
+                return lowerDiscardedExpr(hir.exprStmtExpr(node));
             }
             case HirKind::VarDecl: {
                 // Allocate the local's slot on the current block. The declared
@@ -2340,6 +2745,13 @@ struct Lowerer {
                 if (!rhs.valid()) return false;
                 MirInstId const ptr = lowerLvalueAddress(targetN);
                 if (!ptr.valid()) return false;
+                // FC8 D-CSUBSET-BITFIELD: a bit-field write is a READ-MODIFY-WRITE
+                // of the allocation unit (the Gep targets the unit) — clear the
+                // field's bits, OR in the new value, store back. A plain Store
+                // would overwrite the neighbour bits packed in the same unit.
+                if (BitFieldPlacement const* bf = bitfieldPlacementOf(targetN)) {
+                    return emitBitfieldInsert(ptr, rhs, *bf, hir.typeId(targetN));
+                }
                 std::array<MirInstId, 2> ops{rhs, ptr};
                 mir.addInst(MirOpcode::Store, ops);
                 return true;
@@ -3140,6 +3552,10 @@ struct Lowerer {
         // Global/Default ⇒ externally visible). Carried so emitGlobals stamps a
         // `static`/`__attribute__` global's linkage onto the MirGlobal.
         LinkageAttr                    linkage{};
+        // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: declared const-ness (default false
+        // ⇒ mutable ⇒ writable `.data`/`.bss`). Stamped onto MirGlobal.isConst so
+        // the assembler routes an initialized const global to read-only `.rodata`.
+        bool                           isConst = false;
     };
     std::vector<PendingGlobal> pendingGlobals;
 
@@ -3206,6 +3622,8 @@ struct Lowerer {
             pg.type   = hir.globalType(decl);
             if (linkageMap != nullptr)
                 if (auto const* p = linkageMap->tryGet(decl)) pg.linkage = *p;
+            if (mutabilityMap != nullptr)
+                if (auto const* p = mutabilityMap->tryGet(decl)) pg.isConst = p->isConst;
             if (auto initN = hir.globalInit(decl); initN.has_value()) {
                 // The resolver covers Refs to sibling globals; literal /
                 // arithmetic / Cast paths still fold per CE1.
@@ -3269,13 +3687,16 @@ struct Lowerer {
             if (pg.constInit.has_value()) {
                 std::uint32_t const idx = mir.literalPoolAdd(*pg.constInit);
                 mir.addGlobal(pg.type, pg.symbol, idx, {},
-                              pg.linkage.binding, pg.linkage.visibility);
+                              pg.linkage.binding, pg.linkage.visibility,
+                              pg.isConst);
             } else if (pg.runtimeInit.valid()) {
                 mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, moduleInitFunc,
-                              pg.linkage.binding, pg.linkage.visibility);
+                              pg.linkage.binding, pg.linkage.visibility,
+                              pg.isConst);
             } else {
                 mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, {},
-                              pg.linkage.binding, pg.linkage.visibility);
+                              pg.linkage.binding, pg.linkage.visibility,
+                              pg.isConst);
             }
         }
         // Step 3: fill the init function's body — Store each runtime
@@ -3394,7 +3815,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           HirSourceMap const*      sourceMap,
                           MirLoweringConfig const& config,
                           HirFfiMap const*         ffiMap,
-                          HirLinkageMap const*     linkageMap) {
+                          HirLinkageMap const*     linkageMap,
+                          HirMutabilityMap const*  mutabilityMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -3409,6 +3831,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .config    = config,
         .ffiMap    = ffiMap,
         .linkageMap = linkageMap,
+        .mutabilityMap = mutabilityMap,
         .mir       = MirBuilder{},
     };
     // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: stamp the module-

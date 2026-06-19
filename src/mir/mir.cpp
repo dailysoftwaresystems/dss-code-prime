@@ -406,7 +406,8 @@ MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
                                   std::uint32_t initLiteralIndex,
                                   MirFuncId initFunc,
                                   SymbolBinding    binding,
-                                  SymbolVisibility visibility) {
+                                  SymbolVisibility visibility,
+                                  bool             isConst) {
     if (!type.valid()) {
         std::fputs("dss::MirBuilder fatal: addGlobal: type TypeId must be valid\n",
                    stderr);
@@ -434,6 +435,7 @@ MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
     g.initFunc         = initFunc;
     g.binding          = binding;
     g.visibility       = visibility;
+    g.isConst          = isConst;
     return globalArena_.addNode(g);
 }
 

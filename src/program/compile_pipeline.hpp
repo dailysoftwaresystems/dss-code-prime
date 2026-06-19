@@ -70,6 +70,20 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 DSS_EXPORT void copyDiagnostics(DiagnosticReporter const& src,
                                  DiagnosticReporter&       dst);
 
+// D-CSUBSET-BITFIELD-ABI-EXACT: resolve the effective per-ABI bit-field packing
+// strategy for a (target, format) pair. C bit-field allocation is FORMAT/OS-
+// determined (one CPU target — x86_64 — serves BOTH ELF-SysV `gnu_packed` and
+// PE-MS `msvc_straddle`), so the FORMAT's declared strategy WINS; when the format
+// declares none (`None`), it falls back to the TARGET's
+// `aggregateLayout().bitFieldStrategy` (back-compat for targets that predate the
+// format-side field). This is the ONE resolution chokepoint the driver overlays
+// onto the target's `AggregateLayoutParams` before threading them into the layout
+// engine at all three consumer sites (analyze / HIR→MIR / asm globals). It selects
+// purely on config (the declared enum), NEVER on a target/format name.
+[[nodiscard]] DSS_EXPORT BitFieldStrategy
+effectiveBitFieldStrategy(TargetSchema const&       target,
+                          ObjectFormatSchema const& format) noexcept;
+
 // Compile a single CompilationUnit through the full HIR→write
 // pipeline for one (target, format) pair. Returns true iff every
 // tier succeeded AND `writeImage` committed bytes to disk.
@@ -221,6 +235,13 @@ struct DSS_EXPORT CuMirModule {
     // encoder needs it (with the target's `aggregateLayout`) to compute byte
     // layout. The target's alignment params are read from `*target` directly.
     DataModel dataModel{};
+    // D-CSUBSET-BITFIELD-ABI-EXACT: the FORMAT-resolved bit-field packing strategy
+    // (`effectiveBitFieldStrategy(target, format)`), captured here for the SAME
+    // reason as `dataModel` — the LOWER half sees only this struct, and the
+    // aggregate-global rodata encoder must lay out a bit-field global byte-ABI-
+    // exact for the active format. The target's alignment params come from
+    // `*target`; this overlays the per-format bit-field rule onto them.
+    BitFieldStrategy bitFieldStrategy = BitFieldStrategy::None;
 };
 
 // BUILD half: semantic analysis → HIR → FFI synthesis → MIR → optimize. Returns the
@@ -280,6 +301,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       GrammarSchema const& grammar,
                       TargetSchema const&  target,
                       DataModel            dataModel,
+                      BitFieldStrategy     bitFieldStrategy,
                       std::uint16_t        callingConventionIndex,
                       CompilationUnitId    cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,

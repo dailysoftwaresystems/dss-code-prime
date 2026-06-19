@@ -94,6 +94,53 @@ TEST(TypeRules, InvalidIsAssignableEitherWay) {
     EXPECT_TRUE(isAssignable(in, InvalidType, InvalidType));
 }
 
+// ── enum ↔ int conversion (D-CSUBSET-ENUM-INT-CONVERSION) ──────────────────
+// C 6.7.2.2: an enum IS an integer type. The `enumConvertsToArith` gate admits
+// Enum ↔ the integer ranks in BOTH directions. RED-ON-DISABLE: the SAME calls
+// with the gate OFF (the default) must REJECT — proving the arm actually gates.
+TEST(TypeRules, IsAssignableEnumToIntWhenGated) {
+    auto in    = makeInterner();
+    auto i32   = in.primitive(TypeKind::I32);
+    auto color = in.enumType("Color", TypeKind::I32);
+    EXPECT_TRUE(isAssignable(in, i32, color, {}, false, false, /*enum=*/true))
+        << "enum→int widens when gated (`return BLUE;`)";
+    EXPECT_FALSE(isAssignable(in, i32, color))
+        << "RED-ON-DISABLE: ungated, enum stays distinct from int";
+}
+TEST(TypeRules, IsAssignableIntToEnumWhenGated) {
+    auto in    = makeInterner();
+    auto i32   = in.primitive(TypeKind::I32);
+    auto color = in.enumType("Color", TypeKind::I32);
+    EXPECT_TRUE(isAssignable(in, color, i32, {}, false, false, /*enum=*/true))
+        << "int→enum narrows when gated (`enum e = 1;` / `e += 1` write-back)";
+    EXPECT_FALSE(isAssignable(in, color, i32))
+        << "RED-ON-DISABLE: ungated, int does not flow into enum";
+}
+// SCOPE GUARD: the arm admits enum↔INT only — NEVER enum↔DIFFERENT-enum, even
+// gated (a cross-enum assignment is a C constraint violation that stays loud).
+TEST(TypeRules, IsAssignableDifferentEnumsRemainMismatch) {
+    auto in = makeInterner();
+    auto a  = in.enumType("A", TypeKind::I32);
+    auto b  = in.enumType("B", TypeKind::I32);
+    EXPECT_FALSE(isAssignable(in, a, b, {}, false, false, /*enum=*/true))
+        << "different enums stay a mismatch even gated (no over-admission)";
+    EXPECT_TRUE(isAssignable(in, a, a, {}, false, false, /*enum=*/true))
+        << "same enum is the identity path";
+}
+// UAC: an enum participates in arithmetic AS its underlying int (`e + 1` types
+// as int, not enum). RED-ON-DISABLE: revert the enum-underlying resolution in
+// `usualArithmeticCommonType` → enum is unrecognized → InvalidType returns.
+TEST(TypeRules, EnumPromotesToUnderlyingInArith) {
+    auto in    = makeInterner();
+    auto i32   = in.primitive(TypeKind::I32);
+    auto color = in.enumType("Color", TypeKind::I32);
+    ResolvedArithmeticRules const rules{};
+    EXPECT_EQ(usualArithmeticCommonType(in, color, i32, rules), i32)
+        << "enum + int → the underlying int (C 6.7.2.2 promotion)";
+    EXPECT_EQ(usualArithmeticCommonType(in, color, color, rules), i32)
+        << "enum + same-enum → the underlying int";
+}
+
 // unify picks the wider operand within a lattice; returns Invalid when
 // the kinds don't share a lattice.
 TEST(TypeRules, UnifyPicksWider) {

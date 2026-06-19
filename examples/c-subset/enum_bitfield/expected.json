@@ -1,0 +1,15 @@
+{
+  "$comment": "D-CSUBSET-ENUM-BITFIELD (FC8 cycle 5) end-to-end: an ENUM-typed bit-field (`enum Color c : 4;`) is permitted (C 6.7.2.1) — an enum behaves AS its underlying integer (D-CSUBSET-ENUM-INT-CONVERSION), so it validates its width against the underlying (semantic) and lowers its allocation-unit access at that underlying integer. The LOAD-BEARING witness is SIGNEDNESS: this v1's enum underlying is signed int, so an enum bit-field SIGN-EXTENDS on read. NEG=-3 stored in a 4-bit enum bit-field (pattern 1101) must read back -3 (signed extract), not 13 (unsigned). RED-ON-DISABLE: revert the emitBitfieldExtract enum->underlying resolve and the two NEG-holding enum bit-fields read 13 -> exit 74, not 42. (The LIR reprKind tier already masks the load/store WIDTH, so signedness is the arm a runtime witness can discriminate; the const/op REPRESENTATION resolve is pinned by the MIR unit test EnumTypedBitFieldResolvesAndLowers asserting no bit-field const/op is Enum-typed.) Also red-on-disable: revert the resolveBitfieldSuffix enum->underlying resolve -> S_BitFieldNonIntegerType rejects the field. Covers TWO enum bit-fields packing (c:4+d:4), a GLOBAL init AND a LOCAL init + writes + reads, a signed int neighbour (s:4). g={NEG,BLUE,-2}=>1, local written {NEG,BLUE,-1}=>2, exit 1+2+39=42. LAYOUT-RULE-AGNOSTIC: write+read share the gnu_packed rule (D-CSUBSET-BITFIELD-ABI-EXACT). The optimizedPipelines arm proves the flow survives Mem2Reg/ConstFold. arm64 runs under qemu; macho on the macos-latest leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}

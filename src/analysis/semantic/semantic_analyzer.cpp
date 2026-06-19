@@ -986,6 +986,99 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     return s.lattice.interner().array(base, *len);
 }
 
+// FC8 D-CSUBSET-BITFIELD: if `decl` configures a bit-field suffix and a node of
+// that rule appears in the field subtree, resolve the field's declared bit-width.
+// Returns `present` (a `: W` suffix exists on this field) + `width` (the
+// VALIDATED width, set only when valid). A bit-field's TYPE is UNCHANGED (it
+// stays its declared integer type — the width is a layout/codegen property
+// carried on the struct type's scalars, not a type wrapper like an array). Fails
+// loud (leaving `width` unset) on: a non-integer base (C 6.7.2.1p5), a width
+// that is negative / exceeds the base type's bit-size (p4), or a zero width on a
+// NAMED field (p3 — a zero-width bit-field must be anonymous).
+struct BitfieldResolution {
+    bool                         present = false;   // a `: W` suffix exists
+    std::optional<std::uint32_t> width;             // validated width (0 = anon zero-width)
+};
+
+[[nodiscard]] BitfieldResolution
+resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
+                      NodeId declNode, TypeId fieldType, bool hasName,
+                      ScopeId fromScope, SemanticConfig const* cfg) {
+    BitfieldResolution out;
+    if (!decl.bitfieldSuffix.has_value()) return out;
+    BitfieldSuffix const& bs = *decl.bitfieldSuffix;
+    // Bounded descendant search for the suffix rule (mirror applyArraySuffix).
+    NodeId suffix{};
+    std::vector<NodeId> stack{declNode};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        if (tree.rule(c) == bs.rule) { suffix = c; break; }
+        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+    }
+    if (!suffix.valid()) return out;   // no `: W` on this field
+    out.present = true;
+    auto emit = [&](DiagnosticCode code) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(suffix);
+        d.actual   = std::string{tree.text(suffix)};
+        s.reporter.report(std::move(d));
+    };
+    if (!fieldType.valid()) return out;   // unresolved base — upstream already loud
+    // FC8 D-CSUBSET-ENUM-BITFIELD: an enum-typed bit-field (`enum E e : 3;`) is
+    // permitted (C 6.7.2.1) — an enum behaves AS its underlying integer
+    // (D-CSUBSET-ENUM-INT-CONVERSION), so validate the width against the
+    // UNDERLYING's bit-size (a >32-bit underlying still hits the wide-unit
+    // reject below, consistent with a plain `long` bit-field). Non-enum types
+    // pass through unchanged.
+    using namespace detail::type_rules;
+    TypeId const reprType =
+        enumUnderlyingOrSelf(s.lattice.interner(), fieldType);
+    TypeKind const k = s.lattice.interner().kind(reprType);
+    // The base type's bit-size (fixed-width integer kinds only; 0 ⇒ non-integer).
+    auto intBits = [](TypeKind kk) -> std::uint32_t {
+        switch (kk) {
+            case TypeKind::Bool: case TypeKind::Char:
+            case TypeKind::I8:   case TypeKind::U8:   return 8;
+            case TypeKind::I16:  case TypeKind::U16:  return 16;
+            case TypeKind::I32:  case TypeKind::U32:  return 32;
+            case TypeKind::I64:  case TypeKind::U64:  return 64;
+            case TypeKind::I128: case TypeKind::U128: return 128;
+            default:                                  return 0;
+        }
+    };
+    std::uint32_t const typeBits = intBits(k);
+    if (typeBits == 0) { emit(DiagnosticCode::S_BitFieldNonIntegerType); return out; }
+    // A bit-field on a >32-bit base (`long`/`long long`/I64/U64) needs a 64-bit
+    // allocation-unit access. D-CSUBSET-BITFIELD-WIDE-UNIT (v0.0.2 FC8) closed the
+    // last codegen gap — materializing a 64-bit constant > int32 (the wide-mask
+    // dead-end): the x86 backend now emits `mov r64, imm64` (REX.W B8+rd io) and
+    // arm64 the MOVZ/MOVK ladder, both capability-probed in MIR→LIR. The
+    // extract/insert shapes (Load/Store/And/Or/Shl/LShr/AShr @64) already
+    // encoded, so 64-bit-base bit-fields now compile + run end-to-end. I128/U128
+    // bit-fields stay rejected — there is no 128-bit allocation-unit codegen (no
+    // 128-bit `mov`/ALU forms). 8/16/32/64-bit integer bases are the supported set.
+    if (typeBits > 64) { emit(DiagnosticCode::S_BitFieldWidthOutOfRange); return out; }
+    NodeId widthNode{};
+    if (bs.widthChild.has_value()) {
+        auto sufKids = visibleChildren(tree, suffix);
+        if (*bs.widthChild < sufKids.size()) widthNode = sufKids[*bs.widthChild];
+    }
+    auto w = constIntExpr(s, tree, widthNode, fromScope, cfg);
+    if (!w.has_value() || *w < 0
+        || static_cast<std::uint64_t>(*w) > typeBits) {
+        emit(DiagnosticCode::S_BitFieldWidthOutOfRange); return out;
+    }
+    if (*w == 0 && hasName) {   // C 6.7.2.1p3: a zero-width bit-field has no name
+        emit(DiagnosticCode::S_BitFieldWidthOutOfRange); return out;
+    }
+    out.width = static_cast<std::uint32_t>(*w);
+    return out;
+}
+
 // ── FC4 c1: the declarator-inversion engine (M3) ────────────────────────────
 //
 // A declarator-mode DeclarationRule splits a declaration's type across the
@@ -1764,7 +1857,10 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                     cfg.bracketIdentifierToken);
                 // FC4 c1 (anonymousNameAllowed): mirror Pass 1's anonymous
                 // re-anchor — the symbol lives on the DECL node when the
-                // name child resolved to a non-identifier leaf.
+                // name child resolved to a non-identifier leaf. FC8 bitfields:
+                // capture whether the field has a real name (`fieldHasName`) for
+                // the bit-field width/anonymity validation below.
+                bool fieldHasName = true;
                 if (decl.anonymousNameAllowed) {
                     std::string leafText;
                     bool const isIdentLeaf = resolved.node.valid()
@@ -1772,6 +1868,7 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                         cfg.identifierToken,
                                         cfg.bracketIdentifierToken, leafText);
                     if (!isIdentLeaf) resolved.node = node;
+                    fieldHasName = isIdentLeaf;
                 }
                 SymbolId sym = resolved.node.valid()
                     ? s.symbolAtOr(resolved.node) : InvalidSymbol;
@@ -1900,6 +1997,24 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                 fieldTypes.reserve(fields.size());
                                 for (auto const& fe : fields)
                                     fieldTypes.push_back(fe.type);
+                                // FC8 D-CSUBSET-BITFIELD: gather each field's
+                                // declared bit-width (set at the field's Pass 1.5
+                                // resolution) into the parallel array passed to
+                                // structType — `kNotBitfield` for an ordinary
+                                // field. All-ordinary ⇒ structType emits empty
+                                // scalars (the struct interns bit-identically to a
+                                // pre-bitfield struct). The interned type is then
+                                // the authoritative bit-width source.
+                                std::vector<std::int64_t> fieldBitWidths;
+                                fieldBitWidths.reserve(fields.size());
+                                for (auto const& fe : fields) {
+                                    auto const& w =
+                                        s.symbols.at(fe.sym).bitFieldWidth;
+                                    fieldBitWidths.push_back(
+                                        w.has_value()
+                                            ? static_cast<std::int64_t>(*w)
+                                            : kNotBitfield);
+                                }
                                 // D5.4 / D5.5: struct vs union vs enum
                                 // dispatch is config-driven via
                                 // FieldChildrenDescriptor::compositeKind.
@@ -1951,7 +2066,7 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                 TypeId compositeTy;
                                 if (ck == CompositeKind::Union) {
                                     compositeTy = s.lattice.interner().unionType(
-                                        srec.name, fieldTypes);
+                                        srec.name, fieldTypes, fieldBitWidths);
                                 } else if (ck == CompositeKind::Enum) {
                                     // D5.5: enum type carries no field-
                                     // operands — only its nominal name +
@@ -2059,6 +2174,7 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                                 s.reporter.report(std::move(d2));
                                             }
                                             erec.enumValue = value;
+                                            erec.isEnumerator = true;
                                             nextValue = value + 1;
                                             // D5.5-FU2: only also-bind to the
                                             // enclosing scope when the config
@@ -2085,7 +2201,7 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                     }
                                 } else {
                                     compositeTy = s.lattice.interner().structType(
-                                        srec.name, fieldTypes);
+                                        srec.name, fieldTypes, fieldBitWidths);
                                 }
                                 srec.type = compositeTy;
                                 s.nodeToType.set(resolved.node, compositeTy);
@@ -2166,6 +2282,28 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                         if (declTy.valid()) {
                             s.symbols.at(sym).type = declTy;
                             s.nodeToType.set(resolved.node, declTy);
+                        }
+                        // FC8 D-CSUBSET-BITFIELD: resolve a `: W` bit-field width
+                        // (the field TYPE is unchanged — the width rides on the
+                        // record, then the struct type's scalars at composition).
+                        BitfieldResolution const bf = resolveBitfieldSuffix(
+                            s, tree, decl, node, declTy, fieldHasName, here, &cfg);
+                        if (bf.width.has_value())
+                            s.symbols.at(sym).bitFieldWidth = bf.width;
+                        // An anonymous field is legal ONLY as a bit-field
+                        // (C 6.7.2.1) — `int;` / anonymous `int[3];` declare
+                        // nothing. Gated on `bitfieldSuffix` so it only fires for
+                        // a field form (an anonymous struct/union tag is a
+                        // separate, unbuilt feature, never reached here).
+                        if (!fieldHasName && !bf.present
+                            && decl.bitfieldSuffix.has_value()) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_DeclarationDeclaresNothing;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(node);
+                            d.actual   = std::string{tree.text(node)};
+                            s.reporter.report(std::move(d));
                         }
                     }
                 }
@@ -2657,7 +2795,7 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith)
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith)
                                    && !admitsNullPointerConstant(
                                           s, tree, rec.type, initNode,
                                           tree.schema().semantics()
@@ -2705,7 +2843,7 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith)
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith)
                                    // D-LANG-NULL-POINTER-CONSTANT (step
                                    // 13.3): admit `T* p = 0;` initializer
                                    // per C §6.3.2.3.3.
@@ -3023,7 +3161,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         if (!argTy.valid()) continue;  // unknown arg type — suppress cascade
         if (!isAssignable(s.lattice.interner(), params[i], argTy, ptrRules,
                           /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith)) {
             // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit literal-0
             // → Ptr<*> as null pointer constant per C §6.3.2.3.3. The
             // check lives here (NOT in isAssignable) because it is
@@ -3850,7 +3988,7 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     auto const& ptrRules = tree.schema().semantics().pointerConversions;
     if (!isAssignable(s.lattice.interner(), fnResult, exprTy, ptrRules,
                       /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith)) {
         // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit `return 0;`
         // from a Ptr<*>-returning function per C §6.3.2.3.3.
         if (admitsNullPointerConstant(s, tree, fnResult,

@@ -147,6 +147,64 @@ TEST(MirLoweringCSubset, StraightLineAddFunction) {
     EXPECT_EQ(retOps[0], sum);
 }
 
+// D-CSUBSET-ENUM-INT-CONVERSION (FC8): a bare enumerator lowers to a Const of its
+// value through HIR→MIR. RED-ON-DISABLE (and red TODAY before the A1 Ref→Const
+// fold): an enumerator Ref has no storage / SSA binding, so without the fold it
+// hits the unbound-symbol fail-loud here → `L.mir.ok` is false. The `enum_value`
+// corpus is the runtime witness; this pins the IR-tier fold in isolation.
+TEST(MirLoweringCSubset, EnumeratorLowersToConstNotUnboundRef) {
+    auto L = lowerCSubset(
+        "enum Color { RED, GREEN, BLUE };\n"
+        "int main(void) { return BLUE; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "enumerator must fold to a Const (no unbound-symbol fail-loud): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    // The folded enumerator BLUE is a Const(2) in the entry block.
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    bool sawConst = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        if (m.instOpcode(m.blockInstAt(entry, i)) == MirOpcode::Const) {
+            sawConst = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawConst) << "the enumerator `BLUE` must lower to a Const";
+}
+
+// §3 two-tier: an enum-typed COMPOUND expr (`c + 1`) must type cleanly through
+// BOTH the semantic typer (subtreeType, feeds the return check) AND HIR→MIR
+// lowering — they must AGREE that an enum promotes to its underlying int. The
+// param `c` is storage-backed, so it stays a Ref (isEnumerator false) — proving
+// the A1 fold's guard. RED-ON-DISABLE: revert the UAC enum-promotion → `c + 1`
+// stays enum → the int return check mismatches (or lowering fails).
+TEST(MirLoweringCSubset, EnumParamArithmeticLowersClean) {
+    auto L = lowerCSubset(
+        "enum Color { RED, GREEN, BLUE };\n"
+        "int g(enum Color c) { return c + 1; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+}
+
+// Scope guard at the SEMANTIC tier: enum↔DIFFERENT-enum stays a loud mismatch
+// (the conversion arm admits enum↔int ONLY). RED-ON-DISABLE: if the arm
+// over-admitted enum↔enum, this cross-enum assignment would wrongly type-check.
+TEST(MirLoweringCSubset, DifferentEnumAssignStaysMismatch) {
+    auto L = lowerCSubset(
+        "enum A { X };\n"
+        "enum B { Y };\n"
+        "int main(void) { enum A a = Y; return (int)a; }\n");
+    EXPECT_TRUE(L.model.hasErrors())
+        << "assigning a B enumerator to an A-typed var must be a loud mismatch";
+}
+
 // ML2 cycle 1: literal + return.
 // `int f() { return 42; }` lowers to one block with Const(42:i32), Return(%0).
 TEST(MirLoweringCSubset, ReturnLiteralProducesConst) {
@@ -1304,6 +1362,292 @@ TEST(MirLoweringCSubset, MemberAccessReadEmitsGepThenLoad) {
         << "field x is at byte offset 0";
 }
 
+// FC8 D-CSUBSET-BITFIELD: a bit-field READ lowers to Load-unit + extract
+// (LShr by bitOffset + And mask); a bit-field WRITE lowers to a read-modify-
+// write (Load + And-clear + And-mask + Shl + Or + Store). This is the
+// HOST-INDEPENDENT structural guard (runs on every CI leg) complementing the
+// runtime `bitfields` corpus. RED-ON-DISABLE: drop the bitfield intercepts and
+// a read is a plain Load (no LShr/And) and a write a plain Store (no Or/Shl).
+TEST(MirLoweringCSubset, BitFieldReadExtractsAndWriteIsReadModifyWrite) {
+    auto L = lowerCSubset(
+        "struct S { unsigned pad : 4; unsigned a : 3; };\n"
+        "unsigned read_a(struct S* p) { return p->a; }\n"
+        "void set_a(struct S* p, unsigned v) { p->a = v; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto countIn = [&](std::uint32_t fnIdx, MirOpcode op) {
+        MirBlockId const entry = m.funcEntry(m.funcAt(fnIdx));
+        int n = 0;
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i)
+            if (m.instOpcode(m.blockInstAt(entry, i)) == op) ++n;
+        return n;
+    };
+    // read_a (fn 0): a is at bitOffset 4 (after pad:4) → LShr 4 + And mask.
+    EXPECT_GE(countIn(0, MirOpcode::LShr), 1) << "bit-field read must shift by bitOffset";
+    EXPECT_GE(countIn(0, MirOpcode::And), 1)  << "bit-field read must mask the width";
+    // set_a (fn 1): read-modify-write → And (clear + mask) + Shl + Or + Store.
+    EXPECT_GE(countIn(1, MirOpcode::And), 2)   << "RMW clears the field AND masks the value";
+    EXPECT_GE(countIn(1, MirOpcode::Or), 1)    << "RMW ORs the shifted value back";
+    EXPECT_GE(countIn(1, MirOpcode::Shl), 1)   << "RMW shifts the value to bitOffset";
+    EXPECT_GE(countIn(1, MirOpcode::Store), 1) << "RMW stores the merged unit";
+}
+
+// FC8 D-CSUBSET-BITFIELD-WIDE-UNIT: a bit-field on a 64-BIT BASE
+// (`unsigned long long` / `long long` → a 64-bit allocation unit) now
+// COMPILES + LOWERS end-to-end. Before FC8 the semantic analyzer
+// REJECTED it (`S_BitFieldWidthOutOfRange` via the `typeBits > 32`
+// guard) because materializing the >int32 extract/insert masks hit a
+// literal-pool dead-end; FC8 closed that (x86 `mov r64, imm64` / arm64
+// MOVZ+MOVK ladder), so the guard is now `typeBits > 64` (I128/U128
+// still rejected). This is the SEMANTIC FLIP: the same shape that was a
+// reject is now a clean compile. RED-ON-DISABLE: restore the
+// `typeBits > 32` guard in resolveBitfieldSuffix → `model.hasErrors()`
+// becomes true (the field is rejected) → the `ASSERT_FALSE` goes RED.
+// The extract/insert chain (a 40-bit field at bitOffset 0, mask
+// 0xFFFFFFFFFF) lowers exactly like the 32-bit case — Load + And on
+// read, RMW And/Shl/Or/Store on write — just at 64-bit width.
+TEST(MirLoweringCSubset, WideUnitBitFieldOnLongLongBaseCompilesAndLowers) {
+    auto L = lowerCSubset(
+        "struct W { unsigned long long a : 40; unsigned long long b : 20; "
+        "long long s : 36; };\n"
+        "unsigned long long read_a(struct W* p) { return p->a; }\n"
+        "long long read_s(struct W* p) { return p->s; }\n"
+        "void set_a(struct W* p, unsigned long long v) { p->a = v; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "a 64-bit-base bit-field must now COMPILE (the wide-unit anchor "
+           "closed) — restoring the typeBits>32 guard turns this RED";
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto countIn = [&](std::uint32_t fnIdx, MirOpcode op) {
+        MirBlockId const entry = m.funcEntry(m.funcAt(fnIdx));
+        int n = 0;
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i)
+            if (m.instOpcode(m.blockInstAt(entry, i)) == op) ++n;
+        return n;
+    };
+    // read_a (fn 0): a 40-bit unsigned field at bitOffset 0 — masks the
+    // width (And); a is the low field so no shift needed for read but the
+    // And mask (0xFFFFFFFFFF) is the wide-constant witness.
+    EXPECT_GE(countIn(0, MirOpcode::And), 1) << "wide read masks the field width";
+    // read_s (fn 1): a SIGNED field sign-extends via Shl + AShr.
+    EXPECT_GE(countIn(1, MirOpcode::Shl), 1)  << "signed wide read sign-extends (Shl)";
+    EXPECT_GE(countIn(1, MirOpcode::AShr), 1) << "signed wide read sign-extends (AShr)";
+    // set_a (fn 2): read-modify-write → And (clear + mask) + Or + Store.
+    EXPECT_GE(countIn(2, MirOpcode::And), 2)   << "wide RMW clears the field AND masks the value";
+    EXPECT_GE(countIn(2, MirOpcode::Or), 1)    << "wide RMW ORs the value back";
+    EXPECT_GE(countIn(2, MirOpcode::Store), 1) << "wide RMW stores the merged unit";
+}
+
+// FC8 D-CSUBSET-BITFIELD-WIDE-UNIT: a width EXCEEDING the 64-bit base
+// stays REJECTED — the `*w > typeBits` check (typeBits=64 for long long)
+// fires for `long long s : 100`. This pins the UPPER bound the wide-unit
+// lift did NOT remove: 64 is the new ceiling for the BASE, and a width
+// larger than the base is still out of range. RED-ON-DISABLE: removing
+// the `*w > typeBits` check would let `: 100` compile → hasErrors false →
+// RED. (A 128-bit BASE — I128/U128 — is also rejected by the
+// `typeBits > 64` guard, but `__int128` is not in the c-subset's spelled
+// type set, so the BASE-128 path is unreachable from source and pinned
+// by the guard logic + comment rather than a corpus.)
+TEST(MirLoweringCSubset, WideUnitBitFieldWidthAboveBaseStaysRejected) {
+    auto L = lowerCSubset(
+        "struct H { long long s : 100; };\n"
+        "int main(void) { return 0; }\n");
+    EXPECT_TRUE(L.model.hasErrors())
+        << "a bit-field width exceeding its 64-bit base must stay rejected";
+}
+
+// FC8 D-CSUBSET-BITFIELD-INIT: aggregate INITIALIZATION of a bit-field struct
+// (`struct S s = {1,2};`) now LOWERS with per-allocation-unit PACKING (replacing
+// the cycle-2 fail-loud). Two co-resident bit-fields a:3,b:5 share unit 0, so the
+// slot init must: zero the unit ONCE, then read-modify-write each field in (And to
+// clear + And to mask the value + Shl to bitOffset + Or + Store) — NOT a plain
+// full-width store per field (which would clobber the neighbour). RED-ON-DISABLE:
+// revert lowerBitfieldAggregateInitIntoSlot to a fail-loud and `mir.ok` goes
+// false; revert the per-unit packing to plain stores and the And/Or/Shl chain
+// (the packing signature) disappears.
+TEST(MirLoweringCSubset, BitFieldStructInitializerPacksPerUnit) {
+    auto L = lowerCSubset(
+        "struct S { unsigned a : 3; unsigned b : 5; };\n"
+        "void f(void) { struct S s = { 1, 2 }; }\n");
+    ASSERT_FALSE(L.model.hasErrors()) << "the initializer is well-typed";
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a bit-field struct aggregate initializer must now LOWER with per-unit "
+           "packing (D-CSUBSET-BITFIELD-INIT): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto count = [&](MirOpcode op) {
+        int n = 0;
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i)
+            if (m.instOpcode(m.blockInstAt(entry, i)) == op) ++n;
+        return n;
+    };
+    // a + b share unit 0: zero-store + two read-modify-writes. b is at bitOffset 3
+    // (after a:3), so at least one Shl; each RMW masks the value (And) and clears
+    // the field (And) and ORs it back (Or). A plain full-width per-field store
+    // would emit neither the Or nor the Shl, and only 2 stores (no unit-zero).
+    EXPECT_GE(count(MirOpcode::Or), 2)  << "each bit-field init ORs its value into the unit";
+    EXPECT_GE(count(MirOpcode::And), 3) << "RMW clears the field AND masks the value";
+    EXPECT_GE(count(MirOpcode::Shl), 1) << "b is at bitOffset 3 → shifted before OR";
+    EXPECT_GE(count(MirOpcode::Store), 3) << "unit zeroed once + two RMW stores";
+}
+
+// F1 (review-caught silent miscompile): an ordinary field that PRECEDES a
+// bit-field sharing its allocation unit must NOT be clobbered by the unit's
+// zero-fill. `struct { char x; unsigned a:3; }` puts x at byte 0 and a's int
+// unit at bytes [0,4) — overlapping x. The fix zeroes every bit-field unit in a
+// PRE-PASS (before any field value is written), so x's store lands on the
+// already-zeroed unit and survives (a's read-modify-write then preserves it).
+// The buggy lazy-zero stored x first then wiped its unit → x == 0 (and a
+// global/local divergence, since the static-data encoder pre-zeroes once).
+// RED-ON-DISABLE: collapse the two passes (zero a unit on first touch in
+// declaration order) and the FIRST store becomes the ordinary field's value
+// store, not the unit zero → this assertion fails. The bitfield_init corpus is
+// the end-to-end witness (lt.x survives → exit 42, not 35).
+TEST(MirLoweringCSubset, BitFieldUnitZeroPrecedesOrdinaryFieldStoreInSharedUnit) {
+    auto L = lowerCSubset(
+        "struct T { char x; unsigned a : 3; };\n"
+        "void f(void) { struct T t = { 7, 5 }; }\n");
+    ASSERT_FALSE(L.model.hasErrors()) << "the initializer is well-typed";
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // The FIRST store into the slot must be the pass-1 unit zero (value Const 0),
+    // emitted BEFORE the ordinary field x is written. Under the lazy-zero bug the
+    // first store is instead x's value store (x precedes a in declaration order).
+    int firstStoreIdx = -1;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i)
+        if (m.instOpcode(m.blockInstAt(entry, i)) == MirOpcode::Store) {
+            firstStoreIdx = static_cast<int>(i);
+            break;
+        }
+    ASSERT_GE(firstStoreIdx, 0) << "the initializer must emit stores";
+    MirInstId const firstStore =
+        m.blockInstAt(entry, static_cast<std::uint32_t>(firstStoreIdx));
+    auto ops = m.instOperands(firstStore);
+    ASSERT_EQ(ops.size(), 2u);
+    ASSERT_EQ(m.instOpcode(ops[0]), MirOpcode::Const)
+        << "the FIRST store must be the pass-1 unit zero, not an ordinary value";
+    auto const& lit = m.literalValue(m.constLiteralIndex(ops[0]));
+    auto const* iv  = std::get_if<std::int64_t>(&lit.value);
+    ASSERT_NE(iv, nullptr);
+    EXPECT_EQ(*iv, 0)
+        << "the bit-field unit must be zeroed BEFORE the ordinary field x is "
+           "stored, else the zero clobbers x (the F1 silent miscompile)";
+}
+
+// FC8 D-CSUBSET-ENUM-BITFIELD: an enum-typed bit-field (`enum E e : W`) is
+// permitted (C 6.7.2.1) — an enum behaves AS its underlying integer
+// (D-CSUBSET-ENUM-INT-CONVERSION), so it must be ACCEPTED at semantic and LOWER
+// its allocation-unit access at the underlying. This pins two arms; the runtime
+// SIGNEDNESS arm (the load-bearing behavioural fix — a signed-underlying enum
+// bit-field must SIGN-extend) is pinned end-to-end by the `enum_bitfield`
+// corpus (a negative enumerator reads back -3, not 13 → exit 42, not 74).
+//  (a) RED-ON-DISABLE: revert resolveBitfieldSuffix's enum→underlying resolve →
+//      the field is rejected S_BitFieldNonIntegerType → model.hasErrors().
+//  (b) RED-ON-DISABLE: revert the enumReprType resolve at emitBitfieldExtract/
+//      emitBitfieldInsert → every bit-field shift/mask op result is typed at the
+//      Enum (primitive(Enum)) rather than the underlying integer. (The unit Load
+//      is intentionally left Enum-typed — the LIR `reprKind` tier resolves its
+//      WIDTH — so we assert the arithmetic OP results, which the resolve makes
+//      underlying; a behaviour-equivalent-but-malformed Enum-typed op is exactly
+//      what the LIR tier would mask, so this MIR-tier representation check is the
+//      only place it can be caught.) Exercises READ (extract) + WRITE (insert).
+TEST(MirLoweringCSubset, EnumTypedBitFieldResolvesAndLowers) {
+    auto L = lowerCSubset(
+        "enum Color { RED, GREEN = 5, BLUE };\n"
+        "struct S { enum Color c : 4; unsigned x : 3; };\n"
+        "int f(void) { struct S s = { GREEN, 3 }; s.c = BLUE; return (int)s.c; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "an enum-typed bit-field must be ACCEPTED (C 6.7.2.1), not rejected "
+           "S_BitFieldNonIntegerType";
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "an enum bit-field must LOWER (extract/insert resolve Enum→underlying): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // Every bit-field arithmetic op (the read extract's shift/mask, the write
+    // RMW's clear/mask/shift/merge) must be typed at the underlying integer, NOT
+    // the Enum. In this function those opcodes come ONLY from the bit-field
+    // codegen, so the check is unambiguous.
+    bool sawBitfieldOp = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        switch (m.instOpcode(ix)) {
+            case MirOpcode::And: case MirOpcode::Or:   case MirOpcode::Shl:
+            case MirOpcode::AShr: case MirOpcode::LShr:
+                sawBitfieldOp = true;
+                EXPECT_NE(interner.kind(m.instType(ix)), TypeKind::Enum)
+                    << "bit-field op #" << i << " must be typed at the enum's "
+                       "UNDERLYING integer (enumReprType), not the Enum itself";
+                break;
+            default: break;
+        }
+    }
+    EXPECT_TRUE(sawBitfieldOp)
+        << "the enum bit-field read + write must emit shift/mask ops";
+}
+
+// FC8 (cycle-4 audit coverage debt): two bit-fields of DIFFERENT declared-type
+// widths sharing one offset (`unsigned char a:3` → 1-byte unit at off 0;
+// `unsigned b:4` → 4-byte unit also at off 0). The init two-pass must zero BOTH
+// units up front, so the dedup keys on (offset, unitBytes) — NOT offset alone.
+// RED-ON-DISABLE: dedup on `off` only → the wider unit's high bytes are left
+// unzeroed (stale) → only ONE zero-store is emitted. This asserts TWO distinct
+// unit zero-stores (value Const 0).
+TEST(MirLoweringCSubset, MixedWidthBitFieldsSharingOffsetEachZeroTheirUnit) {
+    auto L = lowerCSubset(
+        "struct M { unsigned char a : 3; unsigned b : 4; };\n"
+        "void f(void) { struct M m = { 5, 9 }; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    int zeroStores = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Store) continue;
+        auto ops = m.instOperands(id);
+        if (ops.size() != 2 || m.instOpcode(ops[0]) != MirOpcode::Const) continue;
+        auto const& lit = m.literalValue(m.constLiteralIndex(ops[0]));
+        if (auto const* iv = std::get_if<std::int64_t>(&lit.value);
+            iv != nullptr && *iv == 0)
+            ++zeroStores;
+    }
+    EXPECT_EQ(zeroStores, 2)
+        << "each distinct-width unit at the shared offset must be zeroed once "
+           "(dedup on (offset,unitBytes)); off-only dedup leaves the wider unit "
+           "partly stale";
+}
+
+// FC8 D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY + NONSTRING-GLOBAL-ARRAY-DECAY: a
+// non-string array used as a pointer DECAYS to its first-element address — it
+// must LOWER (not fail loud as it did pre-FC8). RED-ON-DISABLE: revert the decay
+// arm and the Cast(Array→Ptr) on a non-literal operand hits H0009 -> mir.ok
+// false. Covers a LOCAL array (alloca) and a GLOBAL array (GlobalAddr).
+TEST(MirLoweringCSubset, NonStringArrayDecaysToPointerNotFailLoud) {
+    auto L = lowerCSubset(
+        "int g[2] = { 1, 2 };\n"
+        "int use(int* p) { return p[0] + p[1]; }\n"
+        "int f(void) { int a[2]; a[0] = 3; a[1] = 4; return use(a) + use(g); }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    EXPECT_TRUE(L.mir.ok)
+        << "non-string array→pointer decay (local + global) must lower, not "
+           "fail loud: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+}
+
 // Symmetric write: `p->y = v` lowers to GEP-then-Store, with the value
 // operand being the Arg v and the ptr operand the GEP result.
 TEST(MirLoweringCSubset, MemberAccessAssignEmitsGepThenStore) {
@@ -1967,6 +2311,164 @@ namespace {
     return InvalidMirInst;
 }
 } // namespace
+
+// FC8 D-CSUBSET-BITFIELD-RVALUE-RUNTIME: a by-value aggregate COMPOUND LITERAL
+// rvalue `take((struct P){a, 2})` (a NON-bit-field struct, runtime first field)
+// is lowered through the SYNTHESIZED-SLOT carrier — `lowerLvalueAddress`'s new
+// ConstructAggregate arm materializes a slot (Alloca) and inits it ELEMENT-WISE
+// (one Gep+Store per field at its byte offset), exactly as a named local's
+// `= {…}` does; the by-value arg path then consumes that slot by ADDRESS. This
+// pins the MEMORY model and forbids regression to an SSA-aggregate InsertValue
+// chain. The literal's field stores land at byte offsets 0 (a) and 4 (the `2`);
+// offset 4 is written ONLY by the literal init (the 8-byte by-value copy is a
+// single I64 chunk at offset 0), so a Store at offset 4 is the literal-init
+// witness. RED-ON-DISABLE: revert the lowerLvalueAddress ConstructAggregate arm
+// → the by-value arg fail-louds H0009 (ordinal 32) and `mir.ok` goes false; a
+// regression to the InsertValue chain trips the `InsertValue == 0` assertion.
+TEST(MirLoweringCSubset, ByValueCompoundLiteralArgMaterializesSlotElementWise) {
+    auto L = lowerCSubset(
+        "struct P { int a; int b; };\n"
+        "int take(struct P p) { return p.a + p.b; }\n"
+        "int main(void) { int a = 40; return take((struct P){a, 2}); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a by-value compound-literal aggregate rvalue must lower via a "
+           "synthesized slot (D-CSUBSET-BITFIELD-RVALUE-RUNTIME): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // main is the function that CALLs take — find it by the entry-block Call.
+    // The compound-literal carrier lives in main's entry block.
+    std::uint32_t mainFi = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        auto const ops = funcEntryOpcodes(m, fi);
+        if (countOpcode(ops, MirOpcode::Call) > 0) { mainFi = fi; break; }
+    }
+    auto const ops = funcEntryOpcodes(m, mainFi);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "the compound literal is materialized in MEMORY — never an "
+           "SSA-aggregate InsertValue chain";
+    EXPECT_GE(countOpcode(ops, MirOpcode::Alloca), 1u)
+        << "a slot is synthesized for the compound-literal lvalue";
+    // The literal's two field stores land at byte offsets 0 (a) and 4 (b=2).
+    // Offset 4 is written ONLY by the literal init in this 8-byte layout.
+    MirBlockId const entry = m.funcEntry(m.funcAt(mainFi));
+    bool storeAt0 = false, storeAt4 = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        if (m.instOpcode(ix) != MirOpcode::Store) continue;
+        auto st = m.instOperands(ix);
+        if (st.size() != 2) continue;
+        // st[1] is the destination pointer — a Gep(base, Const(off)).
+        MirInstId const dst = st[1];
+        if (m.instOpcode(dst) != MirOpcode::Gep) continue;
+        auto g = m.instOperands(dst);
+        if (g.size() != 2) continue;
+        if (m.instOpcode(g[1]) != MirOpcode::Const) continue;
+        auto const& lit = m.literalValue(m.constLiteralIndex(g[1]));
+        auto const* off = std::get_if<std::int64_t>(&lit.value);
+        if (off == nullptr) continue;
+        if (*off == 0) storeAt0 = true;
+        if (*off == 4) storeAt4 = true;
+    }
+    EXPECT_TRUE(storeAt0) << "field a stored at byte offset 0";
+    EXPECT_TRUE(storeAt4)
+        << "field b (=2) stored at byte offset 4 — the literal-init witness "
+           "(only the element-wise slot init writes offset 4 here)";
+}
+
+// FC8 D-CSUBSET-BITFIELD-RVALUE-RUNTIME (bit-field variant): a by-value BIT-FIELD
+// compound literal `take((struct B){a, 20})` (a:3 + b:5 share unit 0, runtime
+// first field) is lowered through the synthesized-slot carrier whose init routes
+// to `lowerBitfieldAggregateInitIntoSlot` — so the literal PACKS per allocation
+// unit (zero the unit, then read-modify-write each field: And to clear + And to
+// mask the value + Shl to bitOffset + Or). A plain full-width per-field store
+// would clobber the neighbour in the shared unit. Mirrors
+// BitFieldStructInitializerPacksPerUnit but in by-value RVALUE position.
+// RED-ON-DISABLE: revert the lowerLvalueAddress ConstructAggregate arm → the
+// by-value arg fail-louds H0009 (ordinal 32), `mir.ok` false; revert the per-unit
+// packing → the And/Or/Shl packing signature disappears.
+TEST(MirLoweringCSubset, ByValueBitfieldCompoundLiteralArgPacksPerUnit) {
+    auto L = lowerCSubset(
+        "struct B { unsigned a : 3; unsigned b : 5; };\n"
+        "int take(struct B v) { return (int)v.a + (int)v.b; }\n"
+        "int main(void) { int a = 5; return take((struct B){a, 20}); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a by-value bit-field compound-literal rvalue must lower with per-unit "
+           "packing via a synthesized slot (D-CSUBSET-BITFIELD-RVALUE-RUNTIME): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t mainFi = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        auto const ops = funcEntryOpcodes(m, fi);
+        if (countOpcode(ops, MirOpcode::Call) > 0) { mainFi = fi; break; }
+    }
+    MirBlockId const entry = m.funcEntry(m.funcAt(mainFi));
+    auto count = [&](MirOpcode op) {
+        int n = 0;
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i)
+            if (m.instOpcode(m.blockInstAt(entry, i)) == op) ++n;
+        return n;
+    };
+    auto const ops = funcEntryOpcodes(m, mainFi);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "the bit-field literal is packed in MEMORY — no SSA-aggregate chain";
+    EXPECT_GE(countOpcode(ops, MirOpcode::Alloca), 1u)
+        << "a slot is synthesized for the bit-field compound-literal lvalue";
+    // a + b share unit 0; b is at bitOffset 3 → at least one Shl; each RMW masks
+    // (And) and clears the field (And) and ORs it back (Or). A full-width
+    // per-field store would emit neither the Or nor the Shl.
+    EXPECT_GE(count(MirOpcode::Or), 2)  << "each bit-field init ORs its value into the unit";
+    EXPECT_GE(count(MirOpcode::And), 3) << "RMW clears the field AND masks the value";
+    EXPECT_GE(count(MirOpcode::Shl), 1) << "b at bitOffset 3 → shifted before OR";
+}
+
+// D-CSUBSET-BITFIELD-RVALUE-RUNTIME (discard position): an aggregate compound
+// literal used as a DISCARDED statement (`(struct P){h(), 2};`) must lower —
+// materialized into a throwaway slot so its operand SIDE EFFECTS run, then the
+// address dropped. Completes the carrier across the discard position (and
+// removes the regression where a discarded aggregate literal fail-louded).
+// RED-ON-DISABLE: revert the ExprStmt ConstructAggregate routing → lowerExpr
+// hits the anti-resurrection fail-loud → mir.ok false.
+TEST(MirLoweringCSubset, DiscardedAggregateCompoundLiteralStatementRunsSideEffects) {
+    auto L = lowerCSubset(
+        "struct P { int a; int b; };\n"
+        "int h(void) { return 7; }\n"
+        "void f(void) { (struct P){h(), 2}; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a discarded aggregate compound-literal statement must lower (its "
+           "operand side effects run via a throwaway slot), not fail loud: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // f() is the function with the discarded literal — find it by its Call to
+    // h() (h() itself has no call). It must contain the h() side-effect call +
+    // the throwaway slot, and NO SSA-aggregate chain.
+    std::uint32_t fFi = 0;
+    bool found = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        if (countOpcode(funcEntryOpcodes(m, fi), MirOpcode::Call) > 0) {
+            fFi = fi; found = true; break;
+        }
+    }
+    ASSERT_TRUE(found) << "f() (the discarded-literal body, with the h() call) not found";
+    auto const ops = funcEntryOpcodes(m, fFi);
+    EXPECT_GE(countOpcode(ops, MirOpcode::Call), 1u)
+        << "the operand h() side effect must be lowered — the call survives the discard";
+    EXPECT_GE(countOpcode(ops, MirOpcode::Alloca), 1u)
+        << "a throwaway slot is synthesized for the discarded aggregate literal";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "memory-based — no SSA-aggregate chain";
+}
 
 // All-constant `struct Point p = {1, 2}` const-folds to a single
 // Const(MirAggregateValue) — no InsertValue chain needed because the
@@ -3142,4 +3644,305 @@ TEST(MirLoweringCSubset, Aapcs64StructSretUsesReadIndirectResultAndFlagsCall) {
     EXPECT_EQ(hiddenSretArgCount, 0u)
         << "the x8-sret callee must NOT also consume a hidden GPR Arg for the sret "
            "pointer (that is the SysV/Win64 path; x8-sret uses ReadIndirectResult)";
+}
+
+// ─── D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR (FC8 SUBSTRATE) ──────────────────
+// An AGGREGATE-typed ternary / comma-SeqExpr used BY VALUE materializes each
+// control-flow arm into ONE COMMON result slot under a CFG diamond — the
+// memory-based aggregate model, NOT an SSA Phi-of-aggregate. These pins assert
+// the diamond + the common slot + the no-Phi-of-aggregate invariant (and the
+// bit-field arm's per-unit packing through the slot). They WALK ALL BLOCKS of
+// the function (the diamond spreads the arm stores across the then/else
+// blocks), unlike the entry-only `funcEntryOpcodes` helper.
+
+namespace {
+// Count `op` across EVERY block of function `fi` (the aggregate-ternary diamond
+// places per-arm stores in the then/else blocks, not the entry).
+[[nodiscard]] std::size_t countOpcodeAllBlocks(Mir const& m, std::uint32_t fi,
+                                               MirOpcode op) {
+    std::size_t n = 0;
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i)
+            if (m.instOpcode(m.blockInstAt(blk, i)) == op) ++n;
+    }
+    return n;
+}
+// The function index that CALLs another function (main/the by-value consumer's
+// caller — where the aggregate ternary/comma carrier lives).
+[[nodiscard]] std::uint32_t funcWithCall(Mir const& m) {
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi)
+        if (countOpcodeAllBlocks(m, fi, MirOpcode::Call) > 0) return fi;
+    return 0;
+}
+// True iff ANY instruction in function `fi` is a Phi whose RESULT type is an
+// aggregate (Struct/Union/Array). The memory-based model forbids this — the
+// aggregate "merge" of a ternary is a shared SLOT, never an SSA Phi.
+[[nodiscard]] bool hasAggregatePhi(Mir const& m, TypeInterner const& interner,
+                                   std::uint32_t fi) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Phi) continue;
+            TypeId const t = m.instType(ix);
+            if (!t.valid()) continue;
+            TypeKind const k = interner.kind(t);
+            if (k == TypeKind::Struct || k == TypeKind::Union
+                || k == TypeKind::Array)
+                return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+// CORE PIN: a by-value NON-bit-field aggregate ternary `take(cond ? A : B)`
+// lowers with (a) a CondBr diamond (the control-flow-dependent value); (b) a
+// COMMON result slot (Alloca) — allocated ONCE before the branch, written by
+// BOTH arms; (c) per-arm Stores into that slot (the arm materialization); (d)
+// InsertValue == 0 (memory-based, no SSA-aggregate chain); (e) NO Phi whose
+// type is the aggregate (the slot IS the merge, not a Phi). RED-ON-DISABLE:
+// revert the lowerLvalueAddress Ternary arm → the by-value arg fail-louds H0009
+// (ordinal 33) and `mir.ok` goes false (and the diamond/slot signatures vanish).
+TEST(MirLoweringCSubset, ByValueAggregateTernaryMaterializesCommonSlotUnderDiamond) {
+    // `pick` is a runtime PARAMETER (keeps the condition runtime so neither arm
+    // folds away — c-subset has no bare prototypes; a param is the clean lever).
+    auto L = lowerCSubset(
+        "struct P { int a; int b; };\n"
+        "int take(struct P p) { return p.a + p.b; }\n"
+        "int run(int pick, int a) {\n"
+        "  return take(pick ? (struct P){a, 2} : (struct P){a, 3});\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a by-value aggregate ternary must lower via a common slot under a "
+           "diamond (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    std::uint32_t const fi = funcWithCall(m);
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 1u)
+        << "the aggregate ternary lowers as a CONTROL-FLOW diamond (CondBr)";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
+        << "memory-based aggregate model — never an SSA-aggregate InsertValue chain";
+    EXPECT_FALSE(hasAggregatePhi(m, interner, fi))
+        << "the arms merge into a COMMON SLOT — there must be NO Phi whose type "
+           "is the aggregate (Struct/Union/Array)";
+    // The common result slot + the by-value arg's eightbyte temp are both
+    // Allocas; the slot init + each arm's stores into it give >= 2 Stores total
+    // (one per arm's 2 fields, across the then/else blocks). The diamond's two
+    // arms each store the literal's fields into the SAME slot.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Alloca), 1u)
+        << "a common result slot is synthesized for the aggregate ternary";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Store), 2u)
+        << "each arm materializes the aggregate into the common slot (per-field "
+           "Stores across the then/else blocks)";
+}
+
+// BIT-FIELD ARM PIN: a by-value BIT-FIELD aggregate ternary packs per allocation
+// unit THROUGH the common slot under the diamond — each arm's slot init routes
+// to lowerBitfieldAggregateInitIntoSlot (And/Or/Shl RMW packing), proving the
+// per-unit packing flows through the diamond-materialized slot (not a plain
+// per-field store that would clobber a shared-unit neighbour). RED-ON-DISABLE:
+// revert the Ternary arm → H0009 ordinal 33; revert the per-unit packing → the
+// And/Or/Shl signature disappears.
+TEST(MirLoweringCSubset, ByValueBitfieldAggregateTernaryPacksPerUnitUnderDiamond) {
+    auto L = lowerCSubset(
+        "struct B { unsigned a : 3; unsigned b : 5; };\n"
+        "int take(struct B v) { return (int)v.a + (int)v.b; }\n"
+        "int run(int pick, int a) {\n"
+        "  return take(pick ? (struct B){a, 20} : (struct B){a, 7});\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a by-value bit-field aggregate ternary must lower with per-unit "
+           "packing through a common slot under a diamond "
+           "(D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    std::uint32_t const fi = funcWithCall(m);
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 1u)
+        << "the bit-field aggregate ternary lowers as a control-flow diamond";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
+        << "memory-based — no SSA-aggregate chain";
+    EXPECT_FALSE(hasAggregatePhi(m, interner, fi))
+        << "no Phi of the aggregate — the arms merge into a common slot";
+    // a + b share unit 0; b is at bitOffset 3. Each arm packs via RMW (And to
+    // clear + And to mask + Shl + Or). Two arms → at least one Shl + several
+    // And/Or. A plain full-width per-field store would emit neither.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Or), 2u)
+        << "each bit-field arm ORs its packed value into the unit";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Shl), 1u)
+        << "field b at bitOffset 3 is shifted before OR (per-unit packing)";
+}
+
+// SeqExpr (comma) PIN: a comma/SeqExpr whose VALUE is an aggregate rvalue used
+// BY VALUE lowers — the side-effect statement runs (here a Call), then the
+// aggregate result recurses to its lvalue (the compound-literal slot). No fail-
+// loud, no Phi of aggregate. RED-ON-DISABLE: revert the lowerLvalueAddress
+// SeqExpr arm → the by-value arg fail-louds H0009 (ordinal 39) → mir.ok false.
+TEST(MirLoweringCSubset, AggregateSeqExprByValueLowersWithSideEffectAndSlot) {
+    auto L = lowerCSubset(
+        "struct P { int a; int b; };\n"
+        "int side(void) { return 7; }\n"
+        "int take(struct P p) { return p.a + p.b; }\n"
+        "int main(void) {\n"
+        "  int a = 40;\n"
+        "  return take((side(), (struct P){a, 2}));\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a by-value aggregate comma/SeqExpr rvalue must lower (side effect "
+           "runs, result recurses to its slot) "
+           "(D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    std::uint32_t const fi = funcWithCall(m);
+    // The side() call (side effect) AND the take() call both lower → >= 2 Calls.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Call), 2u)
+        << "the comma side-effect call must run, plus the by-value consumer call";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Alloca), 1u)
+        << "the aggregate result's compound-literal slot is synthesized";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
+        << "memory-based — no SSA-aggregate chain";
+    EXPECT_FALSE(hasAggregatePhi(m, interner, fi))
+        << "a comma aggregate rvalue is not a Phi-of-aggregate";
+}
+
+// COPY-PATH PIN: a by-value aggregate ternary whose ARMS are NAMED LVALUES (not
+// compound literals) exercises materializeAggregateArmIntoSlot's COPY branch
+// (lowerLvalueAddress(arm) + lowerAggregateCopy into the common slot) — distinct
+// from the in-place compound-literal init the pins above cover. Still a CFG
+// diamond into ONE common slot, still NO Phi-of-aggregate. RED-ON-DISABLE: revert
+// the lowerLvalueAddress Ternary arm → the by-value arg fail-louds → mir.ok false.
+TEST(MirLoweringCSubset, ByValueAggregateTernaryNamedLvalueArmsCopyIntoCommonSlot) {
+    auto L = lowerCSubset(
+        "struct P { int a; int b; };\n"
+        "int take(struct P p) { return p.a + p.b; }\n"
+        "int run(int pick, int a) {\n"
+        "  struct P s1 = {a, 2};\n"
+        "  struct P s2 = {a, 3};\n"
+        "  return take(pick ? s1 : s2);\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a by-value aggregate ternary with NAMED-LVALUE arms must lower via a "
+           "common slot under a diamond (the copy-path) "
+           "(D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    std::uint32_t const fi = funcWithCall(m);
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 1u)
+        << "a named-arm aggregate ternary still lowers as a control-flow diamond";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
+        << "memory-based — no SSA-aggregate chain";
+    EXPECT_FALSE(hasAggregatePhi(m, interner, fi))
+        << "the named arms are COPIED into a common slot — no Phi of the aggregate";
+    // Each arm copies a named local into the common slot (lowerAggregateCopy,
+    // field-wise for a flat scalar struct) → per-field Stores across the
+    // then/else blocks (on top of the two VarDecl inits before the branch).
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Store), 2u)
+        << "each arm copies its named local into the common result slot";
+}
+
+// DISCARD-POSITION PIN (gate-discovered silent-miscompile seal): a DISCARDED
+// aggregate ternary with NAMED-LVALUE arms (`(cond ? s1 : s2);` as a bare
+// statement) must route through the ExprStmt aggregate chokepoint →
+// lowerLvalueAddress's Ternary arm (a diamond into a throwaway slot, side effects
+// run, address dropped) — NOT through lowerExpr, which would silently synthesize a
+// phi-of-aggregate + aggregate-width arm Loads (the latent miscompile this seals).
+// RED-ON-DISABLE: revert the ExprStmt aggregate chokepoint → falls to lowerExpr's
+// Ternary arm → its anti-resurrection guard fail-louds → mir.ok false; revert that
+// guard TOO → hasAggregatePhi becomes true (the forbidden phi-of-aggregate appears).
+TEST(MirLoweringCSubset, DiscardedAggregateTernaryNamedArmsRoutesThroughSlotNoPhi) {
+    auto L = lowerCSubset(
+        "struct P { int a; int b; };\n"
+        "int sink(int x) { return x; }\n"
+        "int run(int pick, int a) {\n"
+        "  struct P s1 = {a, 2};\n"
+        "  struct P s2 = {a, 3};\n"
+        "  (pick ? s1 : s2);\n"
+        "  return sink(a);\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a discarded aggregate ternary must route through the slot carrier, not "
+           "a phi-of-aggregate (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    std::uint32_t const fi = funcWithCall(m);
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 1u)
+        << "the discarded aggregate ternary still lowers as a control-flow diamond";
+    EXPECT_FALSE(hasAggregatePhi(m, interner, fi))
+        << "the discard routes through a slot — NEVER a phi-of-aggregate (the "
+           "silent miscompile this seals)";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
+        << "memory-based — no SSA-aggregate chain";
+}
+
+// SECOND DISCARD POSITION PIN (seal-review follow-up): a for-init/for-update
+// clause is a BARE expression (NOT wrapped in ExprStmt), lowered via
+// `lowerForClauseNode` → it is a SECOND discard position. An aggregate ternary in
+// a for-UPDATE clause (`for (...; ...; (cond ? s1 : s2))`) must route through the
+// SHARED discard chokepoint (`lowerDiscardedExpr`) → the slot carrier, NOT
+// lowerExpr's anti-resurrection fail-loud and NEVER a phi-of-aggregate. This
+// proves the chokepoint is by-construction across BOTH discard positions (no
+// per-POSITION miss). RED-ON-DISABLE: revert the for-clause routing → the update
+// fail-louds (mir.ok false); revert the lowerExpr Ternary guard too → a
+// phi-of-aggregate appears in the update (hasAggregatePhi true).
+TEST(MirLoweringCSubset, ForUpdateAggregateTernaryRoutesThroughSlotNoPhi) {
+    auto L = lowerCSubset(
+        "struct P { int a; int b; };\n"
+        "int sink(int x) { return x; }\n"
+        "int run(int pick, int n) {\n"
+        "  struct P s1 = {1, 2};\n"
+        "  struct P s2 = {3, 4};\n"
+        "  int acc = 0;\n"
+        "  for (int i = 0; i < n; (pick ? s1 : s2)) { acc = acc + i; i = i + 1; }\n"
+        "  return sink(acc);\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "an aggregate ternary in a for-update clause must route through the "
+           "shared discard chokepoint, not fail loud "
+           "(D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    std::uint32_t const fi = funcWithCall(m);
+    // The for-loop's own `i < n` test is one CondBr; the aggregate ternary in the
+    // update clause adds a SECOND (the diamond) — so >= 2 distinguishes the
+    // diamond from the loop test alone.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 2u)
+        << "the loop test (1 CondBr) PLUS the for-update aggregate ternary's "
+           "diamond (a 2nd CondBr)";
+    EXPECT_FALSE(hasAggregatePhi(m, interner, fi))
+        << "the for-update ternary routes through a slot — NEVER a phi-of-aggregate";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
+        << "memory-based — no SSA-aggregate chain";
 }

@@ -12,6 +12,9 @@
   "$dataModelComment": "FC3 c1: 64-bit linux/darwin are LP64 (int 32, long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I64 here. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
   "dataModel": "LP64",
 
+  "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: C bit-field allocation is OS/format-determined (the x86_64 CPU target serves BOTH this ELF-SysV format and PE-MS), so the strategy lives here, not on the target. SysV/Itanium/GNU LSB-first packing into the declared-type unit — byte-ABI-exact to gcc (verified by the conformance witness). Different-sized adjacent bit-fields may SHARE a unit (unlike MSVC).",
+  "bitFieldStrategy": "gnu_packed",
+
   "elf": {
     "$comment": "Elf64_Ehdr identity fields. `class` = ELFCLASS64; `data` = ELFDATA2LSB (little-endian); `osabi` = ELFOSABI_NONE (SysV, conventional for relocatable .o); `machine` = EM_X86_64 (62).",
     "class": "elf64",

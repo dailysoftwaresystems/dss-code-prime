@@ -963,7 +963,9 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
     // never consumed (nullopt is the faithful value; a guard fires only if
     // an extern import survives without one). D-FFI-EXTERN-CALL-DISPATCH.
     auto mod = lowerMergedToAssembly(*merged, *grammar, **targetR,
-                                     (*formatR)->dataModel(), ccIndex,
+                                     (*formatR)->dataModel(),
+                                     effectiveBitFieldStrategy(**targetR, **formatR),
+                                     ccIndex,
                                      cuMirs[0].cuId, std::nullopt, rep);
     ASSERT_TRUE(mod.has_value()) << "errorCount=" << rep.errorCount();
 

@@ -302,7 +302,8 @@ DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
         }
         builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
                           newInitIdx, MirFuncId{},
-                          mir.globalBinding(g), mir.globalVisibility(g));
+                          mir.globalBinding(g), mir.globalVisibility(g),
+                          mir.globalIsConst(g));
     }
 
     // Step 3: walk each function. Dead functions are simply NOT
