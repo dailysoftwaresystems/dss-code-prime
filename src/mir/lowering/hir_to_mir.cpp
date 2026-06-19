@@ -2553,8 +2553,44 @@ struct Lowerer {
             case HirKind::Block:
                 return lowerStmt(node);
             default:
-                return lowerExpr(node).valid();
+                // A bare for-init / for-update expression is a DISCARD position
+                // too (its value is unused) — share the ExprStmt aggregate
+                // chokepoint (lowerDiscardedExpr) so an aggregate ternary/comma
+                // in a for-clause routes through the carrier, not lowerExpr's
+                // anti-resurrection fail-loud (D-CSUBSET-AGGREGATE-VALUED-
+                // CONTROL-EXPR).
+                return lowerDiscardedExpr(node);
         }
+    }
+
+    // Lower an expression whose VALUE is DISCARDED — an `ExprStmt`, or a bare
+    // for-init / for-update clause — emitted for its SIDE EFFECTS only. An
+    // AGGREGATE-typed discarded expression (a compound literal
+    // `(struct S){f(),g()};`, an aggregate ternary `(cond ? a : b);`, a comma/
+    // SeqExpr `(f(), s);`, a struct-returning call `g();`, or a bare aggregate
+    // lvalue) has NO SSA rvalue under the memory-based aggregate model — there is
+    // no aggregate-width value to produce-and-drop. Route EVERY aggregate-typed
+    // discard through ONE chokepoint — `lowerLvalueAddress` — so coverage is by
+    // construction with NO per-kind AND NO per-POSITION miss (both the ExprStmt
+    // site and the for-clause site funnel HERE): it resolves the value's ADDRESS
+    // (materializing a slot + running operand/arm side effects for an rvalue
+    // carrier; returning the existing storage for a named lvalue) and drops it.
+    // This completes the by-value aggregate-rvalue carriers across BOTH discard
+    // positions — the compound-literal slot (D-CSUBSET-BITFIELD-RVALUE-RUNTIME)
+    // AND the aggregate Ternary / comma-SeqExpr control-expr carrier
+    // (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR) — and keeps `lowerExpr`'s per-kind
+    // anti-resurrection fail-louds (ConstructAggregate / Ternary / SeqExpr)
+    // reachable ONLY by genuine internal misrouting (unreachable from user code).
+    // A scalar discard lowers as an ordinary rvalue via `lowerExpr`.
+    [[nodiscard]] bool lowerDiscardedExpr(HirNodeId expr) {
+        if (TypeId const et = hir.typeId(expr); et.valid()) {
+            TypeKind const ek = interner.kind(et);
+            if (ek == TypeKind::Struct || ek == TypeKind::Union
+                || ek == TypeKind::Array) {
+                return lowerLvalueAddress(expr).valid();
+            }
+        }
+        return lowerExpr(expr).valid();
     }
 
     // Lower a single HIR statement in the currently-open MIR block.
@@ -2620,35 +2656,10 @@ struct Lowerer {
                 return true;
             }
             case HirKind::ExprStmt: {
-                // Discard the value; emit for side effects.
-                HirNodeId const expr = hir.exprStmtExpr(node);
-                // An AGGREGATE-typed expression used as a DISCARDED statement —
-                // a compound literal (`(struct S){f(),g()};`), an aggregate
-                // ternary (`(cond ? a : b);`), a comma/SeqExpr (`(f(), s);`), a
-                // struct-returning call (`g();`), or a bare aggregate lvalue —
-                // has NO SSA rvalue under the memory-based aggregate model (no
-                // aggregate-width value to produce-and-drop). Route EVERY
-                // aggregate-typed discard through ONE chokepoint —
-                // lowerLvalueAddress — so coverage is by construction (no
-                // per-kind miss): it materializes the value into a slot, running
-                // all operand/arm side effects, and yields an address we drop.
-                // This completes the by-value aggregate-rvalue carriers across
-                // the discard position — the compound-literal slot (D-CSUBSET-
-                // BITFIELD-RVALUE-RUNTIME) AND the aggregate Ternary / comma-
-                // SeqExpr control-expr carrier (D-CSUBSET-AGGREGATE-VALUED-
-                // CONTROL-EXPR) — and keeps lowerExpr's per-kind anti-
-                // resurrection fail-louds (ConstructAggregate / Ternary /
-                // SeqExpr) reachable ONLY by genuine internal misrouting (truly
-                // unreachable from user code).
-                if (TypeId const et = hir.typeId(expr); et.valid()) {
-                    TypeKind const ek = interner.kind(et);
-                    if (ek == TypeKind::Struct || ek == TypeKind::Union
-                        || ek == TypeKind::Array) {
-                        return lowerLvalueAddress(expr).valid();
-                    }
-                }
-                MirInstId const v = lowerExpr(expr);
-                return v.valid();
+                // Discard the value; emit for side effects. The aggregate-discard
+                // chokepoint is shared with the for-clause site — see
+                // lowerDiscardedExpr (one funnel, no per-kind/per-position miss).
+                return lowerDiscardedExpr(hir.exprStmtExpr(node));
             }
             case HirKind::VarDecl: {
                 // Allocate the local's slot on the current block. The declared

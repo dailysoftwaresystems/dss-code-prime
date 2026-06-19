@@ -3901,3 +3901,48 @@ TEST(MirLoweringCSubset, DiscardedAggregateTernaryNamedArmsRoutesThroughSlotNoPh
     EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
         << "memory-based — no SSA-aggregate chain";
 }
+
+// SECOND DISCARD POSITION PIN (seal-review follow-up): a for-init/for-update
+// clause is a BARE expression (NOT wrapped in ExprStmt), lowered via
+// `lowerForClauseNode` → it is a SECOND discard position. An aggregate ternary in
+// a for-UPDATE clause (`for (...; ...; (cond ? s1 : s2))`) must route through the
+// SHARED discard chokepoint (`lowerDiscardedExpr`) → the slot carrier, NOT
+// lowerExpr's anti-resurrection fail-loud and NEVER a phi-of-aggregate. This
+// proves the chokepoint is by-construction across BOTH discard positions (no
+// per-POSITION miss). RED-ON-DISABLE: revert the for-clause routing → the update
+// fail-louds (mir.ok false); revert the lowerExpr Ternary guard too → a
+// phi-of-aggregate appears in the update (hasAggregatePhi true).
+TEST(MirLoweringCSubset, ForUpdateAggregateTernaryRoutesThroughSlotNoPhi) {
+    auto L = lowerCSubset(
+        "struct P { int a; int b; };\n"
+        "int sink(int x) { return x; }\n"
+        "int run(int pick, int n) {\n"
+        "  struct P s1 = {1, 2};\n"
+        "  struct P s2 = {3, 4};\n"
+        "  int acc = 0;\n"
+        "  for (int i = 0; i < n; (pick ? s1 : s2)) { acc = acc + i; i = i + 1; }\n"
+        "  return sink(acc);\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "an aggregate ternary in a for-update clause must route through the "
+           "shared discard chokepoint, not fail loud "
+           "(D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    std::uint32_t const fi = funcWithCall(m);
+    // The for-loop's own `i < n` test is one CondBr; the aggregate ternary in the
+    // update clause adds a SECOND (the diamond) — so >= 2 distinguishes the
+    // diamond from the loop test alone.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 2u)
+        << "the loop test (1 CondBr) PLUS the for-update aggregate ternary's "
+           "diamond (a 2nd CondBr)";
+    EXPECT_FALSE(hasAggregatePhi(m, interner, fi))
+        << "the for-update ternary routes through a slot — NEVER a phi-of-aggregate";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
+        << "memory-based — no SSA-aggregate chain";
+}
