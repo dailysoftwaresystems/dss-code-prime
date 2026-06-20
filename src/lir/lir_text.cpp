@@ -233,6 +233,8 @@ renderOperand(LirOperand const& op, TargetSchema const& schema,
                        : std::format("{}", op.offset);
         case LirOperandKind::LiteralIndex:
             return std::format("lit#{}", op.litIndex);
+        case LirOperandKind::ByValueStackAgg:
+            return std::format("byval#{}", op.byValueAggBytes);
     }
     // Fall-through is a substrate-corruption signal — the discriminator
     // landed on the reserved slot 3 (formerly ImmFloat) or on an out-of-
@@ -1254,13 +1256,21 @@ private:
                 return LirOperand::makeMemOffset(v);
             }
             case TokKind::Ident: {
-                // Either `lit#<N>` literal-index OR a phys-reg mnemonic.
+                // `lit#<N>` literal-index, `byval#<N>` by-value-stack-agg size
+                // marker (FC12a-struct), OR a phys-reg mnemonic.
                 if (pk.text == "lit") {
                     lex_.take();
                     (void)expect(TokKind::Hash);
                     Tok n = lex_.take();
                     return LirOperand::makeLiteralIndex(
                         parseNumber<std::uint32_t>(n.text, "LiteralIndex"));
+                }
+                if (pk.text == "byval") {
+                    lex_.take();
+                    (void)expect(TokKind::Hash);
+                    Tok n = lex_.take();
+                    return LirOperand::makeByValueStackAgg(
+                        parseNumber<std::uint32_t>(n.text, "ByValueStackAgg bytes"));
                 }
                 return LirOperand::makeReg(parseRegOperand());
             }

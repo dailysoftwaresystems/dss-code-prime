@@ -1,0 +1,12 @@
+{
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 66,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ]
+}

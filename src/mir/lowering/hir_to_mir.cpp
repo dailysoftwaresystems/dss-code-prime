@@ -685,25 +685,71 @@ struct Lowerer {
                                 return InvalidMirInst;
                             }
                             if (abi->kind == AbiPassing::Kind::ByReference) {
-                                // MEMORY class (>16B / empty): the SysV variadic ABI
-                                // requires it BY VALUE in the overflow area, which
-                                // needs the by-value stack-arg mechanism (not yet
-                                // built). The non-variadic ByReference path keeps the
-                                // existing hidden-pointer convention via
+                                // MEMORY class (>16B / empty). At the VARIADIC boundary
+                                // SysV §3.2.3/§3.5.7 requires it BY VALUE in the overflow
+                                // area UNCONDITIONALLY (even with free arg registers) —
+                                // the Option-C carrier (D-FC12A-VARIADIC-MEMORY-CLASS-
+                                // STRUCT). runGpr/runFpr are NOT advanced (it's on the
+                                // stack, not in a register). The NON-variadic ByReference
+                                // path keeps the existing hidden-pointer convention via
                                 // appendByValueArg (a single GPR pointer operand).
                                 if (calleeVariadic) {
-                                    unsupported(kids[i],
-                                        "passing a struct/union >16B (MEMORY class) "
-                                        "BY VALUE to a variadic function is not yet "
-                                        "supported — SysV requires it by value in the "
-                                        "overflow area, which needs the by-value "
-                                        "stack-arg mechanism "
-                                        "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
-                                    return InvalidMirInst;
+                                    // The carrier is CC-neutral, but the va_list layout
+                                    // must be present for a variadic callee (it is the
+                                    // overflow geometry source); absent ⇒ struct varargs
+                                    // are impossible on this CC. Mirror the Win64/AAPCS64
+                                    // strategy guards below so a non-SysV variadic struct
+                                    // vararg fails loud at ITS anchor (the overflow
+                                    // placement + va_arg read for those CCs are their own
+                                    // cycles, reusing this carrier).
+                                    if (!config.vaListLayout.has_value()) {
+                                        unsupported(kids[i],
+                                            "passing a struct/union BY VALUE to a "
+                                            "variadic function requires the CC's "
+                                            "'vaListLayout' (overflow geometry) which "
+                                            "this target does not declare "
+                                            "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+                                        return InvalidMirInst;
+                                    }
+                                    VaListLayout const& vlMem = *config.vaListLayout;
+                                    if (vlMem.strategy
+                                        == VaListStrategy::HomogeneousPointer) {
+                                        unsupported(kids[i],
+                                            "passing a struct/union BY VALUE to a "
+                                            "Win64 ms_x64 variadic function is not yet "
+                                            "supported — the homogeneous struct-vararg "
+                                            "caller placement is the FC12b-struct "
+                                            "follow-on (D-FC12B-WIN64-STRUCT-VARARG)");
+                                        return InvalidMirInst;
+                                    }
+                                    if (vlMem.strategy
+                                        == VaListStrategy::Aapcs64DualCursor) {
+                                        unsupported(kids[i],
+                                            "passing a struct/union BY VALUE to an "
+                                            "AAPCS64 variadic function is not yet "
+                                            "supported — the HFA struct-vararg caller "
+                                            "placement is a separate sub-feature "
+                                            "(D-FC12C-AAPCS64-HFA-STRUCT-VARARG)");
+                                        return InvalidMirInst;
+                                    }
+                                    if (vlMem.strategy
+                                        != VaListStrategy::SysVRegisterSave) {
+                                        unsupported(kids[i],
+                                            "passing a struct/union BY VALUE to a "
+                                            "variadic function under this va_list "
+                                            "strategy is not realized "
+                                            "(internal: unknown VaListStrategy)");
+                                        return InvalidMirInst;
+                                    }
+                                    if (!appendByValueStackArg(operands, kids[i], argTy))
+                                        return InvalidMirInst;
+                                    // NOT counted in runGpr/runFpr — it's in the overflow
+                                    // (stack) area, consuming no arg register.
+                                } else {
+                                    if (!appendByValueArg(operands, kids[i], argTy, *abi))
+                                        return InvalidMirInst;
+                                    runGpr += 1;   // the pointer operand is GPR-class
                                 }
-                                if (!appendByValueArg(operands, kids[i], argTy, *abi))
-                                    return InvalidMirInst;
-                                runGpr += 1;   // the pointer operand is GPR-class
                             } else {
                                 // InRegisters: count the eightbyte pieces per class.
                                 std::uint32_t numGp = 0, numFp = 0;
@@ -711,14 +757,14 @@ struct Lowerer {
                                     if (p.cls == AbiPieceClass::Fpr) ++numFp;
                                     else ++numGp;
                                 }
+                                bool routeToStack = false;
                                 if (calleeVariadic) {
                                     // ATOMIC-FIT CHECK: SysV §3.5.7 — if the whole
                                     // aggregate's pieces do not ALL fit in the
                                     // remaining arg registers, it goes by value in
-                                    // MEMORY (no register/stack split). We can only
-                                    // express that with the by-value stack-arg
-                                    // mechanism. The vaListLayout MUST be present for
-                                    // a variadic callee (it is the gp/fp save-count
+                                    // MEMORY (no register/stack split) via the Option-C
+                                    // carrier. The vaListLayout MUST be present for a
+                                    // variadic callee (it is the gp/fp save-count
                                     // source); absent ⇒ struct varargs are impossible
                                     // on this CC.
                                     if (!config.vaListLayout.has_value()) {
@@ -771,29 +817,33 @@ struct Lowerer {
                                             "(internal: unknown VaListStrategy)");
                                         return InvalidMirInst;
                                     }
+                                    // The register-exhaustion SPLIT: if the pieces do
+                                    // not ALL fit in the remaining arg registers, SysV
+                                    // forces the WHOLE aggregate to memory (the overflow
+                                    // area) — route it to the Option-C carrier instead
+                                    // of register pieces (NOT a split).
                                     if (runGpr + numGp > vl.gpSaveCount
                                         || runFpr + numFp > vl.fpSaveCount) {
-                                        unsupported(kids[i],
-                                            "a struct/union vararg whose eightbyte "
-                                            "pieces do not all fit in the remaining "
-                                            "argument registers would be split across "
-                                            "registers and the stack; SysV requires "
-                                            "the whole aggregate in memory, which "
-                                            "needs the by-value stack-arg mechanism "
-                                            "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
-                                        return InvalidMirInst;
+                                        routeToStack = true;
                                     }
                                 }
-                                // FC7 C1b / FC12a-struct: push each eightbyte piece
-                                // as a scalar Call operand IN ORDER; lir_callconv
-                                // assigns them to consecutive per-class arg
-                                // registers. Then advance the running per-class
-                                // counts (after a SUCCESSFUL append, AFTER the
-                                // fit-check above).
-                                if (!appendByValueArg(operands, kids[i], argTy, *abi))
-                                    return InvalidMirInst;
-                                runGpr += numGp;
-                                runFpr += numFp;
+                                if (routeToStack) {
+                                    // Whole aggregate by value in the overflow area;
+                                    // runGpr/runFpr NOT advanced (no register consumed).
+                                    if (!appendByValueStackArg(operands, kids[i], argTy))
+                                        return InvalidMirInst;
+                                } else {
+                                    // FC7 C1b / FC12a-struct: push each eightbyte piece
+                                    // as a scalar Call operand IN ORDER; lir_callconv
+                                    // assigns them to consecutive per-class arg
+                                    // registers. Then advance the running per-class
+                                    // counts (after a SUCCESSFUL append, AFTER the
+                                    // fit-check above).
+                                    if (!appendByValueArg(operands, kids[i], argTy, *abi))
+                                        return InvalidMirInst;
+                                    runGpr += numGp;
+                                    runFpr += numFp;
+                                }
                             }
                             if (i == fnParamsSize) {
                                 fixedOperandCount =
@@ -2513,6 +2563,46 @@ struct Lowerer {
         return true;
     }
 
+    // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): append a by-value
+    // struct/union ARG that must be passed ENTIRELY in the outgoing overflow (stack)
+    // area — the Option-C carrier. Used at the variadic boundary for the two shapes
+    // SysV §3.2.3/§3.5.7 forces wholly to memory: a MEMORY-class (>16B) aggregate, AND
+    // an InRegisters aggregate whose eightbyte pieces do not all fit in the remaining
+    // arg registers (the register-exhaustion split). Copies the source into a callee-
+    // owned eightbyte-rounded temp (so the callee gets by-value semantics + a full-
+    // eightbyte read can't over-run a non-padded source), then pushes ONE Call operand:
+    // a `ByValueStackArg` wrapping the temp address, carrying the aggregate byte size as
+    // its payload. lir_callconv places it at the next overflow offset(s) (NOT a register
+    // — runGpr/runFpr are NOT advanced by the caller). CC-NEUTRAL: no SysV-specific
+    // assumption; the Win64/AAPCS64 struct-vararg cycles reuse this carrier. Returns
+    // false (fail-loud already emitted).
+    [[nodiscard]] bool appendByValueStackArg(std::vector<MirInstId>& operands,
+                                             HirNodeId argNode, TypeId aggTy) {
+        MirInstId const srcAddr = lowerLvalueAddress(argNode);
+        if (!srcAddr.valid()) return false;
+        StructLayout const* layout = cachedLayout(aggTy);
+        MirInstId const temp = freshAggregateTemp(aggTy);
+        if (layout == nullptr || !temp.valid()) {
+            unsupported(argNode, "by-value stack aggregate arg requires a sizeable "
+                                 "layout (target 'aggregateLayout' / complete type)");
+            return false;
+        }
+        if (!lowerByteWiseCopy(srcAddr, temp, layout->size)) return false;
+        if (layout->size > std::numeric_limits<std::uint32_t>::max()) {
+            unsupported(argNode, "by-value stack aggregate arg is too large to "
+                                 "encode its byte size");
+            return false;
+        }
+        std::array<MirInstId, 1> carrierOps{temp};
+        MirInstId const carrier =
+            mir.addInst(MirOpcode::ByValueStackArg, carrierOps,
+                        interner.pointer(aggTy),
+                        static_cast<std::uint32_t>(layout->size));
+        if (!carrier.valid()) return false;
+        operands.push_back(carrier);
+        return true;
+    }
+
     // Receive a by-value struct/union PARAM into its frame slot, consuming
     // physical-arg ordinals from the per-class `ArgOrdinalCounter` (kept in
     // lockstep with the caller's operand order). InRegisters ⇒ one Arg per
@@ -3302,8 +3392,10 @@ struct Lowerer {
     // (SysV §3.5.7). AGNOSTIC: the field offsets / save-area geometry come from
     // `config.vaListLayout`, the eightbyte CLASSIFICATION from `classifyAggregate`
     // (never a target/format/cc identity branch). Algorithm:
-    //   * Classify T. MEMORY class (>16B / empty) ⇒ fail loud (needs the by-value
-    //     stack-arg overflow mechanism — symmetric with the caller-side wall 1).
+    //   * Classify T. MEMORY class (>16B / empty) ⇒ the struct sits ENTIRELY by value
+    //     in the overflow area (SysV §3.5.7): dispatch EARLY to the overflow-only arm
+    //     (no register pieces → no diamond), the read-side mirror of the caller's
+    //     appendByValueStackArg (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT).
     //   * InRegisters (1-2 eightbyte pieces): the ATOMIC reg-vs-overflow decision —
     //     ALL pieces' classes must fit in the remaining save-area slots
     //     (gp_offset + num_gp*gpSlot <= gpLimit AND fp_offset + num_fp*fpSlot <=
@@ -3359,10 +3451,10 @@ struct Lowerer {
             return InvalidMirInst;
         }
         auto const abi = byValueClassify(t);
-        if (!abi.has_value() || abi->kind == AbiPassing::Kind::ByReference) {
+        if (!abi.has_value()) {
             unsupported(node,
-                "va_arg of a struct/union >16B (MEMORY class) is not yet supported "
-                "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+                "va_arg of a struct/union is not supported by this target's calling "
+                "convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
             return InvalidMirInst;
         }
         StructLayout const* layout = cachedLayout(t);
@@ -3390,6 +3482,39 @@ struct Lowerer {
         TypeId const voidPtr   = interner.pointer(interner.primitive(TypeKind::Void));
         TypeId const voidPtrPtr = interner.pointer(voidPtr);
         TypeId const boolTy    = interner.primitive(TypeKind::Bool);
+
+        // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a MEMORY-class (>16B)
+        // aggregate is passed ENTIRELY by value in the overflow area (SysV §3.5.7) —
+        // it has NO register pieces (numGp == numFp == 0), so it must NOT enter the
+        // reg-vs-overflow diamond below (a zero-piece atomic fit is trivially TRUE →
+        // the register arm would gather ZERO pieces → a garbage address). Dispatch
+        // EARLY to the overflow-only path: the struct sits at overflow_arg_area; that
+        // pointer is the result; bump overflow_arg_area by roundUp(size, gpSlotBytes)
+        // (a >16B struct occupies multiple stack eightbytes). Straight-line (no
+        // branch) since there is no register alternative. This is the read-side mirror
+        // of the caller's appendByValueStackArg overflow placement.
+        if (abi->kind == AbiPassing::Kind::ByReference) {
+            MirInstId const ovfPtr =
+                vaFieldPtr(tagBase, vl.overflowArgAreaField, voidPtrPtr);
+            if (!ovfPtr.valid()) return InvalidMirInst;
+            std::array<MirInstId, 1> loadOvfOps{ovfPtr};
+            MirInstId const ovfArea = mir.addInst(MirOpcode::Load, loadOvfOps, voidPtr);
+            // Round the struct up to a whole stack slot — the CC's pointer-width arg
+            // slot `vl.gpSlotBytes` (the same quantum the scalar/InRegisters overflow
+            // arms bump by), read from config, never a hardcoded 8 (agnostic).
+            std::uint64_t const slotQ = static_cast<std::uint64_t>(vl.gpSlotBytes);
+            std::uint64_t const roundedSize =
+                ((layout->size + slotQ - 1u) / slotQ) * slotQ;
+            MirInstId const stepK =
+                constInt(static_cast<std::int64_t>(roundedSize));
+            if (!stepK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> ovfStepOps{ovfArea, stepK};
+            MirInstId const ovfNext = mir.addInst(MirOpcode::Gep, ovfStepOps, voidPtr);
+            std::array<MirInstId, 2> ovfStore{ovfNext, ovfPtr};
+            mir.addInst(MirOpcode::Store, ovfStore);
+            // The aggregate's address IS overflow_arg_area (by address — NO Load).
+            return ovfArea;
+        }
 
         // Load both class cursors up front (the atomic decision needs both).
         MirInstId const gpOffPtr = vaFieldPtr(tagBase, vl.gpOffsetField, u32Ptr);
@@ -4222,7 +4347,6 @@ struct Lowerer {
         // function the per-class GPR ordinal equals the param index (no change); a
         // mixed int/float signature now lands each arg in its own class (fixes
         // D-ML7-2.10). `argCtr` is hoisted above (shared with the sret arg).
-        bool const fnVariadic = interner.fnIsVariadic(signature);
         for (std::size_t i = 0; i < params.size(); ++i) {
             HirNodeId const p = params[i];
             // A param is a VarDecl whose typeId carries the param's type;
@@ -4244,18 +4368,16 @@ struct Lowerer {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
                 }
-                // A ByReference (MEMORY class, >16B) fixed param uses the hidden-
-                // pointer convention, which the variadic cursor model does not yet
-                // thread (the fixed-stack/overflow geometry is the deferred piece).
-                // Fail loud rather than mis-account.
-                if (fnVariadic && abi->kind == AbiPassing::Kind::ByReference) {
-                    unsupported(p, "a by-value struct/union >16B (MEMORY class) "
-                                   "parameter in a variadic function is not yet "
-                                   "supported "
-                                   "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
-                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
-                    return false;
-                }
+                // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a ByReference
+                // (MEMORY class, >16B) FIXED param in a variadic fn uses the hidden-
+                // pointer convention — receiveByValueParam's ByReference arm receives
+                // it as ONE GPR arg (counted in argCtr.gpr → currentFnFixedGpr_), so
+                // va_start's gp_offset starts past it correctly, exactly like any
+                // other fixed GPR param. The SEPARATE fixed-params-OVERFLOW-to-stack
+                // case (≥7 fixed integer regs of THIS class → the va_start guard fires
+                // D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS) is unchanged; the common
+                // case (one >16B fixed param = 1 GPR + ≤5 scalars → currentFnFixedGpr_
+                // ≤ 6) lowers cleanly.
                 if (!receiveByValueParam(sym, ty, p, *abi, argCtr)) {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;

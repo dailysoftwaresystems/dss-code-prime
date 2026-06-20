@@ -44,6 +44,18 @@ alignUp(std::uint32_t n, std::uint32_t align) {
     return (n + align - 1u) & ~(align - 1u);
 }
 
+// FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): the number of outgoing
+// overflow SLOTS a by-value-stack aggregate of `bytes` occupies = ceil(bytes /
+// slotSize). One source of the slot formula so the pre-scan reservation
+// (computeMaxOutgoingStackArgs) and the placement byte-copy (materializeOneFunc)
+// can NEVER disagree — a divergence would either under-reserve the frame (the
+// stack stores clobber the frame, a silent miscompile) or over-reserve it.
+[[nodiscard]] inline std::uint32_t
+byValueStackAggSlots(std::uint32_t bytes, std::uint32_t slotSize) noexcept {
+    if (slotSize == 0) return 0;
+    return (bytes + slotSize - 1u) / slotSize;
+}
+
 // Walk every inst of a function and collect the set of phys-reg
 // ordinals that appear as a result or as a Reg-kind operand AND that
 // are in the cc's calleeSaved set. Returns each saved reg as a
@@ -435,6 +447,11 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
         static_cast<std::uint32_t>(cc.argFprs.size());
     std::uint32_t const slotAlignedPoolSize =
         std::max(gprPoolSize, fprPoolSize);
+    // FC12a-struct: the outgoing slot quantum (= GPR width) — the unit a by-value-
+    // stack aggregate's bytes round up to. MUST equal FrameLayout.outgoingSlotSize
+    // (computeFrameLayout sets it from widthForClass GPR), else the reservation and
+    // the placement store offsets disagree (a frame clobber).
+    std::uint32_t const outgoingSlotSize = widthForClass(schema, LirRegClass::GPR);
 
     std::uint32_t maxOverflow = 0;
     std::uint32_t const blockCount = src.funcBlockCount(fn);
@@ -450,10 +467,6 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
             auto const ops = src.instOperands(inst);
             if (ops.empty()) continue;  // malformed; the materialize
                                          // pass will report loud.
-            // Operand[0] is the callee SymbolRef (post-isel peephole);
-            // args are operands[1..].
-            std::uint32_t const argCount =
-                static_cast<std::uint32_t>(ops.size() - 1);
 
             // FC12c (D-FC12C-APPLE-ARM64-VARIADIC-CALLEE): the outgoing-arg-area
             // pre-scan MUST mirror the materialize placement loop's stack-forcing,
@@ -464,61 +477,82 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
             bool const variadicForcesStack =
                 cc.variadicArgsAlwaysStack
                 && ::dss::call_payload::isVariadic(payload);
+            std::uint32_t const fixedOps =
+                ::dss::call_payload::fixedOperandCount(payload);
 
-            std::uint32_t overflow = 0;
+            // Single pass over the arg operands (ops[1..]) that MIRRORS the
+            // materialize placement loop exactly. A by-value-stack aggregate is a
+            // (Reg, ByValueStackAgg) pair: the Reg is NOT a register arg (it does not
+            // consume a class pool slot) and the pair occupies ceil(bytes / slot)
+            // OVERFLOW slots UNCONDITIONALLY (FC12a-struct, D-FC12A-VARIADIC-MEMORY-
+            // CLASS-STRUCT). `byValSlots` accumulates those; the per-class / slot-
+            // aligned tallies count only ordinary register args; `forcedVarargs`
+            // counts the always-stacked variadic region (carriers excluded — already
+            // in byValSlots). `argRegionIdx` (the materialize loop's index, advanced
+            // once per ARG-position incl. a carrier) gates the forced-vararg region.
+            std::uint32_t gprArgs = 0, fprArgs = 0;     // register-arg class counts
+            std::uint32_t slotArgs = 0;                 // slot-aligned register-arg count
+            std::uint32_t byValSlots = 0;               // by-value-stack overflow slots
+            std::uint32_t forcedVarargs = 0;            // always-stacked variadic region
+            std::uint32_t argRegionIdx = 0;             // 0-based arg position
+            for (std::size_t k = 1; k < ops.size(); ++k) {
+                LirOperand const& argOp = ops[k];
+                if (argOp.kind == LirOperandKind::ByValueStackAgg) {
+                    // Marker — accounted with its preceding Reg; never a position.
+                    continue;
+                }
+                // A Reg immediately FOLLOWED by a ByValueStackAgg marker is a
+                // by-value-stack aggregate carrier (the address Reg). It occupies
+                // overflow slots, NOT a register; advance argRegionIdx (it IS an arg
+                // position for the forced-vararg boundary) but skip the class tally.
+                bool const isByValCarrier =
+                    argOp.kind == LirOperandKind::Reg
+                    && (k + 1) < ops.size()
+                    && ops[k + 1].kind == LirOperandKind::ByValueStackAgg;
+                if (isByValCarrier) {
+                    byValSlots += byValueStackAggSlots(ops[k + 1].byValueAggBytes,
+                                                       outgoingSlotSize);
+                    ++argRegionIdx;
+                    continue;
+                }
+                // FC12c always-stack: a vararg (arg position past the fixed ones) under
+                // such a CC is stacked regardless of class/pool. Count it as forced
+                // overflow and do NOT add it to the class tallies (it never fills a
+                // register slot). Named args fall through to the class tallies.
+                if (variadicForcesStack && argRegionIdx >= fixedOps) {
+                    ++forcedVarargs;
+                    ++argRegionIdx;
+                    continue;
+                }
+                // Ordinary register arg. Gate on Reg-kind only (silent-failure H1
+                // audit fold, 2026-06-02): a non-Reg/non-marker operand is a future
+                // isel bug the materialize gate reports loud — don't silently count it.
+                if (argOp.kind != LirOperandKind::Reg) { ++argRegionIdx; continue; }
+                if (argOp.reg.regClass() == LirRegClass::FPR) ++fprArgs;
+                else ++gprArgs;
+                ++slotArgs;
+                ++argRegionIdx;
+            }
+
+            std::uint32_t overflow = byValSlots;
             if (variadicForcesStack) {
-                // Named args fill registers (no overflow until a class pool is full);
-                // EVERY vararg (operand index >= fixedOperandCount) is stacked. The
-                // named args here never exceed the pools in the corpora, but bound the
-                // named-arg overflow too so a >8-fixed-arg variadic call is still safe.
-                std::uint32_t const fixedOps =
-                    ::dss::call_payload::fixedOperandCount(payload);
-                std::uint32_t const forcedVarargs =
-                    (argCount > fixedOps) ? (argCount - fixedOps) : 0u;
+                // forcedVarargs already excludes carriers (counted in byValSlots).
                 // Named-arg overflow under independent counters (Apple is NOT
                 // slotAligned; bound by the larger pool defensively if it ever is).
-                std::uint32_t namedGpr = 0, namedFpr = 0;
-                for (std::size_t k = 1; k < ops.size(); ++k) {
-                    if ((k - 1) >= fixedOps) break;  // only the named region
-                    LirOperand const& argOp = ops[k];
-                    if (argOp.kind != LirOperandKind::Reg) continue;
-                    if (argOp.reg.regClass() == LirRegClass::FPR) ++namedFpr;
-                    else ++namedGpr;
-                }
                 std::uint32_t const namedOverflow =
-                    ((namedGpr > gprPoolSize) ? (namedGpr - gprPoolSize) : 0u)
-                    + ((namedFpr > fprPoolSize) ? (namedFpr - fprPoolSize) : 0u);
-                overflow = forcedVarargs + namedOverflow;
+                    ((gprArgs > gprPoolSize) ? (gprArgs - gprPoolSize) : 0u)
+                    + ((fprArgs > fprPoolSize) ? (fprArgs - fprPoolSize) : 0u);
+                overflow += forcedVarargs + namedOverflow;
             } else if (cc.slotAligned) {
-                // Each arg consumes one shared slot regardless of class.
-                if (argCount > slotAlignedPoolSize) {
-                    overflow = argCount - slotAlignedPoolSize;
-                }
+                // Each register arg consumes one shared slot regardless of class.
+                if (slotArgs > slotAlignedPoolSize)
+                    overflow += slotArgs - slotAlignedPoolSize;
             } else {
-                // Independent counters per class. Gate on Reg-kind
-                // operands only (silent-failure H1 audit fold,
-                // 2026-06-02): the materialize call arm reports
-                // `L_VirtualRegInPostRegalloc` for non-Reg arg
-                // operands, but THIS pre-scan runs BEFORE the
-                // materialize gate. A future isel arm that puts an
-                // Imm or SymbolRef in operand[1..] would otherwise
-                // silently inflate this fn's frame by counting the
-                // non-Reg as a GPR arg.
-                std::uint32_t gprArgs = 0, fprArgs = 0;
-                for (std::size_t k = 1; k < ops.size(); ++k) {
-                    LirOperand const& argOp = ops[k];
-                    if (argOp.kind != LirOperandKind::Reg) continue;
-                    if (argOp.reg.regClass() == LirRegClass::FPR) {
-                        ++fprArgs;
-                    } else {
-                        ++gprArgs;
-                    }
-                }
                 std::uint32_t const gprOverflow =
                     (gprArgs > gprPoolSize) ? (gprArgs - gprPoolSize) : 0u;
                 std::uint32_t const fprOverflow =
                     (fprArgs > fprPoolSize) ? (fprArgs - fprPoolSize) : 0u;
-                overflow = gprOverflow + fprOverflow;
+                overflow += gprOverflow + fprOverflow;
             }
             if (overflow > maxOverflow) maxOverflow = overflow;
         }
@@ -1813,8 +1847,19 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     LirReg       src;
                     std::int32_t offset;  // from THIS fn's SP-post-prologue
                 };
+                // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a by-value-
+                // stack aggregate arg — byte-copy `bytes` from [addr] into the
+                // outgoing area at `dstOffset`. Emitted in the stack-store phase
+                // (before any register move) so the source `addr` reg is read while
+                // still intact. `addr` is the carrier's (already-physical) Reg.
+                struct ByValStackCopy {
+                    LirReg       addr;
+                    std::int32_t dstOffset;  // from THIS fn's SP-post-prologue
+                    std::uint32_t bytes;
+                };
                 std::vector<ArgMove> argMoves;
                 std::vector<StackArgStore> stackStores;
+                std::vector<ByValStackCopy> byValStackCopies;
                 argMoves.reserve(ops.size());
                 // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, PART 5): Win64 passes each FP
                 // VARARG in BOTH the XMM and the matching integer (home) register; the
@@ -1873,9 +1918,17 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 std::uint32_t gprIdx = 0;
                 std::uint32_t fprIdx = 0;
                 std::uint32_t slotIdx = 0;
-                std::uint32_t overflowIdx = 0;  // count of stack-args so far
+                std::uint32_t overflowIdx = 0;  // count of stack-arg SLOTS so far
+                // FC12a-struct: arg POSITION (advanced once per arg, incl. a by-value-
+                // stack aggregate carrier; NOT per raw operand — a carrier is a Reg +
+                // a ByValueStackAgg marker, two operands but ONE arg). The forced-
+                // vararg boundary + the pre-scan both index by this, so they agree.
+                std::uint32_t argRegionIdx = 0;
                 for (std::size_t i = firstArgIdx; i < ops.size(); ++i) {
                     LirOperand const& argOp = ops[i];
+                    // FC12a-struct: the ByValueStackAgg marker is consumed WITH its
+                    // preceding Reg (below) — never on its own. Skip it here.
+                    if (argOp.kind == LirOperandKind::ByValueStackAgg) continue;
                     if (argOp.kind != LirOperandKind::Reg
                         || argOp.reg.isPhysical == 0) {
                         report(reporter,
@@ -1884,12 +1937,32 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                std::format("callconv: call inst {} arg {} "
                                            "is not a physical-reg operand "
                                            "after regalloc", inst.v,
-                                           i - firstArgIdx));
+                                           argRegionIdx));
                         return false;
                     }
                     LirReg const srcReg = argOp.reg;
                     LirRegClass const cls = srcReg.regClass();
-                    std::size_t const argRegionIdx = i - firstArgIdx;
+                    // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a Reg
+                    // immediately FOLLOWED by a ByValueStackAgg marker is the by-value-
+                    // stack aggregate carrier. It is passed ENTIRELY in the overflow
+                    // area by a byte-copy from its address reg — UNCONDITIONALLY, never
+                    // in a register, never split (SysV §3.2.3/§3.5.7). It consumes NO
+                    // arg register (the class/slot counters do NOT advance) and reserves
+                    // ceil(bytes / slot) overflow slots. This is the force-to-stack
+                    // lever the greedy register-then-overflow placement otherwise lacks.
+                    if ((i + 1) < ops.size()
+                        && ops[i + 1].kind == LirOperandKind::ByValueStackAgg) {
+                        std::uint32_t const aggBytes = ops[i + 1].byValueAggBytes;
+                        std::int32_t const dstOffset =
+                            static_cast<std::int32_t>(
+                                static_cast<std::uint32_t>(cc.shadowSpaceBytes)
+                                + overflowIdx * outLayout.outgoingSlotSize);
+                        byValStackCopies.push_back({srcReg, dstOffset, aggBytes});
+                        overflowIdx += byValueStackAggSlots(
+                            aggBytes, outLayout.outgoingSlotSize);
+                        ++argRegionIdx;
+                        continue;
+                    }
                     std::uint32_t argIndex;
                     std::uint32_t poolSize;
                     if (cc.slotAligned) {
@@ -1948,6 +2021,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         stackStores.push_back({srcReg, offset});
                         ++overflowIdx;
                     }
+                    ++argRegionIdx;   // this arg position is done (one per arg)
                 }
                 // FC7 C3: route the prepended sret pointer (ops[1]) to the cc's
                 // indirect-result register. APPENDED to argMoves (last) so it joins
@@ -2138,6 +2212,113 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     if (!stkStore.has_value()) return false;
                     emitFrameStore(b, *stkStore, s.src, sp, s.offset);
                 }
+                // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): emit the by-
+                // value-stack aggregate byte-copies — ALSO in the stack-store phase
+                // (before any register move), so each carrier's source ADDRESS reg is
+                // read while still intact. Each copy reads chunks from [addr + off] and
+                // writes them to the outgoing area at [sp + dstOffset + off], via a
+                // caller-saved scratch GPR. The scratch must avoid: SP, the indirect
+                // callee reg, the variadic vector-count reg, AND every carrier's
+                // address reg (a later carrier's address must survive an earlier copy).
+                // GPR-chunked (load/store class GPR) — the byte size rounds to whole
+                // outgoing slots, so the copy can over-read into the temp's own padding
+                // (the temp is a 16-rounded freshAggregateTemp) but never past it.
+                if (!byValStackCopies.empty()) {
+                    auto const gpLoad = classOpHandle(
+                        schema, LirRegClass::GPR, RegClassOp::Load,
+                        "materializeOneFunc: by-value-stack agg copy load", reporter);
+                    auto const gpStore = classOpHandle(
+                        schema, LirRegClass::GPR, RegClassOp::Store,
+                        "materializeOneFunc: by-value-stack agg copy store", reporter);
+                    if (!gpLoad.has_value() || !gpStore.has_value()) return false;
+                    std::uint32_t const chunk =
+                        widthForClass(schema, LirRegClass::GPR);
+                    if (chunk == 0) {
+                        report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+                               DiagnosticSeverity::Error,
+                               "callconv: by-value-stack aggregate copy requires a "
+                               "nonzero GPR width (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+                        return false;
+                    }
+                    // FOLD (adversarial-review BLOCKER-3, silent miscompile): the
+                    // byte-copies are emitted HERE, in the stack-store phase, BEFORE the
+                    // register arg-moves (`argMoves`, below) and the Win64 FP-vararg
+                    // duplications (`fpDupMoves`, below) read their `.src`. So the scratch
+                    // must additionally avoid every register those LATER moves still read
+                    // as a SOURCE — otherwise, if regalloc parked an outgoing scalar arg
+                    // VALUE in the chosen scratch, the byte-copy would clobber it before
+                    // its `mov dest, src` could read it, and that argument would silently
+                    // receive the struct's bytes. The sret indirect-result source is
+                    // ALREADY appended to `argMoves` above (so iterating argMove sources
+                    // covers it); `fpDupMove` sources are XMM/FPR regs (never GPR
+                    // candidates) but are included for completeness.
+                    //
+                    // NOTE the avoid-set is the precise SOURCE set, NOT the whole
+                    // `cc.argGprs` pool: an arg-move's DEST register (e.g. an argGpr that
+                    // only RECEIVES a value) is written by that move AFTER this copy
+                    // finishes storing to memory, so the copy's transient write to it is
+                    // already dead — it is safe scratch. Blanket-rejecting all argGprs
+                    // (the lir_rewrite collectAllocatable precedent, which guards a
+                    // DIFFERENT mechanism: a spill-reload that lands BETWEEN the
+                    // not-yet-emitted arg moves) would here falsely fail-loud on a valid
+                    // register-exhaustion call that legitimately fills every argGpr as a
+                    // DEST (see examples/c-subset/varargs_struct_split: 1 fixed + 5 longs
+                    // exhaust rdi..r9, all dests) — so we exclude only argGprs that are
+                    // ALSO a live source, which `liveArgSrc` already captures.
+                    std::unordered_set<std::uint16_t> liveArgSrc;
+                    for (auto const& m : argMoves)
+                        if (m.src.isPhysical != 0) liveArgSrc.insert(m.src.id);
+                    for (auto const& m : fpDupMoves)
+                        if (m.src.isPhysical != 0) liveArgSrc.insert(m.src.id);
+                    // Pick a caller-saved GPR scratch avoiding the hazard set above.
+                    std::optional<LirReg> scratch;
+                    for (std::string_view const name : cc.callerSaved) {
+                        auto const ord = schema.registerByName(name);
+                        if (!ord.has_value()) continue;
+                        auto const* rinfo = schema.registerInfo(*ord);
+                        if (rinfo == nullptr
+                            || rinfo->regClass != TargetRegClass::GPR) continue;
+                        bool clash = false;
+                        if (calleeIsReg && *ord == calleeOp.reg.id) clash = true;
+                        if (!clash
+                            && ::dss::call_payload::isVariadic(payload)
+                            && cc.variadicVectorCountReg.has_value()
+                            && cc.variadicVectorCountReg->ordinal == *ord)
+                            clash = true;
+                        if (!clash)
+                            for (auto const& cpy : byValStackCopies)
+                                if (cpy.addr.id == *ord) { clash = true; break; }
+                        // FOLD: reject any reg a later arg-move/FP-dup source reads
+                        // (the silent arg-clobber avoid-set).
+                        if (!clash && liveArgSrc.contains(*ord)) clash = true;
+                        if (clash) continue;
+                        scratch = makePhysicalReg(*ord, LirRegClass::GPR);
+                        break;
+                    }
+                    if (!scratch.has_value()) {
+                        report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+                               DiagnosticSeverity::Error,
+                               std::format("callconv: call inst {} found no free caller-"
+                                           "saved scratch GPR for a by-value-stack "
+                                           "aggregate copy "
+                                           "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)",
+                                           inst.v));
+                        return false;
+                    }
+                    for (auto const& cpy : byValStackCopies) {
+                        // Copy ceil(bytes/chunk)*chunk bytes in `chunk`-wide steps. The
+                        // dst slots were reserved as whole outgoing slots (= chunk), so
+                        // the tail step writes a full slot (reading the temp's padding)
+                        // — bounded by the 16-rounded temp + the reserved slot span.
+                        std::uint32_t off = 0;
+                        for (; off < cpy.bytes; off += chunk) {
+                            emitFrameLoad(b, *gpLoad, *scratch, cpy.addr,
+                                          static_cast<std::int32_t>(off));
+                            emitFrameStore(b, *gpStore, *scratch, sp,
+                                           cpy.dstOffset + static_cast<std::int32_t>(off));
+                        }
+                    }
+                }
                 // Cycle-free — emit register moves in order. FC2
                 // Part B: each move's mnemonic follows its class
                 // (FPR arg-passing moves use movaps).
@@ -2204,6 +2385,11 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         // produced, not the param count.
                         std::size_t const argIdx = i - firstArgIdx;
                         if (argIdx < fixedCount) continue;
+                        // FC12a-struct: a by-value-stack aggregate is a (Reg,
+                        // ByValueStackAgg) pair — the GPR-class address Reg fails the
+                        // FPR test below, and the marker is non-Reg, so NEITHER inflates
+                        // the SSE/AL count (a by-value MEMORY-class struct vararg has no
+                        // SSE register pieces — SysV §3.5.7). No special-case needed.
                         if (ops[i].kind != LirOperandKind::Reg) continue;
                         if (ops[i].reg.regClass() == LirRegClass::FPR) {
                             ++vectorArgsInVararg;

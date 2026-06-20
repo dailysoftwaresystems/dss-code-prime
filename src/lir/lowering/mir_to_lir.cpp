@@ -1303,6 +1303,7 @@ struct Lowerer {
             case MirOpcode::UIToFP:  return lowerCast(id, MnemonicSlot::UiToFp,  "MIR UIToFP");
             // ── cycle 3e: Calls + GlobalAddr ───────────────────────
             case MirOpcode::GlobalAddr:    return lowerGlobalAddr(id);
+            case MirOpcode::ByValueStackArg: return lowerByValueStackArg(id);
             case MirOpcode::Call:          return lowerCall(id);
             case MirOpcode::IntrinsicCall: return lowerIntrinsicCall(id);
             // ── cycle 3e: aggregate ops (memory-flattening lowering) ──
@@ -2102,6 +2103,28 @@ struct Lowerer {
     // OUT of isel is the abstract `call(callee, args...)` form —
     // target-blind — and the callconv pass rewrites it to the
     // schema-encodable single-SymbolRef form.
+    // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): the by-value-aggregate
+    // stack-arg carrier. Its sole operand is the temp ADDRESS (a pointer value); its
+    // result THREADS THAT ADDRESS through (a pure value-map alias, NO LIR emitted) so
+    // a later `lowerCall` resolving this operand gets the address register. The
+    // payload (aggregate byte size) is read by `lowerCall` directly off the MIR op to
+    // build the `ByValueStackAgg` size marker — it never needs a register. The carrier
+    // is only ever consumed by a Call (it sits in the Call's operand list at the
+    // aggregate's argument position); aliasing the address keeps the value-map total
+    // without an extra mov. (A stray ByValueStackArg whose result is consumed by
+    // anything OTHER than a Call's by-value-stack arm would simply read the address,
+    // which is harmless — but no such source path exists.)
+    void lowerByValueStackArg(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(MirOpcode::ByValueStackArg, id);
+            return;
+        }
+        std::optional<LirReg> const addr = regForValue(operands[0]);
+        if (!addr.has_value()) return;   // poisoned upstream; diagnostic already out
+        defineValue(id, *addr);          // alias: result IS the address vreg
+    }
+
     void lowerCall(MirInstId id) {
         // Cycle 3e fix-up: opcode resolution now goes through the
         // MnemonicCache (was ad-hoc `target.opcodeByMnemonic("call")`
@@ -2195,10 +2218,17 @@ struct Lowerer {
             return;
         }
 
+        // Resolve every arg operand's register FIRST (the hoist discipline:
+        // a mid-build bail-out must not leave a partial operand list dangling).
+        // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): an operand whose
+        // defining MIR op is `ByValueStackArg` is the by-value-aggregate stack-arg
+        // carrier — its (already-resolved) register holds the temp ADDRESS and it
+        // expands to TWO LIR operands (the address Reg + a `ByValueStackAgg` size
+        // marker). For a normal operand it's a single Reg. We resolve all the regs
+        // up front, then build `ops` (so the partial-list hazard can't happen).
+        std::size_t const firstArgIdx = calleeIsGlobalAddr ? 1u : 0u;
         std::vector<LirReg> argRegs;
         argRegs.reserve(operands.size());
-        // Skip operand[0] (callee) when we fold it; otherwise include it.
-        std::size_t const firstArgIdx = calleeIsGlobalAddr ? 1u : 0u;
         for (std::size_t i = firstArgIdx; i < operands.size(); ++i) {
             std::optional<LirReg> const r = regForValue(operands[i]);
             if (!r.has_value()) return;
@@ -2214,12 +2244,24 @@ struct Lowerer {
         // Indirect (fn-pointer): [callee_reg, arg0, arg1, ...]
         //     (FC4 c2 — materialized as `call <reg>` by lir_callconv
         //     against the schema's `["reg"]` encoding variant).
+        // A by-value-stack aggregate arg expands to [..., addrReg, ByValueStackAgg].
         std::vector<LirOperand> ops;
-        ops.reserve(argRegs.size() + 1);
+        ops.reserve(argRegs.size() + 2);
         if (calleeIsGlobalAddr) {
             ops.push_back(LirOperand::makeSymbolRef(calleeSym.v));
         }
-        for (auto const r : argRegs) ops.push_back(LirOperand::makeReg(r));
+        for (std::size_t k = 0; k < argRegs.size(); ++k) {
+            MirInstId const operandMir = operands[firstArgIdx + k];
+            ops.push_back(LirOperand::makeReg(argRegs[k]));
+            if (mir.instOpcode(operandMir) == MirOpcode::ByValueStackArg) {
+                // The preceding Reg is the aggregate's temp address; this marker
+                // carries the byte size (the MIR op's payload) so lir_callconv
+                // reserves ceil(size / outgoingSlot) overflow slots + byte-copies
+                // the temp into the outgoing area instead of register-passing it.
+                ops.push_back(LirOperand::makeByValueStackAgg(
+                    mir.instPayload(operandMir)));
+            }
+        }
 
         // Result class follows MIR's result type. Void-returning calls
         // produce an invalid result vreg (no value).

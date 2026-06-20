@@ -85,6 +85,20 @@ enum class LirOperandKind : std::uint8_t {
     // through `LirLiteralPool` (cycle 3c). `litIndex` indexes into the
     // owning module's pool; consumers fetch via `lir.literalValue(idx)`.
     LiteralIndex = 8,
+    // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a by-value-
+    // aggregate stack-arg MARKER on a Call's operand list. It carries the
+    // aggregate's BYTE SIZE (`byValueAggBytes`) and ALWAYS immediately
+    // FOLLOWS the `Reg` operand holding the aggregate's temp address —
+    // mirroring the leading-Reg + trailing-descriptor convention the
+    // memory addressing modes use (Reg + MemBase + MemOffset). The
+    // preceding Reg is a normal register use (liveness/regalloc track it,
+    // keeping the temp address live to the callconv pass); this marker is
+    // invisible to liveness/regalloc (not a Reg) and tells lir_callconv to
+    // pass that aggregate ENTIRELY in the outgoing overflow area by a
+    // byte-wise copy (ceil(size / outgoingSlot) slots), never in a register
+    // and never split (SysV §3.2.3/§3.5.7). CC-neutral: the size is the
+    // only datum; the overflow placement is the callconv's, config-driven.
+    ByValueStackAgg = 9,
 };
 
 // One slot in the operand pool. The tag picks the active field.
@@ -99,6 +113,7 @@ struct LirOperand {
         std::uint32_t scale;      // 4 — kind == MemBase (1/2/4/8)
         std::int32_t  offset;     // 4 — kind == MemOffset
         std::uint32_t litIndex;   // 4 — kind == LiteralIndex (into LirLiteralPool)
+        std::uint32_t byValueAggBytes; // 4 — kind == ByValueStackAgg (aggregate byte size)
     };
 
     constexpr LirOperand() noexcept : kind(LirOperandKind::None), reg{} {}
@@ -150,6 +165,14 @@ struct LirOperand {
         LirOperand o{};
         o.kind     = LirOperandKind::LiteralIndex;
         o.litIndex = idx;
+        return o;
+    }
+    // FC12a-struct: the by-value-aggregate stack-arg size marker. ALWAYS emitted
+    // immediately AFTER the Reg operand holding the aggregate's temp address.
+    [[nodiscard]] static constexpr LirOperand makeByValueStackAgg(std::uint32_t bytes) noexcept {
+        LirOperand o{};
+        o.kind            = LirOperandKind::ByValueStackAgg;
+        o.byValueAggBytes = bytes;
         return o;
     }
 };
