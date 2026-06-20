@@ -1,6 +1,7 @@
 #include "program/program.hpp"
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
+#include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: build CUs on a large stack
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -807,12 +808,22 @@ int Program::compileFiles(
     // (cross-file references resolved WITHIN the CU; each file routes to the language's
     // schema by extension). For one CU per file (a multi-CU image the linker MERGES, LK11)
     // use `compileUnits` — this entry's single-CU semantics are unchanged.
-    UnitBuilder builder{grammar};
-    applySystemDirs(builder, *grammar);
-    for (auto const& path : sourceFiles) {
-        builder.addFile(fs::path{path});
-    }
-    auto cu = std::move(builder).finish();
+    // D-PARSE-DEEP-FRONTEND-STACK: the CU build (preprocess + parse + the
+    // type-name oracle reparse) recurses over the expression tree on the
+    // thread stack, so a deeply-nested-but-legal expression that the raised
+    // parser cap (256) admits would overflow the host's ~1 MB main stack
+    // here — symmetric to the downstream `analyze` overflow. Run it on the
+    // same 64 MiB worker stack (synchronous join) so parse and analysis are
+    // BOTH deep-safe and the cap is a real semantic limit end-to-end.
+    auto cu = substrate::callOnLargeStack(
+        substrate::kDeepRecursionStackBytes, [&] {
+            UnitBuilder builder{grammar};
+            applySystemDirs(builder, *grammar);
+            for (auto const& path : sourceFiles) {
+                builder.addFile(fs::path{path});
+            }
+            return std::move(builder).finish();
+        });
 
     // Stem of the first source file names the artifact (one artifact per target). Plan 06
     // will eventually let artifact profiles override this.
@@ -873,10 +884,16 @@ int Program::compileUnits(
     std::vector<CompilationUnit> cus;
     cus.reserve(sourceFiles.size());
     for (auto const& path : sourceFiles) {
-        UnitBuilder builder{grammar};
-        applySystemDirs(builder, *grammar);
-        builder.addFile(fs::path{path});
-        cus.push_back(std::move(builder).finish());
+        // D-PARSE-DEEP-FRONTEND-STACK: build each CU on the 64 MiB worker
+        // stack (see compileFiles for the rationale) so a deeply-nested
+        // expression parses without overflowing the host main stack.
+        cus.push_back(substrate::callOnLargeStack(
+            substrate::kDeepRecursionStackBytes, [&] {
+                UnitBuilder builder{grammar};
+                applySystemDirs(builder, *grammar);
+                builder.addFile(fs::path{path});
+                return std::move(builder).finish();
+            }));
     }
 
     std::string const sourceStem = fs::path{sourceFiles.front()}.stem().string();

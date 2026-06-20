@@ -4,6 +4,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "asm/asm.hpp"
+#include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: BUILD half on a large stack
 #include "core/types/parse_diagnostic.hpp"
 #include "ffi/ingest.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
@@ -132,7 +133,43 @@ bool optimizeModule(Mir&                  mir,
 // `SemanticModel` is MOVED into the result so its `TypeLattice` interner stays alive
 // past this call — `lowerCuMirToAssembly` re-opens it for MIR→LIR + the symbol-table
 // populate. Returns nullopt on any front-half tier failure (diagnostics via `reporter`).
+// Forward decl of the deep-frontend BUILD body; the public `buildCuMir`
+// below runs it on a large worker stack.
+static std::optional<CuMirModule> buildCuMirImpl(
+    CompilationUnit const& cu, GrammarSchema const& grammar,
+    TargetSchema const& target, ObjectFormatSchema const& format,
+    std::uint16_t callingConventionIndex, DiagnosticReporter& reporter,
+    CompileOptions const& opts);
+
+// D-PARSE-DEEP-FRONTEND-STACK: the per-CU BUILD half runs the three frontend
+// stages that recurse one host-stack frame per expression-nesting level —
+// semantic `analyze`, CST→HIR (`lowerToHir`), and HIR→MIR (`lowerToMir`). At
+// the raised parser cap (256) a deep-but-legal expression would overflow the
+// host's ~1 MB main thread mid-lowering: HIR/MIR run inline on the caller's
+// thread, AFTER `analyze`'s own worker has already joined. So the WHOLE BUILD
+// half runs on a 64 MiB worker stack (synchronous join — no concurrency).
+// NOTE: `analyze` ALSO self-wraps (it has direct callers, e.g. the diagnostic-
+// corpus test); reached through here it is a benign NESTED worker — only one
+// stack is ever live-deep at a time (analyze's, then HIR/MIR's), peak ~10 MB
+// (256 × ~40 KB) << 64 MiB. The LOWER half (MIR→LIR→codegen,
+// `lowerMirModuleToAssembly`) iterates a flat SSA arena, not a tree, so it
+// needs no wrap.
 std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
+                                      GrammarSchema const&          grammar,
+                                      TargetSchema const&           target,
+                                      ObjectFormatSchema const&     format,
+                                      std::uint16_t                 callingConventionIndex,
+                                      DiagnosticReporter&           reporter,
+                                      CompileOptions const&         opts) {
+    return substrate::callOnLargeStack(
+        substrate::kDeepRecursionStackBytes, [&] {
+            return buildCuMirImpl(cu, grammar, target, format,
+                                  callingConventionIndex, reporter, opts);
+        });
+}
+
+static std::optional<CuMirModule> buildCuMirImpl(
+                                      CompilationUnit const&        cu,
                                       GrammarSchema const&          grammar,
                                       TargetSchema const&           target,
                                       ObjectFormatSchema const&     format,

@@ -7,6 +7,7 @@
 // tree shape isn't obscured by surrounding syntax.
 
 #include "analysis/syntactic/parser.hpp"
+#include "core/substrate/large_stack_call.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -837,18 +838,29 @@ TEST(PrattWalker, ExceedingMaxExpressionDepthDiagnosesAndRecovers) {
 }
 
 // The HEADLINE pin: a pathologically deep PAREN nest — 1000 levels, far
-// past the DEFAULT cap and far past the C++ stack-overflow depth — must
-// yield the POSITIONED diagnostic, NOT a raw stack overflow / rc-127 /
+// past the DEFAULT cap (256) and far past the C++ stack-overflow depth —
+// must yield the POSITIONED diagnostic, NOT a raw stack overflow / rc-127 /
 // hang. Paren is the heaviest recursion path (atom re-entry through the
 // frame machinery). Runs at the DEFAULT cap (no lowering) to prove the
 // shipped configuration is crash-safe.
+//
+// D-PARSE-DEEP-FRONTEND-STACK: at the raised default cap (256) the guard
+// deliberately lets the parser build a ~256-deep tree before firing — which
+// needs the large worker stack the production driver runs the parse on
+// (Program::compileFiles wraps the CU build via callOnLargeStack). So this
+// pin runs the parse on that SAME 64 MiB stack: it proves the guard fires
+// within the production stack budget, exactly as it does end-to-end. (The
+// shallower cap=4 variants below build tiny trees and need no wrap.)
 TEST(PrattWalker, DeeplyNestedParensDiagnoseAtDefaultCapWithoutCrashing) {
     std::string src = "x";
     constexpr int kDepth = 1000;
     for (int i = 0; i < kDepth; ++i) src = "(" + src + ")";
     src += ";";
-    // DEFAULT cap (ParserConfig default) — not lowered.
-    Tree t = parse(kParenSchema, std::move(src));
+    // DEFAULT cap (ParserConfig default) — not lowered. Built on the large
+    // stack, mirroring the production deep-parse path.
+    Tree t = dss::substrate::callOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes,
+        [&] { return parse(kParenSchema, std::move(src)); });
 
     ASSERT_NE(t.root(), InvalidNode);
     // At least one positioned too-deep diagnostic surfaced (the guard

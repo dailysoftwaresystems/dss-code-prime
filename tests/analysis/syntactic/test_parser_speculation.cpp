@@ -1,4 +1,5 @@
 #include "analysis/syntactic/parser.hpp"
+#include "core/substrate/large_stack_call.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -17,19 +18,8 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
-
-#if defined(_WIN32)
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <windows.h>
-#endif
 
 using namespace dss;
 
@@ -572,33 +562,6 @@ timeDeepNestParse(std::shared_ptr<GrammarSchema const> const& schema,
     return std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0);
 }
 
-#if defined(_WIN32)
-// WINAPI (__stdcall) trampoline for CreateThread. The lpParameter is a
-// pointer to a std::function<void()> the caller keeps alive across the join.
-inline unsigned long __stdcall largeStackTrampoline(void* p) {
-    (*static_cast<std::function<void()>*>(p))();
-    return 0;
-}
-#endif
-
-// Run `fn` on a thread with a LARGE stack so the deep-nest parse can recurse
-// hundreds/thousands of paren levels without tripping the parser's own
-// host-stack ceiling (D-PARSE-DEEP-FRONTEND-STACK), which is what limits
-// depth here — NOT the speculation cost the test measures. Win32 thread with
-// an explicit stack reserve on Windows; a std::thread fallback elsewhere.
-inline void runOnLargeStack(std::function<void()> fn) {
-#if defined(_WIN32)
-    constexpr SIZE_T kStackBytes = SIZE_T{256} * 1024 * 1024;  // 256 MiB
-    HANDLE h = ::CreateThread(nullptr, kStackBytes, &largeStackTrampoline,
-                              &fn, 0, nullptr);
-    ASSERT_NE(h, nullptr) << "CreateThread failed for the large-stack runner";
-    ::WaitForSingleObject(h, INFINITE);
-    ::CloseHandle(h);
-#else
-    std::thread(std::move(fn)).join();
-#endif
-}
-
 } // namespace
 
 TEST(ParserSpeculation, DeepNestCastVsParenIsLinear) {
@@ -621,7 +584,12 @@ TEST(ParserSpeculation, DeepNestCastVsParenIsLinear) {
     // ~4× — and the historical bug's per-level panic-scan blowup pushes it
     // FAR past that (the pre-fix CLI hung for >150 s at N=300).
     std::chrono::nanoseconds t500{}, t1000{};
-    runOnLargeStack([&] {
+    // The shared substrate large-stack runner (the SAME facility the production
+    // driver uses for the deep parse). A 256 MiB reserve gives this stress test
+    // generous headroom at the 4000-deep cap — well above the 64 MiB the
+    // shipped pipeline reserves for the 256-deep shipped cap.
+    constexpr std::size_t kRunnerStackBytes = std::size_t{256} * 1024 * 1024;
+    dss::substrate::runOnLargeStack(kRunnerStackBytes, [&] {
         // Warm allocator/caches so the first timed run isn't setup-taxed.
         (void)timeDeepNestParse(schema, 50, kCap);
         t500  = timeDeepNestParse(schema, 500,  kCap);

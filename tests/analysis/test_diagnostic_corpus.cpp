@@ -20,6 +20,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/substrate/large_stack_call.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -97,9 +98,18 @@ namespace {
     }
     const std::string source = dss::test_support::readFile(sourceFile);
 
-    UnitBuilder builder{*loaded};
-    builder.addInMemory(source, sourceFile.filename().string());
-    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    // D-PARSE-DEEP-FRONTEND-STACK: build the CU on the large worker stack
+    // exactly as the production driver does (Program::compileFiles). A
+    // deeply-nested corpus fixture (e.g. expression_too_deeply_nested.c,
+    // >256 parens to trip the depth cap) parses a ~256-deep tree, which
+    // would overflow this test thread's default stack if built inline.
+    auto cu = dss::substrate::callOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes,
+        [&]() -> std::shared_ptr<CompilationUnit> {
+            UnitBuilder builder{*loaded};
+            builder.addInMemory(source, sourceFile.filename().string());
+            return std::make_shared<CompilationUnit>(std::move(builder).finish());
+        });
 
     // BufferId -> source buffer, for line:col resolution (reuses the
     // Part-A registry + `Tree::sourceShared()`).

@@ -1,0 +1,10 @@
+{
+  "$comment": "D-PARSE-DEEP-FRONTEND-STACK end-to-end witness: a DEEP-but-legal expression (200 nested parens around a literal, just under the 256 cap) compiles AND runs to exit 7 — exercising the WHOLE pipeline (parse -> analyze -> CST->HIR -> HIR->MIR -> codegen) at 200 nesting levels. The parser's maxExpressionDepth cap is 256 because (1) the speculative operand probe is O(N) via the LL(k) predictive prune (D-PARSE-SPECULATION-OPERAND-QUADRATIC) and (2) the deep-recursive frontend — the CU build (parse) AND the BUILD half (analyze + CST->HIR + HIR->MIR, each recursing one host-stack frame per nesting level) — runs on a 64 MiB worker stack (core/substrate/large_stack_call) instead of the host's ~1 MB main stack, which overflows at ~25 levels. 200 parens is far past the old crash point (~25) and old cap (16) and DEEP into HIR/MIR lowering (the stages an earlier draft left on the main stack); a regression that unwrapped any deep stage would crash (rc-127) here instead of exiting 7.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 7,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] }
+  ]
+}

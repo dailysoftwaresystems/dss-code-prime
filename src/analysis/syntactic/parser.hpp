@@ -69,21 +69,26 @@ struct DSS_EXPORT ParserConfig {
     // chains build ITERATIVELY in the climb loop and never deepen the
     // stack, so they do not count against this cap regardless of length.)
     //
-    // The cap is deliberately LOW (16). Two pre-existing properties of the
-    // c-subset frontend make a higher cap impractical until each is fixed:
-    // (1) the parse's DOWNSTREAM consumers (semantic analysis, HIR/MIR
-    // lowering) recurse over the expression tree on the host's default
-    // ~1 MB thread stack and overflow at ~25 levels (D-PARSE-DEEP-FRONTEND-
-    // STACK); (2) the c-subset `operand` rule's speculative cast-vs-paren
-    // probe is super-linear (O(N^2)+) in nesting depth, so a deeply-nested
-    // expression is slow to PARSE and the guard is slow to REACH at a high
-    // cap (D-PARSE-SPECULATION-OPERAND-QUADRATIC). A cap of 16 keeps fail-
-    // loud prompt (the guard is reached fast), truncates the tree well
-    // before the downstream overflow, and comfortably admits hand-written C
-    // (real expression nesting is far under 16). Raising the cap to support
-    // deep machine-generated nesting requires BOTH fixes — a dedicated
-    // follow-up, tracked by the two anchors named above.
-    std::size_t maxExpressionDepth = 16;
+    // The cap (256) is now a real SEMANTIC limit on nesting depth, not a
+    // host-stack artifact. Both former blockers to a high cap are resolved:
+    // (1) the c-subset `operand` rule's speculative cast-vs-paren probe is
+    // no longer super-linear — a config-driven LL(k) predictive prune makes
+    // the parse O(N) in nesting depth (D-PARSE-SPECULATION-OPERAND-QUADRATIC,
+    // closed), so the guard is reached promptly even at this cap; (2) the
+    // parse's DOWNSTREAM consumer that overflowed the host's ~1 MB main
+    // thread stack at ~25 levels — semantic `analyze` — now runs on a
+    // dedicated 64 MiB worker stack, as do the CU build (parse) and the
+    // HIR/MIR lowering (the `buildCuMir` BUILD half); these three frontend
+    // stages all recurse per nesting level (D-PARSE-DEEP-FRONTEND-STACK,
+    // closed; see `core/substrate/large_stack_call.hpp` and
+    // `kDeepRecursionStackBytes`).
+    // So deep-but-legal C (machine-generated nesting included) compiles end-
+    // to-end, and only genuinely pathological nesting past 256 trips this
+    // guard — a positioned `P_ExpressionTooDeep` with graceful recovery,
+    // never a raw stack overflow. 256 is deep enough for any realistic
+    // generated input while keeping the worst-case worker stack (~256 ×
+    // ~40 KB/level ≈ 10 MB) comfortably inside the 64 MiB reserve.
+    std::size_t maxExpressionDepth = 256;
 
     // Recovery strategy for unrecognized tokens. Default scans to
     // the next sync/follow point; `SingleToken` is the legacy single-
