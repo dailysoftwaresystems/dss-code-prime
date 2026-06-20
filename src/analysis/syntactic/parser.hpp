@@ -57,14 +57,33 @@ struct DSS_EXPORT ParserConfig {
     // nesting independently of the builder's checkpoint cap.
     std::size_t maxSpeculationDepth = 8;
 
-    // Recursion-depth cap for the Pratt walker's C++-stack recursion
-    // on the right-hand side of infix operators. Pathological input
-    // (deeply nested parens or right-assoc chains) would otherwise
-    // blow the call stack. The walker fatal-aborts when this cap is
-    // exceeded — same posture as the dispatch loop's forward-progress
-    // watchdog. 256 fits both real C-style code and the test corpus
-    // with plenty of headroom.
-    std::size_t maxExpressionDepth = 256;
+    // Recursion-depth cap for the Pratt walker's C++-stack recursion.
+    // EVERY expression-deepening path funnels through one chokepoint
+    // (`parseExpressionAt`): nested parens (via the atom re-entry),
+    // right-assoc RHS chains, prefix operands, and ternary clauses.
+    // Pathological input would otherwise blow the C++ call stack. When
+    // this cap is reached the walker FAILS LOUD with a positioned
+    // `P_ExpressionTooDeep` diagnostic at the offending token and
+    // RECOVERS (Error leaf + panic-scan + graceful unwind) — it does
+    // NOT abort and never risks a raw stack overflow. (Left/None-assoc
+    // chains build ITERATIVELY in the climb loop and never deepen the
+    // stack, so they do not count against this cap regardless of length.)
+    //
+    // The cap is deliberately LOW (16). Two pre-existing properties of the
+    // c-subset frontend make a higher cap impractical until each is fixed:
+    // (1) the parse's DOWNSTREAM consumers (semantic analysis, HIR/MIR
+    // lowering) recurse over the expression tree on the host's default
+    // ~1 MB thread stack and overflow at ~25 levels (D-PARSE-DEEP-FRONTEND-
+    // STACK); (2) the c-subset `operand` rule's speculative cast-vs-paren
+    // probe is super-linear (O(N^2)+) in nesting depth, so a deeply-nested
+    // expression is slow to PARSE and the guard is slow to REACH at a high
+    // cap (D-PARSE-SPECULATION-OPERAND-QUADRATIC). A cap of 16 keeps fail-
+    // loud prompt (the guard is reached fast), truncates the tree well
+    // before the downstream overflow, and comfortably admits hand-written C
+    // (real expression nesting is far under 16). Raising the cap to support
+    // deep machine-generated nesting requires BOTH fixes — a dedicated
+    // follow-up, tracked by the two anchors named above.
+    std::size_t maxExpressionDepth = 16;
 
     // Recovery strategy for unrecognized tokens. Default scans to
     // the next sync/follow point; `SingleToken` is the legacy single-

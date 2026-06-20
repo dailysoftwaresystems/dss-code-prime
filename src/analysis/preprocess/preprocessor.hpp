@@ -132,6 +132,18 @@ struct DSS_EXPORT PreprocessResult {
     // Owned here; the caller folds them into the tree's reporter.
     std::unique_ptr<DiagnosticReporter> diagnostics;
 
+    // TRUE when a FATAL preprocessor backstop fired and TRUNCATED the
+    // token stream: the macro-expansion-nesting guard (>256) or the
+    // include-nesting guard (possible cycle). Distinct from
+    // `diagnostics->hasErrors()`: a RECOVERABLE PP error (missing
+    // `#include` file, malformed directive, redefinition) or a folded
+    // LEXER error leaves the stream INTACT and parseable, so it does NOT
+    // set this. The caller (D-PP-FATAL-HALTS-PARSE) gates the parser on
+    // THIS flag — a truncated stream must not be fed to the parser (it
+    // produces an inscrutable secondary cascade), but a recoverable PP
+    // error must still parse so the parse-level diagnostics surface.
+    bool fatal = false;
+
     // Build a remap closure usable by `DiagnosticReporter::remapBuffers`:
     // it rewrites any diagnostic whose buffer is the synth buffer to the
     // origin (buffer id + offset-shifted span). Diagnostics on other buffers

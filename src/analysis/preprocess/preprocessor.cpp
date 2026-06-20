@@ -181,6 +181,10 @@ struct SynthBuilder {
     DiagnosticReporter&                  rep;
     int                                  depth;
     std::vector<fs::path>&               includeStack;
+    // Set TRUE when the include-nesting backstop fires (truncating the
+    // splice). Shared by reference across the recursive child builders so
+    // a deep-nest truncation at any level reaches `preprocess()`.
+    bool&                                fatal;
 
     PreprocessConfig const& cfg() const { return schema->preprocess(); }
 
@@ -237,6 +241,7 @@ struct SynthBuilder {
                    SourceSpan::empty(0),
                    std::string{"include nesting too deep (possible cycle): "}
                        + std::string{source->name()});
+            fatal = true;   // splice truncated — PP fatal
             return;
         }
         std::string spliced;
@@ -323,7 +328,7 @@ struct SynthBuilder {
 
             includeStack.push_back(canon);
             SynthBuilder child{schema, includeDirs, rep, depth + 1,
-                               includeStack};
+                               includeStack, fatal};
             child.build(headerBuf, out, map);
             includeStack.pop_back();
 
@@ -445,6 +450,9 @@ public:
         variadicMarker_ =
             schema_->schemaTokens().find(cfg().variadicMarkerToken);
     }
+
+    // TRUE iff a fatal nesting-backstop truncated the expansion.
+    [[nodiscard]] bool truncated() const noexcept { return truncated_; }
 
     std::vector<Token> run(std::vector<Token> const& in) {
         std::vector<Token> body;
@@ -953,6 +961,7 @@ private:
             emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported, synth_->id(),
                    (in.empty() ? SourceSpan::empty(0) : in.front().tok.span),
                    "macro expansion nesting too deep (>256)");
+            truncated_ = true;   // stream is now truncated — PP fatal
             return in;
         }
         std::size_t i = 0;
@@ -1107,6 +1116,10 @@ private:
     std::shared_ptr<SourceBuffer>        synth_;
     std::shared_ptr<GrammarSchema const> schema_;
     DiagnosticReporter&                  rep_;
+    // Set TRUE when the >256 macro-expansion-nesting backstop fires and
+    // RETURNS the input verbatim (truncating the expansion). Surfaced via
+    // `truncated()` so `preprocess()` can flag the result fatal.
+    bool                                 truncated_ = false;
     SchemaTokenId                        hashKind_{};
     SchemaTokenId                        parenOpen_{};
     SchemaTokenId                        parenClose_{};
@@ -1138,7 +1151,7 @@ PreprocessResult preprocess(
         includeStack.push_back(ec ? fs::path{mainSource->name()} : canon);
     }
     SynthBuilder builder{schema, includeDirs, *result.diagnostics, 0,
-                         includeStack};
+                         includeStack, result.fatal};
     builder.build(mainSource, synthText, result.lineMap);
 
     result.synthBuffer = SourceBuffer::fromString(
@@ -1175,6 +1188,9 @@ PreprocessResult preprocess(
 
     MacroExpander expander{result.synthBuffer, schema, *result.diagnostics};
     std::vector<Token> finalTokens = expander.run(synthTokens);
+    // OR in the macro-expansion truncation; the SynthBuilder already wrote
+    // `result.fatal` by reference for an include-nesting truncation.
+    result.fatal = result.fatal || expander.truncated();
 
     Token eof;
     eof.coreKind = CoreTokenKind::Eof;

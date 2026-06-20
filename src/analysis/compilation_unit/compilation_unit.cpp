@@ -217,7 +217,35 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         // The parser consumes a stream built from a COPY of the preprocessed
         // tokens; the vector is retained in the sidecar for the FC2 oracle
         // reparse. The synthesized buffer is the parse source.
-        TokenStream stream = TokenStream::fromTokens(pp.tokens);
+        // FC13 gate (D-PP-FATAL-HALTS-PARSE): a FATAL preprocessor backstop
+        // (the >256 macro-expansion-nesting guard or the include-nesting
+        // guard) TRUNCATES the synthesized stream at the failure point.
+        // Feeding that truncated stream to the parser produces an
+        // inscrutable secondary cascade (or, on a pathologically deep
+        // partial expansion, drives the expression recursion to its depth
+        // guard) on top of the real PP cause. So on a FATAL truncation we
+        // do NOT parse the truncated tokens: we parse an EOF-ONLY stream,
+        // which yields a minimal well-formed tree that still CARRIES the
+        // PP diagnostics (the Parser ingests them into the produced tree
+        // below), then remap + addTree exactly as the normal path does.
+        // The PP error surfaces cleanly and the parse halts before the
+        // cascade.
+        //
+        // The gate keys on `pp.fatal` (stream truncated), NOT on
+        // `diagnostics->hasErrors()`: a RECOVERABLE PP error (missing
+        // `#include` file, malformed directive, redefinition) or a folded
+        // LEXER error (illegal char) leaves the stream INTACT, so the
+        // parser MUST still run to surface the parse-level diagnostics
+        // (gating those would SWALLOW the real frontend errors — e.g. an
+        // unresolved `#include` must not suppress the rest of the file).
+        const bool ppFatal = pp.fatal;
+        // `pp.tokens` is Eof-terminated by contract; its last element is
+        // that Eof. `fromTokens` takes its argument by value (copies),
+        // so `pp.tokens` survives intact for the sidecar move below.
+        TokenStream stream =
+            ppFatal
+                ? TokenStream::fromTokens({pp.tokens.back()})
+                : TokenStream::fromTokens(pp.tokens);
         Parser p{synth, schema, std::move(stream), {},
                  std::move(pp.diagnostics)};
         ParseResult result = std::move(p).parse();

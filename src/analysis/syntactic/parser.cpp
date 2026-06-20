@@ -35,6 +35,7 @@ namespace {
     std::abort();
 }
 
+
 // Trivia: the builder owns cursor-skip for these tokens; the parser
 // pushes them through without consulting the cursor and the parser's
 // own walker stays put so the next iteration re-checks the slot
@@ -204,13 +205,15 @@ struct Parser::Impl {
     // indefinitely would otherwise stack-loop the call stack.
     std::size_t speculationDepth = 0;
 
-    // Pratt-walker recursion depth. Incremented on every recursive
-    // call into `DefaultPrattWalker`'s climb routine; fatal-aborts
-    // when it would exceed `config.maxExpressionDepth`. Bounds C++
-    // stack growth for adversarial right-recursion (deeply nested
-    // parens, long right-assoc chains). Same posture as the
-    // forward-progress watchdog — better to halt loudly than risk a
-    // silent stack overflow.
+    // Pratt-walker recursion depth. Incremented on every entry to
+    // `parseExpressionAt` (the single chokepoint all expression-
+    // deepening funnels through) and decremented by its RAII guard on
+    // return. When it would exceed `config.maxExpressionDepth` the
+    // walker emits a positioned `P_ExpressionTooDeep` diagnostic and
+    // recovers (it does NOT abort). Bounds C++ stack growth for
+    // adversarial right-recursion (deeply nested parens, long right-
+    // assoc chains, deep prefix/ternary) — fail loud + recover rather
+    // than risk a silent stack overflow.
     std::size_t expressionDepth = 0;
 
     // Operator-precedence walker, looked up once per `expr`-rule
@@ -408,6 +411,30 @@ struct Parser::Impl {
         (void)panicRecover();
         stepRecovered_ = true;
         return StepOutcome::Continue;
+    }
+
+    // Recover an OVER-DEEP expression: the Pratt walker's recursion
+    // (nested parens, right-assoc RHS chains, prefix operands, ternary
+    // clauses) reached `config.maxExpressionDepth`. Emit ONE positioned
+    // `P_ExpressionTooDeep` at the offending token, drop an Error leaf,
+    // and panic-scan forward to the next stop-point so the recursion
+    // UNWINDS with forward progress instead of recursing one level
+    // deeper and blowing the C++ call stack. Idempotent across the
+    // unwind: only the deepest frame trips the guard (parents are
+    // suspended mid-operand and resume their climb loop on a non-
+    // operator peek), so exactly one diagnostic surfaces. The Error
+    // leaf propagates HasError up through every wrapper frame.
+    void recoverExpressionTooDeep_(Token const& peek) {
+        // No `expected` set — the reporter renders `got <actual>`, so
+        // `actual` carries the explanation plus the offending lexeme.
+        emitParserError(
+            DiagnosticCode::P_ExpressionTooDeep, peek.span,
+            std::format(
+                "{} — expression nesting is too deep (exceeds the "
+                "maximum expression depth of {})",
+                renderActual(peek), config.maxExpressionDepth));
+        (void)panicRecover();
+        stepRecovered_ = true;
     }
 
     // Recover a MISSING required RULE: the dispatch needs to descend into
@@ -1816,12 +1843,17 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
     // parens, prefix operands, grouped-postfix bodies, ternary
     // clauses) and RIGHT-associative RHS chains — Left/None-assoc
     // chains build iteratively in the climb loop below and never
-    // deepen the C++ stack.
+    // deepen the C++ stack. This is the SINGLE chokepoint every
+    // deepening path funnels through: prefix operands, the paren/atom
+    // re-entry (parsePrimary -> parseUntilFrameDepth -> stepOnce ->
+    // walkExpression -> here), ternary clauses, and infix RHS all
+    // recurse back into parseExpressionAt, so the cap covers them ALL
+    // by construction. On trip we FAIL LOUD with a positioned
+    // diagnostic + recover (Error leaf + panic-scan + graceful unwind)
+    // rather than recursing one level deeper into a C++ stack overflow.
     if (I.expressionDepth >= I.config.maxExpressionDepth) {
-        fatal("dss::DefaultPrattWalker: expression recursion depth "
-              "exceeded ParserConfig::maxExpressionDepth — deeply "
-              "nested parens or right-associative chains would have "
-              "blown the C++ call stack");
+        I.recoverExpressionTooDeep_(I.tokens.peek());
+        return;
     }
     ++I.expressionDepth;
     struct DepthGuard {

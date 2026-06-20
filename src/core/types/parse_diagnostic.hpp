@@ -67,6 +67,13 @@ enum class DiagnosticCode : std::uint16_t {
     P_PreprocessorIncludeError    = 0x0016,  // quote-`#include` target not found / unreadable / recursion overflow
     P_PreprocessorMacroArgument   = 0x0017,  // function-like macro INVOCATION error (arity mismatch / unterminated arg list)
 
+    // Expression-nesting depth guard (Pratt walker). A too-deeply-nested
+    // expression (parens / right-assoc / prefix / ternary recursion past
+    // ParserConfig::maxExpressionDepth) is reported HERE at the offending
+    // token and RECOVERED (Error leaf + graceful unwind) -- never a raw
+    // C++ stack overflow and never a fatal-abort.
+    P_ExpressionTooDeep           = 0x0018,
+
     // ── P9xxx — builder internal-invariant violations (release-mode rescues) ──
     P_BuilderInvariant            = 0x9000,
     P_TooManyDiagnostics          = 0x9001,

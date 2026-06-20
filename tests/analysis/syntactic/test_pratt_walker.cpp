@@ -75,6 +75,87 @@ constexpr std::string_view kInfixSchema = R"JSON({
   }
 })JSON";
 
+// Inline schema whose operand can be a PARENTHESIZED expression:
+// `operand = Identifier | ( expression )`. This is the HEAVIEST
+// expression-recursion path — a nested paren re-enters the Pratt
+// walker through the atom (parsePrimary -> parseUntilFrameDepth ->
+// stepOnce -> walkExpression -> parseExpressionAt), so it exercises
+// the depth guard's chokepoint on the path that consumes the most
+// C++ stack per level. Used by the too-deep diagnostic+recovery pins.
+constexpr std::string_view kParenSchema = R"JSON({
+  "dssSchemaVersion": 4,
+  "language": { "name": "PrattParen", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "+":  [{ "kind": "PlusOp"  }],
+    "(":  [{ "kind": "ParenOpen",  "opensScope": "Paren" }],
+    ")":  [{ "kind": "ParenClose", "closesScope": true   }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "operators": {
+    "groups": [
+      { "precedence": 65, "associativity": "left", "operators": ["+"] }
+    ]
+  },
+  "shapes": {
+    "root":       { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":       { "sequence": ["expression", "Semi"] },
+    "expression": {
+      "expr": {
+        "atom": "operand",
+        "wrapperRules": {
+          "binary":  "binaryExpr",
+          "unary":   "unaryExpr",
+          "postfix": "postfixExpr"
+        }
+      }
+    },
+    "operand": {
+      "alt": [
+        "Identifier",
+        { "sequence": ["ParenOpen", "expression", "ParenClose"] }
+      ]
+    }
+  }
+})JSON";
+
+// Inline schema with a RIGHT-assoc ternary `?:` (mirrors c-subset's
+// operator-table shape). The ternary else-clause recurses through
+// parseExpressionAt at the operator's own precedence — the path a deep
+// `a?b:a?b:...:c` chain stresses. Declares the `ternary` wrapper rule so
+// the `?` participates (without it the climb drops `?` to the parent).
+constexpr std::string_view kTernarySchema = R"JSON({
+  "dssSchemaVersion": 4,
+  "language": { "name": "PrattTernary", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "?":  [{ "kind": "QuestionOp" }],
+    ":":  [{ "kind": "Colon" }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "operators": {
+    "groups": [
+      { "precedence": 16, "associativity": "right", "arity": "ternary", "operators": ["?"], "middle": ":" }
+    ]
+  },
+  "shapes": {
+    "root":       { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":       { "sequence": ["expression", "Semi"] },
+    "expression": {
+      "expr": {
+        "atom": "operand",
+        "wrapperRules": {
+          "binary":  "binaryExpr",
+          "unary":   "unaryExpr",
+          "postfix": "postfixExpr",
+          "ternary": "ternaryExpr"
+        }
+      }
+    },
+    "operand":    { "alt": ["Identifier"] }
+  }
+})JSON";
+
 // Inline schema with a single postfix operator `?`. C-subset ships its
 // own postfix ops (`++ -- ( [ . ->`), but this minimal grammar pins
 // the SIMPLE single-token postfix arm in isolation (c-subset's are
@@ -716,35 +797,113 @@ TEST(PrattWalker, AltChoiceScanRoutesExprRuleThroughWalker) {
     EXPECT_EQ(prettyPrint(t), kExpected);
 }
 
-// ── recursion-depth death ───────────────────────────────────────────────
+// ── recursion-depth guard: positioned diagnostic + recovery ────────
 
-// Adversarial right-associative input — chain of `=` ops longer than
-// the configured `maxExpressionDepth`. The walker fatal-aborts rather
-// than risking a C++ stack overflow.
-TEST(PrattWalkerDeath, ExceedingMaxExpressionDepthAborts) {
-    auto loaded = GrammarSchema::loadFromText(kInfixSchema);
-    ASSERT_TRUE(loaded.has_value());
-    auto schema = *loaded;
-
-    // 8 right-assoc `=` ops will recurse to depth 8+ — well above
-    // maxExpressionDepth=4.
-    auto src = SourceBuffer::fromString(
-        "a = b = c = d = e = f = g = h = i;", "<deep>");
-    Tokenizer tk{src, schema};
-    auto [stream, _] = std::move(tk).tokenize();
-
+// Helper: parse `source` under `schema` with an EXPLICIT expression-depth
+// cap, returning the produced tree. Drives the REAL parse path (no death
+// expected) so the depth guard's diagnostic + recovery are observable on
+// the finished tree.
+[[nodiscard]] Tree parseWithCap(std::string_view schemaText,
+                                std::string source, std::size_t cap) {
+    auto h = loadAndTokenize(schemaText, std::move(source));
     ParserConfig cfg;
-    cfg.maxExpressionDepth = 4;
+    cfg.maxExpressionDepth = cap;
+    Parser p{h.src, h.schema, std::move(h.stream), std::move(cfg)};
+    auto result = std::move(p).parse();
+    return std::move(result.tree);
+}
 
-    // Lambda wraps the multi-statement body so the C preprocessor sees
-    // a single argument to `EXPECT_DEATH` — without it, commas in
-    // declarations would be interpreted as macro argument separators.
-    auto run = [&] {
-        Parser p{src, schema, std::move(stream), std::move(cfg)};
-        (void)std::move(p).parse();
-    };
-    EXPECT_DEATH(run(),
-        "expression recursion depth exceeded ParserConfig::maxExpressionDepth");
+// Structural pin (host-INDEPENDENT): an adversarial right-associative
+// chain of `=` ops recurses past a LOWERED cap. The guard FAILS LOUD with
+// a positioned `P_ExpressionTooDeep` at the offending token and RECOVERS
+// (no fatal-abort, no stack overflow) — the produced tree carries exactly
+// ONE such diagnostic and flags HasError. RED-on-disable: deleting the
+// guard makes this recurse to a C++ stack overflow (crash) OR emit zero
+// P_ExpressionTooDeep — either way the assertions below fail.
+TEST(PrattWalker, ExceedingMaxExpressionDepthDiagnosesAndRecovers) {
+    // 8 right-assoc `=` ops recurse to depth 8+ — well above the cap=4.
+    Tree t = parseWithCap(kInfixSchema,
+                          "a = b = c = d = e = f = g = h = i;", 4);
+
+    // The parse RETURNED (did not abort) and built a tree.
+    ASSERT_NE(t.root(), InvalidNode);
+    // Exactly one too-deep diagnostic — the deepest frame trips the guard
+    // once; parents resume their climb on a non-operator peek and do not
+    // re-trip. (The primary RED-on-disable lever.)
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_ExpressionTooDeep), 1u);
+    // HasError propagated up through the wrapper frames via the Error leaf.
+    EXPECT_TRUE(t.diagnostics().hasErrors());
+}
+
+// The HEADLINE pin: a pathologically deep PAREN nest — 1000 levels, far
+// past the DEFAULT cap and far past the C++ stack-overflow depth — must
+// yield the POSITIONED diagnostic, NOT a raw stack overflow / rc-127 /
+// hang. Paren is the heaviest recursion path (atom re-entry through the
+// frame machinery). Runs at the DEFAULT cap (no lowering) to prove the
+// shipped configuration is crash-safe.
+TEST(PrattWalker, DeeplyNestedParensDiagnoseAtDefaultCapWithoutCrashing) {
+    std::string src = "x";
+    constexpr int kDepth = 1000;
+    for (int i = 0; i < kDepth; ++i) src = "(" + src + ")";
+    src += ";";
+    // DEFAULT cap (ParserConfig default) — not lowered.
+    Tree t = parse(kParenSchema, std::move(src));
+
+    ASSERT_NE(t.root(), InvalidNode);
+    // At least one positioned too-deep diagnostic surfaced (the guard
+    // fired before the stack overflowed).
+    auto const& diags = t.diagnostics().all();
+    ASSERT_GE(countCode(diags, DiagnosticCode::P_ExpressionTooDeep), 1u);
+    EXPECT_TRUE(t.diagnostics().hasErrors());
+
+    // The diagnostic is POSITIONED at a real `(` token — line 1, and a
+    // column at or before the innermost paren (depth `kDepth`). The exact
+    // column is the cap-th `(` (1-based), which is well within the run.
+    for (auto const& d : diags) {
+        if (d.code != DiagnosticCode::P_ExpressionTooDeep) continue;
+        const auto lc = t.source().lineCol(d.span.start());
+        EXPECT_EQ(lc.line, 1u);
+        EXPECT_GE(lc.column, 1u);
+        EXPECT_LE(lc.column, static_cast<std::uint32_t>(kDepth));
+        // The offending lexeme is a `(`.
+        EXPECT_EQ(t.source().slice(d.span), "(");
+    }
+}
+
+// Multi-form coverage: deep PREFIX (`- - - ... x`) trips the SAME guard.
+// Prefix recurses through `parsePrimary`'s prefix arm into
+// parseExpressionAt at the operator's own precedence — a distinct path
+// from parens/infix, proving the chokepoint covers it too. Asserts >=1
+// (not exactly 1): a long prefix run whose tail exceeds the recovery
+// scan window (`maxSyncScanTokens`) can re-trip once more as the stack
+// unwinds onto a still-pending prefix operand — still fail-loud + no
+// crash, just the same honest diagnostic again on pathological input.
+TEST(PrattWalker, DeepPrefixChainDiagnosesAndRecovers) {
+    std::string src;
+    for (int i = 0; i < 40; ++i) src += "- ";   // 40 spaced unary minuses
+    src += "a;";
+    Tree t = parseWithCap(kInfixSchema, std::move(src), 4);
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_GE(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_ExpressionTooDeep), 1u);
+    EXPECT_TRUE(t.diagnostics().hasErrors());
+}
+
+// Multi-form coverage: a deep RIGHT-assoc TERNARY chain
+// (`a?a:a?a:...:a`) trips the SAME guard. The ternary else-clause
+// recurses through parseExpressionAt at the operator's precedence — the
+// right-nesting path. Pinned at a lowered cap so the guard fires well
+// before any stack pressure.
+TEST(PrattWalker, DeepTernaryChainDiagnosesAndRecovers) {
+    std::string src = "a";
+    for (int i = 0; i < 20; ++i) src += "?a:a";   // 20 nested ternaries
+    src += ";";
+    Tree t = parseWithCap(kTernarySchema, std::move(src), 4);
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_GE(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_ExpressionTooDeep), 1u);
+    EXPECT_TRUE(t.diagnostics().hasErrors());
 }
 
 // ── 08.55: wrapperRules genericity pin ─────────────────────────────────────
