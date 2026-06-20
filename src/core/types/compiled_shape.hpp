@@ -149,6 +149,37 @@ struct CompiledRule {
     std::vector<SchemaTokenId> followSet;
     bool                       nullable = false;
 
+    // LL(k) PREDICTIVE PREFIX (speculative-alt candidate pruning).
+    //
+    // A bounded, per-offset over-approximation of the token sequences that
+    // can BEGIN a derivation of this rule. `predictivePrefix[i]` is the
+    // (sorted) set of token kinds admissible as the (i)-th consumed token,
+    // for the leading run of FIXED-WIDTH (single-token) grammar elements:
+    //
+    //   - prefix[0] == firstSet (the exact 1-token FIRST, always present
+    //     for a non-nullable rule with a concrete leading element).
+    //   - prefix[i+1] is added only while element i is a TokenLeaf (it
+    //     consumes EXACTLY one token, so grammar-element offset == input
+    //     offset stays exact). The run stops — and the prefix ends — at the
+    //     first element that is a sub-rule (RuleLeaf: variable width), a
+    //     branch/optional/loop (AltChoice: variable width), or End.
+    //
+    // SOUNDNESS: because every offset before the stop corresponds to a
+    // single-token element, `prefix[i]` is the EXACT set of admissible
+    // tokens at input offset i; beyond the stop the prefix is simply absent
+    // (no constraint). A speculative-alt prune that rejects a candidate only
+    // when `peek(i)` ∉ `prefix[i]` for some defined `i` therefore never
+    // drops a candidate that could legitimately match — it is a sound
+    // over-approximation of the candidate's accepted-prefix set. The prune
+    // is purely config-derived (FIRST sets + the position table) and names
+    // no token, language, or rule.
+    //
+    // Empty (size 0) when the rule's entry is itself an AltChoice or the
+    // rule is nullable/empty: such rules carry no fixed leading prefix, so
+    // only the standard 1-token FIRST gate applies (the pre-existing
+    // behavior). The loader fills this in `computePredictivePrefixes`.
+    std::vector<std::vector<SchemaTokenId>> predictivePrefix;
+
     // `expr`-shape metadata. `isExpr` true iff the rule's body is
     // `{ "expr": { "atom": ... } }`. The cursor still compiles `expr`
     // as a transparent reference to the atom rule (see

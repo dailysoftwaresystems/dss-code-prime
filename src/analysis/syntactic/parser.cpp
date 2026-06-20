@@ -817,14 +817,55 @@ struct Parser::Impl {
         return schema->canEndSource(post);
     }
 
+    // The effective kind of the `n`-th SIGNIFICANT (non-trivia) token at
+    // or after the current stream position, looking through skippable
+    // trivia exactly as the AltChoice dispatch does. `n == 0` is the
+    // upcoming significant token (the alt already skipped leading trivia,
+    // so it equals the dispatched `tokKind`). Returns the Eof kind once
+    // the stream is exhausted (peek past end is idempotent-Eof). Used by
+    // the speculative-alt predictive prune to compare input offsets >0
+    // against a candidate's FIRST_k prefix.
+    [[nodiscard]] SchemaTokenId peekSignificantKind(std::size_t n) const noexcept {
+        std::size_t seen = 0;
+        for (std::size_t raw = 0; ; ++raw) {
+            Token const& t = tokens.peek(raw);
+            if (t.coreKind == CoreTokenKind::Eof) {
+                return effectiveKind(t, identifierKind, errorKind);
+            }
+            if (isSkippableTrivia(t)) continue;
+            if (seen == n) return effectiveKind(t, identifierKind, errorKind);
+            ++seen;
+        }
+    }
+
     // Enumerate candidate branch rules at the current speculative
     // AltChoice: the alt's RuleLeaf branches `r` (depth-first through
-    // nested AltChoice positions) for which both
+    // nested AltChoice positions) for which all of
     //   (1) `FIRST(r)` contains the upcoming token's effective kind, AND
-    //   (2) `routeToRuleLeaf(walker.cursor(), r)` is valid (the alt
+    //   (2) the LL(k) PREDICTIVE PREFIX of `r` accepts the next k
+    //       significant tokens (k = the alt's declared `lookahead`), AND
+    //   (3) `routeToRuleLeaf(walker.cursor(), r)` is valid (the alt
     //       structurally allows descending into r).
     //
-    // CONTRACT: speculative candidates probe in DECLARED grammar order
+    // (2) is the bounded-lookahead PREDICTIVE PRUNE that replaces the
+    // C cast-vs-paren ambiguity's unbounded backtracking. A candidate
+    // whose FIRST_k prefix provably cannot match the upcoming tokens is
+    // dropped BEFORE it speculates — so a deeply-nested `((((0))))` no
+    // longer runs (and panic-recovers) a doomed `castExpr` probe at every
+    // level: token[+1] == `(` ∉ FIRST(castTypeRef) prunes `castExpr` and
+    // `compoundLiteralExpr`, leaving only `parenExpr` (O(N) total, not
+    // O(N²)). The genuine `(Identifier)` ambiguity is NOT pruned —
+    // token[+1] == Identifier ∈ FIRST(castTypeRef) keeps `castExpr`
+    // speculating so the binder triage (`commitRequiresTypeName`) decides.
+    //
+    // The prefix is a SOUND over-approximation (see
+    // `CompiledRule::predictivePrefix`): each recorded offset is the EXACT
+    // admissible-token set at that input position, so the prune can never
+    // drop a candidate that could legitimately match. It is fully
+    // config-derived — the engine walks FIRST sets + the position table
+    // and names no token, rule, or language.
+    //
+    // CONTRACT: surviving candidates probe in DECLARED grammar order
     // — author-controlled, never interner/name order. The list comes
     // from the AltChoice's compiled branch table (JSON-array order via
     // `altRuleBranches`); sourcing it from the rule interner instead
@@ -832,20 +873,91 @@ struct Parser::Impl {
     // NAMING — interner ids are assigned in alphabetical key order —
     // silently overriding the author's declared branch order whenever
     // two branches structurally accept the same input.
+    // `applyPrune` selects the candidate set's purpose:
+    //   true  → the SPECULATION set: the predictive prune is applied, so the
+    //           probe loop / unique-production descent only sees branches
+    //           whose FIRST_k can still match. This is the O(N) lever.
+    //   false → the STRUCTURAL set: only the 1-token FIRST gate + routing,
+    //           NO predictive prune. This is the set the all-fail fallback
+    //           REPLAY draws its declared-last diagnostic target from — the
+    //           replay deliberately runs a doomed branch for its precise
+    //           errors, so the prune (which removes branches that can't match
+    //           LATER tokens) must NOT strip the replay's target. Sourcing
+    //           the replay target from the pruned set would, for input that
+    //           every branch's FIRST_k rejects, leave the fallback with no
+    //           target and surface an opaque P_BacktrackFailed instead
+    //           (pinned by ParserSpeculation.BacktrackFailedAndRecoveryOn-
+    //           BogusInput).
     [[nodiscard]] std::vector<RuleId>
-    candidateBranches(SchemaTokenId tokKind) const {
+    candidateBranches(SchemaTokenId tokKind, std::size_t lookahead,
+                      bool applyPrune) const {
         std::vector<RuleId> out;
         for (RuleId const candidate
              : schema->altRuleBranches(walker.cursor())) {
             const auto firstSet = schema->firstSetOf(candidate);
             if (firstSet.empty()) continue;
             if (std::ranges::find(firstSet, tokKind) == firstSet.end()) continue;
+            if (applyPrune && predictivePrefixPrunes(candidate, lookahead))
+                continue;
             const auto routed =
                 schema->routeToRuleLeaf(walker.cursor(), candidate);
             if (!routed.valid()) continue;
             out.push_back(candidate);
         }
         return out;
+    }
+
+    // True iff `candidate`'s LL(k) predictive prefix provably CANNOT match
+    // the upcoming significant tokens, so the candidate may be pruned
+    // before speculating. Bounded by `k` (the alt's `lookahead`, the
+    // author-declared disambiguation distance) AND by the candidate's own
+    // prefix length (which self-terminates at its first variable-width
+    // element). Offset 0 is skipped — the FIRST gate in `candidateBranches`
+    // already covers it; only offsets >=1 add discriminating power.
+    //
+    // Sound by construction: a candidate is pruned ONLY when an OBSERVED
+    // token at some defined offset lies OUTSIDE that offset's exact
+    // admissible set. An empty prefix (no multi-token discriminator) never
+    // prunes — the function returns false immediately.
+    //
+    // PRECONDITION (contextual / scope-sensitive kinds) — anchor
+    // D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD. The observed kind comes
+    // from `peekSignificantKind` → `effectiveKind`, which by design does NOT
+    // model contextual-keyword demotion: a soft keyword (a `contextual: true`
+    // entry, or ANY keyword under `reservedWordPolicy: "contextual"`) still
+    // reports its KEYWORD kind here, even though the builder may later demote
+    // it to Identifier against the live cursor expectedSet + scope stack. So
+    // at an offset whose admissible set holds the demotion target (Identifier)
+    // the prune could wrongly drop a candidate that the demoted token would in
+    // fact match — a silent mis-parse. The prune is therefore SOUND ONLY for
+    // grammars with NO contextual / scope-resolvable kind in a speculative
+    // candidate's FIXED prefix. This holds for every shipped speculative-alt
+    // grammar today (c-subset's speculative prefixes are all hard keywords /
+    // punctuation; tsql is `reservedWordPolicy: "contextual"` but its
+    // `nameOrCall` candidates discriminate at offset 1 on `(` /
+    // qualified-name punctuation, not on a soft-keyword Identifier slot). The
+    // conservative closing fix — skip the prune at an offset whose observed
+    // token has a contextual/scope-resolvable kind — is deferred behind the
+    // anchor because no token-id-keyed "is this kind contextual" query exists
+    // today (the `contextual` flag is per-LexemeMeaning, lexeme-string-keyed;
+    // only the grammar-wide `reservedWordPolicy()` lever is exposed, which
+    // would not cover a per-keyword `contextual: true` under a Strict policy).
+    // The anchor's trigger is the first contextual-keyword speculative-alt
+    // consumer that puts a soft keyword in a candidate's fixed prefix.
+    [[nodiscard]] bool
+    predictivePrefixPrunes(RuleId candidate, std::size_t k) const noexcept {
+        const std::size_t prefixLen = schema->predictivePrefixLen(candidate);
+        if (prefixLen < 2 || k < 2) return false;  // nothing beyond FIRST
+        const std::size_t bound = std::min(prefixLen, k);
+        for (std::size_t i = 1; i < bound; ++i) {
+            const auto admissible = schema->predictivePrefixAt(candidate, i);
+            if (admissible.empty()) continue;  // no constraint at this offset
+            const SchemaTokenId got = peekSignificantKind(i);
+            if (std::ranges::find(admissible, got) == admissible.end()) {
+                return true;  // observed token outside the exact set ⇒ prune
+            }
+        }
+        return false;
     }
 
     // Move-only RAII guard for one speculative-branch probe.
@@ -1500,9 +1612,56 @@ struct Parser::Impl {
                 }
 
                 // Try each candidate RULE branch in declaration order.
-                // First success commits and falls through to the
-                // next outer iteration.
-                const auto candidates = candidateBranches(tokKind);
+                // First success commits and falls through to the next outer
+                // iteration. The SPECULATION set applies the LL(k) predictive
+                // prune (k = the alt's declared lookahead) so doomed probes
+                // never run.
+                const auto candidates =
+                    candidateBranches(tokKind, walker.lookahead(),
+                                      /*applyPrune=*/true);
+
+                // LL(k) UNIQUE-PRODUCTION DIRECT DESCENT. When the
+                // predictive prune leaves EXACTLY ONE viable candidate and
+                // that candidate carries no commit-time triage
+                // (`commitRequiresTypeName`), there is nothing left to
+                // disambiguate — the lookahead has already SELECTED the
+                // production. Descend into it directly, exactly as the
+                // non-speculative RuleLeaf path would, WITHOUT a
+                // speculation probe.
+                //
+                // This is the load-bearing half of the deep-nest fix: it
+                // is what makes a pruned `(((…)))` actually O(N). The prune
+                // removes `castExpr`/`compoundLiteralExpr`, but the lone
+                // survivor `parenExpr` still RECURSES (its body is
+                // `( expression )`), and probing it at every one of N
+                // levels — each probe driving the inner parse to its frame
+                // close, nested N deep — is the super-linear blowup. A
+                // direct descent recurses ONCE per level with no probe,
+                // no per-level checkpoint, and no re-drive: O(N) total.
+                //
+                // Sound because the prune is a sound over-approximation:
+                // every OTHER branch was proven unable to match the
+                // upcoming tokens, so the survivor is the only possible
+                // parse — committing to it discards nothing. A surviving
+                // candidate WITH a commit guard is excluded (it keeps
+                // speculating so the binder triage runs: the genuine
+                // `(Identifier)` cast-vs-paren case where both `castExpr`
+                // and `parenExpr` survive is unaffected, and a lone
+                // guarded survivor still gets its triage). Fully generic —
+                // no token, rule, or language is named.
+                if (candidates.size() == 1
+                    && !schema->typeNameCommitRule(candidates.front())
+                            .valid()) {
+                    const RuleId only = candidates.front();
+                    if (schema->isExprRule(only)) {
+                        prattWalker->walkExpression(
+                            *outer, only, schema->exprMinPrecedence(only));
+                    } else {
+                        openExprFrame(only);
+                    }
+                    return StepOutcome::Continue;
+                }
+
                 for (auto const branch : candidates) {
                     if (trySpeculativeBranch(branch)) {
                         return StepOutcome::Continue;
@@ -1528,14 +1687,25 @@ struct Parser::Impl {
                 // pre-replay contract did. Inside a NESTED probe the
                 // rollback semantics stay pure (the outer probe owns the
                 // failure), so no replay fires there either.
-                if (speculationDepth == 0 && !candidates.empty()
+                //
+                // The replay target is the declared-last of the STRUCTURAL
+                // (1-token-FIRST-gated, UN-pruned) candidate set, not the
+                // pruned speculation set: the predictive prune can legitimately
+                // empty the speculation set (every branch's FIRST_k rejects the
+                // later tokens, e.g. `A X ;` where neither `A B ;` nor `A C ;`
+                // matches at offset 1), but the fallback must still replay a
+                // branch to surface its precise diagnostic instead of an opaque
+                // P_BacktrackFailed.
+                const auto structuralCandidates = candidateBranches(
+                    tokKind, walker.lookahead(), /*applyPrune=*/false);
+                if (speculationDepth == 0 && !structuralCandidates.empty()
                     && !(replayedFallback_
                          && lastReplayCursor_ == walker.cursor()
                          && lastReplayTokPos_ == tokens.position())) {
                     replayedFallback_  = true;
                     lastReplayCursor_  = walker.cursor();
                     lastReplayTokPos_  = tokens.position();
-                    const RuleId fallback = candidates.back();
+                    const RuleId fallback = structuralCandidates.back();
                     if (schema->isExprRule(fallback)) {
                         prattWalker->walkExpression(
                             *outer, fallback,

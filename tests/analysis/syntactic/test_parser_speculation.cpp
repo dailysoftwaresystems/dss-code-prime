@@ -10,13 +10,26 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
 
 using namespace dss;
 
@@ -478,4 +491,278 @@ TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
     EXPECT_EQ(names, declared)
         << "operand's speculative rule branches must surface in the "
            "JSON-array order declared in c-subset.lang.json";
+}
+
+// ── Deep-nest predictive-prune O(N) pin (D-PARSE-SPECULATION-OPERAND-
+//    QUADRATIC) ──────────────────────────────────────────────────────────
+//
+// `((((…0…))))` is the C cast-vs-paren worst case: at EVERY nesting level
+// `operand`'s speculative alt sees `(`, and pre-fix tried the `castExpr`
+// probe first — which fails (`castTypeRef` can't start with `(`) and runs
+// panic recovery that scans O(min(N,syncCap)) tokens, repeated at N levels
+// ⇒ O(N²) (deep input HUNG: N=300 took >150 s wall-clock through the CLI).
+//
+// The fix is the engine's LL(k) PREDICTIVE PRUNE plus unique-production
+// direct descent: token[+1]==`(` ∉ FIRST(castTypeRef) prunes `castExpr` and
+// `compoundLiteralExpr` BEFORE they speculate, and the lone survivor
+// `parenExpr` (no commit-triage) is descended into directly — no per-level
+// speculation probe. Net: O(N).
+//
+// This pin parses the REAL shipped c-subset grammar at a high
+// `maxExpressionDepth` (so the parse runs to completion instead of tripping
+// the low default cap) and asserts (a) a CLEAN parse — no diagnostics, no
+// `P_BacktrackFailed` — proving the prune kept the valid `parenExpr` reading
+// at every level, and (b) ROUGHLY LINEAR scaling: doubling the nesting
+// depth must not blow the parse time up super-linearly. A quadratic
+// regression (the bug) makes the 2N parse ~4× the N parse and far exceeds
+// the generous ceiling asserted here; the headroom keeps the test robust to
+// CI timing jitter while still catching an O(N²) reintroduction (which would
+// be orders of magnitude over, not a small multiple).
+//
+// NOTE: only the PARSE is exercised here — the downstream semantic / HIR /
+// MIR passes recurse on the host stack and overflow at ~25 levels
+// (D-PARSE-DEEP-FRONTEND-STACK, a SEPARATE anchor), so this stays at the
+// parser boundary deliberately.
+namespace {
+
+[[nodiscard]] std::string deepNestSource(std::size_t depth) {
+    std::string s = "int main(void){return ";
+    s.append(depth, '(');
+    s.push_back('0');
+    s.append(depth, ')');
+    s += ";}";
+    return s;
+}
+
+// Parse `((…0…))` nested `depth` deep through the SHIPPED c-subset grammar
+// at a raised expression-depth cap; return the wall-clock parse duration.
+// Fails the calling test (via gtest macros) on any parse diagnostic.
+//
+// `schema` is loaded ONCE by the caller and reused so the timed region is
+// the parse alone, not a per-call schema reload.
+[[nodiscard]] std::chrono::nanoseconds
+timeDeepNestParse(std::shared_ptr<GrammarSchema const> const& schema,
+                  std::size_t depth, std::size_t cap) {
+    auto src = SourceBuffer::fromString(deepNestSource(depth), "<deep>");
+    Tokenizer tk{src, schema};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+
+    ParserConfig cfg;
+    cfg.maxExpressionDepth = cap;
+    Parser p{src, schema, std::move(stream), std::move(cfg)};
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto result = std::move(p).parse();
+    const auto t1 = std::chrono::steady_clock::now();
+
+    auto const& t = result.tree;
+    EXPECT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "deep-nest `" << depth << "`-paren parse must be CLEAN — the "
+           "predictive prune must keep the valid parenExpr reading at every "
+           "level (first diag: "
+        << (t.diagnostics().all().empty()
+                ? std::string{"<none>"}
+                : t.diagnostics().all().front().actual)
+        << ")";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u)
+        << "no candidate-backtrack failures may surface for a well-formed "
+           "deeply-nested paren expression";
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0);
+}
+
+#if defined(_WIN32)
+// WINAPI (__stdcall) trampoline for CreateThread. The lpParameter is a
+// pointer to a std::function<void()> the caller keeps alive across the join.
+inline unsigned long __stdcall largeStackTrampoline(void* p) {
+    (*static_cast<std::function<void()>*>(p))();
+    return 0;
+}
+#endif
+
+// Run `fn` on a thread with a LARGE stack so the deep-nest parse can recurse
+// hundreds/thousands of paren levels without tripping the parser's own
+// host-stack ceiling (D-PARSE-DEEP-FRONTEND-STACK), which is what limits
+// depth here — NOT the speculation cost the test measures. Win32 thread with
+// an explicit stack reserve on Windows; a std::thread fallback elsewhere.
+inline void runOnLargeStack(std::function<void()> fn) {
+#if defined(_WIN32)
+    constexpr SIZE_T kStackBytes = SIZE_T{256} * 1024 * 1024;  // 256 MiB
+    HANDLE h = ::CreateThread(nullptr, kStackBytes, &largeStackTrampoline,
+                              &fn, 0, nullptr);
+    ASSERT_NE(h, nullptr) << "CreateThread failed for the large-stack runner";
+    ::WaitForSingleObject(h, INFINITE);
+    ::CloseHandle(h);
+#else
+    std::thread(std::move(fn)).join();
+#endif
+}
+
+} // namespace
+
+TEST(ParserSpeculation, DeepNestCastVsParenIsLinear) {
+    // Cap comfortably above the deepest probe so the parse runs to the end
+    // (the per-parser `maxExpressionDepth` override — independent of the low
+    // shipped default — lets the parse descend the full nesting).
+    constexpr std::size_t kCap = 4000;
+
+    // Load the shipped grammar ONCE; reuse it across every timed parse so the
+    // measured region is the parse alone, not a per-call schema reload.
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+
+    // The deep parse recurses one host-stack frame per paren level, so run on
+    // a large-stack thread — the parser's own stack ceiling (not the
+    // speculation cost) is otherwise the depth limit (D-PARSE-DEEP-FRONTEND-
+    // STACK). N=500 and N=1000 are the task's deep-nest proof points; 1000 is
+    // exactly 2× 500, so an O(N) parse scales ~2× and an O(N²) regression
+    // ~4× — and the historical bug's per-level panic-scan blowup pushes it
+    // FAR past that (the pre-fix CLI hung for >150 s at N=300).
+    std::chrono::nanoseconds t500{}, t1000{};
+    runOnLargeStack([&] {
+        // Warm allocator/caches so the first timed run isn't setup-taxed.
+        (void)timeDeepNestParse(schema, 50, kCap);
+        t500  = timeDeepNestParse(schema, 500,  kCap);
+        t1000 = timeDeepNestParse(schema, 1000, kCap);
+    });
+
+    // Doubling the nesting (500→1000) must NOT explode the parse time. The
+    // pre-fix O(N²) cast-vs-paren speculation made deep input catastrophic —
+    // the per-level panic-scan blowup pushed the CLI past 150 s at N=300, i.e.
+    // a multi-thousand-× scaling, not a small multiple. The ceiling here is
+    // intentionally generous (Debug-build allocator noise + CI timing jitter
+    // make the observed clean-parse ratio swing a few × around the ideal 2×),
+    // yet still fails LOUD on a quadratic reintroduction, which overshoots it
+    // by orders of magnitude. The CLEAN-parse assertions inside
+    // `timeDeepNestParse` (no diagnostics, no `P_BacktrackFailed` at depth 500
+    // AND 1000) are the precise functional guard that the prune kept the valid
+    // `parenExpr` reading at every level. A floor on the denominator avoids
+    // divide-by-noise on a fast baseline.
+    const double small = std::max<double>(
+        static_cast<double>(t500.count()), 1.0);
+    const double ratio = static_cast<double>(t1000.count()) / small;
+    EXPECT_LT(ratio, 8.0)
+        << "deep-nest parse time scaled " << ratio << "× when nesting "
+           "doubled (500→1000); linear is ~2×. A super-linear ratio of this "
+           "magnitude signals the O(N²) cast-vs-paren speculation regressed "
+           "(D-PARSE-SPECULATION-OPERAND-QUADRATIC). t500="
+        << (static_cast<double>(t500.count()) / 1e6) << "ms t1000="
+        << (static_cast<double>(t1000.count()) / 1e6) << "ms";
+}
+
+// ── LL(k) predictive prune at offset >=1 + nullable-stop soundness ───────
+//
+// These two synthetic-schema tests exercise the predictive prune at a NON-
+// zero offset (offset 0 is the standard 1-token FIRST gate; the prune's extra
+// discriminating power is entirely at offsets >=1) and pin the nullable-stop
+// soundness invariant of `computePredictivePrefixes`.
+
+// (a) PRUNE-FIRES POSITIVE PATH. Reuses `kSpeculativeSchema` (caseA=[A,B,Semi]
+// / caseB=[A,C,Semi], lookahead 3). For input `A C ;` both branches share
+// FIRST={A}, so offset 0 cannot discriminate — the offset-1 prefix does:
+// caseA's prefix[1]={B}, caseB's prefix[1]={C}. The prune drops caseA
+// (observed C ∉ {B}) and the LONE survivor caseB carries no commit-time triage
+// (no `commitRequiresTypeName`), so the parser takes the UNIQUE-PRODUCTION
+// DIRECT-DESCENT path — committing caseB WITHOUT a speculation probe. The
+// resulting tree (clean, caseB present, caseA absent) is the functional pin;
+// the O(N) deep-nest test above is the performance witness that the
+// direct-descent path (not a per-level probe) is what runs.
+TEST(ParserSpeculation, PrunesFirstBranchAtOffsetOneAndDirectDescends) {
+    auto h = loadAndTokenize("A C ;");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "the offset-1 prune must keep the valid caseB reading and parse "
+           "`A C ;` cleanly";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u)
+        << "the lone-survivor direct descent must not surface a backtrack "
+           "failure";
+    EXPECT_EQ(countNodesByRule(t, "caseB"), 1u)
+        << "caseB is the lone candidate the offset-1 prune leaves — it must "
+           "commit via the unique-production direct-descent path";
+    EXPECT_EQ(countNodesByRule(t, "caseA"), 0u)
+        << "caseA must NOT appear — the offset-1 prefix prunes it (observed "
+           "C is not in caseA's prefix[1]={B})";
+}
+
+// (b) NULLABLE-STOP SOUNDNESS GUARD (Finding 1 — RED on the pre-fix code).
+//
+// caseA's second element is a NULLABLE NAMED rule (`nullableRule =
+// {optional CKind}`), referenced as a RuleLeaf — and a RuleLeaf's expectedSet
+// is FIRST(sub-rule) ALONE (it never absorbs the parent continuation, unlike
+// an inline optional's AltChoice, whose expectedSet `recomputeAltExpectedSets`
+// already unions with the continuation). Pre-fix, `computePredictivePrefixes`
+// recorded that RuleLeaf's expectedSet as caseA's prefix[1] = FIRST(nullableRule)
+// = {C}. But `nullableRule` can derive EMPTY, so after `A` the next REAL token
+// may be `nullableRule`'s first token (C) OR — when nullableRule is skipped —
+// caseA's following `BKind` (B). The recorded {C} UNDER-approximates the true
+// admissible set {B, C}; for input `A B ;` the prune then WRONGLY drops caseA
+// (observed B ∉ {C}). caseB=[A,D,Semi] is likewise pruned (B ∉ {D}), so the
+// speculation set empties and the fallback replays caseB, which fails on `B`
+// where it expects `D` — a LOUD mis-parse where a clean caseA parse was due.
+//
+// The fix: a nullable stop element (here, a RuleLeaf whose sub-rule is
+// nullable) is NOT recorded — the walk STOPS with only the exact single-token
+// offsets so far. caseA's prefix collapses to length 1 ({A}) and is cleared,
+// so caseA carries no multi-token discriminator, never prunes, and `A B ;`
+// matches caseA cleanly. This test asserts that clean parse; it is RED on the
+// pre-Finding-1 code (revert the nullable guard in `computePredictivePrefixes`
+// → the EXPECT_FALSE(hasErrors) and caseA==1 assertions fail).
+constexpr std::string_view kNullableStopSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "NullableStopSpec", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\t": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "A":  [{ "kind": "AKind" }],
+    "B":  [{ "kind": "BKind" }],
+    "C":  [{ "kind": "CKind" }],
+    "D":  [{ "kind": "DKind" }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "shapes": {
+    "root":         { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":         { "alt": ["caseA", "caseB"], "speculative": true, "lookahead": 4 },
+    "nullableRule": { "optional": "CKind" },
+    "caseA":        { "sequence": ["AKind", "nullableRule", "BKind", "Semi"] },
+    "caseB":        { "sequence": ["AKind", "DKind", "Semi"] }
+  }
+})JSON";
+
+TEST(ParserSpeculation, NullableStopElementDoesNotOverPrune) {
+    auto loaded = GrammarSchema::loadFromText(kNullableStopSchema);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.has_value() ? "" : loaded.error()[0].message);
+
+    // `A B ;` — caseA with the nullable `nullableRule` skipped (zero C's),
+    // then B then ;. The offset-1 prune must NOT drop caseA on the strength of
+    // FIRST(nullableRule)={C}: the sub-rule is nullable, so B is a legitimate
+    // offset-1 token for caseA.
+    auto src = SourceBuffer::fromString("A B ;", "<nullstop>");
+    Tokenizer tk{src, *loaded};
+    auto [stream, _] = std::move(tk).tokenize();
+    Parser p{src, *loaded, std::move(stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "a nullable stop element must not be recorded as an exact offset — "
+           "`A B ;` is a valid caseA parse (nullableRule derives empty) and "
+           "the prune must NOT drop caseA (RED on the pre-Finding-1 code)";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u)
+        << "no backtrack failure may surface for the well-formed `A B ;`";
+    EXPECT_EQ(countNodesByRule(t, "caseA"), 1u)
+        << "caseA must commit — the nullable-stop soundness guard keeps it in "
+           "the candidate set for the offset-1 token B";
+    EXPECT_EQ(countNodesByRule(t, "caseB"), 0u)
+        << "caseB must NOT appear — `A B ;` is unambiguously caseA";
 }

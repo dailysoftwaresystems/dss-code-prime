@@ -360,6 +360,21 @@ std::span<SchemaTokenId const> GrammarSchema::followSetOf(RuleId rule) const noe
     return it->second.followSet;
 }
 
+std::size_t GrammarSchema::predictivePrefixLen(RuleId rule) const noexcept {
+    auto it = d_.compiledRules.find(rule.v);
+    if (it == d_.compiledRules.end()) return 0;
+    return it->second.predictivePrefix.size();
+}
+
+std::span<SchemaTokenId const>
+GrammarSchema::predictivePrefixAt(RuleId rule, std::size_t offset) const noexcept {
+    auto it = d_.compiledRules.find(rule.v);
+    if (it == d_.compiledRules.end()) return {};
+    auto const& pfx = it->second.predictivePrefix;
+    if (offset >= pfx.size()) return {};
+    return pfx[offset];
+}
+
 std::span<SchemaTokenId const> GrammarSchema::syncTokens() const noexcept {
     return d_.syncTokens;
 }

@@ -550,6 +550,22 @@ public:
     [[nodiscard]] std::span<SchemaTokenId const> followSetOf(RuleId rule) const noexcept;
     [[nodiscard]] bool                           isNullable(RuleId rule) const noexcept;
 
+    // LL(k) PREDICTIVE PREFIX of `rule` — the per-offset over-approximation
+    // of the token sequences that can begin a derivation of `rule`, used by
+    // the parser to PRUNE speculative-alt candidates without backtracking.
+    // `predictivePrefixOf(rule)[i]` is the (sorted) exact set of token kinds
+    // admissible as the (i)-th consumed token across the rule's leading run
+    // of single-token elements (see `CompiledRule::predictivePrefix`).
+    //
+    // Empty when the rule carries no multi-token discriminator (entry is a
+    // lone non-terminal / AltChoice, or the rule is nullable/empty) — the
+    // caller then falls back to the standard 1-token FIRST gate. Each inner
+    // span is stable for the schema's lifetime. Config-derived; names no
+    // token, rule, or language.
+    [[nodiscard]] std::size_t predictivePrefixLen(RuleId rule) const noexcept;
+    [[nodiscard]] std::span<SchemaTokenId const>
+    predictivePrefixAt(RuleId rule, std::size_t offset) const noexcept;
+
     // Schema-declared panic-mode sync tokens. Sorted ascending by
     // `id.v`. Empty when the config omits the `syncTokens` field.
     // Parser's panic-mode recovery consumes until peek is in this set

@@ -1225,6 +1225,158 @@ void recomputeAltExpectedSets(GrammarSchemaData& data) {
     }
 }
 
+// LL(k) PREDICTIVE PREFIX — per-rule, for speculative-alt candidate pruning.
+//
+// For each compiled rule, record `predictivePrefix`: a bounded, per-offset
+// over-approximation of the token sequences that can BEGIN a derivation of
+// the rule. `predictivePrefix[i]` is the (sorted, deduped) set of token
+// kinds admissible as the (i)-th consumed token, computed by walking the
+// LEADING RUN of fixed-width (single-token) elements in the rule's position
+// table:
+//
+//   prefix[0] = {leading token}           (entry is a TokenLeaf)
+//   prefix[1] = {next token}              (still a TokenLeaf — exact offset)
+//   ...stop at the first element that is NOT a TokenLeaf...
+//   prefix[m] = FIRST/expectedSet of that stop element, THEN STOP.
+//
+// The stop element's own FIRST (its position `expectedSet`) is the LAST
+// recorded offset — BUT ONLY when that element MUST consume a token here
+// (it is NOT nullable). A RuleLeaf's expectedSet is FIRST(sub-rule); an
+// AltChoice's is the union of its branch firsts. Recording it captures the
+// cast-vs-paren signal — `castExpr = (ParenOpen castTypeRef ...)` yields
+// `[{ParenOpen}, FIRST(castTypeRef)]` — while stopping there keeps every
+// recorded offset EXACT (offsets 0..m-1 are single-token elements, so input
+// offset == element offset; offset m is the stop element's own first-token
+// set, which IS the exact admissible set at that input offset).
+//
+// NULLABLE STOP ELEMENT (soundness). If the stop sub-rule/alt can derive
+// EMPTY, the rule may SKIP it and continue with whatever follows, so the true
+// admissible set at offset m is FIRST(stop) ∪ FIRST(continuation) — a strict
+// superset of `expectedSet`. Recording `expectedSet` would then UNDER-
+// approximate and the prune could wrongly drop a candidate that legitimately
+// matches. So when the stop element is nullable we STOP WITHOUT recording it,
+// keeping only the exact single-token offsets accumulated so far. Nullability
+// is read from the flags earlier passes already computed: a RuleLeaf's
+// sub-rule `nullable` (computeFirstAndNullable), or an AltChoice's
+// `nullableTail()` (computeNullableTails) — both run before this pass. (A
+// non-nullable AltChoice's expectedSet is the union of ALL branches incl. the
+// skip/continuation branch, so it stays exact and IS recorded.)
+//
+// SOUNDNESS: every recorded offset is an EXACT admissible-token set for that
+// input position, so a prune that rejects a candidate only when some
+// observed `peek(i)` lies OUTSIDE `prefix[i]` can never reject a candidate
+// that could legitimately produce that input — it is a sound
+// over-approximation. Beyond the recorded offsets the prefix imposes no
+// constraint (the candidate still speculates).
+//
+// The prefix is left EMPTY (no extra pruning beyond the standard 1-token
+// FIRST gate) when the rule's entry slot is itself an AltChoice, a nullable
+// skip, or End — such rules have no fixed leading token chain. The walk
+// follows `nextPos` linearly and is naturally short (it terminates at the
+// first non-terminal / branch), so no recursion or cycle guard is needed:
+// a TokenLeaf's `nextPos` strictly advances toward a non-TokenLeaf or End.
+//
+// 100% config-derived: it consumes only the position table + FIRST sets the
+// loader already built. The engine names no token, rule, or language.
+//
+// PRECONDITION (contextual / scope-sensitive kinds) — anchor
+// D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD. A recorded offset's set is the
+// EXACT set of SCHEMA kinds for that position, but the parser-side consumer
+// (`Parser::predictivePrefixPrunes`) compares it against a token's
+// `effectiveKind`, which does NOT model contextual-keyword demotion. So the
+// resulting prune is sound ONLY for grammars whose speculative-alt candidates
+// carry no contextual / scope-resolvable kind in their FIXED prefix — see the
+// full precondition + the deferred conservative-skip fix at
+// `Parser::predictivePrefixPrunes`. This prefix table itself is unconditionally
+// exact; the precondition is purely about how the parser interprets the
+// observed token against it.
+void computePredictivePrefixes(GrammarSchemaData& data) {
+    // A defensive cap on prefix length. The walk self-terminates at the
+    // first non-terminal, so a realistic prefix is 1-3 entries; this only
+    // bounds a pathological all-token-leaf rule (e.g. a long fixed keyword
+    // run) so the stored vector stays small. Larger than any sane rule's
+    // `lookahead`, so it never truncates a usable predictive offset.
+    constexpr std::size_t kMaxPrefixLen = 16;
+
+    for (auto& [_, rule] : data.compiledRules) {
+        auto& prefix = rule.predictivePrefix;
+        prefix.clear();
+        auto const& positions = rule.positions;
+        if (rule.entryPos >= positions.size()) continue;
+
+        std::uint32_t posId = rule.entryPos;
+        while (prefix.size() < kMaxPrefixLen) {
+            if (posId >= positions.size()) break;
+            auto const& p = positions[posId];
+            if (p.slotKind() == SlotKind::TokenLeaf) {
+                // Exact single-token element: record {token}, advance one
+                // input offset, and keep walking the fixed-width run.
+                prefix.emplace_back(p.expectedSet().begin(),
+                                    p.expectedSet().end());
+                posId = p.nextPos();
+                continue;
+            }
+            if (p.slotKind() == SlotKind::RuleLeaf
+                || p.slotKind() == SlotKind::AltChoice) {
+                // First variable-width element: its `expectedSet` is normally
+                // the exact first-token set at THIS input offset (FIRST of the
+                // sub-rule, or the union of branch firsts) — record it as the
+                // final offset, then STOP, since beyond a variable-width
+                // element input/element offsets decouple and no further offset
+                // is soundly exact.
+                //
+                // SOUNDNESS GUARD (nullable stop element). The recorded set is
+                // exact ONLY when the stop element MUST consume at least one
+                // token here. If it can derive EMPTY, the rule may instead skip
+                // it and continue with whatever follows, so the true admissible
+                // set at this offset is FIRST(stop) ∪ FIRST(continuation) — a
+                // strict SUPERSET of `expectedSet`. Recording `expectedSet`
+                // would then UNDER-approximate and the prune could drop a
+                // candidate that legitimately matches (a silent mis-parse).
+                //
+                //   - RuleLeaf: nullable iff its sub-rule is nullable
+                //     (the `nullable` flag `computeFirstAndNullable` set on the
+                //     callee rule, which ran before this pass). A RuleLeaf's
+                //     `expectedSet` is FIRST(sub-rule) ALONE — it never absorbed
+                //     the parent continuation — so a nullable sub-rule is the
+                //     canonical under-approximation case.
+                //   - AltChoice: nullable iff the position can reach End
+                //     consuming nothing, i.e. `nullableTail()` — which
+                //     `computeNullableTails` (also run before this pass) defines
+                //     as "any branch position has a nullable tail". (A non-
+                //     nullable AltChoice's `expectedSet` is already the union of
+                //     ALL its branches, so it stays exact and IS recorded.)
+                //
+                // When the stop element is nullable we therefore STOP WITHOUT
+                // recording it — the prefix keeps only the exact single-token
+                // offsets accumulated so far, preserving the
+                // never-over-prune invariant.
+                bool stopNullable = false;
+                if (p.slotKind() == SlotKind::RuleLeaf) {
+                    auto it = data.compiledRules.find(p.ruleId().v);
+                    stopNullable = (it != data.compiledRules.end())
+                                   && it->second.nullable;
+                } else {  // AltChoice
+                    stopNullable = p.nullableTail();
+                }
+                if (!stopNullable && !p.expectedSet().empty()) {
+                    prefix.emplace_back(p.expectedSet().begin(),
+                                        p.expectedSet().end());
+                }
+                break;
+            }
+            // End slot: rule complete, no further prefix.
+            break;
+        }
+
+        // A length-1 prefix is exactly the standard FIRST gate — drop it so
+        // the hot path can cheaply skip rules with no EXTRA predictive power
+        // (entry is a lone non-terminal / AltChoice / single token). Keep
+        // length>=2: those carry a genuine multi-token discriminator.
+        if (prefix.size() < 2) prefix.clear();
+    }
+}
+
 // FOLLOW(R) = the set of token kinds that can legitimately follow a
 // successful parse of rule R, anywhere it's referenced. Used by the
 // parser's panic-mode recovery to decide "have I reached a resync
@@ -2827,6 +2979,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 detectAmbiguousAlternatives(data, coll, doc.at("shapes"));
                 computeNullableTails       (data);
                 recomputeAltExpectedSets   (data);
+                computePredictivePrefixes  (data);
                 computeFollowSets          (data, coll);
                 validateBodyDefaultKindsOffGrammar(data, coll);
                 validateOperatorBodyRules  (data, coll);
