@@ -1,0 +1,16 @@
+{
+  "$comment": "FC12b (D-FC12B-WIN64-STRUCT-VARARG): structs passed BY VALUE across the Win64 (ms_x64) variadic boundary + read via va_arg(struct). Covers BOTH Win64 by-value shapes: a pow2-≤8B struct (struct Small=8B) rides in ONE arg slot BY VALUE — appendByValueArg loads it as one I64, and va_arg returns the slot's address (the slot IS the storage, no deref); a >8B struct (struct Big=24B) rides as a HIDDEN POINTER in ONE slot — va_arg dereferences the slot to recover the caller's copy. Win64 has no register/stack split and no SysV MEMORY-class rule: one struct == one slot, value-or-pointer, placed by position like a scalar. ANTI-FOLD: every field derives from a mutable global g_seed loaded at runtime, so the by-value copy + the hidden-pointer copy + the va_arg walk run at runtime in BOTH arms. g_seed=5: Small={6,7}, Big={8,9,10}, total = 5+6+7+8+9+10 = 45. A broken by-value slot, a missing/spurious deref, or a desynced cursor flips the exit off 45. The optimizedPipelines arm proves the flow survives ConstFold/Mem2Reg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 45,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}

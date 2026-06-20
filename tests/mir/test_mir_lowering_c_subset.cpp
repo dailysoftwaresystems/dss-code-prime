@@ -4209,14 +4209,56 @@ anyDiagActualContains(DiagnosticReporter const& r, std::string_view anchor) {
     return false;
 }
 
-// FC12b (D-FC12B-WIN64-STRUCT-VARARG) fail-loud: `va_arg(ap, struct)` under the
-// Win64 (ms_x64) HomogeneousPointer strategy is DEFERRED — the homogeneous struct
-// gather is the FC12b-struct follow-on. RED-ON-DISABLE: removing the Win64 arm in
-// lowerVaArgAggregate would let it fall through to the SysV by-value gather (a silent
-// wrong-ABI struct read) and flip mir.ok true.
-TEST(MirLoweringCSubset, Win64VaArgStructFailsLoud) {
+// The function index that issues NO Call — the variadic CALLEE (`sum`/`pick`),
+// where the va_arg walk lives (the mirror of `funcWithCall`, which finds the
+// caller). The struct-vararg fixtures have exactly one callee + one caller.
+[[nodiscard]] inline std::uint32_t funcWithoutCall(Mir const& m) {
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi)
+        if (countOpcodeAllBlocks(m, fi, MirOpcode::Call) == 0) return fi;
+    return 0;
+}
+
+// Count `Load` instructions in `fi` whose FIRST operand is itself a `Load` — i.e.
+// a CHAINED `Load(Load(...))`. This is the host-independent structural signature of
+// the Win64 (HomogeneousPointer) >8B-struct va_arg by-reference DEREF: the va_arg
+// emits `apVal = Load(tagBase)` (the slot cursor) and, for a >8B ByReference struct,
+// `structAddr = Load(apVal)` (deref the hidden pointer the slot holds). The deref's
+// operand IS `apVal`, a Load — so it is a chained Load. The ≤8B by-value path returns
+// `apVal` directly (NO chained Load). Crucially NO OTHER Load in these fixtures is
+// chained: every field read (member access AND `lowerAggregateCopy`'s copy-in) loads
+// through a `Gep` (even at offset 0 — MemberAccess/aggregate-copy always emit a Gep),
+// so its operand is a Gep, not a Load; and `tagBase` is the `ap` local's Alloca
+// address, not a Load. Thus this count discriminates deref-present (>=1) from
+// deref-dropped (0) regardless of how many incidental copy-in/member Loads exist —
+// the "Load >= N" whole-function count it replaces could not (the copy-in Loads kept
+// the total above the threshold even with the deref dropped).
+[[nodiscard]] std::size_t countChainedLoadOfLoad(Mir const& m, std::uint32_t fi) {
+    std::size_t n = 0;
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Load) continue;
+            auto const ops = m.instOperands(ix);
+            if (ops.empty()) continue;
+            if (m.instOpcode(ops[0]) == MirOpcode::Load) ++n;
+        }
+    }
+    return n;
+}
+
+// FC12b (D-FC12B-WIN64-STRUCT-VARARG) — INVERTED to SUCCESS: `va_arg(ap, struct)`
+// under the Win64 (ms_x64) HomogeneousPointer strategy for a pow2-≤8B struct. The
+// struct sits BY VALUE in the one arg slot, so va_arg returns the slot's ADDRESS
+// (apVal) directly — NO deref Load, NO Phi (the slot IS the storage), and a LINEAR
+// pointer bump (no reg-vs-overflow diamond → NO atomic-fit ICmpUle pair, NO
+// ByValueStackArg carrier). RED-ON-DISABLE: reverting the lowerVaArgAggregate
+// HomogeneousPointer arm to fail-loud flips mir.ok false; a regression to the SysV
+// by-value gather would emit the ICmpUle atomic-fit pair (caught below).
+TEST(MirLoweringCSubset, Win64VaArgStructLeq8ReturnsSlotAddr) {
     auto L = lowerCSubset(
-        "struct Pt { int a; int b; };\n"   // 8B, would be InRegisters under SysV
+        "struct Pt { int a; int b; };\n"   // 8B (pow2 ≤8) → InRegisters[1], by value
         "int sum(int n, ...) {\n"
         "  va_list ap;\n"
         "  va_start(ap, n);\n"
@@ -4225,31 +4267,168 @@ TEST(MirLoweringCSubset, Win64VaArgStructFailsLoud) {
         "  return p.a + p.b;\n"
         "}\n",
         "x86_64", "ms_x64");
-    EXPECT_FALSE(L.mir.ok)
-        << "va_arg of a struct under Win64 must FAIL LOUD (D-FC12B-WIN64-STRUCT-VARARG)";
-    EXPECT_TRUE(anyDiagActualContains(L.mirReporter, "D-FC12B-WIN64-STRUCT-VARARG"))
-        << "the fail-loud must cite the Win64 struct-vararg anchor";
+    ASSERT_TRUE(L.mir.ok)
+        << "Win64 va_arg(≤8B struct) must lower (D-FC12B-WIN64-STRUCT-VARARG): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithoutCall(m);   // `sum` (the variadic callee)
+    // The slot IS the storage: a ≤8B struct va_arg has NO reg-vs-overflow diamond
+    // (linear pointer bump), so NO atomic-fit ICmpUle pair and NO carrier.
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUle), 0u)
+        << "a Win64 ≤8B struct va_arg is a LINEAR pointer bump — no atomic-fit "
+           "diamond (a SysV-gather regression would emit the ICmpUle pair)";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 0u)
+        << "no overflow carrier — Win64 places the struct in one slot by position";
+    // The va_arg bump is by namedArgSlotBytes (8) — pin the Const so a wrong stride
+    // (e.g. sizeof not slot) goes red. The struct fields are then byte-copied out of
+    // the slot (the member-access reads p.a@0 / p.b@4) — anti-folded by the corpus.
+    EXPECT_TRUE(funcHasConstInt(m, fi, 8))
+        << "the va_list cursor bumps by namedArgSlotBytes==8 (one Win64 arg slot)";
+    // STRUCTURAL no-deref mirror of the >8B pin: the ≤8B by-value path returns the
+    // SLOT ADDRESS (apVal) directly, so there is NO chained `Load(Load(ap))`. A
+    // spurious value Load of the cursor (returning the slot's *contents* — a scalar —
+    // as if it were the aggregate's address) would be a silent miscompile that only
+    // the Windows-only PE corpus catches; pin it red here too. (funcHasConstInt(8) and
+    // the ICmpUle/ByValueStackArg==0 checks above can't see this — they don't inspect
+    // the va_arg result chain.)
+    EXPECT_EQ(countChainedLoadOfLoad(m, fi), 0u)
+        << "the ≤8B by-value va_arg returns the slot ADDRESS (apVal) directly — there "
+           "must be NO chained Load(Load(ap)) deref (a value Load here would return a "
+           "scalar as the aggregate address)";
 }
 
-// FC12b (D-FC12B-WIN64-STRUCT-VARARG) fail-loud: passing a struct BY VALUE to a
-// Win64 (ms_x64) variadic CALLEE is DEFERRED — the caller-side homogeneous
-// placement is the FC12b-struct follow-on. RED-ON-DISABLE: removing the Win64 arm
-// in the Call arg loop lets the SysV-shaped gpSaveCount fit-check run on Win64's
-// zeroed save-counts (mis-message at best, silent split at worst).
-TEST(MirLoweringCSubset, Win64StructByValueVarargCallFailsLoud) {
+// FC12b (D-FC12B-WIN64-STRUCT-VARARG) — SUCCESS, >8B by-reference arm. A struct
+// whose size is NOT pow2-≤8 (here 24B) rides as a hidden POINTER in the one slot;
+// va_arg must DEREFERENCE the slot to get the caller's copy address. So the callee
+// emits an EXTRA Load (the slot Load + the pointer deref Load) that the ≤8B by-value
+// arm does NOT, still with NO diamond/carrier. RED-ON-DISABLE: dropping the
+// ByReference deref Load would return the slot addr (a pointer-to-pointer) → the
+// consumer copies 24 bytes of pointer+garbage (a silent miscompile).
+TEST(MirLoweringCSubset, Win64VaArgStructGt8DerefsPointer) {
     auto L = lowerCSubset(
-        "struct Pt { int a; int b; };\n"
+        "struct Big { long a; long b; long c; };\n"  // 24B → ByReference (hidden ptr)
+        "long pick(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct Big b = va_arg(ap, struct Big);\n"
+        "  va_end(ap);\n"
+        "  return b.a + b.b + b.c;\n"
+        "}\n",
+        "x86_64", "ms_x64");
+    ASSERT_TRUE(L.mir.ok)
+        << "Win64 va_arg(>8B struct) must lower (D-FC12B-WIN64-STRUCT-VARARG): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithoutCall(m);   // `pick`
+    // Still linear (one slot, by pointer): no atomic-fit diamond, no carrier.
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUle), 0u)
+        << "a Win64 >8B struct va_arg is a LINEAR pointer bump (one slot, by ptr)";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 0u)
+        << "no overflow carrier — the >8B struct rides as a pointer in one slot";
+    // The bump is ONE slot, NOT roundUp(24,8)==24: the SLOT holds a pointer, not the
+    // 24-byte struct. A regression to a by-value overflow bump would emit a Const 24
+    // (the by-value tail-round). The struct's three long fields live at 0/8/16, so
+    // there is NO legitimate Const 24 in the body — its presence means a wrong bump.
+    EXPECT_FALSE(funcHasConstInt(m, fi, 24))
+        << "Win64 does NOT bump by roundUp(sizeof,8)==24 (that is the SysV by-value "
+           "overflow stride — the Win64 slot holds a pointer, not the bytes)";
+    // The by-reference arm emits the slot-cursor Load `apVal = Load(tagBase)` AND a
+    // chained deref `structAddr = Load(apVal)` (the slot holds a hidden pointer). The
+    // ≤8B by-value arm omits the deref (returns apVal directly). A whole-function
+    // `Load >= N` count CANNOT discriminate the two: BOTH paths also emit the
+    // aggregate copy-in's per-field Loads (`lowerAggregateCopy` loads each of the 3
+    // longs) plus the `return` member reads, so dropping the deref still leaves the
+    // total well above any fixed floor. Instead assert the STRUCTURAL signature that
+    // is UNIQUE to the deref: a `Load` whose operand is itself a `Load` (the chained
+    // slot-Load → deref-Load). Every other Load here goes through a `Gep` (field
+    // reads) or loads `tagBase` (the `ap` Alloca), so none is chained — dropping the
+    // deref takes this count to 0. Host-independent: it inspects the MIR shape, not a
+    // count the (Windows-only) PE corpus would otherwise be the sole guard of.
+    EXPECT_GE(countChainedLoadOfLoad(m, fi), 1u)
+        << "the >8B by-reference va_arg must deref the slot: a chained Load(Load(ap)) "
+           "— dropping the deref (returning the slot address) takes this to 0 (a "
+           "silent miscompile caught here, not just on the Windows PE leg)";
+}
+
+// FC12b (D-FC12B-WIN64-STRUCT-VARARG) — INVERTED to SUCCESS, caller side: passing a
+// pow2-≤8B struct BY VALUE to a Win64 (ms_x64) variadic callee. The struct rides in
+// exactly ONE arg slot BY VALUE — the Call gets exactly ONE value operand for it (a
+// loaded I64), NOT a ByValueStackArg carrier and NOT the SysV piece-split. RED-ON-
+// DISABLE: reverting the wall-2 HomogeneousPointer arm to fail-loud flips mir.ok
+// false; a regression to the SysV atomic-fit path would emit a carrier or split.
+TEST(MirLoweringCSubset, Win64StructByValueVarargCallLeq8OneSlot) {
+    auto L = lowerCSubset(
+        "struct Pt { int a; int b; };\n"   // 8B → InRegisters[1], one slot by value
         "int sink(int n, ...);\n"
         "int main(void) {\n"
         "  struct Pt p; p.a = 1; p.b = 2;\n"
         "  return sink(1, p);\n"          // struct BY VALUE to a Win64 variadic fn
         "}\n",
         "x86_64", "ms_x64");
-    EXPECT_FALSE(L.mir.ok)
-        << "a struct-by-value vararg to a Win64 variadic fn must FAIL LOUD "
-           "(D-FC12B-WIN64-STRUCT-VARARG)";
-    EXPECT_TRUE(anyDiagActualContains(L.mirReporter, "D-FC12B-WIN64-STRUCT-VARARG"))
-        << "the caller-side fail-loud must cite the Win64 struct-vararg anchor";
+    ASSERT_TRUE(L.mir.ok)
+        << "a ≤8B struct-by-value vararg to a Win64 variadic fn must lower "
+           "(D-FC12B-WIN64-STRUCT-VARARG): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithCall(m);   // `main` (the caller)
+    // NO overflow carrier — the by-value struct is ONE value operand in one slot.
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 0u)
+        << "a Win64 ≤8B by-value struct vararg is ONE value slot, never a carrier";
+    // The Call has exactly the fixed callee + the count `1` + ONE struct value
+    // operand = 3 operands. (callee GlobalAddr, n=1, struct-as-I64.)
+    MirFuncId const f = m.funcAt(fi);
+    MirInstId call = InvalidMirInst;
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f) && !call.valid(); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) == MirOpcode::Call) { call = ix; break; }
+        }
+    }
+    ASSERT_TRUE(call.valid());
+    auto const ops = m.instOperands(call);
+    EXPECT_EQ(ops.size(), 3u)
+        << "Call = [callee, n=1, ONE struct value operand] — the ≤8B struct is a "
+           "single by-value slot (NOT 0/fail-loud, NOT a 2-piece split)";
+}
+
+// FC12b (D-FC12B-WIN64-STRUCT-VARARG) — SUCCESS, caller side >8B by-reference. A
+// non-pow2/>8B struct passed BY VALUE to a Win64 variadic callee rides as a hidden
+// POINTER in ONE slot — the Call gets exactly ONE pointer operand (the temp copy
+// address), still NO carrier. RED-ON-DISABLE: a regression to the SysV MEMORY-class
+// carrier would emit a ByValueStackArg instead of the pointer operand.
+TEST(MirLoweringCSubset, Win64StructByValueVarargCallGt8OnePointer) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"  // 24B → ByReference (hidden ptr)
+        "int sink(int n, ...);\n"
+        "int main(void) {\n"
+        "  struct Big b; b.a = 1; b.b = 2; b.c = 3;\n"
+        "  return sink(1, b);\n"          // >8B struct BY VALUE to a Win64 variadic fn
+        "}\n",
+        "x86_64", "ms_x64");
+    ASSERT_TRUE(L.mir.ok)
+        << "a >8B struct-by-value vararg to a Win64 variadic fn must lower "
+           "(D-FC12B-WIN64-STRUCT-VARARG): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithCall(m);   // `main`
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 0u)
+        << "a Win64 >8B by-value struct vararg rides as a pointer in one slot — "
+           "never the SysV MEMORY-class overflow carrier";
+    MirFuncId const f = m.funcAt(fi);
+    MirInstId call = InvalidMirInst;
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f) && !call.valid(); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) == MirOpcode::Call) { call = ix; break; }
+        }
+    }
+    ASSERT_TRUE(call.valid());
+    auto const ops = m.instOperands(call);
+    EXPECT_EQ(ops.size(), 3u)
+        << "Call = [callee, n=1, ONE struct POINTER operand] — the >8B struct is a "
+           "single hidden-pointer slot (NOT a carrier, NOT 0/fail-loud)";
 }
 
 // A variadic callee whose FIXED params overflow to the stack (more fixed integer

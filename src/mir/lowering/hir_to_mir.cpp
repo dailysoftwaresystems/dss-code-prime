@@ -714,15 +714,34 @@ struct Lowerer {
                                     VaListLayout const& vlMem = *config.vaListLayout;
                                     if (vlMem.strategy
                                         == VaListStrategy::HomogeneousPointer) {
-                                        unsupported(kids[i],
-                                            "passing a struct/union BY VALUE to a "
-                                            "Win64 ms_x64 variadic function is not yet "
-                                            "supported — the homogeneous struct-vararg "
-                                            "caller placement is the FC12b-struct "
-                                            "follow-on (D-FC12B-WIN64-STRUCT-VARARG)");
-                                        return InvalidMirInst;
-                                    }
-                                    if (vlMem.strategy
+                                        // Win64 (ms_x64) ByReference vararg
+                                        // (D-FC12B-WIN64-STRUCT-VARARG): a non-pow2/>8B
+                                        // struct rides as a hidden POINTER to a caller
+                                        // copy in exactly ONE arg slot — IDENTICAL to
+                                        // the non-variadic ByReference path (Win64 has
+                                        // no SysV MEMORY-class-to-stack rule; the slot
+                                        // is register-or-stack BY POSITION, placed by
+                                        // lir_callconv's slot-aligned walk like any GPR
+                                        // operand). appendByValueArg's ByReference arm
+                                        // copies to a callee-owned temp + pushes the
+                                        // temp POINTER (1 GPR-class operand). The
+                                        // `runGpr += 1` is INERT for Win64 slot
+                                        // indexing: under HomogeneousPointer the slot
+                                        // index is lir_callconv's positional
+                                        // slot-aligned walk, and runGpr is consulted
+                                        // ONLY by the SysV gpSaveCount split check (the
+                                        // InRegisters `else` arm below) which this
+                                        // ByReference arm never reaches. We advance it
+                                        // anyway for uniformity with the SysV/scalar
+                                        // arms (a single running-register cursor), but
+                                        // it does NOT drive Win64 placement. NO carrier,
+                                        // NO force-to-stack — fall through to the shared
+                                        // fixedOperandCount stamp + continue below.
+                                        if (!appendByValueArg(operands, kids[i],
+                                                              argTy, *abi))
+                                            return InvalidMirInst;
+                                        runGpr += 1;
+                                    } else if (vlMem.strategy
                                         == VaListStrategy::Aapcs64DualCursor) {
                                         unsupported(kids[i],
                                             "passing a struct/union BY VALUE to an "
@@ -731,9 +750,16 @@ struct Lowerer {
                                             "placement is a separate sub-feature "
                                             "(D-FC12C-AAPCS64-HFA-STRUCT-VARARG)");
                                         return InvalidMirInst;
-                                    }
-                                    if (vlMem.strategy
-                                        != VaListStrategy::SysVRegisterSave) {
+                                    } else if (vlMem.strategy
+                                        == VaListStrategy::SysVRegisterSave) {
+                                        // SysV MEMORY class → the Option-C overflow
+                                        // carrier, unconditionally by value on the stack.
+                                        if (!appendByValueStackArg(operands, kids[i],
+                                                                   argTy))
+                                            return InvalidMirInst;
+                                        // NOT counted in runGpr/runFpr — it's in the
+                                        // overflow (stack) area, consuming no register.
+                                    } else {
                                         unsupported(kids[i],
                                             "passing a struct/union BY VALUE to a "
                                             "variadic function under this va_list "
@@ -741,10 +767,6 @@ struct Lowerer {
                                             "(internal: unknown VaListStrategy)");
                                         return InvalidMirInst;
                                     }
-                                    if (!appendByValueStackArg(operands, kids[i], argTy))
-                                        return InvalidMirInst;
-                                    // NOT counted in runGpr/runFpr — it's in the overflow
-                                    // (stack) area, consuming no arg register.
                                 } else {
                                     if (!appendByValueArg(operands, kids[i], argTy, *abi))
                                         return InvalidMirInst;
@@ -777,22 +799,41 @@ struct Lowerer {
                                         return InvalidMirInst;
                                     }
                                     VaListLayout const& vl = *config.vaListLayout;
-                                    // FC12b: a by-value struct passed to a Win64
-                                    // (HomogeneousPointer) variadic callee is DEFERRED
-                                    // — the atomic-fit/placement below is SysV-shaped
-                                    // (reads gpSaveCount/fpSaveCount, which Win64 does
-                                    // not declare). Fail loud with the Win64 anchor
-                                    // BEFORE the SysV-shaped checks run on zeroed
-                                    // fields (which would mis-message).
+                                    // FC12b (D-FC12B-WIN64-STRUCT-VARARG): a by-value
+                                    // pow2-≤8B struct passed to a Win64 (Homogeneous-
+                                    // Pointer) variadic callee rides in exactly ONE arg
+                                    // slot BY VALUE (InRegisters[1 GPR piece]) — placed
+                                    // like a scalar by lir_callconv's slot-aligned walk.
+                                    // Win64 has NO atomic-fit/register-exhaustion SPLIT
+                                    // (the SysV §3.5.7 rule below reads gpSaveCount/
+                                    // fpSaveCount which Win64 does not declare): one
+                                    // struct == one slot, register-or-stack BY POSITION.
+                                    // So SKIP the SysV split check + routeToStack carrier
+                                    // entirely — appendByValueArg's InRegisters arm
+                                    // pushes the 1 I64 value operand; advance runGpr/
+                                    // runFpr by its piece count (numGp==1; numFp==0 — a
+                                    // Win64 homogeneous piece is GPR-class). That
+                                    // advance is INERT for Win64 slot indexing (the slot
+                                    // index is lir_callconv's positional slot-aligned
+                                    // walk; runGpr feeds ONLY the SysV gpSaveCount split
+                                    // check below, which this arm `continue`s past) —
+                                    // kept for uniformity with the SysV/scalar
+                                    // running-register cursor, not because Win64 reads
+                                    // it. Stamp the fixed boundary + continue (do NOT
+                                    // fall into the SysV atomic-fit/piece-push below).
                                     if (vl.strategy
                                         == VaListStrategy::HomogeneousPointer) {
-                                        unsupported(kids[i],
-                                            "passing a struct/union BY VALUE to a "
-                                            "Win64 ms_x64 variadic function is not yet "
-                                            "supported — the homogeneous struct-vararg "
-                                            "caller placement is the FC12b-struct "
-                                            "follow-on (D-FC12B-WIN64-STRUCT-VARARG)");
-                                        return InvalidMirInst;
+                                        if (!appendByValueArg(operands, kids[i],
+                                                              argTy, *abi))
+                                            return InvalidMirInst;
+                                        runGpr += numGp;
+                                        runFpr += numFp;
+                                        if (i == fnParamsSize) {
+                                            fixedOperandCount =
+                                                operands.size() - operandsBeforeArgs;
+                                            fixedOperandCountStamped = true;
+                                        }
+                                        continue;
                                     }
                                     if (vl.strategy
                                         == VaListStrategy::Aapcs64DualCursor) {
@@ -3415,17 +3456,73 @@ struct Lowerer {
             return InvalidMirInst;
         }
         VaListLayout const& vl = *config.vaListLayout;
-        // FC12b: strategy-dispatch. The SysV eightbyte gather is below; Win64 struct
-        // varargs are DEFERRED (the caller-side atomic-fit/placement is SysV-shaped
-        // and needs a Win64 homogeneous analog — the FC12b-struct follow-on); AAPCS64
-        // is FC12c. Fail loud rather than fall through to the SysV by-value gather on
-        // a non-SysV layout (a silent wrong-ABI struct read).
+        // FC12b: strategy-dispatch. The SysV eightbyte gather is below; AAPCS64 is
+        // FC12c. Fail loud rather than fall through to the SysV by-value gather on a
+        // non-SysV layout (a silent wrong-ABI struct read).
         if (vl.strategy == VaListStrategy::HomogeneousPointer) {
-            unsupported(node,
-                "va_arg of a struct/union under the Win64 ms_x64 ABI is not yet "
-                "supported — the homogeneous-pointer struct-vararg walk is the "
-                "FC12b-struct follow-on (D-FC12B-WIN64-STRUCT-VARARG)");
-            return InvalidMirInst;
+            // ── Win64 (ms_x64) struct va_arg: ONE 8-byte slot, value-or-pointer ──
+            // (D-FC12B-WIN64-STRUCT-VARARG). The Win64 ABI passes a by-value struct
+            // in exactly ONE arg slot: a pow2-≤8B struct sits in the slot BY VALUE
+            // (InRegisters[1 GPR piece]); every other size rides as a hidden POINTER
+            // to a caller copy (ByReference). `ap` is a `char*` cursor (the
+            // HomogeneousPointer va_list); tagBase is its lvalue address (`char**`).
+            // Classify T, then dispatch on the slot's meaning — the read-side mirror
+            // of the caller's `appendByValueArg` (which placed exactly one slot here).
+            // LINEAR (no diamond): the home/overflow areas are contiguous from the
+            // va_start base, so one Gep bump crosses them uniformly, exactly like the
+            // scalar HomogeneousPointer arm above.
+            TypeId const t = hir.typeId(node);
+            if (!t.valid()) {
+                unsupported(node, "VaArg has no result type");
+                return InvalidMirInst;
+            }
+            auto const abi = byValueClassify(t);
+            if (!abi.has_value()) {
+                unsupported(node,
+                    "va_arg of a struct/union is not supported by this target's "
+                    "calling convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                return InvalidMirInst;
+            }
+            auto kids = hir.children(node);
+            if (kids.size() != 2) {
+                unsupported(node, "malformed VaArg (expect [apExpr, TypeRef])");
+                return InvalidMirInst;
+            }
+            MirInstId const tagBase = vaTagBase(kids[0]);   // child 1 NEVER lowered
+            if (!tagBase.valid()) return InvalidMirInst;
+            TypeId const voidPtr =
+                interner.pointer(interner.primitive(TypeKind::Void));
+            // apVal = Load(tagBase) — the current slot cursor (a void* into the
+            // contiguous home/overflow arg area).
+            std::array<MirInstId, 1> loadApOps{tagBase};
+            MirInstId const apVal = mir.addInst(MirOpcode::Load, loadApOps, voidPtr);
+            MirInstId structAddr;
+            if (abi->kind == AbiPassing::Kind::ByReference) {
+                // The slot HOLDS A POINTER to the caller's by-value copy: deref it.
+                // apVal is the slot's address (void*); Load the stored pointer (the
+                // Load's void* result width reads the pointer, agnostic to pointee).
+                std::array<MirInstId, 1> derefOps{apVal};
+                structAddr = mir.addInst(MirOpcode::Load, derefOps, voidPtr);
+            } else {
+                // InRegisters (pow2 ≤8B): the slot IS the storage — the struct's
+                // bytes were written into this slot as one I64 by the caller's
+                // appendByValueArg. The slot's address (apVal) is the struct's
+                // address; the consumer byte-copies sizeof(T) (≤8) bytes from it.
+                // NO extra Load (mirrors the SysV overflow-arm `return ovfArea`).
+                structAddr = apVal;
+            }
+            // Bump the cursor by one slot (namedArgSlotBytes), exactly like the
+            // scalar HomogeneousPointer arm: a Win64 struct vararg occupies ONE slot
+            // whether by value or by pointer. Gep apVal + slot, store back to tagBase.
+            MirInstId const stepK =
+                constInt(static_cast<std::int64_t>(vl.namedArgSlotBytes));
+            if (!stepK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> gepOps{apVal, stepK};
+            MirInstId const apNext = mir.addInst(MirOpcode::Gep, gepOps, voidPtr);
+            std::array<MirInstId, 2> st{apNext, tagBase};
+            mir.addInst(MirOpcode::Store, st);
+            // The aggregate's ADDRESS is the result (by address — NO value Load).
+            return structAddr;
         }
         if (vl.strategy == VaListStrategy::Aapcs64DualCursor) {
             // FC12c ships the SCALAR (int + fp) dual-cursor diamond; a STRUCT/union
