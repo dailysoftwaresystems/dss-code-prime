@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FC12C-APPLE-ARM64-VARIADIC-CALLEE (struct varargs): STRUCT varargs under Apple arm64 (Mach-O). Apple always-stacks varargs, so the callee va_arg(struct) is the linear HomogeneousPointer slot walk. sumTwoHfa(TWO {double,double} 16B HFA)=38 is the FOLD 1(a) BLOCKER witness for the Step 2.0 size-aware bump: each 16B HFA spans TWO 8-byte slots, so the cursor must advance by roundUp(16,8)=16 — with the latent 8-byte under-bump the second va_arg re-reads the first struct's tail ({5,10}) and the sum is 23, not 38. sumSmall({int,int} 8B InRegisters by value)=30 + sumLarge({long,long,long} 24B ByReference deref)=6. 38+30+6 = 74. COMPILES on every host (a structural Mach-O-arm64 cross-compile witness); RUNS only on macos-latest (no off-Mac emulator) — SkippedCrossHost elsewhere is expected. RED-ON-DISABLE: the Step 2.0 under-bump flips sumTwoHfa off 38.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 74,
+  "targets": [
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ]
+}

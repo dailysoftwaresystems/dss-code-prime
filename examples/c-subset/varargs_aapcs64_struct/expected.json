@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FC12C-AAPCS64-HFA-STRUCT-VARARG: AAPCS64 (ARM64-ELF) STRUCT varargs across every Aapcs64Hfa class on BOTH the register arm AND the __stack overflow arm. sumHfa({double,double})=8 (VR register gather, H1+H2) + sumGpr({long,long})=30 (GR register gather) + sumByRef({long,long,long} 24B)=6 (hidden-pointer deref, H5/H7) + sumAfterDrain(7 longs drain GR, then {long,long} on __stack)=73 (caller H8 + non-HFA overflow read) + sumHfaOverflow(8 doubles drain VR, then {double,double} HFA on __stack)=18 (FOLD 2 / H6 HFA overflow arm, roundUp(16,8) bump). 8+30+6+73+18 = 135. RED-ON-DISABLE: a dropped piece, wrong-class save block (H2), missing sign-extend (H1), dropped ByRef deref (H5), missing caller exhaustion check (H8), or wrong overflow stride (H6) flips the exit off 135. arm64-ELF under qemu-aarch64.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 135,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ]
+}

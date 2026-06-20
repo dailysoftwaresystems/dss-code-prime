@@ -3399,3 +3399,126 @@ TEST(LirCallconvAbi, SysVByValueStackAggByteCopyScratchAvoidsArgMoveSources) {
         << "the scratch must not be rcx — rcx is arg 1's live source; choosing it (the "
            "reverted behavior) corrupts the rsi argument with the struct's bytes";
 }
+
+// D-FC12C-AAPCS64-HFA-STRUCT-VARARG (Step 5.1, LIR) — an HFA `{double,double}` vararg
+// passed to an AAPCS64 variadic call with room in the VR pool is placed in FPR arg
+// registers (d0/d1) BY VALUE: the lowered Call carries TWO FPR-class operands and NO
+// ByValueStackAgg carrier; after materialization the call fits entirely in registers
+// (outgoingArgAreaSize == 0). RED-ON-DISABLE: a wrong-class exhaustion check (testing
+// the GR pool for an HFA) would route it to the overflow carrier (ByValueStackAgg
+// appears, outgoingArgAreaSize grows).
+TEST(LirCallconvVariadicFC12c, Aapcs64VarArgHfaStructInRegisters) {
+    auto bundle = lowerThroughRewrite(
+        "struct HFA { double a; double b; };\n"
+        "int sink(int n, ...);\n"
+        "int f(void) {\n"
+        "  struct HFA h; h.a = 1.0; h.b = 2.0;\n"
+        "  return sink(1, h);\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");   // aapcs64 = cc index 0
+    ASSERT_TRUE(bundle.lowered.lir.ok)
+        << (bundle.lowered.lirReporter.all().empty()
+                ? "" : bundle.lowered.lirReporter.all()[0].actual);
+    ASSERT_TRUE(bundle.alloc.ok());
+    ASSERT_TRUE(bundle.rewritten.ok);
+
+    // Inspect the lowered (pre-materialization) Call: it still carries the arg-reg
+    // operands. The HFA must contribute TWO FPR-class operands and ZERO ByValueStackAgg.
+    auto const callOp = bundle.lowered.target->opcodeByMnemonic("call");
+    ASSERT_TRUE(callOp.has_value());
+    std::uint32_t fprArgOps = 0, byValueAggMarkers = 0, callCount = 0;
+    Lir const& lir = bundle.lowered.lir.lir;
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(blk); ++i) {
+                LirInstId const inst = lir.blockInstAt(blk, i);
+                if (lir.instOpcode(inst) != *callOp) continue;
+                ++callCount;
+                for (auto const& op : lir.instOperands(inst)) {
+                    if (op.kind == LirOperandKind::ByValueStackAgg) ++byValueAggMarkers;
+                    if (op.kind == LirOperandKind::Reg
+                        && op.reg.regClass() == LirRegClass::FPR)
+                        ++fprArgOps;
+                }
+            }
+        }
+    }
+    ASSERT_GT(callCount, 0u) << "the fixture has a sink(...) call site";
+    EXPECT_EQ(byValueAggMarkers, 0u)
+        << "an HFA with room in the VR pool is register-placed (FPR pieces), NOT routed "
+           "to the overflow via the ByValueStackAgg carrier (H4/H8)";
+    EXPECT_GE(fprArgOps, 2u)
+        << "the 2-double HFA contributes TWO FPR-class arg operands (d0/d1)";
+
+    // CC-level cross-check: materialize and confirm the call fits in registers (no
+    // outgoing overflow). A misroute to the carrier would reserve overflow bytes.
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+    auto const* layout = result.forFuncByIndex(0);   // `f`
+    ASSERT_NE(layout, nullptr);
+    EXPECT_EQ(layout->outgoingArgAreaSize, 0u)
+        << "the HFA vararg rides in d0/d1 — the call fits in registers, no overflow";
+}
+
+// D-FC12C-AAPCS64-HFA-STRUCT-VARARG (Step 5.2, LIR) — a non-HFA `{long,long}` vararg
+// passed AFTER 8 scalar long varargs drain the GR pool (gpSaveCount=8) is forced WHOLE
+// to the overflow via the ByValueStackAgg carrier. The lowered Call carries the marker;
+// after materialization the outgoing area reserves ceil(16/8)*8 = 16 bytes. RED-ON-
+// DISABLE: a missing exhaustion check emits register pieces (no carrier, no overflow).
+TEST(LirCallconvVariadicFC12c, Aapcs64VarArgNonHfaStructStackAfterExhaustion) {
+    auto bundle = lowerThroughRewrite(
+        "struct LL { long a; long b; };\n"
+        "long sink(int n, ...);\n"
+        "long use(void) {\n"
+        "  struct LL p; p.a = 40; p.b = 5;\n"
+        "  return sink(8, 1L,2L,3L,4L,5L,6L,7L,8L, p);\n"   // 8 longs drain GR, then struct
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");   // aapcs64 = cc index 0
+    ASSERT_TRUE(bundle.lowered.lir.ok)
+        << (bundle.lowered.lirReporter.all().empty()
+                ? "" : bundle.lowered.lirReporter.all()[0].actual);
+    ASSERT_TRUE(bundle.alloc.ok());
+    ASSERT_TRUE(bundle.rewritten.ok);
+
+    auto const callOp = bundle.lowered.target->opcodeByMnemonic("call");
+    ASSERT_TRUE(callOp.has_value());
+    std::uint32_t byValueAggMarkers = 0, callCount = 0;
+    Lir const& lir = bundle.lowered.lir.lir;
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(blk); ++i) {
+                LirInstId const inst = lir.blockInstAt(blk, i);
+                if (lir.instOpcode(inst) != *callOp) continue;
+                ++callCount;
+                for (auto const& op : lir.instOperands(inst))
+                    if (op.kind == LirOperandKind::ByValueStackAgg) ++byValueAggMarkers;
+            }
+        }
+    }
+    ASSERT_GT(callCount, 0u) << "the fixture has a sink(...) call site";
+    EXPECT_EQ(byValueAggMarkers, 1u)
+        << "H8: 8 scalar longs drain the GR pool → the trailing {long,long} struct is "
+           "forced WHOLE to the overflow via the ByValueStackAgg carrier";
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok())
+        << "the by-value-stack carrier must materialize cleanly: "
+        << (ccRep.all().empty() ? "" : ccRep.all()[0].actual);
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+    auto const* layout = result.forFuncByIndex(0);   // `use`
+    ASSERT_NE(layout, nullptr);
+    EXPECT_GE(layout->outgoingArgAreaSize, 16u)
+        << "the outgoing area must reserve ceil(16/8)*8 = 16 bytes for the forced "
+           "{long,long} struct vararg (plus the 8 overflow longs' slots)";
+}
