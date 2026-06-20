@@ -2487,7 +2487,17 @@ struct Lowerer {
                                 "is not supported");
             return false;
         }
-        auto const fieldTypes = interner.operands(aggTy);
+        // COPY the field types out of the interner's pool: `operands` returns a
+        // SPAN into operandPool_, and `interner.pointer(...)` in the field-copy
+        // loop below interns fresh `Ptr<…>` types — an intern can REALLOCATE the
+        // pool, dangling a retained span (a host-STL-growth-dependent
+        // heap-use-after-free; non-Windows release legs misread the freed bytes
+        // as an invalid Load result-type → MirBuilder fatal). The owning vector
+        // is immune. Twin of the FC7-C1c fix at the function-param setup below.
+        std::vector<TypeId> const fieldTypes = [&] {
+            auto const s = interner.operands(aggTy);
+            return std::vector<TypeId>(s.begin(), s.end());
+        }();
         if (fieldTypes.size() != layout->fieldOffsets.size()) {
             unsupported(atNode, "struct copy: field-type count mismatches the "
                                 "layout field-offset count (internal invariant)");
