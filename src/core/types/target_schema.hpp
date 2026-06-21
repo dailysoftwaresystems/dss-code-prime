@@ -1060,11 +1060,38 @@ enum class EncodingSlotKind : std::uint8_t {
     // is representable. Distinct from `Imm32` (4 bytes, sign-extended
     // consumers) and `Imm8` (1 byte, shift counts).
     Imm64         = 25,
+    // D-ASM-AARCH64-LARGE-FRAME-IMM12 (v0.0.2 cycle ⑤): the AArch64
+    // SCALED unsigned 12-bit displacement of the unsigned-offset LDR/STR
+    // form (`LDR/STR Xt, [Xn, #pimm]`), bits 10..21 — the SAME bit-window
+    // as `Imm12`, but with DISTINCT encode semantics, hence a distinct
+    // slot (NOT a reuse of Imm12 + a flag — §B.2 FORCED). Whereas Imm12
+    // (ADD/SUB-immediate) writes the RAW byte value, this slot writes the
+    // SCALED field `imm12 = byteOffset / accessSizeBytes` (accessSizeBytes
+    // = the access width in bytes: 8 for a 64-bit LDR, 4 for a 32-bit, 2
+    // for 16-bit, 1 for 8-bit). The walker (fixed32.cpp MemOffset arm)
+    // derives accessSizeBytes from the inst's operation width, validates
+    // the byte offset is NON-NEGATIVE and ACCESS-SIZE-ALIGNED and the
+    // scaled field fits 12 bits (0..4095), then writes the scaled value
+    // (fail-loud A_ImmediateOperandOutOfRange on any of the three). This
+    // gives a frame reach of 4095*8 = 32760 bytes for 64-bit loads — the
+    // form a ≥9-fixed-param AAPCS64 callee needs to load its 9th
+    // (incoming-stack) param at `[sp + frameSize]` when frameSize exceeds
+    // the unscaled imm9 ±256. DECODE (disasm) extracts the RAW 12-bit
+    // field — the round-trip oracle pins the scaled value (e.g. 24 for a
+    // 64-bit `[sp,#192]`), NOT the byte offset. A frame offset that is
+    // negative-and-out-of-imm9, OR aligned-but >32760, OR
+    // non-aligned-and-out-of-imm9 stays fail-loud (anchored
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12; the shifted imm12<<12 LDR
+    // form / scratch-register address materialization is the future
+    // generalization). The LOWERING (lir_callconv.cpp) picks the mnemonic
+    // (load/store vs load_u/store_u) from the offset value — the variant
+    // selector matches operand KINDS only and cannot inspect the value.
+    Imm12Scaled   = 26,
     // Future fixed32 slots (paired with their consumer cycle):
-    //   ImmShift / Sf-flag / scaled LDR imm12 / etc.
+    //   ImmShift / Sf-flag / shifted imm12<<12 / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 26> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 27> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -1091,6 +1118,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 26> kEncodingSlotKindTable{{{
     { EncodingSlotKind::MemOffsetZero, "memoffset.zero" },
     { EncodingSlotKind::OpcodePlusReg, "opcode.reg"     },
     { EncodingSlotKind::Imm64,         "imm64"          },
+    { EncodingSlotKind::Imm12Scaled,   "imm12.scaled"   },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -1109,7 +1137,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 26,
+static_assert(kEncodingSlotKindCount == 27,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -1151,6 +1179,11 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::MemBaseNoScale:
         case EncodingSlotKind::MemOffsetZero:
         case EncodingSlotKind::Imm12:
+        // D-ASM-AARCH64-LARGE-FRAME-IMM12: the scaled imm12 LDR/STR
+        // displacement is a fixed32 slot (HAZARD #6 — MUST be Fixed32 or
+        // validate() rejects every `load_u`/`store_u` variant that wires
+        // it as a cross-shape declaration on a fixed32 opcode).
+        case EncodingSlotKind::Imm12Scaled:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
             return TargetEncodingShape::Fixed32;
@@ -1334,6 +1367,9 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::MemBaseNoScale:
         case EncodingSlotKind::MemOffsetZero:
         case EncodingSlotKind::Imm12:
+        // D-ASM-AARCH64-LARGE-FRAME-IMM12: the scaled imm12 displacement
+        // writes its immediate field directly — no linker relocation.
+        case EncodingSlotKind::Imm12Scaled:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
         case EncodingSlotKind::Disp32Mem:

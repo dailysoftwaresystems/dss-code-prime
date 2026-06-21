@@ -6,6 +6,7 @@
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <format>
@@ -92,6 +93,12 @@ windowFor(EncodingSlotKind s) noexcept {
         // unsigned 12-bit field at bits 10..21 (frame-size stack
         // adjust). Range-checked 0..4095 in the wire loop.
         case EncodingSlotKind::Imm12: return SlotBitWindow{ 10, 12 };
+        // Imm12Scaled (D-ASM-AARCH64-LARGE-FRAME-IMM12): the SAME bit-
+        // window as Imm12 (bits 10..21), but the MemOffset wire arm writes
+        // the SCALED value `byteOffset / accessSizeBytes` here (vs Imm12's
+        // raw byte value). Distinct slot, identical window — the encode
+        // arithmetic differs, not the placement.
+        case EncodingSlotKind::Imm12Scaled: return SlotBitWindow{ 10, 12 };
         // SymbolPatchMarker (D-AS4-3): width-0 symbol-patch marker, like
         // MemBaseNoScale. The walker writes NO bits (the linker patches
         // the whole field via the wire's relocationKind); the slot only
@@ -623,6 +630,97 @@ bool encode(Lir const&                  lir,
                     return false;
                 }
                 if (!orInto(wire.slotKind, 0u, wire.wordIndex)) return false;
+                continue;
+            }
+            // D-ASM-AARCH64-LARGE-FRAME-IMM12: the SCALED imm12 LDR/STR
+            // form (`load_u`/`store_u`). The unsigned-offset LDR/STR
+            // encodes its displacement as a SCALED field — `imm12 =
+            // byteOffset / accessSizeBytes` — where accessSizeBytes is the
+            // load/store access width in bytes (8 for a 64-bit LDR, 4 for
+            // 32-bit, 2 for 16-bit, 1 for 8-bit). This is the form a frame
+            // offset BEYOND the unscaled imm9 ±256 takes (the ≥9-fixed-
+            // param AAPCS64 callee loading its 9th incoming-stack param at
+            // `[sp + frameSize]`). The displacement MUST be NON-NEGATIVE
+            // (the unsigned-offset form has no sign bit), ACCESS-SIZE-
+            // ALIGNED (the field is scaled by the access size — a non-
+            // multiple has no representation; an unaligned LDR is
+            // architecturally undefined), and the scaled field MUST fit 12
+            // bits (0..4095 ⇒ a 64-bit reach of 32760). Each is a distinct
+            // fail-loud A_ImmediateOperandOutOfRange (a frame offset that
+            // is negative-and-out-of-imm9, OR aligned-but >32760, OR non-
+            // aligned-and-out-of-imm9 stays fail-loud — the residual
+            // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12; the shifted
+            // imm12<<12 form / scratch-register address materialization is
+            // the future closing work). Handled in its own arm BEFORE the
+            // Imm9/Imm12 reject so the scaled slot never leaks into the
+            // unscaled range logic.
+            if (wire.slotKind == EncodingSlotKind::Imm12Scaled) {
+                auto const w = windowFor(wire.slotKind);
+                if (!w.has_value()) {
+                    report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': slot '{}' has no bit-window "
+                                       "(walker-vs-enum drift)", info->mnemonic,
+                                       encodingSlotKindName(wire.slotKind)));
+                    return false;
+                }
+                // accessSizeBytes from the inst's operation width (max(1,
+                // width/8) — width is 8/16/32/64 here, so this is 1/2/4/8;
+                // the max guards a 0 width defensively). Deriving the scale
+                // from the SAME width axis the variant selector matched on
+                // keeps the scaled encode width-exact (a 32-bit LDR scales
+                // by 4, a 64-bit by 8) with no per-opcode constant.
+                std::uint32_t const accessSizeBytes =
+                    std::max(1u, static_cast<std::uint32_t>(instWidth) / 8u);
+                std::int32_t const disp = srcOp.offset;
+                if (disp < 0) {
+                    report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': memory offset {} is negative "
+                                       "but the scaled unsigned-offset LDR/STR "
+                                       "'{}' slot encodes only non-negative "
+                                       "displacements — a negative frame offset "
+                                       "needs the signed unscaled imm9 form or a "
+                                       "scratch-register address (not yet "
+                                       "supported)",
+                                       info->mnemonic, disp,
+                                       encodingSlotKindName(wire.slotKind)));
+                    return false;
+                }
+                if (static_cast<std::uint32_t>(disp) % accessSizeBytes != 0) {
+                    report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': memory offset {} is not a "
+                                       "multiple of the {}-byte access size for "
+                                       "the scaled '{}' slot — the unsigned-"
+                                       "offset LDR/STR field is scaled by the "
+                                       "access size, so an unaligned offset has "
+                                       "no encoding (an unaligned LDR is "
+                                       "architecturally undefined); use the "
+                                       "unscaled imm9 form",
+                                       info->mnemonic, disp, accessSizeBytes,
+                                       encodingSlotKindName(wire.slotKind)));
+                    return false;
+                }
+                std::uint32_t const scaled =
+                    static_cast<std::uint32_t>(disp) / accessSizeBytes;
+                std::uint32_t const maxVal = (1u << w->width) - 1u;
+                if (scaled > maxVal) {
+                    report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': memory offset {} scales to "
+                                       "{} which exceeds the unsigned {}-bit "
+                                       "'{}' field (valid 0..{}, i.e. a byte "
+                                       "reach of {}) — a larger frame needs the "
+                                       "shifted imm12<<12 LDR form or a scratch-"
+                                       "register address (not yet supported)",
+                                       info->mnemonic, disp, scaled, w->width,
+                                       encodingSlotKindName(wire.slotKind),
+                                       maxVal, maxVal * accessSizeBytes));
+                    return false;
+                }
+                if (!orInto(wire.slotKind, scaled, wire.wordIndex))
+                    return false;
                 continue;
             }
             bool const isSignedSlot = wire.slotKind == EncodingSlotKind::Imm9;

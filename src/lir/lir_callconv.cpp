@@ -692,6 +692,18 @@ struct OpcodeHandles {
     // AAPCS64 spill path requires it and fails loud if a dual-cursor CC reaches the
     // VR-spill with the opcode missing.
     std::uint16_t vaVrSpillStore;
+    // D-ASM-AARCH64-LARGE-FRAME-IMM12: the SCALED imm12 unsigned-offset LDR/STR
+    // (`load_u`/`store_u`), the large-frame siblings of the universal `load`/`store`
+    // (unscaled imm9). The incoming-stack-arg load/store path picks these over
+    // `load`/`store` when the frame offset exceeds the imm9 ±256 reach (a ≥9-fixed-
+    // param callee). Optional — only a target with a scaled load/store form declares
+    // them (arm64 does; x86_64 does not — its memory forms already carry a disp32).
+    // Absent ⇒ field 0; the selection then keeps `load`/`store` and the encoder fails
+    // loud on an out-of-imm9 offset (the residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-
+    // IMM12). Resolved via the same optional-handle table (FOLD 2 — NOT a new
+    // RegClassOp role; the scaled form is a single-ISA concern, parallel to fstur_q).
+    std::uint16_t loadU;
+    std::uint16_t storeU;
 };
 
 // FC2 Part B: resolve the class-correct opcode for a register-data-
@@ -1268,7 +1280,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 19> const table{{
+    std::array<Entry, 21> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -1317,6 +1329,13 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // cursor prologue's VR spill emits the 128-bit `fstur_q`. Absent ⇒ field 0;
         // the spill fails loud if a dual-cursor CC reaches the VR-spill without it.
         {&OpcodeHandles::vaVrSpillStore,    "fstur_q",              true},
+        // D-ASM-AARCH64-LARGE-FRAME-IMM12: optional — only a target with a scaled
+        // unsigned-offset load/store form declares these (arm64). Absent ⇒ field 0;
+        // the incoming-stack-arg selection then keeps `load`/`store` (the encoder
+        // fails loud on an out-of-imm9 offset — the residual). Fail-loud once HERE,
+        // not per-inst (FOLD 2 — the fstur_q/lea optional-handle pattern).
+        {&OpcodeHandles::loadU,             "load_u",               true},
+        {&OpcodeHandles::storeU,            "store_u",              true},
     }};
     for (auto const& [field, mnem, optional] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
@@ -1578,7 +1597,47 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         "materializeOneFunc: stack-resident arg load",
                         reporter);
                     if (!argLoad.has_value()) return false;
-                    emitFrameLoad(b, *argLoad, result, sp, offset);
+                    // D-ASM-AARCH64-LARGE-FRAME-IMM12: pick the load
+                    // mnemonic from the OFFSET VALUE. The unscaled form
+                    // (`load`, AArch64 LDUR imm9) reaches only ±256; a
+                    // ≥9-fixed-param callee loads its 9th incoming-stack
+                    // param at `[sp + totalFrameSize + ...]`, which exceeds
+                    // imm9 once the frame (register-save-area + locals)
+                    // grows past 255. The scaled form (`load_u`, LDR
+                    // imm12-scaled) reaches 4095*accessSize. This MUST be
+                    // decided here, not in the encoder: the variant
+                    // selector commits on operand KINDS (both forms share
+                    // [reg, membase, memoffset]) and cannot inspect the
+                    // offset value, and the encoder does not backtrack on
+                    // an encode-range failure (§B.1 FORCED). Pure
+                    // arithmetic + config-handle lookup — NO arch/cc/format
+                    // identity branch: the swap is gated on the resolved
+                    // load BEING the universal `load` (so its scaled twin
+                    // `h.loadU` applies — an FPR/other-class load keeps its
+                    // class form), and `h.loadU` is 0 on a target without a
+                    // scaled form (x86_64 — whose memory ops already carry
+                    // disp32, so the imm9 path is never hit). The access
+                    // size is the scalar stack-arg stride; emitFrameLoad
+                    // builds a default-width (64-bit ⇒ 8-byte) load, so the
+                    // scale is `outgoingSlotSize`. A frame offset that fits
+                    // neither imm9 nor a scaled imm12 (e.g. unaligned, or
+                    // beyond 32760) stays fail-loud at the encoder — the
+                    // residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12.
+                    std::uint16_t loadOpcode = *argLoad;
+                    bool const fitsImm9 = offset >= -256 && offset <= 255;
+                    if (!fitsImm9 && *argLoad == h.load && h.loadU != 0) {
+                        std::uint32_t const bytes =
+                            std::max(1u, outLayout.outgoingSlotSize);
+                        if (offset >= 0
+                            && static_cast<std::uint32_t>(offset) % bytes == 0
+                            && static_cast<std::uint32_t>(offset) / bytes <= 4095u) {
+                            loadOpcode = h.loadU;
+                        }
+                        // else: leave loadOpcode = *argLoad; the encoder
+                        // fails loud (A_ImmediateOperandOutOfRange) — the
+                        // residual unencodable-offset case.
+                    }
+                    emitFrameLoad(b, loadOpcode, result, sp, offset);
                 }
                 continue;
             }

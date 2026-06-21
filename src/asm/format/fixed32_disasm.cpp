@@ -44,6 +44,17 @@ windowFor(EncodingSlotKind s) noexcept {
         // signs without re-sign-extending here).
         case EncodingSlotKind::Imm9:           return SlotBitWindow{ 12, 9 };
         case EncodingSlotKind::MemBaseNoScale: return SlotBitWindow{ 0,  0 };
+        // D-ASM-AARCH64-LARGE-FRAME-IMM12: the unsigned-offset LDR/STR
+        // (`load_u`/`store_u`) scaled displacement at bits 10..21. Decoded
+        // so the new opcodes round-trip through the disasm oracle. The
+        // RAW 12-bit field is extracted — the round-trip oracle pins the
+        // SCALED value (e.g. 24 for a 64-bit `[sp,#192]`), NOT the byte
+        // offset. The companion `Imm12` (ADD/SUB-immediate, same window)
+        // is decoded here too — previously it returned nullopt (the
+        // disasm-completeness gap D-AS5-MULTIWORD-DISASM); adding the
+        // scaled twin closed the cheaper sibling at the same time.
+        case EncodingSlotKind::Imm12:          return SlotBitWindow{ 10, 12 };
+        case EncodingSlotKind::Imm12Scaled:    return SlotBitWindow{ 10, 12 };
         // Every remaining slot decodes to nullopt. This is an
         // intentionally PARTIAL mirror of `fixed32::windowFor`: the
         // round-trip decoder only needs the register/immediate windows
@@ -53,10 +64,12 @@ windowFor(EncodingSlotKind s) noexcept {
         //     RipRelDisp32, CondCodeNibble, BlockRel32, MemBaseScale)
         //     never appear on a fixed32 variant — validate() rejects
         //     cross-shape variants.
-        //   * The other fixed32 slots (Imm12/Imm19/MemOffsetZero/
+        //   * The other fixed32 slots (Imm19/MemOffsetZero/
         //     SymbolPatchMarker) are not decoded by this mirror yet — the
         //     disasm-completeness gap tracked by D-AS5-MULTIWORD-DISASM.
-        //     (Imm9 + MemBaseNoScale ARE decoded above — FC12c fstur_q.)
+        //     (Imm9 + MemBaseNoScale ARE decoded above — FC12c fstur_q;
+        //     Imm12 + Imm12Scaled ARE decoded above — D-ASM-AARCH64-LARGE-
+        //     FRAME-IMM12 load_u/store_u.)
         // Both return nullopt — behavior unchanged from the prior
         // enum-drift fallback. Listed EXHAUSTIVELY (no `default:`) so the
         // D-AS-ENCODINGSLOT-EXHAUSTIVE-WARN gate flags a new enumerator.
@@ -77,7 +90,6 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::OpcodePlusReg:
         case EncodingSlotKind::Imm64:
         case EncodingSlotKind::MemOffsetZero:
-        case EncodingSlotKind::Imm12:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
             return std::nullopt;

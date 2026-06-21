@@ -3188,6 +3188,87 @@ TEST(LirCallconvVariadicFC12deferral4, Aapcs64VaStartFixedStackOverflowBaseCongr
            "presence means the fixed-stack-arg payload was discarded";
 }
 
+// D-ASM-AARCH64-LARGE-FRAME-IMM12 (FOLD 1, LOAD-BEARING): the SELECTION witness.
+// A ≥9-fixed-param AAPCS64 callee loads its 9th (incoming-stack) fixed param at
+// `[sp + totalFrameSize]`. With a large touched local (the `long pad[40]`
+// mirror of the runtime corpus) the frame is comfortably > 255, so that load's byte
+// offset exceeds the unscaled imm9 (-256..255) and the materialize pass MUST select the
+// SCALED `load_u` (LDR imm12-scaled) opcode — NOT the unscaled `load` (LDUR imm9).
+// Exit-210 in the qemu corpus is necessary-but-not-sufficient (the byte-pins prove the
+// ENCODING; this proves the SELECTION). RED-ON-DISABLE: revert the load_u selection in
+// `lir_callconv.cpp::materializeOneFunc` (always emit `*argLoad`) → the stack-arg load
+// at offset > 255 emits the unscaled `load` and NO `load_u` appears at a large offset →
+// `sawLoadUAtLargeOffset` flips false. (The corpus would then fail to encode at the
+// assembler — A_ImmediateOperandOutOfRange — but this structural pin catches it earlier
+// and host-independently, on every CI leg.)
+TEST(LirCallconvLargeFrameImm12, Aapcs64NinthFixedParamLoadUsesScaledLoadU) {
+    // `long pad[40]` (320B) forces the frame > 255. An array alloca is never
+    // scalar-promoted (mem2reg refuses array allocas), and this pipeline runs
+    // NO optimizer anyway (lower -> liveness -> regalloc -> rewrite -> callconv),
+    // so the full reservation survives. `volatile` is NOT used — it fails loud in
+    // the c-subset frontend (S_VolatileNotSupported), which runs before lowering.
+    auto bundle = lowerThroughRewrite(
+        "int sum9(int a, int b, int c, int d, int e, int f, int g, int h, int i,"
+        " ...) {\n"
+        "    long pad[40];\n"             // FOLD 1: 320B local -> frame > 255
+        "    pad[0] = i;\n"
+        "    va_list ap; va_start(ap, i);\n"
+        "    int v = va_arg(ap, int);\n"
+        "    va_end(ap);\n"
+        "    return a + b + c + d + e + f + g + h + i + v;\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "AAPCS64 9-fixed-param large-frame callee lower";
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* layout = result.forFuncByIndex(0);
+    ASSERT_NE(layout, nullptr);
+    EXPECT_GT(layout->totalFrameSize, 255u)
+        << "FOLD 1 invariant: the touched pad MUST push the frame past the imm9 reach "
+           "(255) so the 9th-param load cannot fit the unscaled form — got "
+        << layout->totalFrameSize;
+
+    auto const loadOp  = bundle.lowered.target->opcodeByMnemonic("load");
+    auto const loadUOp = bundle.lowered.target->opcodeByMnemonic("load_u");
+    ASSERT_TRUE(loadOp.has_value() && loadUOp.has_value());
+
+    // Scan the materialized LIR for a frame load whose MemOffset is beyond imm9.
+    // That load is the 9th-param incoming-stack read; it MUST use `load_u`, and
+    // NO plain (unscaled) `load` may carry such an offset.
+    bool sawLoadUAtLargeOffset = false;
+    bool sawPlainLoadAtLargeOffset = false;
+    auto const& lir = result.lir;
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < lir.blockInstCount(blk); ++ii) {
+                LirInstId const inst = lir.blockInstAt(blk, ii);
+                std::uint16_t const op = lir.instOpcode(inst);
+                auto const ops = lir.instOperands(inst);
+                // Frame load shape: [base_reg, MemBase, MemOffset] (3 ops).
+                if (ops.size() != 3 || ops[2].kind != LirOperandKind::MemOffset)
+                    continue;
+                bool const beyondImm9 = ops[2].offset > 255 || ops[2].offset < -256;
+                if (op == *loadUOp && beyondImm9) sawLoadUAtLargeOffset = true;
+                if (op == *loadOp && beyondImm9)  sawPlainLoadAtLargeOffset = true;
+            }
+        }
+    }
+    EXPECT_TRUE(sawLoadUAtLargeOffset)
+        << "the 9th fixed param's incoming-stack load (offset > 255) MUST use the scaled "
+           "`load_u` — reverting the selection emits the unscaled `load` instead";
+    EXPECT_FALSE(sawPlainLoadAtLargeOffset)
+        << "no unscaled `load` (LDUR imm9) may carry an offset beyond ±256 — the encoder "
+           "would fail loud (A_ImmediateOperandOutOfRange)";
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): the by-value-stack
 // aggregate carrier — SysV x86_64 LIR-tier structural pins. These are the

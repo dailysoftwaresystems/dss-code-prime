@@ -902,6 +902,124 @@
       }
     },
     {
+      "$comment": "D-ASM-AARCH64-LARGE-FRAME-IMM12 — Memory LOAD, unsigned-offset form: AArch64 LDR Xt, [Xn, #pimm] (scaled, unsigned 12-bit byte offset). The large-frame sibling of `load` (LDUR, signed imm9): a frame offset BEYOND the unscaled ±256 reach takes this form. Fixed word 0xF9400000 (= the LDUR base | (1<<24), the unsigned-offset mode bit). SAME operand layout as `load` ([base_reg, MemBase(scale=1), MemOffset(disp)] + result) so the callconv emits the SAME shape — only the opcode (mnemonic) differs, picked at lowering time from the offset value (the variant selector matches operand KINDS, not the value). Wires: result→Rt (rd, bits 0..4), base_reg→Rn (bits 5..9), MemOffset→Imm12Scaled (bits 10..21, the SCALED field imm12=byteOffset/accessSize). MemBase carries no bits (scale==1). Offset must be non-negative + access-size-aligned + scale ≤4095 (reach 32760 for 64-bit); else fail-loud (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12).",
+      "mnemonic":      "load_u",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "$comment": "width 64: LDR Xt, [Xn, #pimm] (0xF9400000). accessSize 8 ⇒ imm12 = byteOffset/8 (e.g. [sp,#192] ⇒ imm12=24). Every GPR integer/pointer load carries width 64.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
+            "template":   { "fixedWord": 4181721088 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12.scaled"   }
+            ]
+          },
+          {
+            "$comment": "width 8: LDRB Wt, [Xn, #pimm] (0x39400000 — the unsigned-offset word with size 11→00). accessSize 1 ⇒ imm12 = byteOffset (unscaled in effect). Selected when the Load's result type is Char (width 8).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "template":   { "fixedWord": 960495616 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12.scaled"   }
+            ]
+          },
+          {
+            "$comment": "width 32: LDR Wt, [Xn, #pimm] (0xB9400000 — size 11→10). accessSize 4 ⇒ imm12 = byteOffset/4 (e.g. [x3,#64] ⇒ imm12=16). Selected for a 4-byte integer load (I32/U32, or long under LLP64) — width 32.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "template":   { "fixedWord": 3107979264 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12.scaled"   }
+            ]
+          },
+          {
+            "$comment": "width 16: LDRH Wt, [Xn, #pimm] (0x79400000 — size 11→01). accessSize 2 ⇒ imm12 = byteOffset/2. Selected for I16/U16 — width 16.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "template":   { "fixedWord": 2034237440 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12.scaled"   }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-ASM-AARCH64-LARGE-FRAME-IMM12 — Memory STORE, unsigned-offset form: AArch64 STR Xt, [Xn, #pimm] (scaled). The large-frame sibling of `store` (STUR, signed imm9). Fixed word 0xF9000000 (= the STUR base | (1<<24)). SAME operand layout as `store` ([value_reg, base_reg, MemBase(scale=1), MemOffset(disp)], no result). Wires: value_reg→Rt (rd, 0..4), base_reg→Rn (5..9), MemOffset→Imm12Scaled (10..21, scaled). MemBase carries no bits. Offset non-negative + access-size-aligned + scale ≤4095, else fail-loud.",
+      "mnemonic":      "store_u",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "$comment": "width 64: STR Xt, [Xn, #pimm] (0xF9000000). accessSize 8 ⇒ imm12 = byteOffset/8. Every GPR integer/pointer store carries width 64.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "fixedWord": 4177526784 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm12.scaled"   }
+            ]
+          },
+          {
+            "$comment": "width 8: STRB Wt, [Xn, #pimm] (0x39000000 — size 11→00). accessSize 1 ⇒ imm12 = byteOffset. Selected when the stored value's type is Char (width 8).",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "fixedWord": 956301312 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm12.scaled"   }
+            ]
+          },
+          {
+            "$comment": "width 32: STR Wt, [Xn, #pimm] (0xB9000000 — size 11→10). accessSize 4 ⇒ imm12 = byteOffset/4. Selected for a 4-byte integer store — width 32.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "fixedWord": 3103784960 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm12.scaled"   }
+            ]
+          },
+          {
+            "$comment": "width 16: STRH Wt, [Xn, #pimm] (0x79000000 — size 11→01). accessSize 2 ⇒ imm12 = byteOffset/2. Selected for I16/U16 — width 16.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "fixedWord": 2030043136 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm12.scaled"   }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "Load-effective-address — AArch64 ADRP+ADD pair (D-AS4-3 multi-instruction macro-op materializing a module symbol's address into Xd). Mirrors x86_64's 1-operand RIP-relative `lea reg, [rip+sym]` so `lowerGlobalAddr` is target-blind: ONE SymbolRef operand wired into BOTH words. word0 = ADRP Xd, sym@PG (0x90000000=2415919104): Rd at bits 0..4; immlo[30:29]+immhi[23:5] left ZERO — the adr_prel_pg_hi21 reloc patches the ±4 GiB page delta. word1 = ADD Xd, Xd, #:lo12:sym (0x91000000=2432696320, the ADD-imm base shared with `add`'s imm variant): Rd at 0..4 AND Rn at 5..9 (BOTH = the result reg via extraResultSlots — ADD reads its own dest as the source base); imm12[21:10] left ZERO — the add_abs_lo12_nc reloc patches. Both relocs target the SAME symbol at byte offsets base+0 and base+4. The two `sym.patch` wires write NO immediate bits (the linker owns them); they carry only relocationKind + wordIndex.",
       "mnemonic":      "lea",
       "result":        "value",
