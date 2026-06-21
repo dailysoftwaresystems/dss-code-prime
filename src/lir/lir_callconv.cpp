@@ -1713,10 +1713,19 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // without revisiting the entire Win64 va_arg walk — every va_arg
                 // would then read one home-slot too far (a silent miscompile the
                 // congruence pin in test_lir_callconv guards).
+                // FC12-deferral④ (D-FC12A/C-VARIADIC-OVERFLOW-FIXED-STACK-ARGS): the
+                // MIR payload is the fixed-stack-arg byte displacement — bytes of named
+                // params that overflowed onto the incoming stack, so overflow_arg_area /
+                // __stack must skip them to point at the FIRST vararg. 0 for the common
+                // case (no fixed-param overflow). The displacement is in BYTES and
+                // assumes the incoming-slot size == gpSlotBytes (true SysV/AAPCS64,
+                // where MIR baked the count * gpSlotBytes).
+                std::uint32_t const fixedStackBytes = payload;
                 std::int32_t const ovfOffset = static_cast<std::int32_t>(
                     outLayout.totalFrameSize
                     + static_cast<std::uint32_t>(cc.callPushBytes)
-                    + static_cast<std::uint32_t>(cc.shadowSpaceBytes));
+                    + static_cast<std::uint32_t>(cc.shadowSpaceBytes)
+                    + fixedStackBytes);
                 emitFrameAddr(b, h.lea, result, sp, ovfOffset);
                 continue;
             }

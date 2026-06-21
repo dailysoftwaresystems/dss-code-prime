@@ -1117,8 +1117,7 @@ struct Lowerer {
                 return lowerVaFrameAddr(id, MnemonicSlot::VaRegSaveArea,
                                         "MIR VaRegSaveAreaAddr");
             case MirOpcode::VaOverflowArgAreaAddr:
-                return lowerVaFrameAddr(id, MnemonicSlot::VaOverflowArgArea,
-                                        "MIR VaOverflowArgAreaAddr");
+                return lowerVaOverflowArgArea(id);
             case MirOpcode::VaHomeArgAreaAddr:
                 return lowerVaHomeArgArea(id);
             case MirOpcode::Const:  return lowerConst(id);
@@ -1362,11 +1361,13 @@ struct Lowerer {
         defineValue(id, result);
     }
 
-    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the two frame-relative va_list address
-    // leaves (VaRegSaveAreaAddr / VaOverflowArgAreaAddr) lower to their virtual LIR
-    // op (no operands, GPR-class pointer result). lir_callconv materializes each into
-    // a `lea result, [sp + offset]` once it owns the frame layout — the `alloca`/
-    // `read_indirect_result` precedent. Fail loud if the schema lacks the opcode.
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the frame-relative VaRegSaveAreaAddr leaf
+    // lowers to its virtual LIR op (no operands, GPR-class pointer result, payload 0 —
+    // the register-save-area base carries NO displacement). lir_callconv materializes
+    // it into a `lea result, [sp + offset]` once it owns the frame layout — the
+    // `alloca`/`read_indirect_result` precedent. Fail loud if the schema lacks the
+    // opcode. (VaOverflowArgAreaAddr is lowered SEPARATELY — see lowerVaOverflowArgArea
+    // — because it THREADS the MIR fixed-stack-arg displacement payload.)
     void lowerVaFrameAddr(MirInstId id, MnemonicSlot slot, char const* what) {
         if (!opcode(slot).has_value()) {
             reportMissingOpcode(slot, what);
@@ -1374,6 +1375,26 @@ struct Lowerer {
         }
         LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
         emitInst(*opcode(slot), result, std::span<LirOperand const>{}, /*payload=*/0);
+        defineValue(id, result);
+    }
+
+    // FC12-deferral④ (D-FC12A/C-VARIADIC-OVERFLOW-FIXED-STACK-ARGS): the
+    // VaOverflowArgAreaAddr leaf, like lowerVaFrameAddr but THREADS the MIR payload
+    // (the fixed-stack-arg byte displacement — bytes of named params that overflowed
+    // onto the incoming stack; 0 for the common case) into the LIR op. lir_callconv
+    // reads it and adds it to the overflow base `totalFrameSize + callPushBytes +
+    // shadowSpaceBytes + payload`. Without this threading the displacement would be
+    // discarded (the generic lowerVaFrameAddr hardcodes payload 0) → overflow_arg_area
+    // / __stack would point AT a named stack param, a silent miscompile.
+    void lowerVaOverflowArgArea(MirInstId id) {
+        if (!opcode(MnemonicSlot::VaOverflowArgArea).has_value()) {
+            reportMissingOpcode(MnemonicSlot::VaOverflowArgArea,
+                                "MIR VaOverflowArgAreaAddr");
+            return;
+        }
+        LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
+        emitInst(*opcode(MnemonicSlot::VaOverflowArgArea), result,
+                 std::span<LirOperand const>{}, /*payload=*/mir.instPayload(id));
         defineValue(id, result);
     }
 

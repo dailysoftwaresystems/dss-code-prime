@@ -3998,6 +3998,49 @@ namespace {
     }
     return false;
 }
+// FC12-deferral④ (FOLD 3): the payload of the (single) VaOverflowArgAreaAddr leaf in
+// function `fi` — the fixed-stack-arg byte displacement va_start bakes for
+// overflow_arg_area / __stack. Returns nullopt if there is no such inst (so a test
+// can ASSERT presence before pinning the value, rather than silently reading 0).
+[[nodiscard]] std::optional<std::uint32_t>
+vaOverflowArgAreaPayload(Mir const& m, std::uint32_t fi) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) == MirOpcode::VaOverflowArgAreaAddr)
+                return m.instPayload(ix);
+        }
+    }
+    return std::nullopt;
+}
+// FC12-deferral④ (FOLD 3, AAPCS64 clamp): true iff function `fi` has ANY `Const`
+// inst whose integer value is STRICTLY LESS than `threshold`. The clamped
+// __gr_offs/__vr_offs are 0 when a class's fixed params consume its whole save block;
+// the OLD underflowing formula `-(saveCount - fixedCount)*slotBytes` with fixedCount >
+// saveCount wraps UNSIGNED then negates to a HUGE magnitude (≈ -4.29e9 i64) — far
+// below ANY legitimate cursor (the largest legit magnitude is __vr_offs = -128). So
+// "no const below -1000 survives" is the strict, precise witness that the clamp fired
+// (red-on-disable: revert the clamp → the huge-magnitude underflow const appears),
+// while NOT tripping on the legitimately-negative -64/-128 cursors of a partially-
+// consumed class. (A blunt "any negative const" check would false-fail on those.)
+[[nodiscard]] bool funcHasConstIntBelow(Mir const& m, std::uint32_t fi,
+                                        std::int64_t threshold) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Const) continue;
+            auto const& lit = m.literalValue(m.constLiteralIndex(ix));
+            if (std::holds_alternative<std::int64_t>(lit.value)
+                && std::get<std::int64_t>(lit.value) < threshold)
+                return true;
+        }
+    }
+    return false;
+}
 } // namespace
 
 TEST(MirLoweringCSubset, VaStartEmitsFourFieldStoresPlusFrameAddrs) {
@@ -4599,17 +4642,16 @@ TEST(MirLoweringCSubset, Win64StructByValueVarargCallGt8OnePointer) {
            "single hidden-pointer slot (NOT a carrier, NOT 0/fail-loud)";
 }
 
-// A variadic callee whose FIXED params overflow to the stack (more fixed integer
-// params than the 6 SysV integer arg registers) MUST fail loud at va_start —
-// `overflow_arg_area` would otherwise point at a fixed STACK param, not the first
-// vararg (SysV §3.5.7), a silent miscompile this cycle's constant slot-0 overflow
-// offset cannot avoid (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS, deferred).
-// RED-ON-DISABLE: remove the `currentFnFixedGpr_ > vl.gpSaveCount` guard in
-// lowerVaStart → mir.ok goes true (the function lowers with a wrong overflow base).
-TEST(MirLoweringCSubset, VaStartFixedParamsOverflowToStackFailsLoud) {
-    // 7 fixed int params (a..g): SysV has 6 integer arg registers, so `g` is passed
-    // ON THE STACK; the fixed-stack-arg displacement for overflow_arg_area is not
-    // yet threaded, so this must reject loudly rather than silently miscompile.
+// FC12-deferral④ (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS, CLOSED): a SysV
+// variadic callee whose FIXED params overflow the 6 integer arg registers onto the
+// stack now LOWERS — va_start bakes the fixed-stack-arg byte displacement into the
+// VaOverflowArgAreaAddr payload so overflow_arg_area skips the named stack arg(s) and
+// points at the FIRST vararg (SysV §3.5.7). FOLD 3 (strict): pin the payload VALUE.
+// RED-ON-DISABLE: revert the mir_to_lir VaOverflowArgAreaAddr payload threading (or
+// the hir_to_mir displacement) → the payload drops to 0 and this EXPECT_EQ goes red.
+TEST(MirLoweringCSubset, VaStartFixedParamsOverflowToStackSucceeds) {
+    // 7 fixed int params (a..g): SysV has 6 integer arg registers, so `g` overflows
+    // ON THE STACK. gprOver = 7 - 6 = 1 → fixedStackBytes = 1 * gpSlotBytes(8) = 8.
     auto L = lowerCSubset(
         "int pick(int a, int b, int c, int d, int e, int f, int g, ...) {\n"
         "  va_list ap;\n"
@@ -4618,25 +4660,33 @@ TEST(MirLoweringCSubset, VaStartFixedParamsOverflowToStackFailsLoud) {
         "  va_end(ap);\n"
         "  return a + g + v;\n"
         "}\n");
-    EXPECT_FALSE(L.mir.ok)
-        << "a variadic callee whose fixed params overflow to the stack must FAIL "
-           "LOUD at va_start (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)";
+    ASSERT_TRUE(L.mir.ok)
+        << "a SysV variadic callee whose fixed params overflow to the stack must now "
+           "LOWER (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    auto const payload = vaOverflowArgAreaPayload(m, fi);
+    ASSERT_TRUE(payload.has_value())
+        << "the lowered va_start must emit a VaOverflowArgAreaAddr leaf";
+    EXPECT_EQ(*payload, 8u)
+        << "overflow_arg_area must be displaced PAST the 1 overflowed fixed GPR "
+           "(1 * gpSlotBytes(8) = 8) — a 0 payload would read the fixed stack arg `g` "
+           "as the first vararg (FOLD 3: value, not presence)";
 }
 
-// AAPCS64 mirror of the SysV overflow-to-stack pin: a variadic ARM64 callee whose
-// FIXED params overflow the 8 int arg registers (x0..x7) to the stack MUST fail
-// loud at va_start — the dual-cursor's `__stack`/`__gr_offs` init does not yet
-// thread the fixed-stack-arg displacement (the negative cursor would underflow and
-// `__stack` would read a fixed STACK param as the first vararg), a silent miscompile
-// converted to fail-loud (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS,
-// deferred). RED-ON-DISABLE: temp-remove the `currentFnFixedGpr_ > vl.gpSaveCount`
-// arm of the Aapcs64DualCursor lowerVaStart guard (hir_to_mir.cpp ~line 2950) →
-// mir.ok flips TRUE (the function lowers with a wrong `__stack`/cursor base);
-// restore to make this go red again. (Verified by temp-revert.)
-TEST(MirLoweringCSubset, Aapcs64VaStartFixedParamsOverflowToStackFailsLoud) {
-    // 9 fixed int params (a..i): AAPCS64 has 8 integer arg registers (x0..x7), so
-    // `i` is passed ON THE STACK; the fixed-stack-arg displacement for `__stack` is
-    // not yet threaded, so this must reject loudly rather than silently miscompile.
+// FC12-deferral④ (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS, CLOSED): AAPCS64
+// mirror — a variadic ARM64 callee whose FIXED int params overflow the 8 GPR arg regs
+// (x0..x7) onto the stack now LOWERS. va_start bakes the fixed-stack-arg displacement
+// into VaOverflowArgAreaAddr (→ __stack) AND CLAMPS __gr_offs to 0 (the GR block is
+// fully consumed by fixed params, so every GPR vararg routes to __stack). FOLD 3
+// (strict): payload VALUE == 8 + no negative const survives (the __gr_offs clamp).
+// RED-ON-DISABLE: revert the payload threading → payload 0 (red); revert the
+// __gr_offs clamp to `-(gpSaveCount - fixedGpr)` → a negative i32 const appears (red).
+TEST(MirLoweringCSubset, Aapcs64VaStartFixedParamsOverflowToStackSucceeds) {
+    // 9 fixed int params (a..i): AAPCS64 has 8 GPR arg regs (x0..x7), so `i` overflows
+    // ON THE STACK. gprOver = 9 - 8 = 1 → fixedStackBytes = 1 * gpSlotBytes(8) = 8;
+    // __gr_offs clamps to 0 (fixedGpr 9 >= gpSaveCount 8).
     auto L = lowerCSubset(
         "int pick(int a, int b, int c, int d, int e, int f, int g, int h, int i,"
         " ...) {\n"
@@ -4647,20 +4697,38 @@ TEST(MirLoweringCSubset, Aapcs64VaStartFixedParamsOverflowToStackFailsLoud) {
         "  return a + i + v;\n"
         "}\n",
         "arm64", "aapcs64");
-    EXPECT_FALSE(L.mir.ok)
+    ASSERT_TRUE(L.mir.ok)
         << "an AAPCS64 variadic callee whose fixed INT params overflow to the stack "
-           "must FAIL LOUD at va_start "
-           "(D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)";
-    EXPECT_TRUE(anyDiagActualContains(
-        L.mirReporter, "D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS"))
-        << "the AAPCS64 va_start overflow fail-loud must cite the FC12c overflow anchor";
+           "must now LOWER (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    auto const payload = vaOverflowArgAreaPayload(m, fi);
+    ASSERT_TRUE(payload.has_value())
+        << "the lowered va_start must emit a VaOverflowArgAreaAddr (→ __stack) leaf";
+    EXPECT_EQ(*payload, 8u)
+        << "__stack must skip the 1 overflowed fixed GPR (1 * gpSlotBytes(8) = 8)";
+    // __gr_offs CLAMPS to 0 (GR block fully consumed). NOTE __vr_offs is legitimately
+    // -128 here (no fixed FP params → whole VR block available), so a blunt "any
+    // negative const" check would false-fail; the strict witness is "no HUGE-magnitude
+    // underflow const survives" (< -1000), which the reverted clamp's ≈ -4.29e9 trips.
+    EXPECT_TRUE(funcHasConstInt(m, fi, 0))
+        << "__gr_offs must be CLAMPED to 0 (the GR block is fully consumed)";
+    EXPECT_FALSE(funcHasConstIntBelow(m, fi, -1000))
+        << "the OLD underflowing `-(gpSaveCount - fixedGpr)*8` wraps unsigned to a "
+           "HUGE-magnitude negative const (≈ -4.29e9) for __gr_offs — its absence is "
+           "the strict clamp witness (FOLD 3; the legit __vr_offs=-128 is far above "
+           "the -1000 floor)";
 }
 
-// FP-cursor variant of the AAPCS64 overflow pin: 9 fixed DOUBLE params overflow the
-// 8 fp arg registers (v0..v7) to the stack — the same fail-loud guard fires via its
-// `currentFnFixedFpr_ > vl.fpSaveCount` arm. RED-ON-DISABLE: temp-remove that fp arm
-// → mir.ok flips TRUE. (Verified by temp-revert.)
-TEST(MirLoweringCSubset, Aapcs64VaStartFixedDoubleParamsOverflowToStackFailsLoud) {
+// FC12-deferral④ (FP-cursor variant, CLOSED): 9 fixed DOUBLE params overflow the 8 FP
+// arg regs (v0..v7) onto the stack — now LOWERS. fprOver = 9 - 8 = 1 → fixedStackBytes
+// = 1 * gpSlotBytes(8) = 8 (the overflow FP slot is 8B, NOT fpSlotBytes(16)); __vr_offs
+// clamps to 0. NOTE __gr_offs is legitimately -64 here (no fixed GPR params → whole GR
+// block available), so the no-negative-const check does NOT apply to this FP case.
+// RED-ON-DISABLE: revert the payload threading → payload 0 (red); revert the __vr_offs
+// clamp → __vr_offs underflows (the Const 0 disappears) → red.
+TEST(MirLoweringCSubset, Aapcs64VaStartFixedDoubleParamsOverflowToStackSucceeds) {
     auto L = lowerCSubset(
         "double pick(double a, double b, double c, double d, double e, double f,"
         " double g, double h, double i, ...) {\n"
@@ -4671,13 +4739,117 @@ TEST(MirLoweringCSubset, Aapcs64VaStartFixedDoubleParamsOverflowToStackFailsLoud
         "  return a + i + v;\n"
         "}\n",
         "arm64", "aapcs64");
-    EXPECT_FALSE(L.mir.ok)
+    ASSERT_TRUE(L.mir.ok)
         << "an AAPCS64 variadic callee whose fixed FP params overflow to the stack "
-           "must FAIL LOUD at va_start "
-           "(D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)";
+           "must now LOWER (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    auto const payload = vaOverflowArgAreaPayload(m, fi);
+    ASSERT_TRUE(payload.has_value())
+        << "the lowered va_start must emit a VaOverflowArgAreaAddr (→ __stack) leaf";
+    EXPECT_EQ(*payload, 8u)
+        << "__stack must skip the 1 overflowed fixed FP slot, sized gpSlotBytes(8) "
+           "NOT fpSlotBytes(16) (incoming overflow slots are 8B)";
+    EXPECT_TRUE(funcHasConstInt(m, fi, 0))
+        << "__vr_offs must be CLAMPED to 0 (the VR block is fully consumed by fixed "
+           "FP params)";
+}
+
+// FC12-deferral④ (mixed-class overflow): 9 fixed int (x0..x7 + 1 overflow) AND 9 fixed
+// double (v0..v7 + 1 overflow) → BOTH classes overflow by one slot. gprOver = 1,
+// fprOver = 1 → fixedStackBytes = (1 + 1) * gpSlotBytes(8) = 16; BOTH __gr_offs and
+// __vr_offs clamp to 0 (each block fully consumed). This is the dual-cursor stress
+// case the single-class pins do not cover. RED-ON-DISABLE: drop the payload threading
+// → payload 0; revert either clamp → a negative const appears (red).
+TEST(MirLoweringCSubset, Aapcs64VaStartMixedClassFixedStackOverflow) {
+    auto L = lowerCSubset(
+        "double pick(int a, int b, int c, int d, int e, int f, int g, int h, int i,"
+        " double m0, double m1, double m2, double m3, double m4, double m5,"
+        " double m6, double m7, double m8, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, m8);\n"
+        "  double v = va_arg(ap, double);\n"
+        "  va_end(ap);\n"
+        "  return a + i + v;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok)
+        << "an AAPCS64 variadic callee whose fixed INT and FP params BOTH overflow must "
+           "LOWER (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    auto const payload = vaOverflowArgAreaPayload(m, fi);
+    ASSERT_TRUE(payload.has_value())
+        << "the lowered va_start must emit a VaOverflowArgAreaAddr (→ __stack) leaf";
+    EXPECT_EQ(*payload, 16u)
+        << "__stack must skip BOTH overflowed fixed slots (gprOver 1 + fprOver 1) * 8 "
+           "= 16";
+    EXPECT_TRUE(funcHasConstInt(m, fi, 0))
+        << "both __gr_offs and __vr_offs must be CLAMPED to 0 (both blocks consumed)";
+    EXPECT_FALSE(funcHasConstIntBelow(m, fi, -1000))
+        << "with BOTH classes fully consumed, NO huge-magnitude underflow const may "
+           "survive — reverting EITHER clamp emits one (≈ -4.29e9) (FOLD 3: the "
+           "both-clamp witness)";
+}
+
+// FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS, OPEN): a SysV variadic
+// callee whose fixed params overflow the GPR pool AND include a by-value AGGREGATE
+// that STRADDLES the register/stack boundary MUST fail loud. `f(a..e, struct S16, ...)`
+// : a..e consume 5 GPR (rdi..r8), leaving only r9; S16 = {long,long} needs 2 GPR
+// eightbytes but only 1 remains → real SysV puts the WHOLE struct in MEMORY (16B), yet
+// the per-register-slot formula (gprOver counts the straddling eightbyte that landed in
+// r9) would UNDERCOUNT the named stack bytes → a silent miscompile, rejected here.
+// RED-ON-DISABLE: remove the `currentFnHasAggregateFixedParam_` guard in lowerVaStart's
+// SysV overflow path → mir.ok flips TRUE (the function lowers with a wrong __overflow
+// displacement). Restore to make this go red again.
+TEST(MirLoweringCSubset, VaStartFixedStructStraddleOverflowFailsLoud) {
+    auto L = lowerCSubset(
+        "struct S16 { long x; long y; };\n"
+        "long f(long a, long b, long c, long d, long e, struct S16 s, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, s);\n"
+        "  long v = va_arg(ap, long);\n"
+        "  va_end(ap);\n"
+        "  return a + s.x + v;\n"
+        "}\n");
+    EXPECT_FALSE(L.mir.ok)
+        << "a SysV variadic callee with an overflowing fixed by-value aggregate "
+           "(register/stack straddle) must FAIL LOUD at va_start "
+           "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)";
     EXPECT_TRUE(anyDiagActualContains(
-        L.mirReporter, "D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS"))
-        << "the AAPCS64 va_start FP-overflow fail-loud must cite the FC12c overflow anchor";
+        L.mirReporter, "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS"))
+        << "the aggregate-straddle fail-loud must cite the new aggregate-overflow anchor";
+}
+
+// FOLD 1 mirror (AAPCS64): a variadic ARM64 callee whose fixed params overflow the FP
+// pool AND include a by-value HFA (homogeneous float aggregate) straddling the
+// register/stack boundary MUST fail loud. `f(6 doubles, struct H3, ...)` where H3 =
+// {double,double,double} is a 3-element HFA (3 VR slots): the 6 fixed doubles consume
+// v0..v5, leaving v6,v7 (2 VR) but H3 needs 3 → AAPCS64 places the WHOLE HFA on the
+// stack (24B), which the per-register-slot formula undercounts → rejected.
+// RED-ON-DISABLE: remove the `currentFnHasAggregateFixedParam_` guard in the
+// Aapcs64DualCursor overflow path → mir.ok flips TRUE.
+TEST(MirLoweringCSubset, Aapcs64VaStartFixedHfaStraddleOverflowFailsLoud) {
+    auto L = lowerCSubset(
+        "struct H3 { double a; double b; double c; };\n"
+        "double f(double a, double b, double c, double d, double e, double g,"
+        " struct H3 h, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, h);\n"
+        "  double v = va_arg(ap, double);\n"
+        "  va_end(ap);\n"
+        "  return a + h.a + v;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    EXPECT_FALSE(L.mir.ok)
+        << "an AAPCS64 variadic callee with an overflowing fixed by-value HFA "
+           "(register/stack straddle) must FAIL LOUD at va_start "
+           "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)";
+    EXPECT_TRUE(anyDiagActualContains(
+        L.mirReporter, "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS"))
+        << "the HFA-straddle fail-loud must cite the new aggregate-overflow anchor";
 }
 
 namespace {

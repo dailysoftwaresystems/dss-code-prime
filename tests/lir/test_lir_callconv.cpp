@@ -3081,6 +3081,113 @@ TEST(LirCallconvVariadicFC12c, AppleVaStartOverflowBaseCongruence) {
            "first incoming stack vararg, congruent with the caller's stack-store";
 }
 
+// FC12-deferral④ (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS, FOLD 3): a SysV
+// variadic callee whose 7 fixed int params overflow the 6 integer arg registers. The
+// va_start fixed-stack-arg displacement (1 overflowed GPR * 8 = 8) rides the
+// VaOverflowArgAreaAddr MIR payload, is threaded through mir_to_lir, and lir_callconv
+// adds it to the overflow base. PIN: the materialized `va_overflow_arg_area` `lea`
+// carries MemOffset == totalFrameSize + callPushBytes(8) + shadowSpaceBytes(0) + 8
+// — and the un-displaced base (payload-dropped value) is NOT among the leas.
+// RED-ON-DISABLE: revert mir_to_lir's VaOverflowArgAreaAddr payload threading (or the
+// lir_callconv `+ fixedStackBytes`) → the lea offset drops to the bare base → the
+// `+8` offset disappears and the bare base appears → both EXPECTs go red.
+TEST(LirCallconvVariadicFC12deferral4, SysVVaStartFixedStackOverflowBaseCongruence) {
+    auto bundle = lowerThroughRewrite(
+        "int pick(int a, int b, int c, int d, int e, int f, int g, ...) {\n"
+        "    va_list ap; va_start(ap, g);\n"
+        "    int v = va_arg(ap, int);\n"
+        "    va_end(ap);\n"
+        "    return a + g + v;\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"x86_64");
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "SysV fixed-overflow variadic callee lower";
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    auto const* layout = result.forFuncByIndex(0);
+    ASSERT_NE(layout, nullptr);
+
+    std::uint32_t const base =
+        layout->totalFrameSize
+        + static_cast<std::uint32_t>(cc->callPushBytes)
+        + static_cast<std::uint32_t>(cc->shadowSpaceBytes);
+    std::int32_t const expectedOverflow = static_cast<std::int32_t>(base + 8u);
+
+    auto const stats = collectInstStats(result.lir, *bundle.lowered.target);
+    bool const sawDisplaced =
+        std::find(stats.leaOffsets.begin(), stats.leaOffsets.end(),
+                  expectedOverflow) != stats.leaOffsets.end();
+    bool const sawBareBase =
+        std::find(stats.leaOffsets.begin(), stats.leaOffsets.end(),
+                  static_cast<std::int32_t>(base)) != stats.leaOffsets.end();
+    EXPECT_TRUE(sawDisplaced)
+        << "the va_overflow_arg_area `lea` MemOffset must INCLUDE the +8 fixed-stack-arg "
+           "displacement (base " << base << " + 8 = " << expectedOverflow << ") — a "
+           "dropped payload would leave it at the bare base " << base;
+    EXPECT_FALSE(sawBareBase)
+        << "no `lea` may carry the UN-displaced overflow base (" << base << ") — its "
+           "presence means the fixed-stack-arg payload was discarded (the exact bug)";
+}
+
+// FC12-deferral④ (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS, FOLD 3): AAPCS64
+// mirror — 9 fixed int params overflow the 8 GPR arg regs. The `__stack`
+// (va_overflow_arg_area) lea MemOffset must include the +8 displacement; arm64 has no
+// shadow/callPush term so base == totalFrameSize. RED-ON-DISABLE identical to the SysV
+// pin (drop the threading or the `+ fixedStackBytes` → +8 disappears, bare base shows).
+TEST(LirCallconvVariadicFC12deferral4, Aapcs64VaStartFixedStackOverflowBaseCongruence) {
+    auto bundle = lowerThroughRewrite(
+        "int pick(int a, int b, int c, int d, int e, int f, int g, int h, int i,"
+        " ...) {\n"
+        "    va_list ap; va_start(ap, i);\n"
+        "    int v = va_arg(ap, int);\n"
+        "    va_end(ap);\n"
+        "    return a + i + v;\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "AAPCS64 fixed-overflow variadic callee lower";
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* cc = bundle.lowered.target->callingConventionByName("aapcs64");
+    ASSERT_NE(cc, nullptr);
+    EXPECT_EQ(cc->shadowSpaceBytes, 0u);
+    EXPECT_EQ(cc->callPushBytes, 0u) << "arm64 BL writes LR — no stack push";
+    auto const* layout = result.forFuncByIndex(0);
+    ASSERT_NE(layout, nullptr);
+
+    std::uint32_t const base =
+        layout->totalFrameSize
+        + static_cast<std::uint32_t>(cc->callPushBytes)
+        + static_cast<std::uint32_t>(cc->shadowSpaceBytes);
+    std::int32_t const expectedOverflow = static_cast<std::int32_t>(base + 8u);
+
+    auto const stats = collectInstStats(result.lir, *bundle.lowered.target);
+    bool const sawDisplaced =
+        std::find(stats.leaOffsets.begin(), stats.leaOffsets.end(),
+                  expectedOverflow) != stats.leaOffsets.end();
+    bool const sawBareBase =
+        std::find(stats.leaOffsets.begin(), stats.leaOffsets.end(),
+                  static_cast<std::int32_t>(base)) != stats.leaOffsets.end();
+    EXPECT_TRUE(sawDisplaced)
+        << "the __stack (va_overflow_arg_area) `lea` MemOffset must INCLUDE the +8 "
+           "displacement (base " << base << " + 8 = " << expectedOverflow << ")";
+    EXPECT_FALSE(sawBareBase)
+        << "no `lea` may carry the UN-displaced __stack base (" << base << ") — its "
+           "presence means the fixed-stack-arg payload was discarded";
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): the by-value-stack
 // aggregate carrier — SysV x86_64 LIR-tier structural pins. These are the

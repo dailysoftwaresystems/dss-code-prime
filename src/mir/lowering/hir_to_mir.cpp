@@ -147,6 +147,18 @@ struct Lowerer {
     // an int-only-named-param fn; differs only when a named param is FP (each still
     // one slot). Set alongside the per-class counts before the body is lowered.
     std::uint32_t currentFnFixedFlat_ = 0;
+    // FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): true iff this
+    // function received at least one by-value AGGREGATE fixed param (an InRegisters
+    // multi-piece struct OR a ByReference >16B struct → the hidden pointer). The
+    // fixed-params-overflow displacement baked into VaOverflowArgAreaAddr is
+    // `(gprOver + fprOver) * gpSlotBytes` — a per-REGISTER-SLOT count that is ONLY
+    // correct when every overflowed fixed param is a single scalar slot. A multi-slot
+    // aggregate that STRADDLES the register/stack boundary is placed WHOLLY in memory
+    // by SysV (all-or-nothing), so the slot-count formula UNDERCOUNTS the named stack
+    // bytes → a silent miscompile. lowerVaStart's overflow path fails loud unless this
+    // flag is false (every fixed param was scalar). Reset per function (with the
+    // counters) before the param-reception loop.
+    bool currentFnHasAggregateFixedParam_ = false;
 
     // FC5: per-function `goto`/label lowering. A LabelStmt and its goto(s) share a
     // per-function ordinal (HIR payload); this maps the ordinal → its MIR block.
@@ -3025,20 +3037,38 @@ struct Lowerer {
         // and silently runs the SysV path on a Win64 (or unknown) layout.
         switch (vl.strategy) {
         case VaListStrategy::SysVRegisterSave: {
-            // FAIL-LOUD (no silent miscompile): a variadic callee with MORE fixed
-            // params than the register-save area holds (fixedGpr > gpSaveCount, or
-            // fixedFpr > fpSaveCount) has a fixed param passed ON THE STACK. SysV
-            // §3.5.7 then requires overflow_arg_area to point PAST those named stack
-            // args — a fixed-stack-arg displacement this cycle does NOT yet thread
-            // (VaOverflowArgAreaAddr emits a constant slot-0 offset). Reject loudly
-            // rather than silently read a fixed param as the first vararg.
-            if (currentFnFixedGpr_ > vl.gpSaveCount
-                || currentFnFixedFpr_ > vl.fpSaveCount) {
+            // FC12-deferral④ (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS): a variadic
+            // callee whose FIXED params overflow the register-save area (fixedGpr >
+            // gpSaveCount, or fixedFpr > fpSaveCount) has named param(s) passed ON THE
+            // STACK. SysV §3.5.7 then requires overflow_arg_area to point PAST those
+            // named stack args. We bake that displacement into the VaOverflowArgAreaAddr
+            // payload (read at LIR materialization). The overflowed slot count per class
+            // is `fixedCount - saveCount` (each overflowed fixed param is a single
+            // incoming stack slot); incoming stack slots are gpSlotBytes(8) wide for
+            // BOTH classes (the SysV va_arg overflow arm bumps doubles by 8 too).
+            std::uint32_t const gprOver =
+                (currentFnFixedGpr_ > vl.gpSaveCount)
+                    ? (currentFnFixedGpr_ - vl.gpSaveCount) : 0u;
+            std::uint32_t const fprOver =
+                (currentFnFixedFpr_ > vl.fpSaveCount)
+                    ? (currentFnFixedFpr_ - vl.fpSaveCount) : 0u;
+            std::uint32_t const fixedStackBytes =
+                (gprOver + fprOver) * vl.gpSlotBytes;
+            // FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): the
+            // per-register-slot displacement above is only correct when every
+            // overflowed fixed param is a single scalar slot. A multi-slot by-value
+            // AGGREGATE fixed param that STRADDLES the register/stack boundary is
+            // placed WHOLLY in memory by SysV (all-or-nothing), so `gprOver+fprOver`
+            // UNDERCOUNTS the named stack bytes. Fail loud (no silent miscompile)
+            // when the fixed params overflow AND any was a by-value aggregate.
+            if (fixedStackBytes != 0 && currentFnHasAggregateFixedParam_) {
                 unsupported(node,
-                    "variadic callee whose fixed parameters overflow to the stack "
-                    "(more fixed integer/SSE params than the register-save area "
-                    "holds) is not yet supported — overflow_arg_area must skip the "
-                    "named stack args (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)");
+                    "variadic callee whose fixed parameters overflow to the stack AND "
+                    "include a by-value aggregate (struct/union) param is not yet "
+                    "supported — a multi-slot aggregate straddling the register/stack "
+                    "boundary is placed wholly in memory, which the per-register-slot "
+                    "overflow displacement undercounts "
+                    "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)");
                 return InvalidMirInst;
             }
             MirInstId const tagBase = vaTagBase(kids[0]);
@@ -3075,11 +3105,14 @@ struct Lowerer {
                 std::array<MirInstId, 2> st{rsaVal, rsaField};
                 mir.addInst(MirOpcode::Store, st);
             }
-            // overflow_arg_area = &incoming-stack-args.
+            // overflow_arg_area = &incoming-stack-args, displaced PAST any named
+            // params that overflowed onto the incoming stack (payload = fixedStackBytes,
+            // 0 for the common case). LIR materialization adds it to the overflow base.
             MirInstId const ovfField = vaFieldPtr(tagBase, vl.overflowArgAreaField, voidPtrPtr);
             if (!ovfField.valid()) return InvalidMirInst;
             MirInstId const ovfVal =
-                mir.addInst(MirOpcode::VaOverflowArgAreaAddr, {}, voidPtr);
+                mir.addInst(MirOpcode::VaOverflowArgAreaAddr, {}, voidPtr,
+                            /*payload=*/fixedStackBytes);
             std::array<MirInstId, 2> st{ovfVal, ovfField};
             return mir.addInst(MirOpcode::Store, st);   // last Store — a valid void inst
         }
@@ -3120,18 +3153,33 @@ struct Lowerer {
             // The offs are NEGATIVE i32: va_arg adds them to <gr|vr>_top (which points
             // PAST the block) to address the right slot, and counts up toward 0.
             //
-            // FAIL-LOUD (mirrors the SysV arm): a variadic callee with MORE fixed
-            // params than the save area holds (fixedGpr > gpSaveCount / fixedFpr >
-            // fpSaveCount) has a fixed param passed on the stack; the negative-offset
-            // init would underflow (unsigned) AND __stack must skip those named stack
-            // args (a displacement not threaded this cycle). Reject rather than miscompile.
-            if (currentFnFixedGpr_ > vl.gpSaveCount
-                || currentFnFixedFpr_ > vl.fpSaveCount) {
+            // FC12-deferral④ (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS):
+            // mirrors the SysV arm. A variadic callee whose FIXED params overflow the
+            // save area (fixedGpr > gpSaveCount / fixedFpr > fpSaveCount) has named
+            // param(s) on the incoming stack: __stack must skip them (baked into the
+            // VaOverflowArgAreaAddr payload below) AND the per-class cursor (__gr_offs /
+            // __vr_offs) is CLAMPED to 0 (no register slots remain for varargs of that
+            // class) — the old `-(saveCount - fixedCount)` would underflow unsigned.
+            std::uint32_t const gprOver =
+                (currentFnFixedGpr_ > vl.gpSaveCount)
+                    ? (currentFnFixedGpr_ - vl.gpSaveCount) : 0u;
+            std::uint32_t const fprOver =
+                (currentFnFixedFpr_ > vl.fpSaveCount)
+                    ? (currentFnFixedFpr_ - vl.fpSaveCount) : 0u;
+            std::uint32_t const fixedStackBytes =
+                (gprOver + fprOver) * vl.gpSlotBytes;   // incoming slots are 8B both classes
+            // FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): the
+            // per-register-slot displacement is wrong for a multi-slot by-value
+            // aggregate (e.g. a >2-double HFA) straddling the register/stack boundary.
+            // Fail loud when the fixed params overflow AND any was a by-value aggregate.
+            if (fixedStackBytes != 0 && currentFnHasAggregateFixedParam_) {
                 unsupported(node,
-                    "variadic callee whose fixed parameters overflow to the stack "
-                    "(more fixed integer/FP params than the AAPCS64 register-save area "
-                    "holds) is not yet supported — __stack must skip the named stack "
-                    "args (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)");
+                    "variadic callee whose fixed parameters overflow to the stack AND "
+                    "include a by-value aggregate (struct/union/HFA) param is not yet "
+                    "supported — a multi-slot aggregate straddling the register/stack "
+                    "boundary is placed wholly in memory, which the per-register-slot "
+                    "overflow displacement undercounts "
+                    "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)");
                 return InvalidMirInst;
             }
             MirInstId const base = vaTagBase(kids[0]);   // the `__va_list` struct base
@@ -3172,32 +3220,47 @@ struct Lowerer {
                 std::array<MirInstId, 2> st{vrTop, vrTopField};
                 mir.addInst(MirOpcode::Store, st);
             }
-            // __stack = &incoming-stack-args (the overflow base).
+            // __stack = &incoming-stack-args (the overflow base), displaced PAST any
+            // named params that overflowed onto the incoming stack (payload =
+            // fixedStackBytes, 0 for the common case). LIR adds it to the overflow base.
             MirInstId const stackField = vaFieldPtr(base, vl.stackField, voidPtrPtr);
             if (!stackField.valid()) return InvalidMirInst;
             {
                 MirInstId const ovf =
-                    mir.addInst(MirOpcode::VaOverflowArgAreaAddr, {}, voidPtr);
+                    mir.addInst(MirOpcode::VaOverflowArgAreaAddr, {}, voidPtr,
+                                /*payload=*/fixedStackBytes);
                 std::array<MirInstId, 2> st{ovf, stackField};
                 mir.addInst(MirOpcode::Store, st);
             }
-            // __gr_offs = -(gpSaveCount - fixedGpr) * gpSlotBytes (NEGATIVE i32).
+            // __gr_offs = -(gpSaveCount - fixedGpr) * gpSlotBytes (NEGATIVE i32),
+            // CLAMPED to 0 when the fixed GPR params have consumed the whole GR block
+            // (fixedGpr >= gpSaveCount): no GR slots remain for varargs, and the naive
+            // subtraction would underflow (unsigned). va_arg's reg arm tests
+            // ICmpSlt(offs, 0) → 0 routes every GPR vararg straight to __stack. (The
+            // fixed-stack-arg displacement is carried by the VaOverflowArgAreaAddr
+            // payload above; the FOLD 1 fail-loud rejects the aggregate-straddle case.)
             MirInstId const grOffsField = vaFieldPtr(base, vl.grOffsField, i32Ptr);
             if (!grOffsField.valid()) return InvalidMirInst;
             {
                 std::int64_t const grOffs =
-                    -static_cast<std::int64_t>(
-                        (vl.gpSaveCount - currentFnFixedGpr_) * vl.gpSlotBytes);
+                    (currentFnFixedGpr_ >= vl.gpSaveCount)
+                        ? 0
+                        : -static_cast<std::int64_t>(
+                              (vl.gpSaveCount - currentFnFixedGpr_) * vl.gpSlotBytes);
                 std::array<MirInstId, 2> st{constIntOfType(grOffs, i32), grOffsField};
                 mir.addInst(MirOpcode::Store, st);
             }
-            // __vr_offs = -(fpSaveCount - fixedFpr) * fpSlotBytes (NEGATIVE i32).
+            // __vr_offs = -(fpSaveCount - fixedFpr) * fpSlotBytes (NEGATIVE i32),
+            // CLAMPED to 0 when the fixed FP params have consumed the whole VR block
+            // (fixedFpr >= fpSaveCount) — same rationale as __gr_offs.
             MirInstId const vrOffsField = vaFieldPtr(base, vl.vrOffsField, i32Ptr);
             if (!vrOffsField.valid()) return InvalidMirInst;
             {
                 std::int64_t const vrOffs =
-                    -static_cast<std::int64_t>(
-                        (vl.fpSaveCount - currentFnFixedFpr_) * vl.fpSlotBytes);
+                    (currentFnFixedFpr_ >= vl.fpSaveCount)
+                        ? 0
+                        : -static_cast<std::int64_t>(
+                              (vl.fpSaveCount - currentFnFixedFpr_) * vl.fpSlotBytes);
                 std::array<MirInstId, 2> st{constIntOfType(vrOffs, i32), vrOffsField};
                 return mir.addInst(MirOpcode::Store, st);   // last Store — a valid inst
             }
@@ -4723,6 +4786,9 @@ struct Lowerer {
         // first INTEGER arg register goes to the result pointer and every real arg
         // shifts by one — hoisted above the sret `Arg` so both use one counter.
         ArgOrdinalCounter argCtr{config.argSlotAligned};
+        // FOLD 1: reset the aggregate-fixed-param flag per function (set true below
+        // when the param loop receives a by-value struct/union param).
+        currentFnHasAggregateFixedParam_ = false;
 
         // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value struct/union
         // RETURN. Classify under the active CC's strategy. ByReference (class
@@ -4809,6 +4875,15 @@ struct Lowerer {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
                 }
+                // FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): record
+                // that a by-value AGGREGATE fixed param was placed (InRegisters
+                // multi-piece OR ByReference hidden pointer). If this fn is variadic
+                // AND its fixed params overflow the register pool, va_start's
+                // per-register-slot displacement formula is WRONG for a multi-slot
+                // aggregate straddling the reg/stack boundary (SysV puts the whole
+                // struct in memory; the slot count undercounts) → lowerVaStart fails
+                // loud rather than silently miscompile.
+                currentFnHasAggregateFixedParam_ = true;
                 continue;
             }
             // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG / fixes D-ML7-2.10): a scalar
