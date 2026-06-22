@@ -76,7 +76,18 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      than duplicate; add a NEW example only for a genuine coverage gap. **Make it a *good*
      exercise, not a vacuous one:** the feature must actually manifest at runtime with operands
      no earlier pass can fold away (cycle 10r's division corpus uses runtime function-args,
-     never a literal `100/7` that const-folds before the idiv ever runs). **Carve-out — do not
+     never a literal `100/7` that const-folds before the idiv ever runs). **Witness the
+     OPTIMIZER, not just the lowering:** a runtime-observable feature's corpus MUST carry an
+     optimized arm that runs the REAL shipped pipeline — `{"shippedPipeline": "release"}`, NEVER
+     a hand-listed `passes` subset and NEVER baseline-only — so the optimizer×feature composition
+     (Inlining / Mem2Reg / LICM over the feature's NEW MIR shapes) is exercised end-to-end at
+     runtime. A baseline-only example runs the no-op `debug` pipeline, and a hand-listed subset
+     drops passes the release build runs; either silently lets a future optimizer regression — or
+     a frame-slack-masked overrun — pass green (the FC7-C3 array-storage width overrun the
+     `passes`-subset corpus MASKED; the FC12 variadic cycle then shipped 18/19 examples
+     baseline-only, leaving the optimizer's effect on the new va_list cursor/alloca shapes
+     unwitnessed). The MIR/LIR pins lock the *pre-optimizer* shape; only a `release`-arm corpus
+     proves the optimizer preserves the feature's runtime semantics. **Carve-out — do not
      manufacture a vacuous corpus:** a feature with *no* runtime-observable behavior (pure
      substrate, a diagnostic-only fail-loud, a MIR-tier transform with no runtime difference —
      e.g. single-CU `static`→Local DCE just drops an unused symbol — a behavior-preserving
