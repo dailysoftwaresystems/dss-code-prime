@@ -28,6 +28,77 @@
 
 namespace dss {
 
+namespace detail {
+// [[noreturn]] loud abort for a stale operand/scalar span read (debug guard).
+// Defined in type_lattice.cpp; the message is matched by the red-on-disable pin.
+[[noreturn]] DSS_EXPORT void typeInternerStaleSpan();
+}  // namespace detail
+
+// ── D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD ──
+// `operands()`/`scalars()`/`fnParams()` hand back a VIEW into `operandPool_` /
+// `scalarPool_`. A caller that retains the view across a later intern — which
+// may `insert` and REALLOCATE the pool — then reads freed memory: a
+// host-dependent heap-use-after-free (MSVC's 1.5× vector growth often has spare
+// capacity and survives by luck; libstdc++/libc++'s 2× realloc moves the buffer
+// and aborts only under ASan). It bit TWICE (`hir_to_mir.cpp` 4660 + 2490) and
+// is INVISIBLE to the Windows-only non-ASan local gate.
+//
+// `GuardedSpan<T>` makes the anti-pattern abort DETERMINISTICALLY on EVERY host
+// in a DEBUG build: it captures the interner's pool-mutation generation when the
+// view is created and re-checks it on every access; a mutation since creation →
+// loud abort, no ASan required. In a RELEASE build it is a zero-overhead alias
+// to `std::span<T const>`, so the public contract and codegen are unchanged. The
+// guard is source/target/format-agnostic — pure substrate.
+#ifdef NDEBUG
+template <class T> using GuardedSpan = std::span<T const>;
+#else
+template <class T>
+class GuardedSpan {
+    // A MINIMAL std::span API mirror — only the operations the ~234 accessor
+    // call sites actually use (verified at build). Extend (add `rbegin`, an
+    // `iterator` typedef, `size_bytes`, …) only when a real caller needs it; the
+    // release alias is full std::span, so any addition must keep both arms in sync.
+public:
+    using element_type = T const;
+    using value_type   = T;
+
+    GuardedSpan() = default;
+    GuardedSpan(std::span<T const> s, std::uint64_t const* gen, std::uint64_t captured)
+        : span_(s), gen_(gen), captured_(captured) {}
+
+    [[nodiscard]] std::size_t size()  const { check_(); return span_.size(); }
+    [[nodiscard]] bool        empty() const { check_(); return span_.empty(); }
+    [[nodiscard]] T const&    operator[](std::size_t i) const { check_(); return span_[i]; }
+    [[nodiscard]] T const&    front() const { check_(); return span_.front(); }
+    [[nodiscard]] T const&    back()  const { check_(); return span_.back(); }
+    [[nodiscard]] T const*    data()  const { check_(); return span_.data(); }
+    [[nodiscard]] auto        begin() const { check_(); return span_.begin(); }
+    [[nodiscard]] auto        end()   const { check_(); return span_.end(); }
+    [[nodiscard]] GuardedSpan subspan(std::size_t off) const {
+        check_(); return GuardedSpan{span_.subspan(off), gen_, captured_};
+    }
+    [[nodiscard]] GuardedSpan first(std::size_t n) const {
+        check_(); return GuardedSpan{span_.first(n), gen_, captured_};
+    }
+    [[nodiscard]] GuardedSpan last(std::size_t n) const {
+        check_(); return GuardedSpan{span_.last(n), gen_, captured_};
+    }
+    // Implicit decay to a plain span (the historic return type). The check runs
+    // at the decay point; the resulting raw span is unguarded for LATER reads —
+    // acceptable, as the two historical bugs retained the ACCESSOR result (the
+    // `auto ops = interner.operands(id)` shape), which keeps the guard.
+    [[nodiscard]] operator std::span<T const>() const { check_(); return span_; }
+
+private:
+    void check_() const {
+        if (gen_ != nullptr && *gen_ != captured_) detail::typeInternerStaleSpan();
+    }
+    std::span<T const>   span_{};
+    std::uint64_t const* gen_      = nullptr;
+    std::uint64_t        captured_ = 0;
+};
+#endif
+
 class DSS_EXPORT TypeInterner {
 public:
     // `owner` MUST be a valid CompilationUnitId: it is the arena tag stamped
@@ -123,9 +194,9 @@ public:
     // ── accessors ──
     [[nodiscard]] TypeRecord const&  get(TypeId id)      const { return arena_.at(id); }
     [[nodiscard]] TypeKind           kind(TypeId id)     const { return arena_.at(id).kind; }
-    [[nodiscard]] std::span<TypeId const>       operands(TypeId id) const;
-    [[nodiscard]] std::span<std::int64_t const> scalars(TypeId id)  const;
-    [[nodiscard]] std::string_view              name(TypeId id)     const;
+    [[nodiscard]] GuardedSpan<TypeId>        operands(TypeId id) const;
+    [[nodiscard]] GuardedSpan<std::int64_t> scalars(TypeId id)  const;
+    [[nodiscard]] std::string_view           name(TypeId id)     const;
 
     // FC8 bitfields (D-CSUBSET-BITFIELD): the declared bit-width of struct field
     // `fieldIndex`, or nullopt if that field is ordinary (non-bitfield). A
@@ -139,8 +210,8 @@ public:
     // FnSig decoders — hand back the result/params without the caller needing
     // to know the operands=[result, params...] storage convention. Abort if
     // `id` is not a FnSig.
-    [[nodiscard]] TypeId                   fnResult(TypeId id) const;
-    [[nodiscard]] std::span<TypeId const>  fnParams(TypeId id) const;
+    [[nodiscard]] TypeId               fnResult(TypeId id) const;
+    [[nodiscard]] GuardedSpan<TypeId>  fnParams(TypeId id) const;
     // D-LANG-VARIADIC (step 13.4): true iff this FnSig was built via
     // the 4-arg `fnSig()` overload with `isVariadic=true`. Read from
     // scalars[1]. Pre-13.4 FnSigs (built via the 3-arg overload)
@@ -177,9 +248,24 @@ private:
                                     std::span<std::int64_t const> scalars,
                                     TypeNameId name) const;
 
+    // Wrap a raw pool view in a GuardedSpan tagged with the current pool
+    // generation (debug) — or return it unchanged (release alias). The single
+    // chokepoint every accessor routes through.
+    template <class T>
+    [[nodiscard]] GuardedSpan<T> guard_(std::span<T const> raw) const noexcept {
+#ifdef NDEBUG
+        return raw;
+#else
+        return GuardedSpan<T>{raw, &poolGen_, poolGen_};
+#endif
+    }
+
     substrate::ArenaBuilder<TypeRecord, TypeId, CompilationUnitId> arena_;
     std::vector<TypeId>                            operandPool_;
     std::vector<std::int64_t>                      scalarPool_;
+    // Bumped on every pool-mutating intern (D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-
+    // GUARD). A GuardedSpan captures this at creation and aborts on a stale read.
+    std::uint64_t                                  poolGen_ = 0;
     Interner<TypeNameId>                           names_;
     std::unordered_multimap<std::uint64_t, TypeId> byHash_;
 };
