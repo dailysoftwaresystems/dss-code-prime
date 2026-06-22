@@ -64,14 +64,40 @@ TEST(TypeRules, IsAssignableWidensWithinSigned) {
     EXPECT_FALSE(isAssignable(in, i16, i32)) << "I32 does NOT narrow to I16";
 }
 
-// Cross-signedness is NOT assignable (caller-declared explicit cast is
-// the only path — no silent C-style I32 ↔ U32).
+// Cross-signedness is NOT assignable by DEFAULT (caller-declared explicit cast is
+// the only path — no silent C-style I32 ↔ U32 for a non-C schema).
 TEST(TypeRules, IsAssignableRejectsCrossSignedness) {
     auto in  = makeInterner();
     auto i32 = in.primitive(TypeKind::I32);
     auto u32 = in.primitive(TypeKind::U32);
     EXPECT_FALSE(isAssignable(in, i32, u32));
     EXPECT_FALSE(isAssignable(in, u32, i32));
+}
+
+// D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT: with the `intCrossSignednessConverts` gate ON
+// (c-subset), signed↔unsigned IS assignable in BOTH directions and at ANY width (incl.
+// cross-signedness narrowing U64→I32) — C 6.3.1.3 / 6.5.16.1. coerce() materializes the
+// width-exact Cast. RED-ON-DISABLE: revert the isAssignable cross-signedness arm → the
+// four EXPECT_TRUE flip to false. SCOPE GUARD: the gate is signed↔unsigned ONLY — a
+// SAME-signedness narrowing stays strictly rejected even with the gate on.
+TEST(TypeRules, IsAssignableAdmitsCrossSignednessWhenGated) {
+    auto in  = makeInterner();
+    auto i16 = in.primitive(TypeKind::I16);
+    auto i32 = in.primitive(TypeKind::I32);
+    auto u32 = in.primitive(TypeKind::U32);
+    auto i64 = in.primitive(TypeKind::I64);
+    auto u64 = in.primitive(TypeKind::U64);
+    auto const G = [&](TypeId l, TypeId r) {
+        return isAssignable(in, l, r, {}, /*boolWidensToArith=*/false,
+                            /*charConvertsToArith=*/false, /*enumConvertsToArith=*/false,
+                            /*intCrossSignednessConverts=*/true);
+    };
+    EXPECT_TRUE(G(i32, u32)) << "U32 -> I32 (same width)";
+    EXPECT_TRUE(G(u32, i32)) << "I32 -> U32";
+    EXPECT_TRUE(G(i32, u64)) << "U64 -> I32 (cross-signedness NARROWING, C 6.3.1.3)";
+    EXPECT_TRUE(G(i64, u32)) << "U32 -> I64 (cross-signedness widening)";
+    EXPECT_FALSE(G(i16, i32))
+        << "I32 -> I16 SAME-signedness narrowing stays rejected (gate is cross-only)";
 }
 
 // Int ↔ Float is NOT assignable.

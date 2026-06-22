@@ -7187,6 +7187,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     cfg.enumConvertsToArith = v.get<bool>();
                 }
             }
+            // C 6.3.1.3/6.5.16.1 signed↔unsigned implicit assignment conversion (read
+            // by `isAssignable`'s cross-signedness arm). Opt-in (default false → a
+            // non-C schema keeps signed/unsigned strictly distinct).
+            if (sem.contains("intCrossSignednessConverts")) {
+                auto const& v = sem.at("intCrossSignednessConverts");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/intCrossSignednessConverts",
+                              "'intCrossSignednessConverts' must be a boolean");
+                } else {
+                    cfg.intCrossSignednessConverts = v.get<bool>();
+                }
+            }
 
             // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d):
             // per-language `pointerAliasing` block. Single bool field

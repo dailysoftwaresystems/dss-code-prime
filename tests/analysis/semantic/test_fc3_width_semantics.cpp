@@ -17,6 +17,8 @@
 #include "analysis/semantic/semantic_test_fixture.hpp"
 #include "core/types/data_model.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/tree_cursor.hpp"
+#include "core/types/tree_visitor.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "link/object_format_schema.hpp"
@@ -216,42 +218,41 @@ TEST(Fc3WidthSemantics, ModelCarriesTheAnalysisDataModel) {
 // ── P3: the integer-literal ladder (C 6.4.4.1) ──────────────────────────
 
 namespace {
-// Pin the literal's ladder type through the CALL-ARG assignability check
-// (the semantic surface that consumes literal types — c-subset declares
-// no decl-init child, so the call check is the strict observable):
-// passing the literal to a SAME-kind parameter must be clean, and to the
-// CROSS-SIGNEDNESS sibling at the same width must MISMATCH (assignability
-// is same-signedness rank-based) — proving the ladder picked the exact
-// (width × signedness) type, not merely "something assignable".
+// Pin the literal's EXACT ladder type (C 6.4.4.1) by reading the TypeId the
+// semantic analyzer STAMPED on the IntLiteral leaf — the strongest possible
+// assertion: the literal's *actual decoded type* (width AND signedness), not
+// an assignability proxy.
+//
+// This supersedes the prior cross-signedness-mismatch proxy. The c-subset
+// `intCrossSignednessConverts` opt-in (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT,
+// C 6.3.1.3) admits signed<->unsigned ASSIGNMENT, so an opposite-signedness
+// parameter no longer mismatches — signedness became unobservable through
+// assignability. Reading the stamped type observes both axes directly, and is
+// the stronger pin regardless of the gate.
 void expectLiteralTypes(std::string const& literal, TypeKind want,
                         DataModel dm = DataModel::Lp64) {
-    char const* binder = nullptr;
-    switch (want) {
-        case TypeKind::I32: binder = "int";                 break;
-        case TypeKind::I64: binder = "long long";           break;
-        case TypeKind::U32: binder = "unsigned int";        break;
-        case TypeKind::U64: binder = "unsigned long long";  break;
-        default: FAIL() << "unsupported want kind"; return;
-    }
-    auto const probe = [&](char const* paramType) {
-        return std::string{"int take("} + paramType
-            + " v) { return 0; }\n"
-              "int main() { int r; r = take(" + literal + "); return 0; }\n";
-    };
-    auto clean = analyzeCSubset(probe(binder), dm);
-    EXPECT_EQ(countCode(clean.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
-        << literal << " should pass cleanly into a " << binder << " param";
-    char const* crossBinder = nullptr;
-    switch (want) {
-        case TypeKind::I32: crossBinder = "unsigned int";       break;
-        case TypeKind::I64: crossBinder = "unsigned long long"; break;
-        case TypeKind::U32: crossBinder = "int";                break;
-        case TypeKind::U64: crossBinder = "long long";          break;
-        default: return;
-    }
-    auto cross = analyzeCSubset(probe(crossBinder), dm);
-    EXPECT_EQ(countCode(cross.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-        << literal << " must NOT pass into a " << crossBinder << " param";
+    auto cu = buildShippedUnit(
+        "c-subset", {std::string{"int main() { "} + literal + "; return 0; }\n"});
+    assertNoBuilderErrors(*cu);
+    auto m = analyze(cu, dm);
+    EXPECT_FALSE(m.hasErrors()) << literal << " should analyze without error";
+    // Locate the IntLiteral leaf by its token spelling. The `return 0;`
+    // epilogue uses a distinct `0` token, so the match is unique for every
+    // laddered literal under test (none is the bare "0"). Take the FIRST hit.
+    Tree const& tree = cu->trees()[0];
+    NodeId lit{};
+    walkPreOrder(tree, [&](TreeCursor const& cursor) {
+        NodeId const n = cursor.current();
+        if (lit.valid()) return;
+        if (tree.kind(n) == NodeKind::Token && tree.text(n) == literal) lit = n;
+    });
+    ASSERT_TRUE(lit.valid())
+        << "IntLiteral leaf '" << literal << "' not found in the tree";
+    TypeId const got = m.typeAt(lit);
+    ASSERT_TRUE(got.valid()) << literal << " leaf carries no stamped type";
+    EXPECT_EQ(m.lattice().interner().kind(got), want)
+        << literal << " must type kind " << static_cast<int>(want) << " — got "
+        << static_cast<int>(m.lattice().interner().kind(got));
 }
 } // namespace
 

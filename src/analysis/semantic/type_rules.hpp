@@ -123,7 +123,8 @@ namespace detail::type_rules {
     SemanticConfig::PointerConversionRules const&      ptrRules = {},
     bool                                               boolWidensToArith = false,
     bool                                               charConvertsToArith = false,
-    bool                                               enumConvertsToArith = false) noexcept {
+    bool                                               enumConvertsToArith = false,
+    bool                                               intCrossSignednessConverts = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     if (sameType(lhs, rhs)) return true;
     auto const lk = interner.kind(lhs);
@@ -187,6 +188,24 @@ namespace detail::type_rules {
              && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0))
             || (rk == TypeKind::Enum
                 && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0)))) {
+        return true;
+    }
+    // C 6.3.1.3 / 6.5.16.1 (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT): a signed integer
+    // and an unsigned integer are mutually assignable — value-preserving in range,
+    // modular out of range (`int x = u;`, `unsigned u = i;`, `return i;`/`f(u)` across
+    // the signedness boundary), in BOTH directions and at ANY width. The same-signedness
+    // rank arms above already RETURNED for matching signedness, so this arm is reached
+    // only for a signed↔unsigned MIX (one rank is signed, the other unsigned); a
+    // non-int rhs/lhs (float/char/enum — already handled, or int↔float) fails both
+    // disjuncts and stays a loud mismatch. The HIR `coerce()` arithmetic-core arm
+    // materializes the width-exact Cast, so the post-coerce verifier (gate default
+    // false) stays strict. Gated on `intCrossSignednessConverts` (default false → a
+    // non-C schema keeps signed/unsigned strictly distinct); mirrors the
+    // charConvertsToArith / enumConvertsToArith gates. SAME-signedness narrowing
+    // (`int x = aLong`) is UNAFFECTED — it returned at the rank arms above.
+    if (intCrossSignednessConverts
+        && ((signedIntRank(lk) != 0 && unsignedIntRank(rk) != 0)
+            || (unsignedIntRank(lk) != 0 && signedIntRank(rk) != 0))) {
         return true;
     }
     // C-standard array-to-pointer decay (D-LK4-RODATA-PRODUCER-STRING

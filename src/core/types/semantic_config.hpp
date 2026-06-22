@@ -1148,6 +1148,19 @@ struct DSS_EXPORT SemanticConfig {
     // distinct from the integer ranks. Closes D-CSUBSET-ENUM-INT-CONVERSION.
     bool enumConvertsToArith = false;
 
+    // C 6.3.1.3 / 6.5.16.1 (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT): a signed↔unsigned
+    // implicit conversion in an ASSIGNMENT context — `int x = u;`, `x = u;`,
+    // `return i;` from an int-returning fn with an unsigned `i`, `f(u)` to an int
+    // param — is value-preserving in range / modular out of range. Read by
+    // `isAssignable`'s cross-signedness arm, which admits signed↔unsigned WITHIN the
+    // integer ranks in BOTH directions and at ANY width (incl. cross-signedness
+    // narrowing like `int x = sizeUL`); the HIR `coerce()` arithmetic-core arm already
+    // materializes the width-exact Cast. Default false → a non-C schema (toy/tsql) keeps
+    // signed/unsigned strictly distinct. SCOPE: signed↔unsigned only — SAME-signedness
+    // narrowing (`int x = aLong`) stays its strict widening-only rank rule (a separate
+    // deliberate choice, pinned by test_type_rules `isAssignable(i16,i32)==false`).
+    bool intCrossSignednessConverts = false;
+
     // Two orthogonal per-language alias-analysis opt-ins, both threaded
     // through `MirLoweringConfig` → `Mir` and read by CSE/LICM Load
     // admission via `Mir.aliasingMode()` + `Mir.charTypesAliasAll()`.
