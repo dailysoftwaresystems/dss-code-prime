@@ -333,6 +333,12 @@ enum class DiagnosticCode : std::uint16_t {
     // type's bit-size (C 6.7.2.1p4), or is zero on a NAMED field (C 6.7.2.1p3 — a
     // zero-width bit-field shall have no declarator, i.e. be anonymous).
     S_BitFieldWidthOutOfRange     = 0xE01F,
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the active CC's `vaListLayout.strategy`
+    // is a variadic-callee ABI not yet realized (Aapcs64DualCursor — FC12c). The
+    // semantic `va_list`-type injection fails loud rather than inject a wrong-sized
+    // `va_list` (which would mis-size the `ap` local and corrupt the stack). SysV
+    // (register-save) + Win64 (homogeneous-pointer) are realized and never hit this.
+    S_VariadicCalleeUnsupported   = 0xE020,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

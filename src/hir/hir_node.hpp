@@ -51,6 +51,13 @@ enum class HirKind : std::uint16_t {
     Literal, Ref, Call, IntrinsicCall, BinaryOp, UnaryOp, Cast, MemberAccess,
     Index, Swizzle, ConstructAggregate, Ternary, LogicalAnd, LogicalOr,
     SizeOf, AddressOf, Deref, SeqExpr,
+    // ── Variadic intrinsics (FC12a-core) — DEDICATED nodes mirroring SizeOf:
+    //    `VaArg` carries the read TYPE on a [TypeRef] child it NEVER value-lowers
+    //    (vs IntrinsicCall, which value-lowers every child). VaStart/VaEnd take the
+    //    `va_list` lvalue [apExpr] child. Each is an expression node (VaArg yields
+    //    the read value typed T; VaStart/VaEnd yield void, modelled as a typed
+    //    expr like a void-returning call so they sit in expression position). ──
+    VaStart, VaArg, VaEnd,
     // ── Types-as-values ──
     TypeRef,
     // ── Special ──
@@ -102,6 +109,12 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
         case HirKind::Swizzle: case HirKind::ConstructAggregate: case HirKind::Ternary:
         case HirKind::LogicalAnd: case HirKind::LogicalOr: case HirKind::SizeOf:
         case HirKind::AddressOf: case HirKind::Deref: case HirKind::SeqExpr:
+        // ── Variadic intrinsics (FC12a-core): every one is an expression node.
+        //    VaArg's type is the READ value's type T; VaStart/VaEnd carry a valid
+        //    `void` type (the void-returning-call convention — a valid TypeId, not
+        //    InvalidType), so all three require a resolved type and fail loud if
+        //    typeless. ──
+        case HirKind::VaStart: case HirKind::VaArg: case HirKind::VaEnd:
         // ── Types-as-values: carries the referenced lattice TypeId ──
         case HirKind::TypeRef:
         // ── Declarations carrying their own (source-defined) type ──
@@ -198,7 +211,12 @@ struct ChildArity {
         case HirKind::UnaryOp: case HirKind::Cast: case HirKind::MemberAccess:
         case HirKind::Swizzle: case HirKind::SizeOf: case HirKind::AddressOf:
         case HirKind::Deref:
+        // FC12a-core: VaStart/VaEnd = [apExpr] — one child (the va_list lvalue).
+        case HirKind::VaStart: case HirKind::VaEnd:
             return {1, 1};
+        // FC12a-core: VaArg = [apExpr, TypeRef] — the va_list lvalue (value-lowered)
+        // PLUS the read TYPE on a SizeOf-style TypeRef child (NEVER value-lowered).
+        case HirKind::VaArg:              return {2, 2};
         case HirKind::BinaryOp: case HirKind::Index: case HirKind::LogicalAnd:
         case HirKind::LogicalOr:
             return {2, 2};

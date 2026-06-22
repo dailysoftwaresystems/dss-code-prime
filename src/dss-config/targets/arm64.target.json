@@ -51,6 +51,36 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (FC12a-core, D-FC12A-VARIADIC-CALLEE): the variadic register-save-area address. Declared for substrate uniformity (like read_indirect_result); AArch64's variadic ABI differs (no SysV-style register-save-area / vaListLayout this cycle), so its sysv-less CC never EMITS this op — it is materialized away by lir_callconv only for a CC that declares a vaListLayout. No encoding.",
+      "mnemonic":      "va_reg_save_area",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Virtual-ISA pseudo-op (FC12a-core, D-FC12A-VARIADIC-CALLEE): the incoming overflow-stack-args address. Declared for substrate uniformity; never emitted on a CC without a vaListLayout. No encoding (materialized away by lir_callconv).",
+      "mnemonic":      "va_overflow_arg_area",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Virtual-ISA pseudo-op (FC12b, D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start base (&home[namedArgCount]). Declared for substrate uniformity; AAPCS64 uses the dual-cursor strategy (FC12c) and never emits this op. No encoding (materialized away by lir_callconv).",
+      "mnemonic":      "va_home_arg_area",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "AAPCS64 has no native `mov reg, reg` instruction — the canonical encoding is `ORR Xd, XZR, Xm` (32-bit fixed word 0xAA0003E0 = base + Rn=XZR=31; Rd and Rm via slots). LIR's `mov` is 2-operand (result + 1 source); 3-address natively (no requires2Address).",
       "mnemonic":      "mov",
       "result":        "value",
@@ -872,6 +902,124 @@
       }
     },
     {
+      "$comment": "D-ASM-AARCH64-LARGE-FRAME-IMM12 — Memory LOAD, unsigned-offset form: AArch64 LDR Xt, [Xn, #pimm] (scaled, unsigned 12-bit byte offset). The large-frame sibling of `load` (LDUR, signed imm9): a frame offset BEYOND the unscaled ±256 reach takes this form. Fixed word 0xF9400000 (= the LDUR base | (1<<24), the unsigned-offset mode bit). SAME operand layout as `load` ([base_reg, MemBase(scale=1), MemOffset(disp)] + result) so the callconv emits the SAME shape — only the opcode (mnemonic) differs, picked at lowering time from the offset value (the variant selector matches operand KINDS, not the value). Wires: result→Rt (rd, bits 0..4), base_reg→Rn (bits 5..9), MemOffset→Imm12Scaled (bits 10..21, the SCALED field imm12=byteOffset/accessSize). MemBase carries no bits (scale==1). Offset must be non-negative + access-size-aligned + scale ≤4095 (reach 32760 for 64-bit); else fail-loud (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12).",
+      "mnemonic":      "load_u",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "$comment": "width 64: LDR Xt, [Xn, #pimm] (0xF9400000). accessSize 8 ⇒ imm12 = byteOffset/8 (e.g. [sp,#192] ⇒ imm12=24). Every GPR integer/pointer load carries width 64.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
+            "template":   { "fixedWord": 4181721088 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12.scaled"   }
+            ]
+          },
+          {
+            "$comment": "width 8: LDRB Wt, [Xn, #pimm] (0x39400000 — the unsigned-offset word with size 11→00). accessSize 1 ⇒ imm12 = byteOffset (unscaled in effect). Selected when the Load's result type is Char (width 8).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "template":   { "fixedWord": 960495616 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12.scaled"   }
+            ]
+          },
+          {
+            "$comment": "width 32: LDR Wt, [Xn, #pimm] (0xB9400000 — size 11→10). accessSize 4 ⇒ imm12 = byteOffset/4 (e.g. [x3,#64] ⇒ imm12=16). Selected for a 4-byte integer load (I32/U32, or long under LLP64) — width 32.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "template":   { "fixedWord": 3107979264 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12.scaled"   }
+            ]
+          },
+          {
+            "$comment": "width 16: LDRH Wt, [Xn, #pimm] (0x79400000 — size 11→01). accessSize 2 ⇒ imm12 = byteOffset/2. Selected for I16/U16 — width 16.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "template":   { "fixedWord": 2034237440 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12.scaled"   }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-ASM-AARCH64-LARGE-FRAME-IMM12 — Memory STORE, unsigned-offset form: AArch64 STR Xt, [Xn, #pimm] (scaled). The large-frame sibling of `store` (STUR, signed imm9). Fixed word 0xF9000000 (= the STUR base | (1<<24)). SAME operand layout as `store` ([value_reg, base_reg, MemBase(scale=1), MemOffset(disp)], no result). Wires: value_reg→Rt (rd, 0..4), base_reg→Rn (5..9), MemOffset→Imm12Scaled (10..21, scaled). MemBase carries no bits. Offset non-negative + access-size-aligned + scale ≤4095, else fail-loud.",
+      "mnemonic":      "store_u",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "$comment": "width 64: STR Xt, [Xn, #pimm] (0xF9000000). accessSize 8 ⇒ imm12 = byteOffset/8. Every GPR integer/pointer store carries width 64.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "fixedWord": 4177526784 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm12.scaled"   }
+            ]
+          },
+          {
+            "$comment": "width 8: STRB Wt, [Xn, #pimm] (0x39000000 — size 11→00). accessSize 1 ⇒ imm12 = byteOffset. Selected when the stored value's type is Char (width 8).",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "fixedWord": 956301312 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm12.scaled"   }
+            ]
+          },
+          {
+            "$comment": "width 32: STR Wt, [Xn, #pimm] (0xB9000000 — size 11→10). accessSize 4 ⇒ imm12 = byteOffset/4. Selected for a 4-byte integer store — width 32.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "fixedWord": 3103784960 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm12.scaled"   }
+            ]
+          },
+          {
+            "$comment": "width 16: STRH Wt, [Xn, #pimm] (0x79000000 — size 11→01). accessSize 2 ⇒ imm12 = byteOffset/2. Selected for I16/U16 — width 16.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "fixedWord": 2030043136 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm12.scaled"   }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "Load-effective-address — AArch64 ADRP+ADD pair (D-AS4-3 multi-instruction macro-op materializing a module symbol's address into Xd). Mirrors x86_64's 1-operand RIP-relative `lea reg, [rip+sym]` so `lowerGlobalAddr` is target-blind: ONE SymbolRef operand wired into BOTH words. word0 = ADRP Xd, sym@PG (0x90000000=2415919104): Rd at bits 0..4; immlo[30:29]+immhi[23:5] left ZERO — the adr_prel_pg_hi21 reloc patches the ±4 GiB page delta. word1 = ADD Xd, Xd, #:lo12:sym (0x91000000=2432696320, the ADD-imm base shared with `add`'s imm variant): Rd at 0..4 AND Rn at 5..9 (BOTH = the result reg via extraResultSlots — ADD reads its own dest as the source base); imm12[21:10] left ZERO — the add_abs_lo12_nc reloc patches. Both relocs target the SAME symbol at byte offsets base+0 and base+4. The two `sym.patch` wires write NO immediate bits (the linker owns them); they carry only relocationKind + wordIndex.",
       "mnemonic":      "lea",
       "result":        "value",
@@ -1265,6 +1413,31 @@
           }
         ]
       }
+    },
+    {
+      "$comment": "FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE, BLOCKER-1): FPR 128-bit memory STORE — STUR Qt, [Xn, #simm9] (SIMD&FP 128-bit, unscaled). Used to spill the v0..v7 VR arg registers (16-byte slots) into the AAPCS64 variadic register-save-area's VR block so va_arg(double) reads the right 8 bytes. CRITICAL fixedWord = 0x3C800000 = 1015021568, NOT 0x3C000000: the latter is STURB (8-bit byte store) and would spill one byte per FP slot → va_arg(double) garbage. Derivation (ARM ARM C7 LDR/STR SIMD&FP unscaled, 128-bit): Q form size[31:30]=00, [29:27]=111, V[26]=1, opc[23:22]=10 (store, 128-bit) → 0x00000000(size=00) | 0x38000000([29:27]=111) | 0x04000000(V=1,[26]) | 0x00800000(opc=10,[23:22]) = 0x3C800000. Operand layout is IDENTICAL to the D/S-form fstur rows above (shared LIR store form [value_reg, base_reg, MemBase(scale=1), MemOffset(disp)], no result): value→Rt (rd wire), base→Rn, MemOffset→Imm9 (signed -256..255). Single 128-bit form (no width variants — Q is always 16 bytes). Byte-pin: STUR Q0,[X1,#0] = 0x3C800000 (Rd=0,Rn=1<<5=0x20,Imm9=0 → 0x3C800020), LE bytes 20 00 80 3C.",
+      "mnemonic":      "fstur_q",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "template": { "fixedWord": 1015021568 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm9"           }
+            ]
+          }
+        ]
+      }
     }
   ],
   "$condCodeEncodingComment": "D-AS3-COND-CODE-ARM64 (mirror of x86's table): per-cond-code nibble for the AArch64 B.cond instruction's bits [3:0]. Numeric values are the AArch64 condition codes (ARM ARM C1.2.4): EQ=0, NE=1, CS/HS=2, CC/LO=3, HI=8, LS=9, GE=10(0xA), LT=11(0xB), GT=12(0xC), LE=13(0xD). Signed comparisons map slt→LT(0xB)=11, sle→LE(0xD)=13, sgt→GT(0xC)=12, sge→GE(0xA)=10; unsigned map ult→CC/LO=3, ule→LS=9, ugt→HI=8, uge→CS/HS=2. The encoder ORs this nibble into word 0 bits 0..3 of the jcc macro (vs x86's low 4 bits of the opcode byte — same field-position abstraction, different ISA placement). The 10 integer arms are REQUIRED; the FC3.5 float arms (next comment) are per-entry optional.",
@@ -1389,7 +1562,21 @@
       "$entryStackPointerBiasComment": "D-LK10-ENTRY-TRAMP-PROLOGUE: AArch64 BL does NOT push a return address (it writes LR / x30 directly), so process entry — whether by kernel-jump (Linux/Mac) or `RtlUserThreadStart`-BL (Windows) — leaves SP 16-byte-aligned (bias 0 mod 16). Trampoline `sub sp, 0` is emitted as nothing — `alignedSizeWithBias(shadowSpaceBytes=0, stackAlignment=16, bias=0) = 0`.",
       "entryStackPointerBias": 0,
       "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: AArch64 BL writes the return address into LR/x30 — no stack push. callPushBytes=0 is the right ISA-level fact for ARM64. Non-leaf functions on ARM64 still save x30 in their prologue + reload it before `ret`; because x30 is the `linkRegister` (deliberately NOT in `calleeSaved` — it must not be allocatable), this is realized by the link-register fold in `lir_callconv.cpp::materializeOneFunc` (gated on hasCalls + cc.linkRegister), which adds x30 to `savedRegs` so it lands in `savedRegAreaSize`. Without it the epilogue `ret` returns to a clobbered LR — see D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER. Independent of the call-push bias.",
-      "callPushBytes": 0
+      "callPushBytes": 0,
+      "$vaListLayoutComment": "FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE): AAPCS64 §B.4 dual-cursor variadic callee. `__va_list` = {void* __stack@0; void* __gr_top@8; void* __vr_top@16; int __gr_offs@24; int __vr_offs@28;} (32B). The prologue spills x0..x7 (GR block, 8×8=64B) then v0..v7 (VR block, 8×16=128B) into a callee-local register-save-area (regSaveAreaBytes()=192). va_start sets __gr_top=rsa+64 (past the GR block), __vr_top=rsa+192 (past the VR block), __stack=overflow base, __gr_offs=-(8-fixedGpr)*8, __vr_offs=-(8-fixedFpr)*16. va_arg(T) classifies T (GPR vs VR), reads the negative class cursor, and if <0 reads `<gr|vr>_top + (sign-extended cursor)` then bumps by the slot stride, else walks __stack by 8 (the NSAA round-up quantum, even for a double). namedArgSlotBytes=8.",
+      "vaListLayout": {
+        "strategy":          "aapcs64_dual_cursor",
+        "namedArgSlotBytes": 8,
+        "stackField":   { "byteOffset": 0,  "widthBytes": 8 },
+        "grTopField":   { "byteOffset": 8,  "widthBytes": 8 },
+        "vrTopField":   { "byteOffset": 16, "widthBytes": 8 },
+        "grOffsField":  { "byteOffset": 24, "widthBytes": 4 },
+        "vrOffsField":  { "byteOffset": 28, "widthBytes": 4 },
+        "gpSaveCount":  8,
+        "gpSlotBytes":  8,
+        "fpSaveCount":  8,
+        "fpSlotBytes":  16
+      }
     },
     {
       "$comment": "apple_arm64 — Apple's ARM64 ABI for Apple platforms (developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms). The ABI catalog (abi_catalog.cpp) maps (arm64, MachO) → CcApple → \"apple_arm64\"; shipping this row CLOSES D-FF3-5 (trigger: 'apple_arm64 cc row ships in arm64.target.json') and is what lets `resolveAbi` + the entry trampoline resolve a Mach-O-ARM64 cc. The general-purpose REGISTER vocabulary is IDENTICAL to AAPCS64 — integer args x0..x7, returns x0/x1, callee-saved x19..x28+x29, link x30, sp, 16-byte stack alignment, bias 0 (BL writes LR, no push). The Apple ABI's documented DIVERGENCES from AAPCS64 are NOT register-assignment differences: (1) variadic args are ALWAYS passed on the stack (vs AAPCS64's register-then-stack) and (2) a different indirect-result-location rule. Neither is modeled at today's scalar-only asm tier (variadic support is gated at D-FFI-DESCRIPTOR-VARIADIC-SIGNATURE), so for the scalar register-passing this row carries the same fields as aapcs64; a SEPARATE named row keeps the ABI identity explicit and correct, so when variadic/indirect-result lands it is updated HERE, not by silently reusing aapcs64. The always-stack variadic rule + indirect-result-location divergence are pinned at D-FF3-APPLE-ARM64-ABI-DIVERGENCE (they land WITH the proper CcApple field set when the trigger fires — a variadic OR struct-return call on arm64-Apple — not as a silent aapcs64 reuse; distinct from D-FF3-4, which is the Microsoft CcMSARM64 split).",
@@ -1414,7 +1601,14 @@
       "shadowSpaceBytes": 0,
       "redZoneBytes":     0,
       "entryStackPointerBias": 0,
-      "callPushBytes": 0
+      "callPushBytes": 0,
+      "$variadicComment": "FC12c (D-FC12C-APPLE-ARM64-VARIADIC-CALLEE): the variadic half of D-FF3-APPLE-ARM64-ABI-DIVERGENCE. Apple arm64 passes ALL variadic args on the stack (vs AAPCS64's register-then-stack), so `va_list` is a PLAIN POINTER (HomogeneousPointer strategy, like Win64) that linearly bumps over the contiguous overflow area — no register-save-area, no dual cursor. `variadicArgsAlwaysStack` forces the CALLER to stack every vararg past the fixed args; `variadicUsesOverflowBase` makes va_start anchor `ap` at the overflow (first stacked vararg) base rather than a home area (Apple has none — named args stay in their registers, read via SSA). namedArgSlotBytes=8.",
+      "variadicArgsAlwaysStack": true,
+      "vaListLayout": {
+        "strategy":                "homogeneous_pointer",
+        "namedArgSlotBytes":       8,
+        "variadicUsesOverflowBase": true
+      }
     }
   ],
   "$relocationsComment": "AArch64 ELF relocation kinds (plan 13 AS4 + plan 14 LK6 cycle 1 + D-LK6-1 closure 2026-06-01). The 'formula' field is a closed-enum discriminator (RelocFormulaKind in target_schema.hpp): 'aarch64_call26' = (S+A-P)>>2, signed-26-bit, OR into BL/B inst[25:0]; 'aarch64_adr_prel_pg_hi21' = ((S+A)>>12)-(P>>12), signed-21-bit, ADRP-split into immlo[30:29]+immhi[23:5]; 'aarch64_add_abs_lo12' = (S+A)&0xFFF, ADD imm12[21:10]; 'linear' (used for abs64) writes 8 LE bytes. Tag values are arbitrary per-target — only the NAME round-trips with format.json cross-reference. Paired anchors: D-LK6-8 (ARM64 PLT stub bytes) + D-LK6-14 (Apple Silicon chained-fixups dispatch) remain open and are independent of the formula reshape.",

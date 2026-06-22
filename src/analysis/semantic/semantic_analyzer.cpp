@@ -169,6 +169,12 @@ struct EngineState {
     // dimension fails loud rather than folding a wrong size. Read by
     // `constIntExpr`'s sizeof-folding closure (array-dimension const-context).
     std::optional<AggregateLayoutParams> aggregateLayout;
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the active CC's va_list lowering
+    // strategy (`analyze()`'s parameter). Selects the injected `va_list` TYPE AND
+    // the `va_start`/`va_arg`/`va_end` `ap`-operand type check: SysVRegisterSave (or
+    // nullopt) ⇒ `ap` is `__va_list_tag[1]`/`*`; HomogeneousPointer (Win64) ⇒ `ap`
+    // is `char*`. `nullopt` ⇒ the SysV-family default (back-compat).
+    std::optional<VaListStrategy> vaListStrategy;
     // HR11: per-schema index bundles, keyed by SchemaId.v; `active_` is the
     // bundle for the tree currently being processed (set via `activate`).
     std::unordered_map<std::uint32_t, SchemaIndexes> schemaIndexes;
@@ -1196,6 +1202,23 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             if (paramsList.valid()) {
                 collectParamTypes(s, cfg, tree, paramsList, scope, params,
                                   emitOnMiss);
+            }
+            // FC12a-core (D-FC12A-VARIADIC-CALLEE): a `...` in this param list makes
+            // the FnSig C-style variadic. This SHARED suffix resolver is the path a
+            // function DEFINITION (`T f(int n, ...) {...}`) + a fn-pointer type take —
+            // the legacy decl-only path scanned its per-rule marker but this one did
+            // NOT, so a variadic DEFINITION built a non-variadic FnSig and every call
+            // to it tripped S_ArgCountMismatch. Scan here (stopping at nested decl
+            // rules, like the legacy path) so the def + decl agree on variadic-ness.
+            if (paramsList.valid() && dc.variadicMarker.has_value()
+                && subtreeContainsToken(tree, paramsList, *dc.variadicMarker,
+                                        &s.idx().declByRule)) {
+                normalizeSoleVoidParams(s, cfg, tree, params, emitOnMiss);
+                std::vector<TypeId> vt;
+                vt.reserve(params.size());
+                for (auto const& [pNode, pTy] : params) vt.push_back(pTy);
+                return s.lattice.interner().fnSig(vt, inner, CallConv::CcSysV,
+                                                  /*isVariadic=*/true);
             }
         }
         // C 6.7.6.3p10 `(void)` normalization — the same call the legacy
@@ -2610,6 +2633,92 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
         }
 
+        // FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-CALLEE):
+        // variadic-intrinsic typing. va_arg(ap,T) resolves+stamps its castTypeRef type
+        // child (so the HIR lowering recovers T — a VALUE in the type position fails
+        // loud at resolveTypeNode's S_UnknownType) + stamps the node T; va_start/va_end
+        // stamp the node `void`. ALL THREE check the `ap` operand is a va_list. The
+        // SHAPE of a va_list is STRATEGY-dependent (matching the injected type):
+        //   * SysVRegisterSave (or nullopt): Array<__va_list_tag> or Ptr<__va_list_tag>
+        //     (array-decay makes both shapes legitimate).
+        //   * HomogeneousPointer (Win64 + Apple arm64): `char*` = Ptr<I8> (the injected
+        //     `va_list`).
+        //   * Aapcs64DualCursor (AAPCS64 ARM64-ELF): the `__va_list` STRUCT directly
+        //     (NOT array-decayed, NOT a pointer) — the ap operand is the struct lvalue.
+        // A wrong `ap` (e.g. an int) is S_TypeMismatch. The check shares ONE helper.
+        {
+            auto& in = s.lattice.interner();
+            bool const homogeneousVaList =
+                s.vaListStrategy.has_value()
+                && *s.vaListStrategy == VaListStrategy::HomogeneousPointer;
+            bool const aapcs64VaList =
+                s.vaListStrategy.has_value()
+                && *s.vaListStrategy == VaListStrategy::Aapcs64DualCursor;
+            // True iff `ty` is a va_list for the active strategy.
+            auto isVaList = [&](TypeId ty) -> bool {
+                if (!ty.valid()) return false;
+                TypeKind const k = in.kind(ty);
+                if (homogeneousVaList) {
+                    // Win64 / Apple arm64: `va_list` is `char*` (Ptr<I8>). Accept any
+                    // Ptr-to-char (the injected type) — its element width is what the
+                    // linear va_arg walk reads, so a Ptr<I8> is the precise shape.
+                    if (k != TypeKind::Ptr) return false;
+                    auto const ops = in.operands(ty);
+                    if (ops.empty()) return false;
+                    TypeId const inner = ops[0];
+                    return inner.valid() && in.kind(inner) == TypeKind::I8;
+                }
+                if (aapcs64VaList) {
+                    // AAPCS64: `va_list` IS the `__va_list` struct (no decay). The ap
+                    // operand is the struct lvalue; its address is the cursor base.
+                    return k == TypeKind::Struct && in.name(ty) == "__va_list";
+                }
+                // SysV family: Array<__va_list_tag> or Ptr<__va_list_tag>.
+                if (k != TypeKind::Array && k != TypeKind::Ptr) return false;
+                auto const ops = in.operands(ty);
+                if (ops.empty()) return false;
+                TypeId const inner = ops[0];
+                return inner.valid() && in.kind(inner) == TypeKind::Struct
+                    && in.name(inner) == "__va_list_tag";
+            };
+            // Emit S_TypeMismatch at `apNode` when its type is not a va_list.
+            auto checkAp = [&](NodeId apNode) {
+                TypeId const apTy = subtreeType(s, tree, apNode);
+                if (isVaList(apTy)) return;
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_TypeMismatch;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(apNode);
+                d.actual   = std::string{tree.text(apNode)};
+                s.reporter.report(std::move(d));
+            };
+            if (cfg.vaArgRule.valid() && rule.v == cfg.vaArgRule.v) {
+                auto kids = visibleChildren(tree, node);
+                TypeId argTy = InvalidType;
+                if (cfg.vaArgTypeChild < kids.size()) {
+                    NodeId const typeNode = kids[cfg.vaArgTypeChild];
+                    argTy = resolveTypeNode(s, cfg, tree, typeNode, here);
+                    if (argTy.valid()) s.nodeToType.set(typeNode, argTy);
+                    // argTy invalid ⇒ resolveTypeNode emitted S_UnknownType (the
+                    // `va_arg(ap, x)` for a VALUE x fail-loud).
+                }
+                if (cfg.vaArgApChild < kids.size()) checkAp(kids[cfg.vaArgApChild]);
+                // The node's RESULT type is the read type T (invalid cascades-suppress).
+                if (argTy.valid()) s.nodeToType.set(node, argTy);
+            }
+            if (cfg.vaStartRule.valid() && rule.v == cfg.vaStartRule.v) {
+                auto kids = visibleChildren(tree, node);
+                if (cfg.vaStartApChild < kids.size()) checkAp(kids[cfg.vaStartApChild]);
+                s.nodeToType.set(node, in.primitive(TypeKind::Void));
+            }
+            if (cfg.vaEndRule.valid() && rule.v == cfg.vaEndRule.v) {
+                auto kids = visibleChildren(tree, node);
+                if (cfg.vaEndApChild < kids.size()) checkAp(kids[cfg.vaEndApChild]);
+                s.nodeToType.set(node, in.primitive(TypeKind::Void));
+            }
+        }
+
         // FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF):
         // compound-literal typing (`semantics.compoundLiterals`). The
         // type-position child resolves through the SAME resolver the
@@ -4003,7 +4112,8 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 
 SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       DataModel dataModel,
-                      std::optional<AggregateLayoutParams> aggregateLayout) {
+                      std::optional<AggregateLayoutParams> aggregateLayout,
+                      std::optional<VaListStrategy> vaListStrategy) {
     if (!cu) {
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();
@@ -4011,6 +4121,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
     EngineState s{*cu};
     s.dataModel = dataModel;
     s.aggregateLayout = aggregateLayout;
+    s.vaListStrategy = vaListStrategy;
 
     // FC3 c1: ILP32 is DECLARED-ONLY (the wasm/spirv skeleton formats
     // carry it for honesty) — no exercised 32-bit width path exists, so
@@ -4085,6 +4196,107 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
             rec.variadicBuiltin = bf.variadic;
             SymbolId const id = s.symbols.mint(rec);
             s.scopes.injectBinding(builtinScope, bf.name, id);
+        }
+        // FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-CALLEE):
+        // inject the `va_list` type iff this language declares a va_arg surface
+        // (config-driven: `vaArgRule` valid). The CONCRETE va_list TYPE is selected
+        // by the active CC's `vaListStrategy` (BLOCKER-2: threaded into analyze() so
+        // sizeof(va_list) is right per ABI — a wrong size mis-sizes the `ap` local
+        // and corrupts the stack). Switch on the closed strategy (never cc.name /
+        // arch / format), with a fail-loud default for an un-realized ABI:
+        //   * SysVRegisterSave (or ABSENT — direct-API/back-compat) → `__va_list_tag`
+        //     {u32,u32,void*,void*} + `va_list = __va_list_tag[1]` (24B). The C ABI
+        //     definition; it array-decays to `__va_list_tag*` when passed to
+        //     va_start/va_arg/va_end. The per-field BYTE OFFSETS at codegen come from
+        //     the target's `vaListLayout`; this struct only makes the type resolvable
+        //     by name + sizes `ap`.
+        //   * HomogeneousPointer (Win64 + Apple arm64) → `va_list = char*` (a pointer
+        //     to I8). NO __va_list_tag struct: sizeof(va_list)==8 sizes `ap` as one
+        //     pointer.
+        //   * Aapcs64DualCursor (AAPCS64 ARM64-ELF, FC12c) → `va_list = __va_list`, a
+        //     typedef to the 5-field STRUCT DIRECTLY (NOT an array like SysV, NOT a
+        //     pointer like Win64): {void* __stack; void* __gr_top; void* __vr_top;
+        //     int __gr_offs; int __vr_offs;} (32B). The va_start/va_arg/va_end ap
+        //     operand is this struct lvalue; its ADDRESS is the dual-cursor base.
+        // A language without the surface injects nothing — no leak, no pollution.
+        if (sch->semantics().vaArgRule.valid()) {
+            auto& in = s.lattice.interner();
+            VaListStrategy const strat =
+                vaListStrategy.value_or(VaListStrategy::SysVRegisterSave);
+            if (strat == VaListStrategy::Aapcs64DualCursor) {
+                // AAPCS64 §B.4: `va_list = __va_list` (the struct directly). The five
+                // members in declaration order — pointers first (8B each), then the two
+                // i32 cursors (4+4) — give a 32B struct under natural alignment, exactly
+                // the AAPCS64 `__va_list` layout. `va_list` typedefs DIRECTLY to this
+                // struct (no array decay): the va_start/va_arg/va_end ap operand IS the
+                // struct lvalue and its address is the dual-cursor base.
+                TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+                TypeId const i32     = in.primitive(TypeKind::I32);
+                std::array<TypeId, 5> vaFields{
+                    voidPtr,   // __stack
+                    voidPtr,   // __gr_top
+                    voidPtr,   // __vr_top
+                    i32,       // __gr_offs
+                    i32,       // __vr_offs
+                };
+                TypeId const vaStructTy = in.structType("__va_list", vaFields);
+                SymbolRecord structRec;
+                structRec.name  = "__va_list";
+                structRec.scope = builtinScope;
+                structRec.tree  = InvalidTree;
+                structRec.kind  = DeclarationKind::Type;
+                structRec.type  = vaStructTy;
+                SymbolId const structId = s.symbols.mint(structRec);
+                s.scopes.injectBinding(builtinScope, "__va_list", structId);
+
+                SymbolRecord vaRec;
+                vaRec.name  = "va_list";
+                vaRec.scope = builtinScope;
+                vaRec.tree  = InvalidTree;
+                vaRec.kind  = DeclarationKind::Type;
+                vaRec.type  = vaStructTy;   // typedef to the struct DIRECTLY
+                SymbolId const vaId = s.symbols.mint(vaRec);
+                s.scopes.injectBinding(builtinScope, "va_list", vaId);
+            } else if (strat == VaListStrategy::HomogeneousPointer) {
+                // Win64: `va_list` is a plain `char*` (pointer to I8) — sizeof 8.
+                TypeId const charPtr = in.pointer(in.primitive(TypeKind::I8));
+                SymbolRecord vaRec;
+                vaRec.name  = "va_list";
+                vaRec.scope = builtinScope;
+                vaRec.tree  = InvalidTree;
+                vaRec.kind  = DeclarationKind::Type;
+                vaRec.type  = charPtr;
+                SymbolId const vaId = s.symbols.mint(vaRec);
+                s.scopes.injectBinding(builtinScope, "va_list", vaId);
+            } else {
+                // SysVRegisterSave (or absent): __va_list_tag[1].
+                TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+                std::array<TypeId, 4> tagFields{
+                    in.primitive(TypeKind::U32),  // gp_offset
+                    in.primitive(TypeKind::U32),  // fp_offset
+                    voidPtr,                      // overflow_arg_area
+                    voidPtr,                      // reg_save_area
+                };
+                TypeId const tagTy = in.structType("__va_list_tag", tagFields);
+                SymbolRecord tagRec;
+                tagRec.name  = "__va_list_tag";
+                tagRec.scope = builtinScope;
+                tagRec.tree  = InvalidTree;
+                tagRec.kind  = DeclarationKind::Type;
+                tagRec.type  = tagTy;
+                SymbolId const tagId = s.symbols.mint(tagRec);
+                s.scopes.injectBinding(builtinScope, "__va_list_tag", tagId);
+
+                TypeId const vaListTy = in.array(tagTy, 1);
+                SymbolRecord vaRec;
+                vaRec.name  = "va_list";
+                vaRec.scope = builtinScope;
+                vaRec.tree  = InvalidTree;
+                vaRec.kind  = DeclarationKind::Type;
+                vaRec.type  = vaListTy;
+                SymbolId const vaId = s.symbols.mint(vaRec);
+                s.scopes.injectBinding(builtinScope, "va_list", vaId);
+            }
         }
     }
 

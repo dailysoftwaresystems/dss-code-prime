@@ -235,6 +235,15 @@ struct DSS_EXPORT DeclaratorConfig {
     RuleId        arraySuffixRule{};
     RuleId        initDeclaratorRule{};
     RuleId        listRule{};
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the `...` marker token whose presence
+    // in a fnSuffix's param list makes the FnSig C-style variadic. Declarator-level
+    // (vs the per-`DeclarationRule` `variadicMarker`) so the SHARED declarator-suffix
+    // resolver `applyDeclaratorSuffix` — the path a function DEFINITION + fn-pointer
+    // typing both take — builds a variadic FnSig (the legacy decl path scanned its
+    // own per-rule marker but the suffix path did not, so a `T f(...) {...}`
+    // DEFINITION built a non-variadic FnSig — the gap FC12a-core closes). `nullopt`
+    // ⇒ the language has no varargs (FnSigs through this path are non-variadic).
+    std::optional<SchemaTokenId> variadicMarker;
     // Source spellings, retained for diagnostics (mirrors the
     // rule+ruleName pairing convention of the other facets).
     std::string   declaratorRuleName;
@@ -248,6 +257,7 @@ struct DSS_EXPORT DeclaratorConfig {
     std::string   arraySuffixRuleName;
     std::string   initDeclaratorRuleName;
     std::string   listRuleName;
+    std::string   variadicMarkerName;
 };
 
 struct DSS_EXPORT DeclarationRule {
@@ -922,6 +932,21 @@ struct DSS_EXPORT SemanticConfig {
     RuleId        sizeofTypeRule{};   std::string sizeofTypeRuleName;
     std::uint32_t sizeofTypeChild = 0;
     RuleId        sizeofValueRule{};  std::string sizeofValueRuleName;
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. `vaArgRule`
+    // = the `va_arg(ap,T)` form; pass 2 resolves+stamps its `vaArgTypeChild`
+    // castTypeRef (so the HIR lowering recovers the read type T) + stamps the node
+    // T, and type-checks the `vaArgApChild` operand is a va_list. `vaStartRule`/
+    // `vaEndRule` stamp the node `void`, type-check their `va*ApChild` operand is a
+    // va_list, and `vaStartRule` additionally flips the enclosing function's
+    // uses-va-start attribute (the LIR prologue spills the arg regs only for such
+    // functions). All invalid ⇒ the language has no variadic-intrinsic surface.
+    RuleId        vaArgRule{};        std::string vaArgRuleName;
+    std::uint32_t vaArgApChild   = 0;
+    std::uint32_t vaArgTypeChild = 0;
+    RuleId        vaStartRule{};      std::string vaStartRuleName;
+    std::uint32_t vaStartApChild = 0;
+    RuleId        vaEndRule{};        std::string vaEndRuleName;
+    std::uint32_t vaEndApChild   = 0;
     // FC3.5 sweep-c3: compound-literal type-position stamping rules
     // (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF). See CompoundLiteralRule.
     std::vector<CompoundLiteralRule> compoundLiteralRules;

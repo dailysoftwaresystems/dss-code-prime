@@ -180,6 +180,18 @@ enum class MnemonicSlot : std::uint8_t {
     // register. Like `RetPiece`/`arg`, materialized away by lir_callconv (a
     // mov-from-indirectResultRegister) — never encoded. Declared in every schema.
     ReadIndirectResult,
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the two FRAME-relative va_list address
+    // virtual ops. Like `arg`/`alloca`, materialized away by lir_callconv into a
+    // `lea result, [sp + offset]` once the frame layout is known — never encoded.
+    // VaRegSaveArea = &(the variadic prologue's register-save-area); VaOverflowArgArea
+    // = &(the incoming overflow stack args). Declared in every schema for uniformity.
+    VaRegSaveArea, VaOverflowArgArea,
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start
+    // base. Like the two above but PAYLOAD-carrying (the named-arg slot count);
+    // lir_callconv materializes it to `lea result, [sp + totalFrameSize +
+    // callPushBytes + payload*outgoingSlotSize]` — the NO-SHADOW contiguous home
+    // base (BLOCKER-1). Its presence ALSO triggers the Win64 prologue home-spill.
+    VaHomeArgArea,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -268,6 +280,9 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::MovkLsl48,     "movk_lsl48"},
     {MnemonicSlot::RetPiece,      "ret_piece"},
     {MnemonicSlot::ReadIndirectResult, "read_indirect_result"},
+    {MnemonicSlot::VaRegSaveArea,      "va_reg_save_area"},
+    {MnemonicSlot::VaOverflowArgArea,  "va_overflow_arg_area"},
+    {MnemonicSlot::VaHomeArgArea,      "va_home_arg_area"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -1098,6 +1113,13 @@ struct Lowerer {
             case MirOpcode::Arg:    return lowerArg(id);
             case MirOpcode::ReturnPiece: return lowerReturnPiece(id);
             case MirOpcode::ReadIndirectResult: return lowerReadIndirectResult(id);
+            case MirOpcode::VaRegSaveAreaAddr:
+                return lowerVaFrameAddr(id, MnemonicSlot::VaRegSaveArea,
+                                        "MIR VaRegSaveAreaAddr");
+            case MirOpcode::VaOverflowArgAreaAddr:
+                return lowerVaOverflowArgArea(id);
+            case MirOpcode::VaHomeArgAreaAddr:
+                return lowerVaHomeArgArea(id);
             case MirOpcode::Const:  return lowerConst(id);
             case MirOpcode::Add:    return lowerBinaryOp(id, MnemonicSlot::Add);
             case MirOpcode::Sub:    return lowerBinaryOp(id, MnemonicSlot::Sub);
@@ -1280,6 +1302,7 @@ struct Lowerer {
             case MirOpcode::UIToFP:  return lowerCast(id, MnemonicSlot::UiToFp,  "MIR UIToFP");
             // ── cycle 3e: Calls + GlobalAddr ───────────────────────
             case MirOpcode::GlobalAddr:    return lowerGlobalAddr(id);
+            case MirOpcode::ByValueStackArg: return lowerByValueStackArg(id);
             case MirOpcode::Call:          return lowerCall(id);
             case MirOpcode::IntrinsicCall: return lowerIntrinsicCall(id);
             // ── cycle 3e: aggregate ops (memory-flattening lowering) ──
@@ -1335,6 +1358,58 @@ struct Lowerer {
         LirReg const result = lir.newVReg(regClassFor(id));
         emitInst(*opcode(MnemonicSlot::ReadIndirectResult), result,
                  std::span<LirOperand const>{}, /*payload=*/0);
+        defineValue(id, result);
+    }
+
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the frame-relative VaRegSaveAreaAddr leaf
+    // lowers to its virtual LIR op (no operands, GPR-class pointer result, payload 0 —
+    // the register-save-area base carries NO displacement). lir_callconv materializes
+    // it into a `lea result, [sp + offset]` once it owns the frame layout — the
+    // `alloca`/`read_indirect_result` precedent. Fail loud if the schema lacks the
+    // opcode. (VaOverflowArgAreaAddr is lowered SEPARATELY — see lowerVaOverflowArgArea
+    // — because it THREADS the MIR fixed-stack-arg displacement payload.)
+    void lowerVaFrameAddr(MirInstId id, MnemonicSlot slot, char const* what) {
+        if (!opcode(slot).has_value()) {
+            reportMissingOpcode(slot, what);
+            return;
+        }
+        LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
+        emitInst(*opcode(slot), result, std::span<LirOperand const>{}, /*payload=*/0);
+        defineValue(id, result);
+    }
+
+    // FC12-deferral④ (D-FC12A/C-VARIADIC-OVERFLOW-FIXED-STACK-ARGS): the
+    // VaOverflowArgAreaAddr leaf, like lowerVaFrameAddr but THREADS the MIR payload
+    // (the fixed-stack-arg byte displacement — bytes of named params that overflowed
+    // onto the incoming stack; 0 for the common case) into the LIR op. lir_callconv
+    // reads it and adds it to the overflow base `totalFrameSize + callPushBytes +
+    // shadowSpaceBytes + payload`. Without this threading the displacement would be
+    // discarded (the generic lowerVaFrameAddr hardcodes payload 0) → overflow_arg_area
+    // / __stack would point AT a named stack param, a silent miscompile.
+    void lowerVaOverflowArgArea(MirInstId id) {
+        if (!opcode(MnemonicSlot::VaOverflowArgArea).has_value()) {
+            reportMissingOpcode(MnemonicSlot::VaOverflowArgArea,
+                                "MIR VaOverflowArgAreaAddr");
+            return;
+        }
+        LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
+        emitInst(*opcode(MnemonicSlot::VaOverflowArgArea), result,
+                 std::span<LirOperand const>{}, /*payload=*/mir.instPayload(id));
+        defineValue(id, result);
+    }
+
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start
+    // base. Like lowerVaFrameAddr but THREADS the MIR payload (the named-arg slot
+    // count) into the LIR op — lir_callconv reads it to compute the contiguous home
+    // offset `totalFrameSize + callPushBytes + payload*outgoingSlotSize`.
+    void lowerVaHomeArgArea(MirInstId id) {
+        if (!opcode(MnemonicSlot::VaHomeArgArea).has_value()) {
+            reportMissingOpcode(MnemonicSlot::VaHomeArgArea, "MIR VaHomeArgAreaAddr");
+            return;
+        }
+        LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
+        emitInst(*opcode(MnemonicSlot::VaHomeArgArea), result,
+                 std::span<LirOperand const>{}, /*payload=*/mir.instPayload(id));
         defineValue(id, result);
     }
 
@@ -2049,6 +2124,28 @@ struct Lowerer {
     // OUT of isel is the abstract `call(callee, args...)` form —
     // target-blind — and the callconv pass rewrites it to the
     // schema-encodable single-SymbolRef form.
+    // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): the by-value-aggregate
+    // stack-arg carrier. Its sole operand is the temp ADDRESS (a pointer value); its
+    // result THREADS THAT ADDRESS through (a pure value-map alias, NO LIR emitted) so
+    // a later `lowerCall` resolving this operand gets the address register. The
+    // payload (aggregate byte size) is read by `lowerCall` directly off the MIR op to
+    // build the `ByValueStackAgg` size marker — it never needs a register. The carrier
+    // is only ever consumed by a Call (it sits in the Call's operand list at the
+    // aggregate's argument position); aliasing the address keeps the value-map total
+    // without an extra mov. (A stray ByValueStackArg whose result is consumed by
+    // anything OTHER than a Call's by-value-stack arm would simply read the address,
+    // which is harmless — but no such source path exists.)
+    void lowerByValueStackArg(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(MirOpcode::ByValueStackArg, id);
+            return;
+        }
+        std::optional<LirReg> const addr = regForValue(operands[0]);
+        if (!addr.has_value()) return;   // poisoned upstream; diagnostic already out
+        defineValue(id, *addr);          // alias: result IS the address vreg
+    }
+
     void lowerCall(MirInstId id) {
         // Cycle 3e fix-up: opcode resolution now goes through the
         // MnemonicCache (was ad-hoc `target.opcodeByMnemonic("call")`
@@ -2142,10 +2239,17 @@ struct Lowerer {
             return;
         }
 
+        // Resolve every arg operand's register FIRST (the hoist discipline:
+        // a mid-build bail-out must not leave a partial operand list dangling).
+        // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): an operand whose
+        // defining MIR op is `ByValueStackArg` is the by-value-aggregate stack-arg
+        // carrier — its (already-resolved) register holds the temp ADDRESS and it
+        // expands to TWO LIR operands (the address Reg + a `ByValueStackAgg` size
+        // marker). For a normal operand it's a single Reg. We resolve all the regs
+        // up front, then build `ops` (so the partial-list hazard can't happen).
+        std::size_t const firstArgIdx = calleeIsGlobalAddr ? 1u : 0u;
         std::vector<LirReg> argRegs;
         argRegs.reserve(operands.size());
-        // Skip operand[0] (callee) when we fold it; otherwise include it.
-        std::size_t const firstArgIdx = calleeIsGlobalAddr ? 1u : 0u;
         for (std::size_t i = firstArgIdx; i < operands.size(); ++i) {
             std::optional<LirReg> const r = regForValue(operands[i]);
             if (!r.has_value()) return;
@@ -2161,12 +2265,24 @@ struct Lowerer {
         // Indirect (fn-pointer): [callee_reg, arg0, arg1, ...]
         //     (FC4 c2 — materialized as `call <reg>` by lir_callconv
         //     against the schema's `["reg"]` encoding variant).
+        // A by-value-stack aggregate arg expands to [..., addrReg, ByValueStackAgg].
         std::vector<LirOperand> ops;
-        ops.reserve(argRegs.size() + 1);
+        ops.reserve(argRegs.size() + 2);
         if (calleeIsGlobalAddr) {
             ops.push_back(LirOperand::makeSymbolRef(calleeSym.v));
         }
-        for (auto const r : argRegs) ops.push_back(LirOperand::makeReg(r));
+        for (std::size_t k = 0; k < argRegs.size(); ++k) {
+            MirInstId const operandMir = operands[firstArgIdx + k];
+            ops.push_back(LirOperand::makeReg(argRegs[k]));
+            if (mir.instOpcode(operandMir) == MirOpcode::ByValueStackArg) {
+                // The preceding Reg is the aggregate's temp address; this marker
+                // carries the byte size (the MIR op's payload) so lir_callconv
+                // reserves ceil(size / outgoingSlot) overflow slots + byte-copies
+                // the temp into the outgoing area instead of register-passing it.
+                ops.push_back(LirOperand::makeByValueStackAgg(
+                    mir.instPayload(operandMir)));
+            }
+        }
 
         // Result class follows MIR's result type. Void-returning calls
         // produce an invalid result vreg (no value).
@@ -2174,7 +2290,7 @@ struct Lowerer {
         bool const isVoid = !resultTy.valid()
                          || interner.kind(resultTy) == TypeKind::Void;
         // D-LANG-VARIADIC (step 13.4): forward the MIR Call's
-        // variadic-payload bits (isVariadic + fixedArgCount) to the
+        // variadic-payload bits (isVariadic + fixedOperandCount) to the
         // LIR Call so the post-regalloc ML7 materialize pass can
         // emit the platform's variadic-call setup (SysV `mov al,
         // <xmm-arg-count>` etc.). Non-variadic calls keep payload=0.

@@ -46,9 +46,18 @@ namespace dss {
 // `sizeof` in an array-dimension const-expression fails loud rather than folding
 // a wrong size. Direct-API callers (unit tests, LSP) default to `nullopt`: they
 // analyze exactly as before, and an array-dim `sizeof` simply does not fold.
+// FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): `vaListStrategy` is the active CC's va_list
+// lowering strategy (`cc.vaListLayout->strategy`), threaded from the SAME resolved
+// CC the pipeline reads for `aggregateLayout`. It selects the injected `va_list`
+// TYPE so `sizeof(va_list)` is right (SysV `__va_list_tag[1]`=24B vs Win64
+// `char*`=8B) — a wrong size mis-sizes the `ap` local and corrupts the stack.
+// `nullopt` (direct-API callers, or a CC with no variadic-callee ABI) ⇒ the
+// SysV-family `__va_list_tag[1]` default (back-compat: tests analyze exactly as
+// before). An `Aapcs64DualCursor` strategy fails loud at injection (FC12c).
 [[nodiscard]] DSS_EXPORT SemanticModel
 analyze(std::shared_ptr<CompilationUnit const> cu,
         DataModel dataModel = DataModel::Lp64,
-        std::optional<AggregateLayoutParams> aggregateLayout = std::nullopt);
+        std::optional<AggregateLayoutParams> aggregateLayout = std::nullopt,
+        std::optional<VaListStrategy> vaListStrategy = std::nullopt);
 
 } // namespace dss

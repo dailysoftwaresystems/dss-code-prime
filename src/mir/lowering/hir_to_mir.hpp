@@ -5,6 +5,7 @@
 #include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
+#include "core/types/target_schema.hpp"   // VaListLayout
 #include "core/types/type_lattice/type_interner.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_attrs.hpp"
@@ -113,6 +114,15 @@ struct DSS_EXPORT MirLoweringConfig {
     // also fixes the latent mixed-class `D-ML7-2.10`: a scalar param's payload is
     // now its per-class index, not the param index.)
     bool               argSlotAligned             = false;
+
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the active CC's `__va_list_tag` layout +
+    // register-save-area geometry, threaded from the resolved `TargetCallingConvention`
+    // (mirrors `aggregateClassification`). ENGAGED ⇒ HIR→MIR lowers va_start (4 field
+    // Stores), va_arg (the reg-vs-overflow diamond), va_end (nothing). ABSENT (a CC
+    // with no variadic-callee ABI this cycle) ⇒ a va_start/va_arg/va_end FAILS LOUD
+    // ("variadic callee unsupported for this CC") — never silently mis-walked. The
+    // has_value() guard mirrors `variadicVectorCountReg.has_value()`.
+    std::optional<VaListLayout> vaListLayout;
 };
 
 // Lower the frozen `hir` module to MIR. `literals` is the HirLiteralPool

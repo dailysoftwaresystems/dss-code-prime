@@ -132,6 +132,34 @@ struct Lowerer {
     };
     std::vector<BranchFrame> branchStack;
 
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the enclosing function's count of FIXED
+    // (non-variadic) params that consumed an integer / SSE arg register. `va_start`
+    // initializes gp_offset = fixedGpr*gpSlotBytes and fp_offset = gpOffsetLimit +
+    // fixedSse*fpSlotBytes from these (the SysV cursor past the fixed args into the
+    // register-save-area). Set by the function-lowering method BEFORE the body is
+    // lowered (so a body `va_start` reads the right counts); reset per function.
+    std::uint32_t currentFnFixedGpr_ = 0;
+    std::uint32_t currentFnFixedFpr_ = 0;
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the enclosing function's count of FIXED
+    // named-arg SLOTS under a slot-aligned CC (Win64). The HomogeneousPointer
+    // va_start sets ap = &home[currentFnFixedFlat_] — the slot count positions past
+    // ALL named args (int OR float, each one slot). Equal to currentFnFixedGpr_ for
+    // an int-only-named-param fn; differs only when a named param is FP (each still
+    // one slot). Set alongside the per-class counts before the body is lowered.
+    std::uint32_t currentFnFixedFlat_ = 0;
+    // FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): true iff this
+    // function received at least one by-value AGGREGATE fixed param (an InRegisters
+    // multi-piece struct OR a ByReference >16B struct → the hidden pointer). The
+    // fixed-params-overflow displacement baked into VaOverflowArgAreaAddr is
+    // `(gprOver + fprOver) * gpSlotBytes` — a per-REGISTER-SLOT count that is ONLY
+    // correct when every overflowed fixed param is a single scalar slot. A multi-slot
+    // aggregate that STRADDLES the register/stack boundary is placed WHOLLY in memory
+    // by SysV (all-or-nothing), so the slot-count formula UNDERCOUNTS the named stack
+    // bytes → a silent miscompile. lowerVaStart's overflow path fails loud unless this
+    // flag is false (every fixed param was scalar). Reset per function (with the
+    // counters) before the param-reception loop.
+    bool currentFnHasAggregateFixedParam_ = false;
+
     // FC5: per-function `goto`/label lowering. A LabelStmt and its goto(s) share a
     // per-function ordinal (HIR payload); this maps the ordinal → its MIR block.
     // `getOrCreateLabelBlock` is lazy so a FORWARD goto (`goto end;` before `end:`)
@@ -442,6 +470,9 @@ struct Lowerer {
                 lit.core  = TypeKind::U64;
                 return mir.addConst(std::move(lit), t);
             }
+            case HirKind::VaStart: return lowerVaStart(node);
+            case HirKind::VaArg:   return lowerVaArg(node);
+            case HirKind::VaEnd:   return lowerVaEnd(node);
             case HirKind::Ref: {
                 // Resolution order:
                 //   1. Addressable local (slot-backed: body-VarDecl or address-
@@ -605,22 +636,58 @@ struct Lowerer {
                     if (structRetAbi->kind == AbiPassing::Kind::ByReference)
                         operands.push_back(structRetSlot);  // hidden sret pointer
                 }
+                // FC12a-struct: the OPERAND-unit boundary for the variadic payload.
+                // `operandsBeforeArgs` is the operand count BEFORE the first arg.
+                // We snapshot `fixedOperandCount` = (operands.size() -
+                // operandsBeforeArgs) the instant the LAST FIXED arg's operands are
+                // appended (a by-value struct fixed param expands to several scalar
+                // operands, so this is NOT the param count — see call_payload.hpp).
+                //
+                // Mirror lir_callconv's firstArgIdx: callee is always leading; a
+                // ByReference sret pointer is a real ARG (argIdx 0) for the hidden-arg
+                // convention (counted in fixedOperandCount, firstArgIdx == 1), but is
+                // routed to the indirect-result register (x8) for the x8-IRR convention
+                // (NOT an arg → excluded, firstArgIdx == 2). config.aggregateSretViaHiddenArg
+                // distinguishes them. Capturing operands.size() here (post-sret-push)
+                // would WRONGLY exclude the hidden-arg sret pointer from fixedOperandCount,
+                // making it one too small → the last fixed operand misclassified as the
+                // first vararg → AL set one too high (silent miscompile).
+                std::size_t const operandsBeforeArgs =
+                    1 /*callee*/
+                  + ((structRetAbi.has_value()
+                      && structRetAbi->kind == AbiPassing::Kind::ByReference
+                      && !config.aggregateSretViaHiddenArg) ? 1u : 0u);
+                // The number of FIXED params of the callee (0 if the callee is not a
+                // resolvable FnSig). `byvalCalleeSig` was already dereferenced
+                // through one Ptr wrapper above.
+                std::size_t const fnParamsSize =
+                    (byvalCalleeSig.valid()
+                     && interner.kind(byvalCalleeSig) == TypeKind::FnSig)
+                        ? interner.fnParams(byvalCalleeSig).size()
+                        : 0;
+                std::size_t fixedOperandCount = 0;
+                bool fixedOperandCountStamped = false;
+                // Running per-class register-passed-operand counts for the WHOLE
+                // call, in operand order — predicts lir_callconv's per-class
+                // assignment so a struct vararg's eightbyte pieces can be checked
+                // against the remaining arg registers (the atomic-fit check). A
+                // ByReference sret hidden pointer (x86 hidden-arg convention)
+                // consumes arg GPR 0; an x8-indirect-result sret consumes NO arg GPR
+                // (it rides the dedicated IRR). Maintained for EVERY call so the
+                // bookkeeping is uniform; only the variadic checks below consult it.
+                std::uint32_t runGpr = 0, runFpr = 0;
+                if (structRetAbi.has_value()
+                    && structRetAbi->kind == AbiPassing::Kind::ByReference
+                    && config.aggregateSretViaHiddenArg)
+                    runGpr = 1;
                 for (std::size_t i = 1; i < kids.size(); ++i) {
                     TypeId const argTy = hir.typeId(kids[i]);
                     if (argTy.valid()) {
                         TypeKind const ak = interner.kind(argTy);
                         if (ak == TypeKind::Struct || ak == TypeKind::Union) {
-                            // Classify + synthesize the by-value struct arg into
-                            // register pieces / a by-ref pointer. Variadic or an
-                            // unimplemented CC strategy ⇒ fail loud (never a
-                            // silent wrong-ABI pass).
-                            if (calleeVariadic) {
-                                unsupported(kids[i],
-                                    "passing a struct/union BY VALUE to a "
-                                    "variadic function is not yet supported "
-                                    "(D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
-                                return InvalidMirInst;
-                            }
+                            // Classify the by-value struct/union arg. An
+                            // unimplemented CC strategy ⇒ fail loud (never a silent
+                            // wrong-ABI pass).
                             auto const abi = byValueClassify(argTy);
                             if (!abi.has_value()) {
                                 unsupported(kids[i],
@@ -629,21 +696,273 @@ struct Lowerer {
                                     "convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
                                 return InvalidMirInst;
                             }
-                            // FC7 C1b: the caller pushes each eightbyte piece as
-                            // a scalar Call operand IN ORDER; lir_callconv assigns
-                            // them to consecutive per-class arg registers. No
-                            // multi-register guard — the callee's per-class Arg
-                            // counter + the verifier's physical-arg-count bound
-                            // (D-FC7-SYSV-STRUCT-ARG-MULTIREG) now handle >1 piece.
-                            if (!appendByValueArg(operands, kids[i], argTy, *abi))
-                                return InvalidMirInst;
+                            if (abi->kind == AbiPassing::Kind::ByReference) {
+                                // MEMORY class (>16B / empty). At the VARIADIC boundary
+                                // SysV §3.2.3/§3.5.7 requires it BY VALUE in the overflow
+                                // area UNCONDITIONALLY (even with free arg registers) —
+                                // the Option-C carrier (D-FC12A-VARIADIC-MEMORY-CLASS-
+                                // STRUCT). runGpr/runFpr are NOT advanced (it's on the
+                                // stack, not in a register). The NON-variadic ByReference
+                                // path keeps the existing hidden-pointer convention via
+                                // appendByValueArg (a single GPR pointer operand).
+                                if (calleeVariadic) {
+                                    // The carrier is CC-neutral, but the va_list layout
+                                    // must be present for a variadic callee (it is the
+                                    // overflow geometry source); absent ⇒ struct varargs
+                                    // are impossible on this CC. Mirror the Win64/AAPCS64
+                                    // strategy guards below so a non-SysV variadic struct
+                                    // vararg fails loud at ITS anchor (the overflow
+                                    // placement + va_arg read for those CCs are their own
+                                    // cycles, reusing this carrier).
+                                    if (!config.vaListLayout.has_value()) {
+                                        unsupported(kids[i],
+                                            "passing a struct/union BY VALUE to a "
+                                            "variadic function requires the CC's "
+                                            "'vaListLayout' (overflow geometry) which "
+                                            "this target does not declare "
+                                            "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+                                        return InvalidMirInst;
+                                    }
+                                    VaListLayout const& vlMem = *config.vaListLayout;
+                                    if (vlMem.strategy
+                                        == VaListStrategy::HomogeneousPointer) {
+                                        // Win64 (ms_x64) ByReference vararg
+                                        // (D-FC12B-WIN64-STRUCT-VARARG): a non-pow2/>8B
+                                        // struct rides as a hidden POINTER to a caller
+                                        // copy in exactly ONE arg slot — IDENTICAL to
+                                        // the non-variadic ByReference path (Win64 has
+                                        // no SysV MEMORY-class-to-stack rule; the slot
+                                        // is register-or-stack BY POSITION, placed by
+                                        // lir_callconv's slot-aligned walk like any GPR
+                                        // operand). appendByValueArg's ByReference arm
+                                        // copies to a callee-owned temp + pushes the
+                                        // temp POINTER (1 GPR-class operand). The
+                                        // `runGpr += 1` is INERT for Win64 slot
+                                        // indexing: under HomogeneousPointer the slot
+                                        // index is lir_callconv's positional
+                                        // slot-aligned walk, and runGpr is consulted
+                                        // ONLY by the SysV gpSaveCount split check (the
+                                        // InRegisters `else` arm below) which this
+                                        // ByReference arm never reaches. We advance it
+                                        // anyway for uniformity with the SysV/scalar
+                                        // arms (a single running-register cursor), but
+                                        // it does NOT drive Win64 placement. NO carrier,
+                                        // NO force-to-stack — fall through to the shared
+                                        // fixedOperandCount stamp + continue below.
+                                        if (!appendByValueArg(operands, kids[i],
+                                                              argTy, *abi))
+                                            return InvalidMirInst;
+                                        runGpr += 1;
+                                    } else if (vlMem.strategy
+                                        == VaListStrategy::Aapcs64DualCursor) {
+                                        // AAPCS64 (D-FC12C-AAPCS64-HFA-STRUCT-VARARG):
+                                        // a >16B (ByReference) struct vararg rides as a
+                                        // hidden POINTER in exactly ONE GR arg slot —
+                                        // IDENTICAL to the non-variadic ByReference path
+                                        // (AAPCS64 §B has NO SysV MEMORY-class-to-stack
+                                        // rule for ByReference: the pointer is placed in
+                                        // the next x-register, or on the stack BY
+                                        // POSITION once the GR pool is exhausted — by
+                                        // lir_callconv's positional walk, like any GPR
+                                        // operand). So this MUST use appendByValueArg
+                                        // (one pointer operand), NOT appendByValueStackArg
+                                        // (which would force the pointer ITSELF into the
+                                        // overflow area — a silent ABI mismatch, hazard
+                                        // H7). Advance runGpr by 1 (the pointer consumes
+                                        // one GR slot) so a SUBSEQUENT InRegisters struct
+                                        // vararg's atomic-fit check sees the consumed slot.
+                                        if (!appendByValueArg(operands, kids[i],
+                                                              argTy, *abi))
+                                            return InvalidMirInst;
+                                        runGpr += 1;
+                                    } else if (vlMem.strategy
+                                        == VaListStrategy::SysVRegisterSave) {
+                                        // SysV MEMORY class → the Option-C overflow
+                                        // carrier, unconditionally by value on the stack.
+                                        if (!appendByValueStackArg(operands, kids[i],
+                                                                   argTy))
+                                            return InvalidMirInst;
+                                        // NOT counted in runGpr/runFpr — it's in the
+                                        // overflow (stack) area, consuming no register.
+                                    } else {
+                                        unsupported(kids[i],
+                                            "passing a struct/union BY VALUE to a "
+                                            "variadic function under this va_list "
+                                            "strategy is not realized "
+                                            "(internal: unknown VaListStrategy)");
+                                        return InvalidMirInst;
+                                    }
+                                } else {
+                                    if (!appendByValueArg(operands, kids[i], argTy, *abi))
+                                        return InvalidMirInst;
+                                    runGpr += 1;   // the pointer operand is GPR-class
+                                }
+                            } else {
+                                // InRegisters: count the eightbyte pieces per class.
+                                std::uint32_t numGp = 0, numFp = 0;
+                                for (AbiPiece const& p : abi->pieces) {
+                                    if (p.cls == AbiPieceClass::Fpr) ++numFp;
+                                    else ++numGp;
+                                }
+                                bool routeToStack = false;
+                                if (calleeVariadic) {
+                                    // ATOMIC-FIT CHECK: SysV §3.5.7 — if the whole
+                                    // aggregate's pieces do not ALL fit in the
+                                    // remaining arg registers, it goes by value in
+                                    // MEMORY (no register/stack split) via the Option-C
+                                    // carrier. The vaListLayout MUST be present for a
+                                    // variadic callee (it is the gp/fp save-count
+                                    // source); absent ⇒ struct varargs are impossible
+                                    // on this CC.
+                                    if (!config.vaListLayout.has_value()) {
+                                        unsupported(kids[i],
+                                            "passing a struct/union BY VALUE to a "
+                                            "variadic function requires the CC's "
+                                            "'vaListLayout' (register-save geometry) "
+                                            "which this target does not declare "
+                                            "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+                                        return InvalidMirInst;
+                                    }
+                                    VaListLayout const& vl = *config.vaListLayout;
+                                    // FC12b (D-FC12B-WIN64-STRUCT-VARARG): a by-value
+                                    // pow2-≤8B struct passed to a Win64 (Homogeneous-
+                                    // Pointer) variadic callee rides in exactly ONE arg
+                                    // slot BY VALUE (InRegisters[1 GPR piece]) — placed
+                                    // like a scalar by lir_callconv's slot-aligned walk.
+                                    // Win64 has NO atomic-fit/register-exhaustion SPLIT
+                                    // (the SysV §3.5.7 rule below reads gpSaveCount/
+                                    // fpSaveCount which Win64 does not declare): one
+                                    // struct == one slot, register-or-stack BY POSITION.
+                                    // So SKIP the SysV split check + routeToStack carrier
+                                    // entirely — appendByValueArg's InRegisters arm
+                                    // pushes the 1 I64 value operand; advance runGpr/
+                                    // runFpr by its piece count (numGp==1; numFp==0 — a
+                                    // Win64 homogeneous piece is GPR-class). That
+                                    // advance is INERT for Win64 slot indexing (the slot
+                                    // index is lir_callconv's positional slot-aligned
+                                    // walk; runGpr feeds ONLY the SysV gpSaveCount split
+                                    // check below, which this arm `continue`s past) —
+                                    // kept for uniformity with the SysV/scalar
+                                    // running-register cursor, not because Win64 reads
+                                    // it. Stamp the fixed boundary + continue (do NOT
+                                    // fall into the SysV atomic-fit/piece-push below).
+                                    if (vl.strategy
+                                        == VaListStrategy::HomogeneousPointer) {
+                                        if (!appendByValueArg(operands, kids[i],
+                                                              argTy, *abi))
+                                            return InvalidMirInst;
+                                        runGpr += numGp;
+                                        runFpr += numFp;
+                                        if (i == fnParamsSize) {
+                                            fixedOperandCount =
+                                                operands.size() - operandsBeforeArgs;
+                                            fixedOperandCountStamped = true;
+                                        }
+                                        continue;
+                                    }
+                                    if (vl.strategy
+                                        == VaListStrategy::Aapcs64DualCursor) {
+                                        // AAPCS64 (D-FC12C-AAPCS64-HFA-STRUCT-VARARG):
+                                        // an InRegisters struct vararg is EITHER a pure-
+                                        // FPR HFA (1-4 VR pieces) OR a pure-GPR ≤16B
+                                        // non-HFA (1-2 GR pieces) — the Aapcs64Hfa
+                                        // classifier never mixes classes. The atomic-fit
+                                        // check is PER CLASS against its OWN remaining
+                                        // pool (hazard H8): an HFA checks the VR pool
+                                        // (fpSaveCount); a non-HFA checks the GR pool
+                                        // (gpSaveCount). If the whole aggregate's pieces
+                                        // do not ALL fit, AAPCS64 §B forces it WHOLE to
+                                        // the overflow area (no register/stack split) via
+                                        // the CC-neutral Option-C carrier. Set
+                                        // routeToStack and fall through to the shared
+                                        // dispatch below (which also advances runGpr/runFpr
+                                        // on the register path).
+                                        bool const isHfa = (numFp > 0 && numGp == 0);
+                                        if (isHfa) {
+                                            routeToStack =
+                                                (runFpr + numFp > vl.fpSaveCount);
+                                        } else if (numGp > 0) {
+                                            routeToStack =
+                                                (runGpr + numGp > vl.gpSaveCount);
+                                        } else {
+                                            // Zero-piece InRegisters — a classifier
+                                            // invariant violation (an empty struct should
+                                            // be ByReference, handled above). Fail loud
+                                            // rather than route a zero-piece carrier.
+                                            unsupported(kids[i],
+                                                "AAPCS64 InRegisters struct vararg has "
+                                                "zero register pieces (internal: "
+                                                "classifier invariant violated)");
+                                            return InvalidMirInst;
+                                        }
+                                    } else if (vl.strategy
+                                        == VaListStrategy::SysVRegisterSave) {
+                                        // The SysV register-exhaustion SPLIT: if the
+                                        // pieces do not ALL fit in the remaining arg
+                                        // registers, SysV forces the WHOLE aggregate to
+                                        // memory (the overflow area) — route it to the
+                                        // Option-C carrier instead of register pieces
+                                        // (NOT a split). SysV's INTEGER+SSE eightbytes
+                                        // can mix classes, so BOTH pools are checked.
+                                        if (runGpr + numGp > vl.gpSaveCount
+                                            || runFpr + numFp > vl.fpSaveCount) {
+                                            routeToStack = true;
+                                        }
+                                    } else {
+                                        unsupported(kids[i],
+                                            "passing a struct/union BY VALUE to a "
+                                            "variadic function under this va_list "
+                                            "strategy is not realized "
+                                            "(internal: unknown VaListStrategy)");
+                                        return InvalidMirInst;
+                                    }
+                                }
+                                if (routeToStack) {
+                                    // Whole aggregate by value in the overflow area;
+                                    // runGpr/runFpr NOT advanced (no register consumed).
+                                    if (!appendByValueStackArg(operands, kids[i], argTy))
+                                        return InvalidMirInst;
+                                } else {
+                                    // FC7 C1b / FC12a-struct: push each eightbyte piece
+                                    // as a scalar Call operand IN ORDER; lir_callconv
+                                    // assigns them to consecutive per-class arg
+                                    // registers. Then advance the running per-class
+                                    // counts (after a SUCCESSFUL append, AFTER the
+                                    // fit-check above).
+                                    if (!appendByValueArg(operands, kids[i], argTy, *abi))
+                                        return InvalidMirInst;
+                                    runGpr += numGp;
+                                    runFpr += numFp;
+                                }
+                            }
+                            if (i == fnParamsSize) {
+                                fixedOperandCount =
+                                    operands.size() - operandsBeforeArgs;
+                                fixedOperandCountStamped = true;
+                            }
                             continue;
                         }
                     }
                     MirInstId const arg = lowerExpr(kids[i]);
                     if (!arg.valid()) return InvalidMirInst;
                     operands.push_back(arg);
+                    // A scalar arg consumes exactly one register of its class.
+                    if (argTy.valid()) {
+                        if (scalarArgClass(argTy) == AbiPieceClass::Fpr) ++runFpr;
+                        else ++runGpr;
+                    } else {
+                        ++runGpr;   // typeless fallback: treat as GPR
+                    }
+                    if (i == fnParamsSize) {
+                        fixedOperandCount = operands.size() - operandsBeforeArgs;
+                        fixedOperandCountStamped = true;
+                    }
                 }
+                // Edge: a variadic callee with 0 fixed params (fnParamsSize == 0),
+                // or a call with fewer kids than fnParamsSize+1 — the loop never
+                // hit `i == fnParamsSize`. fixedOperandCount stays 0 (no fixed
+                // operands), which is correct for both shapes.
+                (void)fixedOperandCountStamped;
                 // D-LANG-VARIADIC (step 13.4): stamp the MIR Call's
                 // payload with the callee's variadic-shape bits. The
                 // callee HIR node's TypeId is its FnSig (for direct
@@ -675,23 +994,24 @@ struct Lowerer {
                 if (calleeTy.valid()
                     && interner.kind(calleeTy) == TypeKind::FnSig
                     && interner.fnIsVariadic(calleeTy)) {
-                    auto const fixedSz = interner.fnParams(calleeTy).size();
-                    // Post-13.4 audit-fold (HIGH-3): the call_payload
-                    // u32 encodes fixedArgCount in bits 0..30 (mask
-                    // 0x7FFF_FFFF). A FnSig with >= 2^31 params
-                    // would silently truncate AND collide with the
-                    // isVariadic bit. Practically unreachable (no
-                    // function has 2-billion fixed params) but pin
-                    // the contract so a future builder bypass can't
-                    // silently corrupt the payload.
-                    if (fixedSz > ::dss::call_payload::kFixedArgMask) {
+                    // FC12a-struct: the payload's fixed count is now in OPERAND
+                    // units (the snapshot taken after the last fixed arg's operands
+                    // were appended), NOT the param count — a by-value struct fixed
+                    // param expands to several scalar register-piece operands.
+                    // The call_payload u32 encodes fixedOperandCount in bits 0..29
+                    // (mask 0x3FFF_FFFF). A count exceeding the 30-bit field would
+                    // silently truncate AND collide with the isVariadic bit;
+                    // practically unreachable (no call has 2^30 operands) but pin
+                    // the contract so a future bypass can't corrupt the payload.
+                    if (fixedOperandCount
+                        > ::dss::call_payload::kFixedOperandMask) {
                         unsupported(node,
-                            "Call payload: fixed-arg count exceeds 31-bit "
+                            "Call payload: fixed-operand count exceeds 30-bit "
                             "encoding limit");
                         return InvalidMirInst;
                     }
                     callPayload = ::dss::call_payload::encode(
-                        true, static_cast<std::uint32_t>(fixedSz));
+                        true, static_cast<std::uint32_t>(fixedOperandCount));
                 }
                 // FC7 C3 (AAPCS64/Apple x8 sret): when the by-value aggregate
                 // RETURN is class-MEMORY (ByReference) AND this CC carries the
@@ -1649,6 +1969,25 @@ struct Lowerer {
             }
             return lowerLvalueAddress(hir.seqExprResult(node));
         }
+        if (k == HirKind::VaArg) {
+            // FC12a-struct (D-FC12A-VARIADIC-CALLEE): an aggregate-typed
+            // `va_arg(ap, struct S)` is realized BY ADDRESS — the eightbyte pieces
+            // are gathered from the register-save-area (or the struct is read by
+            // value from the overflow area) into a fresh temp whose ADDRESS is the
+            // result. A SCALAR va_arg never reaches here (it lowers as an rvalue in
+            // lowerExpr); reaching here with a non-aggregate type is an internal
+            // invariant violation.
+            TypeId const at = hir.typeId(node);
+            TypeKind const ak = at.valid() ? interner.kind(at) : TypeKind::Void;
+            if (ak == TypeKind::Struct || ak == TypeKind::Union) {
+                return lowerVaArgAggregate(node);
+            }
+            unsupported(node,
+                "internal: a non-aggregate va_arg reached lowerLvalueAddress — a "
+                "scalar va_arg is an rvalue lowered via lowerExpr "
+                "(D-FC12A-VARIADIC-CALLEE)");
+            return InvalidMirInst;
+        }
         // Any OTHER lvalue kind is still unsupported — fail loud (the
         // aggregate-valued Ternary/SeqExpr carriers above are
         // D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR; the compound-literal carrier
@@ -2160,7 +2499,17 @@ struct Lowerer {
                                 "is not supported");
             return false;
         }
-        auto const fieldTypes = interner.operands(aggTy);
+        // COPY the field types out of the interner's pool: `operands` returns a
+        // SPAN into operandPool_, and `interner.pointer(...)` in the field-copy
+        // loop below interns fresh `Ptr<…>` types — an intern can REALLOCATE the
+        // pool, dangling a retained span (a host-STL-growth-dependent
+        // heap-use-after-free; non-Windows release legs misread the freed bytes
+        // as an invalid Load result-type → MirBuilder fatal). The owning vector
+        // is immune. Twin of the FC7-C1c fix at the function-param setup below.
+        std::vector<TypeId> const fieldTypes = [&] {
+            auto const s = interner.operands(aggTy);
+            return std::vector<TypeId>(s.begin(), s.end());
+        }();
         if (fieldTypes.size() != layout->fieldOffsets.size()) {
             unsupported(atNode, "struct copy: field-type count mismatches the "
                                 "layout field-offset count (internal invariant)");
@@ -2311,6 +2660,46 @@ struct Lowerer {
             if (!v.valid()) return false;
             operands.push_back(v);
         }
+        return true;
+    }
+
+    // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): append a by-value
+    // struct/union ARG that must be passed ENTIRELY in the outgoing overflow (stack)
+    // area — the Option-C carrier. Used at the variadic boundary for the two shapes
+    // SysV §3.2.3/§3.5.7 forces wholly to memory: a MEMORY-class (>16B) aggregate, AND
+    // an InRegisters aggregate whose eightbyte pieces do not all fit in the remaining
+    // arg registers (the register-exhaustion split). Copies the source into a callee-
+    // owned eightbyte-rounded temp (so the callee gets by-value semantics + a full-
+    // eightbyte read can't over-run a non-padded source), then pushes ONE Call operand:
+    // a `ByValueStackArg` wrapping the temp address, carrying the aggregate byte size as
+    // its payload. lir_callconv places it at the next overflow offset(s) (NOT a register
+    // — runGpr/runFpr are NOT advanced by the caller). CC-NEUTRAL: no SysV-specific
+    // assumption; the Win64/AAPCS64 struct-vararg cycles reuse this carrier. Returns
+    // false (fail-loud already emitted).
+    [[nodiscard]] bool appendByValueStackArg(std::vector<MirInstId>& operands,
+                                             HirNodeId argNode, TypeId aggTy) {
+        MirInstId const srcAddr = lowerLvalueAddress(argNode);
+        if (!srcAddr.valid()) return false;
+        StructLayout const* layout = cachedLayout(aggTy);
+        MirInstId const temp = freshAggregateTemp(aggTy);
+        if (layout == nullptr || !temp.valid()) {
+            unsupported(argNode, "by-value stack aggregate arg requires a sizeable "
+                                 "layout (target 'aggregateLayout' / complete type)");
+            return false;
+        }
+        if (!lowerByteWiseCopy(srcAddr, temp, layout->size)) return false;
+        if (layout->size > std::numeric_limits<std::uint32_t>::max()) {
+            unsupported(argNode, "by-value stack aggregate arg is too large to "
+                                 "encode its byte size");
+            return false;
+        }
+        std::array<MirInstId, 1> carrierOps{temp};
+        MirInstId const carrier =
+            mir.addInst(MirOpcode::ByValueStackArg, carrierOps,
+                        interner.pointer(aggTy),
+                        static_cast<std::uint32_t>(layout->size));
+        if (!carrier.valid()) return false;
+        operands.push_back(carrier);
         return true;
     }
 
@@ -2594,6 +2983,1153 @@ struct Lowerer {
             }
         }
         return lowerExpr(expr).valid();
+    }
+
+    // ── FC12a-core variadic CALLEE lowering (D-FC12A-VARIADIC-CALLEE) ────────────
+    //
+    // SysV AMD64 §3.5.7. `va_list` is `__va_list_tag[1]`; its lvalue ADDRESS is the
+    // tag base. All four field offsets + the reg-save geometry + the reg-vs-overflow
+    // thresholds come from `config.vaListLayout` (CONFIG, agnostic) — this code
+    // never branches on cc.name/arch/format. The two FRAME addresses (reg-save-area,
+    // incoming-overflow-area) are emitted as the leaf opcodes VaRegSaveAreaAddr /
+    // VaOverflowArgAreaAddr that the LIR callconv pass fills in once it owns the
+    // frame layout (the ReadIndirectResult precedent).
+
+    // The `__va_list_tag*` base address of a va_list lvalue `apChild`. `ap` is
+    // `__va_list_tag[1]`, so its lvalue address IS the address of its first (only)
+    // tag element — the base every field-Gep indexes from.
+    [[nodiscard]] MirInstId vaTagBase(HirNodeId apChild) {
+        return lowerLvalueAddress(apChild);
+    }
+
+    // `&tag.<field>` as a pointer to the field — a base+disp Gep (the FC7 member-
+    // address pattern). `fieldPtrType` is the pointer-to-field type for the Store/Load.
+    [[nodiscard]] MirInstId vaFieldPtr(MirInstId tagBase,
+                                       VaListLayout::Field const& f,
+                                       TypeId fieldPtrType) {
+        MirInstId const off = constInt(static_cast<std::int64_t>(f.byteOffset));
+        if (!off.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> ops{tagBase, off};
+        return mir.addInst(MirOpcode::Gep, ops, fieldPtrType);
+    }
+
+    // `va_start(ap, last)` → 4 field Stores into the tag. gp_offset = fixedGpr *
+    // gpSlotBytes; fp_offset = gpOffsetLimit + fixedFpr * fpSlotBytes (the SysV
+    // cursor PAST the fixed args, into the SSE block of the save area);
+    // reg_save_area = &save (VaRegSaveAreaAddr); overflow_arg_area = &incoming-stack
+    // (VaOverflowArgAreaAddr). Returns the last Store's id (a valid inst the discard
+    // chokepoint accepts — va_start is a void expression). Fail loud if the CC
+    // declared no vaListLayout.
+    [[nodiscard]] MirInstId lowerVaStart(HirNodeId node) {
+        if (!config.vaListLayout.has_value()) {
+            unsupported(node, "variadic callee (va_start) is unsupported for this "
+                              "target's calling convention — it declares no "
+                              "'vaListLayout' (D-FC12A-VARIADIC-CALLEE)");
+            return InvalidMirInst;
+        }
+        VaListLayout const& vl = *config.vaListLayout;
+        auto kids = hir.children(node);
+        if (kids.size() != 1) {
+            unsupported(node, "malformed VaStart (expect 1 child)");
+            return InvalidMirInst;
+        }
+        // FC12b: strategy-dispatch with a fail-loud default so no site half-migrates
+        // and silently runs the SysV path on a Win64 (or unknown) layout.
+        switch (vl.strategy) {
+        case VaListStrategy::SysVRegisterSave: {
+            // FC12-deferral④ (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS): a variadic
+            // callee whose FIXED params overflow the register-save area (fixedGpr >
+            // gpSaveCount, or fixedFpr > fpSaveCount) has named param(s) passed ON THE
+            // STACK. SysV §3.5.7 then requires overflow_arg_area to point PAST those
+            // named stack args. We bake that displacement into the VaOverflowArgAreaAddr
+            // payload (read at LIR materialization). The overflowed slot count per class
+            // is `fixedCount - saveCount` (each overflowed fixed param is a single
+            // incoming stack slot); incoming stack slots are gpSlotBytes(8) wide for
+            // BOTH classes (the SysV va_arg overflow arm bumps doubles by 8 too).
+            std::uint32_t const gprOver =
+                (currentFnFixedGpr_ > vl.gpSaveCount)
+                    ? (currentFnFixedGpr_ - vl.gpSaveCount) : 0u;
+            std::uint32_t const fprOver =
+                (currentFnFixedFpr_ > vl.fpSaveCount)
+                    ? (currentFnFixedFpr_ - vl.fpSaveCount) : 0u;
+            std::uint32_t const fixedStackBytes =
+                (gprOver + fprOver) * vl.gpSlotBytes;
+            // FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): the
+            // per-register-slot displacement above is only correct when every
+            // overflowed fixed param is a single scalar slot. A multi-slot by-value
+            // AGGREGATE fixed param that STRADDLES the register/stack boundary is
+            // placed WHOLLY in memory by SysV (all-or-nothing), so `gprOver+fprOver`
+            // UNDERCOUNTS the named stack bytes. Fail loud (no silent miscompile)
+            // when the fixed params overflow AND any was a by-value aggregate.
+            if (fixedStackBytes != 0 && currentFnHasAggregateFixedParam_) {
+                unsupported(node,
+                    "variadic callee whose fixed parameters overflow to the stack AND "
+                    "include a by-value aggregate (struct/union) param is not yet "
+                    "supported — a multi-slot aggregate straddling the register/stack "
+                    "boundary is placed wholly in memory, which the per-register-slot "
+                    "overflow displacement undercounts "
+                    "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)");
+                return InvalidMirInst;
+            }
+            MirInstId const tagBase = vaTagBase(kids[0]);
+            if (!tagBase.valid()) return InvalidMirInst;
+
+            TypeId const u32      = interner.primitive(TypeKind::U32);
+            TypeId const u32Ptr   = interner.pointer(u32);
+            TypeId const voidPtr  = interner.pointer(interner.primitive(TypeKind::Void));
+            TypeId const voidPtrPtr = interner.pointer(voidPtr);
+
+            // gp_offset = fixedGpr * gpSlotBytes.
+            std::uint32_t const gpInit = currentFnFixedGpr_ * vl.gpSlotBytes;
+            // fp_offset = gpOffsetLimit + fixedFpr * fpSlotBytes (SSE block follows GPR).
+            std::uint32_t const fpInit = vl.gpOffsetLimit + currentFnFixedFpr_ * vl.fpSlotBytes;
+
+            MirInstId const gpField = vaFieldPtr(tagBase, vl.gpOffsetField, u32Ptr);
+            if (!gpField.valid()) return InvalidMirInst;
+            {
+                std::array<MirInstId, 2> st{constIntOfType(gpInit, u32), gpField};
+                mir.addInst(MirOpcode::Store, st);
+            }
+            MirInstId const fpField = vaFieldPtr(tagBase, vl.fpOffsetField, u32Ptr);
+            if (!fpField.valid()) return InvalidMirInst;
+            {
+                std::array<MirInstId, 2> st{constIntOfType(fpInit, u32), fpField};
+                mir.addInst(MirOpcode::Store, st);
+            }
+            // reg_save_area = &save.
+            MirInstId const rsaField = vaFieldPtr(tagBase, vl.regSaveAreaField, voidPtrPtr);
+            if (!rsaField.valid()) return InvalidMirInst;
+            MirInstId const rsaVal =
+                mir.addInst(MirOpcode::VaRegSaveAreaAddr, {}, voidPtr);
+            {
+                std::array<MirInstId, 2> st{rsaVal, rsaField};
+                mir.addInst(MirOpcode::Store, st);
+            }
+            // overflow_arg_area = &incoming-stack-args, displaced PAST any named
+            // params that overflowed onto the incoming stack (payload = fixedStackBytes,
+            // 0 for the common case). LIR materialization adds it to the overflow base.
+            MirInstId const ovfField = vaFieldPtr(tagBase, vl.overflowArgAreaField, voidPtrPtr);
+            if (!ovfField.valid()) return InvalidMirInst;
+            MirInstId const ovfVal =
+                mir.addInst(MirOpcode::VaOverflowArgAreaAddr, {}, voidPtr,
+                            /*payload=*/fixedStackBytes);
+            std::array<MirInstId, 2> st{ovfVal, ovfField};
+            return mir.addInst(MirOpcode::Store, st);   // last Store — a valid void inst
+        }
+        case VaListStrategy::HomogeneousPointer: {
+            // Win64 / Apple arm64: `va_list` is a `char*` (a single pointer, NOT a tag
+            // struct), so its lvalue ADDRESS is a `char**` slot we store the start
+            // pointer into. `va_arg` linearly bumps that pointer.
+            //   * Win64 (variadicUsesOverflowBase=false): start = &home[namedArgCount]
+            //     (VaHomeArgAreaAddr, payload = the slot-aligned named-arg count) — the
+            //     first vararg in the CONTIGUOUS home+overflow area.
+            //   * Apple arm64 (variadicUsesOverflowBase=true): start = the OVERFLOW base
+            //     (VaOverflowArgAreaAddr) — Apple has NO home area; every vararg is
+            //     stacked (the CALLER forces it, variadicArgsAlwaysStack), so the first
+            //     vararg sits at the overflow base. NO payload (the named args are NOT
+            //     in a home block — they stay in their registers, read via SSA).
+            MirInstId const apPtr = lowerLvalueAddress(kids[0]);
+            if (!apPtr.valid()) return InvalidMirInst;
+            TypeId const voidPtr = interner.pointer(interner.primitive(TypeKind::Void));
+            MirInstId const first =
+                vl.variadicUsesOverflowBase
+                    ? mir.addInst(MirOpcode::VaOverflowArgAreaAddr, {}, voidPtr)
+                    : mir.addInst(MirOpcode::VaHomeArgAreaAddr, {}, voidPtr,
+                                  /*payload=*/currentFnFixedFlat_);
+            std::array<MirInstId, 2> st{first, apPtr};
+            return mir.addInst(MirOpcode::Store, st);
+        }
+        case VaListStrategy::Aapcs64DualCursor: {
+            // AAPCS64 §B.4: initialize the 5-field `__va_list`. `ap` is the struct
+            // itself, so its lvalue ADDRESS is the struct base every field-Gep indexes
+            // from. The GR/VR save area is a single contiguous callee-local zone the
+            // prologue spilled x0..x7 then v0..v7 into (VaRegSaveAreaAddr = its base):
+            //   __gr_top  = rsa + gpSaveCount*gpSlotBytes            (past the GR block)
+            //   __vr_top  = rsa + gpSaveCount*gpSlotBytes
+            //                   + fpSaveCount*fpSlotBytes            (past the VR block)
+            //   __stack   = VaOverflowArgAreaAddr                    (incoming stack args)
+            //   __gr_offs = -(gpSaveCount - fixedGpr)*gpSlotBytes    (NEGATIVE; →0)
+            //   __vr_offs = -(fpSaveCount - fixedFpr)*fpSlotBytes    (NEGATIVE; →0)
+            // The offs are NEGATIVE i32: va_arg adds them to <gr|vr>_top (which points
+            // PAST the block) to address the right slot, and counts up toward 0.
+            //
+            // FC12-deferral④ (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS):
+            // mirrors the SysV arm. A variadic callee whose FIXED params overflow the
+            // save area (fixedGpr > gpSaveCount / fixedFpr > fpSaveCount) has named
+            // param(s) on the incoming stack: __stack must skip them (baked into the
+            // VaOverflowArgAreaAddr payload below) AND the per-class cursor (__gr_offs /
+            // __vr_offs) is CLAMPED to 0 (no register slots remain for varargs of that
+            // class) — the old `-(saveCount - fixedCount)` would underflow unsigned.
+            std::uint32_t const gprOver =
+                (currentFnFixedGpr_ > vl.gpSaveCount)
+                    ? (currentFnFixedGpr_ - vl.gpSaveCount) : 0u;
+            std::uint32_t const fprOver =
+                (currentFnFixedFpr_ > vl.fpSaveCount)
+                    ? (currentFnFixedFpr_ - vl.fpSaveCount) : 0u;
+            std::uint32_t const fixedStackBytes =
+                (gprOver + fprOver) * vl.gpSlotBytes;   // incoming slots are 8B both classes
+            // FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): the
+            // per-register-slot displacement is wrong for a multi-slot by-value
+            // aggregate (e.g. a >2-double HFA) straddling the register/stack boundary.
+            // Fail loud when the fixed params overflow AND any was a by-value aggregate.
+            if (fixedStackBytes != 0 && currentFnHasAggregateFixedParam_) {
+                unsupported(node,
+                    "variadic callee whose fixed parameters overflow to the stack AND "
+                    "include a by-value aggregate (struct/union/HFA) param is not yet "
+                    "supported — a multi-slot aggregate straddling the register/stack "
+                    "boundary is placed wholly in memory, which the per-register-slot "
+                    "overflow displacement undercounts "
+                    "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)");
+                return InvalidMirInst;
+            }
+            MirInstId const base = vaTagBase(kids[0]);   // the `__va_list` struct base
+            if (!base.valid()) return InvalidMirInst;
+
+            TypeId const i32      = interner.primitive(TypeKind::I32);
+            TypeId const i32Ptr   = interner.pointer(i32);
+            TypeId const voidPtr  = interner.pointer(interner.primitive(TypeKind::Void));
+            TypeId const voidPtrPtr = interner.pointer(voidPtr);
+
+            std::uint32_t const grBlockBytes = vl.gpSaveCount * vl.gpSlotBytes;
+            std::uint32_t const vrBlockBytes = vl.fpSaveCount * vl.fpSlotBytes;
+
+            // rsa base (the spilled register-save-area, materialized by lir_callconv).
+            MirInstId const rsa =
+                mir.addInst(MirOpcode::VaRegSaveAreaAddr, {}, voidPtr);
+
+            // __gr_top = rsa + grBlockBytes.
+            MirInstId const grTopField = vaFieldPtr(base, vl.grTopField, voidPtrPtr);
+            if (!grTopField.valid()) return InvalidMirInst;
+            {
+                MirInstId const k = constInt(static_cast<std::int64_t>(grBlockBytes));
+                if (!k.valid()) return InvalidMirInst;
+                std::array<MirInstId, 2> gepOps{rsa, k};
+                MirInstId const grTop = mir.addInst(MirOpcode::Gep, gepOps, voidPtr);
+                std::array<MirInstId, 2> st{grTop, grTopField};
+                mir.addInst(MirOpcode::Store, st);
+            }
+            // __vr_top = rsa + grBlockBytes + vrBlockBytes.
+            MirInstId const vrTopField = vaFieldPtr(base, vl.vrTopField, voidPtrPtr);
+            if (!vrTopField.valid()) return InvalidMirInst;
+            {
+                MirInstId const k =
+                    constInt(static_cast<std::int64_t>(grBlockBytes + vrBlockBytes));
+                if (!k.valid()) return InvalidMirInst;
+                std::array<MirInstId, 2> gepOps{rsa, k};
+                MirInstId const vrTop = mir.addInst(MirOpcode::Gep, gepOps, voidPtr);
+                std::array<MirInstId, 2> st{vrTop, vrTopField};
+                mir.addInst(MirOpcode::Store, st);
+            }
+            // __stack = &incoming-stack-args (the overflow base), displaced PAST any
+            // named params that overflowed onto the incoming stack (payload =
+            // fixedStackBytes, 0 for the common case). LIR adds it to the overflow base.
+            MirInstId const stackField = vaFieldPtr(base, vl.stackField, voidPtrPtr);
+            if (!stackField.valid()) return InvalidMirInst;
+            {
+                MirInstId const ovf =
+                    mir.addInst(MirOpcode::VaOverflowArgAreaAddr, {}, voidPtr,
+                                /*payload=*/fixedStackBytes);
+                std::array<MirInstId, 2> st{ovf, stackField};
+                mir.addInst(MirOpcode::Store, st);
+            }
+            // __gr_offs = -(gpSaveCount - fixedGpr) * gpSlotBytes (NEGATIVE i32),
+            // CLAMPED to 0 when the fixed GPR params have consumed the whole GR block
+            // (fixedGpr >= gpSaveCount): no GR slots remain for varargs, and the naive
+            // subtraction would underflow (unsigned). va_arg's reg arm tests
+            // ICmpSlt(offs, 0) → 0 routes every GPR vararg straight to __stack. (The
+            // fixed-stack-arg displacement is carried by the VaOverflowArgAreaAddr
+            // payload above; the FOLD 1 fail-loud rejects the aggregate-straddle case.)
+            MirInstId const grOffsField = vaFieldPtr(base, vl.grOffsField, i32Ptr);
+            if (!grOffsField.valid()) return InvalidMirInst;
+            {
+                std::int64_t const grOffs =
+                    (currentFnFixedGpr_ >= vl.gpSaveCount)
+                        ? 0
+                        : -static_cast<std::int64_t>(
+                              (vl.gpSaveCount - currentFnFixedGpr_) * vl.gpSlotBytes);
+                std::array<MirInstId, 2> st{constIntOfType(grOffs, i32), grOffsField};
+                mir.addInst(MirOpcode::Store, st);
+            }
+            // __vr_offs = -(fpSaveCount - fixedFpr) * fpSlotBytes (NEGATIVE i32),
+            // CLAMPED to 0 when the fixed FP params have consumed the whole VR block
+            // (fixedFpr >= fpSaveCount) — same rationale as __gr_offs.
+            MirInstId const vrOffsField = vaFieldPtr(base, vl.vrOffsField, i32Ptr);
+            if (!vrOffsField.valid()) return InvalidMirInst;
+            {
+                std::int64_t const vrOffs =
+                    (currentFnFixedFpr_ >= vl.fpSaveCount)
+                        ? 0
+                        : -static_cast<std::int64_t>(
+                              (vl.fpSaveCount - currentFnFixedFpr_) * vl.fpSlotBytes);
+                std::array<MirInstId, 2> st{constIntOfType(vrOffs, i32), vrOffsField};
+                return mir.addInst(MirOpcode::Store, st);   // last Store — a valid inst
+            }
+        }
+        }
+        unsupported(node, "internal: unknown VaListStrategy in va_start");
+        return InvalidMirInst;
+    }
+
+    // `va_end(ap)` → nothing (SysV + Win64 teardown is a no-op). A valid placeholder
+    // value for the discard chokepoint; DCE drops it. (The node + opcode-less
+    // lowering are the hook a future ABI needing real teardown would fill.)
+    [[nodiscard]] MirInstId lowerVaEnd(HirNodeId node) {
+        if (!config.vaListLayout.has_value()) {
+            unsupported(node, "variadic callee (va_end) is unsupported for this "
+                              "target's calling convention — it declares no "
+                              "'vaListLayout' (D-FC12A-VARIADIC-CALLEE)");
+            return InvalidMirInst;
+        }
+        // FC12b/FC12c: strategy-dispatch. va_end teardown is a no-op on all three
+        // realized ABIs (SysV register-save, Win64/Apple pointer, AAPCS64 dual-cursor).
+        switch (config.vaListLayout->strategy) {
+        case VaListStrategy::SysVRegisterSave:
+        case VaListStrategy::HomogeneousPointer:
+        case VaListStrategy::Aapcs64DualCursor:
+            return constInt(0);   // no teardown on any realized ABI
+        }
+        unsupported(node, "internal: unknown VaListStrategy in va_end");
+        return InvalidMirInst;
+    }
+
+    // `va_arg(ap, T)` for a SCALAR T → the reg-vs-overflow diamond (SysV §3.5.7).
+    // STRUCT/UNION T STAYS FAIL-LOUD this cycle (the FC12a-struct boundary). The
+    // diamond mirrors the Ternary value-diamond: classify T (GPR vs SSE) → pick the
+    // gp_offset/fp_offset cursor → if cursor < limit, read reg_save_area+cursor &
+    // bump the cursor by the slot stride; else read overflow_arg_area & bump it by a
+    // stack slot → Phi the two address arms → Load the value.
+    [[nodiscard]] MirInstId lowerVaArg(HirNodeId node) {
+        if (!config.vaListLayout.has_value()) {
+            unsupported(node, "variadic callee (va_arg) is unsupported for this "
+                              "target's calling convention — it declares no "
+                              "'vaListLayout' (D-FC12A-VARIADIC-CALLEE)");
+            return InvalidMirInst;
+        }
+        VaListLayout const& vl = *config.vaListLayout;
+        TypeId const t = hir.typeId(node);   // the read type T (the node's result)
+        if (!t.valid()) {
+            unsupported(node, "VaArg has no result type");
+            return InvalidMirInst;
+        }
+        // FC12a-struct: an AGGREGATE-typed va_arg has NO aggregate-width SSA value
+        // (the compiler's aggregate model is MEMORY-based). It MUST be lowered BY
+        // ADDRESS via lowerLvalueAddress's VaArg arm (→ lowerVaArgAggregate), exactly
+        // like the aggregate Ternary/SeqExpr carriers; every consumer (VarDecl init /
+        // AssignStmt / discard) reaches it that way. Reaching here with an aggregate
+        // type means a NEW consumer lowered an aggregate va_arg as a bare rvalue —
+        // fail loud rather than synthesize a Phi-of-aggregate / aggregate-width Load
+        // (a latent miscompile), mirroring the Ternary anti-resurrection guard.
+        TypeKind const tk = interner.kind(t);
+        if (tk == TypeKind::Struct || tk == TypeKind::Union) {
+            unsupported(node,
+                "internal: an aggregate-typed va_arg must be lowered by ADDRESS via "
+                "lowerLvalueAddress, never as a bare SSA rvalue — the MIR has no "
+                "aggregate-width value (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR / "
+                "D-FC12A-VARIADIC-CALLEE)");
+            return InvalidMirInst;
+        }
+        auto kids = hir.children(node);
+        if (kids.size() != 2) {
+            unsupported(node, "malformed VaArg (expect [apExpr, TypeRef])");
+            return InvalidMirInst;
+        }
+        MirInstId const tagBase = vaTagBase(kids[0]);   // child 1 (TypeRef) NEVER lowered
+        if (!tagBase.valid()) return InvalidMirInst;
+
+        // FC12b: strategy-dispatch. The Win64 HomogeneousPointer path is LINEAR (no
+        // diamond) and returns here; the Aapcs64 path fails loud; SysVRegisterSave
+        // falls through to the reg-vs-overflow diamond below. A fail-loud default
+        // guards against a half-migrated site silently running the SysV diamond on a
+        // non-SysV layout.
+        if (vl.strategy == VaListStrategy::HomogeneousPointer) {
+            // `va_list` is a `char*`: tagBase is its lvalue address (a `char**`).
+            // Load the current cursor, Load T from it, bump by namedArgSlotBytes,
+            // store the bumped cursor back. Crosses home→overflow uniformly because
+            // they are contiguous from the va_start base.
+            TypeId const voidPtr = interner.pointer(interner.primitive(TypeKind::Void));
+            std::array<MirInstId, 1> loadApOps{tagBase};
+            MirInstId const apVal = mir.addInst(MirOpcode::Load, loadApOps, voidPtr);
+            std::array<MirInstId, 1> loadValOps{apVal};
+            MirInstId const result = mir.addInst(MirOpcode::Load, loadValOps, t);
+            MirInstId const stepK =
+                constInt(static_cast<std::int64_t>(vl.namedArgSlotBytes));
+            if (!stepK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> gepOps{apVal, stepK};
+            MirInstId const apNext = mir.addInst(MirOpcode::Gep, gepOps, voidPtr);
+            std::array<MirInstId, 2> st{apNext, tagBase};
+            mir.addInst(MirOpcode::Store, st);
+            return result;
+        }
+        if (vl.strategy == VaListStrategy::Aapcs64DualCursor) {
+            // ── AAPCS64 §B.6: the per-class dual-cursor diamond (SCALAR) ──
+            // `ap` is the `__va_list` struct; tagBase is its address. Classify T:
+            // GPR (integer/pointer) walks __gr_offs/__gr_top/gpSlotBytes; FPR (float)
+            // walks __vr_offs/__vr_top/fpSlotBytes. The cursor is a NEGATIVE i32 that
+            // counts up toward 0; while < 0 a register slot remains.
+            bool const isFpr = (scalarArgClass(t) == AbiPieceClass::Fpr);
+            VaListLayout::Field const& offField =
+                isFpr ? vl.vrOffsField : vl.grOffsField;
+            VaListLayout::Field const& topField =
+                isFpr ? vl.vrTopField : vl.grTopField;
+            std::uint32_t const regSlotBytes =
+                isFpr ? vl.fpSlotBytes : vl.gpSlotBytes;
+
+            TypeId const i32      = interner.primitive(TypeKind::I32);
+            TypeId const i64      = interner.primitive(TypeKind::I64);
+            TypeId const i32Ptr   = interner.pointer(i32);
+            TypeId const voidPtr  = interner.pointer(interner.primitive(TypeKind::Void));
+            TypeId const voidPtrPtr = interner.pointer(voidPtr);
+            TypeId const boolTy   = interner.primitive(TypeKind::Bool);
+
+            // curOffs = Load(offPtr, i32) — a NEGATIVE cursor.
+            MirInstId const offPtr = vaFieldPtr(tagBase, offField, i32Ptr);
+            if (!offPtr.valid()) return InvalidMirInst;
+            std::array<MirInstId, 1> loadOffOps{offPtr};
+            MirInstId const curOffs = mir.addInst(MirOpcode::Load, loadOffOps, i32);
+
+            // inReg = curOffs < 0 (a SIGNED compare — §B.6: gr_offs<0 ⇒ reg slot left).
+            MirInstId const zeroK = constIntOfType(0, i32);
+            std::array<MirInstId, 2> cmpOps{curOffs, zeroK};
+            MirInstId const inReg = mir.addInst(MirOpcode::ICmpSlt, cmpOps, boolTy);
+
+            MirBlockId const regBB  = mir.createBlock(StructCfMarker::IfThen);
+            MirBlockId const ovfBB  = mir.createBlock(StructCfMarker::IfElse);
+            MirBlockId const joinBB = mir.createBlock(StructCfMarker::IfJoin);
+            mir.addCondBr(inReg, regBB, ovfBB);
+
+            // ── register arm: addr = <gr|vr>_top + SExt(curOffs); cursor += slot. ──
+            // BLOCKER-2: the i32 cursor is NEGATIVE; it MUST be SIGN-EXTENDED to i64
+            // before the byte Gep. A 32-bit -40 used directly as a Gep index would be
+            // zero-extended to 0xFFFFFFD8 (≈ +4 GiB) → a wild address → segfault.
+            // SExt (AArch64 SXTW) gives the correct negative 64-bit index.
+            mir.beginBlock(regBB);
+            MirInstId const topPtr = vaFieldPtr(tagBase, topField, voidPtrPtr);
+            if (!topPtr.valid()) return InvalidMirInst;
+            std::array<MirInstId, 1> loadTopOps{topPtr};
+            MirInstId const top = mir.addInst(MirOpcode::Load, loadTopOps, voidPtr);
+            std::array<MirInstId, 1> sextOps{curOffs};
+            MirInstId const idx64 = mir.addInst(MirOpcode::SExt, sextOps, i64);
+            std::array<MirInstId, 2> regGepOps{top, idx64};   // negative byte index
+            MirInstId const regAddr = mir.addInst(MirOpcode::Gep, regGepOps, voidPtr);
+            // bump cursor: store curOffs + regSlotBytes back.
+            MirInstId const slotK =
+                constIntOfType(static_cast<std::int64_t>(regSlotBytes), i32);
+            std::array<MirInstId, 2> addOps{curOffs, slotK};
+            MirInstId const bumped = mir.addInst(MirOpcode::Add, addOps, i32);
+            std::array<MirInstId, 2> bumpStore{bumped, offPtr};
+            mir.addInst(MirOpcode::Store, bumpStore);
+            MirBlockId const regPred = mir.currentlyOpenBlock();
+            mir.addBr(joinBB);
+
+            // ── overflow arm: addr = __stack; __stack += gpSlotBytes. ──
+            // The stack bump is the NSAA round-up-to-8 quantum (gpSlotBytes=8) even for
+            // a double on the stack — NOT fpSlotBytes=16.
+            mir.beginBlock(ovfBB);
+            MirInstId const stackPtr = vaFieldPtr(tagBase, vl.stackField, voidPtrPtr);
+            if (!stackPtr.valid()) return InvalidMirInst;
+            std::array<MirInstId, 1> loadStackOps{stackPtr};
+            MirInstId const stack = mir.addInst(MirOpcode::Load, loadStackOps, voidPtr);
+            MirInstId const stepK =
+                constInt(static_cast<std::int64_t>(vl.gpSlotBytes));
+            if (!stepK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> stackGepOps{stack, stepK};
+            MirInstId const stackNext = mir.addInst(MirOpcode::Gep, stackGepOps, voidPtr);
+            std::array<MirInstId, 2> stackStore{stackNext, stackPtr};
+            mir.addInst(MirOpcode::Store, stackStore);
+            MirBlockId const ovfPred = mir.currentlyOpenBlock();
+            mir.addBr(joinBB);
+
+            // ── join: pick the address, then Load the value. ──
+            mir.beginBlock(joinBB);
+            std::array<MirPhiIncoming, 2> incomings{
+                MirPhiIncoming{regAddr, regPred},
+                MirPhiIncoming{stack,   ovfPred},
+            };
+            MirInstId const argPtr = mir.addPhi(voidPtr, incomings);
+            std::array<MirInstId, 1> finalLoad{argPtr};
+            return mir.addInst(MirOpcode::Load, finalLoad, t);
+        }
+        if (vl.strategy != VaListStrategy::SysVRegisterSave) {
+            unsupported(node, "internal: unknown VaListStrategy in va_arg");
+            return InvalidMirInst;
+        }
+
+        // ── SysVRegisterSave: the reg-vs-overflow diamond (SysV §3.5.7) ──
+        // Classify the SCALAR: SSE (FPR) reads the fp cursor; INTEGER (GPR) the gp
+        // cursor. (A scalar isn't an aggregate; `scalarArgClass` is the direct
+        // equivalent of the eightbyte INTEGER/SSE split for one register.)
+        bool const isSse = (scalarArgClass(t) == AbiPieceClass::Fpr);
+        VaListLayout::Field const& offField =
+            isSse ? vl.fpOffsetField : vl.gpOffsetField;
+        std::uint32_t const offLimit = isSse ? vl.fpOffsetLimit : vl.gpOffsetLimit;
+        std::uint32_t const regSlotBytes = isSse ? vl.fpSlotBytes : vl.gpSlotBytes;
+
+        TypeId const u32      = interner.primitive(TypeKind::U32);
+        TypeId const u32Ptr   = interner.pointer(u32);
+        TypeId const voidPtr  = interner.pointer(interner.primitive(TypeKind::Void));
+        TypeId const voidPtrPtr = interner.pointer(voidPtr);
+
+        // Load the current per-class offset cursor.
+        MirInstId const offPtr = vaFieldPtr(tagBase, offField, u32Ptr);
+        if (!offPtr.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> loadOffOps{offPtr};
+        MirInstId const curOff = mir.addInst(MirOpcode::Load, loadOffOps, u32);
+
+        // inReg = curOff < offLimit.
+        MirInstId const limitK = constIntOfType(offLimit, u32);
+        std::array<MirInstId, 2> cmpOps{curOff, limitK};
+        MirInstId const inReg = mir.addInst(MirOpcode::ICmpUlt, cmpOps,
+                                            interner.primitive(TypeKind::Bool));
+
+        MirBlockId const regBB = mir.createBlock(StructCfMarker::IfThen);
+        MirBlockId const ovfBB = mir.createBlock(StructCfMarker::IfElse);
+        MirBlockId const joinBB = mir.createBlock(StructCfMarker::IfJoin);
+        mir.addCondBr(inReg, regBB, ovfBB);
+
+        // The argument's ADDRESS is carried through the diamond as a `void*` (every
+        // arm produces a byte address; the join Phi unifies them and the final Load
+        // reads T from it). Keeping the address `void*` (not `T*`) avoids minting a
+        // per-T pointer type for the carrier — the Load's result type is what selects
+        // the load width, agnostic to the address operand's pointee.
+
+        // ── register arm: addr = reg_save_area + curOff; cursor += regSlotBytes. ──
+        mir.beginBlock(regBB);
+        MirInstId const rsaField = vaFieldPtr(tagBase, vl.regSaveAreaField, voidPtrPtr);
+        if (!rsaField.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> loadRsaOps{rsaField};
+        MirInstId const rsa = mir.addInst(MirOpcode::Load, loadRsaOps, voidPtr);
+        std::array<MirInstId, 2> regGepOps{rsa, curOff};   // byte-offset index
+        MirInstId const regAddr = mir.addInst(MirOpcode::Gep, regGepOps, voidPtr);
+        // bump cursor: store curOff + regSlotBytes back.
+        MirInstId const slotK = constIntOfType(static_cast<std::int64_t>(regSlotBytes), u32);
+        std::array<MirInstId, 2> addOps{curOff, slotK};
+        MirInstId const bumped = mir.addInst(MirOpcode::Add, addOps, u32);
+        std::array<MirInstId, 2> bumpStore{bumped, offPtr};
+        mir.addInst(MirOpcode::Store, bumpStore);
+        MirBlockId const regPred = mir.currentlyOpenBlock();
+        mir.addBr(joinBB);
+
+        // ── overflow arm: addr = overflow_arg_area; overflow += one stack slot. ──
+        mir.beginBlock(ovfBB);
+        MirInstId const ovfPtr = vaFieldPtr(tagBase, vl.overflowArgAreaField, voidPtrPtr);
+        if (!ovfPtr.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> loadOvfOps{ovfPtr};
+        MirInstId const ovfArea = mir.addInst(MirOpcode::Load, loadOvfOps, voidPtr);
+        // SysV rounds each stack vararg up to one 8-byte (pointer-width) slot; a
+        // scalar (≤8B) consumes exactly one. Bump overflow_arg_area by gpSlotBytes
+        // (= pointer width = the stack-arg stride) via a base+disp Gep.
+        MirInstId const stepK =
+            constInt(static_cast<std::int64_t>(vl.gpSlotBytes));
+        if (!stepK.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> ovfStepOps{ovfArea, stepK};
+        MirInstId const ovfNext = mir.addInst(MirOpcode::Gep, ovfStepOps, voidPtr);
+        std::array<MirInstId, 2> ovfStore{ovfNext, ovfPtr};
+        mir.addInst(MirOpcode::Store, ovfStore);
+        MirBlockId const ovfPred = mir.currentlyOpenBlock();
+        mir.addBr(joinBB);
+
+        // ── join: pick the address, then Load the value. ──
+        mir.beginBlock(joinBB);
+        std::array<MirPhiIncoming, 2> incomings{
+            MirPhiIncoming{regAddr, regPred},
+            MirPhiIncoming{ovfArea, ovfPred},
+        };
+        MirInstId const argPtr = mir.addPhi(voidPtr, incomings);
+        std::array<MirInstId, 1> finalLoad{argPtr};
+        return mir.addInst(MirOpcode::Load, finalLoad, t);
+    }
+
+    // `va_arg(ap, T)` for an AGGREGATE T (struct/union) → the struct's ADDRESS
+    // (SysV §3.5.7). AGNOSTIC: the field offsets / save-area geometry come from
+    // `config.vaListLayout`, the eightbyte CLASSIFICATION from `classifyAggregate`
+    // (never a target/format/cc identity branch). Algorithm:
+    //   * Classify T. MEMORY class (>16B / empty) ⇒ the struct sits ENTIRELY by value
+    //     in the overflow area (SysV §3.5.7): dispatch EARLY to the overflow-only arm
+    //     (no register pieces → no diamond), the read-side mirror of the caller's
+    //     appendByValueStackArg (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT).
+    //   * InRegisters (1-2 eightbyte pieces): the ATOMIC reg-vs-overflow decision —
+    //     ALL pieces' classes must fit in the remaining save-area slots
+    //     (gp_offset + num_gp*gpSlot <= gpLimit AND fp_offset + num_fp*fpSlot <=
+    //     fpLimit), else the whole aggregate sits in the overflow area by value.
+    //     - register arm: copy each piece from reg_save_area+cursor into a fresh
+    //       temp at piece.byteOffset, bumping that CLASS's cursor per piece; store
+    //       the final cursors back. The temp's address is the result.
+    //     - overflow arm: the struct sits by value at overflow_arg_area; that
+    //       pointer IS the result; bump overflow_arg_area by roundUp(sizeof T, 8)
+    //       (distinct from the scalar arm's one-slot bump).
+    //     - join: Phi the two addresses (a void*). NO Load — aggregates by address.
+    [[nodiscard]] MirInstId lowerVaArgAggregate(HirNodeId node) {
+        if (!config.vaListLayout.has_value()) {
+            unsupported(node, "variadic callee (va_arg) is unsupported for this "
+                              "target's calling convention — it declares no "
+                              "'vaListLayout' (D-FC12A-VARIADIC-CALLEE)");
+            return InvalidMirInst;
+        }
+        VaListLayout const& vl = *config.vaListLayout;
+        // FC12b: strategy-dispatch. The SysV eightbyte gather is below; AAPCS64 is
+        // FC12c. Fail loud rather than fall through to the SysV by-value gather on a
+        // non-SysV layout (a silent wrong-ABI struct read).
+        if (vl.strategy == VaListStrategy::HomogeneousPointer) {
+            // ── Win64 (ms_x64) AND Apple (apple_arm64) struct va_arg: a contiguous
+            // 8-byte-slot walk, value-or-pointer ── (D-FC12B-WIN64-STRUCT-VARARG +
+            // D-FC12C-APPLE-ARM64-VARIADIC-CALLEE — this ONE arm covers BOTH CCs: both
+            // declare the HomogeneousPointer strategy, so this is NOT a separate
+            // arm64-Apple feature). BOTH CCs use a `char*` va_list over a contiguous arg
+            // area; Apple's spec forces ALL variadic args (including aggregates) onto the
+            // stack in 8-byte slots (`variadicArgsAlwaysStack` handles the caller side),
+            // so the callee sees exactly the same LINEAR slot walk as Win64 — no
+            // register-save-area, no diamond. Classify T and dispatch on the slot's
+            // meaning — the read-side mirror of the caller's `appendByValueArg`. A
+            // pow2-≤8B struct sits in the slot(s) BY VALUE (InRegisters); a >16B struct
+            // (and, for Win64, any non-pow2/>8B) rides as a hidden POINTER to a caller
+            // copy (ByReference). The size-aware InRegisters bump below (Step 2.0) is
+            // what makes Apple's 16B HFA — which spans TWO 8-byte slots — advance the
+            // cursor correctly (Win64 InRegisters structs are pow2-≤8B ⇒ one slot).
+            // `ap` is the `char*` cursor; tagBase is its lvalue address (`char**`).
+            // The home/overflow areas are contiguous from the va_start base, so one
+            // Gep bump crosses them uniformly, exactly like the scalar arm above.
+            TypeId const t = hir.typeId(node);
+            if (!t.valid()) {
+                unsupported(node, "VaArg has no result type");
+                return InvalidMirInst;
+            }
+            auto const abi = byValueClassify(t);
+            if (!abi.has_value()) {
+                unsupported(node,
+                    "va_arg of a struct/union is not supported by this target's "
+                    "calling convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                return InvalidMirInst;
+            }
+            // The aggregate's byte size drives the InRegisters slot advance (Apple's
+            // 16B HFA spans TWO 8-byte slots; Win64's InRegisters structs are pow2-≤8B
+            // so roundUp == one slot). A complete, sizeable layout is required.
+            StructLayout const* hpLayout = cachedLayout(t);
+            if (hpLayout == nullptr) {
+                unsupported(node, "va_arg of a struct/union requires a sizeable layout "
+                                  "(target 'aggregateLayout' / complete type)");
+                return InvalidMirInst;
+            }
+            auto kids = hir.children(node);
+            if (kids.size() != 2) {
+                unsupported(node, "malformed VaArg (expect [apExpr, TypeRef])");
+                return InvalidMirInst;
+            }
+            MirInstId const tagBase = vaTagBase(kids[0]);   // child 1 NEVER lowered
+            if (!tagBase.valid()) return InvalidMirInst;
+            TypeId const voidPtr =
+                interner.pointer(interner.primitive(TypeKind::Void));
+            // apVal = Load(tagBase) — the current slot cursor (a void* into the
+            // contiguous home/overflow arg area).
+            std::array<MirInstId, 1> loadApOps{tagBase};
+            MirInstId const apVal = mir.addInst(MirOpcode::Load, loadApOps, voidPtr);
+            MirInstId structAddr;
+            if (abi->kind == AbiPassing::Kind::ByReference) {
+                // The slot HOLDS A POINTER to the caller's by-value copy: deref it.
+                // apVal is the slot's address (void*); Load the stored pointer (the
+                // Load's void* result width reads the pointer, agnostic to pointee).
+                std::array<MirInstId, 1> derefOps{apVal};
+                structAddr = mir.addInst(MirOpcode::Load, derefOps, voidPtr);
+            } else {
+                // InRegisters (pow2 ≤8B): the slot IS the storage — the struct's
+                // bytes were written into this slot as one I64 by the caller's
+                // appendByValueArg. The slot's address (apVal) is the struct's
+                // address; the consumer byte-copies sizeof(T) (≤8) bytes from it.
+                // NO extra Load (mirrors the SysV overflow-arm `return ovfArea`).
+                structAddr = apVal;
+            }
+            // Bump the cursor by the slot(s) this struct occupied. The advance is a
+            // function of `abi->kind` ONLY (NOT the strategy — agnostic):
+            //   * ByReference  → ONE slot (namedArgSlotBytes): the slot holds a single
+            //     hidden POINTER to the caller copy, regardless of the pointee size.
+            //   * InRegisters  → roundUp(sizeof T, namedArgSlotBytes): as MANY 8-byte
+            //     slots as the struct's bytes need. For Win64 every InRegisters struct
+            //     is pow2-≤8B so roundUp == namedArgSlotBytes (one slot) — byte-for-byte
+            //     unchanged. For Apple a 16B HFA spans TWO 8-byte slots, so this bumps
+            //     by 16 — without it the NEXT va_arg re-reads this struct's tail (Apple
+            //     spec: "assigned to the appropriate number of 8-byte stack slots").
+            std::uint64_t const slotQ =
+                static_cast<std::uint64_t>(vl.namedArgSlotBytes);
+            std::uint64_t const stepBytes =
+                (abi->kind == AbiPassing::Kind::ByReference)
+                    ? slotQ
+                    : ((hpLayout->size + slotQ - 1u) / slotQ) * slotQ;
+            MirInstId const stepK =
+                constInt(static_cast<std::int64_t>(stepBytes));
+            if (!stepK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> gepOps{apVal, stepK};
+            MirInstId const apNext = mir.addInst(MirOpcode::Gep, gepOps, voidPtr);
+            std::array<MirInstId, 2> st{apNext, tagBase};
+            mir.addInst(MirOpcode::Store, st);
+            // The aggregate's ADDRESS is the result (by address — NO value Load).
+            return structAddr;
+        }
+        if (vl.strategy == VaListStrategy::Aapcs64DualCursor) {
+            // ── AAPCS64 §B.6 va_arg(struct): the per-class dual-cursor GATHER ──
+            // (D-FC12C-AAPCS64-HFA-STRUCT-VARARG). The aggregate ABI splits into THREE
+            // shapes (the Aapcs64Hfa classifier never mixes piece classes):
+            //   * ByReference (>16B): the caller placed a hidden POINTER in ONE GR slot
+            //     — read that slot (GR cursor), deref it. Result = the caller's copy.
+            //   * InRegisters HFA (1-4 pure-FPR pieces): gather each piece from the VR
+            //     save block (`__vr_top`/`__vr_offs`, 16B stride) into a fresh temp.
+            //   * InRegisters non-HFA (1-2 pure-GPR pieces): gather from the GR save
+            //     block (`__gr_top`/`__gr_offs`, 8B stride) into a fresh temp.
+            // GEOMETRY (mirrors the scalar arm above): the class cursor is a NEGATIVE
+            // i32 counting UP toward 0; while it WILL STILL BE < 0 after consuming this
+            // aggregate's slots, the registers hold it (atomic-fit), else it spills to
+            // `__stack`. ALL cursor arithmetic stays i32; the i32→i64 SExt (SXTW) is
+            // used ONLY as the byte Gep index, NEVER stored back (a stored i64 would
+            // truncate / type-mismatch). The bump stored back is Add(cur_i32,K_i32,i32).
+            TypeId const t = hir.typeId(node);
+            if (!t.valid()) {
+                unsupported(node, "VaArg has no result type");
+                return InvalidMirInst;
+            }
+            auto const abi = byValueClassify(t);
+            if (!abi.has_value()) {
+                unsupported(node,
+                    "va_arg of a struct/union is not supported by this target's "
+                    "calling convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                return InvalidMirInst;
+            }
+            StructLayout const* layout = cachedLayout(t);
+            if (layout == nullptr) {
+                unsupported(node, "va_arg of a struct/union requires a sizeable layout "
+                                  "(target 'aggregateLayout' / complete type)");
+                return InvalidMirInst;
+            }
+            auto kids = hir.children(node);
+            if (kids.size() != 2) {
+                unsupported(node, "malformed VaArg (expect [apExpr, TypeRef])");
+                return InvalidMirInst;
+            }
+            MirInstId const tagBase = vaTagBase(kids[0]);   // child 1 NEVER lowered
+            if (!tagBase.valid()) return InvalidMirInst;
+
+            // Count + class-check the pieces (the classifier guarantees pure-class).
+            std::uint32_t numGp = 0, numFp = 0;
+            for (AbiPiece const& p : abi->pieces) {
+                if (p.cls == AbiPieceClass::Fpr) ++numFp; else ++numGp;
+            }
+            bool const isHfa =
+                (abi->kind == AbiPassing::Kind::InRegisters && numFp > 0 && numGp == 0);
+            bool const isGprInReg =
+                (abi->kind == AbiPassing::Kind::InRegisters && numGp > 0 && numFp == 0);
+            if (abi->kind == AbiPassing::Kind::InRegisters && !isHfa && !isGprInReg) {
+                // Mixed-class InRegisters — AAPCS64 §5.4 forbids it for the Aapcs64Hfa
+                // strategy (HFA is pure-FPR; a non-HFA ≤16B is pure-GPR). Fail loud
+                // rather than gather from the wrong save block.
+                unsupported(node,
+                    "AAPCS64 va_arg: mixed-class aggregate (HFA or non-HFA only) "
+                    "(internal: classifier invariant violated)");
+                return InvalidMirInst;
+            }
+
+            TypeId const i32       = interner.primitive(TypeKind::I32);
+            TypeId const i64       = interner.primitive(TypeKind::I64);
+            TypeId const i32Ptr    = interner.pointer(i32);
+            TypeId const voidPtr   = interner.pointer(interner.primitive(TypeKind::Void));
+            TypeId const voidPtrPtr = interner.pointer(voidPtr);
+            TypeId const boolTy    = interner.primitive(TypeKind::Bool);
+            MirInstId const zeroK  = constIntOfType(0, i32);
+
+            // The overflow (`__stack`) bump quantum: AAPCS64 §B.4 rounds EVERY stack
+            // vararg up to an 8-byte NSAA slot — gpSlotBytes (NOT fpSlotBytes, even for
+            // an HFA; hazard H6). A ByReference struct on the stack occupies ONE 8-byte
+            // pointer slot; an InRegisters struct occupies roundUp(size,8) bytes.
+            std::uint64_t const stackQ = static_cast<std::uint64_t>(vl.gpSlotBytes);
+
+            // ── Path A1: ByReference (>16B) — ONE GR slot holds a hidden pointer ──
+            if (abi->kind == AbiPassing::Kind::ByReference) {
+                MirInstId const offPtr = vaFieldPtr(tagBase, vl.grOffsField, i32Ptr);
+                if (!offPtr.valid()) return InvalidMirInst;
+                std::array<MirInstId, 1> loadOffOps{offPtr};
+                MirInstId const curOffs =
+                    mir.addInst(MirOpcode::Load, loadOffOps, i32);
+                // inReg = curOffs < 0 (one GR slot left). SINGLE-slot ⇒ the scalar test.
+                std::array<MirInstId, 2> cmpOps{curOffs, zeroK};
+                MirInstId const inReg = mir.addInst(MirOpcode::ICmpSlt, cmpOps, boolTy);
+                MirBlockId const regBB  = mir.createBlock(StructCfMarker::IfThen);
+                MirBlockId const ovfBB  = mir.createBlock(StructCfMarker::IfElse);
+                MirBlockId const joinBB = mir.createBlock(StructCfMarker::IfJoin);
+                mir.addCondBr(inReg, regBB, ovfBB);
+
+                // reg arm: addr = __gr_top + SExt(curOffs); deref → structPtr; bump +8.
+                mir.beginBlock(regBB);
+                MirInstId const topPtr = vaFieldPtr(tagBase, vl.grTopField, voidPtrPtr);
+                if (!topPtr.valid()) return InvalidMirInst;
+                std::array<MirInstId, 1> loadTopOps{topPtr};
+                MirInstId const grTop =
+                    mir.addInst(MirOpcode::Load, loadTopOps, voidPtr);
+                std::array<MirInstId, 1> sextOps{curOffs};
+                MirInstId const idx64 = mir.addInst(MirOpcode::SExt, sextOps, i64);
+                std::array<MirInstId, 2> slotGepOps{grTop, idx64};
+                MirInstId const slotAddr =
+                    mir.addInst(MirOpcode::Gep, slotGepOps, voidPtr);
+                std::array<MirInstId, 1> derefOps{slotAddr};
+                MirInstId const regStructPtr =
+                    mir.addInst(MirOpcode::Load, derefOps, voidPtr);   // deref pointer
+                MirInstId const slotK =
+                    constIntOfType(static_cast<std::int64_t>(vl.gpSlotBytes), i32);
+                std::array<MirInstId, 2> addOps{curOffs, slotK};
+                MirInstId const bumped = mir.addInst(MirOpcode::Add, addOps, i32);
+                std::array<MirInstId, 2> bumpStore{bumped, offPtr};
+                mir.addInst(MirOpcode::Store, bumpStore);
+                MirBlockId const regPred = mir.currentlyOpenBlock();
+                mir.addBr(joinBB);
+
+                // overflow arm: the __stack slot holds a pointer too — deref it; bump
+                // __stack by ONE 8-byte slot (the slot holds a pointer, not the bytes).
+                mir.beginBlock(ovfBB);
+                MirInstId const stackPtr = vaFieldPtr(tagBase, vl.stackField, voidPtrPtr);
+                if (!stackPtr.valid()) return InvalidMirInst;
+                std::array<MirInstId, 1> loadStackOps{stackPtr};
+                MirInstId const stack =
+                    mir.addInst(MirOpcode::Load, loadStackOps, voidPtr);
+                std::array<MirInstId, 1> ovfDerefOps{stack};
+                MirInstId const ovfStructPtr =
+                    mir.addInst(MirOpcode::Load, ovfDerefOps, voidPtr);   // deref pointer
+                MirInstId const stackStepK =
+                    constInt(static_cast<std::int64_t>(vl.gpSlotBytes));
+                if (!stackStepK.valid()) return InvalidMirInst;
+                std::array<MirInstId, 2> stackGepOps{stack, stackStepK};
+                MirInstId const stackNext =
+                    mir.addInst(MirOpcode::Gep, stackGepOps, voidPtr);
+                std::array<MirInstId, 2> stackStore{stackNext, stackPtr};
+                mir.addInst(MirOpcode::Store, stackStore);
+                MirBlockId const ovfPred = mir.currentlyOpenBlock();
+                mir.addBr(joinBB);
+
+                // join: pick the struct ADDRESS (NO value Load — aggregate by address).
+                mir.beginBlock(joinBB);
+                std::array<MirPhiIncoming, 2> incomings{
+                    MirPhiIncoming{regStructPtr, regPred},
+                    MirPhiIncoming{ovfStructPtr, ovfPred},
+                };
+                return mir.addPhi(voidPtr, incomings);
+            }
+
+            // ── Paths A2/A3: InRegisters — gather N same-class pieces, atomic-fit ──
+            // A2 (HFA) walks the VR block (vrOffs/vrTop, fpSlotBytes); A3 (non-HFA)
+            // walks the GR block (grOffs/grTop, gpSlotBytes). Identical shape; the only
+            // differences are the cursor/top fields, the slot stride, and the piece
+            // count (numFp vs numGp). The fail-loud above guarantees exactly one holds.
+            VaListLayout::Field const& offField =
+                isHfa ? vl.vrOffsField : vl.grOffsField;
+            VaListLayout::Field const& topField =
+                isHfa ? vl.vrTopField : vl.grTopField;
+            std::uint32_t const regSlotBytes =
+                isHfa ? vl.fpSlotBytes : vl.gpSlotBytes;
+            std::uint32_t const pieceCount = isHfa ? numFp : numGp;
+
+            MirInstId const offPtr = vaFieldPtr(tagBase, offField, i32Ptr);
+            if (!offPtr.valid()) return InvalidMirInst;
+            std::array<MirInstId, 1> loadOffOps{offPtr};
+            MirInstId const curOffs = mir.addInst(MirOpcode::Load, loadOffOps, i32);
+
+            // ATOMIC fit (FOLD 4): the WHOLE aggregate fits in registers iff, AFTER
+            // consuming all `pieceCount` slots, the cursor is STILL negative —
+            // ICmpSlt(Add(curOffs, pieceCount*regSlotBytes), 0). STRICT less-than:
+            // the last fitting slot has cur=-slot, and -slot+slot=0 is NOT <0, which
+            // is correct (zero slots remain ⇒ go to the stack). No piece-by-piece check
+            // (AAPCS64 forbids a register/stack split).
+            MirInstId const fitK = constIntOfType(
+                static_cast<std::int64_t>(pieceCount * regSlotBytes), i32);
+            std::array<MirInstId, 2> fitAddOps{curOffs, fitK};
+            MirInstId const fitSum = mir.addInst(MirOpcode::Add, fitAddOps, i32);
+            std::array<MirInstId, 2> fitCmpOps{fitSum, zeroK};
+            MirInstId const inReg = mir.addInst(MirOpcode::ICmpSlt, fitCmpOps, boolTy);
+
+            MirBlockId const regBB  = mir.createBlock(StructCfMarker::IfThen);
+            MirBlockId const ovfBB  = mir.createBlock(StructCfMarker::IfElse);
+            MirBlockId const joinBB = mir.createBlock(StructCfMarker::IfJoin);
+            mir.addCondBr(inReg, regBB, ovfBB);
+
+            // reg arm: copy each piece from <gr|vr>_top + (curOffs + i*slot) into a
+            // fresh temp at piece.byteOffset; then store the final cursor back.
+            mir.beginBlock(regBB);
+            MirInstId const temp = freshAggregateTemp(t);
+            if (!temp.valid()) {
+                unsupported(node, "va_arg of a struct/union requires a sizeable layout "
+                                  "(target 'aggregateLayout' / complete type)");
+                return InvalidMirInst;
+            }
+            MirInstId const topPtr = vaFieldPtr(tagBase, topField, voidPtrPtr);
+            if (!topPtr.valid()) return InvalidMirInst;
+            std::array<MirInstId, 1> loadTopOps{topPtr};
+            MirInstId const top = mir.addInst(MirOpcode::Load, loadTopOps, voidPtr);
+            std::uint32_t pieceIdx = 0;
+            for (AbiPiece const& p : abi->pieces) {
+                // localCursor = curOffs + pieceIdx*regSlotBytes (i32; NOT re-loaded).
+                MirInstId const stepK = constIntOfType(
+                    static_cast<std::int64_t>(pieceIdx * regSlotBytes), i32);
+                std::array<MirInstId, 2> curAddOps{curOffs, stepK};
+                MirInstId const localCursor =
+                    mir.addInst(MirOpcode::Add, curAddOps, i32);
+                // SExt (SXTW) the NEGATIVE i32 cursor before the byte Gep (hazard H1).
+                std::array<MirInstId, 1> sextOps{localCursor};
+                MirInstId const idx64 = mir.addInst(MirOpcode::SExt, sextOps, i64);
+                std::array<MirInstId, 2> srcGepOps{top, idx64};
+                MirInstId const srcAddr =
+                    mir.addInst(MirOpcode::Gep, srcGepOps, voidPtr);
+                // The piece WIDTH selects the load form (F32/F64 for an HFA element,
+                // I64 for a GPR piece) — a wrong-width FP load would clobber the next
+                // element (hazard via pieceType, reused unchanged).
+                TypeId const pty = pieceType(p);
+                std::array<MirInstId, 1> loadPieceOps{srcAddr};
+                MirInstId const pieceVal =
+                    mir.addInst(MirOpcode::Load, loadPieceOps, pty);
+                // dst = temp + piece.byteOffset.
+                MirInstId const offK =
+                    constInt(static_cast<std::int64_t>(p.byteOffset));
+                if (!offK.valid()) return InvalidMirInst;
+                std::array<MirInstId, 2> dstGepOps{temp, offK};
+                MirInstId const dstAddr =
+                    mir.addInst(MirOpcode::Gep, dstGepOps, interner.pointer(pty));
+                std::array<MirInstId, 2> stOps{pieceVal, dstAddr};
+                mir.addInst(MirOpcode::Store, stOps);
+                ++pieceIdx;
+            }
+            // Store the final cursor back: curOffs + pieceCount*regSlotBytes (i32).
+            {
+                std::array<MirInstId, 2> finalAddOps{curOffs, fitK};
+                MirInstId const newOffs =
+                    mir.addInst(MirOpcode::Add, finalAddOps, i32);
+                std::array<MirInstId, 2> offStore{newOffs, offPtr};
+                mir.addInst(MirOpcode::Store, offStore);
+            }
+            MirInstId const regAddr = temp;
+            MirBlockId const regPred = mir.currentlyOpenBlock();
+            mir.addBr(joinBB);
+
+            // overflow arm: the struct sits BY VALUE at __stack; that pointer IS the
+            // result. Bump __stack by roundUp(size, gpSlotBytes) (8-byte NSAA slots —
+            // NOT fpSlotBytes, even for an HFA; hazard H6).
+            mir.beginBlock(ovfBB);
+            MirInstId const stackPtr = vaFieldPtr(tagBase, vl.stackField, voidPtrPtr);
+            if (!stackPtr.valid()) return InvalidMirInst;
+            std::array<MirInstId, 1> loadStackOps{stackPtr};
+            MirInstId const stack = mir.addInst(MirOpcode::Load, loadStackOps, voidPtr);
+            std::uint64_t const roundedSize =
+                ((layout->size + stackQ - 1u) / stackQ) * stackQ;
+            MirInstId const stackStepK =
+                constInt(static_cast<std::int64_t>(roundedSize));
+            if (!stackStepK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> stackGepOps{stack, stackStepK};
+            MirInstId const stackNext =
+                mir.addInst(MirOpcode::Gep, stackGepOps, voidPtr);
+            std::array<MirInstId, 2> stackStore{stackNext, stackPtr};
+            mir.addInst(MirOpcode::Store, stackStore);
+            MirInstId const ovfAddr = stack;
+            MirBlockId const ovfPred = mir.currentlyOpenBlock();
+            mir.addBr(joinBB);
+
+            // join: pick the struct ADDRESS (NO value Load — aggregate by address).
+            mir.beginBlock(joinBB);
+            std::array<MirPhiIncoming, 2> incomings{
+                MirPhiIncoming{regAddr, regPred},
+                MirPhiIncoming{ovfAddr, ovfPred},
+            };
+            return mir.addPhi(voidPtr, incomings);
+        }
+        if (vl.strategy != VaListStrategy::SysVRegisterSave) {
+            unsupported(node, "internal: unknown VaListStrategy in va_arg(struct)");
+            return InvalidMirInst;
+        }
+        TypeId const t = hir.typeId(node);
+        if (!t.valid()) {
+            unsupported(node, "VaArg has no result type");
+            return InvalidMirInst;
+        }
+        auto const abi = byValueClassify(t);
+        if (!abi.has_value()) {
+            unsupported(node,
+                "va_arg of a struct/union is not supported by this target's calling "
+                "convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+            return InvalidMirInst;
+        }
+        StructLayout const* layout = cachedLayout(t);
+        if (layout == nullptr) {
+            unsupported(node, "va_arg of a struct/union requires a sizeable layout "
+                              "(target 'aggregateLayout' / complete type)");
+            return InvalidMirInst;
+        }
+        // Count the eightbyte pieces per class (1-2 total for SysV).
+        std::uint32_t numGp = 0, numFp = 0;
+        for (AbiPiece const& p : abi->pieces) {
+            if (p.cls == AbiPieceClass::Fpr) ++numFp; else ++numGp;
+        }
+
+        auto kids = hir.children(node);
+        if (kids.size() != 2) {
+            unsupported(node, "malformed VaArg (expect [apExpr, TypeRef])");
+            return InvalidMirInst;
+        }
+        MirInstId const tagBase = vaTagBase(kids[0]);   // child 1 (TypeRef) NEVER lowered
+        if (!tagBase.valid()) return InvalidMirInst;
+
+        TypeId const u32       = interner.primitive(TypeKind::U32);
+        TypeId const u32Ptr    = interner.pointer(u32);
+        TypeId const voidPtr   = interner.pointer(interner.primitive(TypeKind::Void));
+        TypeId const voidPtrPtr = interner.pointer(voidPtr);
+        TypeId const boolTy    = interner.primitive(TypeKind::Bool);
+
+        // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a MEMORY-class (>16B)
+        // aggregate is passed ENTIRELY by value in the overflow area (SysV §3.5.7) —
+        // it has NO register pieces (numGp == numFp == 0), so it must NOT enter the
+        // reg-vs-overflow diamond below (a zero-piece atomic fit is trivially TRUE →
+        // the register arm would gather ZERO pieces → a garbage address). Dispatch
+        // EARLY to the overflow-only path: the struct sits at overflow_arg_area; that
+        // pointer is the result; bump overflow_arg_area by roundUp(size, gpSlotBytes)
+        // (a >16B struct occupies multiple stack eightbytes). Straight-line (no
+        // branch) since there is no register alternative. This is the read-side mirror
+        // of the caller's appendByValueStackArg overflow placement.
+        if (abi->kind == AbiPassing::Kind::ByReference) {
+            MirInstId const ovfPtr =
+                vaFieldPtr(tagBase, vl.overflowArgAreaField, voidPtrPtr);
+            if (!ovfPtr.valid()) return InvalidMirInst;
+            std::array<MirInstId, 1> loadOvfOps{ovfPtr};
+            MirInstId const ovfArea = mir.addInst(MirOpcode::Load, loadOvfOps, voidPtr);
+            // Round the struct up to a whole stack slot — the CC's pointer-width arg
+            // slot `vl.gpSlotBytes` (the same quantum the scalar/InRegisters overflow
+            // arms bump by), read from config, never a hardcoded 8 (agnostic).
+            std::uint64_t const slotQ = static_cast<std::uint64_t>(vl.gpSlotBytes);
+            std::uint64_t const roundedSize =
+                ((layout->size + slotQ - 1u) / slotQ) * slotQ;
+            MirInstId const stepK =
+                constInt(static_cast<std::int64_t>(roundedSize));
+            if (!stepK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> ovfStepOps{ovfArea, stepK};
+            MirInstId const ovfNext = mir.addInst(MirOpcode::Gep, ovfStepOps, voidPtr);
+            std::array<MirInstId, 2> ovfStore{ovfNext, ovfPtr};
+            mir.addInst(MirOpcode::Store, ovfStore);
+            // The aggregate's address IS overflow_arg_area (by address — NO Load).
+            return ovfArea;
+        }
+
+        // Load both class cursors up front (the atomic decision needs both).
+        MirInstId const gpOffPtr = vaFieldPtr(tagBase, vl.gpOffsetField, u32Ptr);
+        if (!gpOffPtr.valid()) return InvalidMirInst;
+        MirInstId const fpOffPtr = vaFieldPtr(tagBase, vl.fpOffsetField, u32Ptr);
+        if (!fpOffPtr.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> loadGpOps{gpOffPtr};
+        MirInstId const gpOff = mir.addInst(MirOpcode::Load, loadGpOps, u32);
+        std::array<MirInstId, 1> loadFpOps{fpOffPtr};
+        MirInstId const fpOff = mir.addInst(MirOpcode::Load, loadFpOps, u32);
+
+        // Per-class fit thresholds, folded to constants (limits & counts are known):
+        // a class fits iff cursor <= limit - num*slot. With num==0 the RHS is the
+        // limit (always satisfiable since cursor<=limit by construction), so a
+        // single-class aggregate's other-class check is a tautology — harmless.
+        std::uint32_t const gpThresh =
+            vl.gpOffsetLimit - numGp * vl.gpSlotBytes;
+        std::uint32_t const fpThresh =
+            vl.fpOffsetLimit - numFp * vl.fpSlotBytes;
+        MirInstId const gpThreshK = constIntOfType(gpThresh, u32);
+        MirInstId const fpThreshK = constIntOfType(fpThresh, u32);
+        std::array<MirInstId, 2> gpCmpOps{gpOff, gpThreshK};
+        MirInstId const gpFits = mir.addInst(MirOpcode::ICmpUle, gpCmpOps, boolTy);
+        std::array<MirInstId, 2> fpCmpOps{fpOff, fpThreshK};
+        MirInstId const fpFits = mir.addInst(MirOpcode::ICmpUle, fpCmpOps, boolTy);
+
+        // ATOMIC decision via NESTED CondBr (both classes must fit): check gp first
+        // → if ok check fp → regBB, else ovfBB. (Mirrors the canonical `&&` short-
+        // circuit topology the StructCfMarker derivation recognizes; the final
+        // rederive at lowering finish stamps the markers, so the creation-time
+        // markers below are placeholders.) ovfBB has two CFG predecessors (the gp-
+        // fail edge and the fp-fail edge); its overflow read/bump runs exactly once.
+        MirBlockId const fpChkBB = mir.createBlock(StructCfMarker::IfThen);
+        MirBlockId const regBB   = mir.createBlock(StructCfMarker::IfThen);
+        MirBlockId const ovfBB   = mir.createBlock(StructCfMarker::IfElse);
+        MirBlockId const joinBB  = mir.createBlock(StructCfMarker::IfJoin);
+        mir.addCondBr(gpFits, fpChkBB, ovfBB);
+        mir.beginBlock(fpChkBB);
+        mir.addCondBr(fpFits, regBB, ovfBB);
+
+        // ── register arm: gather each piece from reg_save_area + per-class cursor
+        // into a fresh temp at piece.byteOffset; bump that class's cursor per piece;
+        // store the final cursors back. The temp's address is this arm's result. ──
+        mir.beginBlock(regBB);
+        MirInstId const temp = freshAggregateTemp(t);
+        if (!temp.valid()) {
+            unsupported(node, "va_arg of a struct/union requires a sizeable layout "
+                              "(target 'aggregateLayout' / complete type)");
+            return InvalidMirInst;
+        }
+        MirInstId const rsaField = vaFieldPtr(tagBase, vl.regSaveAreaField, voidPtrPtr);
+        if (!rsaField.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> loadRsaOps{rsaField};
+        MirInstId const rsa = mir.addInst(MirOpcode::Load, loadRsaOps, voidPtr);
+        // Local per-class cursors, bumped as pieces are consumed (so a 2-GPR struct
+        // reads consecutive save-area slots). Initialized to the loaded offsets.
+        MirInstId gpCursor = gpOff;
+        MirInstId fpCursor = fpOff;
+        for (AbiPiece const& p : abi->pieces) {
+            bool const isFp = (p.cls == AbiPieceClass::Fpr);
+            MirInstId const cursor = isFp ? fpCursor : gpCursor;
+            // src = reg_save_area + cursor (byte-offset Gep).
+            std::array<MirInstId, 2> srcGepOps{rsa, cursor};
+            MirInstId const srcAddr = mir.addInst(MirOpcode::Gep, srcGepOps, voidPtr);
+            TypeId const pty = pieceType(p);
+            std::array<MirInstId, 1> loadPieceOps{srcAddr};
+            MirInstId const pieceVal = mir.addInst(MirOpcode::Load, loadPieceOps, pty);
+            // dst = temp + piece.byteOffset.
+            MirInstId const offK =
+                constInt(static_cast<std::int64_t>(p.byteOffset));
+            if (!offK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> dstGepOps{temp, offK};
+            MirInstId const dstAddr =
+                mir.addInst(MirOpcode::Gep, dstGepOps, interner.pointer(pty));
+            std::array<MirInstId, 2> stOps{pieceVal, dstAddr};
+            mir.addInst(MirOpcode::Store, stOps);
+            // Bump this class's cursor by its slot stride.
+            std::uint32_t const slot = isFp ? vl.fpSlotBytes : vl.gpSlotBytes;
+            MirInstId const slotK = constIntOfType(slot, u32);
+            std::array<MirInstId, 2> addOps{cursor, slotK};
+            MirInstId const bumped = mir.addInst(MirOpcode::Add, addOps, u32);
+            if (isFp) fpCursor = bumped; else gpCursor = bumped;
+        }
+        // Store the final cursors back into the tag.
+        {
+            std::array<MirInstId, 2> gpSt{gpCursor, gpOffPtr};
+            mir.addInst(MirOpcode::Store, gpSt);
+            std::array<MirInstId, 2> fpSt{fpCursor, fpOffPtr};
+            mir.addInst(MirOpcode::Store, fpSt);
+        }
+        MirInstId const regAddr = temp;
+        MirBlockId const regPred = mir.currentlyOpenBlock();
+        mir.addBr(joinBB);
+
+        // ── overflow arm: the struct sits BY VALUE at overflow_arg_area; that
+        // pointer is this arm's result. Bump overflow_arg_area by roundUp(size,8)
+        // (NOT one slot — a >8B struct occupies multiple stack eightbytes). ──
+        mir.beginBlock(ovfBB);
+        MirInstId const ovfPtr = vaFieldPtr(tagBase, vl.overflowArgAreaField, voidPtrPtr);
+        if (!ovfPtr.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> loadOvfOps{ovfPtr};
+        MirInstId const ovfArea = mir.addInst(MirOpcode::Load, loadOvfOps, voidPtr);
+        // Round the struct up to a whole stack slot. The stack-slot quantum is the
+        // CC's pointer-width arg slot — `vl.gpSlotBytes` (the same field the scalar
+        // overflow arm bumps by) — read from config, never a hardcoded 8 (agnostic).
+        std::uint64_t const slotQ = static_cast<std::uint64_t>(vl.gpSlotBytes);
+        std::uint64_t const roundedSize = ((layout->size + slotQ - 1u) / slotQ) * slotQ;
+        MirInstId const stepK =
+            constInt(static_cast<std::int64_t>(roundedSize));
+        if (!stepK.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> ovfStepOps{ovfArea, stepK};
+        MirInstId const ovfNext = mir.addInst(MirOpcode::Gep, ovfStepOps, voidPtr);
+        std::array<MirInstId, 2> ovfStore{ovfNext, ovfPtr};
+        mir.addInst(MirOpcode::Store, ovfStore);
+        MirInstId const ovfAddr = ovfArea;
+        MirBlockId const ovfPred = mir.currentlyOpenBlock();
+        mir.addBr(joinBB);
+
+        // ── join: pick the struct's address (NO Load — aggregates by address). ──
+        mir.beginBlock(joinBB);
+        std::array<MirPhiIncoming, 2> incomings{
+            MirPhiIncoming{regAddr, regPred},
+            MirPhiIncoming{ovfAddr, ovfPred},
+        };
+        return mir.addPhi(voidPtr, incomings);
     }
 
     // Lower a single HIR statement in the currently-open MIR block.
@@ -3250,6 +4786,9 @@ struct Lowerer {
         // first INTEGER arg register goes to the result pointer and every real arg
         // shifts by one — hoisted above the sret `Arg` so both use one counter.
         ArgOrdinalCounter argCtr{config.argSlotAligned};
+        // FOLD 1: reset the aggregate-fixed-param flag per function (set true below
+        // when the param loop receives a by-value struct/union param).
+        currentFnHasAggregateFixedParam_ = false;
 
         // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value struct/union
         // RETURN. Classify under the active CC's strategy. ByReference (class
@@ -3301,7 +4840,6 @@ struct Lowerer {
         // function the per-class GPR ordinal equals the param index (no change); a
         // mixed int/float signature now lands each arg in its own class (fixes
         // D-ML7-2.10). `argCtr` is hoisted above (shared with the sret arg).
-        bool const fnVariadic = interner.fnIsVariadic(signature);
         for (std::size_t i = 0; i < params.size(); ++i) {
             HirNodeId const p = params[i];
             // A param is a VarDecl whose typeId carries the param's type;
@@ -3310,13 +4848,11 @@ struct Lowerer {
             TypeId const ty = paramTypes[i];
             TypeKind const pk = interner.kind(ty);
             if (pk == TypeKind::Struct || pk == TypeKind::Union) {
-                if (fnVariadic) {
-                    unsupported(p, "a by-value struct/union parameter in a "
-                                   "variadic function is not yet supported "
-                                   "(D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
-                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
-                    return false;
-                }
+                // Classify FIRST (FC12a-struct): the variadic check now keys on the
+                // ABI kind, not the type kind. An InRegisters fixed struct param in
+                // a variadic function is fine — receiveByValueParam advances argCtr
+                // per-class per piece, so currentFnFixedGpr_/Fpr_ (stamped below)
+                // include the struct's pieces and va_start's cursors reflect them.
                 auto const abi = byValueClassify(ty);
                 if (!abi.has_value()) {
                     unsupported(p, "a by-value struct/union parameter is not "
@@ -3325,10 +4861,29 @@ struct Lowerer {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
                 }
+                // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a ByReference
+                // (MEMORY class, >16B) FIXED param in a variadic fn uses the hidden-
+                // pointer convention — receiveByValueParam's ByReference arm receives
+                // it as ONE GPR arg (counted in argCtr.gpr → currentFnFixedGpr_), so
+                // va_start's gp_offset starts past it correctly, exactly like any
+                // other fixed GPR param. The SEPARATE fixed-params-OVERFLOW-to-stack
+                // case (≥7 fixed integer regs of THIS class → the va_start guard fires
+                // D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS) is unchanged; the common
+                // case (one >16B fixed param = 1 GPR + ≤5 scalars → currentFnFixedGpr_
+                // ≤ 6) lowers cleanly.
                 if (!receiveByValueParam(sym, ty, p, *abi, argCtr)) {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
                 }
+                // FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): record
+                // that a by-value AGGREGATE fixed param was placed (InRegisters
+                // multi-piece OR ByReference hidden pointer). If this fn is variadic
+                // AND its fixed params overflow the register pool, va_start's
+                // per-register-slot displacement formula is WRONG for a multi-slot
+                // aggregate straddling the reg/stack boundary (SysV puts the whole
+                // struct in memory; the slot count undercounts) → lowerVaStart fails
+                // loud rather than silently miscompile.
+                currentFnHasAggregateFixedParam_ = true;
                 continue;
             }
             // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG / fixes D-ML7-2.10): a scalar
@@ -3347,6 +4902,18 @@ struct Lowerer {
                 symbolToValue[sym.v] = arg;
             }
         }
+        // FC12a-core (D-FC12A-VARIADIC-CALLEE): after every FIXED param is placed,
+        // `argCtr.gpr`/`.fpr` hold the count of fixed params that consumed an
+        // integer / SSE arg register (the sret hidden GPR, if any, is already
+        // included — argCtr is the single source). A SysVRegisterSave body `va_start`
+        // reads these to initialize gp_offset/fp_offset past the fixed args.
+        // FC12b: `argCtr.flat` is the slot-aligned named-arg SLOT count (Win64); a
+        // HomogeneousPointer `va_start` reads it to set ap = &home[flat], past ALL
+        // named slots (int OR float). For SysV (`slotAligned=false`) `flat` stays 0
+        // and is unused; for Win64 `gpr`/`fpr` stay 0 and `flat` is the live count.
+        currentFnFixedGpr_  = argCtr.gpr;
+        currentFnFixedFpr_  = argCtr.fpr;
+        currentFnFixedFlat_ = argCtr.flat;
         // Body: a single Block of statements.
         if (!lowerStmt(body)) {
             // Failed mid-body — seal the block so finish() can complete and

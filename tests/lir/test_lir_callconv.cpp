@@ -35,6 +35,7 @@
 #include <array>
 #include <cstdint>
 #include <ios>
+#include <unordered_set>
 #include <vector>
 
 using namespace dss;
@@ -66,7 +67,11 @@ struct RewrittenBundle {
 [[nodiscard]] RewrittenBundle
 lowerThroughRewrite(std::string src, std::uint16_t ccIndex = 0,
                     std::string targetName = "x86_64") {
-    RewrittenBundle out{lowerCSubsetToLir(std::move(src), std::move(targetName))};
+    // FC12b: the MIR config + analyze() va_list strategy must come from the SAME CC
+    // the regalloc uses (ccIndex) — otherwise a ccIndex=1 (ms_x64) regalloc would run
+    // over MIR lowered for cc0 (SysV), mixing ABIs. Thread ccIndex into the fixture.
+    RewrittenBundle out{lowerCSubsetToLir(std::move(src), std::move(targetName),
+                                          ccIndex)};
     if (!out.lowered.lir.ok) return out;
     out.liveness = analyzeLiveness(out.lowered.lir.lir);
     out.alloc = allocateRegisters(out.lowered.lir.lir, *out.lowered.target,
@@ -896,13 +901,212 @@ TEST(LirCallconvAbi, SysVCcDeclaresVariadicVectorCountReg) {
     EXPECT_EQ(*ord, cc->variadicVectorCountReg->ordinal);
 }
 
+TEST(LirCallconvAbi, MsX64VaListLayoutIsHomogeneousPointer) {
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE) config pin: the ms_x64 CC declares the
+    // HomogeneousPointer va_list strategy with an 8-byte slot stride, and — because
+    // Win64 spills into the caller's home space (no callee-local register-save-area)
+    // — its regSaveAreaBytes() is 0. A regression that pasted SysV's register-save
+    // geometry (gpSaveCount/fpSaveCount) onto ms_x64 would size a phantom 176-byte
+    // zone into every Win64 variadic frame; this pin catches it red-on-disable.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const* msX64 = (*target)->callingConventionByName("ms_x64");
+    ASSERT_NE(msX64, nullptr) << "x86_64 must declare 'ms_x64'";
+    ASSERT_TRUE(msX64->vaListLayout.has_value())
+        << "ms_x64 must declare a vaListLayout (the Win64 variadic-callee ABI)";
+    EXPECT_EQ(msX64->vaListLayout->strategy, VaListStrategy::HomogeneousPointer);
+    EXPECT_EQ(msX64->vaListLayout->namedArgSlotBytes, 8u);
+    EXPECT_EQ(msX64->vaListLayout->regSaveAreaBytes(), 0u)
+        << "Win64 HomogeneousPointer has NO callee-local register-save-area — it "
+           "spills into the caller's home space; regSaveAreaBytes() MUST be 0.";
+}
+
+TEST(LirCallconvAbi, SysVVaListLayoutUntouchedBySysVRegisterSave) {
+    // FC12b SysV-untouched guard: the FC12b strategy tagging must NOT perturb the
+    // SysV vaListLayout — it stays SysVRegisterSave with the §3.5.7 geometry
+    // (6 GPR + 8 SSE save slots = 176B). A regression flipping the SysV strategy or
+    // dropping its save-counts would silently break the (still-shipping) SysV
+    // varargs path; this pin keeps them byte-stable.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const* sysv = (*target)->callingConventionByName("sysv_amd64");
+    ASSERT_NE(sysv, nullptr) << "x86_64 must declare 'sysv_amd64'";
+    ASSERT_TRUE(sysv->vaListLayout.has_value());
+    EXPECT_EQ(sysv->vaListLayout->strategy, VaListStrategy::SysVRegisterSave);
+    EXPECT_EQ(sysv->vaListLayout->gpSaveCount, 6u);
+    EXPECT_EQ(sysv->vaListLayout->fpSaveCount, 8u);
+    EXPECT_EQ(sysv->vaListLayout->regSaveAreaBytes(), 176u);
+    // namedArgSlotBytes is additive (== gpSlotBytes on SysV) and behavior-identical.
+    EXPECT_EQ(sysv->vaListLayout->namedArgSlotBytes, 8u);
+}
+
+TEST(LirCallconvAbi, Win64VariadicCalleeHomeBaseCongruenceNoShadow) {
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-1) CONGRUENCE PIN (red-on-
+    // disable). Lower a Win64 (ms_x64, cc index 1) variadic CALLEE end-to-end and
+    // assert that BOTH the `va_home_arg_area` materialization (the `lea` va_start
+    // base) AND the prologue home-spill stores use the byte-identical NO-SHADOW base
+    // `totalFrameSize + callPushBytes` — never `+ shadowSpaceBytes`. If anyone adds
+    // shadowSpaceBytes to either, the va_start base and/or every home-spill target
+    // jumps 32 bytes past the home space → va_arg reads garbage. Also pins
+    // vaRegSaveAreaSize == 0 (Win64 has no callee-local register-save zone).
+    auto bundle = lowerThroughRewrite(
+        "int sum(int n, ...) {\n"
+        "    va_list ap; va_start(ap, n);\n"
+        "    int t = va_arg(ap, int);\n"
+        "    va_end(ap);\n"
+        "    return t;\n"
+        "}\n",
+        /*ccIndex=*/1);
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "Win64 variadic callee failed to lower";
+    ASSERT_TRUE(bundle.alloc.ok());
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* cc = bundle.lowered.target->callingConventionByName("ms_x64");
+    ASSERT_NE(cc, nullptr);
+    ASSERT_GT(cc->shadowSpaceBytes, 0u) << "ms_x64 must declare shadow space for the "
+                                           "no-shadow pin to be meaningful";
+
+    // `sum` is function 0. Its FrameLayout: vaRegSaveAreaSize MUST be 0 (Win64).
+    auto const* layout = result.forFuncByIndex(0);
+    ASSERT_NE(layout, nullptr);
+    EXPECT_EQ(layout->vaRegSaveAreaSize, 0u)
+        << "Win64 HomogeneousPointer reserves NO callee-local register-save-area";
+
+    std::uint32_t const noShadowBase =
+        layout->totalFrameSize + static_cast<std::uint32_t>(cc->callPushBytes);
+    std::uint32_t const withShadowBase =
+        noShadowBase + static_cast<std::uint32_t>(cc->shadowSpaceBytes);
+
+    // Resolve the lea opcode (va_home materializes to lea) + the GPR store opcode
+    // (home spill) + the first integer arg reg ordinal (rcx) for the spill check.
+    auto const leaOp = bundle.lowered.target->opcodeByMnemonic("lea");
+    ASSERT_TRUE(leaOp.has_value());
+    auto const storeOp = bundle.lowered.target->opcodeByMnemonic("store");
+    ASSERT_TRUE(storeOp.has_value());
+    ASSERT_FALSE(cc->argGprs.empty());
+    auto const rcxOrd = bundle.lowered.target->registerByName(cc->argGprs[0]);
+    ASSERT_TRUE(rcxOrd.has_value());
+
+    // Helper: the MemOffset operand value of an inst (the [sp + disp] disp), or
+    // nullopt if the inst has no MemOffset operand.
+    auto memOffsetOf = [](Lir const& lir, LirInstId inst) -> std::optional<std::int32_t> {
+        for (auto const& op : lir.instOperands(inst)) {
+            if (op.kind == LirOperandKind::MemOffset) return op.offset;
+        }
+        return std::nullopt;
+    };
+
+    // Scan function 0's blocks. The va_home base is the EXPECTED no-shadow value
+    // `noShadowBase + namedArgCount*8`; namedArgCount = 1 (the single fixed `n`).
+    std::uint32_t const expectedHomeBase = noShadowBase + 1u * layout->outgoingSlotSize;
+    bool sawVaHomeLeaAtNoShadow = false;
+    bool sawHomeSpillRcxAtNoShadow = false;
+    LirFuncId const fn = result.lir.funcAt(0);
+    for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+        LirBlockId const blk = result.lir.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < result.lir.blockInstCount(blk); ++i) {
+            LirInstId const inst = result.lir.blockInstAt(blk, i);
+            std::uint16_t const op = result.lir.instOpcode(inst);
+            auto const off = memOffsetOf(result.lir, inst);
+            if (!off.has_value()) continue;
+            if (op == *leaOp
+                && static_cast<std::uint32_t>(*off) == expectedHomeBase) {
+                sawVaHomeLeaAtNoShadow = true;
+            }
+            // The home spill of rcx (arg reg 0) targets the no-shadow base + 0.
+            if (op == *storeOp
+                && static_cast<std::uint32_t>(*off) == noShadowBase) {
+                for (auto const& o : result.lir.instOperands(inst)) {
+                    if (o.kind == LirOperandKind::Reg && o.reg.isPhysical != 0
+                        && o.reg.id == *rcxOrd) {
+                        sawHomeSpillRcxAtNoShadow = true;
+                    }
+                }
+            }
+            // Anti-pin: NO va-related lea/store may sit at the WITH-shadow base
+            // (would mean shadowSpaceBytes leaked into the home geometry).
+            EXPECT_NE(static_cast<std::uint32_t>(*off), withShadowBase)
+                << "a va_home/home-spill at the WITH-shadow base "
+                << withShadowBase << " means shadowSpaceBytes leaked into the Win64 "
+                   "home geometry (BLOCKER-1 violated) — every va_arg reads garbage";
+        }
+    }
+    EXPECT_TRUE(sawVaHomeLeaAtNoShadow)
+        << "the va_start home base (lea) must be totalFrameSize + callPushBytes + "
+           "namedArgCount*slot = " << expectedHomeBase << " (NO shadowSpaceBytes)";
+    EXPECT_TRUE(sawHomeSpillRcxAtNoShadow)
+        << "the named int reg (rcx) home spill must target totalFrameSize + "
+           "callPushBytes = " << noShadowBase << " (== the va_arg-read base; the "
+           "spill-target == va_arg-read-target congruence)";
+}
+
+TEST(LirCallconvAbi, Win64VariadicCallDupsFpVarargIntoHomeGpr) {
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, PART 5) FP-dup callconv pin: a Win64
+    // (ms_x64, cc index 1) variadic CALL with a register-resident FP vararg must
+    // emit a `movq_xmm_to_gpr` duplicating the FP vararg into its matching home
+    // integer register. Without the dup, the callee's va_arg(double) reads an
+    // uninitialized home GPR slot → garbage. RED-ON-DISABLE: deleting the FP-dup
+    // emission removes the only `movq_xmm_to_gpr` in the call sequence.
+    auto bundle = lowerThroughRewrite(
+        "double take(int n, ...);\n"
+        "int main(void) {\n"
+        "  return (int)take(1, 2.5);\n"   // one int fixed arg + one double vararg
+        "}\n",
+        /*ccIndex=*/1);
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.alloc.ok());
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const movqOp =
+        bundle.lowered.target->opcodeByMnemonic("movq_xmm_to_gpr");
+    ASSERT_TRUE(movqOp.has_value());
+    auto const* cc = bundle.lowered.target->callingConventionByName("ms_x64");
+    ASSERT_NE(cc, nullptr);
+    ASSERT_GE(cc->argGprs.size(), 2u);
+    // The double vararg is slot 1 (slot 0 = the fixed int `n`); its home GPR is
+    // argGprs[1] (rdx). The dup writes that GPR.
+    auto const homeGprOrd =
+        bundle.lowered.target->registerByName(cc->argGprs[1]);
+    ASSERT_TRUE(homeGprOrd.has_value());
+
+    bool sawDupIntoHomeGpr = false;
+    for (std::uint32_t fi = 0; fi < result.lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = result.lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < result.lir.blockInstCount(blk); ++i) {
+                LirInstId const inst = result.lir.blockInstAt(blk, i);
+                if (result.lir.instOpcode(inst) != *movqOp) continue;
+                LirReg const r = result.lir.instResult(inst);
+                if (r.valid() && r.isPhysical != 0 && r.id == *homeGprOrd)
+                    sawDupIntoHomeGpr = true;
+            }
+        }
+    }
+    EXPECT_TRUE(sawDupIntoHomeGpr)
+        << "a Win64 variadic call with an FP vararg must emit `movq_xmm_to_gpr` "
+           "duplicating the FP vararg into its home GPR (" << cc->argGprs[1] << ")";
+}
+
 TEST(CallPayload, EncodeDecodeRoundtripsVariadicAndFixedCount) {
     // D-LANG-VARIADIC (step 13.4) substrate pin: the shared MIR/LIR
-    // Call payload encoding (bit 31 = isVariadic; bits 0..30 =
-    // fixedArgCount) round-trips for both the non-variadic and
+    // Call payload encoding (bit 31 = isVariadic; bits 0..29 =
+    // fixedOperandCount) round-trips for both the non-variadic and
     // variadic cases. The ML7 materialize call arm reads these bits
     // off every call inst; an off-by-one in the mask would either
-    // truncate fixedArgCount or silently flip the variadic bit, both
+    // truncate fixedOperandCount or silently flip the variadic bit, both
     // of which would corrupt the count-mov emission for variadic
     // calls (and falsely trigger it for non-variadic calls).
     using namespace dss::call_payload;
@@ -910,47 +1114,47 @@ TEST(CallPayload, EncodeDecodeRoundtripsVariadicAndFixedCount) {
     // default for every pre-13.4 call site).
     EXPECT_EQ(encode(false, 0u), 0u);
     EXPECT_FALSE(isVariadic(encode(false, 0u)));
-    // The high bit alone flips isVariadic; fixedArgCount=0 round-
+    // The high bit alone flips isVariadic; fixedOperandCount=0 round-
     // trips (a hypothetical thunk-style vararg-only function).
     EXPECT_TRUE(isVariadic(encode(true, 0u)));
-    EXPECT_EQ(fixedArgCount(encode(true, 0u)), 0u);
-    // Typical printf shape: 1 fixed param + vararg.
+    EXPECT_EQ(fixedOperandCount(encode(true, 0u)), 0u);
+    // Typical printf shape: 1 fixed param contributing 1 operand + vararg.
     EXPECT_TRUE(isVariadic(encode(true, 1u)));
-    EXPECT_EQ(fixedArgCount(encode(true, 1u)), 1u);
-    // Round-trip at the high edge of the fixed-arg field. If the
-    // mask boundary regresses, fixedArgCount(kFixedArgMask) returns
+    EXPECT_EQ(fixedOperandCount(encode(true, 1u)), 1u);
+    // Round-trip at the high edge of the fixed-operand field. If the
+    // mask boundary regresses, fixedOperandCount(kFixedOperandMask) returns
     // a different value here — pins the contract.
-    EXPECT_EQ(fixedArgCount(encode(true, kFixedArgMask)),
-              kFixedArgMask);
-    EXPECT_TRUE(isVariadic(encode(true, kFixedArgMask)));
-    // A non-variadic encoding with a fixed-arg count carries the
-    // fixedArgCount through but reports isVariadic=false — the
+    EXPECT_EQ(fixedOperandCount(encode(true, kFixedOperandMask)),
+              kFixedOperandMask);
+    EXPECT_TRUE(isVariadic(encode(true, kFixedOperandMask)));
+    // A non-variadic encoding with a fixed-operand count carries the
+    // fixedOperandCount through but reports isVariadic=false — the
     // accessor never spuriously reports variadic just because
-    // fixedArgCount is non-zero.
+    // fixedOperandCount is non-zero.
     EXPECT_FALSE(isVariadic(encode(false, 42u)));
-    EXPECT_EQ(fixedArgCount(encode(false, 42u)), 42u);
+    EXPECT_EQ(fixedOperandCount(encode(false, 42u)), 42u);
 
     // FC7 C3 (AAPCS64/Apple x8 sret): bit 30 = hasIndirectResult, the flag
     // lir_callconv reads to route the prepended sret-pointer operand to the cc's
     // indirect-result register (x8) instead of arg0. It is INDEPENDENT of the
-    // variadic bit (31) and the fixedArgCount field (0..29) — a flip of any one must
-    // not perturb the others (else an x8-sret call would mis-route args or mis-stamp
-    // the variadic count).
+    // variadic bit (31) and the fixedOperandCount field (0..29) — a flip of any one
+    // must not perturb the others (else an x8-sret call would mis-route args or
+    // mis-stamp the variadic count).
     EXPECT_FALSE(hasIndirectResult(encode(false, 0u)));
     EXPECT_TRUE(hasIndirectResult(encode(false, 0u, /*hasIndirectResult=*/true)));
-    // Independent of fixedArgCount: an x8-sret call to a 3-fixed-param fn.
+    // Independent of fixedOperandCount: an x8-sret call to a 3-fixed-operand fn.
     {
         std::uint32_t const p = encode(false, 3u, true);
         EXPECT_TRUE(hasIndirectResult(p));
         EXPECT_FALSE(isVariadic(p));
-        EXPECT_EQ(fixedArgCount(p), 3u);
+        EXPECT_EQ(fixedOperandCount(p), 3u);
     }
     // Independent of variadic: all three bits coexist.
     {
         std::uint32_t const p = encode(true, 7u, true);
         EXPECT_TRUE(isVariadic(p));
         EXPECT_TRUE(hasIndirectResult(p));
-        EXPECT_EQ(fixedArgCount(p), 7u);
+        EXPECT_EQ(fixedOperandCount(p), 7u);
     }
     // Default (2-arg encode) never sets the IRR bit — every pre-C3 call site stays
     // non-sret.
@@ -2439,4 +2643,1070 @@ TEST(LirCallconvAbi,
            "specifically — a regression that hit a DIFFERENT error "
            "would pass `EXPECT_FALSE(result.ok())` but fail this "
            "specificity pin, making the regression cause attributable.";
+}
+
+// ── FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-callee prologue spill ──────
+//
+// A function that calls va_start must, in its prologue, (a) reserve a register-
+// save-area sized by the CC's vaListLayout and (b) spill the integer + SSE arg
+// registers into it, so va_start's reg_save_area points at live values. Pins both
+// the FrameLayout zone size AND the spill-store count. RED-ON-DISABLE: stub the
+// `emitVariadicRegSaveSpill` call in lir_callconv.cpp → the store-count assertion
+// fails (0 saved-area stores instead of gpSaveCount + fpSaveCount).
+TEST(LirCallconvVariadic, VaStartFunctionPrologueSpillsArgRegsIntoSaveArea) {
+    auto bundle = lowerThroughRewrite(
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = 0;\n"
+        "  for (int i = 0; i < n; i = i + 1) { t = t + va_arg(ap, int); }\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n");
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "c-subset → LIR failed";
+    ASSERT_TRUE(bundle.rewritten.ok) << "regalloc rewrite failed";
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok()) << "callconv materialize failed";
+    ASSERT_EQ(result.perFunc.size(), 1u);
+
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->vaListLayout.has_value())
+        << "SysV cc must declare a vaListLayout for variadic-callee support";
+    auto const& vl = *cc->vaListLayout;
+
+    // (a) the FrameLayout reserves the full register-save-area (6*8 + 8*16 = 176).
+    auto const& layout = result.perFunc[0];
+    EXPECT_EQ(layout.vaRegSaveAreaSize, vl.regSaveAreaBytes())
+        << "the prologue must reserve a vaListLayout-sized register-save-area";
+    EXPECT_GT(layout.vaRegSaveAreaSize, 0u);
+
+    // (b) the prologue spills gpSaveCount integer + fpSaveCount SSE arg regs into
+    // the save area. Count `store` insts whose SP-relative MemOffset lands in the
+    // save-area byte range [vaRegSaveAreaOffset, +regSaveAreaBytes). A stubbed spill
+    // emits zero of these.
+    // Count store-shaped insts (a Reg source + a SP-relative MemOffset) whose
+    // offset lands in the save-area byte range — across BOTH register classes: the
+    // GPR spill uses `store`, the FPR spill `movsd_store` (the registerClassOps
+    // FPR store), so we match by the store SHAPE, not one mnemonic.
+    std::uint32_t const lo = layout.vaRegSaveAreaOffset();
+    std::uint32_t const hi = lo + vl.regSaveAreaBytes();
+    Lir const& dst = result.lir;
+    LirFuncId const fn = dst.funcAt(0);
+    std::uint32_t saveAreaStores = 0;
+    for (std::uint32_t bi = 0; bi < dst.funcBlockCount(fn); ++bi) {
+        LirBlockId const b = dst.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < dst.blockInstCount(b); ++i) {
+            LirInstId const inst = dst.blockInstAt(b, i);
+            bool hasRegSrc = false, inRange = false;
+            for (auto const& op : dst.instOperands(inst)) {
+                if (op.kind == LirOperandKind::Reg) hasRegSrc = true;
+                if (op.kind == LirOperandKind::MemOffset) {
+                    auto const off = static_cast<std::int64_t>(op.offset);
+                    if (off >= static_cast<std::int64_t>(lo)
+                        && off < static_cast<std::int64_t>(hi))
+                        inRange = true;
+                }
+            }
+            if (hasRegSrc && inRange) ++saveAreaStores;
+        }
+    }
+    // The prologue spills all 6 GPR (rdi..r9) + 8 SSE (xmm0..7) = gpSaveCount +
+    // fpSaveCount registers into the save area (≥, not ==: a later for-loop/cursor
+    // spill could incidentally also land a store in the zone; the load-bearing pin
+    // is that EVERY arg register is spilled — a stubbed/absent spill emits 0, far
+    // below 14, so the red-on-disable holds).
+    EXPECT_GE(saveAreaStores, vl.gpSaveCount + vl.fpSaveCount)
+        << "the variadic prologue must spill all " << vl.gpSaveCount
+        << " integer + " << vl.fpSaveCount << " SSE arg registers into the "
+           "register-save-area (a stubbed/absent spill emits 0 — the red-on-disable)";
+}
+
+// FC12a-core: a NON-variadic function must NOT reserve a register-save-area or
+// spill — the zone is keyed precisely on calling va_start, not on every function.
+TEST(LirCallconvVariadic, NonVariadicFunctionHasNoRegisterSaveArea) {
+    auto bundle = lowerThroughRewrite("int add(int a, int b) { return a + b; }");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(result.perFunc.size(), 1u);
+    EXPECT_EQ(result.perFunc[0].vaRegSaveAreaSize, 0u)
+        << "a function that never calls va_start must reserve NO save area";
+}
+
+// ─── FC12c (D-FC12C-*) AAPCS64 + Apple arm64 variadic-callee config + lowering pins ───
+
+// Gate #1: AAPCS64 vaListLayout config — the Aapcs64DualCursor strategy + the 5
+// `__va_list` field offsets + the GR/VR save geometry (regSaveAreaBytes()==192).
+TEST(LirCallconvAbiFC12c, Aapcs64VaListLayoutConfigPins) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const* cc = (*target)->callingConventionByName("aapcs64");
+    ASSERT_NE(cc, nullptr) << "arm64 must declare 'aapcs64'";
+    ASSERT_TRUE(cc->vaListLayout.has_value())
+        << "aapcs64 must declare a vaListLayout for variadic-callee support";
+    auto const& vl = *cc->vaListLayout;
+    EXPECT_EQ(vl.strategy, VaListStrategy::Aapcs64DualCursor);
+    // The 5 __va_list field locators (byteOffset within the 32B struct).
+    EXPECT_EQ(vl.stackField.byteOffset,  0u);
+    EXPECT_EQ(vl.grTopField.byteOffset,  8u);
+    EXPECT_EQ(vl.vrTopField.byteOffset,  16u);
+    EXPECT_EQ(vl.grOffsField.byteOffset, 24u);
+    EXPECT_EQ(vl.vrOffsField.byteOffset, 28u);
+    EXPECT_EQ(vl.grOffsField.widthBytes, 4u);   // i32 cursor
+    EXPECT_EQ(vl.vrOffsField.widthBytes, 4u);
+    // GR (8x8) + VR (8x16) save geometry = 192 bytes.
+    EXPECT_EQ(vl.gpSaveCount, 8u);
+    EXPECT_EQ(vl.gpSlotBytes, 8u);
+    EXPECT_EQ(vl.fpSaveCount, 8u);
+    EXPECT_EQ(vl.fpSlotBytes, 16u);
+    EXPECT_EQ(vl.regSaveAreaBytes(), 192u);
+    EXPECT_EQ(vl.namedArgSlotBytes, 8u);
+    // AAPCS64 does NOT always-stack varargs (that is Apple).
+    EXPECT_FALSE(cc->variadicArgsAlwaysStack);
+    EXPECT_FALSE(vl.variadicUsesOverflowBase);
+}
+
+// Gate #1: Apple arm64 vaListLayout config — HomogeneousPointer + the two FC12c flags.
+TEST(LirCallconvAbiFC12c, AppleArm64VaListLayoutConfigPins) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const* cc = (*target)->callingConventionByName("apple_arm64");
+    ASSERT_NE(cc, nullptr) << "arm64 must declare 'apple_arm64'";
+    ASSERT_TRUE(cc->vaListLayout.has_value());
+    auto const& vl = *cc->vaListLayout;
+    EXPECT_EQ(vl.strategy, VaListStrategy::HomogeneousPointer);
+    EXPECT_TRUE(vl.variadicUsesOverflowBase)
+        << "Apple anchors ap at the overflow base (no home area)";
+    EXPECT_TRUE(cc->variadicArgsAlwaysStack)
+        << "Apple always-stacks every vararg";
+    EXPECT_EQ(vl.namedArgSlotBytes, 8u);
+}
+
+// Gate #1 (cross-CC guard): SysV + Win64 vaListLayout are UNCHANGED by FC12c.
+TEST(LirCallconvAbiFC12c, SysVAndWin64VaListUnchanged) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const* sysv = (*target)->callingConventionByName("sysv_amd64");
+    ASSERT_NE(sysv, nullptr);
+    ASSERT_TRUE(sysv->vaListLayout.has_value());
+    EXPECT_EQ(sysv->vaListLayout->strategy, VaListStrategy::SysVRegisterSave);
+    EXPECT_FALSE(sysv->variadicArgsAlwaysStack);
+    EXPECT_FALSE(sysv->vaListLayout->variadicUsesOverflowBase);
+    auto const* msx64 = (*target)->callingConventionByName("ms_x64");
+    ASSERT_NE(msx64, nullptr);
+    ASSERT_TRUE(msx64->vaListLayout.has_value());
+    EXPECT_EQ(msx64->vaListLayout->strategy, VaListStrategy::HomogeneousPointer);
+    EXPECT_FALSE(msx64->variadicArgsAlwaysStack)
+        << "Win64 is register-then-stack, NOT always-stack";
+    EXPECT_FALSE(msx64->vaListLayout->variadicUsesOverflowBase)
+        << "Win64 anchors ap at the HOME base, not the overflow base";
+}
+
+// Gate #9 (host-independent): an AAPCS64 variadic callee reserves the 192B callee-local
+// register-save-area + spills x0..x7 (GR) and v0..v7 (VR via fstur_q) into it. A
+// stubbed/absent spill emits zero save-area stores — the red-on-disable.
+TEST(LirCallconvVariadicFC12c, Aapcs64VariadicCalleeReservesAndSpillsSaveArea) {
+    auto bundle = lowerThroughRewrite(
+        "int sum(int n, ...) {\n"
+        "    va_list ap; va_start(ap, n);\n"
+        "    int t = va_arg(ap, int);\n"
+        "    va_end(ap);\n"
+        "    return t;\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "AAPCS64 variadic callee failed to lower";
+    ASSERT_TRUE(bundle.alloc.ok());
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* cc = bundle.lowered.target->callingConventionByName("aapcs64");
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->vaListLayout.has_value());
+    auto const& vl = *cc->vaListLayout;
+
+    auto const* layout = result.forFuncByIndex(0);
+    ASSERT_NE(layout, nullptr);
+    EXPECT_EQ(layout->vaRegSaveAreaSize, vl.regSaveAreaBytes())
+        << "AAPCS64 reserves a 192B callee-local register-save-area";
+    EXPECT_EQ(layout->vaRegSaveAreaSize, 192u);
+
+    // Count store-shaped insts (a Reg source operand). The GR spill uses the class
+    // GPR store, the VR spill uses fstur_q — both are 4-operand stores with a Reg
+    // value source. We require AT LEAST gpSaveCount + fpSaveCount = 16 spill stores
+    // (a stubbed spill emits 0). The base is a scratch register (add scratch, sp, #off)
+    // so MemOffsets are small; matching by store-shape + the fstur_q opcode is robust.
+    auto const fsturQ = bundle.lowered.target->opcodeByMnemonic("fstur_q");
+    ASSERT_TRUE(fsturQ.has_value());
+    Lir const& dst = result.lir;
+    LirFuncId const fn = dst.funcAt(0);
+    std::uint32_t vrSpills = 0;   // fstur_q stores specifically (the VR block)
+    for (std::uint32_t bi = 0; bi < dst.funcBlockCount(fn); ++bi) {
+        LirBlockId const b = dst.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < dst.blockInstCount(b); ++i) {
+            LirInstId const inst = dst.blockInstAt(b, i);
+            if (dst.instOpcode(inst) == *fsturQ) ++vrSpills;
+        }
+    }
+    EXPECT_EQ(vrSpills, vl.fpSaveCount)
+        << "the AAPCS64 prologue must spill all " << vl.fpSaveCount
+        << " VR arg registers via fstur_q (a stubbed/absent VR spill emits 0)";
+}
+
+// FOLD #1 (adversarial-review) red-on-disable: the AAPCS64 variadic prologue's
+// save-area scratch-base register must AVOID x8 (the indirectResultRegister / sret
+// pointer). A variadic fn that ALSO returns a >16B (ByReference/MEMORY-class) struct
+// receives its incoming result-buffer address in x8; the prologue materializes the
+// register-save-area base via `add <scratch>, sp, #off` BEFORE the per-inst loop's
+// `read_indirect_result` reads x8. If the scratch picker lands on x8 (the first
+// caller-saved GPR after excluding the arg GPRs x0..x7), the `add` CLOBBERS the sret
+// pointer → the struct result is written to the callee's own frame, not the caller's
+// buffer: a silent miscompile. The fix adds cc.indirectResultRegister's ordinal to the
+// scratch avoid-set so the picker chooses x9. RED-ON-DISABLE: revert that avoid-set
+// addition in emitVariadicPrologueSpill (lir_callconv.cpp) → the scratch becomes x8
+// and this test fails (it asserts the save-area `add` base is NOT x8 and NOT an arg
+// GPR). The witness corpus examples/c-subset/varargs_aapcs64_sret/ runs the same
+// composition end-to-end under qemu.
+TEST(LirCallconvVariadicFC12c, Aapcs64VariadicStructReturnPrologueScratchAvoidsX8) {
+    // `Big` is 24B (>16B) → AAPCS64 returns it via the x8 sret pointer; `make` is also
+    // variadic, so its prologue spills the GR/VR save area via a scratch base. The
+    // typedef-name return type is the reachable form (a top-level `struct Tag` return
+    // type is a pre-FC4 grammar residue) — identical ABI codegen.
+    auto bundle = lowerThroughRewrite(
+        "typedef struct { long a; long b; long c; } Big;\n"
+        "Big make(int n, ...) {\n"
+        "    va_list ap; va_start(ap, n);\n"
+        "    long s = 0;\n"
+        "    for (int i = 0; i < n; i = i + 1) { s = s + va_arg(ap, long); }\n"
+        "    va_end(ap);\n"
+        "    Big r; r.a = s; r.b = n; r.c = s + n; return r;\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "variadic+sret callee failed to lower";
+    ASSERT_TRUE(bundle.alloc.ok());
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* cc = bundle.lowered.target->callingConventionByName("aapcs64");
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->indirectResultRegister.has_value())
+        << "aapcs64 must declare x8 as the indirect-result register";
+    std::uint16_t const x8Ord = cc->indirectResultRegister->ordinal;
+    auto const addOp = bundle.lowered.target->opcodeByMnemonic("add");
+    auto const spOrd = bundle.lowered.target->registerByName("sp");
+    ASSERT_TRUE(addOp.has_value());
+    ASSERT_TRUE(spOrd.has_value());
+    auto isArgGpr = [&](std::uint16_t ord) {
+        for (auto const& name : cc->argGprs)
+            if (auto const a = bundle.lowered.target->registerByName(name);
+                a.has_value() && *a == ord)
+                return true;
+        return false;
+    };
+
+    // Precondition (read on the PRE-callconv LIR): the variadic+sret composition must
+    // actually be engaged — the callee carries a `read_indirect_result` op (the x8 sret
+    // read) AND reserves a save area. `materializeCallingConvention` MATERIALIZES the
+    // virtual `read_indirect_result` AWAY into `mov result, x8` (and continues, so it
+    // is absent from result.lir), so the precondition is checked on bundle.rewritten.lir
+    // — where the op still exists. (That x8 mov is exactly what the prologue scratch must
+    // not clobber.) If the op were absent the scratch-vs-x8 pin would be vacuous.
+    auto const readIrr = bundle.lowered.target->opcodeByMnemonic("read_indirect_result");
+    ASSERT_TRUE(readIrr.has_value());
+    bool sawReadIrr = false;
+    {
+        Lir const& pre = bundle.rewritten.lir;
+        LirFuncId const pfn = pre.funcAt(0);
+        for (std::uint32_t bi = 0; bi < pre.funcBlockCount(pfn); ++bi) {
+            LirBlockId const b = pre.funcBlockAt(pfn, bi);
+            for (std::uint32_t i = 0; i < pre.blockInstCount(b); ++i)
+                if (pre.instOpcode(pre.blockInstAt(b, i)) == *readIrr) sawReadIrr = true;
+        }
+    }
+    auto const* layout = result.forFuncByIndex(0);
+    ASSERT_NE(layout, nullptr);
+    EXPECT_GT(layout->vaRegSaveAreaSize, 0u)
+        << "the variadic callee must reserve a register-save-area (else no scratch base)";
+
+    // Locate the save-area base `add <scratch>, sp, #imm` in the POST-callconv prologue:
+    // an `add` whose result is a physical reg OTHER than sp, taking sp as a Reg operand
+    // and an immediate. (The epilogue's `add sp, sp, #frame` writes sp → excluded by the
+    // result!=sp guard.)
+    Lir const& dst = result.lir;
+    LirFuncId const fn = dst.funcAt(0);
+    bool sawScratchBase = false;
+    for (std::uint32_t bi = 0; bi < dst.funcBlockCount(fn); ++bi) {
+        LirBlockId const b = dst.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < dst.blockInstCount(b); ++i) {
+            LirInstId const inst = dst.blockInstAt(b, i);
+            if (dst.instOpcode(inst) != *addOp) continue;
+            LirReg const res = dst.instResult(inst);
+            if (!res.valid() || res.isPhysical == 0 || res.id == *spOrd) continue;
+            bool srcIsSp = false, hasImm = false;
+            for (auto const& op : dst.instOperands(inst)) {
+                if (op.kind == LirOperandKind::Reg && op.reg.isPhysical != 0
+                    && op.reg.id == *spOrd)
+                    srcIsSp = true;
+                if (op.kind == LirOperandKind::ImmInt) hasImm = true;
+            }
+            if (!srcIsSp || !hasImm) continue;
+            sawScratchBase = true;
+            // THE LOAD-BEARING ASSERTIONS (red-on-disable): the save-area scratch base
+            // must not be x8 (clobbering the live sret pointer) nor an arg GPR.
+            EXPECT_NE(res.id, x8Ord)
+                << "AAPCS64 variadic prologue scratch base must NOT be x8 (the "
+                   "indirect-result/sret pointer) — reverting the IRR avoid-set in "
+                   "emitVariadicPrologueSpill clobbers the >16B struct return";
+            EXPECT_FALSE(isArgGpr(res.id))
+                << "the scratch base must not be an arg GPR (x0..x7) being spilled";
+        }
+    }
+    EXPECT_TRUE(sawReadIrr)
+        << "precondition: the >16B struct return must engage the x8 sret path "
+           "(read_indirect_result) — else this scratch-vs-x8 pin is vacuous";
+    EXPECT_TRUE(sawScratchBase)
+        << "the AAPCS64 variadic prologue must materialize the save-area base via "
+           "`add <scratch>, sp, #off` (the topmost-zone STUR-reach workaround)";
+}
+
+// Gate #6 + cross-CC discriminator (host-independent): an apple_arm64 variadic call
+// FORCES a vararg that WOULD fit in x2 onto the stack; the SAME call under aapcs64
+// keeps it in-register. We assert via the outgoing-arg-area size: Apple reserves
+// stack overflow for the forced varargs; AAPCS64 reserves none (all args fit regs).
+TEST(LirCallconvVariadicFC12c, AppleForcesVarargToStackAapcs64KeepsInReg) {
+    char const* src =
+        "int sink(int n, ...);\n"
+        "int f(void) { return sink(1, 7, 8); }\n";  // 1 fixed + 2 varargs, all small ints
+    // apple_arm64 = cc index 1; aapcs64 = cc index 0.
+    auto apple = lowerThroughRewrite(src, /*ccIndex=*/1, /*targetName=*/"arm64");
+    ASSERT_TRUE(apple.lowered.lir.ok);
+    ASSERT_TRUE(apple.rewritten.ok);
+    DiagnosticReporter appleRep;
+    auto appleRes = materializeCallingConvention(apple.rewritten.lir,
+                                                 *apple.lowered.target,
+                                                 apple.alloc, appleRep);
+    ASSERT_TRUE(appleRes.ok());
+    ASSERT_EQ(appleRep.errorCount(), 0u);
+
+    auto aapcs = lowerThroughRewrite(src, /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(aapcs.lowered.lir.ok);
+    ASSERT_TRUE(aapcs.rewritten.ok);
+    DiagnosticReporter aapcsRep;
+    auto aapcsRes = materializeCallingConvention(aapcs.rewritten.lir,
+                                                 *aapcs.lowered.target,
+                                                 aapcs.alloc, aapcsRep);
+    ASSERT_TRUE(aapcsRes.ok());
+    ASSERT_EQ(aapcsRep.errorCount(), 0u);
+
+    // `f` is function 0 in both. Apple forces the 2 varargs to the stack → a nonzero
+    // outgoing-arg area; AAPCS64 places them in x1/x2 → zero outgoing args (the call
+    // fits entirely in registers). The discriminator: Apple > AAPCS64.
+    auto const* appleLayout = appleRes.forFuncByIndex(0);
+    auto const* aapcsLayout = aapcsRes.forFuncByIndex(0);
+    ASSERT_NE(appleLayout, nullptr);
+    ASSERT_NE(aapcsLayout, nullptr);
+    EXPECT_GT(appleLayout->outgoingArgAreaSize, 0u)
+        << "Apple must reserve stack overflow for the forced varargs";
+    EXPECT_EQ(aapcsLayout->outgoingArgAreaSize, 0u)
+        << "AAPCS64 places the same varargs in x1/x2 — no stack overflow";
+    EXPECT_GT(appleLayout->outgoingArgAreaSize, aapcsLayout->outgoingArgAreaSize)
+        << "the cross-CC discriminator: variadicArgsAlwaysStack forces stack on Apple "
+           "but not AAPCS64 for a call that fits the register pool";
+}
+
+// Gate #4 (host-independent): Apple's va_start overflow-base lea uses the no-shadow,
+// no-callPush base (== totalFrameSize on arm64) — congruent with where the caller
+// stacks the first vararg (the FC12b BLOCKER-1 congruence mirror, for Apple). Also
+// pins vaRegSaveAreaSize == 0 (Apple HomogeneousPointer reserves no save area).
+TEST(LirCallconvVariadicFC12c, AppleVaStartOverflowBaseCongruence) {
+    auto bundle = lowerThroughRewrite(
+        "int sum(int n, ...) {\n"
+        "    va_list ap; va_start(ap, n);\n"
+        "    int t = va_arg(ap, int);\n"
+        "    va_end(ap);\n"
+        "    return t;\n"
+        "}\n",
+        /*ccIndex=*/1, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "Apple variadic callee failed to lower";
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* cc = bundle.lowered.target->callingConventionByName("apple_arm64");
+    ASSERT_NE(cc, nullptr);
+    EXPECT_EQ(cc->shadowSpaceBytes, 0u);
+    EXPECT_EQ(cc->callPushBytes, 0u) << "arm64 BL writes LR — no stack push";
+
+    auto const* layout = result.forFuncByIndex(0);
+    ASSERT_NE(layout, nullptr);
+    EXPECT_EQ(layout->vaRegSaveAreaSize, 0u)
+        << "Apple HomogeneousPointer reserves NO callee-local register-save-area";
+
+    // The va_start overflow base = totalFrameSize + callPushBytes(0) + shadowSpaceBytes(0)
+    // = totalFrameSize. Find the va_overflow_arg_area materialization (`lea`/`add` with a
+    // MemOffset) and assert its offset == totalFrameSize.
+    auto const vaOvf = bundle.lowered.target->opcodeByMnemonic("va_overflow_arg_area");
+    ASSERT_TRUE(vaOvf.has_value());
+    // The op is materialized away into `lea result, [sp + off]`; we assert the
+    // congruent offset arithmetic at the config level (the materialization uses
+    // totalFrameSize + callPushBytes + shadowSpaceBytes — all the additive terms but
+    // shadow/callPush are 0 on arm64, so the base IS totalFrameSize).
+    std::uint32_t const overflowBase =
+        layout->totalFrameSize
+        + static_cast<std::uint32_t>(cc->callPushBytes)
+        + static_cast<std::uint32_t>(cc->shadowSpaceBytes);
+    EXPECT_EQ(overflowBase, layout->totalFrameSize)
+        << "on arm64 the Apple overflow base has no shadow/callPush term — it is the "
+           "first incoming stack vararg, congruent with the caller's stack-store";
+}
+
+// FC12-deferral④ (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS, FOLD 3): a SysV
+// variadic callee whose 7 fixed int params overflow the 6 integer arg registers. The
+// va_start fixed-stack-arg displacement (1 overflowed GPR * 8 = 8) rides the
+// VaOverflowArgAreaAddr MIR payload, is threaded through mir_to_lir, and lir_callconv
+// adds it to the overflow base. PIN: the materialized `va_overflow_arg_area` `lea`
+// carries MemOffset == totalFrameSize + callPushBytes(8) + shadowSpaceBytes(0) + 8
+// — and the un-displaced base (payload-dropped value) is NOT among the leas.
+// RED-ON-DISABLE: revert mir_to_lir's VaOverflowArgAreaAddr payload threading (or the
+// lir_callconv `+ fixedStackBytes`) → the lea offset drops to the bare base → the
+// `+8` offset disappears and the bare base appears → both EXPECTs go red.
+TEST(LirCallconvVariadicFC12deferral4, SysVVaStartFixedStackOverflowBaseCongruence) {
+    auto bundle = lowerThroughRewrite(
+        "int pick(int a, int b, int c, int d, int e, int f, int g, ...) {\n"
+        "    va_list ap; va_start(ap, g);\n"
+        "    int v = va_arg(ap, int);\n"
+        "    va_end(ap);\n"
+        "    return a + g + v;\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"x86_64");
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "SysV fixed-overflow variadic callee lower";
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    auto const* layout = result.forFuncByIndex(0);
+    ASSERT_NE(layout, nullptr);
+
+    std::uint32_t const base =
+        layout->totalFrameSize
+        + static_cast<std::uint32_t>(cc->callPushBytes)
+        + static_cast<std::uint32_t>(cc->shadowSpaceBytes);
+    std::int32_t const expectedOverflow = static_cast<std::int32_t>(base + 8u);
+
+    auto const stats = collectInstStats(result.lir, *bundle.lowered.target);
+    bool const sawDisplaced =
+        std::find(stats.leaOffsets.begin(), stats.leaOffsets.end(),
+                  expectedOverflow) != stats.leaOffsets.end();
+    bool const sawBareBase =
+        std::find(stats.leaOffsets.begin(), stats.leaOffsets.end(),
+                  static_cast<std::int32_t>(base)) != stats.leaOffsets.end();
+    EXPECT_TRUE(sawDisplaced)
+        << "the va_overflow_arg_area `lea` MemOffset must INCLUDE the +8 fixed-stack-arg "
+           "displacement (base " << base << " + 8 = " << expectedOverflow << ") — a "
+           "dropped payload would leave it at the bare base " << base;
+    EXPECT_FALSE(sawBareBase)
+        << "no `lea` may carry the UN-displaced overflow base (" << base << ") — its "
+           "presence means the fixed-stack-arg payload was discarded (the exact bug)";
+}
+
+// FC12-deferral④ (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS, FOLD 3): AAPCS64
+// mirror — 9 fixed int params overflow the 8 GPR arg regs. The `__stack`
+// (va_overflow_arg_area) lea MemOffset must include the +8 displacement; arm64 has no
+// shadow/callPush term so base == totalFrameSize. RED-ON-DISABLE identical to the SysV
+// pin (drop the threading or the `+ fixedStackBytes` → +8 disappears, bare base shows).
+TEST(LirCallconvVariadicFC12deferral4, Aapcs64VaStartFixedStackOverflowBaseCongruence) {
+    auto bundle = lowerThroughRewrite(
+        "int pick(int a, int b, int c, int d, int e, int f, int g, int h, int i,"
+        " ...) {\n"
+        "    va_list ap; va_start(ap, i);\n"
+        "    int v = va_arg(ap, int);\n"
+        "    va_end(ap);\n"
+        "    return a + i + v;\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "AAPCS64 fixed-overflow variadic callee lower";
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* cc = bundle.lowered.target->callingConventionByName("aapcs64");
+    ASSERT_NE(cc, nullptr);
+    EXPECT_EQ(cc->shadowSpaceBytes, 0u);
+    EXPECT_EQ(cc->callPushBytes, 0u) << "arm64 BL writes LR — no stack push";
+    auto const* layout = result.forFuncByIndex(0);
+    ASSERT_NE(layout, nullptr);
+
+    std::uint32_t const base =
+        layout->totalFrameSize
+        + static_cast<std::uint32_t>(cc->callPushBytes)
+        + static_cast<std::uint32_t>(cc->shadowSpaceBytes);
+    std::int32_t const expectedOverflow = static_cast<std::int32_t>(base + 8u);
+
+    auto const stats = collectInstStats(result.lir, *bundle.lowered.target);
+    bool const sawDisplaced =
+        std::find(stats.leaOffsets.begin(), stats.leaOffsets.end(),
+                  expectedOverflow) != stats.leaOffsets.end();
+    bool const sawBareBase =
+        std::find(stats.leaOffsets.begin(), stats.leaOffsets.end(),
+                  static_cast<std::int32_t>(base)) != stats.leaOffsets.end();
+    EXPECT_TRUE(sawDisplaced)
+        << "the __stack (va_overflow_arg_area) `lea` MemOffset must INCLUDE the +8 "
+           "displacement (base " << base << " + 8 = " << expectedOverflow << ")";
+    EXPECT_FALSE(sawBareBase)
+        << "no `lea` may carry the UN-displaced __stack base (" << base << ") — its "
+           "presence means the fixed-stack-arg payload was discarded";
+}
+
+// D-ASM-AARCH64-LARGE-FRAME-IMM12 (FOLD 1, LOAD-BEARING): the SELECTION witness.
+// A ≥9-fixed-param AAPCS64 callee loads its 9th (incoming-stack) fixed param at
+// `[sp + totalFrameSize]`. With a large touched local (the `long pad[40]`
+// mirror of the runtime corpus) the frame is comfortably > 255, so that load's byte
+// offset exceeds the unscaled imm9 (-256..255) and the materialize pass MUST select the
+// SCALED `load_u` (LDR imm12-scaled) opcode — NOT the unscaled `load` (LDUR imm9).
+// Exit-210 in the qemu corpus is necessary-but-not-sufficient (the byte-pins prove the
+// ENCODING; this proves the SELECTION). RED-ON-DISABLE: revert the load_u selection in
+// `lir_callconv.cpp::materializeOneFunc` (always emit `*argLoad`) → the stack-arg load
+// at offset > 255 emits the unscaled `load` and NO `load_u` appears at a large offset →
+// `sawLoadUAtLargeOffset` flips false. (The corpus would then fail to encode at the
+// assembler — A_ImmediateOperandOutOfRange — but this structural pin catches it earlier
+// and host-independently, on every CI leg.)
+TEST(LirCallconvLargeFrameImm12, Aapcs64NinthFixedParamLoadUsesScaledLoadU) {
+    // `long pad[40]` (320B) forces the frame > 255. An array alloca is never
+    // scalar-promoted (mem2reg refuses array allocas), and this pipeline runs
+    // NO optimizer anyway (lower -> liveness -> regalloc -> rewrite -> callconv),
+    // so the full reservation survives. `volatile` is NOT used — it fails loud in
+    // the c-subset frontend (S_VolatileNotSupported), which runs before lowering.
+    auto bundle = lowerThroughRewrite(
+        "int sum9(int a, int b, int c, int d, int e, int f, int g, int h, int i,"
+        " ...) {\n"
+        "    long pad[40];\n"             // FOLD 1: 320B local -> frame > 255
+        "    pad[0] = i;\n"
+        "    va_list ap; va_start(ap, i);\n"
+        "    int v = va_arg(ap, int);\n"
+        "    va_end(ap);\n"
+        "    return a + b + c + d + e + f + g + h + i + v;\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "AAPCS64 9-fixed-param large-frame callee lower";
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* layout = result.forFuncByIndex(0);
+    ASSERT_NE(layout, nullptr);
+    EXPECT_GT(layout->totalFrameSize, 255u)
+        << "FOLD 1 invariant: the touched pad MUST push the frame past the imm9 reach "
+           "(255) so the 9th-param load cannot fit the unscaled form — got "
+        << layout->totalFrameSize;
+
+    auto const loadOp  = bundle.lowered.target->opcodeByMnemonic("load");
+    auto const loadUOp = bundle.lowered.target->opcodeByMnemonic("load_u");
+    ASSERT_TRUE(loadOp.has_value() && loadUOp.has_value());
+
+    // Scan the materialized LIR for a frame load whose MemOffset is beyond imm9.
+    // That load is the 9th-param incoming-stack read; it MUST use `load_u`, and
+    // NO plain (unscaled) `load` may carry such an offset.
+    bool sawLoadUAtLargeOffset = false;
+    bool sawPlainLoadAtLargeOffset = false;
+    auto const& lir = result.lir;
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < lir.blockInstCount(blk); ++ii) {
+                LirInstId const inst = lir.blockInstAt(blk, ii);
+                std::uint16_t const op = lir.instOpcode(inst);
+                auto const ops = lir.instOperands(inst);
+                // Frame load shape: [base_reg, MemBase, MemOffset] (3 ops).
+                if (ops.size() != 3 || ops[2].kind != LirOperandKind::MemOffset)
+                    continue;
+                bool const beyondImm9 = ops[2].offset > 255 || ops[2].offset < -256;
+                if (op == *loadUOp && beyondImm9) sawLoadUAtLargeOffset = true;
+                if (op == *loadOp && beyondImm9)  sawPlainLoadAtLargeOffset = true;
+            }
+        }
+    }
+    EXPECT_TRUE(sawLoadUAtLargeOffset)
+        << "the 9th fixed param's incoming-stack load (offset > 255) MUST use the scaled "
+           "`load_u` — reverting the selection emits the unscaled `load` instead";
+    EXPECT_FALSE(sawPlainLoadAtLargeOffset)
+        << "no unscaled `load` (LDUR imm9) may carry an offset beyond ±256 — the encoder "
+           "would fail loud (A_ImmediateOperandOutOfRange)";
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): the by-value-stack
+// aggregate carrier — SysV x86_64 LIR-tier structural pins. These are the
+// audit's BLOCKER-1 (force-to-stack) + BLOCKER-2 (outgoing-area sizing) gates,
+// host-independent (structural over the post-materialize LIR, no execution).
+// ───────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// The (single) call-making function's FrameLayout in a materialized result.
+[[nodiscard]] FrameLayout const*
+soleCallerLayout(LirCallconvResult const& result) {
+    FrameLayout const* found = nullptr;
+    for (std::uint32_t i = 0; i < result.lir.moduleFuncCount(); ++i) {
+        auto const* layout = result.forFuncByIndex(i);
+        if (layout != nullptr && layout->hasCalls) found = layout;
+    }
+    return found;
+}
+
+// Count SP-relative `store` insts in `fn` whose MemOffset displacement is in
+// [lo, hi). The base register MUST be the stack pointer (`spOrd`) — otherwise a
+// frame-local aggregate's init/copy stores (base = a `lea`-derived local reg, but
+// the SAME 0/8/16 GEP offsets) would be miscounted as outgoing-area stores.
+[[nodiscard]] std::uint32_t
+countSpStoresInOffsetRange(Lir const& lir, LirFuncId fn, std::uint16_t storeOp,
+                          std::uint16_t spOrd, std::int32_t lo, std::int32_t hi) {
+    std::uint32_t n = 0;
+    for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+        LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < lir.blockInstCount(blk); ++i) {
+            LirInstId const inst = lir.blockInstAt(blk, i);
+            if (lir.instOpcode(inst) != storeOp) continue;
+            auto const ops = lir.instOperands(inst);
+            // store layout: [value_reg, base_reg, MemBase, MemOffset]
+            if (ops.size() != 4
+                || ops[1].kind != LirOperandKind::Reg
+                || ops[1].reg.isPhysical == 0
+                || ops[1].reg.id != spOrd
+                || ops[3].kind != LirOperandKind::MemOffset) continue;
+            if (ops[3].offset >= lo && ops[3].offset < hi) ++n;
+        }
+    }
+    return n;
+}
+
+} // namespace
+
+// BLOCKER-1 (the force-to-stack pin) + BLOCKER-2 (the outgoing-area sizing pin):
+// a >16B (MEMORY class) struct vararg with FREE arg registers (it is the FIRST
+// vararg after `int n` — rsi/rdx/rcx/r8/r9 are all free) is passed ENTIRELY in the
+// overflow area by a byte-copy, NOT register-passed. RED-ON-DISABLE: revert the
+// caller's appendByValueStackArg route (so the >16B struct fails loud or pushes a
+// hidden pointer) → no carrier → the outgoing area is not sized for 24 bytes and the
+// stack-copy stores vanish → both EXPECTs go red. (Reverting the carrier to register
+// pieces — the silent split — would land the struct bytes in rsi/rdx/rcx, NOT the
+// outgoing area, so countStoresInOffsetRange would see 0 → red.)
+TEST(LirCallconvAbi, SysVByValueStackAggStructVarargForcedToOverflowWithFreeRegs) {
+    auto bundle = lowerThroughRewrite(
+        "struct Big { long a; long b; long c; };\n"   // 24B → MEMORY class
+        "long combine(int n, ...) { return n; }\n"    // DEFINED so the symbol binds
+        "long use(void) {\n"
+        "  struct Big b = {1, 2, 3};\n"
+        "  return combine(1, b);\n"                    // 24B struct is the FIRST vararg
+        "}\n");
+    ASSERT_TRUE(bundle.lowered.lir.ok)
+        << (bundle.lowered.lirReporter.all().empty()
+                ? "" : bundle.lowered.lirReporter.all()[0].actual);
+    ASSERT_TRUE(bundle.alloc.ok());
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok())
+        << "the by-value-stack carrier must materialize cleanly: "
+        << (ccRep.all().empty() ? "" : ccRep.all()[0].actual);
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_FALSE(cc->slotAligned);          // SysV — independent counters
+    EXPECT_EQ(cc->shadowSpaceBytes, 0u);
+
+    // BLOCKER-2: the caller's outgoing-args area is sized for the 24B struct =
+    // ceil(24/8)*8 = 24 bytes. The naive pre-scan (counting the carrier's address
+    // Reg as ONE GPR arg → 0 overflow) would under-reserve to 0 → this goes red.
+    FrameLayout const* callerLayout = soleCallerLayout(result);
+    ASSERT_NE(callerLayout, nullptr);
+    EXPECT_GE(callerLayout->outgoingArgAreaSize, 24u)
+        << "BLOCKER-2: the outgoing-args area must reserve ceil(24/8)*8 = 24 bytes "
+           "for the by-value-stack aggregate (computeMaxOutgoingStackArgs accounts "
+           "for the carrier's overflow slots)";
+
+    // BLOCKER-1: the struct's bytes are byte-COPIED into the outgoing area at
+    // [sp + 0 .. 24) (shadowSpaceBytes=0) — three 8-byte SP-relative stores. NO
+    // register move of the struct bytes (it must NOT land in rsi/rdx/rcx with free
+    // registers). The SP-base filter excludes the local `b` init + the temp copy
+    // (their stores are based on local `lea` regs, not SP).
+    ASSERT_TRUE(cc->stackPointer.has_value());
+    std::uint16_t const spOrd = cc->stackPointer->ordinal;
+    auto const storeOpId = bundle.lowered.target->opcodeByMnemonic("store");
+    ASSERT_TRUE(storeOpId.has_value());
+    LirFuncId const callerFn = result.lir.funcAt(1);   // `use`
+    std::uint32_t const stackCopyStores = countSpStoresInOffsetRange(
+        result.lir, callerFn, *storeOpId, spOrd, 0, 24);
+    EXPECT_EQ(stackCopyStores, 3u)
+        << "BLOCKER-1 (force-to-stack): a 24B struct vararg byte-copies as three "
+           "8-byte SP-relative stores into the outgoing area [sp+0,sp+8,sp+16] — NOT "
+           "register moves (the struct goes to the stack even though rsi/rdx/rcx free)";
+}
+
+// The register-exhaustion SPLIT: an InRegisters {long,long} (2-GPR) struct vararg
+// that cannot fit wholly in the remaining arg registers goes ENTIRELY to the overflow
+// area via the SAME carrier (never a register/stack split). Here 1 fixed int (rdi) + 5
+// long varargs (rsi/rdx/rcx/r8/r9) exhaust the 6 GPRs, then the {long,long} struct
+// needs 2 → whole struct to overflow. RED-ON-DISABLE: reverting the split route to
+// register pieces lands the first piece in a register + splits → the 16B contiguous
+// stack copy vanishes → red.
+TEST(LirCallconvAbi, SysVByValueStackAggRegisterExhaustionSplitWholeStructToOverflow) {
+    auto bundle = lowerThroughRewrite(
+        "struct LL { long a; long b; };\n"            // 16B → InRegisters (2 GPR)
+        "long combine(int n, ...) { return n; }\n"
+        "long use(void) {\n"
+        "  struct LL p = {7, 8};\n"
+        "  return combine(1, 100L, 200L, 300L, 400L, 500L, p);\n"
+        "}\n");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.alloc.ok());
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok())
+        << "the register-exhaustion-split carrier must materialize cleanly: "
+        << (ccRep.all().empty() ? "" : ccRep.all()[0].actual);
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+
+    FrameLayout const* callerLayout = soleCallerLayout(result);
+    ASSERT_NE(callerLayout, nullptr);
+    // 5 scalar long varargs overflow nothing (rsi..r9 = 5 regs, all in pool), so the
+    // ONLY overflow is the 16B struct = ceil(16/8)*8 = 16 bytes. (rdi=n, rsi..r9 =
+    // the 5 longs → 6 GPRs used → the struct's 2 pieces don't fit → whole to stack.)
+    EXPECT_GE(callerLayout->outgoingArgAreaSize, 16u)
+        << "the split struct reserves ceil(16/8)*8 = 16 outgoing bytes";
+
+    // The 16B struct byte-copies as two 8-byte SP-relative stores into [sp+0, sp+8] —
+    // a WHOLE contiguous copy, never one piece in a register and one on the stack.
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->stackPointer.has_value());
+    std::uint16_t const spOrd = cc->stackPointer->ordinal;
+    auto const storeOpId = bundle.lowered.target->opcodeByMnemonic("store");
+    ASSERT_TRUE(storeOpId.has_value());
+    LirFuncId const callerFn = result.lir.funcAt(1);   // `use`
+    std::uint32_t const stackCopyStores = countSpStoresInOffsetRange(
+        result.lir, callerFn, *storeOpId, spOrd, 0, 16);
+    EXPECT_EQ(stackCopyStores, 2u)
+        << "the {long,long} struct goes WHOLLY to the overflow area as two 8-byte "
+           "SP-relative stores [sp+0,sp+8] — never a register/stack split";
+}
+
+// FOLD (adversarial-review BLOCKER-3, silent miscompile) red-on-disable: the by-value-
+// stack aggregate byte-copy scratch GPR must AVOID the SOURCE registers of the pending
+// register arg-moves. The byte-copies are emitted in the stack-store phase BEFORE the
+// register arg-moves read their `.src` (lir_callconv.cpp: copies ~line 2300 vs arg-moves
+// ~line 2310); if an outgoing scalar arg VALUE lives in the chosen scratch, the byte-copy
+// clobbers it before its `mov dest, src` reads it → that argument SILENTLY receives the
+// struct's bytes.
+//
+// This is a SYNTHETIC-LIR pin (not driven through regalloc) for full control over which
+// physical register is a live arg-move source — the hazard requires an arg-move SOURCE to
+// coincide with the scratch picker's choice, and the register allocator systematically
+// parks call-surviving arg sources in callee-saved registers (away from the caller-saved
+// scratch pool), so a regalloc-driven C shape cannot deterministically force the collision.
+// Here we hand-build a variadic call whose arg 1 source is rcx — the FIRST caller-saved
+// GPR the (reverted) scratch picker would choose after skipping the variadic-count reg
+// (rax) — so reverting the avoid-set deterministically aliases the scratch with a live
+// source.
+//
+// The invariant pinned is the PRECISE one the fix enforces: the byte-copy scratch ∉
+// {sources of the arg-passing moves}. (We deliberately do NOT assert ∉ cc.argGprs — an
+// argGpr that is only an arg-move DEST is written AFTER the copy stores to memory, so the
+// copy's transient write to it is dead; blanket-rejecting the whole argGpr pool would
+// falsely fail-loud on the legitimate register-exhaustion carrier — see
+// examples/c-subset/varargs_struct_split — so the fix and this pin both track only the
+// live SOURCE set.)
+//
+// RED-ON-DISABLE: revert the avoid-set extension in lir_callconv.cpp (the `liveArgSrc`
+// build + the `liveArgSrc.contains(*ord)` rejection). The scratch picker walks
+// cc.callerSaved = [rax, rcx, ...] and chooses the first GPR not in {rax (variadic count),
+// callee, carrier addr} → rcx. But rcx is arg 1's source (`mov rsi, rcx`), so the byte-
+// copy `load rcx,[addr]; store [sp],rcx` clobbers it before the arg-move reads it: the
+// silent arg-clobber miscompile, and the load-bearing assertion (scratch ∉ arg-move
+// sources) goes red. With the fix, rcx ∈ liveArgSrc is rejected and the scratch falls
+// through to rdx (a non-source) → green.
+TEST(LirCallconvAbi, SysVByValueStackAggByteCopyScratchAvoidsArgMoveSources) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+
+    auto const callOp = sch.opcodeByMnemonic("call");
+    auto const retOp  = sch.opcodeByMnemonic("ret");
+    auto const storeOpId = sch.opcodeByMnemonic("store");
+    ASSERT_TRUE(callOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+    ASSERT_TRUE(storeOpId.has_value());
+
+    auto const* cc = sch.callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_EQ(cc->name, "sysv_amd64");
+    ASSERT_FALSE(cc->slotAligned);
+    ASSERT_TRUE(cc->stackPointer.has_value());
+    ASSERT_TRUE(cc->variadicVectorCountReg.has_value());  // SysV rax (AL)
+    std::uint16_t const spOrd = cc->stackPointer->ordinal;
+
+    // Pin the register roles the scenario depends on. r12/r13 are callee-saved (stable
+    // arg-source homes that the scratch picker WOULD pass over anyway); rcx is the
+    // critical one — it is BOTH a live arg-move source here AND the first caller-saved GPR
+    // the reverted scratch picker selects (after the rax variadic-count reg).
+    auto const rcxOrd = sch.registerByName("rcx");
+    auto const r12Ord = sch.registerByName("r12");   // carrier address reg
+    auto const r13Ord = sch.registerByName("r13");   // arg 0 source
+    ASSERT_TRUE(rcxOrd.has_value());
+    ASSERT_TRUE(r12Ord.has_value());
+    ASSERT_TRUE(r13Ord.has_value());
+    LirReg const rcx = makePhysicalReg(*rcxOrd, LirRegClass::GPR);
+    LirReg const r12 = makePhysicalReg(*r12Ord, LirRegClass::GPR);
+    LirReg const r13 = makePhysicalReg(*r13Ord, LirRegClass::GPR);
+
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{71});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    // A variadic call:
+    //   call <sym>, r13, rcx, r12, byval#24
+    //     arg 0 (fixed)  src = r13          -> dest argGprs[0] = rdi  : mov rdi, r13
+    //     arg 1 (vararg) src = rcx          -> dest argGprs[1] = rsi  : mov rsi, rcx
+    //     arg 2 (vararg) = (r12, byval#24)  -> 24B by-value-stack carrier, byte-copied
+    //                                          from [r12] into the outgoing area
+    // fixedOperandCount = 1 (only arg 0 is a named param). The carrier address r12 and the
+    // arg sources {r13, rcx} are all distinct; the arg-moves {rdi<-r13, rsi<-rcx} form no
+    // cycle (no source equals a dest), so materialization emits them in order.
+    std::uint32_t const variadicPayload =
+        call_payload::encode(/*isVariadic=*/true, /*fixedOperandCount=*/1u);
+    std::array<LirOperand, 5> callOps{
+        LirOperand::makeSymbolRef(13),
+        LirOperand::makeReg(r13),
+        LirOperand::makeReg(rcx),
+        LirOperand::makeReg(r12),
+        LirOperand::makeByValueStackAgg(24),
+    };
+    b.addInst(*callOp, InvalidLirReg, callOps, variadicPayload);
+    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{71};
+    alloc.perFunc.back().callingConventionIndex = 0;
+    alloc.perFunc.back().numSpillSlots          = 0;
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
+    ASSERT_TRUE(result.ok())
+        << "the by-value-stack carrier must materialize cleanly: "
+        << (ccRep.all().empty() ? "" : ccRep.all()[0].actual);
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+
+    // The byte-copy scratch is the VALUE register of each SP-relative store into the
+    // outgoing area [sp+0, 24). store layout: [value_reg, base_reg, MemBase, MemOffset].
+    // (The carrier pins above already prove a 24B carrier emits exactly these SP stores.)
+    LirFuncId const fn = result.lir.funcAt(0);
+    Lir const& out = result.lir;
+    std::unordered_set<std::uint16_t> scratchOrds;
+    for (std::uint32_t bi = 0; bi < out.funcBlockCount(fn); ++bi) {
+        LirBlockId const blk = out.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < out.blockInstCount(blk); ++i) {
+            LirInstId const inst = out.blockInstAt(blk, i);
+            if (out.instOpcode(inst) != *storeOpId) continue;
+            auto const ops = out.instOperands(inst);
+            if (ops.size() == 4
+                && ops[0].kind == LirOperandKind::Reg && ops[0].reg.isPhysical != 0
+                && ops[1].kind == LirOperandKind::Reg && ops[1].reg.isPhysical != 0
+                && ops[1].reg.id == spOrd
+                && ops[3].kind == LirOperandKind::MemOffset
+                && ops[3].offset >= 0 && ops[3].offset < 24)
+                scratchOrds.insert(ops[0].reg.id);
+        }
+    }
+    ASSERT_FALSE(scratchOrds.empty())
+        << "precondition: the 24B struct carrier must byte-copy into [sp+0,24) — the "
+           "scratch value-reg is read from those SP stores (else the pin is vacuous)";
+
+    // The arg-move SOURCE set: rcx (arg 1) and r13 (arg 0) are the registers the arg-
+    // passing moves READ after the byte-copy. We assert against rcx by name (the one the
+    // reverted scratch picker collides with) plus the structural source set for breadth.
+    std::unordered_set<std::uint16_t> argMoveSrcOrds{*rcxOrd, *r13Ord};
+
+    // THE LOAD-BEARING ASSERTION (red-on-disable): the byte-copy scratch must NOT be a
+    // source of any arg-passing move. Reverting the liveArgSrc avoid-set lands the scratch
+    // on rcx (arg 1's source) → the byte-copy clobbers it before `mov rsi, rcx` reads it:
+    // the silent arg-clobber miscompile.
+    for (std::uint16_t const ord : scratchOrds) {
+        EXPECT_FALSE(argMoveSrcOrds.contains(ord))
+            << "the by-value-stack byte-copy scratch must not be a SOURCE of any arg-"
+               "passing move — the copy clobbers it before the arg-move reads it, so that "
+               "outgoing scalar arg silently receives the struct's bytes "
+               "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)";
+    }
+    // Specifically: rcx (the reverted picker's first choice + arg 1's source) must have
+    // been rejected in favor of a non-source scratch.
+    EXPECT_EQ(scratchOrds.count(*rcxOrd), 0u)
+        << "the scratch must not be rcx — rcx is arg 1's live source; choosing it (the "
+           "reverted behavior) corrupts the rsi argument with the struct's bytes";
+}
+
+// D-FC12C-AAPCS64-HFA-STRUCT-VARARG (Step 5.1, LIR) — an HFA `{double,double}` vararg
+// passed to an AAPCS64 variadic call with room in the VR pool is placed in FPR arg
+// registers (d0/d1) BY VALUE: the lowered Call carries TWO FPR-class operands and NO
+// ByValueStackAgg carrier; after materialization the call fits entirely in registers
+// (outgoingArgAreaSize == 0). RED-ON-DISABLE: a wrong-class exhaustion check (testing
+// the GR pool for an HFA) would route it to the overflow carrier (ByValueStackAgg
+// appears, outgoingArgAreaSize grows).
+TEST(LirCallconvVariadicFC12c, Aapcs64VarArgHfaStructInRegisters) {
+    auto bundle = lowerThroughRewrite(
+        "struct HFA { double a; double b; };\n"
+        "int sink(int n, ...);\n"
+        "int f(void) {\n"
+        "  struct HFA h; h.a = 1.0; h.b = 2.0;\n"
+        "  return sink(1, h);\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");   // aapcs64 = cc index 0
+    ASSERT_TRUE(bundle.lowered.lir.ok)
+        << (bundle.lowered.lirReporter.all().empty()
+                ? "" : bundle.lowered.lirReporter.all()[0].actual);
+    ASSERT_TRUE(bundle.alloc.ok());
+    ASSERT_TRUE(bundle.rewritten.ok);
+
+    // Inspect the lowered (pre-materialization) Call: it still carries the arg-reg
+    // operands. The HFA must contribute TWO FPR-class operands and ZERO ByValueStackAgg.
+    auto const callOp = bundle.lowered.target->opcodeByMnemonic("call");
+    ASSERT_TRUE(callOp.has_value());
+    std::uint32_t fprArgOps = 0, byValueAggMarkers = 0, callCount = 0;
+    Lir const& lir = bundle.lowered.lir.lir;
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(blk); ++i) {
+                LirInstId const inst = lir.blockInstAt(blk, i);
+                if (lir.instOpcode(inst) != *callOp) continue;
+                ++callCount;
+                for (auto const& op : lir.instOperands(inst)) {
+                    if (op.kind == LirOperandKind::ByValueStackAgg) ++byValueAggMarkers;
+                    if (op.kind == LirOperandKind::Reg
+                        && op.reg.regClass() == LirRegClass::FPR)
+                        ++fprArgOps;
+                }
+            }
+        }
+    }
+    ASSERT_GT(callCount, 0u) << "the fixture has a sink(...) call site";
+    EXPECT_EQ(byValueAggMarkers, 0u)
+        << "an HFA with room in the VR pool is register-placed (FPR pieces), NOT routed "
+           "to the overflow via the ByValueStackAgg carrier (H4/H8)";
+    EXPECT_GE(fprArgOps, 2u)
+        << "the 2-double HFA contributes TWO FPR-class arg operands (d0/d1)";
+
+    // CC-level cross-check: materialize and confirm the call fits in registers (no
+    // outgoing overflow). A misroute to the carrier would reserve overflow bytes.
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+    auto const* layout = result.forFuncByIndex(0);   // `f`
+    ASSERT_NE(layout, nullptr);
+    EXPECT_EQ(layout->outgoingArgAreaSize, 0u)
+        << "the HFA vararg rides in d0/d1 — the call fits in registers, no overflow";
+}
+
+// D-FC12C-AAPCS64-HFA-STRUCT-VARARG (Step 5.2, LIR) — a non-HFA `{long,long}` vararg
+// passed AFTER 8 scalar long varargs drain the GR pool (gpSaveCount=8) is forced WHOLE
+// to the overflow via the ByValueStackAgg carrier. The lowered Call carries the marker;
+// after materialization the outgoing area reserves ceil(16/8)*8 = 16 bytes. RED-ON-
+// DISABLE: a missing exhaustion check emits register pieces (no carrier, no overflow).
+TEST(LirCallconvVariadicFC12c, Aapcs64VarArgNonHfaStructStackAfterExhaustion) {
+    auto bundle = lowerThroughRewrite(
+        "struct LL { long a; long b; };\n"
+        "long sink(int n, ...);\n"
+        "long use(void) {\n"
+        "  struct LL p; p.a = 40; p.b = 5;\n"
+        "  return sink(8, 1L,2L,3L,4L,5L,6L,7L,8L, p);\n"   // 8 longs drain GR, then struct
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");   // aapcs64 = cc index 0
+    ASSERT_TRUE(bundle.lowered.lir.ok)
+        << (bundle.lowered.lirReporter.all().empty()
+                ? "" : bundle.lowered.lirReporter.all()[0].actual);
+    ASSERT_TRUE(bundle.alloc.ok());
+    ASSERT_TRUE(bundle.rewritten.ok);
+
+    auto const callOp = bundle.lowered.target->opcodeByMnemonic("call");
+    ASSERT_TRUE(callOp.has_value());
+    std::uint32_t byValueAggMarkers = 0, callCount = 0;
+    Lir const& lir = bundle.lowered.lir.lir;
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(blk); ++i) {
+                LirInstId const inst = lir.blockInstAt(blk, i);
+                if (lir.instOpcode(inst) != *callOp) continue;
+                ++callCount;
+                for (auto const& op : lir.instOperands(inst))
+                    if (op.kind == LirOperandKind::ByValueStackAgg) ++byValueAggMarkers;
+            }
+        }
+    }
+    ASSERT_GT(callCount, 0u) << "the fixture has a sink(...) call site";
+    EXPECT_EQ(byValueAggMarkers, 1u)
+        << "H8: 8 scalar longs drain the GR pool → the trailing {long,long} struct is "
+           "forced WHOLE to the overflow via the ByValueStackAgg carrier";
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok())
+        << "the by-value-stack carrier must materialize cleanly: "
+        << (ccRep.all().empty() ? "" : ccRep.all()[0].actual);
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+    auto const* layout = result.forFuncByIndex(0);   // `use`
+    ASSERT_NE(layout, nullptr);
+    EXPECT_GE(layout->outgoingArgAreaSize, 16u)
+        << "the outgoing area must reserve ceil(16/8)*8 = 16 bytes for the forced "
+           "{long,long} struct vararg (plus the 8 overflow longs' slots)";
 }

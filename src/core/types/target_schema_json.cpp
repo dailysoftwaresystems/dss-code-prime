@@ -1522,6 +1522,19 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         cc.slotAligned = c.at("slotAligned").get<bool>();
                     }
                 }
+                // FC12c (D-FC12C-APPLE-ARM64-VARIADIC-CALLEE): optional — when true,
+                // every variadic arg of a variadic call is forced onto the stack
+                // (Apple arm64). Default false (AAPCS64 + x86 CCs unaffected).
+                if (c.contains("variadicArgsAlwaysStack")) {
+                    if (!c.at("variadicArgsAlwaysStack").is_boolean()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/variadicArgsAlwaysStack", ccPath),
+                                  "'variadicArgsAlwaysStack' must be a boolean");
+                    } else {
+                        cc.variadicArgsAlwaysStack =
+                            c.at("variadicArgsAlwaysStack").get<bool>();
+                    }
+                }
                 if (c.contains("linkRegister")) {
                     if (!c.at("linkRegister").is_string()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,
@@ -1610,6 +1623,141 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                       std::format("indirect-result register '{}' is not "
                                                   "in the register table", name));
                         }
+                    }
+                }
+                // FC12a-core (D-FC12A-VARIADIC-CALLEE): the optional `__va_list_tag`
+                // layout + register-save-area geometry for variadic-callee support.
+                // Present on SysV AMD64; omitted by Win64 / AAPCS64 (their variadic
+                // ABI differs — those CCs fail loud at the va_start site). Mirrors
+                // the optional `variadicVectorCountReg` / `indirectResultRegister`
+                // shape above: a present-but-malformed block emits and skips
+                // (leaving the optional unengaged), so the consumer's
+                // has_value() guard fails loud rather than mis-walking a half-set layout.
+                if (c.contains("vaListLayout")) {
+                    if (!c.at("vaListLayout").is_object()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/vaListLayout", ccPath),
+                                  "must be an object");
+                    } else {
+                        auto const& vl = c.at("vaListLayout");
+                        VaListLayout layout;
+                        bool vlOk = true;
+                        // Read a required non-negative u32 scalar; emit + clear vlOk on miss.
+                        auto readU32 = [&](char const* key, std::uint32_t& out) {
+                            if (!vl.contains(key) || !vl.at(key).is_number_unsigned()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/vaListLayout/{}", ccPath, key),
+                                          std::format("'{}' is required and must be a "
+                                                      "non-negative integer", key));
+                                vlOk = false;
+                                return;
+                            }
+                            out = vl.at(key).get<std::uint32_t>();
+                        };
+                        // Read a {byteOffset,widthBytes} field object.
+                        auto readField = [&](char const* key, VaListLayout::Field& out) {
+                            if (!vl.contains(key) || !vl.at(key).is_object()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/vaListLayout/{}", ccPath, key),
+                                          std::format("'{}' is required and must be an "
+                                                      "object {{byteOffset,widthBytes}}", key));
+                                vlOk = false;
+                                return;
+                            }
+                            auto const& f = vl.at(key);
+                            if (!f.contains("byteOffset") || !f.at("byteOffset").is_number_unsigned()
+                             || !f.contains("widthBytes") || !f.at("widthBytes").is_number_unsigned()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/vaListLayout/{}", ccPath, key),
+                                          "field must declare non-negative 'byteOffset' "
+                                          "and 'widthBytes'");
+                                vlOk = false;
+                                return;
+                            }
+                            out.byteOffset = f.at("byteOffset").get<std::uint32_t>();
+                            out.widthBytes = f.at("widthBytes").get<std::uint32_t>();
+                        };
+                        // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the lowering
+                        // strategy gates WHICH fields are required. ABSENT defaults
+                        // to SysVRegisterSave (the pre-FC12b shape — back-compat).
+                        if (vl.contains("strategy")) {
+                            if (!vl.at("strategy").is_string()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("{}/vaListLayout/strategy", ccPath),
+                                          "'strategy' must be a string");
+                                vlOk = false;
+                            } else {
+                                auto const sname =
+                                    vl.at("strategy").get<std::string>();
+                                auto const s = vaListStrategyFromName(sname);
+                                if (!s.has_value()) {
+                                    coll.emit(DiagnosticCode::C_MalformedJson,
+                                              std::format("{}/vaListLayout/strategy", ccPath),
+                                              std::format("unknown va_list strategy '{}' "
+                                                          "(sysv_register_save / "
+                                                          "homogeneous_pointer / "
+                                                          "aapcs64_dual_cursor)", sname));
+                                    vlOk = false;
+                                } else {
+                                    layout.strategy = *s;
+                                }
+                            }
+                        }
+                        // FC12c: an optional bool on the va_list block — default false.
+                        auto readBoolDefaultFalse =
+                            [&](char const* key, bool& out) {
+                                if (!vl.contains(key)) { out = false; return; }
+                                if (!vl.at(key).is_boolean()) {
+                                    coll.emit(DiagnosticCode::C_MalformedJson,
+                                              std::format("{}/vaListLayout/{}", ccPath, key),
+                                              std::format("'{}' must be a boolean", key));
+                                    vlOk = false;
+                                    return;
+                                }
+                                out = vl.at(key).get<bool>();
+                            };
+                        // Branch the remaining parse on the strategy. SysVRegisterSave
+                        // requires the full register-save geometry; HomogeneousPointer
+                        // requires only namedArgSlotBytes (+ optional variadicUsesOverflow
+                        // Base for Apple arm64); Aapcs64DualCursor (FC12c) requires the
+                        // 5 `__va_list` fields + the GR/VR save geometry. namedArgSlot
+                        // Bytes is required on every realized arm.
+                        switch (layout.strategy) {
+                            case VaListStrategy::SysVRegisterSave:
+                                readField("gpOffsetField",        layout.gpOffsetField);
+                                readField("fpOffsetField",        layout.fpOffsetField);
+                                readField("overflowArgAreaField", layout.overflowArgAreaField);
+                                readField("regSaveAreaField",     layout.regSaveAreaField);
+                                readU32("gpSaveCount",   layout.gpSaveCount);
+                                readU32("gpSlotBytes",   layout.gpSlotBytes);
+                                readU32("fpSaveCount",   layout.fpSaveCount);
+                                readU32("fpSlotBytes",   layout.fpSlotBytes);
+                                readU32("gpOffsetLimit", layout.gpOffsetLimit);
+                                readU32("fpOffsetLimit", layout.fpOffsetLimit);
+                                readU32("namedArgSlotBytes", layout.namedArgSlotBytes);
+                                break;
+                            case VaListStrategy::HomogeneousPointer:
+                                readU32("namedArgSlotBytes", layout.namedArgSlotBytes);
+                                // FC12c: Apple arm64 anchors `ap` at the overflow base.
+                                readBoolDefaultFalse("variadicUsesOverflowBase",
+                                                     layout.variadicUsesOverflowBase);
+                                break;
+                            case VaListStrategy::Aapcs64DualCursor:
+                                // FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE): the 5-field
+                                // `__va_list` locator + the GR/VR save-area geometry.
+                                readField("stackField",   layout.stackField);
+                                readField("grTopField",   layout.grTopField);
+                                readField("vrTopField",   layout.vrTopField);
+                                readField("grOffsField",  layout.grOffsField);
+                                readField("vrOffsField",  layout.vrOffsField);
+                                readU32("gpSaveCount",       layout.gpSaveCount);
+                                readU32("gpSlotBytes",       layout.gpSlotBytes);
+                                readU32("fpSaveCount",       layout.fpSaveCount);
+                                readU32("fpSlotBytes",       layout.fpSlotBytes);
+                                readU32("namedArgSlotBytes", layout.namedArgSlotBytes);
+                                break;
+                        }
+                        if (vlOk) cc.vaListLayout = layout;
                     }
                 }
 

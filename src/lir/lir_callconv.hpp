@@ -177,6 +177,13 @@ struct DSS_EXPORT FrameLayout {
     // re-scanning the LIR.
     std::uint32_t       localAreaSize     = 0;  // bytes occupied by local-alloca slots
     std::uint32_t       numLocalAllocas   = 0;  // count of `alloca` LIR ops in this function
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): bytes reserved for the variadic
+    // register-save-area — the zone a variadic callee's prologue spills its integer
+    // + (al-gated) SSE arg registers into. Nonzero ONLY when this function calls
+    // va_start (detected by a `va_reg_save_area` LIR op) AND the CC declares a
+    // `vaListLayout` (size = vaListLayout.regSaveAreaBytes()). Zero everywhere else
+    // — backward-compatible with every non-variadic frame.
+    std::uint32_t       vaRegSaveAreaSize = 0;
     std::uint32_t       slotSize          = 0;  // uniform per-class spill-slot width (bytes; = max(GPR width, FPR width))
     std::uint32_t       outgoingSlotSize  = 0;  // outgoing-arg slot width (bytes; = pointer width = GPR width)
     std::vector<LirReg> savedRegs;              // callee-saved phys regs actually used
@@ -235,6 +242,17 @@ struct DSS_EXPORT FrameLayout {
     [[nodiscard]] constexpr std::uint32_t
     localAreaOffset() const noexcept {
         return outgoingArgAreaSize + savedRegAreaSize + spillAreaSize;
+    }
+
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the variadic register-save-area sits
+    // immediately ABOVE the local-alloca area (the topmost frame zone, positive
+    // offset from post-prologue SP). The variadic prologue spills the integer arg
+    // regs at this offset (gpSlotBytes stride) then the al-gated SSE arg regs after
+    // them (fpSlotBytes stride); `va_reg_save_area` materializes to `lea [sp + this]`.
+    // Zero-width when this function doesn't call va_start.
+    [[nodiscard]] constexpr std::uint32_t
+    vaRegSaveAreaOffset() const noexcept {
+        return outgoingArgAreaSize + savedRegAreaSize + spillAreaSize + localAreaSize;
     }
 };
 

@@ -22,6 +22,7 @@
 
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -49,7 +50,17 @@ struct Lowered {
     UnitBuilder builder{*loaded};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    auto model = analyze(cu);
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): thread the selected CC's va_list
+    // strategy into analyze() so a Win64 (ms_x64) variadic source gets the `char*`
+    // `va_list` type (not SysV's __va_list_tag[1]) — mirrors compile_pipeline.cpp.
+    std::optional<VaListStrategy> vaStrategy;
+    if (auto t = TargetSchema::loadShipped(targetName); t.has_value()) {
+        if (auto const* cc = (*t)->callingConventionByName(ccName);
+            cc != nullptr && cc->vaListLayout.has_value()) {
+            vaStrategy = cc->vaListLayout->strategy;
+        }
+    }
+    auto model = analyze(cu, DataModel::Lp64, std::nullopt, vaStrategy);
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
@@ -80,6 +91,9 @@ struct Lowered {
             mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
             mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
             mirCfg.argSlotAligned            = cc->slotAligned;
+            // FC12a-core (D-FC12A-VARIADIC-CALLEE): thread the CC's va_list layout so
+            // va_start/va_arg lower (or fail loud when the CC omits it).
+            mirCfg.vaListLayout              = cc->vaListLayout;
         }
     }
     // D-CSUBSET-LINKAGE-SPECIFIERS: thread the native-decl linkage side-table
@@ -3945,4 +3959,1752 @@ TEST(MirLoweringCSubset, ForUpdateAggregateTernaryRoutesThroughSlotNoPhi) {
         << "the for-update ternary routes through a slot — NEVER a phi-of-aggregate";
     EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::InsertValue), 0u)
         << "memory-based — no SSA-aggregate chain";
+}
+
+// ── FC12a-core (D-FC12A-VARIADIC-CALLEE): va_start / va_arg MIR-shape pins ────
+//
+// `va_start(ap,n)` lowers to FOUR field Stores into the __va_list_tag (gp_offset,
+// fp_offset, reg_save_area, overflow_arg_area) PLUS the two frame-address leaves
+// (VaRegSaveAreaAddr / VaOverflowArgAreaAddr). `va_arg(ap,int)` lowers to the reg-
+// vs-overflow diamond: a Load of the gp_offset cursor → an ICmpUlt against the gp
+// limit → a CondBr → a Phi joining the two address arms → a final Load of the value.
+// A `va_arg(ap, struct S)` STAYS FAIL-LOUD (the FC12a-struct boundary). RED-ON-
+// DISABLE: half-implementing the struct path (returning a value instead of
+// unsupported) flips the fail-loud assertion.
+
+namespace {
+// The function index whose body contains a VaRegSaveAreaAddr (i.e. called va_start).
+[[nodiscard]] std::uint32_t funcWithVaStart(Mir const& m) {
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi)
+        if (countOpcodeAllBlocks(m, fi, MirOpcode::VaRegSaveAreaAddr) > 0) return fi;
+    return 0;
+}
+// True iff function `fi` contains a `Const` inst whose integer value == `value`.
+// (Hoisted here from a later block so the FC12a-struct va_arg/param pins — which
+// precede that block — can pin the cursor/overflow Const values.)
+[[nodiscard]] bool funcHasConstInt(Mir const& m, std::uint32_t fi,
+                                   std::int64_t value) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Const) continue;
+            auto const& lit = m.literalValue(m.constLiteralIndex(ix));
+            if (std::holds_alternative<std::int64_t>(lit.value)
+                && std::get<std::int64_t>(lit.value) == value)
+                return true;
+        }
+    }
+    return false;
+}
+// FC12-deferral④ (FOLD 3): the payload of the (single) VaOverflowArgAreaAddr leaf in
+// function `fi` — the fixed-stack-arg byte displacement va_start bakes for
+// overflow_arg_area / __stack. Returns nullopt if there is no such inst (so a test
+// can ASSERT presence before pinning the value, rather than silently reading 0).
+[[nodiscard]] std::optional<std::uint32_t>
+vaOverflowArgAreaPayload(Mir const& m, std::uint32_t fi) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) == MirOpcode::VaOverflowArgAreaAddr)
+                return m.instPayload(ix);
+        }
+    }
+    return std::nullopt;
+}
+// FC12-deferral④ (FOLD 3, AAPCS64 clamp): true iff function `fi` has ANY `Const`
+// inst whose integer value is STRICTLY LESS than `threshold`. The clamped
+// __gr_offs/__vr_offs are 0 when a class's fixed params consume its whole save block;
+// the OLD underflowing formula `-(saveCount - fixedCount)*slotBytes` with fixedCount >
+// saveCount wraps UNSIGNED then negates to a HUGE magnitude (≈ -4.29e9 i64) — far
+// below ANY legitimate cursor (the largest legit magnitude is __vr_offs = -128). So
+// "no const below -1000 survives" is the strict, precise witness that the clamp fired
+// (red-on-disable: revert the clamp → the huge-magnitude underflow const appears),
+// while NOT tripping on the legitimately-negative -64/-128 cursors of a partially-
+// consumed class. (A blunt "any negative const" check would false-fail on those.)
+[[nodiscard]] bool funcHasConstIntBelow(Mir const& m, std::uint32_t fi,
+                                        std::int64_t threshold) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Const) continue;
+            auto const& lit = m.literalValue(m.constLiteralIndex(ix));
+            if (std::holds_alternative<std::int64_t>(lit.value)
+                && std::get<std::int64_t>(lit.value) < threshold)
+                return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+TEST(MirLoweringCSubset, VaStartEmitsFourFieldStoresPlusFrameAddrs) {
+    auto L = lowerCSubset(
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  va_end(ap);\n"
+        "  return n;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok) << "variadic-callee va_start MIR lowering must succeed";
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // The two frame-address leaves (reg-save-area + overflow-arg-area).
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::VaRegSaveAreaAddr), 1u);
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::VaOverflowArgAreaAddr), 1u);
+    // va_start writes all FOUR __va_list_tag fields (4 Stores via Gep+Store). va_end
+    // is a no-op, so these are the only Stores in this body.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Store), 4u)
+        << "va_start must Store gp_offset + fp_offset + reg_save_area + "
+           "overflow_arg_area into the __va_list_tag";
+    // 4 field Geps for the tag fields (one per Store).
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Gep), 4u);
+}
+
+TEST(MirLoweringCSubset, VaArgIntLowersToRegVsOverflowDiamond) {
+    auto L = lowerCSubset(
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // The reg-vs-overflow diamond: an ICmpUlt (cursor < limit) feeding a CondBr,
+    // a Phi joining the reg-arm + overflow-arm addresses, and Loads (the cursor +
+    // the reg_save_area pointer + the final value).
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUlt), 1u)
+        << "va_arg compares the per-class offset cursor against its limit";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 1u)
+        << "va_arg branches reg-vs-overflow";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Phi), 1u)
+        << "va_arg joins the two address arms with a Phi (of a POINTER — scalar)";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Load), 3u)
+        << "va_arg Loads the cursor, the reg_save_area pointer, AND the final value";
+}
+
+// FC12b (D-FC12B-WIN64-VARIADIC-CALLEE) MIR pin: the SAME `va_arg(ap, int)` source
+// lowers DIFFERENTLY by strategy — a reg-vs-overflow DIAMOND under SysV (cc 0) vs a
+// LINEAR pointer bump (NO diamond) under Win64 (ms_x64). This is the strategy-
+// dispatch witness: same source, two shapes, selected only by the CC's vaListLayout
+// strategy. RED-ON-DISABLE: if the Win64 va_arg seam fell through to the SysV diamond
+// (a half-migrated dispatch), the CondBr-count assertion below flips.
+TEST(MirLoweringCSubset, Win64VaArgIntLowersLinearNotDiamond) {
+    char const* src =
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n";
+    // Win64 (ms_x64) lowering.
+    auto W = lowerCSubset(src, "x86_64", "ms_x64");
+    ASSERT_FALSE(W.model.hasErrors())
+        << "Win64 variadic callee must type-check (va_list = char*)";
+    ASSERT_TRUE(W.hir->ok);
+    ASSERT_TRUE(W.mir.ok);
+    Mir const& wm = W.mir.mir;
+    // The Win64 va_start emits VaHomeArgAreaAddr (NOT VaRegSaveAreaAddr).
+    std::uint32_t wfi = 0;
+    bool foundW = false;
+    for (std::uint32_t fi = 0; fi < wm.moduleFuncCount(); ++fi) {
+        if (countOpcodeAllBlocks(wm, fi, MirOpcode::VaHomeArgAreaAddr) > 0) {
+            wfi = fi; foundW = true; break;
+        }
+    }
+    ASSERT_TRUE(foundW) << "Win64 va_start must emit a VaHomeArgAreaAddr leaf";
+    EXPECT_EQ(countOpcodeAllBlocks(wm, wfi, MirOpcode::VaHomeArgAreaAddr), 1u);
+    EXPECT_EQ(countOpcodeAllBlocks(wm, wfi, MirOpcode::VaRegSaveAreaAddr), 0u)
+        << "Win64 does NOT use the SysV register-save-area leaf";
+    // The LINEAR walk: NO reg-vs-overflow diamond. The scalar va_arg adds NO CondBr
+    // (and no ICmpUlt/Phi). The loop's own CondBr is the baseline; this body has the
+    // `while (i<n)` loop (1 CondBr) but the va_arg adds ZERO extra — so total CondBr
+    // here (a straight body with one va_arg, NO loop) is 0. Pin exactly 0.
+    EXPECT_EQ(countOpcodeAllBlocks(wm, wfi, MirOpcode::CondBr), 0u)
+        << "Win64 va_arg is a LINEAR pointer bump — no reg-vs-overflow diamond";
+    EXPECT_EQ(countOpcodeAllBlocks(wm, wfi, MirOpcode::ICmpUlt), 0u)
+        << "Win64 va_arg compares nothing (no per-class limit check)";
+    EXPECT_EQ(countOpcodeAllBlocks(wm, wfi, MirOpcode::Phi), 0u)
+        << "Win64 va_arg joins nothing (single linear arm)";
+
+    // SysV (sysv_amd64) lowering of the SAME source → the DIAMOND (the contrast).
+    auto S = lowerCSubset(src, "x86_64", "sysv_amd64");
+    ASSERT_TRUE(S.mir.ok);
+    Mir const& sm = S.mir.mir;
+    std::uint32_t sfi = 0;
+    for (std::uint32_t fi = 0; fi < sm.moduleFuncCount(); ++fi) {
+        if (countOpcodeAllBlocks(sm, fi, MirOpcode::VaRegSaveAreaAddr) > 0) {
+            sfi = fi; break;
+        }
+    }
+    EXPECT_GE(countOpcodeAllBlocks(sm, sfi, MirOpcode::CondBr), 1u)
+        << "SysV va_arg of the SAME source emits the reg-vs-overflow diamond "
+           "(CondBr) — the strategy dispatch distinguishes the two shapes";
+    EXPECT_EQ(countOpcodeAllBlocks(sm, sfi, MirOpcode::VaHomeArgAreaAddr), 0u)
+        << "SysV does NOT use the Win64 home-area leaf";
+}
+
+// FC12a-struct: `va_arg(ap, struct {long; double})` (a mixed GPR+SSE 16B aggregate,
+// InRegisters under SysV) lowers to the ATOMIC register-gather diamond — BY ADDRESS,
+// never as a bare aggregate value. RED-ON-DISABLE: reverting lowerVaArgAggregate to
+// the old fail-loud flips mir.ok to false; reverting the gather to a single-class
+// bump or a Load-of-aggregate breaks the structural assertions below.
+TEST(MirLoweringCSubset, VaArgStructMixedLowersToAtomicRegisterGather) {
+    auto L = lowerCSubset(
+        "struct Pt { long a; double b; };\n"
+        "long sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct Pt p = va_arg(ap, struct Pt);\n"
+        "  va_end(ap);\n"
+        "  return p.a + (long)p.b;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "an InRegisters (<=16B) struct va_arg must lower (the FC12a-struct gather)";
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // A fresh Alloca for the gathered struct (the result-by-address temp). The `ap`
+    // local + the `p` local also Alloca, so >= 1 is the floor that the gather adds.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Alloca), 1u)
+        << "the gather copies the pieces into a fresh aggregate temp";
+    // The ATOMIC decision is TWO ICmpUle (gp fits AND fp fits) feeding nested CondBr.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUle), 2u)
+        << "the atomic gather compares BOTH class cursors against their folded limits";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 2u)
+        << "nested CondBr: gp-fits? -> fp-fits? -> regBB, else ovfBB";
+    // The result is an ADDRESS Phi (a void* pointer) — NOT a Phi of the aggregate.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Phi), 1u)
+        << "the two address arms join with a Phi of the struct's ADDRESS";
+    EXPECT_FALSE(hasAggregatePhi(m, L.model.lattice().interner(), fi))
+        << "the gather must NEVER produce a Phi of an aggregate-width value";
+    // Both class cursors are bumped (the register arm: gp += 8, fp += 16) — two Adds
+    // on the cursors, plus the per-class Stores writing them back (4 reg-arm Stores:
+    // 2 piece-stores into temp + 2 cursor write-backs). va_start adds 4 Stores; so
+    // the body Stores are well above the scalar-arm count. Pin the cursor Adds.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Add), 2u)
+        << "the register arm bumps BOTH per-class cursors (gp by 8, fp by 16)";
+}
+
+// FC12a-struct fail-loud: `va_arg(ap, >16B struct)` is MEMORY class — it requires
+// the by-value overflow mechanism not built this cycle. RED-ON-DISABLE: removing the
+// ByReference guard in lowerVaArgAggregate lets a wrong gather lower (mir.ok true).
+// FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT, va_arg ByReference): a >16B
+// (MEMORY class) struct `va_arg` now LOWERS (was fail-loud) and DISPATCHES to the
+// overflow-only arm — the struct sits ENTIRELY by value at overflow_arg_area (SysV
+// §3.5.7), so there is NO register-gather diamond. STRUCTURAL PIN (red-on-disable):
+// the ByReference dispatch in lowerVaArgAggregate emits NO `ICmpUle` (the InRegisters
+// diamond's atomic-fit pair) — reverting the early ByReference dispatch (so a >16B
+// MEMORY-class struct fell into the diamond with numGp==numFp==0 → a trivially-true
+// fit → ZERO pieces gathered → a garbage address) would either re-introduce the
+// fail-loud (mir.ok false) or emit the ICmpUle pair → this goes red.
+TEST(MirLoweringCSubset, VaArgStructOver16BDispatchesToOverflowArm) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"   // 24B → MEMORY class
+        "long sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct Big s = va_arg(ap, struct Big);\n"
+        "  va_end(ap);\n"
+        "  return s.a;\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "va_arg of a >16B (MEMORY class) struct must now LOWER via the overflow arm "
+           "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // The ByReference va_arg takes the OVERFLOW-ONLY arm — no reg-vs-overflow diamond,
+    // so the atomic-fit `ICmpUle` pair is absent. (A scalar/InRegisters aggregate
+    // va_arg emits exactly 2 ICmpUle; a >16B MEMORY-class struct emits 0.)
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUle), 0u)
+        << "a >16B (MEMORY class) va_arg dispatches to the overflow arm with NO "
+           "register-gather diamond (no atomic-fit ICmpUle pair)";
+    // The overflow bump is roundUp(24, 8) == 24 — pin the Const so a wrong tail-round
+    // (e.g. one slot=8) goes red. The struct's 24-byte size is read from the overflow
+    // slot, anti-folded by the run-witnessed corpus.
+    EXPECT_TRUE(funcHasConstInt(m, fi, 24))
+        << "the overflow_arg_area bump must be roundUp(sizeof(Big)=24, gpSlotBytes=8) "
+           "== 24 (a >8B struct occupies multiple stack eightbytes)";
+}
+
+// Helper: does ANY diagnostic in `r` carry `anchor` in its `actual` text? (The
+// `unsupported()` lowering helper routes its message into `.actual`.)
+[[nodiscard]] inline bool
+anyDiagActualContains(DiagnosticReporter const& r, std::string_view anchor) {
+    for (auto const& d : r.all()) {
+        if (d.actual.find(anchor) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// The function index that issues NO Call — the variadic CALLEE (`sum`/`pick`),
+// where the va_arg walk lives (the mirror of `funcWithCall`, which finds the
+// caller). The struct-vararg fixtures have exactly one callee + one caller.
+[[nodiscard]] inline std::uint32_t funcWithoutCall(Mir const& m) {
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi)
+        if (countOpcodeAllBlocks(m, fi, MirOpcode::Call) == 0) return fi;
+    return 0;
+}
+
+// Count `Load` instructions in `fi` whose FIRST operand is itself a `Load` — i.e.
+// a CHAINED `Load(Load(...))`. This is the host-independent structural signature of
+// the Win64 (HomogeneousPointer) >8B-struct va_arg by-reference DEREF: the va_arg
+// emits `apVal = Load(tagBase)` (the slot cursor) and, for a >8B ByReference struct,
+// `structAddr = Load(apVal)` (deref the hidden pointer the slot holds). The deref's
+// operand IS `apVal`, a Load — so it is a chained Load. The ≤8B by-value path returns
+// `apVal` directly (NO chained Load). Crucially NO OTHER Load in these fixtures is
+// chained: every field read (member access AND `lowerAggregateCopy`'s copy-in) loads
+// through a `Gep` (even at offset 0 — MemberAccess/aggregate-copy always emit a Gep),
+// so its operand is a Gep, not a Load; and `tagBase` is the `ap` local's Alloca
+// address, not a Load. Thus this count discriminates deref-present (>=1) from
+// deref-dropped (0) regardless of how many incidental copy-in/member Loads exist —
+// the "Load >= N" whole-function count it replaces could not (the copy-in Loads kept
+// the total above the threshold even with the deref dropped).
+[[nodiscard]] std::size_t countChainedLoadOfLoad(Mir const& m, std::uint32_t fi) {
+    std::size_t n = 0;
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Load) continue;
+            auto const ops = m.instOperands(ix);
+            if (ops.empty()) continue;
+            if (m.instOpcode(ops[0]) == MirOpcode::Load) ++n;
+        }
+    }
+    return n;
+}
+
+// FOLD 3 — a trivial "is `op` present anywhere in `fi`?" predicate (the
+// countOpcodeAllBlocks>0 wrapper the AAPCS64 struct-vararg pins use to assert the
+// gather emitted an SExt / ICmpSlt etc.). Distinct from funcEntryOpcodes (entry-only).
+[[nodiscard]] bool hasMirOpcode(Mir const& m, std::uint32_t fi, MirOpcode op) {
+    return countOpcodeAllBlocks(m, fi, op) > 0;
+}
+
+// FOLD 3 (the load-bearing H2 guard) — count `Load`s in `fi` that read a `__va_list`
+// FIELD at byte offset `byteOffset`. The structural signature of a va_list field read
+// is `Load(Gep(tagBase, Const(byteOffset)))` — a Load whose first operand is a Gep
+// whose first operand is the va_list tagBase and whose second operand is an integer
+// Const equal to `byteOffset`. This DISCRIMINATES the AAPCS64 dual-cursor's per-class
+// save-block selection: an HFA gather reads __vr_offs@28 (>0) and NEVER __gr_offs@24
+// (==0); a non-HFA gather is the mirror. Reading the WRONG cursor (an HFA from the GR
+// block, hazard H2) is silent garbage with NO trap — only this offset-keyed count
+// catches it host-independently.
+//
+// tagBase identity (class-INDEPENDENT): it is the `Alloca` (the `ap` local) that is
+// the base of at least one Gep whose RESULT is itself LOADED — the cursor/top/stack
+// field reads. The va_arg RESULT temp (`freshAggregateTemp`) is ALSO an Alloca with
+// Geps WHOSE RESULTS ARE LOADED — `lowerByteWiseCopy` (src hir_to_mir.cpp ~2440)
+// emits `Load(Gep(temp,...))` when the gathered struct is copied out into the
+// destination local, so the temp's Geps are NOT "unloaded". We rely on PROGRAM ORDER
+// instead: the va_list cursor read `Load(Gep(tagBase, offset))` is EMITTED FIRST —
+// va_start emits only Stores, so the first `Load(Gep(Alloca,...))` the scan meets is
+// always a cursor read off the `ap` Alloca, never a result-temp copy-out (which is
+// emitted later). (`__stack`@0 is both loaded and stored, so the tagBase also
+// qualifies via that read even when offsets 0/8/16 would otherwise alias a temp Gep.)
+[[nodiscard]] MirInstId findVaListTagBase(Mir const& m, std::uint32_t fi) {
+    MirFuncId const f = m.funcAt(fi);
+    // The tagBase is the Alloca that is the base of at least one Gep whose RESULT is
+    // the op[0] of a Load (a cursor/top/stack FIELD read). Single linear scan: for
+    // each Load(Gep(base, ...)) where base is an Alloca, that Alloca is the tagBase.
+    // Correct by PROGRAM ORDER (NOT because the result temp's Geps are unloaded — they
+    // are, via the copy-out): the cursor read is emitted before any copy-out, so the
+    // FIRST such Load encountered is a `ap`-Alloca cursor read.
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Load) continue;
+            auto const lops = m.instOperands(ix);
+            if (lops.empty()) continue;
+            MirInstId const base = lops[0];
+            if (m.instOpcode(base) != MirOpcode::Gep) continue;
+            auto const gops = m.instOperands(base);
+            if (gops.empty()) continue;
+            if (m.instOpcode(gops[0]) == MirOpcode::Alloca) return gops[0];
+        }
+    }
+    return InvalidMirInst;
+}
+
+[[nodiscard]] std::size_t countLoadsAtFieldOffset(Mir const& m, std::uint32_t fi,
+                                                  std::int64_t byteOffset) {
+    MirInstId const tagBase = findVaListTagBase(m, fi);
+    if (!tagBase.valid()) return 0;
+    std::size_t n = 0;
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Load) continue;
+            auto const lops = m.instOperands(ix);
+            if (lops.empty()) continue;
+            MirInstId const base = lops[0];
+            if (m.instOpcode(base) != MirOpcode::Gep) continue;
+            auto const gops = m.instOperands(base);
+            if (gops.size() < 2) continue;
+            if (gops[0] != tagBase) continue;
+            MirInstId const offInst = gops[1];
+            if (m.instOpcode(offInst) != MirOpcode::Const) continue;
+            auto const& lit = m.literalValue(m.constLiteralIndex(offInst));
+            if (std::holds_alternative<std::int64_t>(lit.value)
+                && std::get<std::int64_t>(lit.value) == byteOffset)
+                ++n;
+        }
+    }
+    return n;
+}
+
+// FOLD B (NIT 2 — the host-independent H5 REGISTER-arm pin) — count Loads in `fi`
+// whose shape is the AAPCS64 ByReference register-arm pointer DEREF:
+// `Load(Gep(<top>, idx))` where `<top>` is itself `Load(Gep(tagBase, byteOffset))` —
+// the `__<gr|vr>_top` field read. Concretely (src hir_to_mir.cpp ~3683-3697): the reg
+// arm computes `grTop = Load(Gep(tagBase, grTopField))`, then `slotAddr = Gep(grTop,
+// SExt(curOffs))`, then DEREFS `regStructPtr = Load(slotAddr)`. This count matches the
+// final deref Load: its op[0] is a Gep whose BASE op is a Load of the field at
+// `byteOffset` (grTopField==8). `countChainedLoadOfLoad` CANNOT see this — the deref is
+// `Load(Gep(...))`, NOT a `Load(Load(...))` — so that pin witnesses only the OVERFLOW
+// arm (whose deref IS `Load(Load(stackField))`). Removing the register-arm deref
+// (returning `slotAddr` instead of dereferencing the hidden pointer — a silent
+// miscompile) takes THIS count to 0 while leaving countChainedLoadOfLoad>=1.
+// Reuses findVaListTagBase to anchor the field read class-independently.
+[[nodiscard]] std::size_t countRegArmTopDeref(Mir const& m, std::uint32_t fi,
+                                              std::int64_t byteOffset) {
+    MirInstId const tagBase = findVaListTagBase(m, fi);
+    if (!tagBase.valid()) return 0;
+    std::size_t n = 0;
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            // The DEREF: a Load whose op[0] is a Gep.
+            if (m.instOpcode(ix) != MirOpcode::Load) continue;
+            auto const dops = m.instOperands(ix);
+            if (dops.empty()) continue;
+            MirInstId const slotGep = dops[0];
+            if (m.instOpcode(slotGep) != MirOpcode::Gep) continue;
+            auto const sg = m.instOperands(slotGep);
+            if (sg.empty()) continue;
+            // The Gep's BASE op must be a Load of the __<gr|vr>_top FIELD: itself a
+            // `Load(Gep(tagBase, Const(byteOffset)))`.
+            MirInstId const topLoad = sg[0];
+            if (m.instOpcode(topLoad) != MirOpcode::Load) continue;
+            auto const tl = m.instOperands(topLoad);
+            if (tl.empty()) continue;
+            MirInstId const topGep = tl[0];
+            if (m.instOpcode(topGep) != MirOpcode::Gep) continue;
+            auto const tg = m.instOperands(topGep);
+            if (tg.size() < 2) continue;
+            if (tg[0] != tagBase) continue;
+            MirInstId const offInst = tg[1];
+            if (m.instOpcode(offInst) != MirOpcode::Const) continue;
+            auto const& lit = m.literalValue(m.constLiteralIndex(offInst));
+            if (std::holds_alternative<std::int64_t>(lit.value)
+                && std::get<std::int64_t>(lit.value) == byteOffset)
+                ++n;
+        }
+    }
+    return n;
+}
+
+// FOLD 3 SELF-TEST: the load-bearing H2 helper (`countLoadsAtFieldOffset`) +
+// `findVaListTagBase` must be NON-VACUOUS — prove they locate the va_list tagBase and
+// count a known field read on a fixture independent of the new struct gather. The
+// AAPCS64 SCALAR va_arg(int) reads the GR cursor __gr_offs@24 exactly once (one
+// `Load(Gep(ap, 24))`); offset 28 (__vr_offs) is NOT read on the integer path. If the
+// helper were broken (returned 0 unconditionally, or failed to find the tagBase) the
+// H2 pins below would PASS VACUOUSLY — this self-test forecloses that.
+TEST(MirLoweringCSubset, Aapcs64FieldOffsetHelperSelfTest) {
+    auto L = lowerCSubset(
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    EXPECT_TRUE(findVaListTagBase(m, fi).valid())
+        << "the helper must locate the `ap` Alloca tagBase (the base of the cursor "
+           "field Loads) — a broken finder makes the H2 pins vacuous";
+    EXPECT_GE(countLoadsAtFieldOffset(m, fi, 24), 1u)
+        << "the AAPCS64 scalar va_arg(int) reads __gr_offs@24 — the helper must COUNT "
+           "it (a vacuous 0 would silently pass the HFA-from-VR-not-GR H2 guard)";
+    EXPECT_EQ(countLoadsAtFieldOffset(m, fi, 28), 0u)
+        << "the integer path does NOT read __vr_offs@28 — the helper must distinguish "
+           "field offsets (not just count all field Loads)";
+    EXPECT_TRUE(hasMirOpcode(m, fi, MirOpcode::SExt))
+        << "hasMirOpcode wrapper must report the scalar arm's SXTW present";
+}
+
+// FC12b (D-FC12B-WIN64-STRUCT-VARARG) — INVERTED to SUCCESS: `va_arg(ap, struct)`
+// under the Win64 (ms_x64) HomogeneousPointer strategy for a pow2-≤8B struct. The
+// struct sits BY VALUE in the one arg slot, so va_arg returns the slot's ADDRESS
+// (apVal) directly — NO deref Load, NO Phi (the slot IS the storage), and a LINEAR
+// pointer bump (no reg-vs-overflow diamond → NO atomic-fit ICmpUle pair, NO
+// ByValueStackArg carrier). RED-ON-DISABLE: reverting the lowerVaArgAggregate
+// HomogeneousPointer arm to fail-loud flips mir.ok false; a regression to the SysV
+// by-value gather would emit the ICmpUle atomic-fit pair (caught below).
+TEST(MirLoweringCSubset, Win64VaArgStructLeq8ReturnsSlotAddr) {
+    auto L = lowerCSubset(
+        "struct Pt { int a; int b; };\n"   // 8B (pow2 ≤8) → InRegisters[1], by value
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct Pt p = va_arg(ap, struct Pt);\n"
+        "  va_end(ap);\n"
+        "  return p.a + p.b;\n"
+        "}\n",
+        "x86_64", "ms_x64");
+    ASSERT_TRUE(L.mir.ok)
+        << "Win64 va_arg(≤8B struct) must lower (D-FC12B-WIN64-STRUCT-VARARG): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithoutCall(m);   // `sum` (the variadic callee)
+    // The slot IS the storage: a ≤8B struct va_arg has NO reg-vs-overflow diamond
+    // (linear pointer bump), so NO atomic-fit ICmpUle pair and NO carrier.
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUle), 0u)
+        << "a Win64 ≤8B struct va_arg is a LINEAR pointer bump — no atomic-fit "
+           "diamond (a SysV-gather regression would emit the ICmpUle pair)";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 0u)
+        << "no overflow carrier — Win64 places the struct in one slot by position";
+    // The va_arg bump is by namedArgSlotBytes (8) — pin the Const so a wrong stride
+    // (e.g. sizeof not slot) goes red. The struct fields are then byte-copied out of
+    // the slot (the member-access reads p.a@0 / p.b@4) — anti-folded by the corpus.
+    EXPECT_TRUE(funcHasConstInt(m, fi, 8))
+        << "the va_list cursor bumps by namedArgSlotBytes==8 (one Win64 arg slot)";
+    // STRUCTURAL no-deref mirror of the >8B pin: the ≤8B by-value path returns the
+    // SLOT ADDRESS (apVal) directly, so there is NO chained `Load(Load(ap))`. A
+    // spurious value Load of the cursor (returning the slot's *contents* — a scalar —
+    // as if it were the aggregate's address) would be a silent miscompile that only
+    // the Windows-only PE corpus catches; pin it red here too. (funcHasConstInt(8) and
+    // the ICmpUle/ByValueStackArg==0 checks above can't see this — they don't inspect
+    // the va_arg result chain.)
+    EXPECT_EQ(countChainedLoadOfLoad(m, fi), 0u)
+        << "the ≤8B by-value va_arg returns the slot ADDRESS (apVal) directly — there "
+           "must be NO chained Load(Load(ap)) deref (a value Load here would return a "
+           "scalar as the aggregate address)";
+}
+
+// FC12b (D-FC12B-WIN64-STRUCT-VARARG) — SUCCESS, >8B by-reference arm. A struct
+// whose size is NOT pow2-≤8 (here 24B) rides as a hidden POINTER in the one slot;
+// va_arg must DEREFERENCE the slot to get the caller's copy address. So the callee
+// emits an EXTRA Load (the slot Load + the pointer deref Load) that the ≤8B by-value
+// arm does NOT, still with NO diamond/carrier. RED-ON-DISABLE: dropping the
+// ByReference deref Load would return the slot addr (a pointer-to-pointer) → the
+// consumer copies 24 bytes of pointer+garbage (a silent miscompile).
+TEST(MirLoweringCSubset, Win64VaArgStructGt8DerefsPointer) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"  // 24B → ByReference (hidden ptr)
+        "long pick(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct Big b = va_arg(ap, struct Big);\n"
+        "  va_end(ap);\n"
+        "  return b.a + b.b + b.c;\n"
+        "}\n",
+        "x86_64", "ms_x64");
+    ASSERT_TRUE(L.mir.ok)
+        << "Win64 va_arg(>8B struct) must lower (D-FC12B-WIN64-STRUCT-VARARG): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithoutCall(m);   // `pick`
+    // Still linear (one slot, by pointer): no atomic-fit diamond, no carrier.
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUle), 0u)
+        << "a Win64 >8B struct va_arg is a LINEAR pointer bump (one slot, by ptr)";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 0u)
+        << "no overflow carrier — the >8B struct rides as a pointer in one slot";
+    // The bump is ONE slot, NOT roundUp(24,8)==24: the SLOT holds a pointer, not the
+    // 24-byte struct. A regression to a by-value overflow bump would emit a Const 24
+    // (the by-value tail-round). The struct's three long fields live at 0/8/16, so
+    // there is NO legitimate Const 24 in the body — its presence means a wrong bump.
+    EXPECT_FALSE(funcHasConstInt(m, fi, 24))
+        << "Win64 does NOT bump by roundUp(sizeof,8)==24 (that is the SysV by-value "
+           "overflow stride — the Win64 slot holds a pointer, not the bytes)";
+    // The by-reference arm emits the slot-cursor Load `apVal = Load(tagBase)` AND a
+    // chained deref `structAddr = Load(apVal)` (the slot holds a hidden pointer). The
+    // ≤8B by-value arm omits the deref (returns apVal directly). A whole-function
+    // `Load >= N` count CANNOT discriminate the two: BOTH paths also emit the
+    // aggregate copy-in's per-field Loads (`lowerAggregateCopy` loads each of the 3
+    // longs) plus the `return` member reads, so dropping the deref still leaves the
+    // total well above any fixed floor. Instead assert the STRUCTURAL signature that
+    // is UNIQUE to the deref: a `Load` whose operand is itself a `Load` (the chained
+    // slot-Load → deref-Load). Every other Load here goes through a `Gep` (field
+    // reads) or loads `tagBase` (the `ap` Alloca), so none is chained — dropping the
+    // deref takes this count to 0. Host-independent: it inspects the MIR shape, not a
+    // count the (Windows-only) PE corpus would otherwise be the sole guard of.
+    EXPECT_GE(countChainedLoadOfLoad(m, fi), 1u)
+        << "the >8B by-reference va_arg must deref the slot: a chained Load(Load(ap)) "
+           "— dropping the deref (returning the slot address) takes this to 0 (a "
+           "silent miscompile caught here, not just on the Windows PE leg)";
+}
+
+// FC12b (D-FC12B-WIN64-STRUCT-VARARG) — INVERTED to SUCCESS, caller side: passing a
+// pow2-≤8B struct BY VALUE to a Win64 (ms_x64) variadic callee. The struct rides in
+// exactly ONE arg slot BY VALUE — the Call gets exactly ONE value operand for it (a
+// loaded I64), NOT a ByValueStackArg carrier and NOT the SysV piece-split. RED-ON-
+// DISABLE: reverting the wall-2 HomogeneousPointer arm to fail-loud flips mir.ok
+// false; a regression to the SysV atomic-fit path would emit a carrier or split.
+TEST(MirLoweringCSubset, Win64StructByValueVarargCallLeq8OneSlot) {
+    auto L = lowerCSubset(
+        "struct Pt { int a; int b; };\n"   // 8B → InRegisters[1], one slot by value
+        "int sink(int n, ...);\n"
+        "int main(void) {\n"
+        "  struct Pt p; p.a = 1; p.b = 2;\n"
+        "  return sink(1, p);\n"          // struct BY VALUE to a Win64 variadic fn
+        "}\n",
+        "x86_64", "ms_x64");
+    ASSERT_TRUE(L.mir.ok)
+        << "a ≤8B struct-by-value vararg to a Win64 variadic fn must lower "
+           "(D-FC12B-WIN64-STRUCT-VARARG): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithCall(m);   // `main` (the caller)
+    // NO overflow carrier — the by-value struct is ONE value operand in one slot.
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 0u)
+        << "a Win64 ≤8B by-value struct vararg is ONE value slot, never a carrier";
+    // The Call has exactly the fixed callee + the count `1` + ONE struct value
+    // operand = 3 operands. (callee GlobalAddr, n=1, struct-as-I64.)
+    MirFuncId const f = m.funcAt(fi);
+    MirInstId call = InvalidMirInst;
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f) && !call.valid(); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) == MirOpcode::Call) { call = ix; break; }
+        }
+    }
+    ASSERT_TRUE(call.valid());
+    auto const ops = m.instOperands(call);
+    EXPECT_EQ(ops.size(), 3u)
+        << "Call = [callee, n=1, ONE struct value operand] — the ≤8B struct is a "
+           "single by-value slot (NOT 0/fail-loud, NOT a 2-piece split)";
+}
+
+// FC12b (D-FC12B-WIN64-STRUCT-VARARG) — SUCCESS, caller side >8B by-reference. A
+// non-pow2/>8B struct passed BY VALUE to a Win64 variadic callee rides as a hidden
+// POINTER in ONE slot — the Call gets exactly ONE pointer operand (the temp copy
+// address), still NO carrier. RED-ON-DISABLE: a regression to the SysV MEMORY-class
+// carrier would emit a ByValueStackArg instead of the pointer operand.
+TEST(MirLoweringCSubset, Win64StructByValueVarargCallGt8OnePointer) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"  // 24B → ByReference (hidden ptr)
+        "int sink(int n, ...);\n"
+        "int main(void) {\n"
+        "  struct Big b; b.a = 1; b.b = 2; b.c = 3;\n"
+        "  return sink(1, b);\n"          // >8B struct BY VALUE to a Win64 variadic fn
+        "}\n",
+        "x86_64", "ms_x64");
+    ASSERT_TRUE(L.mir.ok)
+        << "a >8B struct-by-value vararg to a Win64 variadic fn must lower "
+           "(D-FC12B-WIN64-STRUCT-VARARG): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithCall(m);   // `main`
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 0u)
+        << "a Win64 >8B by-value struct vararg rides as a pointer in one slot — "
+           "never the SysV MEMORY-class overflow carrier";
+    MirFuncId const f = m.funcAt(fi);
+    MirInstId call = InvalidMirInst;
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f) && !call.valid(); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) == MirOpcode::Call) { call = ix; break; }
+        }
+    }
+    ASSERT_TRUE(call.valid());
+    auto const ops = m.instOperands(call);
+    EXPECT_EQ(ops.size(), 3u)
+        << "Call = [callee, n=1, ONE struct POINTER operand] — the >8B struct is a "
+           "single hidden-pointer slot (NOT a carrier, NOT 0/fail-loud)";
+}
+
+// FC12-deferral④ (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS, CLOSED): a SysV
+// variadic callee whose FIXED params overflow the 6 integer arg registers onto the
+// stack now LOWERS — va_start bakes the fixed-stack-arg byte displacement into the
+// VaOverflowArgAreaAddr payload so overflow_arg_area skips the named stack arg(s) and
+// points at the FIRST vararg (SysV §3.5.7). FOLD 3 (strict): pin the payload VALUE.
+// RED-ON-DISABLE: revert the mir_to_lir VaOverflowArgAreaAddr payload threading (or
+// the hir_to_mir displacement) → the payload drops to 0 and this EXPECT_EQ goes red.
+TEST(MirLoweringCSubset, VaStartFixedParamsOverflowToStackSucceeds) {
+    // 7 fixed int params (a..g): SysV has 6 integer arg registers, so `g` overflows
+    // ON THE STACK. gprOver = 7 - 6 = 1 → fixedStackBytes = 1 * gpSlotBytes(8) = 8.
+    auto L = lowerCSubset(
+        "int pick(int a, int b, int c, int d, int e, int f, int g, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, g);\n"
+        "  int v = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return a + g + v;\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "a SysV variadic callee whose fixed params overflow to the stack must now "
+           "LOWER (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    auto const payload = vaOverflowArgAreaPayload(m, fi);
+    ASSERT_TRUE(payload.has_value())
+        << "the lowered va_start must emit a VaOverflowArgAreaAddr leaf";
+    EXPECT_EQ(*payload, 8u)
+        << "overflow_arg_area must be displaced PAST the 1 overflowed fixed GPR "
+           "(1 * gpSlotBytes(8) = 8) — a 0 payload would read the fixed stack arg `g` "
+           "as the first vararg (FOLD 3: value, not presence)";
+}
+
+// FC12-deferral④ (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS, CLOSED): AAPCS64
+// mirror — a variadic ARM64 callee whose FIXED int params overflow the 8 GPR arg regs
+// (x0..x7) onto the stack now LOWERS. va_start bakes the fixed-stack-arg displacement
+// into VaOverflowArgAreaAddr (→ __stack) AND CLAMPS __gr_offs to 0 (the GR block is
+// fully consumed by fixed params, so every GPR vararg routes to __stack). FOLD 3
+// (strict): payload VALUE == 8 + no negative const survives (the __gr_offs clamp).
+// RED-ON-DISABLE: revert the payload threading → payload 0 (red); revert the
+// __gr_offs clamp to `-(gpSaveCount - fixedGpr)` → a negative i32 const appears (red).
+TEST(MirLoweringCSubset, Aapcs64VaStartFixedParamsOverflowToStackSucceeds) {
+    // 9 fixed int params (a..i): AAPCS64 has 8 GPR arg regs (x0..x7), so `i` overflows
+    // ON THE STACK. gprOver = 9 - 8 = 1 → fixedStackBytes = 1 * gpSlotBytes(8) = 8;
+    // __gr_offs clamps to 0 (fixedGpr 9 >= gpSaveCount 8).
+    auto L = lowerCSubset(
+        "int pick(int a, int b, int c, int d, int e, int f, int g, int h, int i,"
+        " ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, i);\n"
+        "  int v = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return a + i + v;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok)
+        << "an AAPCS64 variadic callee whose fixed INT params overflow to the stack "
+           "must now LOWER (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    auto const payload = vaOverflowArgAreaPayload(m, fi);
+    ASSERT_TRUE(payload.has_value())
+        << "the lowered va_start must emit a VaOverflowArgAreaAddr (→ __stack) leaf";
+    EXPECT_EQ(*payload, 8u)
+        << "__stack must skip the 1 overflowed fixed GPR (1 * gpSlotBytes(8) = 8)";
+    // __gr_offs CLAMPS to 0 (GR block fully consumed). NOTE __vr_offs is legitimately
+    // -128 here (no fixed FP params → whole VR block available), so a blunt "any
+    // negative const" check would false-fail; the strict witness is "no HUGE-magnitude
+    // underflow const survives" (< -1000), which the reverted clamp's ≈ -4.29e9 trips.
+    EXPECT_TRUE(funcHasConstInt(m, fi, 0))
+        << "__gr_offs must be CLAMPED to 0 (the GR block is fully consumed)";
+    EXPECT_FALSE(funcHasConstIntBelow(m, fi, -1000))
+        << "the OLD underflowing `-(gpSaveCount - fixedGpr)*8` wraps unsigned to a "
+           "HUGE-magnitude negative const (≈ -4.29e9) for __gr_offs — its absence is "
+           "the strict clamp witness (FOLD 3; the legit __vr_offs=-128 is far above "
+           "the -1000 floor)";
+}
+
+// FC12-deferral④ (FP-cursor variant, CLOSED): 9 fixed DOUBLE params overflow the 8 FP
+// arg regs (v0..v7) onto the stack — now LOWERS. fprOver = 9 - 8 = 1 → fixedStackBytes
+// = 1 * gpSlotBytes(8) = 8 (the overflow FP slot is 8B, NOT fpSlotBytes(16)); __vr_offs
+// clamps to 0. NOTE __gr_offs is legitimately -64 here (no fixed GPR params → whole GR
+// block available), so the no-negative-const check does NOT apply to this FP case.
+// RED-ON-DISABLE: revert the payload threading → payload 0 (red); revert the __vr_offs
+// clamp → __vr_offs underflows (the Const 0 disappears) → red.
+TEST(MirLoweringCSubset, Aapcs64VaStartFixedDoubleParamsOverflowToStackSucceeds) {
+    auto L = lowerCSubset(
+        "double pick(double a, double b, double c, double d, double e, double f,"
+        " double g, double h, double i, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, i);\n"
+        "  double v = va_arg(ap, double);\n"
+        "  va_end(ap);\n"
+        "  return a + i + v;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok)
+        << "an AAPCS64 variadic callee whose fixed FP params overflow to the stack "
+           "must now LOWER (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    auto const payload = vaOverflowArgAreaPayload(m, fi);
+    ASSERT_TRUE(payload.has_value())
+        << "the lowered va_start must emit a VaOverflowArgAreaAddr (→ __stack) leaf";
+    EXPECT_EQ(*payload, 8u)
+        << "__stack must skip the 1 overflowed fixed FP slot, sized gpSlotBytes(8) "
+           "NOT fpSlotBytes(16) (incoming overflow slots are 8B)";
+    EXPECT_TRUE(funcHasConstInt(m, fi, 0))
+        << "__vr_offs must be CLAMPED to 0 (the VR block is fully consumed by fixed "
+           "FP params)";
+}
+
+// FC12-deferral④ (mixed-class overflow): 9 fixed int (x0..x7 + 1 overflow) AND 9 fixed
+// double (v0..v7 + 1 overflow) → BOTH classes overflow by one slot. gprOver = 1,
+// fprOver = 1 → fixedStackBytes = (1 + 1) * gpSlotBytes(8) = 16; BOTH __gr_offs and
+// __vr_offs clamp to 0 (each block fully consumed). This is the dual-cursor stress
+// case the single-class pins do not cover. RED-ON-DISABLE: drop the payload threading
+// → payload 0; revert either clamp → a negative const appears (red).
+TEST(MirLoweringCSubset, Aapcs64VaStartMixedClassFixedStackOverflow) {
+    auto L = lowerCSubset(
+        "double pick(int a, int b, int c, int d, int e, int f, int g, int h, int i,"
+        " double m0, double m1, double m2, double m3, double m4, double m5,"
+        " double m6, double m7, double m8, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, m8);\n"
+        "  double v = va_arg(ap, double);\n"
+        "  va_end(ap);\n"
+        "  return a + i + v;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok)
+        << "an AAPCS64 variadic callee whose fixed INT and FP params BOTH overflow must "
+           "LOWER (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    auto const payload = vaOverflowArgAreaPayload(m, fi);
+    ASSERT_TRUE(payload.has_value())
+        << "the lowered va_start must emit a VaOverflowArgAreaAddr (→ __stack) leaf";
+    EXPECT_EQ(*payload, 16u)
+        << "__stack must skip BOTH overflowed fixed slots (gprOver 1 + fprOver 1) * 8 "
+           "= 16";
+    EXPECT_TRUE(funcHasConstInt(m, fi, 0))
+        << "both __gr_offs and __vr_offs must be CLAMPED to 0 (both blocks consumed)";
+    EXPECT_FALSE(funcHasConstIntBelow(m, fi, -1000))
+        << "with BOTH classes fully consumed, NO huge-magnitude underflow const may "
+           "survive — reverting EITHER clamp emits one (≈ -4.29e9) (FOLD 3: the "
+           "both-clamp witness)";
+}
+
+// FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS, OPEN): a SysV variadic
+// callee whose fixed params overflow the GPR pool AND include a by-value AGGREGATE
+// that STRADDLES the register/stack boundary MUST fail loud. `f(a..e, struct S16, ...)`
+// : a..e consume 5 GPR (rdi..r8), leaving only r9; S16 = {long,long} needs 2 GPR
+// eightbytes but only 1 remains → real SysV puts the WHOLE struct in MEMORY (16B), yet
+// the per-register-slot formula (gprOver counts the straddling eightbyte that landed in
+// r9) would UNDERCOUNT the named stack bytes → a silent miscompile, rejected here.
+// RED-ON-DISABLE: remove the `currentFnHasAggregateFixedParam_` guard in lowerVaStart's
+// SysV overflow path → mir.ok flips TRUE (the function lowers with a wrong __overflow
+// displacement). Restore to make this go red again.
+TEST(MirLoweringCSubset, VaStartFixedStructStraddleOverflowFailsLoud) {
+    auto L = lowerCSubset(
+        "struct S16 { long x; long y; };\n"
+        "long f(long a, long b, long c, long d, long e, struct S16 s, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, s);\n"
+        "  long v = va_arg(ap, long);\n"
+        "  va_end(ap);\n"
+        "  return a + s.x + v;\n"
+        "}\n");
+    EXPECT_FALSE(L.mir.ok)
+        << "a SysV variadic callee with an overflowing fixed by-value aggregate "
+           "(register/stack straddle) must FAIL LOUD at va_start "
+           "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)";
+    EXPECT_TRUE(anyDiagActualContains(
+        L.mirReporter, "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS"))
+        << "the aggregate-straddle fail-loud must cite the new aggregate-overflow anchor";
+}
+
+// FOLD 1 mirror (AAPCS64): a variadic ARM64 callee whose fixed params overflow the FP
+// pool AND include a by-value HFA (homogeneous float aggregate) straddling the
+// register/stack boundary MUST fail loud. `f(6 doubles, struct H3, ...)` where H3 =
+// {double,double,double} is a 3-element HFA (3 VR slots): the 6 fixed doubles consume
+// v0..v5, leaving v6,v7 (2 VR) but H3 needs 3 → AAPCS64 places the WHOLE HFA on the
+// stack (24B), which the per-register-slot formula undercounts → rejected.
+// RED-ON-DISABLE: remove the `currentFnHasAggregateFixedParam_` guard in the
+// Aapcs64DualCursor overflow path → mir.ok flips TRUE.
+TEST(MirLoweringCSubset, Aapcs64VaStartFixedHfaStraddleOverflowFailsLoud) {
+    auto L = lowerCSubset(
+        "struct H3 { double a; double b; double c; };\n"
+        "double f(double a, double b, double c, double d, double e, double g,"
+        " struct H3 h, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, h);\n"
+        "  double v = va_arg(ap, double);\n"
+        "  va_end(ap);\n"
+        "  return a + h.a + v;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    EXPECT_FALSE(L.mir.ok)
+        << "an AAPCS64 variadic callee with an overflowing fixed by-value HFA "
+           "(register/stack straddle) must FAIL LOUD at va_start "
+           "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)";
+    EXPECT_TRUE(anyDiagActualContains(
+        L.mirReporter, "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS"))
+        << "the HFA-straddle fail-loud must cite the new aggregate-overflow anchor";
+}
+
+namespace {
+// Find the FIRST Call inst in function `fi` and return its payload (0 if none).
+[[nodiscard]] std::uint32_t firstCallPayload(Mir const& m, std::uint32_t fi) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) == MirOpcode::Call) return m.instPayload(ix);
+        }
+    }
+    return 0;
+}
+// FOLD 2 (va_arg same-class cursor threading): true iff some `Gep` in function `fi`
+// has its INDEX operand (operand[1]) equal to the result of an `Add` instruction.
+// In lowerVaArgAggregate's register arm, the SOURCE read of each eightbyte is
+// `Gep(reg_save_area, cursor)`. The FIRST piece's cursor is the loaded gp/fp_offset;
+// every SUBSEQUENT same-class piece's cursor is the PRIOR cursor + stride — an `Add`
+// result. So a multi-piece SAME-class gather ALWAYS produces a Gep indexed off an Add.
+// The threading regression (re-reading the ORIGINAL Load cursor for the 2nd piece)
+// would make BOTH source Geps index off the Load, never off an Add → this returns
+// false. (The DST Gep `Gep(temp, constOffset)` and the overflow-arm Gep both index
+// off a `Const`, never an `Add`; the loop counter's `Add` feeds the compare/store,
+// not a Gep index — so an Add-indexed Gep is unambiguously the threaded cursor read.)
+[[nodiscard]] bool gepIndexesOffBumpedCursor(Mir const& m, std::uint32_t fi) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Gep) continue;
+            auto const ops = m.instOperands(ix);
+            if (ops.size() < 2) continue;
+            MirInstId const idxOperand = ops[1];
+            if (idxOperand.valid()
+                && m.instOpcode(idxOperand) == MirOpcode::Add)
+                return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+// FC12a-struct (operand-count stamp): a variadic call that passes a FIXED by-value
+// struct AND a struct vararg in ONE call stamps fixedOperandCount in OPERAND units —
+// NOT param units. `combine(struct Pt base, int n, ...)` with one `struct Pt` vararg:
+//   fixed params = {base (1 GPR + 1 FPR = 2 operands), n (1 operand)} → 3 operands;
+//   the struct vararg adds 2 more (1 GPR + 1 FPR). So fixedOperandCount must be 3.
+// RED-ON-DISABLE: reverting the snapshot to fnParams().size() (=2) makes the
+// lir_callconv vararg loop treat operand index 2 (base's FPR piece) as a vararg FPR,
+// over-counting the SysV AL by one — here pinned at MIR as fixedOperandCount==3.
+TEST(MirLoweringCSubset, VariadicCallWithStructStampsFixedOperandCount) {
+    using namespace dss::call_payload;
+    // `combine` is DEFINED in-TU (not extern) so its symbol binds in the MIR-tier
+    // driver (which fails loud on unbound symbols — extern symbols resolve only in
+    // the full link pipeline). The body is minimal; `use` is the function under test.
+    auto L = lowerCSubset(
+        "struct Pt { long a; double b; };\n"
+        "long combine(struct Pt base, int n, ...) { return base.a + n; }\n"
+        "long use(void) {\n"
+        "  struct Pt base = {1, 2.0};\n"
+        "  struct Pt v = {3, 4.0};\n"
+        "  return combine(base, 1, v);\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "the variadic call with a struct vararg must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // `use` is the caller — the function whose Call is variadic. (combine also
+    // exists; pick the function that CONTAINS the variadic Call.)
+    std::uint32_t fi = 0;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        if (dss::call_payload::isVariadic(firstCallPayload(m, f))) { fi = f; break; }
+    }
+    std::uint32_t const payload = firstCallPayload(m, fi);
+    EXPECT_TRUE(isVariadic(payload)) << "the call to a variadic callee is variadic";
+    EXPECT_EQ(fixedOperandCount(payload), 3u)
+        << "fixedOperandCount is in OPERAND units: base (2 pieces) + n (1) = 3 — "
+           "NOT the param count (2)";
+}
+
+// FC12a-struct (FOLD 1 — hidden-arg sret in fixedOperandCount): a VARIADIC call to a
+// callee that RETURNS a >16B struct BY VALUE (SysV hidden-arg sret) with a trailing
+// FIXED `double` param. SysV routes the sret pointer as a REAL arg in rdi (argIdx 0,
+// firstArgIdx==1 in lir_callconv — NOT the x8-IRR convention), so `operandsBeforeArgs`
+// must COUNT it: operands = [callee, sretPtr, 2.5(fixed double), 1(vararg), 2(vararg)];
+// at the stamp point (after the fixed double) operands.size()==3 and
+// operandsBeforeArgs==1 (callee only — the hidden-arg sret is INSIDE fixedOperandCount),
+// so fixedOperandCount == 2 (sret@argIdx0 + double@argIdx1 are both fixed; varargs start
+// at argIdx 2 → AL vector count EXCLUDES the fixed double's FPR).
+//
+// RED-ON-DISABLE: reverting `operandsBeforeArgs` to `operands.size()` (the post-sret-push
+// capture) makes it 2, so fixedOperandCount == 3-2 == 1. Then lir_callconv's vararg loop
+// (firstArgIdx==1) sees the fixed double at argIdx 1 >= fixedCount(1) → misclassifies it
+// as the FIRST vararg, an FPR → AL set one too high → silent miscompile. The EXPECT below
+// goes red (sees 1, expects 2). Verified by temp-reverting the capture and confirming red.
+//
+// `vsret` is DEFINED in-TU so its symbol binds in the MIR-tier driver (extern symbols
+// resolve only in the full link pipeline), mirroring the other call-site fixtures.
+TEST(MirLoweringCSubset, VariadicCallSretHiddenArgCountedInFixedOperandCount) {
+    using namespace dss::call_payload;
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"   // 24B → MEMORY class → hidden-arg sret
+        "struct Big vsret(double d, ...) {\n"
+        "  struct Big r = {0, 0, 0};\n"
+        "  return r;\n"
+        "}\n"
+        "long use(void) {\n"
+        "  struct Big r = vsret(2.5, 1, 2);\n"
+        "  return r.a;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a variadic call returning a >16B struct (hidden-arg sret) with a trailing "
+           "fixed double must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // `use` is the caller — the function whose Call is variadic. (`vsret` is also
+    // variadic-typed but contains NO Call; pick the function that CONTAINS the call.)
+    std::uint32_t fi = 0;
+    bool found = false;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        if (isVariadic(firstCallPayload(m, f))) { fi = f; found = true; break; }
+    }
+    ASSERT_TRUE(found) << "the variadic call must be present in some function";
+    std::uint32_t const payload = firstCallPayload(m, fi);
+    EXPECT_TRUE(isVariadic(payload)) << "the call to a variadic callee is variadic";
+    EXPECT_TRUE(hasIndirectResult(payload) == false)
+        << "SysV (no indirectResultRegister) uses the hidden-ARG sret convention, "
+           "NOT the x8-IRR bit — the sret pointer is a real arg, not routed to x8";
+    EXPECT_EQ(fixedOperandCount(payload), 2u)
+        << "fixedOperandCount MUST count the hidden-arg sret pointer (argIdx 0) AND the "
+           "fixed double (argIdx 1) = 2. Reverting operandsBeforeArgs to operands.size() "
+           "(post-sret-push) yields 1, mis-binning the fixed double as the first vararg "
+           "and over-counting the SysV AL by one.";
+}
+
+// FC12a-struct (wall 3): a variadic fn with a FIXED InRegisters `{long; double}`
+// param LOWERS (no longer fail-loud) and its va_start initializes gp_offset/fp_offset
+// PAST the struct's pieces (1 GPR + 1 FPR). For SysV: gp_offset = 1*8 = 8;
+// fp_offset = gpOffsetLimit(48) + 1*16 = 64. RED-ON-DISABLE: reverting wall-3 to
+// fail-loud makes mir.ok false; reverting receiveByValueParam's per-class advance
+// (so the FPR piece is not counted) makes fp_offset 48 (no Const 64) → red.
+TEST(MirLoweringCSubset, VariadicFnFixedStructParamThreadsBothClassCursors) {
+    auto L = lowerCSubset(
+        "struct Pt { long a; double b; };\n"
+        "long sum(struct Pt base, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, base);\n"
+        "  va_end(ap);\n"
+        "  return base.a;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a variadic fn with a fixed InRegisters struct param must LOWER (wall-3 "
+           "now classifies before the variadic check)";
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // gp_offset init = fixedGpr(1) * gpSlotBytes(8) = 8 (the struct's 1 GPR piece).
+    EXPECT_TRUE(funcHasConstInt(m, fi, 8))
+        << "va_start gp_offset must start PAST the struct's 1 GPR piece (1*8=8)";
+    // fp_offset init = gpOffsetLimit(48) + fixedFpr(1) * fpSlotBytes(16) = 64.
+    EXPECT_TRUE(funcHasConstInt(m, fi, 64))
+        << "va_start fp_offset must start PAST the struct's 1 FPR piece "
+           "(48 + 1*16 = 64) — pins the per-class accounting through the struct";
+}
+
+// FC12a-struct (wall 1, MEMORY class): passing a >16B (MEMORY class) struct BY VALUE
+// to a variadic callee now LOWERS via the Option-C carrier (was fail-loud). STRUCTURAL
+// PIN (red-on-disable): the call's vararg region carries exactly ONE `ByValueStackArg`
+// (the by-value-stack aggregate carrier) — reverting the ByReference-variadic route to
+// fail-loud makes mir.ok false; a regression that pushed the hidden pointer instead
+// (the non-variadic Win64-style path) would emit 0 ByValueStackArg → red.
+TEST(MirLoweringCSubset, VariadicCallStructOver16BByValueUsesCarrier) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"   // 24B → MEMORY class
+        "long combine(int n, ...) { return n; }\n"    // DEFINED so the symbol binds
+        "long use(void) {\n"
+        "  struct Big b = {1, 2, 3};\n"
+        "  return combine(1, b);\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "a >16B (MEMORY class) struct vararg must now LOWER via the Option-C carrier "
+           "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithCall(m);   // `use` (the caller)
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 1u)
+        << "the >16B struct vararg is routed to exactly one by-value-stack carrier "
+           "(NOT the hidden-pointer convention)";
+}
+
+// FC12a-struct (wall 3, MEMORY class): a >16B by-value struct FIXED param in a
+// variadic fn now LOWERS (was fail-loud) — receiveByValueParam's ByReference arm
+// receives the hidden pointer as ONE GPR arg, so va_start's gp_offset starts past it
+// (1 GPR consumed → gp_offset init = 1*8 = 8). STRUCTURAL PIN (red-on-disable):
+// reverting wall-3 to fail-loud makes mir.ok false; the Const 8 pins that the hidden
+// pointer was counted as exactly one fixed GPR (a regression that miscounted it would
+// not emit Const 8). The SEPARATE D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS guard is
+// untouched (this fn has 1 fixed GPR ≤ 6, so it does not fire).
+TEST(MirLoweringCSubset, VariadicFnFixedStructOver16BParamThreadsHiddenPtrCursor) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"   // 24B → MEMORY class
+        "long sum(struct Big base, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, base);\n"
+        "  va_end(ap);\n"
+        "  return base.a;\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "a >16B (MEMORY class) fixed struct param in a variadic fn must now LOWER "
+           "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // gp_offset init = fixedGpr(1) * gpSlotBytes(8) = 8 — the hidden sret-style pointer
+    // for the >16B param consumed exactly one GPR arg register.
+    EXPECT_TRUE(funcHasConstInt(m, fi, 8))
+        << "va_start gp_offset must start PAST the >16B param's 1 hidden-pointer GPR "
+           "(1*8 = 8)";
+}
+
+// FC12a-struct (atomic-exhaustion split): a variadic call where enough prior GPR
+// args have been consumed that a `{long, long}` (2-GPR) struct vararg cannot fit
+// wholly in registers now routes the WHOLE struct to the Option-C carrier (was
+// fail-loud) — SysV forbids the register/stack split, so the aggregate goes ENTIRELY
+// to memory. Here: `combine(int n, ...)` with 1 fixed int (GPR 0) + 5 long varargs
+// (GPRs 1..5) means only 1 arg GPR remains, but `{long,long}` needs 2 → whole struct
+// to overflow. STRUCTURAL PIN (red-on-disable): exactly ONE `ByValueStackArg` carrier
+// is emitted (NOT 2 register pieces); reverting the split route to fail-loud makes
+// mir.ok false; a regression that emitted the 2 register pieces (the silent split the
+// audit caught) would emit 0 ByValueStackArg → red.
+TEST(MirLoweringCSubset, VariadicCallStructRegisterExhaustionSplitRoutesToCarrier) {
+    auto L = lowerCSubset(
+        "struct LL { long a; long b; };\n"
+        "long combine(int n, ...) { return n; }\n"    // DEFINED so the symbol binds
+        "long use(void) {\n"
+        "  struct LL p = {7, 8};\n"
+        "  return combine(1, 100L, 200L, 300L, 400L, 500L, p);\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "a struct vararg that cannot fit wholly in registers must route the WHOLE "
+           "aggregate to the carrier (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithCall(m);   // `use` (the caller)
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 1u)
+        << "the register-exhaustion-split struct vararg goes WHOLLY to the overflow "
+           "area via one by-value-stack carrier (never a register/stack split)";
+}
+
+// FC12a-struct (anti-resurrection / by-address routing): a DISCARDED aggregate
+// va_arg (`va_arg(ap, struct Pt);` as a bare ExprStmt — side effect only) MUST
+// route through lowerLvalueAddress's VaArg arm (→ lowerVaArgAggregate), running the
+// gather BY ADDRESS so the cursor side-effect happens, and MUST NOT synthesize a
+// Phi-of-aggregate / aggregate-width value. The lowerExpr VaArg arm is a fail-loud
+// anti-resurrection backstop (no C-subset source reaches it — every aggregate
+// va_arg consumer keys on type-kind → by address). RED-ON-DISABLE: removing the
+// lowerLvalueAddress VaArg arm makes the discard fall to lowerLvalueAddress's final
+// fail-loud (mir.ok false); a regression that synthesized an aggregate Phi trips the
+// hasAggregatePhi assertion.
+TEST(MirLoweringCSubset, DiscardedAggregateVaArgRoutesByAddressNoAggregatePhi) {
+    auto L = lowerCSubset(
+        "struct Pt { long a; double b; };\n"
+        "long sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  va_arg(ap, struct Pt);\n"   // DISCARDED aggregate va_arg (side effect only)
+        "  va_end(ap);\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "a discarded aggregate va_arg routes BY ADDRESS via lowerLvalueAddress's "
+           "VaArg arm (the gather's cursor bump is the side effect) — it must lower";
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // The gather ran (the atomic decision's ICmpUle pair is present), confirming the
+    // by-address arm — not the scalar lowerExpr path (which would fail loud).
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUle), 2u)
+        << "the discarded aggregate va_arg lowered via the atomic register-gather";
+    EXPECT_FALSE(hasAggregatePhi(m, L.model.lattice().interner(), fi))
+        << "an aggregate va_arg must NEVER produce a Phi of an aggregate value — it "
+           "is lowered BY ADDRESS (the lowerExpr bare-rvalue path is fail-loud)";
+}
+
+// FOLD 2 (va_arg SAME-class cursor threading — MIR pin paired with the run-witnessed
+// varargs_struct corpus): a `va_arg(ap, struct LL)` where `struct LL {long a; long b;}`
+// gathers TWO GPR eightbytes. lowerVaArgAggregate must thread the cursor: piece 0 reads
+// `Gep(reg_save_area, gp_offset)`; piece 1 reads `Gep(reg_save_area, gp_offset + 8)` —
+// the BUMPED cursor (an `Add` result). The MIR therefore contains a source Gep whose
+// INDEX operand is an `Add`. RED-ON-DISABLE: if the 2nd-piece read re-used the ORIGINAL
+// `gp_offset` Load (the threading regression — `b` aliases `a`'s slot), NO Gep would
+// index off an Add, and `gepIndexesOffBumpedCursor` returns false → this EXPECT goes
+// red. The runtime corpus is the primary lever (it witnesses a WRONG exit code); this
+// pin localizes the same regression to the MIR shape for a fast, host-independent fail.
+TEST(MirLoweringCSubset, VaArgTwoSameClassStructThreadsCursorThroughAdd) {
+    auto L = lowerCSubset(
+        "struct LL { long a; long b; };\n"
+        "long sumLL(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct LL p = va_arg(ap, struct LL);\n"
+        "  va_end(ap);\n"
+        "  return p.a + p.b;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "a 2-GPR struct va_arg must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // The atomic register-gather ran (the by-address arm, not the fail-loud rvalue path).
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUle), 2u)
+        << "the aggregate va_arg lowered via the atomic register-gather";
+    // The 2nd GPR piece's source Gep indexes off the BUMPED cursor (an Add), proving
+    // the cursor was threaded rather than re-read from the original gp_offset Load.
+    EXPECT_TRUE(gepIndexesOffBumpedCursor(m, fi))
+        << "the 2nd same-class eightbyte must read reg_save_area + the BUMPED cursor "
+           "(a Gep indexed off an Add); a Gep indexed only off the original gp_offset "
+           "Load for both pieces is the threading regression (b aliases a's slot)";
+}
+
+// ─── FC12c (D-FC12C-*) AAPCS64 dual-cursor MIR pins (host-independent) ───
+
+namespace {
+// BLOCKER-2 pin support: true iff ANY Gep in function `fi` has an index operand that
+// is a SExt (sign-extend) instruction. The AAPCS64 va_arg reg arm MUST sign-extend
+// the NEGATIVE i32 cursor to i64 BEFORE the byte Gep (a zero-extended -40 becomes
+// ~+4 GiB → a wild address). Removing the SExt (the red-on-disable) flips this false.
+[[nodiscard]] bool sextFeedsGepIndex(Mir const& m, std::uint32_t fi) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Gep) continue;
+            auto const ops = m.instOperands(ix);
+            if (ops.size() < 2) continue;
+            MirInstId const idx = ops[1];
+            if (idx.valid() && m.instOpcode(idx) == MirOpcode::SExt) return true;
+        }
+    }
+    return false;
+}
+// True iff function `fi` contains a Const instruction whose integer value == `want`.
+[[nodiscard]] bool hasConstValue(Mir const& m, std::uint32_t fi, std::int64_t want) {
+    MirFuncId const f = m.funcAt(fi);
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) != MirOpcode::Const) continue;
+            auto const& lit = m.literalValue(m.constLiteralIndex(ix));
+            if (auto const* v = std::get_if<std::int64_t>(&lit.value);
+                v != nullptr && *v == want)
+                return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+// Gate #2 + #9 (host-independent, BLOCKER-2): an AAPCS64 va_arg(int) lowers to the
+// dual-cursor diamond — ICmpSlt(offs, 0) (NEGATIVE cursor < 0, a SIGNED compare, not
+// the SysV ICmpUlt-vs-limit) feeding a CondBr, a Phi joining the two address arms,
+// AND — the BLOCKER-2 pin — a SExt feeding the reg-arm's address Gep index. RED-ON-
+// DISABLE: removing the SExt (the load-bearing sign-extend) flips sextFeedsGepIndex.
+TEST(MirLoweringCSubset, Aapcs64VaArgIntLowersToDualCursorDiamondSignExtend) {
+    auto L = lowerCSubset(
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "AAPCS64 variadic callee must type-check (va_list = __va_list struct)";
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "the AAPCS64 dual-cursor va_arg must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // SIGNED compare against 0 (the negative cursor) — NOT the SysV unsigned-vs-limit.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpSlt), 1u)
+        << "AAPCS64 va_arg compares the NEGATIVE class cursor against 0 (signed)";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUlt), 0u)
+        << "AAPCS64 does NOT use the SysV unsigned-vs-limit compare";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::CondBr), 1u)
+        << "AAPCS64 va_arg branches reg-vs-stack";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Phi), 1u)
+        << "AAPCS64 va_arg joins the two address arms with a Phi (scalar pointer)";
+    EXPECT_TRUE(sextFeedsGepIndex(m, fi))
+        << "BLOCKER-2: the reg arm MUST sign-extend the i32 cursor before the byte Gep "
+           "(a zero-extended negative cursor is a +4 GiB wild address → segfault); "
+           "remove the SExt and this assertion goes red";
+    // AAPCS64 uses the dual-cursor leaf (VaRegSaveAreaAddr), not the Win64 home leaf.
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::VaRegSaveAreaAddr), 1u);
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::VaHomeArgAreaAddr), 0u);
+}
+
+// Gate #3 (host-independent): AAPCS64 va_start with N fixed int args sets __gr_offs =
+// -(8 - N) * 8. With N=1 (the fixed `n`) → -(8-1)*8 = -56. Emit a Const of that value.
+// RED-ON-DISABLE: a wrong sign (e.g. +56) or wrong arithmetic flips the Const value.
+TEST(MirLoweringCSubset, Aapcs64VaStartInitsNegativeGrOffs) {
+    auto L = lowerCSubset(
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // __gr_offs = -(8 - 1) * 8 = -56 (1 fixed int arg in x0).
+    EXPECT_TRUE(hasConstValue(m, fi, -56))
+        << "AAPCS64 va_start must init __gr_offs = -(gpSaveCount - fixedGpr)*gpSlotBytes "
+           "= -(8-1)*8 = -56 for one fixed int arg (a NEGATIVE cursor counting up to 0)";
+    // __vr_offs = -(8 - 0) * 16 = -128 (no fixed FP args).
+    EXPECT_TRUE(hasConstValue(m, fi, -128))
+        << "AAPCS64 va_start must init __vr_offs = -(8-0)*16 = -128 (no fixed FP args)";
+}
+
+// D-FC12C-AAPCS64-HFA-STRUCT-VARARG — INVERTED to SUCCESS (was Aapcs64VaArgStructFailsLoud).
+// A struct va_arg under AAPCS64 now GATHERS via the dual-cursor diamond. `struct Pt`
+// (8B, non-HFA) is a 1-GPR InRegisters aggregate → it reads the GR save block. The
+// inverted pin asserts the gather's structural signature (NOT a bare ok flip): the
+// SIGNED atomic-fit (ICmpSlt, NOT the SysV ICmpUlt), the SXTW (SExt, hazard H1), and
+// the H2 wrong-class guard (reads __gr_offs@24, NEVER __vr_offs@28). RED-ON-DISABLE:
+// reverting the lowerVaArgAggregate Aapcs64DualCursor arm to fail-loud flips ok false.
+TEST(MirLoweringCSubset, Aapcs64VaArgStructGathersViaDualCursor) {
+    auto L = lowerCSubset(
+        "struct Pt { int a; int b; };\n"   // 8B, non-HFA → 1 GPR piece (GR block)
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct Pt p = va_arg(ap, struct Pt);\n"
+        "  va_end(ap);\n"
+        "  return p.a + p.b;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok)
+        << "va_arg of a struct under AAPCS64 must SUCCEED after "
+           "D-FC12C-AAPCS64-HFA-STRUCT-VARARG: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);   // `sum` (the variadic callee)
+    EXPECT_TRUE(hasMirOpcode(m, fi, MirOpcode::ICmpSlt))
+        << "the AAPCS64 struct gather uses the SIGNED atomic-fit (negative cursor < 0)";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUlt), 0u)
+        << "AAPCS64 does NOT use the SysV unsigned-vs-limit compare (a fall-through to "
+           "the SysV gather would emit ICmpUlt)";
+    EXPECT_TRUE(hasMirOpcode(m, fi, MirOpcode::SExt))
+        << "H1: the reg arm MUST sign-extend the i32 cursor before the byte Gep";
+    // H2 (wrong-class save block): a non-HFA reads __gr_offs@24, NEVER __vr_offs@28.
+    EXPECT_GE(countLoadsAtFieldOffset(m, fi, 24), 1u)
+        << "a non-HFA struct gather reads the GR cursor __gr_offs@24";
+    EXPECT_EQ(countLoadsAtFieldOffset(m, fi, 28), 0u)
+        << "a non-HFA struct gather must NEVER read the VR cursor __vr_offs@28 (H2: "
+           "reading the wrong save block is silent garbage)";
+}
+
+// D-FC12C-AAPCS64-HFA-STRUCT-VARARG — INVERTED to SUCCESS (was
+// Aapcs64StructByValueVarargCallFailsLoud). Passing a struct BY VALUE to an AAPCS64
+// variadic CALLEE now places it in registers (the GR/VR pool has room). `struct Pt`
+// is non-HFA → 1 GPR operand. The inverted pin asserts the register placement (NOT a
+// bare ok flip): NO ByValueStackArg carrier when the struct fits in registers. RED-ON-
+// DISABLE: reverting the Call-arg-loop Aapcs64DualCursor arm to fail-loud flips ok false.
+TEST(MirLoweringCSubset, Aapcs64StructByValueVarargCallPlacesInRegisters) {
+    auto L = lowerCSubset(
+        "struct Pt { int a; int b; };\n"
+        "int sink(int n, ...);\n"
+        "int main(void) {\n"
+        "  struct Pt p; p.a = 1; p.b = 2;\n"
+        "  return sink(1, p);\n"          // struct BY VALUE to an AAPCS64 variadic fn
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok)
+        << "a struct-by-value vararg to an AAPCS64 variadic fn must SUCCEED after "
+           "D-FC12C-AAPCS64-HFA-STRUCT-VARARG: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithCall(m);   // `main` (the caller)
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 0u)
+        << "a struct that fits in the GR pool is REGISTER-placed (piece operands), "
+           "NOT forced to the overflow via the ByValueStackArg carrier";
+}
+
+// D-FC12C-AAPCS64-HFA-STRUCT-VARARG (Step 4.3) — an HFA `{double,double}` va_arg
+// gathers from the VR save block, NOT the GR block (hazard H2). 2 FPR pieces ⇒ ≥2
+// SExt (one cursor SXTW per piece, H1) + the signed VR atomic-fit. The load-bearing
+// H2 pin: __vr_offs@28 is read (>0) and __gr_offs@24 is NEVER read (==0). RED-ON-
+// DISABLE: routing HFA pieces through the GR cursor (offField=grOffs) flips both
+// offset counts (24 becomes >0, 28 becomes 0) → silent garbage from the integer block.
+TEST(MirLoweringCSubset, Aapcs64VaArgHfaFromVrNotGr) {
+    auto L = lowerCSubset(
+        "struct HFA { double a; double b; };\n"   // 16B, 2 FPR pieces (VR block)
+        "double sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  double t = 0;\n"
+        "  for (int i = 0; i < n; i = i + 1) {\n"
+        "    struct HFA p = va_arg(ap, struct HFA);\n"
+        "    t = t + p.a + p.b;\n"
+        "  }\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok)
+        << "AAPCS64 HFA va_arg must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    EXPECT_TRUE(hasMirOpcode(m, fi, MirOpcode::ICmpSlt))
+        << "the VR atomic-fit is a SIGNED compare (negative cursor)";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::SExt), 2u)
+        << "H1: each of the 2 HFA pieces sign-extends its i32 cursor before the byte Gep";
+    EXPECT_GE(countLoadsAtFieldOffset(m, fi, 28), 1u)
+        << "an HFA gather reads the VR cursor __vr_offs@28";
+    EXPECT_EQ(countLoadsAtFieldOffset(m, fi, 24), 0u)
+        << "H2: an HFA gather must NEVER read the GR cursor __gr_offs@24 (reading the "
+           "integer save block for an FPR piece is silent garbage)";
+}
+
+// D-FC12C-AAPCS64-HFA-STRUCT-VARARG (Step 4.4) — the MIRROR of the H2 pin: a non-HFA
+// `{long,long}` (16B, 2 GPR pieces) reads the GR block and NEVER the VR block.
+TEST(MirLoweringCSubset, Aapcs64VaArgNonHfaFromGrNotVr) {
+    auto L = lowerCSubset(
+        "struct Pair { long a; long b; };\n"   // 16B, 2 GPR pieces (GR block)
+        "long sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct Pair p = va_arg(ap, struct Pair);\n"
+        "  va_end(ap);\n"
+        "  return p.a + p.b;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok)
+        << "AAPCS64 non-HFA ≤16B va_arg must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    EXPECT_GE(countLoadsAtFieldOffset(m, fi, 24), 1u)
+        << "a non-HFA gather reads the GR cursor __gr_offs@24";
+    EXPECT_EQ(countLoadsAtFieldOffset(m, fi, 28), 0u)
+        << "H2 mirror: a non-HFA gather must NEVER read the VR cursor __vr_offs@28";
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::SExt), 2u)
+        << "H1: each of the 2 GPR pieces sign-extends its i32 cursor before the byte Gep";
+}
+
+// D-FC12C-AAPCS64-HFA-STRUCT-VARARG (Step 4.5) — a >16B `{long,long,long}` (24B,
+// ByReference) va_arg DEREFERENCES a hidden pointer from ONE GR slot (hazards H5/H7):
+// a chained Load(Load(...)) (the slot-Load → pointer-deref-Load). RED-ON-DISABLE:
+// dropping the deref (returning the slot address) takes the chained-Load count to 0.
+TEST(MirLoweringCSubset, Aapcs64VaArgByRefUsesChainedLoad) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"   // 24B → ByReference (hidden ptr)
+        "long pick(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct Big b = va_arg(ap, struct Big);\n"
+        "  va_end(ap);\n"
+        "  return b.a + b.b + b.c;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok)
+        << "AAPCS64 >16B ByReference va_arg must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    EXPECT_GE(countChainedLoadOfLoad(m, fi), 1u)
+        << "H5: the ByReference va_arg must deref the GR slot (chained Load(Load(...)))";
+    EXPECT_GE(countLoadsAtFieldOffset(m, fi, 24), 1u)
+        << "the hidden pointer rides in ONE GR slot — read __gr_offs@24 (NOT the VR "
+           "cursor; a pointer is integer-class, hazard H5)";
+    EXPECT_EQ(countLoadsAtFieldOffset(m, fi, 28), 0u)
+        << "a ByReference pointer is GR-class — the VR cursor __vr_offs@28 is untouched";
+}
+
+// FOLD B (NIT 2) — the precise, host-independent H5 REGISTER-arm deref pin. The
+// existing Aapcs64VaArgByRefUsesChainedLoad above uses countChainedLoadOfLoad, which
+// matches `Load(Load(...))` — the OVERFLOW arm's deref (`Load(Load(stackField))`). But
+// the REGISTER arm's deref is `Load(Gep(__gr_top, idx))` = `Load(Gep(...))`, NOT a
+// chained Load-of-Load — so that pin does NOT witness the register arm. Dropping the
+// register-arm deref (returning `slotAddr` — the address OF the hidden pointer slot —
+// instead of dereferencing it: a silent miscompile that hands the consumer a
+// pointer-to-pointer) would leave countChainedLoadOfLoad>=1 (overflow arm intact) and
+// flip NO host-independent pin. This asserts the register-arm deref SHAPE directly:
+// `Load(Gep(<gr_top>, idx))` where `<gr_top>` is `Load(Gep(tagBase, grTopField==8))`
+// (the byteOffset is read from arm64.target.json aapcs64 vaListLayout). RED-ON-DISABLE:
+// removing the deref Load takes countRegArmTopDeref(...,8) to 0.
+TEST(MirLoweringCSubset, Aapcs64VaArgByRefRegArmDerefsGrTop) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"   // 24B → ByReference (hidden ptr)
+        "long pick(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct Big b = va_arg(ap, struct Big);\n"
+        "  va_end(ap);\n"
+        "  return b.a + b.b + b.c;\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok)
+        << "AAPCS64 >16B ByReference va_arg must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    // grTopField byteOffset == 8 (arm64.target.json aapcs64 vaListLayout). The register
+    // arm derefs the hidden pointer: Load(Gep(Load(Gep(ap, 8)), SExt(curOffs))). This
+    // count is EXACTLY 1 (the single register-arm deref) and goes to 0 if the deref is
+    // removed — a witness the chained-Load pin above structurally cannot provide.
+    EXPECT_EQ(countRegArmTopDeref(m, fi, 8), 1u)
+        << "H5 (register arm): the ByReference va_arg must DEREF the hidden pointer in "
+           "the GR slot — Load(Gep(__gr_top@8, idx)). Removing the deref (returning the "
+           "slot address) is a silent miscompile that countChainedLoadOfLoad (overflow "
+           "arm only) cannot catch — this pin can";
+}
+
+// D-FC12C-AAPCS64-HFA-STRUCT-VARARG (Step 4.6, CALLER) — passing an HFA
+// `{double,double}` vararg with room in the VR pool places it in REGISTERS (FPR
+// pieces), NOT the overflow carrier (hazards H4/H8). RED-ON-DISABLE: a wrong-class
+// exhaustion check that tests the GR pool for an HFA would route it to the stack
+// carrier (ByValueStackArg present).
+TEST(MirLoweringCSubset, Aapcs64CallerHfaVarargInRegisters) {
+    auto L = lowerCSubset(
+        "struct HFA { double a; double b; };\n"
+        "int sink(int n, ...);\n"
+        "int main(void) {\n"
+        "  struct HFA h; h.a = 1.0; h.b = 2.0;\n"
+        "  return sink(1, h);\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok)
+        << "AAPCS64 HFA vararg caller must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithCall(m);
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 0u)
+        << "H4/H8: an HFA with room in the VR pool is register-placed (FPR pieces), "
+           "NOT routed to the overflow carrier";
+}
+
+// D-FC12C-AAPCS64-HFA-STRUCT-VARARG (Step 4.7, CALLER) — a non-HFA `{long,long}`
+// vararg passed AFTER 8 scalar long varargs drains the GR pool (gpSaveCount=8) forces
+// the struct WHOLE to the overflow via the ByValueStackArg carrier (hazard H8). RED-
+// ON-DISABLE: a missing exhaustion check would emit register pieces (no carrier).
+TEST(MirLoweringCSubset, Aapcs64CallerNonHfaVarargExhaustsGpr) {
+    auto L = lowerCSubset(
+        "struct LL { long a; long b; };\n"
+        "long sink(int n, ...);\n"
+        "int main(void) {\n"
+        "  struct LL p; p.a = 40; p.b = 5;\n"
+        "  return (int)sink(8, 1L,2L,3L,4L,5L,6L,7L,8L, p);\n"
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok)
+        << "AAPCS64 GR-exhaustion vararg caller must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithCall(m);
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 1u)
+        << "H8: 8 scalar longs drain the GR pool (gpSaveCount=8) → the trailing struct "
+           "is forced WHOLE to the overflow via the ByValueStackArg carrier";
+}
+
+// FOLD C (NIT 3) — the host-independent H7 caller-ByReference pin. The caller arms have
+// host-independent MIR pins for HFA-in-regs (Aapcs64CallerHfaVarargInRegisters), non-
+// HFA-in-regs (Aapcs64StructByValueVarargCallPlacesInRegisters), and GR-exhaustion→
+// carrier (Aapcs64CallerNonHfaVarargExhaustsGpr). But the >16B ByReference caller arm
+// (src hir_to_mir.cpp ~762-765: `appendByValueArg` + `runGpr += 1` — a hidden POINTER
+// in ONE GR slot, placed BY POSITION, NO carrier — hazard H7) was covered ONLY by the
+// qemu runtime corpus. AAPCS64 has no SysV-style MEMORY-class-to-stack rule for
+// ByReference, so the pointer must ride as a normal GR operand (register or, once the
+// pool drains, the stack BY POSITION via lir_callconv's positional walk), NEVER forced
+// into the overflow area by the carrier. RED-ON-DISABLE: swapping this arm's
+// `appendByValueArg` for `appendByValueStackArg` makes a ByValueStackArg appear in the
+// Call (and drops the plain pointer operand) — both checked below.
+TEST(MirLoweringCSubset, Aapcs64CallerByRefVarargIsPositionedPointerNotCarrier) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"  // 24B → ByReference (hidden ptr)
+        "int sink(int n, ...);\n"
+        "int main(void) {\n"
+        "  struct Big b; b.a = 1; b.b = 2; b.c = 3;\n"
+        "  return sink(1, b);\n"          // >16B struct BY VALUE to an AAPCS64 variadic fn
+        "}\n",
+        "arm64", "aapcs64");
+    ASSERT_TRUE(L.mir.ok)
+        << "a >16B struct-by-value vararg to an AAPCS64 variadic fn must lower "
+           "(D-FC12C-AAPCS64-HFA-STRUCT-VARARG): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithCall(m);   // `main` (the caller)
+    // H7: the >16B ByReference vararg is a hidden pointer placed BY POSITION (register or
+    // positional stack) — NEVER force-routed to the overflow via the carrier.
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 0u)
+        << "H7: a >16B ByReference vararg rides as a pointer in ONE GR slot (by "
+           "position), NOT the SysV MEMORY-class overflow carrier — swapping "
+           "appendByValueArg for appendByValueStackArg would make a carrier appear here";
+    // The Call gained exactly ONE extra operand for the struct: a single pointer. So
+    // Call = [callee, n=1, ONE struct pointer] = 3 operands. A carrier swap would
+    // replace this plain pointer with a ByValueStackArg-kind operand (caught above) — and
+    // a piece-split (wrong: ByReference is one pointer, not eightbytes) would push it >3.
+    MirFuncId const f = m.funcAt(fi);
+    MirInstId call = InvalidMirInst;
+    for (std::uint32_t b = 0; b < m.funcBlockCount(f) && !call.valid(); ++b) {
+        MirBlockId const blk = m.funcBlockAt(f, b);
+        for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+            MirInstId const ix = m.blockInstAt(blk, i);
+            if (m.instOpcode(ix) == MirOpcode::Call) { call = ix; break; }
+        }
+    }
+    ASSERT_TRUE(call.valid());
+    auto const ops = m.instOperands(call);
+    EXPECT_EQ(ops.size(), 3u)
+        << "Call = [callee, n=1, ONE struct POINTER operand] — the >16B ByReference "
+           "struct adds exactly one pointer operand (NOT a carrier, NOT a piece-split)";
+}
+
+// D-FC12C-APPLE-ARM64-VARIADIC-CALLEE (Step 4.8, Apple struct CALLEE) — apple_arm64
+// `va_arg(struct Pair)` where Pair={int,int} (8B, InRegisters) is a LINEAR slot read
+// (the slot IS the storage): NO diamond (no ICmpSlt), NO deref (no chained Load). This
+// exercises the existing HomogeneousPointer arm for Apple — an integration witness.
+TEST(MirLoweringCSubset, AppleVaArgStructSmallByValueLinear) {
+    auto L = lowerCSubset(
+        "struct Pair { int a; int b; };\n"   // 8B (pow2 ≤8) → InRegisters, by value
+        "long sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct Pair p = va_arg(ap, struct Pair);\n"
+        "  va_end(ap);\n"
+        "  return p.a + p.b;\n"
+        "}\n",
+        "arm64", "apple_arm64");
+    ASSERT_TRUE(L.mir.ok)
+        << "Apple va_arg(≤8B struct) must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    EXPECT_FALSE(hasMirOpcode(m, fi, MirOpcode::ICmpSlt))
+        << "Apple HomogeneousPointer is LINEAR — no dual-cursor diamond";
+    EXPECT_EQ(countChainedLoadOfLoad(m, fi), 0u)
+        << "a ≤8B by-value Apple struct va_arg returns the slot ADDRESS — no deref";
+    EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ByValueStackArg), 0u)
+        << "the callee va_arg never emits a caller-side carrier";
+}
+
+// D-FC12C-APPLE-ARM64-VARIADIC-CALLEE (Step 4.9, Apple struct CALLEE) — apple_arm64
+// `va_arg(struct Big)` where Big is 24B (>16B, ByReference) DEREFERENCES the slot (the
+// slot holds a hidden pointer) — chained Load — but is still LINEAR (no diamond, no
+// SExt: HomogeneousPointer never deals with negative cursors).
+TEST(MirLoweringCSubset, AppleVaArgStructLargeByRefLinear) {
+    auto L = lowerCSubset(
+        "struct Big { long a; long b; long c; };\n"   // 24B → ByReference (hidden ptr)
+        "long pick(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  struct Big b = va_arg(ap, struct Big);\n"
+        "  va_end(ap);\n"
+        "  return b.a + b.b + b.c;\n"
+        "}\n",
+        "arm64", "apple_arm64");
+    ASSERT_TRUE(L.mir.ok)
+        << "Apple va_arg(>16B struct) must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    EXPECT_FALSE(hasMirOpcode(m, fi, MirOpcode::ICmpSlt))
+        << "Apple HomogeneousPointer is LINEAR — no diamond";
+    EXPECT_FALSE(hasMirOpcode(m, fi, MirOpcode::SExt))
+        << "HomogeneousPointer never sign-extends a negative cursor";
+    EXPECT_GE(countChainedLoadOfLoad(m, fi), 1u)
+        << "the >16B ByReference Apple struct va_arg derefs the slot (chained Load)";
+}
+
+// FOLD 1(b) (BLOCKER) — the ALWAYS-ON, host-independent witness for the Step 2.0
+// size-aware bump. apple_arm64 `va_arg(struct HFA{double,double})` is 16B InRegisters
+// and MUST advance the va_list cursor by 16 (TWO 8-byte slots), NOT 8 — else a
+// SUBSEQUENT va_arg re-reads this struct's tail (a silent miscompile only the macOS
+// runtime leg would otherwise catch). This pins the bump CONSTANT == 16 directly. RED-
+// ON-DISABLE: reverting Step 2.0 to the flat `namedArgSlotBytes` bump removes the 16.
+TEST(MirLoweringCSubset, AppleVaArgHfa16BBumpsBySixteenNotEight) {
+    auto L = lowerCSubset(
+        "struct HFA { double a; double b; };\n"   // 16B InRegisters (2 eightbytes)
+        "double sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  double t = 0;\n"
+        "  for (int i = 0; i < n; i = i + 1) {\n"
+        "    struct HFA p = va_arg(ap, struct HFA);\n"
+        "    t = t + p.a + p.b;\n"
+        "  }\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+        "arm64", "apple_arm64");
+    ASSERT_TRUE(L.mir.ok)
+        << "Apple va_arg(16B HFA) must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    EXPECT_TRUE(funcHasConstInt(m, fi, 16))
+        << "Step 2.0: the Apple 16B-HFA va_arg must bump the cursor by 16 (two 8-byte "
+           "slots) — a flat namedArgSlotBytes=8 bump re-reads the struct's tail on the "
+           "NEXT va_arg (Apple spec: 'the appropriate number of 8-byte stack slots')";
+}
+
+// FC12c MIR pin (Apple): the SAME va_arg(int) source lowers to a LINEAR pointer bump
+// under apple_arm64 (HomogeneousPointer) — NO dual-cursor diamond — and va_start
+// anchors at the OVERFLOW base (VaOverflowArgAreaAddr), NOT a home/save-area leaf.
+TEST(MirLoweringCSubset, AppleVaArgIntLowersLinearOverflowBase) {
+    auto L = lowerCSubset(
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+        "arm64", "apple_arm64");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "Apple variadic callee must type-check (va_list = char*)";
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    // Apple va_start emits VaOverflowArgAreaAddr (NOT VaHomeArgAreaAddr, NOT
+    // VaRegSaveAreaAddr) — the overflow-base anchor for the always-stacked varargs.
+    std::uint32_t afi = 0;
+    bool found = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        if (countOpcodeAllBlocks(m, fi, MirOpcode::VaOverflowArgAreaAddr) > 0) {
+            afi = fi; found = true; break;
+        }
+    }
+    ASSERT_TRUE(found) << "Apple va_start must emit a VaOverflowArgAreaAddr leaf";
+    EXPECT_EQ(countOpcodeAllBlocks(m, afi, MirOpcode::VaHomeArgAreaAddr), 0u)
+        << "Apple has NO home area (it always-stacks varargs)";
+    EXPECT_EQ(countOpcodeAllBlocks(m, afi, MirOpcode::VaRegSaveAreaAddr), 0u)
+        << "Apple HomogeneousPointer uses no register-save-area";
+    // LINEAR walk: no reg-vs-overflow diamond from va_arg (no CondBr/ICmp/Phi added).
+    EXPECT_EQ(countOpcodeAllBlocks(m, afi, MirOpcode::CondBr), 0u)
+        << "Apple va_arg is a LINEAR pointer bump — no diamond";
+    EXPECT_EQ(countOpcodeAllBlocks(m, afi, MirOpcode::Phi), 0u);
 }

@@ -81,6 +81,51 @@ enum class MirOpcode : std::uint16_t {
     // Call operand routed to the IRR by the `call_payload::kIndirectResultBit`
     // flag — see the IRR-reroute design in lir_callconv. No WriteIndirectResult.)
     ReadIndirectResult,
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the two FRAME-relative address value-
+    // origins a `va_start` writes into the `__va_list_tag`. Both are leaves (like
+    // `Arg`/`ReadIndirectResult`): the concrete byte offset is unknown until the
+    // LIR callconv pass owns the frame layout, so they survive to LIR as virtual
+    // ops that materialize into `lea reg, [sp + offset]`. Result = a pointer; side-
+    // effecting so DCE can't drop them and no pass hoists them off their function.
+    //   VaRegSaveAreaAddr:     &(the register-save-area the variadic prologue spills
+    //                          rdi..r9 + al-gated xmm0..7 into).
+    //   VaOverflowArgAreaAddr: &(the incoming STACK args — where overflow varargs
+    //                          live; geometry mirrors the stack-resident `arg` read).
+    // The PRESENCE of a VaRegSaveAreaAddr in a function is ALSO the LIR pass's
+    // signal that the function called va_start and so needs the save-area reserved +
+    // the prologue spill (self-contained — no FnSig lookup, no threaded flag).
+    //
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start
+    // leaf. Win64's named-arg HOME space (rcx/rdx/r8/r9 slots) and the stack overflow
+    // are CONTIGUOUS in the caller's outgoing area, so a single base address +
+    // namedArgCount slots positions `ap` past ALL named args (home or stack). Carries
+    // the NAMED-ARG SLOT COUNT as its PAYLOAD; lir_callconv materializes it to
+    // `lea result, [sp + totalFrameSize + callPushBytes + payload*outgoingSlotSize]`
+    // — the SAME base as the va-overflow leaf MINUS shadowSpaceBytes (the home space
+    // IS the shadow space). Its PRESENCE is also the Win64 prologue-spill signal.
+    //   VaHomeArgAreaAddr:     &(home[namedArgCount]) — the first vararg under Win64.
+    VaRegSaveAreaAddr, VaOverflowArgAreaAddr, VaHomeArgAreaAddr,
+    // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a first-class BY-VALUE-
+    // AGGREGATE STACK ARG carrier. Some ABIs require a by-value aggregate to be
+    // passed ENTIRELY in the outgoing overflow (stack) area UNCONDITIONALLY — even
+    // when arg registers are free — and never split across registers and the stack
+    // (SysV §3.2.3/§3.5.7: a MEMORY-class >16B aggregate, OR an InRegisters
+    // aggregate whose eightbyte pieces do not all fit in the remaining arg
+    // registers). The callconv's greedy register-then-overflow placement has no
+    // per-arg force-to-stack lever, so this op is the lever: it wraps the temp
+    // ADDRESS of a callee-owned copy (operand 0 — a freshAggregateTemp filled by
+    // lowerByteWiseCopy, same as the by-reference arg) and carries the aggregate's
+    // BYTE SIZE as its PAYLOAD. It appears as ONE Call operand at the aggregate's
+    // left-to-right argument position; mir_to_lir lowers it to a Reg (the address,
+    // kept live by regalloc) immediately followed by a `ByValueStackAgg` marker
+    // operand carrying the size, and lir_callconv reserves ceil(size / outgoing-
+    // slot) overflow slots + byte-copies the temp into the outgoing area (it does
+    // NOT consume an arg register and does NOT inflate the SSE/AL count). CC-NEUTRAL
+    // by construction (the size is the only datum; the overflow geometry is the
+    // callconv's, config-driven) so the Win64 + AAPCS64 struct-vararg cycles reuse
+    // it. Result = a pointer (the temp address, threaded through); side-effecting so
+    // DCE can't drop it and no pass hoists it off its call.
+    ByValueStackArg,
     // ── SSA join ──
     Phi,           // operand range addresses the PHI pool, not the operand pool
     // ── terminators (exactly one, last in a block; successors live in succ pool) ──
@@ -251,6 +296,18 @@ struct MirOpcodeInfo {
         // ReadIndirectResult: a leaf value-origin (reads x8 at entry) — mirror of
         // Arg; side-effecting so it pins to entry and DCE can't drop it.
         case MirOpcode::ReadIndirectResult:  return {0, 0, 0, 0, R::Value, false, true, false, "readindirectresult"};
+        // FC12a-core: frame-relative va_list address leaves (mirror ReadIndirectResult:
+        // 0 operands, value result, side-effecting so they pin to their function).
+        case MirOpcode::VaRegSaveAreaAddr:     return {0, 0, 0, 0, R::Value, false, true, false, "varegsavearea"};
+        case MirOpcode::VaOverflowArgAreaAddr: return {0, 0, 0, 0, R::Value, false, true, false, "vaoverflowargarea"};
+        // FC12b: like VaOverflowArgAreaAddr but PAYLOAD-carrying (the named-arg slot
+        // count) — a value leaf, side-effecting so it pins to its function + DCE
+        // can't drop it; lir_callconv reads the payload for the contiguous offset.
+        case MirOpcode::VaHomeArgAreaAddr:     return {0, 0, 0, 0, R::Value, false, true, false, "vahomeargarea"};
+        // FC12a-struct: by-value-aggregate stack-arg carrier. 1 operand (the temp
+        // address); value result (the pointer, threaded through); side-effecting so
+        // it pins to its call + DCE can't drop it. payload = aggregate byte size.
+        case MirOpcode::ByValueStackArg:       return {1, 1, 0, 0, R::Value, false, true, false, "byvaluestackarg"};
 
         // phi — operand range addresses the PHI pool (incoming value/block pairs).
         case MirOpcode::Phi: return {0, N, 0, 0, R::Value, false, false, true, "phi"};

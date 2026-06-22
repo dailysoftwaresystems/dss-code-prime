@@ -230,6 +230,15 @@ struct DSS_EXPORT HirLoweringConfig {
     // language has no `sizeof` surface.
     RuleId      sizeofRule{};          std::string sizeofRuleName;
 
+    // FC12a-core: the three variadic-intrinsic operand-alt rules. Each routes its
+    // CST subtree to its dedicated lowering (`HirKind::VaStart`/`VaArg`/`VaEnd`) —
+    // the type child of `va_arg` is recovered from the semantic stamp, NEVER lowered
+    // as an expression (the SizeOf precedent). Invalid ⇒ the language has no
+    // variadic-intrinsic surface (these stay unset and the dispatch skips them).
+    RuleId      vaStartRule{};         std::string vaStartRuleName;
+    RuleId      vaArgRule{};           std::string vaArgRuleName;
+    RuleId      vaEndRule{};           std::string vaEndRuleName;
+
     // Per-language MIR-globals const-evaluation policy. The shared
     // const-eval engine (plan 12.5) supports a float-folding gate via
     // its `allowFloat` knob; today every v1 schema is IEEE 754 so the

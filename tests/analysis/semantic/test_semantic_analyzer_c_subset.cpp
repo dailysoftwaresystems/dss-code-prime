@@ -37,7 +37,11 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    ASSERT_EQ(model.symbols().size() - 1, 2u) << "main (function) + x (variable)";
+    // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
+    // (`__va_list_tag` + `va_list`) injected into every c-subset CU's builtin scope
+    // (D-FC12A-VARIADIC-CALLEE — gated on the schema declaring `vaArgRule`).
+    ASSERT_EQ(model.symbols().size() - 1, 4u)
+        << "main (function) + x (variable) + __va_list_tag + va_list";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -681,6 +685,110 @@ TEST(SemanticAnalyzerCSubset, BadFieldSizeofArrayDimensionRejected) {
         << "sizeof(s.nope) — no such field — must fail loud, never fold a guess";
 }
 
+// FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2) sizeof(va_list) pin: the injected
+// `va_list` TYPE is strategy-selected, so its size differs per ABI — 24B under SysV
+// (`__va_list_tag[1]` = {u32,u32,void*,void*}) vs 8B under Win64 (`char*`). A wrong
+// size mis-sizes the `ap` local → stack corruption. Fold sizeof(va_list) into an
+// array dimension (the established sizeof-folding probe) and read it back. RED-ON-
+// DISABLE: a regression injecting the SysV tag under Win64 (or vice versa) flips the
+// dimension.
+TEST(SemanticAnalyzerCSubset, SizeofVaListIs24UnderSysV) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int a[sizeof(va_list)];\n",
+    });
+    assertNoBuilderErrors(*cu);
+    // SysVRegisterSave (the default/absent strategy): va_list = __va_list_tag[1].
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                         VaListStrategy::SysVRegisterSave);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_TRUE(aRec->type.valid());
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    ASSERT_EQ(ti.scalars(aRec->type).size(), 1u);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 24)
+        << "sizeof(va_list) under SysV = sizeof(__va_list_tag[1]) = 24";
+}
+
+TEST(SemanticAnalyzerCSubset, SizeofVaListIs8UnderWin64) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int a[sizeof(va_list)];\n",
+    });
+    assertNoBuilderErrors(*cu);
+    // HomogeneousPointer (Win64): va_list = char* (one pointer = 8B).
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                         VaListStrategy::HomogeneousPointer);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_TRUE(aRec->type.valid());
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    ASSERT_EQ(ti.scalars(aRec->type).size(), 1u);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 8)
+        << "sizeof(va_list) under Win64 = sizeof(char*) = 8";
+}
+
+// FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE) sizeof(va_list) pin: AAPCS64 realizes the
+// dual-cursor strategy by injecting `va_list = __va_list` (the 5-field struct
+// {void* __stack; void* __gr_top; void* __vr_top; int __gr_offs; int __vr_offs;}) —
+// 24B of pointers + 8B of i32 cursors = 32B under natural alignment. NOT an array
+// (SysV), NOT a pointer (Win64) — the struct DIRECTLY. RED-ON-DISABLE: reverting to
+// the FC12b fail-loud, or injecting a pointer/array shape, flips the dimension off 32.
+TEST(SemanticAnalyzerCSubset, SizeofVaListIs32UnderAapcs64) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int a[sizeof(va_list)];\n",
+    });
+    assertNoBuilderErrors(*cu);
+    // Aapcs64DualCursor: va_list = __va_list (the 5-field struct, 32B).
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                         VaListStrategy::Aapcs64DualCursor);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_VariadicCalleeUnsupported), 0u)
+        << "AAPCS64 va_list is realized in FC12c — no fail-loud at injection";
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_TRUE(aRec->type.valid());
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    ASSERT_EQ(ti.scalars(aRec->type).size(), 1u);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 32)
+        << "sizeof(va_list) under AAPCS64 = sizeof(__va_list) = 3*8 + 2*4 = 32";
+}
+
+// FC12c: an AAPCS64 variadic callee that walks its varargs analyzes CLEANLY now that
+// the dual-cursor seam is realized (the FC12b-era fail-loud is gone). The c-subset
+// `vaArgRule` gates the injection; the body NAMES + USES va_list/va_start/va_arg.
+TEST(SemanticAnalyzerCSubset, Aapcs64VariadicCalleeAnalyzesClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(int n, ...) { va_list ap; va_start(ap, n);"
+        " int t = va_arg(ap, int); va_end(ap); return t; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                         VaListStrategy::Aapcs64DualCursor);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_VariadicCalleeUnsupported), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "the __va_list struct ap operand must pass isVaList for AAPCS64";
+}
+
 // SE-pointers (G5): a pointer parameter types as Ptr in the FnSig.
 TEST(SemanticAnalyzerCSubset, PointerParamInFnSig) {
     auto cu = buildShippedUnit("c-subset", { "void f(int *p) {}\n" });
@@ -729,8 +837,9 @@ TEST(SemanticAnalyzerCSubset, NestedBlocksShadowWithoutRedecl) {
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
         << "different blocks → different scopes → no shadow redecl";
-    // main (function) + two distinct `x` symbols (one per block scope).
-    EXPECT_EQ(model.symbols().size() - 1, 3u);
+    // main (function) + two distinct `x` symbols (one per block scope) + the 2
+    // FC12a-core builtin TYPES (__va_list_tag + va_list).
+    EXPECT_EQ(model.symbols().size() - 1, 5u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -745,8 +854,9 @@ TEST(SemanticAnalyzerCSubset, ForwardReferenceWithinBlock) {
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 
-    // main (function) + x (variable). Find x by name.
-    ASSERT_EQ(model.symbols().size() - 1, 2u);
+    // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
+    // (__va_list_tag + va_list). Find x by name.
+    ASSERT_EQ(model.symbols().size() - 1, 4u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -2075,8 +2185,10 @@ TEST(SemanticAnalyzerCSubset, ValueStarValueStaysExpressionStatement) {
         "int main() { int a = 2; int b = 3; a * b; return a; }\n",
     });
     EXPECT_FALSE(model.hasErrors());
-    EXPECT_EQ(model.symbols().size() - 1, 3u)
-        << "main + a + b — the multiplication must mint NO symbol";
+    // main + a + b + the 2 FC12a-core builtin TYPES (__va_list_tag + va_list) — the
+    // multiplication must mint NO symbol.
+    EXPECT_EQ(model.symbols().size() - 1, 5u)
+        << "main + a + b + __va_list_tag + va_list — the multiplication mints none";
 }
 
 // UNKNOWN `u * v;` (no `u` anywhere, single file) — the oracle-candidate
@@ -2253,4 +2365,76 @@ TEST(SemanticAnalyzerCSubset, DerefFnPtrCalleeTypesAndChecks) {
     EXPECT_FALSE(derefDesignator.hasErrors())
         << "deref of a function designator decays right back (C "
            "6.5.3.2p4) — must be clean";
+}
+
+// ── FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing pins ──────
+
+// `va_list ap;` resolves the injected builtin typedef; va_start/va_arg/va_end of a
+// proper va_list with a BUILTIN-int type arg are clean; va_arg's node types as int.
+TEST(SemanticAnalyzerCSubset, VaArgWithBuiltinIntTypesClean) {
+    auto model = analyzeShipped("c-subset", {
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int t = va_arg(ap, int);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "va_list / va_start / va_arg(ap,int) / va_end must type cleanly";
+}
+
+// `va_arg(ap, T)` with T a TYPEDEF name commits the type position as a type (the
+// shared castTypeRef + commitRequiresTypeName triage) and types the node as T.
+TEST(SemanticAnalyzerCSubset, VaArgWithTypedefTypeResolves) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int MyInt;\n"
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  MyInt t = va_arg(ap, MyInt);\n"
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "va_arg(ap, MyInt) — a typedef in the type position — must resolve";
+}
+
+// `va_arg(ap, x)` where `x` is a VALUE (not a type) must FAIL LOUD: the type
+// position resolves through the same resolver casts use, which emits S_UnknownType
+// for a non-type name. (The red-on-disable guard against silently treating a value
+// as a type — a wrong va_arg width would be a silent garbage read.)
+TEST(SemanticAnalyzerCSubset, VaArgWithValueInTypePositionFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int sum(int n, ...) {\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  int x = 7;\n"
+        "  int t = va_arg(ap, x);\n"   // x is a VALUE, not a type
+        "  va_end(ap);\n"
+        "  return t;\n"
+        "}\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "va_arg(ap, x) for a VALUE x must fail loud — never treat a value as a type";
+    EXPECT_GT(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "the failure must be S_UnknownType at the type position (attributable)";
+}
+
+// `va_start(ap, n)` where `ap` is NOT a va_list (a bare int) must fail loud with a
+// type mismatch — the first arg must be a va_list.
+TEST(SemanticAnalyzerCSubset, VaStartWithNonVaListFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int sum(int n, ...) {\n"
+        "  int notAList;\n"
+        "  va_start(notAList, n);\n"
+        "  return 0;\n"
+        "}\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "va_start of a non-va_list first arg must fail loud";
+    EXPECT_GT(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "the failure must be S_TypeMismatch on the ap operand";
 }

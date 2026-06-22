@@ -491,13 +491,20 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
             // Record the cookie so that future call is a clean no-op.
             closedCookies_.insert(fr.cookie);
         }
+        // `fr` is a reference into `open_`; snapshot the two fields read
+        // after the pop BEFORE removing the frame. Reading `fr.openerSpan` /
+        // `fr.rule` after `open_.pop_back()` is a use-after-pop_back of the
+        // dead back slot (UB — MSVC-release reads the stale-but-intact bytes
+        // by luck and passes; libstdc++/libc++ and any ASan build abort).
+        auto const openerSpan = fr.openerSpan;
+        auto const rule       = fr.rule;
         open_.pop_back();
         // Invariant: walker_.depth() == open_.size() at every
         // open/close boundary. leaveRule on a non-RuleLeaf saved
         // cursor returns invalid and trips the walker's desync
         // callback — strict-only contextual resolution for the
         // remainder of the build.
-        walker_.leaveRule(fr.openerSpan, std::optional<RuleId>{fr.rule});
+        walker_.leaveRule(openerSpan, std::optional<RuleId>{rule});
         if (isTarget) break;
         if (open_.empty()) break;
     }

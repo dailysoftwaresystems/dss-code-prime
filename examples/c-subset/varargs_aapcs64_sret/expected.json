@@ -1,0 +1,14 @@
+{
+  "$comment": "FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE) x FC7 C3 (x8 sret) COMPOSITION: an AAPCS64 variadic fn `make(int n, ...)` that ALSO returns a 24B (>16B) struct via the x8 indirect-result pointer. The end-to-end witness that x8 survives the variadic prologue's save-area scratch base (`add <scratch>, sp, #off`): the scratch picker excludes x8 (cc.indirectResultRegister), so it never clobbers the incoming sret pointer that read_indirect_result reads later. make(3,10,20,30): s=60, n=3 -> r.a=60,r.b=3,r.c=63; main returns 60+3+63=126. RED-ON-DISABLE: with scratch=x8 the add overwrites the sret pointer and make writes the struct to a stray frame address -> main reads uninitialized -> exit != 126 (segfault/garbage). arm64-ELF under qemu-aarch64 (Apple Mach-O = same struct+variadic ABI, macos leg only; x86_64 SysV/Win64 take the hidden-arg sret path).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 126,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ]
+}

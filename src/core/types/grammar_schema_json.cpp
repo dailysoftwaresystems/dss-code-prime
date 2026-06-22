@@ -3577,14 +3577,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 11>
+                    static constexpr std::array<std::string_view, 12>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
                             "groupRule",          "nameToken",
                             "fnSuffixRule",       "fnSuffixParamsRule",
                             "arraySuffixRule",    "initDeclaratorRule",
-                            "listRule"};
+                            "listRule",
+                            // FC12a-core (D-FC12A-VARIADIC-CALLEE): declarator-level
+                            // `...` marker for variadic function definitions / fn-ptr types.
+                            "variadicMarker"};
                     bool dOk = true;
                     for (auto it = dj.begin(); it != dj.end(); ++it) {
                         bool known = false;
@@ -3689,6 +3692,32 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             } else {
                                 dc.fnSuffixParamsRule = data.rules->find(
                                     dc.fnSuffixParamsRuleName);
+                            }
+                        }
+                    }
+                    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the declarator-level
+                    // `...` marker, so the SHARED suffix resolver builds a variadic
+                    // FnSig for function DEFINITIONS + fn-pointer types (the legacy
+                    // decl path's per-rule marker didn't reach those). Optional; a
+                    // bad token name emits but doesn't fail the load (the FnSig just
+                    // stays non-variadic — mirrors the per-rule marker's stance).
+                    if (dj.contains("variadicMarker")) {
+                        if (!dj.at("variadicMarker").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      dPath + "/variadicMarker",
+                                      "'declarators.variadicMarker' must be a string");
+                        } else {
+                            dc.variadicMarkerName =
+                                dj.at("variadicMarker").get<std::string>();
+                            if (!data.schemaTokens->contains(dc.variadicMarkerName)) {
+                                coll.emit(DiagnosticCode::C_UnknownToken,
+                                          dPath + "/variadicMarker",
+                                          std::format("'declarators.variadicMarker' "
+                                                      "references unknown token kind '{}'",
+                                                      dc.variadicMarkerName));
+                            } else {
+                                dc.variadicMarker =
+                                    data.schemaTokens->find(dc.variadicMarkerName);
                             }
                         }
                     }
@@ -6256,6 +6285,54 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── variadic intrinsics (FC12a-core, D-FC12A-VARIADIC-CALLEE) ──
+            // `{ vaArgRule, vaArgApChild, vaArgTypeChild, vaStartRule,
+            //    vaStartApChild, vaEndRule, vaEndApChild }`. Pass 2 resolves the
+            // va_arg type child + type-checks each `ap` operand is a va_list, and
+            // flips the function's uses-va-start attribute. Mirrors the sizeof
+            // block's readRule discipline (a present-but-bad field emits + fails
+            // the load; an ABSENT block leaves every rule invalid → no surface).
+            if (sem.contains("variadic")) {
+                json const& va = sem.at("variadic");
+                if (!va.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/variadic",
+                              "'semantics.variadic' must be an object");
+                } else {
+                    auto readRule = [&](char const* key, RuleId& outRule,
+                                        std::string& outName) {
+                        if (!va.contains(key) || !va.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      std::string{"/semantics/variadic/"} + key,
+                                      std::format("'{}' is required and must be a "
+                                                  "string", key));
+                            return;
+                        }
+                        outName = va.at(key).get<std::string>();
+                        if (!data.rules->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape,
+                                      std::string{"/semantics/variadic/"} + key,
+                                      std::format("'variadic.{}' references unknown "
+                                                  "shape '{}'", key, outName));
+                            return;
+                        }
+                        outRule = data.rules->find(outName);
+                    };
+                    readRule("vaArgRule",   cfg.vaArgRule,   cfg.vaArgRuleName);
+                    readRule("vaStartRule", cfg.vaStartRule, cfg.vaStartRuleName);
+                    readRule("vaEndRule",   cfg.vaEndRule,   cfg.vaEndRuleName);
+                    bool idxOk = true;
+                    readReqIndex(va, "vaArgApChild",   "/semantics/variadic",
+                                 cfg.vaArgApChild,   idxOk);
+                    readReqIndex(va, "vaArgTypeChild", "/semantics/variadic",
+                                 cfg.vaArgTypeChild, idxOk);
+                    readReqIndex(va, "vaStartApChild", "/semantics/variadic",
+                                 cfg.vaStartApChild, idxOk);
+                    readReqIndex(va, "vaEndApChild",   "/semantics/variadic",
+                                 cfg.vaEndApChild,   idxOk);
+                    (void)idxOk;
+                }
+            }
+
             // ── compoundLiterals (FC3.5 sweep-c3,
             //    D-CSUBSET-COMPOUND-LITERAL-TYPEDEF) ──
             // `{ rule, typeChild }` — the compound-literal expression
@@ -7019,6 +7096,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readExprRule("castRule",            cfg.castRule,            cfg.castRuleName);
             // FC6: `sizeof(T)` / `sizeof e` → core HirKind::SizeOf.
             readExprRule("sizeofRule",          cfg.sizeofRule,          cfg.sizeofRuleName);
+            // FC12a-core: variadic intrinsics → core HirKind::VaStart/VaArg/VaEnd.
+            readExprRule("vaStartRule",         cfg.vaStartRule,         cfg.vaStartRuleName);
+            readExprRule("vaArgRule",           cfg.vaArgRule,           cfg.vaArgRuleName);
+            readExprRule("vaEndRule",           cfg.vaEndRule,           cfg.vaEndRuleName);
 
             // ── HR10: extensionKinds [{ name, lang }] ──
             if (hl.contains("extensionKinds")) {

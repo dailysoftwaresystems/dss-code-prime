@@ -110,6 +110,10 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
 
     TypeInterner& dst        = dstHost.interner();
     TypeKind const kind      = src.kind(srcId);
+    // The GuardedSpan results decay to raw spans here (D-TYPEINTERNER-OPERAND-
+    // SPAN-LIFETIME-GUARD): SAFE — `src` is `const` and every intern below targets
+    // `dst`, a DISTINCT interner, so `src`'s pools are never mutated while these
+    // views are live (the dangling hazard the guard exists for cannot arise).
     std::span<TypeId const>       srcOps    = src.operands(srcId);
     std::span<std::int64_t const> srcScalar = src.scalars(srcId);
 

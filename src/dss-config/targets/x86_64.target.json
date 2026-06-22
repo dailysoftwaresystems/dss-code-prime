@@ -51,6 +51,36 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (FC12a-core, D-FC12A-VARIADIC-CALLEE): 'this LirReg is the ADDRESS of the variadic register-save-area' — the frame zone a variadic callee's prologue spills rdi..r9 + the al-gated xmm0..7 into. lir_callconv reserves the zone (sized by the cc's vaListLayout.regSaveAreaBytes) + materializes this op into `lea result, [sp + offset]` once the frame layout is known. The PRESENCE of this op in a function is also lir_callconv's signal that the function called va_start (→ emit the spill). No encoding (materialized away).",
+      "mnemonic":      "va_reg_save_area",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Virtual-ISA pseudo-op (FC12a-core, D-FC12A-VARIADIC-CALLEE): 'this LirReg is the ADDRESS of the incoming overflow stack args' — where varargs that didn't fit in registers live (the caller's outgoing-args area, above this frame). lir_callconv materializes it into `lea result, [sp + totalFrameSize + callPushBytes + shadowSpaceBytes]` (the same geometry the stack-resident `arg` read uses; on SysV shadowSpaceBytes=0 so it is `totalFrameSize + callPushBytes`). NOTE (FC12b): this offset's `totalFrameSize + callPushBytes` base ALSO serves as the Win64 va_home_arg_area home base, which must NOT include shadowSpaceBytes — the Win64 home leaf is a SEPARATE op (`va_home_arg_area`) so this op may keep its shadow term; do not collapse them. No encoding (materialized away).",
+      "mnemonic":      "va_overflow_arg_area",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Virtual-ISA pseudo-op (FC12b, D-FC12B-WIN64-VARIADIC-CALLEE): 'this LirReg is the ADDRESS of the Win64 HomogeneousPointer va_start base' — &home[namedArgCount], the first vararg. Win64's named-arg home space (rcx/rdx/r8/r9 slots) and the 5th+ stack args are CONTIGUOUS in the caller's outgoing area, so this single base + the named-arg slot count positions `ap` past ALL named args. PAYLOAD = the named-arg slot count; lir_callconv materializes it into `lea result, [sp + totalFrameSize + callPushBytes + payload*outgoingSlotSize]` — the NO-SHADOW base (the home space IS the caller's shadow space, so adding shadowSpaceBytes would skip it and read past every named arg). Its PRESENCE is also lir_callconv's signal to spill the named integer arg regs into their home slots. No encoding (materialized away).",
+      "mnemonic":      "va_home_arg_area",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "2-operand-shape mov: destination = result vreg, source = operands[0]. AS2 cycle 2 wires this to two encoding variants: REX.W 0x8B /r (mov r64, r64) when source is a register; REX.W 0xC7 /0 imm32 (mov r/m64, imm32 SIGN-extended to 64-bit) when source is an immediate. FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): both shapes gain explicit `width` keys + 32-bit siblings (same opcodes WITHOUT REX.W, Intel SDM Vol. 2B MOV) — a 32-bit register write auto-zero-extends to the full 64-bit register, and the 32-bit imm32 form is EXACT (not sign-extending), the difference that matters for an `unsigned int` 0xFFFFFFFF. Plumbing movs (phi/copy/capture/spill) are emitted width-default (64) — full-register copies are value-correct for every type. FC8 (D-CSUBSET-BITFIELD-WIDE-UNIT): a fifth variant materializes a FULL 64-bit immediate — REX.W B8+rd io (mov r64, imm64) — selected by the `imm64` operand-kind (a `LiteralIndex` LIR operand: the wide value lives in the LIR literal pool, since it does not fit the inline imm32 path). This is the ONLY x86-64 form that loads a >imm32 constant into a register; its destination rides the opcode byte (B8+rd), not ModR/M, so it uses the `opcode.reg` result slot.",
       "mnemonic":      "mov",
       "result":        "value",
@@ -1306,6 +1336,24 @@
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
+      "$comment": "FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): xmm→r64 bit-copy — MOVQ r/m64, xmm = 66 REX.W 0F 7E /r (Intel SDM MOVQ, the store-to-GPR direction). The CALLER of a Win64 variadic function duplicates each FP vararg into its matching integer (home) register so the callee's va_arg(double) can read it from the home slot. A SEPARATE opcode from `movq_xclass`: the variant guard keys only on (operandKinds, width) and CANNOT disambiguate the two MOVQ directions (both are `reg`/width-64), and `movq_xclass` is consumed bidirectionally by Bitcast — overloading it would force a silent miscompile on the GPR→FPR Bitcast direction. ModR/M.reg = the xmm SOURCE (the wired source operand → modrm.reg), ModR/M.rm = the r64 DESTINATION (the result vreg → modrm.rm). Byte-pin: `movq rdx, xmm1` = 66 48 0F 7E CA (66 prefix; REX.W=0x48; 0F 7E; ModR/M mod=11 reg=xmm1=001 rm=rdx=010 → 0xCA).",
+      "mnemonic": "movq_xmm_to_gpr", "result": "value",
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [102], "rexW": true, "opcode": [15, 126] },
+            "resultSlot": "modrm.rm",
+            "wires":      [{ "index": 0, "slotKind": "modrm.reg" }]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "Intrinsic call. Payload = intrinsic id (per HirIntrinsicRegistry / MIR convention). Operands = args. Result is optional (some intrinsics produce values, some don't). AS1 maps the intrinsic id to its concrete sequence (e.g. memcpy, debugtrap, sqrt) per target. Cycle 3e lowers MIR IntrinsicCall to this opcode.",
       "mnemonic": "intrinsic_call", "result": "optional",
       "minOperands": 0, "maxOperands": 255,
@@ -1494,7 +1542,22 @@
       "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: x86_64 `call` instruction pushes the 8-byte return address. ML7 `computeFrameLayout` consumes this as the bias for non-leaf functions so their prologue `sub rsp, N` produces RSP ≡ 0 mod 16 at the next call site. SysV's entry bias is 0 (kernel JMP) but this in-program call-push is 8 — the two distinct facts coincide on Win64 (both 8) and diverge here. Without this wired, the user-fn → extern-call shadow-space + alignment violation reappears one stack frame below the trampoline (the same 0xC0000005 class as D-LK10-ENTRY-TRAMP-PROLOGUE, now recurring at the user-fn boundary).",
       "callPushBytes": 8,
       "$variadicVectorCountRegComment": "D-LANG-VARIADIC (step 13.4, 2026-06-02): SysV AMD64 §3.5.7 — the caller MUST set AL to the number of vector (XMM) registers used to pass variadic arguments before any call to a function with `...`. printf reads %al to know whether to consult the XMM save area in its va_list walk; passing AL uninitialized yields garbage formatting and (on hardened glibcs) an abort. C-subset has no float type today, so every variadic call from c-subset stamps the count as 0; the count-of-FPRs logic in ML7 materialize is data-driven via this field — future float support (in c-subset or any other source language) lights up the same code path with zero substrate change. The field names `rax` (the register table's canonical full-width name) rather than `al` (the ABI document's low-byte alias) because the register table does NOT yet model the x86 subregister aliases (al / ax / eax for the low-byte / low-word / low-dword of rax); anchored D-TARGET-SUBREGISTER-ALIASES. Writing rax = count is ABI-equivalent: a `mov rax, <count<=8>` sets AL to the same byte and the upper bits are irrelevant to printf's ABI contract.",
-      "variadicVectorCountReg": "rax"
+      "variadicVectorCountReg": "rax",
+      "$vaListLayoutComment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): System V AMD64 §3.5.7 variadic-CALLEE layout. `__va_list_tag` = {u32 gp_offset@0; u32 fp_offset@4; void* overflow_arg_area@8; void* reg_save_area@16;} = 24B. A variadic callee's prologue spills the 6 integer arg regs (rdi..r9, 8B each = 48B) then the al-gated 8 SSE arg regs (xmm0..xmm7, 16B each = 128B) into a 176B register-save-area. va_start sets gp_offset = fixedGPR*8, fp_offset = 48 + fixedSSE*16, reg_save_area = &save, overflow_arg_area = &(incoming stack args). va_arg(T) of an INTEGER reads reg_save_area+gp_offset (bump +8) while gp_offset < gpOffsetLimit(48), else overflow; an SSE arg reads reg_save_area+fp_offset (bump +16) while fp_offset < fpOffsetLimit(176), else overflow. Every fact is config — the HIR→MIR diamond + LIR prologue spill read these, never branching on cc.name/arch/format. Win64/AAPCS64 omit this block (different variadic ABI) and fail loud at the va_start site.",
+      "vaListLayout": {
+        "strategy": "sysv_register_save",
+        "gpOffsetField":        { "byteOffset": 0,  "widthBytes": 4 },
+        "fpOffsetField":        { "byteOffset": 4,  "widthBytes": 4 },
+        "overflowArgAreaField": { "byteOffset": 8,  "widthBytes": 8 },
+        "regSaveAreaField":     { "byteOffset": 16, "widthBytes": 8 },
+        "gpSaveCount": 6,
+        "gpSlotBytes": 8,
+        "fpSaveCount": 8,
+        "fpSlotBytes": 16,
+        "gpOffsetLimit": 48,
+        "fpOffsetLimit": 176,
+        "namedArgSlotBytes": 8
+      }
     },
     {
       "name": "ms_x64",
@@ -1520,7 +1583,12 @@
       "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: x86_64 `call` instruction pushes the 8-byte return address (same as SysV — ISA-level fact). ML7 `computeFrameLayout` for any non-leaf Win64 function emits `sub rsp, N` where N satisfies BOTH N >= max(savedRegs+spill, shadowSpaceBytes=32) AND N ≡ callPushBytes=8 (mod stackAlignment=16) — same `alignedSizeWithBias` helper the trampoline emitter uses. For a hello_puts-shape main (no callee-saved, no spills, calls puts): raw = max(0, 32) = 32; N = alignedSizeWithBias(32, 16, 8) = 40. Main's prologue becomes `sub rsp, 0x28`; main calls puts at RSP ≡ 0 mod 16 (Win64 ABI requirement) with 32 bytes of shadow space available for puts's register-arg home area. This closes the actual cause of the 2026-06-02 hello_puts SEGV — NOT a CRT-init gap (msvcrt's DllMain self-inits stdio at DLL load).",
       "callPushBytes": 8,
       "$slotAlignedComment": "D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): Win64 ms_x64 uses SLOT-ALIGNED arg passing — each arg consumes one shared slot index regardless of register class. Slot N reserves BOTH argGprs[N] AND argFprs[N]. `f(int, double, int, double, int)` consumes slots 0..4 → (rcx OR xmm0, rdx OR xmm1, r8 OR xmm2, r9 OR xmm3, [rsp+0x20]). Pure-GPR calls (WriteFile, GetStdHandle, etc.) happen to give the same overflow count as independent counters; mixed-class calls require the slot-aligned counting to land arg-5 on the stack correctly. ML7 `computeMaxOutgoingStackArgs` + `materializeOneFunc` consult this flag.",
-      "slotAligned": true
+      "slotAligned": true,
+      "$vaListLayoutComment": "FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): Microsoft x64 variadic-CALLEE layout. `va_list` is a plain `char*` (sizeof 8) — the HomogeneousPointer strategy, NOT SysV's __va_list_tag/register-save-area. Win64 spills the first 4 named integer args into the caller-provided 32-byte HOME SPACE (rcx/rdx/r8/r9 slots) which sits CONTIGUOUS with the 5th+ stack args, so `va_arg` is a LINEAR pointer bump by namedArgSlotBytes (8) across home→overflow — no diamond, no per-class cursor. The callee prologue spills the named integer arg regs into their home slots; `va_start` sets ap = &home[namedArgCount]. FP varargs are passed in BOTH the XMM and matching integer register, and the callee reads va_arg(double) from the home (GPR) slot — so the CALLER duplicates each FP vararg into the matching integer reg (lir_callconv, strategy-gated). Struct-by-value varargs are DEFERRED this cycle (D-FC12B-WIN64-STRUCT-VARARG, fail-loud). Every fact is config — the lowering + spill read these, never branching on cc.name/arch/format.",
+      "vaListLayout": {
+        "strategy": "homogeneous_pointer",
+        "namedArgSlotBytes": 8
+      }
     }
   ],
   "$condCodeEncodingComment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): per-cond-code nibble mapping for x86 setcc / jcc opcodes. The encoder OR's this nibble into the LOW 4 BITS of the LAST opcode byte: setcc emits `0F 9x` (where x = cc nibble); jcc emits `0F 8x rel32`. Numeric values from Intel SDM Vol. 1 Appendix B (condition code encoding table). The 10 integer arms are REQUIRED; the FC3.5 float arms (next comment) are per-entry optional. ARM64 declares its own table mapping into bits 0..3 of the B.cc instruction word — different numeric values, same field-position abstraction (D-AS3-COND-CODE-ARM64 anchor).",

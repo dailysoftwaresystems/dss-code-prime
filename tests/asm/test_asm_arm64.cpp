@@ -1622,6 +1622,324 @@ TEST(Arm64Encoder, FsturEncodesNegativeImm9) {
     EXPECT_EQ(bytes[3], 0xFC);
 }
 
+// FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE, BLOCKER-1): the 128-bit FPR store fstur_q
+// (STUR Qt, [Xn, #simm9]) used to spill v0..v7 into the AAPCS64 variadic VR save
+// block (16-byte slots). The fixedWord MUST be 0x3C800000 — 0x3C000000 is STURB
+// (8-bit byte store), which would spill 1 byte per FP slot → va_arg(double) garbage.
+// Byte-pin STUR Q0,[X1,#0]:
+//   base 0x3C800000
+//   | Rn = x1 (1) << 5 → 0x00000020
+//   | Rt = q0 (0)      → 0x00000000
+//   | Imm9 = 0         → 0x00000000
+//   = 0x3C800020 — LE bytes: 20 00 80 3C. A regression to 0x3C000000 (STURB) flips
+//   byte[3] to 0x38 (and would silently mis-encode the whole VR spill).
+TEST(Arm64Encoder, FsturQEncodesByteExact) {
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const stOp  = (*s)->opcodeByMnemonic("fstur_q");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(stOp.has_value()) << "arm64 must declare the fstur_q opcode (FC12c)";
+    ASSERT_TRUE(retOp.has_value());
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(fpr(**s, "d0")),   // q0 shares the d0 ordinal (V register)
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(0)
+    };
+    (void)b.addInst(*stOp, InvalidLirReg, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    // 0x3C800020, little-endian.
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0x80);
+    EXPECT_EQ(bytes[3], 0x3C)
+        << "fstur_q byte[3] must be 0x3C (STUR Q) — 0x38 would be STURB (1-byte)";
+}
+
+// FC12c (BLOCKER-1): the matching 128-bit Q disasm arm round-trips. Disassemble a
+// hand-encoded STUR Q3,[X5,#16] and verify the Rd/Rn/Imm9 wires decode (proves the
+// fixed32_disasm windowFor learned the Imm9 + MemBaseNoScale slots fstur_q uses).
+TEST(Arm64Encoder, FsturQDisassemblesRoundTrip) {
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const stOp = (*s)->opcodeByMnemonic("fstur_q");
+    ASSERT_TRUE(stOp.has_value());
+    // STUR Q3, [X5, #16]: 0x3C800000 | (16<<12)=0x10000 | (5<<5)=0xA0 | 3 = 0x3C8100A3.
+    // LE bytes: A3 00 81 3C.
+    std::array<std::uint8_t, 4> bytes{0xA3, 0x00, 0x81, 0x3C};
+    DiagnosticReporter rep;
+    auto disasmed = disassembleInst(**s, *stOp, bytes, rep);
+    ASSERT_TRUE(disasmed.has_value())
+        << "fstur_q must disassemble — the fixed32_disasm Imm9/MemBaseNoScale window";
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // result slot: none (a store). Wires: rd(Rt=3), rn(Rn=5), membase(no bits), imm9(16).
+    ASSERT_FALSE(disasmed->result.has_value());
+    ASSERT_EQ(disasmed->wires.size(), 4u);
+    // wire[0] = rd (Rt) = q3.
+    EXPECT_EQ(disasmed->wires[0].kind, EncodingSlotKind::Rd);
+    ASSERT_TRUE(disasmed->wires[0].value.has_value());
+    EXPECT_EQ(*disasmed->wires[0].value, 3);
+    // wire[1] = rn (Rn) = x5.
+    EXPECT_EQ(disasmed->wires[1].kind, EncodingSlotKind::Rn);
+    ASSERT_TRUE(disasmed->wires[1].value.has_value());
+    EXPECT_EQ(*disasmed->wires[1].value, 5);
+    // wire[3] = imm9 = 16.
+    EXPECT_EQ(disasmed->wires[3].kind, EncodingSlotKind::Imm9);
+    ASSERT_TRUE(disasmed->wires[3].value.has_value());
+    EXPECT_EQ(*disasmed->wires[3].value, 16);
+}
+
+// ── D-ASM-AARCH64-LARGE-FRAME-IMM12: the scaled unsigned-offset LDR/STR ──
+//
+// Byte-pins for the new `load_u`/`store_u` (scaled imm12) forms. The
+// scaling is load-bearing: the encoded field is byteOffset/accessSize
+// (e.g. 192/8 = 24 for a 64-bit LDR), NOT the raw byte offset. Each pin
+// also catches a bit-24 LDUR-vs-LDR error (the unsigned-offset mode bit)
+// and, for the 32-bit pin, the access-size scale (4, not 8).
+
+TEST(Arm64Encoder, LoadUnsignedOffsetEncodes64Bit) {
+    // load_u X1, [SP, #192] → LDR X1, [SP, #192]. Base 0xF9400000.
+    //   Rt = X1 (1) at 0..4; Rn = SP (31) at 5..9; imm12 = 192/8 = 24 at 10..21.
+    // word = 0xF94063E1; LE: E1 63 40 F9. (raw 192 would be a wild offset.)
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const loadOp = (*s)->opcodeByMnemonic("load_u");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(loadOp.has_value()) << "arm64 must declare load_u (D-ASM-AARCH64-LARGE-FRAME-IMM12)";
+    ASSERT_TRUE(retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(192)
+    };
+    (void)b.addInst(*loadOp, gpr(**s, "x1"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE1);
+    EXPECT_EQ(bytes[1], 0x63);
+    EXPECT_EQ(bytes[2], 0x40);
+    EXPECT_EQ(bytes[3], 0xF9)
+        << "load_u byte[3] must be 0xF9 (LDR unsigned-offset) — 0xF8 is LDUR (imm9)";
+}
+
+TEST(Arm64Encoder, StoreUnsignedOffsetEncodes64Bit) {
+    // store_u X1, [SP, #192] → STR X1, [SP, #192]. Base 0xF9000000.
+    //   Rt(value) = X1 (1) at 0..4; Rn = SP (31) at 5..9; imm12 = 24.
+    // word = 0xF90063E1; LE: E1 63 00 F9.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const storeOp = (*s)->opcodeByMnemonic("store_u");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(storeOp.has_value()) << "arm64 must declare store_u";
+    ASSERT_TRUE(retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(192)
+    };
+    (void)b.addInst(*storeOp, InvalidLirReg, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE1);
+    EXPECT_EQ(bytes[1], 0x63);
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0xF9);
+}
+
+TEST(Arm64Encoder, LoadUnsignedOffsetEncodes32Bit) {
+    // load_u(width 32) W2, [X3, #64] → LDR W2, [X3, #64]. Base 0xB9400000.
+    //   Rt = W2 (2) at 0..4; Rn = X3 (3) at 5..9; accessSize=4 ⇒ imm12 = 64/4 = 16.
+    // word = 0xB9404062; LE: 62 40 40 B9. (a /8 scale would give imm12=8 → 0x39 wrong.)
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const loadOp = (*s)->opcodeByMnemonic("load_u");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(loadOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x3")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(64)
+    };
+    // width 32 selects the LDR Wt variant (accessSize 4).
+    (void)b.addInst(*loadOp, gpr(**s, "x2"), ops, /*payload=*/0, kLirInstFlagWidth32);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x62);
+    EXPECT_EQ(bytes[1], 0x40);
+    EXPECT_EQ(bytes[2], 0x40);
+    EXPECT_EQ(bytes[3], 0xB9)
+        << "load_u(32) byte[3] must be 0xB9 (LDR W unsigned-offset)";
+}
+
+TEST(Arm64Encoder, LoadUnsignedOffsetNonMultipleOfAccessSizeFailsLoud) {
+    // RED-on-disable for the alignment guard: a 64-bit access (accessSize 8)
+    // at byte offset 7 is NOT a multiple of 8 → the scaled field has no
+    // encoding (an unaligned LDR is architecturally undefined). Fail loud.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const loadOp = (*s)->opcodeByMnemonic("load_u");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(loadOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(7)
+    };
+    (void)b.addInst(*loadOp, gpr(**s, "x1"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    (void)assemble(lir, **s, lirToMir, rep);
+    bool sawOutOfRange = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange) sawOutOfRange = true;
+    }
+    EXPECT_TRUE(sawOutOfRange)
+        << "a non-access-size-aligned scaled offset must emit A_ImmediateOperandOutOfRange";
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(Arm64Encoder, LoadUnsignedOffsetTooLargeFailsLoud) {
+    // RED-on-disable for the >4095 guard: a 64-bit access (accessSize 8) at
+    // byte offset 32768 scales to 4096, one past the 12-bit field max
+    // (0..4095). Fail loud (a larger frame needs the shifted imm12<<12 form).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const loadOp = (*s)->opcodeByMnemonic("load_u");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(loadOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(32768)   // 32768/8 = 4096 > 4095
+    };
+    (void)b.addInst(*loadOp, gpr(**s, "x1"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    (void)assemble(lir, **s, lirToMir, rep);
+    bool sawOutOfRange = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange) sawOutOfRange = true;
+    }
+    EXPECT_TRUE(sawOutOfRange)
+        << "a scaled offset > 4095 must emit A_ImmediateOperandOutOfRange";
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(Arm64Encoder, LoadUnsignedOffsetNegativeFailsLoud) {
+    // RED-on-disable for the non-negative guard: the unsigned-offset form has
+    // no sign bit, so a negative displacement (-8) must fail loud rather than
+    // wrap into a huge positive offset. (The signed unscaled imm9 LDUR is the
+    // form for small negative offsets; this scaled form rejects them.)
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const loadOp = (*s)->opcodeByMnemonic("load_u");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(loadOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(-8)
+    };
+    (void)b.addInst(*loadOp, gpr(**s, "x1"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    (void)assemble(lir, **s, lirToMir, rep);
+    bool sawOutOfRange = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange) sawOutOfRange = true;
+    }
+    EXPECT_TRUE(sawOutOfRange)
+        << "a negative scaled offset must emit A_ImmediateOperandOutOfRange";
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(Arm64Encoder, LoadUnsignedOffsetDisassemblesRoundTrip) {
+    // The disasm oracle round-trips the scaled imm12. Disassemble a hand-
+    // encoded LDR X1,[SP,#192] (0xF94063E1) and verify the decoder extracts
+    // the RAW scaled field (imm12 == 24), NOT the byte offset (192), plus
+    // Rt==1 and Rn==31 — proving fixed32_disasm.windowFor learned Imm12Scaled.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const loadOp = (*s)->opcodeByMnemonic("load_u");
+    ASSERT_TRUE(loadOp.has_value());
+    // 0xF94063E1, LE bytes: E1 63 40 F9.
+    std::array<std::uint8_t, 4> bytes{0xE1, 0x63, 0x40, 0xF9};
+    DiagnosticReporter rep;
+    auto disasmed = disassembleInst(**s, *loadOp, bytes, rep);
+    ASSERT_TRUE(disasmed.has_value())
+        << "load_u must disassemble — the fixed32_disasm Imm12Scaled window";
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // result slot: rd (Rt) = x1.
+    ASSERT_TRUE(disasmed->result.has_value());
+    EXPECT_EQ(disasmed->result->kind, EncodingSlotKind::Rd);
+    ASSERT_TRUE(disasmed->result->value.has_value());
+    EXPECT_EQ(*disasmed->result->value, 1);
+    ASSERT_EQ(disasmed->wires.size(), 3u);
+    // wire[0] = rn (Rn) = sp (31).
+    EXPECT_EQ(disasmed->wires[0].kind, EncodingSlotKind::Rn);
+    ASSERT_TRUE(disasmed->wires[0].value.has_value());
+    EXPECT_EQ(*disasmed->wires[0].value, 31);
+    // wire[2] = imm12.scaled = 24 (the RAW scaled field, NOT 192).
+    EXPECT_EQ(disasmed->wires[2].kind, EncodingSlotKind::Imm12Scaled);
+    ASSERT_TRUE(disasmed->wires[2].value.has_value());
+    EXPECT_EQ(*disasmed->wires[2].value, 24)
+        << "the disasm oracle pins the RAW imm12 (24), NOT the byte offset (192)";
+}
+
 // ── D-ARM64-FLOAT-SUBSTRATE: the FULL pipeline (the SSE-test mirror) ──
 
 namespace {

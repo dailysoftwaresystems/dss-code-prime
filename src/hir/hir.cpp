@@ -391,6 +391,22 @@ HirNodeId HirBuilder::makeSizeOf(HirNodeId typeRef, TypeId type, HirFlags flags)
     return addParent(HirKind::SizeOf, kids, type, /*payload=*/0, flags);
 }
 
+HirNodeId HirBuilder::makeVaStart(HirNodeId apExpr, TypeId type, HirFlags flags) {
+    HirNodeId const kids[] = {apExpr};
+    return addParent(HirKind::VaStart, kids, type, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeVaArg(HirNodeId apExpr, HirNodeId typeRef, TypeId type,
+                               HirFlags flags) {
+    HirNodeId const kids[] = {apExpr, typeRef};
+    return addParent(HirKind::VaArg, kids, type, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeVaEnd(HirNodeId apExpr, TypeId type, HirFlags flags) {
+    HirNodeId const kids[] = {apExpr};
+    return addParent(HirKind::VaEnd, kids, type, /*payload=*/0, flags);
+}
+
 HirNodeId HirBuilder::makeAddressOf(HirNodeId operand, TypeId type, HirFlags flags) {
     HirNodeId const kids[] = {operand};
     return addParent(HirKind::AddressOf, kids, type, /*payload=*/0, flags);

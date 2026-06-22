@@ -358,3 +358,37 @@ TEST(AggregateAbiAapcs64, TwentyByteStruct_ByReference) {
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->kind, AbiPassing::Kind::ByReference);
 }
+
+// ── FC12a-core (D-FC12A-VARIADIC-CALLEE): va_arg scalar-class pins ────────────
+//
+// `va_arg(ap, T)` for a SCALAR T routes by the SAME SysV eightbyte class the
+// by-value classifier assigns: an INTEGER scalar reads the gp_offset cursor / the
+// GPR half of the register-save-area; an SSE scalar reads fp_offset / the XMM half.
+// These pin that contract at the classifier (the single-eightbyte forms a scalar
+// `int` / `double` occupy), so a wrong-class regression — which would make va_arg
+// read the WRONG save-area half (a silent garbage-vararg miscompile) — fails here.
+// (The FC12a-core lowering classifies scalars via the lighter `scalarArgClass`; this
+// engine is the by-value path the FC12a-struct follow-on will reuse for the same T.)
+
+// `int` (4B) → ONE eightbyte, INTEGER → GPR (gp_offset / integer save area).
+TEST(AggregateAbiSysV, VaArgInt_ClassifiesGpr) {
+    auto ti = makeInterner(1);
+    TypeId const i = ti.primitive(TypeKind::I32);
+    auto r = classifySysV(structOf(ti, "Wi", {i}), ti);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->pieces.size(), 1u);
+    EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Gpr)
+        << "va_arg(ap,int) must read the INTEGER (gp_offset) save-area half";
+}
+
+// `double` (8B) → ONE eightbyte, SSE → FPR (fp_offset / XMM save area).
+TEST(AggregateAbiSysV, VaArgDouble_ClassifiesFpr) {
+    auto ti = makeInterner(1);
+    TypeId const d = ti.primitive(TypeKind::F64);
+    auto r = classifySysV(structOf(ti, "Wd", {d}), ti);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->pieces.size(), 1u);
+    EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Fpr)
+        << "va_arg(ap,double) must read the SSE (fp_offset) save-area half — NOT "
+           "the GPR half (the silent-miscompile this pins)";
+}

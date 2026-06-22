@@ -13,6 +13,21 @@
 
 namespace dss {
 
+namespace detail {
+// D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD: a GuardedSpan detected a read after
+// the interner pool was mutated since the view was created (a heap-use-after-free
+// the Windows-only non-ASan local gate cannot otherwise see). Loud, deterministic.
+[[noreturn]] void typeInternerStaleSpan() {
+    std::fputs("dss::TypeInterner fatal: stale operand/scalar span read — the "
+               "interner pool was mutated by a later intern since this view was "
+               "created; retaining operands()/scalars()/fnParams() across an "
+               "intern is a heap-use-after-free "
+               "(D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD).\n",
+               stderr);
+    std::abort();
+}
+}  // namespace detail
+
 namespace {
 
 [[noreturn]] void latticeFatal(char const* what) {
@@ -117,6 +132,11 @@ TypeId TypeInterner::internContent(TypeKind kind, TypeKindId extensionKind,
     record.scalarStart   = static_cast<std::uint32_t>(scalarPool_.size());
     record.scalarCount   = static_cast<std::uint32_t>(scalars.size());
     scalarPool_.insert(scalarPool_.end(), scalars.begin(), scalars.end());
+    // The pools were just appended to (and may have reallocated): bump the
+    // generation so any GuardedSpan handed out before this intern aborts on its
+    // next read (D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD). Reached only on a
+    // genuinely NEW type — the dedup path above returns before any mutation.
+    ++poolGen_;
 
     const TypeId id = arena_.addNode(record);
     byHash_.insert({h, id});
@@ -284,17 +304,23 @@ TypeId TypeInterner::extension(TypeKindId kind, std::string_view name,
 
 // ── TypeInterner: accessors ───────────────────────────────────────────────
 
-std::span<TypeId const> TypeInterner::operands(TypeId id) const {
+GuardedSpan<TypeId> TypeInterner::operands(TypeId id) const {
     TypeRecord const& record = arena_.at(id);
-    return {operandPool_.data() + record.operandStart, record.operandCount};
+    return guard_<TypeId>({operandPool_.data() + record.operandStart, record.operandCount});
 }
 
-std::span<std::int64_t const> TypeInterner::scalars(TypeId id) const {
+GuardedSpan<std::int64_t> TypeInterner::scalars(TypeId id) const {
     TypeRecord const& record = arena_.at(id);
-    return {scalarPool_.data() + record.scalarStart, record.scalarCount};
+    return guard_<std::int64_t>({scalarPool_.data() + record.scalarStart, record.scalarCount});
 }
 
 std::string_view TypeInterner::name(TypeId id) const {
+    // NOTE: the returned string_view points into the SEPARATE `names_` string
+    // interner, NOT the operand/scalar pools — so it is deliberately OUT of the
+    // GuardedSpan scope (D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD covers
+    // operands()/scalars()/fnParams()). Name views are consumed immediately and
+    // have no historical dangling incident; if a names_-realloc hazard ever
+    // surfaces, extend the same generation-guard pattern to a guarded string view.
     return names_.name(arena_.at(id).name);
 }
 
@@ -315,7 +341,7 @@ TypeId TypeInterner::fnResult(TypeId id) const {
     return operands(id)[0];   // operands = [result, params...]; always >= 1
 }
 
-std::span<TypeId const> TypeInterner::fnParams(TypeId id) const {
+GuardedSpan<TypeId> TypeInterner::fnParams(TypeId id) const {
     if (kind(id) != TypeKind::FnSig) latticeFatal("fnParams: TypeId is not a FnSig");
     return operands(id).subspan(1);
 }

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <set>
 #include <type_traits>
+#include <vector>
 
 using namespace dss;
 
@@ -255,4 +256,58 @@ TEST(TypeInternerDeathTest, FnAccessorOnNonFnSigAborts) {
     auto ti = makeInterner(1);
     const TypeId i32 = ti.primitive(TypeKind::I32);
     EXPECT_DEATH({ (void)ti.fnResult(i32); }, "not a FnSig");
+}
+
+// ── D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD ──────────────────────────────
+// operands()/scalars()/fnParams() return a VIEW into the interner pool. Holding
+// it across a later intern (which may realloc the pool) is a heap-use-after-free
+// that bit TWICE (hir_to_mir 4660 + 2490), host-dependent and INVISIBLE to the
+// Windows-only non-ASan local gate. The debug GuardedSpan makes that read abort
+// DETERMINISTICALLY on EVERY host — no ASan, no realloc-luck needed.
+
+TEST(TypeInternerDeathTest, StaleOperandSpanAfterInternAborts) {
+#ifdef NDEBUG
+    GTEST_SKIP() << "GuardedSpan is a zero-overhead std::span alias in release; "
+                    "the deterministic span-lifetime guard is debug-only.";
+#else
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    // RED-ON-DISABLE: remove the `check_()` call inside GuardedSpan and this stops
+    // aborting → EXPECT_DEATH fails. Hoisted into a lambda (not inlined in the
+    // macro) because the `std::array<TypeId, 1>` comma would split the EXPECT_DEATH
+    // argument list; self-contained so the threadsafe re-exec reproduces it
+    // deterministically (no allocator/realloc dependence).
+    auto trigger = [] {
+        auto ti = makeInterner(1);
+        const TypeId i32 = ti.primitive(TypeKind::I32);
+        std::array<TypeId, 1> const fields{i32};
+        const TypeId s = ti.structType("S", fields);
+        auto ops = ti.operands(s);            // GuardedSpan captures the pool gen
+        (void)ti.primitive(TypeKind::F64);    // a NEW intern bumps the gen
+        (void)ops.size();                     // stale read → loud abort
+    };
+    EXPECT_DEATH({ trigger(); }, "stale operand/scalar span");
+#endif
+}
+
+// The guard does NOT false-fire on correct use: an immediate read is fine, and
+// the copy-to-owning-vector FIX pattern survives any number of later interns.
+TEST(TypeInterner, FreshSpanAndOwningCopySurviveIntern) {
+    auto ti = makeInterner(1);
+    const TypeId i32 = ti.primitive(TypeKind::I32);
+    const TypeId f32 = ti.primitive(TypeKind::F32);
+    std::array<TypeId, 2> const fields{i32, f32};
+    const TypeId s = ti.structType("S", fields);
+
+    auto ops = ti.operands(s);
+    ASSERT_EQ(ops.size(), 2u);          // immediate read — no intervening intern
+    EXPECT_EQ(ops[0].v, i32.v);
+    EXPECT_EQ(ops[1].v, f32.v);
+
+    // Own-before-mutate (the fix pattern): copy out, THEN intern freely.
+    std::vector<TypeId> const owned(ops.begin(), ops.end());
+    (void)ti.array(i32, 8);             // mutate the pool (new types)
+    (void)ti.primitive(TypeKind::F64);
+    ASSERT_EQ(owned.size(), 2u);        // the owning copy is immune to the realloc
+    EXPECT_EQ(owned[0].v, i32.v);
+    EXPECT_EQ(owned[1].v, f32.v);
 }

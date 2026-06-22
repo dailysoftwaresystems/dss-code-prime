@@ -381,6 +381,106 @@ struct DSS_EXPORT TargetRegisterClassOps {
     }
 };
 
+// FC12a-core variadic CALLEE ABI (D-FC12A-VARIADIC-CALLEE): the layout of this
+// CC's `__va_list_tag` PLUS the register-save-area geometry a `va_start`/`va_arg`
+// walk needs. A target WITHOUT this block fails loud at the variadic-callee site
+// (mirrors `variadicVectorCountReg.has_value()` / `indirectResultRegister.has_value()`
+// — an un-built CC is never silently mis-walked). All facts are CONFIG; the per-CC
+// algorithm (semantic `__va_list_tag` injection, HIR→MIR `va_arg` diamond, LIR
+// prologue spill) reads them, never branching on cc.name / arch / format.
+//
+// SysV AMD64 (§3.5.7): `__va_list_tag` = `{u32 gp_offset; u32 fp_offset;
+// void* overflow_arg_area; void* reg_save_area;}` (24B). The callee prologue of a
+// variadic function spills the 6 integer arg regs (rdi..r9) + the al-gated 8 SSE
+// arg regs (xmm0..xmm7) into a register-save-area; `va_arg` reads the next slot of
+// the right class from there until the per-class offset hits its limit, then walks
+// the overflow (incoming stack-arg) area.
+//
+// FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the `VaListStrategy` closed enum that
+// keys every va seam lives in `aggregate_layout.hpp` (included above) — the same
+// link/target-substrate-free home as `AggregateClassKind`/`BitFieldStrategy`, so
+// the SEMANTIC `va_list`-type injection can read the strategy without pulling this
+// target/link substrate (the layering precedent `AggregateLayoutParams` set).
+struct VaListLayout {
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the lowering strategy — the FIRST field
+    // so every consumer reads it before any strategy-specific field. Defaults to
+    // SysVRegisterSave for back-compat (a `vaListLayout` block that omits "strategy"
+    // is the pre-FC12b SysV shape).
+    VaListStrategy strategy = VaListStrategy::SysVRegisterSave;
+
+    // The stride one named/variadic arg slot occupies when walking the contiguous
+    // home+overflow area (HomogeneousPointer) OR — on SysVRegisterSave — the GPR
+    // slot stride (== gpSlotBytes; the overflow walk's per-slot quantum). Win64 = 8.
+    // Read on BOTH arms; the SysV arm uses it as the stack-arg stride, the Win64 arm
+    // as the uniform va_arg bump.
+    std::uint32_t namedArgSlotBytes = 0;
+    // One field of the `__va_list_tag` struct: its byte offset within the tag and
+    // its width (the four SysV fields are gp_offset@0/w4, fp_offset@4/w4,
+    // overflow_arg_area@8/w8, reg_save_area@16/w8). Offset/width are CONFIG so a CC
+    // with a different tag shape (or field order) needs no substrate change.
+    struct Field {
+        std::uint32_t byteOffset = 0;
+        std::uint32_t widthBytes = 0;
+    };
+
+    // NOTE: the `__va_list_tag` TOTAL size is NOT carried here — the sema-injected
+    // builtin struct {u32,u32,void*,void*} sizes the `ap` local; these field offsets
+    // + the save-area shape below are what codegen reads.
+    Field gpOffsetField{};            // current GPR byte-cursor into the save area
+    Field fpOffsetField{};            // current SSE byte-cursor into the save area
+    Field overflowArgAreaField{};     // pointer to the next incoming STACK arg
+    Field regSaveAreaField{};         // pointer to the spilled register-save-area
+
+    // FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE): the AAPCS64 `__va_list` 5-field struct
+    // (AAPCS64 §B.4). Read ONLY when strategy == Aapcs64DualCursor (the SysV fields
+    // above are read only when SysVRegisterSave). The struct is
+    // `{void* __stack; void* __gr_top; void* __vr_top; int __gr_offs; int __vr_offs;}`
+    // (32B). `va_arg` runs a per-class dual-cursor walk: a NEGATIVE byte cursor
+    // (`__gr_offs`/`__vr_offs`) counts UP toward 0 from the head of that class's save
+    // block; while it is < 0 a register slot remains (read `<gr|vr>_top + cursor`,
+    // bump the cursor by the slot stride); once it reaches 0 the arg is on the stack
+    // (read `__stack`, bump by the GPR slot quantum). The save-area geometry reuses
+    // the gpSaveCount/gpSlotBytes (GR: 8×8) + fpSaveCount/fpSlotBytes (VR: 8×16)
+    // fields above; these five locate the cursor/top fields within the `ap` struct.
+    Field stackField{};               // __stack: next incoming STACK arg (AAPCS64 §B.4)
+    Field grTopField{};               // __gr_top: one past the GR save block
+    Field vrTopField{};               // __vr_top: one past the VR save block
+    Field grOffsField{};              // __gr_offs: NEGATIVE i32 GR cursor (→0)
+    Field vrOffsField{};              // __vr_offs: NEGATIVE i32 VR cursor (→0)
+
+    // Register-save-area geometry. The prologue spills `gpSaveCount` integer arg
+    // regs at `gpSlotBytes` stride, then `fpSaveCount` SSE arg regs at `fpSlotBytes`
+    // stride (the SSE block follows the GPR block). For SysV: 6×8 then 8×16 = 176B.
+    // For AAPCS64 (Aapcs64DualCursor): GR 8×8 then VR 8×16 = 64 + 128 = 192B.
+    std::uint32_t gpSaveCount = 0;    // integer arg regs spilled (SysV: 6; AAPCS64: 8)
+    std::uint32_t gpSlotBytes = 0;    // bytes per integer save slot (SysV/AAPCS64: 8)
+    std::uint32_t fpSaveCount = 0;    // SSE/VR arg regs spilled (SysV/AAPCS64: 8)
+    std::uint32_t fpSlotBytes = 0;    // bytes per SSE/VR save slot (SysV/AAPCS64: 16)
+
+    // `va_arg` reg-vs-overflow thresholds. gp_offset < gpOffsetLimit ⇒ read from
+    // the save area (SysV: 48 = 6×8); fp_offset < fpOffsetLimit ⇒ likewise
+    // (SysV: 176 = 48 + 8×16). These are CONFIG because they are a function of the
+    // save-area geometry the ABI fixes, not anything the substrate may infer.
+    // (Aapcs64DualCursor does NOT use these — its threshold is the NEGATIVE cursor
+    // reaching 0, not a positive limit; left 0 there.)
+    std::uint32_t gpOffsetLimit = 0;  // SysV: 48
+    std::uint32_t fpOffsetLimit = 0;  // SysV: 176
+
+    // FC12c (D-FC12C-APPLE-ARM64-VARIADIC-CALLEE): when true, a HomogeneousPointer
+    // `va_start` anchors `ap` at the OVERFLOW (incoming-stack-arg) base
+    // (`VaOverflowArgAreaAddr`) rather than the named-arg HOME base
+    // (`VaHomeArgAreaAddr`). Apple arm64 has NO home area — its variadic args are
+    // ALWAYS stacked (see `variadicArgsAlwaysStack` on the CC), so the first vararg
+    // sits at the overflow base. Win64 (false, default) keeps the home base.
+    bool variadicUsesOverflowBase = false;
+
+    // Total register-save-area size the prologue reserves = gpSaveCount*gpSlotBytes
+    // + fpSaveCount*fpSlotBytes (derived; the layout pass uses it to size the zone).
+    [[nodiscard]] constexpr std::uint32_t regSaveAreaBytes() const noexcept {
+        return gpSaveCount * gpSlotBytes + fpSaveCount * fpSlotBytes;
+    }
+};
+
 // One calling convention. A target may declare multiple (SysV AMD64,
 // Microsoft x64, fastcall, ...); the front-end picks one via attribute /
 // driver flag. The `argGprs` / `argFprs` ordering is significant — the
@@ -512,6 +612,17 @@ struct DSS_EXPORT TargetCallingConvention {
     // the two shapes; only mixed-class 5+ arg calls diverge.
     bool slotAligned = false;
 
+    // FC12c (D-FC12C-APPLE-ARM64-VARIADIC-CALLEE): when true, EVERY variadic argument
+    // (an operand past `call_payload::fixedOperandCount`) of a variadic call is forced
+    // onto the stack overflow area regardless of available arg registers — Apple
+    // arm64's documented divergence from AAPCS64 (variadic args are ALWAYS stacked).
+    // NAMED args (operand index < fixedOperandCount) stay register-placed. Gated in
+    // the caller arg-placement loop on this flag + the call's isVariadic bit, so
+    // AAPCS64 (false) and the x86 CCs (false, default) are unaffected — they keep the
+    // register-then-stack placement. This realizes the variadic half of
+    // D-FF3-APPLE-ARM64-ABI-DIVERGENCE.
+    bool variadicArgsAlwaysStack = false;
+
     // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the
     // classification STRATEGY for a struct/union passed/returned by value.
     // A closed enum (the `aggregate_abi` classifier switches on it, never on
@@ -559,12 +670,17 @@ struct DSS_EXPORT TargetCallingConvention {
     // arguments used by varargs (0..8)`. Win64 ms_x64 has no
     // equivalent (the loader-side ABI uses GPR-shadow + double-spill
     // — anchored D-ML7-VARIADIC-WIN64-DOUBLE-SPILL — and this field
-    // is left empty). AAPCS64 (ARM64): no equivalent (variadic floats
-    // pass on the stack, no count register). Empty optional ⇒ this
-    // CC requires no caller-side vector-count register for variadic
-    // calls. When engaged, ML7 materialize for a Call with
-    // payload `isVariadic=true` counts FPR args in
-    // [fixedArgCount..N) and emits a `mov <reg>, <count>` before
+    // is left empty). AAPCS64 (ARM64-ELF): no equivalent — variadic FP
+    // args pass in v0..v7 and ARE spilled to the VR save area (the dual-
+    // cursor walk reads them via __vr_offs); there is simply no SysV-style
+    // al count register. (APPLE arm64 is the ABI where variadic args —
+    // int AND fp — are ALWAYS stacked; that is `variadicArgsAlwaysStack`,
+    // NOT this field.) Both arm64 CCs leave this empty for the same
+    // reason: no caller-side vector-COUNT register exists on AArch64.
+    // Empty optional ⇒ this CC requires no caller-side vector-count
+    // register for variadic calls. When engaged, ML7 materialize for a Call with
+    // payload `isVariadic=true` counts FPR-class arg operands in
+    // [fixedOperandCount..N) and emits a `mov <reg>, <count>` before
     // the call instruction.
     std::optional<NamedRegisterRef> variadicVectorCountReg;
 
@@ -576,6 +692,15 @@ struct DSS_EXPORT TargetCallingConvention {
     // (consuming argGprs[0]) returned in returnGprs[0]. This one field selects
     // between the two sret mechanisms agnostically — no per-CC branch.
     std::optional<NamedRegisterRef> indirectResultRegister;
+
+    // FC12a-core (D-FC12A-VARIADIC-CALLEE): the `__va_list_tag` layout + register-
+    // save-area geometry for `va_start`/`va_arg`/`va_end` in a variadic CALLEE.
+    // ENGAGED (SysV AMD64) ⇒ the semantic phase injects `__va_list_tag`, HIR→MIR
+    // lowers the va_arg diamond, and the LIR prologue spills the arg registers.
+    // ABSENT (Win64 / AAPCS64 this cycle — a different variadic ABI) ⇒ a variadic
+    // function body using va_start fails LOUD ("variadic callee unsupported for
+    // this CC"), never silently mis-walked. One field selects support agnostically.
+    std::optional<VaListLayout> vaListLayout;
 };
 
 // Discriminates the byte-encoding shape an opcode commits to (plan 13
@@ -935,11 +1060,38 @@ enum class EncodingSlotKind : std::uint8_t {
     // is representable. Distinct from `Imm32` (4 bytes, sign-extended
     // consumers) and `Imm8` (1 byte, shift counts).
     Imm64         = 25,
+    // D-ASM-AARCH64-LARGE-FRAME-IMM12 (v0.0.2 cycle ⑤): the AArch64
+    // SCALED unsigned 12-bit displacement of the unsigned-offset LDR/STR
+    // form (`LDR/STR Xt, [Xn, #pimm]`), bits 10..21 — the SAME bit-window
+    // as `Imm12`, but with DISTINCT encode semantics, hence a distinct
+    // slot (NOT a reuse of Imm12 + a flag — §B.2 FORCED). Whereas Imm12
+    // (ADD/SUB-immediate) writes the RAW byte value, this slot writes the
+    // SCALED field `imm12 = byteOffset / accessSizeBytes` (accessSizeBytes
+    // = the access width in bytes: 8 for a 64-bit LDR, 4 for a 32-bit, 2
+    // for 16-bit, 1 for 8-bit). The walker (fixed32.cpp MemOffset arm)
+    // derives accessSizeBytes from the inst's operation width, validates
+    // the byte offset is NON-NEGATIVE and ACCESS-SIZE-ALIGNED and the
+    // scaled field fits 12 bits (0..4095), then writes the scaled value
+    // (fail-loud A_ImmediateOperandOutOfRange on any of the three). This
+    // gives a frame reach of 4095*8 = 32760 bytes for 64-bit loads — the
+    // form a ≥9-fixed-param AAPCS64 callee needs to load its 9th
+    // (incoming-stack) param at `[sp + frameSize]` when frameSize exceeds
+    // the unscaled imm9 ±256. DECODE (disasm) extracts the RAW 12-bit
+    // field — the round-trip oracle pins the scaled value (e.g. 24 for a
+    // 64-bit `[sp,#192]`), NOT the byte offset. A frame offset that is
+    // negative-and-out-of-imm9, OR aligned-but >32760, OR
+    // non-aligned-and-out-of-imm9 stays fail-loud (anchored
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12; the shifted imm12<<12 LDR
+    // form / scratch-register address materialization is the future
+    // generalization). The LOWERING (lir_callconv.cpp) picks the mnemonic
+    // (load/store vs load_u/store_u) from the offset value — the variant
+    // selector matches operand KINDS only and cannot inspect the value.
+    Imm12Scaled   = 26,
     // Future fixed32 slots (paired with their consumer cycle):
-    //   ImmShift / Sf-flag / scaled LDR imm12 / etc.
+    //   ImmShift / Sf-flag / shifted imm12<<12 / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 26> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 27> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -966,6 +1118,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 26> kEncodingSlotKindTable{{{
     { EncodingSlotKind::MemOffsetZero, "memoffset.zero" },
     { EncodingSlotKind::OpcodePlusReg, "opcode.reg"     },
     { EncodingSlotKind::Imm64,         "imm64"          },
+    { EncodingSlotKind::Imm12Scaled,   "imm12.scaled"   },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -984,7 +1137,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 26,
+static_assert(kEncodingSlotKindCount == 27,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -1026,6 +1179,11 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::MemBaseNoScale:
         case EncodingSlotKind::MemOffsetZero:
         case EncodingSlotKind::Imm12:
+        // D-ASM-AARCH64-LARGE-FRAME-IMM12: the scaled imm12 LDR/STR
+        // displacement is a fixed32 slot (HAZARD #6 — MUST be Fixed32 or
+        // validate() rejects every `load_u`/`store_u` variant that wires
+        // it as a cross-shape declaration on a fixed32 opcode).
+        case EncodingSlotKind::Imm12Scaled:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
             return TargetEncodingShape::Fixed32;
@@ -1209,6 +1367,9 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::MemBaseNoScale:
         case EncodingSlotKind::MemOffsetZero:
         case EncodingSlotKind::Imm12:
+        // D-ASM-AARCH64-LARGE-FRAME-IMM12: the scaled imm12 displacement
+        // writes its immediate field directly — no linker relocation.
+        case EncodingSlotKind::Imm12Scaled:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
         case EncodingSlotKind::Disp32Mem:
