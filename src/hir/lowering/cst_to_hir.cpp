@@ -204,6 +204,15 @@ struct Lowerer {
     // never re-introduces the read-only-store crash).
     std::vector<std::pair<HirNodeId, MutabilityAttr>>& mutability;
 
+    // D-CSUBSET-LOCAL-STATIC: the module-level decls accumulator (the SAME
+    // vector `lowerTree` appends top-level decls to). A block-scope `static`
+    // local lowers to a hidden module-global appended HERE — not to the
+    // enclosing function body — so its symbol joins `globalSymbols` and its
+    // references route through GlobalAddr (static storage), while its NAME
+    // stays block-scoped. Set at each `lowerTree` entry; null outside a tree
+    // walk (the static-emit site fails loud on null — never a silent drop).
+    std::vector<HirNodeId>* moduleDecls_ = nullptr;
+
     // O(1) lookups.
     std::unordered_map<std::uint32_t, std::size_t> ruleMap_;     // RuleId.v → ruleMappings idx
     std::unordered_map<std::uint32_t, std::size_t> declMap_;     // RuleId.v → sem.declarations idx
@@ -671,7 +680,8 @@ struct Lowerer {
     // (D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC). Agnostic: BOTH the effect
     // map and the ignored-kind set are per-language config; the engine compares
     // resolved SchemaTokenIds + source text, never a hardcoded kind/identity.
-    [[nodiscard]] LinkageAttr linkageFrom(NodeId prefixNode, DeclarationRule const& decl) {
+    [[nodiscard]] LinkageAttr linkageFrom(NodeId prefixNode, DeclarationRule const& decl,
+                                          bool* staticStorageOut = nullptr) {
         LinkageAttr attr{};
         if (!prefixNode.valid() || decl.linkageSpecifiers.empty()) return attr;
         // Collect the prefix's tokens in SOURCE order (the composite-key
@@ -758,6 +768,8 @@ struct Lowerer {
             if (it != decl.linkageSpecifiers.end()) {
                 if (it->second.binding)    attr.binding    = *it->second.binding;
                 if (it->second.visibility) attr.visibility = *it->second.visibility;
+                if (it->second.staticStorage && staticStorageOut != nullptr)
+                    *staticStorageOut = true;
             } else {
                 emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
                       std::format("'{}' is not a recognized linkage specifier",
@@ -3499,8 +3511,29 @@ struct Lowerer {
         auto it = declMap_.find(tree().rule(node).v);
         DeclarationRule const* decl =
             (it != declMap_.end()) ? &sem.declarations[it->second] : nullptr;
+        // D-CSUBSET-LOCAL-STATIC: a block-scope `static` confers static storage
+        // duration — fold it from the SAME specifier-prefix scan linkageFrom
+        // uses (the `staticStorage` axis), and the LinkageAttr it returns
+        // ({Local, Default}) is the internal linkage the emitted hidden global
+        // carries. Only meaningful for a LOCAL decl: a top-level `static` is
+        // already a global (file-scope `binding:local`, handled by asGlobal).
+        bool staticStorage = false;
+        LinkageAttr staticLinkage{};
+        if (!asGlobal && decl != nullptr) {
+            staticLinkage = linkageFrom(specifierPrefixChild(tree(), node, *decl),
+                                        *decl, &staticStorage);
+        }
         if (decl == nullptr || !decl->isDeclaratorMode()
             || !sem.declarators.has_value()) {
+            // MF-3: a static local can only flow through the declarator-mode
+            // path (no shipped non-declarator language admits `static` locals).
+            // Never silently lower it as an automatic local on the legacy path.
+            if (staticStorage) {
+                out.push_back(reportedError(node,
+                    "static-storage-duration local declarations require "
+                    "declarator-mode lowering"));
+                return;
+            }
             out.push_back(lowerVarLikeLegacy(node, asGlobal, decl));
             return;
         }
@@ -3564,6 +3597,29 @@ struct Lowerer {
                     init = lowerExprOrBraceInit(c, type);
                     break;
                 }
+            }
+            // D-CSUBSET-LOCAL-STATIC: a `static` local is a hidden module-global.
+            // Emit makeGlobal + internal ({Local}) linkage + const-ness, append
+            // it to the MODULE decls (so collectGlobals sees it → its Ref routes
+            // through GlobalAddr, static storage), and append NOTHING to the
+            // function body's `out`: the storage IS the global and the init is
+            // load-time (like any global), so the body holds no runtime stmt for
+            // it. A non-constant initializer fails loud downstream at the asm
+            // tier (D-LK4-RODATA-PRODUCER-RUNTIME-INIT), never a silent accept.
+            if (staticStorage) {
+                // MF-3: the module-decls accumulator is set at lowerTree entry;
+                // a static seen outside a tree walk is a bug — fail loud.
+                if (moduleDecls_ == nullptr) {
+                    out.push_back(reportedError(d,
+                        "static local lowered with no module-decls accumulator "
+                        "(outside a module tree walk)"));
+                    continue;
+                }
+                HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), d);
+                recordMutability(g, sym);
+                recordLinkage(g, staticLinkage);  // {Local, Default} — internal
+                moduleDecls_->push_back(g);
+                continue;
             }
             HirNodeId const lowered = asGlobal
                 ? track(builder.makeGlobal(type, sym.v, init), d)
@@ -4333,6 +4389,10 @@ struct Lowerer {
     // this tree (HR11), so `lowerDecl` always reads this tree's own language config.
     void lowerTree(Tree const& t, std::vector<HirNodeId>& decls) {
         t_ = &t;
+        // D-CSUBSET-LOCAL-STATIC: expose the module-decls accumulator so a
+        // block-scope `static` lowered deep in a function body can append its
+        // hidden global here (collectGlobals reads `hir.moduleDecls`).
+        moduleDecls_ = &decls;
         if (!t.root().valid()) return;
         for (NodeId top : visible(t.root())) {
             if (isToken(top)) continue;

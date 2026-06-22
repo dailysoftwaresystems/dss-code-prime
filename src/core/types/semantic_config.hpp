@@ -175,9 +175,25 @@ enum class SymbolVisibility : std::uint8_t;
 // value (so `static` sets only `binding`; `visibility("hidden")` sets only
 // `visibility`). Agnostic: the engine performs the lookup; WHICH texts exist and
 // what binding/visibility they mean are entirely per-language config.
+//
+// D-CSUBSET-LOCAL-STATIC (2026-06-22): the same per-(rule,token) effect map also
+// carries a STORAGE-DURATION axis (`staticStorage`). A C `static` storage-class
+// specifier confers different effects by scope: at FILE scope it sets `binding`
+// (internal linkage); at BLOCK scope it confers STATIC storage duration (the
+// object lives in `.data`/`.bss`, not the stack frame) AND, for the emitted
+// hidden global, internal (`local`) binding. Both are folded from the ONE
+// specifier-prefix scan (`linkageFrom`); the block-scope `static` row therefore
+// declares `{ "binding": "local", "staticStorage": true }`. Naming note: the map
+// is the declaration-SPECIFIER effect map (linkage is one axis of several), not
+// linkage-only — kept under the existing `linkageSpecifiers` facet so a single
+// scan folds every axis rather than duplicating the prefix walk.
 struct DSS_EXPORT LinkageSpecifierEffect {
     std::optional<SymbolBinding>    binding;
     std::optional<SymbolVisibility> visibility;
+    // Block-scope static storage duration (C 6.2.4/6.7.1): the object gets
+    // static (module-global) storage, not an automatic stack slot. Folded by
+    // CST→HIR to route the local declaration down the global-emission path.
+    bool                            staticStorage = false;
 };
 
 // FC4 c1 (M5): a config-driven fail-loud gate on a declaration form. When the

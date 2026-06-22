@@ -134,6 +134,55 @@ TEST(HirLoweringCSubset, ControlFlowAndAssignment) {
     EXPECT_EQ(res->hir.kind(stmts[0]), HirKind::WhileStmt);
 }
 
+// D-CSUBSET-LOCAL-STATIC: a block-scope `static` lowers to a hidden module
+// GLOBAL (static storage duration, C 6.2.4), NOT a function-body VarDecl (a
+// stack slot). The name stays block-scoped; the STORAGE is global → the value
+// persists across calls. RED-ON-DISABLE: revert the cst_to_hir staticStorage
+// arm → `n` lowers to a body VarDecl → moduleDecls carries only the Function
+// (zero Globals) and the body's first statement is a VarDecl, not the empty
+// Block placeholder. This is the host-independent guard the runtime corpus
+// (`local_static`) pairs with.
+TEST(HirLoweringCSubset, StaticLocalLowersToModuleGlobal) {
+    SemanticModel model = analyzeCSubset(
+        "int f(void) { static int n = 0; n = n + 1; return n; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t fns = 0, globals = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) == HirKind::Function) ++fns;
+        if (res->hir.kind(d) == HirKind::Global)   ++globals;
+    }
+    EXPECT_EQ(fns, 1u);
+    EXPECT_EQ(globals, 1u)
+        << "the static local must lower to ONE hidden module Global";
+    // No stack VarDecl for `n` survives in the function body.
+    HirNodeId fn = firstFunction(res->hir);
+    for (HirNodeId s : res->hir.children(res->hir.functionBody(fn)))
+        EXPECT_NE(res->hir.kind(s), HirKind::VarDecl)
+            << "a static local must not leave a stack VarDecl in the body";
+}
+
+// Two SIBLING statics with the SAME source name in distinct blocks get DISTINCT
+// module globals (distinct SymbolIds — no mangling needed; internal-linkage
+// globals are intra-module by id). RED-ON-DISABLE: the revert collapses both to
+// body VarDecls → zero module Globals.
+TEST(HirLoweringCSubset, SiblingStaticLocalsGetDistinctGlobals) {
+    SemanticModel model = analyzeCSubset(
+        "int f(void) { { static int x = 1; x = x + 1; } "
+        "{ static int x = 2; x = x + 1; } return 0; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t globals = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root()))
+        if (res->hir.kind(d) == HirKind::Global) ++globals;
+    EXPECT_EQ(globals, 2u)
+        << "two sibling statics must mint two DISTINCT module globals";
+}
+
 TEST(HirLoweringCSubset, ForLoop) {
     SemanticModel model = analyzeCSubset(
         "void f() { for (int i = 0; i < 10; i = i + 1) {} }");

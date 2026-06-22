@@ -363,6 +363,16 @@ enum class DiagnosticCode : std::uint16_t {
     // `va_list` (which would mis-size the `ap` local and corrupt the stack). SysV
     // (register-save) + Win64 (homogeneous-pointer) are realized and never hit this.
     S_VariadicCalleeUnsupported   = 0xE020,
+    // D-CSUBSET-LOCAL-STATIC (MF-2): a `static` storage-class specifier in a
+    // for-statement init-declaration is a C 6.8.5p3 constraint violation ("the
+    // declaration part of a for statement shall only declare identifiers for
+    // objects having storage class auto or register"). The grammar admits the
+    // shared `localDeclSpecifiers` prefix (so `static` PARSES in the for-init),
+    // and a block-scope `static` IS supported — but in for-init it must fail
+    // loud, never silently lower as an automatic local. Config-driven: the
+    // for-init declaration row declares the `StaticKeyword`→this-code gated
+    // marker; nothing here hardcodes the word "static".
+    S_StaticStorageInForInit      = 0xE021,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

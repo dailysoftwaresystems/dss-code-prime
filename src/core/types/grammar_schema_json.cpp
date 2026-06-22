@@ -4283,11 +4283,28 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                         effect.visibility = *v;
                                         any = true;
                                     }
+                                    // D-CSUBSET-LOCAL-STATIC: the storage-duration
+                                    // axis — a block-scope `static` confers static
+                                    // storage (the engine routes the local decl to
+                                    // the global-emission path). Optional bool.
+                                    if (eff.contains("staticStorage")) {
+                                        if (!eff.at("staticStorage").is_boolean()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'staticStorage' must be a "
+                                                      "boolean");
+                                            continue;
+                                        }
+                                        effect.staticStorage =
+                                            eff.at("staticStorage").get<bool>();
+                                        if (effect.staticStorage) any = true;
+                                    }
                                     if (!any) {
                                         coll.emit(DiagnosticCode::C_InvalidSemantics,
                                                   effPath,
                                                   "linkage effect must set at least "
-                                                  "one of 'binding' or 'visibility'");
+                                                  "one of 'binding', 'visibility', or "
+                                                  "'staticStorage'");
                                         continue;
                                     }
                                     rule.linkageSpecifiers.emplace(specText, effect);

@@ -650,8 +650,8 @@
       "sequence": [ "localDeclSpecifier", { "repeat": "localDeclSpecifier" } ]
     },
     "localDeclSpecifier": {
-      "$comment": "Local storage-class specifiers + attributes. NO static (C-valid but unsupported local-lifetime semantics — stays a parse error); register/auto parse and are semantically inert (C: hints/default storage).",
-      "alt": [ "RegisterKeyword", "AutoKeyword", "attrSpec", "stdAttr" ]
+      "$comment": "Local storage-class specifiers + attributes. `static` (D-CSUBSET-LOCAL-STATIC) confers STATIC storage duration (C 6.2.4) — the varDecl row's linkageSpecifiers maps it to {binding:local, staticStorage:true} and CST→HIR routes the declaration to a hidden module-global; register/auto parse and are semantically inert (C: hints/default storage). `static` in a for-init is a C 6.8.5p3 violation, gated loud by the forDecl row.",
+      "alt": [ "StaticKeyword", "RegisterKeyword", "AutoKeyword", "attrSpec", "stdAttr" ]
     },
 
     "paramList": {
@@ -1005,6 +1005,10 @@
         "constMarker": "ConstKeyword", "warnIfUnused": true,
         "specifierPrefix": "localDeclSpecifiers",
         "requireNamedDeclarators": true,
+        "$staticStorageComment": "D-CSUBSET-LOCAL-STATIC: a block-scope `static` confers static storage duration (C 6.2.4). CST→HIR's linkageFrom folds {binding:local, staticStorage:true} from the SAME prefix scan and routes the declaration to a hidden module-global (internal linkage). register/auto/attribute specifiers carry no linkage and are ignored (ignoredKinds/ignoredRules) so they never trip the unknown-specifier diagnostic.",
+        "linkageSpecifiers": { "static": { "binding": "local", "staticStorage": true } },
+        "linkageSpecifierIgnoredKinds": ["RegisterKeyword", "AutoKeyword", "AttributeKeyword", "ParenOpen", "ParenClose"],
+        "linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr"],
         "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" } ] },
       { "rule": "identVarDecl", "head": 0, "declaratorList": 1, "kind": "variable",
         "constMarker": "ConstKeyword", "warnIfUnused": true,
@@ -1014,7 +1018,8 @@
         "constMarker": "ConstKeyword", "warnIfUnused": true,
         "specifierPrefix": "localDeclSpecifiers",
         "requireNamedDeclarators": true,
-        "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" } ] },
+        "$forStaticComment": "D-CSUBSET-LOCAL-STATIC (MF-2): `static` parses in the shared localDeclSpecifiers prefix, but a static (or any non-auto/register) storage class in a for-statement init-declaration is a C 6.8.5p3 constraint violation — gate it LOUD (never silently lower as an automatic loop variable). NO linkageSpecifiers here: a static for-init must error, not route to a hidden global.",
+        "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" }, { "token": "StaticKeyword", "code": "S_StaticStorageInForInit" } ] },
       { "rule": "forIdentDecl", "head": 0, "declaratorList": 1, "kind": "variable",
         "constMarker": "ConstKeyword", "warnIfUnused": true,
         "requireNamedDeclarators": true,
