@@ -2021,6 +2021,19 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
     // by construction. On trip we FAIL LOUD with a positioned
     // diagnostic + recover (Error leaf + panic-scan + graceful unwind)
     // rather than recursing one level deeper into a C++ stack overflow.
+    //
+    // PERF (D-PARSE-DEEP-NEST-RECURSION-MEMORY): this per-OPERAND host
+    // recursion is the source of the residual ~exp-1.7 WALL-CLOCK super-
+    // linearity on deeply-nested input (e.g. `((((0))))`). The parse WORK is
+    // O(N) — a flat `0+0+…+0` chain of the same node count parses with a FLAT
+    // per-element cost (pinned by `FlatChainParseWorkIsLinear`) — so the
+    // residual is a memory-hierarchy constant (live call-stack working set +
+    // strided unwind re-access of the depth-indexed frame/cursor vectors),
+    // NOT an algorithmic O(N²) term. It is bounded/moot: `maxExpressionDepth`
+    // caps depth (default 256) and the whole downstream frontend is itself
+    // recursion-bound to that cap (D-PARSE-DEEP-FRONTEND-STACK), so flattening
+    // it would need an explicit-stack iterative rewrite of the WHOLE frontend
+    // for zero in-cap benefit. Deferred (trigger-gated) — see the registry.
     if (I.expressionDepth >= I.config.maxExpressionDepth) {
         I.recoverExpressionTooDeep_(I.tokens.peek());
         return;

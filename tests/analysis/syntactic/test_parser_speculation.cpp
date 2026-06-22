@@ -513,6 +513,16 @@ TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
 // MIR passes recurse on the host stack and overflow at ~25 levels
 // (D-PARSE-DEEP-FRONTEND-STACK, a SEPARATE anchor), so this stays at the
 // parser boundary deliberately.
+//
+// NOTE 2 (the generous 8× ceiling): the parse WORK is O(N) — the companion
+// `FlatChainParseWorkIsLinear` pins the shared machinery flat — but this
+// RECURSIVE nest carries a residual ~exp-1.7 wall-clock super-linearity that
+// is a memory-hierarchy constant of the N-deep host recursion (live call
+// stack + strided unwind), NOT an algorithmic term. It is bounded/moot in
+// practice (the 256 depth cap + the recursion-bound downstream frontend) and
+// documented as D-PARSE-DEEP-NEST-RECURSION-MEMORY; the 8× bound is sized to
+// absorb it while still catching an O(N²) speculation regression (orders of
+// magnitude over).
 namespace {
 
 [[nodiscard]] std::string deepNestSource(std::size_t depth) {
@@ -733,4 +743,118 @@ TEST(ParserSpeculation, NullableStopElementDoesNotOverPrune) {
            "the candidate set for the offset-1 token B";
     EXPECT_EQ(countNodesByRule(t, "caseB"), 0u)
         << "caseB must NOT appear — `A B ;` is unambiguously caseA";
+}
+
+// ── Flat-chain O(N)-WORK pin — the non-recursive control for the deep-nest
+//    memory-latency residual (D-PARSE-DEEP-NEST-RECURSION-MEMORY) ───────────
+//
+// A flat left-assoc `0+0+…+0` chain has the SAME O(N) total nodes/tokens as a
+// deep `((((0))))` nest but builds ITERATIVELY (the Pratt climb wraps in
+// place; recursion depth peaks at ~2), so it isolates the SHARED parse
+// machinery — TreeBuilder frame open/close, the node arena, the schema-walker
+// advance — from the deep nest's N-frame host recursion. It pins that the
+// shared machinery is genuinely O(N): per-element cost stays ~constant as N
+// grows (measured ns/level was FLAT — ~20.5 µs — from 250 to 3000, while the
+// node count rose exactly linearly). A reintroduced O(N²) in the arena /
+// TreeBuilder bookkeeping (the hypothesis the controlled measurement REFUTED —
+// see D-PARSE-DEEP-NEST-RECURSION-MEMORY) would blow this far past the
+// generous ceiling: quadrupling the length ⇒ ~16× under O(N²) vs ~4× linear.
+//
+// This is the COMPLEMENT of `DeepNestCastVsParenIsLinear`: that test runs the
+// recursive nest (and tolerates a larger ratio precisely because its N-deep
+// recursion adds the memory-hierarchy constant this flat control isolates
+// away); this one pins the underlying work as linear with a tighter bound.
+namespace {
+
+[[nodiscard]] std::string flatChainSource(std::size_t additions) {
+    // `int main(void){return 0+0+…+0;}` — `additions` `+` ops, additions+1
+    // zeros. A left-assoc chain: the Pratt walker climbs it iteratively, so
+    // expression-depth peaks at ~2 and the default cap suffices (no large
+    // stack needed, unlike the deep nest).
+    std::string s = "int main(void){return 0";
+    for (std::size_t i = 0; i < additions; ++i) s += "+0";
+    s += ";}";
+    return s;
+}
+
+// Median wall-clock of `runs` clean flat-chain parses at `additions` length.
+// Uses EXPECT_ (not ASSERT_) so the helper stays valid in a non-void context.
+[[nodiscard]] std::chrono::nanoseconds
+timeFlatChainParse(std::shared_ptr<GrammarSchema const> const& schema,
+                   std::size_t additions, int runs) {
+    std::vector<std::chrono::nanoseconds> samples;
+    for (int r = 0; r < runs; ++r) {
+        auto src = SourceBuffer::fromString(flatChainSource(additions), "<flat>");
+        Tokenizer tk{src, schema};
+        auto [stream, lexDiags] = std::move(tk).tokenize();
+        Parser p{src, schema, std::move(stream)};
+        const auto t0 = std::chrono::steady_clock::now();
+        auto result = std::move(p).parse();
+        const auto t1 = std::chrono::steady_clock::now();
+        EXPECT_FALSE(result.tree.diagnostics().hasErrors())
+            << "flat chain of " << additions << " additions must parse clean";
+        samples.push_back(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0));
+    }
+    std::ranges::sort(samples);
+    return samples[samples.size() / 2];
+}
+
+// Node count of a single clean flat-chain parse (deterministic — one parse,
+// no timing). Used to pin the O(N)-STRUCTURE half of the linearity claim
+// independently of any wall-clock measurement.
+[[nodiscard]] std::uint32_t
+flatChainNodeCount(std::shared_ptr<GrammarSchema const> const& schema,
+                   std::size_t additions) {
+    auto src = SourceBuffer::fromString(flatChainSource(additions), "<flat>");
+    Tokenizer tk{src, schema};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+    Parser p{src, schema, std::move(stream)};
+    auto result = std::move(p).parse();
+    EXPECT_FALSE(result.tree.diagnostics().hasErrors())
+        << "flat chain of " << additions << " additions must parse clean";
+    return result.tree.nodeCount();
+}
+
+} // namespace
+
+TEST(ParserSpeculation, FlatChainParseWorkIsLinear) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+
+    constexpr int kRuns = 3;  // median-of-3 dampens Debug allocator jitter
+    (void)timeFlatChainParse(schema, 100, 1);  // warm allocator/caches
+    const auto t500  = timeFlatChainParse(schema, 500,  kRuns);
+    const auto t2000 = timeFlatChainParse(schema, 2000, kRuns);
+
+    // Quadrupling the chain length must scale ~4× (linear), not ~16× (O(N²)).
+    // A floor on the denominator avoids divide-by-noise on a fast baseline.
+    const double small =
+        std::max<double>(static_cast<double>(t500.count()), 1.0);
+    const double ratio = static_cast<double>(t2000.count()) / small;
+    EXPECT_LT(ratio, 8.0)
+        << "flat-chain parse scaled " << ratio << "× when the chain length "
+           "quadrupled (500→2000); linear is ~4×. A ratio approaching 16× "
+           "signals an O(N²) regression in the SHARED TreeBuilder / node-arena "
+           "/ schema-walker machinery (the deep-nest residual is a separate "
+           "memory-hierarchy effect -- D-PARSE-DEEP-NEST-RECURSION-MEMORY). "
+           "t500=" << (static_cast<double>(t500.count()) / 1e6) << "ms t2000="
+        << (static_cast<double>(t2000.count()) / 1e6) << "ms";
+
+    // O(N)-STRUCTURE pin (zero-flake complement to the timing guard above):
+    // the parse node count grows by a CONSTANT per added `+0` element, so its
+    // FIRST DIFFERENCE over equally-spaced lengths is constant ⇒ exactly
+    // linear. Using 500/1000/1500 (spacing 500) keeps this grammar-agnostic —
+    // no magic per-element constant. A super-linear NODE emission (structural
+    // O(N²), distinct from a time-only O(N²) the ratio above catches) would
+    // make the second difference non-zero.
+    const std::uint32_t n500  = flatChainNodeCount(schema, 500);
+    const std::uint32_t n1000 = flatChainNodeCount(schema, 1000);
+    const std::uint32_t n1500 = flatChainNodeCount(schema, 1500);
+    EXPECT_EQ(n1000 - n500, n1500 - n1000)
+        << "flat-chain node count must grow by a constant per element (linear "
+           "first difference); a non-constant difference signals super-linear "
+           "node emission. n500=" << n500 << " n1000=" << n1000
+        << " n1500=" << n1500;
 }
