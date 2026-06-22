@@ -1,5 +1,6 @@
 add_library(analysis_preprocess OBJECT
     preprocessor.cpp
+    pp_if_eval.cpp
 )
 
 target_include_directories(analysis_preprocess PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../..)

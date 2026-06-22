@@ -3611,6 +3611,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readField("defineDirective",      cfg.defineDirective);
             readField("undefDirective",       cfg.undefDirective);
             readField("includeDirective",     cfg.includeDirective);
+            // FC14 (D-PP-CONDITIONAL-COMPILATION): the conditional-compilation
+            // directive WORDS + the `defined` operator are matched by lexeme
+            // TEXT (like define/undef/include), so they are REQUIRED + validated
+            // NON-EMPTY (readField) but NOT `checkToken`-resolved (there is no
+            // token kind -- they lex as plain Identifier). Required-when-block-
+            // present so an opt-in language declares the whole conditional
+            // vocabulary; the engine never hard-codes a directive spelling.
+            readField("ifDirective",          cfg.ifDirective);
+            readField("ifdefDirective",       cfg.ifdefDirective);
+            readField("ifndefDirective",      cfg.ifndefDirective);
+            readField("elifDirective",        cfg.elifDirective);
+            readField("elseDirective",        cfg.elseDirective);
+            readField("endifDirective",       cfg.endifDirective);
+            readField("definedOperator",      cfg.definedOperator);
             readField("quoteIncludeToken",    cfg.quoteIncludeToken);
             // `functionLikeOpenToken` (C's `(`) is REQUIRED + validated: the
             // macro engine reads it to tell `#define F(x)` (function-like, the

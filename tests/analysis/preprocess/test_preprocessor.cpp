@@ -1216,3 +1216,375 @@ TEST(Preprocessor, DisabledLanguageGatePipelineIsStrictIdentity) {
     EXPECT_TRUE(cu.auxiliaryBuffers().empty())
         << "the preprocessor must not run for a language without a block";
 }
+
+// ============================================================================
+// FC14 (D-PP-CONDITIONAL-COMPILATION): #if / #ifdef / #ifndef / #elif / #else /
+// #endif + the `defined` operator. Dead-branch tokens are NOT emitted into the
+// body (elision precedes macro expansion); the #if/#elif controlling expression
+// is an integer-constant-expression folded by the shared const-eval core via a
+// config-precedence Pratt parser. Every assertion is RED-ON-DISABLE.
+// ============================================================================
+
+// #if 0 elides the whole group -- grammatically GARBAGE tokens inside a dead
+// branch are dropped before the parser sees them (so they never become a parse
+// error). RED-ON-DISABLE: dropping the stackActive gate on the body-push leaves
+// the garbage in the stream. NOTE: the garbage is lexically VALID -- a lexically
+// ILLEGAL character (`@`) would still diagnose, because conditional elision is a
+// token-level pass that runs AFTER the single global tokenize of the synth
+// buffer (same ordering limit as D-PP-CONDITIONAL-INCLUDE-ORDERING); the
+// property under test is that dead-branch *parse*-garbage is elided.
+TEST(Preprocessor, IfZeroElidesGarbageBranch) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if 0\nthis is not valid c 1 2 3 ) ) ( foo bar baz\n#endif\nint x;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a dead #if-0 branch must elide silently (its garbage never parses)";
+    ASSERT_EQ(lexs.size(), 3u) << "expected only: int x ;";
+    EXPECT_EQ(lexs[0], "int");
+    EXPECT_EQ(lexs[1], "x");
+    EXPECT_EQ(lexs[2], ";");
+}
+
+// #if 1 / #else: the TRUE branch is kept, the #else branch elided.
+TEST(Preprocessor, IfOneKeepsThenElseElided) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#if 1\nint a;\n#else\nint b;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "expected only the #if-1 branch: int a ;";
+    EXPECT_EQ(lexs[0], "int");
+    EXPECT_EQ(lexs[1], "a");
+    EXPECT_EQ(lexs[2], ";");
+}
+
+// PRECEDENCE pin (the crux): `1+2*3 == 7` AND `2*3+1 == 7` must BOTH take the
+// branch -- proving the evaluator uses the operator table's precedence (a naive
+// left-fold of `1+2*3` would give 9, and `9 == 7` is false). This is the proof
+// that the Pratt parser reuses `operatorTable()`.
+TEST(Preprocessor, IfExpressionUsesOperatorPrecedence) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#if 1+2*3 == 7\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u) << "1+2*3 == 7 is true -> branch taken";
+        EXPECT_EQ(lexs[1], "a");
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#if 2*3+1 == 7\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u) << "2*3+1 == 7 is true -> branch taken";
+        EXPECT_EQ(lexs[1], "a");
+    }
+    {
+        // Negative control: a LEFT-fold would make 1+2*3 == 9, so if precedence
+        // were wrong this branch would be WRONGLY taken. With correct
+        // precedence `1+2*3 == 9` is false -> branch elided.
+        PreprocessResult r;
+        auto lexs = ppLexemes("#if 1+2*3 == 9\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 0u)
+            << "1+2*3 == 9 is FALSE under correct precedence -> elided";
+    }
+}
+
+// Division by zero in a #if expression FAILS LOUD (MF-5) -- never a silent fold.
+TEST(Preprocessor, IfDivisionByZeroFailsLoud) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#if 1/0\nint a;\n#endif\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "a division by zero in a #if expression must fail loud";
+    (void)lexs;
+}
+
+// #ifdef / #ifndef after a #define FOO: #ifdef takes the branch, #ifndef does
+// not (and vice-versa when undefined).
+TEST(Preprocessor, IfdefIfndefTrackDefinedness) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#define FOO 1\n#ifdef FOO\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u) << "#ifdef FOO is true after #define FOO";
+        EXPECT_EQ(lexs[1], "a");
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#define FOO 1\n#ifndef FOO\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 0u) << "#ifndef FOO is false after #define FOO";
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#ifndef BAR\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u) << "#ifndef BAR is true when BAR is undefined";
+        EXPECT_EQ(lexs[1], "a");
+    }
+}
+
+// `defined(FOO)` (paren form) AND `defined BAR` (no-paren form). FOO is defined
+// -> true; BAR is undefined -> false. Proves MF-1 (the defined parens are the
+// CONFIG parens) end to end via behavior.
+TEST(Preprocessor, IfDefinedOperatorParenAndNoParen) {
+    {
+        PreprocessResult r;
+        auto lexs =
+            ppLexemes("#define FOO 1\n#if defined(FOO)\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u) << "defined(FOO) is true";
+        EXPECT_EQ(lexs[1], "a");
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#if defined BAR\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 0u) << "defined BAR (undefined) is false -> elided";
+    }
+    {
+        // `!defined X` composes with the `!` unary operator.
+        PreprocessResult r;
+        auto lexs = ppLexemes("#if !defined BAZ\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u) << "!defined BAZ (undefined) is true";
+        EXPECT_EQ(lexs[1], "a");
+    }
+}
+
+// MACRO EXPANSION in the operand: `#define N 1` then `#if N+1 > 1` -> the N
+// expands to 1, 1+1 > 1 is true. RED-ON-DISABLE: skipping the macro-expand
+// callback leaves N as an identifier -> 0 (C 6.10.1p4), 0+1 > 1 is false.
+TEST(Preprocessor, IfOperandIsMacroExpanded) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define N 1\n#if N+1 > 1\nint a;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "N expands to 1; 1+1 > 1 is true -> taken";
+    EXPECT_EQ(lexs[1], "a");
+}
+
+// An identifier that SURVIVES expansion (not a macro) folds to 0 (C 6.10.1p4):
+// `#if UNDEFINED_NAME` is `#if 0` -> elided, NO diagnostic.
+TEST(Preprocessor, IfUnknownIdentifierIsZero) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#if UNDEFINED_NAME\nint a;\n#else\nint b;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "an unknown identifier in #if folds to 0, not an error";
+    ASSERT_EQ(lexs.size(), 3u) << "the #else branch is taken: int b ;";
+    EXPECT_EQ(lexs[1], "b");
+}
+
+// #elif chaining: FIRST true branch wins; later true #elif branches + the #else
+// are elided.
+TEST(Preprocessor, ElifChainFirstTrueWins) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if 0\nint a;\n#elif 1\nint b;\n#elif 1\nint c;\n#else\nint d;\n#endif\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "the FIRST true #elif wins: int b ;";
+    EXPECT_EQ(lexs[1], "b") << "later true #elif / #else branches are elided";
+}
+
+// A #elif AFTER a #else fails loud, and a SECOND #else fails loud (C 6.10.1p4).
+TEST(Preprocessor, ElifOrElseAfterElseFailsLoud) {
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#if 0\n#else\nint a;\n#elif 1\nint b;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "a #elif after a #else must fail loud";
+    }
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#if 0\n#else\nint a;\n#else\nint b;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "a second #else in one group must fail loud";
+    }
+}
+
+// An UNTERMINATED conditional (no #endif) fails loud at end of input.
+TEST(Preprocessor, UnterminatedConditionalFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#if 1\nint a;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "a #if with no matching #endif must fail loud";
+}
+
+// #endif / #else / #elif with NO matching #if each fail loud.
+TEST(Preprocessor, DanglingConditionalDirectivesFailLoud) {
+    {
+        PreprocessResult r;
+        (void)ppLexemes("int a;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "a #endif with no matching #if must fail loud";
+    }
+    {
+        PreprocessResult r;
+        (void)ppLexemes("int a;\n#else\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "a #else with no matching #if must fail loud";
+    }
+}
+
+// A string literal in a #if operand is REJECTED as the unsupported subset
+// (P_PreprocessorUnsupported, config-driven via the `literalTypes` string
+// kinds), never silently folded. `sizeof` is NOT special-cased: the C
+// preprocessor does not know keywords (C 6.10.1p4), so `sizeof` folds as an
+// ordinary identifier -> 0 and the trailing `(int)` is then a MALFORMED
+// expression (P_PreprocessorDirective) -- the C-faithful behavior (matches
+// gcc's "missing binary operator"), and agnostic (no hard-coded `sizeof` name).
+TEST(Preprocessor, IfRejectsSizeofAndStringLiteral) {
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#if sizeof(int) > 2\nint a;\n#endif\n", r);
+        EXPECT_TRUE(r.diagnostics->hasErrors())
+            << "sizeof(int) in a #if expression must fail loud (never silently fold)";
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+            << "sizeof folds to 0 (identifier); the trailing `(int)` is malformed";
+    }
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#if \"x\"\nint a;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+            << "a string literal in a #if expression must be rejected";
+    }
+}
+
+// A DEAD branch's directives are NOT errors (C 6.10p1): an unsupported directive
+// AND a malformed `#if sizeof` nested inside a `#if 0` are SKIPPED silently
+// (only nesting is tracked). RED-ON-DISABLE: gating the else-arm error on
+// stackActive is what suppresses these.
+TEST(Preprocessor, DeadBranchDirectivesAreNotErrors) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if 0\n#pragma whatever\n#if sizeof(int)\nint dead;\n#endif\n#endif\n"
+        "int x;\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "directives inside a dead #if-0 branch must not error (only nesting "
+           "is tracked)";
+    ASSERT_EQ(lexs.size(), 3u) << "expected only: int x ;";
+    EXPECT_EQ(lexs[1], "x");
+}
+
+// C 6.10.1p6: a #elif whose group ALREADY took a branch does NOT evaluate its
+// controlling expression -- so a div-by-zero in a dead #elif operand must NOT
+// fire. RED-ON-DISABLE: dropping the `mayTake` guard in handleElif evaluates the
+// dead operand and `1/0` raises a P_PreprocessorDirective.
+TEST(Preprocessor, DeadElifOperandIsNotEvaluated) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if 1\nint a;\n#elif 1/0\nint b;\n#endif\nint x;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a #elif after a taken branch must NOT evaluate its operand (no 1/0)";
+    // Only the taken #if branch + the trailing decl: int a ; int x ;
+    ASSERT_EQ(lexs.size(), 6u);
+    EXPECT_EQ(lexs[1], "a");
+    EXPECT_EQ(lexs[4], "x");
+}
+
+// NESTED conditionals: a #if inside a taken branch behaves normally; a #if
+// inside a DEAD branch stays dead (its taken-looking inner branch is elided).
+TEST(Preprocessor, NestedConditionalsRespectEnclosingDeadBranch) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if 1\n#if 0\nint inner_dead;\n#else\nint inner_live;\n#endif\n#endif\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "the live nested #else branch: int inner_live ;";
+    EXPECT_EQ(lexs[1], "inner_live");
+    {
+        // Same nest but the OUTER branch is dead -> everything inside is elided,
+        // including the inner #else that would otherwise be live.
+        PreprocessResult r2;
+        auto lexs2 = ppLexemes(
+            "#if 0\n#if 0\nint a;\n#else\nint b;\n#endif\n#endif\nint x;\n", r2);
+        EXPECT_FALSE(r2.diagnostics->hasErrors());
+        ASSERT_EQ(lexs2.size(), 3u) << "outer-dead elides all inner branches";
+        EXPECT_EQ(lexs2[1], "x");
+    }
+}
+
+// The ternary operator works in a #if expression (proves the operator-table
+// Ternary-arity reuse): `#if 1 ? 2 : 0` is 2 (truthy) -> taken.
+TEST(Preprocessor, IfTernaryExpression) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#if 1 ? 2 : 0\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u) << "1 ? 2 : 0 == 2 (truthy) -> taken";
+        EXPECT_EQ(lexs[1], "a");
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("#if 0 ? 1 : 0\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 0u) << "0 ? 1 : 0 == 0 (falsey) -> elided";
+    }
+}
+
+// && short-circuit: `0 && (1/0)` does NOT trip the div-by-zero (the RHS is not
+// evaluated), and folds false. RED-ON-DISABLE: a non-short-circuit && would
+// evaluate 1/0 and fail loud.
+TEST(Preprocessor, IfLogicalAndShortCircuits) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#if 0 && (1/0)\nint a;\n#else\nint b;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "0 && (1/0) must short-circuit -- the 1/0 is never evaluated";
+    ASSERT_EQ(lexs.size(), 3u) << "the #else branch: int b ;";
+    EXPECT_EQ(lexs[1], "b");
+}
+
+// A line-continuation inside a #if composes (the splice happens in phase 2,
+// before this pass): `#if 1 \<nl> && 1` is one logical line `#if 1 && 1` -> taken.
+TEST(Preprocessor, IfWithLineContinuation) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#if 1 \\\n && 1\nint a;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a backslash-newline continued #if must compose to one logical line";
+    ASSERT_EQ(lexs.size(), 3u) << "1 && 1 is true -> taken: int a ;";
+    EXPECT_EQ(lexs[1], "a");
+}
+
+// AGNOSTICISM pin (RED-ON-DISABLE): the conditional directive word is CONFIG-
+// driven (`preprocess.ifDirective`), NOT a hard-coded "if". Rebind `ifDirective`
+// from "if" to "whenever" and reload: now `#whenever 1` conditionalizes while a
+// literal `#if 1` is just an unknown directive. RED-ON-DISABLE: hard-coding the
+// directive word as "if" makes `#whenever` an unknown directive (the body is
+// NOT conditionalized) and `#if` still conditionalizes -> both halves fail.
+TEST(Preprocessor, ConditionalDirectiveWordIsConfigDrivenNotHardcoded) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+
+    auto schema = reboundCSubset("\"ifDirective\":         \"if\"",
+                                 "\"ifDirective\":         \"whenever\"",
+                                 "<rebound-if-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->preprocess().ifDirective, "whenever");
+
+    // (1) `#whenever 0` now conditionalizes -> the body is elided.
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"#whenever 0\nint dead;\n#endif\nint x;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        std::vector<std::string> lexs;
+        for (Token const& t : r.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof) continue;
+            if (t.coreKind == CoreTokenKind::Whitespace) continue;
+            if (t.coreKind == CoreTokenKind::Newline) continue;
+            lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+        }
+        ASSERT_EQ(lexs.size(), 3u)
+            << "#whenever 0 must conditionalize (elide the dead branch): int x ;";
+        EXPECT_EQ(lexs[1], "x");
+    }
+    // (2) The OLD spelling `#if` is now an UNKNOWN directive -> it does NOT
+    // conditionalize (and fails loud as unsupported, proving it is no longer the
+    // conditional opener).
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"#if 0\nint a;\n#endif\nint x;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+            << "with `if` rebound to `whenever`, a literal `#if` is an unknown "
+               "directive -- proving the conditional word is read from config";
+    }
+}

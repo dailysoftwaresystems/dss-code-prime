@@ -7,6 +7,7 @@
 #include "core/types/semantic_config.hpp"
 #include "core/types/tree.hpp"
 #include "hir/const_eval_arith.hpp"
+#include "hir/const_eval_operators.hpp"   // shared opFromName / opEntryFor seams
 #include "hir/hir_op.hpp"
 
 #include <cassert>
@@ -36,13 +37,9 @@ using detail::makeBoolLiteral;
     return ceOk(std::move(v));
 }
 
-[[nodiscard]] std::optional<HirOpKind> opFromName(std::string const& s) {
-    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(HirOpKind::Count_); ++i) {
-        auto const op = static_cast<HirOpKind>(i);
-        if (opName(op) == s) return op;
-    }
-    return std::nullopt;
-}
+// `opFromName` (config target name -> HirOpKind) now lives in the shared
+// `hir/const_eval_operators.hpp` so the C-preprocessor `#if` evaluator reuses
+// the identical bridge. Reachable here as `dss::opFromName` (unqualified).
 
 // Non-EmptySpace children — the same indexing convention semantic Pass
 // 1.5 and HIR lowering use. Duplicated here (rather than calling into
@@ -57,15 +54,9 @@ visibleChildren(Tree const& tree, NodeId parent) {
     return out;
 }
 
-// Map an `HirOperatorEntry` (token-keyed) for the given token kind in
-// the supplied table. Linear scan; tables are ≤ ~16 entries.
-[[nodiscard]] HirOperatorEntry const*
-opEntryFor(std::vector<HirOperatorEntry> const& table, SchemaTokenId tok) {
-    for (auto const& e : table) {
-        if (e.token.v == tok.v) return &e;
-    }
-    return nullptr;
-}
+// `opEntryFor` (token-keyed operator-entry lookup) now lives in the shared
+// `hir/const_eval_operators.hpp` (see opFromName note above). Reachable here as
+// `dss::opEntryFor` (unqualified).
 
 // Internal recursive impl. `visitedInitNodes` carries the per-call
 // cycle-detection set, keyed on the RESOLVED init-expression NodeId

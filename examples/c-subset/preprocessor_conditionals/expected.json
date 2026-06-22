@@ -1,0 +1,35 @@
+{
+  "$comment": "FC14 (D-PP-CONDITIONAL-COMPILATION) runtime witness: #if/#ifdef/#ifndef/#elif/#else/#endif + the `defined` operator select the right branch and elide the wrong ones. MODE==2 takes the #elif (BASE=40), the #if-0 block containing `return 99` is elided, #ifdef BASE + the defined() chain set MARGIN=2; add(40,2)=42 -> exit 42. RED-ON-DISABLE: a wrong elision leaves `return 99` live (exit 99) or an undefined identifier (link failure); a wrong #elif pick changes BASE. BASE/MARGIN reach add() as function args so the baseline arm keeps a live runtime add (not const-folded), and the optimizedPipelines `release` arm runs the shipped pipeline over the same source.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
