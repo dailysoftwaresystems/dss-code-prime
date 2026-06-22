@@ -1,0 +1,7 @@
+{
+  "$comment": "D-CSUBSET-FN-PROTOTYPE (negative): an incompatible function redeclaration (`int f(int);` then `int f(char *x){...}`) fails loud with S_IncompatibleRedeclaration at the absorbed prototype (6:5, after the 5-line header comment), with a related-location at the surviving definition. Never silently picks one signature.",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [ { "spec": "x86_64:elf64-x86_64-linux-exec" } ],
+  "expectDiagnostics": [ { "code": "S_IncompatibleRedeclaration", "line": 6, "col": 5 } ]
+}

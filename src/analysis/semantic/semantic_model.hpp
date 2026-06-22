@@ -97,6 +97,21 @@ struct DSS_EXPORT SymbolRecord {
     // fold re-reads it per the type's signedness. Meaningful only when exactly
     // one of `isEnumerator` / `isInjectedConstant` is set; harmless 0 elsewhere.
     std::int64_t    enumValue = 0;
+    // D-CSUBSET-FN-PROTOTYPE: a bare function PROTOTYPE — a function-TYPED object
+    // declaration with a function suffix on its NAME and NO body (`int f(int);`).
+    // Set by Pass 1 (effectiveKind == Variable + the name carries a function
+    // suffix); Pass 1.5 UPGRADES such a symbol's `kind` to Function (it is a
+    // function declaration, callable, mergeable with a later definition). A
+    // function POINTER (`int (*fp)(int)`) does NOT set this — its suffix sits on
+    // the outer declarator, not the name's direct declarator. Default false.
+    bool            isProtoDeclaration = false;
+    // D-CSUBSET-FN-PROTOTYPE: a proto / redundant function redeclaration that a
+    // SURVIVING declaration superseded (proto→def: the proto is absorbed and the
+    // definition wins the binding; def→proto / proto→proto: the new redundant
+    // decl is absorbed and the prior binding is kept). An absorbed declarator
+    // emits NO HIR node — the survivor carries the symbol (the definition emits
+    // the body; an unabsorbed proto emits nothing either). Default false.
+    bool            isAbsorbedProto = false;
     // D-CSUBSET-ENUM-INT-CONVERSION (FC8): TRUE iff this symbol IS an enumerator
     // constant (bound under a `compositeKind:"enum"` decl, where `enumValue` was
     // set). DISTINGUISHES an enumerator from a storage-backed `enum E e;` local —

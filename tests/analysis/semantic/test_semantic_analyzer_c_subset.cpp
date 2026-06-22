@@ -2530,3 +2530,102 @@ TEST(SemanticAnalyzerCSubset, VaStartWithNonVaListFailsLoud) {
     EXPECT_GT(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
         << "the failure must be S_TypeMismatch on the ap operand";
 }
+
+// ── D-CSUBSET-FN-PROTOTYPE — prototype/definition merging ──────────────────
+//
+// Count the SURVIVING function symbols named `name` — Function-kind records that
+// are NOT absorbed protos. The merge keeps a SymbolRecord per declaration (proto
+// + def), but exactly one survives the binding (`!isAbsorbedProto`); that is the
+// single callable symbol. (An absorbed proto record also has its kind upgraded
+// to Function, so the `!isAbsorbedProto` filter is what isolates the survivor.)
+[[nodiscard]] inline std::size_t
+countSurvivingFns(SemanticModel const& model, std::string_view name) {
+    std::size_t n = 0;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& r = model.symbols()[i];
+        if (r.name == name && r.kind == DeclarationKind::Function
+            && !r.isAbsorbedProto) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+// (a) A prototype followed by a compatible definition MERGES: zero diagnostics,
+// and exactly one surviving Function symbol for `f` (the definition; the proto
+// is absorbed). RED-ON-DISABLE: revert the Pass-1.5 proto upgrade (restore the
+// S_InvalidFunctionDeclarator emission) -> hasErrors() becomes true and the
+// proto stays a Variable, so countSurvivingFns drops to the lone definition only
+// after a redeclaration error fires (the EXPECT_FALSE(hasErrors) flips first).
+TEST(SemanticAnalyzerCSubset, FnPrototypeThenDefinitionMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int);\n"
+        "int f(int x){return x;}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a prototype + a compatible definition must merge with no diagnostics";
+    EXPECT_EQ(countSurvivingFns(model, "f"), 1u)
+        << "exactly one surviving Function symbol for f (the definition)";
+}
+
+// (b) Proto-idempotence: multiple compatible declarations + one definition is
+// well-formed (zero diagnostics, one surviving Function). C 6.7p4 permits any
+// number of compatible declarations.
+TEST(SemanticAnalyzerCSubset, FnPrototypeIdempotentDeclarations) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int);\n"
+        "int f(int);\n"
+        "int f(int x){return x;}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "repeated compatible prototypes + a definition must merge cleanly";
+    EXPECT_EQ(countSurvivingFns(model, "f"), 1u);
+}
+
+// (c) Definition FIRST, then a redundant compatible prototype: also a clean
+// merge. The definition keeps the binding; the trailing proto is absorbed. A
+// later call resolves to the definition (use-resolution reads the final scope
+// binding) — witnessed by zero diagnostics on a call through `f`.
+TEST(SemanticAnalyzerCSubset, FnDefinitionThenPrototypeMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int x){return x;}\n"
+        "int f(int);\n"
+        "int g(void){return f(3);}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a definition followed by a redundant prototype must merge cleanly, "
+           "and the call must resolve to the definition";
+    EXPECT_EQ(countSurvivingFns(model, "f"), 1u);
+}
+
+// (d) Incompatible redeclaration: a prototype and a definition with DIFFERENT
+// signatures (return type differs) fail loud with exactly one
+// S_IncompatibleRedeclaration. RED-ON-DISABLE: make the post-1.5 sweep compare
+// nothing (skip the `.v` inequality) -> the count drops to 0 and the mismatch is
+// silently accepted (the definition's resolved signature would be wrong).
+TEST(SemanticAnalyzerCSubset, FnPrototypeIncompatibleRedeclarationFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int);\n"
+        "long f(int x){return x;}\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "an incompatible function redeclaration must fail loud exactly once";
+}
+
+// (e) A standalone prototype that is CALLED but NEVER defined is callable at the
+// semantic tier (forward reference is legal — the undefined-symbol failure lands
+// at HIR->MIR, see the CLI verification / corpus). The semantic phase itself
+// must NOT reject the prototype: it is a valid function declaration. Zero
+// diagnostics here; the call resolves to the (upgraded) Function symbol.
+TEST(SemanticAnalyzerCSubset, FnPrototypeForwardCallResolvesSemantically) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int);\n"
+        "int g(void){return f(1);}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a forward call through a prototype is legal at the semantic tier";
+    EXPECT_EQ(countSurvivingFns(model, "f"), 1u)
+        << "the prototype is upgraded to a callable Function symbol";
+}

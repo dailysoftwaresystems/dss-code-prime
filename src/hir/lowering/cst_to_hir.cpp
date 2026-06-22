@@ -3585,6 +3585,23 @@ struct Lowerer {
                 continue;
             }
             SymbolId const sym = model.symbolAt(nameNode);
+            // D-CSUBSET-FN-PROTOTYPE: a bare function prototype declarator
+            // (`int f(int);`) emits NO HIR node — it is a function DECLARATION,
+            // not an object. The merged DEFINITION (a separate declarator with a
+            // body) emits the Function; an unabsorbed proto (declared, never
+            // defined) emits nothing AND is never registered as a global/
+            // function symbol, so a call to it fails loud at HIR→MIR (a Ref to
+            // an unbound symbol). Emitting a Global here would create a spurious
+            // FnSig-typed data global (a miscompile). Covers BOTH the absorbed
+            // proto (`isAbsorbedProto`, superseded by a def/redundant decl) and
+            // a standalone proto (`isProtoDeclaration`). A static-storage axis is
+            // per-declaration, so a proto can never share a declarator with a
+            // non-proto object — but the check is per-declarator regardless.
+            if (auto const* pr = model.recordFor(sym);
+                pr != nullptr
+                && (pr->isProtoDeclaration || pr->isAbsorbedProto)) {
+                continue;
+            }
             TypeId type = InvalidType;
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
             // The init = the init-declarator's visible Internal child that

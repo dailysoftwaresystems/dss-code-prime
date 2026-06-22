@@ -1054,7 +1054,7 @@ TEST(LirCallconvAbi, Win64VariadicCallDupsFpVarargIntoHomeGpr) {
     // uninitialized home GPR slot → garbage. RED-ON-DISABLE: deleting the FP-dup
     // emission removes the only `movq_xmm_to_gpr` in the call sequence.
     auto bundle = lowerThroughRewrite(
-        "double take(int n, ...);\n"
+        "double take(int n, ...) { return (double)n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE)
         "int main(void) {\n"
         "  return (int)take(1, 2.5);\n"   // one int fixed arg + one double vararg
         "}\n",
@@ -2991,9 +2991,15 @@ TEST(LirCallconvVariadicFC12c, Aapcs64VariadicStructReturnPrologueScratchAvoidsX
 // keeps it in-register. We assert via the outgoing-arg-area size: Apple reserves
 // stack overflow for the forced varargs; AAPCS64 reserves none (all args fit regs).
 TEST(LirCallconvVariadicFC12c, AppleForcesVarargToStackAapcs64KeepsInReg) {
+    // The CALLER `f` is declared FIRST so it is function index 0 (the layout query
+    // below uses forFuncByIndex(0)); `sink` is DEFINED after via a forward reference
+    // that resolves through prototype/definition merging (D-CSUBSET-FN-PROTOTYPE) —
+    // sink must be a real (defined) function so the call binds, not a bare proto
+    // (which would emit no symbol and fail loud at HIR->MIR).
     char const* src =
-        "int sink(int n, ...);\n"
-        "int f(void) { return sink(1, 7, 8); }\n";  // 1 fixed + 2 varargs, all small ints
+        "int sink(int n, ...);\n"                    // forward prototype (merges with the def below)
+        "int f(void) { return sink(1, 7, 8); }\n"   // 1 fixed + 2 varargs, all small ints — function 0
+        "int sink(int n, ...) { return n; }\n";     // the definition (function 1)
     // apple_arm64 = cc index 1; aapcs64 = cc index 0.
     auto apple = lowerThroughRewrite(src, /*ccIndex=*/1, /*targetName=*/"arm64");
     ASSERT_TRUE(apple.lowered.lir.ok);
@@ -3685,7 +3691,7 @@ TEST(LirCallconvAbi, SysVByValueStackAggByteCopyScratchAvoidsArgMoveSources) {
 TEST(LirCallconvVariadicFC12c, Aapcs64VarArgHfaStructInRegisters) {
     auto bundle = lowerThroughRewrite(
         "struct HFA { double a; double b; };\n"
-        "int sink(int n, ...);\n"
+        "int sink(int n, ...) { return n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE: a bare proto no longer emits a spurious FnSig global)
         "int f(void) {\n"
         "  struct HFA h; h.a = 1.0; h.b = 2.0;\n"
         "  return sink(1, h);\n"
@@ -3747,13 +3753,17 @@ TEST(LirCallconvVariadicFC12c, Aapcs64VarArgHfaStructInRegisters) {
 // after materialization the outgoing area reserves ceil(16/8)*8 = 16 bytes. RED-ON-
 // DISABLE: a missing exhaustion check emits register pieces (no carrier, no overflow).
 TEST(LirCallconvVariadicFC12c, Aapcs64VarArgNonHfaStructStackAfterExhaustion) {
+    // The CALLER `use` is declared FIRST (function index 0 for the layout query);
+    // `sink` is DEFINED after via a forward reference that merges with the leading
+    // prototype (D-CSUBSET-FN-PROTOTYPE) — a real defined function so the call binds.
     auto bundle = lowerThroughRewrite(
         "struct LL { long a; long b; };\n"
-        "long sink(int n, ...);\n"
-        "long use(void) {\n"
+        "long sink(int n, ...);\n"                     // forward prototype (merges below)
+        "long use(void) {\n"                            // the caller — function 0
         "  struct LL p; p.a = 40; p.b = 5;\n"
         "  return sink(8, 1L,2L,3L,4L,5L,6L,7L,8L, p);\n"   // 8 longs drain GR, then struct
-        "}\n",
+        "}\n"
+        "long sink(int n, ...) { return n; }\n",        // the definition (function 1)
         /*ccIndex=*/0, /*targetName=*/"arm64");   // aapcs64 = cc index 0
     ASSERT_TRUE(bundle.lowered.lir.ok)
         << (bundle.lowered.lirReporter.all().empty()

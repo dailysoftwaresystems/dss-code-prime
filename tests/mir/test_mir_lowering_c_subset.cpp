@@ -4576,7 +4576,7 @@ TEST(MirLoweringCSubset, Win64VaArgStructGt8DerefsPointer) {
 TEST(MirLoweringCSubset, Win64StructByValueVarargCallLeq8OneSlot) {
     auto L = lowerCSubset(
         "struct Pt { int a; int b; };\n"   // 8B → InRegisters[1], one slot by value
-        "int sink(int n, ...);\n"
+        "int sink(int n, ...) { return n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE: a bare proto no longer emits a spurious FnSig global)
         "int main(void) {\n"
         "  struct Pt p; p.a = 1; p.b = 2;\n"
         "  return sink(1, p);\n"          // struct BY VALUE to a Win64 variadic fn
@@ -4617,7 +4617,7 @@ TEST(MirLoweringCSubset, Win64StructByValueVarargCallLeq8OneSlot) {
 TEST(MirLoweringCSubset, Win64StructByValueVarargCallGt8OnePointer) {
     auto L = lowerCSubset(
         "struct Big { long a; long b; long c; };\n"  // 24B → ByReference (hidden ptr)
-        "int sink(int n, ...);\n"
+        "int sink(int n, ...) { return n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE: a bare proto no longer emits a spurious FnSig global)
         "int main(void) {\n"
         "  struct Big b; b.a = 1; b.b = 2; b.c = 3;\n"
         "  return sink(1, b);\n"          // >8B struct BY VALUE to a Win64 variadic fn
@@ -5416,7 +5416,7 @@ TEST(MirLoweringCSubset, Aapcs64VaArgStructGathersViaDualCursor) {
 TEST(MirLoweringCSubset, Aapcs64StructByValueVarargCallPlacesInRegisters) {
     auto L = lowerCSubset(
         "struct Pt { int a; int b; };\n"
-        "int sink(int n, ...);\n"
+        "int sink(int n, ...) { return n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE: a bare proto no longer emits a spurious FnSig global)
         "int main(void) {\n"
         "  struct Pt p; p.a = 1; p.b = 2;\n"
         "  return sink(1, p);\n"          // struct BY VALUE to an AAPCS64 variadic fn
@@ -5572,7 +5572,7 @@ TEST(MirLoweringCSubset, Aapcs64VaArgByRefRegArmDerefsGrTop) {
 TEST(MirLoweringCSubset, Aapcs64CallerHfaVarargInRegisters) {
     auto L = lowerCSubset(
         "struct HFA { double a; double b; };\n"
-        "int sink(int n, ...);\n"
+        "int sink(int n, ...) { return n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE: a bare proto no longer emits a spurious FnSig global)
         "int main(void) {\n"
         "  struct HFA h; h.a = 1.0; h.b = 2.0;\n"
         "  return sink(1, h);\n"
@@ -5595,7 +5595,7 @@ TEST(MirLoweringCSubset, Aapcs64CallerHfaVarargInRegisters) {
 TEST(MirLoweringCSubset, Aapcs64CallerNonHfaVarargExhaustsGpr) {
     auto L = lowerCSubset(
         "struct LL { long a; long b; };\n"
-        "long sink(int n, ...);\n"
+        "long sink(int n, ...) { return n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE)
         "int main(void) {\n"
         "  struct LL p; p.a = 40; p.b = 5;\n"
         "  return (int)sink(8, 1L,2L,3L,4L,5L,6L,7L,8L, p);\n"
@@ -5626,7 +5626,7 @@ TEST(MirLoweringCSubset, Aapcs64CallerNonHfaVarargExhaustsGpr) {
 TEST(MirLoweringCSubset, Aapcs64CallerByRefVarargIsPositionedPointerNotCarrier) {
     auto L = lowerCSubset(
         "struct Big { long a; long b; long c; };\n"  // 24B → ByReference (hidden ptr)
-        "int sink(int n, ...);\n"
+        "int sink(int n, ...) { return n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE: a bare proto no longer emits a spurious FnSig global)
         "int main(void) {\n"
         "  struct Big b; b.a = 1; b.b = 2; b.c = 3;\n"
         "  return sink(1, b);\n"          // >16B struct BY VALUE to an AAPCS64 variadic fn

@@ -192,6 +192,13 @@ struct EngineState {
     // Pass 2's member-access resolution reads this to find the field-name's
     // scope from the LHS expression's TypeId (no type-name string lookup).
     std::unordered_map<std::uint32_t /*TypeId.v*/, ScopeId> compositeScopeByType;
+    // D-CSUBSET-FN-PROTOTYPE: function REDECLARATIONS Pass 1 merged — one
+    // {survivor, absorbed} pair per (proto→def / def→proto / proto→proto /
+    // extern→proto) merge. After Pass 1.5 resolves both records' FnSig types, a
+    // compatibility sweep compares each pair's `type` (interner TypeId equality =
+    // structural signature equality) and emits S_IncompatibleRedeclaration on a
+    // mismatch. Built in Pass 1, consumed once after Pass 1.5 (before Pass 2).
+    std::vector<std::pair<SymbolId, SymbolId>> mergedFnDecls;
 
     // Select the index bundle for `schema` before processing one of its trees.
     void activate(GrammarSchema const& schema) {
@@ -230,6 +237,32 @@ visibleChildren(Tree const& tree, NodeId parent) {
         if (!isEmptySpace(tree.flags(child))) out.push_back(child);
     }
     return out;
+}
+
+// D-CSUBSET-FN-PROTOTYPE: does the declarator NAME carry a function suffix —
+// i.e. is `nameNode` the name of a function declarator (`int f(int)` /
+// `int f(int x){…}`) rather than a function POINTER (`int (*fp)(int)`)? True
+// iff the name's DIRECT declarator (its parent) is the config's `directRule`
+// AND has a `fnSuffixRule` child. For a function pointer the suffix sits on the
+// OUTER declarator (the name's direct declarator is the inner group's, which
+// carries no suffix), so this cleanly distinguishes a prototype from a fnptr.
+// Shared by Pass 1 (proto detection) and Pass 1.5 (definition's fn-declarator
+// constraint check) so the two never diverge.
+[[nodiscard]] bool
+hasFnSuffixOnName(Tree const& tree, NodeId nameNode,
+                  DeclaratorConfig const& dc) {
+    NodeId const direct = tree.parent(nameNode);
+    if (!direct.valid() || tree.kind(direct) != NodeKind::Internal
+        || tree.rule(direct) != dc.directRule) {
+        return false;
+    }
+    for (NodeId c : visibleChildren(tree, direct)) {
+        if (tree.kind(c) == NodeKind::Internal
+            && tree.rule(c) == dc.fnSuffixRule) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Follow a path of visible-child indices from `start`. Returns
@@ -1530,25 +1563,105 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                 tree, node, *decl.constMarker,
                                 &s.idx().declByRule);
                         }
+                        // D-CSUBSET-FN-PROTOTYPE: a bare function prototype is a
+                        // Variable-kind declarator (the kindByChild definition
+                        // discriminator did NOT match — no body) whose NAME
+                        // carries a function suffix. A fnptr (`int (*fp)(int)`)
+                        // is NOT one (its suffix sits on the outer declarator).
+                        rec.isProtoDeclaration =
+                            (effectiveKind == DeclarationKind::Variable)
+                            && nameNode.valid()
+                            && hasFnSuffixOnName(tree, nameNode, *cfg.declarators);
                         SymbolId const newId = s.symbols.mint(rec);
                         SymbolId const prior =
                             s.scopes.bind(bindScope, name, newId);
                         if (prior.valid()) {
-                            ParseDiagnostic d;
-                            d.code     = DiagnosticCode::S_RedeclaredSymbol;
-                            d.severity = DiagnosticSeverity::Error;
-                            d.buffer   = tree.source().id();
-                            d.span     = tree.span(nameNode);
-                            d.actual   = name;
-                            auto const& priorRec = s.symbols.at(prior);
-                            if (priorRec.tree.v == tree.id().v) {
-                                d.related.push_back(RelatedLocation{
-                                    tree.source().id(),
-                                    tree.span(priorRec.declNode),
-                                    "previously declared here",
-                                });
+                            // D-CSUBSET-FN-PROTOTYPE: a function REDECLARATION
+                            // (proto/def in any order) MERGES instead of
+                            // colliding. Four cases, on whether each side is a
+                            // proto vs a real definition:
+                            //   proto → def : the DEFINITION wins the binding;
+                            //                 the proto is absorbed.
+                            //   def → proto, proto → proto, extern → proto :
+                            //                 a redundant declaration; KEEP the
+                            //                 prior binding, absorb the new one.
+                            //   def → def, extern → def (prior is a real def/
+                            //                 extern AND new is a def) :
+                            //                 two bodies / a scope-out → the
+                            //                 existing S_RedeclaredSymbol path.
+                            // A signature mismatch on a merged pair fails loud
+                            // AFTER Pass 1.5 (S_IncompatibleRedeclaration) once
+                            // both FnSigs are resolved.
+                            auto& priorRec = s.symbols.at(prior);
+                            bool const priorProto = priorRec.isProtoDeclaration;
+                            bool const priorFn =
+                                priorProto
+                                || priorRec.kind == DeclarationKind::Function;
+                            bool const newDef =
+                                (effectiveKind == DeclarationKind::Function);
+                            bool const newFn = rec.isProtoDeclaration || newDef;
+                            if (priorFn && newFn && !(!priorProto && newDef)) {
+                                if (priorProto && newDef) {
+                                    // proto → definition: the DEFINITION wins
+                                    // the binding; the proto is absorbed (its
+                                    // declarator emits no HIR node).
+                                    s.scopes.injectBinding(bindScope, name, newId);
+                                    priorRec.isAbsorbedProto = true;
+                                    s.nodeToSymbol.set(nameNode, newId);
+                                    s.mergedFnDecls.push_back({newId, prior});
+                                } else {
+                                    // def → proto / proto → proto / extern →
+                                    // proto: a redundant declaration. Keep the
+                                    // PRIOR binding; absorb the NEW one (set on
+                                    // the MINTED record's symbol — `rec` was
+                                    // moved into mint()).
+                                    //
+                                    // DEVIATION from the locked spec's
+                                    // `nodeToSymbol.set(nameNode, prior)`: bind
+                                    // the absorbed declarator's NAME node to its
+                                    // OWN record (newId), NOT the survivor. Two
+                                    // reasons, both correctness-bearing:
+                                    //  (1) HIR (Edit 4) skips this declarator by
+                                    //      reading `recordFor(symbolAt(nameNode))
+                                    //      ->isProtoDeclaration`; newId carries
+                                    //      that flag, the survivor (a real def)
+                                    //      does NOT — pointing at `prior` would
+                                    //      fail to skip → a spurious FnSig global.
+                                    //  (2) Pass 1.5 resolves THIS declarator's
+                                    //      FnSig into `symbolAt(nameNode)`. Aimed
+                                    //      at newId, the absorbed record gets its
+                                    //      OWN signature → the post-1.5 sweep
+                                    //      compares survivor.type vs absorbed.type
+                                    //      with BOTH valid (catches an incompatible
+                                    //      def→proto, e.g. `int f(int){} long
+                                    //      f(int);`). Aimed at `prior` it would
+                                    //      instead CLOBBER the survivor's resolved
+                                    //      type with the proto's and leave the
+                                    //      absorbed type invalid → the mismatch
+                                    //      goes undetected AND the definition's
+                                    //      type is silently wrong.
+                                    s.symbols.at(newId).isAbsorbedProto = true;
+                                    s.nodeToSymbol.set(nameNode, newId);
+                                    s.mergedFnDecls.push_back({prior, newId});
+                                }
+                            } else {
+                                // Two real definitions, extern+def, or a non-
+                                // function redeclaration — a genuine collision.
+                                ParseDiagnostic d;
+                                d.code     = DiagnosticCode::S_RedeclaredSymbol;
+                                d.severity = DiagnosticSeverity::Error;
+                                d.buffer   = tree.source().id();
+                                d.span     = tree.span(nameNode);
+                                d.actual   = name;
+                                if (priorRec.tree.v == tree.id().v) {
+                                    d.related.push_back(RelatedLocation{
+                                        tree.source().id(),
+                                        tree.span(priorRec.declNode),
+                                        "previously declared here",
+                                    });
+                                }
+                                s.reporter.report(std::move(d));
                             }
-                            s.reporter.report(std::move(d));
                         } else {
                             s.nodeToSymbol.set(nameNode, newId);
                         }
@@ -1824,21 +1937,8 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             //    `int x { }` are not function declarators);
                             //  * no initializer on the init-declarator
                             //    (`int main() = 5 { }` parses; reject here).
-                            NodeId const direct = tree.parent(nameNode);
-                            bool fnSuffixOnName = false;
-                            if (direct.valid()
-                                && tree.kind(direct) == NodeKind::Internal
-                                && tree.rule(direct)
-                                       == cfg.declarators->directRule) {
-                                for (NodeId c : visibleChildren(tree, direct)) {
-                                    if (tree.kind(c) == NodeKind::Internal
-                                        && tree.rule(c)
-                                               == cfg.declarators->fnSuffixRule) {
-                                        fnSuffixOnName = true;
-                                        break;
-                                    }
-                                }
-                            }
+                            bool const fnSuffixOnName = hasFnSuffixOnName(
+                                tree, nameNode, *cfg.declarators);
                             if (!fnSuffixOnName) {
                                 emitInvalidFn(nameNode,
                                               "a function definition's "
@@ -1875,16 +1975,27 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                    && s.symbols.at(sym).kind
                                           == DeclarationKind::Variable) {
                             // A bare function-TYPED object declaration — a C
-                            // prototype (`int f();`). Declaration-without-
-                            // definition is NOT wired (externs carry that
-                            // role); a silent FnSig-typed data global would
-                            // miscompile, so fail loud. Pinned residue:
-                            // D-CSUBSET-FN-PROTOTYPE (stage 2b registry).
-                            emitInvalidFn(nameNode,
-                                          "function prototype declarations "
-                                          "are not supported here; use "
-                                          "'extern' for cross-unit "
-                                          "declarations");
+                            // function PROTOTYPE (`int f(int);`). D-CSUBSET-FN-
+                            // PROTOTYPE: a prototype IS a function declaration —
+                            // it is callable (forward / mutual recursion) and a
+                            // later definition MERGES with it (Pass 1 recorded
+                            // the merge). UPGRADE its kind to Function so Pass 2
+                            // resolves a call through it, and emit NOTHING. A
+                            // function-TYPED Variable that is NOT a prototype
+                            // (`isProtoDeclaration` false — e.g. a malformed
+                            // function-pointer form whose suffix landed on the
+                            // name) still fails loud: a silent FnSig-typed data
+                            // global would miscompile.
+                            if (s.symbols.at(sym).isProtoDeclaration) {
+                                s.symbols.at(sym).kind =
+                                    DeclarationKind::Function;
+                            } else {
+                                emitInvalidFn(nameNode,
+                                              "function prototype declarations "
+                                              "are not supported here; use "
+                                              "'extern' for cross-unit "
+                                              "declarations");
+                            }
                         }
                     }
                 }
@@ -4592,6 +4703,47 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         if (!tree.root().valid()) continue;
         s.activate(tree.schema());
         resolveDeclTypes(s, *s.idx().cfg, tree, tree.root(), treeRootScope.at(tree.id().v));
+    }
+
+    // D-CSUBSET-FN-PROTOTYPE: function-redeclaration COMPATIBILITY sweep. Pass 1
+    // merged each (proto/def) pair into `mergedFnDecls` {survivor, absorbed};
+    // now that Pass 1.5 has resolved both records' FnSig types, compare them.
+    // Interner TypeId equality IS structural FnSig equality (return type AND the
+    // full parameter list — the interner dedups identical signatures), so a
+    // simple `.v` inequality means an INCOMPATIBLE redeclaration (C 6.7p4 /
+    // 6.9.1: `int f(int); long f(int){…}`). Fail loud at the absorbed (later/
+    // redundant) declaration with a related-location at the survivor; do NOT
+    // silently pick one signature. Both `.type` must be valid (an unresolved
+    // type already produced its own diagnostic — don't pile on).
+    {
+        std::unordered_map<std::uint32_t /*TreeId.v*/, Tree const*> treeById;
+        for (auto const& tree : trees) treeById[tree.id().v] = &tree;
+        for (auto const& [survivor, absorbed] : s.mergedFnDecls) {
+            if (!survivor.valid() || !absorbed.valid()) continue;
+            auto const& sRec = s.symbols.at(survivor);
+            auto const& aRec = s.symbols.at(absorbed);
+            if (!sRec.type.valid() || !aRec.type.valid()) continue;
+            if (sRec.type.v == aRec.type.v) continue;   // compatible — merged
+            auto aTreeIt = treeById.find(aRec.tree.v);
+            if (aTreeIt == treeById.end()) continue;
+            Tree const& aTree = *aTreeIt->second;
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_IncompatibleRedeclaration;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = aTree.source().id();
+            d.span     = aTree.span(aRec.declNode);
+            d.actual   = aRec.name;
+            auto sTreeIt = treeById.find(sRec.tree.v);
+            if (sTreeIt != treeById.end()) {
+                Tree const& sTree = *sTreeIt->second;
+                d.related.push_back(RelatedLocation{
+                    sTree.source().id(),
+                    sTree.span(sRec.declNode),
+                    "previously declared here with a different signature",
+                });
+            }
+            s.reporter.report(std::move(d));
+        }
     }
 
     // Pass 2 per tree, against that tree's root scope. Loop-context depth

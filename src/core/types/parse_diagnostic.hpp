@@ -373,6 +373,15 @@ enum class DiagnosticCode : std::uint16_t {
     // for-init declaration row declares the `StaticKeyword`→this-code gated
     // marker; nothing here hardcodes the word "static".
     S_StaticStorageInForInit      = 0xE021,
+    // D-CSUBSET-FN-PROTOTYPE: two declarations of the same function name have
+    // INCOMPATIBLE signatures (a return-type or parameter-list mismatch — C
+    // 6.7p4 / 6.9.1). A bare prototype (`int f(int);`) merges with a later
+    // definition or a redundant declaration only when their interned FnSig
+    // TypeIds are structurally equal; a mismatch (`int f(int); long f(int){…}`)
+    // fails loud here rather than silently picking one signature. Positioned at
+    // the absorbed (later/redundant) declaration with a related-location at the
+    // surviving declaration. Emitted after Pass 1.5 (both FnSigs resolved).
+    S_IncompatibleRedeclaration   = 0xE022,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
