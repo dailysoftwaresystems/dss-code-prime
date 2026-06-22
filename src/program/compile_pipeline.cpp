@@ -365,6 +365,15 @@ static std::optional<CuMirModule> buildCuMirImpl(
         mirCfg.aggregateMaxRegBytes     = cc->aggregateMaxRegBytes;
         mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
         mirCfg.argSlotAligned           = cc->slotAligned;
+        // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the arg-register
+        // pool counts (the agnostic source for the all-or-nothing fit check on
+        // every call) + the stack-exhaust policy (SysV backfill vs AAPCS64 clamp).
+        mirCfg.argGprCount              =
+            static_cast<std::uint32_t>(cc->argGprs.size());
+        mirCfg.argFprCount              =
+            static_cast<std::uint32_t>(cc->argFprs.size());
+        mirCfg.aggregateStackExhaustsRegisters =
+            cc->aggregateStackExhaustsRegisters;
         // FC12a-core (D-FC12A-VARIADIC-CALLEE): thread the active CC's va_list layout
         // so HIR→MIR can lower va_start/va_arg (or fail loud when the CC omits it).
         mirCfg.vaListLayout             = cc->vaListLayout;

@@ -495,7 +495,16 @@ private:
                 // the raw payload integer if non-zero and not already
                 // covered).
                 std::uint32_t const payload = mir_.instPayload(id);
-                if (payload != 0
+                if (op == MirOpcode::ByValueStackArg) {
+                    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the payload
+                    // PACKS the byte size (low 30 bits) + the exhaust class (high 2) —
+                    // print the unpacked fields, not the raw integer (which reads as a
+                    // ~2.1e9 garbage value when an exhaust bit is set).
+                    out_ += std::format(
+                        " size {} exhaust {}",
+                        payload & kByValueStackArgSizeMask,
+                        (payload >> kByValueStackArgExhaustShift) & 0x3u);
+                } else if (payload != 0
                  && op != MirOpcode::ExtractValue
                  && op != MirOpcode::InsertValue) {
                     out_ += std::format(" payload {}", payload);

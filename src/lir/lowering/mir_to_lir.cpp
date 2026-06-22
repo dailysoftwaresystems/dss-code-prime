@@ -192,6 +192,12 @@ enum class MnemonicSlot : std::uint8_t {
     // callPushBytes + payload*outgoingSlotSize]` — the NO-SHADOW contiguous home
     // base (BLOCKER-1). Its presence ALSO triggers the Win64 prologue home-spill.
     VaHomeArgArea,
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the callee-side mirror of
+    // the caller's `ByValueStackArg` — the address of a fixed by-value aggregate
+    // received WHOLLY from the incoming stack. Same materialization as
+    // VaOverflowArgArea (incoming-overflow base + payload byte offset) but a DISTINCT
+    // op so it is not a va_start-detection signal (it occurs in non-variadic fns).
+    RecvByValueStackParam,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -283,6 +289,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::VaRegSaveArea,      "va_reg_save_area"},
     {MnemonicSlot::VaOverflowArgArea,  "va_overflow_arg_area"},
     {MnemonicSlot::VaHomeArgArea,      "va_home_arg_area"},
+    {MnemonicSlot::RecvByValueStackParam, "recv_by_value_stack_param"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -1120,6 +1127,8 @@ struct Lowerer {
                 return lowerVaOverflowArgArea(id);
             case MirOpcode::VaHomeArgAreaAddr:
                 return lowerVaHomeArgArea(id);
+            case MirOpcode::RecvByValueStackParam:
+                return lowerRecvByValueStackParam(id);
             case MirOpcode::Const:  return lowerConst(id);
             case MirOpcode::Add:    return lowerBinaryOp(id, MnemonicSlot::Add);
             case MirOpcode::Sub:    return lowerBinaryOp(id, MnemonicSlot::Sub);
@@ -1394,6 +1403,25 @@ struct Lowerer {
         }
         LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
         emitInst(*opcode(MnemonicSlot::VaOverflowArgArea), result,
+                 std::span<LirOperand const>{}, /*payload=*/mir.instPayload(id));
+        defineValue(id, result);
+    }
+
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the callee-side mirror of
+    // lowerByValueStackArg — a fixed by-value aggregate received WHOLLY from the
+    // incoming stack. Like lowerVaOverflowArgArea, THREADS the MIR payload (this
+    // aggregate's byte offset within the incoming overflow area) into the LIR op;
+    // lir_callconv materializes it to `lea result, [sp + totalFrameSize +
+    // callPushBytes + shadowSpaceBytes + payload]`. HIR→MIR byte-copies from `result`
+    // into the param's local slot.
+    void lowerRecvByValueStackParam(MirInstId id) {
+        if (!opcode(MnemonicSlot::RecvByValueStackParam).has_value()) {
+            reportMissingOpcode(MnemonicSlot::RecvByValueStackParam,
+                                "MIR RecvByValueStackParam");
+            return;
+        }
+        LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
+        emitInst(*opcode(MnemonicSlot::RecvByValueStackParam), result,
                  std::span<LirOperand const>{}, /*payload=*/mir.instPayload(id));
         defineValue(id, result);
     }
@@ -2276,11 +2304,16 @@ struct Lowerer {
             ops.push_back(LirOperand::makeReg(argRegs[k]));
             if (mir.instOpcode(operandMir) == MirOpcode::ByValueStackArg) {
                 // The preceding Reg is the aggregate's temp address; this marker
-                // carries the byte size (the MIR op's payload) so lir_callconv
-                // reserves ceil(size / outgoingSlot) overflow slots + byte-copies
-                // the temp into the outgoing area instead of register-passing it.
+                // carries the byte size + the exhaust class (the MIR op's payload,
+                // per the shared kByValueStackArg* encoding) so lir_callconv reserves
+                // ceil(size / outgoingSlot) overflow slots + byte-copies the temp into
+                // the outgoing area instead of register-passing it, AND clamps the
+                // exhausted arg-cursor (AAPCS64) so a later same-class arg also stacks.
+                std::uint32_t const bvPayload = mir.instPayload(operandMir);
                 ops.push_back(LirOperand::makeByValueStackAgg(
-                    mir.instPayload(operandMir)));
+                    bvPayload & kByValueStackArgSizeMask,
+                    static_cast<std::uint8_t>(
+                        (bvPayload >> kByValueStackArgExhaustShift) & 0x3u)));
             }
         }
 

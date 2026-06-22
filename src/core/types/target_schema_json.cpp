@@ -1535,6 +1535,24 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                             c.at("variadicArgsAlwaysStack").get<bool>();
                     }
                 }
+                // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: optional —
+                // when true, a by-value aggregate placed wholly on the stack
+                // (it straddled the reg/stack boundary) EXHAUSTS the overflowed
+                // arg-register class (AAPCS64). Default false = BACKFILL (SysV:
+                // the leftover registers stay available for later args). Win64 is
+                // slot-aligned so it never straddles (the flag is inert).
+                if (c.contains("aggregateStackExhaustsRegisters")) {
+                    if (!c.at("aggregateStackExhaustsRegisters").is_boolean()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/aggregateStackExhaustsRegisters",
+                                              ccPath),
+                                  "'aggregateStackExhaustsRegisters' must be a "
+                                  "boolean");
+                    } else {
+                        cc.aggregateStackExhaustsRegisters =
+                            c.at("aggregateStackExhaustsRegisters").get<bool>();
+                    }
+                }
                 if (c.contains("linkRegister")) {
                     if (!c.at("linkRegister").is_string()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,

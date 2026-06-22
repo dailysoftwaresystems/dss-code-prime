@@ -147,18 +147,30 @@ struct Lowerer {
     // an int-only-named-param fn; differs only when a named param is FP (each still
     // one slot). Set alongside the per-class counts before the body is lowered.
     std::uint32_t currentFnFixedFlat_ = 0;
-    // FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): true iff this
-    // function received at least one by-value AGGREGATE fixed param (an InRegisters
-    // multi-piece struct OR a ByReference >16B struct → the hidden pointer). The
-    // fixed-params-overflow displacement baked into VaOverflowArgAreaAddr is
-    // `(gprOver + fprOver) * gpSlotBytes` — a per-REGISTER-SLOT count that is ONLY
-    // correct when every overflowed fixed param is a single scalar slot. A multi-slot
-    // aggregate that STRADDLES the register/stack boundary is placed WHOLLY in memory
-    // by SysV (all-or-nothing), so the slot-count formula UNDERCOUNTS the named stack
-    // bytes → a silent miscompile. lowerVaStart's overflow path fails loud unless this
-    // flag is false (every fixed param was scalar). Reset per function (with the
-    // counters) before the param-reception loop.
-    bool currentFnHasAggregateFixedParam_ = false;
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the EXACT byte count of
+    // FIXED params placed on the INCOMING stack, accumulated in param order as the
+    // reception loop runs — a STACKED scalar contributes one outgoing slot
+    // (gpSlotBytes); a STACKED by-value aggregate (it straddled the reg/stack
+    // boundary, received all-or-nothing) contributes roundUp(aggBytes, slot). This
+    // REPLACES the old `(gprOver + fprOver) * gpSlotBytes` slot-count formula (which
+    // silently UNDERCOUNTED a stacked aggregate: the all-or-nothing cursor either
+    // backfills — never exceeds the pool — or clamps to exactly the pool, so neither
+    // surfaces the aggregate's bytes). lowerVaStart reads it as the
+    // VaOverflowArgAreaAddr displacement (the overflow/__stack base skips the named
+    // stack args). Each stacked aggregate's RecvByValueStackParam also reads the
+    // cursor value AT its position as its own incoming byte offset. Reset per fn.
+    std::uint32_t currentFnFixedStackBytes_ = 0;
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: set once a FIXED by-value
+    // aggregate has been received WHOLLY from the incoming stack. The callee receives
+    // a stacked scalar via its per-class Arg ordinal (lir_callconv sites it at
+    // `(ordinal - pool) * slot`), which is consistent with the byte cursor ONLY for a
+    // pure-class FIRST overflow. So a stacked fixed param of ANY kind that FOLLOWS a
+    // stacked aggregate — or a second stacked aggregate, or a stacked scalar BEFORE a
+    // stacked aggregate — would desync the two offset models. Rather than silently
+    // miscompile, lowerFunction FAILS LOUD on those rare shapes (the witnessed cases
+    // place the aggregate as the FIRST/only overflow, offset 0). Reset per fn.
+    bool currentFnSawStackedAggregate_ = false;
+    bool currentFnSawFixedStackParam_  = false;
 
     // FC5: per-function `goto`/label lowering. A LabelStmt and its goto(s) share a
     // per-function ordinal (HIR payload); this maps the ordinal → its MIR block.
@@ -804,131 +816,90 @@ struct Lowerer {
                                     if (p.cls == AbiPieceClass::Fpr) ++numFp;
                                     else ++numGp;
                                 }
-                                bool routeToStack = false;
-                                if (calleeVariadic) {
-                                    // ATOMIC-FIT CHECK: SysV §3.5.7 — if the whole
-                                    // aggregate's pieces do not ALL fit in the
-                                    // remaining arg registers, it goes by value in
-                                    // MEMORY (no register/stack split) via the Option-C
-                                    // carrier. The vaListLayout MUST be present for a
-                                    // variadic callee (it is the gp/fp save-count
-                                    // source); absent ⇒ struct varargs are impossible
-                                    // on this CC.
-                                    if (!config.vaListLayout.has_value()) {
-                                        unsupported(kids[i],
-                                            "passing a struct/union BY VALUE to a "
-                                            "variadic function requires the CC's "
-                                            "'vaListLayout' (register-save geometry) "
-                                            "which this target does not declare "
-                                            "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
-                                        return InvalidMirInst;
-                                    }
-                                    VaListLayout const& vl = *config.vaListLayout;
-                                    // FC12b (D-FC12B-WIN64-STRUCT-VARARG): a by-value
-                                    // pow2-≤8B struct passed to a Win64 (Homogeneous-
-                                    // Pointer) variadic callee rides in exactly ONE arg
-                                    // slot BY VALUE (InRegisters[1 GPR piece]) — placed
-                                    // like a scalar by lir_callconv's slot-aligned walk.
-                                    // Win64 has NO atomic-fit/register-exhaustion SPLIT
-                                    // (the SysV §3.5.7 rule below reads gpSaveCount/
-                                    // fpSaveCount which Win64 does not declare): one
-                                    // struct == one slot, register-or-stack BY POSITION.
-                                    // So SKIP the SysV split check + routeToStack carrier
-                                    // entirely — appendByValueArg's InRegisters arm
-                                    // pushes the 1 I64 value operand; advance runGpr/
-                                    // runFpr by its piece count (numGp==1; numFp==0 — a
-                                    // Win64 homogeneous piece is GPR-class). That
-                                    // advance is INERT for Win64 slot indexing (the slot
-                                    // index is lir_callconv's positional slot-aligned
-                                    // walk; runGpr feeds ONLY the SysV gpSaveCount split
-                                    // check below, which this arm `continue`s past) —
-                                    // kept for uniformity with the SysV/scalar
-                                    // running-register cursor, not because Win64 reads
-                                    // it. Stamp the fixed boundary + continue (do NOT
-                                    // fall into the SysV atomic-fit/piece-push below).
-                                    if (vl.strategy
-                                        == VaListStrategy::HomogeneousPointer) {
-                                        if (!appendByValueArg(operands, kids[i],
-                                                              argTy, *abi))
-                                            return InvalidMirInst;
-                                        runGpr += numGp;
-                                        runFpr += numFp;
-                                        if (i == fnParamsSize) {
-                                            fixedOperandCount =
-                                                operands.size() - operandsBeforeArgs;
-                                            fixedOperandCountStamped = true;
-                                        }
-                                        continue;
-                                    }
-                                    if (vl.strategy
-                                        == VaListStrategy::Aapcs64DualCursor) {
-                                        // AAPCS64 (D-FC12C-AAPCS64-HFA-STRUCT-VARARG):
-                                        // an InRegisters struct vararg is EITHER a pure-
-                                        // FPR HFA (1-4 VR pieces) OR a pure-GPR ≤16B
-                                        // non-HFA (1-2 GR pieces) — the Aapcs64Hfa
-                                        // classifier never mixes classes. The atomic-fit
-                                        // check is PER CLASS against its OWN remaining
-                                        // pool (hazard H8): an HFA checks the VR pool
-                                        // (fpSaveCount); a non-HFA checks the GR pool
-                                        // (gpSaveCount). If the whole aggregate's pieces
-                                        // do not ALL fit, AAPCS64 §B forces it WHOLE to
-                                        // the overflow area (no register/stack split) via
-                                        // the CC-neutral Option-C carrier. Set
-                                        // routeToStack and fall through to the shared
-                                        // dispatch below (which also advances runGpr/runFpr
-                                        // on the register path).
-                                        bool const isHfa = (numFp > 0 && numGp == 0);
-                                        if (isHfa) {
-                                            routeToStack =
-                                                (runFpr + numFp > vl.fpSaveCount);
-                                        } else if (numGp > 0) {
-                                            routeToStack =
-                                                (runGpr + numGp > vl.gpSaveCount);
-                                        } else {
-                                            // Zero-piece InRegisters — a classifier
-                                            // invariant violation (an empty struct should
-                                            // be ByReference, handled above). Fail loud
-                                            // rather than route a zero-piece carrier.
-                                            unsupported(kids[i],
-                                                "AAPCS64 InRegisters struct vararg has "
-                                                "zero register pieces (internal: "
-                                                "classifier invariant violated)");
-                                            return InvalidMirInst;
-                                        }
-                                    } else if (vl.strategy
-                                        == VaListStrategy::SysVRegisterSave) {
-                                        // The SysV register-exhaustion SPLIT: if the
-                                        // pieces do not ALL fit in the remaining arg
-                                        // registers, SysV forces the WHOLE aggregate to
-                                        // memory (the overflow area) — route it to the
-                                        // Option-C carrier instead of register pieces
-                                        // (NOT a split). SysV's INTEGER+SSE eightbytes
-                                        // can mix classes, so BOTH pools are checked.
-                                        if (runGpr + numGp > vl.gpSaveCount
-                                            || runFpr + numFp > vl.fpSaveCount) {
-                                            routeToStack = true;
-                                        }
-                                    } else {
-                                        unsupported(kids[i],
-                                            "passing a struct/union BY VALUE to a "
-                                            "variadic function under this va_list "
-                                            "strategy is not realized "
-                                            "(internal: unknown VaListStrategy)");
-                                        return InvalidMirInst;
-                                    }
+                                // Zero-piece InRegisters is a classifier invariant
+                                // violation (an empty struct should classify
+                                // ByReference). Fail loud rather than emit a 0-operand
+                                // arg / route a zero-piece carrier.
+                                if (numGp == 0 && numFp == 0) {
+                                    unsupported(kids[i],
+                                        "InRegisters struct/union arg has zero register "
+                                        "pieces (internal: classifier invariant "
+                                        "violated)");
+                                    return InvalidMirInst;
                                 }
+                                // A variadic callee struct arg needs the CC's
+                                // vaListLayout (the callee reads the struct vararg
+                                // through it); absent ⇒ struct varargs are impossible on
+                                // this CC. Non-variadic calls have no such requirement.
+                                if (calleeVariadic
+                                    && !config.vaListLayout.has_value()) {
+                                    unsupported(kids[i],
+                                        "passing a struct/union BY VALUE to a variadic "
+                                        "function requires the CC's 'vaListLayout' "
+                                        "(register-save geometry) which this target does "
+                                        "not declare "
+                                        "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+                                    return InvalidMirInst;
+                                }
+                                // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS:
+                                // the ALL-OR-NOTHING register-exhaustion check, HOISTED
+                                // out of the `if (calleeVariadic)` gate so it runs for
+                                // EVERY call — the fix for the latent NON-variadic split
+                                // (a straddling fixed aggregate was pushed as per-
+                                // eightbyte pieces → lir_callconv split it across the
+                                // last register + the stack, non-conformant to SysV
+                                // §3.2.3 / AAPCS64 §B). If the pieces do not all fit the
+                                // remaining arg registers the WHOLE aggregate rides the
+                                // overflow area via the CC-neutral `ByValueStackArg`
+                                // carrier (lir_callconv places it all-or-nothing, never
+                                // split). INDEPENDENT-counter CCs only — Win64
+                                // (slotAligned) never straddles (one struct = one
+                                // positional slot, placed by lir_callconv's slot walk).
+                                // MF-A: the fit uses the CC's ARG register POOL counts
+                                // (argGprCount/argFprCount), the agnostic source — for a
+                                // variadic callee these equal the vaListLayout
+                                // save-counts, so the variadic placement is unchanged.
+                                // The unified `||` subsumes the old per-CC arms: an HFA
+                                // has numGp==0 (the GPR term inert), a ≤16B GPR struct
+                                // has numFp==0, SysV mixes both classes.
+                                bool const routeToStack = !config.argSlotAligned
+                                    && (runGpr + numGp > config.argGprCount
+                                        || runFpr + numFp > config.argFprCount);
                                 if (routeToStack) {
-                                    // Whole aggregate by value in the overflow area;
-                                    // runGpr/runFpr NOT advanced (no register consumed).
-                                    if (!appendByValueStackArg(operands, kids[i], argTy))
+                                    // Whole aggregate by value in the overflow area.
+                                    // Under an EXHAUST CC the carrier conveys which class
+                                    // to exhaust so lir_callconv clamps its ACTUAL arg
+                                    // cursor too (a straddling aggregate is pure-class:
+                                    // an HFA → FPR, a ≤16B GPR struct → GPR). SysV → none
+                                    // (the carrier already doesn't advance the cursor =
+                                    // backfill).
+                                    std::uint8_t const exhaustClass =
+                                        config.aggregateStackExhaustsRegisters
+                                            ? (numFp > 0 ? kByValueStackArgExhaustFpr
+                                                         : kByValueStackArgExhaustGpr)
+                                            : kByValueStackArgExhaustNone;
+                                    if (!appendByValueStackArg(operands, kids[i], argTy,
+                                                               exhaustClass))
                                         return InvalidMirInst;
+                                    // EXHAUST-or-BACKFILL the overflowed class — the
+                                    // CALLER mirror of receiveByValueParam: AAPCS64 sets
+                                    // NGRN/NSRN ← pool (clamp; a later arg also stacks),
+                                    // SysV leaves the cursor (backfill; a later smaller
+                                    // arg reuses the leftover registers). gcc
+                                    // aarch64_layout_arg vs function_arg_advance_64;
+                                    // config-driven, never an arch identity branch. Must
+                                    // match the callee so caller/callee + va_start agree.
+                                    if (config.aggregateStackExhaustsRegisters) {
+                                        if (runGpr + numGp > config.argGprCount)
+                                            runGpr = config.argGprCount;
+                                        if (runFpr + numFp > config.argFprCount)
+                                            runFpr = config.argFprCount;
+                                    }
                                 } else {
                                     // FC7 C1b / FC12a-struct: push each eightbyte piece
                                     // as a scalar Call operand IN ORDER; lir_callconv
                                     // assigns them to consecutive per-class arg
-                                    // registers. Then advance the running per-class
-                                    // counts (after a SUCCESSFUL append, AFTER the
-                                    // fit-check above).
+                                    // registers. Advance the running per-class counts.
                                     if (!appendByValueArg(operands, kids[i], argTy, *abi))
                                         return InvalidMirInst;
                                     runGpr += numGp;
@@ -2676,8 +2647,14 @@ struct Lowerer {
     // — runGpr/runFpr are NOT advanced by the caller). CC-NEUTRAL: no SysV-specific
     // assumption; the Win64/AAPCS64 struct-vararg cycles reuse this carrier. Returns
     // false (fail-loud already emitted).
-    [[nodiscard]] bool appendByValueStackArg(std::vector<MirInstId>& operands,
-                                             HirNodeId argNode, TypeId aggTy) {
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the arg-register class the
+    // CALLER's placement EXHAUSTS once this aggregate is stacked (matches the callee
+    // cursor + va_start clamp so caller/callee agree). The byte size + exhaust class are
+    // packed into the ByValueStackArg payload per the shared `kByValueStackArg*` encoding
+    // (mir_opcode.hpp); mir_to_lir unpacks it onto the LIR `ByValueStackAgg` marker.
+    [[nodiscard]] bool appendByValueStackArg(
+            std::vector<MirInstId>& operands, HirNodeId argNode, TypeId aggTy,
+            std::uint8_t exhaustClass = kByValueStackArgExhaustNone) {
         MirInstId const srcAddr = lowerLvalueAddress(argNode);
         if (!srcAddr.valid()) return false;
         StructLayout const* layout = cachedLayout(aggTy);
@@ -2688,16 +2665,19 @@ struct Lowerer {
             return false;
         }
         if (!lowerByteWiseCopy(srcAddr, temp, layout->size)) return false;
-        if (layout->size > std::numeric_limits<std::uint32_t>::max()) {
+        if (layout->size > kByValueStackArgSizeMask) {
             unsupported(argNode, "by-value stack aggregate arg is too large to "
                                  "encode its byte size");
             return false;
         }
+        std::uint32_t const payload =
+            static_cast<std::uint32_t>(layout->size)
+            | (static_cast<std::uint32_t>(exhaustClass)
+               << kByValueStackArgExhaustShift);
         std::array<MirInstId, 1> carrierOps{temp};
         MirInstId const carrier =
             mir.addInst(MirOpcode::ByValueStackArg, carrierOps,
-                        interner.pointer(aggTy),
-                        static_cast<std::uint32_t>(layout->size));
+                        interner.pointer(aggTy), payload);
         if (!carrier.valid()) return false;
         operands.push_back(carrier);
         return true;
@@ -2714,13 +2694,96 @@ struct Lowerer {
                                            HirNodeId anchor, AbiPassing const& abi,
                                            ArgOrdinalCounter& ctr) {
         if (abi.kind == AbiPassing::Kind::ByReference) {
-            // The hidden pointer is GPR-class.
+            // The hidden pointer is GPR-class. If the GPR pool is already exhausted
+            // (an INDEPENDENT-counter CC) the pointer itself rides the incoming stack
+            // — a stacked SCALAR; account it in the byte cursor + residual guard so
+            // va_start's overflow base skips it (D-FC12-...).
+            if (!config.argSlotAligned && ctr.gpr >= config.argGprCount
+                && !accountFixedStackScalar(anchor))
+                return false;
             MirInstId const ptr =
                 mir.addArg(ctr.next(AbiPieceClass::Gpr), interner.pointer(aggTy));
             if (!ptr.valid()) return false;
             addressableLocal[sym.v] = ptr;   // the caller's copy is the param
             return true;
         }
+        // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: ALL-OR-NOTHING straddle.
+        // For an INDEPENDENT-counter CC, if the aggregate's eightbyte pieces do not all
+        // fit the remaining arg registers it is received WHOLLY from the incoming stack
+        // (never split) — the callee mirror of the caller's `ByValueStackArg` carrier.
+        // Win64 (slotAligned) never straddles (one struct = one positional slot).
+        std::uint32_t numGp = 0, numFp = 0;
+        for (AbiPiece const& p : abi.pieces) {
+            if (p.cls == AbiPieceClass::Fpr) ++numFp; else ++numGp;
+        }
+        bool const straddles = !config.argSlotAligned
+            && (ctr.gpr + numGp > config.argGprCount
+                || ctr.fpr + numFp > config.argFprCount);
+        if (straddles) {
+            // Residual guard (NO silent miscompile): this aggregate is sited via the
+            // incoming-overflow BYTE cursor, but a stacked SCALAR is sited by
+            // lir_callconv from its per-class ordinal `(ord - pool)*slot` — the two
+            // agree ONLY when the aggregate is the FIRST/ONLY fixed param to overflow.
+            // A prior stacked fixed param (scalar OR a first aggregate) desyncs them →
+            // fail loud on the rare multi-overflow shapes (outside the deferral scope).
+            if (currentFnSawFixedStackParam_) {
+                unsupported(anchor,
+                    "a by-value aggregate parameter that straddles the register/stack "
+                    "boundary is only supported as the FIRST fixed parameter to "
+                    "overflow onto the incoming stack; a preceding stacked fixed "
+                    "parameter is not yet supported "
+                    "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)");
+                return false;
+            }
+            StructLayout const* layout = cachedLayout(aggTy);
+            MirInstId const slot = allocaForLocal(sym, aggTy, anchor);
+            if (layout == nullptr || !slot.valid()) {
+                unsupported(anchor, "by-value stacked aggregate parameter requires a "
+                                    "sizeable layout (complete type / target "
+                                    "'aggregateLayout')");
+                return false;
+            }
+            // Symmetric with the caller's appendByValueStackArg size guard: a stacked
+            // aggregate's rounded span accumulates into the uint32 byte cursor, so an
+            // absurd (>1 GiB) layout would overflow it. Fail loud (the type system
+            // bounds real aggregates far below this — defensive parity, not reachable).
+            if (layout->size > kByValueStackArgSizeMask) {
+                unsupported(anchor, "by-value stacked aggregate parameter is too large "
+                                    "to encode its incoming-stack byte span");
+                return false;
+            }
+            // The incoming ADDRESS of this whole aggregate = the overflow base + its
+            // byte offset within the incoming overflow area (the byte cursor; 0 for
+            // the first/only overflowed fixed param, guaranteed by the guard above).
+            // Byte-copy it into the param's local slot (by-value semantics, the
+            // by-reference reception precedent but reading from the stack).
+            MirInstId const src =
+                mir.addInst(MirOpcode::RecvByValueStackParam, {},
+                            interner.pointer(aggTy),
+                            /*payload=*/currentFnFixedStackBytes_);
+            if (!src.valid()) return false;
+            if (!lowerByteWiseCopy(src, slot, layout->size)) return false;
+            addressableLocal[sym.v] = slot;
+            // Advance the byte cursor by this aggregate's rounded incoming-stack span,
+            // then EXHAUST-or-BACKFILL the overflowed per-class cursor: AAPCS64 sets
+            // NGRN/NSRN ← pool (clamp, no backfill); SysV leaves the cursor (backfill).
+            // Config-driven (gcc aarch64_layout_arg vs function_arg_advance_64), never
+            // an arch identity branch.
+            std::uint32_t const slot8 = stackSlotBytes();
+            currentFnFixedStackBytes_ += roundUpToSlot(
+                static_cast<std::uint32_t>(layout->size), slot8);
+            currentFnSawStackedAggregate_ = true;
+            currentFnSawFixedStackParam_  = true;
+            if (config.aggregateStackExhaustsRegisters) {
+                if (ctr.gpr + numGp > config.argGprCount)
+                    ctr.gpr = config.argGprCount;
+                if (ctr.fpr + numFp > config.argFprCount)
+                    ctr.fpr = config.argFprCount;
+            }
+            return true;
+        }
+        // Register-resident: receive each eightbyte from its arg register into the
+        // 16-rounded slot at its offset (trailing padding absorbed).
         MirInstId const slot = allocaForLocal(sym, aggTy, anchor);
         if (!slot.valid()) return false;
         for (AbiPiece const& p : abi.pieces) {
@@ -2737,6 +2800,38 @@ struct Lowerer {
             std::array<MirInstId, 2> st{a, gp};
             mir.addInst(MirOpcode::Store, st);
         }
+        return true;
+    }
+
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the incoming/outgoing
+    // stack-arg slot quantum = the GPR / pointer width (8 on the shipped LP64/LLP64
+    // targets). The same value lir_callconv uses for `outgoingSlotSize`; derived
+    // agnostically from the data model so a future ILP32 ABI is a config change.
+    [[nodiscard]] std::uint32_t stackSlotBytes() const {
+        return static_cast<std::uint32_t>(
+            scalarByteSize(TypeKind::Ptr, config.dataModel).value_or(8));
+    }
+    [[nodiscard]] static std::uint32_t roundUpToSlot(std::uint32_t bytes,
+                                                     std::uint32_t slot) {
+        return slot == 0 ? bytes : ((bytes + slot - 1) / slot) * slot;
+    }
+
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: account ONE stacked fixed
+    // SCALAR (or a ByReference aggregate's stacked hidden pointer) in the byte cursor
+    // + residual guard. A stacked scalar AFTER a stacked aggregate desyncs the
+    // per-class-ordinal siting from the byte cursor (the AAPCS64 clamp strands it) →
+    // fail loud. Returns false (diagnostic emitted) on that residual. INDEPENDENT-
+    // counter CCs only (the caller gates on !argSlotAligned).
+    [[nodiscard]] bool accountFixedStackScalar(HirNodeId anchor) {
+        if (currentFnSawStackedAggregate_) {
+            unsupported(anchor,
+                "a fixed scalar parameter that overflows onto the incoming stack AFTER "
+                "a by-value aggregate parameter was placed there is not yet supported "
+                "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)");
+            return false;
+        }
+        currentFnFixedStackBytes_    += stackSlotBytes();
+        currentFnSawFixedStackParam_  = true;
         return true;
     }
 
@@ -3037,40 +3132,19 @@ struct Lowerer {
         // and silently runs the SysV path on a Win64 (or unknown) layout.
         switch (vl.strategy) {
         case VaListStrategy::SysVRegisterSave: {
-            // FC12-deferral④ (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS): a variadic
-            // callee whose FIXED params overflow the register-save area (fixedGpr >
-            // gpSaveCount, or fixedFpr > fpSaveCount) has named param(s) passed ON THE
-            // STACK. SysV §3.5.7 then requires overflow_arg_area to point PAST those
-            // named stack args. We bake that displacement into the VaOverflowArgAreaAddr
-            // payload (read at LIR materialization). The overflowed slot count per class
-            // is `fixedCount - saveCount` (each overflowed fixed param is a single
-            // incoming stack slot); incoming stack slots are gpSlotBytes(8) wide for
-            // BOTH classes (the SysV va_arg overflow arm bumps doubles by 8 too).
-            std::uint32_t const gprOver =
-                (currentFnFixedGpr_ > vl.gpSaveCount)
-                    ? (currentFnFixedGpr_ - vl.gpSaveCount) : 0u;
-            std::uint32_t const fprOver =
-                (currentFnFixedFpr_ > vl.fpSaveCount)
-                    ? (currentFnFixedFpr_ - vl.fpSaveCount) : 0u;
-            std::uint32_t const fixedStackBytes =
-                (gprOver + fprOver) * vl.gpSlotBytes;
-            // FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): the
-            // per-register-slot displacement above is only correct when every
-            // overflowed fixed param is a single scalar slot. A multi-slot by-value
-            // AGGREGATE fixed param that STRADDLES the register/stack boundary is
-            // placed WHOLLY in memory by SysV (all-or-nothing), so `gprOver+fprOver`
-            // UNDERCOUNTS the named stack bytes. Fail loud (no silent miscompile)
-            // when the fixed params overflow AND any was a by-value aggregate.
-            if (fixedStackBytes != 0 && currentFnHasAggregateFixedParam_) {
-                unsupported(node,
-                    "variadic callee whose fixed parameters overflow to the stack AND "
-                    "include a by-value aggregate (struct/union) param is not yet "
-                    "supported — a multi-slot aggregate straddling the register/stack "
-                    "boundary is placed wholly in memory, which the per-register-slot "
-                    "overflow displacement undercounts "
-                    "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)");
-                return InvalidMirInst;
-            }
+            // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: a variadic callee
+            // whose FIXED params overflow the register-save area has named param(s) on
+            // the incoming STACK; SysV §3.5.7 requires overflow_arg_area to point PAST
+            // them (baked into the VaOverflowArgAreaAddr payload). `currentFnFixedStack
+            // Bytes_` is the EXACT named-stack byte count, accumulated in param order
+            // as the reception loop ran — a stacked scalar contributes one slot
+            // (gpSlotBytes), a stacked by-value AGGREGATE (it straddled the reg/stack
+            // boundary, received all-or-nothing) contributes its rounded span. This
+            // REPLACES the old `(gprOver+fprOver)*gpSlotBytes` slot-count, which
+            // silently UNDERCOUNTED a stacked aggregate (the all-or-nothing cursor
+            // backfills or clamps — never EXCEEDS the pool — so the slot delta missed
+            // the aggregate's bytes entirely → the deferral's fail-loud guard).
+            std::uint32_t const fixedStackBytes = currentFnFixedStackBytes_;
             MirInstId const tagBase = vaTagBase(kids[0]);
             if (!tagBase.valid()) return InvalidMirInst;
 
@@ -3160,28 +3234,17 @@ struct Lowerer {
             // VaOverflowArgAreaAddr payload below) AND the per-class cursor (__gr_offs /
             // __vr_offs) is CLAMPED to 0 (no register slots remain for varargs of that
             // class) — the old `-(saveCount - fixedCount)` would underflow unsigned.
-            std::uint32_t const gprOver =
-                (currentFnFixedGpr_ > vl.gpSaveCount)
-                    ? (currentFnFixedGpr_ - vl.gpSaveCount) : 0u;
-            std::uint32_t const fprOver =
-                (currentFnFixedFpr_ > vl.fpSaveCount)
-                    ? (currentFnFixedFpr_ - vl.fpSaveCount) : 0u;
-            std::uint32_t const fixedStackBytes =
-                (gprOver + fprOver) * vl.gpSlotBytes;   // incoming slots are 8B both classes
-            // FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): the
-            // per-register-slot displacement is wrong for a multi-slot by-value
-            // aggregate (e.g. a >2-double HFA) straddling the register/stack boundary.
-            // Fail loud when the fixed params overflow AND any was a by-value aggregate.
-            if (fixedStackBytes != 0 && currentFnHasAggregateFixedParam_) {
-                unsupported(node,
-                    "variadic callee whose fixed parameters overflow to the stack AND "
-                    "include a by-value aggregate (struct/union/HFA) param is not yet "
-                    "supported — a multi-slot aggregate straddling the register/stack "
-                    "boundary is placed wholly in memory, which the per-register-slot "
-                    "overflow displacement undercounts "
-                    "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)");
-                return InvalidMirInst;
-            }
+            // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the EXACT named-
+            // stack byte count, accumulated in param order as the reception loop ran
+            // (a stacked scalar = one 8B slot; a stacked by-value AGGREGATE/HFA that
+            // straddled = its rounded span). __stack skips them. REPLACES the old
+            // `(gprOver+fprOver)*gpSlotBytes` slot-count that undercounted a stacked
+            // aggregate (under the AAPCS64 EXHAUST rule the class cursor clamps to
+            // EXACTLY the pool on the straddle, so the slot delta is 0 — it missed the
+            // aggregate's bytes). The __gr_offs/__vr_offs clamp below reads
+            // currentFnFixedGpr_/Fpr_ directly (the reception loop set them with the
+            // exhaust/backfill policy), so the cursors are already correct.
+            std::uint32_t const fixedStackBytes = currentFnFixedStackBytes_;
             MirInstId const base = vaTagBase(kids[0]);   // the `__va_list` struct base
             if (!base.valid()) return InvalidMirInst;
 
@@ -4786,9 +4849,12 @@ struct Lowerer {
         // first INTEGER arg register goes to the result pointer and every real arg
         // shifts by one — hoisted above the sret `Arg` so both use one counter.
         ArgOrdinalCounter argCtr{config.argSlotAligned};
-        // FOLD 1: reset the aggregate-fixed-param flag per function (set true below
-        // when the param loop receives a by-value struct/union param).
-        currentFnHasAggregateFixedParam_ = false;
+        // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: reset the incoming-
+        // stack-byte cursor + the stacked-aggregate residual guards per function
+        // (accumulated below as the param-reception loop places each fixed param).
+        currentFnFixedStackBytes_     = 0;
+        currentFnSawStackedAggregate_ = false;
+        currentFnSawFixedStackParam_  = false;
 
         // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value struct/union
         // RETURN. Classify under the active CC's strategy. ByReference (class
@@ -4871,25 +4937,41 @@ struct Lowerer {
                 // D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS) is unchanged; the common
                 // case (one >16B fixed param = 1 GPR + ≤5 scalars → currentFnFixedGpr_
                 // ≤ 6) lowers cleanly.
+                // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS:
+                // receiveByValueParam now PLACES the aggregate (InRegisters pieces, a
+                // ByReference hidden pointer, OR — when it straddles the reg/stack
+                // boundary — all-or-nothing from the incoming stack via a
+                // RecvByValueStackParam) AND accounts any stacked bytes in
+                // `currentFnFixedStackBytes_` for va_start's overflow base. No
+                // separate flag is needed (the old fail-loud fold is now a real fix).
                 if (!receiveByValueParam(sym, ty, p, *abi, argCtr)) {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
                 }
-                // FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): record
-                // that a by-value AGGREGATE fixed param was placed (InRegisters
-                // multi-piece OR ByReference hidden pointer). If this fn is variadic
-                // AND its fixed params overflow the register pool, va_start's
-                // per-register-slot displacement formula is WRONG for a multi-slot
-                // aggregate straddling the reg/stack boundary (SysV puts the whole
-                // struct in memory; the slot count undercounts) → lowerVaStart fails
-                // loud rather than silently miscompile.
-                currentFnHasAggregateFixedParam_ = true;
                 continue;
             }
             // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG / fixes D-ML7-2.10): a scalar
             // param's `Arg` payload is its PER-CLASS register ordinal (GPR/FPR
             // counted separately for an independent CC), not the param index.
-            MirInstId const arg = mir.addArg(argCtr.next(scalarArgClass(ty)), ty);
+            AbiPieceClass const sCls = scalarArgClass(ty);
+            // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: a scalar whose
+            // per-class ordinal has reached the pool rides the INCOMING stack
+            // (independent CC); account it in the byte cursor so a body va_start's
+            // overflow base skips it, and fail loud on the post-stacked-aggregate
+            // desync residual. (Win64/slot-aligned uses currentFnFixedFlat_ + the
+            // home-base path, not the byte cursor — untouched.)
+            if (!config.argSlotAligned) {
+                std::uint32_t const ord =
+                    (sCls == AbiPieceClass::Fpr) ? argCtr.fpr : argCtr.gpr;
+                std::uint32_t const pool =
+                    (sCls == AbiPieceClass::Fpr) ? config.argFprCount
+                                                 : config.argGprCount;
+                if (ord >= pool && !accountFixedStackScalar(p)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+            }
+            MirInstId const arg = mir.addArg(argCtr.next(sCls), ty);
             if (addressTaken.contains(sym.v)) {
                 MirInstId const slot = allocaForLocal(sym, ty, p);
                 if (!slot.valid()) {

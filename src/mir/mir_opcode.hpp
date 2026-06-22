@@ -126,6 +126,21 @@ enum class MirOpcode : std::uint16_t {
     // it. Result = a pointer (the temp address, threaded through); side-effecting so
     // DCE can't drop it and no pass hoists it off its call.
     ByValueStackArg,
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the CALLEE-side mirror of
+    // `ByValueStackArg`. When a FIXED by-value aggregate PARAM straddles the
+    // reg/stack boundary it is received WHOLLY from the incoming overflow (stack)
+    // area — consuming ZERO arg registers — never split. This leaf yields the
+    // ADDRESS of that incoming aggregate (lir_callconv materializes it like
+    // `VaOverflowArgAreaAddr`: `lea result, [sp + totalFrameSize + callPushBytes +
+    // shadowSpaceBytes + payload]`); the PAYLOAD is the aggregate's byte offset
+    // WITHIN the incoming overflow area (0 = first/only overflowed fixed param).
+    // HIR→MIR byte-copies from this address into the param's local slot (the
+    // by-reference reception precedent). DELIBERATELY a distinct opcode from the
+    // va_* leaves: those triple as lir_callconv's "this function called va_start"
+    // signal, and a stacked fixed aggregate occurs in NON-variadic functions too —
+    // reusing one would falsely trigger the variadic prologue spill. 0 operands,
+    // value result (a pointer), side-effecting so it pins to entry + DCE can't drop.
+    RecvByValueStackParam,
     // ── SSA join ──
     Phi,           // operand range addresses the PHI pool, not the operand pool
     // ── terminators (exactly one, last in a block; successors live in succ pool) ──
@@ -154,6 +169,20 @@ inline constexpr std::uint8_t kMirUnboundedOperands = 0xFF;
 
 // Variadic-successor sentinel for `MirOpcodeInfo::maxSuccessors` (Switch).
 inline constexpr std::uint8_t kMirUnboundedSuccessors = 0xFF;
+
+// D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the `ByValueStackArg` op's
+// uint32 PAYLOAD packs the aggregate byte size (low 30 bits) + the arg-register class
+// the CALLER's placement EXHAUSTS once the aggregate is stacked (high 2 bits: 0 =
+// none/BACKFILL [SysV], 1 = GPR, 2 = FPR [AAPCS64 §B]). hir_to_mir encodes it,
+// mir_to_lir unpacks it onto the LIR `ByValueStackAgg` marker, lir_callconv clamps the
+// matching arg-cursor so a subsequent arg/vararg of that class also goes to memory
+// (matching the callee's va_start clamp). An aggregate is never ≥1 GiB so 30 bits hold
+// the size; the encode site fails loud if it would not.
+inline constexpr std::uint32_t kByValueStackArgSizeMask     = 0x3FFFFFFFu;
+inline constexpr unsigned      kByValueStackArgExhaustShift = 30;
+inline constexpr std::uint8_t  kByValueStackArgExhaustNone  = 0;
+inline constexpr std::uint8_t  kByValueStackArgExhaustGpr   = 1;
+inline constexpr std::uint8_t  kByValueStackArgExhaustFpr   = 2;
 
 // The single source of truth for an opcode's shape. The builder consults the
 // operand/successor bounds + result rule at construction; the ML3 verifier, ML4
@@ -308,6 +337,11 @@ struct MirOpcodeInfo {
         // address); value result (the pointer, threaded through); side-effecting so
         // it pins to its call + DCE can't drop it. payload = aggregate byte size.
         case MirOpcode::ByValueStackArg:       return {1, 1, 0, 0, R::Value, false, true, false, "byvaluestackarg"};
+        // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: callee-side mirror —
+        // a 0-operand value leaf (the incoming stacked-aggregate address), side-
+        // effecting so it pins to entry + DCE can't drop it. payload = the byte
+        // offset of this aggregate within the incoming overflow area.
+        case MirOpcode::RecvByValueStackParam: return {0, 0, 0, 0, R::Value, false, true, false, "recvbyvaluestackparam"};
 
         // phi — operand range addresses the PHI pool (incoming value/block pairs).
         case MirOpcode::Phi: return {0, N, 0, 0, R::Value, false, false, true, "phi"};

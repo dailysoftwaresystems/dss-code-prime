@@ -3,6 +3,10 @@
 #include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
+// D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the shared by-value-stack-arg
+// exhaust-class constants (the ByValueStackAgg marker's `byValueAggExhaust` values),
+// defined at the MIR-boundary alongside the op whose payload carries them.
+#include "mir/mir_opcode.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
@@ -512,6 +516,15 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
                 if (isByValCarrier) {
                     byValSlots += byValueStackAggSlots(ops[k + 1].byValueAggBytes,
                                                        outgoingSlotSize);
+                    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: AAPCS64
+                    // EXHAUSTS the carrier's class — a later same-class arg also stacks.
+                    // PAD the class count up to its pool so the "count - pool" overflow
+                    // below counts those later args (mirrors the materialize clamp).
+                    std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
+                    if (ex == kByValueStackArgExhaustGpr)
+                        gprArgs = std::max(gprArgs, gprPoolSize);
+                    else if (ex == kByValueStackArgExhaustFpr)
+                        fprArgs = std::max(fprArgs, fprPoolSize);
                     ++argRegionIdx;
                     continue;
                 }
@@ -672,6 +685,13 @@ struct OpcodeHandles {
     // inst in a function is also this pass's "function called va_start" signal.
     std::uint16_t vaRegSaveArea;
     std::uint16_t vaOverflowArgArea;
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the callee-side mirror of
+    // the caller's by-value-aggregate stack carrier. Materialized into the SAME
+    // incoming-overflow address as `vaOverflowArgArea` (`lea [sp + totalFrameSize +
+    // callPushBytes + shadowSpaceBytes + payload]`) but a DISTINCT handle so it is
+    // NOT one of `functionUsesVaStart`'s signals (it occurs in non-variadic fns —
+    // a false match would wrongly trigger the variadic prologue spill).
+    std::uint16_t recvByValueStackParam;
     // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start
     // base, materialized into `lea result, [sp + totalFrameSize + callPushBytes +
     // payload*outgoingSlotSize]` (NO shadow — BLOCKER-1). Optional (only the Win64
@@ -1280,7 +1300,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 21> const table{{
+    std::array<Entry, 22> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -1324,6 +1344,11 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         {&OpcodeHandles::vaRegSaveArea,     "va_reg_save_area",     true},
         {&OpcodeHandles::vaOverflowArgArea, "va_overflow_arg_area", true},
         {&OpcodeHandles::vaHomeArgArea,     "va_home_arg_area",     true},
+        // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: optional — only emitted
+        // when a fixed by-value aggregate param straddles the reg/stack boundary.
+        // Materialized into `lea [sp + offset]`; needs `lea` (present on any target
+        // that declares it). Absent ⇒ field 0; never matches a real input opcode.
+        {&OpcodeHandles::recvByValueStackParam, "recv_by_value_stack_param", true},
         {&OpcodeHandles::movqXmmToGpr,      "movq_xmm_to_gpr",      true},
         // FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE): optional — only the AAPCS64 dual-
         // cursor prologue's VR spill emits the 128-bit `fstur_q`. Absent ⇒ field 0;
@@ -1788,6 +1813,31 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 emitFrameAddr(b, h.lea, result, sp, ovfOffset);
                 continue;
             }
+            // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: a fixed by-value
+            // aggregate param received WHOLLY from the incoming stack (it straddled
+            // the reg/stack boundary). SAME incoming-overflow geometry as
+            // va_overflow_arg_area — `lea result, [sp + totalFrameSize + callPushBytes
+            // + shadowSpaceBytes + payload]` — but the payload is THIS aggregate's
+            // byte offset within the incoming overflow area (0 when it is the
+            // first/only overflowed fixed param). HIR→MIR then byte-copies from
+            // `result` into the param's local slot.
+            if (h.recvByValueStackParam != 0 && op == h.recvByValueStackParam) {
+                if (h.lea == 0 || !result.valid() || result.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                           DiagnosticSeverity::Error,
+                           "callconv: recv_by_value_stack_param materialization needs "
+                           "'lea' + a physical-reg result "
+                           "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)");
+                    return false;
+                }
+                std::int32_t const recvOffset = static_cast<std::int32_t>(
+                    outLayout.totalFrameSize
+                    + static_cast<std::uint32_t>(cc.callPushBytes)
+                    + static_cast<std::uint32_t>(cc.shadowSpaceBytes)
+                    + payload);
+                emitFrameAddr(b, h.lea, result, sp, recvOffset);
+                continue;
+            }
             // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-1): the Win64
             // HomogeneousPointer va_start base. The named-arg home space
             // (rcx/rdx/r8/r9 slots, = the caller's shadow space) and the 5th+ stack
@@ -2028,6 +2078,20 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         byValStackCopies.push_back({srcReg, dstOffset, aggBytes});
                         overflowIdx += byValueStackAggSlots(
                             aggBytes, outLayout.outgoingSlotSize);
+                        // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: AAPCS64
+                        // EXHAUSTS the carrier's class (NGRN/NSRN←pool) — CLAMP the
+                        // matching arg cursor so a SUBSEQUENT same-class arg/vararg gets
+                        // argIndex >= poolSize → routed to the overflow too (matching the
+                        // callee's va_start __gr_offs/__vr_offs clamp + the pre-scan pad).
+                        // SysV (exhaust 0) leaves the cursor = backfill. Independent-
+                        // counter CCs only (a straddling carrier never arises slot-aligned).
+                        std::uint8_t const ex = ops[i + 1].byValueAggExhaust;
+                        if (ex == kByValueStackArgExhaustGpr)
+                            gprIdx = std::max(gprIdx,
+                                static_cast<std::uint32_t>(cc.argGprs.size()));
+                        else if (ex == kByValueStackArgExhaustFpr)
+                            fprIdx = std::max(fprIdx,
+                                static_cast<std::uint32_t>(cc.argFprs.size()));
                         ++argRegionIdx;
                         continue;
                     }

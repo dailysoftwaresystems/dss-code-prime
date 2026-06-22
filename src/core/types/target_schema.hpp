@@ -623,6 +623,26 @@ struct DSS_EXPORT TargetCallingConvention {
     // D-FF3-APPLE-ARM64-ABI-DIVERGENCE.
     bool variadicArgsAlwaysStack = false;
 
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: what happens to the
+    // ARG REGISTERS of a class once a by-value aggregate is placed WHOLLY on the
+    // stack because its pieces did not all fit (the all-or-nothing/straddle case).
+    // The two shipped ABIs DIVERGE — a documented, config-distinguishable fact,
+    // verified against gcc's own arg-advance logic (NOT an identity branch):
+    //   * false (SysV `sysv_amd64`): BACKFILL. The leftover registers stay
+    //     available for a LATER (smaller) arg — gcc `function_arg_advance_64`
+    //     leaves `cum->nregs`/`regno` untouched on the stack branch; the SysV ABI
+    //     "if registers were assigned for some eightbytes … the assignments get
+    //     reverted". The per-class cursor is NOT advanced on route-to-stack.
+    //   * true  (AAPCS64 `aapcs64`):  EXHAUST. The OVERFLOWED class is marked
+    //     full (NGRN/NSRN ← 8) so every subsequent arg of that class also goes to
+    //     memory — gcc `aarch64_layout_arg` sets `aapcs_nextncrn = NUM_ARG_REGS`
+    //     (or `nextnvrn` for an HFA). The cursor is CLAMPED to the pool size.
+    // Win64 (`ms_x64`, slotAligned) never straddles (1 struct = 1 positional
+    // slot) so the flag is inert (default false). Consumed by HIR→MIR's caller
+    // (Phase A) + callee (Phase B) cursor handling — kept in lockstep so the two
+    // sides agree AND va_start's `__gr_offs`/`__vr_offs` clamp reflects it.
+    bool aggregateStackExhaustsRegisters = false;
+
     // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the
     // classification STRATEGY for a struct/union passed/returned by value.
     // A closed enum (the `aggregate_abi` classifier switches on it, never on

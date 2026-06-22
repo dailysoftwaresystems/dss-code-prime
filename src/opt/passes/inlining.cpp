@@ -289,6 +289,15 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // `release.pipeline.json` (which runs `Inlining`), so this is a real
             // silent-miscompile fix, not a speculative guard.
             if (op == MirOpcode::ReadIndirectResult) return std::nullopt;
+            // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: a fixed by-value
+            // aggregate received WHOLLY from the incoming stack (it straddled the
+            // reg/stack boundary) reads the CALLEE's incoming overflow area via a
+            // frame-relative `RecvByValueStackParam`; spliced into the caller it would
+            // bind to the CALLER's incoming frame (garbage — the caller is not the one
+            // that stacked the aggregate). Refuse, like ReadIndirectResult (fail-SAFE:
+            // forgoes the optimization, never miscompiles). Reachable under the shipped
+            // release.pipeline.json (which runs Inlining), so a real fix not a guard.
+            if (op == MirOpcode::RecvByValueStackParam) return std::nullopt;
             if (op == MirOpcode::Return
                 && mir.instOperands(cid).size() > 1) {
                 return std::nullopt;

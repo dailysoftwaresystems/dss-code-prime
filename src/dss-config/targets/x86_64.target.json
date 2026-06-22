@@ -71,6 +71,16 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): callee-side mirror of the caller's `ByValueStackArg` carrier — 'this LirReg is the ADDRESS of a FIXED by-value aggregate param that was placed WHOLLY on the incoming stack' (it straddled the reg/stack boundary, all-or-nothing). lir_callconv materializes it into `lea result, [sp + totalFrameSize + callPushBytes + shadowSpaceBytes + payload]` — IDENTICAL geometry to va_overflow_arg_area but the PAYLOAD is THIS aggregate's byte offset WITHIN the incoming overflow area (0 when it is the first/only overflowed fixed param). HIR→MIR then byte-copies from this address into the param's local slot. DISTINCT from the va_* ops on purpose: it must NOT be one of lir_callconv's va_start-detection signals (it occurs in NON-variadic functions too — reusing va_overflow_arg_area would falsely trigger the variadic prologue spill). No encoding (materialized away).",
+      "mnemonic":      "recv_by_value_stack_param",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "Virtual-ISA pseudo-op (FC12b, D-FC12B-WIN64-VARIADIC-CALLEE): 'this LirReg is the ADDRESS of the Win64 HomogeneousPointer va_start base' — &home[namedArgCount], the first vararg. Win64's named-arg home space (rcx/rdx/r8/r9 slots) and the 5th+ stack args are CONTIGUOUS in the caller's outgoing area, so this single base + the named-arg slot count positions `ap` past ALL named args. PAYLOAD = the named-arg slot count; lir_callconv materializes it into `lea result, [sp + totalFrameSize + callPushBytes + payload*outgoingSlotSize]` — the NO-SHADOW base (the home space IS the caller's shadow space, so adding shadowSpaceBytes would skip it and read past every named arg). Its PRESENCE is also lir_callconv's signal to spill the named integer arg regs into their home slots. No encoding (materialized away).",
       "mnemonic":      "va_home_arg_area",
       "result":        "value",
@@ -1537,6 +1547,8 @@
       "$aggregateAbiComment": "FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): System V AMD64 §3.2.3 eightbyte classification — a struct/union ≤16 bytes is passed/returned in up to two registers (each 8-byte 'eightbyte' classified INTEGER→GPR or SSE→FPR per the field types overlapping it); larger than aggregateMaxRegBytes (16) goes in MEMORY (by-reference args / sret returns). No indirectResultRegister ⇒ the sret hidden pointer is a first INTEGER arg (rdi) returned in rax (vs AAPCS64's x8). The classification ALGORITHM lives in the aggregate_abi realization tier keyed on this strategy enum, never on cc.name/target identity.",
       "aggregateClassification": "sysv_eightbyte",
       "aggregateMaxRegBytes":    16,
+      "$aggregateStackExhaustsComment": "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: System V §3.2.3 — when a by-value aggregate does not fit the remaining arg registers, 'the assignments get reverted' and it is passed wholly on the stack, but the leftover registers REMAIN AVAILABLE for a later (smaller) arg (gcc function_arg_advance_64 leaves cum->nregs untouched). false = BACKFILL — the per-class cursor is NOT advanced. This DIVERGES from AAPCS64 (true/exhaust); declared explicitly so the fact is visible in config, not buried in a default.",
+      "aggregateStackExhaustsRegisters": false,
       "$entryStackPointerBiasComment": "D-LK10-ENTRY-TRAMP-PROLOGUE: at SysV process entry the kernel maps the image and JUMPS to `_start` with RSP 16-byte-aligned and NO return address pushed — so RSP bias mod stackAlignment is 0. The trampoline emitter computes its prologue `sub rsp, N` via `alignedSizeWithBias(shadowSpaceBytes=0, stackAlignment=16, bias=0) = 0` — no prologue emitted, which is correct for SysV (no shadow space + already aligned).",
       "entryStackPointerBias": 0,
       "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: x86_64 `call` instruction pushes the 8-byte return address. ML7 `computeFrameLayout` consumes this as the bias for non-leaf functions so their prologue `sub rsp, N` produces RSP ≡ 0 mod 16 at the next call site. SysV's entry bias is 0 (kernel JMP) but this in-program call-push is 8 — the two distinct facts coincide on Win64 (both 8) and diverge here. Without this wired, the user-fn → extern-call shadow-space + alignment violation reappears one stack frame below the trampoline (the same 0xC0000005 class as D-LK10-ENTRY-TRAMP-PROLOGUE, now recurring at the user-fn boundary).",

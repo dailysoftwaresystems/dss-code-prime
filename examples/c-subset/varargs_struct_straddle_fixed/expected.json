@@ -1,0 +1,13 @@
+{
+  "$comment": "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS (CLOSED): SysV all-or-nothing fixed-aggregate STRADDLE. f(long a..e, struct S16 s, ...) — a..e fill rdi..r8, S16={long,long} straddles (needs 2 GPR, 1 left) → the WHOLE 16B struct goes to memory (not split) and SysV BACKFILLS r9 for the first vararg (gv). va_start leaves gp_offset=40, va_arg reads r9=gv=100. a+s.x+s.y+v = 1+10+20+100 = 131. RED-ON-DISABLE: a split struct mis-reads s.x/s.y; a wrong (AAPCS64-style clamped) gp_offset=48 routes va_arg to the overflow and reads s.x(10) as the vararg → 41 not 131. Values ride mutable globals (anti-fold). The release arm re-witnesses under Inlining ON (FC7-C3 lesson).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 131,
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -91,6 +91,12 @@ struct Lowered {
             mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
             mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
             mirCfg.argSlotAligned            = cc->slotAligned;
+            mirCfg.argGprCount               =
+                static_cast<std::uint32_t>(cc->argGprs.size());
+            mirCfg.argFprCount               =
+                static_cast<std::uint32_t>(cc->argFprs.size());
+            mirCfg.aggregateStackExhaustsRegisters =
+                cc->aggregateStackExhaustsRegisters;
             // FC12a-core (D-FC12A-VARIADIC-CALLEE): thread the CC's va_list layout so
             // va_start/va_arg lower (or fail loud when the CC omits it).
             mirCfg.vaListLayout              = cc->vaListLayout;
@@ -4794,17 +4800,18 @@ TEST(MirLoweringCSubset, Aapcs64VaStartMixedClassFixedStackOverflow) {
            "both-clamp witness)";
 }
 
-// FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS, OPEN): a SysV variadic
-// callee whose fixed params overflow the GPR pool AND include a by-value AGGREGATE
-// that STRADDLES the register/stack boundary MUST fail loud. `f(a..e, struct S16, ...)`
-// : a..e consume 5 GPR (rdi..r8), leaving only r9; S16 = {long,long} needs 2 GPR
-// eightbytes but only 1 remains → real SysV puts the WHOLE struct in MEMORY (16B), yet
-// the per-register-slot formula (gprOver counts the straddling eightbyte that landed in
-// r9) would UNDERCOUNT the named stack bytes → a silent miscompile, rejected here.
-// RED-ON-DISABLE: remove the `currentFnHasAggregateFixedParam_` guard in lowerVaStart's
-// SysV overflow path → mir.ok flips TRUE (the function lowers with a wrong __overflow
-// displacement). Restore to make this go red again.
-TEST(MirLoweringCSubset, VaStartFixedStructStraddleOverflowFailsLoud) {
+// D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS (CLOSED): a SysV variadic callee
+// whose fixed params overflow the GPR pool AND include a by-value AGGREGATE that
+// STRADDLES the register/stack boundary now LOWERS — the WHOLE struct is received
+// ALL-OR-NOTHING from the incoming stack (a RecvByValueStackParam, the callee mirror of
+// the caller's ByValueStackArg carrier), and va_start's VaOverflowArgArea payload counts
+// its FULL 16 bytes. `f(a..e, struct S16, ...)`: a..e consume 5 GPR (rdi..r8); S16 =
+// {long,long} needs 2 GPR eightbytes but only r9 remains → SysV places the WHOLE 16B in
+// memory (NOT split), and BACKFILLS r9 for the first vararg (SysV does not exhaust on a
+// stacked aggregate). RED-ON-DISABLE: revert the caller all-or-nothing (Phase A) or the
+// callee reception (Phase B) → the struct splits and the byte cursor no longer reaches
+// 16 / no RecvByValueStackParam appears; revert Phase C → wrong payload.
+TEST(MirLoweringCSubset, VaStartFixedStructStraddleOverflowSucceeds) {
     auto L = lowerCSubset(
         "struct S16 { long x; long y; };\n"
         "long f(long a, long b, long c, long d, long e, struct S16 s, ...) {\n"
@@ -4814,24 +4821,43 @@ TEST(MirLoweringCSubset, VaStartFixedStructStraddleOverflowFailsLoud) {
         "  va_end(ap);\n"
         "  return a + s.x + v;\n"
         "}\n");
-    EXPECT_FALSE(L.mir.ok)
-        << "a SysV variadic callee with an overflowing fixed by-value aggregate "
-           "(register/stack straddle) must FAIL LOUD at va_start "
-           "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)";
-    EXPECT_TRUE(anyDiagActualContains(
-        L.mirReporter, "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS"))
-        << "the aggregate-straddle fail-loud must cite the new aggregate-overflow anchor";
+    ASSERT_TRUE(L.mir.ok)
+        << "a SysV variadic callee with a straddling fixed by-value aggregate must now "
+           "LOWER all-or-nothing (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    auto const payload = vaOverflowArgAreaPayload(m, fi);
+    ASSERT_TRUE(payload.has_value())
+        << "the lowered va_start must emit a VaOverflowArgAreaAddr leaf";
+    EXPECT_EQ(*payload, 16u)
+        << "overflow_arg_area must skip the WHOLE 16-byte stacked struct (roundUp(16,8) "
+           "= 16), NOT the per-eightbyte slot count — a 0/8 payload would read the "
+           "struct's own bytes as the first vararg (all-or-nothing, not split)";
+    EXPECT_GT(countOpcodeAllBlocks(m, fi, MirOpcode::RecvByValueStackParam), 0u)
+        << "a straddling fixed aggregate must be RECEIVED via RecvByValueStackParam "
+           "(whole-from-stack), not split into per-eightbyte Args";
+    // BACKFILL witness: SysV does NOT exhaust on a stacked aggregate, so the 5 fixed
+    // GPRs leave gp_offset = 5*8 = 40 (the trailing vararg backfills r9, save-area slot
+    // 5). The AAPCS64-style clamp would (wrongly) advance the cursor to 6 → gp_offset
+    // = 48, and the Const 40 would NOT appear. (NB: 48 itself is also the legitimate
+    // fp_offset base = gpOffsetLimit, so its PRESENCE is not a clamp signal — the
+    // backfill witness is the PRESENCE of 40, absent under a clamp.)
+    EXPECT_TRUE(funcHasConstInt(m, fi, 40))
+        << "gp_offset must be 40 (5 fixed GPRs; SysV BACKFILLS r9 — does not exhaust the "
+           "cursor on a stacked aggregate; a clamp would make it 48 and drop the 40)";
 }
 
-// FOLD 1 mirror (AAPCS64): a variadic ARM64 callee whose fixed params overflow the FP
-// pool AND include a by-value HFA (homogeneous float aggregate) straddling the
-// register/stack boundary MUST fail loud. `f(6 doubles, struct H3, ...)` where H3 =
-// {double,double,double} is a 3-element HFA (3 VR slots): the 6 fixed doubles consume
-// v0..v5, leaving v6,v7 (2 VR) but H3 needs 3 → AAPCS64 places the WHOLE HFA on the
-// stack (24B), which the per-register-slot formula undercounts → rejected.
-// RED-ON-DISABLE: remove the `currentFnHasAggregateFixedParam_` guard in the
-// Aapcs64DualCursor overflow path → mir.ok flips TRUE.
-TEST(MirLoweringCSubset, Aapcs64VaStartFixedHfaStraddleOverflowFailsLoud) {
+// D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS mirror (AAPCS64, CLOSED): a
+// variadic ARM64 callee whose fixed params overflow the FP pool AND include a by-value
+// HFA straddling the register/stack boundary now LOWERS all-or-nothing. `f(6 doubles,
+// struct H3, ...)` where H3 = {double,double,double} is a 3-element HFA: the 6 fixed
+// doubles consume v0..v5, leaving v6,v7 (2 VR) but H3 needs 3 → AAPCS64 §B places the
+// WHOLE 24B HFA in memory AND EXHAUSTS the VR class (NSRN←8), so __vr_offs clamps to 0
+// and the first FP vararg routes to __stack PAST the HFA. RED-ON-DISABLE: revert
+// Phase A/B → split / no RecvByValueStackParam; revert the AAPCS64 cursor exhaust →
+// __vr_offs is -32 (not clamped) and the vararg reads the HFA's bytes.
+TEST(MirLoweringCSubset, Aapcs64VaStartFixedHfaStraddleOverflowSucceeds) {
     auto L = lowerCSubset(
         "struct H3 { double a; double b; double c; };\n"
         "double f(double a, double b, double c, double d, double e, double g,"
@@ -4843,13 +4869,68 @@ TEST(MirLoweringCSubset, Aapcs64VaStartFixedHfaStraddleOverflowFailsLoud) {
         "  return a + h.a + v;\n"
         "}\n",
         "arm64", "aapcs64");
-    EXPECT_FALSE(L.mir.ok)
-        << "an AAPCS64 variadic callee with an overflowing fixed by-value HFA "
-           "(register/stack straddle) must FAIL LOUD at va_start "
-           "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)";
-    EXPECT_TRUE(anyDiagActualContains(
-        L.mirReporter, "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS"))
-        << "the HFA-straddle fail-loud must cite the new aggregate-overflow anchor";
+    ASSERT_TRUE(L.mir.ok)
+        << "an AAPCS64 variadic callee with a straddling fixed by-value HFA must now "
+           "LOWER all-or-nothing (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    auto const payload = vaOverflowArgAreaPayload(m, fi);
+    ASSERT_TRUE(payload.has_value())
+        << "the lowered va_start must emit a VaOverflowArgAreaAddr (→ __stack) leaf";
+    EXPECT_EQ(*payload, 24u)
+        << "__stack must skip the WHOLE 24-byte stacked HFA (roundUp(24,8) = 24)";
+    EXPECT_GT(countOpcodeAllBlocks(m, fi, MirOpcode::RecvByValueStackParam), 0u)
+        << "the straddling HFA must be RECEIVED via RecvByValueStackParam";
+    // EXHAUST witness: the HFA consumed the VR class → __vr_offs clamps to 0. Reverting
+    // the AAPCS64 cursor exhaust leaves __vr_offs = -(8-6)*16 = -32 (not clamped).
+    EXPECT_TRUE(funcHasConstInt(m, fi, 0))
+        << "__vr_offs must be CLAMPED to 0 — the straddling HFA EXHAUSTED the VR class "
+           "(AAPCS64 §B NSRN←8)";
+    EXPECT_FALSE(funcHasConstInt(m, fi, -32))
+        << "__vr_offs must NOT be -32 — the cursor must EXHAUST (clamp), not leave 2 VR "
+           "slots as if the HFA had not consumed the class";
+}
+
+// D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS — the CALLER all-or-nothing (the
+// latent NON-variadic split this cycle ALSO repaired, previously unfiled). A non-variadic
+// call whose fixed by-value aggregate arg STRADDLES the reg/stack boundary must place the
+// WHOLE struct on the stack via a ByValueStackArg carrier, NOT split it into per-eightbyte
+// register pieces (lir_callconv would put one piece in the last register + one on the
+// stack — non-conformant to SysV §3.2.3). `g(a..e, struct S16 s)`: a..e fill 5 GPR, S16 =
+// {long,long} needs 2 but 1 remains → carrier. RED-ON-DISABLE: revert the caller's
+// `!argSlotAligned` exhaustion check (Phase A — its hoist out of `if (calleeVariadic)`)
+// → the struct splits into per-eightbyte Args → NO ByValueStackArg appears in `caller`.
+TEST(MirLoweringCSubset, CallerNonVariadicStraddlingAggregateUsesStackCarrier) {
+    auto L = lowerCSubset(
+        "struct S16 { long x; long y; };\n"
+        "long g(long a, long b, long c, long d, long e, struct S16 s) {\n"
+        "  return a + s.x;\n"
+        "}\n"
+        "long caller(void) {\n"
+        "  struct S16 s;\n"
+        "  s.x = 1; s.y = 2;\n"
+        "  return g(10, 20, 30, 40, 50, s);\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "a non-variadic call with a straddling fixed by-value aggregate must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // The CALLER places the straddling struct via a ByValueStackArg carrier; the CALLEE
+    // `g` receives it via RecvByValueStackParam. Both opcodes must therefore be present
+    // in the module — count each across all functions (the carrier is the Phase-A pin).
+    std::size_t carriers = 0, receives = 0;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        carriers += countOpcodeAllBlocks(m, f, MirOpcode::ByValueStackArg);
+        receives += countOpcodeAllBlocks(m, f, MirOpcode::RecvByValueStackParam);
+    }
+    EXPECT_GT(carriers, 0u)
+        << "the straddling struct arg must be PLACED via a ByValueStackArg carrier "
+           "(whole-to-stack), NOT split into per-eightbyte register pieces — the caller "
+           "mirror of the callee RecvByValueStackParam (all-or-nothing, both sides)";
+    EXPECT_GT(receives, 0u)
+        << "the callee `g` (non-variadic) must RECEIVE the straddling struct via "
+           "RecvByValueStackParam — the all-or-nothing fix covers non-variadic too";
 }
 
 namespace {

@@ -71,6 +71,16 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): callee-side mirror of the caller's `ByValueStackArg` carrier — the ADDRESS of a FIXED by-value aggregate/HFA param placed WHOLLY on the incoming stack (it straddled the reg/stack boundary). lir_callconv materializes it into `lea result, [sp + totalFrameSize + callPushBytes + shadowSpaceBytes + payload]`; the PAYLOAD is this aggregate's byte offset within the incoming overflow area. DISTINCT from the va_* ops so it is NOT a va_start-detection signal (it occurs in non-variadic functions too). No encoding (materialized away).",
+      "mnemonic":      "recv_by_value_stack_param",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "Virtual-ISA pseudo-op (FC12b, D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start base (&home[namedArgCount]). Declared for substrate uniformity; AAPCS64 uses the dual-cursor strategy (FC12c) and never emits this op. No encoding (materialized away by lir_callconv).",
       "mnemonic":      "va_home_arg_area",
       "result":        "value",
@@ -1546,6 +1556,8 @@
       "$aggregateComment": "FC7 C3 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): AAPCS64 §5.4 by-value aggregates. HFA (1-4 leaves all the same FP type) → that many FPR pieces (v0..v3 / d0..d3 for returns, d0..d7 for args). A non-HFA aggregate <=16 bytes → 1-2 GPR pieces (x0..x1 returns / x0..x7 args); > 16 bytes → BY REFERENCE: a caller-allocated copy for args; for RETURNS the caller passes the result address in x8 (`indirectResultRegister`) and the callee returns VOID (it writes through x8 — distinct from SysV/Win64's hidden-arg-then-return-pointer; `aggregateSretViaHiddenArg` is false here because indirectResultRegister is set). `aapcs64_hfa` drives the bounded classifier arm; maxRegBytes = 16 (two X-registers).",
       "aggregateClassification": "aapcs64_hfa",
       "aggregateMaxRegBytes":    16,
+      "$aggregateStackExhaustsComment": "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: AAPCS64 §6.4.2 stage C — when a by-value composite/HFA does not fit the remaining arg registers it is placed WHOLLY on the stack and the overflowed class is EXHAUSTED (gcc aarch64_layout_arg sets aapcs_nextncrn=8 / aapcs_nextnvrn=8), so every subsequent arg of that class also goes to memory. true = no backfill (contrast SysV, which backfills the leftover registers). Read by HIR→MIR's caller+callee cursor handling + va_start's __gr_offs/__vr_offs clamp.",
+      "aggregateStackExhaustsRegisters": true,
       "indirectResultRegister":  "x8",
       "$callerSavedFprComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): AAPCS64 §6.1.2 — v0-v7 (args/results) and v16-v31 are caller-saved; declared here in their d views. Being listed in callerSaved is what keeps the regalloc honest about them: an allocatable register NOT in callerSaved is treated as call-safe (lir_regalloc buildFreeLists), so omitting these while argFprs makes them allocatable would let a float live across a call sit unsaved in a volatile d-register — the same reason x86_64's sysv row lists all sixteen xmm registers here.",
       "callerSaved":      ["x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x18",
@@ -1588,6 +1600,8 @@
       "$aggregateComment": "FC7 C3: Apple ARM64 by-value aggregate register-assignment is IDENTICAL to AAPCS64 (the documented Apple divergences are variadic-always-stack + small-int widening, NOT the struct/HFA/x8 rules) — so it carries the same aggregate fields. This CLOSES the struct-return / indirect-result half of D-FF3-APPLE-ARM64-ABI-DIVERGENCE (x8 sret modeled); the variadic-always-stack half stays open until a variadic arm64-Apple call.",
       "aggregateClassification": "aapcs64_hfa",
       "aggregateMaxRegBytes":    16,
+      "$aggregateStackExhaustsComment": "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: Apple arm64 inherits AAPCS64 stage-C register assignment (the Apple divergences are variadic-always-stack + small-int widening, NOT the composite placement rule) — a stacked composite EXHAUSTS the overflowed class, same as aapcs64.",
+      "aggregateStackExhaustsRegisters": true,
       "indirectResultRegister":  "x8",
       "$fprComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): the SIMD&FP register vocabulary is IDENTICAL to AAPCS64 (Apple's documented divergences are variadic/indirect-result rules, not register assignment): args d0..d7, return d0, v0-v7/v16-v31 caller-saved, v8-v15 callee-saved in their LOW 64 BITS only (d8..d15 — same F128/SIMD-cycle caveat as the aapcs64 row's $calleeSavedFprComment).",
       "callerSaved":      ["x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x18",
