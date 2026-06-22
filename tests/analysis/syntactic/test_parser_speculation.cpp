@@ -1,4 +1,5 @@
 #include "analysis/syntactic/parser.hpp"
+#include "core/substrate/large_stack_call.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -10,7 +11,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -478,4 +481,380 @@ TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
     EXPECT_EQ(names, declared)
         << "operand's speculative rule branches must surface in the "
            "JSON-array order declared in c-subset.lang.json";
+}
+
+// ── Deep-nest predictive-prune O(N) pin (D-PARSE-SPECULATION-OPERAND-
+//    QUADRATIC) ──────────────────────────────────────────────────────────
+//
+// `((((…0…))))` is the C cast-vs-paren worst case: at EVERY nesting level
+// `operand`'s speculative alt sees `(`, and pre-fix tried the `castExpr`
+// probe first — which fails (`castTypeRef` can't start with `(`) and runs
+// panic recovery that scans O(min(N,syncCap)) tokens, repeated at N levels
+// ⇒ O(N²) (deep input HUNG: N=300 took >150 s wall-clock through the CLI).
+//
+// The fix is the engine's LL(k) PREDICTIVE PRUNE plus unique-production
+// direct descent: token[+1]==`(` ∉ FIRST(castTypeRef) prunes `castExpr` and
+// `compoundLiteralExpr` BEFORE they speculate, and the lone survivor
+// `parenExpr` (no commit-triage) is descended into directly — no per-level
+// speculation probe. Net: O(N).
+//
+// This pin parses the REAL shipped c-subset grammar at a high
+// `maxExpressionDepth` (so the parse runs to completion instead of tripping
+// the low default cap) and asserts (a) a CLEAN parse — no diagnostics, no
+// `P_BacktrackFailed` — proving the prune kept the valid `parenExpr` reading
+// at every level, and (b) ROUGHLY LINEAR scaling: doubling the nesting
+// depth must not blow the parse time up super-linearly. A quadratic
+// regression (the bug) makes the 2N parse ~4× the N parse and far exceeds
+// the generous ceiling asserted here; the headroom keeps the test robust to
+// CI timing jitter while still catching an O(N²) reintroduction (which would
+// be orders of magnitude over, not a small multiple).
+//
+// NOTE: only the PARSE is exercised here — the downstream semantic / HIR /
+// MIR passes recurse on the host stack and overflow at ~25 levels
+// (D-PARSE-DEEP-FRONTEND-STACK, a SEPARATE anchor), so this stays at the
+// parser boundary deliberately.
+//
+// NOTE 2 (the generous 8× ceiling): the parse WORK is O(N) — the companion
+// `FlatChainParseWorkIsLinear` pins the shared machinery flat — but this
+// RECURSIVE nest carries a residual ~exp-1.7 wall-clock super-linearity that
+// is a memory-hierarchy constant of the N-deep host recursion (live call
+// stack + strided unwind), NOT an algorithmic term. It is bounded/moot in
+// practice (the 256 depth cap + the recursion-bound downstream frontend) and
+// documented as D-PARSE-DEEP-NEST-RECURSION-MEMORY; the 8× bound is sized to
+// absorb it while still catching an O(N²) speculation regression (orders of
+// magnitude over).
+namespace {
+
+[[nodiscard]] std::string deepNestSource(std::size_t depth) {
+    std::string s = "int main(void){return ";
+    s.append(depth, '(');
+    s.push_back('0');
+    s.append(depth, ')');
+    s += ";}";
+    return s;
+}
+
+// Parse `((…0…))` nested `depth` deep through the SHIPPED c-subset grammar
+// at a raised expression-depth cap; return the wall-clock parse duration.
+// Fails the calling test (via gtest macros) on any parse diagnostic.
+//
+// `schema` is loaded ONCE by the caller and reused so the timed region is
+// the parse alone, not a per-call schema reload.
+[[nodiscard]] std::chrono::nanoseconds
+timeDeepNestParse(std::shared_ptr<GrammarSchema const> const& schema,
+                  std::size_t depth, std::size_t cap) {
+    auto src = SourceBuffer::fromString(deepNestSource(depth), "<deep>");
+    Tokenizer tk{src, schema};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+
+    ParserConfig cfg;
+    cfg.maxExpressionDepth = cap;
+    Parser p{src, schema, std::move(stream), std::move(cfg)};
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto result = std::move(p).parse();
+    const auto t1 = std::chrono::steady_clock::now();
+
+    auto const& t = result.tree;
+    EXPECT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "deep-nest `" << depth << "`-paren parse must be CLEAN — the "
+           "predictive prune must keep the valid parenExpr reading at every "
+           "level (first diag: "
+        << (t.diagnostics().all().empty()
+                ? std::string{"<none>"}
+                : t.diagnostics().all().front().actual)
+        << ")";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u)
+        << "no candidate-backtrack failures may surface for a well-formed "
+           "deeply-nested paren expression";
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0);
+}
+
+} // namespace
+
+TEST(ParserSpeculation, DeepNestCastVsParenIsLinear) {
+    // Cap comfortably above the deepest probe so the parse runs to the end
+    // (the per-parser `maxExpressionDepth` override — independent of the low
+    // shipped default — lets the parse descend the full nesting).
+    constexpr std::size_t kCap = 4000;
+
+    // Load the shipped grammar ONCE; reuse it across every timed parse so the
+    // measured region is the parse alone, not a per-call schema reload.
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+
+    // The deep parse recurses one host-stack frame per paren level, so run on
+    // a large-stack thread — the parser's own stack ceiling (not the
+    // speculation cost) is otherwise the depth limit (D-PARSE-DEEP-FRONTEND-
+    // STACK). N=500 and N=1000 are the task's deep-nest proof points; 1000 is
+    // exactly 2× 500, so an O(N) parse scales ~2× and an O(N²) regression
+    // ~4× — and the historical bug's per-level panic-scan blowup pushes it
+    // FAR past that (the pre-fix CLI hung for >150 s at N=300).
+    std::chrono::nanoseconds t500{}, t1000{};
+    // The shared substrate large-stack runner (the SAME facility the production
+    // driver uses for the deep parse). A 256 MiB reserve gives this stress test
+    // generous headroom at the 4000-deep cap — well above the 64 MiB the
+    // shipped pipeline reserves for the 256-deep shipped cap.
+    constexpr std::size_t kRunnerStackBytes = std::size_t{256} * 1024 * 1024;
+    dss::substrate::runOnLargeStack(kRunnerStackBytes, [&] {
+        // Warm allocator/caches so the first timed run isn't setup-taxed.
+        (void)timeDeepNestParse(schema, 50, kCap);
+        t500  = timeDeepNestParse(schema, 500,  kCap);
+        t1000 = timeDeepNestParse(schema, 1000, kCap);
+    });
+
+    // Doubling the nesting (500→1000) must NOT explode the parse time. The
+    // pre-fix O(N²) cast-vs-paren speculation made deep input catastrophic —
+    // the per-level panic-scan blowup pushed the CLI past 150 s at N=300, i.e.
+    // a multi-thousand-× scaling, not a small multiple. The ceiling here is
+    // intentionally generous (Debug-build allocator noise + CI timing jitter
+    // make the observed clean-parse ratio swing a few × around the ideal 2×),
+    // yet still fails LOUD on a quadratic reintroduction, which overshoots it
+    // by orders of magnitude. The CLEAN-parse assertions inside
+    // `timeDeepNestParse` (no diagnostics, no `P_BacktrackFailed` at depth 500
+    // AND 1000) are the precise functional guard that the prune kept the valid
+    // `parenExpr` reading at every level. A floor on the denominator avoids
+    // divide-by-noise on a fast baseline.
+    const double small = std::max<double>(
+        static_cast<double>(t500.count()), 1.0);
+    const double ratio = static_cast<double>(t1000.count()) / small;
+    EXPECT_LT(ratio, 8.0)
+        << "deep-nest parse time scaled " << ratio << "× when nesting "
+           "doubled (500→1000); linear is ~2×. A super-linear ratio of this "
+           "magnitude signals the O(N²) cast-vs-paren speculation regressed "
+           "(D-PARSE-SPECULATION-OPERAND-QUADRATIC). t500="
+        << (static_cast<double>(t500.count()) / 1e6) << "ms t1000="
+        << (static_cast<double>(t1000.count()) / 1e6) << "ms";
+}
+
+// ── LL(k) predictive prune at offset >=1 + nullable-stop soundness ───────
+//
+// These two synthetic-schema tests exercise the predictive prune at a NON-
+// zero offset (offset 0 is the standard 1-token FIRST gate; the prune's extra
+// discriminating power is entirely at offsets >=1) and pin the nullable-stop
+// soundness invariant of `computePredictivePrefixes`.
+
+// (a) PRUNE-FIRES POSITIVE PATH. Reuses `kSpeculativeSchema` (caseA=[A,B,Semi]
+// / caseB=[A,C,Semi], lookahead 3). For input `A C ;` both branches share
+// FIRST={A}, so offset 0 cannot discriminate — the offset-1 prefix does:
+// caseA's prefix[1]={B}, caseB's prefix[1]={C}. The prune drops caseA
+// (observed C ∉ {B}) and the LONE survivor caseB carries no commit-time triage
+// (no `commitRequiresTypeName`), so the parser takes the UNIQUE-PRODUCTION
+// DIRECT-DESCENT path — committing caseB WITHOUT a speculation probe. The
+// resulting tree (clean, caseB present, caseA absent) is the functional pin;
+// the O(N) deep-nest test above is the performance witness that the
+// direct-descent path (not a per-level probe) is what runs.
+TEST(ParserSpeculation, PrunesFirstBranchAtOffsetOneAndDirectDescends) {
+    auto h = loadAndTokenize("A C ;");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "the offset-1 prune must keep the valid caseB reading and parse "
+           "`A C ;` cleanly";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u)
+        << "the lone-survivor direct descent must not surface a backtrack "
+           "failure";
+    EXPECT_EQ(countNodesByRule(t, "caseB"), 1u)
+        << "caseB is the lone candidate the offset-1 prune leaves — it must "
+           "commit via the unique-production direct-descent path";
+    EXPECT_EQ(countNodesByRule(t, "caseA"), 0u)
+        << "caseA must NOT appear — the offset-1 prefix prunes it (observed "
+           "C is not in caseA's prefix[1]={B})";
+}
+
+// (b) NULLABLE-STOP SOUNDNESS GUARD (Finding 1 — RED on the pre-fix code).
+//
+// caseA's second element is a NULLABLE NAMED rule (`nullableRule =
+// {optional CKind}`), referenced as a RuleLeaf — and a RuleLeaf's expectedSet
+// is FIRST(sub-rule) ALONE (it never absorbs the parent continuation, unlike
+// an inline optional's AltChoice, whose expectedSet `recomputeAltExpectedSets`
+// already unions with the continuation). Pre-fix, `computePredictivePrefixes`
+// recorded that RuleLeaf's expectedSet as caseA's prefix[1] = FIRST(nullableRule)
+// = {C}. But `nullableRule` can derive EMPTY, so after `A` the next REAL token
+// may be `nullableRule`'s first token (C) OR — when nullableRule is skipped —
+// caseA's following `BKind` (B). The recorded {C} UNDER-approximates the true
+// admissible set {B, C}; for input `A B ;` the prune then WRONGLY drops caseA
+// (observed B ∉ {C}). caseB=[A,D,Semi] is likewise pruned (B ∉ {D}), so the
+// speculation set empties and the fallback replays caseB, which fails on `B`
+// where it expects `D` — a LOUD mis-parse where a clean caseA parse was due.
+//
+// The fix: a nullable stop element (here, a RuleLeaf whose sub-rule is
+// nullable) is NOT recorded — the walk STOPS with only the exact single-token
+// offsets so far. caseA's prefix collapses to length 1 ({A}) and is cleared,
+// so caseA carries no multi-token discriminator, never prunes, and `A B ;`
+// matches caseA cleanly. This test asserts that clean parse; it is RED on the
+// pre-Finding-1 code (revert the nullable guard in `computePredictivePrefixes`
+// → the EXPECT_FALSE(hasErrors) and caseA==1 assertions fail).
+constexpr std::string_view kNullableStopSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "NullableStopSpec", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\t": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "A":  [{ "kind": "AKind" }],
+    "B":  [{ "kind": "BKind" }],
+    "C":  [{ "kind": "CKind" }],
+    "D":  [{ "kind": "DKind" }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "shapes": {
+    "root":         { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":         { "alt": ["caseA", "caseB"], "speculative": true, "lookahead": 4 },
+    "nullableRule": { "optional": "CKind" },
+    "caseA":        { "sequence": ["AKind", "nullableRule", "BKind", "Semi"] },
+    "caseB":        { "sequence": ["AKind", "DKind", "Semi"] }
+  }
+})JSON";
+
+TEST(ParserSpeculation, NullableStopElementDoesNotOverPrune) {
+    auto loaded = GrammarSchema::loadFromText(kNullableStopSchema);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.has_value() ? "" : loaded.error()[0].message);
+
+    // `A B ;` — caseA with the nullable `nullableRule` skipped (zero C's),
+    // then B then ;. The offset-1 prune must NOT drop caseA on the strength of
+    // FIRST(nullableRule)={C}: the sub-rule is nullable, so B is a legitimate
+    // offset-1 token for caseA.
+    auto src = SourceBuffer::fromString("A B ;", "<nullstop>");
+    Tokenizer tk{src, *loaded};
+    auto [stream, _] = std::move(tk).tokenize();
+    Parser p{src, *loaded, std::move(stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "a nullable stop element must not be recorded as an exact offset — "
+           "`A B ;` is a valid caseA parse (nullableRule derives empty) and "
+           "the prune must NOT drop caseA (RED on the pre-Finding-1 code)";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u)
+        << "no backtrack failure may surface for the well-formed `A B ;`";
+    EXPECT_EQ(countNodesByRule(t, "caseA"), 1u)
+        << "caseA must commit — the nullable-stop soundness guard keeps it in "
+           "the candidate set for the offset-1 token B";
+    EXPECT_EQ(countNodesByRule(t, "caseB"), 0u)
+        << "caseB must NOT appear — `A B ;` is unambiguously caseA";
+}
+
+// ── Flat-chain O(N)-WORK pin — the non-recursive control for the deep-nest
+//    memory-latency residual (D-PARSE-DEEP-NEST-RECURSION-MEMORY) ───────────
+//
+// A flat left-assoc `0+0+…+0` chain has the SAME O(N) total nodes/tokens as a
+// deep `((((0))))` nest but builds ITERATIVELY (the Pratt climb wraps in
+// place; recursion depth peaks at ~2), so it isolates the SHARED parse
+// machinery — TreeBuilder frame open/close, the node arena, the schema-walker
+// advance — from the deep nest's N-frame host recursion. It pins that the
+// shared machinery is genuinely O(N): per-element cost stays ~constant as N
+// grows (measured ns/level was FLAT — ~20.5 µs — from 250 to 3000, while the
+// node count rose exactly linearly). A reintroduced O(N²) in the arena /
+// TreeBuilder bookkeeping (the hypothesis the controlled measurement REFUTED —
+// see D-PARSE-DEEP-NEST-RECURSION-MEMORY) would blow this far past the
+// generous ceiling: quadrupling the length ⇒ ~16× under O(N²) vs ~4× linear.
+//
+// This is the COMPLEMENT of `DeepNestCastVsParenIsLinear`: that test runs the
+// recursive nest (and tolerates a larger ratio precisely because its N-deep
+// recursion adds the memory-hierarchy constant this flat control isolates
+// away); this one pins the underlying work as linear with a tighter bound.
+namespace {
+
+[[nodiscard]] std::string flatChainSource(std::size_t additions) {
+    // `int main(void){return 0+0+…+0;}` — `additions` `+` ops, additions+1
+    // zeros. A left-assoc chain: the Pratt walker climbs it iteratively, so
+    // expression-depth peaks at ~2 and the default cap suffices (no large
+    // stack needed, unlike the deep nest).
+    std::string s = "int main(void){return 0";
+    for (std::size_t i = 0; i < additions; ++i) s += "+0";
+    s += ";}";
+    return s;
+}
+
+// Median wall-clock of `runs` clean flat-chain parses at `additions` length.
+// Uses EXPECT_ (not ASSERT_) so the helper stays valid in a non-void context.
+[[nodiscard]] std::chrono::nanoseconds
+timeFlatChainParse(std::shared_ptr<GrammarSchema const> const& schema,
+                   std::size_t additions, int runs) {
+    std::vector<std::chrono::nanoseconds> samples;
+    for (int r = 0; r < runs; ++r) {
+        auto src = SourceBuffer::fromString(flatChainSource(additions), "<flat>");
+        Tokenizer tk{src, schema};
+        auto [stream, lexDiags] = std::move(tk).tokenize();
+        Parser p{src, schema, std::move(stream)};
+        const auto t0 = std::chrono::steady_clock::now();
+        auto result = std::move(p).parse();
+        const auto t1 = std::chrono::steady_clock::now();
+        EXPECT_FALSE(result.tree.diagnostics().hasErrors())
+            << "flat chain of " << additions << " additions must parse clean";
+        samples.push_back(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0));
+    }
+    std::ranges::sort(samples);
+    return samples[samples.size() / 2];
+}
+
+// Node count of a single clean flat-chain parse (deterministic — one parse,
+// no timing). Used to pin the O(N)-STRUCTURE half of the linearity claim
+// independently of any wall-clock measurement.
+[[nodiscard]] std::uint32_t
+flatChainNodeCount(std::shared_ptr<GrammarSchema const> const& schema,
+                   std::size_t additions) {
+    auto src = SourceBuffer::fromString(flatChainSource(additions), "<flat>");
+    Tokenizer tk{src, schema};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+    Parser p{src, schema, std::move(stream)};
+    auto result = std::move(p).parse();
+    EXPECT_FALSE(result.tree.diagnostics().hasErrors())
+        << "flat chain of " << additions << " additions must parse clean";
+    return result.tree.nodeCount();
+}
+
+} // namespace
+
+TEST(ParserSpeculation, FlatChainParseWorkIsLinear) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+
+    constexpr int kRuns = 3;  // median-of-3 dampens Debug allocator jitter
+    (void)timeFlatChainParse(schema, 100, 1);  // warm allocator/caches
+    const auto t500  = timeFlatChainParse(schema, 500,  kRuns);
+    const auto t2000 = timeFlatChainParse(schema, 2000, kRuns);
+
+    // Quadrupling the chain length must scale ~4× (linear), not ~16× (O(N²)).
+    // A floor on the denominator avoids divide-by-noise on a fast baseline.
+    const double small =
+        std::max<double>(static_cast<double>(t500.count()), 1.0);
+    const double ratio = static_cast<double>(t2000.count()) / small;
+    EXPECT_LT(ratio, 8.0)
+        << "flat-chain parse scaled " << ratio << "× when the chain length "
+           "quadrupled (500→2000); linear is ~4×. A ratio approaching 16× "
+           "signals an O(N²) regression in the SHARED TreeBuilder / node-arena "
+           "/ schema-walker machinery (the deep-nest residual is a separate "
+           "memory-hierarchy effect -- D-PARSE-DEEP-NEST-RECURSION-MEMORY). "
+           "t500=" << (static_cast<double>(t500.count()) / 1e6) << "ms t2000="
+        << (static_cast<double>(t2000.count()) / 1e6) << "ms";
+
+    // O(N)-STRUCTURE pin (zero-flake complement to the timing guard above):
+    // the parse node count grows by a CONSTANT per added `+0` element, so its
+    // FIRST DIFFERENCE over equally-spaced lengths is constant ⇒ exactly
+    // linear. Using 500/1000/1500 (spacing 500) keeps this grammar-agnostic —
+    // no magic per-element constant. A super-linear NODE emission (structural
+    // O(N²), distinct from a time-only O(N²) the ratio above catches) would
+    // make the second difference non-zero.
+    const std::uint32_t n500  = flatChainNodeCount(schema, 500);
+    const std::uint32_t n1000 = flatChainNodeCount(schema, 1000);
+    const std::uint32_t n1500 = flatChainNodeCount(schema, 1500);
+    EXPECT_EQ(n1000 - n500, n1500 - n1000)
+        << "flat-chain node count must grow by a constant per element (linear "
+           "first difference); a non-constant difference signals super-linear "
+           "node emission. n500=" << n500 << " n1000=" << n1000
+        << " n1500=" << n1500;
 }

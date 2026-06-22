@@ -14,4 +14,7 @@ target_compile_definitions(analysis_compilation_unit PRIVATE DSS_SHARED_BUILD DS
 # CU2's addFile/addInMemory drive the full tokenize → parse pipeline
 # internally, so the CU layer now depends on tokenizer + analysis_syntactic
 # (in addition to core's Tree/DiagnosticReporter/GrammarSchema).
-target_link_libraries(analysis_compilation_unit PRIVATE core tokenizer analysis_syntactic)
+# FC13: the CU pipeline runs the config-selected C preprocessor between
+# tokenize and parse (gated on schema->preprocess().enabled), so it also
+# depends on analysis_preprocess.
+target_link_libraries(analysis_compilation_unit PRIVATE core tokenizer analysis_syntactic analysis_preprocess)

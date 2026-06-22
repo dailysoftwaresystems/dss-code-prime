@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -404,4 +405,103 @@ TEST(CompilationUnitCU2DeathTest, AddFileAfterFinishAborts) {
     // Exercises the addFile guard specifically (distinct from addInMemory).
     EXPECT_DEATH({ b.addFile("anything.toy"); },
                  "addFile.*called after finish");
+}
+
+// ── FC13 D-PP-FATAL-HALTS-PARSE: parser gated on a FATAL PP truncation ──
+
+namespace {
+[[nodiscard]] std::shared_ptr<GrammarSchema const> loadCSubsetSchema() {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) {
+        ADD_FAILURE() << "loadShipped(\"c-subset\") failed";
+        std::abort();
+    }
+    return *loaded;
+}
+} // namespace
+
+// A >256-deep nested macro argument trips the preprocessor's macro-
+// expansion-nesting backstop, which TRUNCATES the stream. The CU must
+// GATE the parser (parse an EOF-only stream) so the run halts cleanly:
+// the PP diagnostic surfaces, the parse does NOT crash / hang / cascade.
+// Pre-fix this fed the truncated deep-paren stream to the parser and
+// drove the expression recursion into a stack overflow / hang.
+TEST(CompilationUnitPPGate, FatalMacroNestingTruncationGatesParser) {
+    auto schema = loadCSubsetSchema();
+    ASSERT_TRUE(schema->preprocess().enabled);
+
+    // F(F(F(...F(0)...))) nested 300 deep > the PP's 256 backstop.
+    std::string src = "#define F(x) (x)\nint v = ";
+    constexpr int kNest = 300;
+    for (int i = 0; i < kNest; ++i) src += "F(";
+    src += "0";
+    for (int i = 0; i < kNest; ++i) src += ")";
+    src += ";\n";
+
+    UnitBuilder b{schema};
+    b.addInMemory(std::move(src), "<deep-macro>");
+    auto cu = std::move(b).finish();
+
+    // A tree was produced (no crash) and it carries the PP backstop
+    // diagnostic. The backstop emits P_PreprocessorUnsupported.
+    ASSERT_EQ(cu.trees().size(), 1u);
+    EXPECT_TRUE(hasCode(cu.trees()[0].diagnostics(),
+                        DiagnosticCode::P_PreprocessorUnsupported))
+        << "the macro-nesting backstop diagnostic must surface on the tree";
+    // NO expression-depth cascade: the parser was gated, so it never
+    // walked the truncated deep-paren remainder. (Pre-fix the truncated
+    // stream drove the expression recursion to its guard or a crash.)
+    EXPECT_FALSE(hasCode(cu.trees()[0].diagnostics(),
+                         DiagnosticCode::P_ExpressionTooDeep))
+        << "a gated parse must not emit a secondary expression-depth cascade";
+}
+
+// CONTROL (non-error path unchanged): an ordinary object-macro compile
+// with NO fatal PP error parses normally — the macro expands and the
+// program is structurally present (gate did NOT fire). RED-on-disable
+// for an over-broad gate: if the gate keyed on `hasErrors()` (or any
+// recoverable diagnostic) this clean compile would still parse, but an
+// unresolved-include sibling case (below) would wrongly gate.
+TEST(CompilationUnitPPGate, OrdinaryMacroCompileIsNotGated) {
+    auto schema = loadCSubsetSchema();
+    UnitBuilder b{schema};
+    b.addInMemory("#define Z 0\nint main(void){ return Z; }\n", "<ok>");
+    auto cu = std::move(b).finish();
+    ASSERT_EQ(cu.trees().size(), 1u);
+    // Clean: no PP fatal, no expression-depth diagnostic, and the tree is
+    // a real parse (root present, function decl reachable).
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors());
+    EXPECT_NE(cu.trees()[0].root(), InvalidNode);
+}
+
+// An UNRESOLVED `#include` is a RECOVERABLE PP error (the stream is
+// intact — the missing header just contributes nothing). The gate must
+// NOT fire: the rest of the file MUST still parse so its declarations
+// surface. RED-on-disable for the over-broad `hasErrors()` gate (which
+// would swallow the whole file on the include error).
+TEST(CompilationUnitPPGate, UnresolvedIncludeStillParsesRestOfFile) {
+    auto schema = loadCSubsetSchema();
+    UnitBuilder b{schema};
+    b.addInMemory("#include \"nonexistent_zzz.h\"\nint f(void){ return 0; }\n",
+                  "<missing-inc>");
+    auto cu = std::move(b).finish();
+    ASSERT_EQ(cu.trees().size(), 1u);
+    // The include error surfaced...
+    EXPECT_TRUE(hasCode(cu.trees()[0].diagnostics(),
+                        DiagnosticCode::P_PreprocessorIncludeError));
+    // ...but the parser STILL ran: the `f` function declaration is in the
+    // tree (gated-to-EOF would have dropped it).
+    const auto fnRule = cu.trees()[0].schema().rules().find("topLevelDecl");
+    bool sawFunc = false;
+    for (std::uint32_t i = 1; i < cu.trees()[0].nodeCount(); ++i) {
+        const NodeId id{i};
+        if (cu.trees()[0].kind(id) == NodeKind::Internal &&
+            fnRule.valid() && cu.trees()[0].rule(id).v == fnRule.v) {
+            sawFunc = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawFunc)
+        << "a recoverable PP error must NOT gate the parse — the rest of "
+           "the file must still parse";
 }

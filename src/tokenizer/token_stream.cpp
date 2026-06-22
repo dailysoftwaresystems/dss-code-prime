@@ -1,5 +1,7 @@
 #include "tokenizer/token_stream.hpp"
 
+#include <atomic>
+
 #include <cstdio>
 #include <cstdlib>
 
@@ -33,6 +35,20 @@ TokenStream::TokenStream(std::vector<Token> tokens,
     // style tests.
     if (tokens_.back().coreKind != CoreTokenKind::Eof)
         streamFatal("constructed with non-Eof trailing token — Tokenizer bug");
+}
+
+TokenStream TokenStream::fromTokens(std::vector<Token> tokens) {
+    // Independent instance-id counter, tagged in the high bit so a PP-built
+    // stream's id can never equal a Tokenizer-built stream's id (the two use
+    // separate counters; the tag makes the disjointness explicit). Bookmarks
+    // are validated per-instance, so this guarantees a bookmark from one
+    // stream is rejected by the other.
+    static std::atomic<std::uint64_t> counter{0};
+    const std::uint64_t id =
+        (std::uint64_t{1} << 63) | (++counter);
+    // The (vector, id) ctor fatal-asserts non-empty + trailing-Eof, so the
+    // PP's own contract (it always appends an Eof) is double-checked here.
+    return TokenStream{std::move(tokens), id};
 }
 
 TokenStream::TokenStream(TokenStream&& other) noexcept

@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <string_view>
 #include <vector>
 
@@ -108,6 +109,19 @@ public:
     [[nodiscard]] DiagnosticReporter const&  diagnostics()    const noexcept;
     [[nodiscard]] bool                       hasSchema()      const noexcept;
     [[nodiscard]] bool                       hasDiagnostics() const noexcept;
+
+    // Rewrite the (buffer, span) of every diagnostic this tree owns through
+    // `fn`. Used by the FC13 C-preprocessor pipeline to remap diagnostics
+    // off the synthesized buffer (which IS this tree's `source()`) back onto
+    // the real header/main file via the preprocessor's line-map, so a
+    // diagnostic originating in an included header is ATTRIBUTED to that
+    // header. This touches only diagnostic source-attribution metadata, not
+    // the tree's node structure -- the tree stays structurally immutable.
+    // No-op on a hand-built tree with no reporter.
+    template <class F>
+    void remapDiagnostics(F&& fn) {
+        if (data_.diagnostics) data_.diagnostics->remapBuffers(std::forward<F>(fn));
+    }
 
     // ── universal per-node accessors ──
     [[nodiscard]] NodeKind    kind(NodeId id)  const;

@@ -1,6 +1,9 @@
 add_library(core OBJECT
     compiler.cpp
 
+    # ── substrate/ — host/OS utilities (the first non-header-only one) ──
+    substrate/large_stack_call.cpp
+
     # ── types/ — universal in-memory model ──
     types/source_span.cpp
     types/source_buffer.cpp

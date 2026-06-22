@@ -5,6 +5,7 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/symbol_table.hpp"
 #include "analysis/semantic/type_rules.hpp"
+#include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: run analyze on a large stack
 #include "core/types/data_model.hpp"
 #include "core/types/decl_prefix_strip.hpp"   // declRoleChildren / descendVisibleDecl / specifierPrefixChild
 #include "core/types/declarator_walk.hpp"     // FC4: declaratorNameNode / collectDeclarators
@@ -4110,10 +4111,40 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 
 } // namespace
 
+// The full semantic-analysis pass, factored out of the public `analyze`
+// entry point so the latter can run it on a large worker-thread stack.
+// File-static: the only caller is `analyze` below. The recursion over the
+// expression tree (and the many tree walks it drives) overflows the host's
+// ~1 MB main stack at ~25 nesting levels (`D-PARSE-DEEP-FRONTEND-STACK`),
+// so `analyze` invokes this via `callOnLargeStack` on a 64 MiB stack.
+static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
+                                 DataModel dataModel,
+                                 std::optional<AggregateLayoutParams> aggregateLayout,
+                                 std::optional<VaListStrategy> vaListStrategy);
+
 SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       DataModel dataModel,
                       std::optional<AggregateLayoutParams> aggregateLayout,
                       std::optional<VaListStrategy> vaListStrategy) {
+    // Run the recursive analysis on a dedicated large-stack worker thread
+    // (JOIN-synchronous — no concurrency) so a deeply-nested-but-legal
+    // expression tree does not overflow the host's ~1 MB main thread stack.
+    // This is what lets `ParserConfig::maxExpressionDepth` be a real
+    // semantic cap (256) rather than a host-stack artifact
+    // (`D-PARSE-DEEP-FRONTEND-STACK`). The null-CU + every other contract
+    // check lives in `analyzeImpl`, which runs on the worker; any exception
+    // it throws is re-thrown here by `callOnLargeStack`.
+    return dss::substrate::callOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+            return analyzeImpl(std::move(cu), dataModel, std::move(aggregateLayout),
+                               std::move(vaListStrategy));
+        });
+}
+
+static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
+                                 DataModel dataModel,
+                                 std::optional<AggregateLayoutParams> aggregateLayout,
+                                 std::optional<VaListStrategy> vaListStrategy) {
     if (!cu) {
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();

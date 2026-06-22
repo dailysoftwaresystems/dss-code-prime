@@ -16,12 +16,39 @@
     "systemPathToken": "HeaderStart"
   },
 
+  "$preprocessComment": "FC13: opts c-subset into the config-SELECTED C preprocessor pass (src/analysis/preprocess/). `enabled:true` runs the pass between tokenize and parse: it builds ONE synthesized buffer by recursively splicing quote-#include\"h\" headers' text, tokenizes once, then runs the object-like macro pass (#define/#undef, expansion + rescan + blue-paint self-ref guard, directive removal). The TOKEN-name fields (directiveIntroToken/quoteIncludeToken/angleIncludeToken) are validated against the interned token kinds; the directive-keyword strings (define/undef/include) are matched by lexeme TEXT against the token after `#` (define/undef are NOT grammar keywords -- they lex as Identifier). Angle #include <h> is LEFT in place for the existing post-parse FF11 import resolver (so angleIncludeToken lets the PP RECOGNISE and pass it through). toy/tsql-subset declare NO preprocess block -> their pass is a strict identity (token stream in == out).",
+  "preprocess": {
+    "enabled":             true,
+    "directiveIntroToken": "HashOp",
+    "defineDirective":     "define",
+    "undefDirective":      "undef",
+    "includeDirective":    "include",
+    "quoteIncludeToken":   "StringStart",
+    "angleIncludeToken":   "HeaderStart",
+    "functionLikeOpenToken": "ParenOpen",
+    "functionLikeCloseToken": "ParenClose",
+    "functionLikeArgSeparatorToken": "Comma",
+    "variadicMarkerToken": "EllipsisOp",
+    "variadicArgsName": "__VA_ARGS__"
+  },
+
   "lexerModes": {
     "main":          { "tokens": "default" },
     "string":        { "defaultToken": { "kind": "StringLiteral", "coalesce": true } },
     "charBody":      { "defaultToken": { "kind": "CharLiteral",   "coalesce": true } },
 
-    "include-directive": {
+    "directive": {
+      "$comment": "FC13: the line-scoped C-directive mode. `#` pushes it (popAtNewline -> auto-pops at the next newline so a malformed directive never leaks state into the following line). It is an INLINE override table that lists ONLY `include`; the tokenizer falls back to the GLOBAL table for every other lexeme, so `define`/`undef`, `\"...\"`, identifiers AND operators all lex normally. CRUCIALLY there is NO `<`-override here: a `<` inside a NON-include directive (e.g. `#define X 1<<2`) falls back to the global `<<`/`<` operators -- no longer catastrophically mis-lexed. The `include` override re-emits IncludeKeyword AND arms the header context (replaceMode -> header-context) so the FOLLOWING `<h>` opens a header path. Scoping the mode-switch to THIS mode (rather than to the global `include` keyword) means a bare `include` identifier at main depth never triggers a replaceMode (which would abort at main-mode depth) -- it just lexes as IncludeKeyword with no side-effect.",
+      "tokens": {
+        "include": [{
+          "kind": "IncludeKeyword",
+          "modeOp": "replaceMode", "modeArg": "header-context"
+        }]
+      },
+      "popAtNewline": true
+    },
+    "header-context": {
+      "$comment": "FC13: armed by the `include` keyword (replaceMode). An INLINE override table lists ONLY `<`; the tokenizer falls back to the GLOBAL table for every other lexeme, so `\"h\"` still opens the quote-string body and identifiers lex normally. The ONE override is `<` -> HeaderStart (replaceMode -> header-body, stringStyle.endsAt `>`). The override-first longest-match rule means `<` wins at length 1 and the global `<<`/`<=` are deliberately suppressed inside an include header context -- correct, since `#include <<x>>` is not valid C. popAtNewline guards a malformed `#include` with no header.",
       "tokens": {
         "<": [{
           "kind": "HeaderStart",
@@ -44,7 +71,7 @@
 
   "$fc2CastExprComment": "FC2 Part A: C-style cast `(type)expr` (castExpr/castTypeRef/castTypeBase/castOperand shapes). castExpr shares the `( ... )` opener with compoundLiteralExpr/parenExpr inside the speculative operand alt; the probe disambiguates structurally (a brace-init follows the compound literal's `)`, an expression follows the cast's). `commitRequiresTypeName` names the type-position child rule: a structurally-successful probe COMMITS only per the parser's GENERIC type-name triage — (1) a type that is NOT a lone Identifier (keyword/struct-tag/star/const present) always commits, those forms cannot be expressions; (2) a lone Identifier the binder sketch knows as a TYPE commits; (3) one it knows as a VALUE rolls back to the value reading (shadowing-aware); (4) an UNKNOWN lone Identifier commits iff the token after the type's closer is NOT an infix/postfix/ternary operator per the operator table (the value reading could not continue), else rolls back AND records an AmbiguousTypeNameCandidate for the compilation-unit oracle's one-shot reparse (cross-file typedefs). castTypeRef duplicates typeRefAllowingStruct PLUS a bare-Identifier base (typedef names in cast position). NOTE (FC7 D-FC7-NESTED-STRUCT-FIELD): typeRefAllowingStruct ITSELF now also carries the bare-Identifier alt — but it is consumed ONLY by structField/unionField, and a struct/union body has NO expression-statement production, so the C decl-vs-expr ambiguity (`T x;` vs `a * b;`) cannot arise there (a bare name in field-type position is unambiguously a type; a non-type fails loud at semantic scope-lookup). varDecl/param do NOT use typeRefAllowingStruct — they use declHead/declHeadForParam with the binder-sketch `commitRequiresTypeName` commit — so the statement/param decl-vs-expr triage is untouched by that alt. castOperand is a second expr-entry rule re-entering the Pratt walker at PREFIX precedence (90): the cast operand binds prefix + postfix operators but NOT binary/ternary ones, giving C-correct `(int)a + b` == ((int)a)+b, `(int)x[2]` == (int)(x[2]), `-(int)x`, and `(int)(long)x` chains. Same wrapper vocabulary as `expression` (wrapper rule names are per-schema; the loader dedups).",
 
-  "$ff11AngleIncludeComment": "FF11 angle-include lexing. `#` pushes the line-scoped `include-directive` mode (popAtNewline:true -> the frame auto-pops at the next newline, so a malformed `#include` with no header -- or any directive -- never leaks `<`-as-header-opener into the following line; C preprocessor directives are line-oriented). That mode inherits the top-level token map (tokens:default) so `include`, `\"...\"`, and identifiers all lex normally; the ONLY override is `<`, which there OPENS a header path (replaceMode -> header-body, stringStyle.endsAt `>`) instead of meaning LtOp. The override-first longest-match rule (language-config-spec section 9.6) means `<` wins at length 1 and the global `<<`/`<=` are deliberately suppressed inside a directive -- correct, since `#include <<x>>` is not valid C. The `header-body` mode mirrors the `string` body: a coalesced `HeaderPath` token captures the raw path bytes between `<` and the closing `>` (which pops the frame back to main); escapeKind:none -- header paths have no escapes. The quote form keeps the global `\"`->StringStart->string body unchanged (additive: both `#include <h>` and `#include \"h\"` work). The resolver reads the raw path slice (a filename, not a decoded string) for both forms, and picks the search path by which token kind it finds under the directive (imports.pathToken=StringStart -> self-dir+includeDirs; imports.systemPathToken=HeaderStart -> shippedLibDirs).",
+  "$ff11AngleIncludeComment": "FF11 angle-include lexing (FC13 mode structure). `#` pushes the line-scoped `directive` mode (popAtNewline:true -> auto-pops at the next newline, so a malformed `#include` -- or any directive -- never leaks state into the following line; C directives are line-oriented). CRUCIALLY `directive` no longer overrides `<`: the ONLY override there is `include` (-> IncludeKeyword + replaceMode to `header-context`), so a `<` in a NON-include directive (e.g. `#define X 1<<2`) falls back to the global `<<`/`<` operators -- no longer mis-lexed as a header opener (the headline FC13 lexer fix). The `<`-OPENS-a-header-path override moved DOWNSTREAM to `header-context` (armed by `include`): there `<` -> HeaderStart (replaceMode -> header-body, stringStyle.endsAt `>`), while `\"h\"` still opens the quote-string body. The override-first longest-match rule (language-config-spec section 9.6) makes `<` win at length 1 inside `header-context` so `<<`/`<=` are suppressed THERE only -- correct, since `#include <<x>>` is not valid C. The `header-body` mode mirrors the `string` body: a coalesced `HeaderPath` captures the raw path bytes between `<` and the closing `>` (which pops back to main); escapeKind:none. The quote form keeps the global `\"`->StringStart->string body unchanged (both `#include <h>` and `#include \"h\"` work). The resolver reads the raw path slice (a filename, not a decoded string) for both forms, and picks the search path by which token kind it finds under the directive (imports.pathToken=StringStart -> self-dir+includeDirs; imports.systemPathToken=HeaderStart -> shippedLibDirs).",
 
   "tokens": {
     " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
@@ -74,7 +101,7 @@
     ",":  [{ "kind": "Comma" }],
     ":":  [{ "kind": "Colon" }],
 
-    "#": [{ "kind": "HashOp", "modeOp": "pushMode", "modeArg": "include-directive" }],
+    "#": [{ "kind": "HashOp", "modeOp": "pushMode", "modeArg": "directive" }],
     "\"": [{
       "kind": "StringStart",
       "modeOp": "pushMode", "modeArg": "string",

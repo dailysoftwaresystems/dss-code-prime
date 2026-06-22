@@ -2,6 +2,7 @@ add_subdirectory(core)
 add_subdirectory(tokenizer)
 add_subdirectory(analysis/syntactic)
 add_subdirectory(analysis/compilation_unit)
+add_subdirectory(analysis/preprocess)
 add_subdirectory(analysis/semantic)
 add_subdirectory(hir)
 add_subdirectory(hir/lowering)
@@ -35,6 +36,7 @@ add_subdirectory(program)
 # dropping PCH coverage.
 foreach(_dss_obj_lib
         core tokenizer analysis_syntactic analysis_compilation_unit
+        analysis_preprocess
         analysis_semantic hir hir_lowering mir mir_lowering mir_merge opt
         lir lir_lowering asm link ffi ffi_shipped ffi_abi ffi_mangling
         lsp program)
@@ -57,6 +59,7 @@ add_library(dss-code-prime-lib SHARED
     $<TARGET_OBJECTS:tokenizer>
     $<TARGET_OBJECTS:analysis_syntactic>
     $<TARGET_OBJECTS:analysis_compilation_unit>
+    $<TARGET_OBJECTS:analysis_preprocess>
     $<TARGET_OBJECTS:analysis_semantic>
     $<TARGET_OBJECTS:hir>
     $<TARGET_OBJECTS:hir_lowering>

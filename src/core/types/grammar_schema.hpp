@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/compiled_shape.hpp"
 #include "core/types/import_config.hpp"
+#include "core/types/preprocess_config.hpp"
 #include "core/types/lexer_mode.hpp"
 #include "core/types/type_lattice/core_type.hpp"  // TypeExtensionDescriptor
 #include "core/types/number_style.hpp"
@@ -296,6 +297,14 @@ struct DSS_EXPORT GrammarSchemaData {
     // the single language-agnostic import engine.
     ImportConfig                                      imports;
 
+    // Config-driven C-preprocessor (schema v4 `preprocess` block; FC13).
+    // Default `enabled == false` (no block) -> the preprocess pass is a
+    // strict identity. A block with `enabled: true` opts the language in and
+    // declares the directive vocabulary. Consumed by the single language-
+    // agnostic preprocessor pass -- NO engine code branches on the language
+    // name.
+    PreprocessConfig                                  preprocess;
+
     // Pratt-walker wrapper rule ids per `expr` shape (08.55 cleanup;
     // schema v4 `expr.wrapperRules`). Keyed by the expr rule's RuleId
     // value. The loader populates this BEFORE shape compile so the
@@ -541,6 +550,22 @@ public:
     [[nodiscard]] std::span<SchemaTokenId const> followSetOf(RuleId rule) const noexcept;
     [[nodiscard]] bool                           isNullable(RuleId rule) const noexcept;
 
+    // LL(k) PREDICTIVE PREFIX of `rule` — the per-offset over-approximation
+    // of the token sequences that can begin a derivation of `rule`, used by
+    // the parser to PRUNE speculative-alt candidates without backtracking.
+    // `predictivePrefixOf(rule)[i]` is the (sorted) exact set of token kinds
+    // admissible as the (i)-th consumed token across the rule's leading run
+    // of single-token elements (see `CompiledRule::predictivePrefix`).
+    //
+    // Empty when the rule carries no multi-token discriminator (entry is a
+    // lone non-terminal / AltChoice, or the rule is nullable/empty) — the
+    // caller then falls back to the standard 1-token FIRST gate. Each inner
+    // span is stable for the schema's lifetime. Config-derived; names no
+    // token, rule, or language.
+    [[nodiscard]] std::size_t predictivePrefixLen(RuleId rule) const noexcept;
+    [[nodiscard]] std::span<SchemaTokenId const>
+    predictivePrefixAt(RuleId rule, std::size_t offset) const noexcept;
+
     // Schema-declared panic-mode sync tokens. Sorted ascending by
     // `id.v`. Empty when the config omits the `syncTokens` field.
     // Parser's panic-mode recovery consumes until peek is in this set
@@ -562,6 +587,12 @@ public:
     // chooseResolver/ConfigDrivenImportResolver — the single language-agnostic
     // import engine; NO engine code branches on the language name.
     [[nodiscard]] ImportConfig const& imports() const noexcept;
+
+    // Config-driven C-preprocessor (schema v4 `preprocess` block). Default
+    // `enabled == false` when the config omits the block. Consumed by the
+    // single language-agnostic preprocessor pass; NO engine code branches on
+    // the language name.
+    [[nodiscard]] PreprocessConfig const& preprocess() const noexcept;
 
     // `expr`-shape introspection. `isExprRule` is true when the rule's
     // body was declared as `{ "expr": { "atom": ..., "minPrecedence": ... } }`.

@@ -37,6 +37,12 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::P_UnterminatedString:       return "P_UnterminatedString";
         case DiagnosticCode::P_UnterminatedComment:      return "P_UnterminatedComment";
         case DiagnosticCode::P_InvalidEscape:            return "P_InvalidEscape";
+        case DiagnosticCode::P_PreprocessorDirective:    return "P_PreprocessorDirective";
+        case DiagnosticCode::P_PreprocessorMacroRedefinition: return "P_PreprocessorMacroRedefinition";
+        case DiagnosticCode::P_PreprocessorUnsupported:  return "P_PreprocessorUnsupported";
+        case DiagnosticCode::P_PreprocessorIncludeError: return "P_PreprocessorIncludeError";
+        case DiagnosticCode::P_PreprocessorMacroArgument: return "P_PreprocessorMacroArgument";
+        case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
         case DiagnosticCode::P_UnfinishedTree:           return "P_UnfinishedTree";
@@ -74,6 +80,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_InvalidShippedFfiHeaderPath: return "C_InvalidShippedFfiHeaderPath";
         case DiagnosticCode::C_InvalidTargetName:        return "C_InvalidTargetName";
         case DiagnosticCode::C_InvalidFormatName:        return "C_InvalidFormatName";
+        case DiagnosticCode::C_InvalidPreprocess:        return "C_InvalidPreprocess";
         case DiagnosticCode::S_UndeclaredIdentifier:     return "S_UndeclaredIdentifier";
         case DiagnosticCode::S_RedeclaredSymbol:         return "S_RedeclaredSymbol";
         case DiagnosticCode::S_TypeMismatch:             return "S_TypeMismatch";

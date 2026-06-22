@@ -1548,14 +1548,14 @@ TEST(SemanticAnalyzerCSubset, BreakAfterLoopIsOutsideLoop) {
         << "a break after the loop closes is back at depth 0";
 }
 
-// ── GAP F: split `# include` ───────────────────────────────────────────────
+// ── GAP F (FC13): split `# include` ───────────────────────────────────────
 
-// `# include "x.h"` (whitespace between `#` and `include`) resolves the
-// include directive — `#` and `include` now tokenize separately, and the
-// EmptySpace between them is skipped by the cursor. We add the directive as
-// in-memory with an include dir holding the target.
-TEST(SemanticAnalyzerCSubset, SpacedIncludeIsRecognized) {
-    // Build a CU with a header on the include path and a spaced `# include`.
+// `# include "x.h"` (whitespace between `#` and `include`) is recognized by
+// the config-selected preprocessor (its directive scan skips trivia between
+// the intro `#` and the `include` word) and the header is INLINED. This both
+// closes GAP F and proves the FC13 splice handles a spaced directive: one
+// tree, zero cross-refs, header text present.
+TEST(SemanticAnalyzerCSubset, SpacedIncludeIsInlined) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path() / "dss_gapF_include_test";
     fs::create_directories(dir);
@@ -1566,13 +1566,15 @@ TEST(SemanticAnalyzerCSubset, SpacedIncludeIsRecognized) {
     auto schema = loadShippedSchema("c-subset");
     UnitBuilder builder{schema};
     builder.addIncludeDir(dir);
-    builder.addInMemory("# include \"x.h\"\nint main() { return 0; }\n", "main.c");
+    builder.addInMemory("# include \"x.h\"\nint main() { return helper(); }\n", "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
-    // The directive resolved → a cross-ref edge + the header tree was loaded.
-    EXPECT_EQ(cu->trees().size(), 2u);
-    EXPECT_EQ(cu->crossRefs().size(), 1u);
+    EXPECT_EQ(cu->trees().size(), 1u);
+    EXPECT_TRUE(cu->crossRefs().empty());
     EXPECT_FALSE(hasCode(cu->driverDiagnostics(), DiagnosticCode::D_UnresolvedImport));
+    EXPECT_NE(std::string{cu->trees()[0].source().text()}.find("int helper()"),
+              std::string::npos)
+        << "a spaced `# include` must still be recognized + inlined";
     std::error_code ec;
     fs::remove_all(dir, ec);
 }
