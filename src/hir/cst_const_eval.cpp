@@ -105,6 +105,17 @@ evalImpl(NodeId                              expr,
             lv.value = static_cast<std::int64_t>(*iv);
             return ok(std::move(lv));
         }
+        // Item 1 DIRECT-VALUE path: a named constant whose value is carried
+        // INLINE on its symbol (an enum enumerator or a shipped-descriptor
+        // constant) has no defining init-expression CST to recurse into — it
+        // resolves DIRECTLY to its literal. Tried BEFORE the init-resolver so
+        // `int a[CHAR_BIT]` / `int b[ENUM_VAL]` fold in const-expr position.
+        if (env.resolveSymbolValue) {
+            assert(tree.kind(expr) == NodeKind::Token);
+            if (auto direct = env.resolveSymbolValue(expr, currentScopeOpaque)) {
+                return ok(std::move(*direct));
+            }
+        }
         // Identifier-Ref path: if the caller supplied a resolver,
         // pass the identifier-token NodeId and recurse into the
         // resolved init expression. Cycle detection is keyed on the

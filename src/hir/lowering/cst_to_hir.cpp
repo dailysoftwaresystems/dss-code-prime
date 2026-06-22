@@ -1,6 +1,7 @@
 #include "hir/lowering/cst_to_hir.hpp"
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
+#include "analysis/semantic/constant_symbol_fold.hpp" // Item 1: shared enum/constant Ref->literal builder
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/type_rules.hpp"      // FC3 c1: usualArithmeticCommonType / resolveArithmeticRules
 #include "core/types/data_model.hpp"
@@ -1009,22 +1010,20 @@ struct Lowerer {
                 // the enum `type` so downstream coerce / UAC see the enum and
                 // resolve it via enumUnderlyingOrSelf. The makeRef below is the
                 // fallback for every non-enumerator identifier.
-                if (auto const* erec = model.recordFor(sym);
-                    erec != nullptr && erec->isEnumerator) {
-                    TypeKind core = TypeKind::I32;
-                    if (type.valid() && interner.kind(type) == TypeKind::Enum) {
-                        auto const sc = interner.scalars(type);
-                        if (!sc.empty()) core = static_cast<TypeKind>(sc[0]);
+                // A named integer CONSTANT (enum enumerator OR shipped-descriptor
+                // constant) folds its Ref to a literal via the ONE shared builder
+                // (constant_symbol_fold.hpp) — the same builder both const-eval
+                // engines use, so value- and const-expr-position agree. The
+                // literal keeps the node `type` (an enumerator's enum type flows
+                // to downstream coerce/UAC); the builder derives the literal CORE
+                // from the symbol's type (enum underlying / the constant's own
+                // scalar).
+                if (auto const* erec = model.recordFor(sym)) {
+                    if (auto lv = constantLiteralForSymbol(*erec, interner)) {
+                        return {track(builder.makeLiteral(
+                                          type, literals.add(std::move(*lv))), node),
+                                type};
                     }
-                    HirLiteralValue lv;
-                    lv.core = core;
-                    if (isSignedCore(core))
-                        lv.value = static_cast<std::int64_t>(erec->enumValue);
-                    else
-                        lv.value = static_cast<std::uint64_t>(erec->enumValue);
-                    return {track(builder.makeLiteral(
-                                      type, literals.add(std::move(lv))), node),
-                            type};
                 }
                 return {track(builder.makeRef(type, sym.v), node), type};
             }
@@ -2520,6 +2519,17 @@ struct Lowerer {
         // the resolver signature; the returned `initScopeOpaque`
         // is set to the symbol's own scope for parity with the
         // semantic-side resolver.
+        // Item 1: an inline-valued named constant (enum enumerator / shipped-
+        // descriptor constant) resolves DIRECTLY to its literal — no init-CST.
+        // Tried before resolveSymbolInit so `int a[CHAR_BIT]` folds.
+        env.resolveSymbolValue = [this](NodeId identTok, std::uint32_t /*curScope*/)
+            -> std::optional<HirLiteralValue> {
+            SymbolId const sym = model.symbolAt(identTok);
+            if (!sym.valid()) return std::nullopt;
+            SymbolRecord const* rec = model.recordFor(sym);
+            if (rec == nullptr) return std::nullopt;
+            return constantLiteralForSymbol(*rec, interner);
+        };
         env.resolveSymbolInit = [this](NodeId identTok, std::uint32_t /*curScope*/)
             -> std::optional<CstResolvedSymbol> {
             SymbolId const sym = model.symbolAt(identTok);

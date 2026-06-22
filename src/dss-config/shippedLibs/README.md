@@ -71,7 +71,17 @@ target's object format picks the runtime image from the map at resolution time.
 | `header`    | **yes**  | The header these symbols come from (`stdio.h`). This is the provenance answer to *"where does `puts` come from?"* — a descriptor that omitted it would defeat the purpose, so the reader **fails loud** (`F_ShippedLibDescriptorMalformed`) if it is missing or empty. |
 | `standard`  | no       | The language standard the surface targets (`c89`, `c99`, …). Provenance only. |
 | `library`   | no       | A per-OBJECT-FORMAT MAP (`"pe"`/`"elf"`/`"macho"` → runtime image). The active compilation target's object format selects its entry at `compile_pipeline` resolution (keyed by `objectFormatKindName`). **Optional**: a map MISSING the active format's key (or absent entirely) inherits the language's `externLibraryByFormat[format]` default for that format. A key NOT in the object-format vocabulary (a typo like `"pee"`) **fails loud** (`F_ShippedLibDescriptorMalformed`) on read. |
-| `symbols`   | yes      | The exported surface. Each entry: `name`, `signature` (a hir-text type string), `kind`, `linkage`. |
+| `symbols`   | no\*     | The exported LINK surface (extern functions/objects). Each entry: `name`, `signature` (a hir-text type string), `kind`, `linkage`. |
+| `constants` | no\*     | The header's object-like `#define` macro-CONSTANTS as NEUTRAL named integer constants (e.g. `CHAR_BIT`). Each entry: `name`, `value` (a JSON integer — the int64 BIT-PATTERN; for an unsigned `type` the uint64 value reinterpreted, so the full unsigned range round-trips), `type` (a hir-text INTEGER-SCALAR type, `i8`…`u128`). The semantic phase injects each as a compile-time constant that folds to a literal in VALUE and CONSTANT-EXPRESSION position (`int a[CHAR_BIT]`). A non-integer-scalar type, an out-of-range / negative-for-unsigned value, or an unknown key **fails loud**. A function-like / float / string macro is out of scope (not a constant). |
+| `typedefs`  | no\*     | The header's `typedef`s as NEUTRAL type aliases (e.g. `size_t`). Each entry: `name`, `type` (any hir-text type). Injected as a type-position name. A builtin type of the same name wins. |
+
+\* A descriptor must declare **at least one** of `symbols` / `constants` /
+`typedefs` (a descriptor that declares nothing **fails loud**). A header may
+legitimately carry only `constants` (e.g. `<limits.h>` — all macros, no link
+surface; see `limits.json`) or only `typedefs`. Because a C `.h` is C-syntax
+TEXT, shipping one would couple the language-NEUTRAL config to C — so a header's
+macros + typedefs live here as neutral data, injected by the semantic phase,
+NOT spliced as text (Item 1, 2026-06-22).
 
 The `signature` grammar is the IR type-text vocabulary documented in
 [`docs/ir-type-text.md`](../../../docs/ir-type-text.md) — the same codec the

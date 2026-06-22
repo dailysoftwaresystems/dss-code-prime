@@ -1669,6 +1669,96 @@ TEST(SemanticAnalyzerCSubset, FF11AngleIncludeResolvesPutsViaDescriptor) {
     EXPECT_EQ(model.lattice().interner().kind(ext.signature), TypeKind::FnSig);
 }
 
+// ── Item 1: shipped-header CONSTANTS + TYPEDEFS via the neutral descriptor ────
+
+// A shipped CONSTANT injects + folds in CONSTANT-EXPRESSION position (an array
+// dimension) — the const-eval direct-value arm (MF-1). The descriptor CHAR_BIT
+// (=8) makes `int a[CHAR_BIT]` a valid 8-element array. RED-ON-DISABLE: remove
+// the const-eval `resolveSymbolValue` arm and `int a[CHAR_BIT]` fails loud with
+// S_NonConstantArrayLength (an injected constant has no init-CST to walk).
+TEST(SemanticAnalyzerCSubset, ShippedConstantFoldsInArrayDimension) {
+    ScratchDir sysDir{Location::Temp, "item1-const"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "limits.json",
+        R"({ "header": "limits.h",
+             "constants": [ { "name": "CHAR_BIT", "value": 8, "type": "i32" } ] })",
+        "#include <limits.h>\nint main() { int a[CHAR_BIT]; return 0; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "CHAR_BIT must resolve to the injected descriptor constant";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NonConstantArrayLength), 0u)
+        << "the injected constant must fold in array-dimension (const-expr) position";
+    // The constant folded to the RIGHT value (8) — assert the resolved array
+    // EXTENT, not merely the absence of a fail-loud (red-on-WRONG-value, not
+    // just red-on-didn't-fold).
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 8)
+        << "CHAR_BIT must fold to 8 in the array dimension";
+}
+
+// A shipped TYPEDEF injects as a Type symbol + resolves in TYPE position.
+// RED-ON-DISABLE: skip the typedef injection loop and `my_int_t x;` fails loud
+// with S_UnknownType.
+TEST(SemanticAnalyzerCSubset, ShippedTypedefResolvesInTypePosition) {
+    ScratchDir sysDir{Location::Temp, "item1-typedef"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "mytypes.json",
+        R"({ "header": "mytypes.h",
+             "typedefs": [ { "name": "my_int_t", "type": "i32" } ] })",
+        "#include <mytypes.h>\nint main() { my_int_t x; x = 5; return x; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "my_int_t must resolve via the injected descriptor typedef";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
+}
+
+// GOAL-2: a user decl of a name WINS over a descriptor constant of the same
+// name — and the skip is SELECTIVE (a different descriptor constant the user
+// does NOT declare is still injected). The descriptor declares CHAR_BIT
+// (user-overridden) + WIDTH (injected). RED if it skips nothing (CHAR_BIT
+// doubled) AND RED if it skips everything (WIDTH lost → S_UndeclaredIdentifier).
+TEST(SemanticAnalyzerCSubset, ShippedConstantUserDeclWins) {
+    ScratchDir sysDir{Location::Temp, "item1-goal2"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "limits.json",
+        R"({ "header": "limits.h",
+             "constants": [ { "name": "CHAR_BIT", "value": 8,  "type": "i32" },
+                            { "name": "WIDTH",    "value": 32, "type": "i32" } ] })",
+        "int CHAR_BIT = 9;\n"
+        "#include <limits.h>\n"
+        "int main() { return CHAR_BIT + WIDTH; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countSymbolsNamed(model, "CHAR_BIT"), 1u)
+        << "the user's CHAR_BIT wins; the descriptor's is skipped (no double-bind)";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "WIDTH (not user-declared) must still inject + resolve";
+    EXPECT_FALSE(hasCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol));
+}
+
+// MF-3: a shipped constant is `isConst` — writing to it emits S_ConstViolation
+// (a macro constant is not assignable), and the InvalidTree / no-declRuleNode
+// symbol does NOT crash the const-violation path.
+TEST(SemanticAnalyzerCSubset, WriteToShippedConstantViolatesConst) {
+    ScratchDir sysDir{Location::Temp, "item1-constviol"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "limits.json",
+        R"({ "header": "limits.h",
+             "constants": [ { "name": "CHAR_BIT", "value": 8, "type": "i32" } ] })",
+        "#include <limits.h>\nint main() { CHAR_BIT = 5; return 0; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u)
+        << "writing to a shipped constant must fail loud (it is not assignable)";
+}
+
 // GOAL-2 BEHAVIOR PIN: a program that BOTH `#include <io.h>` (descriptor
 // declares `puts`) AND writes its OWN `extern char puts(int x);` — the USER
 // DECLARATION WINS. The descriptor injection SKIPS a name a user decl already

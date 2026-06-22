@@ -2,6 +2,7 @@
 
 #include "analysis/compilation_unit/unit_attribute.hpp"
 #include "analysis/semantic/scope_tree.hpp"
+#include "analysis/semantic/constant_symbol_fold.hpp" // Item 1: shared enum/constant Ref->literal builder
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/symbol_table.hpp"
 #include "analysis/semantic/type_rules.hpp"
@@ -855,6 +856,18 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
         // from that scope, returning the resolved symbol's init AND
         // its declaring scope so the engine carries the right
         // context into the recursive evaluation.
+        // Item 1: an inline-valued named constant (enum enumerator / shipped-
+        // descriptor constant) resolves DIRECTLY to its literal — no init-CST.
+        // Tried before resolveSymbolInit so `int a[CHAR_BIT]` / `int b[ENUM_VAL]`
+        // fold at this Pass-1.5 array-dimension stage. Shares the ONE
+        // `constantLiteralForSymbol` builder with the HIR Ref fold.
+        env.resolveSymbolValue = [&s, &tree](NodeId identTok, std::uint32_t curScopeOpaque)
+            -> std::optional<HirLiteralValue> {
+            SymbolId const sym =
+                s.scopes.lookup(ScopeId{curScopeOpaque}, tree.text(identTok));
+            if (!sym.valid()) return std::nullopt;
+            return constantLiteralForSymbol(s.symbols.at(sym), s.lattice.interner());
+        };
         env.resolveSymbolInit = [&s, &tree, cfg](NodeId identTok, std::uint32_t curScopeOpaque)
             -> std::optional<CstResolvedSymbol> {
             return resolveConstSymbolInit(s, tree, *cfg, ScopeId{curScopeOpaque},
@@ -4527,6 +4540,49 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 shippedExterns.push_back(ShippedExternSymbol{
                     id, sym.name, sym.signature, desc->library,
                     sym.kind == ffi::ShippedSymbolKind::Function});
+            }
+
+            // Item 1: inject the descriptor's CONSTANTS (the neutral form of a
+            // header's `#define` macro-constants, e.g. CHAR_BIT) as named
+            // integer-constant symbols. Goal-2 (a user decl of the name wins) +
+            // first-wins dedup share the SAME sets as symbols — constants,
+            // typedefs, and symbols are one name namespace. A constant has NO
+            // link surface, so it is NOT added to shippedExterns; it folds to
+            // its value at HIR Ref-lowering AND in constant-expression position
+            // (the const-eval direct-value arm), via `isInjectedConstant`.
+            for (auto const& c : desc->constants) {
+                if (userDeclaredNames.contains(c.name)) continue;
+                if (!injectedNames.insert(c.name).second) continue;  // first wins
+                SymbolRecord rec;
+                rec.name               = c.name;
+                rec.scope              = cuRoot;
+                rec.tree               = InvalidTree;   // not a user decl
+                rec.kind               = DeclarationKind::Variable;
+                rec.type               = c.type;
+                rec.enumValue          = c.value;       // the int64 bit-pattern
+                rec.isInjectedConstant = true;
+                rec.isConst            = true;          // a macro constant is not assignable
+                SymbolId const id = s.symbols.mint(rec);
+                s.scopes.injectBinding(cuRoot, c.name, id);
+            }
+
+            // Item 1: inject the descriptor's TYPEDEFS as `DeclarationKind::Type`
+            // symbols, so the name resolves in TYPE position (resolveTypeNode
+            // walks the scope chain). This block runs BEFORE Pass 1.5 type
+            // resolution, so a descriptor typedef is visible to a `T x;`
+            // declaration. (A builtin type of the same name wins —
+            // resolveTypeNode checks `builtinTypeIds` before the alias lookup.)
+            for (auto const& td : desc->typedefs) {
+                if (userDeclaredNames.contains(td.name)) continue;
+                if (!injectedNames.insert(td.name).second) continue;  // first wins
+                SymbolRecord rec;
+                rec.name  = td.name;
+                rec.scope = cuRoot;
+                rec.tree  = InvalidTree;   // not a user decl
+                rec.kind  = DeclarationKind::Type;
+                rec.type  = td.type;
+                SymbolId const id = s.symbols.mint(rec);
+                s.scopes.injectBinding(cuRoot, td.name, id);
             }
         }
     }

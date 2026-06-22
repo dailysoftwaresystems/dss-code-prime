@@ -5,10 +5,13 @@
 #include "core/types/object_format_kind.hpp"     // objectFormatKindFromName (library-map key vocabulary)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/strong_ids.hpp"            // InvalidType
+#include "core/types/type_lattice/core_type.hpp"   // TypeKind (constant integer-scalar gate)
+#include "core/types/type_lattice/type_interner.hpp" // TypeInterner::kind (constant type gate)
 #include "hir/hir_text.hpp"                      // parseTypeFromText (the ONE type decoder)
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
 #include <fstream>
 #include <initializer_list>
 #include <optional>
@@ -72,6 +75,58 @@ void emitMalformed(DiagnosticReporter& reporter, std::string what) {
     if (s == "external") return ShippedSymbolLinkage::External;
     if (s == "weak")     return ShippedSymbolLinkage::Weak;
     return std::nullopt;
+}
+
+// True for the core integer SCALAR kinds (signed + unsigned, I8..U128). A
+// shipped CONSTANT's `type` must be one of these: the HIR fold derives the
+// literal's core directly from this kind, so a float/pointer/string/aggregate
+// macro is out of scope and fails loud (a function-like macro is not a constant
+// at all).
+[[nodiscard]] bool isIntegerScalarKind(TypeKind k) {
+    return k >= TypeKind::I8 && k <= TypeKind::U128;
+}
+
+// Validate a JSON integer `value` fits the integer-scalar `kind` and return its
+// int64 BIT-PATTERN (for an unsigned kind the uint64 value reinterpreted; the
+// HIR fold re-reads it per the kind's signedness, so the full unsigned range --
+// e.g. `UINT_MAX` / `SIZE_MAX` -- round-trips losslessly). Returns nullopt (the
+// caller emits the error) on a non-integer / float JSON value, a negative value
+// for an unsigned kind, a value exceeding i64 for a signed kind, or a value
+// outside the kind's declared width.
+[[nodiscard]] std::optional<std::int64_t>
+decodeConstantValue(json const& v, TypeKind kind) {
+    bool const isSigned = (kind == TypeKind::I8 || kind == TypeKind::I16
+                        || kind == TypeKind::I32 || kind == TypeKind::I64
+                        || kind == TypeKind::I128);
+    // An I128/U128 constant is range-limited to 64-bit MAGNITUDE: `value` is an
+    // int64 carrier, and a JSON literal wider than 64 bits parses as a float and
+    // is rejected below — so a 128-bit constant cannot be WRONG, only capped at
+    // 64 bits. Widen `ShippedConstant::value` if a true >64-bit macro ever ships.
+    int const bits = (kind == TypeKind::I8  || kind == TypeKind::U8)  ? 8
+                   : (kind == TypeKind::I16 || kind == TypeKind::U16) ? 16
+                   : (kind == TypeKind::I32 || kind == TypeKind::U32) ? 32
+                   : (kind == TypeKind::I64 || kind == TypeKind::U64) ? 64
+                                                                      : 128;
+    if (isSigned) {
+        if (!v.is_number_integer()) return std::nullopt;   // float / non-integer
+        if (v.is_number_unsigned()
+            && v.get<std::uint64_t>() > static_cast<std::uint64_t>(INT64_MAX))
+            return std::nullopt;                           // exceeds i64
+        std::int64_t const x = v.get<std::int64_t>();
+        if (bits < 64) {
+            std::int64_t const lo = -(std::int64_t{1} << (bits - 1));
+            std::int64_t const hi =  (std::int64_t{1} << (bits - 1)) - 1;
+            if (x < lo || x > hi) return std::nullopt;
+        }
+        return x;
+    }
+    if (!v.is_number_unsigned()) return std::nullopt;      // negative / float / non-integer
+    std::uint64_t const x = v.get<std::uint64_t>();
+    if (bits < 64) {
+        std::uint64_t const hi = (std::uint64_t{1} << bits) - 1;
+        if (x > hi) return std::nullopt;
+    }
+    return static_cast<std::int64_t>(x);                   // bit-pattern (re-read per kind)
 }
 
 } // namespace
@@ -184,28 +239,29 @@ readShippedLibDescriptor(std::filesystem::path const& path,
         }
     }
 
-    // (3) Required `symbols` array (non-empty — a descriptor that declares no
-    // symbol is a no-op artifact that should not ship silently).
-    if (!doc.contains("symbols") || !doc.at("symbols").is_array()) {
+    // (3) `symbols` array — OPTIONAL. A header may carry only `constants`
+    // (e.g. <limits.h>, all `#define`s, no linkable symbols) or only
+    // `typedefs`; the "declares SOMETHING" requirement is enforced across
+    // symbols/constants/typedefs AFTER all three decode (a descriptor that
+    // declares nothing is a no-op artifact and still fails loud). If present,
+    // it must be an array.
+    if (doc.contains("symbols") && !doc.at("symbols").is_array()) {
         emitMalformed(reporter,
             std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': missing or non-array 'symbols'");
+                + "': 'symbols' must be an array");
         return std::nullopt;
     }
-    json const& symbols = doc.at("symbols");
-    if (symbols.empty()) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': 'symbols' array must contain at least one symbol");
-        return std::nullopt;
-    }
+    json const emptyArray = json::array();
+    json const& symbols =
+        doc.contains("symbols") ? doc.at("symbols") : emptyArray;
 
     // Reject unknown top-level keys (closed key set). `$comment` is the
     // repo-wide config-documentation convention (a `$`-prefixed key carrying a
     // human note, e.g. the LP64-vs-LLP64 deferral rationale in stdio/stdlib) —
     // accepted + ignored, never consumed by lowering.
     (void)rejectUnknownKeys(reporter, doc, "(root)",
-                            {"header", "standard", "library", "symbols", "$comment"});
+                            {"header", "standard", "library", "symbols",
+                             "constants", "typedefs", "$comment"});
 
     // (4) Each symbol. Collect-all: a malformed symbol is reported but the
     // loop continues so the operator sees every problem in one pass; the
@@ -366,6 +422,144 @@ readShippedLibDescriptor(std::filesystem::path const& path,
         }
 
         out.symbols.push_back(ShippedSymbol{std::move(name), sig, kind, linkage});
+    }
+
+    // (5) Optional `constants` array — the neutral form of a header's object-
+    // like `#define` macros that ARE compile-time constants (e.g. `CHAR_BIT`).
+    // Each: required non-empty `name`; required hir-text `type` that MUST decode
+    // to an INTEGER SCALAR (I8..U128); required integer `value` that MUST fit the
+    // type's width + signedness. Collect-all (continue on error; the read still
+    // fails via the errorCount delta). A non-integer-scalar type or an out-of-
+    // range value FAILS LOUD — never a silent wrong constant.
+    if (doc.contains("constants")) {
+        if (!doc.at("constants").is_array()) {
+            emitMalformed(reporter,
+                std::string{"shipped-lib descriptor '"} + path.generic_string()
+                    + "': 'constants' must be an array");
+            return std::nullopt;
+        }
+        json const& constants = doc.at("constants");
+        out.constants.reserve(constants.size());
+        std::size_t cidx = 0;
+        for (auto const& c : constants) {
+            std::string const at = std::string{"'"} + path.generic_string()
+                + "' constants[" + std::to_string(cidx) + "]";
+            ++cidx;
+            if (!c.is_object()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
+                continue;
+            }
+            (void)rejectUnknownKeys(reporter, c,
+                                    "constants[" + std::to_string(cidx - 1) + "]",
+                                    {"name", "value", "type"});
+            if (!c.contains("name") || !c.at("name").is_string()
+                || c.at("name").get<std::string>().empty()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": missing or empty 'name'");
+                continue;
+            }
+            std::string cname = c.at("name").get<std::string>();
+            if (!c.contains("type") || !c.at("type").is_string()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": missing or non-string 'type'");
+                continue;
+            }
+            std::string const typeText = c.at("type").get<std::string>();
+            TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter);
+            if (!cty.valid() || cty == InvalidType) {
+                dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                            DiagnosticSeverity::Error,
+                            "shipped-lib descriptor " + at + ": constant '" + cname
+                                + "' has a 'type' that failed to decode ('" + typeText
+                                + "')");
+                continue;
+            }
+            if (!isIntegerScalarKind(interner.kind(cty))) {
+                dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                            DiagnosticSeverity::Error,
+                            "shipped-lib descriptor " + at + ": constant '" + cname
+                                + "' type '" + typeText + "' is not an integer scalar "
+                                  "(a shipped constant must be an integer; a float / "
+                                  "pointer / function-like macro is out of scope)");
+                continue;
+            }
+            if (!c.contains("value") || !c.at("value").is_number()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": missing or non-numeric 'value'");
+                continue;
+            }
+            auto const bits = decodeConstantValue(c.at("value"), interner.kind(cty));
+            if (!bits.has_value()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": constant '"
+                    + cname + "' value does not fit its declared integer type '"
+                    + typeText + "' (out of range, negative-for-unsigned, or non-integer)");
+                continue;
+            }
+            out.constants.push_back(ShippedConstant{std::move(cname), *bits, cty});
+        }
+    }
+
+    // (6) Optional `typedefs` array — the neutral form of a header's `typedef`s
+    // (e.g. `size_t`). Each: required non-empty `name`; required hir-text `type`
+    // (any decodable type — scalar, pointer, struct ref, fn ptr). The semantic
+    // phase injects each as a `DeclarationKind::Type` symbol.
+    if (doc.contains("typedefs")) {
+        if (!doc.at("typedefs").is_array()) {
+            emitMalformed(reporter,
+                std::string{"shipped-lib descriptor '"} + path.generic_string()
+                    + "': 'typedefs' must be an array");
+            return std::nullopt;
+        }
+        json const& typedefs = doc.at("typedefs");
+        out.typedefs.reserve(typedefs.size());
+        std::size_t tidx = 0;
+        for (auto const& t : typedefs) {
+            std::string const at = std::string{"'"} + path.generic_string()
+                + "' typedefs[" + std::to_string(tidx) + "]";
+            ++tidx;
+            if (!t.is_object()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
+                continue;
+            }
+            (void)rejectUnknownKeys(reporter, t,
+                                    "typedefs[" + std::to_string(tidx - 1) + "]",
+                                    {"name", "type"});
+            if (!t.contains("name") || !t.at("name").is_string()
+                || t.at("name").get<std::string>().empty()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": missing or empty 'name'");
+                continue;
+            }
+            std::string tname = t.at("name").get<std::string>();
+            if (!t.contains("type") || !t.at("type").is_string()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": missing or non-string 'type'");
+                continue;
+            }
+            std::string const typeText = t.at("type").get<std::string>();
+            TypeId const tty = parseTypeFromText(typeText, interner, typeReg, reporter);
+            if (!tty.valid() || tty == InvalidType) {
+                dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                            DiagnosticSeverity::Error,
+                            "shipped-lib descriptor " + at + ": typedef '" + tname
+                                + "' has a 'type' that failed to decode ('" + typeText
+                                + "')");
+                continue;
+            }
+            out.typedefs.push_back(ShippedTypedef{std::move(tname), tty});
+        }
+    }
+
+    // (7) A descriptor must declare SOMETHING — a file with no symbols, no
+    // constants, AND no typedefs is a no-op artifact that should not ship
+    // silently (mirrors the old non-empty-`symbols` rule, now spanning all
+    // three surfaces).
+    if (out.symbols.empty() && out.constants.empty() && out.typedefs.empty()) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor '"} + path.generic_string()
+                + "': declares nothing — needs at least one of 'symbols', "
+                  "'constants', or 'typedefs'");
+        return std::nullopt;
     }
 
     // Fail loud, never partial: if ANY diagnostic was emitted while reading
