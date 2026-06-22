@@ -3201,6 +3201,93 @@ TEST(LirCallconvVariadicFC12deferral4, Aapcs64VaStartFixedStackOverflowBaseCongr
 // `sawLoadUAtLargeOffset` flips false. (The corpus would then fail to encode at the
 // assembler — A_ImmediateOperandOutOfRange — but this structural pin catches it earlier
 // and host-independently, on every CI leg.)
+TEST(LirCallconvLargeFrameImm12, Aapcs64FrameBeyondImm12EmitsTwoSubTwoAdd) {
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: a function whose frame
+    // exceeds the single-word imm12 reach (4095) — `int big[9000]` is
+    // 36000B — must have a prologue that adjusts SP with the 2-word
+    // shifted-imm12 macro (TWO `sub sp` words: a sh=0 word then a sh=1
+    // word) and an epilogue with the mirror TWO `add sp` words. The
+    // LIR carries ONE `sub`/`add` instruction each; the TWO-word
+    // expansion is the encoder's doing, so this pin assembles to BYTES
+    // and counts the machine words — host-independent (no execution).
+    //
+    // RED-ON-DISABLE: revert the encoder's imm12.hilo24 split (or the
+    // variant's immMin/immMax routing) → the single `sub sp,#36016`
+    // either fails loud at the assembler (A_ImmediateOperandOutOfRange,
+    // the OLD behavior — `errorCount != 0` below catches it) or, if the
+    // variant were mis-keyed, emits ONE word → the two-word count goes red.
+    auto bundle = lowerThroughRewrite(
+        "int big_frame(void) {\n"
+        "    int big[9000];\n"          // 36000B local -> frame > 4095
+        "    big[8999] = 42;\n"
+        "    return big[8999];\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "arm64 large-frame callee lower";
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter legRep;
+    auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
+                                    legRep);
+    ASSERT_TRUE(legal.ok());
+    DiagnosticReporter ccRep;
+    auto cc = materializeCallingConvention(legal.lir, *bundle.lowered.target,
+                                           bundle.alloc, ccRep);
+    ASSERT_TRUE(cc.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* layout = cc.forFuncByIndex(0);
+    ASSERT_NE(layout, nullptr);
+    ASSERT_GT(layout->totalFrameSize, 4095u)
+        << "the touched 9000-int array MUST push the frame past the single-"
+           "word imm12 reach (4095) — got " << layout->totalFrameSize;
+
+    std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    DiagnosticReporter asmRep;
+    auto mod = assemble(cc.lir, *bundle.lowered.target, lirToMir, asmRep);
+    EXPECT_EQ(asmRep.errorCount(), 0u)
+        << "a >4095-byte frame must assemble cleanly via the 2-word shifted-"
+           "imm12 SP adjust (NOT fail loud as it did before this fix)";
+    ASSERT_EQ(mod.functions.size(), 1u);
+    auto const& fnBytes = mod.functions[0].bytes;
+
+    // Derive the EXACT word pair from the resolved frame size — the same
+    // split the encoder performs (lo = V & 0xFFF, hi = (V>>12) & 0xFFF),
+    // Rd = Rn = sp = 31. Host-independent: the expected bytes follow the
+    // frame size, not a baked constant.
+    std::uint32_t const V  = layout->totalFrameSize;
+    std::uint32_t const lo = V & 0xFFFu;
+    std::uint32_t const hi = (V >> 12) & 0xFFFu;
+    auto leWord = [](std::uint32_t w) {
+        return std::array<std::uint8_t, 4>{
+            static_cast<std::uint8_t>(w & 0xFF),
+            static_cast<std::uint8_t>((w >> 8) & 0xFF),
+            static_cast<std::uint8_t>((w >> 16) & 0xFF),
+            static_cast<std::uint8_t>((w >> 24) & 0xFF)};
+    };
+    auto countWord = [&](std::uint32_t w) {
+        auto const pat = leWord(w);
+        std::uint32_t n = 0;
+        for (std::size_t i = 0; i + 4 <= fnBytes.size(); i += 4) {
+            if (std::equal(pat.begin(), pat.end(), fnBytes.begin() + i)) ++n;
+        }
+        return n;
+    };
+    // SUB sp,sp,#lo (sh=0, 0xD1000000) + SUB sp,sp,#hi,LSL#12 (sh=1, 0xD1400000).
+    std::uint32_t const subLo = 0xD1000000u | (lo << 10) | (31u << 5) | 31u;
+    std::uint32_t const subHi = 0xD1400000u | (hi << 10) | (31u << 5) | 31u;
+    // ADD sp,sp,#lo (sh=0, 0x91000000) + ADD sp,sp,#hi,LSL#12 (sh=1, 0x91400000).
+    std::uint32_t const addLo = 0x91000000u | (lo << 10) | (31u << 5) | 31u;
+    std::uint32_t const addHi = 0x91400000u | (hi << 10) | (31u << 5) | 31u;
+
+    // The leaf function adjusts SP exactly once in the prologue (one sub
+    // pair) and once in the epilogue (one add pair). Both halves of each
+    // pair must be present.
+    EXPECT_EQ(countWord(subLo), 1u) << "prologue must emit the sh=0 `sub sp,#lo` word";
+    EXPECT_EQ(countWord(subHi), 1u) << "prologue must emit the sh=1 `sub sp,#hi,LSL#12` word";
+    EXPECT_EQ(countWord(addLo), 1u) << "epilogue must emit the sh=0 `add sp,#lo` word";
+    EXPECT_EQ(countWord(addHi), 1u) << "epilogue must emit the sh=1 `add sp,#hi,LSL#12` word";
+}
+
 TEST(LirCallconvLargeFrameImm12, Aapcs64NinthFixedParamLoadUsesScaledLoadU) {
     // `long pad[40]` (320B) forces the frame > 255. An array alloca is never
     // scalar-promoted (mem2reg refuses array allocas), and this pipeline runs

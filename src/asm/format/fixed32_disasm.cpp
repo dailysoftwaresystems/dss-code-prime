@@ -55,6 +55,14 @@ windowFor(EncodingSlotKind s) noexcept {
         // scaled twin closed the cheaper sibling at the same time.
         case EncodingSlotKind::Imm12:          return SlotBitWindow{ 10, 12 };
         case EncodingSlotKind::Imm12Scaled:    return SlotBitWindow{ 10, 12 };
+        // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the shifted-imm12 word-
+        // pair's per-word bit-window is bits 10..21 (same as Imm12). This
+        // mirror extracts the RAW 12-bit field of WHICHEVER word it is
+        // applied to (word0 = the low 12 bits, word1 = the high 12 bits);
+        // the full-value reassembly across the two words stays anchored
+        // under D-AS5-MULTIWORD-DISASM (the round-trip oracle today pins
+        // per-word fields, not the recombined value).
+        case EncodingSlotKind::Imm12HiLo24:    return SlotBitWindow{ 10, 12 };
         // Every remaining slot decodes to nullopt. This is an
         // intentionally PARTIAL mirror of `fixed32::windowFor`: the
         // round-trip decoder only needs the register/immediate windows

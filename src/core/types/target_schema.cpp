@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <limits>
 #include <span>
 #include <sstream>
 #include <unordered_map>
@@ -142,6 +143,37 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         }
         for (std::size_t vi = 0; vi < o.encoding.variants.size(); ++vi) {
             auto const& v = o.encoding.variants[vi];
+            // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: immMin/immMax
+            // coherence. (a) Both present ⇒ immMin <= immMax (an inverted
+            // range matches NOTHING — a silent dead variant). (b) Either
+            // present ⇒ the guard MUST declare an immediate-bearing operand
+            // (ImmInt or MemOffset) for the magnitude matcher to read;
+            // otherwise the bound keys on a value that does not exist and
+            // the variant would match nothing (or match-any inconsistently).
+            if (v.immMin.has_value() && v.immMax.has_value()
+                && *v.immMin > *v.immMax) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}/guard", i, vi),
+                     std::format("opcode '{}' variant {}: immMin ({}) > immMax "
+                                 "({}) — an inverted magnitude range matches no "
+                                 "instruction (silent dead variant)",
+                                 o.mnemonic, vi, *v.immMin, *v.immMax));
+            }
+            if (v.immMin.has_value() || v.immMax.has_value()) {
+                bool const hasImmOperand = std::any_of(
+                    v.operandKinds.begin(), v.operandKinds.end(),
+                    [](OperandKindFilter f) {
+                        return f == OperandKindFilter::ImmInt
+                            || f == OperandKindFilter::MemOffset;
+                    });
+                if (!hasImmOperand) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/guard", i, vi),
+                         std::format("opcode '{}' variant {}: declares "
+                                     "immMin/immMax but its operandKinds carry "
+                                     "no 'imm32' or 'memoffset' operand — there "
+                                     "is no immediate magnitude to key on",
+                                     o.mnemonic, vi));
+                }
+            }
             // `opcodeBytes` is meaningful only for the x86-variable
             // shape. fixed32 carries the analog as `fixedWord` (a
             // 32-bit base bit pattern). The "non-empty" rule
@@ -638,11 +670,32 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         // widths the keyed one does NOT declare (if last) — both are
         // config bugs; the author must key EVERY same-kind sibling
         // once any of them is width-discriminated.
+        // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the immediate-magnitude
+        // axis is a SECOND disambiguator. Two same-operandKinds variants
+        // whose [immMin,immMax] ranges are DISJOINT are unambiguously
+        // selectable by VALUE (a frame ≤4095 → the single-word imm12
+        // variant; >4095 → the shifted-imm12 variant), so they do NOT
+        // overlap — regardless of width. Only when the imm-ranges OVERLAP
+        // (or both are absent ⇒ both match-any) does the width check below
+        // decide reachability. Effective range: absent immMin ⇒ 0, absent
+        // immMax ⇒ UINT32_MAX (the match-any bounds).
+        auto const effLo = [](TargetEncodingVariant const& v) -> std::uint32_t {
+            return v.immMin.value_or(0u);
+        };
+        auto const effHi = [](TargetEncodingVariant const& v) -> std::uint32_t {
+            return v.immMax.value_or(std::numeric_limits<std::uint32_t>::max());
+        };
         for (std::size_t a = 0; a < o.encoding.variants.size(); ++a) {
             for (std::size_t b = a + 1; b < o.encoding.variants.size(); ++b) {
                 auto const& va = o.encoding.variants[a];
                 auto const& vb = o.encoding.variants[b];
                 if (va.operandKinds != vb.operandKinds) continue;
+                // Disjoint imm-ranges ⇒ value-distinguishable, never a
+                // shadow. `[loA,hiA]` and `[loB,hiB]` are disjoint iff
+                // hiA < loB or hiB < loA.
+                if (effHi(va) < effLo(vb) || effHi(vb) < effLo(va)) {
+                    continue;
+                }
                 if (va.guardWidthBits == vb.guardWidthBits) {
                     fail(std::format("/opcodes/{}/encoding/variants/{}", i, b),
                          std::format("opcode '{}': variant {} has the "

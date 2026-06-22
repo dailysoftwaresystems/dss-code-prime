@@ -985,12 +985,19 @@ TEST(Arm64Encoder, BaseIndexLeaNonZeroDispFailsLoud) {
            "(memoffset.zero guard), never silently drop or mis-encode it";
 }
 
-TEST(Arm64Encoder, FrameLeaOffsetWiderThanImm12FailsLoud) {
-    // RED-on-disable for the UNSIGNED Imm12 range guard on the frame-lea:
-    // a frame offset wider than unsigned 12-bit (0..4095) must fail loud
-    // rather than silently truncate to a WRONG stack slot. 5000 > 4095.
-    // The shifted `ADD imm12<<12` form for larger frames is a future
-    // generalization — D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE.
+TEST(Arm64Encoder, FrameLeaOffsetWiderThanImm12SplitsToShifted) {
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: a frame-lea offset wider
+    // than the single-word imm12 reach (4095) is no longer fail-loud — it
+    // SPLITS into a 2-word `ADD Xd,Xn,#lo` + `ADD Xd,Xd,#hi,LSL #12` macro
+    // (the imm12.hilo24 slot). EXACT byte-pin for `lea x2, [sp + #35996]`:
+    //   35996 = 0x8C9C → lo = 0xC9C, hi = 0x8.
+    //   word0 = ADD x2, sp, #0xC9C  : 0x91000000 | (0xC9C<<10) | (31<<5) | 2
+    //         = 0x913273E2 → LE bytes E2 73 32 91
+    //   word1 = ADD x2, x2, #0x8,LSL#12 : 0x91400000 | (0x8<<10) | (2<<5) | 2
+    //         = 0x91402042 → LE bytes 42 20 40 91
+    // word1 reads its OWN dest (x2) — SCRATCH-FREE. A wrong split (lo/hi
+    // swap), a missing sh=1 bit (0x400000) in word1, or a dropped Rd-thread
+    // through word1.Rn all diverge these bytes (red-on-disable).
     auto s = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(s.has_value());
     auto const leaOp = (*s)->opcodeByMnemonic("lea");
@@ -1003,7 +1010,53 @@ TEST(Arm64Encoder, FrameLeaOffsetWiderThanImm12FailsLoud) {
     LirOperand const ops[] = {
         LirOperand::makeReg(gpr(**s, "sp")),
         LirOperand::makeMemBase(1),
-        LirOperand::makeMemOffset(5000)
+        LirOperand::makeMemOffset(35996)
+    };
+    (void)b.addInst(*leaOp, gpr(**s, "x2"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    // word0 (E2 73 32 91)
+    EXPECT_EQ(bytes[0], 0xE2);
+    EXPECT_EQ(bytes[1], 0x73);
+    EXPECT_EQ(bytes[2], 0x32);
+    EXPECT_EQ(bytes[3], 0x91);
+    // word1 (42 20 40 91)
+    EXPECT_EQ(bytes[4], 0x42);
+    EXPECT_EQ(bytes[5], 0x20);
+    EXPECT_EQ(bytes[6], 0x40);
+    EXPECT_EQ(bytes[7], 0x91);
+}
+
+TEST(Arm64Encoder, FrameLeaOffsetBeyond16MiBFailsLoud) {
+    // RED-on-disable for the 24-bit (16 MiB) ceiling of the shifted-imm12
+    // word-pair: a frame offset > 0xFFFFFF has no 2-word ADD encoding (the
+    // high 12 bits would overflow word1's imm12 field) and MUST fail loud
+    // — the residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (a third word
+    // / MOVZ+MOVK scratch is its future generalization). 0x1000000 (16 MiB)
+    // is exactly one past the ceiling. The shipped lea variant's
+    // `immMax:16777215` EXCLUDES this value at the VARIANT SELECTOR, so the
+    // diagnostic is A_NoMatchingEncodingVariant (the selector rejects it
+    // before the encoder's 24-bit writeHiLo24 gate — that gate is
+    // defense-in-depth, unreachable through the shipped schema). The pin's
+    // contract is FAIL-LOUD, not a specific code: a >16MiB offset must
+    // never silently truncate to a wrong frame slot.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(0x1000000)   // 16 MiB — one past the ceiling
     };
     (void)b.addInst(*leaOp, gpr(**s, "x2"), ops);
     (void)b.addReturn(*retOp, {});
@@ -1011,15 +1064,216 @@ TEST(Arm64Encoder, FrameLeaOffsetWiderThanImm12FailsLoud) {
     DiagnosticReporter rep;
     std::vector<MirInstId> lirToMir(lir.instCount());
     (void)assemble(lir, **s, lirToMir, rep);
-    bool sawOutOfRange = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange) {
-            sawOutOfRange = true;
-        }
-    }
-    EXPECT_TRUE(sawOutOfRange)
-        << "a >12-bit frame-lea offset must emit A_ImmediateOperandOutOfRange";
-    EXPECT_GT(rep.errorCount(), 0u);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a >16MiB frame-lea offset must fail loud (no matching variant), "
+           "never silently truncate to a wrong frame slot";
+}
+
+TEST(Arm64Encoder, SubSpFrameWiderThanImm12SplitsToShifted) {
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 (prologue): the callconv's
+    // `sub sp, sp, #frame` ([reg, ImmInt] form) splits when frame > 4095.
+    // EXACT byte-pin for `sub sp, sp, #36032` (36032 = 0x8CC0; lo = 0xCC0,
+    // hi = 0x8; Rd = Rn = sp = 31):
+    //   word0 = SUB sp,sp,#0xCC0 : 0xD1000000|(0xCC0<<10)|(31<<5)|31 = 0xD13303FF → FF 03 33 D1
+    //   word1 = SUB sp,sp,#0x8,LSL#12 : 0xD1400000|(0x8<<10)|(31<<5)|31 = 0xD14023FF → FF 23 40 D1
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subOp = (*s)->opcodeByMnemonic("sub");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(36032)
+    };
+    (void)b.addInst(*subOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0xFF);
+    EXPECT_EQ(bytes[1], 0x03);
+    EXPECT_EQ(bytes[2], 0x33);
+    EXPECT_EQ(bytes[3], 0xD1);
+    EXPECT_EQ(bytes[4], 0xFF);
+    EXPECT_EQ(bytes[5], 0x23);
+    EXPECT_EQ(bytes[6], 0x40);
+    EXPECT_EQ(bytes[7], 0xD1);
+}
+
+TEST(Arm64Encoder, AddSpFrameWiderThanImm12SplitsToShifted) {
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 (epilogue): `add sp, sp,
+    // #frame` splits when frame > 4095. EXACT byte-pin for `add sp, sp,
+    // #36032` (same 0x8CC0 split, ADD base 0x91000000 / 0x91400000):
+    //   word0 = ADD sp,sp,#0xCC0 : 0x913303FF → FF 03 33 91
+    //   word1 = ADD sp,sp,#0x8,LSL#12 : 0x914023FF → FF 23 40 91
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const addOp = (*s)->opcodeByMnemonic("add");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(addOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(36032)
+    };
+    (void)b.addInst(*addOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0xFF);
+    EXPECT_EQ(bytes[1], 0x03);
+    EXPECT_EQ(bytes[2], 0x33);
+    EXPECT_EQ(bytes[3], 0x91);
+    EXPECT_EQ(bytes[4], 0xFF);
+    EXPECT_EQ(bytes[5], 0x23);
+    EXPECT_EQ(bytes[6], 0x40);
+    EXPECT_EQ(bytes[7], 0x91);
+}
+
+TEST(Arm64Encoder, FrameSubSpAtImm12BoundaryStaysSingleWord) {
+    // Boundary pin: 4095 (the imm12 max) selects the SINGLE-word variant
+    // (immMax:4095) — 4 bytes, no shift word. `sub sp, sp, #4095`:
+    //   0xD1000000 | (4095<<10) | (31<<5) | 31 = 0xD13FFFFF → FF FF 3F D1
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subOp = (*s)->opcodeByMnemonic("sub");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(4095)
+    };
+    (void)b.addInst(*subOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // sub (4 bytes) + ret (4 bytes) = 8; the single-word sub is the FIRST 4.
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xFF);
+    EXPECT_EQ(bytes[1], 0xFF);
+    EXPECT_EQ(bytes[2], 0x3F);
+    EXPECT_EQ(bytes[3], 0xD1);
+}
+
+TEST(Arm64Encoder, FrameSubSpJustPastImm12IsTwoWord) {
+    // Boundary pin: 4096 (one past imm12 max) selects the 2-word shifted
+    // variant (immMin:4096). `sub sp, sp, #4096` (lo = 0, hi = 1):
+    //   word0 = SUB sp,sp,#0 : 0xD1000000|(0<<10)|(31<<5)|31 = 0xD10003FF → FF 03 00 D1
+    //   word1 = SUB sp,sp,#1,LSL#12 : 0xD1400000|(1<<10)|(31<<5)|31 = 0xD14007FF → FF 07 40 D1
+    // The 2-word emission (8 bytes prologue, not 4) is itself the proof the
+    // 4096 boundary routes to the shifted form.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subOp = (*s)->opcodeByMnemonic("sub");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(4096)
+    };
+    (void)b.addInst(*subOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0xFF);
+    EXPECT_EQ(bytes[1], 0x03);
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0xD1);
+    EXPECT_EQ(bytes[4], 0xFF);
+    EXPECT_EQ(bytes[5], 0x07);
+    EXPECT_EQ(bytes[6], 0x40);
+    EXPECT_EQ(bytes[7], 0xD1);
+}
+
+TEST(Arm64Encoder, FrameSubSpAt16MiBMinusOneIsTwoWord) {
+    // Boundary pin: 16777215 (0xFFFFFF, the 24-bit max) is the LARGEST
+    // value the shifted word-pair encodes. lo = 0xFFF, hi = 0xFFF:
+    //   word0 = SUB sp,sp,#0xFFF : 0xD1000000|(0xFFF<<10)|(31<<5)|31 = 0xD13FFFFF → FF FF 3F D1
+    //   word1 = SUB sp,sp,#0xFFF,LSL#12 : 0xD1400000|(0xFFF<<10)|(31<<5)|31 = 0xD17FFFFF → FF FF 7F D1
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subOp = (*s)->opcodeByMnemonic("sub");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(16777215)
+    };
+    (void)b.addInst(*subOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0xFF);
+    EXPECT_EQ(bytes[1], 0xFF);
+    EXPECT_EQ(bytes[2], 0x3F);
+    EXPECT_EQ(bytes[3], 0xD1);
+    EXPECT_EQ(bytes[4], 0xFF);
+    EXPECT_EQ(bytes[5], 0xFF);
+    EXPECT_EQ(bytes[6], 0x7F);
+    EXPECT_EQ(bytes[7], 0xD1);
+}
+
+TEST(Arm64Encoder, FrameSubSpAt16MiBFailsLoud) {
+    // Boundary pin: 16777216 (0x1000000, one past the 24-bit ceiling)
+    // fails loud — no variant matches (immMax:16777215 excludes it) so the
+    // selector reports A_NoMatchingEncodingVariant. (The lea path's encoder
+    // gate emits A_ImmediateOperandOutOfRange; the add/sub path's VARIANT
+    // selector rejects 0x1000000 before the encoder — either way the
+    // function fails to assemble loud, never silently truncates.)
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subOp = (*s)->opcodeByMnemonic("sub");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(16777216)
+    };
+    (void)b.addInst(*subOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    (void)assemble(lir, **s, lirToMir, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a >16MiB sub-sp frame must fail loud (no matching variant), "
+           "never silently truncate the frame size";
 }
 
 // ── Shape-vs-slot validate rejection ──────────────────────────────

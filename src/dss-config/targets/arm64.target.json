@@ -265,13 +265,27 @@
             ]
           },
           {
-            "$comment": "ADD Xd, Xn, #imm12 (immediate). Fixed word 0x91000000 (sf=1, op=0 add, S=0, sh=0). imm12 at bits 10..21 via the Imm12 slot; Rd 0..4, Rn 5..9. Used by the callconv prologue/epilogue stack adjust (`add sp, sp, #frame`). 2-operand LIR form [reg, imm]: operand 0 → Rn (also the dest via resultSlot), operand 1 → Imm12. Range 0..4095.",
-            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64 },
+            "$comment": "ADD Xd, Xn, #imm12 (immediate, single word). Fixed word 0x91000000 (sf=1, op=0 add, S=0, sh=0). imm12 at bits 10..21 via the Imm12 slot; Rd 0..4, Rn 5..9. Used by the callconv prologue/epilogue stack adjust (`add sp, sp, #frame`) when the frame fits 0..4095. 2-operand LIR form [reg, imm]: operand 0 → Rn (also the dest via resultSlot), operand 1 → Imm12. `immMax:4095` routes ONLY a frame ≤4095 here; a larger value falls through to the 2-word shifted variant below (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12).",
+            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64, "immMax": 4095 },
             "template":   { "fixedWord": 2432696320 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn"    },
               { "index": 1, "slotKind": "imm12" }
+            ]
+          },
+          {
+            "$comment": "ADD Xd, Xn, #imm (shifted imm12 word-pair, D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12). For a frame in (4095, 0xFFFFFF] this emits TWO words: word0 = `ADD Xd, Xn, #(V & 0xFFF)` (0x91000000, sh=0), word1 = `ADD Xd, Xd, #((V>>12) & 0xFFF), LSL #12` (0x91400000 = 0x91000000|0x400000, sh=1). SCRATCH-FREE: word1 reads its OWN dest (Xd) as the source base — extraResultSlots thread the result reg into word1.Rd AND word1.Rn. The single imm12.hilo24 wire (word0) carries the VALUE; the encoder splits it and writes lo→word0 / hi→word1, both into the imm12 bit-window (10..21). `immMin:4096`/`immMax:16777215` route ONLY a >4095, ≤16MiB frame here; >16MiB stays fail-loud (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB).",
+            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64, "immMin": 4096, "immMax": 16777215 },
+            "template":   { "fixedWords": [2432696320, 2436890624] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires":      [
+              { "index": 0, "slotKind": "rn"            },
+              { "index": 1, "slotKind": "imm12.hilo24", "wordIndex": 0 }
             ]
           }
         ]
@@ -305,13 +319,27 @@
             ]
           },
           {
-            "$comment": "SUB Xd, Xn, #imm12 (immediate). Fixed word 0xD1000000 (sf=1, op=1 sub, S=0, sh=0). imm12 at bits 10..21; Rd 0..4, Rn 5..9. Used by the callconv prologue stack adjust (`sub sp, sp, #frame`). Same 2-operand [reg, imm] LIR form as ADD-immediate. FC3 c2: width:64-only like add's imm12 shape (sole producer is the Ptr-width sp-adjust; a width-32 sub-imm fails loud).",
-            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64 },
+            "$comment": "SUB Xd, Xn, #imm12 (immediate, single word). Fixed word 0xD1000000 (sf=1, op=1 sub, S=0, sh=0). imm12 at bits 10..21; Rd 0..4, Rn 5..9. Used by the callconv prologue stack adjust (`sub sp, sp, #frame`) when the frame fits 0..4095. Same 2-operand [reg, imm] LIR form as ADD-immediate. FC3 c2: width:64-only like add's imm12 shape (sole producer is the Ptr-width sp-adjust; a width-32 sub-imm fails loud). `immMax:4095` routes ONLY a ≤4095 frame here; larger falls through to the 2-word shifted variant (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12).",
+            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64, "immMax": 4095 },
             "template":   { "fixedWord": 3506438144 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn"    },
               { "index": 1, "slotKind": "imm12" }
+            ]
+          },
+          {
+            "$comment": "SUB Xd, Xn, #imm (shifted imm12 word-pair, D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12). For a frame in (4095, 0xFFFFFF] this emits TWO words: word0 = `SUB Xd, Xn, #(V & 0xFFF)` (0xD1000000, sh=0), word1 = `SUB Xd, Xd, #((V>>12) & 0xFFF), LSL #12` (0xD1400000 = 0xD1000000|0x400000, sh=1). word1 reads its OWN dest (Xd) — SCRATCH-FREE via extraResultSlots. Single imm12.hilo24 wire (word0) carries the VALUE; the encoder splits lo→word0 / hi→word1. The prologue's `sub sp,sp,#frame` becomes `sub sp,sp,#lo; sub sp,sp,#hi,LSL#12` — the transient sp-lo misalignment between the two words is invisible (no access/call between them; V is 16-aligned). `immMin:4096`/`immMax:16777215`; >16MiB fail-loud.",
+            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64, "immMin": 4096, "immMax": 16777215 },
+            "template":   { "fixedWords": [3506438144, 3510632448] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires":      [
+              { "index": 0, "slotKind": "rn"            },
+              { "index": 1, "slotKind": "imm12.hilo24", "wordIndex": 0 }
             ]
           }
         ]
@@ -1055,14 +1083,29 @@
             ]
           },
           {
-            "$comment": "FRAME-RELATIVE lea — `lea Xd, [base + #disp]` = AArch64 `ADD Xd, Xn, #imm12`. This is the form the ML7 callconv's `emitFrameAddr` materializes from `alloca` (a body-local's effective address): 3-op no-index shape [base_reg, MemBase(scale=1), MemOffset(disp)] + result, MIRRORING x86_64's 3-op `lea` (so the callconv stays target-blind — it emits the same operand layout for both ISAs). Single fixed word 0x91000000 (2432696320, the ADD-imm base, shared with `add`'s imm variant + the SymbolRef lea's word1): base_reg→Rn (bits 5..9), result→Rd (bits 0..4), MemOffset→Imm12 (UNSIGNED, bits 10..21; frame offsets are non-negative). MemBase carries no AArch64 bits (scale must be 1; the walker validates it via membase.noscale). A frame offset >4095 fails loud at the walker (A_ImmediateOperandOutOfRange) — the shifted ADD imm12<<12 form for larger frames is a future generalization (D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE, parallel to the unscaled-vs-scaled LDR/STR split).",
-            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "$comment": "FRAME-RELATIVE lea (single word) — `lea Xd, [base + #disp]` = AArch64 `ADD Xd, Xn, #imm12`. This is the form the ML7 callconv's `emitFrameAddr` materializes from `alloca` (a body-local's effective address): 3-op no-index shape [base_reg, MemBase(scale=1), MemOffset(disp)] + result, MIRRORING x86_64's 3-op `lea` (so the callconv stays target-blind — it emits the same operand layout for both ISAs). Single fixed word 0x91000000 (2432696320, the ADD-imm base, shared with `add`'s imm variant + the SymbolRef lea's word1): base_reg→Rn (bits 5..9), result→Rd (bits 0..4), MemOffset→Imm12 (UNSIGNED, bits 10..21; frame offsets are non-negative). MemBase carries no AArch64 bits (scale must be 1; the walker validates it via membase.noscale). `immMax:4095` routes ONLY a frame offset ≤4095 here; a larger offset falls through to the 2-word shifted variant below (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "immMax": 4095 },
             "template":   { "fixedWord": 2432696320 },
             "resultSlot": "rd",
             "wires": [
               { "index": 0, "slotKind": "rn"              },
               { "index": 1, "slotKind": "membase.noscale" },
               { "index": 2, "slotKind": "imm12"           }
+            ]
+          },
+          {
+            "$comment": "FRAME-RELATIVE lea (shifted imm12 word-pair, D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12) — `lea Xd, [base + #disp]` with disp in (4095, 0xFFFFFF]. The GEP's array-element address (e.g. `int big[9000]; big[8999]` at sp+35996) under a >4095-byte frame. Emits TWO words reusing ADD's base: word0 = `ADD Xd, Xn, #(disp & 0xFFF)` (0x91000000, sh=0), word1 = `ADD Xd, Xd, #((disp>>12) & 0xFFF), LSL #12` (0x91400000, sh=1). SCRATCH-FREE: word0 reads the base (Xn) into Xd, word1 reads Xd→Xd (extraResultSlots thread the result reg into word1.Rd AND word1.Rn). The MemOffset (operand 2) is the VALUE-bearing operand the matcher keys on; its single imm12.hilo24 wire (word0) carries the displacement, split lo→word0 / hi→word1 by the encoder. MemBase (operand 1, scale==1) carries no bits (membase.noscale, word0). `immMin:4096`/`immMax:16777215`; a >16MiB offset stays fail-loud (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB). width:64 (a frame address is Ptr-width); the disjoint imm-range makes it unambiguous against the single-word variant above regardless of width.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64, "immMin": 4096, "immMax": 16777215 },
+            "template":   { "fixedWords": [2432696320, 2436890624] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "rn"              },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12.hilo24", "wordIndex": 0 }
             ]
           },
           {

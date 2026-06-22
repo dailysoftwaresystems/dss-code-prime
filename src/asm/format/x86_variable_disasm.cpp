@@ -388,6 +388,7 @@ disassemble(TargetSchema const&            schema,
                 case EncodingSlotKind::MemOffsetZero:
                 case EncodingSlotKind::Imm12:
                 case EncodingSlotKind::Imm12Scaled:
+                case EncodingSlotKind::Imm12HiLo24:
                 case EncodingSlotKind::SymbolPatchMarker:
                 case EncodingSlotKind::Imm19:
                     return std::nullopt;

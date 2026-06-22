@@ -107,6 +107,36 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
                 static_cast<std::uint8_t>(w.get<std::int64_t>());
         }
     }
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: OPTIONAL `immMin`/`immMax`
+    // immediate-magnitude bounds (uint32, [0, 0xFFFFFFFF]). Absent ⇒ the
+    // variant matches any immediate magnitude (every pre-existing variant).
+    // Present ⇒ the matcher additionally requires the inst's immediate /
+    // memOffset magnitude in [immMin, immMax] — what lets one opcode carry
+    // both a single-word imm12 variant (immMax:4095) and a 2-word shifted
+    // form (immMin:4096). A non-integer or out-of-uint32 value is a load-
+    // time reject (never a silently dropped bound). `immMin > immMax` is
+    // caught at validate() (an empty range matches nothing — a config bug).
+    auto const parseImmBound = [&](char const* key, std::optional<std::uint32_t>& out) {
+        if (!g.contains(key)) return;
+        auto const& jv = g.at(key);
+        auto const path = std::format(
+            "/opcodes/{}/encoding/variants/{}/guard/{}", opIdx, vi, key);
+        if (!jv.is_number_integer()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      std::format("'{}' must be a non-negative integer", key));
+            return;
+        }
+        std::int64_t const n = jv.get<std::int64_t>();
+        if (n < 0 || n > static_cast<std::int64_t>(
+                             std::numeric_limits<std::uint32_t>::max())) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      std::format("'{}' ({}) must fit in [0, 4294967295]", key, n));
+            return;
+        }
+        out = static_cast<std::uint32_t>(n);
+    };
+    parseImmBound("immMin", variant.immMin);
+    parseImmBound("immMax", variant.immMax);
     if (!g.contains("operandKinds")) return;
     auto const& oks = g.at("operandKinds");
     if (!oks.is_array()) {

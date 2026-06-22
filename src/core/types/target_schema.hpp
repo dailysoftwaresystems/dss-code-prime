@@ -1107,11 +1107,37 @@ enum class EncodingSlotKind : std::uint8_t {
     // (load/store vs load_u/store_u) from the offset value — the variant
     // selector matches operand KINDS only and cannot inspect the value.
     Imm12Scaled   = 26,
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 (v0.0.2 FC12 deferral-2):
+    // the AArch64 ADD/SUB-immediate `imm12 LSL #12` shifted-immediate
+    // form, the WORD-PAIR encoding of a value V in (4095, 0xFFFFFF]
+    // (4096 .. 16 MiB-1). This is NOT a single bit-window — it is the
+    // SAME bits 10..21 window as `Imm12`, but the encoder, on matching
+    // this slot, writes BOTH words of a 2-word `add`/`sub`/`lea` macro:
+    //   word0 = `op Xd,Xn,#(V & 0xFFF)`          (sh=0, base word)
+    //   word1 = `op Xd,Xd,#((V>>12) & 0xFFF)`    (sh=1, base|0x400000)
+    // (the wire's slot lives in word0; the macro's word1 carries the
+    // high 12 bits — its fixedWords[1] sets sh=1, and its extraResult
+    // Slots thread Xd through word1's Rd+Rn so the second ADD reads its
+    // OWN dest as the source base — SCRATCH-FREE). A function with a
+    // frame > 4095 bytes (e.g. `int big[9000]` = 36000B) needs this for
+    // the prologue/epilogue `sub/add sp,#frame` AND the GEP `lea
+    // [base,#disp]`. Reaches 16 MiB (every realistic frame); a value
+    // > 0xFFFFFF stays fail-loud (A_ImmediateOperandOutOfRange — the
+    // residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB; a third word /
+    // MOVZ+MOVK scratch materialization is its future generalization).
+    // The encoder derives the split arithmetically (lo = V & 0xFFF, hi
+    // = (V>>12) & 0xFFF) and writes lo into word0's window + hi into
+    // word1's window — both via the same `imm12` bit-window (the slot
+    // is its OWN window twin of Imm12, bits 10..21). x86_64 has no
+    // imm12 slot (it uses Imm32/Disp32), so this slot is never reached
+    // on an x86 variant — the gating is slot-kind `==` + value-
+    // magnitude arithmetic, zero arch identity.
+    Imm12HiLo24   = 27,
     // Future fixed32 slots (paired with their consumer cycle):
-    //   ImmShift / Sf-flag / shifted imm12<<12 / etc.
+    //   Sf-flag / 3-word frame materialization / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 27> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 28> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -1139,6 +1165,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 27> kEncodingSlotKindTable{{{
     { EncodingSlotKind::OpcodePlusReg, "opcode.reg"     },
     { EncodingSlotKind::Imm64,         "imm64"          },
     { EncodingSlotKind::Imm12Scaled,   "imm12.scaled"   },
+    { EncodingSlotKind::Imm12HiLo24,   "imm12.hilo24"   },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -1157,7 +1184,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 27,
+static_assert(kEncodingSlotKindCount == 28,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -1204,6 +1231,11 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         // validate() rejects every `load_u`/`store_u` variant that wires
         // it as a cross-shape declaration on a fixed32 opcode).
         case EncodingSlotKind::Imm12Scaled:
+        // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the shifted-imm12
+        // word-pair form is a fixed32 (AArch64) slot — same reason as
+        // Imm12 / Imm12Scaled (a cross-shape declaration on an x86
+        // opcode would be rejected by validate()).
+        case EncodingSlotKind::Imm12HiLo24:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
             return TargetEncodingShape::Fixed32;
@@ -1390,6 +1422,10 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         // D-ASM-AARCH64-LARGE-FRAME-IMM12: the scaled imm12 displacement
         // writes its immediate field directly — no linker relocation.
         case EncodingSlotKind::Imm12Scaled:
+        // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the shifted-imm12
+        // word-pair writes its (split) immediate bits directly into both
+        // words — no linker relocation.
+        case EncodingSlotKind::Imm12HiLo24:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
         case EncodingSlotKind::Disp32Mem:
@@ -1504,6 +1540,26 @@ struct DSS_EXPORT TargetEncodingVariant {
     // width-keyed variant with a width-absent same-kind sibling
     // (first-match dispatch would silently shadow one of them).
     std::uint8_t                       guardWidthBits = 0;
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: OPTIONAL immediate-MAGNITUDE
+    // discriminators on the guard — the JSON keys `guard.immMin` /
+    // `guard.immMax`. ABSENT (nullopt) ⇒ the variant matches an
+    // instruction of ANY immediate magnitude (every pre-existing variant —
+    // full back-compat). PRESENT ⇒ the variant matches ONLY when the
+    // instruction's immediate/memOffset operand magnitude falls in
+    // [immMin, immMax] (inclusive). This is what lets ONE opcode declare
+    // a single-word imm12 variant (immMax:4095) AND a 2-word shifted-imm12
+    // variant (immMin:4096, immMax:16777215) with the SAME operandKinds —
+    // the selector routes a small frame to the 1-word form and a large
+    // frame to the 2-word form by VALUE, agnostically (any ISA can declare
+    // magnitude-keyed variants; the matcher reads the LIR operand's value,
+    // not the arch). The magnitude is the operand's unsigned value for an
+    // ImmInt, or its (signed) displacement viewed as a magnitude for a
+    // MemOffset — the matcher inspects whichever immediate-bearing operand
+    // the variant's operandKinds declares. A variant that declares NO
+    // immediate/memOffset operand but sets immMin/immMax is a config bug
+    // (validate() rejects it — there is no value to key on).
+    std::optional<std::uint32_t>       immMin;
+    std::optional<std::uint32_t>       immMax;
     TargetEncodingTemplate             tmpl;
     // Where the instruction's RESULT register goes (when the inst
     // has a result). Nullopt for value-less instructions (e.g.

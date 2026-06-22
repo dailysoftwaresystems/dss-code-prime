@@ -122,16 +122,55 @@ operandsMatchGuard(std::span<LirOperand const>          instOps,
     return true;
 }
 
+// D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the unsigned MAGNITUDE of an
+// instruction's immediate-bearing operand, used by the variant matcher's
+// `immMin`/`immMax` magnitude key. Reads the FIRST operand whose guard
+// filter is `ImmInt` or `MemOffset` (the value-bearing slot a magnitude-
+// keyed variant routes on). Returns nullopt when the guard declares no
+// such operand (the variant cannot be magnitude-keyed; validate() rejects
+// that combination, so a runtime nullopt here only arises from a guard
+// whose value operand is out of bounds — treated as "no match" by the
+// caller). An ImmInt's magnitude is its value clamped at 0 for negatives
+// (a negative immediate never matches a non-negative [immMin,immMax]
+// range; the encoder's own range gate is the real bound — the matcher
+// only ROUTES). A MemOffset's magnitude is likewise its non-negative
+// displacement (frame offsets are non-negative; a negative disp does not
+// match the shifted-imm12 range and falls through to the signed Imm9
+// variant). Source/target-agnostic: reads the LIR operand pool, never the
+// arch.
+[[nodiscard]] inline std::optional<std::uint32_t>
+variantImmMagnitude(std::span<LirOperand const>        instOps,
+                    std::span<OperandKindFilter const> guard) noexcept {
+    for (std::size_t i = 0; i < guard.size() && i < instOps.size(); ++i) {
+        if (guard[i] == OperandKindFilter::ImmInt
+            && instOps[i].kind == LirOperandKind::ImmInt) {
+            std::int32_t const v = instOps[i].immInt32;
+            if (v < 0) return std::nullopt;
+            return static_cast<std::uint32_t>(v);
+        }
+        if (guard[i] == OperandKindFilter::MemOffset
+            && instOps[i].kind == LirOperandKind::MemOffset) {
+            std::int32_t const v = instOps[i].offset;
+            if (v < 0) return std::nullopt;
+            return static_cast<std::uint32_t>(v);
+        }
+    }
+    return std::nullopt;
+}
+
 // Full variant-guard match: operand kinds AND the FC3 c2 width axis
-// (D-CSUBSET-32BIT-ALU-FORMS). `instWidthBits` is the instruction's
-// operation width (`lirInstWidthBits(lir.instFlags(inst))` — 64 for
-// every pre-FC3 / hand-built instruction). A variant with
-// `guardWidthBits == 0` (no `width` key in the JSON) matches ANY
-// width — full back-compat for every pre-existing variant; a
-// width-keyed variant matches only its declared width (the 32-bit
-// no-REX.W x86 forms / arm64 W-forms vs their 64-bit siblings).
-// Shared by BOTH walkers (x86_variable + fixed32) — the width axis
-// is format-agnostic by construction.
+// (D-CSUBSET-32BIT-ALU-FORMS) AND the FC12-deferral-2 immediate-magnitude
+// axis (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12). `instWidthBits` is the
+// instruction's operation width (`lirInstWidthBits(lir.instFlags(inst))` —
+// 64 for every pre-FC3 / hand-built instruction). A variant with
+// `guardWidthBits == 0` (no `width` key in the JSON) matches ANY width —
+// full back-compat for every pre-existing variant; a width-keyed variant
+// matches only its declared width (the 32-bit no-REX.W x86 forms / arm64
+// W-forms vs their 64-bit siblings). A variant with absent immMin/immMax
+// matches ANY immediate magnitude (every pre-existing variant); a
+// magnitude-keyed variant matches only when its value-bearing operand's
+// magnitude is in [immMin, immMax]. Shared by BOTH walkers (x86_variable +
+// fixed32) — both axes are format-agnostic by construction.
 [[nodiscard]] inline bool
 variantMatchesInst(std::span<LirOperand const>  instOps,
                    std::uint8_t                 instWidthBits,
@@ -139,7 +178,18 @@ variantMatchesInst(std::span<LirOperand const>  instOps,
     if (v.guardWidthBits != 0 && v.guardWidthBits != instWidthBits) {
         return false;
     }
-    return operandsMatchGuard(instOps, v.operandKinds);
+    if (!operandsMatchGuard(instOps, v.operandKinds)) {
+        return false;
+    }
+    // Immediate-magnitude axis: only consulted when the variant declares a
+    // bound (absent ⇒ match-any, so every existing variant is unaffected).
+    if (v.immMin.has_value() || v.immMax.has_value()) {
+        auto const mag = variantImmMagnitude(instOps, v.operandKinds);
+        if (!mag.has_value()) return false;  // no value-bearing operand in range
+        if (v.immMin.has_value() && *mag < *v.immMin) return false;
+        if (v.immMax.has_value() && *mag > *v.immMax) return false;
+    }
+    return true;
 }
 
 // Read 4 little-endian bytes as a uint32. Caller guarantees the

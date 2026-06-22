@@ -1,0 +1,23 @@
+{
+  "$comment": "D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 (FC12 deferral-2) runtime witness: a function whose frame (36000B, `int big[9000]`) exceeds the AArch64 single-word imm12 reach (4095). The prologue/epilogue SP adjust AND the &big[8999] address (sp+35996) must use the SCRATCH-FREE 2-word shifted-imm12 macro (`op Xd,Xn,#lo` + `op Xd,Xd,#hi,LSL #12`). seed is a mutable global so the store→load round-trip survives ConstFold/Mem2Reg/DCE. Exit 42. The `{shippedPipeline:release}` arm is what surfaces the lea-35996 + sp-adjust split under the REAL release composition (Inlining ON); the full-release-like arm exercises the same under an explicit pass list. RED-ON-DISABLE: revert the encoder's imm12.hilo24 split (or the variant immMin/immMax routing) → the >4095 sp-adjust + lea fail loud at the assembler (A_ImmediateOperandOutOfRange) and the arm64 leg cannot produce a binary. NOTE on the missing x86_64:pe (Windows) target: a 36000B Windows stack frame requires the `__chkstk` stack-probe trampoline (a `sub rsp` that jumps >1 guard page must probe each intermediate page) which is NOT YET IMPLEMENTED — a >4KB Windows frame access-violates (a pre-existing gap ORTHOGONAL to this arm64-only fix; x86_64 has no imm12 slot so its codegen is byte-identical to before). x86_64:elf (Linux) is the non-Windows control leg (Linux's 1MB stack guard-gap absorbs the 9-page jump). The pe target is excluded here rather than crash the gate; the Windows large-frame chkstk gap is tracked separately.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
