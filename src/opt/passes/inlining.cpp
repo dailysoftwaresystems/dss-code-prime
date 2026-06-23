@@ -298,6 +298,16 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // forgoes the optimization, never miscompiles). Reachable under the shipped
             // release.pipeline.json (which runs Inlining), so a real fix not a guard.
             if (op == MirOpcode::RecvByValueStackParam) return std::nullopt;
+            // D-CSUBSET-COMPUTED-GOTO (MF-4): refuse to inline a callee that takes a
+            // label address (`BlockAddress`) or contains an indirect branch
+            // (`IndirectBr`). Inlining renumbers the callee's blocks into the caller,
+            // which invalidates BOTH the synthetic per-block symbols `&&label`
+            // captured AND the IndirectBr's address-taken successor set — a splice
+            // would silently jump to the wrong block. Fail-SAFE (forgoes the
+            // optimization, never miscompiles); reachable under the shipped
+            // release.pipeline.json (which runs Inlining).
+            if (op == MirOpcode::BlockAddress) return std::nullopt;
+            if (op == MirOpcode::IndirectBr) return std::nullopt;
             if (op == MirOpcode::Return
                 && mir.instOperands(cid).size() > 1) {
                 return std::nullopt;
@@ -1210,6 +1220,33 @@ private:
     bool        malformed_    = false;
 };
 
+// True iff function `f` ITSELF contains a computed goto — a `BlockAddress` op or
+// an `IndirectBr` terminator (D-CSUBSET-COMPUTED-GOTO). Such a function must NOT
+// be rebuilt by the `MultiBlockInliner`: its hand-rolled caller-host emit copies
+// a `BlockAddress`'s block-id payload VERBATIM (a stale id once the host's blocks
+// are renumbered = silent miscompile) and has NO `IndirectBr` terminator arm
+// (it would hit the `default:` abort). The single-block `MirFunctionRebuilder`
+// path DOES remap both correctly (the shared rebuild-helper has the arms), so a
+// computed-goto host is routed there instead — single-block callees still inline
+// safely; admitting a MULTI-BLOCK callee into a computed-goto host is the named
+// follow-up `D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST`.
+[[nodiscard]] bool functionHasComputedGoto(Mir const& mir, MirFuncId f) {
+    std::uint32_t const nb = mir.funcBlockCount(f);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const b = mir.funcBlockAt(f, bi);
+        if (mir.instOpcode(mir.blockTerminator(b)) == MirOpcode::IndirectBr) {
+            return true;
+        }
+        std::uint32_t const ni = mir.blockInstCount(b);
+        for (std::uint32_t ii = 0; ii < ni; ++ii) {
+            if (mir.instOpcode(mir.blockInstAt(b, ii)) == MirOpcode::BlockAddress) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 // True iff `caller`'s inline plan contains at least one MULTI-BLOCK
 // callee — the signal to route this function through the multi-block
 // rebuild rather than the cycle-1 `tryRewrite` path.
@@ -1268,7 +1305,12 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
         std::unordered_map<std::uint32_t, MirFuncId> plan;
-        if (planHasMultiBlock(mir, analysis, f, plan, inlineThreshold)) {
+        // D-CSUBSET-COMPUTED-GOTO: a host that itself contains a computed goto is
+        // routed through the single-block path (which remaps BlockAddress/
+        // IndirectBr correctly), NEVER the MultiBlockInliner (whose caller-host
+        // emit would mis-copy the block-id payload / abort on IndirectBr).
+        if (!functionHasComputedGoto(mir, f)
+            && planHasMultiBlock(mir, analysis, f, plan, inlineThreshold)) {
             MultiBlockInliner mb{mir, builder, plan};
             mb.rebuildFunction(f);
             callsInlined += mb.callsInlined();

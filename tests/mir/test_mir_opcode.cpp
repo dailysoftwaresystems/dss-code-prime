@@ -13,9 +13,11 @@ namespace {
 // Every opcode ordinal in [0, Count_) — handy for table sweeps.
 constexpr std::uint32_t kOpcodeCount = static_cast<std::uint32_t>(MirOpcode::Count_);
 
-bool isOneOfTheFiveTerminators(MirOpcode op) {
+bool isOneOfTheTerminators(MirOpcode op) {
+    // D-CSUBSET-COMPUTED-GOTO added IndirectBr (the 6th terminator).
     return op == MirOpcode::Br || op == MirOpcode::CondBr || op == MirOpcode::Switch
-        || op == MirOpcode::Return || op == MirOpcode::Unreachable;
+        || op == MirOpcode::Return || op == MirOpcode::Unreachable
+        || op == MirOpcode::IndirectBr;
 }
 
 } // namespace
@@ -35,19 +37,20 @@ TEST(MirOpcode, EveryOpcodeHasADescriptorWithAMnemonic) {
     }
 }
 
-TEST(MirOpcode, ExactlyFiveTerminators) {
+TEST(MirOpcode, ExactlySixTerminators) {
     int terminatorCount = 0;
     for (std::uint32_t i = 0; i < kOpcodeCount; ++i) {
         auto const op = static_cast<MirOpcode>(i);
         if (isTerminator(op)) {
             ++terminatorCount;
-            EXPECT_TRUE(isOneOfTheFiveTerminators(op))
+            EXPECT_TRUE(isOneOfTheTerminators(op))
                 << "unexpected terminator: " << opcodeInfo(op).mnemonic;
         } else {
-            EXPECT_FALSE(isOneOfTheFiveTerminators(op));
+            EXPECT_FALSE(isOneOfTheTerminators(op));
         }
     }
-    EXPECT_EQ(terminatorCount, 5);
+    // Br, CondBr, Switch, Return, Unreachable + IndirectBr (D-CSUBSET-COMPUTED-GOTO).
+    EXPECT_EQ(terminatorCount, 6);
 }
 
 TEST(MirOpcode, OnlyPhiUsesThePhiPool) {
@@ -64,6 +67,8 @@ TEST(MirOpcode, ResultRules) {
     EXPECT_EQ(resultRule(MirOpcode::Const), MirResultRule::Value);
     EXPECT_EQ(resultRule(MirOpcode::Arg), MirResultRule::Value);
     EXPECT_EQ(resultRule(MirOpcode::GlobalAddr), MirResultRule::Value);
+    // D-CSUBSET-COMPUTED-GOTO: `&&label` produces a pointer value.
+    EXPECT_EQ(resultRule(MirOpcode::BlockAddress), MirResultRule::Value);
     EXPECT_EQ(resultRule(MirOpcode::Load), MirResultRule::Value);
     EXPECT_EQ(resultRule(MirOpcode::ICmpEq), MirResultRule::Value);
     EXPECT_EQ(resultRule(MirOpcode::Phi), MirResultRule::Value);
@@ -71,6 +76,14 @@ TEST(MirOpcode, ResultRules) {
     EXPECT_EQ(resultRule(MirOpcode::Store), MirResultRule::None);
     EXPECT_EQ(resultRule(MirOpcode::Br), MirResultRule::None);
     EXPECT_EQ(resultRule(MirOpcode::Return), MirResultRule::None);
+    // D-CSUBSET-COMPUTED-GOTO: IndirectBr is a value-less terminator with EXACTLY
+    // one operand (the address) and variadic successors (all address-taken blocks).
+    EXPECT_EQ(resultRule(MirOpcode::IndirectBr), MirResultRule::None);
+    EXPECT_EQ(opcodeInfo(MirOpcode::IndirectBr).minOperands, 1);
+    EXPECT_EQ(opcodeInfo(MirOpcode::IndirectBr).maxOperands, 1);
+    EXPECT_EQ(opcodeInfo(MirOpcode::IndirectBr).minSuccessors, 1);
+    EXPECT_EQ(opcodeInfo(MirOpcode::IndirectBr).maxSuccessors, kMirUnboundedSuccessors);
+    EXPECT_TRUE(isTerminator(MirOpcode::IndirectBr));
     // Calls may or may not produce a value (void callee).
     EXPECT_EQ(resultRule(MirOpcode::Call), MirResultRule::Optional);
     EXPECT_EQ(resultRule(MirOpcode::IntrinsicCall), MirResultRule::Optional);

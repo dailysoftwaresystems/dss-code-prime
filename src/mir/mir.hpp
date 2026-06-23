@@ -129,8 +129,17 @@ public:
     [[nodiscard]] std::uint32_t argIndex(MirInstId id) const;          // Arg
     [[nodiscard]] std::uint32_t constLiteralIndex(MirInstId id) const; // Const
     [[nodiscard]] SymbolId      globalAddrSymbol(MirInstId id) const;  // GlobalAddr
+    [[nodiscard]] MirBlockId    blockAddressTarget(MirInstId id) const;// BlockAddress
     [[nodiscard]] std::uint32_t intrinsicId(MirInstId id) const;       // IntrinsicCall
     [[nodiscard]] std::uint32_t returnPieceOrdinal(MirInstId id) const;// ReturnPiece
+
+    // D-CSUBSET-COMPUTED-GOTO (MF-C): is `block` the target of some `BlockAddress`
+    // in its function (i.e. its runtime address is taken via `&&label`)? DERIVED by
+    // scanning the IR — the canonical, drift-proof source consumed by SimplifyCfg
+    // (must not fold/merge an address-taken target) and codegen (mint a per-block
+    // symbol). O(instructions-in-function); call sites that test many blocks of one
+    // function should hoist a set if it becomes hot (today it is not).
+    [[nodiscard]] bool isBlockAddressTaken(MirBlockId block) const;
 
     // ── block accessors ──
     [[nodiscard]] StructCfMarker blockMarker(MirBlockId id) const { return blockArena_.at(id).marker; }
@@ -389,6 +398,10 @@ public:
     MirInstId addArg(std::uint32_t paramIndex, TypeId type, MirInstFlags flags = MirInstFlags::None);
     MirInstId addConst(MirLiteralValue value, TypeId type, MirInstFlags flags = MirInstFlags::None);
     MirInstId addGlobalAddr(SymbolId symbol, TypeId type, MirInstFlags flags = MirInstFlags::None);
+    // D-CSUBSET-COMPUTED-GOTO: `&&label` — the runtime address of `target` as a
+    // value (`type` = a pointer). `target` may be a forward block reference.
+    MirInstId addBlockAddress(MirBlockId target, TypeId type,
+                              MirInstFlags flags = MirInstFlags::None);
     // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): the k-th register piece of a
     // struct-returning `call` (≥1 — piece 0 is the call's own result). `ordinal`
     // is the PER-CLASS return-register index; `pieceType` is the piece's register
@@ -436,6 +449,10 @@ public:
     MirInstId addSwitch(MirInstId discriminant,
                         std::span<std::pair<MirInstId, MirBlockId> const> cases,
                         MirBlockId defaultTarget);
+    // D-CSUBSET-COMPUTED-GOTO: `goto *address`. operand[0] = the address; `targets`
+    // = every address-taken block in the function (the variadic successor list, so
+    // reachability/DCE/phi-validation are correct by construction). ≥1 target.
+    MirInstId addIndirectBr(MirInstId address, std::span<MirBlockId const> targets);
     MirInstId addReturn(std::optional<MirInstId> value = std::nullopt);
     // FC7 C1c: a by-value struct/union returned IN REGISTERS yields N eightbyte
     // pieces (SysV ≤16B → 2). Each `values[i]` is a piece value (I64/F64); the

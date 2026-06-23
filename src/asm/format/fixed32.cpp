@@ -172,6 +172,7 @@ bool encode(Lir const&                  lir,
             // asm.cpp resolver patches the bit-field (different
             // arithmetic from x86's BlockRel32 — no +4 bias, /4 scale).
             std::vector<walker_util::BlockRelPatch>& blockPatches,
+            std::vector<walker_util::BlockSymPatch>& blockSymPatches,
             DiagnosticReporter&         reporter) {
     assert(info != nullptr && "fixed32::encode requires non-null info");
 
@@ -926,6 +927,48 @@ bool encode(Lir const&                  lir,
                                static_cast<int>(srcOp.kind)));
             return false;
         }
+    }
+
+    // D-CSUBSET-COMPUTED-GOTO: a block-address `lea` carries a trailing
+    // UNWIRED BlockRef operand (naming the target LIR block) ALONGSIDE its
+    // SymbolRef (the synthetic per-block symbol, captured into
+    // `pendingRelocs` as the relocation source above — on arm64 the
+    // ADRP+ADD pair yields TWO relocs, both against the SAME synthetic
+    // symbol). That BlockRef contributes NO bytes (a block reference is
+    // never byte-encoded data); it is the SYMBOL ↔ BLOCK binding the
+    // assembler records so the synthetic symbol can be assigned that
+    // block's interior VA at link time. Scan for an UNWIRED BlockRef and
+    // pair it with the captured symbol.
+    //
+    // CRUCIAL: only an UNWIRED BlockRef is the block-address binding. A
+    // WIRED BlockRef is a branch displacement (jmp's Imm26 / jcc's Imm19),
+    // already consumed by the wire loop above as an intra-function branch
+    // patch — it has no SymbolRef and is NOT a block-sym binding. Skipping
+    // wired BlockRefs keeps this scan from firing on every branch
+    // instruction (which would fail-loud spuriously). The block-address
+    // `lea` is the only opcode that carries an UNWIRED BlockRef. A binding
+    // BlockRef WITHOUT a captured SymbolRef is malformed (no symbol to
+    // bind) — fail loud. Byte-identical mirror of x86_variable's scan.
+    std::vector<bool> wiredOperand(instOps.size(), false);
+    for (auto const& wire : selected->wires) {
+        if (wire.index < wiredOperand.size()) wiredOperand[wire.index] = true;
+    }
+    for (std::size_t oi = 0; oi < instOps.size(); ++oi) {
+        if (instOps[oi].kind != LirOperandKind::BlockRef) continue;
+        if (wiredOperand[oi]) continue;  // wired BlockRef = a branch displacement
+        if (pendingRelocs.empty()) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': an unwired BlockRef operand "
+                               "(block-address binding) appears with no "
+                               "SymbolRef operand to bind — a block-address "
+                               "`lea` must carry the synthetic per-block "
+                               "symbol as its relocation source",
+                               info->mnemonic));
+            return false;
+        }
+        blockSymPatches.push_back(walker_util::BlockSymPatch{
+            pendingRelocs.front().target, instOps[oi].blockSlot});
     }
 
     // Emit each word LE, stamping that word's relocations at the word's

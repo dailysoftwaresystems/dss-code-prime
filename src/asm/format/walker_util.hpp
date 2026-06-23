@@ -280,4 +280,27 @@ struct BlockRelPatch {
     BlockRelPatchKind kind = BlockRelPatchKind::X86Rel32;
 };
 
+// D-CSUBSET-COMPUTED-GOTO (`&&label` block-address materialization):
+// a pending SYNTHETIC-SYMBOL ↔ BLOCK binding accumulated by an encoder
+// walker. The block-address `lea` (BOTH targets) carries a SymbolRef
+// (operand 0 — a synthetic per-block local symbol, the relocation
+// source) PLUS a trailing BlockRef naming the target LIR block. The
+// BlockRef contributes NO bytes (a block reference is never byte-
+// encoded data — unlike a register / immediate / displacement); it
+// exists so the assembler can bind `symbol` to `targetBlock`'s byte
+// offset. The encoder reads the BlockRef from the operand list, pairs
+// it with the SymbolRef it already captured for the relocation, and
+// pushes this record. `asm.cpp`'s per-function loop resolves it AFTER
+// `blockOffsets` is complete: `blockSymbols += { symbol,
+// blockOffsets[targetBlock] }`. Distinct from `BlockRelPatch` — that
+// patches a code SITE (a branch displacement) at a known byte offset;
+// this binds a SYMBOL to a block, so it has NO `patchOffset` (the
+// linker, not the assembler, writes the symbol's bytes, via the
+// adjacent `lea` relocation against `symbol`). The linker assigns
+// `symbol` its interior-block VA before relocation resolution.
+struct BlockSymPatch {
+    SymbolId      symbol;       // the synthetic per-block local symbol
+    std::uint32_t targetBlock;  // LirBlockId.v of the address-taken block
+};
+
 } // namespace dss::walker_util

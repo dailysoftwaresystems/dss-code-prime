@@ -5,6 +5,7 @@
 #include "link/format/byte_emit.hpp"
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
+#include "link/format/interior_block_symbol_va.hpp"
 #include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -937,6 +938,16 @@ encodeElfExecDynamic(
             return {};
         }
     }
+    // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols (the `&&label`
+    // block-address `lea`s) get their interior-block VAs before relocation
+    // resolution — sectionVa = textVa, the SAME base as the function
+    // symbols above (block VA = funcVA + blockOffset). The shared helper is
+    // identical across ELF/PE/Mach-O.
+    if (!link::format::addInteriorBlockSymbolVas(
+            module, funcTextStart, textVa, symbolVa,
+            "elf::encodeElfExecDynamic", reporter)) {
+        return {};
+    }
     if (!link::format::applyExecRelocations(
             text, module, funcTextStart, symbolVa,
             targetSchema, textVa,
@@ -1501,6 +1512,17 @@ encode(AssembledModule const&    module,
                    symbolVa, "elf::encode (ET_EXEC)", reporter)) {
             return {};
         }
+        // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols get their
+        // interior-block VAs before relocation resolution — sectionVa =
+        // secText->virtualAddress, the SAME base as the function symbols
+        // above. This static ET_EXEC path handles externless modules (the
+        // dynamic path requires non-empty externImports); the dynamic path
+        // calls the same helper.
+        if (!link::format::addInteriorBlockSymbolVas(
+                module, funcTextStart, secText->virtualAddress, symbolVa,
+                "elf::encode (ET_EXEC)", reporter)) {
+            return {};
+        }
         if (!link::format::applyExecRelocations(
                 text, module, funcTextStart, symbolVa,
                 targetSchema, secText->virtualAddress,
@@ -1540,10 +1562,44 @@ encode(AssembledModule const&    module,
     // IDX_TEXT (=1) by the section ordering below.
     appendSym(0, makeStInfo(STB_LOCAL, STT_SECTION),
               0, /*shndx=.text*/ 1, 0, 0);
-    std::uint32_t const firstNonLocalSymIdx = 2;
 
-    // Map each function's SymbolId to its symtab index (for relocs).
+    // Map each SymbolId to its symtab index (for relocs).
     std::unordered_map<SymbolId, std::uint32_t> symIdxBySymbol;
+
+    // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols (the `&&label`
+    // block-address `lea` relocation sources) are intra-module DEFINED
+    // LOCAL symbols pointing at an interior `.text` offset. In ET_REL they
+    // need a real `.symtab` entry — STB_LOCAL, STT_NOTYPE, st_shndx=.text,
+    // st_value = the block's byte offset within `.text` (funcTextStart[fi]
+    // + blockByteOffset). They MUST precede the GLOBAL function symbols
+    // (ELF requires all LOCAL symbols first; `.symtab.sh_info` = the first
+    // non-LOCAL index), and registering them here makes the `.rela.text`
+    // loop resolve the block-address relocation to this defined LOCAL
+    // rather than the SHN_UNDEF extern-fallback below (which would emit a
+    // bogus undefined-global and break the object at final link). The
+    // ET_EXEC arm resolves these in-place via `addInteriorBlockSymbolVas`
+    // and emits no `.rela.text`/extern symbols, so this block is
+    // ET_REL-only by being inside the symtab/rela construction the
+    // ET_EXEC arm shares — but a block symbol can only arise on a function
+    // that took a block address, and the extern fallback below is
+    // `!isExec`-gated, so an ET_EXEC build never reaches the mis-handling.
+    for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+        for (auto const& bs : module.functions[fi].blockSymbols) {
+            std::string const symName =
+                std::string{"sym_"} + std::to_string(bs.symbol.v);
+            std::uint32_t const nameOff = strtab.add(symName);
+            std::uint32_t const idx =
+                static_cast<std::uint32_t>(symtab.size() / 24);
+            appendSym(nameOff, makeStInfo(STB_LOCAL, STT_NOTYPE), 0,
+                      /*shndx=.text*/ 1,
+                      funcTextStart[fi] + bs.blockByteOffset, 0);
+            symIdxBySymbol.emplace(bs.symbol, idx);
+        }
+    }
+    // `.symtab.sh_info` = index of the first non-LOCAL symbol = the count
+    // of the LOCAL prefix (UNDEF + STT_SECTION + every block symbol).
+    std::uint32_t const firstNonLocalSymIdx =
+        static_cast<std::uint32_t>(symtab.size() / 24);
 
     // Defined function symbols (GLOBAL + STT_FUNC + shndx=.text).
     for (auto const& f : funcSyms) {

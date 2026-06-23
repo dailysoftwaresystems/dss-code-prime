@@ -212,6 +212,13 @@ SymbolId Mir::globalAddrSymbol(MirInstId id) const {
     return SymbolId{payloadForOpcode_(instArena_.at(id), MirOpcode::GlobalAddr, id,
                                       "globalAddrSymbol")};
 }
+MirBlockId Mir::blockAddressTarget(MirInstId id) const {
+    // D-CSUBSET-COMPUTED-GOTO: the target block whose address a BlockAddress takes
+    // (payload). Tagged with THIS module's id (the block lives in the same module).
+    return MirBlockId{payloadForOpcode_(instArena_.at(id), MirOpcode::BlockAddress, id,
+                                        "blockAddressTarget"),
+                      this->id().v};
+}
 std::uint32_t Mir::intrinsicId(MirInstId id) const {
     return payloadForOpcode_(instArena_.at(id), MirOpcode::IntrinsicCall, id, "intrinsicId");
 }
@@ -277,6 +284,31 @@ MirBlockId Mir::funcEntry(MirFuncId id) const {
         std::abort();
     }
     return MirBlockId{f.blockStart, this->id().v};
+}
+
+bool Mir::isBlockAddressTaken(MirBlockId block) const {
+    // D-CSUBSET-COMPUTED-GOTO (MF-C): a block is ADDRESS-TAKEN iff some
+    // `BlockAddress(block)` op exists in its function. DERIVED from the IR — the
+    // single, drift-proof source of truth (like StructCfMarker derivation): a
+    // BlockAddress survives every MIR rebuild (the clone re-maps its target id), so
+    // this answer automatically tracks the current block numbering with NO parallel
+    // side-table to maintain. Consumed by SimplifyCfg (don't fold an address-taken
+    // target) and codegen (emit a synthetic block symbol). Scans only the owning
+    // function's instructions (computed gotos are same-function in GNU C).
+    MirFuncId const fn = blockFunc(block);
+    std::uint32_t const nb = funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const b = funcBlockAt(fn, bi);
+        std::uint32_t const ni = blockInstCount(b);
+        for (std::uint32_t ii = 0; ii < ni; ++ii) {
+            MirInstId const inst = blockInstAt(b, ii);
+            if (instArena_.at(inst).opcode == MirOpcode::BlockAddress
+                && instArena_.at(inst).payload == block.v) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 std::size_t Mir::moduleFuncCount() const noexcept {
@@ -698,6 +730,21 @@ MirInstId MirBuilder::addGlobalAddr(SymbolId symbol, TypeId type, MirInstFlags f
     return appendInst_(pod, {}, /*terminates=*/false);
 }
 
+MirInstId MirBuilder::addBlockAddress(MirBlockId target, TypeId type, MirInstFlags flags) {
+    // D-CSUBSET-COMPUTED-GOTO: `&&label` materialized as a value. Leaf value-origin
+    // (mirror addGlobalAddr); payload = the target block id (the block whose address
+    // is taken). `target` may be a FORWARD reference (a later block id created in
+    // phase 1), so we do NOT require it to exist yet — only same-module.
+    if (!type.valid()) requireValueType_("addBlockAddress");
+    checkSameModule_(target.arenaTag, "block-address target");
+    detail::MirInst pod;
+    pod.opcode  = MirOpcode::BlockAddress;
+    pod.flags   = flags;
+    pod.typeId  = type;
+    pod.payload = target.v;
+    return appendInst_(pod, {}, /*terminates=*/false);
+}
+
 // D5.6: first-class aggregate ops. Each path element is interned as a
 // Const MirInst of type i32 carrying the index value; the resulting
 // operand vector is `[aggregate, (value,) idx0, idx1, ...]` (Gep-shaped).
@@ -837,6 +884,24 @@ MirInstId MirBuilder::addSwitch(MirInstId discriminant,
     pod.opcode = MirOpcode::Switch;
     MirInstId const id = appendInst_(pod, operands, /*terminates=*/true);
     recordSuccessors_(MirOpcode::Switch, succs);
+    return id;
+}
+
+MirInstId MirBuilder::addIndirectBr(MirInstId address,
+                                    std::span<MirBlockId const> targets) {
+    // D-CSUBSET-COMPUTED-GOTO: `goto *address`. operand[0] = the computed address;
+    // successors = EVERY address-taken block (the caller passes all of them). At
+    // least one successor is required (opcodeInfo minSuccessors==1) — a function
+    // with an IndirectBr must have at least one address-taken label.
+    checkSameModule_(address.arenaTag, "indirect-branch address");
+    for (MirBlockId const t : targets) {
+        checkSameModule_(t.arenaTag, "indirect-branch target");
+    }
+    detail::MirInst pod;
+    pod.opcode = MirOpcode::IndirectBr;
+    MirInstId const operands[] = {address};
+    MirInstId const id = appendInst_(pod, operands, /*terminates=*/true);
+    recordSuccessors_(MirOpcode::IndirectBr, targets);
     return id;
 }
 

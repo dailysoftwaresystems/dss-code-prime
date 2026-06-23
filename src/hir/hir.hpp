@@ -130,6 +130,10 @@ public:
     // (its sole child). A GotoStmt and its target LabelStmt share the ordinal.
     [[nodiscard]] std::uint32_t            labelOrdinal(HirNodeId id) const;
     [[nodiscard]] HirNodeId                labelBody(HirNodeId id)    const;
+    // D-CSUBSET-COMPUTED-GOTO: IndirectGotoStmt's address expression (child 0);
+    // LabelAddressOf's target label ordinal (payload, same namespace as labels).
+    [[nodiscard]] HirNodeId                indirectGotoTarget(HirNodeId id) const;
+    [[nodiscard]] std::uint32_t            labelAddressOrdinal(HirNodeId id) const;
 
     // SeqExpr: the statements evaluated for effect (all but the last child) and
     // the result expression (the last child, which supplies the SeqExpr's value
@@ -396,6 +400,12 @@ public:
     HirNodeId makeAddressOf(HirNodeId operand, TypeId type, HirFlags flags = HirFlags::None);
     // Pointer dereference of [operand]; `type` is the pointee type.
     HirNodeId makeDeref(HirNodeId operand, TypeId type, HirFlags flags = HirFlags::None);
+    // D-CSUBSET-COMPUTED-GOTO: `&&label` — a LEAF expression yielding a code
+    // address (`type` is the result pointer type, conventionally `void*`); the
+    // target label's per-function ordinal (the SAME namespace GotoStmt uses) is
+    // carried in `payload`, so MIR maps it to the label's block via BlockAddress.
+    HirNodeId makeLabelAddressOf(std::uint32_t labelOrdinal, TypeId type,
+                                 HirFlags flags = HirFlags::None);
     // A type used as a value; `type` is the referenced lattice type. Leaf.
     HirNodeId makeTypeRef(TypeId type, HirFlags flags = HirFlags::None);
 
@@ -453,6 +463,10 @@ public:
     HirNodeId makeGotoStmt(std::uint32_t labelOrdinal, HirFlags flags = HirFlags::None);
     HirNodeId makeLabelStmt(std::uint32_t labelOrdinal, HirNodeId labeledStmt,
                             HirFlags flags = HirFlags::None);
+    // D-CSUBSET-COMPUTED-GOTO: `goto *expr;` — an unconditional transfer to the
+    // COMPUTED code address `addressExpr` (child 0). No payload (the target set is
+    // every address-taken label, materialized as the IndirectBr's MIR successors).
+    HirNodeId makeIndirectGotoStmt(HirNodeId addressExpr, HirFlags flags = HirFlags::None);
 
     // return [value]; — children [value] or [].
     HirNodeId makeReturn(std::optional<HirNodeId> value = std::nullopt,

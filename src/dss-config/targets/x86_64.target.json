@@ -557,6 +557,29 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-COMPUTED-GOTO: indirect branch `jmp r/m64` — 0xFF /4 (jmp rax = FF E0). Mirrors `call`'s 0xFF /2 indirect form: NO REX.W (FF /4 defaults to 64-bit in long mode); REX.B derives from the register's high ordinal bit. Operand[0] is the target-address register; successors = all address-taken blocks (terminatorKind indirect-br, variadic successors). The MIR IndirectBr lowers to this; the address register is materialized from a preceding `lea` of the target block's synthetic symbol (BlockAddress).",
+      "mnemonic":      "jmp_indirect",
+      "result":        "none",
+      "terminatorKind": "indirect-br",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 1,
+      "maxSuccessors": 255,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"] },
+            "template": { "opcode": [255], "modrmRegExt": 4 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): conditional intra-function jump with mandatory fallthrough. Compound encoding `0F 8x rel32; E9 rel32` (11 bytes total). The cond nibble in 0x80's low 4 bits comes from the inst's payload (TargetCondCode) via the schema's condCodeEncoding table. Both target blocks pass as BlockRef operands: operand[0] = ifTrue (taken when cond holds — encoded as the first rel32); operand[1] = ifFalse (the fallthrough — encoded as the trailing `E9 rel32`). The wire-1's `prefixOpcodeBytes: [0xE9]` bridges the two displacements. A future optimizer pass elides the trailing jmp when ifFalse is the next-laid-out block (anchored D-OPT-JCC-FALLTHROUGH).",
       "mnemonic":      "jcc",
       "result":        "none",
@@ -846,6 +869,15 @@
           {
             "$comment": "1-op RIP-relative form: `lea reg, [rip + sym]` (D-LK4-RODATA-PRODUCER 2026-06-02). The lone SymbolRef operand is wired to the RipRelDisp32 slot, which (a) records a rel32 Relocation at the trailing 4-byte position and (b) forces ModR/M to mod=00 rm=101 (the [rip+disp32] encoding in 64-bit mode). Used by `lowerGlobalAddr` to materialize a global's address into a register.",
             "guard":      { "operandKinds": ["symbol"] },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [141] },
+            "wires":      [
+              { "index": 0, "slotKind": "riprel.disp32", "relocationKind": "rel32" }
+            ]
+          },
+          {
+            "$comment": "2-op block-address form: `lea reg, [rip + sym]` where sym is a SYNTHETIC per-block symbol (D-CSUBSET-COMPUTED-GOTO `&&label`). Byte-IDENTICAL to the 1-op RIP-relative form above — the SymbolRef (operand 0) wires to RipRelDisp32 with a rel32 reloc; the trailing BlockRef (operand 1) is METADATA, wired to NOTHING (it names the target LIR block so the assembler can bind `sym` to that block's byte offset). The assembler reads the BlockRef from the operand list and records a `BlockSymPatch{sym, targetBlock}`; the linker assigns `sym` the interior-block VA. Distinct guard `[symbol, blockref]` so the variant matcher routes this 2-operand `lea` here rather than failing A_NoMatchingEncodingVariant.",
+            "guard":      { "operandKinds": ["symbol", "blockref"] },
             "resultSlot": "modrm.reg",
             "template":   { "rexW": true, "opcode": [141] },
             "wires":      [

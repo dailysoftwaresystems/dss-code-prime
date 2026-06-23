@@ -1083,6 +1083,20 @@
             ]
           },
           {
+            "$comment": "2-op block-address form — ADRP+ADD of a SYNTHETIC per-block symbol (D-CSUBSET-COMPUTED-GOTO `&&label`). Byte-IDENTICAL to the 1-op `[symbol]` ADRP+ADD form above (same fixedWords, same Rd/Rn extraResultSlots, same two sym.patch wires emitting adr_prel_pg_hi21 on word0 + add_abs_lo12_nc on word1 against the SymbolRef at operand 0). The trailing BlockRef (operand 1) is METADATA, wired to NOTHING — it names the target LIR block so the assembler can bind the synthetic symbol to that block's byte offset (recorded as a BlockSymPatch; the linker assigns the interior-block VA). Distinct guard `[symbol, blockref]` so the variant matcher routes this 2-operand `lea` here instead of failing A_NoMatchingEncodingVariant.",
+            "guard":      { "operandKinds": ["symbol", "blockref"] },
+            "template":   { "fixedWords": [2415919104, 2432696320] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "sym.patch", "wordIndex": 0, "relocationKind": "adr_prel_pg_hi21" },
+              { "index": 0, "slotKind": "sym.patch", "wordIndex": 1, "relocationKind": "add_abs_lo12_nc" }
+            ]
+          },
+          {
             "$comment": "FRAME-RELATIVE lea (single word) — `lea Xd, [base + #disp]` = AArch64 `ADD Xd, Xn, #imm12`. This is the form the ML7 callconv's `emitFrameAddr` materializes from `alloca` (a body-local's effective address): 3-op no-index shape [base_reg, MemBase(scale=1), MemOffset(disp)] + result, MIRRORING x86_64's 3-op `lea` (so the callconv stays target-blind — it emits the same operand layout for both ISAs). Single fixed word 0x91000000 (2432696320, the ADD-imm base, shared with `add`'s imm variant + the SymbolRef lea's word1): base_reg→Rn (bits 5..9), result→Rd (bits 0..4), MemOffset→Imm12 (UNSIGNED, bits 10..21; frame offsets are non-negative). MemBase carries no AArch64 bits (scale must be 1; the walker validates it via membase.noscale). `immMax:4095` routes ONLY a frame offset ≤4095 here; a larger offset falls through to the 2-word shifted variant below (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12).",
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "immMax": 4095 },
             "template":   { "fixedWord": 2432696320 },
@@ -1191,6 +1205,29 @@
             "template": { "fixedWord": 335544320 },
             "wires":    [
               { "index": 0, "slotKind": "imm26" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-COMPUTED-GOTO: indirect branch `BR Xn` — 0xD61F0000 | Rn<<5 (unconditional branch to a register, NO link/return-address — the BLR sibling captures one). fixedWord 3592355840 = 0xD61F0000; mirrors the BLR row (0xD63F0000, same D6 family — BR clears bit 21). Rn at bits 5..9 via the `rn` slot. The MIR IndirectBr lowers to this; the target-address register is materialized by a preceding adrp+add `lea` of the target block's synthetic symbol (BlockAddress). terminatorKind indirect-br → variadic address-taken successors.",
+      "mnemonic":      "jmp_indirect",
+      "result":        "none",
+      "terminatorKind": "indirect-br",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 1,
+      "maxSuccessors": 255,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"] },
+            "template": { "fixedWord": 3592355840 },
+            "wires":    [
+              { "index": 0, "slotKind": "rn" }
             ]
           }
         ]

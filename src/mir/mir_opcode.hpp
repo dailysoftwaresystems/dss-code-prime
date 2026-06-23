@@ -32,6 +32,15 @@ enum class MirOpcode : std::uint16_t {
     Arg,         // function parameter value; payload = parameter index
     Const,       // literal value;            payload = MirLiteralPool index
     GlobalAddr,  // address of a function/global as a value; payload = SymbolId.v
+    // D-CSUBSET-COMPUTED-GOTO: the runtime address of a basic block, as a value
+    // (the GNU `&&label`). payload = the target MirBlockId.v; result = a pointer
+    // (void*). A pure value origin like GlobalAddr (no operands, no side effect) —
+    // CSE-safe (the same block's address is one value). Codegen materializes it as
+    // the address of a synthetic per-block symbol (mir_to_lir mints + emits a `lea`
+    // / adrp+add). The PRESENCE of a BlockAddress(b) is ALSO the canonical mark
+    // that block `b` is ADDRESS-TAKEN (Mir::isBlockAddressTaken scans for these),
+    // so reachability / SimplifyCfg / the block-symbol emit all read one source.
+    BlockAddress,
 
     // ── integer arithmetic ──
     Add, Sub, Mul, SDiv, UDiv, SMod, UMod, Neg,
@@ -145,6 +154,14 @@ enum class MirOpcode : std::uint16_t {
     Phi,           // operand range addresses the PHI pool, not the operand pool
     // ── terminators (exactly one, last in a block; successors live in succ pool) ──
     Br, CondBr, Switch, Return, Unreachable,
+    // D-CSUBSET-COMPUTED-GOTO: `goto *expr` — an indirect branch to a COMPUTED
+    // address. operand[0] = the address value; successors = EVERY address-taken
+    // block in the function (variadic, modeled exactly like Switch's successor
+    // list). Listing all address-taken blocks as successors makes the CFG correct
+    // BY CONSTRUCTION — reachability/DCE see them reachable, phi-validation sees
+    // the indirect predecessor (MF-1; blockSuccessors is generic, so RPO/preds/
+    // dominators/verifier handle it like any variadic-successor terminator).
+    IndirectBr,
     // ── SIMD (reserved post-v1; vocabulary fixed now) ──
     VAdd, VSub, VMul, VShuffle, VExtract, VInsert,
 
@@ -228,6 +245,16 @@ struct MirOpcodeInfo {
         case MirOpcode::Arg:        return {0, 0, 0, 0, R::Value, false, false, false, "arg"};
         case MirOpcode::Const:      return {0, 0, 0, 0, R::Value, false, false, false, "const"};
         case MirOpcode::GlobalAddr: return {0, 0, 0, 0, R::Value, false, false, false, "globaladdr"};
+        // D-CSUBSET-COMPUTED-GOTO: block-address value (payload = target block id);
+        // a leaf like GlobalAddr — no operands, a pointer result. Marked
+        // SIDE-EFFECTING so DCE never drops it even if the `&&label` value looks
+        // unused: its PRESENCE is the canonical mark that its target block is
+        // address-taken (Mir::isBlockAddressTaken), which the SimplifyCfg fold-guard
+        // (MF-B) and the IndirectBr's baked successor set both rely on. If DCE could
+        // remove a "dead" BlockAddress, isBlockAddressTaken would flip to false and
+        // SimplifyCfg could fold a block the IndirectBr still lists as a successor —
+        // a dangling edge. Pinning it keeps the address-taken set stable.
+        case MirOpcode::BlockAddress: return {0, 0, 0, 0, R::Value, false, true, false, "blockaddress"};
 
         // integer arithmetic.
         case MirOpcode::Add:  return {2, 2, 0, 0, R::Value, false, false, false, "add"};
@@ -353,6 +380,9 @@ struct MirOpcodeInfo {
         case MirOpcode::Br:          return {0, 0, 1, 1, R::None, true, true, false, "br"};
         case MirOpcode::CondBr:      return {1, 1, 2, 2, R::None, true, true, false, "condbr"};
         case MirOpcode::Switch:      return {1, N, 1, S, R::None, true, true, false, "switch"};
+        // D-CSUBSET-COMPUTED-GOTO: indirect branch. EXACTLY 1 operand (the address
+        // value); successors = every address-taken block (variadic, like Switch).
+        case MirOpcode::IndirectBr:  return {1, 1, 1, S, R::None, true, true, false, "indirectbr"};
         // FC7 C1c: a by-value struct returned IN REGISTERS carries N eightbyte/HFA
         // PIECE operands (each a return-register value); a scalar return carries 1, a
         // void return 0. The bound must admit N — `1` truncated every multi-piece

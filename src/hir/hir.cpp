@@ -417,6 +417,13 @@ HirNodeId HirBuilder::makeDeref(HirNodeId operand, TypeId type, HirFlags flags) 
     return addParent(HirKind::Deref, kids, type, /*payload=*/0, flags);
 }
 
+HirNodeId HirBuilder::makeLabelAddressOf(std::uint32_t labelOrdinal, TypeId type,
+                                         HirFlags flags) {
+    // D-CSUBSET-COMPUTED-GOTO: `&&label` — a leaf carrying the target label's
+    // per-function ordinal in `payload`; `type` is the result pointer (void*).
+    return addLeaf(HirKind::LabelAddressOf, type, labelOrdinal, flags);
+}
+
 HirNodeId HirBuilder::makeTypeRef(TypeId type, HirFlags flags) {
     return addLeaf(HirKind::TypeRef, type, /*payload=*/0, flags);
 }
@@ -500,6 +507,13 @@ HirNodeId HirBuilder::makeLabelStmt(std::uint32_t labelOrdinal, HirNodeId labele
                                     HirFlags flags) {
     HirNodeId const kids[] = {labeledStmt};
     return addParent(HirKind::LabelStmt, kids, InvalidType, labelOrdinal, flags);
+}
+
+HirNodeId HirBuilder::makeIndirectGotoStmt(HirNodeId addressExpr, HirFlags flags) {
+    // D-CSUBSET-COMPUTED-GOTO: `goto *expr;` — [addressExpr]; no payload (the
+    // target set is every address-taken label, realized as IndirectBr successors).
+    HirNodeId const kids[] = {addressExpr};
+    return addParent(HirKind::IndirectGotoStmt, kids, InvalidType, /*payload=*/0, flags);
 }
 
 HirNodeId HirBuilder::makeReturn(std::optional<HirNodeId> value, HirFlags flags) {
@@ -689,6 +703,14 @@ std::uint32_t Hir::labelOrdinal(HirNodeId id) const {
 HirNodeId Hir::labelBody(HirNodeId id) const {
     assert(kind(id) == HirKind::LabelStmt);
     return childAt(id, 0);
+}
+HirNodeId Hir::indirectGotoTarget(HirNodeId id) const {
+    assert(kind(id) == HirKind::IndirectGotoStmt);
+    return childAt(id, 0);
+}
+std::uint32_t Hir::labelAddressOrdinal(HirNodeId id) const {
+    assert(kind(id) == HirKind::LabelAddressOf);
+    return payload(id);
 }
 std::span<HirNodeId const> Hir::seqExprStmts(HirNodeId id) const {
     assert(kind(id) == HirKind::SeqExpr);

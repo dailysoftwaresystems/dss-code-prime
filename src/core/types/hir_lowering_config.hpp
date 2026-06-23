@@ -239,6 +239,14 @@ struct DSS_EXPORT HirLoweringConfig {
     RuleId      vaArgRule{};           std::string vaArgRuleName;
     RuleId      vaEndRule{};           std::string vaEndRuleName;
 
+    // D-CSUBSET-COMPUTED-GOTO: the GNU `&&label` label-address operand rule
+    // (`labelAddressExpr`). A dedicated operand alt (the SizeOf precedent) — its
+    // `Identifier` child is a RAW label name, recovered by the CST→HIR lowering
+    // (`HirKind::LabelAddressOf`, result `void*`) and resolved to the label's
+    // per-function ordinal, NEVER lowered as an expression. Invalid ⇒ the language
+    // has no computed-goto surface (unset; the dispatch skips it).
+    RuleId      labelAddressRule{};    std::string labelAddressRuleName;
+
     // Per-language MIR-globals const-evaluation policy. The shared
     // const-eval engine (plan 12.5) supports a float-folding gate via
     // its `allowFloat` knob; today every v1 schema is IEEE 754 so the

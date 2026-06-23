@@ -8,6 +8,7 @@
 #include "hir/hir_op.hpp"
 #include "mir/mir_struct_markers.hpp"
 
+#include <algorithm>
 #include <array>
 #include <format>
 #include <limits>
@@ -187,6 +188,14 @@ struct Lowerer {
         labelBlocks_.emplace(ordinal, b);
         return b;
     }
+
+    // D-CSUBSET-COMPUTED-GOTO: the per-function set of label ordinals whose ADDRESS
+    // is taken via `&&label` (LabelAddressOf). Collected once at function entry (a
+    // HIR pre-scan) so `goto *p` (IndirectBr) can name EVERY address-taken block as
+    // a successor — the full target set must be known when the IndirectBr is built,
+    // even for a `&&end` that appears textually AFTER the `goto *p`. The blocks
+    // themselves are created on demand via getOrCreateLabelBlock.
+    std::unordered_set<std::uint32_t> addressTakenLabelOrdinals_;
 
     // D-LK4-RODATA-PRODUCER-STRING (2026-06-02): synthetic-symbol
     // counter for string-literal-promoted globals. Initialized to
@@ -1190,6 +1199,19 @@ struct Lowerer {
                     return InvalidMirInst;
                 }
                 return lowerLvalueAddress(kids[0]);
+            }
+            case HirKind::LabelAddressOf: {
+                // D-CSUBSET-COMPUTED-GOTO: `&&label` — materialize the target
+                // label block's runtime address as a value. The payload is the
+                // label's per-function ordinal; map it to the label's MIR block
+                // (creating it forward if not yet emitted — getOrCreateLabelBlock
+                // is the same map GotoStmt resolves through). Emit BlockAddress(b),
+                // typed as the node's pointer type (void*). The mere existence of
+                // this BlockAddress is ALSO what marks `b` address-taken
+                // (Mir::isBlockAddressTaken), so opt + codegen see it.
+                std::uint32_t const ordinal = hir.labelAddressOrdinal(node);
+                MirBlockId const target = getOrCreateLabelBlock(ordinal);
+                return mir.addBlockAddress(target, t);
             }
             case HirKind::Deref: {
                 // children: [pointer]. Lower the pointer expression, then
@@ -3013,6 +3035,21 @@ struct Lowerer {
         }
     }
 
+    // D-CSUBSET-COMPUTED-GOTO: collect every LABEL ORDINAL whose address is taken
+    // via `&&label` (LabelAddressOf) anywhere in the function body, so an IndirectBr
+    // can list all address-taken blocks as successors. A forward `&&end` (textually
+    // after the `goto *p`) is still found — the whole body is scanned up front.
+    void collectAddressTakenLabels(HirNodeId node,
+                                   std::unordered_set<std::uint32_t>& out) {
+        if (!node.valid()) return;
+        if (hir.kind(node) == HirKind::LabelAddressOf) {
+            out.insert(hir.labelAddressOrdinal(node));
+        }
+        for (HirNodeId child : hir.children(node)) {
+            collectAddressTakenLabels(child, out);
+        }
+    }
+
     // FC3.5 sweep-c1 (chip task_20b1224d): lower one `for` header
     // clause (init or update). cst_to_hir's `lowerForClause` emits one
     // of exactly three shapes:
@@ -4643,6 +4680,36 @@ struct Lowerer {
                 mir.addBr(getOrCreateLabelBlock(hir.labelOrdinal(node)));
                 return true;
             }
+            case HirKind::IndirectGotoStmt: {
+                // D-CSUBSET-COMPUTED-GOTO: `goto *expr` — an indirect branch to the
+                // computed address. Successors = EVERY address-taken block (collected
+                // at function entry), so the CFG edges are correct by construction
+                // (reachability/DCE/phi see each `&&label` target reachable). A
+                // computed goto with NO `&&label` anywhere in the function can never
+                // have a valid target → fail loud rather than emit a successorless
+                // IndirectBr (opcodeInfo requires ≥1 successor).
+                if (addressTakenLabelOrdinals_.empty()) {
+                    unsupported(node,
+                        "computed `goto *` in a function that takes no label address "
+                        "(`&&label`) — there is no valid target");
+                    return false;
+                }
+                MirInstId const addr = lowerExpr(hir.indirectGotoTarget(node));
+                if (!addr.valid()) return false;
+                // Deterministic successor order: sort the ordinals so the IndirectBr's
+                // successor list is stable across runs (the blocks are created lazily
+                // here if a `&&label` was not yet lowered).
+                std::vector<std::uint32_t> ordinals(addressTakenLabelOrdinals_.begin(),
+                                                    addressTakenLabelOrdinals_.end());
+                std::sort(ordinals.begin(), ordinals.end());
+                std::vector<MirBlockId> targets;
+                targets.reserve(ordinals.size());
+                for (std::uint32_t const ord : ordinals) {
+                    targets.push_back(getOrCreateLabelBlock(ord));
+                }
+                mir.addIndirectBr(addr, targets);
+                return true;
+            }
             case HirKind::LabelStmt: {
                 // `label: stmt` — the label is a control-flow merge point. If the
                 // open block still falls through (control arrives by fall-through,
@@ -4818,6 +4885,7 @@ struct Lowerer {
         symbolToValue.clear();
         addressableLocal.clear();
         labelBlocks_.clear();   // FC5: labels are function-scoped
+        addressTakenLabelOrdinals_.clear();  // D-CSUBSET-COMPUTED-GOTO
         // FC7 C1c: per-function by-value return state.
         currentFnResult_ = interner.fnResult(signature);
         sretPtr_         = InvalidMirInst;
@@ -4830,6 +4898,10 @@ struct Lowerer {
         HirNodeId const body = hir.functionBody(node);
         std::unordered_set<std::uint32_t> addressTaken;
         collectAddressTakenSymbols(body, addressTaken);
+        // D-CSUBSET-COMPUTED-GOTO: collect the address-taken LABEL ordinals up front
+        // (a forward `&&end` must be a known IndirectBr successor regardless of
+        // textual order). The blocks are created lazily at first reference.
+        collectAddressTakenLabels(body, addressTakenLabelOrdinals_);
 
         // From here on a block is open — any return-false MUST seal it.
         // D-CSUBSET-LINKAGE-SPECIFIERS / D-OPT7-LINKAGE-HIR-TO-MIR-MAPPING

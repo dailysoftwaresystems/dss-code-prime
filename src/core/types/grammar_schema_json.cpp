@@ -7502,6 +7502,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readExprRule("vaStartRule",         cfg.vaStartRule,         cfg.vaStartRuleName);
             readExprRule("vaArgRule",           cfg.vaArgRule,           cfg.vaArgRuleName);
             readExprRule("vaEndRule",           cfg.vaEndRule,           cfg.vaEndRuleName);
+            // D-CSUBSET-COMPUTED-GOTO: `&&label` → core HirKind::LabelAddressOf.
+            readExprRule("labelAddressRule",    cfg.labelAddressRule,    cfg.labelAddressRuleName);
 
             // ── HR10: extensionKinds [{ name, lang }] ──
             if (hl.contains("extensionKinds")) {

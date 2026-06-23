@@ -45,12 +45,20 @@ enum class HirKind : std::uint16_t {
     BreakStmt, ContinueStmt, ReturnStmt, ExprStmt, VarDecl, AssignStmt,
     // ── Unstructured control flow (FC5) — GotoStmt jumps to a function-scoped
     //    LabelStmt; the CFG is general at the MIR tier (struct-CF markers are a
-    //    derived function of the CFG, so unstructured edges derive Linear). ──
-    GotoStmt, LabelStmt,
+    //    derived function of the CFG, so unstructured edges derive Linear).
+    //    IndirectGotoStmt (D-CSUBSET-COMPUTED-GOTO) is the GNU `goto *expr;`: an
+    //    unconditional transfer to a COMPUTED code address (child = the pointer
+    //    expression); its MIR successors are every address-taken label block. ──
+    GotoStmt, LabelStmt, IndirectGotoStmt,
     // ── Expressions ──
     Literal, Ref, Call, IntrinsicCall, BinaryOp, UnaryOp, Cast, MemberAccess,
     Index, Swizzle, ConstructAggregate, Ternary, LogicalAnd, LogicalOr,
     SizeOf, AddressOf, Deref, SeqExpr,
+    // ── GNU label-address (D-CSUBSET-COMPUTED-GOTO): `&&label` yields a `void*`
+    //    holding a basic block's runtime address. A LEAF expression node whose
+    //    payload is the target label's per-function ordinal (same namespace as
+    //    GotoStmt/LabelStmt); the MIR lowering maps the ordinal → BlockAddress. ──
+    LabelAddressOf,
     // ── Variadic intrinsics (FC12a-core) — DEDICATED nodes mirroring SizeOf:
     //    `VaArg` carries the read TYPE on a [TypeRef] child it NEVER value-lowers
     //    (vs IntrinsicCall, which value-lowers every child). VaStart/VaEnd take the
@@ -109,6 +117,8 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
         case HirKind::Swizzle: case HirKind::ConstructAggregate: case HirKind::Ternary:
         case HirKind::LogicalAnd: case HirKind::LogicalOr: case HirKind::SizeOf:
         case HirKind::AddressOf: case HirKind::Deref: case HirKind::SeqExpr:
+        // D-CSUBSET-COMPUTED-GOTO: `&&label` is an expression yielding `void*`.
+        case HirKind::LabelAddressOf:
         // ── Variadic intrinsics (FC12a-core): every one is an expression node.
         //    VaArg's type is the READ value's type T; VaStart/VaEnd carry a valid
         //    `void` type (the void-returning-call convention — a valid TypeId, not
@@ -132,7 +142,7 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
         case HirKind::WhileStmt: case HirKind::DoWhileStmt: case HirKind::ForStmt:
         case HirKind::SwitchStmt: case HirKind::CaseArm: case HirKind::BreakStmt:
         case HirKind::ContinueStmt: case HirKind::ReturnStmt: case HirKind::ExprStmt:
-        case HirKind::GotoStmt: case HirKind::LabelStmt:
+        case HirKind::GotoStmt: case HirKind::LabelStmt: case HirKind::IndirectGotoStmt:
         case HirKind::AssignStmt: case HirKind::Unreachable:
         case HirKind::Error: case HirKind::Extension: case HirKind::Count_:
             return false;
@@ -204,6 +214,8 @@ struct ChildArity {
     switch (kind) {
         // ── Expressions (HR2) ──
         case HirKind::Literal: case HirKind::Ref: case HirKind::TypeRef:
+        // D-CSUBSET-COMPUTED-GOTO: `&&label` leaf — target label ordinal in payload.
+        case HirKind::LabelAddressOf:
             return {0, 0};
         case HirKind::Call:               return {1, kUnboundedArity};  // [callee, args...]
         case HirKind::IntrinsicCall:      return {0, kUnboundedArity};  // [args...]
@@ -244,6 +256,8 @@ struct ChildArity {
         // ── Unstructured CF (FC5) ──
         case HirKind::GotoStmt:           return {0, 0};   // leaf; target label ordinal in payload
         case HirKind::LabelStmt:          return {1, 1};   // [labeledStmt]; label ordinal in payload
+        // D-CSUBSET-COMPUTED-GOTO: `goto *expr;` — [addressExpr], the pointer to jump to.
+        case HirKind::IndirectGotoStmt:   return {1, 1};
         // ── Declarations (HR4) ──
         case HirKind::Function:      return {1, kUnboundedArity};  // [params…, body Block]
         case HirKind::ExternFunction: return {0, kUnboundedArity}; // [params…] (no body)

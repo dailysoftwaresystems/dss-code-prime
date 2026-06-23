@@ -41,6 +41,16 @@ namespace {
     for (auto const& d : mod.dataItems) {
         if (d.symbol.v > maxV) maxV = d.symbol.v;
     }
+    // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols (`&&label` targets) also
+    // occupy SymbolIds — mint past them too, or the trampoline's exit/_start externs
+    // collide with a block symbol (surfaces downstream as K_SymbolUndefined "declared
+    // more than once" in the linker's compound-symbol index, away from this root
+    // cause — the same silent-here/loud-downstream class the dataItems scan closes).
+    for (auto const& fn : mod.functions) {
+        for (auto const& bs : fn.blockSymbols) {
+            if (bs.symbol.v > maxV) maxV = bs.symbol.v;
+        }
+    }
     return maxV;
 }
 

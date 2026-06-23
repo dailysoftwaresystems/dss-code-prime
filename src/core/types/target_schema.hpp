@@ -1840,18 +1840,20 @@ enum class TargetTerminatorKind : std::uint8_t {
     Switch      = 3,    // >=2 successors                           (LirBuilder::addSwitch — reserved)
     Return      = 4,    // 0 successors, may carry return-value ops (LirBuilder::addReturn)
     Unreachable = 5,    // 0 successors, 0 operands                 (LirBuilder::addUnreachable)
+    IndirectBr  = 6,    // >=1 successors, 1 reg operand (the addr) (LirBuilder::addIndirectBr) — D-CSUBSET-COMPUTED-GOTO
 };
 
 // Canonical string form used by `.target.json` and `.dsslir` text.
 // Single source of truth for the loader (string → enum) and any future
 // emit-side serializer (enum → string).
-inline constexpr EnumNameTable<TargetTerminatorKind, 6> kTargetTerminatorKindTable{{{
+inline constexpr EnumNameTable<TargetTerminatorKind, 7> kTargetTerminatorKindTable{{{
     { TargetTerminatorKind::None,        "none"        },
     { TargetTerminatorKind::Br,          "br"          },
     { TargetTerminatorKind::CondBr,      "cond-br"     },
     { TargetTerminatorKind::Switch,      "switch"      },
     { TargetTerminatorKind::Return,      "return"      },
     { TargetTerminatorKind::Unreachable, "unreachable" },
+    { TargetTerminatorKind::IndirectBr,  "indirect-br" },
 }}};
 
 [[nodiscard]] constexpr std::string_view
@@ -1877,12 +1879,14 @@ struct TargetTerminatorShape {
     // treats `maxSuccessors == 255` as "no upper bound".
 };
 
-inline constexpr std::array<TargetTerminatorShape, 5> kTargetTerminatorShapes{{
+inline constexpr std::array<TargetTerminatorShape, 6> kTargetTerminatorShapes{{
     { TargetTerminatorKind::Br,          1, 1   },
     { TargetTerminatorKind::CondBr,      2, 2   },
     { TargetTerminatorKind::Switch,      2, 255 },  // 255 = unbounded sentinel
     { TargetTerminatorKind::Return,      0, 0   },
     { TargetTerminatorKind::Unreachable, 0, 0   },
+    // D-CSUBSET-COMPUTED-GOTO: >=1 address-taken successors (255 = unbounded).
+    { TargetTerminatorKind::IndirectBr,  1, 255 },
 }};
 
 [[nodiscard]] constexpr TargetTerminatorShape const*

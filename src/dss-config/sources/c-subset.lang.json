@@ -642,7 +642,13 @@
       "speculative": true, "lookahead": 256
     },
 
-    "gotoStmt":  { "sequence": [ "GotoKeyword", "Identifier", "EndStatement" ] },
+    "gotoStmt": {
+      "$comment": "D-CSUBSET-COMPUTED-GOTO: `goto label;` (C 6.8.6.1) OR the GNU extension `goto *expr;` (indirect branch to a computed code address). Two alternatives, mirroring sizeofExpr's 2-alt triage. The leading `*` is consumed as GOTO-STATEMENT syntax — so `gotoIndirect`'s operand is the pointer expression `expr` itself (NOT a deref), distinct from the prec-90 prefix `*`. `gotoLabel` keeps the FC5 plain form; the label-vs-indirect choice is unambiguous on the token AFTER `goto` (Identifier+EndStatement is a label; StarOp begins an indirect target). Both lower in cst_to_hir (gotoLabel→GotoStmt, gotoIndirect→IndirectGotoStmt).",
+      "alt": [ "gotoLabel", "gotoIndirect" ],
+      "speculative": true, "lookahead": 64
+    },
+    "gotoLabel":    { "sequence": [ "GotoKeyword", "Identifier", "EndStatement" ] },
+    "gotoIndirect": { "sequence": [ "GotoKeyword", "StarOp", "expression", "EndStatement" ] },
     "labelStmt": { "sequence": [ "Identifier", "Colon", "statement" ] },
     "emptyStmt": { "sequence": [ "EndStatement" ] },
 
@@ -837,6 +843,7 @@
         "charLiteralExpr",
         "compoundLiteralExpr",
         "sizeofExpr",
+        "labelAddressExpr",
         "vaStartExpr",
         "vaArgExpr",
         "vaEndExpr",
@@ -874,6 +881,10 @@
       "sequence": [ "SizeofKeyword", "castOperand" ]
     },
 
+    "labelAddressExpr": {
+      "$comment": "D-CSUBSET-COMPUTED-GOTO: the GNU `&&label` label-address expression. A DEDICATED operand rule (parallel to sizeofExpr) — NOT the prec-90 prefix `&` doubled — because its operand is a LABEL name in the label namespace, NOT a value: routing it through the ordinary identifier-operand path would resolve `label` as an (undefined) variable and fail to parse. The `Identifier` here is a RAW token (like labelStmt's), recovered by the CST→HIR lowering which resolves it to the label's per-function ordinal and stamps the result `void*`. The leading `&&` is the single AndAndOp token (no lexer change).",
+      "sequence": [ "AndAndOp", "Identifier" ]
+    },
     "vaStartExpr": {
       "$comment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): `va_start(ap, last)`. Takes the `va_list` lvalue (assignmentExpr — the comma-free, non-comma-operator form) and an OPTIONAL second `last` arg that is parsed-and-ignored (the SysV gp/fp offsets derive from the FnSig, not from `last`). A leaf form in the operand alternative list, parallel to sizeofExpr.",
       "sequence": [
@@ -1248,7 +1259,8 @@
       { "rule": "breakStmt",    "hirKind": "BreakStmt"    },
       { "rule": "continueStmt", "hirKind": "ContinueStmt" },
       { "rule": "returnStmt",   "hirKind": "ReturnStmt"  },
-      { "rule": "gotoStmt",     "hirKind": "GotoStmt"    },
+      { "rule": "gotoLabel",    "hirKind": "GotoStmt"    },
+      { "rule": "gotoIndirect", "hirKind": "IndirectGotoStmt" },
       { "rule": "labelStmt",    "hirKind": "LabelStmt"   },
       { "rule": "emptyStmt",    "hirKind": "Skip"        },
       { "rule": "exprStmt",     "hirKind": "ExprStmt"    }
@@ -1267,6 +1279,7 @@
     "compoundLiteralRule": "compoundLiteralExpr",
     "castRule":            "castExpr",
     "sizeofRule":          "sizeofExpr",
+    "labelAddressRule":    "labelAddressExpr",
     "vaStartRule":         "vaStartExpr",
     "vaArgRule":           "vaArgExpr",
     "vaEndRule":           "vaEndExpr",

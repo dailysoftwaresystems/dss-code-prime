@@ -804,6 +804,10 @@ struct Lowerer {
             || (cfg.ternaryExprRule.valid() && r == cfg.ternaryExprRule.v);
     }
     [[nodiscard]] TypeId boolType() { return interner.primitive(TypeKind::Bool); }
+    // D-CSUBSET-COMPUTED-GOTO: `void*` — the type of a `&&label` code address.
+    [[nodiscard]] TypeId voidPtrType() {
+        return interner.pointer(interner.primitive(TypeKind::Void));
+    }
     [[nodiscard]] TypeId typeAtOr(NodeId n, TypeId fallback) const {
         TypeId t = model.typeAt(n);
         return t.valid() ? t : fallback;
@@ -983,6 +987,14 @@ struct Lowerer {
             if (cfg.sizeofRule.valid()
              && tree().rule(c).v == cfg.sizeofRule.v) {
                 return lowerSizeof(c);
+            }
+            // D-CSUBSET-COMPUTED-GOTO: `&&label` — its Identifier child is a RAW
+            // label name (the label namespace), NOT a value to resolve, so it
+            // routes to a dedicated lowering (the sizeof precedent) before any
+            // attempt to type the operand as an expression.
+            if (cfg.labelAddressRule.valid()
+             && tree().rule(c).v == cfg.labelAddressRule.v) {
+                return lowerLabelAddress(c);
             }
             // FC12a-core: the three variadic intrinsics route to their dedicated
             // lowerings (their type child must NOT be lowered as an expression,
@@ -1695,8 +1707,8 @@ struct Lowerer {
                                           tree().text(opTok)));
             return {errorNode(node), InvalidType};
         }
-        E operand = lowerExpr(operandN);
         HirOperatorEntry const& e = cfg.unaryOps[it->second];
+        E operand = lowerExpr(operandN);
         if (e.target == "AddressOf") {
             TypeId const result = operand.type.valid() ? interner.pointer(operand.type) : InvalidType;
             return {track(builder.makeAddressOf(operand.id, result), node), result};
@@ -2006,6 +2018,7 @@ struct Lowerer {
         if (k == "ForStmt")     return lowerFor(node);
         if (k == "SwitchStmt")  return lowerSwitch(node);
         if (k == "GotoStmt")    return lowerGoto(node);
+        if (k == "IndirectGotoStmt") return lowerIndirectGoto(node);
         if (k == "LabelStmt")   return lowerLabel(node);
         // FC5: an empty statement `;` lowers to a no-op (an empty Block: it lowers
         // to nothing in MIR, doesn't terminate, and emits no warning). `Skip` is
@@ -2082,6 +2095,32 @@ struct Lowerer {
             return errorNode(node);
         }
         return track(builder.makeGotoStmt(it->second), node);
+    }
+
+    // D-CSUBSET-COMPUTED-GOTO: `goto *expr;` (GNU). The CST shape is
+    // [GotoKeyword, StarOp, expression, EndStatement] — the `*` is GOTO syntax
+    // (consumed by the grammar), so the sole visible non-token child is the
+    // pointer EXPRESSION (lowered as a value, not via the prefix-deref path).
+    // The pointer-operand requirement is enforced by the semantic typer; here we
+    // only build the node. Successors (every address-taken label) are realized at
+    // the MIR tier by IndirectBr.
+    HirNodeId lowerIndirectGoto(NodeId node) {
+        NodeId addrN{};
+        for (NodeId c : visible(node)) { if (!isToken(c)) { addrN = c; break; } }
+        if (!addrN.valid()) {
+            unsupported(node, "computed goto is missing a target address expression");
+            return errorNode(node);
+        }
+        E addr = lowerExpr(addrN);
+        // C/GNU: the operand of `goto *expr` must be a pointer (the computed code
+        // address; `void*` from `&&label` or any object pointer). Fail loud on a
+        // non-pointer rather than silently jumping to a garbage address.
+        if (addr.type.valid() && interner.kind(addr.type) != TypeKind::Ptr) {
+            emitH(DiagnosticCode::S_NotAPointer, addrN,
+                  "the operand of computed `goto *` must be a pointer");
+            return errorNode(node);
+        }
+        return track(builder.makeIndirectGotoStmt(addr.id), node);
     }
 
     // A statement-context expression: an assignment becomes an AssignStmt (HIR
@@ -2367,6 +2406,31 @@ struct Lowerer {
         HirNodeId const tref = track(builder.makeTypeRef(sized), node);
         TypeId const u64 = interner.primitive(TypeKind::U64);
         return {track(builder.makeSizeOf(tref, u64), node), u64};
+    }
+
+    // D-CSUBSET-COMPUTED-GOTO: `&&label` → core `HirKind::LabelAddressOf`. The
+    // grammar (`labelAddressExpr = AndAndOp Identifier`) carries the target label
+    // as a RAW Identifier token (the label namespace — NOT a value symbol). Resolve
+    // it to the label's per-function ordinal (the SAME `labelOrdinals_` map
+    // GotoStmt/LabelStmt use; `prescanLabels` collected every label DEFINITION, so
+    // a forward `&&end` before `end:` resolves), stamp the result `void*`, and emit
+    // the leaf. A reference to a label NOT defined in this function is C/GNU-invalid
+    // → fail loud (never a silent bad ordinal).
+    [[nodiscard]] E lowerLabelAddress(NodeId node) {
+        NodeId const nameTok = firstIdentifierToken(node);
+        if (!nameTok.valid()) {
+            return exprError(node, "&&label is missing a target label identifier");
+        }
+        auto it = labelOrdinals_.find(std::string{tree().text(nameTok)});
+        if (it == labelOrdinals_.end()) {
+            emitH(DiagnosticCode::S_UndefinedLabel, nameTok,
+                  std::format("'&&{}' references label '{}' which is not defined "
+                              "in this function",
+                              tree().text(nameTok), tree().text(nameTok)));
+            return {errorNode(node), InvalidType};
+        }
+        TypeId const result = voidPtrType();
+        return {track(builder.makeLabelAddressOf(it->second, result), node), result};
     }
 
     // FC12a-core: `va_start ( ap, last )` → core `HirKind::VaStart`. The grammar

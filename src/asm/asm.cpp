@@ -40,6 +40,7 @@ using dss::report;
                               std::vector<Relocation>&   relocs,
                               std::vector<SourceMapEntry>& srcMap,
                               std::vector<walker_util::BlockRelPatch>& blockPatches,
+                              std::vector<walker_util::BlockSymPatch>& blockSymPatches,
                               std::span<MirInstId const> lirToMir,
                               DiagnosticReporter&     reporter) {
     auto const opcode = lir.instOpcode(inst);
@@ -82,12 +83,13 @@ using dss::report;
         case TargetEncodingShape::X86Variable:
             return x86_variable::encode(lir, schema, inst, info,
                                          lirToMir, out, relocs, srcMap,
-                                         blockPatches, reporter);
+                                         blockPatches, blockSymPatches,
+                                         reporter);
 
         case TargetEncodingShape::Fixed32:
             return fixed32::encode(lir, schema, inst, info, lirToMir,
                                     out, relocs, srcMap, blockPatches,
-                                    reporter);
+                                    blockSymPatches, reporter);
         }
 
         // Enum-drift fallback. A new `TargetEncodingShape` value
@@ -208,6 +210,11 @@ AssembledModule assemble(Lir const&                 lir,
         std::unordered_map<std::uint32_t, std::uint32_t> blockOffsets;
         blockOffsets.reserve(blockCount);
         std::vector<walker_util::BlockRelPatch> blockPatches;
+        // D-CSUBSET-COMPUTED-GOTO: synthetic-symbol ↔ block bindings a
+        // block-address `lea` accumulates (its trailing BlockRef). Resolved
+        // into `outFn.blockSymbols` once `blockOffsets` is complete (after
+        // the funcEncodeOk check), mirroring the `blockPatches` discipline.
+        std::vector<walker_util::BlockSymPatch> blockSymPatches;
 
         // D-ASM-ENCODE-FAILURE-FUNCTION-ROLLBACK (step 13.5 cycle 1
         // post-fold, silent-failure-hunter CRITICAL #2): track
@@ -233,7 +240,7 @@ AssembledModule assemble(Lir const&                 lir,
                 bool const ok = encodeInst(lir, schema, inst,
                                  outFn.bytes, outFn.relocations,
                                  outFn.sourceMap, blockPatches,
-                                 lirToMir, reporter);
+                                 blockSymPatches, lirToMir, reporter);
                 if (!ok) {
                     outFn.bytes.resize(preInstByteCount);
                     funcEncodeOk = false;
@@ -265,6 +272,44 @@ AssembledModule assemble(Lir const&                 lir,
             outFn.relocations.clear();
             outFn.sourceMap.clear();
             continue;  // skip patch resolution for this function
+        }
+
+        // D-CSUBSET-COMPUTED-GOTO: resolve each pending synthetic-symbol
+        // ↔ block binding now that every block's byte offset is known.
+        // Each binds a synthetic local symbol (the `&&label` block-address
+        // `lea`'s relocation source) to its target block's byte offset
+        // within THIS function; the linker turns each into an interior-
+        // block VA. A target block id absent from `blockOffsets` is
+        // malformed LIR (the BlockRef survived the LIR passes but names no
+        // emitted block) — fail loud, mirroring the blockPatches missing-
+        // target guard below. Unlike `blockPatches`, this binds a SYMBOL,
+        // not a code site: there is no in-function byte to patch (the
+        // linker writes the symbol's bytes via the adjacent `lea`
+        // relocation), so no rollback of bytes is needed on failure — the
+        // diagnostic + the function-shape invariant carry it.
+        bool blockSymOk = true;
+        for (auto const& bsp : blockSymPatches) {
+            auto it = blockOffsets.find(bsp.targetBlock);
+            if (it == blockOffsets.end()) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("block-address binding in fn '{}' targets "
+                                   "block id {} which is not in the function's "
+                                   "block list — malformed LIR (D-CSUBSET-"
+                                   "COMPUTED-GOTO)",
+                                   outFn.symbol.v, bsp.targetBlock));
+                blockSymOk = false;
+                break;
+            }
+            outFn.blockSymbols.push_back(SyntheticBlockSymbol{
+                bsp.symbol, it->second});
+        }
+        if (!blockSymOk) {
+            outFn.bytes.clear();
+            outFn.relocations.clear();
+            outFn.sourceMap.clear();
+            outFn.blockSymbols.clear();
+            continue;  // skip branch-patch resolution for this function
         }
 
         // Resolve intra-function block-relative branch patches now

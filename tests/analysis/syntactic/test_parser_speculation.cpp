@@ -472,6 +472,7 @@ TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
         "charLiteralExpr",
         "compoundLiteralExpr",
         "sizeofExpr",            // FC6
+        "labelAddressExpr",      // D-CSUBSET-COMPUTED-GOTO (`&&label`)
         "vaStartExpr",           // FC12a-core (D-FC12A-VARIADIC-CALLEE)
         "vaArgExpr",             // FC12a-core
         "vaEndExpr",             // FC12a-core

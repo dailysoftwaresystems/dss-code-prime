@@ -4,6 +4,7 @@
 #include "link/format/byte_emit.hpp"
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
+#include "link/format/interior_block_symbol_va.hpp"
 #include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -933,6 +934,16 @@ encodeExec(AssembledModule const&    module,
         && !link::format::addDataSymbolVas(
                module.dataItems, bssDataLayout, oh.imageBase + bss->rva,
                symbolVa, "pe::encodeExec", reporter)) {
+        return {};
+    }
+    // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols get their
+    // interior-block VAs before relocation resolution — sectionVa is the
+    // SAME base (`imageBase + secText.virtualAddress`) used for the
+    // function symbols above, so block VA = funcVA + blockOffset. The
+    // shared helper is identical across ELF/PE/Mach-O.
+    if (!link::format::addInteriorBlockSymbolVas(
+            module, funcTextStart, sectionVa, symbolVa,
+            "pe::encodeExec", reporter)) {
         return {};
     }
     if (!link::format::applyExecRelocations(

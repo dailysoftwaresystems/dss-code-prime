@@ -44,6 +44,8 @@ namespace {
         case MirOpcode::Br:            return "Br";
         case MirOpcode::CondBr:        return "CondBr";
         case MirOpcode::Switch:        return "Switch";
+        case MirOpcode::IndirectBr:    return "IndirectBr";
+        case MirOpcode::BlockAddress:  return "BlockAddress";
         case MirOpcode::Phi:           return "Phi";
         case MirOpcode::Return:        return "Return";
         case MirOpcode::Unreachable:   return "Unreachable";
@@ -76,7 +78,8 @@ namespace {
         || op == MirOpcode::CondBr
         || op == MirOpcode::Switch
         || op == MirOpcode::Return
-        || op == MirOpcode::Unreachable;
+        || op == MirOpcode::Unreachable
+        || op == MirOpcode::IndirectBr;  // D-CSUBSET-COMPUTED-GOTO
 }
 
 // Single source of truth for the lowerer's opcode-mnemonic cache. The
@@ -116,6 +119,10 @@ enum class MnemonicSlot : std::uint8_t {
     // instances `kSDivPair` / `kUDivPair` define the only valid pairs
     // the lowering dispatch can use.
     Cmp, Setcc, Jmp, Jcc,
+    // D-CSUBSET-COMPUTED-GOTO: indirect branch through a register (x86 `jmp r/m64`
+    // FF /4, arm64 `BR Xn`). The MIR IndirectBr's address operand is the register;
+    // its address-taken successors ride as the LIR terminator's successor list.
+    JmpIndirect,
     Ret, Unreachable,
     Alloca, Load, Store, Lea,        // cycle 3c memory ops
     SExt, ZExt, Trunc,                // cycle 3c cast lowering
@@ -244,6 +251,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::Setcc,         "setcc"},
     {MnemonicSlot::Jmp,           "jmp"},
     {MnemonicSlot::Jcc,           "jcc"},
+    {MnemonicSlot::JmpIndirect,   "jmp_indirect"},
     {MnemonicSlot::Ret,           "ret"},
     {MnemonicSlot::Unreachable,   "unreachable"},
     {MnemonicSlot::Alloca,        "alloca"},
@@ -477,6 +485,47 @@ struct Lowerer {
     // extern imports under a nullopt dispatch is a fail-loud at ctor (no
     // silent default — the wrong shape miscompiles).
     std::optional<ExternCallDispatch> externCallDispatch_;
+
+    // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbol minting for `&&label`
+    // block-address materialization. A block whose address is taken gets ONE local
+    // symbol (deduped by MIR block id within the module). `nextBlockSym_` is seeded
+    // lazily to 1 + max(existing function/global SymbolId) on first use so a minted
+    // id can't collide with a user symbol (same discipline as hir_to_mir's
+    // string-literal synthetic minter). `blockToSym_` keys the dedup off the MIR
+    // block id (stable for the duration of THIS lowering — the LIR-pass block
+    // renumbering happens AFTER, and the BlockRef operand carried on the emitted
+    // `lea` is what survives those passes via remapBlockRef).
+    std::optional<std::uint32_t>                  nextBlockSym_;
+    std::unordered_map<std::uint32_t, SymbolId>   blockToSym_;
+    [[nodiscard]] SymbolId mintBlockSymbol(MirBlockId block) {
+        if (auto it = blockToSym_.find(block.v); it != blockToSym_.end()) {
+            return it->second;
+        }
+        if (!nextBlockSym_.has_value()) {
+            std::uint32_t maxV = 0;
+            for (std::uint32_t fi = 0; fi < mir.moduleFuncCount(); ++fi) {
+                if (std::uint32_t const v = mir.funcSymbol(mir.funcAt(fi)).v; v > maxV) {
+                    maxV = v;
+                }
+            }
+            for (std::uint32_t gi = 0; gi < mir.moduleGlobalCount(); ++gi) {
+                if (std::uint32_t const v = mir.globalSymbol(mir.globalAt(gi)).v; v > maxV) {
+                    maxV = v;
+                }
+            }
+            // EXTERN imports occupy SymbolIds too (the exec entry/_start/exit
+            // trampoline externs are minted past the function/global high-water at
+            // HIR→MIR time). A block symbol minted into their range would collide
+            // at link (K_SymbolUndefined "declared more than once"), so clear them.
+            for (std::uint32_t const ev : externSymbols) {
+                if (ev > maxV) maxV = ev;
+            }
+            nextBlockSym_ = maxV + 1u;
+        }
+        SymbolId const sym{(*nextBlockSym_)++};
+        blockToSym_.emplace(block.v, sym);
+        return sym;
+    }
 
     // Whether the running lowering pass added any error-severity
     // diagnostics. Mirrors ML2's delta-on-errorCount; reset by the ctor.
@@ -1311,6 +1360,8 @@ struct Lowerer {
             case MirOpcode::UIToFP:  return lowerCast(id, MnemonicSlot::UiToFp,  "MIR UIToFP");
             // ── cycle 3e: Calls + GlobalAddr ───────────────────────
             case MirOpcode::GlobalAddr:    return lowerGlobalAddr(id);
+            // D-CSUBSET-COMPUTED-GOTO: `&&label` block address materialization.
+            case MirOpcode::BlockAddress:  return lowerBlockAddress(id);
             case MirOpcode::ByValueStackArg: return lowerByValueStackArg(id);
             case MirOpcode::Call:          return lowerCall(id);
             case MirOpcode::IntrinsicCall: return lowerIntrinsicCall(id);
@@ -2136,6 +2187,76 @@ struct Lowerer {
         std::array<LirOperand, 1> ops{LirOperand::makeSymbolRef(sym.v)};
         emitInst(*opcode(MnemonicSlot::Lea), result, ops);
         defineValue(id, result);
+    }
+
+    // D-CSUBSET-COMPUTED-GOTO: `&&label` → materialize the target block's runtime
+    // address into a register, exactly like `lowerGlobalAddr` materializes a global
+    // — a `lea` of a SYNTHETIC per-block symbol (rel32 on x86; adrp+add on arm64;
+    // the linker assigns the symbol the interior-block VA). The `lea` carries a
+    // SECOND operand — a `BlockRef` naming the target LIR block — so the assembler
+    // can bind the synthetic symbol to that block's byte offset. The BlockRef rides
+    // through every LIR rewrite pass (remapBlockRef keeps it current); the SymbolRef
+    // rides unchanged. The two operands together are the block-symbol binding.
+    void lowerBlockAddress(MirInstId id) {
+        if (!opcode(MnemonicSlot::Lea).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Lea, "MIR BlockAddress");
+            return;
+        }
+        MirBlockId const mirTarget = mir.blockAddressTarget(id);
+        if (!mirBlockToLirBlock.has(mirTarget)) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "MIR BlockAddress target block %{} has no LIR block mapping",
+                mirTarget.v);
+            reporter.report(std::move(d));
+            return;
+        }
+        LirBlockId const lirTarget = mirBlockToLirBlock.get(mirTarget);
+        SymbolId const sym = mintBlockSymbol(mirTarget);
+        LirReg const result = lir.newVReg(regClassFor(id));
+        std::array<LirOperand, 2> ops{
+            LirOperand::makeSymbolRef(sym.v),
+            LirOperand::makeBlockRef(lirTarget.v)};
+        emitInst(*opcode(MnemonicSlot::Lea), result, ops);
+        defineValue(id, result);
+    }
+
+    // D-CSUBSET-COMPUTED-GOTO: `goto *p` → `jmp_indirect <reg>` (x86 jmp r/m64 FF/4
+    // / arm64 BR Xn). operand[0] is the computed address; the address-taken
+    // successor blocks ride as the LIR terminator's successor list (each remapped to
+    // its LIR block), mirroring how `lowerSwitch`/`lowerBr` carry block successors.
+    bool lowerIndirectBr(MirInstId id, std::span<MirBlockId const> succs) {
+        if (!opcode(MnemonicSlot::JmpIndirect).has_value()) {
+            reportMissingOpcode(MnemonicSlot::JmpIndirect, "MIR IndirectBr");
+            return false;
+        }
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1 || succs.empty()) {
+            reportUnsupported(MirOpcode::IndirectBr, id);
+            return false;
+        }
+        std::optional<LirReg> const addr = regForValue(operands[0]);
+        if (!addr.has_value()) return false;
+        std::vector<LirBlockId> lirSuccs;
+        lirSuccs.reserve(succs.size());
+        for (MirBlockId const s : succs) {
+            if (!mirBlockToLirBlock.has(s)) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "MIR IndirectBr successor block %{} has no LIR block mapping",
+                    s.v);
+                reporter.report(std::move(d));
+                return false;
+            }
+            lirSuccs.push_back(mirBlockToLirBlock.get(s));
+        }
+        std::array<LirOperand, 1> ops{LirOperand::makeReg(*addr)};
+        emitIndirectBr(*opcode(MnemonicSlot::JmpIndirect), ops, lirSuccs);
+        return true;
     }
 
     // MIR Call → LIR `call callee, args...`. Convention:
@@ -3444,6 +3565,7 @@ struct Lowerer {
             case MirOpcode::Br:          return lowerBr(termId, succs);
             case MirOpcode::CondBr:      return lowerCondBr(termId, succs);
             case MirOpcode::Switch:      return lowerSwitch(termId, succs);
+            case MirOpcode::IndirectBr:  return lowerIndirectBr(termId, succs);
             case MirOpcode::Unreachable: return lowerUnreachable(termId);
             default:                     break;
         }
@@ -3967,6 +4089,12 @@ struct Lowerer {
     }
     LirInstId emitReturn(std::uint16_t op, std::span<LirOperand const> ops) {
         LirInstId const li = lir.addReturn(op, ops);
+        recordSource(li);
+        return li;
+    }
+    LirInstId emitIndirectBr(std::uint16_t op, std::span<LirOperand const> ops,
+                             std::span<LirBlockId const> targets) {
+        LirInstId const li = lir.addIndirectBr(op, ops, targets);
         recordSource(li);
         return li;
     }

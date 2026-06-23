@@ -3990,6 +3990,13 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) 
     if (hirCfg.sizeofRule.valid() && r.v == hirCfg.sizeofRule.v) {
         return interner.primitive(TypeKind::U64);                  // size_t
     }
+    // D-CSUBSET-COMPUTED-GOTO: `&&label` is `void*`. A dedicated operand rule
+    // (the sizeof precedent) whose Identifier child is a LABEL name — NOT typed as
+    // an expression (the transparent-wrapper fallthrough would try to resolve the
+    // label as a variable). Mirrors cst_to_hir's lowerLabelAddress result type.
+    if (hirCfg.labelAddressRule.valid() && r.v == hirCfg.labelAddressRule.v) {
+        return interner.pointer(interner.primitive(TypeKind::Void));
+    }
     if (auto const it = s.idx().castByRule.find(r.v);
         it != s.idx().castByRule.end()) {
         auto const& cr = sem.castRules[it->second];

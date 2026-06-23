@@ -417,12 +417,30 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             // A variant whose `operandKinds` declares N positions but
             // whose `wires` covers only K<N would match an N-operand
             // LIR inst then silently drop the unwired operand.
+            //
+            // D-CSUBSET-COMPUTED-GOTO (operand-aware exemption, mirroring
+            // the BlockRef-aware exemption the relocationKind rule above
+            // already applies): a `BlockRef` guard position is EXEMPT. A
+            // block reference is never byte-encoded data — it is either
+            // wired to a block-relative displacement slot (jmp/jcc,
+            // resolved at assemble time) OR it is the SYMBOL ↔ BLOCK
+            // binding directive carried by the block-address `lea` (its
+            // trailing BlockRef, intentionally UNWIRED — the encoder reads
+            // it from the operand list and records a `BlockSymPatch`, NOT a
+            // byte). In neither case is anything "silently dropped from the
+            // encoding" in the sense this rule guards (a dropped register /
+            // immediate / displacement that should have contributed bytes).
+            // The encoder fail-loud handles a BlockRef it cannot consume,
+            // so this exemption never hides a real drop.
             {
                 std::vector<bool> covered(v.operandKinds.size(), false);
                 for (auto const& w : v.wires) {
                     if (w.index < covered.size()) covered[w.index] = true;
                 }
                 for (std::size_t gi = 0; gi < covered.size(); ++gi) {
+                    if (v.operandKinds[gi] == OperandKindFilter::BlockRef) {
+                        continue;  // BlockRef positions carry no bytes (see above)
+                    }
                     if (!covered[gi]) {
                         fail(std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi),
                              std::format("opcode '{}' variant {}: guard "

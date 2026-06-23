@@ -23,9 +23,17 @@
 namespace dss {
 
 enum class SymbolKind : std::uint8_t {
-    Defined = 0,  // an intra-module function definition (AssembledFunction)
-    Extern  = 1,  // an FFI import (ExternImport), resolved via the import table
-    Data    = 2,  // a rodata / data item (AssembledData)
+    Defined   = 0,  // an intra-module function definition (AssembledFunction)
+    Extern    = 1,  // an FFI import (ExternImport), resolved via the import table
+    Data      = 2,  // a rodata / data item (AssembledData)
+    // D-CSUBSET-COMPUTED-GOTO: a synthetic per-block LOCAL symbol minted for a
+    // `&&label` block-address `lea` (carried in AssembledFunction::blockSymbols).
+    // Intra-module DEFINED — it names an interior basic block; the per-format
+    // walker assigns it an interior-block VA before relocation resolution (see
+    // link/format/interior_block_symbol_va.hpp). A distinct kind keeps the
+    // which-kind-defined-this distinction precise (it is neither a function entry
+    // nor a data item).
+    BlockLocal = 3,
 };
 
 // A `SymbolId` scoped to its defining CompilationUnit — the linker's collision-

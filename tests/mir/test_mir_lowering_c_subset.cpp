@@ -5827,3 +5827,113 @@ TEST(MirLoweringCSubset, AppleVaArgIntLowersLinearOverflowBase) {
         << "Apple va_arg is a LINEAR pointer bump — no diamond";
     EXPECT_EQ(countOpcodeAllBlocks(m, afi, MirOpcode::Phi), 0u);
 }
+
+// ── D-CSUBSET-COMPUTED-GOTO: HIR→MIR structural pins (MF-1 / MF-A) ──────────
+//
+// `&&label` lowers to a BlockAddress (payload = target block), and `goto *p`
+// lowers to an IndirectBr whose SUCCESSORS are EVERY address-taken block. That
+// successor set is the load-bearing CFG-correctness invariant: it is what makes
+// reachability/DCE keep the label blocks and phi-validation see the indirect
+// predecessor. These pins assert it directly off the MIR.
+
+namespace {
+// Find the single IndirectBr terminator in function `fi`, or InvalidMirInst.
+[[nodiscard]] MirInstId findIndirectBr(Mir const& m, std::uint32_t fi) {
+    MirFuncId const fn = m.funcAt(fi);
+    std::uint32_t const nb = m.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const b = m.funcBlockAt(fn, bi);
+        if (m.blockInstCount(b) == 0) continue;
+        MirInstId const term = m.blockTerminator(b);
+        if (m.instOpcode(term) == MirOpcode::IndirectBr) return term;
+    }
+    return MirInstId{};
+}
+} // namespace
+
+TEST(MirLoweringCSubset, ComputedGotoIndirectBrSuccessorsAreAllAddressTakenBlocks) {
+    // Two `&&label` + a `goto *p`: the IndirectBr must list BOTH label blocks as
+    // successors, and each must read back as address-taken. RED-ON-DISABLE: drop a
+    // successor in a clone arm (mir_merge / mir_rebuild_helper) and the count != 2;
+    // lose the BlockAddress-derived address-taken mark and isBlockAddressTaken flips.
+    auto L = lowerCSubset(
+        "int f(int s) {\n"
+        "  void *a = &&one;\n"
+        "  void *b = &&two;\n"
+        "  void *t = s ? a : b;\n"
+        "  goto *t;\n"
+        "one:\n"
+        "  return 1;\n"
+        "two:\n"
+        "  return 2;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "semantic: " << (L.model.diagnostics().all().empty()
+            ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "HIR: " << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR: " << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+
+    // Two `&&label` → two BlockAddress ops, with two DISTINCT target blocks.
+    EXPECT_EQ(countOpcodeAllBlocks(m, 0, MirOpcode::BlockAddress), 2u)
+        << "each &&label lowers to one BlockAddress";
+
+    MirInstId const ibr = findIndirectBr(m, 0);
+    ASSERT_TRUE(ibr.valid()) << "goto *p must lower to an IndirectBr terminator";
+    EXPECT_EQ(m.instOperands(ibr).size(), 1u) << "IndirectBr operand[0] = the address";
+
+    // ★ THE MF-1 PIN: successors == the FULL address-taken block set (here 2).
+    MirBlockId const ibrBlock = m.instBlock(ibr);
+    auto const succs = m.blockSuccessors(ibrBlock);
+    ASSERT_EQ(succs.size(), 2u)
+        << "IndirectBr successors must be ALL address-taken blocks (2)";
+    for (MirBlockId const s : succs) {
+        EXPECT_TRUE(m.isBlockAddressTaken(s))
+            << "every IndirectBr successor is an address-taken (&&label) block";
+    }
+    // The two successors are the two distinct BlockAddress targets.
+    EXPECT_NE(succs[0].v, succs[1].v) << "the two label blocks are distinct";
+}
+
+TEST(MirLoweringCSubset, ComputedGotoBlockAddressTargetsAreAddressTaken) {
+    // A block targeted by a BlockAddress reads back as address-taken; a block that
+    // is NOT a &&label target does not. RED-ON-DISABLE: isBlockAddressTaken is the
+    // SimplifyCfg fold-guard's source of truth — if it returned false for a real
+    // target, an address-taken block could be folded away (a silent miscompile).
+    auto L = lowerCSubset(
+        "int f(int s) {\n"
+        "  void *a = &&only;\n"
+        "  goto *a;\n"
+        "only:\n"
+        "  return 7;\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR: " << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+
+    // Find the BlockAddress and confirm its target reads back as address-taken.
+    bool sawBlockAddr = false;
+    std::uint32_t const nb = m.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const b = m.funcBlockAt(fn, bi);
+        std::uint32_t const ni = m.blockInstCount(b);
+        for (std::uint32_t ii = 0; ii < ni; ++ii) {
+            MirInstId const inst = m.blockInstAt(b, ii);
+            if (m.instOpcode(inst) != MirOpcode::BlockAddress) continue;
+            sawBlockAddr = true;
+            MirBlockId const target = m.blockAddressTarget(inst);
+            EXPECT_TRUE(m.isBlockAddressTaken(target))
+                << "a BlockAddress target IS address-taken";
+        }
+    }
+    ASSERT_TRUE(sawBlockAddr) << "&&only must lower to a BlockAddress";
+
+    // The function's ENTRY block is not a &&label target → not address-taken.
+    EXPECT_FALSE(m.isBlockAddressTaken(m.funcEntry(fn)))
+        << "a non-&&label block is not address-taken (the negative pin)";
+}
