@@ -1353,6 +1353,45 @@ TEST(Arm64Encoder, SubSpFrameBeyond16MiBSplitsToMovzMovkThreeWord) {
     EXPECT_EQ(bytes[11], 0xCB);
 }
 
+TEST(Arm64Encoder, AddSpFrameBeyond16MiBSplitsToMovzMovkThreeWord) {
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (EPILOGUE): the callconv's
+    // `add sp, sp, #frame` SPLITS to the SAME 3-word MOVZ/MOVK + EXTENDED form
+    // as the prologue sub, differing ONLY in word2's op bit (ADD=0 vs SUB=1).
+    // EXACT byte-pin for `add sp, sp, #0x1234000` — word0/word1 identical to the
+    // sub pin; word2 = ADD sp,sp,x16 EXTENDED = 0x8B3063FF → FF 63 30 8B (NOT
+    // the shifted-register 0x8B000000 where #31=XZR). Closes the dss-audit
+    // coverage gap (the epilogue add was runtime-only before).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const addOp = (*s)->opcodeByMnemonic("add");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(addOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(0x1234000)
+    };
+    (void)b.addInst(*addOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 12u);
+    EXPECT_EQ(bytes[0], 0x10); EXPECT_EQ(bytes[1], 0x00);  // MOVZ x16,#0x4000
+    EXPECT_EQ(bytes[2], 0x88); EXPECT_EQ(bytes[3], 0xD2);
+    EXPECT_EQ(bytes[4], 0x70); EXPECT_EQ(bytes[5], 0x24);  // MOVK x16,#0x123,LSL16
+    EXPECT_EQ(bytes[6], 0xA0); EXPECT_EQ(bytes[7], 0xF2);
+    // word2 — ADD sp,sp,x16 EXTENDED (FF 63 30 8B) — full word
+    EXPECT_EQ(bytes[8],  0xFF);
+    EXPECT_EQ(bytes[9],  0x63);
+    EXPECT_EQ(bytes[10], 0x30);
+    EXPECT_EQ(bytes[11], 0x8B);
+}
+
 TEST(Arm64Encoder, FrameSubSpAt16MiBSplitsToThreeWord) {
     // Boundary pin: 16777216 (0x1000000, the 24-bit ceiling + 1) NO LONGER
     // fails loud — it is the FIRST value routed to the 3-word MOVZ/MOVK form
