@@ -1860,13 +1860,32 @@ struct Lowerer {
             return {track(builder.makeCall(base.id, args, result), node), result};
         }
         if (e.target == "Index") {
-            HirNodeId idx = rest.empty() ? reportedError(node, "index has no subscript expression")
-                                         : lowerExpr(rest.front()).id;
+            E idxE = rest.empty()
+                ? E{reportedError(node, "index has no subscript expression"),
+                    InvalidType}
+                : lowerExpr(rest.front());
+            // D-CSUBSET-INDEX-INTEGER-PROMOTION (C 6.3.1.1 / 6.5.2.1): the
+            // subscript undergoes INTEGER PROMOTION — a `char`/`short` index
+            // promotes to `int` BEFORE the index arithmetic. Without it, a narrow
+            // index forms a narrow stride-`Mul` at MIR (`scaleIndexToBytes`) that
+            // (1) OVERFLOWS — `idx * stride` wraps at the narrow width
+            // (`(char)100 * 4` = 400 mod 256) — and (2) walls at the sub-native
+            // ALU gap (`D-CSUBSET-SUBNATIVE-ALU-FORMS`). Reuse the SAME
+            // `integerPromotedType` the binary-op path uses (config-driven C
+            // 6.3.1 promotion); a block-less language (no `arithmeticConversions`)
+            // or an already-≥int index keeps the raw value (no coerce).
+            if (arith_.has_value() && idxE.type.valid()) {
+                TypeId const promoted =
+                    integerPromotedType(interner, idxE.type, *arith_);
+                if (promoted.valid() && promoted.v != idxE.type.v)
+                    idxE = coerce(idxE, promoted);
+            }
             // element-of-base derivation — the SINGLE source shared with the
             // semantic-tier typer (type_rules.hpp `indexResultType`).
             TypeId const inferred = indexResultType(interner, base.type);
             TypeId const result = typeAtOr(node, inferred);
-            return {track(builder.makeIndex(base.id, idx, result), node), result};
+            return {track(builder.makeIndex(base.id, idxE.id, result), node),
+                    result};
         }
         // D5.1: `obj.field` and `ptr->field`. The semantic phase (Pass 2)
         // already resolved the field's SymbolId (via the `memberAccesses`

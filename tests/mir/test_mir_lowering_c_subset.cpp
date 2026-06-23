@@ -1739,6 +1739,44 @@ TEST(MirLoweringCSubset, IndexOverIntPointerScalesIndexToByteOffset) {
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 5)), MirOpcode::Load);
 }
 
+// D-CSUBSET-INDEX-INTEGER-PROMOTION (C 6.3.1.1 / 6.5.2.1): a `char` subscript of
+// a WIDE-element pointer integer-PROMOTES to int BEFORE the stride `Mul` — else
+// the Mul is Char-typed and (1) OVERFLOWS (idx*stride wraps at char width) and
+// (2) walls at the sub-native ALU gap. The promotion materializes a widening
+// (SExt/ZExt) to I32 whose RESULT (not the raw char Arg) feeds the Mul, and the
+// Mul is I32-typed. RED-ON-DISABLE: revert the cst_to_hir Index promotion arm →
+// the block has no widening inst, the Mul lhs is the raw char Arg, and the Mul is
+// Char-typed (the inst-count 8→7, the opcode + I32-type assertions all flip).
+TEST(MirLoweringCSubset, CharIndexIntegerPromotesToI32BeforeStrideMul) {
+    auto L = lowerCSubset("int f(int* a, char i) { return a[i]; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto& interner = L.model.lattice().interner();
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Arg a, Arg i(char), {SExt|ZExt}(i)->i32, Const(4), Mul(promo,4), Gep, Load, Return]
+    ASSERT_EQ(m.blockInstCount(entry), 8u)
+        << "the char index adds ONE promotion (widen) inst vs the int-index 7";
+    MirInstId const argI  = m.blockInstAt(entry, 1);
+    MirInstId const promo = m.blockInstAt(entry, 2);
+    MirOpcode const pop = m.instOpcode(promo);
+    EXPECT_TRUE(pop == MirOpcode::SExt || pop == MirOpcode::ZExt)
+        << "a char index promotes via a widening (SExt/ZExt) — C 6.3.1.1";
+    EXPECT_EQ(interner.kind(m.instType(promo)), TypeKind::I32)
+        << "the promotion target is int";
+    auto promoOps = m.instOperands(promo);
+    ASSERT_EQ(promoOps.size(), 1u);
+    EXPECT_EQ(promoOps[0], argI) << "the widen source is the raw char Arg i";
+    MirInstId const mul = m.blockInstAt(entry, 4);
+    ASSERT_EQ(m.instOpcode(mul), MirOpcode::Mul);
+    EXPECT_EQ(interner.kind(m.instType(mul)), TypeKind::I32)
+        << "the stride Mul is I32-typed (promoted), NOT Char";
+    auto mulOps = m.instOperands(mul);
+    ASSERT_EQ(mulOps.size(), 2u);
+    EXPECT_EQ(mulOps[0], promo)
+        << "the Mul lhs is the PROMOTED index, not the raw char Arg";
+}
+
 // `int a[5]; a[i]` — a STORAGE array index. PRE-FC: lowered to a 3-op GEP
 // `[&a, 0, i]` that FAILED LOUD at LIR (D-MIR-STORAGE-ARRAY-INDEX-GEP); it was
 // never a miscompile, it didn't compile. NOW: the vestigial leading 0 is
