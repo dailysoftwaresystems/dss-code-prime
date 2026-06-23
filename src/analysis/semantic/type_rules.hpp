@@ -430,6 +430,7 @@ struct ResolvedArithmeticRules {
     std::vector<TypeKind> alsoPromote;              // out-of-lattice promoted kinds
     MixedSignednessRule   mixedSignedness = MixedSignednessRule::RankPreferUnsigned;
     bool                  promoteComparisons = true;
+    ShiftResultRule       shiftResult = ShiftResultRule::PromotedLeft;  // C 6.5.7
 };
 
 [[nodiscard]] inline ResolvedArithmeticRules
@@ -440,6 +441,7 @@ resolveArithmeticRules(ArithmeticConversions const& cfg, DataModel dm) {
     for (auto const& p : cfg.alsoPromote) out.alsoPromote.push_back(p.resolveCore(dm));
     out.mixedSignedness    = cfg.mixedSignedness;
     out.promoteComparisons = cfg.promoteComparisons;
+    out.shiftResult        = cfg.shiftResult;
     return out;
 }
 
@@ -578,6 +580,26 @@ integerPromotedType(TypeInterner& interner, TypeId t,
     TypeKind const p = promoteIntegerKind(k, rules);
     if (p == k) return t;
     return interner.primitive(p);
+}
+
+// C 6.5.7 shift RESULT TYPE under the config verb `shiftResult`
+// (D-UAC-SHIFT-RESULT-RULE-CONFIG) — the SINGLE chokepoint both the CST→HIR
+// shift lowering and the semantic-tier expression typer call, so the two tiers
+// can never diverge on the verb (a regression to one is a regression to both,
+// caught by the one test). `PromotedLeft` (C): the PROMOTED LEFT operand — the
+// count's type never contributes (`i32 << i64` is I32). `CommonType`: the
+// usual-arithmetic common type — a shift typed like an ordinary binary op
+// (`i32 << i64` is I64). Either falls back to the first valid operand for a
+// non-arithmetic pair, mirroring the generic binary result rule.
+[[nodiscard]] inline TypeId
+shiftResultType(TypeInterner& interner, TypeId lhs, TypeId rhs,
+                ResolvedArithmeticRules const& rules) {
+    if (rules.shiftResult == ShiftResultRule::PromotedLeft) {
+        TypeId const lp = integerPromotedType(interner, lhs, rules);
+        return lp.valid() ? lp : (lhs.valid() ? lhs : rhs);
+    }
+    TypeId const common = usualArithmeticCommonType(interner, lhs, rhs, rules);
+    return common.valid() ? common : (lhs.valid() ? lhs : rhs);
 }
 
 // Compile-time sanity: the rank functions are pure (constexpr) and the

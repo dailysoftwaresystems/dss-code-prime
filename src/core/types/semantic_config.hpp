@@ -806,8 +806,22 @@ struct DSS_EXPORT FloatLiteralTypingRule {
 //   * `promoteComparisons` — when true (C), comparison operands run the
 //     same conversion (so `-1 > 0ul` compares as U64); the result stays
 //     Bool. When false, comparisons keep their raw operand types.
+//   * `shiftResult` — closed verb for the C 6.5.7 shift-result discipline
+//     (D-UAC-SHIFT-RESULT-RULE-CONFIG). `promotedLeft` (C): a shift's result
+//     is the integer-PROMOTED LEFT operand's type; the right operand never
+//     contributes (`i32 << i64` is I32). `commonType`: the shift is typed
+//     like an ordinary binary op — both operands run the usual conversions
+//     and the result is their common type (`i32 << i64` is I64). The engine
+//     reads this verb instead of hardcoding C's special shift rule; the
+//     loader rejects an unknown verb. Default `promotedLeft` (a block WITHOUT
+//     it keeps C's rule, so existing adopters are byte-identical).
 enum class MixedSignednessRule : std::uint8_t {
     RankPreferUnsigned = 1,   // C 6.3.1.8
+};
+
+enum class ShiftResultRule : std::uint8_t {
+    PromotedLeft = 1,   // C 6.5.7 — result = the promoted LEFT operand
+    CommonType   = 2,   // symmetric — result = the usual-arithmetic common type
 };
 
 struct DSS_EXPORT ArithmeticConversions {
@@ -815,6 +829,7 @@ struct DSS_EXPORT ArithmeticConversions {
     std::vector<DataModelTypeRef> alsoPromote;          // e.g. ["char", "bool"]
     MixedSignednessRule mixedSignedness = MixedSignednessRule::RankPreferUnsigned;
     bool                promoteComparisons = true;
+    ShiftResultRule     shiftResult = ShiftResultRule::PromotedLeft;  // C 6.5.7
 };
 
 // Type-expression constructors. When a type-position subtree matches

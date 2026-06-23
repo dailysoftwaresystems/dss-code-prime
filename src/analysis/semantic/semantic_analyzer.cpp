@@ -4028,14 +4028,15 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) 
         auto const op = coreOpFromNameSem(e->target);
         if (op.has_value()) {
             if (isComparison(*op)) return boolType();
-            // Shift: result is the PROMOTED LEFT operand (C 6.5.7); the count's
-            // type never contributes. Only WITH the arithmetic block (exactly as
-            // cst_to_hir's combineBinary gates its shift special-case); a block-
-            // less language falls through to the common-type path below — keeping
-            // the two tiers identical for any future shift-declaring language.
+            // Shift result type follows the config verb `shiftResult` via the
+            // shared `shiftResultType` chokepoint (D-UAC-SHIFT-RESULT-RULE-
+            // CONFIG) — the SAME function cst_to_hir's combineBinary uses, so
+            // the semantic tier and HIR lowering can never disagree on a
+            // shift's type for any shift-declaring language. A block-less
+            // language (no `arith`) falls through to the common-type path below.
             if ((*op == HirOpKind::Shl || *op == HirOpKind::Shr)
                 && arith.has_value()) {
-                return integerPromotedType(interner, lt, *arith);
+                return shiftResultType(interner, lt, rt, *arith);
             }
         }
         // Arithmetic / bitwise: the usual-arithmetic common type, falling back

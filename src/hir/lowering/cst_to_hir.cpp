@@ -1559,24 +1559,27 @@ struct Lowerer {
             unsupported(anchor, std::format("binary target '{}' is not a core binary operator", e.target));
             return {errorNode(anchor), InvalidType};
         }
-        // FC3 c1 shifts under the `arithmeticConversions` block: C 6.5.7
-        // — each operand integer-promotes INDEPENDENTLY and the result
-        // type is the PROMOTED LEFT operand only (the count's type never
-        // contributes; `i64 << u32` is I64, `u32 >> 1` is U32 → LShr).
-        // The count is ALSO coerced to the compute type so both register
-        // operands share a width (value-preserving for any in-range
-        // count; an out-of-range count is UB in C). Block-less languages
-        // keep the legacy both-coerce-to-common path below EXACTLY.
+        // FC3 c1 shifts under the `arithmeticConversions` block: the result
+        // type follows the config verb `shiftResult` via the shared
+        // `shiftResultType` chokepoint (D-UAC-SHIFT-RESULT-RULE-CONFIG) — the
+        // SAME function the semantic typer calls, so the two tiers can never
+        // diverge on the verb. `promotedLeft` (C 6.5.7): the PROMOTED LEFT
+        // operand only (the count's type never contributes; `i64 << u32` is
+        // I64, `u32 >> 1` is U32 → LShr). `commonType`: the usual-arithmetic
+        // common type (a shift typed like an ordinary binary op). Both operands
+        // are coerced to that result so the two register operands share a width
+        // (value-preserving for any in-range count; an out-of-range count is UB
+        // in C). A block-less language has no `arith_` and falls through to the
+        // legacy both-coerce-to-common path below EXACTLY.
         if (arith_.has_value()
             && (*op == HirOpKind::Shl || *op == HirOpKind::Shr)) {
-            TypeId const lp = integerPromotedType(interner, lhs.type, *arith_);
-            E lc = lhs, rc = rhs;
-            if (lp.valid()) {
-                lc = coerce(lhs, lp);
-                rc = coerce(rhs, lp);
-            }
             TypeId const result =
-                lp.valid() ? lp : (lhs.type.valid() ? lhs.type : rhs.type);
+                shiftResultType(interner, lhs.type, rhs.type, *arith_);
+            E lc = lhs, rc = rhs;
+            if (result.valid()) {
+                lc = coerce(lhs, result);
+                rc = coerce(rhs, result);
+            }
             return {track(builder.addParent(HirKind::BinaryOp,
                                             std::array{lc.id, rc.id},
                                             result, encodeOp(*op)), anchor),

@@ -67,6 +67,87 @@ namespace {
     return HirNodeId{};
 }
 
+// First node of `want` kind in the subtree rooted at `n` (pre-order). Used to
+// reach the shift BinaryOp past whatever statement wrapper holds it.
+[[nodiscard]] HirNodeId findFirstByKind(Hir const& hir, HirNodeId n, HirKind want) {
+    if (!n.valid()) return {};
+    if (hir.kind(n) == want) return n;
+    for (HirNodeId c : hir.children(n)) {
+        if (HirNodeId r = findFirstByKind(hir, c, want); r.valid()) return r;
+    }
+    return {};
+}
+
+// The shipped c-subset JSON text (for shiftResult perturbation), found by
+// walking up from cwd exactly as loadShipped does. Returned as raw text so the
+// perturbation is a surgical textual swap of the closed verb value — no JSON
+// library dependency in this target.
+[[nodiscard]] std::string shippedCSubsetText() {
+    fs::path dir = fs::current_path();
+    for (int i = 0; i < 12; ++i) {
+        fs::path const cand =
+            dir / "src" / "dss-config" / "sources" / "c-subset.lang.json";
+        if (fs::exists(cand)) {
+            std::ifstream in{cand, std::ios::binary};
+            std::stringstream ss;
+            ss << in.rdbuf();
+            return ss.str();
+        }
+        if (!dir.has_parent_path() || dir.parent_path() == dir) break;
+        dir = dir.parent_path();
+    }
+    ADD_FAILURE() << "could not locate shipped c-subset.lang.json above cwd";
+    return {};
+}
+
+// Lower `void f(int a, long b) { a << b; }` under a schema whose
+// arithmeticConversions.shiftResult is `verb`, and return the TypeKind the
+// shift BinaryOp carries. The shift is an EXPRESSION STATEMENT (no return/assign
+// coercion), so the BinaryOp's own type IS the shift's result type:
+// `promotedLeft` (C 6.5.7) → the promoted left operand int (I32); `commonType`
+// → the usual-arithmetic common type of (int, long) = long (I64). Exercises the
+// cst_to_hir shift arm — the site D-UAC-SHIFT-RESULT-RULE-CONFIG names.
+[[nodiscard]] TypeKind shiftResultKind(std::string const& verb) {
+    std::string text = shippedCSubsetText();
+    // The shipped config declares `promotedLeft`; swap ONLY that closed-verb
+    // value (unique in the file — the doc comment uses backticks, not quotes).
+    std::string const needle = "\"shiftResult\": \"promotedLeft\"";
+    auto const pos = text.find(needle);
+    if (pos == std::string::npos) {
+        ADD_FAILURE() << "shiftResult key not found in shipped c-subset config";
+        std::abort();
+    }
+    text.replace(pos, needle.size(), "\"shiftResult\": \"" + verb + "\"");
+    auto schema = GrammarSchema::loadFromText(text,
+                                              "<shiftResult-" + verb + ">");
+    if (!schema) {
+        ADD_FAILURE() << "perturbed schema (shiftResult=" << verb << ") failed";
+        std::abort();
+    }
+    UnitBuilder builder{*schema};
+    builder.addInMemory("void f(int a, long b) { a << b; }\n", "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    SemanticModel model = analyze(cu);
+    if (model.hasErrors()) {
+        ADD_FAILURE() << "front-end errors under shiftResult=" << verb;
+        std::abort();
+    }
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    if (!res->ok) {
+        ADD_FAILURE() << "lowering failed under shiftResult=" << verb;
+        std::abort();
+    }
+    HirNodeId const fn = firstFunction(res->hir);
+    HirNodeId const shift =
+        findFirstByKind(res->hir, res->hir.functionBody(fn), HirKind::BinaryOp);
+    if (!shift.valid()) {
+        ADD_FAILURE() << "no BinaryOp in body under shiftResult=" << verb;
+        std::abort();
+    }
+    return model.lattice().interner().kind(res->hir.typeId(shift));
+}
+
 } // namespace
 
 TEST(HirLoweringCSubset, EmptyVoidFunction) {
@@ -113,6 +194,24 @@ TEST(HirLoweringCSubset, ArithmeticAndParams) {
     ASSERT_EQ(res->hir.kind(stmts[0]), HirKind::ReturnStmt);
     HirNodeId ret = *res->hir.returnValue(stmts[0]);
     EXPECT_EQ(res->hir.kind(ret), HirKind::BinaryOp);           // a + b
+}
+
+// D-UAC-SHIFT-RESULT-RULE-CONFIG: the C 6.5.7 shift-result rule is the config
+// verb `shiftResult`, read by the cst_to_hir shift arm (the site the anchor
+// names). `promotedLeft` types `int << long` as the promoted left operand (I32);
+// `commonType` types it like an ordinary binary op (common(int,long) = I64). The
+// I32↔I64 flip when ONLY the verb changes is the red-on-disable proof the engine
+// reads the verb at the HIR-lowering tier (the const-context sibling site is
+// pinned in test_fc3_width_semantics.cpp).
+TEST(HirLoweringCSubset, ShiftResultPromotedLeftIsLeftType) {
+    EXPECT_EQ(shiftResultKind("promotedLeft"), TypeKind::I32)
+        << "promotedLeft (C 6.5.7): (int << long) lowers to a BinaryOp typed I32";
+}
+
+TEST(HirLoweringCSubset, ShiftResultCommonTypeIsCommonType) {
+    EXPECT_EQ(shiftResultKind("commonType"), TypeKind::I64)
+        << "commonType: (int << long) lowers to a BinaryOp typed I64 — the "
+           "red-on-disable flip at the cst_to_hir site";
 }
 
 TEST(HirLoweringCSubset, ControlFlowAndAssignment) {

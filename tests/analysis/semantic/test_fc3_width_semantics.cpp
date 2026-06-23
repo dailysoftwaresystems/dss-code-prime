@@ -15,6 +15,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
+#include "core/types/aggregate_layout.hpp"
 #include "core/types/data_model.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/tree_cursor.hpp"
@@ -27,8 +28,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -88,6 +91,48 @@ namespace {
 [[nodiscard]] bool schemaLoads(nlohmann::json const& doc) {
     auto r = GrammarSchema::loadFromText(doc.dump(), "<fc3-perturbed>");
     return r.has_value();
+}
+
+// Analyze a c-subset source under a schema whose `arithmeticConversions`
+// block is `mutate`d in place first — the perturbation that proves a config
+// verb is LIVE (the engine reads it, so flipping it changes a typed result).
+[[nodiscard]] SemanticModel analyzeWithArithMutation(
+    std::string src, std::function<void(nlohmann::json&)> mutate,
+    DataModel dm = DataModel::Lp64) {
+    nlohmann::json doc = loadShippedCSubsetJson();
+    mutate(doc["semantics"]["arithmeticConversions"]);
+    auto schema = GrammarSchema::loadFromText(doc.dump(), "<arith-perturbed>");
+    if (!schema) {
+        ADD_FAILURE() << "perturbed schema failed to load";
+        std::abort();
+    }
+    UnitBuilder builder{*schema};
+    builder.addInMemory(std::move(src), "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    assertNoBuilderErrors(*cu);
+    // aggregateLayout MUST be present for an array-dim sizeof to fold (nullopt
+    // ⇒ deliberate fail-loud) — the probe folds `sizeof(EXPR)` into a dimension.
+    return analyze(cu, dm,
+                   AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+}
+
+// The folded dimension of the first array symbol named `name`. The established
+// sizeof-folding probe (`<T> <name>[sizeof(EXPR)]` → the array's scalars[0]).
+[[nodiscard]] std::int64_t arrayDimOf(SemanticModel const& m,
+                                      std::string_view name) {
+    auto const& ti = m.lattice().interner();
+    for (std::size_t i = 1; i < m.symbols().size(); ++i) {
+        if (m.symbols()[i].name != name) continue;
+        TypeId const t = m.symbols()[i].type;
+        if (!t.valid() || ti.kind(t) != TypeKind::Array
+            || ti.scalars(t).empty()) {
+            ADD_FAILURE() << "symbol '" << name << "' is not a sized array";
+            return -1;
+        }
+        return ti.scalars(t)[0];
+    }
+    ADD_FAILURE() << "array symbol '" << name << "' not found";
+    return -1;
 }
 
 } // namespace
@@ -489,6 +534,14 @@ TEST(Fc3LoaderRejects, UnknownMixedSignednessVerbRejects) {
     EXPECT_FALSE(schemaLoads(doc));
 }
 
+TEST(Fc3LoaderRejects, UnknownShiftResultVerbRejects) {
+    // `shiftResult` (C 6.5.7) is a CLOSED verb — a typo'd spelling must fail
+    // loud at load, never silently fall back to a default discipline.
+    auto doc = loadShippedCSubsetJson();
+    doc["semantics"]["arithmeticConversions"]["shiftResult"] = "promotedRight";
+    EXPECT_FALSE(schemaLoads(doc));
+}
+
 TEST(Fc3LoaderRejects, UnknownLadderTypeNameRejects) {
     auto doc = loadShippedCSubsetJson();
     doc["semantics"]["integerLiteralTyping"][0]["decimal"][0] =
@@ -527,6 +580,54 @@ TEST(Fc3LoaderRejects, NonIntegerLadderCandidateRejects) {
     auto doc = loadShippedCSubsetJson();
     doc["semantics"]["integerLiteralTyping"][0]["decimal"][0] = "double";
     EXPECT_FALSE(schemaLoads(doc));
+}
+
+// ── D-UAC-SHIFT-RESULT-RULE-CONFIG: the shift-result rule is a config verb ──
+//
+// The closed verb `shiftResult` selects a shift's RESULT TYPE (C 6.5.7). The
+// SEMANTIC-tier site (`subtreeType`) is witnessed end-to-end by folding
+// `sizeof(a << b)` into an array dimension: `a` is `int` (I32, 4B), `b` is
+// `long long` (I64, 8B under EVERY data model). `promotedLeft` → the promoted
+// LEFT operand `int` → dim 4; `commonType` → the usual-arithmetic common type
+// `long long` → dim 8. The 4↔8 flip when ONLY the verb changes IS the red-on-
+// disable proof — a dead knob would peg both arms at 4. (Variable operands, not
+// literals: c-subset's `sizeof` of a value expression folds through `subtreeType`
+// — which routes the shift through the same `shiftResultType` chokepoint — so
+// this is the SEMANTIC tier's behavioral pin; the sibling cst_to_hir site is in
+// test_hir_lowering_c_subset.cpp and the chokepoint unit pin in test_type_rules.)
+
+TEST(Fc3ShiftResult, PromotedLeftSizesByLeftOperand) {
+    auto m = analyzeWithArithMutation(
+        "int a; long long b; char arr[sizeof(a << b)];\n",
+        [](nlohmann::json& ac) { ac["shiftResult"] = "promotedLeft"; });
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(arrayDimOf(m, "arr"), 4)
+        << "promotedLeft (C 6.5.7): (int << long long) types as the promoted "
+           "left operand int → sizeof 4";
+}
+
+TEST(Fc3ShiftResult, CommonTypeSizesByCommonType) {
+    auto m = analyzeWithArithMutation(
+        "int a; long long b; char arr[sizeof(a << b)];\n",
+        [](nlohmann::json& ac) { ac["shiftResult"] = "commonType"; });
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(arrayDimOf(m, "arr"), 8)
+        << "commonType: (int << long long) types like an ordinary binary op → "
+           "common(int,long long) = long long → sizeof 8 (the red-on-disable flip)";
+}
+
+TEST(Fc3ShiftResult, ShippedAndAbsentDefaultToPromotedLeft) {
+    // The shipped config declares promotedLeft; a block written WITHOUT the
+    // field keeps C's rule (the struct default is PromotedLeft) — both → 4.
+    auto shipped = analyzeWithArithMutation(
+        "int a; long long b; char arr[sizeof(a << b)];\n",
+        [](nlohmann::json&) { /* no mutation: shipped promotedLeft */ });
+    EXPECT_EQ(arrayDimOf(shipped, "arr"), 4) << "shipped promotedLeft → 4";
+    auto absent = analyzeWithArithMutation(
+        "int a; long long b; char arr[sizeof(a << b)];\n",
+        [](nlohmann::json& ac) { ac.erase("shiftResult"); });
+    EXPECT_EQ(arrayDimOf(absent, "arr"), 4)
+        << "absent shiftResult → default promotedLeft (back-compat) → 4";
 }
 
 // ── Format-schema dataModel fail-louds ──────────────────────────────────

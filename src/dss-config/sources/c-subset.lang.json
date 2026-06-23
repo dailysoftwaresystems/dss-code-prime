@@ -1219,11 +1219,12 @@
         "decimal":    ["unsigned long long"],
         "nondecimal": ["unsigned long long"] }
     ],
-    "$arithmeticConversionsComment": "FC3 c1: C 6.3.1.8 usual arithmetic conversions, declared (the engine algorithm in analysis/semantic/type_rules.hpp is closed-verb config-driven; languages WITHOUT this block keep the legacy commonType path). integerPromotion: operands below `int`'s rank promote to int; `alsoPromote` pulls char/bool (outside the width-rank lattice) into promotion WITHOUT the engine hardcoding C's view of char. mixedSignedness `rank-prefer-unsigned`: unsigned rank >= signed rank -> the unsigned type, else the (strictly wider) signed type. promoteComparisons: comparisons convert operands to the common type (so -1 > 0ul compares as U64 -> true) and still yield Bool.",
+    "$arithmeticConversionsComment": "FC3 c1: C 6.3.1.8 usual arithmetic conversions, declared (the engine algorithm in analysis/semantic/type_rules.hpp is closed-verb config-driven; languages WITHOUT this block keep the legacy commonType path). integerPromotion: operands below `int`'s rank promote to int; `alsoPromote` pulls char/bool (outside the width-rank lattice) into promotion WITHOUT the engine hardcoding C's view of char. mixedSignedness `rank-prefer-unsigned`: unsigned rank >= signed rank -> the unsigned type, else the (strictly wider) signed type. promoteComparisons: comparisons convert operands to the common type (so -1 > 0ul compares as U64 -> true) and still yield Bool. shiftResult `promotedLeft` (C 6.5.7): a shift's type is its PROMOTED LEFT operand (the right operand never contributes, so `i32 << i64` is I32) -- the engine reads this verb instead of hardcoding C's special shift rule; the alternative `commonType` types `<<`/`>>` like an ordinary binary op (common type of both).",
     "arithmeticConversions": {
       "integerPromotion": { "minRankType": "int", "alsoPromote": ["char", "bool"] },
       "mixedSignedness": "rank-prefer-unsigned",
-      "promoteComparisons": true
+      "promoteComparisons": true,
+      "shiftResult": "promotedLeft"
     }
   },
 

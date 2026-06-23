@@ -6250,15 +6250,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     bool ok = true;
                     for (auto const& [key, _] : obj.items()) {
                         if (key != "integerPromotion" && key != "mixedSignedness"
-                            && key != "promoteComparisons"
+                            && key != "promoteComparisons" && key != "shiftResult"
                             && key.rfind("$", 0) != 0) {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                       "/semantics/arithmeticConversions/" + key,
                                       std::format("unknown 'arithmeticConversions' "
                                                   "field '{}' — expected "
                                                   "'integerPromotion', "
-                                                  "'mixedSignedness', or "
-                                                  "'promoteComparisons'", key));
+                                                  "'mixedSignedness', "
+                                                  "'promoteComparisons', or "
+                                                  "'shiftResult'", key));
                             ok = false;
                         }
                     }
@@ -6398,6 +6399,35 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         } else {
                             ac.promoteComparisons =
                                 obj.at("promoteComparisons").get<bool>();
+                        }
+                    }
+                    // `shiftResult` (C 6.5.7) — optional closed verb; absent
+                    // means `promotedLeft` (the struct default, C's rule), so a
+                    // block written before this field keeps C's behavior. An
+                    // unknown spelling fails loud (never a silent default).
+                    if (obj.contains("shiftResult")) {
+                        if (!obj.at("shiftResult").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/arithmeticConversions/"
+                                      "shiftResult",
+                                      "'shiftResult' must be a string (closed verb)");
+                            ok = false;
+                        } else {
+                            auto const verb =
+                                obj.at("shiftResult").get<std::string>();
+                            if (verb == "promotedLeft") {
+                                ac.shiftResult = ShiftResultRule::PromotedLeft;
+                            } else if (verb == "commonType") {
+                                ac.shiftResult = ShiftResultRule::CommonType;
+                            } else {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/arithmeticConversions/"
+                                          "shiftResult",
+                                          std::format("unknown 'shiftResult' verb "
+                                                      "'{}' — expected 'promotedLeft' "
+                                                      "or 'commonType'", verb));
+                                ok = false;
+                            }
                         }
                     }
                     if (ok) cfg.arithmeticConversions = std::move(ac);

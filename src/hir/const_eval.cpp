@@ -187,10 +187,13 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             //   - Comparison ops (Eq/Ne/Lt/Le/Gt/Ge): result is Bool
             //     regardless of operand types (force-override; applyBinaryInt
             //     inherited LHS's core which is wrong for the cmp case).
-            //   - Shift ops (Shl/Shr) (C99 §6.5.7p3): result type is the
-            //     PROMOTED LEFT operand only; the shift count's type does
-            //     not contribute. `commonType(lhs, lhs)` realizes the
-            //     left-operand integer promotion uniformly.
+            //   - Shift ops (Shl/Shr): the result type is the config-driven
+            //     shift-result rule (D-UAC-SHIFT-RESULT-RULE-CONFIG) — already
+            //     resolved and stamped on THIS node's authoritative typeId by
+            //     cst_to_hir's `shiftResultType` funnel. Read it directly so
+            //     the folded mirror agrees with the verb for EVERY language
+            //     (never re-derive C's promoted-left discipline here — that
+            //     would re-hardcode the rule a third time).
             //   - All other arithmetic / bitwise: result is the C99-UAC
             //     common type of both operands.
             // Type source is the HIR node's typeId (the authoritative
@@ -203,8 +206,8 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             if (isComparison(op)) {
                 folded->core = TypeKind::Bool;
             } else if (isShift) {
-                TypeId const promoted = interner.commonType(aTy, aTy);
-                if (promoted.valid()) folded->core = interner.kind(promoted);
+                if (TypeId const t = hir.typeId(expr); t.valid())
+                    folded->core = interner.kind(t);
             } else if (TypeId const common = interner.commonType(aTy, bTy);
                        common.valid()) {
                 folded->core = interner.kind(common);
