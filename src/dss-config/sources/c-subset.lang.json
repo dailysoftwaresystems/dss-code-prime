@@ -1084,9 +1084,9 @@
     ],
     "references": [
       { "rule": "operand" },
-      { "rule": "structTypeRef", "nameMatch": "lastIdentifier" },
-      { "rule": "unionTypeRef",  "nameMatch": "lastIdentifier" },
-      { "rule": "enumTypeRef",   "nameMatch": "lastIdentifier" }
+      { "rule": "structTypeRef", "nameMatch": "lastIdentifier", "isTagReference": true },
+      { "rule": "unionTypeRef",  "nameMatch": "lastIdentifier", "isTagReference": true },
+      { "rule": "enumTypeRef",   "nameMatch": "lastIdentifier", "isTagReference": true }
     ],
     "memberAccesses": [
       { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,

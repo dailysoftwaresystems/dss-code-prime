@@ -624,6 +624,18 @@ struct DSS_EXPORT ReferenceRule {
     // A resolvable name always binds regardless of position.
     std::vector<RuleId>      hardParents;
     std::vector<std::string> hardParentNames;   // source names, for diagnostics
+    // C 6.2.3 tag namespace: when set, a USE of this reference rule resolves
+    // against the TAG namespace (`struct Foo` / `union Foo` / `enum Foo` —
+    // the tag identifier), NOT the ordinary-identifier namespace. The matching
+    // composite TAG BIND is namespace-routed by the existing `fieldChildren`
+    // gate (a declaration WITH a field-body binds Tag); this flag is the
+    // LOOKUP counterpart, so a tag reference and a same-named ordinary symbol
+    // (`typedef struct Pair {…} Pair;`) resolve independently. Default false —
+    // every reference rule resolves Ordinary unless a language opts a
+    // tag-reference rule in. Engine-generic: WHICH rule is a tag reference is
+    // per-language config (c-subset's structTypeRef/unionTypeRef/enumTypeRef),
+    // never a hardcoded keyword.
+    bool isTagReference = false;
 };
 
 // Source built-in type name → lattice type mapping. Used during

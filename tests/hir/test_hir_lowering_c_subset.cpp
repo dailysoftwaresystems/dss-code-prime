@@ -638,25 +638,22 @@ TEST(HirLoweringCSubset, MemberAccessLowersToHirMemberAccess) {
     EXPECT_EQ(interner.kind(res->hir.typeId(kids[0])), TypeKind::Struct);
 }
 
-// D5.2 cycle 1: adding `Identifier` to `typeBase` lets typedef'd / struct-tag
-// names work bare in type position at top level. The engine's `resolveTypeNode`
-// already resolved Identifier-in-type-position via the SE5 alias path
-// (Type-kind symbol → its `.type`); this cycle's contribution is the schema
-// change that lets the parser accept the form. Block-scope alias (`{ Foo x; }`)
-// is intentionally deferred — it collides with `exprStmt` at the statement
-// alt and needs speculative-alt support (later cycle).
+// D5.2 cycle 1: adding `Identifier` to `typeBase` lets a typedef-name work
+// bare in type position at top level. The engine's `resolveTypeNode` resolves
+// Identifier-in-type-position via the SE5 alias path (an ORDINARY Type-kind
+// symbol → its `.type`); this cycle's contribution is the schema change that
+// lets the parser accept the form. Block-scope alias (`{ Foo x; }`) is
+// intentionally deferred — it collides with `exprStmt` at the statement alt
+// and needs speculative-alt support (later cycle).
 //
-// **Known C divergence**: c-subset has a single identifier namespace (no
-// separate "tag namespace"), and `resolveTypeNode`'s alias lookup doesn't
-// distinguish typedef-minted Type symbols from struct-tag Type symbols.
-// Consequence: after `struct Foo { ... };` alone (no typedef), `Foo x;` ALSO
-// lowers cleanly — i.e. every struct tag is implicitly usable as a bare type
-// name. Real C requires `struct Foo` or an explicit typedef. The two tests
-// below pin both shapes honestly.
+// C 6.2.3 tag namespace (now SEPARATED): a bare `Foo` resolves ONLY an
+// ordinary typedef-name — a struct TAG `Foo` is reachable only as `struct Foo`
+// (see `BareStructTagNotUsableAsTypeName` below). Here the alias `FooT` is a
+// genuine typedef (Ordinary), so `FooT origin;` resolves it directly.
 TEST(HirLoweringCSubset, TypedefStructAliasAtTopLevel) {
-    // The alias name must differ from the struct tag because the single
-    // identifier namespace rejects same-name redeclaration. See the negative
-    // test `TypedefSameNameAsTagRedeclaresInSingleNamespace` below.
+    // The alias name differs from the struct tag here purely for clarity; with
+    // the separate tag namespace a SAME-named alias is now also legal (see
+    // `TypedefSameNameAsTagCoexistsAcrossNamespaces`).
     SemanticModel model = analyzeCSubset(
         "struct Foo { int x; };\n"
         "typedef struct Foo FooT;\n"
@@ -681,15 +678,29 @@ TEST(HirLoweringCSubset, TypedefStructAliasAtTopLevel) {
     EXPECT_EQ(interner.name(originType), "Foo");
 }
 
-// D5.2 cycle 1 (review-fix): pin the bare-struct-tag-as-type-name behavior
-// that falls out of the schema change. Without a typedef, `Foo x;` ALSO
-// works — the resolveTypeNode SE5 alias path doesn't distinguish struct
-// tags from typedef'd Type symbols. Documented as a known C divergence; this
-// test pins it so a future cycle that separates the namespaces fails loud.
-TEST(HirLoweringCSubset, BareStructTagUsableAsTypeName) {
+// C 6.2.3 tag namespace (closes the tag-namespace residue of
+// D-CSUBSET-DECL-GRAMMAR-LOW-RESIDUES): a struct TAG is NOT a bare type name.
+// `Foo bare;` (no `struct`, no typedef) must FAIL — the tag `Foo` lives in the
+// Tag namespace and an ordinary type-position lookup of the bare identifier
+// misses it. `struct Foo bare;` IS the valid spelling and resolves the tag.
+// This was previously a DOCUMENTED C DIVERGENCE (the old single-namespace
+// resolveTypeNode treated a tag as a bare typedef-name); this cycle is the
+// "future cycle that separates the namespaces" the prior pin anticipated.
+// RED-ON-DISABLE: with the tag bound Ordinary (pre-change), `Foo bare;`
+// resolves and `hasErrors()` is false → the first EXPECT_TRUE fails.
+TEST(HirLoweringCSubset, BareStructTagNotUsableAsTypeName) {
+    SemanticModel bareModel = analyzeCSubset(
+        "struct Foo { int x; };\n"
+        "Foo bare;\n");                  // no `struct`, no typedef — invalid in C
+    EXPECT_TRUE(bareModel.hasErrors())
+        << "a bare struct tag `Foo` is NOT a type name — `struct Foo` is required";
+    EXPECT_EQ(countCode(bareModel.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "the bare tag name misses the ordinary namespace → S_UnknownType";
+
+    // The valid spelling — `struct Foo bare;` — resolves the tag and lowers.
     SemanticModel model = analyzeCSubset(
         "struct Foo { int x; };\n"
-        "Foo bare;\n");                  // no typedef
+        "struct Foo bare;\n");
     ASSERT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
               ? "" : model.diagnostics().all()[0].actual);
@@ -707,20 +718,22 @@ TEST(HirLoweringCSubset, BareStructTagUsableAsTypeName) {
     EXPECT_EQ(interner.name(bareType), "Foo");
 }
 
-// D5.2 cycle 1 (review-fix): pin the negative — same-name typedef of a
-// struct tag fires S_RedeclaredSymbol (single namespace). Catches any
-// future cycle that mistakenly relaxes the same-scope dup check.
-TEST(HirLoweringCSubset, TypedefSameNameAsTagRedeclaresInSingleNamespace) {
+// C 6.2.3 tag namespace: `typedef struct Foo Foo;` is LEGAL — the tag `Foo`
+// (Tag namespace) and the typedef alias `Foo` (Ordinary namespace) coexist,
+// so NO S_RedeclaredSymbol fires. This INVERTS the prior pin
+// (TypedefSameNameAsTagRedeclaresInSingleNamespace), which asserted the old
+// single-namespace COLLISION the prior cycle documented as a C divergence.
+// RED-ON-DISABLE: route the composite tag BIND Ordinary (drop the
+// fieldChildren→Tag gate) and the alias collides with the tag →
+// S_RedeclaredSymbol reappears and this count rises above 0.
+TEST(HirLoweringCSubset, TypedefSameNameAsTagCoexistsAcrossNamespaces) {
     SemanticModel model = analyzeCSubset(
         "struct Foo { int x; };\n"
-        "typedef struct Foo Foo;\n");    // same name as the tag — collides
-    EXPECT_TRUE(model.hasErrors());
-    bool sawRedecl = false;
-    for (auto const& d : model.diagnostics().all()) {
-        if (d.code == DiagnosticCode::S_RedeclaredSymbol) { sawRedecl = true; break; }
-    }
-    EXPECT_TRUE(sawRedecl)
-        << "expected S_RedeclaredSymbol on `typedef struct Foo Foo;`";
+        "typedef struct Foo Foo;\n");    // tag Foo (Tag) + typedef Foo (Ordinary)
+    EXPECT_FALSE(model.hasErrors())
+        << "C 6.2.3: a typedef alias may share a struct tag's name";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "the tag and the typedef are in separate namespaces — no collision";
 }
 
 // D5.1 cycle 4 review fix: the DOT form goes through a different lowering

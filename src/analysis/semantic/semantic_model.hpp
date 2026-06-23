@@ -36,6 +36,19 @@
 
 namespace dss {
 
+// C 6.2.3 name spaces. C puts struct/union/enum TAGS (`struct Foo`) in a
+// namespace SEPARATE from ordinary identifiers (objects, functions, typedef
+// names, enumerators) — so `typedef struct Pair { … } Pair;` is legal (the
+// tag `Pair` and the typedef alias `Pair` are distinct names). Each binding
+// (and lookup) selects a namespace; the two are independent maps in a scope.
+// This is the only axis C 6.2.3 requires for this frontend's subset (label
+// and member namespaces are handled elsewhere — labels by the goto pre-scan,
+// members by the per-struct field scope).
+enum class SymbolNamespace : std::uint8_t {
+    Ordinary = 0,   // objects, functions, typedef names, enumerators
+    Tag      = 1,   // struct / union / enum TAGS
+};
+
 // A scope-tree node. ScopeId is the index into SemanticModel's scope
 // vector (slot 0 is the InvalidScope sentinel; slot 1 is the CU root).
 // Lookup walks `parent` links; `children` is retained for tooling/tests.
@@ -43,8 +56,14 @@ struct DSS_EXPORT ScopeRecord {
     ScopeId  parent{};
     NodeId   anchor{};   // tree node whose subtree opens this scope (or invalid for root)
     TreeId   tree{};
-    // name -> SymbolId. Same-scope redeclaration is caught here.
+    // name -> SymbolId, for the ORDINARY namespace. Same-scope redeclaration
+    // is caught here.
     std::unordered_map<std::string, SymbolId> bindings;
+    // C 6.2.3 tag namespace: name -> SymbolId for struct/union/enum TAGS,
+    // SEPARATE from `bindings`. A tag and an ordinary symbol of the same name
+    // (`typedef struct Pair {…} Pair;`) coexist — one lives here, one in
+    // `bindings`. Empty for any scope that declares no tags.
+    std::unordered_map<std::string, SymbolId> tagBindings;
     std::vector<ScopeId> children;
 };
 

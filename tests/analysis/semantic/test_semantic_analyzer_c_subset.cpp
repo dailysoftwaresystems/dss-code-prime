@@ -2629,3 +2629,90 @@ TEST(SemanticAnalyzerCSubset, FnPrototypeForwardCallResolvesSemantically) {
     EXPECT_EQ(countSurvivingFns(model, "f"), 1u)
         << "the prototype is upgraded to a callable Function symbol";
 }
+
+// ── C 6.2.3 TAG NAMESPACE (closes the tag-namespace residue of
+//    D-CSUBSET-DECL-GRAMMAR-LOW-RESIDUES) ──
+
+// (a) `typedef struct Pair { int a; } Pair;` — the tag `Pair` (Tag namespace)
+// and the typedef alias `Pair` (Ordinary namespace) share a spelling and must
+// NOT collide. ZERO S_RedeclaredSymbol.
+// RED-ON-DISABLE: route the composite tag BIND back through the Ordinary
+// namespace (drop the `fieldChildren` → Tag gate at the bind site) and the
+// alias collides with the tag → this count becomes 1.
+TEST(SemanticAnalyzerCSubset, TypedefTagSameNameAsAliasNoCollision) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef struct Pair { int a; } Pair;\n"
+        "int main(void) { Pair p; p.a = 0; return p.a; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "C 6.2.3: a struct tag and a typedef alias of the same name are in "
+           "SEPARATE namespaces and must not collide";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// (b) Both namespaces RESOLVE: with `typedef struct Pair {…} Pair;`, a `struct
+// Pair x;` (tag, via the type-position tag-ref early-arm MF-1) AND a `Pair y;`
+// (alias, via the Ordinary leaf arm) both resolve to the struct type — NO
+// S_UnknownType.
+// RED-ON-DISABLE: remove the MF-1 tag-ref early-arm and `struct Pair x;`
+// descends to the bare identifier, looked up Ordinary; it would resolve the
+// typedef alias `Pair` (an Ordinary Type symbol) as the tag — masking the
+// namespace split. Flip the BIND to Tag WITHOUT MF-1 and `struct Pair x;`
+// misses entirely → S_UnknownType count rises.
+TEST(SemanticAnalyzerCSubset, TagAndAliasBothResolveSameType) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef struct Pair { int a; } Pair;\n"
+        "int main(void) {\n"
+        "  struct Pair x; x.a = 1;\n"
+        "  Pair y; y.a = 2;\n"
+        "  return x.a + y.a;\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "both `struct Pair` (Tag) and `Pair` (Ordinary alias) must resolve";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u)
+        << "both resolve to the SAME struct type, so member access is clean";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// (c) The negative is PRESERVED: an undeclared tag `struct Nope x;` still fails
+// loud with exactly one S_UnknownType.
+// RED-ON-DISABLE: drop the `emitOnMiss` fail-loud arm inside MF-1 (return
+// InvalidType silently on a tag miss) and this count falls to 0 — a silent
+// accept of an unknown tag.
+TEST(SemanticAnalyzerCSubset, UnknownTagFiresUnknownType) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef struct Pair { int a; } Pair;\n"
+        "int main(void) { struct Nope x; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "an undeclared struct tag must fail loud exactly once";
+}
+
+// A struct TAG `S` and an ordinary OBJECT `S` coexist in one scope chain and
+// resolve independently (the semantic-tier mirror of the tag_ordinary_coexist
+// corpus). No collision, both resolvable.
+// RED-ON-DISABLE: single-namespace table → the local `int S` collides with the
+// tag `S` → S_RedeclaredSymbol count becomes 1.
+TEST(SemanticAnalyzerCSubset, TagAndOrdinaryObjectSameNameCoexist) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int v; };\n"
+        "int main(void) { struct S a; a.v = 40; int S = 2; return a.v + S; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "a struct tag `S` and an ordinary object `S` are in separate "
+           "namespaces and must coexist";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// MF-2 cross-tree mechanism: the cross-tree import-injection conflict scan
+// re-keys `(name, namespace)`. The load-bearing substrate is exercised
+// directly at the ScopeTree level (see test_scope_tree.cpp,
+// `BindingsOfCarriesNamespaceForCrossTreeReKey`): `bindingsOf` yields each
+// binding's namespace and `injectBinding` re-injects into the matching
+// namespace, so a header's `struct Foo` tag and an including file's
+// `typedef … Foo` alias key distinctly and do NOT false-conflict. A full
+// multi-tree quote-include CU is not constructible through the in-memory
+// fixture (it has no on-disk include resolver), so the mechanism — not the
+// driver plumbing — is what these tests pin.

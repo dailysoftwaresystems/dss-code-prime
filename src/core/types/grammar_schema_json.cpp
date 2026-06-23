@@ -5215,6 +5215,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 }
                             }
                         }
+                        // C 6.2.3 tag namespace: an opt-in flag marking this
+                        // reference rule as a TAG reference (`struct Foo`),
+                        // resolved against the Tag namespace at lookup time.
+                        if (entry.contains("isTagReference")) {
+                            if (!entry.at("isTagReference").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/isTagReference",
+                                          "'isTagReference' must be a boolean");
+                            } else {
+                                rule.isTagReference =
+                                    entry.at("isTagReference").get<bool>();
+                            }
+                        }
                         cfg.references.push_back(std::move(rule));
                     }
                 }

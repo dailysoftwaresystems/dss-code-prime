@@ -752,6 +752,56 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 return InvalidType;
             }
         }
+        // C 6.2.3 tag namespace (MF-1): a TAG reference in type position —
+        // `struct Foo` / `union Foo` / `enum Foo`, the node reached by
+        // descending into a reference rule flagged `isTagReference`. Resolve
+        // the tag identifier against the TAG namespace, NOT ordinary. WITHOUT
+        // this explicit arm the generic child-descent below would bottom out
+        // at the bare Identifier token and the Token-leaf arm would look it up
+        // ORDINARY (line ~835) — which, now that composite tags bind into the
+        // Tag namespace, would miss every tag and (worse) could resolve a
+        // same-named ORDINARY typedef as the tag's type. A miss here falls
+        // through to the generic miss path so `struct Nope x;` still emits
+        // S_UnknownType. The bind side is namespace-routed by `fieldChildren`;
+        // this is its lookup counterpart, both config-driven (no hardcoded
+        // keyword). `emitOnMiss=false` recursive calls (e.g. the pointer-base
+        // descent) keep their soft-miss semantics — the arm only RESOLVES, it
+        // does not emit.
+        {
+            auto refIt = s.idx().refByRule.find(rule.v);
+            if (refIt != s.idx().refByRule.end()
+                && cfg.references[refIt->second].isTagReference
+                && scope.valid()) {
+                auto const& ref = cfg.references[refIt->second];
+                auto rn = extractNameNode(tree, node, ref.nameMatch,
+                                          cfg.identifierToken,
+                                          cfg.bracketIdentifierToken);
+                if (!rn.name.empty()) {
+                    SymbolId const tagSym =
+                        s.scopes.lookup(scope, rn.name, SymbolNamespace::Tag);
+                    if (tagSym.valid()) {
+                        auto const& rec = s.symbols.at(tagSym);
+                        if (rec.kind == DeclarationKind::Type && rec.type.valid()) {
+                            return rec.type;
+                        }
+                    }
+                }
+                // Tag miss: fall through to the generic miss arm (below) so an
+                // undeclared `struct Nope` fails loud with S_UnknownType. Do
+                // NOT descend into the StructKeyword/Identifier children (the
+                // Identifier would resolve ORDINARY and cross the namespaces).
+                if (emitOnMiss && !specifierDiagnosed) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_UnknownType;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(node);
+                    d.actual   = std::string{tree.text(node)};
+                    s.reporter.report(std::move(d));
+                }
+                return InvalidType;
+            }
+        }
         auto kids = visibleChildren(tree, node);
         // SE-pointers (G5): count `pointerToken` children at THIS node (C
         // declarator stars: `int *p`, `int **p`) and wrap the resolved base type
@@ -1755,7 +1805,19 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     }
 
                     SymbolId const newId = s.symbols.mint(rec);
-                    SymbolId const prior = s.scopes.bind(bindScope, resolved.name, newId);
+                    // C 6.2.3 tag namespace: a composite-type declaration
+                    // (carries `fieldChildren`, the same gate that floats the
+                    // tag past the declarator-dominator scope) binds its tag
+                    // into the TAG namespace; a plain typedef-name / object /
+                    // function binds Ordinary. This is the ONLY tag-BIND site;
+                    // it lets `typedef struct Pair {…} Pair;` mint the tag and
+                    // the alias under the same name without collision.
+                    SymbolNamespace const bindNs =
+                        decl.fieldChildren.has_value()
+                            ? SymbolNamespace::Tag
+                            : SymbolNamespace::Ordinary;
+                    SymbolId const prior =
+                        s.scopes.bind(bindScope, resolved.name, newId, bindNs);
                     if (prior.valid()) {
                         ParseDiagnostic d;
                         d.code     = DiagnosticCode::S_RedeclaredSymbol;
@@ -2641,7 +2703,18 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     }
                 }
                 if (isIdentifier && !resolved.name.empty()) {
-                    SymbolId const found = s.scopes.lookup(here, resolved.name);
+                    // C 6.2.3 tag namespace (MF-3): a tag reference rule
+                    // (`struct Foo`) resolves against the Tag namespace; every
+                    // other reference rule resolves Ordinary. This is the
+                    // Pass-2 USE-resolution counterpart of the type-position
+                    // tag arm (MF-1) — it covers a tag reference reached
+                    // through Pass-2 reference resolution rather than
+                    // type-position resolution.
+                    SymbolNamespace const lookupNs =
+                        ref.isTagReference ? SymbolNamespace::Tag
+                                           : SymbolNamespace::Ordinary;
+                    SymbolId const found =
+                        s.scopes.lookup(here, resolved.name, lookupNs);
                     if (found.valid()) {
                         s.nodeToSymbol.set(resolved.node, found);
                         s.usesBySymbol[found.v].push_back(resolved.node);
@@ -4440,6 +4513,17 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 tagRec.kind  = DeclarationKind::Type;
                 tagRec.type  = tagTy;
                 SymbolId const tagId = s.symbols.mint(tagRec);
+                // MF-4 (C 6.2.3): builtins-as-`DeclarationKind::Type` —
+                // `__va_list_tag` here and shipped-descriptor typedefs — are
+                // injected into the ORDINARY namespace (the default param). A
+                // `struct __va_list_tag` reference therefore will NOT resolve
+                // them (the tag-namespace lookup misses → S_UnknownType). That
+                // is an INTENTIONAL fail-loud boundary, not a tag-namespace
+                // bug: these are synthesized typedef-NAMES, not C tags, and no
+                // c-subset source spells `struct __va_list_tag` (the type is
+                // reached only through the `va_list` typedef alias). If a real
+                // tagged builtin is ever needed, bind it with
+                // SymbolNamespace::Tag instead.
                 s.scopes.injectBinding(builtinScope, "__va_list_tag", tagId);
 
                 TypeId const vaListTy = in.array(tagTy, 1);
@@ -4524,25 +4608,39 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         if (srcIt == treeRootScope.end() || tgtIt == treeRootScope.end()) continue;
 
         // The source tree's OWN top-level bindings (declared in pass 1),
-        // keyed by name. An entry here whose symbol's tree is the source
-        // tree is a real user declaration; a later same-name inject is a
-        // conflict. Built once per edge from the source root scope.
-        std::unordered_map<std::string_view, SymbolId> ownByName;
-        for (auto const& [name, sym] : s.scopes.bindingsOf(srcIt->second)) {
+        // keyed by (name, namespace). An entry here whose symbol's tree is the
+        // source tree is a real user declaration; a later same-name inject in
+        // the SAME namespace is a conflict. C 6.2.3: a header's `struct Foo`
+        // tag and the including file's `typedef … Foo` are DIFFERENT
+        // namespaces — distinct keys, no false conflict — while tag+tag /
+        // ordinary+ordinary same-name still collide. Built once per edge from
+        // the source root scope. The namespace byte is appended after a NUL
+        // (never present in an identifier) so the key stays collision-free.
+        auto const nsKey = [](std::string_view name, SymbolNamespace ns) {
+            std::string key{name};
+            key.push_back('\0');
+            key.push_back(static_cast<char>(ns));
+            return key;
+        };
+        std::unordered_map<std::string, SymbolId> ownByName;
+        for (auto const& [name, ns, sym] : s.scopes.bindingsOf(srcIt->second)) {
             if (sym.valid() && s.symbols.at(sym).tree.v == edge.sourceTree.v) {
-                ownByName.emplace(name, sym);
+                ownByName.emplace(nsKey(name, ns), sym);
             }
         }
 
-        for (auto const& [name, sym] : s.scopes.bindingsOf(tgtIt->second)) {
-            if (auto it = ownByName.find(name); it != ownByName.end()) {
+        for (auto const& [name, ns, sym] : s.scopes.bindingsOf(tgtIt->second)) {
+            if (auto it = ownByName.find(nsKey(name, ns)); it != ownByName.end()) {
                 // The source file declared `name` itself AND includes a
-                // header declaring it — duplicate. Fail loud at the source,
-                // but only ONCE per (sourceTree, name): a second include of
-                // the same (or another) header re-declaring `name` is the
-                // same logical conflict, already reported.
+                // header declaring it in the SAME namespace — duplicate. Fail
+                // loud at the source, but only ONCE per (sourceTree, name,
+                // namespace): a second include of the same (or another) header
+                // re-declaring `name` is the same logical conflict, already
+                // reported. The conflict key folds the namespace byte in so a
+                // tag conflict and an ordinary conflict of the same name dedup
+                // independently.
                 if (!reportedConflicts.insert(
-                        conflictKey(edge.sourceTree.v, name)).second) {
+                        conflictKey(edge.sourceTree.v, nsKey(name, ns))).second) {
                     continue;   // already reported; still skip injection
                 }
                 auto const& srcTree = *std::find_if(
@@ -4569,7 +4667,9 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 s.reporter.report(std::move(d));
                 continue;   // do not inject the conflicting binding
             }
-            s.scopes.injectBinding(srcIt->second, std::string{name}, sym);
+            // Re-inject into the SAME namespace it came from — a tag stays a
+            // tag in the target's tagBindings.
+            s.scopes.injectBinding(srcIt->second, std::string{name}, sym, ns);
         }
     }
 
@@ -4601,7 +4701,14 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // bindings carry the DEFINING tree's id; builtins carry InvalidTree).
         std::unordered_set<std::string> userDeclaredNames;
         for (auto const& [treeV, scope] : treeRootScope) {
-            for (auto const& [name, sym] : s.scopes.bindingsOf(scope)) {
+            // Across BOTH namespaces: a user declaration of `name` (object,
+            // function, typedef, OR a struct/union/enum tag) blocks a
+            // descriptor symbol of that name — this is a NAME-level goal-2 skip
+            // (the descriptor injects ordinary names; a same-name user tag
+            // still claims the spelling, preserving the pre-tag-namespace
+            // behavior). `ns` is intentionally unused here.
+            for (auto const& [name, ns, sym] : s.scopes.bindingsOf(scope)) {
+                (void)ns;
                 if (sym.valid() && s.symbols.at(sym).tree.v == treeV) {
                     userDeclaredNames.insert(std::string{name});
                 }
