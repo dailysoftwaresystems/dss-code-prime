@@ -8,6 +8,7 @@
 //   * reserved registers (rsp / rflags) never allocated
 //   * FPR-class allocation for floating-point arithmetic
 
+#include "core/types/call_payload.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -1463,4 +1464,132 @@ TEST(LirRegAlloc, AssignmentVRegMatchesIndexId) {
         if (a.vreg.id == 0) continue;
         EXPECT_EQ(a.vreg.id, i);
     }
+}
+
+// ── D-FC7-INDIRECT-X8-SRET-CALLEE-EXCLUSION (AAPCS64 / Apple arm64) ─────────
+// An INDIRECT (fn-ptr) call returning a >16-byte struct BY VALUE gets a
+// POST-regalloc `mov x8, sretPtr` IRR reroute (x8 = the cc's indirectResult-
+// Register). The callee vreg is consumed AT the call, so it does not "cross" it
+// — every caller-saved register, INCLUDING x8 (caller-saved, NOT an arg reg), is
+// otherwise eligible. The arg-reg exclusion (R2) already pushes the callee off
+// x0..x7, so x8 is the very next caller-saved pick: without the indirect-result
+// exclusion the drained callee lands ON x8 and the IRR move clobbers it (the
+// loud L_IndirectCalleeClobberedByArgSetup backstop = a valid program fails to
+// COMPILE). PRESSURED exactly like PressuredIndirectCalleeExcludesArgRegs above:
+// crossing locals drain the callee-saved pool, the k arg locals drain the
+// caller-saved LIFO toward x8; the post-call re-read keeps fp's vreg live across
+// the call. Host-independent structural pin (the end-to-end qemu witness is
+// examples/c-subset/struct_byval_indirect_aapcs64). RED-ON-DISABLE (demonstrated
+// 2026-06-23 + restored): comment out the indirect-result block in
+// allocateOneFunc's indirect-callee consumer -> the callee lands on x8 at a
+// drained sweep point -> this pin goes RED. Agnostic: the forbidden ordinal is
+// read back from the ACTIVE cc's declared indirectResultRegister, no names.
+TEST(LirRegAlloc, Aapcs64PressuredIndirectStructReturnCalleeExcludesX8) {
+    bool sawIndirectStructCall = false;
+    bool sawPhysAssignedCallee = false;
+
+    for (int k = 5; k <= 11; ++k) {
+        std::string pickParams;
+        std::string pickSum;
+        std::string fpParams;
+        for (int i = 0; i < k; ++i) {
+            if (i > 0) { pickParams += ", "; pickSum += " + "; fpParams += ", "; }
+            pickParams += "int a" + std::to_string(i);
+            pickSum    += "a" + std::to_string(i);
+            fpParams   += "int";
+        }
+        std::string src =
+            "typedef struct { long a; long b; long c; } Big;\n"
+            "Big pick(" + pickParams + ") {\n"
+            "    Big r; r.a = " + pickSum + "; r.b = 1; r.c = 2; return r; }\n"
+            "int f(int x, int n) {\n"
+            "    Big (*fp)(" + fpParams + ") = &pick;\n";
+        for (int i = 0; i < 16; ++i) {           // crossing locals (callee-saved)
+            src += "    int c" + std::to_string(i) + " = x + "
+                 + std::to_string(i + 1) + ";\n";
+        }
+        for (int i = 0; i < k; ++i) {            // arg locals (caller-saved LIFO)
+            src += "    int t" + std::to_string(i) + " = x + "
+                 + std::to_string(i + 31) + ";\n";
+        }
+        src += "    Big s = fp(t0";
+        for (int i = 1; i < k; ++i) src += ", t" + std::to_string(i);
+        src += ");\n";
+        src += "    int z = 0;\n";
+        src += "    if (fp != 0) { z = 1; }\n";   // re-read fp AFTER the call
+        src += "    return (int)(s.a + s.b + s.c) + x + n + z";
+        for (int i = 0; i < 16; ++i) src += " + c" + std::to_string(i);
+        src += ";\n}\n";
+
+        auto lowered = lowerCSubsetToLir(src, "arm64", /*mirCcIndex=*/0);
+        ASSERT_FALSE(lowered.model.hasErrors()) << "k=" << k;
+        ASSERT_TRUE(lowered.lir.ok) << "k=" << k << ": "
+            << (lowered.lirReporter.all().empty()
+                    ? std::string{}
+                    : lowered.lirReporter.all()[0].actual);
+        Lir const& lir = lowered.lir.lir;
+
+        // The forbidden ordinal, read back from the ACTIVE cc's declared
+        // indirect-result register (config-driven; no register name here).
+        auto const* cc = lowered.target->callingConvention(0);
+        ASSERT_NE(cc, nullptr);
+        ASSERT_TRUE(cc->indirectResultRegister.has_value())
+            << "aapcs64 must declare an indirectResultRegister (x8)";
+        auto const x8 = lowered.target->registerByName(
+            cc->indirectResultRegister->name);
+        ASSERT_TRUE(x8.has_value());
+
+        LirLiveness const lv = analyzeLiveness(lir);
+        DiagnosticReporter regallocRep;
+        LirAllocation const out = allocateRegisters(
+            lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
+        ASSERT_TRUE(out.ok()) << "k=" << k;
+
+        std::size_t const funcCount = lir.moduleFuncCount();
+        for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
+            LirFuncId const fn = lir.funcAt(fi);
+            LirFuncAllocation const* alloc = nullptr;
+            for (auto const& fa : out.perFunc) {
+                if (fa.fn == fn) { alloc = &fa; break; }
+            }
+            ASSERT_NE(alloc, nullptr) << "k=" << k;
+            std::uint32_t const blockCount = lir.funcBlockCount(fn);
+            for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+                LirBlockId const blk = lir.funcBlockAt(fn, bi);
+                std::uint32_t const instCount = lir.blockInstCount(blk);
+                for (std::uint32_t ii = 0; ii < instCount; ++ii) {
+                    LirInstId const inst = lir.blockInstAt(blk, ii);
+                    auto const* info =
+                        lowered.target->opcodeInfo(lir.instOpcode(inst));
+                    if (info == nullptr || !info->isCall) continue;
+                    auto const ops = lir.instOperands(inst);
+                    if (ops.empty() || ops[0].kind != LirOperandKind::Reg
+                        || ops[0].reg.isPhysical != 0) {
+                        continue;  // direct call (SymbolRef callee)
+                    }
+                    if (!::dss::call_payload::hasIndirectResult(
+                            lir.instPayload(inst))) {
+                        continue;  // scalar-returning indirect call (no x8)
+                    }
+                    sawIndirectStructCall = true;
+                    auto const* a = alloc->forVReg(ops[0].reg.id);
+                    if (a == nullptr || a->isSpilled()) continue;
+                    sawPhysAssignedCallee = true;
+                    EXPECT_NE(static_cast<std::uint16_t>(a->physReg().id), *x8)
+                        << "k=" << k << ": the indirect struct-returning callee "
+                        << "vreg " << ops[0].reg.id << " was allocated to the cc's "
+                        << "indirect-result register (x8) — the post-regalloc "
+                        << "`mov x8, sretPtr` reroute would clobber the callee "
+                        << "before the call consumes it "
+                        << "(D-FC7-INDIRECT-X8-SRET-CALLEE-EXCLUSION).";
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(sawIndirectStructCall)
+        << "sweep produced no indirect struct-returning call — the fn-ptr "
+           "struct-return lowering shape regressed";
+    EXPECT_TRUE(sawPhysAssignedCallee)
+        << "no indirect struct-returning callee was register-allocated — the "
+           "pin would be vacuous";
 }

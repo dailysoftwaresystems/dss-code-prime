@@ -1,0 +1,12 @@
+{
+  "$comment": "D-FC7-INDIRECT-X8-SRET-CALLEE-EXCLUSION (AAPCS64/Apple arm64): an INDIRECT (fn-ptr) call returning a 24B {long;long;long} struct BY VALUE -> >16B -> x8 SRET. The callee `fp` is a regalloc vreg that must avoid x8 (the post-regalloc IRR `mov x8, sretPtr` reroute clobbers it otherwise -> the loud L_IndirectCalleeClobberedByArgSetup backstop). The fix adds the cc's indirectResultRegister to the regalloc indirect-callee exclusion set alongside the arg regs. 13+14+15=42 via the non-inlined mkl(). SCOPE: this corpus is the END-TO-END runtime witness that the x8-sret fn-ptr path works (exit 42) — it does NOT force the x8 collision (unpressured, the allocator parks fp on callee-saved x29, so disabling the fix leaves THIS program byte-identical). The RED-ON-DISABLE guard is the structural pin LirRegAlloc.Aapcs64PressuredIndirectStructReturnCalleeExcludesX8. AAPCS64 = arm64-ELF under qemu (Apple Mach-O same ABI on the macos leg only; SysV/Win64 have no indirectResultRegister).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}
