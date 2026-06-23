@@ -382,6 +382,41 @@ TEST(HirLoweringCSubset, CaseLabelOutsideSwitchFailsLoud) {
     EXPECT_GE(countCode(r, DiagnosticCode::S_CaseLabelNotInSwitch), 1u);
 }
 
+// D-CSUBSET-LABEL-BEFORE-CASE — the multi-label ADJACENT-case chain (the iterative
+// lowerCaseChain `continue` + empty-arm makeSkip path) AND a label before `default`,
+// the two forms the corpus/equivalence pins do not exercise. `foo: case 1: case 2: S`
+// → arm(1, [LabelStmt(foo, {})]) (empty, label-marked) + arm(2, [S, …]); `bar: default:`
+// → the default arm's body starts with LabelStmt(bar).
+TEST(HirLoweringCSubset, LabelBeforeAdjacentCasesAndDefaultChainArms) {
+    SemanticModel model = analyzeCSubset(
+        "void f(int x){ switch(x){ foo: case 1: case 2: x=x+1; break; "
+        "bar: default: x=x+9; break; } }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId sw = res->hir.children(res->hir.functionBody(fn))[0];
+    ASSERT_EQ(res->hir.kind(sw), HirKind::SwitchStmt);
+    auto arms = res->hir.switchArms(sw);
+    ASSERT_EQ(arms.size(), 3u);                          // case 1, case 2, default
+    // arm 0 = case 1: empty body, label-marked at entry (LabelStmt(foo, {}))
+    EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));
+    auto b0 = res->hir.caseArmBody(arms[0]);
+    ASSERT_FALSE(b0.empty());
+    EXPECT_EQ(res->hir.kind(b0[0]), HirKind::LabelStmt);
+    // arm 1 = case 2: the real body statement, NOT label-wrapped
+    EXPECT_FALSE(res->hir.caseArmIsDefault(arms[1]));
+    auto b1 = res->hir.caseArmBody(arms[1]);
+    ASSERT_FALSE(b1.empty());
+    EXPECT_NE(res->hir.kind(b1[0]), HirKind::LabelStmt);
+    // arm 2 = default: label-before-default → body starts with LabelStmt(bar)
+    EXPECT_TRUE(res->hir.caseArmIsDefault(arms[2]));
+    auto b2 = res->hir.caseArmBody(arms[2]);
+    ASSERT_FALSE(b2.empty());
+    EXPECT_EQ(res->hir.kind(b2[0]), HirKind::LabelStmt);
+}
+
 TEST(HirLoweringCSubset, CallAndTypedef) {
     SemanticModel model = analyzeCSubset(
         "typedef int myint;\n"
