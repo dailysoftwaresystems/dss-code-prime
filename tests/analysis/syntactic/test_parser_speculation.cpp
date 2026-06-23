@@ -693,8 +693,26 @@ TEST(ParserSpeculation, DeepNestCastVsParenIsLinear) {
     dss::substrate::runOnLargeStack(kRunnerStackBytes, [&] {
         // Warm allocator/caches so the first timed run isn't setup-taxed.
         (void)timeDeepNestParse(schema, 50, kCap);
-        t500  = timeDeepNestParse(schema, 500,  kCap);
-        t1000 = timeDeepNestParse(schema, 1000, kCap);
+        // Take the MIN over several runs. A wall-clock sample is
+        // `true_compute_time + non-negative OS/scheduler/cache noise`, so the
+        // minimum is the closest estimate of the true compute time and the ratio
+        // of minima reflects the ALGORITHMIC scaling, not CI jitter. Single
+        // sub-millisecond samples on a shared CI runner (especially the macOS
+        // hosted runner) swing the ratio wildly — a lucky-fast `t500` against a
+        // noisy `t1000` produced an intermittent failure (ratio 9.68 from
+        // t500=0.7ms / t1000=6.78ms, where the true exp-~1.7 scaling is ~3.25×).
+        constexpr int kRuns = 9;  // match FlatChainParseWorkIsLinear: more
+                                  // samples → a better shot at one uninterrupted
+                                  // run on a loaded shared CI runner.
+        auto const minParse = [&](std::size_t depth) {
+            auto best = std::chrono::nanoseconds::max();
+            for (int i = 0; i < kRuns; ++i) {
+                best = std::min(best, timeDeepNestParse(schema, depth, kCap));
+            }
+            return best;
+        };
+        t500  = minParse(500);
+        t1000 = minParse(1000);
     });
 
     // Doubling the nesting (500→1000) must NOT explode the parse time. The
@@ -712,7 +730,11 @@ TEST(ParserSpeculation, DeepNestCastVsParenIsLinear) {
     const double small = std::max<double>(
         static_cast<double>(t500.count()), 1.0);
     const double ratio = static_cast<double>(t1000.count()) / small;
-    EXPECT_LT(ratio, 8.0)
+    // Bound: the true exp-~1.7 scaling is ~3.25× for a doubling; min-over-runs
+    // removes the jitter, so 10× is a generous cross-platform ceiling that still
+    // fails LOUD on the catastrophic O(N²) cast-vs-paren regression (>>100×, the
+    // pre-fix bug hung >150 s at N=300).
+    EXPECT_LT(ratio, 10.0)
         << "deep-nest parse time scaled " << ratio << "× when nesting "
            "doubled (500→1000); linear is ~2×. A super-linear ratio of this "
            "magnitude signals the O(N²) cast-vs-paren speculation regressed "
