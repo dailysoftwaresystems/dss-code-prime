@@ -3932,6 +3932,13 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     // member-access chain (`a.b.c`) still recurses through `resolveMemberAccess`
     // → `subtreeType` (a separate, shallow-in-practice residual).
 
+    // Stamped type wins — short-circuit on the HOT PATH (Pass-2 calls on an
+    // already-stamped node) BEFORE building the per-call closures below (notably
+    // `resolveArithmeticRules`). The driver's `enter` repeats this check for
+    // every child, so this is purely the root's fast exit (output-identical).
+    if (!rootNode.valid()) return InvalidType;
+    if (TypeId t = s.typeAt(rootNode); t.valid()) return t;
+
     // The interning derivations memoize into the interner's arena, so they need
     // a mutable handle. Sound because every caller owns a non-const EngineState
     // (see the const note above); the const-cast never mutates a const object.
