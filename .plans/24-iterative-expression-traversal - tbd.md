@@ -3,7 +3,8 @@
 **Status:** 🟦 GO — staged build (branch feature/0-0-2-p14, 2026-06-23). Plan-lock v1 = REWORK →
 design v2 folds every finding (§4 ledger). User signed off the corrected six-family scope (4th
 confirmation) + authorized "as many cycles as needed"; backup branch
-`feature/0-0-2-p14-before-rework` exists for comparison. Executing Stage 1 next.
+`feature/0-0-2-p14-before-rework` exists for comparison. **Stage 1 (semantic `subtreeType`) ✅
+DONE** (output-identity 375 ctest + deep corpus pin) — Stage 2 (`pass1`/`pass2`) next.
 
 ## §0 — Decision provenance & HONEST (corrected) scope
 
@@ -75,7 +76,7 @@ frame kind.
 
 | # | Stage | Risk | Per-stage gate (all + full 374 ctest green = OUTPUT-IDENTITY) |
 |---|---|---|---|
-| 1 | semantic `subtreeType` | low | synthetic deep mixed-op tree typed on a SMALL stack; folded-width pin in a `sizeof`/array-dim context (the one place it runs deep today) |
+| 1 | semantic `subtreeType` ✅ **DONE** | low | OUTPUT-IDENTITY 374→375 ctest green + corpus `deep_subtree_type_dim` (200-deep parens around a `long long` in an array-dim `sizeof`, typed at Pass-1.5 on the UNSTAMPED CST → 8 → exit 42, value-sensitive). **Validation deviation (honest):** the planned isolated small-stack unit pin (SF-4) was infeasible — BOTH `subtreeType` AND `EngineState` are anonymous-namespace (no test-callable seam without API pollution). Used a deep-CORRECTNESS corpus pin instead (big stack); the small-stack FLAT property is validated end-to-end at Stage 7. Used deep PARENS (Wrapper arm, ~150ms) not deep BINARY (parser-bound: 18s at depth 60 — the parser super-linearity this arc fixes at Stage 5, so a deep-binary pin is impractical until then). |
 | 2 | semantic `pass1`/`pass2` | low-med | synthetic deep STATEMENT-nested tree walked on a small stack |
 | 3 | cst_to_hir `lowerExpr`+`lowerFlatExpr` ({Expr,Lvalue}) | med | synthetic deep tree; HIR arena/ExprStmt-order differential pin for comma/assign/post-inc |
 | 3b | cst_to_hir statement tier ({Stmt}) | med | synthetic deep block/if/while nest lowered on a small stack |

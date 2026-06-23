@@ -3919,11 +3919,18 @@ admitsNullPointerConstant(EngineState& s, Tree const& tree,
 // memoize into the interner's arena), so a mutable interner reference is taken
 // once here — the same handle the lowering tier uses.
 [[nodiscard]] TypeId
-subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) {
-    if (!node.valid()) return InvalidType;
-    // Stamped type wins — Pass 2 already computed refs, member, call, cast,
-    // sizeof, literals, and compound literals onto the node itself.
-    if (TypeId t = s.typeAt(node); t.valid()) return t;
+subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId scope) {
+    // D-PARSE-DEEP-NEST-RECURSION-MEMORY (plan 24 Stage 1): this typer is an
+    // EXPLICIT HEAP WORK-STACK driver — NOT host recursion — so a deeply-nested
+    // expression carries flat O(N) host-stack cost. The five recursive arms
+    // (binary lhs/rhs, unary operand, postfix base, ternary then/else, the
+    // transparent-wrapper children) become phase-machine frames; every terminal
+    // arm and combine rule below is byte-identical to the prior recursive form
+    // (OUTPUT-IDENTITY is THE gate — the full ctest suite is the oracle). `scope`
+    // is INVARIANT across the whole traversal (every prior recursive call passed
+    // the same `scope`), so it is captured once, not carried per frame. The
+    // member-access chain (`a.b.c`) still recurses through `resolveMemberAccess`
+    // → `subtreeType` (a separate, shallow-in-practice residual).
 
     // The interning derivations memoize into the interner's arena, so they need
     // a mutable handle. Sound because every caller owns a non-const EngineState
@@ -3948,13 +3955,13 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) 
         }
         return interner.commonType(a, b);
     };
+    auto const& hirCfg = tree.schema().hirLowering();
 
     // ── leaf typing: an identifier resolves to its symbol's type by scope ──
-    // A literal token is Pass-2-stamped (handled by the `typeAt` above); a
-    // Pass-1.5 `sizeof(literal)` is rare and InvalidType there is an acceptable
-    // fail-loud (the array length then reports S_NonConstantArrayLength, never a
-    // guessed size). An IDENTIFIER leaf, however, MUST resolve here — that is
-    // the Pass-1.5 `sizeof b` / `sizeof(b[0])` case the sizeof closure feeds.
+    // A literal token is Pass-2-stamped (handled by the `typeAt` short-circuit in
+    // `enter`); a Pass-1.5 `sizeof(literal)` is rare and InvalidType there is an
+    // acceptable fail-loud. An IDENTIFIER leaf MUST resolve here — the Pass-1.5
+    // `sizeof b` / `sizeof(b[0])` case the sizeof closure feeds.
     auto const leafType = [&](NodeId tok) -> TypeId {
         if (tree.kind(tok) != NodeKind::Token) return InvalidType;
         if (!sem.identifierToken.valid()
@@ -3966,21 +3973,12 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) 
         if (!sym.valid()) return InvalidType;
         return s.symbols.at(sym).type;
     };
-
-    // A token-leaf node reached directly (only at Pass 1.5; Pass 2 would have
-    // stamped it). Type it as a leaf.
-    if (tree.kind(node) != NodeKind::Internal) {
-        return leafType(node);
-    }
-
-    auto const& hirCfg = tree.schema().hirLowering();
-    RuleId const r = tree.rule(node);
-
-    // The visible operator token + its `hirLowering` op-table entry. `verb` is
-    // the entry's `target` (the HIR op NAME or special tag) the law dispatches
-    // on, matching cst_to_hir's `binOp_`/`unOp_`/`postOp_` token→entry maps.
+    // The visible operator token + its `hirLowering` op-table entry — the entry's
+    // `target` (HIR op NAME / special tag) the law dispatches on, matching
+    // cst_to_hir's `binOp_`/`unOp_`/`postOp_` token→entry maps.
     auto const opEntryFor =
-        [&](std::vector<HirOperatorEntry> const& ops) -> HirOperatorEntry const* {
+        [&](NodeId node, std::vector<HirOperatorEntry> const& ops)
+        -> HirOperatorEntry const* {
         for (NodeId c : visibleChildren(tree, node)) {
             if (tree.kind(c) != NodeKind::Token) continue;
             std::uint32_t const tk = tree.tokenKind(c).v;
@@ -3991,121 +3989,40 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) 
         return nullptr;
     };
 
-    // ── cast / sizeof / compound-literal: RE-TYPING wrappers ──
-    // Pass 2 STAMPS these (the `typeAt` above returns them there); but at Pass
-    // 1.5 — a sizeof-operand sub-expression — they are NOT stamped yet, so type
-    // them HERE exactly as the Pass-2 arms do. Without this, the transparent-
-    // wrapper fallthrough below would descend PAST the cast and return the
-    // operand's PRE-cast type — but the cast's whole purpose is to RE-TYPE, so
-    // `sizeof((char)x)` ≠ `sizeof(x)` would silently fold the WRONG size in an
-    // array dimension (the divergence-from-cst_to_hir class this typer forbids).
-    if (hirCfg.sizeofRule.valid() && r.v == hirCfg.sizeofRule.v) {
-        return interner.primitive(TypeKind::U64);                  // size_t
-    }
-    // D-CSUBSET-COMPUTED-GOTO: `&&label` is `void*`. A dedicated operand rule
-    // (the sizeof precedent) whose Identifier child is a LABEL name — NOT typed as
-    // an expression (the transparent-wrapper fallthrough would try to resolve the
-    // label as a variable). Mirrors cst_to_hir's lowerLabelAddress result type.
-    if (hirCfg.labelAddressRule.valid() && r.v == hirCfg.labelAddressRule.v) {
-        return interner.pointer(interner.primitive(TypeKind::Void));
-    }
-    if (auto const it = s.idx().castByRule.find(r.v);
-        it != s.idx().castByRule.end()) {
-        auto const& cr = sem.castRules[it->second];
-        auto const kids = visibleChildren(tree, node);
-        if (cr.typeChild >= kids.size()) return InvalidType;
-        // emitOnMiss=false — the Pass-2 cast arm owns the S_UnknownType
-        // diagnostic; here we only need the (re-typed) target type.
-        return resolveTypeNode(const_cast<EngineState&>(s), sem, tree,
-                               kids[cr.typeChild], scope, /*emitOnMiss=*/false);
-    }
-    if (auto const it = s.idx().compoundLiteralByRule.find(r.v);
-        it != s.idx().compoundLiteralByRule.end()) {
-        auto const& cl = sem.compoundLiteralRules[it->second];
-        auto const kids = visibleChildren(tree, node);
-        if (cl.typeChild >= kids.size()) return InvalidType;
-        return resolveTypeNode(const_cast<EngineState&>(s), sem, tree,
-                               kids[cl.typeChild], scope, /*emitOnMiss=*/false);
-    }
-
-    // ── binary: mirror cst_to_hir combineBinary / lowerBinary ──
-    if (r.v == hirCfg.binaryExprRule.v) {
-        // [lhs(Internal), OP-token, rhs(Internal)]
-        NodeId lhsN{}, rhsN{};
-        for (NodeId c : visibleChildren(tree, node)) {
-            if (tree.kind(c) == NodeKind::Token) continue;
-            if (!lhsN.valid()) lhsN = c; else if (!rhsN.valid()) rhsN = c;
-        }
-        HirOperatorEntry const* e = opEntryFor(hirCfg.binaryOps);
-        if (e == nullptr) return InvalidType;
-        TypeId const lt = subtreeType(s, tree, lhsN, scope);
-        TypeId const rt = subtreeType(s, tree, rhsN, scope);
+    // ── combine helpers (each verbatim from the prior recursive arm; operate on
+    //    already-typed child results, so no recursion) ──
+    auto const combineBinary =
+        [&](HirOperatorEntry const* e, TypeId lt, TypeId rt) -> TypeId {
         if (e->target == "LogicalAnd" || e->target == "LogicalOr") return boolType();
         if (e->target == "Comma")  return rt;                       // value of RHS
-        // Assignment / compound-assignment yield the LHS (lvalue) type.
         if (e->target == "Assign" || !e->compoundBase.empty()) return lt;
         auto const op = coreOpFromNameSem(e->target);
         if (op.has_value()) {
             if (isComparison(*op)) return boolType();
             // Shift result type follows the config verb `shiftResult` via the
-            // shared `shiftResultType` chokepoint (D-UAC-SHIFT-RESULT-RULE-
-            // CONFIG) — the SAME function cst_to_hir's combineBinary uses, so
-            // the semantic tier and HIR lowering can never disagree on a
-            // shift's type for any shift-declaring language. A block-less
-            // language (no `arith`) falls through to the common-type path below.
+            // shared `shiftResultType` chokepoint (D-UAC-SHIFT-RESULT-RULE-CONFIG)
+            // — the SAME function cst_to_hir's combineBinary uses.
             if ((*op == HirOpKind::Shl || *op == HirOpKind::Shr)
                 && arith.has_value()) {
                 return shiftResultType(interner, lt, rt, *arith);
             }
         }
-        // Arithmetic / bitwise: the usual-arithmetic common type, falling back
-        // to the first valid operand (pointer arithmetic / non-arith pairs)
-        // exactly as combineBinary's result rule.
         TypeId const common = commonArithType(lt, rt);
         if (common.valid()) return common;
         return lt.valid() ? lt : rt;
-    }
-
-    // ── unary: mirror cst_to_hir lowerUnary ──
-    if (r.v == hirCfg.unaryExprRule.v) {
-        // [OP-token, operand(Internal)]
-        NodeId opTok{}, operandN{};
-        for (NodeId c : visibleChildren(tree, node)) {
-            if (tree.kind(c) == NodeKind::Token) { if (!opTok.valid()) opTok = c; continue; }
-            if (!operandN.valid()) operandN = c;
-        }
-        HirOperatorEntry const* e = opEntryFor(hirCfg.unaryOps);
-        if (e == nullptr) return InvalidType;
-        TypeId const ot = subtreeType(s, tree, operandN, scope);
+    };
+    auto const combineUnary = [&](HirOperatorEntry const* e, TypeId ot) -> TypeId {
         if (e->target == "AddressOf") return ot.valid() ? interner.pointer(ot) : InvalidType;
         if (e->target == "Deref")     return derefResultType(interner, ot);
         auto const op = coreOpFromNameSem(e->target);
         if (op.has_value() && *op == HirOpKind::Not) return boolType();
         return ot;   // Neg / BitNot are type-preserving
-    }
-
-    // ── postfix: mirror cst_to_hir lowerPostfix ──
-    if (r.v == hirCfg.postfixExprRule.v) {
-        // [base(Internal), OP-token, rest...]
-        NodeId baseN{};
-        for (NodeId c : visibleChildren(tree, node)) {
-            if (tree.kind(c) != NodeKind::Token) { baseN = c; break; }
-        }
-        HirOperatorEntry const* e = opEntryFor(hirCfg.postfixOps);
-        if (e == nullptr) return InvalidType;
-        TypeId const bt = subtreeType(s, tree, baseN, scope);
+    };
+    auto const combinePostfix =
+        [&](NodeId node, HirOperatorEntry const* e, TypeId bt) -> TypeId {
         if (e->target == "Index")   return indexResultType(interner, bt);
         if (e->target == "PostInc" || e->target == "PostDec") return bt;
-        // Call / member access are Pass-2-stamped (the leading `typeAt` returns
-        // before here). Unstamped is only reachable at Pass 1.5; a Call resolves
-        // its result from the callee signature, and member access resolves its
-        // field type via the shared `resolveMemberAccess` (R1 — so `sizeof(s.y)`
-        // in an array dimension folds, instead of failing loud spuriously).
         if (e->target == "Call") {
-            // Unwrap the callee type to its FnSig — a direct FnSig designator or
-            // a `Ptr<FnSig>` function-pointer value (one pointer level), the same
-            // `calleeSigOf` unwrap cst_to_hir uses; then the result is its
-            // `fnResult`. InvalidType for any other callee shape.
             TypeId sig{};
             if (bt.valid()) {
                 if (interner.kind(bt) == TypeKind::FnSig) {
@@ -4119,43 +4036,189 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) 
             }
             return sig.valid() ? interner.fnResult(sig) : InvalidType;
         }
-        // Member access (`.` / `->`): the shared helper resolves the field type.
-        // It returns NotMemberAccess for any non-member postfix verb, yielding
-        // InvalidType — the same fail-loud as before for an unhandled verb.
+        // Member access (`.`/`->`): the shared helper resolves the field type (it
+        // re-derives the object type via subtreeType — the member-chain residual).
         auto const mr = resolveMemberAccess(s, sem, tree, node, scope);
         return mr.status == MemberResolution::Status::Ok ? mr.fieldType
                                                          : InvalidType;
-    }
-
-    // ── ternary: mirror cst_to_hir lowerTernary ──
-    if (hirCfg.ternaryExprRule.valid() && r.v == hirCfg.ternaryExprRule.v) {
-        // operands = the 3 non-token visible children [cond, then, else]
-        std::vector<NodeId> operands;
-        for (NodeId c : visibleChildren(tree, node)) {
-            if (tree.kind(c) != NodeKind::Token) operands.push_back(c);
-        }
-        if (operands.size() != 3) return InvalidType;
-        TypeId const thenT = subtreeType(s, tree, operands[1], scope);
-        TypeId const elseT = subtreeType(s, tree, operands[2], scope);
+    };
+    auto const combineTernary = [&](TypeId thenT, TypeId elseT) -> TypeId {
         TypeId const common = commonArithType(thenT, elseT);
         if (common.valid()) return common;
         return thenT.valid() ? thenT : elseT;   // non-arith arms (pointers etc.)
-    }
+    };
 
-    // Transparent / operand wrapper (paren-expression, operand alts, the
-    // primary-expression that wraps a bare literal or identifier leaf): the
-    // wrapper passes its inner expression's type through unchanged. Recurse via
-    // `subtreeType` on each visible child in order and return the first VALID
-    // result — `subtreeType` itself checks the stamped side-table first (so a
-    // Pass-2-stamped literal leaf yields its type), then a nested operator
-    // wrapper by its verb, then an identifier leaf by scope-lookup. This is the
-    // single-source equivalent of the old "first stamped descendant wins" DFS,
-    // now made operator-AWARE (a nested `&x` returns `Ptr<I32>`, not the inner
-    // leaf's I32). An EmptySpace child is already filtered by visibleChildren.
-    for (NodeId c : visibleChildren(tree, node)) {
-        if (TypeId t = subtreeType(s, tree, c, scope); t.valid()) return t;
+    // ── the explicit work-stack ──
+    struct Frame {
+        NodeId node;
+        enum class Kind : std::uint8_t {
+            Binary, Unary, Postfix, Ternary, Wrapper
+        } kind;
+        std::uint8_t           phase;
+        NodeId                  n0;     // binary lhs / unary operand / postfix base
+        NodeId                  n1;     // binary rhs
+        HirOperatorEntry const* e;      // binary / unary / postfix op entry
+        std::vector<NodeId>     list;   // ternary [cond,then,else] / wrapper children
+        std::size_t             idx;    // wrapper child cursor
+        TypeId                  c0;     // first child result (lt / thenT)
+    };
+    std::vector<Frame> work;
+    TypeId result{};
+
+    // Classify `node`: either set `result` to its type (TERMINAL — typeAt /
+    // leaf / sizeof / label / cast / compound-literal / no-op-entry), or push a
+    // Frame for one of the five recursive arms. Mirrors the prior dispatch order
+    // EXACTLY so the result is byte-identical.
+    auto const enter = [&](NodeId node) {
+        if (!node.valid()) { result = InvalidType; return; }
+        // Stamped type wins — Pass 2 already computed refs/member/call/cast/
+        // sizeof/literals/compound-literals onto the node itself.
+        if (TypeId t = s.typeAt(node); t.valid()) { result = t; return; }
+        if (tree.kind(node) != NodeKind::Internal) { result = leafType(node); return; }
+        RuleId const r = tree.rule(node);
+        // ── cast / sizeof / compound-literal: RE-TYPING wrappers (Pass-1.5; Pass 2
+        //    stamps them so the typeAt above wins there). Without this the wrapper
+        //    fallthrough would return the PRE-cast type — `sizeof((char)x)` would
+        //    fold the wrong size. ──
+        if (hirCfg.sizeofRule.valid() && r.v == hirCfg.sizeofRule.v) {
+            result = interner.primitive(TypeKind::U64); return;        // size_t
+        }
+        // D-CSUBSET-COMPUTED-GOTO: `&&label` is `void*` (a dedicated operand rule
+        // whose Identifier child is a LABEL name, never typed as an expression).
+        if (hirCfg.labelAddressRule.valid() && r.v == hirCfg.labelAddressRule.v) {
+            result = interner.pointer(interner.primitive(TypeKind::Void)); return;
+        }
+        if (auto const it = s.idx().castByRule.find(r.v);
+            it != s.idx().castByRule.end()) {
+            auto const& cr = sem.castRules[it->second];
+            auto const kids = visibleChildren(tree, node);
+            // emitOnMiss=false — the Pass-2 cast arm owns the S_UnknownType diag.
+            result = (cr.typeChild >= kids.size())
+                ? InvalidType
+                : resolveTypeNode(const_cast<EngineState&>(s), sem, tree,
+                                  kids[cr.typeChild], scope, /*emitOnMiss=*/false);
+            return;
+        }
+        if (auto const it = s.idx().compoundLiteralByRule.find(r.v);
+            it != s.idx().compoundLiteralByRule.end()) {
+            auto const& cl = sem.compoundLiteralRules[it->second];
+            auto const kids = visibleChildren(tree, node);
+            result = (cl.typeChild >= kids.size())
+                ? InvalidType
+                : resolveTypeNode(const_cast<EngineState&>(s), sem, tree,
+                                  kids[cl.typeChild], scope, /*emitOnMiss=*/false);
+            return;
+        }
+        // ── binary: [lhs(Internal), OP-token, rhs(Internal)] ──
+        if (r.v == hirCfg.binaryExprRule.v) {
+            NodeId lhsN{}, rhsN{};
+            for (NodeId c : visibleChildren(tree, node)) {
+                if (tree.kind(c) == NodeKind::Token) continue;
+                if (!lhsN.valid()) lhsN = c; else if (!rhsN.valid()) rhsN = c;
+            }
+            HirOperatorEntry const* e = opEntryFor(node, hirCfg.binaryOps);
+            if (e == nullptr) { result = InvalidType; return; }
+            work.push_back(Frame{node, Frame::Kind::Binary, 0, lhsN, rhsN, e,
+                                 {}, 0, {}});
+            return;
+        }
+        // ── unary: [OP-token, operand(Internal)] ──
+        if (r.v == hirCfg.unaryExprRule.v) {
+            NodeId operandN{};
+            for (NodeId c : visibleChildren(tree, node)) {
+                if (tree.kind(c) == NodeKind::Token) continue;
+                operandN = c; break;
+            }
+            HirOperatorEntry const* e = opEntryFor(node, hirCfg.unaryOps);
+            if (e == nullptr) { result = InvalidType; return; }
+            work.push_back(Frame{node, Frame::Kind::Unary, 0, operandN, {}, e,
+                                 {}, 0, {}});
+            return;
+        }
+        // ── postfix: [base(Internal), OP-token, rest...] ──
+        if (r.v == hirCfg.postfixExprRule.v) {
+            NodeId baseN{};
+            for (NodeId c : visibleChildren(tree, node)) {
+                if (tree.kind(c) != NodeKind::Token) { baseN = c; break; }
+            }
+            HirOperatorEntry const* e = opEntryFor(node, hirCfg.postfixOps);
+            if (e == nullptr) { result = InvalidType; return; }
+            work.push_back(Frame{node, Frame::Kind::Postfix, 0, baseN, {}, e,
+                                 {}, 0, {}});
+            return;
+        }
+        // ── ternary: operands = the 3 non-token visible children [cond,then,else] ──
+        if (hirCfg.ternaryExprRule.valid() && r.v == hirCfg.ternaryExprRule.v) {
+            std::vector<NodeId> operands;
+            for (NodeId c : visibleChildren(tree, node)) {
+                if (tree.kind(c) != NodeKind::Token) operands.push_back(c);
+            }
+            if (operands.size() != 3) { result = InvalidType; return; }
+            work.push_back(Frame{node, Frame::Kind::Ternary, 0, {}, {}, nullptr,
+                                 std::move(operands), 0, {}});
+            return;
+        }
+        // ── transparent / operand wrapper: pass the inner expression's type
+        //    through; recurse on each visible child in order, first VALID wins
+        //    (operator-AWARE via the per-child `enter`). ──
+        std::vector<NodeId> kids;
+        for (NodeId c : visibleChildren(tree, node)) kids.push_back(c);
+        work.push_back(Frame{node, Frame::Kind::Wrapper, 0, {}, {}, nullptr,
+                             std::move(kids), 0, {}});
+    };
+
+    // Driver: each frame either pushes a child (`enter`, last statement of the
+    // branch — `f` may be invalidated by the push, so nothing reads `f` after it)
+    // or, when its children are typed, combines + pops, leaving the result in
+    // `result` for the parent's next phase to consume.
+    enter(rootNode);
+    while (!work.empty()) {
+        Frame& f = work.back();
+        switch (f.kind) {
+        case Frame::Kind::Binary:
+            if (f.phase == 0) { f.phase = 1; NodeId n = f.n0; enter(n); }
+            else if (f.phase == 1) {
+                f.c0 = result; f.phase = 2; NodeId n = f.n1; enter(n);
+            } else {
+                HirOperatorEntry const* e = f.e; TypeId lt = f.c0;
+                work.pop_back(); result = combineBinary(e, lt, result);
+            }
+            break;
+        case Frame::Kind::Unary:
+            if (f.phase == 0) { f.phase = 1; NodeId n = f.n0; enter(n); }
+            else {
+                HirOperatorEntry const* e = f.e;
+                work.pop_back(); result = combineUnary(e, result);
+            }
+            break;
+        case Frame::Kind::Postfix:
+            if (f.phase == 0) { f.phase = 1; NodeId n = f.n0; enter(n); }
+            else {
+                NodeId node = f.node; HirOperatorEntry const* e = f.e;
+                work.pop_back(); result = combinePostfix(node, e, result);
+            }
+            break;
+        case Frame::Kind::Ternary:
+            if (f.phase == 0) { f.phase = 1; NodeId n = f.list[1]; enter(n); }
+            else if (f.phase == 1) {
+                f.c0 = result; f.phase = 2; NodeId n = f.list[2]; enter(n);
+            } else {
+                TypeId thenT = f.c0;
+                work.pop_back(); result = combineTernary(thenT, result);
+            }
+            break;
+        case Frame::Kind::Wrapper:
+            if (f.phase == 0) {
+                if (f.idx >= f.list.size()) { work.pop_back(); result = InvalidType; }
+                else { f.phase = 1; NodeId n = f.list[f.idx]; enter(n); }
+            } else {  // phase 1: a child just delivered `result`
+                if (result.valid()) { work.pop_back(); }  // first valid wins
+                else { ++f.idx; f.phase = 0; }             // try the next child
+            }
+            break;
+        }
     }
-    return InvalidType;
+    return result;
 }
 
 // R1: shared member-access resolver (declared after subtreeType's forward decl).
