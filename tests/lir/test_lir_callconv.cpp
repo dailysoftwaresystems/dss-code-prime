@@ -129,7 +129,112 @@ savedRegsContain(FrameLayout const& layout, std::uint16_t ord) {
     return false;
 }
 
+// D-WIN64-LARGE-FRAME-STACK-PROBE helper: count how many insts in a
+// materialized module carry the given opcode. Used by the prologue
+// structural pin to assert a `stack_probe` op is (or is NOT) emitted.
+[[nodiscard]] std::uint32_t
+countOpcodeInModule(Lir const& lir, std::uint16_t op) {
+    std::uint32_t n = 0;
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const b = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(b); ++i) {
+                if (lir.instOpcode(lir.blockInstAt(b, i)) == op) ++n;
+            }
+        }
+    }
+    return n;
+}
+
 } // namespace
+
+// ── D-WIN64-LARGE-FRAME-STACK-PROBE prologue structural pins ──────────
+//
+// The ms_x64 prologue must emit a `stack_probe` op (NOT a plain `sub rsp`)
+// when the frame exceeds the cc's stackProbePageBytes (4096). A ms_x64
+// frame ≤ 4096 keeps the plain sub; a sysv frame > 4096 ALSO keeps the
+// plain sub (sysv declares stackProbePageBytes=0 → no probing). RED-ON-
+// DISABLE: flipping the prologue's threshold branch flips the op choice
+// (the witness corpus large_frame_win64 then SIGSEGVs on Windows).
+
+TEST(LirCallconv, MsX64LargeFrameEmitsStackProbeNotPlainSub) {
+    // ms_x64 = ccIndex 1. `int big[2000]` = 8000 bytes > one 4096 guard
+    // page → the prologue must emit `stack_probe`, NOT a bare `sub rsp,F`.
+    auto bundle = lowerThroughRewrite(
+        "int f(void) { int big[2000]; big[0] = 7; return big[0]; }",
+        /*ccIndex=*/1);
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    EXPECT_TRUE(result.ok());
+    ASSERT_EQ(result.perFunc.size(), 1u);
+    // Confirm the frame really exceeds one page (the precondition).
+    auto const* cc = bundle.lowered.target->callingConvention(1);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_GT(cc->stackProbePageBytes, 0u) << "ms_x64 must declare a probe page";
+    EXPECT_GT(result.perFunc[0].totalFrameSize, cc->stackProbePageBytes);
+
+    auto const probeOp = bundle.lowered.target->opcodeByMnemonic("stack_probe");
+    ASSERT_TRUE(probeOp.has_value());
+    EXPECT_EQ(countOpcodeInModule(result.lir, *probeOp), 1u)
+        << "ms_x64 >4096 frame must emit exactly one stack_probe";
+}
+
+TEST(LirCallconv, MsX64SmallFrameEmitsPlainSubNotStackProbe) {
+    // ms_x64, a TRIVIAL frame (one int, well under 4096) → plain `sub rsp`,
+    // NO stack_probe. (The frame is rounded to stackAlignment but stays a
+    // small fraction of a page.)
+    auto bundle = lowerThroughRewrite(
+        "int f(int x) { return x + x; }", /*ccIndex=*/1);
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    EXPECT_TRUE(result.ok());
+    ASSERT_EQ(result.perFunc.size(), 1u);
+    auto const* cc = bundle.lowered.target->callingConvention(1);
+    ASSERT_NE(cc, nullptr);
+    EXPECT_LE(result.perFunc[0].totalFrameSize, cc->stackProbePageBytes);
+
+    auto const probeOp = bundle.lowered.target->opcodeByMnemonic("stack_probe");
+    ASSERT_TRUE(probeOp.has_value());
+    EXPECT_EQ(countOpcodeInModule(result.lir, *probeOp), 0u)
+        << "ms_x64 ≤4096 frame must NOT emit stack_probe (plain sub rsp)";
+}
+
+TEST(LirCallconv, SysVLargeFrameEmitsPlainSubNotStackProbe) {
+    // sysv_amd64 = ccIndex 0, declares NO stackProbePageBytes (0). Even a
+    // LARGE frame (`int big[2000]` = 8000B) must keep the plain `sub rsp`
+    // — Linux auto-grows the stack, no probe needed. This is the agnostic
+    // control: the SAME source on a non-probing CC takes the plain path.
+    auto bundle = lowerThroughRewrite(
+        "int f(void) { int big[2000]; big[0] = 7; return big[0]; }",
+        /*ccIndex=*/0);
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    EXPECT_TRUE(result.ok());
+    ASSERT_EQ(result.perFunc.size(), 1u);
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    EXPECT_EQ(cc->stackProbePageBytes, 0u) << "sysv must NOT declare a probe page";
+    // The frame is genuinely large (precondition for a meaningful control).
+    EXPECT_GT(result.perFunc[0].totalFrameSize, 4096u);
+
+    auto const probeOp = bundle.lowered.target->opcodeByMnemonic("stack_probe");
+    ASSERT_TRUE(probeOp.has_value());
+    EXPECT_EQ(countOpcodeInModule(result.lir, *probeOp), 0u)
+        << "sysv (stackProbePageBytes=0) must NEVER emit stack_probe";
+}
 
 TEST(LirCallconv, StraightLineFunctionGetsPrologueEpilogueAndZeroFrameOps) {
     auto bundle = lowerThroughRewrite("int f(int x) { return x + x; }");

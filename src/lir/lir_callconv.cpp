@@ -589,6 +589,27 @@ void emitSpAdjust(LirBuilder& b, std::uint16_t op, LirReg sp,
     b.addInst(op, sp, ops);
 }
 
+// D-WIN64-LARGE-FRAME-STACK-PROBE: emit the `stack_probe` virtual op —
+// the prologue's guard-page-safe replacement for a single `sub SP, F`
+// when the frame exceeds the OS guard-page size. Operands:
+// [sp(reg), frameBytes(imm32), pageBytes(imm32)] — the x86_64 encoder
+// hand-lowers this ONE op to a page-walking loop that descends SP by
+// `pageBytes` at a time (touching/committing each page) for `frameBytes`
+// total, ending at SP = entry_SP - frameBytes. Two immediates so the
+// page step is config-driven (the encoder hardcodes NO page size). The
+// op's result is `none` — like a bare `sub SP,F`, it mutates SP in place
+// and exposes no SSA value; SP is a fixed physical reg the encoder reads
+// from operand 0.
+void emitStackProbe(LirBuilder& b, std::uint16_t op, LirReg sp,
+                    std::uint32_t frameBytes, std::uint32_t pageBytes) {
+    std::array<LirOperand, 3> ops{
+        LirOperand::makeReg(sp),
+        LirOperand::makeImmInt32(static_cast<std::int32_t>(frameBytes)),
+        LirOperand::makeImmInt32(static_cast<std::int32_t>(pageBytes))
+    };
+    b.addInst(op, InvalidLirReg, ops);
+}
+
 // Emit `store reg, [SP + offset]` (saved-reg store, or frame-store
 // materialization). `store` operand layout per x86_64.target.json:
 // [value_reg, base_reg, MemBase(scale), MemOffset(disp)] — 4 ops, no result.
@@ -724,6 +745,16 @@ struct OpcodeHandles {
     // RegClassOp role; the scaled form is a single-ISA concern, parallel to fstur_q).
     std::uint16_t loadU;
     std::uint16_t storeU;
+    // D-WIN64-LARGE-FRAME-STACK-PROBE: the `stack_probe` virtual op the
+    // prologue emits INSTEAD of a plain `sub SP, F` when the cc declares
+    // a nonzero `stackProbePageBytes` AND the frame exceeds it. The
+    // x86_64 encoder lowers it to an inline page-walking loop. Optional —
+    // only a target with a probe-needing CC declares it (x86_64 does;
+    // arm64 OMITS it so an accidental emission there fires
+    // A_NoEncodingDeclared, defense-in-depth). Absent ⇒ field 0; the
+    // prologue's emit site fails loud if a CC declares stackProbePageBytes
+    // but the schema lacks the opcode (a config mismatch).
+    std::uint16_t stackProbe;
 };
 
 // FC2 Part B: resolve the class-correct opcode for a register-data-
@@ -754,10 +785,41 @@ classOpHandle(TargetSchema const&  schema,
 }
 
 void emitPrologue(LirBuilder& b, FrameLayout const& layout,
-                  TargetSchema const& schema, LirReg sp,
-                  std::uint16_t subOp, DiagnosticReporter& reporter,
-                  bool& ok) {
-    emitSpAdjust(b, subOp, sp, layout.totalFrameSize);
+                  TargetSchema const& schema,
+                  TargetCallingConvention const& cc, LirReg sp,
+                  std::uint16_t subOp, std::uint16_t stackProbeOp,
+                  DiagnosticReporter& reporter, bool& ok) {
+    // D-WIN64-LARGE-FRAME-STACK-PROBE: when the cc declares a guard-page
+    // size (Windows ms_x64 = 4096) AND the frame DESCENDS past one guard
+    // page, the single `sub SP, F` would skip the OS guard page and
+    // access-violate on the first deep write. Emit the `stack_probe` op
+    // INSTEAD — the x86_64 encoder lowers it to a page-walking loop that
+    // touches every page on the way down. Every OTHER case (frame ≤ page,
+    // OR a cc with stackProbePageBytes==0 = Linux/macOS/arm64) keeps the
+    // plain `sub SP, F` below — byte-identical to before this feature.
+    // Agnostic: the decision reads cc.stackProbePageBytes (a config
+    // value), NEVER cc.name / arch / object format.
+    if (cc.stackProbePageBytes > 0
+        && layout.totalFrameSize > cc.stackProbePageBytes) {
+        if (stackProbeOp == 0) {
+            // The cc asks for probing but the schema declares no
+            // `stack_probe` opcode — a config mismatch. Fail loud rather
+            // than silently fall back to the guard-skipping `sub`.
+            report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                   DiagnosticSeverity::Error,
+                   std::format("calling convention '{}' declares "
+                               "stackProbePageBytes={} but the target "
+                               "schema has no 'stack_probe' opcode to "
+                               "emit the guard-page probe loop",
+                               cc.name, cc.stackProbePageBytes));
+            ok = false;
+            return;
+        }
+        emitStackProbe(b, stackProbeOp, sp, layout.totalFrameSize,
+                       static_cast<std::uint32_t>(cc.stackProbePageBytes));
+    } else {
+        emitSpAdjust(b, subOp, sp, layout.totalFrameSize);
+    }
     // D-ML7-2.2 audit-fold (2026-06-02 silent-failure CRITICAL C1):
     // saved regs sit at [SP + savedRegAreaOffset() + i*slotSize),
     // NOT [SP + i*slotSize). The new outgoing-args area pushes saved
@@ -1300,7 +1362,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 22> const table{{
+    std::array<Entry, 23> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -1361,6 +1423,11 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // not per-inst (FOLD 2 — the fstur_q/lea optional-handle pattern).
         {&OpcodeHandles::loadU,             "load_u",               true},
         {&OpcodeHandles::storeU,            "store_u",              true},
+        // D-WIN64-LARGE-FRAME-STACK-PROBE: optional — only a target whose
+        // CC declares a nonzero stackProbePageBytes emits it (x86_64).
+        // Absent ⇒ field 0; the prologue emit site fails loud if a CC
+        // declares stackProbePageBytes but the schema omits the opcode.
+        {&OpcodeHandles::stackProbe,        "stack_probe",          true},
     }};
     for (auto const& [field, mnem, optional] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
@@ -1508,8 +1575,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
 
         if (bi == 0) {
             bool prologueOk = false;
-            emitPrologue(b, outLayout, schema, sp, h.sub, reporter,
-                         prologueOk);
+            emitPrologue(b, outLayout, schema, cc, sp, h.sub,
+                         h.stackProbe, reporter, prologueOk);
             if (!prologueOk) return false;
             // FC12a/b/c: a function that calls va_start spills its arg registers
             // immediately after the prologue's SP-adjust + saved-reg stores (so the

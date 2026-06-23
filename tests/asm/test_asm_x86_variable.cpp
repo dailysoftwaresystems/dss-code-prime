@@ -1387,6 +1387,127 @@ TEST(X86VariableEncoder, AddRspImm32EmitsExactEpilogueBytes) {
     EXPECT_EQ(bytes[6], 0x00);
 }
 
+// ── D-WIN64-LARGE-FRAME-STACK-PROBE encoder byte-pins ─────────────────
+//
+// The `stack_probe` op is the ONE x86-variable op that emits MULTIPLE
+// machine instructions for a single LIR op. Pin the EXACT 30-byte probe
+// loop the dedicated encoder arm hand-emits (NOT via assertRoundTripsClean
+// — the round-trip oracle assumes one instruction per op; F2). The op
+// carries [sp(reg), frameBytes(imm32), pageBytes(imm32)]; the loop is:
+//   mov   r11d, frame    ; 41 BB <frame LE>
+// .L:
+//   sub   rsp, page      ; 48 81 EC <page LE>
+//   or    qword [rsp], 0 ; 48 83 0C 24 00
+//   sub   r11d, page     ; 41 81 EB <page LE>
+//   cmp   r11d, page     ; 41 81 FB <page LE>
+//   ja    .L             ; 77 E4   (rel8 = -28 back to .L)
+//   sub   rsp, r11       ; 4C 29 DC
+// The `0x77` (ja, strictly-above) byte is pinned EXPLICITLY (F8): jbe/jb
+// would under-probe = SILENT CRASH; jae over-probes. The exact-page case
+// (frame=8192) is a SECOND pin: `ja` falls through at remaining==0 so the
+// trailing `sub rsp, r11` (r11=0) is a harmless no-op there.
+namespace {
+// The fixed tail of the probe loop (everything after the `mov r11d,frame`
+// header), parameterized only by the page step. Returns the 24 bytes from
+// `.L` through `sub rsp, r11`. The `ja` rel8 is the compile-time-constant
+// -28 (0xE4) for this fixed loop body.
+[[nodiscard]] std::vector<std::uint8_t> probeLoopTail(std::uint32_t page) {
+    auto const lo = [](std::uint32_t v, unsigned s) {
+        return static_cast<std::uint8_t>((v >> s) & 0xFFu);
+    };
+    return {
+        0x48, 0x81, 0xEC, lo(page,0), lo(page,8), lo(page,16), lo(page,24),
+        0x48, 0x83, 0x0C, 0x24, 0x00,
+        0x41, 0x81, 0xEB, lo(page,0), lo(page,8), lo(page,16), lo(page,24),
+        0x41, 0x81, 0xFB, lo(page,0), lo(page,8), lo(page,16), lo(page,24),
+        0x77, 0xE4,
+        0x4C, 0x29, 0xDC,
+    };
+}
+} // namespace
+
+TEST(X86VariableEncoder, StackProbeNonMultipleFrameEmitsExactLoop) {
+    // StackProbe(frame=36000, page=4096) → 30-byte page-walking loop.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const probeOp = (*schema)->opcodeByMnemonic("stack_probe");
+    ASSERT_TRUE(probeOp.has_value());
+    LirReg const rsp = physGprByName(**schema, "rsp");
+
+    constexpr std::uint32_t kFrame = 36000u;  // 0x8CA0 — NOT a page multiple
+    constexpr std::uint32_t kPage  = 4096u;   // 0x1000
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rsp),
+            LirOperand::makeImmInt32(static_cast<std::int32_t>(kFrame)),
+            LirOperand::makeImmInt32(static_cast<std::int32_t>(kPage)),
+        };
+        (void)b.addInst(*probeOp, InvalidLirReg, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    // Expected = `mov r11d, 0x8CA0` header + the fixed page-4096 tail.
+    std::vector<std::uint8_t> expected = {0x41, 0xBB, 0xA0, 0x8C, 0x00, 0x00};
+    auto const tail = probeLoopTail(kPage);
+    expected.insert(expected.end(), tail.begin(), tail.end());
+
+    ASSERT_GE(bytes.size(), expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_EQ(bytes[i], expected[i])
+            << "probe-loop byte mismatch at index " << i;
+    }
+    // F8: the `ja` condition byte is load-bearing — pin it explicitly.
+    // It sits at offset 6 (header) + 26 (loop body up to the ja opcode).
+    EXPECT_EQ(bytes[6 + 26], 0x77) << "ja (strictly-above) opcode";
+    EXPECT_EQ(bytes[6 + 27], 0xE4) << "ja rel8 = -28 back to .L";
+    // And the final remainder drop is `sub rsp, r11` = 4C 29 DC (NOT the
+    // 49 29 DB = `sub r11, rbx` that a reg-swap bug emits).
+    EXPECT_EQ(bytes[6 + 28], 0x4C);
+    EXPECT_EQ(bytes[6 + 29], 0x29);
+    EXPECT_EQ(bytes[6 + 30], 0xDC);
+}
+
+TEST(X86VariableEncoder, StackProbeExactPageMultipleFrameEmitsExactLoop) {
+    // StackProbe(frame=8192, page=4096) — EXACT 2-page multiple (F8): the
+    // header immediate is 0x2000; the loop body (incl. the `ja`) is
+    // byte-identical to the non-multiple case (only the header value
+    // differs). `ja` falls through when remaining hits exactly 0.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const probeOp = (*schema)->opcodeByMnemonic("stack_probe");
+    ASSERT_TRUE(probeOp.has_value());
+    LirReg const rsp = physGprByName(**schema, "rsp");
+
+    constexpr std::uint32_t kFrame = 8192u;  // 0x2000 — exact page multiple
+    constexpr std::uint32_t kPage  = 4096u;
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rsp),
+            LirOperand::makeImmInt32(static_cast<std::int32_t>(kFrame)),
+            LirOperand::makeImmInt32(static_cast<std::int32_t>(kPage)),
+        };
+        (void)b.addInst(*probeOp, InvalidLirReg, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    std::vector<std::uint8_t> expected = {0x41, 0xBB, 0x00, 0x20, 0x00, 0x00};
+    auto const tail = probeLoopTail(kPage);
+    expected.insert(expected.end(), tail.begin(), tail.end());
+
+    ASSERT_GE(bytes.size(), expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_EQ(bytes[i], expected[i])
+            << "exact-page probe-loop byte mismatch at index " << i;
+    }
+    EXPECT_EQ(bytes[6 + 26], 0x77) << "ja opcode (exact-page: falls through at 0)";
+}
+
 TEST(X86VariableEncoder, LoadFromRspForcesSibByte) {
     // `mov rcx, [rsp + 0x10]` → 48 8B 4C 24 10 00 00 00
     auto schema = TargetSchema::loadShipped("x86_64");

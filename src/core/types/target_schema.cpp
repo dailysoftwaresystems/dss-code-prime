@@ -1239,8 +1239,25 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                               // callPushBytes field (a cc declaring
                               // only callPushBytes would bypass the
                               // multiple-of-alignment check below).
-                              || cc.callPushBytes != 0;
+                              || cc.callPushBytes != 0
+                              // D-WIN64-LARGE-FRAME-STACK-PROBE: same
+                              // protection for stackProbePageBytes (a cc
+                              // declaring only it would bypass the
+                              // power-of-two check below).
+                              || cc.stackProbePageBytes != 0;
         if (hasAbiInfo) {
+            // D-WIN64-LARGE-FRAME-STACK-PROBE: the probe page size IS the
+            // loop's per-iteration step; if it is not a power of two the
+            // guard-page geometry is wrong and a typo'd 4000 would
+            // silently skip a guard page. Independent of stackAlignment
+            // (checked unconditionally so a malformed stackAlignment does
+            // not also mask this).
+            if (cc.stackProbePageBytes != 0
+                && !isPow2Nonzero(cc.stackProbePageBytes)) {
+                fail(std::format("/callingConventions/{}/stackProbePageBytes", i),
+                     std::format("callingConvention '{}': stackProbePageBytes ({}) must be a power of two",
+                                 cc.name, cc.stackProbePageBytes));
+            }
             if (!isPow2Nonzero(cc.stackAlignment)) {
                 fail(std::format("/callingConventions/{}/stackAlignment", i),
                      std::format("callingConvention '{}': stackAlignment ({}) must be a non-zero power of two",

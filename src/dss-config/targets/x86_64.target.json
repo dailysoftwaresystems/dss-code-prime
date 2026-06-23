@@ -242,6 +242,26 @@
       }
     },
     {
+      "$comment": "D-WIN64-LARGE-FRAME-STACK-PROBE: a SINGLE LIR op that the x86_64 encoder lowers to a MULTI-INSTRUCTION inline stack-probe loop (one-LIR-op→N-instructions). Operands: [sp(reg), frameBytes(imm32), pageBytes(imm32)] — the stack-pointer register, the total frame size to descend, and the guard-page step (= the cc's stackProbePageBytes). The ML7 prologue emits this INSTEAD of a bare `sub rsp, F` when totalFrameSize > stackProbePageBytes, so the loop touches (commits) every guard page on the way down (Windows reserves the stack lazily behind a single PAGE_GUARD page; a bare `sub` skips it → access violation). The encoder hand-pushes the loop: `mov r11d, frame` / .L: `sub rsp, page` / `or qword [rsp], 0` (page-touch) / `sub r11d, page` / `cmp r11d, page` / `ja .L` (rel8 back) / `sub rsp, r11` (final remainder). r11 is ms_x64 caller-saved, never an arg/return reg, and the probe runs before any arg-home, so it is free. NO __chkstk, NO relocation (the rel8 is a compile-time constant). This is x86_64-ONLY: arm64 OMITS this opcode entirely (its CCs have stackProbePageBytes=0 → never emitted → arm64 encoder would fire A_NoEncodingDeclared, defense-in-depth). The encoding block below exists ONLY to satisfy the shape/routing contract (shape!=None ⇒ asm.cpp routes to the x86-variable walker; the walker's DEDICATED stack_probe arm intercepts BEFORE variant matching and hand-emits the bytes — the variant row itself is never consumed for emission). hasSideEffects=true so no pass drops/reorders it.",
+      "mnemonic":      "stack_probe",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "Contract-only variant (see opcode $comment): the x86-variable walker's DEDICATED stack_probe arm emits the probe loop by hand BEFORE this variant is ever matched, so this row carries NO operand wiring (an empty guard — the schema's per-position wire check requires a wire for every declared operandKind, but the probe op's 3 operands are consumed by the hand-written arm, not by slot wiring). Its sole purpose is to make `encoding.shape != None` so asm.cpp routes stack_probe to the x86-variable walker (and opcodeInfo != nullptr, avoiding A_NoEncodingDeclared). If the dedicated arm ever fails to intercept (mnemonic drift), this empty-guard variant does NOT match the 3-operand inst -> A_NoMatchingEncodingVariant fires LOUD (never a silent mis-encode). `template.opcode` is a placeholder never emitted.",
+            "guard":    { "operandKinds": [] },
+            "template": { "opcode": [144] }
+          }
+        ]
+      }
+    },
+    {
       "$comment": "2-operand multiply. x86 has both 2-op `imul reg, reg` (writes the low half to the destination — what we emit) and 1-op `mul/imul reg` (rdx:rax full-width — needed only for overflow/128-bit results, future cycle). The 2-op form is REX.W 0x0F 0xAF /r — UNUSUAL among x86 binary arith because dest goes to ModR/M.reg (not r/m), source-1 goes to r/m. Wires reflect this: op[0]→modrm.reg (the destination per 2-address), op[1]→modrm.rm.",
       "mnemonic":      "mul",
       "result":        "value",
@@ -1626,6 +1646,8 @@
       "entryStackPointerBias": 8,
       "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: x86_64 `call` instruction pushes the 8-byte return address (same as SysV — ISA-level fact). ML7 `computeFrameLayout` for any non-leaf Win64 function emits `sub rsp, N` where N satisfies BOTH N >= max(savedRegs+spill, shadowSpaceBytes=32) AND N ≡ callPushBytes=8 (mod stackAlignment=16) — same `alignedSizeWithBias` helper the trampoline emitter uses. For a hello_puts-shape main (no callee-saved, no spills, calls puts): raw = max(0, 32) = 32; N = alignedSizeWithBias(32, 16, 8) = 40. Main's prologue becomes `sub rsp, 0x28`; main calls puts at RSP ≡ 0 mod 16 (Win64 ABI requirement) with 32 bytes of shadow space available for puts's register-arg home area. This closes the actual cause of the 2026-06-02 hello_puts SEGV — NOT a CRT-init gap (msvcrt's DllMain self-inits stdio at DLL load).",
       "callPushBytes": 8,
+      "$stackProbePageBytesComment": "D-WIN64-LARGE-FRAME-STACK-PROBE: the Windows x86-64 stack guard-page size (4096). A function whose total frame EXCEEDS 4096 bytes must touch every page on the way down (committing each PAGE_GUARD page) instead of a bare `sub rsp, F` that jumps over the guard page → STATUS_GUARD_PAGE_VIOLATION → access violation on the first deep write. The ML7 prologue reads this generically and, when totalFrameSize > 4096, emits the `stack_probe` virtual op (page step = this value) which the x86_64 encoder lowers to an inline page-walking loop — INSTEAD of the plain `sub rsp, F`. NO __chkstk dependency (dss PE exes are freestanding; __chkstk lives in msvcrt/ucrt). sysv_amd64 omits this field (0 = no probing: Linux auto-grows the stack via demand paging). Agnostic: the prologue branches on the VALUE, never on cc.name/arch/format.",
+      "stackProbePageBytes": 4096,
       "$slotAlignedComment": "D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): Win64 ms_x64 uses SLOT-ALIGNED arg passing — each arg consumes one shared slot index regardless of register class. Slot N reserves BOTH argGprs[N] AND argFprs[N]. `f(int, double, int, double, int)` consumes slots 0..4 → (rcx OR xmm0, rdx OR xmm1, r8 OR xmm2, r9 OR xmm3, [rsp+0x20]). Pure-GPR calls (WriteFile, GetStdHandle, etc.) happen to give the same overflow count as independent counters; mixed-class calls require the slot-aligned counting to land arg-5 on the stack correctly. ML7 `computeMaxOutgoingStackArgs` + `materializeOneFunc` consult this flag.",
       "slotAligned": true,
       "$vaListLayoutComment": "FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): Microsoft x64 variadic-CALLEE layout. `va_list` is a plain `char*` (sizeof 8) — the HomogeneousPointer strategy, NOT SysV's __va_list_tag/register-save-area. Win64 spills the first 4 named integer args into the caller-provided 32-byte HOME SPACE (rcx/rdx/r8/r9 slots) which sits CONTIGUOUS with the 5th+ stack args, so `va_arg` is a LINEAR pointer bump by namedArgSlotBytes (8) across home→overflow — no diamond, no per-class cursor. The callee prologue spills the named integer arg regs into their home slots; `va_start` sets ap = &home[namedArgCount]. FP varargs are passed in BOTH the XMM and matching integer register, and the callee reads va_arg(double) from the home (GPR) slot — so the CALLER duplicates each FP vararg into the matching integer reg (lir_callconv, strategy-gated). Struct-by-value varargs are DEFERRED this cycle (D-FC12B-WIN64-STRUCT-VARARG, fail-loud). Every fact is config — the lowering + spill read these, never branching on cc.name/arch/format.",

@@ -1513,6 +1513,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // contract).
                 readBoundedInt(c, coll, ccPath, "callPushBytes",
                                cc.callPushBytes);
+                // D-WIN64-LARGE-FRAME-STACK-PROBE: OS stack guard-page
+                // size + probe step. Optional (default 0 = no probing —
+                // Linux/macOS/arm64). ms_x64 declares 4096. Validated
+                // below: when nonzero MUST be a power of two.
+                readBoundedInt(c, coll, ccPath, "stackProbePageBytes",
+                               cc.stackProbePageBytes);
                 // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN):
                 // the max aggregate size passed/returned in registers (SysV 16,
                 // Win64 8, AAPCS64 16); larger ⇒ by-reference / sret.

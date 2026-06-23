@@ -481,6 +481,93 @@ wireDisp32Mem(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
     return true;
 }
 
+// D-WIN64-LARGE-FRAME-STACK-PROBE: hand-emit the inline stack-probe loop
+// for the `stack_probe` virtual op. This is the ONE place in the
+// x86-variable walker that emits N machine instructions for a single LIR
+// op (F1 — there is no multi-instruction encoding TEMPLATE; the variant
+// system emits exactly one instruction per op, so the probe loop is
+// hand-pushed here). The op carries [sp(reg), frameBytes(imm32),
+// pageBytes(imm32)]; `frame` and `page` are the two immediates. The loop
+// descends RSP by `page` bytes at a time, TOUCHING (committing) each page
+// via `or qword [rsp], 0`, until the remaining count (in r11d) is <= one
+// page, then drops the final remainder with `sub rsp, r11`:
+//
+//   mov   r11d, frame      ; 41 BB <frame imm32 LE>      remaining = frame
+// .L:
+//   sub   rsp, page        ; 48 81 EC <page imm32 LE>
+//   or    qword [rsp], 0   ; 48 83 0C 24 00              touch this page
+//   sub   r11d, page       ; 41 81 EB <page imm32 LE>
+//   cmp   r11d, page       ; 41 81 FB <page imm32 LE>
+//   ja    .L               ; 77 <rel8 back to .L>        EXACT 0x77 (F8)
+//   sub   rsp, r11         ; 49 29 DB                     final remainder
+//
+// r11 is SAFE here (F5): under ms_x64 it is CALLER-saved and is never an
+// incoming argument (rcx/rdx/r8/r9) or the return register (rax); the
+// probe runs at the very top of the prologue, BEFORE any arg-home store,
+// so no live value sits in r11. Its clobber is dead by prologue exit.
+//
+// The `ja` rel8 is a COMPILE-TIME CONSTANT — the loop body (.L through
+// the end of the `ja` instruction) is a fixed byte size, so the backward
+// displacement is computed here and emitted as a literal signed byte. NO
+// relocation, NO patch list. `ja` (CF=0 ∧ ZF=0, strictly-above) exits on
+// the exact-page-multiple case (remaining hits exactly 0 → not above →
+// fall through), so the trailing `sub rsp, r11` (r11=0) is a harmless
+// no-op there; using `jae`/`jb`/`jbe` would over- or under-probe (the
+// under-probe forms are a SILENT CRASH — see F8).
+void emitStackProbeLoop(std::vector<std::uint8_t>& out,
+                        std::uint32_t frame, std::uint32_t page) {
+    using dss::asm_byte_emit::appendU32LE;
+    // mov r11d, frame   — 41 BB id
+    out.push_back(0x41);
+    out.push_back(0xBB);
+    appendU32LE(out, frame);
+    // The loop body starts HERE (.L = the `sub rsp, page` instruction).
+    std::size_t const loopStart = out.size();
+    // sub rsp, page     — 48 81 EC id   (REX.W 0x81 /5, rsp.lo3=100b)
+    out.push_back(0x48);
+    out.push_back(0x81);
+    out.push_back(0xEC);
+    appendU32LE(out, page);
+    // or qword [rsp], 0 — 48 83 0C 24 00 (REX.W 0x83 /1 ib, SIB 0x24 for rsp)
+    out.push_back(0x48);
+    out.push_back(0x83);
+    out.push_back(0x0C);
+    out.push_back(0x24);
+    out.push_back(0x00);
+    // sub r11d, page    — 41 81 EB id   (0x81 /5, r11.lo3=011b, REX.B)
+    out.push_back(0x41);
+    out.push_back(0x81);
+    out.push_back(0xEB);
+    appendU32LE(out, page);
+    // cmp r11d, page    — 41 81 FB id   (0x81 /7, r11.lo3=011b, REX.B)
+    out.push_back(0x41);
+    out.push_back(0x81);
+    out.push_back(0xFB);
+    appendU32LE(out, page);
+    // ja .L             — 77 cb   (rel8 relative to the END of this insn)
+    out.push_back(0x77);
+    // rel8 = loopStart - (offset of the byte AFTER the rel8 byte).
+    // The byte after the rel8 is at `out.size() + 1` once we push it; the
+    // displacement is measured from there back to loopStart. Compute it
+    // BEFORE the push so the arithmetic is explicit.
+    std::ptrdiff_t const afterJa =
+        static_cast<std::ptrdiff_t>(out.size()) + 1;
+    std::ptrdiff_t const rel =
+        static_cast<std::ptrdiff_t>(loopStart) - afterJa;
+    // The loop body is a fixed 28 bytes (.L..end-of-ja), so rel == -28;
+    // it always fits a signed byte. Assert defensively.
+    assert(rel >= -128 && rel <= 127
+           && "stack-probe loop rel8 out of range (fixed-size loop)");
+    out.push_back(static_cast<std::uint8_t>(static_cast<std::int8_t>(rel)));
+    // sub rsp, r11      — 4C 29 DC   (SUB r/m64, r64 = REX.W 0x29 /r;
+    // dest rsp is ModR/M.rm (lo3=100b), src r11 is ModR/M.reg (lo3=011b,
+    // its high bit drives REX.R). REX = 0x48|R = 0x4C; ModR/M = mod=11
+    // reg=011 rm=100 = 0xDC. (NOT 49 29 DB — that is `sub r11, rbx`.)
+    out.push_back(0x4C);
+    out.push_back(0x29);
+    out.push_back(0xDC);
+}
+
 } // namespace
 
 bool encode(Lir const&                  lir,
@@ -510,6 +597,36 @@ bool encode(Lir const&                  lir,
 
     auto const instOps = lir.instOperands(inst);
     LirReg const result = lir.instResult(inst);
+
+    // D-WIN64-LARGE-FRAME-STACK-PROBE: the `stack_probe` op is the sole
+    // x86-variable op that emits MULTIPLE machine instructions for one
+    // LIR op. It has NO usable encoding template (F1), so it is handled
+    // here by a DEDICATED hand-written arm that intercepts BEFORE the
+    // single-instruction variant-matching loop below. Its operands are
+    // [sp(reg), frameBytes(imm32), pageBytes(imm32)] — read the two
+    // immediates and hand-emit the page-walking probe loop. (One srcMap
+    // entry attributes the whole loop to the prologue — F2: fine for
+    // debug info; it is intentionally OUTSIDE the disasm round-trip
+    // oracle, which assumes one instruction per op.)
+    if (info->mnemonic == "stack_probe") {
+        if (instOps.size() != 3
+            || instOps[1].kind != LirOperandKind::ImmInt
+            || instOps[2].kind != LirOperandKind::ImmInt) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode 'stack_probe': expected operands "
+                               "[reg, imm32(frame), imm32(page)] but got "
+                               "{} operands of mismatched kinds",
+                               instOps.size()));
+            return false;
+        }
+        std::uint32_t const frame =
+            static_cast<std::uint32_t>(instOps[1].immInt32);
+        std::uint32_t const page =
+            static_cast<std::uint32_t>(instOps[2].immInt32);
+        emitStackProbeLoop(out, frame, page);
+        return true;
+    }
 
     // Find the first variant whose guard matches the operand kinds AND
     // the instruction's operation width (FC3 c2 width axis —

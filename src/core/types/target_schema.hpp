@@ -584,6 +584,33 @@ struct DSS_EXPORT TargetCallingConvention {
     // implementation detail.
     std::uint16_t callPushBytes = 0;
 
+    // D-WIN64-LARGE-FRAME-STACK-PROBE: the OS stack guard-page size, in
+    // bytes, AND the step granularity for the inline stack-probe loop.
+    // A function whose total frame size EXCEEDS this value must touch
+    // every guard-page-sized step on the way down (committing each page)
+    // instead of doing a single bare `sub SP, F` that skips the guard
+    // page (Windows reserves the stack lazily behind a single PAGE_GUARD
+    // page; a `sub` that jumps over it access-violates on the first deep
+    // write). The prologue reads this generically — NO arch/format/cc
+    // identity branch:
+    //   * `ms_x64` (Windows PE):  4096 — emit the probe loop for any
+    //                             frame > 4096; the encoder lowers the
+    //                             new `stack_probe` op to a page-walking
+    //                             loop with THIS value as the step.
+    //   * `sysv_amd64` (Linux ELF / Mach-O): 0 — Linux/macOS auto-grow
+    //                             the stack (the kernel faults in deeper
+    //                             pages on demand), so no probe is needed.
+    //   * the arm64 CCs: 0 — large arm64 frames are handled by the
+    //                             shifted-imm12 `sub sp` encoding, and
+    //                             those OSes auto-grow the stack too.
+    // 0 (the default) ⇒ NO probing: the prologue keeps the plain
+    // `sub SP, F` for every frame (byte-identical to before this field).
+    //
+    // Validators (target_schema.cpp::validate): when nonzero it MUST be a
+    // power of two (mirrors the stackAlignment check) — a typo'd 4000
+    // would silently skip a guard page and reintroduce the crash.
+    std::uint16_t stackProbePageBytes = 0;
+
     // D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): when true,
     // the cc uses SLOT-ALIGNED arg passing — each arg consumes ONE
     // shared slot index regardless of its register class, AND both
