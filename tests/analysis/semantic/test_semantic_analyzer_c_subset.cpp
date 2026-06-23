@@ -201,6 +201,45 @@ TEST(SemanticAnalyzerCSubset, CharStarToVoidStarArgImplicit) {
                         DiagnosticCode::S_ArgCountMismatch), 0u);
 }
 
+// D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD regression (red-on-disable on DEBUG):
+// `checkCallAgainstSig` held the callee's `fnParams()` span across the per-arg
+// `subtreeType()` loop. An `&x` argument MATERIALIZES `pointer<int>` on first use,
+// mutating the interner pool MID-LOOP, so the retained `params` span dangled — a
+// heap-use-after-free masked in Release (the guard is compiled out → exit 42 by
+// luck) and caught only on Debug. This is the `memcpy(&b,&a,4)` (`#include
+// <string.h>`) case that read "libc FFI 9/10" on Debug. A MULTI-param callee + an
+// address-of arg is the minimal trip: the FIRST `&x` interns pointer<int>, then
+// `params[1]`/`params[2]` read the now-stale span. Single-param libc fns
+// (malloc/free) never trip it — a literal `4` / an existing pointer arg interns
+// nothing. The fix copies `params` into an owned vector before the loop; WITHOUT
+// it, this `analyze()` ABORTS (the guard) on a Debug build → the test goes red.
+TEST(SemanticAnalyzerCSubset, MultiParamCallAddressOfArgsNoStaleParamSpan) {
+    // The callee params are `void*` (NOT `int*`) — this is load-bearing for the
+    // red-on-disable. The bug needs the arg's `subtreeType()` to intern a FRESH
+    // type mid-loop: `&x` is `int*`, which is NOT already interned (the params are
+    // `void*`), so checking it materializes pointer<int> and mutates the pool —
+    // exactly memcpy's `void*` params + `&b`/`&a` `int*` args. (An `int*`-param
+    // version does NOT trip it: `&x` dedups against the param's pointer<int>, no
+    // mutation.) `int*` → `void*` is implicit in c-subset, so the call is
+    // well-typed; WITHOUT the owned-copy fix this analyze() aborts (guard) on Debug.
+    auto cu = buildShippedUnit("c-subset", {
+        "void multi(void* a, void* b, int n);\n"
+        "void f(void) {\n"
+        "    int x;\n"
+        "    int y;\n"
+        "    multi(&x, &y, 4);\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // The call is well-typed (int*→void* implicit, int→int): no mismatch, no abort.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
 // D-LANG-POINTER-VOID-CONVERT: the reverse direction (`void*` →
 // `char*`) is also implicit under C semantics (c-subset declares
 // `implicitFromVoidPtr: true`) — C++ would forbid this without

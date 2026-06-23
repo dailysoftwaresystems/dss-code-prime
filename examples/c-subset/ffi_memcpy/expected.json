@@ -1,0 +1,19 @@
+{
+  "$comment": "D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD regression: the shipped <string.h> memcpy is a MULTI-param FnSig (void*, const void*, size_t); calling it with address-of args (`&b`) used to dangle a retained fnParams() span in checkCallAgainstSig (the `&b` arg interns pointer<int> mid arg-check loop). UAF masked in Release (exit 42 by luck), caught on Debug (guard aborts the compile). Fix = copy the param span to an owned vector. b := a (42) via memcpy -> exit 42. RED-ON-DISABLE on a DEBUG-built compiler: revert the fix and this example fails to compile (guard abort).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ]
+}

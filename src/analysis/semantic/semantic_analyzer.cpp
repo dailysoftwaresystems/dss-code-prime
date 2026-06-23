@@ -3417,7 +3417,19 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         gatherArgExpressions(tree, kids[call.argsChild], argNodes);
     }
 
-    auto params = s.lattice.interner().fnParams(fnSig);
+    // D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD: COPY the param-type span into a
+    // stable owned vector. The per-arg assignability loop below calls subtreeType()
+    // (~line 3467), which can INTERN a fresh type mid-loop — e.g. an `&b` arg
+    // materializes pointer<int> on first use — mutating the interner pool and
+    // dangling a retained fnParams() view. That is a heap-use-after-free masked in
+    // Release (the guard is compiled out) and only caught on Debug: the ffi_memcpy
+    // multi-param shipped-FnSig case (`memcpy(&b,&a,4)`). Single-param libc fns
+    // (malloc/free) don't trip it — a literal `4` / an existing pointer arg interns
+    // nothing. Owning the params makes the loop robust against ANY downstream intern.
+    std::vector<TypeId> const params = [&] {
+        auto const sp = s.lattice.interner().fnParams(fnSig);
+        return std::vector<TypeId>(sp.begin(), sp.end());
+    }();
 
     // D-LANG-VARIADIC (step 13.4): a C-style variadic FnSig
     // (scalars[1] == 1) admits >= fixedParamCount args; a non-variadic
