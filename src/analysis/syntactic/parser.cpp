@@ -928,22 +928,16 @@ struct Parser::Impl {
     // reports its KEYWORD kind here, even though the builder may later demote
     // it to Identifier against the live cursor expectedSet + scope stack. So
     // at an offset whose admissible set holds the demotion target (Identifier)
-    // the prune could wrongly drop a candidate that the demoted token would in
-    // fact match — a silent mis-parse. The prune is therefore SOUND ONLY for
-    // grammars with NO contextual / scope-resolvable kind in a speculative
-    // candidate's FIXED prefix. This holds for every shipped speculative-alt
-    // grammar today (c-subset's speculative prefixes are all hard keywords /
-    // punctuation; tsql is `reservedWordPolicy: "contextual"` but its
-    // `nameOrCall` candidates discriminate at offset 1 on `(` /
-    // qualified-name punctuation, not on a soft-keyword Identifier slot). The
-    // conservative closing fix — skip the prune at an offset whose observed
-    // token has a contextual/scope-resolvable kind — is deferred behind the
-    // anchor because no token-id-keyed "is this kind contextual" query exists
-    // today (the `contextual` flag is per-LexemeMeaning, lexeme-string-keyed;
-    // only the grammar-wide `reservedWordPolicy()` lever is exposed, which
-    // would not cover a per-keyword `contextual: true` under a Strict policy).
-    // The anchor's trigger is the first contextual-keyword speculative-alt
-    // consumer that puts a soft keyword in a candidate's fixed prefix.
+    // the prune WOULD wrongly drop a candidate that the demoted token matches.
+    // ✅ CLOSED (cycle 13): the loop body SKIPS the prune at any offset whose
+    // observed token `schema->isContextualKind(got)` — a soft keyword / any
+    // keyword under `reservedWordPolicy: "contextual"` (the loader derives the
+    // token-id-keyed `contextualKinds` set from the per-LexemeMeaning `contextual`
+    // flags, the query that didn't exist before). So the prune never drops a
+    // candidate a contextual demotion would match. EMPTY contextualKinds for a
+    // non-contextual grammar (every shipped c-subset speculative alt) ⇒ the
+    // deep-nest O(N) win is unaffected. Pinned by the synthetic contextual-keyword
+    // speculative-alt schemas in test_parser_speculation.cpp (RED-on-disable).
     [[nodiscard]] bool
     predictivePrefixPrunes(RuleId candidate, std::size_t k) const noexcept {
         const std::size_t prefixLen = schema->predictivePrefixLen(candidate);
@@ -953,6 +947,14 @@ struct Parser::Impl {
             const auto admissible = schema->predictivePrefixAt(candidate, i);
             if (admissible.empty()) continue;  // no constraint at this offset
             const SchemaTokenId got = peekSignificantKind(i);
+            // D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD: a CONTEXTUAL observed
+            // kind (a soft keyword) may DEMOTE to Identifier in the builder, so
+            // its `effectiveKind` here understates what the candidate can match.
+            // Skip the prune at this offset rather than wrongly drop a candidate
+            // the demoted token would in fact match (a silent mis-parse). O(1);
+            // empty contextualKinds for non-contextual grammars ⇒ deep-nest O(N)
+            // win preserved.
+            if (schema->isContextualKind(got)) continue;
             if (std::ranges::find(admissible, got) == admissible.end()) {
                 return true;  // observed token outside the exact set ⇒ prune
             }
@@ -1477,13 +1479,38 @@ struct Parser::Impl {
             const auto expected = walker.expectedSet();
             const SchemaTokenId tokKind =
                 effectiveKind(peek, identifierKind, errorKind);
-            const bool matches = !expected.empty()
+            bool matches = !expected.empty()
                 && std::ranges::find(expected, tokKind) != expected.end();
+
+            // D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD (probe-demotion
+            // half): a CONTEXTUAL keyword whose own kind is not admissible
+            // here DEMOTES to the identifier kind when THAT is admissible —
+            // exactly the builder's `pushToken` demotion (tree_builder.cpp
+            // "contextual keyword resolution"). The parser's match gate
+            // tests the UN-demoted `tokKind` (effectiveKind by design does
+            // not model the demotion), so without this mirror the gate
+            // rejects the token (`recoverAt`) BEFORE the builder ever
+            // demotes — and a speculative candidate the demotion would
+            // satisfy is lost (its probe emits P_UnexpectedToken → fails).
+            // Mirror it: consume the token AND advance the parser's walker
+            // with the SAME demoted kind the builder's walker takes, so the
+            // two cursors stay in lockstep (no spurious desync). Gated on
+            // `identifierKind` actually being admissible — if it is not, the
+            // demotion would not match either, so `recoverAt` is correct.
+            // O(1); for a non-contextual grammar `isContextualKind` is always
+            // false ⇒ this arm never fires ⇒ zero behavior change.
+            SchemaTokenId advanceKind = tokKind;
+            if (!matches && schema->isContextualKind(tokKind)
+                && std::ranges::find(expected, identifierKind)
+                       != expected.end()) {
+                matches     = true;
+                advanceKind = identifierKind;
+            }
 
             if (matches) {
                 const Token tok = tokens.advance();
                 builder->pushToken(tok);
-                walker.advance(tokKind, tok.span,
+                walker.advance(advanceKind, tok.span,
                                std::optional<RuleId>{builder->currentRule()});
                 return StepOutcome::Continue;
             }

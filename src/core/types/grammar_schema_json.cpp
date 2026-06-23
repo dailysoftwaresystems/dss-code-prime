@@ -1290,6 +1290,22 @@ void recomputeAltExpectedSets(GrammarSchemaData& data) {
 // `Parser::predictivePrefixPrunes`. This prefix table itself is unconditionally
 // exact; the precondition is purely about how the parser interprets the
 // observed token against it.
+// D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD. Derive the token-id-keyed set of
+// CONTEXTUAL/scope-resolvable kinds from the `contextual` LexemeMeaning flags
+// (already forced on every keyword under `reservedWordPolicy: "contextual"`).
+// `LexemeMeaning::id` is the SchemaTokenId the lexeme produces; a kind is
+// contextual iff ANY of its meanings is a soft keyword. The parser-side prune
+// (`predictivePrefixPrunes`) queries this O(1) to skip a contextual offset.
+// AGNOSTIC + config-derived: walks the lexeme table, names no token/language.
+void computeContextualKinds(GrammarSchemaData& data) {
+    data.contextualKinds.clear();
+    for (auto const& [_, meanings] : data.lexemeTable) {
+        for (auto const& m : meanings) {
+            if (m.contextual && m.id.valid()) data.contextualKinds.insert(m.id.v);
+        }
+    }
+}
+
 void computePredictivePrefixes(GrammarSchemaData& data) {
     // A defensive cap on prefix length. The walk self-terminates at the
     // first non-terminal, so a realistic prefix is 1-3 entries; this only
@@ -2980,6 +2996,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 computeNullableTails       (data);
                 recomputeAltExpectedSets   (data);
                 computePredictivePrefixes  (data);
+                computeContextualKinds     (data);
                 computeFollowSets          (data, coll);
                 validateBodyDefaultKindsOffGrammar(data, coll);
                 validateOperatorBodyRules  (data, coll);

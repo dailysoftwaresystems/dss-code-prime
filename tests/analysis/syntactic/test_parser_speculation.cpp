@@ -286,6 +286,96 @@ TEST(ParserSpeculation, CommitsCaseBOnLaterBranchInput) {
         << "caseA must NOT appear (would indicate first-branch commit)";
 }
 
+// D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD: the LL(k) predictive prune must NOT
+// drop a speculative candidate whose fixed prefix admits Identifier at an offset
+// where the observed token is a CONTEXTUAL (soft) keyword — the builder demotes it
+// to Identifier, so the candidate DOES match. `caseId = [AKind, Identifier, Semi]`;
+// `kw` is a soft keyword (`contextual: true`); `hk` is a HARD keyword.
+constexpr std::string_view kContextualSpecSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "CtxSpec", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "A":  [{ "kind": "AKind" }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "keywords": [
+    { "word": "kw", "kind": "KwKind", "contextual": true },
+    { "word": "hk", "kind": "HkKind" }
+  ],
+  "semantics": { "identifierToken": "Identifier" },
+  "shapes": {
+    "root":   { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":   { "alt": ["caseId", "caseKw"], "speculative": true, "lookahead": 4 },
+    "caseId": { "sequence": ["AKind", "Identifier", "Semi"] },
+    "caseKw": { "sequence": ["AKind", "AKind", "Semi"] }
+  }
+})JSON";
+
+[[nodiscard]] SpecHarness loadCtx(std::string source) {
+    auto loaded = GrammarSchema::loadFromText(kContextualSpecSchema);
+    EXPECT_TRUE(loaded.has_value())
+        << (loaded.has_value() ? "" : loaded.error()[0].message);
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString(std::move(source), "<ctx>");
+    Tokenizer tk{src, schema};
+    auto [stream, _] = std::move(tk).tokenize();
+    return SpecHarness{ .src    = std::move(src),
+                        .schema = std::move(schema),
+                        .stream = std::move(stream) };
+}
+
+TEST(ParserSpeculation, ContextualKeywordInSpeculativePrefixNotMispruned) {
+    // `A kw ;` — `kw` is a soft keyword at offset 1. caseId's prefix admits
+    // Identifier there, caseKw's admits AKind. The end-to-end parse needs BOTH
+    // halves of D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD:
+    //   (1) prune-skip — without `isContextualKind(got) → continue`, the
+    //       predictive prune drops caseId (KwKind ∉ {Identifier}) before the
+    //       probe runs;
+    //   (2) match-gate demotion mirror — even surviving the prune, caseId's
+    //       probe would `recoverAt(P_UnexpectedToken)` because the TokenLeaf
+    //       gate tests the un-demoted KwKind ∉ {Identifier}, unless the gate
+    //       mirrors the builder's demotion and advances the walker as Identifier.
+    // WITH both, caseKw fails its probe (kw ≠ AKind), caseId demotes kw→Identifier
+    // and commits. RED-on-disable: revert either half → this errors (verified by
+    // disabling each independently during the cycle).
+    auto h = loadCtx("A kw ;");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "the soft keyword `kw` demotes to Identifier; caseId must commit "
+           "(without the fix the prune drops the candidate AND the match gate "
+           "rejects the keyword — both halves are load-bearing)";
+    EXPECT_EQ(countNodesByRule(t, "caseId"), 1u);
+    EXPECT_EQ(countNodesByRule(t, "caseKw"), 0u);
+    // Prove the commit went through the DEMOTION path specifically (not some
+    // other route to caseId): the builder records an info-level
+    // P_ContextualKeywordResolution exactly when it demotes the soft keyword.
+    std::size_t demotions = 0;
+    for (auto const& d : t.diagnostics().all()) {
+        if (d.code == DiagnosticCode::P_ContextualKeywordResolution) ++demotions;
+    }
+    EXPECT_EQ(demotions, 1u)
+        << "`kw` must be recorded as demoted-to-Identifier (the demotion ran)";
+}
+
+TEST(ParserSpeculation, HardKeywordInSpeculativePrefixStillPruned) {
+    // Negative control — the fix skips ONLY contextual kinds, never widening to
+    // HARD keywords. `A hk ;`: the hard keyword `hk` cannot demote to Identifier
+    // (caseId) nor be AKind (caseKw) → no valid stmt, with OR without the fix.
+    // Proves the prune stays precise (no over-broadening).
+    auto h = loadCtx("A hk ;");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+    EXPECT_TRUE(t.diagnostics().hasErrors())
+        << "a hard keyword matches neither Identifier nor AKind — no valid stmt";
+    EXPECT_EQ(countNodesByRule(t, "caseId"), 0u);
+}
+
 TEST(ParserSpeculation, BacktrackFailedAndRecoveryOnBogusInput) {
     // `A X ;` — X is illegal. The tokenizer emits an Error token.
     // Speculation probes every branch; all fail and roll back. FC4 c1:

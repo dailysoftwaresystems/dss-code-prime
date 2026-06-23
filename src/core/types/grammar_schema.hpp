@@ -193,6 +193,18 @@ struct DSS_EXPORT GrammarSchemaData {
     // O(1) "is this token EmptySpace?" without scanning lexemeTable.
     std::unordered_set<std::uint32_t>                 emptySpaceTokens;
 
+    // D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD: the set of SchemaTokenId
+    // values that are CONTEXTUAL / scope-resolvable — a soft keyword that the
+    // builder may DEMOTE to Identifier outside the cursor's expectedSet (a
+    // `contextual: true` LexemeMeaning, or — under `reservedWordPolicy:
+    // "contextual"` — every keyword, which the loader marks contextual). Derived
+    // at load by `computeContextualKinds` from the `contextual` flags. The LL(k)
+    // predictive prune (`Parser::predictivePrefixPrunes`) SKIPS any offset whose
+    // observed token is in this set, so it never wrongly prunes a candidate the
+    // demoted token would match. Token-id-keyed (the `contextual` flag is
+    // per-lexeme-string in `lexemeTable`; this is the parser-side query).
+    std::unordered_set<std::uint32_t>                 contextualKinds;
+
     // Per-scope forbidden-token sets — keyed by ScopeKind's underlying
     // value, value = set of SchemaTokenId values.
     std::unordered_map<std::uint16_t, std::unordered_set<std::uint32_t>> scopeForbid;
@@ -565,6 +577,14 @@ public:
     [[nodiscard]] std::size_t predictivePrefixLen(RuleId rule) const noexcept;
     [[nodiscard]] std::span<SchemaTokenId const>
     predictivePrefixAt(RuleId rule, std::size_t offset) const noexcept;
+
+    // D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD: true iff `kind` is a
+    // contextual / scope-resolvable token kind (a soft keyword the builder may
+    // demote to Identifier). The LL(k) predictive prune skips any offset whose
+    // observed token is contextual, so it never prunes a candidate the demoted
+    // token would match. Config-derived (the `contextual` LexemeMeaning flag /
+    // `reservedWordPolicy`); names no token, rule, or language.
+    [[nodiscard]] bool isContextualKind(SchemaTokenId kind) const noexcept;
 
     // Schema-declared panic-mode sync tokens. Sorted ascending by
     // `id.v`. Empty when the config omits the `syncTokens` field.
