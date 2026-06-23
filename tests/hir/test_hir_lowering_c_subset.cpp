@@ -316,6 +316,72 @@ TEST(HirLoweringCSubset, SwitchGroupsFlatCases) {
     EXPECT_TRUE(res->hir.caseArmIsDefault(arms[1]));     // default
 }
 
+// D-CSUBSET-LABEL-BEFORE-CASE — the load-bearing equivalence (MF-3): a goto-label
+// BEFORE a case (`foo: case 1: S`) lowers to the SAME HIR as the long-supported
+// label AFTER the colon (`case 1: foo: S`) — arm(value 1, body=[LabelStmt(foo, S), …]).
+// The label stays a real LabelStmt node (so it is pre-scanned + goto-resolvable).
+TEST(HirLoweringCSubset, LabelBeforeCaseNestsLikeLabelAfterColon) {
+    struct Shape { std::size_t arms; bool def0; HirKind body0; std::uint32_t ord; bool ok; };
+    auto shapeOf = [](std::string src) -> Shape {
+        SemanticModel model = analyzeCSubset(std::move(src));
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        if (model.hasErrors() || !res->ok) return {0, false, HirKind::Error, 0, false};
+        HirNodeId fn = firstFunction(res->hir);
+        HirNodeId sw = res->hir.children(res->hir.functionBody(fn))[0];
+        if (res->hir.kind(sw) != HirKind::SwitchStmt) return {0, false, HirKind::Error, 0, false};
+        auto arms = res->hir.switchArms(sw);
+        if (arms.empty()) return {0, false, HirKind::Error, 0, false};
+        auto body0 = res->hir.caseArmBody(arms[0]);
+        HirKind const b0 = body0.empty() ? HirKind::Error : res->hir.kind(body0[0]);
+        std::uint32_t const ord = (b0 == HirKind::LabelStmt) ? res->hir.labelOrdinal(body0[0]) : 9999u;
+        return { arms.size(), res->hir.caseArmIsDefault(arms[0]), b0, ord, true };
+    };
+    Shape const before = shapeOf("void f(int x){ switch(x){ foo: case 1: x=x+1; break; default: break; } }");
+    Shape const after  = shapeOf("void f(int x){ switch(x){ case 1: foo: x=x+1; break; default: break; } }");
+    ASSERT_TRUE(before.ok);
+    ASSERT_TRUE(after.ok);
+    EXPECT_EQ(before.arms, 2u);
+    EXPECT_EQ(before.arms, after.arms);
+    EXPECT_FALSE(before.def0);
+    EXPECT_FALSE(after.def0);
+    EXPECT_EQ(before.body0, HirKind::LabelStmt);     // label nests at the arm's entry
+    EXPECT_EQ(after.body0,  HirKind::LabelStmt);
+    EXPECT_EQ(before.ord, after.ord);                // same label, same arm entry
+}
+
+// D-CSUBSET-LABEL-BEFORE-CASE Finding 2 — the speculative switchBodyItem must keep
+// the FLAT reading for a BARE case: `case 1: x=…;` groups as caseLabel + a plain
+// body stmt, NEVER a LabelStmt- or caseStmt-wrapped arm. Guards MF-3 against a
+// future reorder of the speculative branches.
+TEST(HirLoweringCSubset, BareCaseStaysFlatNoLabelWrapper) {
+    SemanticModel model = analyzeCSubset(
+        "void f(int x){ switch(x){ case 1: x=x+1; break; default: break; } }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId sw = res->hir.children(res->hir.functionBody(fn))[0];
+    ASSERT_EQ(res->hir.kind(sw), HirKind::SwitchStmt);
+    auto arms = res->hir.switchArms(sw);
+    ASSERT_EQ(arms.size(), 2u);
+    auto body0 = res->hir.caseArmBody(arms[0]);
+    ASSERT_FALSE(body0.empty());
+    EXPECT_NE(res->hir.kind(body0[0]), HirKind::LabelStmt);   // NOT label-wrapped
+}
+
+// D-CSUBSET-LABEL-BEFORE-CASE guard — a `caseStmt` that is not a direct switch-body
+// item (here: outside any switch) fails loud S_CaseLabelNotInSwitch (C 6.8.1),
+// never a stray arm-less case. Red-on-disable: drop the lowerStmt CaseStmt guard.
+TEST(HirLoweringCSubset, CaseLabelOutsideSwitchFailsLoud) {
+    SemanticModel model = analyzeCSubset("int f(void){ case 1: return 0; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_GE(countCode(r, DiagnosticCode::S_CaseLabelNotInSwitch), 1u);
+}
+
 TEST(HirLoweringCSubset, CallAndTypedef) {
     SemanticModel model = analyzeCSubset(
         "typedef int myint;\n"

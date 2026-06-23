@@ -7687,6 +7687,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 (void)resolveRuleField(hl, "caseLabelRule", "/hirLowering",
                                        cfg.caseLabelRule, cfg.caseLabelRuleName);
             }
+            if (hl.contains("caseStmtRule")) {   // D-CSUBSET-LABEL-BEFORE-CASE (optional)
+                (void)resolveRuleField(hl, "caseStmtRule", "/hirLowering",
+                                       cfg.caseStmtRule, cfg.caseStmtRuleName);
+            }
 
             // Char / string literal lowering blocks:
             //   "charLiteral":   { "startToken": "CharStart",   "bodyToken": "CharLiteral"   }

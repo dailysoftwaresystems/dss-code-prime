@@ -116,6 +116,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::S_VariadicCalleeUnsupported: return "S_VariadicCalleeUnsupported";
         case DiagnosticCode::S_StaticStorageInForInit:   return "S_StaticStorageInForInit";
         case DiagnosticCode::S_IncompatibleRedeclaration: return "S_IncompatibleRedeclaration";
+        case DiagnosticCode::S_CaseLabelNotInSwitch:     return "S_CaseLabelNotInSwitch";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

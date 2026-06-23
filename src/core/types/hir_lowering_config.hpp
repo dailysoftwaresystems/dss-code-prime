@@ -147,7 +147,14 @@ struct DSS_EXPORT HirLoweringConfig {
     // body. `caseDefaultToken` is the token (e.g. DefaultKeyword) that marks the
     // default arm (no match value). A valued label's match expression is found
     // by the engine as the label's expression child.
+    //   `caseStmtRule` (optional) is the C 6.8.1 labeled-statement form of a case
+    // — `caseLabel statement` — which lets a goto-label precede a case
+    // (`foo: case 1: stmt`, D-CSUBSET-LABEL-BEFORE-CASE). When valid, lowerSwitch
+    // peels a (label-wrapped) caseStmt into an arm; a caseStmt reached as a plain
+    // statement (NOT a direct switch-body item) is the fail-loud outside-switch
+    // case. Invalid (unset) for languages without the form (toy/tsql) -> no-op.
     RuleId        caseLabelRule{};     std::string caseLabelRuleName;
+    RuleId        caseStmtRule{};      std::string caseStmtRuleName;
     SchemaTokenId caseDefaultToken{};  std::string caseDefaultTokenName;
 
     // Char / string literal lowering. A value-bearing body literal materializes

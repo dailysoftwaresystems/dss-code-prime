@@ -709,6 +709,7 @@
         "continueStmt",
         "returnStmt",
         "gotoStmt",
+        "caseStmt",
         "emptyStmt",
         "declOrExprStmt"
       ]
@@ -794,7 +795,7 @@
       ]
     },
 
-    "switchBodyItem": { "alt": [ "caseLabel", "statement" ] },
+    "switchBodyItem": { "alt": [ "caseLabel", "statement" ], "speculative": true, "lookahead": 256 },
 
     "caseLabel": {
       "alt": [
@@ -802,6 +803,8 @@
         { "sequence": [ "DefaultKeyword", "Colon" ] }
       ]
     },
+
+    "caseStmt": { "sequence": [ "caseLabel", "statement" ] },
 
 
     "exprStmt": { "sequence": [ "expression", "EndStatement" ] },
@@ -1262,6 +1265,7 @@
       { "rule": "gotoLabel",    "hirKind": "GotoStmt"    },
       { "rule": "gotoIndirect", "hirKind": "IndirectGotoStmt" },
       { "rule": "labelStmt",    "hirKind": "LabelStmt"   },
+      { "rule": "caseStmt",     "hirKind": "CaseStmt"    },
       { "rule": "emptyStmt",    "hirKind": "Skip"        },
       { "rule": "exprStmt",     "hirKind": "ExprStmt"    }
     ],
@@ -1341,6 +1345,7 @@
 
     "forClauseSeparator": "EndStatement",
     "caseLabelRule":      "caseLabel",
+    "caseStmtRule":       "caseStmt",
     "caseDefaultToken":   "DefaultKeyword",
 
     "charLiteral":   { "startToken": "CharStart",   "bodyToken": "CharLiteral"   },

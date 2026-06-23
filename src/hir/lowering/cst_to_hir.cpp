@@ -2020,6 +2020,18 @@ struct Lowerer {
         if (k == "GotoStmt")    return lowerGoto(node);
         if (k == "IndirectGotoStmt") return lowerIndirectGoto(node);
         if (k == "LabelStmt")   return lowerLabel(node);
+        // D-CSUBSET-LABEL-BEFORE-CASE: a `case`/`default` labeled statement (the
+        // `caseStmt` form that lets a goto-label precede a case) reaches the
+        // statement dispatch ONLY when it is NOT a direct switch-body item —
+        // lowerSwitch consumes the in-switch (label-wrapped) ones first. So this
+        // is a case outside any switch, or nested in an inner block of a switch
+        // arm (the flat-switch model groups only top-level items). Fail loud
+        // (C 6.8.1) rather than emit a stray arm-less case.
+        if (k == "CaseStmt") {
+            emitH(DiagnosticCode::S_CaseLabelNotInSwitch, node,
+                  "'case'/'default' label is not a direct switch-body item (C 6.8.1)");
+            return errorNode(node);
+        }
         // FC5: an empty statement `;` lowers to a no-op (an empty Block: it lowers
         // to nothing in MIR, doesn't terminate, and emits no warning). `Skip` is
         // also the include-directive's kind, handled at the top-level decl path.
@@ -3556,26 +3568,106 @@ struct Lowerer {
             arms.push_back(track(builder.makeCaseArm(value, curBody), node));
             curBody.clear();
         };
+
+        // ── D-CSUBSET-LABEL-BEFORE-CASE helpers ──────────────────────────────
+        // A goto-label before a case (`foo: case 1: stmt`) parses as
+        // labelStmt(foo, caseStmt(caseLabel(1), stmt)) — the label STAYS a real
+        // labelStmt node, so it is pre-scanned + goto-resolvable for free. These
+        // helpers peel the (possibly multi-)label-wrapped caseStmt into arms,
+        // producing HIR identical to the long-supported `case 1: foo: stmt`.
+        auto isLabelStmtNode = [&](NodeId n) {
+            HirRuleMapping const* m = mappingFor(n);
+            return m != nullptr && m->hirKind == "LabelStmt";
+        };
+        auto isRuleNode = [&](NodeId n, RuleId r) {
+            return r.valid() && tree().kind(n) == NodeKind::Internal
+                && tree().rule(n).v == r.v;
+        };
+        auto firstNonToken = [&](NodeId n) -> NodeId {
+            for (NodeId c : visible(n)) if (!isToken(c)) return c;
+            return NodeId{};
+        };
+        auto makeSkip = [&]() { return track(builder.makeBlock({}), node); };
+        // Open a new arm from a `caseLabel` node (the SAME match-value/default
+        // extraction the bare flat path uses).
+        auto startArm = [&](NodeId caseLabelNode) {
+            flush();
+            haveArm = true;
+            curIsDefault = false;
+            curValue = std::nullopt;
+            for (NodeId lc : visible(caseLabelNode)) {
+                if (isToken(lc)) {
+                    if (cfg.caseDefaultToken.valid()
+                        && tree().tokenKind(lc).v == cfg.caseDefaultToken.v)
+                        curIsDefault = true;
+                } else {
+                    curValue = lc;   // the case match expression
+                }
+            }
+        };
+        // Peel leading LabelStmt layers off `core`, collecting their name tokens;
+        // return the innermost peeled core.
+        auto peelLabels = [&](NodeId core, std::vector<NodeId>& outToks) {
+            while (isLabelStmtNode(core)) {
+                NodeId body = firstNonToken(core);
+                if (!body.valid()) break;
+                outToks.push_back(firstIdentifierToken(core));
+                core = peelToCore(body);
+            }
+            return core;
+        };
+        // Wrap `inner` in the collected goto-labels (outermost first). Each is a
+        // real pre-scanned LabelStmt so `goto foo` resolves to this arm's entry
+        // exactly as `case 1: foo: stmt` would (C 6.8.1).
+        auto wrapLabels = [&](std::vector<NodeId> const& toks, HirNodeId inner) {
+            HirNodeId result = inner;
+            for (auto it = toks.rbegin(); it != toks.rend(); ++it) {
+                auto found = labelOrdinals_.find(std::string{tree().text(*it)});
+                if (found == labelOrdinals_.end()) continue;   // pre-scan covers all
+                result = track(builder.makeLabelStmt(found->second, result), node);
+            }
+            return result;
+        };
+        // Lower a (label-wrapped) `caseStmt` into arms. Iterates over adjacent
+        // label-prefixed cases (`foo: case 1: case 2: stmt`): an empty case with a
+        // leading label is marked by LabelStmt(label, {}) at its entry.
+        auto lowerCaseChain = [&](NodeId cs, std::vector<NodeId> labels) {
+            for (;;) {
+                NodeId caseLabelNode{}, caseBody{};
+                bool seenFirst = false;
+                for (NodeId c : visible(cs)) {
+                    if (isToken(c)) continue;
+                    if (!seenFirst) { caseLabelNode = c; seenFirst = true; }
+                    else { caseBody = c; break; }
+                }
+                startArm(caseLabelNode);
+                if (!caseBody.valid()) {                          // empty case body (defensive)
+                    if (!labels.empty()) curBody.push_back(wrapLabels(labels, makeSkip()));
+                    return;
+                }
+                NodeId bodyCore = peelToCore(caseBody);
+                std::vector<NodeId> innerLabels;
+                NodeId bodyProbe = peelLabels(bodyCore, innerLabels);
+                if (isRuleNode(bodyProbe, cfg.caseStmtRule)) {     // adjacent case → label-mark this empty arm
+                    if (!labels.empty()) curBody.push_back(wrapLabels(labels, makeSkip()));
+                    cs = bodyProbe;
+                    labels = std::move(innerLabels);
+                    continue;                                      // → next arm
+                }
+                curBody.push_back(wrapLabels(labels, lowerStmt(bodyCore)));
+                return;
+            }
+        };
+
         for (NodeId raw : items) {
             NodeId core = peelToCore(raw);
-            bool const isLabel = cfg.caseLabelRule.valid()
-                && tree().kind(core) == NodeKind::Internal
-                && tree().rule(core).v == cfg.caseLabelRule.v;
-            if (isLabel) {
-                flush();
-                haveArm = true;
-                curIsDefault = false;
-                curValue = std::nullopt;
-                for (NodeId lc : visible(core)) {
-                    if (isToken(lc)) {
-                        if (cfg.caseDefaultToken.valid()
-                            && tree().tokenKind(lc).v == cfg.caseDefaultToken.v)
-                            curIsDefault = true;
-                    } else {
-                        curValue = lc;   // the case match expression
-                    }
-                }
-            } else if (haveArm) {
+            std::vector<NodeId> labelToks;
+            NodeId probe = peelLabels(core, labelToks);
+            if (isRuleNode(probe, cfg.caseStmtRule)) {            // (label-wrapped) case statement
+                lowerCaseChain(probe, std::move(labelToks));
+            } else if (isRuleNode(core, cfg.caseLabelRule)) {     // bare flat case (EXISTING path)
+                startArm(core);
+            } else if (haveArm) {                                 // plain stmt (incl. `foo: x=1;` via lowerLabel)
                 curBody.push_back(lowerStmt(core));
             }
         }
