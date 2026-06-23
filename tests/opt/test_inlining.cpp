@@ -3236,4 +3236,35 @@ TEST(Inlining, ComputedGotoHostInlinesSingleBlockCalleeAndKeepsGoto) {
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u);
     EXPECT_EQ(countOpInModule(mir, MirOpcode::IndirectBr), 1u);
     EXPECT_EQ(countOpInModule(mir, MirOpcode::BlockAddress), 1u);
+
+    // Stronger than the counts: the surviving BlockAddress must still name the
+    // RETURN target block AFTER the single-block splice renumbered the host's
+    // blocks — the precise "address survives renumbering correctly" property a
+    // bad rebuild-helper BlockAddress arm would break — and the whole module
+    // must stay verifier-valid post-inline.
+    bool checkedTarget = false;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < nf && !checkedTarget; ++fi) {
+        MirFuncId const fn = mir.funcAt(fi);
+        std::uint32_t const nb = mir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < nb && !checkedTarget; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(fn, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t ii = 0; ii < ni && !checkedTarget; ++ii) {
+                MirInstId const inst = mir.blockInstAt(b, ii);
+                if (mir.instOpcode(inst) != MirOpcode::BlockAddress) continue;
+                MirBlockId const tgt = mir.blockAddressTarget(inst);
+                EXPECT_EQ(mir.instOpcode(mir.blockTerminator(tgt)),
+                          MirOpcode::Return)
+                    << "the BlockAddress target must still be the Return block "
+                       "after the inline splice renumbered the host's blocks";
+                checkedTarget = true;
+            }
+        }
+    }
+    EXPECT_TRUE(checkedTarget) << "the host's BlockAddress must be locatable";
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the module must stay verifier-valid after inlining a single-block "
+           "callee into a computed-goto host";
 }
