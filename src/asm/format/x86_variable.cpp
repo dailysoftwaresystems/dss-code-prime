@@ -499,7 +499,7 @@ wireDisp32Mem(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
 //   sub   r11d, page       ; 41 81 EB <page imm32 LE>
 //   cmp   r11d, page       ; 41 81 FB <page imm32 LE>
 //   ja    .L               ; 77 <rel8 back to .L>        EXACT 0x77 (F8)
-//   sub   rsp, r11         ; 49 29 DB                     final remainder
+//   sub   rsp, r11         ; 4C 29 DC                     final remainder
 //
 // r11 is SAFE here (F5): under ms_x64 it is CALLER-saved and is never an
 // incoming argument (rcx/rdx/r8/r9) or the return register (rax); the
