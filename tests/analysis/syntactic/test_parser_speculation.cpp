@@ -797,7 +797,13 @@ timeFlatChainParse(std::shared_ptr<GrammarSchema const> const& schema,
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0));
     }
     std::ranges::sort(samples);
-    return samples[samples.size() / 2];
+    // Return the MINIMUM, not the median: scheduler/allocator noise (a context
+    // switch, a page fault, a loaded shared CI runner) can only ADD time, so the
+    // fastest run is the least-perturbed estimate of the true algorithmic cost.
+    // The median still folds in slow runs — that is what flaked the wall-clock
+    // ratio on the shared gcc-release CI runners (a sub-ms baseline made any
+    // jitter dominate). min is the standard benchmark statistic for exactly this.
+    return samples.front();
 }
 
 // Node count of a single clean flat-chain parse (deterministic — one parse,
@@ -823,7 +829,8 @@ TEST(ParserSpeculation, FlatChainParseWorkIsLinear) {
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
 
-    constexpr int kRuns = 3;  // median-of-3 dampens Debug allocator jitter
+    constexpr int kRuns = 9;  // MIN-of-9: more samples → a better shot at one
+                              // uninterrupted run on a loaded shared CI runner
     (void)timeFlatChainParse(schema, 100, 1);  // warm allocator/caches
     const auto t500  = timeFlatChainParse(schema, 500,  kRuns);
     const auto t2000 = timeFlatChainParse(schema, 2000, kRuns);
