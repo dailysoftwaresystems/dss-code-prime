@@ -100,6 +100,11 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::MemOffsetZero:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
+        // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: the MOVZ/MOVK 3-word
+        // form is not decoded by this round-trip mirror yet (the same
+        // disasm-completeness gap as Imm19/MemOffsetZero — anchored
+        // D-AS5-MULTIWORD-DISASM).
+        case EncodingSlotKind::Imm32MovzMovk:
             return std::nullopt;
     }
     // Unreachable for any in-range EncodingSlotKind (the switch is

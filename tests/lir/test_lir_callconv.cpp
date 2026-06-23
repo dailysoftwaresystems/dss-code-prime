@@ -441,6 +441,83 @@ TEST(LirCallconv, NonLeafAarch64FramePrologueEpilogueByteExact) {
         << "leaf AAPCS64 function must NOT spill x30 — the discrimination check";
 }
 
+// D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (F4 — durable x16 safety). A
+// function whose frame EXCEEDS the 2-word shifted-imm12 reach (0xFFFFFF =
+// 16 MiB) forces the prologue `sub sp,sp,#frame` to lower to the 3-word
+// MOVZ/MOVK + EXTENDED-register macro, whose FIRST emitted word materializes
+// the frame size into x16 (the AAPCS64 IP0 scratch). This pin assembles the
+// real C→callconv→assemble pipeline and asserts the prologue's FIRST 32-bit
+// word is `MOVZ x16,#imm16` — so a future change that allocated x16 to a
+// value live across the sp-adjust (clobbering the scratch) would diverge
+// this word (red-on-disable). `int big[5000000]` ≈ 20 MB > 16 MiB.
+TEST(LirCallconv, Aarch64FrameBeyond16MiBPrologueMaterializesIntoX16) {
+    auto bundle = lowerThroughRewrite(
+        "int seed;\n"
+        "int f(void) { int big[5000000]; big[0] = seed; return big[0]; }\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter legRep;
+    auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
+                                    legRep);
+    ASSERT_TRUE(legal.ok());
+    DiagnosticReporter ccRep;
+    auto cc = materializeCallingConvention(legal.lir, *bundle.lowered.target,
+                                           bundle.alloc, ccRep);
+    ASSERT_TRUE(cc.ok());
+    ASSERT_EQ(cc.perFunc.size(), 1u);
+    // Precondition: the frame genuinely exceeds the 16 MiB shifted-imm12 reach
+    // (so the prologue MUST take the 3-word MOVZ/MOVK path, not the 2-word one).
+    EXPECT_GT(cc.perFunc[0].totalFrameSize, 0xFFFFFFu)
+        << "the 20MB array frame must exceed 16 MiB to force the 3-word form";
+
+    std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    DiagnosticReporter asmRep;
+    auto mod = assemble(cc.lir, *bundle.lowered.target, lirToMir, asmRep);
+    EXPECT_EQ(asmRep.errorCount(), 0u)
+        << "a >16MiB-frame AAPCS64 function must assemble clean (3-word sp-adjust)";
+    ASSERT_EQ(mod.functions.size(), 1u);
+    auto const& fBytes = mod.functions[0].bytes;
+    ASSERT_GE(fBytes.size(), 4u);
+    // Decode the prologue's first word LE. Mask out the imm16 field (bits
+    // 5..20, frame-size dependent) and assert the MOVZ-x16 skeleton: opcode
+    // bits + Rd=16. 0xD2800000 = MOVZ X base; |16 = Rd. The mask 0xFFE0001F
+    // keeps [31:21] (opcode+hw) and [4:0] (Rd), clearing the imm16 window.
+    std::uint32_t const w0 =
+          static_cast<std::uint32_t>(fBytes[0])
+        | (static_cast<std::uint32_t>(fBytes[1]) << 8)
+        | (static_cast<std::uint32_t>(fBytes[2]) << 16)
+        | (static_cast<std::uint32_t>(fBytes[3]) << 24);
+    EXPECT_EQ(w0 & 0xFFE0001Fu, 0xD2800000u | 16u)
+        << "the >16MiB prologue's first word must be `MOVZ x16,#imm16` — a "
+           "regalloc change clobbering x16 (the IP0 scratch) across the "
+           "sp-adjust would diverge this (red-on-disable). Got word 0x"
+        << std::hex << w0;
+
+    // Durability corroboration: x16 (hwEncoding 16) must NOT be assigned to
+    // any value across the function — it is platform scratch, baked into the
+    // 3-word macro. (A regalloc that handed x16 to a live value would both
+    // break the byte pin above AND surface here.)
+    auto const x16Ord = bundle.lowered.target->registerByName("x16");
+    ASSERT_TRUE(x16Ord.has_value());
+    Lir const& dst = cc.lir;
+    for (std::uint32_t fi = 0; fi < dst.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = dst.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < dst.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = dst.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < dst.blockInstCount(blk); ++i) {
+                LirInstId const inst = dst.blockInstAt(blk, i);
+                LirReg const r = dst.instResult(inst);
+                EXPECT_FALSE(r.valid() && r.isPhysical != 0
+                             && r.id == *x16Ord)
+                    << "x16 (IP0 scratch) must not be a value-carrying result "
+                       "in a >16MiB-frame function — it is reserved for the "
+                       "3-word sp-adjust materialization";
+            }
+        }
+    }
+}
+
 // D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow) byte-pin.
 //
 // HAND-BUILT LIR exercising the three control-flow opcodes (cmp / jcc / jmp)

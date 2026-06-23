@@ -43,6 +43,13 @@
 #include <string_view>
 #include <vector>
 
+// D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (harness): RLIMIT_STACK on POSIX
+// to give the large-frame corpus a generous native stack (belt-and-
+// suspenders alongside QEMU_STACK_SIZE, which covers the qemu child).
+#if !defined(_WIN32)
+  #include <sys/resource.h>
+#endif
+
 namespace fs = std::filesystem;
 using namespace dss;
 using namespace dss::test_support;
@@ -59,6 +66,48 @@ namespace {
 #else
     return "unknown";
 #endif
+}
+
+// D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (harness): give EVERY spawned
+// corpus binary a generous stack ONCE, in the parent, before the first run.
+// The large_frame_beyond_16mib example reserves a ~20 MB stack frame which
+// SIGSEGVs under the default 8 MB ulimit. Two mechanisms, both inherited by
+// the child (the run-harness spawns with inherited env on Windows and
+// `environ` on POSIX):
+//   * QEMU_STACK_SIZE=256MB — the PRIMARY knob; the qemu-aarch64 child reads
+//     it to size the emulated guest stack (cross-platform; harmless to the
+//     native x86_64 leg, which ignores it). setenv in the parent → the child
+//     inherits it.
+//   * RLIMIT_STACK=256MB (POSIX only) — belt-and-suspenders for the NATIVE
+//     x86_64 Linux leg (whose real stack is bounded by the parent's ulimit).
+//     Raise the soft limit toward the hard cap; clamp to the hard limit
+//     (raising past it needs privilege). Best-effort: a failure is non-fatal
+//     (the example still runs if the ambient ulimit already suffices).
+// Harmless to every small-frame example. Called once via a function-local
+// static so the cost is paid exactly once per test-process.
+void ensureGenerousStackForCorpus() {
+    static bool const done = [] {
+        constexpr char const* kStackBytes = "268435456";  // 256 MiB
+        // setenv (POSIX) / _putenv_s (Windows) — the child inherits it.
+#if defined(_WIN32)
+        ::_putenv_s("QEMU_STACK_SIZE", kStackBytes);
+#else
+        ::setenv("QEMU_STACK_SIZE", kStackBytes, /*overwrite=*/1);
+        struct rlimit rl{};
+        if (::getrlimit(RLIMIT_STACK, &rl) == 0) {
+            rlim_t const want = static_cast<rlim_t>(268435456);  // 256 MiB
+            rlim_t const target =
+                (rl.rlim_max == RLIM_INFINITY) ? want
+                                               : std::min<rlim_t>(want, rl.rlim_max);
+            if (rl.rlim_cur < target) {
+                rl.rlim_cur = target;
+                (void)::setrlimit(RLIMIT_STACK, &rl);  // best-effort
+            }
+        }
+#endif
+        return true;
+    }();
+    (void)done;
 }
 
 // D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): host ARCH detection, returning the
@@ -600,6 +649,10 @@ compileAndRunArm(fs::path const& exampleDir,
         }
         launcherPrefix.push_back(emuPath);
     }
+
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: raise the child stack (once)
+    // before the first spawn so the ~20 MB-frame corpus does not SIGSEGV.
+    ensureGenerousStackForCorpus();
 
     // Model 3: capture stdout when EITHER the manifest-level pin OR this target's
     // override is present (so a per-target override alone still routes the pipe).

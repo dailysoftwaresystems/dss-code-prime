@@ -632,6 +632,24 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                    return w.index == 0
                                        && isDestSlot(w.slotKind);
                                });
+            // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: a variant that wires
+            // an operand to the `Imm32MovzMovk` slot materializes its value
+            // into a scratch register (MOVZ/MOVK) and applies an EXTENDED-
+            // register operation whose destination is BAKED into the
+            // template's operation word (the sp-adjust `sub sp,sp,x16` /
+            // `add sp,sp,x16` bake Rd=sp=31 — there is no result-register
+            // FIELD for a `resultSlot` to fill). The result is architecturally
+            // implicit, exactly like the `isCall` rationale below: the byte
+            // encoding carries it via the baked register, not a routed slot.
+            // (The lea form of this slot DOES route its dest via resultSlot/
+            // extraResultSlots — scratch-free into Xd — so this exemption
+            // only relaxes the sp-adjust form that has no dest field to fill.)
+            bool const hasMovzMovkBakedDest =
+                std::any_of(v.wires.begin(), v.wires.end(),
+                            [&](TargetEncodingWire const& w) {
+                                return w.slotKind
+                                    == EncodingSlotKind::Imm32MovzMovk;
+                            });
             // `isCall` opcodes declare `result: optional` in LIR for
             // callee-returns-a-value semantics, but the byte
             // encoding doesn't carry the result — ML7 callconv
@@ -646,13 +664,15 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 && !v.resultSlot.has_value()
                 && !v.tmpl.modrmRegExt.has_value()
                 && !has2AddrDestWire
+                && !hasMovzMovkBakedDest
                 && !o.isCall) {
                 fail(std::format("/opcodes/{}/encoding/variants/{}", i, vi),
                      std::format("opcode '{}' variant {}: opcode has "
                                  "`result='{}'` but variant declares "
                                  "none of `resultSlot` / "
                                  "`template.modrmRegExt` / "
-                                 "(`requires2Address` + wire on operand 0) "
+                                 "(`requires2Address` + wire on operand 0) / "
+                                 "(`imm32.movzmovk` baked-dest) "
                                  "— destination register would be "
                                  "silently dropped",
                                  o.mnemonic, vi,

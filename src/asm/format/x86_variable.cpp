@@ -304,6 +304,7 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
         case EncodingSlotKind::Imm12:
         case EncodingSlotKind::Imm12Scaled:
         case EncodingSlotKind::Imm12HiLo24:
+        case EncodingSlotKind::Imm32MovzMovk:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
             // Other shapes — the fixed32 register/immediate slots plus

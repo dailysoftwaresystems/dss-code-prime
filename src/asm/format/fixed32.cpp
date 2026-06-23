@@ -107,6 +107,14 @@ windowFor(EncodingSlotKind s) noexcept {
         // per word. Identical placement to Imm12, distinct slot + distinct
         // (word-pair) encode arithmetic.
         case EncodingSlotKind::Imm12HiLo24: return SlotBitWindow{ 10, 12 };
+        // Imm32MovzMovk (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB): the
+        // MOVZ/MOVK halfword window — bits 5..20, the SAME window as Imm16
+        // (AArch64 MOVZ/MOVK both carry imm16 at [20:5], Rd at [4:0]).
+        // `windowFor` returns the per-WORD window; the wire arm (writeMovzMovk
+        // helper) splits the 32-bit value lo16→word0 / hi16→word1 and calls
+        // `orInto` twice with this window — once per MOVZ/MOVK word. The
+        // third (operation) word carries no Imm32MovzMovk bits.
+        case EncodingSlotKind::Imm32MovzMovk: return SlotBitWindow{ 5, 16 };
         // SymbolPatchMarker (D-AS4-3): width-0 symbol-patch marker, like
         // MemBaseNoScale. The walker writes NO bits (the linker patches
         // the whole field via the wire's relocationKind); the slot only
@@ -395,6 +403,52 @@ bool encode(Lir const&                  lir,
         return true;
     };
 
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: write a value V into the
+    // MOVZ/MOVK 3-word materialization slot. V must be NON-NEGATIVE and fit
+    // 0..0x7FFFFFFF (the int32 frame-size ceiling — a frame > 2 GiB flows
+    // through `int32_t` as a NEGATIVE magnitude and never reaches this slot,
+    // the residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-2GIB). The low 16 bits
+    // go into `word[wordIndex]`'s imm16 window (the MOVZ word — its
+    // fixedWords[wordIndex] is the `MOVZ Xs,#imm16` base) and the high 16
+    // bits into `word[wordIndex+1]`'s imm16 window (the MOVK word — its
+    // fixedWords[wordIndex+1] is the `MOVK Xs,#imm16,LSL #16` base, hw=01).
+    // The scratch register Xs (x16 baked into the sub/add base words, or the
+    // lea's threaded dest reg) is the variant's concern via the base words +
+    // resultSlot/extraResultSlots, NOT this helper's — exactly like
+    // `writeHiLo24` writes only the value split, never the Rd thread. The
+    // THIRD word (the extended-register operation) carries no Imm32MovzMovk
+    // bits. The halfword split mirrors `materializeViaMovkLadder`
+    // (mir_to_lir.cpp): `chunk[k] = (V >> 16*k) & 0xFFFF`. `valueDesc` names
+    // the operand (immediate vs memory offset) for the diagnostic. Both
+    // halves OR through `orInto`, so the per-word wroteSlot collision guard
+    // fires if a malformed schema double-writes either MOVZ/MOVK word.
+    constexpr std::int64_t kMovzMovkMax = 0x7FFFFFFF;  // int32 frame ceiling
+    auto const writeMovzMovk = [&](std::int64_t value,
+                                   std::uint8_t wordIndex,
+                                   std::string_view valueDesc) -> bool {
+        if (value < 0 || value > kMovzMovkMax) {
+            report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': {} {} is out of range for the "
+                               "MOVZ/MOVK 3-word materialization (valid "
+                               "0..{}, i.e. the non-negative int32 frame "
+                               "ceiling) — a frame > 2 GiB has no encoding "
+                               "(D-ASM-AARCH64-FRAME-OFFSET-BEYOND-2GIB)",
+                               info->mnemonic, valueDesc, value,
+                               kMovzMovkMax));
+            return false;
+        }
+        std::uint32_t const v   = static_cast<std::uint32_t>(value);
+        std::uint32_t const lo  = v & 0xFFFFu;          // chunk 0 → MOVZ word
+        std::uint32_t const hi  = (v >> 16) & 0xFFFFu;  // chunk 1 → MOVK word
+        if (!orInto(EncodingSlotKind::Imm32MovzMovk, lo, wordIndex))
+            return false;
+        if (!orInto(EncodingSlotKind::Imm32MovzMovk, hi,
+                    static_cast<std::uint8_t>(wordIndex + 1)))
+            return false;
+        return true;
+    };
+
     // Wire the result register into its declared slot (word 0), plus any
     // extra placements (D-AS4-3 — a multi-word macro threading the SAME
     // destination register through later words, e.g. lea's ADD reads
@@ -606,6 +660,22 @@ bool encode(Lir const&                  lir,
                     return false;
                 continue;
             }
+            // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: the MOVZ/MOVK 3-word
+            // form. The callconv's prologue/epilogue `sub/add sp,#frame`
+            // (an [reg, ImmInt] form) wires its frame size here when it
+            // exceeds the 2-word shifted-imm12 reach (0xFFFFFF). The value
+            // materializes into the x16 scratch (MOVZ x16 + MOVK x16) across
+            // words 0/1, and word2 is the extended-register `sub/add sp,sp,
+            // x16`. Handled BEFORE the Imm16/Imm12 reject so the 3-word slot
+            // never leaks into the single-word range logic. The variant
+            // selector (immMin:0x1000000 magnitude key) routes a >16MiB
+            // frame here; the encoder writes whichever it is handed.
+            if (wire.slotKind == EncodingSlotKind::Imm32MovzMovk) {
+                if (!writeMovzMovk(static_cast<std::int64_t>(srcOp.immInt32),
+                                   wire.wordIndex, "immediate"))
+                    return false;
+                continue;
+            }
             // Immediate operand → an UNSIGNED immediate fixed32 slot.
             // Cycle scope (D-LK10-ENTRY-ARM64): Imm16 (AArch64 MOVZ
             // wide-immediate) or Imm12 (AArch64 ADD/SUB-immediate frame
@@ -809,6 +879,22 @@ bool encode(Lir const&                  lir,
             if (wire.slotKind == EncodingSlotKind::Imm12HiLo24) {
                 if (!writeHiLo24(static_cast<std::int64_t>(srcOp.offset),
                                  wire.wordIndex, "memory offset"))
+                    return false;
+                continue;
+            }
+            // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: the MOVZ/MOVK 3-word
+            // form for a frame-relative `lea Xd,[base,#disp]` whose disp
+            // exceeds the 2-word shifted-imm12 reach (0xFFFFFF). The GEP's
+            // high-element address (e.g. `int big[5000000]; big[4999999]` at
+            // sp+~20MB). SCRATCH-FREE: the displacement materializes into the
+            // lea's DEST reg Xd (MOVZ Xd + MOVK Xd, threaded via resultSlot/
+            // extraResultSlots), then word2 is `add Xd, sp, Xd` (extended,
+            // Rn=sp). Handled BEFORE the Imm9/Imm12 reject so the 3-word slot
+            // never leaks into the single-word range logic. `writeMovzMovk`
+            // owns the non-negative + int32-ceiling fail-loud gate.
+            if (wire.slotKind == EncodingSlotKind::Imm32MovzMovk) {
+                if (!writeMovzMovk(static_cast<std::int64_t>(srcOp.offset),
+                                   wire.wordIndex, "memory offset"))
                     return false;
                 continue;
             }

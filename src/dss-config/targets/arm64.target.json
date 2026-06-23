@@ -287,6 +287,15 @@
               { "index": 0, "slotKind": "rn"            },
               { "index": 1, "slotKind": "imm12.hilo24", "wordIndex": 0 }
             ]
+          },
+          {
+            "$comment": "ADD sp, sp, #imm (MOVZ/MOVK + EXTENDED-register 3-word form, D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB). The epilogue mirror of SUB's 3-word form. word0 = `MOVZ x16, #(V & 0xFFFF)` (0xD2800010), word1 = `MOVK x16, #((V>>16) & 0xFFFF), LSL #16` (0xF2A00010), word2 = `ADD sp, sp, x16` (the EXTENDED-register form 0x8B3063FF: option=011 UXTX, bit 21 set, Rd=Rn=sp=31, Rm=x16=16). x16=IP0 scratch baked; NO resultSlot (sp=31 baked into word2 — rule-G baked-dest exemption). Same immMin/immMax routing + >2GiB fail-loud as SUB.",
+            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64, "immMin": 16777216, "immMax": 2147483647 },
+            "template":   { "fixedWords": [3531603984, 4070572048, 2335204351] },
+            "wires":      [
+              { "index": 0, "slotKind": "rn",            "wordIndex": 2 },
+              { "index": 1, "slotKind": "imm32.movzmovk", "wordIndex": 0 }
+            ]
           }
         ]
       }
@@ -340,6 +349,15 @@
             "wires":      [
               { "index": 0, "slotKind": "rn"            },
               { "index": 1, "slotKind": "imm12.hilo24", "wordIndex": 0 }
+            ]
+          },
+          {
+            "$comment": "SUB sp, sp, #imm (MOVZ/MOVK + EXTENDED-register 3-word form, D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB). For a frame in (0xFFFFFF, 0x7FFFFFFF] (>16 MiB, ≤2 GiB) this emits THREE words: word0 = `MOVZ x16, #(V & 0xFFFF)` (0xD2800010, Rd=x16=16 baked), word1 = `MOVK x16, #((V>>16) & 0xFFFF), LSL #16` (0xF2A00010, hw=01, Rd=x16), word2 = `SUB sp, sp, x16` (the EXTENDED-register form 0xCB3063FF: option=011 UXTX, bit 21 set, Rd=Rn=sp=31, Rm=x16=16 — NOT the shifted-register 0xCB000000 where #31=XZR → `sp±0` corrupt frame). x16 is AAPCS64 IP0, the architecturally-blessed intra-procedure scratch, free at the prologue/epilogue; it is BAKED into all three base words (NO resultSlot — the destination sp=31 is baked into word2, validate's rule-G `imm32.movzmovk` baked-dest exemption). The single imm32.movzmovk wire (operand 1, word0) carries the VALUE; the encoder splits lo16→word0 / hi16→word1. Operand 0 (sp) wires to word2's `rn` (re-confirming the baked sp=31). `immMin:16777216`/`immMax:2147483647` route ONLY a >16MiB, ≤2GiB frame here; a frame > 2 GiB flows through int32 as NEGATIVE → magnitude nullopt → no variant matches → fail-loud (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-2GIB).",
+            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64, "immMin": 16777216, "immMax": 2147483647 },
+            "template":   { "fixedWords": [3531603984, 4070572048, 3408946175] },
+            "wires":      [
+              { "index": 0, "slotKind": "rn",            "wordIndex": 2 },
+              { "index": 1, "slotKind": "imm32.movzmovk", "wordIndex": 0 }
             ]
           }
         ]
@@ -1120,6 +1138,22 @@
               { "index": 0, "slotKind": "rn"              },
               { "index": 1, "slotKind": "membase.noscale" },
               { "index": 2, "slotKind": "imm12.hilo24", "wordIndex": 0 }
+            ]
+          },
+          {
+            "$comment": "FRAME-RELATIVE lea (MOVZ/MOVK + EXTENDED-register 3-word form, D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB) — `lea Xd, [sp + #disp]` with disp in (0xFFFFFF, 0x7FFFFFFF] (>16 MiB, ≤2 GiB). The GEP's high-element address (e.g. `int big[5000000]; big[4999999]` at sp+~20MB) under a >16MiB frame. Emits THREE words, SCRATCH-FREE: the displacement materializes into the lea's DEST reg Xd, then an extended-register ADD off sp. word0 = `MOVZ Xd, #(disp & 0xFFFF)` (0xD2800000, Rd=Xd via resultSlot), word1 = `MOVK Xd, #((disp>>16) & 0xFFFF), LSL #16` (0xF2A00000, Rd=Xd via extraResultSlots word1.rd), word2 = `ADD Xd, sp, Xd` (the EXTENDED-register form 0x8B2063E0: option=011 UXTX, bit 21 set, Rn=sp=31 baked, Rd=Xd + Rm=Xd via extraResultSlots word2.rd/word2.rm). The dest reg threads through ALL THREE words (resultSlot=rd word0 + three extraResultSlots) — no separate scratch needed. The MemOffset (operand 2) is the VALUE-bearing operand the matcher keys on; its single imm32.movzmovk wire (word0) carries the displacement, split lo16→word0 / hi16→word1 by the encoder. Operand 0 (base=sp) → word2's `rn` (re-confirming the baked sp=31); operand 1 (membase, scale==1) → membase.noscale (word2, no bits). `immMin:16777216`/`immMax:2147483647`; a >2GiB offset goes negative through int32 → fail-loud (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-2GIB).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64, "immMin": 16777216, "immMax": 2147483647 },
+            "template":   { "fixedWords": [3531603968, 4070572032, 2334155744] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rd", "wordIndex": 2 },
+              { "slotKind": "rm", "wordIndex": 2 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "rn",              "wordIndex": 2 },
+              { "index": 1, "slotKind": "membase.noscale", "wordIndex": 2 },
+              { "index": 2, "slotKind": "imm32.movzmovk",  "wordIndex": 0 }
             ]
           },
           {

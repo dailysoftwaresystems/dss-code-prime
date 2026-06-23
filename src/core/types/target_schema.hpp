@@ -1160,11 +1160,43 @@ enum class EncodingSlotKind : std::uint8_t {
     // on an x86 variant — the gating is slot-kind `==` + value-
     // magnitude arithmetic, zero arch identity.
     Imm12HiLo24   = 27,
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (v0.0.2 cycle 12): the
+    // AArch64 MOVZ/MOVK + EXTENDED-register `add`/`sub`/`lea` THREE-word
+    // materialization of a value V in (0xFFFFFF, 0x7FFFFFFF] — a frame
+    // LARGER than the 24-bit shifted-imm12 reach (16 MiB) but representable
+    // in a non-negative int32 (a frame size flows through `int32_t` →
+    // `> 0x7FFFFFFF` goes NEGATIVE and never matches this slot's
+    // `immMin:16777216` variant guard → fail-loud, the residual
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-2GIB). Like `Imm12HiLo24` this is
+    // NOT a single bit-window — the encoder, on matching this slot, writes
+    // a 3-word macro whose FIRST TWO words are `MOVZ Xs,#(V & 0xFFFF)` +
+    // `MOVK Xs,#((V>>16) & 0xFFFF),LSL #16` (materialize V into a scratch
+    // register Xs) and whose THIRD word is the operation:
+    //   * sp adjust  — `sub sp,sp,x16` / `add sp,sp,x16` (the EXTENDED-
+    //     register form 0xCB30_63FF / 0x8B30_63FF, where Rn=Rd=sp(31) is
+    //     SP not XZR — the shifted-register form would write XZR). The
+    //     scratch is x16 = AAPCS64 IP0, the architecturally-blessed intra-
+    //     procedure scratch, BAKED into the MOVZ/MOVK base words (Rd=16)
+    //     and the extended op's Rm=16. Free at the prologue (pre-arg-home)
+    //     + epilogue (post-return-value).
+    //   * lea        — `add Xd,sp,Xd` (extended, Rn=sp), SCRATCH-FREE: V
+    //     materializes into the lea's DEST reg Xd (the MOVZ/MOVK Rd + the
+    //     extended op's Rd AND Rm all thread the result register). The
+    //     value writes into both MOVZ/MOVK words' imm16 windows (bits 5..20)
+    //     — the SAME window as `Imm16`, the encoder splits lo16→word0 /
+    //     hi16→word1 (mirroring `materializeViaMovkLadder`'s chunk split).
+    // The slot's `windowFor` returns the imm16 window (bits 5..20); the
+    // encoder calls `orInto` twice (lo→word0, hi→word1). x86_64 has no
+    // imm16/movk-ladder slot → never reached on an x86 variant (gating is
+    // slot-kind `==`, zero arch identity). The x16 scratch identity is
+    // justified the same way XZR=31/sp=31 already are (a config-baked
+    // architectural register).
+    Imm32MovzMovk = 28,
     // Future fixed32 slots (paired with their consumer cycle):
-    //   Sf-flag / 3-word frame materialization / etc.
+    //   Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 28> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 29> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -1193,6 +1225,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 28> kEncodingSlotKindTable{{{
     { EncodingSlotKind::Imm64,         "imm64"          },
     { EncodingSlotKind::Imm12Scaled,   "imm12.scaled"   },
     { EncodingSlotKind::Imm12HiLo24,   "imm12.hilo24"   },
+    { EncodingSlotKind::Imm32MovzMovk, "imm32.movzmovk" },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -1211,7 +1244,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 28,
+static_assert(kEncodingSlotKindCount == 29,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -1263,6 +1296,10 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         // Imm12 / Imm12Scaled (a cross-shape declaration on an x86
         // opcode would be rejected by validate()).
         case EncodingSlotKind::Imm12HiLo24:
+        // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: the MOVZ/MOVK +
+        // extended-register 3-word form is a fixed32 (AArch64) slot —
+        // same reason as Imm12 / Imm12HiLo24.
+        case EncodingSlotKind::Imm32MovzMovk:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
             return TargetEncodingShape::Fixed32;
@@ -1453,6 +1490,10 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         // word-pair writes its (split) immediate bits directly into both
         // words — no linker relocation.
         case EncodingSlotKind::Imm12HiLo24:
+        // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: the MOVZ/MOVK 3-word
+        // form writes its (split) immediate halfwords directly into the
+        // MOVZ/MOVK words — no linker relocation.
+        case EncodingSlotKind::Imm32MovzMovk:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
         case EncodingSlotKind::Disp32Mem:

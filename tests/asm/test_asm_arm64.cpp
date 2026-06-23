@@ -1031,19 +1031,20 @@ TEST(Arm64Encoder, FrameLeaOffsetWiderThanImm12SplitsToShifted) {
     EXPECT_EQ(bytes[7], 0x91);
 }
 
-TEST(Arm64Encoder, FrameLeaOffsetBeyond16MiBFailsLoud) {
-    // RED-on-disable for the 24-bit (16 MiB) ceiling of the shifted-imm12
-    // word-pair: a frame offset > 0xFFFFFF has no 2-word ADD encoding (the
-    // high 12 bits would overflow word1's imm12 field) and MUST fail loud
-    // — the residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (a third word
-    // / MOVZ+MOVK scratch is its future generalization). 0x1000000 (16 MiB)
-    // is exactly one past the ceiling. The shipped lea variant's
-    // `immMax:16777215` EXCLUDES this value at the VARIANT SELECTOR, so the
-    // diagnostic is A_NoMatchingEncodingVariant (the selector rejects it
-    // before the encoder's 24-bit writeHiLo24 gate — that gate is
-    // defense-in-depth, unreachable through the shipped schema). The pin's
-    // contract is FAIL-LOUD, not a specific code: a >16MiB offset must
-    // never silently truncate to a wrong frame slot.
+TEST(Arm64Encoder, FrameLeaOffsetBeyond16MiBSplitsToMovzMovkThreeWord) {
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (the high-element lea tier): a
+    // frame-lea offset > 0xFFFFFF SPLITS into a 3-word MOVZ/MOVK + EXTENDED-
+    // register macro. SCRATCH-FREE — the displacement materializes into the
+    // lea's DEST reg (here x2), then `add x2, sp, x2`. EXACT byte-pin for
+    // `lea x2, [sp + #0x1234000]` (lo16 = 0x4000, hi16 = 0x0123):
+    //   word0 = MOVZ x2,#0x4000       : 0xD2800000|(0x4000<<5)|2 = 0xD2880002 → 02 00 88 D2
+    //   word1 = MOVK x2,#0x123,LSL#16 : 0xF2A00000|(0x123<<5)|2  = 0xF2A02462 → 62 24 A0 F2
+    //   word2 = ADD x2,sp,x2 (EXTENDED): 0x8B2063E0|(2<<16)|2    = 0x8B2263E2 → E2 63 22 8B
+    // word2 is the EXTENDED-register ADD (Rn=sp=31, Rd=Rm=x2) — the dest reg
+    // threads through ALL THREE words (resultSlot + extraResultSlots). The
+    // FULL word2 is pinned (a shifted-register mis-encode 0x8B0263E2 would
+    // read x2 as the base instead of sp — corrupt address). Red-on-disable:
+    // revert the variant / immMax and 0x1234000 fails A_NoMatchingEncodingVariant.
     auto s = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(s.has_value());
     auto const leaOp = (*s)->opcodeByMnemonic("lea");
@@ -1056,17 +1057,72 @@ TEST(Arm64Encoder, FrameLeaOffsetBeyond16MiBFailsLoud) {
     LirOperand const ops[] = {
         LirOperand::makeReg(gpr(**s, "sp")),
         LirOperand::makeMemBase(1),
-        LirOperand::makeMemOffset(0x1000000)   // 16 MiB — one past the ceiling
+        LirOperand::makeMemOffset(0x1234000)
     };
     (void)b.addInst(*leaOp, gpr(**s, "x2"), ops);
     (void)b.addReturn(*retOp, {});
     Lir lir = std::move(b).finish();
     DiagnosticReporter rep;
-    std::vector<MirInstId> lirToMir(lir.instCount());
-    (void)assemble(lir, **s, lirToMir, rep);
-    EXPECT_GT(rep.errorCount(), 0u)
-        << "a >16MiB frame-lea offset must fail loud (no matching variant), "
-           "never silently truncate to a wrong frame slot";
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 12u);
+    // word0 — MOVZ x2,#0x4000 (02 00 88 D2)
+    EXPECT_EQ(bytes[0], 0x02);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0x88);
+    EXPECT_EQ(bytes[3], 0xD2);
+    // word1 — MOVK x2,#0x123,LSL#16 (62 24 A0 F2)
+    EXPECT_EQ(bytes[4], 0x62);
+    EXPECT_EQ(bytes[5], 0x24);
+    EXPECT_EQ(bytes[6], 0xA0);
+    EXPECT_EQ(bytes[7], 0xF2);
+    // word2 — ADD x2,sp,x2 EXTENDED (E2 63 22 8B) — full word, F1 critical
+    EXPECT_EQ(bytes[8],  0xE2);
+    EXPECT_EQ(bytes[9],  0x63);
+    EXPECT_EQ(bytes[10], 0x22);
+    EXPECT_EQ(bytes[11], 0x8B);
+}
+
+TEST(Arm64Encoder, FrameLeaOffsetAtMaxInt32EncodesThreeWord) {
+    // Boundary pin: 0x7FFFFFFF (the int32 frame ceiling) is the LARGEST
+    // offset the MOVZ/MOVK form encodes. lo16 = 0xFFFF, hi16 = 0x7FFF;
+    // `lea x2, [sp + #0x7FFFFFFF]`:
+    //   word0 = MOVZ x2,#0xFFFF       : 0xD29FFFE2 → E2 FF 9F D2
+    //   word1 = MOVK x2,#0x7FFF,LSL16 : 0xF2AFFFE2 → E2 FF AF F2
+    //   word2 = ADD x2,sp,x2          : 0x8B2263E2 → E2 63 22 8B
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(0x7FFFFFFF)
+    };
+    (void)b.addInst(*leaOp, gpr(**s, "x2"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 12u);
+    EXPECT_EQ(bytes[0], 0xE2);
+    EXPECT_EQ(bytes[1], 0xFF);
+    EXPECT_EQ(bytes[2], 0x9F);
+    EXPECT_EQ(bytes[3], 0xD2);
+    EXPECT_EQ(bytes[4], 0xE2);
+    EXPECT_EQ(bytes[5], 0xFF);
+    EXPECT_EQ(bytes[6], 0xAF);
+    EXPECT_EQ(bytes[7], 0xF2);
+    EXPECT_EQ(bytes[8],  0xE2);
+    EXPECT_EQ(bytes[9],  0x63);
+    EXPECT_EQ(bytes[10], 0x22);
+    EXPECT_EQ(bytes[11], 0x8B);
 }
 
 TEST(Arm64Encoder, SubSpFrameWiderThanImm12SplitsToShifted) {
@@ -1245,13 +1301,67 @@ TEST(Arm64Encoder, FrameSubSpAt16MiBMinusOneIsTwoWord) {
     EXPECT_EQ(bytes[7], 0xD1);
 }
 
-TEST(Arm64Encoder, FrameSubSpAt16MiBFailsLoud) {
-    // Boundary pin: 16777216 (0x1000000, one past the 24-bit ceiling)
-    // fails loud — no variant matches (immMax:16777215 excludes it) so the
-    // selector reports A_NoMatchingEncodingVariant. (The lea path's encoder
-    // gate emits A_ImmediateOperandOutOfRange; the add/sub path's VARIANT
-    // selector rejects 0x1000000 before the encoder — either way the
-    // function fails to assemble loud, never silently truncates.)
+TEST(Arm64Encoder, SubSpFrameBeyond16MiBSplitsToMovzMovkThreeWord) {
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (prologue): the callconv's
+    // `sub sp, sp, #frame` SPLITS into a 3-word MOVZ/MOVK + EXTENDED-register
+    // macro when frame > 0xFFFFFF (16 MiB). x16 (IP0) is the baked scratch.
+    // EXACT byte-pin for `sub sp, sp, #0x1234000` (lo16 = 0x4000, hi16 =
+    // 0x0123 — BOTH halves nonzero, so a lo/hi swap diverges these bytes):
+    //   word0 = MOVZ x16,#0x4000        : 0xD2800010|(0x4000<<5) = 0xD2880010 → 10 00 88 D2
+    //   word1 = MOVK x16,#0x123,LSL#16  : 0xF2A00010|(0x123<<5)  = 0xF2A02470 → 70 24 A0 F2
+    //   word2 = SUB sp,sp,x16 (EXTENDED): 0xCB3063FF             → FF 63 30 CB
+    // word2 is the EXTENDED-register form (Rd=Rn=sp=31, Rm=x16=16, opt=UXTX,
+    // bit 21 set) — NOT the shifted-register 0xCB000000 (where #31=XZR would
+    // make this `sp - 0` = corrupt frame). The FULL 32-bit word2 is pinned
+    // (a low-byte-only pin would pass the XZR mis-encode: 0xCB0063FF and
+    // 0xCB3063FF share byte[0]=0xFF). Red-on-disable: revert the variant /
+    // immMax, and 0x1234000 fails A_NoMatchingEncodingVariant.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subOp = (*s)->opcodeByMnemonic("sub");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(0x1234000)
+    };
+    (void)b.addInst(*subOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 12u);
+    // word0 — MOVZ x16,#0x4000 (10 00 88 D2)
+    EXPECT_EQ(bytes[0], 0x10);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0x88);
+    EXPECT_EQ(bytes[3], 0xD2);
+    // word1 — MOVK x16,#0x123,LSL#16 (70 24 A0 F2)
+    EXPECT_EQ(bytes[4], 0x70);
+    EXPECT_EQ(bytes[5], 0x24);
+    EXPECT_EQ(bytes[6], 0xA0);
+    EXPECT_EQ(bytes[7], 0xF2);
+    // word2 — SUB sp,sp,x16 EXTENDED (FF 63 30 CB) — full word, F1 critical
+    EXPECT_EQ(bytes[8],  0xFF);
+    EXPECT_EQ(bytes[9],  0x63);
+    EXPECT_EQ(bytes[10], 0x30);
+    EXPECT_EQ(bytes[11], 0xCB);
+}
+
+TEST(Arm64Encoder, FrameSubSpAt16MiBSplitsToThreeWord) {
+    // Boundary pin: 16777216 (0x1000000, the 24-bit ceiling + 1) NO LONGER
+    // fails loud — it is the FIRST value routed to the 3-word MOVZ/MOVK form
+    // (immMin:16777216). lo16 = 0, hi16 = 0x0100:
+    //   word0 = MOVZ x16,#0          : 0xD2800010 → 10 00 80 D2
+    //   word1 = MOVK x16,#0x100,LSL16: 0xF2A02010 → 10 20 A0 F2
+    //   word2 = SUB sp,sp,x16        : 0xCB3063FF → FF 63 30 CB
+    // The 12-byte emission (not 8, not a diagnostic) IS the proof the
+    // 0x1000000 boundary now routes to the 3-word form.
     auto s = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(s.has_value());
     auto const subOp = (*s)->opcodeByMnemonic("sub");
@@ -1269,11 +1379,55 @@ TEST(Arm64Encoder, FrameSubSpAt16MiBFailsLoud) {
     (void)b.addReturn(*retOp, {});
     Lir lir = std::move(b).finish();
     DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 12u);
+    EXPECT_EQ(bytes[0], 0x10);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0x80);
+    EXPECT_EQ(bytes[3], 0xD2);
+    EXPECT_EQ(bytes[4], 0x10);
+    EXPECT_EQ(bytes[5], 0x20);
+    EXPECT_EQ(bytes[6], 0xA0);
+    EXPECT_EQ(bytes[7], 0xF2);
+    EXPECT_EQ(bytes[8],  0xFF);
+    EXPECT_EQ(bytes[9],  0x63);
+    EXPECT_EQ(bytes[10], 0x30);
+    EXPECT_EQ(bytes[11], 0xCB);
+}
+
+TEST(Arm64Encoder, FrameSubSpAt2GiBFailsLoud) {
+    // Boundary pin (the NEW ceiling, D-ASM-AARCH64-FRAME-OFFSET-BEYOND-2GIB):
+    // 0x80000000 (2 GiB) is the first value PAST the int32 frame ceiling. The
+    // frame size flows through `emitSpAdjust`'s `static_cast<int32_t>(bytes)`
+    // and `variantImmMagnitude`'s `immInt32` — 0x80000000 as int32 is
+    // NEGATIVE, so `variantImmMagnitude` returns nullopt → NO variant matches
+    // (the 3-word variant's immMin:16777216 is never reached) → fail-loud
+    // A_NoMatchingEncodingVariant. A >2GiB frame is absurd; it must never
+    // silently wrap to a small (or negative) frame.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subOp = (*s)->opcodeByMnemonic("sub");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        // 0x80000000 stored into the int32 immInt32 field → INT32_MIN.
+        LirOperand::makeImmInt32(static_cast<std::int32_t>(0x80000000u))
+    };
+    (void)b.addInst(*subOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
     std::vector<MirInstId> lirToMir(lir.instCount());
     (void)assemble(lir, **s, lirToMir, rep);
     EXPECT_GT(rep.errorCount(), 0u)
-        << "a >16MiB sub-sp frame must fail loud (no matching variant), "
-           "never silently truncate the frame size";
+        << "a >2GiB sub-sp frame must fail loud (no matching variant), "
+           "never silently wrap the frame size";
 }
 
 // ── Shape-vs-slot validate rejection ──────────────────────────────
