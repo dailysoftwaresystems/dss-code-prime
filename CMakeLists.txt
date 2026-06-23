@@ -22,6 +22,14 @@ project(dss-code-prime VERSION ${DSS_VERSION} LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# This project uses ZERO C++20 modules (no .cppm/.ixx, no `export module`/`import std`
+# — header-based C++23 via <expected>/<format>). CMake 3.28+ (policy CMP0155) scans
+# every C++20+ TU for module dependencies BY DEFAULT, which (a) costs a gratuitous
+# scan pass on cold builds and (b) puts module-mapper/dyndep flags on every compile
+# command — and ccache flags any module-mapper compile as UNCACHEABLE (~94% of CI
+# compiles were uncacheable because of this). Disabling the scan is safe (no modules)
+# and a double win: faster cold builds + ccache can finally cache the compiles.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Default visibility to hidden on shared builds (only DSS_EXPORT symbols are public)
