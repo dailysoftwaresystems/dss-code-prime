@@ -4,7 +4,8 @@
 design v2 folds every finding (§4 ledger). User signed off the corrected six-family scope (4th
 confirmation) + authorized "as many cycles as needed"; backup branch
 `feature/0-0-2-p14-before-rework` exists for comparison. **Stage 1 (semantic `subtreeType`) ✅
-DONE** (output-identity 375 ctest + deep corpus pin) — Stage 2 (`pass1`/`pass2`) next.
+DONE**; **Stage 2 (semantic `pass1`/`pass2`) ✅ DONE** (output-identity 376 ctest +
+deep nested-block scope pin) — Stage 3 (`cst_to_hir` expr) next.
 
 ## §0 — Decision provenance & HONEST (corrected) scope
 
@@ -77,7 +78,7 @@ frame kind.
 | # | Stage | Risk | Per-stage gate (all + full 374 ctest green = OUTPUT-IDENTITY) |
 |---|---|---|---|
 | 1 | semantic `subtreeType` ✅ **DONE** | low | OUTPUT-IDENTITY 374→375 ctest green + corpus `deep_subtree_type_dim` (200-deep parens around a `long long` in an array-dim `sizeof`, typed at Pass-1.5 on the UNSTAMPED CST → 8 → exit 42, value-sensitive). **Validation deviation (honest):** the planned isolated small-stack unit pin (SF-4) was infeasible — BOTH `subtreeType` AND `EngineState` are anonymous-namespace (no test-callable seam without API pollution). Used a deep-CORRECTNESS corpus pin instead (big stack); the small-stack FLAT property is validated end-to-end at Stage 7. Used deep PARENS (Wrapper arm, ~150ms) not deep BINARY (parser-bound: 18s at depth 60 — the parser super-linearity this arc fixes at Stage 5, so a deep-binary pin is impractical until then). |
-| 2 | semantic `pass1`/`pass2` | low-med | synthetic deep STATEMENT-nested tree walked on a small stack |
+| 2 | semantic `pass1`/`pass2` ✅ **DONE** | low-med | OUTPUT-IDENTITY 375→376 ctest green + corpus `deep_stmt_scope_walk` (150 nested block scopes; pass1 builds a 150-deep scope chain, pass2 walks it + the innermost `return base` resolves through all 150 scopes → exit 42, value-sensitive). Conversion: extracted per-node helpers (`pass1Node` returns the child scope `here`; `pass2Post` is the post-child handling, where a `return;` ends that node's post-work not the whole walk) + explicit-stack drivers — `pass1` pre-order (pop→work→push children), `pass2` two-phase post-order (phase 0 resolve scope/loopDepth+push children, phase 1 `pass2Post`); children pushed in reverse for source-order LIFO; realloc-safe (copy frame fields before any push_back). Deep BLOCKS (parse O(N), no expr speculation) not deep binary. |
 | 3 | cst_to_hir `lowerExpr`+`lowerFlatExpr` ({Expr,Lvalue}) | med | synthetic deep tree; HIR arena/ExprStmt-order differential pin for comma/assign/post-inc |
 | 3b | cst_to_hir statement tier ({Stmt}) | med | synthetic deep block/if/while nest lowered on a small stack |
 | 4 | hir_to_mir `lowerExpr`+`lowerLvalueAddress` ({Value,Address}) | **high** | **MIR differential pin: block-emission order + phi-predecessor IDs** for nested `?:`/`&&`/`\|\|`/member-index chains (the exact thing a phase bug corrupts) |

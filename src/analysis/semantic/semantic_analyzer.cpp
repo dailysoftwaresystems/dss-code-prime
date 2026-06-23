@@ -1504,10 +1504,14 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
 }
 
 // ── Pass 1: pre-order — mint decls + push/pop scopes + const marking ───────
-void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-           NodeId node, ScopeId current) {
-    if (!node.valid()) return;
-    if (isEmptySpace(tree.flags(node))) return;
+// pass1 PER-NODE work for ONE node — extracted for the iterative driver below
+// (D-PARSE-DEEP-NEST-RECURSION-MEMORY plan 24 Stage 2). PRE-order: resolves this
+// node's child scope `here` (a pushScope for a scope-rule node, else `current`)
+// and binds its declarations; the driver then walks the children under the
+// returned `here`. Byte-identical to the prior pre-child body of `pass1`.
+[[nodiscard]] ScopeId
+pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+          NodeId node, ScopeId current) {
     auto const k = tree.kind(node);
 
     ScopeId here = current;
@@ -1842,8 +1846,29 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         }
     }
 
-    for (auto const& child : tree.children(node)) {
-        pass1(s, cfg, tree, child, here);
+    return here;
+}
+
+// pass1 — iterative whole-tree PRE-ORDER walk (D-PARSE-DEEP-NEST-RECURSION-
+// MEMORY plan 24 Stage 2): an explicit heap work-stack replaces host recursion.
+// Each node: skip if invalid / empty-space, else run `pass1Node` (scope push +
+// declaration binding) and push its children under the returned scope `here`, in
+// SOURCE order. OUTPUT-IDENTICAL — pre-order scope/bind, left-to-right children.
+void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+           NodeId rootNode, ScopeId rootCurrent) {
+    std::vector<std::pair<NodeId, ScopeId>> stack;
+    stack.push_back({rootNode, rootCurrent});
+    while (!stack.empty()) {
+        // Copy the frame out BEFORE any push_back (which can realloc the stack).
+        auto const [node, current] = stack.back();
+        stack.pop_back();
+        if (!node.valid() || isEmptySpace(tree.flags(node))) continue;
+        ScopeId const here = pass1Node(s, cfg, tree, node, current);
+        // Push children so they POP in source (left-to-right) order.
+        std::span<NodeId const> const kids = tree.children(node);
+        for (std::size_t i = kids.size(); i-- > 0;) {
+            stack.push_back({kids[i], here});
+        }
     }
 }
 
@@ -2526,28 +2551,16 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
 // `loopDepth` (GAP C) is the count of enclosing `loopRules` subtrees the
 // walk is currently inside; a `loopControls` node at depth 0 is outside
 // any loop and emits S_ControlOutsideLoop.
-void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-           NodeId node, ScopeId current, int loopDepth) {
-    if (!node.valid()) return;
-    if (isEmptySpace(tree.flags(node))) return;
+// pass2 POST-CHILD work for ONE node — extracted for the iterative driver below
+// (D-PARSE-DEEP-NEST-RECURSION-MEMORY plan 24 Stage 2). Runs AFTER all
+// descendants are walked; `here` is this node's OWN resolved scope and
+// `loopDepth` its OWN enclosing-loop depth (both threaded by the driver). A
+// `return;` here ends THIS node's post-work and the driver loop continues —
+// exactly as the recursive `return;` did. The body is byte-identical to the
+// prior post-child portion of `pass2`.
+void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+               NodeId node, ScopeId here, int loopDepth) {
     auto const k = tree.kind(node);
-    ScopeId here = current;
-
-    if (k == NodeKind::Internal && s.idx().scopeByRule.contains(tree.rule(node).v)) {
-        here = childScopeFor(s, tree, node, current);
-    }
-
-    // GAP C: entering a loop-context subtree raises the depth for the
-    // children walk. Detected on the node itself; the increment applies to
-    // descendants (a break/continue is valid anywhere inside the subtree).
-    int const childLoopDepth =
-        (k == NodeKind::Internal && s.idx().loopByRule.contains(tree.rule(node).v))
-            ? loopDepth + 1
-            : loopDepth;
-
-    for (auto const& child : tree.children(node)) {
-        pass2(s, cfg, tree, child, here, childLoopDepth);
-    }
 
     // Literal typing.
     if (k == NodeKind::Token) {
@@ -3259,6 +3272,65 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         d.span     = tree.span(node);
         d.actual   = std::string{tree.text(node)};
         s.reporter.report(std::move(d));
+    }
+}
+
+// pass2 — iterative whole-tree POST-ORDER walk (D-PARSE-DEEP-NEST-RECURSION-
+// MEMORY plan 24 Stage 2): an explicit heap work-stack replaces host recursion
+// so a deeply-nested tree (statements OR expressions) carries flat O(N)
+// host-stack cost. Two phases per node — phase 0 resolves its scope `here` +
+// `childLoopDepth` (the prior pre-child setup) and pushes its children in SOURCE
+// order; phase 1 runs `pass2Post` (the prior post-child handling). OUTPUT-
+// IDENTICAL to the recursion: same pre-order scope resolution, same left-to-
+// right child order, same post-order node handling.
+void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+           NodeId rootNode, ScopeId rootCurrent, int rootLoopDepth) {
+    struct Frame {
+        NodeId       node;
+        ScopeId      current;
+        int          loopDepth;
+        ScopeId      here;       // resolved at phase 0, consumed at phase 1
+        std::uint8_t phase;
+    };
+    std::vector<Frame> stack;
+    stack.push_back(Frame{rootNode, rootCurrent, rootLoopDepth, {}, 0});
+    while (!stack.empty()) {
+        // Copy out the fields we need BEFORE any push_back (which can realloc
+        // and dangle a reference into `stack`).
+        Frame const f = stack.back();
+        if (f.phase == 0) {
+            if (!f.node.valid() || isEmptySpace(tree.flags(f.node))) {
+                stack.pop_back();
+                continue;
+            }
+            auto const k = tree.kind(f.node);
+            ScopeId here = f.current;
+            if (k == NodeKind::Internal
+                && s.idx().scopeByRule.contains(tree.rule(f.node).v)) {
+                here = childScopeFor(s, tree, f.node, f.current);
+            }
+            // GAP C: entering a loop-context subtree raises the depth for the
+            // children walk (a break/continue is valid anywhere inside it).
+            int const childLoopDepth =
+                (k == NodeKind::Internal
+                 && s.idx().loopByRule.contains(tree.rule(f.node).v))
+                    ? f.loopDepth + 1
+                    : f.loopDepth;
+            // Record `here` + advance to the post phase BEFORE pushing children.
+            stack.back().here  = here;
+            stack.back().phase = 1;
+            // Push children so they POP in source (left-to-right) order: a LIFO
+            // stack needs reverse insertion. Each child inherits `here` as its
+            // `current` and `childLoopDepth` as its `loopDepth`, exactly as the
+            // recursive `pass2(child, here, childLoopDepth)` passed.
+            std::span<NodeId const> const kids = tree.children(f.node);
+            for (std::size_t i = kids.size(); i-- > 0;) {
+                stack.push_back(Frame{kids[i], here, childLoopDepth, {}, 0});
+            }
+        } else {
+            stack.pop_back();
+            pass2Post(s, cfg, tree, f.node, f.here, f.loopDepth);
+        }
     }
 }
 
