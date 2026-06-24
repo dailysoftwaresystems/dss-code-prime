@@ -74,6 +74,61 @@ TEST(LinkWriter, WritesBytesVerbatim) {
     EXPECT_EQ(read, image.bytes);
 }
 
+// ── D-OUTPUT-EXEC-BIT: executable-flavor output carries the +x bit ──────
+//
+// The `executable` flag (the caller derives it from
+// `ObjectFormatSchema::isImageFlavor()`) controls whether the written file
+// gets the POSIX execute bits. POSIX-gated because the bit is a Unix concept
+// (Windows/PE ignores Unix modes); on the POSIX CI legs this is the
+// red-on-disable witness — remove the `permissions(… add)` call in
+// writer.cpp and the `executable=true` arm goes RED (file stays 0644).
+#ifndef _WIN32
+TEST(LinkWriter, ExecutableOutputCarriesExecuteBitPosix) {
+    ScratchDir scratch{Location::Temp, "link-writer-exec"};
+    auto const image = makeImage({0x7f, 'E', 'L', 'F', 0x02, 0x01, 0x01, 0x00});
+
+    // executable=true → owner/group/others execute bits all present.
+    {
+        auto const out = scratch.path() / "runnable";
+        DiagnosticReporter rep;
+        ASSERT_TRUE(linker::writeImage(image, out, rep, /*executable=*/true));
+        EXPECT_EQ(rep.errorCount(), 0u);
+        auto const p = fs::status(out).permissions();
+        EXPECT_NE(p & fs::perms::owner_exec, fs::perms::none)
+            << "an executable output must carry owner-exec so `./out` runs "
+               "without a manual chmod (D-OUTPUT-EXEC-BIT)";
+        EXPECT_NE(p & fs::perms::group_exec, fs::perms::none);
+        EXPECT_NE(p & fs::perms::others_exec, fs::perms::none);
+    }
+
+    // executable=false (the default) → NO execute bit: a plain artifact is
+    // left at the host umask. Pins the CONDITIONALITY — unconditionally
+    // setting +x would make this arm RED.
+    {
+        auto const out = scratch.path() / "plain";
+        DiagnosticReporter rep;
+        ASSERT_TRUE(linker::writeImage(image, out, rep, /*executable=*/false));
+        auto const p = fs::status(out).permissions();
+        EXPECT_EQ(p & fs::perms::owner_exec, fs::perms::none)
+            << "a non-executable output must NOT be marked executable";
+    }
+}
+#endif
+
+// Host-independent guard: the `executable=true` path is reachable and clean
+// on EVERY platform (on Windows it is a no-op, but must not error/fail the
+// write). Runs on the local MSVC gate, where the POSIX bit-assertion above
+// is skipped.
+TEST(LinkWriter, ExecutableWriteSucceedsEveryPlatform) {
+    ScratchDir scratch{Location::Temp, "link-writer-exec-smoke"};
+    auto const out = scratch.path() / "smoke";
+    auto const image = makeImage({0x01, 0x02, 0x03, 0x04});
+    DiagnosticReporter rep;
+    EXPECT_TRUE(linker::writeImage(image, out, rep, /*executable=*/true));
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "setting the exec bit must not fail a write on any host";
+}
+
 TEST(LinkWriter, WritesAnyFormatBytesVerbatim) {
     // pr-test-analyzer Gap 5 fold: writeImage is format-blind
     // by construction (just dumps `image.bytes`). Pin this with

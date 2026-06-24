@@ -3,9 +3,11 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_pass_util.hpp"
 
+#include <filesystem>
 #include <fstream>
 #include <ios>
 #include <string>
+#include <system_error>
 
 // Linker image file emission — plan 14 LK10 cycle 1 substrate
 // implementation. See writer.hpp for the contract.
@@ -49,7 +51,8 @@ void emit(DiagnosticReporter& reporter,
 
 bool writeImage(LinkedImage const&             image,
                 std::filesystem::path const&   path,
-                DiagnosticReporter&            reporter) {
+                DiagnosticReporter&            reporter,
+                bool                           executable) {
     // Precondition 1: parallel-index gate. Writing an image whose
     // `ok()` is false would silently ship bytes that don't match
     // the expected function count. Fail loud here so a
@@ -148,6 +151,36 @@ bool writeImage(LinkedImage const&             image,
                  + "' (deferred I/O error on flush — file on disk "
                    "may be incomplete).");
         return false;
+    }
+    // D-OUTPUT-EXEC-BIT: an EXECUTABLE-flavor output must carry the POSIX
+    // execute bit so the produced binary runs directly (`./out`) without a
+    // manual `chmod +x` (qemu's prepare_binprm + the kernel's execve both
+    // reject a file lacking `mode & 0111`). Add owner/group/others-exec on
+    // top of whatever the umask left (`perm_options::add`); a no-op on
+    // Windows, where PE ignores Unix modes. Best-effort by design: the bytes
+    // are already safely flushed above, so a failure to set the bit is a
+    // WARNING (the artifact is valid — it just needs a manual chmod), NOT a
+    // write failure. `executable` is the CALLER's config-driven decision
+    // (`ObjectFormatSchema::isImageFlavor()`); this code never inspects the
+    // format itself, staying format-blind.
+    if (executable) {
+        std::error_code ec;
+        std::filesystem::permissions(
+            path,
+            std::filesystem::perms::owner_exec
+                | std::filesystem::perms::group_exec
+                | std::filesystem::perms::others_exec,
+            std::filesystem::perm_options::add, ec);
+        if (ec) {
+            dss::report(reporter, DiagnosticCode::K_ImageExecBitFailed,
+                        DiagnosticSeverity::Warning,
+                        std::string{"link::writeImage: wrote '"}
+                            + pathForDiag(path)
+                            + "' but could not set its POSIX execute bit ("
+                            + ec.message()
+                            + "); the binary is valid but needs `chmod +x` to "
+                              "run directly.");
+        }
     }
     return true;
 }
