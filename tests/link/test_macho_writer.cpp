@@ -347,6 +347,65 @@ TEST(MachOFormatJson, NonZeroVirtualAddressRejectedOnMhObject) {
     ASSERT_FALSE(r.has_value());
 }
 
+// ── D-LK10-ENTRY-MACHO-SECTIONVA-COMPUTED: schema __text VA inconsistent
+//    with the computed textFileOff fails loud ───────────────────────────
+
+TEST(MachOExecWriter, SchemaTextVaInconsistentWithTextFileOffFailsLoud) {
+    // The exec walker derives textFileOff = alignUp(headerAndCmds,
+    // segmentPageSize) but trusts the schema's __text.virtualAddress to equal
+    // pageZeroSize + textFileOff. This synthetic exec format declares a VA of
+    // pageZeroSize + 0x2000 (TWO segmentPageSizes — congruent, so validate()
+    // accepts it: validate only checks `>= pageZeroSize` + `% segmentPageSize`,
+    // NOT this stronger equality), but a trivial module's header+load-commands
+    // fit in ONE page so the real textFileOff is 0x1000. The walker must FAIL
+    // LOUD on the mismatch rather than emit a section_64.addr dyld would
+    // mis-map. RED-on-disable: without the `textSegmentVaMatchesFileOff` check
+    // the encode SUCCEEDS and `bytes.empty()` flips to false.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": { "name": "macho-va-inconsistent-test", "version": "1.0", "kind": "macho" },
+      "dataModel": "LP64",
+      "bitFieldStrategy": "gnu_packed",
+      "entryPoint": "",
+      "externCallDispatch": "direct-plt",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "bindNow": true
+      },
+      "sections": [
+        { "kind": "text", "name": "__text", "segment": "__TEXT", "type": 2147484672, "flags": 0, "addrAlign": 16, "entrySize": 0, "virtualAddress": 4294975488 }
+      ],
+      "relocations": [
+        { "name": "X86_64_RELOC_BRANCH", "kind": 1, "nativeId": 369098752 },
+        { "name": "X86_64_RELOC_UNSIGNED_8", "kind": 2, "nativeId": 100663296 },
+        { "name": "X86_64_RELOC_UNSIGNED_4", "kind": 3, "nativeId": 33554432 }
+      ]
+    })");
+    ASSERT_TRUE(r.has_value())
+        << "the synthetic exec format must PASS validate (VA 0x100002000 is "
+           "congruent + >= pageZeroSize); the textFileOff inequality is exactly "
+           "what validate does NOT check";
+    auto const& fmt = *r.value();
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, fmt, rep);
+    EXPECT_TRUE(bytes.empty())
+        << "an inconsistent schema VA must abort the encode, not emit a "
+           "mis-mapped binary";
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode)
+        << "must fail loud with the __text VA / textFileOff inconsistency "
+           "diagnostic";
+}
+
 // ── Non-zero addend fails loud (Mach-O has no Rela addend) ─────
 
 TEST(MachOWriter, NonZeroAddendFailsLoud) {
