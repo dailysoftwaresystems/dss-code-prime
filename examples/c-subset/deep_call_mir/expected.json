@@ -1,0 +1,15 @@
+{
+  "$comment": "Plan 24 (hir_to_mir Call residual) end-to-end witness for the now-iterative Call arm of the HIR->MIR expression lowerer (`runExprDriver`'s ValueFrame::Kind::Call in src/mir/lowering/hir_to_mir.cpp). `id` is the identity function `int id(int x){return x;}`; main returns `id(id(...id(v)...))` — a 150-deep chain of single-argument calls (just under the parser's 256 maxExpressionDepth cap) whose innermost argument is the RUNTIME local `v` (= 42), NOT a constant, so the value is genuinely threaded through 150 real calls (a constant innermost arg would let const-fold collapse the chain). Each call's sole argument is itself a call, so before this change the HIR->MIR Call arm lowered each argument via `lowerExpr(arg)`, re-entering `runExprDriver` 150 host frames deep DURING HIR->MIR; now the Call frame on the driver's explicit work-stack carries that descent (callee built first, then the scalar argument lowered through the SAME work-stack) with FLAT O(1) host-stack cost per level (only the heap `work` + `callCtxs` vectors grow). The companion deep_call_chain witnesses the CST->HIR Call flatten; THIS example witnesses the HIR->MIR Call flatten specifically (the sibling deep_mir_expr covers the HIR->MIR straight-line unary/binary arms). Because `id` returns its argument unchanged, the whole chain evaluates to `v` = 42 — the return value, which is miscompile-sensitive: a dropped/duplicated call, a callee/argument build mis-order, or a wrong argument operand would flip the exit code. The whole front-end build (semantic + CST->HIR + HIR->MIR) runs on the 64 MiB worker stack (core/substrate/large_stack_call via compile_pipeline's buildCuMir), so 150 levels of HIR->MIR work is well within budget either way; this example is the end-to-end RUN/correctness witness (the flattened Call arm produces correct, runnable code through the FULL pipeline), and the strict byte-identity-at-depth witness lives in the unit pin IterativeDeepCallChainLowersFlatAndByteIdentical. The optimizedPipelines arm proves the lowered MIR survives the full release pipeline (the calls to a non-inlined identity function remain a genuine call chain through the optimized pipeline). arm64 runs under qemu; macho on the macos-latest leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}

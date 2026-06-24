@@ -578,6 +578,17 @@ struct Lowerer {
                 // already pulled it from the callee's FnSig at lowering
                 // time). A void-returning callee has typeId == InvalidType,
                 // which Call's MirResultRule::Optional accepts.
+                //
+                // Plan 24 (hir_to_mir Call residual): this RECURSIVE body is now
+                // the byte-identical FALLBACK — it drives the SAME shared helpers
+                // (`callSetup` / `processOneCallArg` / `finishScalarCallArg` /
+                // `finishCall`) as the iterative `runExprDriver` Call frame, which
+                // is what actually lowers a call at runtime (so a deep
+                // `f(f(f(…)))` chain carries flat host-stack cost — only the arg
+                // VALUE-lowering recursion is hoisted; the struct ABI synthesis
+                // stays inline). The two stay in lockstep because the emission
+                // sequence lives in ONE place. This arm is unreachable via the
+                // driver but kept as the recursive source of truth.
                 auto kids = hir.children(node);
                 if (kids.empty()) {
                     unsupported(node, "malformed Call (no callee child)");
@@ -585,430 +596,40 @@ struct Lowerer {
                 }
                 MirInstId const callee = lowerExpr(kids[0]);
                 if (!callee.valid()) return InvalidMirInst;
-                std::vector<MirInstId> operands;
-                operands.reserve(kids.size());
-                operands.push_back(callee);
-                // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a struct/union
-                // RETURN by value is classified + synthesized below, AFTER the
-                // callee-variadic resolution (the sret hidden pointer prepends the
-                // first arg, so it must be in place before the arg loop runs).
-                // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): resolve whether the
-                // callee is variadic (through one Ptr wrapper) BEFORE lowering
-                // args, so a by-value struct ARG to a variadic function is
-                // fail-loud this phase (its register-piece expansion would
-                // desync the prefix-sum Arg-ordinal accounting from variadic
-                // marshalling — FC12). The callPayload block below recomputes
-                // this for the variadic-count stamp; kept separate to avoid
-                // perturbing that audited path.
-                TypeId byvalCalleeSig = hir.typeId(kids[0]);
-                if (byvalCalleeSig.valid()
-                    && interner.kind(byvalCalleeSig) == TypeKind::Ptr) {
-                    auto const w = interner.operands(byvalCalleeSig);
-                    if (!w.empty()) byvalCalleeSig = w[0];
-                }
-                bool const calleeVariadic =
-                    byvalCalleeSig.valid()
-                    && interner.kind(byvalCalleeSig) == TypeKind::FnSig
-                    && interner.fnIsVariadic(byvalCalleeSig);
-                // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value
-                // struct/union RETURN. Classify it; allocate the result slot `R`;
-                // for sret (class MEMORY, >16B) prepend `R` as the hidden first
-                // arg so the arg loop below appends the real args AFTER it (the
-                // callee receives the pointer as arg 0 and writes the result
-                // through it). The `abi` + `R` are consumed at the Call-emit site.
-                std::optional<AbiPassing> structRetAbi;
-                MirInstId structRetSlot = InvalidMirInst;
-                if (t.valid()
-                    && (interner.kind(t) == TypeKind::Struct
-                        || interner.kind(t) == TypeKind::Union)) {
-                    structRetAbi = byValueClassify(t);
-                    if (!structRetAbi.has_value()) {
-                        unsupported(node,
-                            "returning a by-value struct/union is not supported "
-                            "by this target's calling convention "
-                            "(D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
-                        return InvalidMirInst;
-                    }
-                    structRetSlot = freshAggregateTemp(t);
-                    if (!structRetSlot.valid()) {
-                        unsupported(node,
-                            "by-value struct/union return requires a sizeable "
-                            "layout (complete type)");
-                        return InvalidMirInst;
-                    }
-                    if (structRetAbi->kind == AbiPassing::Kind::ByReference)
-                        operands.push_back(structRetSlot);  // hidden sret pointer
-                }
-                // FC12a-struct: the OPERAND-unit boundary for the variadic payload.
-                // `operandsBeforeArgs` is the operand count BEFORE the first arg.
-                // We snapshot `fixedOperandCount` = (operands.size() -
-                // operandsBeforeArgs) the instant the LAST FIXED arg's operands are
-                // appended (a by-value struct fixed param expands to several scalar
-                // operands, so this is NOT the param count — see call_payload.hpp).
-                //
-                // Mirror lir_callconv's firstArgIdx: callee is always leading; a
-                // ByReference sret pointer is a real ARG (argIdx 0) for the hidden-arg
-                // convention (counted in fixedOperandCount, firstArgIdx == 1), but is
-                // routed to the indirect-result register (x8) for the x8-IRR convention
-                // (NOT an arg → excluded, firstArgIdx == 2). config.aggregateSretViaHiddenArg
-                // distinguishes them. Capturing operands.size() here (post-sret-push)
-                // would WRONGLY exclude the hidden-arg sret pointer from fixedOperandCount,
-                // making it one too small → the last fixed operand misclassified as the
-                // first vararg → AL set one too high (silent miscompile).
-                std::size_t const operandsBeforeArgs =
-                    1 /*callee*/
-                  + ((structRetAbi.has_value()
-                      && structRetAbi->kind == AbiPassing::Kind::ByReference
-                      && !config.aggregateSretViaHiddenArg) ? 1u : 0u);
-                // The number of FIXED params of the callee (0 if the callee is not a
-                // resolvable FnSig). `byvalCalleeSig` was already dereferenced
-                // through one Ptr wrapper above.
-                std::size_t const fnParamsSize =
-                    (byvalCalleeSig.valid()
-                     && interner.kind(byvalCalleeSig) == TypeKind::FnSig)
-                        ? interner.fnParams(byvalCalleeSig).size()
-                        : 0;
-                std::size_t fixedOperandCount = 0;
-                bool fixedOperandCountStamped = false;
-                // Running per-class register-passed-operand counts for the WHOLE
-                // call, in operand order — predicts lir_callconv's per-class
-                // assignment so a struct vararg's eightbyte pieces can be checked
-                // against the remaining arg registers (the atomic-fit check). A
-                // ByReference sret hidden pointer (x86 hidden-arg convention)
-                // consumes arg GPR 0; an x8-indirect-result sret consumes NO arg GPR
-                // (it rides the dedicated IRR). Maintained for EVERY call so the
-                // bookkeeping is uniform; only the variadic checks below consult it.
-                std::uint32_t runGpr = 0, runFpr = 0;
-                if (structRetAbi.has_value()
-                    && structRetAbi->kind == AbiPassing::Kind::ByReference
-                    && config.aggregateSretViaHiddenArg)
-                    runGpr = 1;
-                for (std::size_t i = 1; i < kids.size(); ++i) {
-                    TypeId const argTy = hir.typeId(kids[i]);
-                    if (argTy.valid()) {
-                        TypeKind const ak = interner.kind(argTy);
-                        if (ak == TypeKind::Struct || ak == TypeKind::Union) {
-                            // Classify the by-value struct/union arg. An
-                            // unimplemented CC strategy ⇒ fail loud (never a silent
-                            // wrong-ABI pass).
-                            auto const abi = byValueClassify(argTy);
-                            if (!abi.has_value()) {
-                                unsupported(kids[i],
-                                    "passing a struct/union BY VALUE is not "
-                                    "supported by this target's calling "
-                                    "convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
-                                return InvalidMirInst;
-                            }
-                            if (abi->kind == AbiPassing::Kind::ByReference) {
-                                // MEMORY class (>16B / empty). At the VARIADIC boundary
-                                // SysV §3.2.3/§3.5.7 requires it BY VALUE in the overflow
-                                // area UNCONDITIONALLY (even with free arg registers) —
-                                // the Option-C carrier (D-FC12A-VARIADIC-MEMORY-CLASS-
-                                // STRUCT). runGpr/runFpr are NOT advanced (it's on the
-                                // stack, not in a register). The NON-variadic ByReference
-                                // path keeps the existing hidden-pointer convention via
-                                // appendByValueArg (a single GPR pointer operand).
-                                if (calleeVariadic) {
-                                    // The carrier is CC-neutral, but the va_list layout
-                                    // must be present for a variadic callee (it is the
-                                    // overflow geometry source); absent ⇒ struct varargs
-                                    // are impossible on this CC. Mirror the Win64/AAPCS64
-                                    // strategy guards below so a non-SysV variadic struct
-                                    // vararg fails loud at ITS anchor (the overflow
-                                    // placement + va_arg read for those CCs are their own
-                                    // cycles, reusing this carrier).
-                                    if (!config.vaListLayout.has_value()) {
-                                        unsupported(kids[i],
-                                            "passing a struct/union BY VALUE to a "
-                                            "variadic function requires the CC's "
-                                            "'vaListLayout' (overflow geometry) which "
-                                            "this target does not declare "
-                                            "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
-                                        return InvalidMirInst;
-                                    }
-                                    VaListLayout const& vlMem = *config.vaListLayout;
-                                    if (vlMem.strategy
-                                        == VaListStrategy::HomogeneousPointer) {
-                                        // Win64 (ms_x64) ByReference vararg
-                                        // (D-FC12B-WIN64-STRUCT-VARARG): a non-pow2/>8B
-                                        // struct rides as a hidden POINTER to a caller
-                                        // copy in exactly ONE arg slot — IDENTICAL to
-                                        // the non-variadic ByReference path (Win64 has
-                                        // no SysV MEMORY-class-to-stack rule; the slot
-                                        // is register-or-stack BY POSITION, placed by
-                                        // lir_callconv's slot-aligned walk like any GPR
-                                        // operand). appendByValueArg's ByReference arm
-                                        // copies to a callee-owned temp + pushes the
-                                        // temp POINTER (1 GPR-class operand). The
-                                        // `runGpr += 1` is INERT for Win64 slot
-                                        // indexing: under HomogeneousPointer the slot
-                                        // index is lir_callconv's positional
-                                        // slot-aligned walk, and runGpr is consulted
-                                        // ONLY by the SysV gpSaveCount split check (the
-                                        // InRegisters `else` arm below) which this
-                                        // ByReference arm never reaches. We advance it
-                                        // anyway for uniformity with the SysV/scalar
-                                        // arms (a single running-register cursor), but
-                                        // it does NOT drive Win64 placement. NO carrier,
-                                        // NO force-to-stack — fall through to the shared
-                                        // fixedOperandCount stamp + continue below.
-                                        if (!appendByValueArg(operands, kids[i],
-                                                              argTy, *abi))
-                                            return InvalidMirInst;
-                                        runGpr += 1;
-                                    } else if (vlMem.strategy
-                                        == VaListStrategy::Aapcs64DualCursor) {
-                                        // AAPCS64 (D-FC12C-AAPCS64-HFA-STRUCT-VARARG):
-                                        // a >16B (ByReference) struct vararg rides as a
-                                        // hidden POINTER in exactly ONE GR arg slot —
-                                        // IDENTICAL to the non-variadic ByReference path
-                                        // (AAPCS64 §B has NO SysV MEMORY-class-to-stack
-                                        // rule for ByReference: the pointer is placed in
-                                        // the next x-register, or on the stack BY
-                                        // POSITION once the GR pool is exhausted — by
-                                        // lir_callconv's positional walk, like any GPR
-                                        // operand). So this MUST use appendByValueArg
-                                        // (one pointer operand), NOT appendByValueStackArg
-                                        // (which would force the pointer ITSELF into the
-                                        // overflow area — a silent ABI mismatch, hazard
-                                        // H7). Advance runGpr by 1 (the pointer consumes
-                                        // one GR slot) so a SUBSEQUENT InRegisters struct
-                                        // vararg's atomic-fit check sees the consumed slot.
-                                        if (!appendByValueArg(operands, kids[i],
-                                                              argTy, *abi))
-                                            return InvalidMirInst;
-                                        runGpr += 1;
-                                    } else if (vlMem.strategy
-                                        == VaListStrategy::SysVRegisterSave) {
-                                        // SysV MEMORY class → the Option-C overflow
-                                        // carrier, unconditionally by value on the stack.
-                                        if (!appendByValueStackArg(operands, kids[i],
-                                                                   argTy))
-                                            return InvalidMirInst;
-                                        // NOT counted in runGpr/runFpr — it's in the
-                                        // overflow (stack) area, consuming no register.
-                                    } else {
-                                        unsupported(kids[i],
-                                            "passing a struct/union BY VALUE to a "
-                                            "variadic function under this va_list "
-                                            "strategy is not realized "
-                                            "(internal: unknown VaListStrategy)");
-                                        return InvalidMirInst;
-                                    }
-                                } else {
-                                    if (!appendByValueArg(operands, kids[i], argTy, *abi))
-                                        return InvalidMirInst;
-                                    runGpr += 1;   // the pointer operand is GPR-class
-                                }
-                            } else {
-                                // InRegisters: count the eightbyte pieces per class.
-                                std::uint32_t numGp = 0, numFp = 0;
-                                for (AbiPiece const& p : abi->pieces) {
-                                    if (p.cls == AbiPieceClass::Fpr) ++numFp;
-                                    else ++numGp;
-                                }
-                                // Zero-piece InRegisters is a classifier invariant
-                                // violation (an empty struct should classify
-                                // ByReference). Fail loud rather than emit a 0-operand
-                                // arg / route a zero-piece carrier.
-                                if (numGp == 0 && numFp == 0) {
-                                    unsupported(kids[i],
-                                        "InRegisters struct/union arg has zero register "
-                                        "pieces (internal: classifier invariant "
-                                        "violated)");
-                                    return InvalidMirInst;
-                                }
-                                // A variadic callee struct arg needs the CC's
-                                // vaListLayout (the callee reads the struct vararg
-                                // through it); absent ⇒ struct varargs are impossible on
-                                // this CC. Non-variadic calls have no such requirement.
-                                if (calleeVariadic
-                                    && !config.vaListLayout.has_value()) {
-                                    unsupported(kids[i],
-                                        "passing a struct/union BY VALUE to a variadic "
-                                        "function requires the CC's 'vaListLayout' "
-                                        "(register-save geometry) which this target does "
-                                        "not declare "
-                                        "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
-                                    return InvalidMirInst;
-                                }
-                                // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS:
-                                // the ALL-OR-NOTHING register-exhaustion check, HOISTED
-                                // out of the `if (calleeVariadic)` gate so it runs for
-                                // EVERY call — the fix for the latent NON-variadic split
-                                // (a straddling fixed aggregate was pushed as per-
-                                // eightbyte pieces → lir_callconv split it across the
-                                // last register + the stack, non-conformant to SysV
-                                // §3.2.3 / AAPCS64 §B). If the pieces do not all fit the
-                                // remaining arg registers the WHOLE aggregate rides the
-                                // overflow area via the CC-neutral `ByValueStackArg`
-                                // carrier (lir_callconv places it all-or-nothing, never
-                                // split). INDEPENDENT-counter CCs only — Win64
-                                // (slotAligned) never straddles (one struct = one
-                                // positional slot, placed by lir_callconv's slot walk).
-                                // MF-A: the fit uses the CC's ARG register POOL counts
-                                // (argGprCount/argFprCount), the agnostic source — for a
-                                // variadic callee these equal the vaListLayout
-                                // save-counts, so the variadic placement is unchanged.
-                                // The unified `||` subsumes the old per-CC arms: an HFA
-                                // has numGp==0 (the GPR term inert), a ≤16B GPR struct
-                                // has numFp==0, SysV mixes both classes.
-                                bool const routeToStack = !config.argSlotAligned
-                                    && (runGpr + numGp > config.argGprCount
-                                        || runFpr + numFp > config.argFprCount);
-                                if (routeToStack) {
-                                    // Whole aggregate by value in the overflow area.
-                                    // Under an EXHAUST CC the carrier conveys which class
-                                    // to exhaust so lir_callconv clamps its ACTUAL arg
-                                    // cursor too (a straddling aggregate is pure-class:
-                                    // an HFA → FPR, a ≤16B GPR struct → GPR). SysV → none
-                                    // (the carrier already doesn't advance the cursor =
-                                    // backfill).
-                                    std::uint8_t const exhaustClass =
-                                        config.aggregateStackExhaustsRegisters
-                                            ? (numFp > 0 ? kByValueStackArgExhaustFpr
-                                                         : kByValueStackArgExhaustGpr)
-                                            : kByValueStackArgExhaustNone;
-                                    if (!appendByValueStackArg(operands, kids[i], argTy,
-                                                               exhaustClass))
-                                        return InvalidMirInst;
-                                    // EXHAUST-or-BACKFILL the overflowed class — the
-                                    // CALLER mirror of receiveByValueParam: AAPCS64 sets
-                                    // NGRN/NSRN ← pool (clamp; a later arg also stacks),
-                                    // SysV leaves the cursor (backfill; a later smaller
-                                    // arg reuses the leftover registers). gcc
-                                    // aarch64_layout_arg vs function_arg_advance_64;
-                                    // config-driven, never an arch identity branch. Must
-                                    // match the callee so caller/callee + va_start agree.
-                                    if (config.aggregateStackExhaustsRegisters) {
-                                        if (runGpr + numGp > config.argGprCount)
-                                            runGpr = config.argGprCount;
-                                        if (runFpr + numFp > config.argFprCount)
-                                            runFpr = config.argFprCount;
-                                    }
-                                } else {
-                                    // FC7 C1b / FC12a-struct: push each eightbyte piece
-                                    // as a scalar Call operand IN ORDER; lir_callconv
-                                    // assigns them to consecutive per-class arg
-                                    // registers. Advance the running per-class counts.
-                                    if (!appendByValueArg(operands, kids[i], argTy, *abi))
-                                        return InvalidMirInst;
-                                    runGpr += numGp;
-                                    runFpr += numFp;
-                                }
-                            }
-                            if (i == fnParamsSize) {
-                                fixedOperandCount =
-                                    operands.size() - operandsBeforeArgs;
-                                fixedOperandCountStamped = true;
-                            }
-                            continue;
-                        }
-                    }
-                    MirInstId const arg = lowerExpr(kids[i]);
+                CallLowerCtx ctx{.node = node, .resultTy = t};
+                if (!callSetup(callee, ctx)) return InvalidMirInst;
+                for (;;) {
+                    CallArgStep const step = processOneCallArg(ctx);
+                    if (step == CallArgStep::Error) return InvalidMirInst;
+                    if (step == CallArgStep::Done) break;
+                    if (step == CallArgStep::StructDone) continue;
+                    // ScalarPending: lower the in-flight scalar arg's VALUE
+                    // (recursively here; the driver frame routes it onto the
+                    // work-stack), then collect it.
+                    MirInstId const arg = lowerExpr(kids[ctx.argIdx]);
                     if (!arg.valid()) return InvalidMirInst;
-                    operands.push_back(arg);
-                    // A scalar arg consumes exactly one register of its class.
-                    if (argTy.valid()) {
-                        if (scalarArgClass(argTy) == AbiPieceClass::Fpr) ++runFpr;
-                        else ++runGpr;
-                    } else {
-                        ++runGpr;   // typeless fallback: treat as GPR
-                    }
-                    if (i == fnParamsSize) {
-                        fixedOperandCount = operands.size() - operandsBeforeArgs;
-                        fixedOperandCountStamped = true;
-                    }
+                    finishScalarCallArg(ctx, arg);
                 }
-                // Edge: a variadic callee with 0 fixed params (fnParamsSize == 0),
-                // or a call with fewer kids than fnParamsSize+1 — the loop never
-                // hit `i == fnParamsSize`. fixedOperandCount stays 0 (no fixed
-                // operands), which is correct for both shapes.
-                (void)fixedOperandCountStamped;
-                // D-LANG-VARIADIC (step 13.4): stamp the MIR Call's
-                // payload with the callee's variadic-shape bits. The
-                // callee HIR node's TypeId is its FnSig (for direct
-                // calls — `Ref` to a function symbol carries the
-                // symbol's FnSig type) OR a pointer-to-FnSig (for
-                // indirect calls). We read it through one optional
-                // pointer-deref to support both. A non-FnSig callee
-                // (lowering bug, or fn-pointer-to-non-fn — already
-                // caught at semantic) emits payload=0 (non-variadic).
-                // Post-13.4 audit-fold (HIGH-5): a Ptr with empty
-                // operands is structurally malformed (Ptr<*> always
-                // carries the pointee at operands[0]) — fail-loud
-                // rather than silently leave calleeTy pointing at
-                // the Ptr wrapper which would silently degrade the
-                // call to non-variadic.
-                std::uint32_t callPayload = 0;
-                TypeId calleeTy = hir.typeId(kids[0]);
-                if (calleeTy.valid()
-                    && interner.kind(calleeTy) == TypeKind::Ptr) {
-                    auto const operands_ = interner.operands(calleeTy);
-                    if (operands_.empty()) {
-                        unsupported(node,
-                            "Call callee has Ptr-typed FnSig with empty "
-                            "operands — interner invariant violated");
-                        return InvalidMirInst;
-                    }
-                    calleeTy = operands_[0];
-                }
-                if (calleeTy.valid()
-                    && interner.kind(calleeTy) == TypeKind::FnSig
-                    && interner.fnIsVariadic(calleeTy)) {
-                    // FC12a-struct: the payload's fixed count is now in OPERAND
-                    // units (the snapshot taken after the last fixed arg's operands
-                    // were appended), NOT the param count — a by-value struct fixed
-                    // param expands to several scalar register-piece operands.
-                    // The call_payload u32 encodes fixedOperandCount in bits 0..29
-                    // (mask 0x3FFF_FFFF). A count exceeding the 30-bit field would
-                    // silently truncate AND collide with the isVariadic bit;
-                    // practically unreachable (no call has 2^30 operands) but pin
-                    // the contract so a future bypass can't corrupt the payload.
-                    if (fixedOperandCount
-                        > ::dss::call_payload::kFixedOperandMask) {
-                        unsupported(node,
-                            "Call payload: fixed-operand count exceeds 30-bit "
-                            "encoding limit");
-                        return InvalidMirInst;
-                    }
-                    callPayload = ::dss::call_payload::encode(
-                        true, static_cast<std::uint32_t>(fixedOperandCount));
-                }
-                // FC7 C3 (AAPCS64/Apple x8 sret): when the by-value aggregate
-                // RETURN is class-MEMORY (ByReference) AND this CC carries the
-                // result pointer in a dedicated indirect-result register (x8, not
-                // a hidden arg), flag the call so lir_callconv ROUTES the prepended
-                // sret-pointer operand (operands[1]) to the IRR instead of arg0,
-                // and shifts the real-arg index past it. Bit-30; independent of the
-                // variadic bits already encoded above.
-                if (structRetAbi.has_value()
-                    && structRetAbi->kind == AbiPassing::Kind::ByReference
-                    && !config.aggregateSretViaHiddenArg)
-                    callPayload |= ::dss::call_payload::kIndirectResultBit;
-                // FC7 C1c: a by-value struct/union return materializes the call
-                // into its result slot `R` (sret pointer or eightbyte pieces) and
-                // yields `R`'s address — the aggregate-by-address value the
-                // consumers (assign/arg/member/return) expect.
-                if (structRetAbi.has_value())
-                    return emitStructReturningCall(node, operands, callPayload,
-                                                   *structRetAbi, structRetSlot);
-                return mir.addInst(MirOpcode::Call, operands, t, callPayload);
+                return finishCall(ctx);
             }
             case HirKind::IntrinsicCall: {
                 // children: [args...]; the intrinsic id lives in payload.
                 // MirOpcode::IntrinsicCall has the same Optional result rule.
+                // Plan 24: this recursive body is the byte-identical fallback for
+                // the driver's IntrinsicCall frame (all-scalar args; no callee
+                // child, no struct ABI). Emission order: lower each arg left→
+                // right, push, then emit the IntrinsicCall.
                 auto kids = hir.children(node);
-                std::vector<MirInstId> operands;
-                operands.reserve(kids.size());
+                CallLowerCtx ctx{.node = node, .resultTy = t,
+                                 .isIntrinsic = true, .intrinsicId = hir.payload(node)};
+                ctx.operands.reserve(kids.size());
                 for (HirNodeId argN : kids) {
                     MirInstId const arg = lowerExpr(argN);
                     if (!arg.valid()) return InvalidMirInst;
-                    operands.push_back(arg);
+                    ctx.operands.push_back(arg);
                 }
-                std::uint32_t const intrinsicId = hir.payload(node);
-                return mir.addInst(MirOpcode::IntrinsicCall, operands, t,
-                                   intrinsicId);
+                return mir.addInst(MirOpcode::IntrinsicCall, ctx.operands, t,
+                                   ctx.intrinsicId);
             }
             case HirKind::Ternary: {
                 // children: [cond, thenExpr, elseExpr]. Lower as a diamond
@@ -1643,11 +1264,21 @@ struct Lowerer {
             // with its sub-expression requests; the block handles + first-arm
             // value/predecessor it minted are carried in the frame fields below
             // (NEVER in a dangling `work.back()` reference) across phases.
-            Ternary, Logical, SeqExpr
+            Ternary, Logical, SeqExpr,
+            // Plan 24 (hir_to_mir Call residual): the {Call, IntrinsicCall}
+            // VALUE arms. A Call frame builds the callee (phase 0→1), runs the
+            // pre-loop setup (phase 1), then PUMPS each argument — a struct arg
+            // inline, a scalar arg through the work-stack (phase 2) — so a deep
+            // `f(f(f(…)))` chain carries flat host-stack cost. The accumulating
+            // per-call state lives in a `callCtxs` LIFO vector (a nested call's
+            // arg grows it mid-pump → a held reference would dangle); the frame
+            // references its ctx by the STABLE index `aux`.
+            Call, IntrinsicCall
         } kind;
         HirNodeId node;
         std::uint8_t phase;
         MirInstId c0;
+        std::uint32_t aux{};   // Call/IntrinsicCall: index into the local callCtxs
         // CFG-frame state, carried across phases (realloc-safe — they live in
         // the vector element, copied to locals before any push). Unused by the
         // straight-line/address kinds. `bb0/bb1/bb2` are the minted blocks
@@ -1675,6 +1306,12 @@ struct Lowerer {
     // (inst order, vreg ids, operands) is byte-identical to the recursive form.
     [[nodiscard]] MirInstId runExprDriver(HirNodeId node, bool rootWantAddr) {
         std::vector<ValueFrame> work;
+        // Plan 24: the flattened Call/IntrinsicCall accumulators (see `CallLowerCtx`
+        // + the ValueFrame::Kind::Call note). A LIFO stack parallel to `work`; a
+        // Call frame references its ctx by the STABLE index `aux` (a scalar arg
+        // that is itself a call grows this vector mid-pump, so the index — never a
+        // held reference — is what survives).
+        std::vector<CallLowerCtx> callCtxs;
         // Default-init: `request` ALWAYS assigns `result` for a delegated node,
         // and every pushed frame delivers into `result` before it is read (then
         // popped), so this sentinel never leaks.
@@ -1782,9 +1419,63 @@ struct Lowerer {
                     work.push_back({.kind = ValueFrame::Kind::SeqExpr,
                                     .node = n, .phase = 0});
                     return;
+                // Plan 24: a Call flattens its callee + each SCALAR argument
+                // through a Call frame (a struct arg stays inline in the pump) so
+                // a deep `f(f(f(…)))` chain carries flat host-stack cost. A
+                // malformed Call (no callee child) keeps the recursive body's
+                // fail-loud. IntrinsicCall is the all-scalar variant (no callee
+                // child, no struct ABI). Each pushes its ctx (stable index `aux`).
+                case HirKind::Call:
+                    if (!hir.children(n).empty()) {
+                        std::uint32_t const ctxIdx =
+                            static_cast<std::uint32_t>(callCtxs.size());
+                        callCtxs.push_back(CallLowerCtx{
+                            .node = n, .resultTy = hir.typeId(n)});
+                        work.push_back({.kind = ValueFrame::Kind::Call,
+                                        .node = n, .phase = 0, .aux = ctxIdx});
+                        return;   // phase 0 enters the callee
+                    }
+                    break;
+                case HirKind::IntrinsicCall: {
+                    std::uint32_t const ctxIdx =
+                        static_cast<std::uint32_t>(callCtxs.size());
+                    callCtxs.push_back(CallLowerCtx{
+                        .node = n, .resultTy = hir.typeId(n), .isIntrinsic = true,
+                        .intrinsicId = hir.payload(n)});
+                    callCtxs.back().argIdx = 0;   // intrinsic args start at 0
+                    work.push_back({.kind = ValueFrame::Kind::IntrinsicCall,
+                                    .node = n, .phase = 0, .aux = ctxIdx});
+                    return;
+                }
                 default: break;
             }
             result = lowerExprNode(n);   // delegate (terminal / CFG / by-address)
+        };
+
+        // Plan 24: the per-arg pump for a flattened Call (ctx at stable index
+        // `ctxIdx`). Advances `processOneCallArg` until a SCALAR arg is reached
+        // (struct args materialize inline there), which it routes through `request`
+        // (the Call frame's phase 2 then collects it). Returns true iff it entered
+        // a scalar arg's value-lowering (the caller must wait for it); false when
+        // all args are consumed (the caller finishes the call). `request` (if
+        // called) is the LAST action, so the dangling-`work.back()` rule holds.
+        // Re-addresses `callCtxs[ctxIdx]` fresh each access — a scalar arg that is
+        // itself a call grows `callCtxs`, so the INDEX is stable where a reference
+        // would dangle. Returns -1 to signal a fail-loud (the caller aborts).
+        auto const pumpCallArgs = [&](std::uint32_t ctxIdx) -> int {
+            for (;;) {
+                CallArgStep const step = processOneCallArg(callCtxs[ctxIdx]);
+                if (step == CallArgStep::Error) return -1;          // fail-loud
+                if (step == CallArgStep::Done) return 0;            // finish
+                if (step == CallArgStep::StructDone) continue;      // next arg
+                // ScalarPending: route the in-flight scalar arg's VALUE onto the
+                // work-stack (phase 2 collects it). `argIdx` stays put so phase 2
+                // derives the same arg child.
+                HirNodeId const argN =
+                    hir.children(callCtxs[ctxIdx].node)[callCtxs[ctxIdx].argIdx];
+                request(argN, false);
+                return 1;   // entered a scalar arg — wait
+            }
         };
 
         request(node, rootWantAddr);
@@ -2075,6 +1766,99 @@ struct Lowerer {
                     work.pop_back();
                 }
                 break;
+            case ValueFrame::Kind::Call:
+                // `f(a, b, …)`: build the callee FIRST (phase 0→1, matching the
+                // recursive arm's `callee = lowerExpr(kids[0])` which sequences
+                // before the args), run the pre-loop setup (phase 1: callee-
+                // variadic resolution + struct-return classification + sret Alloca
+                // — the ONLY MIR before the args, so it MUST emit here), then pump
+                // the arguments (a struct arg inline, a scalar arg through the
+                // work-stack at phase 2). When all args are consumed, `finishCall`.
+                // The per-arg pump + the immediate per-arg collect reproduce the
+                // recursive loop's emission order EXACTLY (the helpers are the one
+                // source of truth). The ctx lives at the stable index `f.aux`.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    HirNodeId const calleeN = hir.children(f.node)[0];
+                    request(calleeN, false);   // build callee — may invalidate `f`
+                } else if (f.phase == 1) {
+                    std::uint32_t const ctxIdx = f.aux;
+                    MirInstId const callee = result;
+                    if (!callee.valid()) {
+                        work.pop_back(); callCtxs.pop_back();
+                        result = InvalidMirInst; break;
+                    }
+                    f.phase = 2;
+                    if (!callSetup(callee, callCtxs[ctxIdx])) {  // emits sret Alloca
+                        work.pop_back(); callCtxs.pop_back();
+                        result = InvalidMirInst; break;
+                    }
+                    int const p = pumpCallArgs(ctxIdx);  // may push (invalidates `f`)
+                    if (p == 1) break;                   // entered a scalar — wait
+                    if (p < 0) {
+                        work.pop_back(); callCtxs.pop_back();
+                        result = InvalidMirInst; break;
+                    }
+                    result = finishCall(callCtxs[ctxIdx]);  // all args consumed
+                    work.pop_back(); callCtxs.pop_back();
+                } else {
+                    // A scalar arg just completed (`result` holds its value).
+                    // Collect it (push + advance the running ABI cursor), then
+                    // pump the next arg or finish.
+                    std::uint32_t const ctxIdx = f.aux;
+                    MirInstId const argVal = result;
+                    if (!argVal.valid()) {
+                        work.pop_back(); callCtxs.pop_back();
+                        result = InvalidMirInst; break;
+                    }
+                    finishScalarCallArg(callCtxs[ctxIdx], argVal);
+                    int const p = pumpCallArgs(ctxIdx);  // may push (invalidates `f`)
+                    if (p == 1) break;                   // entered next scalar — wait
+                    if (p < 0) {
+                        work.pop_back(); callCtxs.pop_back();
+                        result = InvalidMirInst; break;
+                    }
+                    result = finishCall(callCtxs[ctxIdx]);  // all args consumed
+                    work.pop_back(); callCtxs.pop_back();
+                }
+                break;
+            case ValueFrame::Kind::IntrinsicCall: {
+                // `__intrinsic(a, b, …)`: all-scalar args, no callee child, no
+                // struct ABI. phase 0 requests the FIRST arg (if any); phase 1
+                // collects the just-lowered arg, advances, and requests the next —
+                // staying in phase 1 until all args are consumed, then emits the
+                // IntrinsicCall. Byte-identical to the recursive arm (lower arg →
+                // push → … → emit). A scalar arg that is itself a call grows
+                // `callCtxs`, so the ctx is re-addressed by the stable index `aux`.
+                std::uint32_t const ctxIdx = f.aux;
+                auto emitIntrinsic = [&] {
+                    result = mir.addInst(MirOpcode::IntrinsicCall,
+                                         callCtxs[ctxIdx].operands,
+                                         callCtxs[ctxIdx].resultTy,
+                                         callCtxs[ctxIdx].intrinsicId);
+                    work.pop_back(); callCtxs.pop_back();
+                };
+                if (f.phase == 1) {
+                    // Collect the arg that just completed, then advance.
+                    MirInstId const argVal = result;
+                    if (!argVal.valid()) {
+                        work.pop_back(); callCtxs.pop_back();
+                        result = InvalidMirInst; break;
+                    }
+                    callCtxs[ctxIdx].operands.push_back(argVal);
+                    ++callCtxs[ctxIdx].argIdx;
+                }
+                if (callCtxs[ctxIdx].argIdx
+                    >= hir.children(callCtxs[ctxIdx].node).size()) {
+                    emitIntrinsic();   // all args consumed (or zero-arg)
+                    break;
+                }
+                f.phase = 1;
+                HirNodeId const argN =
+                    hir.children(callCtxs[ctxIdx].node)[callCtxs[ctxIdx].argIdx];
+                request(argN, false);   // lower the next arg — may invalidate `f`
+                break;
+            }
             }
         }
         return result;
@@ -3206,6 +2990,305 @@ struct Lowerer {
             return (cls == AbiPieceClass::Fpr) ? fpr++ : gpr++;
         }
     };
+
+    // ── Plan 24 (hir_to_mir Call residual) — shared Call-arm pieces ─────────
+    // The accumulating per-call state for lowering a `Call` / `IntrinsicCall`.
+    // The recursive `lowerExprNode` Call arm builds one of these on the stack;
+    // the iterative `runExprDriver` Call frame keeps one in a `callCtxs` LIFO
+    // vector keyed by a STABLE index (the cst_to_hir `CallCtx` idiom — a nested
+    // call's argument grows that vector mid-pump, so a held reference would
+    // dangle while the index survives). The four helpers below
+    // (`callSetup` / `processOneCallArg` / `finishScalarCallArg` / `finishCall`)
+    // are the SINGLE source of truth for the emission sequence, so the recursive
+    // arm and the flattened frame are byte-identical by construction. Field
+    // semantics mirror the recursive arm's locals 1:1 (see the originals).
+    struct CallLowerCtx {
+        HirNodeId                  node{};        // the Call / IntrinsicCall node
+        TypeId                     resultTy{};    // hir.typeId(node) (the `t` local)
+        bool                       isIntrinsic = false;
+        std::uint32_t              intrinsicId = 0;
+        std::vector<MirInstId>     operands;      // [callee, (sret,) args…] accumulating
+        TypeId                     byvalCalleeSig{};
+        bool                       calleeVariadic = false;
+        std::optional<AbiPassing>  structRetAbi;
+        MirInstId                  structRetSlot = InvalidMirInst;
+        std::size_t                operandsBeforeArgs = 0;
+        std::size_t                fnParamsSize = 0;
+        std::size_t                fixedOperandCount = 0;
+        bool                       fixedOperandCountStamped = false;
+        std::uint32_t              runGpr = 0;
+        std::uint32_t              runFpr = 0;
+        std::size_t                argIdx = 0;    // index of the NEXT arg child
+    };
+    // The outcome of advancing one argument (`processOneCallArg`): a struct arg
+    // emits inline and reports `StructDone`; a scalar arg is NOT lowered here —
+    // it reports `ScalarPending` so the caller can lower it (recursively, or via
+    // the work-stack) and then call `finishScalarCallArg` with the result.
+    enum class CallArgStep : std::uint8_t { Done, ScalarPending, StructDone, Error };
+
+    // Pre-arg-loop setup for a `Call` (mirrors the recursive arm's lines between
+    // the callee `lowerExpr` and the arg loop). The callee MirInstId is already
+    // lowered and passed in; this pushes it (+ a ByReference sret hidden pointer)
+    // onto `ctx.operands`, resolves the callee-variadic flag, classifies a
+    // by-value struct RETURN (allocating the result slot via `freshAggregateTemp`
+    // — the ONLY MIR this emits, which is why it must run AFTER the callee and
+    // BEFORE any argument, exactly as the recursive form), and seeds the running
+    // ABI counters. Returns false on a fail-loud (diagnostic already emitted).
+    // INTRINSIC calls never call this (no callee child, no struct ABI).
+    [[nodiscard]] bool callSetup(MirInstId callee, CallLowerCtx& ctx) {
+        HirNodeId const node = ctx.node;
+        TypeId const t = ctx.resultTy;
+        auto kids = hir.children(node);
+        ctx.operands.reserve(kids.size());
+        ctx.operands.push_back(callee);
+        ctx.byvalCalleeSig = hir.typeId(kids[0]);
+        if (ctx.byvalCalleeSig.valid()
+            && interner.kind(ctx.byvalCalleeSig) == TypeKind::Ptr) {
+            auto const w = interner.operands(ctx.byvalCalleeSig);
+            if (!w.empty()) ctx.byvalCalleeSig = w[0];
+        }
+        ctx.calleeVariadic =
+            ctx.byvalCalleeSig.valid()
+            && interner.kind(ctx.byvalCalleeSig) == TypeKind::FnSig
+            && interner.fnIsVariadic(ctx.byvalCalleeSig);
+        if (t.valid()
+            && (interner.kind(t) == TypeKind::Struct
+                || interner.kind(t) == TypeKind::Union)) {
+            ctx.structRetAbi = byValueClassify(t);
+            if (!ctx.structRetAbi.has_value()) {
+                unsupported(node,
+                    "returning a by-value struct/union is not supported "
+                    "by this target's calling convention "
+                    "(D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+                return false;
+            }
+            ctx.structRetSlot = freshAggregateTemp(t);
+            if (!ctx.structRetSlot.valid()) {
+                unsupported(node,
+                    "by-value struct/union return requires a sizeable "
+                    "layout (complete type)");
+                return false;
+            }
+            if (ctx.structRetAbi->kind == AbiPassing::Kind::ByReference)
+                ctx.operands.push_back(ctx.structRetSlot);  // hidden sret pointer
+        }
+        ctx.operandsBeforeArgs =
+            1 /*callee*/
+          + ((ctx.structRetAbi.has_value()
+              && ctx.structRetAbi->kind == AbiPassing::Kind::ByReference
+              && !config.aggregateSretViaHiddenArg) ? 1u : 0u);
+        ctx.fnParamsSize =
+            (ctx.byvalCalleeSig.valid()
+             && interner.kind(ctx.byvalCalleeSig) == TypeKind::FnSig)
+                ? interner.fnParams(ctx.byvalCalleeSig).size()
+                : 0;
+        ctx.runGpr = 0;
+        ctx.runFpr = 0;
+        if (ctx.structRetAbi.has_value()
+            && ctx.structRetAbi->kind == AbiPassing::Kind::ByReference
+            && config.aggregateSretViaHiddenArg)
+            ctx.runGpr = 1;
+        ctx.argIdx = 1;   // arg children start after the callee
+        return true;
+    }
+
+    // Advance ONE `Call` argument (`ctx.argIdx`), mirroring the recursive arm's
+    // per-iteration loop body. A by-value struct/union arg is fully materialized
+    // HERE (emitting Alloca/copy/Gep/Load or the ByValueStackArg carrier, exactly
+    // as the recursive loop) and `ctx.argIdx` advanced → `StructDone`. A scalar
+    // arg is NOT lowered here (the caller owns that, recursively or via the
+    // work-stack); it reports `ScalarPending` with `ctx.argIdx` STILL pointed at
+    // the in-flight arg so `finishScalarCallArg` derives the same `argTy`. When
+    // all args are consumed → `Done`. A fail-loud (already emitted) → `Error`.
+    [[nodiscard]] CallArgStep processOneCallArg(CallLowerCtx& ctx) {
+        auto kids = hir.children(ctx.node);
+        if (ctx.argIdx >= kids.size()) return CallArgStep::Done;
+        std::size_t const i = ctx.argIdx;
+        TypeId const argTy = hir.typeId(kids[i]);
+        if (argTy.valid()) {
+            TypeKind const ak = interner.kind(argTy);
+            if (ak == TypeKind::Struct || ak == TypeKind::Union) {
+                if (!emitByValueStructCallArg(ctx, kids[i], argTy))
+                    return CallArgStep::Error;
+                if (i == ctx.fnParamsSize) {
+                    ctx.fixedOperandCount =
+                        ctx.operands.size() - ctx.operandsBeforeArgs;
+                    ctx.fixedOperandCountStamped = true;
+                }
+                ++ctx.argIdx;
+                return CallArgStep::StructDone;   // caller pumps the next arg
+            }
+        }
+        return CallArgStep::ScalarPending;   // caller lowers the scalar value
+    }
+
+    // The by-value struct/union ARG synthesis lifted VERBATIM from the recursive
+    // arm's loop body (the ~200-line ABI block: classify, variadic carrier
+    // selection per va_list strategy, the all-or-nothing register-exhaustion
+    // split, the InRegisters piece push). Pushes onto `ctx.operands` and advances
+    // `ctx.runGpr`/`ctx.runFpr`. Returns false on a fail-loud (already emitted).
+    [[nodiscard]] bool emitByValueStructCallArg(CallLowerCtx& ctx, HirNodeId argNode,
+                                                TypeId argTy) {
+        std::vector<MirInstId>& operands = ctx.operands;
+        auto const abi = byValueClassify(argTy);
+        if (!abi.has_value()) {
+            unsupported(argNode,
+                "passing a struct/union BY VALUE is not "
+                "supported by this target's calling "
+                "convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
+            return false;
+        }
+        if (abi->kind == AbiPassing::Kind::ByReference) {
+            if (ctx.calleeVariadic) {
+                if (!config.vaListLayout.has_value()) {
+                    unsupported(argNode,
+                        "passing a struct/union BY VALUE to a "
+                        "variadic function requires the CC's "
+                        "'vaListLayout' (overflow geometry) which "
+                        "this target does not declare "
+                        "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+                    return false;
+                }
+                VaListLayout const& vlMem = *config.vaListLayout;
+                if (vlMem.strategy == VaListStrategy::HomogeneousPointer) {
+                    if (!appendByValueArg(operands, argNode, argTy, *abi))
+                        return false;
+                    ctx.runGpr += 1;
+                } else if (vlMem.strategy == VaListStrategy::Aapcs64DualCursor) {
+                    if (!appendByValueArg(operands, argNode, argTy, *abi))
+                        return false;
+                    ctx.runGpr += 1;
+                } else if (vlMem.strategy == VaListStrategy::SysVRegisterSave) {
+                    if (!appendByValueStackArg(operands, argNode, argTy))
+                        return false;
+                } else {
+                    unsupported(argNode,
+                        "passing a struct/union BY VALUE to a "
+                        "variadic function under this va_list "
+                        "strategy is not realized "
+                        "(internal: unknown VaListStrategy)");
+                    return false;
+                }
+            } else {
+                if (!appendByValueArg(operands, argNode, argTy, *abi))
+                    return false;
+                ctx.runGpr += 1;   // the pointer operand is GPR-class
+            }
+        } else {
+            // InRegisters: count the eightbyte pieces per class.
+            std::uint32_t numGp = 0, numFp = 0;
+            for (AbiPiece const& p : abi->pieces) {
+                if (p.cls == AbiPieceClass::Fpr) ++numFp;
+                else ++numGp;
+            }
+            if (numGp == 0 && numFp == 0) {
+                unsupported(argNode,
+                    "InRegisters struct/union arg has zero register "
+                    "pieces (internal: classifier invariant "
+                    "violated)");
+                return false;
+            }
+            if (ctx.calleeVariadic && !config.vaListLayout.has_value()) {
+                unsupported(argNode,
+                    "passing a struct/union BY VALUE to a variadic "
+                    "function requires the CC's 'vaListLayout' "
+                    "(register-save geometry) which this target does "
+                    "not declare "
+                    "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+                return false;
+            }
+            bool const routeToStack = !config.argSlotAligned
+                && (ctx.runGpr + numGp > config.argGprCount
+                    || ctx.runFpr + numFp > config.argFprCount);
+            if (routeToStack) {
+                std::uint8_t const exhaustClass =
+                    config.aggregateStackExhaustsRegisters
+                        ? (numFp > 0 ? kByValueStackArgExhaustFpr
+                                     : kByValueStackArgExhaustGpr)
+                        : kByValueStackArgExhaustNone;
+                if (!appendByValueStackArg(operands, argNode, argTy, exhaustClass))
+                    return false;
+                if (config.aggregateStackExhaustsRegisters) {
+                    if (ctx.runGpr + numGp > config.argGprCount)
+                        ctx.runGpr = config.argGprCount;
+                    if (ctx.runFpr + numFp > config.argFprCount)
+                        ctx.runFpr = config.argFprCount;
+                }
+            } else {
+                if (!appendByValueArg(operands, argNode, argTy, *abi))
+                    return false;
+                ctx.runGpr += numGp;
+                ctx.runFpr += numFp;
+            }
+        }
+        return true;
+    }
+
+    // Collect a just-lowered SCALAR `Call` argument (`argResult`), mirroring the
+    // recursive arm's scalar tail after `lowerExpr(kids[i])`: push it, advance the
+    // running per-class register cursor by its scalar class, stamp the fixed-
+    // operand boundary if this was the last fixed param, and advance `ctx.argIdx`.
+    void finishScalarCallArg(CallLowerCtx& ctx, MirInstId argResult) {
+        auto kids = hir.children(ctx.node);
+        std::size_t const i = ctx.argIdx;          // the in-flight arg
+        TypeId const argTy = hir.typeId(kids[i]);
+        ctx.operands.push_back(argResult);
+        if (argTy.valid()) {
+            if (scalarArgClass(argTy) == AbiPieceClass::Fpr) ++ctx.runFpr;
+            else ++ctx.runGpr;
+        } else {
+            ++ctx.runGpr;   // typeless fallback: treat as GPR
+        }
+        if (i == ctx.fnParamsSize) {
+            ctx.fixedOperandCount = ctx.operands.size() - ctx.operandsBeforeArgs;
+            ctx.fixedOperandCountStamped = true;
+        }
+        ++ctx.argIdx;
+    }
+
+    // Emit the final MIR for a fully-accumulated `Call` (mirrors the recursive
+    // arm's tail after the arg loop): stamp the variadic call payload, set the
+    // indirect-result bit for an x8-sret CC, and emit either a plain `Call` or
+    // (for a by-value struct return) the multi-piece struct-returning call. The
+    // returned MirInstId is the call's value (or the result slot's address for a
+    // struct return). InvalidMirInst on a fail-loud (already emitted).
+    [[nodiscard]] MirInstId finishCall(CallLowerCtx& ctx) {
+        HirNodeId const node = ctx.node;
+        TypeId const t = ctx.resultTy;
+        (void)ctx.fixedOperandCountStamped;
+        std::uint32_t callPayload = 0;
+        TypeId calleeTy = hir.typeId(hir.children(node)[0]);
+        if (calleeTy.valid() && interner.kind(calleeTy) == TypeKind::Ptr) {
+            auto const operands_ = interner.operands(calleeTy);
+            if (operands_.empty()) {
+                unsupported(node,
+                    "Call callee has Ptr-typed FnSig with empty "
+                    "operands — interner invariant violated");
+                return InvalidMirInst;
+            }
+            calleeTy = operands_[0];
+        }
+        if (calleeTy.valid()
+            && interner.kind(calleeTy) == TypeKind::FnSig
+            && interner.fnIsVariadic(calleeTy)) {
+            if (ctx.fixedOperandCount > ::dss::call_payload::kFixedOperandMask) {
+                unsupported(node,
+                    "Call payload: fixed-operand count exceeds 30-bit "
+                    "encoding limit");
+                return InvalidMirInst;
+            }
+            callPayload = ::dss::call_payload::encode(
+                true, static_cast<std::uint32_t>(ctx.fixedOperandCount));
+        }
+        if (ctx.structRetAbi.has_value()
+            && ctx.structRetAbi->kind == AbiPassing::Kind::ByReference
+            && !config.aggregateSretViaHiddenArg)
+            callPayload |= ::dss::call_payload::kIndirectResultBit;
+        if (ctx.structRetAbi.has_value())
+            return emitStructReturningCall(node, ctx.operands, callPayload,
+                                           *ctx.structRetAbi, ctx.structRetSlot);
+        return mir.addInst(MirOpcode::Call, ctx.operands, t, callPayload);
+    }
 
     // The register class of a SCALAR/pointer param (for the per-class arg
     // ordinal): FPR for a float type, GPR otherwise (ints, pointers, bool).

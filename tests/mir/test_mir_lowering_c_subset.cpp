@@ -6487,3 +6487,127 @@ TEST(MirLoweringCSubset, IterativeDeepLogicalChainLowersFlatAndByteIdentical) {
     }
         });  // runOnLargeStack
 }
+
+// ─── Plan 24 (hir_to_mir Call residual) — iterative HIR→MIR Call driver ──────
+//
+// SF-4 differential pin for the flattened Call arm: a DEEPLY-nested single-arg
+// call chain `id(id(id(…id(42)…)))` (each call's sole argument is the next inner
+// call — exactly the `f(f(f(…)))` shape the residual targets). Before this change
+// the recursive `lowerExprNode` Call arm lowered each argument via
+// `lowerExpr(arg)`, re-entering `runExprDriver` once per nesting level → 800 host
+// frames deep during HIR→MIR. Now the Call frame on the driver's explicit
+// work-stack carries that descent (callee built first, then the scalar argument
+// lowered through the SAME work-stack) with FLAT O(1) host-stack cost per level.
+//
+// BYTE-IDENTITY backbone: the OUTERMOST call lowers its callee FIRST, then its
+// arg (the next inner call), recursively — so the emission order is all D callee
+// `GlobalAddr`s OUTER→INNER, then the innermost `Const(42)`, then all D `Call`s
+// INNER→OUTER (each `Call_k` takes `Call_{k+1}` — the instruction immediately
+// before it — as its single argument operand), then `Return(Call_outer)`. A
+// dropped/duplicated callee, a callee-after-arg mis-order, or a wrong arg
+// operand would break this exact shape. The WITNESS SPLIT mirrors the other
+// IterativeDeep pins: the flat/host-stack-overflow run witness lives in the
+// corpus example `deep_call_mir` (a deep call chain through the real pipeline
+// that would crash if the Call arg-lowering recursed); THIS unit pin asserts the
+// orthogonal byte-identity half. Build/lower/teardown run on the 64 MiB worker
+// (kDeepRecursionStackBytes) so the deep HIR-tree teardown does not depend on
+// the host's small main-stack budget (stock MSVC Debug main stack = 1 MiB).
+//
+// Synthetic (SF-4): the parser's 256 maxExpressionDepth cap forbids an 800-deep
+// call in source, so the deep input is built via the public `HirBuilder`.
+TEST(MirLoweringCSubset, IterativeDeepCallChainLowersFlatAndByteIdentical) {
+    constexpr std::uint32_t kDepth   = 800;  // # of nested id() calls
+    constexpr std::uint32_t kIdSym   = 1;    // the identity function's symbol
+    constexpr std::uint32_t kDeepSym = 7;    // the caller function's symbol
+
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const idTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
+    TypeId const deepTy = ti.fnSig(std::array<TypeId, 0>{}, i32, CallConv::CcSysV);
+
+    HirLiteralPool pool;
+    std::uint32_t const lit42 =
+        pool.add(HirLiteralValue{.value = std::int64_t{42}, .core = TypeKind::I32});
+
+    HirBuilder b{"c-subset"};
+    // `int id(int x) { return x; }` — its Refs resolve to Arg(0).
+    HirNodeId const idParam = b.makeVarDecl(i32, /*sym=*/2);
+    HirNodeId const idBody =
+        b.makeBlock(std::array{b.makeReturn(b.makeRef(i32, /*sym=*/2))});
+    HirNodeId const idFn =
+        b.makeFunction(idTy, kIdSym, std::array{idParam}, idBody);
+
+    // `int deep(void) { return id(id(…id(42)…)); }` — 800 nested single-arg
+    // calls around the innermost literal `42`. Each call's callee is a fresh
+    // `Ref(id):FnSig` (lowers to GlobalAddr); the arg is the inner call.
+    HirNodeId cur = b.makeLiteral(i32, lit42);          // innermost argument
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        HirNodeId const callee = b.makeRef(idTy, kIdSym);
+        cur = b.makeCall(callee, std::array{cur}, i32);
+    }
+    HirNodeId const deepBody = b.makeBlock(std::array{b.makeReturn(cur)});
+    HirNodeId const deepFn =
+        b.makeFunction(deepTy, kDeepSym, std::array<HirNodeId, 0>{}, deepBody);
+    HirNodeId const root = b.makeModule(std::array{idFn, deepFn});
+    Hir hir = std::move(b).finish(root);
+
+    DiagnosticReporter rep;
+    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
+                             MirLoweringConfig{});
+    ASSERT_TRUE(result.ok)
+        << "deep Call chain must lower clean: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Mir const& m = result.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+    // funcAt(1) is `deep` (declared second). Its single entry block holds the
+    // whole flattened chain (no CFG — pure straight-line calls).
+    MirFuncId const f = m.funcAt(1);
+    ASSERT_EQ(m.funcBlockCount(f), 1u);
+    MirBlockId const entry = m.funcEntry(f);
+
+    // Body = D GlobalAddr (callees, outer→inner) + 1 Const(42) + D Call
+    // (inner→outer) + 1 Return.
+    ASSERT_EQ(m.blockInstCount(entry), 2u * kDepth + 2u);
+
+    // The D callee GlobalAddrs come first, in OUTER→INNER order (the outermost
+    // call lowers its callee before descending into its argument).
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        MirInstId const ga = m.blockInstAt(entry, i);
+        EXPECT_EQ(m.instOpcode(ga), MirOpcode::GlobalAddr)
+            << "callee GlobalAddr at level " << i;
+    }
+    // Then the innermost argument `Const(42)`.
+    MirInstId const konst = m.blockInstAt(entry, kDepth);
+    EXPECT_EQ(m.instOpcode(konst), MirOpcode::Const);
+
+    // Then the D Calls, INNER→OUTER. Call at position kDepth+1 is the INNERMOST
+    // (`id(42)`): its callee operand is the LAST GlobalAddr (innermost) and its
+    // arg operand is the Const. Each subsequent Call takes the PREVIOUS Call as
+    // its argument (the byte-identity guard: a call-before-callee or wrong-arg
+    // build would move these). The callee operand of Call rank j (counting from
+    // the inner) is GlobalAddr[kDepth-1-j].
+    MirInstId prevValue = konst;   // innermost arg feeds the innermost call
+    for (std::uint32_t j = 0; j < kDepth; ++j) {
+        MirInstId const call = m.blockInstAt(entry, kDepth + 1u + j);
+        EXPECT_EQ(m.instOpcode(call), MirOpcode::Call) << "Call at depth-rank " << j;
+        auto ops = m.instOperands(call);
+        ASSERT_EQ(ops.size(), 2u) << "Call[" << j << "] = (callee, arg)";
+        MirInstId const expectedCallee = m.blockInstAt(entry, kDepth - 1u - j);
+        EXPECT_EQ(ops[0], expectedCallee)
+            << "Call[" << j << "] callee is its matching GlobalAddr";
+        EXPECT_EQ(ops[1], prevValue)
+            << "Call[" << j << "] arg is the next-inner call's result "
+               "(red on a callee-after-arg or dropped-call build)";
+        prevValue = call;
+    }
+
+    // Return(outermost Call).
+    MirInstId const ret = m.blockInstAt(entry, 2u * kDepth + 1u);
+    EXPECT_EQ(m.instOpcode(ret), MirOpcode::Return);
+    ASSERT_EQ(m.instOperands(ret).size(), 1u);
+    EXPECT_EQ(m.instOperands(ret)[0], prevValue) << "Return takes the outermost Call";
+        });  // runOnLargeStack
+}
