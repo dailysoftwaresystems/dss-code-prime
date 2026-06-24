@@ -8,14 +8,19 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "analysis/syntactic/parser.hpp"
+#include "core/substrate/large_stack_call.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/source_buffer.hpp"
 #include "hir/const_eval.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_intrinsic_registry.hpp"
 #include "hir/hir_text.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "tokenizer/token_stream.hpp"
+#include "tokenizer/tokenizer.hpp"
 
 #include <gtest/gtest.h>
 
@@ -48,6 +53,35 @@ namespace {
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
     UnitBuilder builder{*loaded};
     builder.addInMemory(std::move(src), "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    return analyze(cu);
+}
+
+// Drive c-subset → SemanticModel with the parser's expression-depth cap RAISED to
+// `cap` (the default is 256), so a deep-but-legal nesting beyond the cap parses to
+// completion — the DEEP-NEST-RECURSION lowering pins need an input deeper than any
+// program the shipped cap admits. The deep CST's parse + the orthogonal recursive
+// analyze + the deep tree's teardown all run on the 64 MiB worker (the standard
+// pipeline stack); `lowerToHir` is then called by the test ON ITS OWN MAIN STACK,
+// which is the flat-property witness for the lowerer. A bare `int main(){…}`
+// program (no `#include`) parses via Tokenizer+Parser directly (skipping the PP)
+// and is ingested via `UnitBuilder::addTree` — exactly the construct these pins use.
+[[nodiscard]] SemanticModel analyzeCSubsetRaisedCap(std::string src, std::size_t cap) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    auto srcBuf = SourceBuffer::fromString(std::move(src), "<deepmem>");
+    Tokenizer tk{srcBuf, schema};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+    ParserConfig cfg;
+    cfg.maxExpressionDepth = cap;
+    Parser p{srcBuf, schema, std::move(stream), std::move(cfg), std::move(lexDiags)};
+    ParseResult result = std::move(p).parse();
+    if (result.tree.diagnostics().hasErrors()) {
+        ADD_FAILURE() << "raised-cap parse produced errors (cap=" << cap << ")";
+    }
+    UnitBuilder builder{schema};
+    builder.addTree(std::move(result.tree));
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     return analyze(cu);
 }
@@ -1163,6 +1197,38 @@ TEST(HirLoweringCSubset, ComplexLvalueCompoundAssignUsesTempPointer) {
     // the temp pointer's type is Ptr<I32>
     auto const& ti = model.lattice().interner();
     EXPECT_EQ(ti.kind(res->hir.varDeclType(inner[0])), TypeKind::Ptr);
+}
+
+// A COMPOUND assignment USED AS A VALUE (`y = (x += 2)`) — the path the Assign
+// frame's `compound` branch handles, which the statement-position compound tests
+// above do NOT exercise (those route through the separate `lowerCompoundAssign`).
+// `(x += 2)` lowers to `SeqExpr([AssignStmt(Ref x, BinaryOp(Ref x, 2))], yield Ref
+// x)`: the stored value is `lvRead(x) + 2` with operand[0] = the lvalue read,
+// operand[1] = the rhs (`2`). This pins the flattened frame builds the SAME
+// structure (and ordering: the lvRead is emitted before the rhs) as the recursive
+// `lowerBinary` Assign arm. Guards the byte-identity of the compound-as-value arm.
+TEST(HirLoweringCSubset, CompoundAssignAsSubExpressionLowersToSeqExpr) {
+    SemanticModel model = analyzeCSubset(
+        "void f(int x) { int y; y = (x += 2); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    // children: [VarDecl y, AssignStmt(y, <value of (x += 2)>)].
+    HirNodeId outer = res->hir.children(body)[1];
+    ASSERT_EQ(res->hir.kind(outer), HirKind::AssignStmt);
+    HirNodeId val = res->hir.assignValue(outer);             // the (x += 2) value
+    ASSERT_EQ(res->hir.kind(val), HirKind::SeqExpr);
+    auto const stmts = res->hir.seqExprStmts(val);
+    ASSERT_EQ(stmts.size(), 1u);
+    ASSERT_EQ(res->hir.kind(stmts[0]), HirKind::AssignStmt);  // x = (x + 2)
+    HirNodeId stored = res->hir.assignValue(stmts[0]);
+    ASSERT_EQ(res->hir.kind(stored), HirKind::BinaryOp);      // x + 2
+    auto const ops = res->hir.children(stored);
+    ASSERT_EQ(ops.size(), 2u);
+    EXPECT_EQ(res->hir.kind(ops[0]), HirKind::Ref);           // operand[0] = lvRead(x)
+    EXPECT_EQ(res->hir.kind(res->hir.seqExprResult(val)), HirKind::Ref);  // yield Ref x
 }
 
 TEST(HirLoweringCSubset, ArrayDeclarationLowersToArrayType) {
@@ -3239,4 +3305,134 @@ TEST(HirLoweringCSubset, NoShippedConstructLowersToIntrinsic) {
                "the inliner's blanket IntrinsicCall admission, gate it on per-"
                "intrinsic inline-safety: D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.";
     }
+}
+
+// ── plan 24 (cst_to_hir residuals): the Assign + Switch arms are now flattened
+// onto the existing ExprFrame/StmtFrame work-stack drivers. These two strict pins
+// witness the FLAT-on-the-main-stack property (RED-on-disable: revert the
+// flattening → host recursion overflows the test's normal stack at the chain
+// depth → crash) AND the exact byte-identical HIR shape (a flattening that parsed
+// without crashing but produced the WRONG structure fails the shape assertions).
+// They run the LOWERING on the default test main stack (NO large-stack wrapper) —
+// that is the whole point — while the orthogonal recursive parse/analyze of the
+// deep tree runs on the 64 MiB worker (the parser's assign-RHS arm is flat since
+// plan-24 Stage 5; `analyze` wraps itself in `callOnLargeStack`). The Tree/Hir
+// arenas tear down FLATLY (dense ArenaContainer, not a recursive node graph), so
+// the deep tree's destruction never overflows the main stack. The cap is raised
+// above the depth so the SEMANTIC P_ExpressionTooDeep does not fire (the separate
+// too-deep pins prove the cap still fires at its configured point).
+
+// A ~2000-deep RIGHT-assoc assignment chain `a=a=…=a;` lowers (CST→HIR) flat on the
+// normal stack to the nested-SeqExpr backbone. Each `=` USED AS A VALUE lowers to
+// `SeqExpr([AssignStmt(Ref a, ·)], yield = Ref a)`; the outermost `=` is in
+// statement position (an AssignStmt whose value is the (N-1)-op sub-chain). The
+// Assign frame turns the deep RHS re-entry into a heap work-stack push, so the
+// descent carries flat O(1) host-stack cost. RED-on-disable: restore the recursive
+// `lowerBinary` Assign arm → the deep RHS recurses ~2000 host frames → overflow.
+TEST(HirLoweringCSubset, DeepRightAssocAssignChainLowersFlatOnNormalStack) {
+    constexpr int kOps = 2000;   // 2000 `=` ops → a 2000-deep right-assoc chain
+
+    // `int main(void){ int a; a=a=…=a; return 0; }` — `a` is a simple int lvalue,
+    // so the chain recurses PURELY through the value-yielding Assign RHS arm (no
+    // prep, no other nesting). Built once; parsed with the cap raised.
+    std::string src = "int main(void){ int a; a";
+    for (int i = 0; i < kOps; ++i) src += "=a";
+    src += "; return 0; }";
+
+    SemanticModel model = analyzeCSubsetRaisedCap(std::move(src), kOps + 1000);
+    ASSERT_FALSE(model.hasErrors());
+
+    DiagnosticReporter r;
+    // Lower on THIS (main) stack — the flat-property witness. A revert recurses
+    // here and overflows.
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    // Shape walk: the function body's first statement is the outermost AssignStmt;
+    // its value is the (N-1)-op sub-chain = exactly kOps-1 nested SeqExprs, each
+    // holding one AssignStmt whose stored value is the next-deeper SeqExpr, the
+    // innermost storing a bare Ref. A left-nested or level-dropping mis-lowering
+    // breaks the count/shape here (not merely "didn't crash").
+    HirNodeId const fnBody =
+        res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    // children: [VarDecl a, AssignStmt(...)] (the ExprStmt-position assign lowers
+    // to a bare AssignStmt statement).
+    auto const bodyStmts = res->hir.children(fnBody);
+    ASSERT_GE(bodyStmts.size(), 2u);
+    HirNodeId const outerAssign = bodyStmts[1];
+    ASSERT_EQ(res->hir.kind(outerAssign), HirKind::AssignStmt);
+    EXPECT_EQ(res->hir.kind(res->hir.assignTarget(outerAssign)), HirKind::Ref);
+
+    int seqLevels = 0;
+    HirNodeId cur = res->hir.assignValue(outerAssign);   // the (N-1)-op value chain
+    while (res->hir.kind(cur) == HirKind::SeqExpr) {
+        ++seqLevels;
+        // Each value-`=` is `SeqExpr([AssignStmt(Ref a, stored)], yield Ref a)`.
+        auto const stmts = res->hir.seqExprStmts(cur);
+        ASSERT_EQ(stmts.size(), 1u) << "value-assign SeqExpr has exactly one stmt";
+        ASSERT_EQ(res->hir.kind(stmts[0]), HirKind::AssignStmt);
+        EXPECT_EQ(res->hir.kind(res->hir.seqExprResult(cur)), HirKind::Ref)
+            << "the SeqExpr yields the re-read lvalue";
+        cur = res->hir.assignValue(stmts[0]);            // descend to the next level
+    }
+    // The innermost stored value is the bare `a` Ref (the chain's tail operand).
+    EXPECT_EQ(res->hir.kind(cur), HirKind::Ref);
+    EXPECT_EQ(seqLevels, kOps - 1)
+        << "exactly one nested value-SeqExpr per `=` below the statement-position "
+           "outermost assign";
+}
+
+// A deeply-NESTED switch (`switch(x){ case 1: switch(x){ case 1: … default: …} … }`)
+// lowers (CST→HIR) flat on the normal stack to a SwitchStmt whose single case-arm
+// body is the next-inner SwitchStmt, nested kDepth deep. The Switch frame turns the
+// per-arm-body `lowerStmt` re-entry into a heap work-stack push, so a switch nested
+// in a switch-arm body carries flat O(1) host-stack cost (the recursive form
+// recursed `lowerStmt → lowerSwitch → lowerStmt` once per level). RED-on-disable:
+// restore the recursive `lowerSwitch` body re-entries → ~kDepth host frames →
+// overflow. The shape walk pins the exact innermost-SwitchStmt backbone.
+TEST(HirLoweringCSubset, DeepNestedSwitchLowersFlatOnNormalStack) {
+    constexpr int kDepth = 1200;   // nesting levels of switch-in-case-body
+
+    // `int main(void){ int x=0; switch(x){case 1: switch(x){case 1: … case 0:
+    // return 0; …} default: break;} … return 0; }` — each level is a switch whose
+    // `case 1:` body is the next-inner switch; the innermost returns. Each switch
+    // also has a `default: break;` so every level is a real multi-arm switch.
+    std::string src = "int main(void){ int x=0; ";
+    for (int i = 0; i < kDepth; ++i) src += "switch(x){ case 1: ";
+    src += "return 0;";                          // innermost case-1 body
+    for (int i = 0; i < kDepth; ++i) src += " default: break; }";
+    src += " return 0; }";
+
+    SemanticModel model = analyzeCSubsetRaisedCap(std::move(src), kDepth + 1000);
+    ASSERT_FALSE(model.hasErrors());
+
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);   // lower on THIS (main) stack — flat witness
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    // Shape walk: descend the SwitchStmt backbone. The body's switch is level 0;
+    // each level's FIRST arm (case 1) body's first statement is the next switch,
+    // kDepth deep, the innermost arm body holding the `return`. A dropped level or
+    // mis-grouped arm breaks the count here.
+    HirNodeId const fnBody =
+        res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    auto const bodyStmts = res->hir.children(fnBody);
+    // children: [VarDecl x, SwitchStmt, ReturnStmt].
+    ASSERT_GE(bodyStmts.size(), 2u);
+    HirNodeId cur = bodyStmts[1];
+    int switchLevels = 0;
+    while (res->hir.kind(cur) == HirKind::SwitchStmt) {
+        ++switchLevels;
+        auto const arms = res->hir.switchArms(cur);
+        ASSERT_GE(arms.size(), 2u) << "each level is case 1 + default";
+        EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));   // arm 0 = case 1
+        EXPECT_TRUE(res->hir.caseArmIsDefault(arms[1]));     // arm 1 = default
+        auto const arm0Body = res->hir.caseArmBody(arms[0]);
+        ASSERT_FALSE(arm0Body.empty());
+        cur = arm0Body[0];                                   // descend into case 1's body
+    }
+    // The innermost case-1 body is the `return 0;`.
+    EXPECT_EQ(res->hir.kind(cur), HirKind::ReturnStmt);
+    EXPECT_EQ(switchLevels, kDepth)
+        << "exactly one nested SwitchStmt per source `switch`";
 }

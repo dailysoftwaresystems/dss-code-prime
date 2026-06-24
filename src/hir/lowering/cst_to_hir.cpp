@@ -933,6 +933,23 @@ struct Lowerer {
     // toolchain) so the literal pool / arena fill in the SAME order. The parser's
     // `P_ExpressionTooDeep` cap is UNCHANGED and still the positioned backstop.
 
+    // A resolved lvalue: how to READ its current value and WRITE a new one, plus
+    // the prep statements that must run FIRST. A SIMPLE variable lvalue needs no
+    // prep (reading a `Ref` is side-effect-free, so it can be read repeatedly). A
+    // COMPLEX lvalue (an index / deref whose address sub-expressions may have
+    // side effects) binds its ADDRESS into a temp pointer once in `prep`, then
+    // reads/writes through `*ptr` — so `a[f()] += 1` evaluates `f()` exactly
+    // once. This is what makes compound-assign / ++ / assignment-as-value correct
+    // for every lvalue, not just simple variables. (Defined HERE — ahead of its
+    // natural home near `classifyLvalue` — so the `AssignCtx` below can embed it.)
+    struct Lvalue {
+        bool                   simple = true;
+        TypeId                 type{};       // the lvalue's value type
+        SymbolId               sym{};        // simple: the variable; via-ptr: the temp pointer
+        TypeId                 ptrType{};    // via-ptr only: interner.pointer(type)
+        std::vector<HirNodeId> prep;         // via-ptr only: [ var ptr = &<lvalue> ]
+    };
+
     // One work-stack frame. Only the DEEP arms allocate a frame; the per-arm
     // `phase` machine pushes ONE child (via `enter`, which only ever PUSHES — it
     // does not recurse — so the descent is driven by the loop, keeping host-stack
@@ -942,7 +959,7 @@ struct Lowerer {
     // `f` and advances `f.phase` BEFORE calling `enter` (the Stage-1/2 idiom).
     struct ExprFrame {
         enum class Kind : std::uint8_t { PassThrough, Binary, Unary, Cast, Postfix,
-                                         Ternary, Comma, Call } kind;
+                                         Ternary, Comma, Call, Assign } kind;
         NodeId                  node;    // the source node (provenance / combine anchor)
         std::uint8_t            phase;
         NodeId                  n0;      // PassThrough inner / binary+comma lhs / unary+cast operand / postfix+call base / ternary cond
@@ -973,6 +990,29 @@ struct Lowerer {
         std::vector<HirNodeId>  args;        // accumulated lowered+coerced argument ids
     };
 
+    // The accumulating state for a flattened assignment sub-expression (`lhs = rhs`
+    // / `lhs OP= rhs` used as a VALUE — `lowerBinary`'s `Assign` arm). Lives in an
+    // `assignCtxs` stack LOCAL to `lowerExpr` (NOT in `ExprFrame` — the `Lvalue`
+    // carries a `prep` vector, and `work` reallocs across the rhs `enter`). An
+    // Assign frame holds only an INDEX (`aux`); indices are stable because a
+    // right-assoc chain `a=b=c=…` finishes inner-first (LIFO push/pop the back).
+    // The lhs lvalue is CLASSIFIED in the `enter` classifier BEFORE the frame is
+    // pushed (so a complex lhs's `prep` AddressOf/VarDecl emit before the rhs, as
+    // the recursive arm does); the frame then flattens ONLY the rhs through the
+    // work-stack — which is the sole deep-recursion axis of an assign chain. For a
+    // COMPOUND `OP=`, the lvalue READ (`compoundLhsRead`) is also emitted in `enter`
+    // (BEFORE the rhs) — the recursive `addParent(BinaryOp, std::array{lvRead(*lv),
+    // lowerExpr(rhsN).id}, …)` evaluates the braced-init-list LEFT-TO-RIGHT with a
+    // sequence point ([dcl.init.list]/4, NOT the unsequenced function-arg rule), so
+    // lvRead's node precedes the rhs subtree on EVERY conforming compiler. Emitting
+    // it in `enter` reproduces that arena order exactly (prep → lvRead → rhs → op).
+    struct AssignCtx {
+        Lvalue       lv;              // the classified lhs (simple sym OR temp-ptr + prep)
+        bool         compound{};      // true for `OP=` (compound assignment)
+        HirOpKind    baseOp{};        // compound only: the core binary op
+        HirNodeId    compoundLhsRead{}; // compound only: the lvRead emitted BEFORE the rhs
+    };
+
     // The public expression-lowering entry: a driver over an explicit work-stack.
     // `enter` classifies a node (TERMINAL → set `result`; DEEP arm → push a
     // phase-0 frame and return WITHOUT recursing); the loop runs each frame's
@@ -983,6 +1023,11 @@ struct Lowerer {
         // The flattened postfix-Call accumulators (see `CallCtx`). A LIFO stack
         // parallel to `work`; a Call frame references its ctx by stable index.
         std::vector<CallCtx> callCtxs;
+        // The flattened assignment accumulators (see `AssignCtx`). A LIFO stack
+        // parallel to `work`; an Assign frame references its ctx by stable index.
+        // Separate from `callCtxs` (a frame is Call XOR Assign, but each space is
+        // independent); a right-assoc `a=b=c=…` chain pushes one per `=`.
+        std::vector<AssignCtx> assignCtxs;
         // Default-init (no node emitted): `enter` ALWAYS assigns `result` for a
         // terminal, and every pushed frame eventually delivers into `result`
         // before it is read, so this never leaks an Error node.
@@ -1023,8 +1068,11 @@ struct Lowerer {
                 if (r == cfg.binaryExprRule.v) {
                     // The PLAIN binary operands flatten through a Binary frame; the
                     // COMMA operator (whose `ExprStmt(lhs)` emits between lhs and
-                    // rhs) flattens through a Comma frame. Assign keeps its bespoke
-                    // classifyLvalue+SeqExpr emission in `lowerBinary`.
+                    // rhs) flattens through a Comma frame. ASSIGN (`lhs = rhs` /
+                    // `lhs OP= rhs` as a value) flattens its RHS through an Assign
+                    // frame so a right-assoc chain `a=b=c=…` carries flat host-stack
+                    // cost (the lhs is classified inline here, before the frame —
+                    // its prep emits before the rhs, as the recursive arm does).
                     NodeId lhsN{}, rhsN{}, opTok{};
                     for (NodeId c : visible(n)) {
                         if (isToken(c)) { if (!opTok.valid()) opTok = c; continue; }
@@ -1041,7 +1089,45 @@ struct Lowerer {
                                         .n0 = lhsN, .n1 = rhsN});
                         return;
                     }
-                    result = lowerBinary(n); return;  // Assign / malformed
+                    // ASSIGN: classify the lhs lvalue + resolve the (compound) op
+                    // EXACTLY as `lowerBinary`'s Assign arm — same order, same
+                    // diagnostics, so a complex lhs's prep AddressOf/VarDecl emit
+                    // here (before the rhs). On success push an Assign frame whose
+                    // ctx carries the lvalue; phase 0 enters the rhs. Malformed /
+                    // non-assign nodes fall through to `lowerBinary` unchanged.
+                    if (HirOperatorEntry const* ae =
+                            assignBinaryEntry(n, opTok, lhsN, rhsN)) {
+                        AssignCtx ctx;
+                        auto lv = lhsN.valid() ? classifyLvalue(lhsN) : std::nullopt;
+                        if (!lv || !rhsN.valid()) {
+                            result = exprError(n, "assignment sub-expression needs an "
+                                                  "lvalue and a value");
+                            return;
+                        }
+                        ctx.lv = std::move(*lv);
+                        if (!ae->compoundBase.empty()) {
+                            auto op = coreOpFromName(ae->compoundBase);
+                            if (!op || arityOf(*op) != HirOpArity::Binary) {
+                                result = exprError(n, std::format(
+                                    "compound base op '{}' is not binary",
+                                    ae->compoundBase));
+                                return;
+                            }
+                            ctx.compound = true;
+                            ctx.baseOp   = *op;
+                            // Emit the lvalue READ HERE — BEFORE entering the rhs —
+                            // to match the recursive arm's L-to-R braced-init order
+                            // (lvRead's node precedes the rhs subtree). See AssignCtx.
+                            ctx.compoundLhsRead = lvRead(ctx.lv);
+                        }
+                        std::uint32_t const ctxIdx =
+                            static_cast<std::uint32_t>(assignCtxs.size());
+                        assignCtxs.push_back(std::move(ctx));
+                        work.push_back({.kind = ExprFrame::Kind::Assign, .node = n,
+                                        .n0 = rhsN, .aux = ctxIdx});
+                        return;   // phase 0 enters the rhs
+                    }
+                    result = lowerBinary(n); return;  // malformed (non-assign)
                 }
                 if (r == cfg.unaryExprRule.v) {
                     NodeId opTok{}, operandN{};
@@ -1059,7 +1145,13 @@ struct Lowerer {
                     // Call flattens its callee + each scalar arg through a Call
                     // frame (so `f(g(h(...)))` chains carry flat host-stack cost);
                     // Index / Member flatten their base (and Index's subscript).
-                    // PostInc / PostDec keep delegating (classifyLvalue + SeqExpr).
+                    // PostInc / PostDec keep DELEGATING to `lowerPostfix` (their
+                    // bespoke classifyLvalue + temp-SeqExpr): unlike Assign they
+                    // CANNOT chain deeply — `x++` is not an lvalue, so it can never
+                    // be the operand of another `++`. Their sole `classifyLvalue`
+                    // re-entry lowers the (already-flat) lvalue operand via this
+                    // driver, so they carry only O(1) host-stack frames. Flattening
+                    // them would add byte-identity risk for zero depth payoff.
                     NodeId callBaseN{};
                     std::vector<NodeId> callArgNodes;
                     if (callBaseAndArgs(n, callBaseN, callArgNodes)) {
@@ -1355,6 +1447,25 @@ struct Lowerer {
                     finishCall(work, callCtxs, ctxIdx, result);  // all args consumed
                 }
                 break;
+            case ExprFrame::Kind::Assign:
+                // `lhs = rhs` / `lhs OP= rhs` as a VALUE. The lhs lvalue was already
+                // classified in `enter` (its prep emitted before us); for a compound
+                // `OP=` the lvalue READ was ALSO emitted there (`compoundLhsRead`,
+                // before the rhs). Phase 0 enters the RHS through the work-stack (the
+                // sole deep axis of an assign chain → flat). Phase 1 runs the
+                // recursive tail: compute `stored` (plain = rhs; compound =
+                // `compoundLhsRead OP rhs`), then [prep…, lvWrite] + a fresh `lvRead`
+                // yield, all in a SeqExpr — byte-identical to `lowerBinary`'s Assign
+                // arm, including the prep→lvRead→rhs→op emission order.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const rhsN = f.n0;
+                    enter(rhsN);            // lower the rhs — may invalidate `f`
+                } else {
+                    std::uint32_t const ctxIdx = f.aux;
+                    finishAssign(work, assignCtxs, ctxIdx, result);
+                }
+                break;
             }
         }
         return result;
@@ -1376,6 +1487,43 @@ struct Lowerer {
         work.pop_back();
         callCtxs.pop_back();
         result = callE;
+    }
+
+    // Finish a flattened Assign: `result` holds the lowered RHS. Build the SeqExpr
+    // EXACTLY as `lowerBinary`'s Assign arm — for plain `=` the stored value is the
+    // rhs; for `OP=` it is `lvRead OP rhs`, where `lvRead` was ALREADY emitted in
+    // `enter` (before the rhs — `compoundLhsRead`), reproducing the recursive arm's
+    // L-to-R braced-init order (prep → lvRead → rhs → op). Then `[prep…,
+    // lvWrite(stored)]` with a fresh `lvRead` yield, SeqExpr, deliver into `result`,
+    // and pop this frame + its ctx (the LIFO top — a right-assoc chain finishes
+    // inner-first). The Assign frame is `work.back()` here (phase 1 entered nothing
+    // above it); its `.node` is the binary node — the SAME provenance as the
+    // recursive `track(makeSeqExpr(...), node)`.
+    void finishAssign(std::vector<ExprFrame>& work, std::vector<AssignCtx>& assignCtxs,
+                      std::uint32_t ctxIdx, E& result) {
+        AssignCtx const& ctx = assignCtxs[ctxIdx];
+        Lvalue const& lv = ctx.lv;
+        NodeId const node = work.back().node;   // the binary (assign) node (provenance)
+        HirNodeId stored;
+        if (!ctx.compound) {
+            stored = result.id;                                       // plain `=`
+        } else {
+            // `OP=`: `compoundLhsRead OP rhs`. `compoundLhsRead` was emitted in
+            // `enter` (BEFORE the rhs), so operand[0]'s node precedes operand[1]'s —
+            // the SAME arena order as the recursive braced-init `{lvRead, rhs}`.
+            stored = builder.addParent(HirKind::BinaryOp,
+                                       std::array{ctx.compoundLhsRead, result.id},
+                                       lv.type, encodeOp(ctx.baseOp));
+        }
+        std::vector<HirNodeId> stmts = lv.prep;
+        stmts.push_back(lvWrite(lv, stored));
+        HirNodeId const yield = lvRead(lv);     // the new value (re-read of the lvalue)
+        E const seqE{track(builder.makeSeqExpr(stmts, yield, lv.type, HirFlags::Synthetic),
+                           node),
+                     lv.type};
+        work.pop_back();
+        assignCtxs.pop_back();
+        result = seqE;
     }
 
     // The single non-token child, or invalid if there isn't exactly one.
@@ -2266,6 +2414,22 @@ struct Lowerer {
         return cfg.binaryOps[it->second].target == "Comma";
     }
 
+    // The operator entry for an ASSIGNMENT binary (`=` or a compound `OP=`) — the
+    // form the driver flattens through an Assign frame (its RHS re-enters the
+    // work-stack). Returns nullptr for the plain/comma forms the other classifiers
+    // own and for malformed/unmapped nodes, so the driver delegates the whole node
+    // to `lowerBinary` unchanged. Mirrors `lowerBinary`'s extraction + lookup so
+    // the same node routes the same way; `e.compoundBase` (empty for plain `=`)
+    // distinguishes plain from compound, exactly as the recursive Assign arm.
+    [[nodiscard]] HirOperatorEntry const*
+    assignBinaryEntry(NodeId node, NodeId opTok, NodeId lhsN, NodeId rhsN) {
+        if (!opTok.valid() || !lhsN.valid() || !rhsN.valid()) return nullptr;  // malformed
+        auto it = binOp_.find(tree().tokenKind(opTok).v);
+        if (it == binOp_.end()) return nullptr;                                // unmapped
+        HirOperatorEntry const& e = cfg.binaryOps[it->second];
+        return e.target == "Assign" ? &e : nullptr;
+    }
+
     // The three operands of a ternary wrapper [cond, `?`, then, `:`, else] — the
     // visible non-token children. Returns false (and leaves the out-params
     // untouched) when there are not exactly three, so the caller routes a
@@ -2670,7 +2834,7 @@ struct Lowerer {
     // in the frame fields `c0`/`c1`.
     struct StmtFrame {
         enum class Kind : std::uint8_t { PassThrough, Block, If, While, For,
-                                         Label } kind;
+                                         Label, Switch } kind;
         NodeId        node;     // the source node (provenance / combine anchor)
         std::uint8_t  phase;
         bool          doWhile;  // While frame: DoWhileStmt vs WhileStmt
@@ -2697,6 +2861,38 @@ struct Lowerer {
         std::vector<HirNodeId>  stmts;       // accumulated lowered statement ids
     };
 
+    // The accumulating Switch state — the full grouping machine that the recursive
+    // `lowerSwitch` ran as locals, lifted into a ctx so its TWO body-lowering
+    // re-entries (`lowerStmt(bodyCore)` in the case-chain + `lowerStmt(core)` for a
+    // plain arm body) become work-stack pushes on the OUTER `lowerStmt` driver
+    // instead of host recursion — so a switch nested in a switch-arm body carries
+    // flat O(1) host-stack cost per nesting level. Lives in a `switchCtxs` LIFO
+    // stack LOCAL to `lowerStmt` (referenced by stable INDEX `aux`, like `blockCtxs`
+    // — a nested switch grows the stack, and indices survive realloc). The
+    // bookkeeping is byte-IDENTICAL to `lowerSwitch`: `pumpSwitch` runs the same
+    // item loop + adjacent-case chain + label peeling, emitting the SAME nodes in
+    // the SAME order; the ONLY change is that a body lowers via `enterStmt` (and
+    // the Switch frame resumes the pump once `stmtResult` holds it).
+    struct SwitchCtx {
+        NodeId                  node{};        // the switch CST node (provenance anchor)
+        HirNodeId               discId{};      // the (already-lowered) discriminant
+        std::vector<NodeId>     items;         // switchBodyItem wrappers (source order)
+        std::size_t             itemIdx{};     // next top-level item to process
+        // arm-grouping accumulators (the recursive `lowerSwitch` locals):
+        std::vector<HirNodeId>  arms;          // collected CaseArm ids
+        std::optional<NodeId>   curValue;      // the open arm's match expr, if any
+        bool                    curIsDefault{};// the open arm is `default`
+        bool                    haveArm{};     // an arm is open
+        std::vector<HirNodeId>  curBody;       // the open arm's collected body stmts
+        // adjacent-case chain resumption (the `lowerCaseChain` inner `for(;;)`):
+        bool                    inChain{};     // a case-chain is in progress
+        NodeId                  chainCs{};     // the current caseStmt node in the chain
+        std::vector<NodeId>     chainLabels;   // labels to wrap this chain link's body
+        // the just-entered body's pending label-wrap (applied when it completes;
+        // EMPTY ⇒ no wrap — the plain-stmt arm body):
+        std::vector<NodeId>     pendingLabels; // labels for the pending body
+    };
+
     // The public statement-lowering entry: a driver over an explicit work-stack.
     // `enterStmt` classifies a node (TERMINAL / Switch → set `stmtResult`; DEEP
     // form → push a phase-0 frame and return WITHOUT recursing); the loop runs
@@ -2706,6 +2902,7 @@ struct Lowerer {
     HirNodeId lowerStmt(NodeId node) {
         std::vector<StmtFrame> work;
         std::vector<BlockCtx>  blockCtxs;   // accumulators for flattened Blocks
+        std::vector<SwitchCtx> switchCtxs;  // accumulators for flattened Switches
         // Default-init: `enterStmt` ALWAYS assigns `stmtResult` for a terminal,
         // and every pushed frame delivers into `stmtResult` before it is read.
         HirNodeId stmtResult{};
@@ -2772,9 +2969,19 @@ struct Lowerer {
             if (k == "ReturnStmt")  { stmtResult = lowerReturn(n); return; }
             if (k == "BreakStmt")    { stmtResult = track(builder.makeBreak(0), n); return; }
             if (k == "ContinueStmt") { stmtResult = track(builder.makeContinue(0), n); return; }
-            // Switch's arm-grouping stays recursive (it re-enters this driver for
-            // each `lowerStmt(body)`, so deep statements in arms still flatten).
-            if (k == "SwitchStmt")  { stmtResult = lowerSwitch(n); return; }
+            // Switch is a DEEP form: its arm-grouping re-enters the driver for each
+            // arm body (`lowerStmt(body)`), so a switch nested in a switch-arm body
+            // would recurse on the host stack. Flatten it through a Switch frame —
+            // the discriminant + item list lower INLINE here (the prologue,
+            // matching `lowerSwitch`'s opening scan), then the body re-entries go
+            // through the work-stack. `switchPrologue` is byte-identical to the
+            // recursive scan (discriminant first, then collect switchBodyItems).
+            if (k == "SwitchStmt") {
+                std::uint32_t const ctxIdx = static_cast<std::uint32_t>(switchCtxs.size());
+                switchCtxs.push_back(switchPrologue(n));
+                work.push_back({.kind = StmtFrame::Kind::Switch, .node = n, .aux = ctxIdx});
+                return;
+            }
             if (k == "GotoStmt")    { stmtResult = lowerGoto(n); return; }
             if (k == "IndirectGotoStmt") { stmtResult = lowerIndirectGoto(n); return; }
             // D-CSUBSET-LABEL-BEFORE-CASE: a `case`/`default` labeled statement (the
@@ -2818,6 +3025,85 @@ struct Lowerer {
             return true;
         };
 
+        // The Switch arm-grouping PUMP (ctx at stable index `ctxIdx`): runs the
+        // SAME item loop + adjacent-case chain + label peeling as the recursive
+        // `lowerSwitch`, emitting the SAME nodes in the SAME order — but each time
+        // it reaches a BODY to lower it `enterStmt`s the body and returns `true`
+        // (suspended; the Switch frame collects `stmtResult` on resume, applies the
+        // pending label-wrap, then calls this again). Returns `false` when all
+        // top-level items are consumed (the caller finishes the switch). The ctx is
+        // re-addressed fresh each access (a body that is itself a switch grows
+        // `switchCtxs` via `enterStmt`, so a held reference could dangle; the INDEX
+        // is stable). `enterStmt` is the LAST action before a `return true`, so the
+        // dangling-`work.back()` rule holds. The in-flight body's labels are stashed
+        // in `pendingLabels` (empty ⇒ no wrap — the plain-stmt arm body).
+        auto const pumpSwitch = [&](std::uint32_t ctxIdx) -> bool {
+            for (;;) {
+                if (switchCtxs[ctxIdx].inChain) {
+                    // One iteration of `lowerCaseChain`'s `for(;;)` for the current
+                    // chain link (`chainCs` / `chainLabels`).
+                    NodeId const cs = switchCtxs[ctxIdx].chainCs;
+                    std::vector<NodeId> labels = std::move(switchCtxs[ctxIdx].chainLabels);
+                    NodeId caseLabelNode{}, caseBody{};
+                    bool seenFirst = false;
+                    for (NodeId c : visible(cs)) {
+                        if (isToken(c)) continue;
+                        if (!seenFirst) { caseLabelNode = c; seenFirst = true; }
+                        else { caseBody = c; break; }
+                    }
+                    switchStartArm(switchCtxs[ctxIdx], switchCtxs[ctxIdx].node, caseLabelNode);
+                    if (!caseBody.valid()) {                       // empty case body (defensive)
+                        if (!labels.empty())
+                            switchCtxs[ctxIdx].curBody.push_back(switchWrapLabels(
+                                switchCtxs[ctxIdx].node, labels,
+                                switchMakeSkip(switchCtxs[ctxIdx].node)));
+                        switchCtxs[ctxIdx].inChain = false;
+                        continue;                                  // chain done → next top-level item
+                    }
+                    NodeId bodyCore = peelToCore(caseBody);
+                    std::vector<NodeId> innerLabels;
+                    NodeId bodyProbe = switchPeelLabels(bodyCore, innerLabels);
+                    if (switchIsRuleNode(bodyProbe, cfg.caseStmtRule)) {  // adjacent case
+                        if (!labels.empty())
+                            switchCtxs[ctxIdx].curBody.push_back(switchWrapLabels(
+                                switchCtxs[ctxIdx].node, labels,
+                                switchMakeSkip(switchCtxs[ctxIdx].node)));
+                        switchCtxs[ctxIdx].chainCs = bodyProbe;
+                        switchCtxs[ctxIdx].chainLabels = std::move(innerLabels);
+                        continue;                                  // → next chain link (stay inChain)
+                    }
+                    // The real body of this chain link → SUSPEND. The chain ends
+                    // after it (the recursive `lowerCaseChain` returns here).
+                    switchCtxs[ctxIdx].inChain = false;
+                    switchCtxs[ctxIdx].pendingLabels = std::move(labels);
+                    enterStmt(bodyCore);   // LAST action — may grow switchCtxs
+                    return true;
+                }
+                // The top-level item loop (`for (raw : items)`).
+                if (switchCtxs[ctxIdx].itemIdx >= switchCtxs[ctxIdx].items.size())
+                    return false;          // all items consumed → finish
+                NodeId const raw = switchCtxs[ctxIdx].items[switchCtxs[ctxIdx].itemIdx];
+                ++switchCtxs[ctxIdx].itemIdx;
+                NodeId core = peelToCore(raw);
+                std::vector<NodeId> labelToks;
+                NodeId probe = switchPeelLabels(core, labelToks);
+                if (switchIsRuleNode(probe, cfg.caseStmtRule)) {   // (label-wrapped) case statement
+                    switchCtxs[ctxIdx].inChain = true;
+                    switchCtxs[ctxIdx].chainCs = probe;
+                    switchCtxs[ctxIdx].chainLabels = std::move(labelToks);
+                    continue;                                      // enter the chain
+                } else if (switchIsRuleNode(core, cfg.caseLabelRule)) {  // bare flat case
+                    switchStartArm(switchCtxs[ctxIdx], switchCtxs[ctxIdx].node, core);
+                    continue;
+                } else if (switchCtxs[ctxIdx].haveArm) {           // plain stmt body → SUSPEND (no wrap)
+                    switchCtxs[ctxIdx].pendingLabels.clear();
+                    enterStmt(core);       // LAST action — may grow switchCtxs
+                    return true;
+                }
+                // not haveArm and not a case → nothing to emit; next item.
+            }
+        };
+
         enterStmt(node);
         while (!work.empty()) {
             StmtFrame& f = work.back();
@@ -2849,6 +3135,32 @@ struct Lowerer {
                     ++blockCtxs[ctxIdx].itemIdx;
                     if (pumpBlock(ctxIdx)) break;       // entered the next item — wait
                     finishBlock(work, blockCtxs, ctxIdx, stmtResult);   // all consumed
+                }
+                break;
+            case StmtFrame::Kind::Switch:
+                // The discriminant + items lowered in the prologue; now the
+                // arm-grouping pump (phase 0), suspending at each body so it lowers
+                // through the work-stack. On resume (else) a body just completed
+                // (`stmtResult`): apply its pending label-wrap, collect it into the
+                // open arm's body, then pump again — or finish (flush + makeSwitch).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    std::uint32_t const ctxIdx = f.aux;
+                    if (pumpSwitch(ctxIdx)) break;      // entered the first body — wait
+                    finishSwitch(work, switchCtxs, ctxIdx, stmtResult);   // no bodies
+                } else {
+                    // A body just completed (`stmtResult`). Wrap it in its pending
+                    // goto-labels (empty ⇒ unchanged — the plain-stmt arm body) and
+                    // collect it, exactly as the recursive `curBody.push_back(
+                    // wrapLabels(labels, lowerStmt(body)))`. Then pump the next.
+                    std::uint32_t const ctxIdx = f.aux;
+                    NodeId const node2 = switchCtxs[ctxIdx].node;
+                    HirNodeId const wrapped = switchWrapLabels(
+                        node2, switchCtxs[ctxIdx].pendingLabels, stmtResult);
+                    switchCtxs[ctxIdx].curBody.push_back(wrapped);
+                    switchCtxs[ctxIdx].pendingLabels.clear();
+                    if (pumpSwitch(ctxIdx)) break;      // entered the next body — wait
+                    finishSwitch(work, switchCtxs, ctxIdx, stmtResult);   // all consumed
                 }
                 break;
             case StmtFrame::Kind::If:
@@ -2979,6 +3291,22 @@ struct Lowerer {
         work.pop_back();
         blockCtxs.pop_back();
         stmtResult = blockH;
+    }
+
+    // Finish a flattened Switch: flush the last open arm (the match VALUE lowers
+    // HERE, after its body — exactly as the recursive `lowerSwitch`'s trailing
+    // `flush()`), emit makeSwitchStmt, pop the Switch frame + its ctx (LIFO top — a
+    // nested switch finished inner-first), and deliver into `stmtResult`. Shared by
+    // the no-bodies and all-items-consumed paths. Byte-identical to `lowerSwitch`'s
+    // `track(makeSwitchStmt(discId, arms), node)`.
+    void finishSwitch(std::vector<StmtFrame>& work, std::vector<SwitchCtx>& switchCtxs,
+                      std::uint32_t ctxIdx, HirNodeId& stmtResult) {
+        SwitchCtx& ctx = switchCtxs[ctxIdx];
+        switchFlush(ctx, ctx.node);
+        HirNodeId const swH = track(builder.makeSwitchStmt(ctx.discId, ctx.arms), ctx.node);
+        work.pop_back();
+        switchCtxs.pop_back();
+        stmtResult = swH;
     }
 
     // FC5 — pre-assign a per-function ordinal to every label in `node`'s subtree
@@ -4158,21 +4486,7 @@ struct Lowerer {
     }
     std::uint32_t nextSyntheticSym_ = 0;
 
-    // A resolved lvalue: how to READ its current value and WRITE a new one, plus
-    // the prep statements that must run FIRST. A SIMPLE variable lvalue needs no
-    // prep (reading a `Ref` is side-effect-free, so it can be read repeatedly). A
-    // COMPLEX lvalue (an index / deref whose address sub-expressions may have
-    // side effects) binds its ADDRESS into a temp pointer once in `prep`, then
-    // reads/writes through `*ptr` — so `a[f()] += 1` evaluates `f()` exactly
-    // once. This is what makes compound-assign / ++ / assignment-as-value correct
-    // for every lvalue, not just simple variables.
-    struct Lvalue {
-        bool                   simple = true;
-        TypeId                 type{};       // the lvalue's value type
-        SymbolId               sym{};        // simple: the variable; via-ptr: the temp pointer
-        TypeId                 ptrType{};    // via-ptr only: interner.pointer(type)
-        std::vector<HirNodeId> prep;         // via-ptr only: [ var ptr = &<lvalue> ]
-    };
+    // (`struct Lvalue` is defined up near `ExprFrame`/`AssignCtx`, which embeds it.)
 
     [[nodiscard]] HirNodeId lvRead(Lvalue const& lv) {
         if (lv.simple) return builder.makeRef(lv.type, lv.sym.v);
@@ -4597,91 +4911,109 @@ struct Lowerer {
         return lowerStmtExprCore(core, /*wrapBare=*/false);
     }
 
-    HirNodeId lowerSwitch(NodeId node) {
+    // ── Switch arm-grouping: SHARED bookkeeping (the recursive `lowerSwitch`
+    // locals/lambdas, lifted to members so BOTH the retained recursive oracle AND
+    // the `lowerStmt` driver's Switch frame run the SAME logic → byte-identical).
+    // Only the two BODY-lowering re-entries differ between them (the oracle uses
+    // `lowerStmt` recursion; the driver's `pumpSwitch` uses `enterStmt`). All node
+    // emission below is unchanged from the prior inline form. ─────────────────────
+
+    // A goto-label before a case (`foo: case 1: stmt`) parses as
+    // labelStmt(foo, caseStmt(caseLabel(1), stmt)) — the label STAYS a real
+    // labelStmt node (pre-scanned + goto-resolvable). `D-CSUBSET-LABEL-BEFORE-CASE`.
+    [[nodiscard]] bool switchIsLabelStmtNode(NodeId n) {
+        HirRuleMapping const* m = mappingFor(n);
+        return m != nullptr && m->hirKind == "LabelStmt";
+    }
+    [[nodiscard]] bool switchIsRuleNode(NodeId n, RuleId r) const {
+        return r.valid() && tree().kind(n) == NodeKind::Internal
+            && tree().rule(n).v == r.v;
+    }
+    [[nodiscard]] NodeId switchFirstNonToken(NodeId n) const {
+        for (NodeId c : visible(n)) if (!isToken(c)) return c;
+        return NodeId{};
+    }
+    [[nodiscard]] HirNodeId switchMakeSkip(NodeId node) {
+        return track(builder.makeBlock({}), node);
+    }
+    // Flush the open arm into a CaseArm. The match VALUE lowers HERE (at flush time,
+    // exactly as the recursive form — after the arm's body statements).
+    void switchFlush(SwitchCtx& ctx, NodeId node) {
+        if (!ctx.haveArm) return;
+        std::optional<HirNodeId> value;
+        if (!ctx.curIsDefault && ctx.curValue) value = lowerExpr(*ctx.curValue).id;
+        ctx.arms.push_back(track(builder.makeCaseArm(value, ctx.curBody), node));
+        ctx.curBody.clear();
+    }
+    // Open a new arm from a `caseLabel` node (the SAME match-value/default
+    // extraction the bare flat path uses).
+    void switchStartArm(SwitchCtx& ctx, NodeId node, NodeId caseLabelNode) {
+        switchFlush(ctx, node);
+        ctx.haveArm = true;
+        ctx.curIsDefault = false;
+        ctx.curValue = std::nullopt;
+        for (NodeId lc : visible(caseLabelNode)) {
+            if (isToken(lc)) {
+                if (cfg.caseDefaultToken.valid()
+                    && tree().tokenKind(lc).v == cfg.caseDefaultToken.v)
+                    ctx.curIsDefault = true;
+            } else {
+                ctx.curValue = lc;   // the case match expression
+            }
+        }
+    }
+    // Peel leading LabelStmt layers off `core`, collecting their name tokens;
+    // return the innermost peeled core.
+    [[nodiscard]] NodeId switchPeelLabels(NodeId core, std::vector<NodeId>& outToks) {
+        while (switchIsLabelStmtNode(core)) {
+            NodeId body = switchFirstNonToken(core);
+            if (!body.valid()) break;
+            outToks.push_back(firstIdentifierToken(core));
+            core = peelToCore(body);
+        }
+        return core;
+    }
+    // Wrap `inner` in the collected goto-labels (outermost first). Each is a real
+    // pre-scanned LabelStmt so `goto foo` resolves to this arm's entry exactly as
+    // `case 1: foo: stmt` would (C 6.8.1). EMPTY `toks` ⇒ returns `inner` unchanged.
+    [[nodiscard]] HirNodeId switchWrapLabels(NodeId node, std::vector<NodeId> const& toks,
+                                             HirNodeId inner) {
+        HirNodeId result = inner;
+        for (auto it = toks.rbegin(); it != toks.rend(); ++it) {
+            auto found = labelOrdinals_.find(std::string{tree().text(*it)});
+            if (found == labelOrdinals_.end()) continue;   // pre-scan covers all
+            result = track(builder.makeLabelStmt(found->second, result), node);
+        }
+        return result;
+    }
+
+    // The Switch PROLOGUE shared by `lowerSwitch` (recursive oracle) and the
+    // `lowerStmt` driver's Switch frame: lower the discriminant INLINE (the first
+    // `Role::Expr` child, at its source position — matching the recursive scan) and
+    // collect the switchBodyItem wrappers in source order. Byte-identical to the
+    // recursive opening scan; builds the ctx the grouping machine then consumes.
+    [[nodiscard]] SwitchCtx switchPrologue(NodeId node) {
+        SwitchCtx ctx;
+        ctx.node = node;
         std::optional<HirNodeId> disc;
-        std::vector<NodeId> items;
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
             if (!disc && classify(c) == Role::Expr) { disc = lowerExpr(c).id; continue; }
-            items.push_back(c);   // switchBodyItem wrappers (caseLabel | statement)
+            ctx.items.push_back(c);   // switchBodyItem wrappers (caseLabel | statement)
         }
-        HirNodeId discId = orError(disc, node, "switch has no discriminant");
+        ctx.discId = orError(disc, node, "switch has no discriminant");
+        return ctx;
+    }
 
-        std::vector<HirNodeId> arms;
-        std::optional<NodeId>  curValue;       // the case match expression, if any
-        bool                   curIsDefault = false;
-        bool                   haveArm = false;
-        std::vector<HirNodeId> curBody;
-        auto flush = [&]() {
-            if (!haveArm) return;
-            std::optional<HirNodeId> value;
-            if (!curIsDefault && curValue) value = lowerExpr(*curValue).id;
-            arms.push_back(track(builder.makeCaseArm(value, curBody), node));
-            curBody.clear();
-        };
-
-        // ── D-CSUBSET-LABEL-BEFORE-CASE helpers ──────────────────────────────
-        // A goto-label before a case (`foo: case 1: stmt`) parses as
-        // labelStmt(foo, caseStmt(caseLabel(1), stmt)) — the label STAYS a real
-        // labelStmt node, so it is pre-scanned + goto-resolvable for free. These
-        // helpers peel the (possibly multi-)label-wrapped caseStmt into arms,
-        // producing HIR identical to the long-supported `case 1: foo: stmt`.
-        auto isLabelStmtNode = [&](NodeId n) {
-            HirRuleMapping const* m = mappingFor(n);
-            return m != nullptr && m->hirKind == "LabelStmt";
-        };
-        auto isRuleNode = [&](NodeId n, RuleId r) {
-            return r.valid() && tree().kind(n) == NodeKind::Internal
-                && tree().rule(n).v == r.v;
-        };
-        auto firstNonToken = [&](NodeId n) -> NodeId {
-            for (NodeId c : visible(n)) if (!isToken(c)) return c;
-            return NodeId{};
-        };
-        auto makeSkip = [&]() { return track(builder.makeBlock({}), node); };
-        // Open a new arm from a `caseLabel` node (the SAME match-value/default
-        // extraction the bare flat path uses).
-        auto startArm = [&](NodeId caseLabelNode) {
-            flush();
-            haveArm = true;
-            curIsDefault = false;
-            curValue = std::nullopt;
-            for (NodeId lc : visible(caseLabelNode)) {
-                if (isToken(lc)) {
-                    if (cfg.caseDefaultToken.valid()
-                        && tree().tokenKind(lc).v == cfg.caseDefaultToken.v)
-                        curIsDefault = true;
-                } else {
-                    curValue = lc;   // the case match expression
-                }
-            }
-        };
-        // Peel leading LabelStmt layers off `core`, collecting their name tokens;
-        // return the innermost peeled core.
-        auto peelLabels = [&](NodeId core, std::vector<NodeId>& outToks) {
-            while (isLabelStmtNode(core)) {
-                NodeId body = firstNonToken(core);
-                if (!body.valid()) break;
-                outToks.push_back(firstIdentifierToken(core));
-                core = peelToCore(body);
-            }
-            return core;
-        };
-        // Wrap `inner` in the collected goto-labels (outermost first). Each is a
-        // real pre-scanned LabelStmt so `goto foo` resolves to this arm's entry
-        // exactly as `case 1: foo: stmt` would (C 6.8.1).
-        auto wrapLabels = [&](std::vector<NodeId> const& toks, HirNodeId inner) {
-            HirNodeId result = inner;
-            for (auto it = toks.rbegin(); it != toks.rend(); ++it) {
-                auto found = labelOrdinals_.find(std::string{tree().text(*it)});
-                if (found == labelOrdinals_.end()) continue;   // pre-scan covers all
-                result = track(builder.makeLabelStmt(found->second, result), node);
-            }
-            return result;
-        };
-        // Lower a (label-wrapped) `caseStmt` into arms. Iterates over adjacent
-        // label-prefixed cases (`foo: case 1: case 2: stmt`): an empty case with a
-        // leading label is marked by LabelStmt(label, {}) at its entry.
+    // The retained RECURSIVE `lowerSwitch` (now dead via the driver, like
+    // `lowerBlock`/`lowerIf` — kept as the single-source ORACLE the goldens pin
+    // against). Drives the SHARED grouping members; the body re-entries use
+    // `lowerStmt` recursion. The `lowerStmt` driver flattens the SAME logic via
+    // `pumpSwitch` (its body re-entries push onto the work-stack instead).
+    HirNodeId lowerSwitch(NodeId node) {
+        SwitchCtx ctx = switchPrologue(node);
+        // Lower a (label-wrapped) `caseStmt` chain into arms (adjacent
+        // `foo: case 1: case 2: stmt` → empty label-marked arms + the real body).
         auto lowerCaseChain = [&](NodeId cs, std::vector<NodeId> labels) {
             for (;;) {
                 NodeId caseLabelNode{}, caseBody{};
@@ -4691,39 +5023,40 @@ struct Lowerer {
                     if (!seenFirst) { caseLabelNode = c; seenFirst = true; }
                     else { caseBody = c; break; }
                 }
-                startArm(caseLabelNode);
+                switchStartArm(ctx, node, caseLabelNode);
                 if (!caseBody.valid()) {                          // empty case body (defensive)
-                    if (!labels.empty()) curBody.push_back(wrapLabels(labels, makeSkip()));
+                    if (!labels.empty())
+                        ctx.curBody.push_back(switchWrapLabels(node, labels, switchMakeSkip(node)));
                     return;
                 }
                 NodeId bodyCore = peelToCore(caseBody);
                 std::vector<NodeId> innerLabels;
-                NodeId bodyProbe = peelLabels(bodyCore, innerLabels);
-                if (isRuleNode(bodyProbe, cfg.caseStmtRule)) {     // adjacent case → label-mark this empty arm
-                    if (!labels.empty()) curBody.push_back(wrapLabels(labels, makeSkip()));
+                NodeId bodyProbe = switchPeelLabels(bodyCore, innerLabels);
+                if (switchIsRuleNode(bodyProbe, cfg.caseStmtRule)) {  // adjacent case
+                    if (!labels.empty())
+                        ctx.curBody.push_back(switchWrapLabels(node, labels, switchMakeSkip(node)));
                     cs = bodyProbe;
                     labels = std::move(innerLabels);
                     continue;                                      // → next arm
                 }
-                curBody.push_back(wrapLabels(labels, lowerStmt(bodyCore)));
+                ctx.curBody.push_back(switchWrapLabels(node, labels, lowerStmt(bodyCore)));
                 return;
             }
         };
-
-        for (NodeId raw : items) {
+        for (NodeId raw : ctx.items) {
             NodeId core = peelToCore(raw);
             std::vector<NodeId> labelToks;
-            NodeId probe = peelLabels(core, labelToks);
-            if (isRuleNode(probe, cfg.caseStmtRule)) {            // (label-wrapped) case statement
+            NodeId probe = switchPeelLabels(core, labelToks);
+            if (switchIsRuleNode(probe, cfg.caseStmtRule)) {      // (label-wrapped) case statement
                 lowerCaseChain(probe, std::move(labelToks));
-            } else if (isRuleNode(core, cfg.caseLabelRule)) {     // bare flat case (EXISTING path)
-                startArm(core);
-            } else if (haveArm) {                                 // plain stmt (incl. `foo: x=1;` via lowerLabel)
-                curBody.push_back(lowerStmt(core));
+            } else if (switchIsRuleNode(core, cfg.caseLabelRule)) {  // bare flat case
+                switchStartArm(ctx, node, core);
+            } else if (ctx.haveArm) {                             // plain stmt
+                ctx.curBody.push_back(lowerStmt(core));
             }
         }
-        flush();
-        return track(builder.makeSwitchStmt(discId, arms), node);
+        switchFlush(ctx, node);
+        return track(builder.makeSwitchStmt(ctx.discId, ctx.arms), node);
     }
 
     // ── declarations ──────────────────────────────────────────────────────────
