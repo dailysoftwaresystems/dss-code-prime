@@ -1575,6 +1575,50 @@ struct Lowerer {
         return mir.addInst(MirOpcode::Gep, ops, interner.pointer(elemTy));
     }
 
+    // ── Plan 24 Stage 4-cfg — control-flow value-arm guard slices ──────────
+    // The fail-loud anti-resurrection guards lifted VERBATIM out of the
+    // recursive Ternary / SeqExpr value arms, so the flattened CFG frames run
+    // the EXACT SAME diagnostic at the EXACT SAME point (before any block is
+    // minted). Returns true (and reports) iff the node's value type is an
+    // aggregate — which must reach this carrier by ADDRESS, never as a bare SSA
+    // rvalue (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR). False ⇒ proceed.
+
+    [[nodiscard]] bool ternaryAggregateGuardFails(HirNodeId node) {
+        TypeId const t = hir.typeId(node);
+        if (t.valid()) {
+            TypeKind const tk = interner.kind(t);
+            if (tk == TypeKind::Struct || tk == TypeKind::Union
+                || tk == TypeKind::Array) {
+                unsupported(node,
+                    "internal: an aggregate-typed ternary must be lowered "
+                    "into a slot by ADDRESS (lowerLvalueAddress — a CFG "
+                    "diamond into one common slot), never as a bare SSA "
+                    "rvalue — the MIR has no aggregate-width value and a "
+                    "phi-of-aggregate cannot pack bit-fields "
+                    "(D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR)");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool seqExprAggregateGuardFails(HirNodeId node) {
+        TypeId const t = hir.typeId(node);
+        if (t.valid()) {
+            TypeKind const tk = interner.kind(t);
+            if (tk == TypeKind::Struct || tk == TypeKind::Union
+                || tk == TypeKind::Array) {
+                unsupported(node,
+                    "internal: an aggregate-typed comma/SeqExpr must be "
+                    "lowered by ADDRESS (lowerLvalueAddress), never as a "
+                    "bare SSA rvalue (D-CSUBSET-AGGREGATE-VALUED-CONTROL-"
+                    "EXPR)");
+                return true;
+            }
+        }
+        return false;
+    }
+
     // ── Plan 24 Stage 4 — the iterative value+address-lowering driver ──────
     // A POD work-stack frame for ONE flattened straight-line arm. `phase`
     // 0 = enter the (last) child; for a 2-child arm (BinaryOp) phase 1 = enter
@@ -1593,11 +1637,28 @@ struct Lowerer {
     // request (Binary: the LHS; IndexAddr: the byte-scaled index).
     struct ValueFrame {
         enum class Kind : std::uint8_t {
-            Unary, Binary, Deref, Cast, MemberAddr, IndexAddr
+            Unary, Binary, Deref, Cast, MemberAddr, IndexAddr,
+            // Stage 4-cfg: the control-flow VALUE arms. Each is a multi-phase
+            // machine that INTERLEAVES createBlock/addCondBr/addBr/beginBlock
+            // with its sub-expression requests; the block handles + first-arm
+            // value/predecessor it minted are carried in the frame fields below
+            // (NEVER in a dangling `work.back()` reference) across phases.
+            Ternary, Logical, SeqExpr
         } kind;
         HirNodeId node;
         std::uint8_t phase;
         MirInstId c0;
+        // CFG-frame state, carried across phases (realloc-safe — they live in
+        // the vector element, copied to locals before any push). Unused by the
+        // straight-line/address kinds. `bb0/bb1/bb2` are the minted blocks
+        // (Ternary: then/else/join; Logical: rhs/join, bb2 unused); `v0` is the
+        // first-arm value (Ternary: thenVal; Logical: lhs); `pred0` is the
+        // first-arm predecessor block (Ternary: thenPred; Logical: lhsPred).
+        MirBlockId bb0{};
+        MirBlockId bb1{};
+        MirBlockId bb2{};
+        MirInstId  v0{};
+        MirBlockId pred0{};
     };
 
     // The shared {Value,Address} expression-lowering driver over an explicit
@@ -1689,6 +1750,38 @@ struct Lowerer {
                         return;
                     }
                     break;
+                // Stage 4-cfg: the control-flow VALUE arms flatten so a deeply-
+                // nested `a?b:c?d:e…` / `a&&b&&c…` chain (and a comma chain's
+                // result tail) carries flat host-stack cost. Each pushes a
+                // multi-phase frame whose machine reproduces the recursive arm's
+                // createBlock ORDER, branch successors, and addPhi predecessor
+                // ORDER byte-for-byte (see the driver loop). A malformed arity
+                // delegates to the recursive body (its own fail-loud guard).
+                case HirKind::Ternary:
+                    if (hir.children(n).size() == 3) {
+                        work.push_back({.kind = ValueFrame::Kind::Ternary,
+                                        .node = n, .phase = 0});
+                        return;
+                    }
+                    break;
+                case HirKind::LogicalAnd:
+                case HirKind::LogicalOr:
+                    if (hir.children(n).size() == 2) {
+                        work.push_back({.kind = ValueFrame::Kind::Logical,
+                                        .node = n, .phase = 0});
+                        return;
+                    }
+                    break;
+                case HirKind::SeqExpr:
+                    // The side-effect statements lower via `lowerStmt` (a
+                    // separate machine, kept recursive); only the RESULT-tail
+                    // re-enters this driver, so a deep comma chain's result
+                    // expression flattens. Push unconditionally (no arity gate —
+                    // SeqExpr has no `children()` arity; it carries stmts+result
+                    // accessors) and run the guard+stmts in phase 0.
+                    work.push_back({.kind = ValueFrame::Kind::SeqExpr,
+                                    .node = n, .phase = 0});
+                    return;
                 default: break;
             }
             result = lowerExprNode(n);   // delegate (terminal / CFG / by-address)
@@ -1822,6 +1915,164 @@ struct Lowerer {
                     result = basePtr.valid()
                                  ? combineIndexAddr(node2, byteIdx, basePtr)
                                  : InvalidMirInst;
+                }
+                break;
+            case ValueFrame::Kind::Ternary:
+                // `cond ? then : else` → a diamond CFG with a phi at the join.
+                // Replicates the recursive Ternary arm BYTE-FOR-BYTE:
+                //   phase 0: aggregate guard, then lower COND.
+                //   phase 1: mint thenBB, elseBB, joinBB (IN THAT ORDER —
+                //            createBlock id == creation order), CondBr(cond,
+                //            thenBB, elseBB), beginBlock(thenBB), lower THEN.
+                //   phase 2: thenPred = currentlyOpenBlock(), Br(joinBB),
+                //            beginBlock(elseBB), lower ELSE.
+                //   phase 3: elsePred = currentlyOpenBlock(), Br(joinBB),
+                //            beginBlock(joinBB), Phi[{then,thenPred},
+                //            {else,elsePred}] — predecessor order then-then-else.
+                // The block handles + thenVal + thenPred are carried in the
+                // frame fields (bb0/bb1/bb2/v0/pred0), NEVER in a `work.back()`
+                // reference that dangles after a sub-request push.
+                if (f.phase == 0) {
+                    HirNodeId const node2 = f.node;
+                    if (ternaryAggregateGuardFails(node2)) {
+                        work.pop_back(); result = InvalidMirInst; break;
+                    }
+                    f.phase = 1;
+                    HirNodeId const condN = hir.children(node2)[0];
+                    request(condN, false);    // lower cond — may invalidate `f`
+                } else if (f.phase == 1) {
+                    MirInstId const cond = result;
+                    if (!cond.valid()) { work.pop_back(); result = InvalidMirInst; break; }
+                    HirNodeId const node2 = f.node;
+                    MirBlockId const thenBB = mir.createBlock(StructCfMarker::IfThen);
+                    MirBlockId const elseBB = mir.createBlock(StructCfMarker::IfElse);
+                    MirBlockId const joinBB = mir.createBlock(StructCfMarker::IfJoin);
+                    mir.addCondBr(cond, thenBB, elseBB);
+                    mir.beginBlock(thenBB);
+                    f.bb0 = thenBB; f.bb1 = elseBB; f.bb2 = joinBB;
+                    f.phase = 2;
+                    HirNodeId const thenN = hir.children(node2)[1];
+                    request(thenN, false);    // lower then-value — may invalidate `f`
+                } else if (f.phase == 2) {
+                    MirInstId const thenVal = result;
+                    MirBlockId const elseBB = f.bb1;
+                    MirBlockId const joinBB = f.bb2;
+                    if (!thenVal.valid()) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(elseBB);
+                        sealCreatedAsUnreachable(joinBB);
+                        work.pop_back(); result = InvalidMirInst; break;
+                    }
+                    HirNodeId const node2 = f.node;
+                    MirBlockId const thenPred = mir.currentlyOpenBlock();
+                    mir.addBr(joinBB);
+                    mir.beginBlock(elseBB);
+                    f.v0 = thenVal; f.pred0 = thenPred;
+                    f.phase = 3;
+                    HirNodeId const elseN = hir.children(node2)[2];
+                    request(elseN, false);    // lower else-value — may invalidate `f`
+                } else {
+                    MirInstId const elseVal = result;
+                    MirBlockId const joinBB = f.bb2;
+                    if (!elseVal.valid()) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(joinBB);
+                        work.pop_back(); result = InvalidMirInst; break;
+                    }
+                    HirNodeId const node2 = f.node;
+                    MirInstId const thenVal  = f.v0;
+                    MirBlockId const thenPred = f.pred0;
+                    MirBlockId const elsePred = mir.currentlyOpenBlock();
+                    mir.addBr(joinBB);
+                    mir.beginBlock(joinBB);
+                    std::array<MirPhiIncoming, 2> incomings{
+                        MirPhiIncoming{thenVal, thenPred},
+                        MirPhiIncoming{elseVal, elsePred},
+                    };
+                    work.pop_back();
+                    result = mir.addPhi(hir.typeId(node2), incomings);
+                }
+                break;
+            case ValueFrame::Kind::Logical:
+                // `lhs && rhs` / `lhs || rhs` short-circuit → a one-armed
+                // diamond. Replicates the recursive LogicalAnd/Or arm
+                // BYTE-FOR-BYTE:
+                //   phase 0: lower LHS (in the CURRENT block).
+                //   phase 1: lhsPred = currentlyOpenBlock(), mint rhsBB then
+                //            joinBB (IN THAT ORDER), CondBr(lhs, AND?rhsBB:joinBB,
+                //            AND?joinBB:rhsBB), beginBlock(rhsBB), lower RHS.
+                //   phase 2: rhsPred = currentlyOpenBlock(), Br(joinBB),
+                //            beginBlock(joinBB), Phi[{lhs,lhsPred},{rhs,rhsPred}]
+                //            — predecessor order lhs-then-rhs.
+                // lhs + lhsPred + the block handles carry in v0/pred0/bb0/bb1.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    HirNodeId const lhsN = hir.children(f.node)[0];
+                    request(lhsN, false);     // lower lhs — may invalidate `f`
+                } else if (f.phase == 1) {
+                    MirInstId const lhs = result;
+                    if (!lhs.valid()) { work.pop_back(); result = InvalidMirInst; break; }
+                    HirNodeId const node2 = f.node;
+                    bool const isAnd = (hir.kind(node2) == HirKind::LogicalAnd);
+                    MirBlockId const lhsPred = mir.currentlyOpenBlock();
+                    MirBlockId const rhsBB  = mir.createBlock(StructCfMarker::IfThen);
+                    MirBlockId const joinBB = mir.createBlock(StructCfMarker::IfJoin);
+                    mir.addCondBr(lhs, isAnd ? rhsBB : joinBB,
+                                       isAnd ? joinBB : rhsBB);
+                    mir.beginBlock(rhsBB);
+                    f.v0 = lhs; f.pred0 = lhsPred; f.bb0 = rhsBB; f.bb1 = joinBB;
+                    f.phase = 2;
+                    HirNodeId const rhsN = hir.children(node2)[1];
+                    request(rhsN, false);     // lower rhs — may invalidate `f`
+                } else {
+                    MirInstId const rhs = result;
+                    MirBlockId const joinBB = f.bb1;
+                    if (!rhs.valid()) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(joinBB);
+                        work.pop_back(); result = InvalidMirInst; break;
+                    }
+                    HirNodeId const node2 = f.node;
+                    MirInstId const lhs     = f.v0;
+                    MirBlockId const lhsPred = f.pred0;
+                    MirBlockId const rhsPred = mir.currentlyOpenBlock();
+                    mir.addBr(joinBB);
+                    mir.beginBlock(joinBB);
+                    std::array<MirPhiIncoming, 2> incomings{
+                        MirPhiIncoming{lhs, lhsPred},
+                        MirPhiIncoming{rhs, rhsPred},
+                    };
+                    work.pop_back();
+                    result = mir.addPhi(hir.typeId(node2), incomings);
+                }
+                break;
+            case ValueFrame::Kind::SeqExpr:
+                // `(s1, s2, …, result)` → run the side-effect statements in
+                // order (via `lowerStmt`, a separate machine kept recursive —
+                // it spins up its OWN local driver for any sub-expressions, so
+                // it never touches THIS work-stack), then yield the RESULT
+                // expression's value. Only the result tail re-enters this driver
+                // (phase 0 requests it), so a deep comma chain's result spine
+                // flattens. Byte-identical to the recursive arm: same aggregate
+                // guard, same stmt order, then `lowerExpr(result)`.
+                if (f.phase == 0) {
+                    HirNodeId const node2 = f.node;
+                    if (seqExprAggregateGuardFails(node2)) {
+                        work.pop_back(); result = InvalidMirInst; break;
+                    }
+                    bool stmtFailed = false;
+                    for (HirNodeId stmt : hir.seqExprStmts(node2)) {
+                        if (!lowerStmt(stmt)) { stmtFailed = true; break; }
+                    }
+                    if (stmtFailed) { work.pop_back(); result = InvalidMirInst; break; }
+                    f.phase = 1;
+                    // `lowerStmt` did not push to THIS work-stack, so `f` is
+                    // still live; the result-tail request is the last action.
+                    HirNodeId const resultN = hir.seqExprResult(node2);
+                    request(resultN, false);  // lower result tail — may invalidate `f`
+                } else {
+                    // `result` already holds the tail expression's value.
+                    work.pop_back();
                 }
                 break;
             }

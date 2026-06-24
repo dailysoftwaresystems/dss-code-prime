@@ -6281,3 +6281,209 @@ TEST(MirLoweringCSubset, IterativeDeepIndexAddressChainLowersFlatAndByteIdentica
     EXPECT_EQ(m.instOperands(ret)[0], load);
         });  // runOnLargeStack
 }
+
+// ─── Plan 24 Stage 4-cfg — iterative HIR→MIR control-flow VALUE driver ──────
+//
+// SF-4 differential pin for the CFG-value half: a DEEPLY right-nested ternary
+// chain `a ? b : (c ? d : (e ? f : … ))` (each level's ELSE arm is the next
+// ternary, so the recursion goes one frame deeper per level). The Ternary value
+// arm now flattens onto the shared work-stack — each level is a 4-phase frame
+// that INTERLEAVES createBlock / addCondBr / addBr / beginBlock / addPhi with
+// its cond/then/else sub-lowerings. This pin asserts the EXACT thing a phase
+// bug corrupts: the monotonic BLOCK-ID creation sequence AND each join phi's
+// PREDECESSOR-block ids in INCOMING ORDER.
+//
+// Block-creation order (entry == block 0; createBlock id == creation order, the
+// single-chokepoint monotonic invariant): the lowering is depth-first leftmost,
+// and each ternary mints then→else→join AFTER its cond is lowered and BEFORE its
+// then/else are. So level i (outermost == 0) mints thenBB=block(3i+1),
+// elseBB=block(3i+2), joinBB=block(3i+3); the innermost level is i=kDepth-1.
+//
+// Each level's join phi predecessor order (the byte-identity guard — a swapped
+// incoming or a wrong insertion-block switch flips these):
+//   incoming[0].pred == level i's thenBB == block(3i+1)   (the THEN arm)
+//   incoming[1].pred == (i < kDepth-1) ? level (i+1)'s joinBB == block(3i+6)
+//                                      : level i's elseBB   == block(3i+2)
+// i.e. an OUTER level's else-incoming arrives from the NESTED ternary's JOIN
+// (where the inner phi lives, the open block after the inner diamond closes),
+// while the INNERMOST level's else-incoming arrives from its own elseBB. A
+// phase machine that captured `elsePred` from the wrong block, minted blocks in
+// the wrong order, or swapped the phi incomings would fail these exact asserts.
+//
+// WITNESS SPLIT — the flat/host-stack-overflow witness (that the Ternary value
+// arm is an O(1)-host-stack work-stack, not recursion) lives in the CORPUS
+// example `deep_ternary_mir`, which lowers a deep ?: chain through the real
+// pipeline and would crash if the CFG-value axis recursed. THIS unit pin asserts
+// the orthogonal half: byte-identity of the diamond/phi backbone at depth.
+// Build/lower/teardown run on the 64 MiB worker (kDeepRecursionStackBytes) so
+// neither the deep HIR-tree teardown nor any orthogonal recursion depends on the
+// host's small main-stack budget (stock MSVC Debug main stack = 1 MiB).
+//
+// Synthetic (SF-4): the parser's 256 maxExpressionDepth cap forbids a 1000-deep
+// ternary in source, so the deep input is built via the public `HirBuilder`.
+TEST(MirLoweringCSubset, IterativeDeepTernaryChainLowersFlatAndByteIdentical) {
+    constexpr std::uint32_t kDepth = 1000;  // # of nested ternary levels
+
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    // `int f(int a, int b)` — `a` is the condition value (Arg 0), `b` the arm
+    // value (Arg 1). Both are pure-SSA Args (no emitted instruction), so each
+    // ternary level's cond/then/else are the same two Args; the diamond/phi
+    // scaffolding is the ONLY per-level MIR — exactly what we pin.
+    TypeId const fnTy = ti.fnSig(std::array{i32, i32}, i32, CallConv::CcSysV);
+
+    HirBuilder b{"c-subset"};
+    HirNodeId const pa = b.makeVarDecl(i32, /*sym=*/1);
+    HirNodeId const pb = b.makeVarDecl(i32, /*sym=*/2);
+    auto refA = [&] { return b.makeRef(i32, /*sym=*/1); };
+    auto refB = [&] { return b.makeRef(i32, /*sym=*/2); };
+    // Build right-nested `a ? b : (a ? b : ( … : b))` innermost-first. The
+    // innermost else is a plain `b`; each outer level wraps the prior as its
+    // ELSE arm, so the nesting (and the recursion it would otherwise cost) grows
+    // down the ELSE spine.
+    HirNodeId cur = refB();                                   // innermost else
+    for (std::uint32_t i = 0; i < kDepth; ++i)
+        cur = b.makeTernary(refA(), refB(), cur, i32);
+    HirNodeId const body = b.makeBlock(std::array{b.makeReturn(cur)});
+    HirNodeId const fn   =
+        b.makeFunction(fnTy, /*sym=*/7, std::array{pa, pb}, body);
+    HirNodeId const root = b.makeModule(std::array{fn});
+    Hir hir = std::move(b).finish(root);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
+                             MirLoweringConfig{});
+    ASSERT_TRUE(result.ok)
+        << "deep ternary chain must lower clean: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Mir const& m = result.mir;
+    MirFuncId const f = m.funcAt(0);
+    // entry + 3 blocks (then/else/join) per ternary level.
+    ASSERT_EQ(m.funcBlockCount(f), 3u * kDepth + 1u);
+
+    // Walk every level and assert the diamond markers + the join phi's exact
+    // predecessor-block ids in incoming order (the precise thing a phase bug
+    // corrupts). Block index == creation order == id (single-chokepoint
+    // monotonic), so `funcBlockAt(f, 3i+k)` resolves level i's then/else/join.
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        MirBlockId const thenBB = m.funcBlockAt(f, 3u * i + 1u);
+        MirBlockId const elseBB = m.funcBlockAt(f, 3u * i + 2u);
+        MirBlockId const joinBB = m.funcBlockAt(f, 3u * i + 3u);
+        EXPECT_EQ(m.blockMarker(thenBB), StructCfMarker::IfThen) << "level " << i;
+        EXPECT_EQ(m.blockMarker(elseBB), StructCfMarker::IfElse) << "level " << i;
+        EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::IfJoin) << "level " << i;
+
+        // The join's first instruction is the 2-incoming phi.
+        MirInstId const phi = m.blockInstAt(joinBB, 0);
+        ASSERT_EQ(m.instOpcode(phi), MirOpcode::Phi) << "level " << i;
+        auto inc = m.phiIncomings(phi);
+        ASSERT_EQ(inc.size(), 2u) << "level " << i;
+        // incoming[0] is the THEN arm (predecessor == this level's thenBB).
+        EXPECT_EQ(inc[0].pred, thenBB)
+            << "level " << i << " phi incoming[0] must arrive from the THEN block";
+        // incoming[1] is the ELSE arm: an outer level's else-value is the NESTED
+        // ternary's result, arriving from the nested level's JOIN block; the
+        // innermost level's else-value is a plain `b`, arriving from its elseBB.
+        MirBlockId const expectedElsePred =
+            (i + 1u < kDepth) ? m.funcBlockAt(f, 3u * (i + 1u) + 3u)  // inner join
+                              : elseBB;                                // own else
+        EXPECT_EQ(inc[1].pred, expectedElsePred)
+            << "level " << i << " phi incoming[1] must arrive from "
+            << (i + 1u < kDepth ? "the NESTED ternary's JOIN" : "its own ELSE")
+            << " block (predecessor order then-then-else — red on a swap)";
+    }
+
+    // The entry block's terminator is the OUTERMOST diamond's CondBr into
+    // level-0's then/else (a sanity anchor on the top of the chain).
+    MirBlockId const entry = m.funcEntry(f);
+    EXPECT_EQ(m.instOpcode(m.blockTerminator(entry)), MirOpcode::CondBr);
+    {
+        auto succs = m.blockSuccessors(entry);
+        ASSERT_EQ(succs.size(), 2u);
+        EXPECT_EQ(succs[0], m.funcBlockAt(f, 1u)) << "entry CondBr true → then[0]";
+        EXPECT_EQ(succs[1], m.funcBlockAt(f, 2u)) << "entry CondBr false → else[0]";
+    }
+        });  // runOnLargeStack
+}
+
+// SF-4 companion for the Logical (`&&`/`||`) frame: a DEEPLY LEFT-nested
+// short-circuit chain `((…((a && b) && b) …) && b)`. Left-nesting puts the deep
+// recursion on the LHS spine — which the recursive arm lowers in the CURRENT
+// block BEFORE any block switch (`lhs = lowerExpr(kids[0])`), so it is the axis
+// the work-stack flattening removes. Each level is the 3-phase Logical frame
+// (lower lhs → mint rhsBB/joinBB + CondBr + beginBlock(rhsBB) → lower rhs → phi).
+//
+// Block-creation order (entry == block 0): the innermost `&&` (lowered first,
+// level 0) mints rhsBB=block1(IfThen), joinBB=block2(IfJoin); level i mints
+// rhsBB=block(2i+1), joinBB=block(2i+2). Each level's join phi (block 2i+2):
+//   incoming[0].pred == its LHS predecessor == (i==0 ? entry : level(i-1)'s
+//                       joinBB == block(2i))   — the SHORT-CIRCUIT/lhs edge
+//   incoming[1].pred == its own rhsBB == block(2i+1)  — the rhs edge
+// (predecessor order lhs-then-rhs — red on a swap or a wrong lhsPred capture).
+// All `&&` ⇒ the conditional ARM (rhsBB) is the TRUE-edge target; the join is
+// the FALSE/short-circuit target. Built on the 64 MiB worker (deep teardown).
+TEST(MirLoweringCSubset, IterativeDeepLogicalChainLowersFlatAndByteIdentical) {
+    constexpr std::uint32_t kDepth = 1000;  // # of `&&` levels
+
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const fnTy = ti.fnSig(std::array{i32, i32}, i32, CallConv::CcSysV);
+
+    HirBuilder b{"c-subset"};
+    HirNodeId const pa = b.makeVarDecl(i32, /*sym=*/1);
+    HirNodeId const pb = b.makeVarDecl(i32, /*sym=*/2);
+    auto refA = [&] { return b.makeRef(i32, /*sym=*/1); };
+    auto refB = [&] { return b.makeRef(i32, /*sym=*/2); };
+    // Left-nested: leaf `a`, then `cur = (cur && b)` kDepth times, so the LHS
+    // spine grows down (the deep-recursion axis the frame flattens).
+    HirNodeId cur = refA();
+    for (std::uint32_t i = 0; i < kDepth; ++i)
+        cur = b.makeLogicalAnd(cur, refB(), i32);
+    HirNodeId const body = b.makeBlock(std::array{b.makeReturn(cur)});
+    HirNodeId const fn   =
+        b.makeFunction(fnTy, /*sym=*/7, std::array{pa, pb}, body);
+    HirNodeId const root = b.makeModule(std::array{fn});
+    Hir hir = std::move(b).finish(root);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
+                             MirLoweringConfig{});
+    ASSERT_TRUE(result.ok)
+        << "deep && chain must lower clean: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Mir const& m = result.mir;
+    MirFuncId const f = m.funcAt(0);
+    MirBlockId const entry = m.funcEntry(f);
+    // entry + 2 blocks (rhs/join) per `&&` level.
+    ASSERT_EQ(m.funcBlockCount(f), 2u * kDepth + 1u);
+
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        MirBlockId const rhsBB  = m.funcBlockAt(f, 2u * i + 1u);
+        MirBlockId const joinBB = m.funcBlockAt(f, 2u * i + 2u);
+        EXPECT_EQ(m.blockMarker(rhsBB),  StructCfMarker::IfThen) << "level " << i;
+        EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::IfJoin) << "level " << i;
+
+        MirInstId const phi = m.blockInstAt(joinBB, 0);
+        ASSERT_EQ(m.instOpcode(phi), MirOpcode::Phi) << "level " << i;
+        auto inc = m.phiIncomings(phi);
+        ASSERT_EQ(inc.size(), 2u) << "level " << i;
+        // incoming[0] = lhs edge: level 0 from entry, an outer level from the
+        // nested `&&`'s JOIN block (block 2i). incoming[1] = rhs edge (rhsBB).
+        MirBlockId const expectedLhsPred =
+            (i == 0u) ? entry : m.funcBlockAt(f, 2u * i);
+        EXPECT_EQ(inc[0].pred, expectedLhsPred)
+            << "level " << i << " phi incoming[0] is the lhs/short-circuit edge";
+        EXPECT_EQ(inc[1].pred, rhsBB)
+            << "level " << i << " phi incoming[1] is the rhs edge (lhs-then-rhs "
+               "order — red on a swap)";
+    }
+        });  // runOnLargeStack
+}
