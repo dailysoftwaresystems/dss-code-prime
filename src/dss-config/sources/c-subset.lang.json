@@ -43,7 +43,17 @@
     "variadicMarkerToken": "EllipsisOp",
     "variadicArgsName": "__VA_ARGS__",
     "stringizeToken": "HashOp",
-    "pasteToken": "HashHashOp"
+    "pasteToken": "HashHashOp",
+    "$predefinedMacrosComment": "FC15b (C 6.10.8): the predefined macros. Each entry names the macro IDENTIFIER + a materialization `kind`; the engine keys EVERY behavior off `kind`, never the name. `line`/`file` are OFFSET-derived (resolved through the line-map against the INVOCATION offset -> the invocation line / the presumed file name); `date`/`time` are computed once at preprocess construction (`\"Mmm dd yyyy\"` / `\"hh:mm:ss\"`); `constant` carries a static `value` spelling verbatim. `#define`/`#undef` of any of these is a constraint violation (C 6.10.8.1) -> fail loud. __STDC_VERSION__ = 202311L (C23).",
+    "predefinedMacros": [
+      { "name": "__LINE__",            "kind": "line" },
+      { "name": "__FILE__",            "kind": "file" },
+      { "name": "__STDC__",            "kind": "constant", "value": "1" },
+      { "name": "__STDC_VERSION__",    "kind": "constant", "value": "202311L" },
+      { "name": "__STDC_HOSTED__",     "kind": "constant", "value": "1" },
+      { "name": "__DATE__",            "kind": "date" },
+      { "name": "__TIME__",            "kind": "time" }
+    ]
   },
 
   "lexerModes": {

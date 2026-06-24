@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -362,7 +363,27 @@ using HideSet = std::shared_ptr<std::set<std::string> const>;
 struct ExpToken {
     Token   tok;
     HideSet hide;  // null == empty
+    // FC15b (predefined macros; C 6.10.8.1): the INVOCATION offset that an
+    // offset-derived predefined macro (`__LINE__`/`__FILE__`) resolves against.
+    // C 6.10.8.1: `__LINE__` is the line of the macro's INVOCATION (the current
+    // SOURCE line), NOT the `#define` site. An ORIGINAL body token carries its
+    // OWN synth offset here; a macro's spliced replacement token INHERITS the
+    // invoking token's `invOffset` (propagated DOWN through every nested/chained
+    // expansion). So a `__LINE__` that arrives via `#define WARN __LINE__` resolves
+    // against the WARN INVOCATION line, not the define line. The BARE case
+    // (`int x = __LINE__;`) is the degenerate instance: the `__LINE__` token's own
+    // `invOffset` IS its source position. Defaults to the token's own span start
+    // when a token is lifted from a plain `Token` (`fromToken` below).
+    ByteOffset invOffset = 0;
 };
+
+// Lift a plain (directive-stripped, original) body token into the expansion
+// working set: empty hide set + its OWN synth offset as the invocation anchor
+// (FC15b). Every original source token thus seeds `__LINE__`/`__FILE__` against
+// its real position; macro splices later inherit the invoking token's anchor.
+inline ExpToken fromToken(Token const& t) {
+    return ExpToken{t, nullptr, t.span.start()};
+}
 
 // M is hidden for this token iff M is a member of its hide set.
 inline bool hideContains(HideSet const& hs, std::string const& name) {
@@ -427,9 +448,29 @@ public:
     // that ONE final buffer, exactly what the parser parses.
     MacroExpander(std::shared_ptr<SourceBuffer> synth,
                   std::shared_ptr<GrammarSchema const> schema,
-                  DiagnosticReporter& rep, ByteOffset prefixLen)
+                  DiagnosticReporter& rep, ByteOffset prefixLen,
+                  LineMap const* lineMap)
         : synth_(std::move(synth)), schema_(std::move(schema)), rep_(rep),
-          prefixLen_(prefixLen) {
+          prefixLen_(prefixLen), lineMap_(lineMap) {
+        // FC15b (predefined macros; C 6.10.8): seed the predefined-macro map
+        // (name -> def) from config. An identifier that is NOT a `#define`d
+        // macro but IS a predefined name materializes its configured value (see
+        // `expand`). EMPTY when the language declares none (toy / tsql), so the
+        // engine is a strict identity pass for `__LINE__` &c.
+        for (PredefinedMacroDef const& pm : cfg().predefinedMacros) {
+            predefined_.emplace(pm.name, pm);
+        }
+        // FC15b: compute the translation DATE/TIME spellings ONCE (C 6.10.8.1 --
+        // both stay CONSTANT through a translation unit). `__DATE__` is
+        // `"Mmm dd yyyy"` with a SPACE-padded day (e.g. `"Jun  4 2026"`);
+        // `__TIME__` is `"hh:mm:ss"`. Computed only when at least one date/time
+        // macro is declared (no `std::time` call for a language that needs none).
+        bool needDate = false, needTime = false;
+        for (PredefinedMacroDef const& pm : cfg().predefinedMacros) {
+            if (pm.kind == PredefinedMacroKind::Date) needDate = true;
+            if (pm.kind == PredefinedMacroKind::Time) needTime = true;
+        }
+        if (needDate || needTime) computeDateTime(needDate, needTime);
         hashKind_  = schema_->schemaTokens().find(cfg().directiveIntroToken);
         // FC15a: the STRINGIZE (`#`) and TOKEN-PASTE (`##`) operator kinds are
         // CONFIG lexemes (agnosticism), resolved from `stringizeToken` /
@@ -511,7 +552,11 @@ public:
         // hide sets back to the plain Token stream the parser consumes.
         std::vector<ExpToken> work;
         work.reserve(body.size());
-        for (Token const& t : body) work.push_back(ExpToken{t, nullptr});
+        // FC15b: lift each original body token via fromToken() so it seeds its
+        // OWN synth offset as the invocation anchor -- a bare `__LINE__`/`__FILE__`
+        // then resolves against its real source position, and a macro splice
+        // later inherits the invoking token's anchor.
+        for (Token const& t : body) work.push_back(fromToken(t));
         std::vector<ExpToken> expanded = expand(std::move(work), 0);
         std::vector<Token> out;
         out.reserve(expanded.size());
@@ -785,8 +830,13 @@ private:
             [this](std::vector<Token> const& toks) { return expandTokens(toks); };
         PpIsDefined definedCb =
             [this](std::string_view n) { return isDefined(n); };
+        // FC15b: surface the accumulated product tail (a predefined/`#`/`##`
+        // product expanded inside this `#if` operand materializes into it) so the
+        // evaluator assembles a combined prefix+product buffer to slice it.
+        PpProductText productCb =
+            [this]() -> std::string_view { return productText_; };
         auto v = evaluateIfExpression(operand, *schema_, expandCb, definedCb,
-                                      *synth_, rep_);
+                                      *synth_, productCb, rep_);
         return v.has_value() && *v != 0;
     }
 
@@ -797,7 +847,9 @@ private:
     std::vector<Token> expandTokens(std::vector<Token> const& toks) {
         std::vector<ExpToken> work;
         work.reserve(toks.size());
-        for (Token const& t : toks) work.push_back(ExpToken{t, nullptr});
+        // FC15b: seed each token's own offset as its invocation anchor (a
+        // `__LINE__` in a `#if` operand resolves against that operand's line).
+        for (Token const& t : toks) work.push_back(fromToken(t));
         std::vector<ExpToken> expanded = expand(std::move(work), 0);
         std::vector<Token> out;
         out.reserve(expanded.size());
@@ -831,6 +883,18 @@ private:
         const std::string name{text(in[p])};
         const std::size_t nameIdx = p;
         ++p;
+
+        // FC15b (C 6.10.8.1p2): a PREDEFINED macro name shall not be the subject
+        // of a `#define`. Reject loudly and DO NOT alter the table (the predefined
+        // name keeps materializing its configured value). Looked up in the
+        // config-seeded set, so the engine never hard-codes a name.
+        if (predefined_.find(name) != predefined_.end()) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPredefinedMacro,
+                   synth_->id(), in[nameIdx].span,
+                   std::string{"'"} + name
+                       + "' is a predefined macro and may not be #defined");
+            return;
+        }
 
         MacroDef def;
         // FUNCTION-like iff the configured open-paren is IMMEDIATELY ADJACENT
@@ -1023,7 +1087,18 @@ private:
                    "#undef requires a macro name");
             return;
         }
-        table_.erase(std::string{text(in[p])});
+        const std::string name{text(in[p])};
+        // FC15b (C 6.10.8.1p2): a PREDEFINED macro name shall not be the subject
+        // of a `#undef`. Reject loudly and DO NOT touch the table (config-seeded
+        // lookup, no hard-coded name).
+        if (predefined_.find(name) != predefined_.end()) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPredefinedMacro,
+                   synth_->id(), in[p].span,
+                   std::string{"'"} + name
+                       + "' is a predefined macro and may not be #undef'd");
+            return;
+        }
+        table_.erase(name);
     }
 
     // Index of the next non-trivia / non-newline token from the cursor. A
@@ -1169,11 +1244,17 @@ private:
         std::vector<ExpToken> const& vaArgs,
         std::vector<std::vector<ExpToken>> const& rawArgs,
         std::vector<ExpToken> const& rawVaArgs,
-        HideSet const& hs) {
+        HideSet const& hs, ByteOffset invOffset) {
+        // FC15b: a REPLACEMENT-origin token (a plain replacement token, a `##`
+        // marker/product, a stringize product) inherits the INVOCATION offset
+        // `invOffset` (so a `__LINE__` in the replacement resolves to the
+        // invocation line). An ARGUMENT token keeps its OWN `invOffset` (it came
+        // from the call site -- its real position).
         auto stampArg = [&](std::vector<ExpToken> const& a,
                             std::vector<ExpToken>& outTokens) {
             for (ExpToken const& e : a) {
-                outTokens.push_back(ExpToken{e.tok, hideUnionAll(e.hide, hs)});
+                outTokens.push_back(
+                    ExpToken{e.tok, hideUnionAll(e.hide, hs), e.invOffset});
             }
         };
         // The RAW token run for a `#`/`##` operand at replacement index `i`
@@ -1198,7 +1279,7 @@ private:
                 // parameter (or `__VA_ARGS__`).
                 if (i + 1 < n) {
                     if (auto const* raw = rawArgAt(i + 1)) {
-                        stringizeArg(*raw, hs, items);
+                        stringizeArg(*raw, hs, invOffset, items);
                         ++i;   // consume the parameter operand
                         continue;
                     }
@@ -1207,11 +1288,11 @@ private:
                        r.span,
                        "'#' in a macro replacement must be followed by a "
                        "parameter");
-                items.push_back(ExpToken{r, hs});   // recovery: emit `#` verbatim
+                items.push_back(ExpToken{r, hs, invOffset});  // recovery: `#` verbatim
                 continue;
             }
             if (isPaste(r)) {
-                items.push_back(ExpToken{r, hs});    // marker for phase B
+                items.push_back(ExpToken{r, hs, invOffset});  // marker for phase B
                 continue;
             }
             if (isVaArgsName(r, def)) {
@@ -1233,12 +1314,14 @@ private:
                          items);
                 continue;
             }
-            // A plain replacement token gets EXACTLY hs (no prior hide set).
-            items.push_back(ExpToken{r, hs});
+            // A plain replacement token gets EXACTLY hs (no prior hide set) and
+            // the INVOCATION offset (FC15b: a `__LINE__` in a function-like
+            // replacement resolves to the invocation line).
+            items.push_back(ExpToken{r, hs, invOffset});
         }
 
         // ── PHASE B: collapse every `##` marker LEFT-TO-RIGHT. ──
-        return collapsePastes(std::move(items), hs);
+        return collapsePastes(std::move(items), hs, invOffset);
     }
 
     // Phase B of `substitute`: walk `items`, and at each `##` MARKER concatenate
@@ -1250,7 +1333,8 @@ private:
     // the dangling `##` and keep the lone operand. A product that is not exactly
     // one token (F1) -> P_PreprocessorPaste, recovery: emit both operands verbatim.
     std::vector<ExpToken> collapsePastes(std::vector<ExpToken> items,
-                                         HideSet const& hs) {
+                                         HideSet const& hs,
+                                         ByteOffset invOffset) {
         std::size_t i = 0;
         while (i < items.size()) {
             if (!isPaste(items[i].tok)) { ++i; continue; }
@@ -1286,7 +1370,7 @@ private:
             items.erase(items.begin() + static_cast<std::ptrdiff_t>(lo),
                         items.begin() + static_cast<std::ptrdiff_t>(i + 2));
             items.insert(items.begin() + static_cast<std::ptrdiff_t>(lo),
-                         ExpToken{*product, hs});
+                         ExpToken{*product, hs, invOffset});
             i = lo;   // rescan from the product
         }
         return items;
@@ -1305,7 +1389,7 @@ private:
     // `stringLiteralExpr = StringStart StringLiteral`) whose spans point at the
     // appended region. Each product token is stamped with `hs`.
     void stringizeArg(std::vector<ExpToken> const& raw, HideSet const& hs,
-                      std::vector<ExpToken>& out) {
+                      ByteOffset invOffset, std::vector<ExpToken>& out) {
         std::string inner = "\"";
         if (!raw.empty()) {
             // The raw operand's tokens are un-pre-expanded args from the CALL
@@ -1323,8 +1407,10 @@ private:
             appendStringized(synth_->slice(s, e), inner);
         }
         inner.push_back('"');
+        // FC15b: a stringize product is a replacement-origin token -> inherit
+        // the invocation offset (kept consistent with the other product paths).
         for (Token const& t : materializeSignificant(inner)) {
-            out.push_back(ExpToken{t, hs});
+            out.push_back(ExpToken{t, hs, invOffset});
         }
     }
 
@@ -1348,6 +1434,99 @@ private:
             if (c == '"' || c == '\\') out.push_back('\\');
             out.push_back(c);
         }
+    }
+
+    // FC15b (predefined macros; C 6.10.8.1): compute the once-per-TU translation
+    // DATE / TIME spellings from the wall clock. `__DATE__` is the C-mandated
+    // `"Mmm dd yyyy"` with a SPACE-padded day of month (`"Jun  4 2026"`, two
+    // leading spaces for a single-digit day); `__TIME__` is `"hh:mm:ss"`
+    // (zero-padded). Stored WITHOUT the surrounding quotes (the materializer
+    // wraps them). Uses `std::localtime` (the translation's local date, matching
+    // a hosted C implementation). Defensive: a null `localtime` (impossible in
+    // practice) leaves the strings empty -> a synth `""` literal, never a crash.
+    void computeDateTime(bool needDate, bool needTime) {
+        const std::time_t now = std::time(nullptr);
+        const std::tm* lt = std::localtime(&now);
+        if (lt == nullptr) return;
+        if (needDate) {
+            static char const* const kMon[12] = {
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+            const int mon = (lt->tm_mon >= 0 && lt->tm_mon < 12) ? lt->tm_mon : 0;
+            char buf[16];
+            // SPACE-padded day (`%e` is not portable on MSVC), 4-digit year.
+            std::snprintf(buf, sizeof(buf), "%s %2d %04d", kMon[mon],
+                          lt->tm_mday, lt->tm_year + 1900);
+            dateString_ = buf;
+        }
+        if (needTime) {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", lt->tm_hour,
+                          lt->tm_min, lt->tm_sec);
+            timeString_ = buf;
+        }
+    }
+
+    // FC15b (predefined macros; C 6.10.8.1): MATERIALIZE the replacement token(s)
+    // of a predefined macro at an invocation whose anchor offset is `invOffset`.
+    // The spelling is built then routed through `materializeSignificant` (the
+    // FC15a A2 mechanism) so the value reaches the REAL parser via a real span in
+    // the synth buffer -- a Number for `__LINE__`/Constant, a StringStart +
+    // StringLiteral pair for `__FILE__`/`__DATE__`/`__TIME__` (exactly as a
+    // stringize product). Dispatches ONLY on `def.kind`, never the name.
+    std::vector<Token> materializePredefined(PredefinedMacroDef const& def,
+                                             ByteOffset invOffset) {
+        switch (def.kind) {
+        case PredefinedMacroKind::Line: {
+            // C 6.10.8.1: the LINE number of the macro's INVOCATION. Resolve the
+            // invocation offset through the line-map to its ORIGIN buffer +
+            // offset, then read the 1-based origin line. Null/empty line-map ->
+            // line 1 (defensive; a real TU always has a map).
+            std::uint32_t line = 1;
+            if (lineMap_ != nullptr && !lineMap_->empty()) {
+                LineMap::Resolved const r = lineMap_->resolve(invOffset);
+                if (r.origin != nullptr) line = r.origin->lineCol(r.offset).line;
+            }
+            return materializeSignificant(std::to_string(line));
+        }
+        case PredefinedMacroKind::File: {
+            // C 6.10.8.1: the presumed NAME of the current source file. Resolve
+            // the invocation offset to its ORIGIN buffer so a `__FILE__` inside an
+            // `#include`'d header reports the HEADER's name, not the main file's.
+            // `\` -> `/` normalized, then quoted as a C string literal.
+            std::string name = "<source>";   // defensive synth name
+            if (lineMap_ != nullptr && !lineMap_->empty()) {
+                LineMap::Resolved const r = lineMap_->resolve(invOffset);
+                if (r.origin != nullptr) name = std::string{r.origin->name()};
+            }
+            for (char& c : name) {
+                if (c == '\\') c = '/';
+            }
+            return materializeSignificant(quoteCString(name));
+        }
+        case PredefinedMacroKind::Constant:
+            // A static integer-constant spelling carried verbatim.
+            return materializeSignificant(def.value);
+        case PredefinedMacroKind::Date:
+            return materializeSignificant(quoteCString(dateString_));
+        case PredefinedMacroKind::Time:
+            return materializeSignificant(quoteCString(timeString_));
+        }
+        return {};   // unreachable (the kind set is closed); silence warnings
+    }
+
+    // Wrap `s` in a C string literal: surround with `"` and backslash-escape each
+    // interior `"` and `\` (C 6.4.5). Used for the `__FILE__`/`__DATE__`/`__TIME__`
+    // string-literal products. (A normalized file name or the date/time spellings
+    // contain neither in practice, but escaping is exact + future-proof.)
+    static std::string quoteCString(std::string_view s) {
+        std::string out = "\"";
+        for (char const c : s) {
+            if (c == '"' || c == '\\') out.push_back('\\');
+            out.push_back(c);
+        }
+        out.push_back('"');
+        return out;
     }
 
     // FC15a (A2 -- the load-bearing buffer mechanism): MATERIALIZE a `#`/`##`
@@ -1459,9 +1638,38 @@ private:
             if (!isWord(t.tok)) { out.push_back(t); ++i; continue; }
             const std::string name{text(t.tok)};
             auto it = table_.find(name);
-            // Not a macro, OR M is in THIS token's hide set (Prosser: M ∉
-            // hideset(T) required to expand) -> emit verbatim.
+            // Not a `#define`d macro, OR M is in THIS token's hide set (Prosser:
+            // M ∉ hideset(T) required to expand).
             if (it == table_.end() || hideContains(t.hide, name)) {
+                // FC15b (predefined macros; C 6.10.8): on a `#define` table MISS,
+                // an identifier that is a PREDEFINED-macro name materializes its
+                // configured value (`__LINE__`/`__FILE__`/`__STDC__`/...). The
+                // value token(s) are spliced over `[i, i+1)` and RESCANNED (a
+                // Number/Constant rescans inertly; a string-literal pair likewise)
+                // -- so the resolved value reaches the parser exactly like any
+                // other replacement. Resolved against THIS token's invocation
+                // offset, so a `__LINE__` arriving via a macro replacement reports
+                // the INVOCATION line. The hide set is irrelevant to a predefined
+                // name (it is never self-referential). Gated on a genuine `#define`
+                // table MISS (`it == table_.end()`), so a (constraint-violating,
+                // fail-loud) shadowing `#define` could never reach this arm.
+                if (it == table_.end()) {
+                    auto pit = predefined_.find(name);
+                    if (pit != predefined_.end()) {
+                        std::vector<Token> value =
+                            materializePredefined(pit->second, t.invOffset);
+                        std::vector<ExpToken> repl;
+                        repl.reserve(value.size());
+                        // A predefined product is replacement-origin: carry THIS
+                        // token's invocation offset (inert for the value kinds,
+                        // but kept consistent with every other product path).
+                        for (Token const& v : value) {
+                            repl.push_back(ExpToken{v, t.hide, t.invOffset});
+                        }
+                        spliceOver(in, i, i + 1, repl);
+                        continue;   // rescan from the materialized value
+                    }
+                }
                 out.push_back(t);
                 ++i;
                 continue;
@@ -1475,8 +1683,12 @@ private:
                 const HideSet hs = hideAdd(t.hide, name);
                 std::vector<ExpToken> repl;
                 repl.reserve(def.replacement.size());
+                // FC15b: a replacement token INHERITS the invoking name token's
+                // invocation offset, so a `__LINE__` reached via an object-like
+                // macro (`#define WARN __LINE__`) resolves to the INVOCATION line,
+                // not the `#define` line.
                 for (Token const& r : def.replacement) {
-                    repl.push_back(ExpToken{r, hs});
+                    repl.push_back(ExpToken{r, hs, t.invOffset});
                 }
                 spliceOver(in, i, i + 1, repl);
                 continue;          // rescan from i (the first replacement token)
@@ -1597,8 +1809,14 @@ private:
                     vaArgs.insert(vaArgs.end(), ex.begin(), ex.end());
                 }
             }
+            // FC15b: the WHOLE call's replacement-origin tokens inherit the
+            // invoking NAME token's invocation offset (`invOffset`), so a
+            // `__LINE__` in a function-like replacement resolves to the
+            // invocation line. (`t` is captured before the splice below.)
+            const ByteOffset callInvOffset = t.invOffset;
             std::vector<ExpToken> substituted =
-                substitute(def, expandedArgs, vaArgs, rawArgs, rawVaArgs, hs);
+                substitute(def, expandedArgs, vaArgs, rawArgs, rawVaArgs, hs,
+                           callInvOffset);
             // Splice the substituted result over the WHOLE call `[i, past)` and
             // RESCAN from i: the invoked macro M is in every substituted token's
             // hide set, so a self-reference is frozen; a function-like name newly
@@ -1646,6 +1864,15 @@ private:
     ByteOffset                           prefixLen_{};
     std::string                          productText_;
     std::unordered_map<std::string, MacroDef> table_;
+    // FC15b (predefined macros; C 6.10.8): the config-seeded predefined-macro
+    // set (name -> def), the synth-offset -> origin line-map (for the
+    // offset-derived `__LINE__`/`__FILE__`; may be null/empty for a no-include
+    // identity pass), and the once-computed `__DATE__`/`__TIME__` INNER spellings
+    // (without the surrounding quotes -- `materializePredefined` quotes them).
+    std::unordered_map<std::string, PredefinedMacroDef> predefined_;
+    LineMap const*                       lineMap_ = nullptr;
+    std::string                          dateString_;   // "Mmm dd yyyy"
+    std::string                          timeString_;   // "hh:mm:ss"
     // FC14: the conditional-compilation frame stack (one frame per open
     // `#if`/`#ifdef`/`#ifndef`). See CondFrame + handleIf/Elif/Else/Endif.
     std::vector<CondFrame>               condStack_;
@@ -1695,7 +1922,11 @@ PreprocessResult preprocess(
     synthTokens.reserve(ppToks.size());
     for (auto const& tk : ppToks) synthTokens.push_back(tk.tok);
 
-    MacroExpander expander{prefixBuffer, schema, *result.diagnostics, prefixLen};
+    // FC15b: thread the synth-offset -> origin line-map into the expander so an
+    // offset-derived predefined macro (`__LINE__`/`__FILE__`) resolves an
+    // invocation offset to its real origin file + line.
+    MacroExpander expander{prefixBuffer, schema, *result.diagnostics, prefixLen,
+                           &result.lineMap};
     std::vector<Token> finalTokens = expander.run(synthTokens);
     // OR in the macro-expansion truncation; the SynthBuilder already wrote
     // `result.fatal` by reference for an include-nesting truncation.

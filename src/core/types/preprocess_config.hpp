@@ -3,8 +3,36 @@
 #include "core/export.hpp"
 
 #include <string>
+#include <vector>
 
 namespace dss {
+
+// FC15b (`__FILE__`/`__LINE__`/`__STDC__`/...; C 6.10.8): how a PREDEFINED macro
+// materializes its replacement. The engine dispatches ONLY on this kind, NEVER
+// on the macro NAME (agnosticism: a language whose `__LINE__` is spelled
+// differently still resolves correctly because the name is config and the
+// behavior is keyed off the kind):
+//   Line     -- the line number of the macro's INVOCATION (offset-derived via
+//               the line-map), a decimal integer (C 6.10.8.1).
+//   File     -- the presumed name of the current source FILE (offset-derived via
+//               the line-map origin), a C string literal with `\`->`/` normalized.
+//   Constant -- a STATIC integer-constant spelling carried verbatim in `value`
+//               (`__STDC__`->"1", `__STDC_VERSION__`->"202311L", etc.).
+//   Date     -- the translation DATE, a string literal `"Mmm dd yyyy"` computed
+//               once at construction (C 6.10.8.1).
+//   Time     -- the translation TIME, a string literal `"hh:mm:ss"` computed once.
+enum class PredefinedMacroKind { Line, File, Constant, Date, Time };
+
+// FC15b: one config-declared predefined macro (C 6.10.8). `name` is the macro
+// identifier (matched by TEXT, like the directive words); `kind` selects the
+// materialization behavior; `value` is the literal replacement spelling and is
+// REQUIRED iff `kind == Constant` (ignored for the other kinds, whose value is
+// derived at expansion time / construction).
+struct DSS_EXPORT PredefinedMacroDef {
+    std::string         name;
+    PredefinedMacroKind kind = PredefinedMacroKind::Constant;
+    std::string         value;
+};
 
 // Config-driven C-preprocessor declaration (schema v4 `preprocess` block).
 //
@@ -179,6 +207,20 @@ struct DSS_EXPORT PreprocessConfig {
     // language declares NO paste operator. `checkToken`-validated at load when
     // present (like `variadicMarkerToken`).
     std::string pasteToken;
+
+    // FC15b (predefined macros; C 6.10.8): the language's PREDEFINED macros
+    // (`__FILE__`/`__LINE__`/`__STDC__`/`__STDC_VERSION__`/`__STDC_HOSTED__`/
+    // `__DATE__`/`__TIME__`). Each entry names the macro IDENTIFIER + a
+    // materialization `kind` (+ a literal `value`, REQUIRED iff kind==Constant).
+    // Pre-seeded into the macro expander at construction: an identifier that is
+    // NOT a `#define`d macro but IS a predefined-macro name materializes its
+    // configured value. The engine keys EVERY behavior off `kind`, never the
+    // name (agnosticism). OPTIONAL -- an empty list (toy / tsql-subset, which
+    // declare none) means the language has NO predefined macros, so e.g.
+    // `__LINE__` stays an ordinary identifier (the identity-pass property).
+    // `#define`/`#undef` of a predefined name is a constraint violation
+    // (C 6.10.8.1) -> fail loud `P_PreprocessorPredefinedMacro`.
+    std::vector<PredefinedMacroDef> predefinedMacros;
 };
 
 } // namespace dss

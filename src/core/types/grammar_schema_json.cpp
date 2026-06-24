@@ -3798,6 +3798,111 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     checkToken(cfg.pasteToken, "pasteToken");
                 }
             }
+            // FC15b (predefined macros; C 6.10.8): the `predefinedMacros` array.
+            // Each entry is `{name, kind}` (+ `value` REQUIRED iff
+            // kind=="constant"). The `kind` verb set is CLOSED -- an unknown kind
+            // fails LOUD at load (`C_InvalidPreprocess`); a constant entry missing
+            // its `value` -> `C_MissingField`. OPTIONAL -- absent means the
+            // language declares NO predefined macros (identity for `__LINE__`
+            // &c.). The names are matched by TEXT at expansion time (ordinary
+            // identifiers, like the directive words), so no `checkToken` here.
+            if (pp.contains("predefinedMacros")) {
+                json const& pms = pp.at("predefinedMacros");
+                if (!pms.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/predefinedMacros",
+                              "'preprocess.predefinedMacros' must be an array");
+                } else {
+                    for (std::size_t mi = 0; mi < pms.size(); ++mi) {
+                        const auto mpath =
+                            std::format("/preprocess/predefinedMacros/{}", mi);
+                        json const& e = pms[mi];
+                        if (!e.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, mpath,
+                                      "a 'predefinedMacros' entry must be an "
+                                      "object");
+                            continue;
+                        }
+                        PredefinedMacroDef pm;
+                        // `name` -- REQUIRED, non-empty string.
+                        if (!e.contains("name")) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      mpath + "/name",
+                                      "a 'predefinedMacros' entry requires 'name'");
+                            continue;
+                        }
+                        if (!e.at("name").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      mpath + "/name",
+                                      "'predefinedMacros.name' must be a string");
+                            continue;
+                        }
+                        pm.name = e.at("name").get<std::string>();
+                        if (pm.name.empty()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      mpath + "/name",
+                                      "'predefinedMacros.name' must be non-empty");
+                            continue;
+                        }
+                        // `kind` -- REQUIRED, one of the CLOSED verb set.
+                        if (!e.contains("kind")) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      mpath + "/kind",
+                                      "a 'predefinedMacros' entry requires 'kind'");
+                            continue;
+                        }
+                        if (!e.at("kind").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      mpath + "/kind",
+                                      "'predefinedMacros.kind' must be a string");
+                            continue;
+                        }
+                        const std::string kind = e.at("kind").get<std::string>();
+                        bool isConstant = false;
+                        if (kind == "line") {
+                            pm.kind = PredefinedMacroKind::Line;
+                        } else if (kind == "file") {
+                            pm.kind = PredefinedMacroKind::File;
+                        } else if (kind == "constant") {
+                            pm.kind = PredefinedMacroKind::Constant;
+                            isConstant = true;
+                        } else if (kind == "date") {
+                            pm.kind = PredefinedMacroKind::Date;
+                        } else if (kind == "time") {
+                            pm.kind = PredefinedMacroKind::Time;
+                        } else {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidPreprocess,
+                                mpath + "/kind",
+                                std::format("unknown predefined-macro kind '{}' "
+                                            "(expected line/file/constant/date/"
+                                            "time)",
+                                            kind));
+                            continue;
+                        }
+                        // `value` -- REQUIRED iff kind==constant; the static
+                        // replacement spelling. Ignored for the derived kinds.
+                        if (isConstant) {
+                            if (!e.contains("value")) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          mpath + "/value",
+                                          "a 'constant' predefinedMacros entry "
+                                          "requires 'value'");
+                                continue;
+                            }
+                            if (!e.at("value").is_string()) {
+                                coll.emit(
+                                    DiagnosticCode::C_InvalidPreprocess,
+                                    mpath + "/value",
+                                    "'predefinedMacros.value' must be a string");
+                                continue;
+                            }
+                            pm.value = e.at("value").get<std::string>();
+                        }
+                        cfg.predefinedMacros.push_back(std::move(pm));
+                    }
+                }
+            }
 
             data.preprocess = std::move(cfg);
         }

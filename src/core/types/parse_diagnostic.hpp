@@ -75,6 +75,13 @@ enum class DiagnosticCode : std::uint16_t {
     // paste whose concatenated spelling is NOT a single valid token
     // (C 6.10.3.3p3: the result must be a single preprocessing token).
     P_PreprocessorPaste           = 0x001A,
+    // FC15b (predefined macros; C 6.10.8.1): a `#define` or `#undef` of a
+    // PREDEFINED macro name (`__FILE__`/`__LINE__`/`__STDC__`/...). C 6.10.8.1p2:
+    // none of these macro names shall be the subject of a `#define` or `#undef`.
+    // The rejected directive does NOT alter the macro table. The predefined-macro
+    // SET is config-driven (`predefinedMacros`); the engine never hard-codes a
+    // name.
+    P_PreprocessorPredefinedMacro = 0x001B,
 
     // Expression-nesting depth guard (Pratt walker). A too-deeply-nested
     // expression (parens / right-assoc / prefix / ternary recursion past

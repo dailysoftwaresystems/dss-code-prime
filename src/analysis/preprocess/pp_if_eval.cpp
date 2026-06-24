@@ -130,11 +130,19 @@ class IceParser {
 public:
     IceParser(std::vector<Token> toks, GrammarSchema const& schema,
               SourceBuffer const& synth, SourceBuffer const& scratch,
-              LiteralKinds const& lits, DiagnosticReporter& rep)
+              LiteralKinds const& lits, DiagnosticReporter& rep,
+              BufferId diagBufferId)
         : toks_(std::move(toks)),
           schema_(schema),
           synth_(synth),
           scratch_(scratch),
+          // FC15b: diagnostics attribute to the ORIGINAL prefix synth buffer
+          // (`diagBufferId`), even when real tokens are sliced against a COMBINED
+          // (prefix + product) buffer whose id differs. A real token's span is a
+          // valid PREFIX offset, so it positions correctly under either id; using
+          // the prefix id keeps the diagnostic on the buffer `preprocess()`
+          // remaps (the combined buffer is local + unregistered).
+          diagBufferId_(diagBufferId),
           lits_(lits),
           rep_(rep),
           binaryOps_(schema.hirLowering().binaryOps),
@@ -181,6 +189,7 @@ private:
     GrammarSchema const&          schema_;
     SourceBuffer const&           synth_;
     SourceBuffer const&           scratch_;
+    BufferId                      diagBufferId_{};
     LiteralKinds const&           lits_;
     DiagnosticReporter&           rep_;
     std::vector<HirOperatorEntry> const& binaryOps_;
@@ -216,7 +225,7 @@ private:
             onSynthetic ? SourceSpan::empty(0)
             : atEnd() ? (toks_.empty() ? SourceSpan::empty(0) : toks_.back().span)
                       : peek().span;
-        emit(rep_, code, synth_.id(), span, std::move(msg));
+        emit(rep_, code, diagBufferId_, span, std::move(msg));
     }
 
     // A token KIND -> binary operator entry (config). nullptr if not a binary
@@ -583,6 +592,7 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                      PpMacroExpand const&   macroExpand,
                      PpIsDefined const&     isDefined,
                      SourceBuffer const&    synth,
+                     PpProductText const&   productText,
                      DiagnosticReporter&    rep) {
     LiteralKinds const lits = gatherLiteralKinds(schema);
 
@@ -673,6 +683,24 @@ evaluateIfExpression(std::span<Token const> operandTokens,
     // tokens' spans index into it). `SourceBuffer::fromString` copies the text.
     auto scratchBuf = SourceBuffer::fromString(scratchText, "<pp-if-scratch>");
 
+    // FC15b: a predefined / `#` / `##` PRODUCT materialized during the expansion
+    // above carries a span in the synth buffer's product TAIL (`[prefixLen + ..)`)
+    // -- bytes NOT present in the prefix-only `synth`. Assemble a COMBINED buffer
+    // `synth.text() + productText()` so the ICE parser can slice such a real token
+    // (e.g. `__STDC_VERSION__` -> `202311L`). A prefix span is byte-identical in
+    // the combined buffer (it is a strict prefix), so the operand's own tokens
+    // resolve unchanged. With no products the tail is empty -> combined == prefix.
+    std::string_view const tail = productText ? productText() : std::string_view{};
+    std::shared_ptr<SourceBuffer> combinedHolder;
+    SourceBuffer const* realSlice = &synth;
+    if (!tail.empty()) {
+        std::string combined{synth.text()};
+        combined.append(tail);
+        combinedHolder =
+            SourceBuffer::fromString(std::move(combined), std::string{synth.name()});
+        realSlice = combinedHolder.get();
+    }
+
     // ── Steps 3 + 4: drop trivia, then parse + fold (a surviving identifier ->
     // 0 happens inside the parser's primary). ──
     std::vector<Token> nonTrivia;
@@ -681,7 +709,8 @@ evaluateIfExpression(std::span<Token const> operandTokens,
         if (!isTriviaTok(t)) nonTrivia.push_back(t);
     }
 
-    IceParser parser{std::move(nonTrivia), schema, synth, *scratchBuf, lits, rep};
+    IceParser parser{std::move(nonTrivia), schema, *realSlice, *scratchBuf, lits,
+                     rep, synth.id()};
     return parser.evaluate();
 }
 

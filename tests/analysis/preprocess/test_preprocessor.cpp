@@ -1818,3 +1818,321 @@ TEST(Preprocessor, FC15aHashOpDirectiveVsStringizeNoContamination) {
     // The directive-introducing `#` never leaked a stringize diagnostic.
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorStringize));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FC15b (predefined macros -- C 6.10.8): `__LINE__`/`__FILE__`/`__STDC__`/
+// `__STDC_VERSION__`/`__STDC_HOSTED__`/`__DATE__`/`__TIME__`. The set is
+// CONFIG-driven (`preprocess.predefinedMacros`); the engine dispatches ONLY on
+// the entry `kind`, never on the macro NAME. A predefined name that is NOT a
+// `#define`d macro materializes its configured value at use; `#define`/`#undef`
+// of a predefined name fails loud (C 6.10.8.1p2). The load-bearing subtlety:
+// `__LINE__`/`__FILE__` resolve against the INVOCATION offset (C 6.10.8.1) -- a
+// `__LINE__` reached through a macro replacement reports the INVOCATION line,
+// not the `#define` line. Every assertion is RED-ON-DISABLE.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// MAKE-OR-BREAK (C 6.10.8.1): `__LINE__` inside a macro replacement resolves to
+// the macro's INVOCATION line, NOT the `#define` line and NOT the replacement
+// token's own physical span. With WARN defined on line 1 and invoked on line 4,
+// `WARN` must materialize `4`. RED-ON-DISABLE: resolving via the replacement
+// token's OWN span (its physical position is the `#define` line 1) yields `1`;
+// the invocation-offset inheritance (ExpToken::invOffset threaded through the
+// object-like splice) is exactly what makes it `4`.
+TEST(Preprocessor, FC15bLineInMacroResolvesToInvocationLine) {
+    PreprocessResult r;
+    //              line: 1                    2        3        4
+    auto lexs = ppLexemes("#define WARN __LINE__\nint a;\nint b;\nint x = WARN;\n",
+                          r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int a ; int b ; int x = 4 ;   (the directive line is stripped)
+    ASSERT_EQ(lexs.size(), 11u) << "expected: int a ; int b ; int x = 4 ;";
+    EXPECT_EQ(lexs[9], "4")
+        << "__LINE__ in WARN's replacement must resolve to the INVOCATION line "
+           "(4), not the #define line (1) -- red-on-disable: the replacement "
+           "token's own span would give 1";
+    // Sanity on the surrounding shape (so a stray token can't hide a wrong [9]).
+    EXPECT_EQ(lexs[6], "int");
+    EXPECT_EQ(lexs[7], "x");
+    EXPECT_EQ(lexs[8], "=");
+    EXPECT_EQ(lexs[10], ";");
+}
+
+// The logging idiom: the SAME macro `L` (object-like -> `__LINE__`) used on two
+// DIFFERENT lines yields two DIFFERENT values (the invocation line each time).
+TEST(Preprocessor, FC15bLineMacroDiffersPerInvocationLine) {
+    PreprocessResult r;
+    //              line: 1                 2            3            4
+    auto lexs = ppLexemes("#define L __LINE__\nint a = L;\nint b = L;\nint c = L;\n",
+                          r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int a = 2 ; int b = 3 ; int c = 4 ;
+    ASSERT_EQ(lexs.size(), 15u);
+    EXPECT_EQ(lexs[3], "2") << "first L invoked on line 2";
+    EXPECT_EQ(lexs[8], "3") << "second L invoked on line 3";
+    EXPECT_EQ(lexs[13], "4") << "third L invoked on line 4";
+}
+
+// A BARE `__LINE__` (no macro) resolves to its own physical line -- the
+// degenerate case where the invocation anchor IS the token's source position.
+TEST(Preprocessor, FC15bBareLineResolvesToPhysicalLine) {
+    PreprocessResult r;
+    //              line: 1        2        3
+    auto lexs = ppLexemes("int a;\nint b;\nint x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int a ; int b ; int x = 3 ;
+    ASSERT_EQ(lexs.size(), 11u);
+    EXPECT_EQ(lexs[9], "3") << "a bare __LINE__ on line 3 resolves to 3";
+}
+
+// The `constant` kind (C 6.10.8.1): `__STDC__` -> 1, `__STDC_VERSION__` ->
+// 202311L (C23), `__STDC_HOSTED__` -> 1. The value spelling reaches the parser
+// VERBATIM as a single Number token. RED-ON-DISABLE: without the predefined hook
+// these stay ordinary identifiers (lexs would carry `__STDC__` not `1`).
+TEST(Preprocessor, FC15bStdcConstants) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("int v = __STDC__;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 5u);
+        EXPECT_EQ(lexs[3], "1") << "__STDC__ materializes its config value 1";
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("long v = __STDC_VERSION__;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 5u);
+        EXPECT_EQ(lexs[3], "202311L")
+            << "__STDC_VERSION__ materializes its config value 202311L (C23)";
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("int v = __STDC_HOSTED__;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 5u);
+        EXPECT_EQ(lexs[3], "1") << "__STDC_HOSTED__ materializes its config value 1";
+    }
+}
+
+// `__STDC_VERSION__` works in a `#if` controlling expression (it expands via the
+// SAME engine, then the ICE evaluator folds it): `#if __STDC_VERSION__ >= 201112L`
+// is true under C23. RED-ON-DISABLE: without the predefined hook the identifier
+// folds to 0 and the branch is wrongly elided.
+TEST(Preprocessor, FC15bStdcVersionInIfExpression) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if __STDC_VERSION__ >= 201112L\nint modern;\n#else\nint old;\n#endif\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "C23 version >= 201112L -> the modern branch";
+    EXPECT_EQ(lexs[1], "modern");
+}
+
+// The `file` kind (C 6.10.8.1): `__FILE__` materializes the current source file
+// name as a C string literal. The buffer is named "main.c" by ppLexemes, so the
+// product decodes to "main.c". A string-literal product is a StringStart +
+// StringLiteral pair (like a stringize product), so we reconstruct it.
+TEST(Preprocessor, FC15bFileResolvesToSourceName) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("const char* f = __FILE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // const char * f = " main.c ;   -> the string product is lexs[5]+lexs[6].
+    ASSERT_EQ(lexs.size(), 8u) << "const char * f = <str-start> <str-body> ;";
+    EXPECT_EQ(reconstructStringLiteral(lexs, 5), "\"main.c\"")
+        << "__FILE__ materializes the source file name as a string literal";
+}
+
+// `__FILE__` inside an `#include`'d HEADER reports the HEADER's name, not the
+// main file's (C 6.10.8.1: the PRESUMED name of the current source file -- which
+// after the include splice is the header). The invocation offset of the
+// `__FILE__` token lands in the header's line-map segment, so it resolves to the
+// header's origin buffer name. RED-ON-DISABLE: resolving __FILE__ to the main
+// buffer name (ignoring the line-map origin) yields "main.c" inside the header.
+TEST(Preprocessor, FC15bFileInIncludedHeaderReportsHeaderName) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_pp_file_macro_test";
+    fs::create_directories(dir);
+    // The header USES __FILE__ -- so the product must carry the HEADER's name.
+    { std::ofstream(dir / "hdr.h", std::ios::binary)
+          << "const char* h = __FILE__;\n"; }
+    auto mainPath = dir / "main.c";
+    { std::ofstream(mainPath, std::ios::binary)
+          << "#include \"hdr.h\"\nint x;\n"; }
+
+    auto schema = cSubset();
+    auto mainBuf = SourceBuffer::fromFile(mainPath);
+    ASSERT_NE(mainBuf, nullptr);
+    std::vector<fs::path> noDirs;
+    PreprocessResult r = preprocess(mainBuf, schema, noDirs);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+
+    std::vector<std::string> lexs;
+    for (Token const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+    }
+    // const char * h = " hdr.h ; int x ;  -- find the string product after `=`.
+    // The header's __FILE__ product decodes to a name ENDING in "hdr.h" (the
+    // origin buffer name is the full path passed to fromFile).
+    bool sawHeaderName = false;
+    for (std::size_t i = 0; i + 1 < lexs.size(); ++i) {
+        if (lexs[i] == "\"") {
+            auto decoded = decodeStringLiteralBody(lexs[i + 1]);
+            if (decoded.has_value()) {
+                const std::string& s = *decoded;
+                // Normalized to '/'; ends with "hdr.h" and NOT "main.c".
+                if (s.size() >= 5 && s.compare(s.size() - 5, 5, "hdr.h") == 0) {
+                    sawHeaderName = true;
+                }
+                EXPECT_EQ(s.find("main.c"), std::string::npos)
+                    << "__FILE__ in the header must NOT report the main file name";
+            }
+        }
+    }
+    EXPECT_TRUE(sawHeaderName)
+        << "__FILE__ inside an #include'd header must report the HEADER's name";
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// `__DATE__` SHAPE-ONLY (NEVER the exact value -- the build date is
+// nondeterministic). C 6.10.8.1: the product is a string literal of the form
+// `"Mmm dd yyyy"` -- a decoded body of EXACTLY 11 chars (3 month + space +
+// 2 space-padded day + space + 4 year). We pin the LENGTH + structure (a space
+// at indices 3 and 6), never the contents.
+TEST(Preprocessor, FC15bDateShapeOnly) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("const char* d = __DATE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 8u);
+    EXPECT_EQ(lexs[5], "\"") << "__DATE__ is a string-literal product";
+    auto decoded = decodeStringLiteralBody(lexs[6]);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->size(), 11u)
+        << "__DATE__ decodes to \"Mmm dd yyyy\" -- exactly 11 chars";
+    if (decoded->size() == 11u) {
+        EXPECT_EQ((*decoded)[3], ' ') << "space after the month";
+        EXPECT_EQ((*decoded)[6], ' ') << "space after the (space-padded) day";
+    }
+}
+
+// `__TIME__` SHAPE-ONLY: C 6.10.8.1 `"hh:mm:ss"` -- a decoded body of EXACTLY
+// 8 chars with `:` at indices 2 and 5. Never the exact value.
+TEST(Preprocessor, FC15bTimeShapeOnly) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("const char* t = __TIME__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 8u);
+    EXPECT_EQ(lexs[5], "\"") << "__TIME__ is a string-literal product";
+    auto decoded = decodeStringLiteralBody(lexs[6]);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->size(), 8u)
+        << "__TIME__ decodes to \"hh:mm:ss\" -- exactly 8 chars";
+    if (decoded->size() == 8u) {
+        EXPECT_EQ((*decoded)[2], ':') << "colon after hours";
+        EXPECT_EQ((*decoded)[5], ':') << "colon after minutes";
+    }
+}
+
+// FAIL-LOUD (C 6.10.8.1p2): `#define` of a predefined name is a constraint
+// violation -> P_PreprocessorPredefinedMacro, and the directive does NOT alter
+// the table (a subsequent `__LINE__` still materializes its line value).
+TEST(Preprocessor, FC15bDefineOfPredefinedFailsLoud) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define __LINE__ 5\nint x = __LINE__;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
+        << "#define of a predefined macro name must fail loud";
+    // The rejected #define did not bind __LINE__ to 5; line-2 __LINE__ is 2.
+    ASSERT_EQ(lexs.size(), 5u);
+    EXPECT_EQ(lexs[3], "2")
+        << "the rejected #define must NOT alter the table -- __LINE__ still "
+           "resolves to its invocation line (2), not the rejected value 5";
+}
+
+// FAIL-LOUD (C 6.10.8.1p2): `#undef` of a predefined name is a constraint
+// violation -> P_PreprocessorPredefinedMacro, and the name still materializes.
+TEST(Preprocessor, FC15bUndefOfPredefinedFailsLoud) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#undef __FILE__\nconst char* f = __FILE__;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
+        << "#undef of a predefined macro name must fail loud";
+    // __FILE__ still materializes (the #undef was rejected, not applied).
+    ASSERT_EQ(lexs.size(), 8u);
+    EXPECT_EQ(reconstructStringLiteral(lexs, 5), "\"main.c\"")
+        << "the rejected #undef must NOT remove the predefined macro";
+}
+
+// AGNOSTICISM (RED-ON-DISABLE): the predefined-macro set is CONFIG-driven
+// (`preprocess.predefinedMacros`), NOT hard-coded. Rebind the `__LINE__` entry's
+// name to `__CURLINE__` and reload: now `__CURLINE__` resolves to its line while
+// the OLD spelling `__LINE__` is an ordinary identifier (passes through). RED-
+// ON-DISABLE: hard-coding "__LINE__" makes `__CURLINE__` ordinary (fails (1)) and
+// keeps `__LINE__` resolving (fails (2)).
+TEST(Preprocessor, FC15bPredefinedNameIsConfigDrivenNotHardcoded) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    // Rebind ONLY the name token of the `line` entry (a minimal, unambiguous
+    // substring -- `"name": "__LINE__"` appears exactly once in the config).
+    auto schema = reboundCSubset("\"name\": \"__LINE__\"",
+                                 "\"name\": \"__CURLINE__\"",
+                                 "<rebound-line-c-subset>");
+    ASSERT_NE(schema, nullptr);
+
+    // (1) The REBOUND name resolves to its invocation line.
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"int a;\nint x = __CURLINE__;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        std::vector<std::string> lexs;
+        for (Token const& t : r.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof) continue;
+            if (t.coreKind == CoreTokenKind::Whitespace) continue;
+            if (t.coreKind == CoreTokenKind::Newline) continue;
+            lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+        }
+        ASSERT_EQ(lexs.size(), 8u);
+        EXPECT_EQ(lexs[6], "2")
+            << "the rebound __CURLINE__ resolves to its invocation line (2)";
+    }
+    // (2) The OLD spelling `__LINE__` is now an ORDINARY identifier (it passes
+    // through verbatim, not resolved to a number).
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"int x = __LINE__;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        std::vector<std::string> lexs;
+        for (Token const& t : r.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof) continue;
+            if (t.coreKind == CoreTokenKind::Whitespace) continue;
+            if (t.coreKind == CoreTokenKind::Newline) continue;
+            lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+        }
+        ASSERT_EQ(lexs.size(), 5u);
+        EXPECT_EQ(lexs[3], "__LINE__")
+            << "with __LINE__ rebound away, the literal `__LINE__` is an ordinary "
+               "identifier -- proving the predefined name is read from config";
+    }
+}
+
+// AGNOSTICISM (opt-OUT): a language with NO preprocess block declares NO
+// predefined macros, so `__LINE__` &c. stay ordinary identifiers (zero behavior
+// change for toy / tsql-subset). c-subset, by contrast, declares the 7 entries.
+TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
+    auto toy = GrammarSchema::loadShipped("toy");
+    ASSERT_TRUE(toy.has_value());
+    EXPECT_TRUE((*toy)->preprocess().predefinedMacros.empty())
+        << "toy declares no predefined macros -- __LINE__ stays ordinary";
+
+    auto tsql = GrammarSchema::loadShipped("tsql-subset");
+    ASSERT_TRUE(tsql.has_value());
+    EXPECT_TRUE((*tsql)->preprocess().predefinedMacros.empty());
+
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ((*c)->preprocess().predefinedMacros.size(), 7u)
+        << "c-subset declares the 7 C 6.10.8 predefined macros";
+}
