@@ -48,8 +48,12 @@
 // the product token's span slices to its real text (`"hello"` / `add3`) from
 // the SAME single buffer the parser parses -- never to `#`/`##`. The `#`/`##`
 // vocabulary is config-driven (`preprocess.stringizeToken`/`pasteToken`),
-// default-absent for a non-C language. GNU `,##__VA_ARGS__` comma-elision is
-// DEFERRED (D-PP-VARIADIC-GNU-COMMA-ELISION, FC15b).
+// default-absent for a non-C language. The FC15 paste residuals complete `##`:
+// it also applies to OBJECT-like macros (`#define HW a##b` -> `ab`,
+// D-PP-PASTE-OBJECT-LIKE) and to EMPTY operands via PLACEMARKERS (`J(x,)` -> `x`,
+// C 6.10.3.3p2, D-PP-PASTE-PLACEMARKER); GNU `,##__VA_ARGS__` comma-elision is
+// config-gated (`preprocess.variadicCommaElision`, D-PP-VARIADIC-GNU-COMMA-ELISION).
+// A genuine dangling `##` (no operand token at all) still fails loud.
 //
 // FAIL-LOUD on every unsupported construct (function-like macro arity mismatch,
 // unterminated invocation, variadic/duplicate-parameter/malformed parameter

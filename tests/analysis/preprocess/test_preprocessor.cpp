@@ -479,14 +479,15 @@ TEST(Preprocessor, VariadicMacroEmptyVaArgsIsC23Allowed) {
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroArgument))
         << "an empty __VA_ARGS__ must not trip the arity floor";
     // int v = f ( 7 , ) ;  -- __VA_ARGS__ vanished; the literal comma between
-    // fmt and __VA_ARGS__ in the replacement remains (no GNU comma-elision in
-    // this cycle -- that is FC15's `,##__VA_ARGS__`).
+    // fmt and __VA_ARGS__ in the replacement remains. GNU comma-elision does NOT
+    // apply here: this replacement is `f(fmt, __VA_ARGS__)` with NO `##`, and
+    // elision fires only for the `, ## __VA_ARGS__` shape (see FC15GnuComma*).
     ASSERT_EQ(lexs.size(), 9u) << "expected: int v = f ( 7 , ) ;";
     EXPECT_EQ(lexs[3], "f");
     EXPECT_EQ(lexs[4], "(");
     EXPECT_EQ(lexs[5], "7");
-    EXPECT_EQ(lexs[6], ",") << "the replacement's literal comma stays (no GNU "
-                               "comma-elision in this cycle)";
+    EXPECT_EQ(lexs[6], ",") << "the replacement's literal comma stays (no `##` "
+                               "before __VA_ARGS__, so no comma-elision)";
     EXPECT_EQ(lexs[7], ")") << "__VA_ARGS__ with no trailing args is empty";
     EXPECT_EQ(lexs[8], ";");
 }
@@ -2474,8 +2475,8 @@ TEST(Preprocessor, FC15cOperatorNamesAndAngleTokensAreConfigDeclared) {
 
 // FINDING 1 (RED-ON-DISABLE): the angle delimiters of `__has_include(<h>)` are
 // matched by CONFIG token KIND, not the `<`/`>` bytes. Rebind
-// `hasIncludeAngleOpenToken` from `LtOp` to a DIFFERENT real token (`LBraceOp`?
-// -- use a declared one) and the `<h>` form must NO LONGER be recognized as the
+// `hasIncludeAngleOpenToken` from `LtOp` to a DIFFERENT real declared token
+// (`TildeOp` = `~`) and the `<h>` form must NO LONGER be recognized as the
 // angle opener -> the operand `<stdio.h>` is now a malformed shape -> fail loud.
 // RED-ON-DISABLE: matching `<` by the literal byte would ignore the rebind and
 // still parse the angle form, so no diagnostic fires.
@@ -2530,4 +2531,191 @@ TEST(Preprocessor, FC15cKnownCAttributeBadVersionIsLoadError) {
     auto loaded = GrammarSchema::loadFromText(text, "<bad-attr-c-subset>");
     EXPECT_FALSE(loaded.has_value())
         << "a knownCAttributes entry with version <= 0 must be a load error";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FC15 paste residuals — object-like `##` (D-PP-PASTE-OBJECT-LIKE), placemarkers
+// for empty `##` operands (D-PP-PASTE-PLACEMARKER, C 6.10.3.3p2), and the GNU
+// `,##__VA_ARGS__` comma-elision (D-PP-VARIADIC-GNU-COMMA-ELISION). These COMPLETE
+// FC15: `##` now works in object-like macros and with empty operands, and the GNU
+// elision is config-gated (`variadicCommaElision`). A GENUINE dangling `##` (no
+// operand token in the replacement list) still fails loud (FC15aPasteAt{Start,End}
+// + the object-like pin below).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// (1) Object-like `##`: `#define HW a ## b` -> `HW` pastes to the single token
+// `ab`. RED-ON-DISABLE: without the `collapsePastes` call in the object-like
+// expand arm, `a`, `##`, `b` pass through verbatim (3 tokens; `##` then trips the
+// parser). lexs.size() != 1.
+TEST(Preprocessor, FC15ObjectLikePasteYieldsOneToken) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define HW a ## b\nHW\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 1u) << "object-like ## must yield exactly ONE token";
+    EXPECT_EQ(lexs[0], "ab");
+}
+
+// (2) Object-like `##` chains left-to-right exactly like the function-like path.
+TEST(Preprocessor, FC15ObjectLikePasteChain) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define T x ## y ## z\nT\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 1u) << "two object-like ## collapse to ONE token";
+    EXPECT_EQ(lexs[0], "xyz");
+}
+
+// (3) The object-like paste PRODUCT is rescanned: `MK` -> `foo` (paste) ->
+// rescans as a macro use of `foo` -> 7. RED-ON-DISABLE: an un-collapsed
+// `fo ## o` never forms `foo`, so the `foo`->7 expansion cannot fire.
+TEST(Preprocessor, FC15ObjectLikePasteProductRescanned) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#define MK fo ## o\n#define foo 7\nint v = MK;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int v = 7 ;";
+    EXPECT_EQ(lexs[3], "7")
+        << "object-like ## product `foo` must rescan and expand to 7";
+}
+
+// (4) Placemarker, RIGHT operand empty (C 6.10.3.3p2): `J(x,)` -> `x ## <pm>` ->
+// `x`. RED-ON-DISABLE: without the placemarker, the empty `b` arg pushes nothing,
+// `items` ends `[x, ##]`, and `collapsePastes` fires P_PreprocessorPaste (dangling).
+TEST(Preprocessor, FC15PlacemarkerRightEmpty) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define J(a,b) a ## b\nJ(x,)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste))
+        << "x ## <empty> is a placemarker paste, NOT a dangling ##";
+    ASSERT_EQ(lexs.size(), 1u) << "x ## placemarker -> x";
+    EXPECT_EQ(lexs[0], "x");
+}
+
+// (5) Placemarker, LEFT operand empty: `J(,y)` -> `<pm> ## y` -> `y`.
+TEST(Preprocessor, FC15PlacemarkerLeftEmpty) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define J(a,b) a ## b\nJ(,y)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 1u) << "placemarker ## y -> y";
+    EXPECT_EQ(lexs[0], "y");
+}
+
+// (6) Placemarker, BOTH operands empty: `J(,)` -> `<pm> ## <pm>` -> a placemarker
+// -> dropped -> NO output tokens. RED-ON-DISABLE: a surviving placemarker would
+// emit a garbage token (size 1, not 0); a missing placemarker would fail loud.
+TEST(Preprocessor, FC15PlacemarkerBothEmpty) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define J(a,b) a ## b\nJ(,)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 0u) << "placemarker ## placemarker -> empty";
+}
+
+// (7) Placemarker MID-chain: `J3(x,,z)` = `x ## <pm> ## z` collapses left-to-right
+// (`x ## <pm>` -> `x`, then `x ## z` -> `xz`). RED-ON-DISABLE: the first `##` would
+// try to paste `x` with the bare `##` marker (>1 token) or fail dangling.
+TEST(Preprocessor, FC15PlacemarkerMidChain) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define J3(a,b,c) a ## b ## c\nJ3(x,,z)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 1u) << "x ## pm ## z -> xz";
+    EXPECT_EQ(lexs[0], "xz");
+}
+
+// (8) GNU comma-elision, EMPTY __VA_ARGS__ (the primary pin): `LOG(42)` ->
+// `f(42)` — the separator before `## __VA_ARGS__` is DROPPED. RED-ON-DISABLE
+// (flag off / elision block removed): the comma survives via the standard
+// placemarker rule (`, ## <pm>` -> `,`) -> 5 tokens `f ( 42 , )`.
+TEST(Preprocessor, FC15GnuCommaElisionEmptyVaArgs) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define LOG(fmt, ...) f(fmt, ## __VA_ARGS__)\nLOG(42)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 4u) << "expected: f ( 42 ) -- the comma elided";
+    EXPECT_EQ(lexs[0], "f");
+    EXPECT_EQ(lexs[1], "(");
+    EXPECT_EQ(lexs[2], "42");
+    EXPECT_EQ(lexs[3], ")");
+}
+
+// (9) GNU comma-elision, NON-empty __VA_ARGS__: `LOG(7, 1, 2)` -> `f(7, 1, 2)` —
+// the comma is KEPT and the `##` does NOT paste (`,1` would be two tokens / a
+// malformed paste). RED-ON-DISABLE: pasting `,` with `1` trips P_PreprocessorPaste
+// or mangles the stream.
+TEST(Preprocessor, FC15GnuCommaElisionNonEmptyVaArgs) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define LOG(fmt, ...) f(fmt, ## __VA_ARGS__)\nLOG(7, 1, 2)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 8u) << "expected: f ( 7 , 1 , 2 )";
+    EXPECT_EQ(lexs[2], "7");
+    EXPECT_EQ(lexs[3], ",") << "the separator is KEPT when __VA_ARGS__ is non-empty";
+    EXPECT_EQ(lexs[4], "1") << "no paste between the comma and the first arg";
+    EXPECT_EQ(lexs[5], ",");
+    EXPECT_EQ(lexs[6], "2");
+}
+
+// (10) MUST-FIX-1 pin: an empty `__VA_ARGS__` in a `## __VA_ARGS__` position whose
+// left neighbor is NOT a separator (so comma-elision does NOT apply) still becomes
+// a PLACEMARKER -> `K(x)` = `x ## <empty __VA_ARGS__>` -> `x`. RED-ON-DISABLE:
+// reverting the vaArgs fall-through to `stampArg` (not `stampArgOrPM`) drops the
+// empty operand -> dangling `##` -> P_PreprocessorPaste.
+TEST(Preprocessor, FC15PasteEmptyVaArgsIsPlacemarkerNotDangling) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define K(p, ...) p ## __VA_ARGS__\nK(x)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste))
+        << "x ## <empty __VA_ARGS__> is a placemarker, NOT a dangling ##";
+    ASSERT_EQ(lexs.size(), 1u) << "x ## placemarker -> x";
+    EXPECT_EQ(lexs[0], "x");
+}
+
+// (11) AGNOSTICISM pin: comma-elision is CONFIG-driven. Rebind the shipped
+// c-subset's `variadicCommaElision` to false and re-preprocess: the comma now
+// SURVIVES (standard placemarker) -> `f ( 42 , )`. RED-ON-DISABLE: if the engine
+// hardcoded the elision (ignoring the flag), the comma would vanish even at false.
+TEST(Preprocessor, FC15GnuCommaElisionIsConfigDriven) {
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty());
+    const std::string from = "\"variadicCommaElision\": true";
+    const std::string to   = "\"variadicCommaElision\": false";
+    auto const pos = text.find(from);
+    ASSERT_NE(pos, std::string::npos) << "config no longer carries the flag";
+    text.replace(pos, from.size(), to);
+    auto loaded = GrammarSchema::loadFromText(text, "<no-elision-c-subset>");
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<none>" : loaded.error()[0].message);
+    ASSERT_FALSE((*loaded)->preprocess().variadicCommaElision);
+
+    namespace fs = std::filesystem;
+    auto buf = SourceBuffer::fromString(
+        std::string{"#define LOG(fmt, ...) f(fmt, ## __VA_ARGS__)\nLOG(42)\n"},
+        "main.c");
+    std::vector<fs::path> noDirs;
+    PreprocessResult r = preprocess(buf, *loaded, noDirs);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    std::vector<std::string> lexs;
+    for (Token const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+    }
+    ASSERT_EQ(lexs.size(), 5u) << "without elision: f ( 42 , )";
+    EXPECT_EQ(lexs[3], ",") << "the separator survives without GNU comma-elision";
+}
+
+// (12) Fail-loud preserved for OBJECT-like macros: `#define OBJ a ##` (a genuine
+// dangling `##` -- no operand token at the END of the replacement list) must STILL
+// fail loud, now that the object-like arm routes through `collapsePastes`.
+TEST(Preprocessor, FC15ObjectLikeDanglingPasteFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define OBJ a ##\nOBJ\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste))
+        << "a `##` at the end of an OBJECT-like replacement must fail loud";
 }

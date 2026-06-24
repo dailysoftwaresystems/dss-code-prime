@@ -44,6 +44,8 @@
     "variadicArgsName": "__VA_ARGS__",
     "stringizeToken": "HashOp",
     "pasteToken": "HashHashOp",
+    "$variadicCommaElisionComment": "FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): opt into the GNU `,##__VA_ARGS__` extension. `sep ## __VA_ARGS__` with an EMPTY variadic part drops the preceding separator (`LOG(\"x\")` -> `f(\"x\")`); non-empty keeps it. Without this flag, standard C placemarker behavior leaves the separator. The separator/__VA_ARGS__ are matched by the config KIND/name above, never hardcoded.",
+    "variadicCommaElision": true,
     "$predefinedMacrosComment": "FC15b (C 6.10.8): the predefined macros. Each entry names the macro IDENTIFIER + a materialization `kind`; the engine keys EVERY behavior off `kind`, never the name. `line`/`file` are OFFSET-derived (resolved through the line-map against the INVOCATION offset -> the invocation line / the presumed file name); `date`/`time` are computed once at preprocess construction (`\"Mmm dd yyyy\"` / `\"hh:mm:ss\"`); `constant` carries a static `value` spelling verbatim. `#define`/`#undef` of any of these is a constraint violation (C 6.10.8.1) -> fail loud. __STDC_VERSION__ = 202311L (C23).",
     "predefinedMacros": [
       { "name": "__LINE__",            "kind": "line" },

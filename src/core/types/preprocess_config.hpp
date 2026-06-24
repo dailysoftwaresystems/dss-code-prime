@@ -282,6 +282,18 @@ struct DSS_EXPORT PreprocessConfig {
     // -> `C_InvalidPreprocess` at load). OPTIONAL -- empty means NO attribute is
     // known (every `__has_c_attribute(x)` then yields 0).
     std::vector<CAttributeDef> knownCAttributes;
+
+    // FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): opt into the GNU
+    // `,##__VA_ARGS__` extension. When TRUE, a `separator ## __VA_ARGS__` whose
+    // variadic part expands to EMPTY drops the preceding separator entirely (so
+    // with `#define LOG(fmt, ...) f(fmt, ## __VA_ARGS__)`, `LOG("x")` -> `f("x")`);
+    // a NON-empty `__VA_ARGS__` keeps the separator and does NOT paste. When FALSE
+    // (the default), standard C placemarker behavior applies and the separator
+    // survives (`sep ## <placemarker>` = `sep`). The separator is matched by the
+    // config-declared `functionLikeArgSeparatorToken` KIND and `__VA_ARGS__` by
+    // `variadicArgsName` -- never a hardcoded `,` byte or name. A language that does
+    // not opt in (every non-C grammar) leaves this FALSE -> no behavior change.
+    bool variadicCommaElision = false;
 };
 
 } // namespace dss

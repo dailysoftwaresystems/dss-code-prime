@@ -376,6 +376,14 @@ struct ExpToken {
     // `invOffset` IS its source position. Defaults to the token's own span start
     // when a token is lifted from a plain `Token` (`fromToken` below).
     ByteOffset invOffset = 0;
+    // FC15 paste residuals (D-PP-PASTE-PLACEMARKER, C 6.10.3.3p2): a PLACEMARKER
+    // is a sentinel for an EMPTY `##`-operand argument (`#define J(a,b) a##b`
+    // called `J(x,)` -> `x`). It is NOT a real token: `tok` is left
+    // default-constructed and is never inspected (every placemarker is consumed
+    // by `collapsePastes`'s placemarker-aware branches, then any survivor is
+    // dropped before the result leaves `substitute`). The default `false` makes
+    // every existing ExpToken construction a non-placemarker -- zero regression.
+    bool placemarker = false;
 };
 
 // Lift a plain (directive-stripped, original) body token into the expansion
@@ -566,7 +574,14 @@ public:
         std::vector<ExpToken> expanded = expand(std::move(work), 0);
         std::vector<Token> out;
         out.reserve(expanded.size());
-        for (ExpToken const& et : expanded) out.push_back(et.tok);
+        // FC15 paste residuals: a placemarker is normally consumed (or dropped
+        // at `collapsePastes` return) inside `substitute`; this is a defensive
+        // BACKSTOP so a stray placemarker never reaches the parser as a garbage
+        // (default-constructed) token. The primary drop is in `substitute`.
+        for (ExpToken const& et : expanded) {
+            if (et.placemarker) continue;
+            out.push_back(et.tok);
+        }
         return out;
     }
 
@@ -885,7 +900,12 @@ private:
         std::vector<ExpToken> expanded = expand(std::move(work), 0);
         std::vector<Token> out;
         out.reserve(expanded.size());
-        for (ExpToken const& et : expanded) out.push_back(et.tok);
+        // FC15 paste residuals: backstop drop of any stray placemarker (see
+        // `run()`); the primary drop is at `collapsePastes` return.
+        for (ExpToken const& et : expanded) {
+            if (et.placemarker) continue;
+            out.push_back(et.tok);
+        }
         return out;
     }
 
@@ -1289,6 +1309,25 @@ private:
                     ExpToken{e.tok, hideUnionAll(e.hide, hs), e.invOffset});
             }
         };
+        // FC15 paste residuals (D-PP-PASTE-PLACEMARKER, C 6.10.3.3p2): stamp a
+        // `##`-OPERAND argument, but when that argument is EMPTY emit a single
+        // PLACEMARKER instead of nothing. This is the crux that lets Phase B tell
+        // an empty-argument operand (valid -> `x ## <empty>` = `x`) apart from a
+        // GENUINE dangling `##` (no operand token at all in the replacement list,
+        // which still trips the boundary check in `collapsePastes`). Used ONLY for
+        // `##`-operand positions; a non-operand empty arg still vanishes.
+        auto stampArgOrPM = [&](std::vector<ExpToken> const& a,
+                                std::vector<ExpToken>& outTokens) {
+            if (a.empty()) {
+                ExpToken pm{};
+                pm.hide = hs;
+                pm.invOffset = invOffset;
+                pm.placemarker = true;
+                outTokens.push_back(pm);
+            } else {
+                stampArg(a, outTokens);
+            }
+        };
         // The RAW token run for a `#`/`##` operand at replacement index `i`
         // (a named parameter or `__VA_ARGS__`). Returns nullptr if `i` is not a
         // parameter position.
@@ -1332,7 +1371,44 @@ private:
                 bool const pasteOperand =
                     (i > 0 && isPaste(def.replacement[i - 1]))
                     || (i + 1 < n && isPaste(def.replacement[i + 1]));
-                stampArg(pasteOperand ? rawVaArgs : vaArgs, items);
+                // FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): the GNU
+                // `sep ## __VA_ARGS__` idiom, CONFIG-gated by `variadicCommaElision`
+                // (the separator matched by the config-declared arg-separator KIND,
+                // `__VA_ARGS__` by the config `variadicArgsName` -- never a hardcoded
+                // `,` byte or name). It fires only when the `##` immediately PRECEDES
+                // this `__VA_ARGS__` (left-paste) AND the token before that just-pushed
+                // `##` marker in `items` is the separator. EMPTY __VA_ARGS__: drop BOTH
+                // the separator and the `##` (the comma vanishes -> `f(fmt)`). NON-empty:
+                // drop only the `##` (no paste) and emit the PRE-EXPANDED args after the
+                // kept separator (-> `f(fmt, a, b)`). Anything else (flag off, or
+                // `p ## __VA_ARGS__` where the left neighbor is a value not a separator)
+                // falls through to the standard path below.
+                if (cfg().variadicCommaElision
+                    && i > 0 && isPaste(def.replacement[i - 1])
+                    && items.size() >= 2
+                    && !items.back().placemarker
+                    && isPaste(items.back().tok)
+                    && isArgSeparator(items[items.size() - 2].tok)) {
+                    if (rawVaArgs.empty()) {
+                        items.pop_back();   // drop the `##` marker
+                        items.pop_back();   // drop the preceding separator
+                    } else {
+                        items.pop_back();          // drop only the `##` (no paste)
+                        stampArg(vaArgs, items);   // pre-expanded __VA_ARGS__
+                    }
+                    continue;
+                }
+                // Standard path. A `##`-operand EMPTY `__VA_ARGS__` becomes a
+                // PLACEMARKER (so `x ## __VA_ARGS__` with empty args -> `x`, and the
+                // flag-off `sep ## __VA_ARGS__` empty case -> the standard
+                // `sep ## <pm>` = `sep`); otherwise the raw run for a paste operand,
+                // else the pre-expanded run. (MUST-FIX-1: paste-operand fall-through
+                // uses stampArgOrPM, not stampArg, so an empty operand is a placemarker.)
+                if (pasteOperand) {
+                    stampArgOrPM(rawVaArgs, items);
+                } else {
+                    stampArg(vaArgs, items);
+                }
                 continue;
             }
             int const pi = paramIndexOf(r, def);
@@ -1340,10 +1416,14 @@ private:
                 bool const pasteOperand =
                     (i > 0 && isPaste(def.replacement[i - 1]))
                     || (i + 1 < n && isPaste(def.replacement[i + 1]));
-                stampArg(pasteOperand
-                             ? rawArgs[static_cast<std::size_t>(pi)]
-                             : expandedArgs[static_cast<std::size_t>(pi)],
-                         items);
+                // FC15 paste residuals: a `##`-operand parameter with an EMPTY
+                // argument becomes a PLACEMARKER (C 6.10.3.3p2) via stampArgOrPM;
+                // a non-operand parameter keeps the byte-identical pre-expanded path.
+                if (pasteOperand) {
+                    stampArgOrPM(rawArgs[static_cast<std::size_t>(pi)], items);
+                } else {
+                    stampArg(expandedArgs[static_cast<std::size_t>(pi)], items);
+                }
                 continue;
             }
             // A plain replacement token gets EXACTLY hs (no prior hide set) and
@@ -1383,6 +1463,36 @@ private:
                 // Resume at the operand that now occupies `i` (or end).
                 continue;
             }
+            // FC15 paste residuals (D-PP-PASTE-PLACEMARKER, C 6.10.3.3p2): when an
+            // operand is a PLACEMARKER (an empty `##`-operand argument), the paste
+            // yields the OTHER operand (`pm ## X` -> X, `X ## pm` -> X) and
+            // `pm ## pm` -> a placemarker. This runs BEFORE the spelling-concat path
+            // so a placemarker is never re-tokenized. The surviving operand is
+            // re-stamped with `hs` (the product hide set) by UNION -- mirroring how a
+            // real paste product is stamped, never DROPPING the operand's accreted
+            // hide set (a dropped name would break Prosser recursion-freezing).
+            const bool leftPM  = items[i - 1].placemarker;
+            const bool rightPM = items[i + 1].placemarker;
+            if (leftPM || rightPM) {
+                const std::size_t lo = i - 1;
+                ExpToken keep{};
+                if (leftPM && rightPM) {
+                    keep.hide = hs;
+                    keep.invOffset = invOffset;
+                    keep.placemarker = true;            // pm ## pm -> pm
+                } else if (leftPM) {
+                    keep = items[i + 1];                // pm ## X -> X
+                    keep.hide = hideUnionAll(keep.hide, hs);
+                } else {
+                    keep = items[i - 1];                // X ## pm -> X
+                    keep.hide = hideUnionAll(keep.hide, hs);
+                }
+                items.erase(items.begin() + static_cast<std::ptrdiff_t>(lo),
+                            items.begin() + static_cast<std::ptrdiff_t>(i + 2));
+                items.insert(items.begin() + static_cast<std::ptrdiff_t>(lo), keep);
+                i = lo;   // rescan from the kept operand (chains `a ## pm ## c`)
+                continue;
+            }
             // Concatenate the spellings of the two operands.
             std::string spelling{text(items[i - 1].tok)};
             spelling += text(items[i + 1].tok);
@@ -1405,6 +1515,15 @@ private:
                          ExpToken{*product, hs, invOffset});
             i = lo;   // rescan from the product
         }
+        // FC15 paste residuals (MUST-FIX-2): drop any PLACEMARKER that survived
+        // collapse (e.g. `J(,)` -> a lone placemarker, or a placemarker operand that
+        // never met a `##`). Every `##` marker is consumed within this single call,
+        // so a surviving placemarker is dead -- removing it HERE guarantees a
+        // placemarker never re-enters `expand`'s rescan (the `run()`/`expandTokens()`
+        // drop is a defensive backstop only).
+        items.erase(std::remove_if(items.begin(), items.end(),
+                                   [](ExpToken const& e) { return e.placemarker; }),
+                    items.end());
         return items;
     }
 
@@ -1722,6 +1841,15 @@ private:
                 for (Token const& r : def.replacement) {
                     repl.push_back(ExpToken{r, hs, t.invOffset});
                 }
+                // FC15 paste residuals (D-PP-PASTE-OBJECT-LIKE, C 6.10.3.3): `##`
+                // applies to OBJECT-like macros too. Route the replacement through
+                // the SAME `collapsePastes` chokepoint the function-like path uses
+                // (no duplicated paste logic). An object-like macro has no parameters,
+                // so no placemarker can arise here; `collapsePastes` collapses the
+                // literal `##` operators and still fail-louds a genuine dangling `##`
+                // (`#define OBJ a ##`). `#` (stringize) does NOT apply to object-like
+                // macros (C 6.10.3.2) and there is none to handle here.
+                repl = collapsePastes(std::move(repl), hs, t.invOffset);
                 spliceOver(in, i, i + 1, repl);
                 continue;          // rescan from i (the first replacement token)
             }

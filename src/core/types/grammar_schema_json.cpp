@@ -4030,6 +4030,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): optional bool.
+            // TRUE -> `sep ## __VA_ARGS__` with an empty variadic part drops the
+            // separator (GNU extension); default FALSE -> standard placemarker.
+            if (pp.contains("variadicCommaElision")) {
+                if (!pp.at("variadicCommaElision").is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/variadicCommaElision",
+                              "'preprocess.variadicCommaElision' must be a boolean");
+                } else {
+                    cfg.variadicCommaElision =
+                        pp.at("variadicCommaElision").get<bool>();
+                }
+            }
+
             data.preprocess = std::move(cfg);
         }
     }
