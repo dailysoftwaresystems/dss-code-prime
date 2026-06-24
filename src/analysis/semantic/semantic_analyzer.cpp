@@ -4489,8 +4489,8 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
     // (JOIN-synchronous — no concurrency) so a deeply-nested-but-legal
     // expression tree does not overflow the host's ~1 MB main thread stack.
     // This is what lets `ParserConfig::maxExpressionDepth` be a real
-    // semantic cap (256) rather than a host-stack artifact
-    // (`D-PARSE-DEEP-FRONTEND-STACK`). The null-CU + every other contract
+    // semantic cap (config-driven: c-subset = 1024) rather than a host-stack
+    // artifact (`D-PARSE-DEEP-FRONTEND-STACK`). The null-CU + every other contract
     // check lives in `analyzeImpl`, which runs on the worker; any exception
     // it throws is re-thrown here by `callOnLargeStack`.
     return dss::substrate::callOnLargeStack(

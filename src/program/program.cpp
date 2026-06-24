@@ -810,11 +810,13 @@ int Program::compileFiles(
     // use `compileUnits` — this entry's single-CU semantics are unchanged.
     // D-PARSE-DEEP-FRONTEND-STACK: the CU build (preprocess + parse + the
     // type-name oracle reparse) recurses over the expression tree on the
-    // thread stack, so a deeply-nested-but-legal expression that the raised
-    // parser cap (256) admits would overflow the host's ~1 MB main stack
-    // here — symmetric to the downstream `analyze` overflow. Run it on the
-    // same 64 MiB worker stack (synchronous join) so parse and analysis are
-    // BOTH deep-safe and the cap is a real semantic limit end-to-end.
+    // thread stack (the parser's residual paren/postfix arm), so a deeply-
+    // nested-but-legal expression that the config-driven parser cap
+    // (`parser.maxExpressionDepth`, c-subset = 1024) admits would overflow the
+    // host's ~1 MB main stack here — symmetric to the downstream `analyze`
+    // overflow. Run it on the same 64 MiB worker stack (synchronous join) so
+    // parse and analysis are BOTH deep-safe and the cap is a real semantic
+    // limit end-to-end.
     auto cu = substrate::callOnLargeStack(
         substrate::kDeepRecursionStackBytes, [&] {
             UnitBuilder builder{grammar};

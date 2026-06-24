@@ -1931,6 +1931,41 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
+    // parser: optional top-level block carrying engine-parser tunables the
+    // language wants config-driven rather than baked into a C++ default. Today
+    // the only field is `maxExpressionDepth` — the Pratt walker's
+    // expression-nesting cap (the positioned `P_ExpressionTooDeep` backstop's
+    // threshold). Omitting the block (or the field) leaves the cap at the
+    // `ParserConfig` C++ fallback (256); declaring it makes the cap 100%
+    // config-driven. The value must be a positive integer; the cap is still a
+    // hard fail-loud ceiling (a deeper nest emits the positioned diagnostic and
+    // recovers — never a crash) — declaring a high value just raises HOW deep a
+    // legal nest the engine admits before the backstop trips, bounded by the
+    // worker stack the still-recursive paren arm runs on. AGNOSTIC: every
+    // language reads its own value; the loader names no language.
+    if (doc.contains("parser")) {
+        json const& parserObj = doc.at("parser");
+        if (!parserObj.is_object()) {
+            coll.emit(DiagnosticCode::C_ConflictingField, "/parser",
+                      "'parser' must be an object");
+        } else if (parserObj.contains("maxExpressionDepth")) {
+            json const& med = parserObj.at("maxExpressionDepth");
+            // Must be a positive integer. `is_number_unsigned` rejects negatives
+            // and floats; the explicit `> 0` rejects an authored 0 (which would
+            // make every expression — even a bare identifier, depth 1 — trip the
+            // cap, never producing a usable parse). Mirrors the runtime guard in
+            // the Parser ctor (`maxExpressionDepth must be >= 1`).
+            if (!med.is_number_unsigned() || med.get<std::uint64_t>() == 0) {
+                coll.emit(DiagnosticCode::C_ConflictingField,
+                          "/parser/maxExpressionDepth",
+                          "'maxExpressionDepth' must be a positive integer");
+            } else {
+                data.maxExpressionDepth =
+                    static_cast<std::size_t>(med.get<std::uint64_t>());
+            }
+        }
+    }
+
     data.rules        = std::make_shared<RuleInterner>();
     data.schemaTokens = std::make_shared<SchemaTokenInterner>();
 

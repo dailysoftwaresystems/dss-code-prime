@@ -7,6 +7,11 @@
     "fileExtensions": [".c", ".h"]
   },
 
+  "$parserComment": "plan-24 Stage 7 cap lift. `maxExpressionDepth` is the Pratt walker's expression-NESTING cap -- the threshold of the positioned, fail-loud `P_ExpressionTooDeep` backstop -- now 100% config-driven: the loader reads this key into `ParserConfig::maxExpressionDepth` via `parserConfigFor` (src/analysis/compilation_unit/compilation_unit.cpp); the C++ field default (256) is only the fallback when this key is absent. RAISED 256 -> 1024 (4x). WHY 1024 and not higher: plan-24 flattened the parser's operator/ternary/prefix/infix descent and ALL of cst_to_hir/hir_to_mir/semantic/const-eval onto explicit work-stacks (O(1) host-stack per nesting level), so operator/ternary chains are now bounded ONLY by this cap. The ONE residual recursion is the parser's paren/postfix-body arm (the deferred Stage 5b), which still costs one host frame per nested '(' on the 64 MiB deep-recursion worker stack (core/substrate/large_stack_call `kDeepRecursionStackBytes`). The cap is a SAFETY BACKSTOP: it must trip BEFORE that arm overflows on the WORST supported build, otherwise a deep paren nest would crash (rc 127) instead of failing loud -- so the cap must sit BELOW the tightest crash ceiling, not just near it. MEASURED native-Windows paren-crash ceilings (deepest '(' nest that still compiled on the 64 MiB worker): MSVC Debug ~3000-3200, MSVC Release ~16000-16500, MinGW Release ~20000-24000. 1024 leaves ~3x headroom below the tightest (MSVC Debug) ceiling -- covering Debug-build frame bloat plus cross-platform (Linux/macOS) frame variance -- while being 4x the old 256 and far above any realistic machine-generated C nesting. A nest beyond 1024 still FAILS LOUD with the positioned diagnostic + recovery; it never crashes. toy/tsql omit the `parser` block, so they keep the 256 fallback.",
+  "parser": {
+    "maxExpressionDepth": 1024
+  },
+
   "artifactProfiles": ["cli", "lib", "staticlib"],
 
   "imports": {

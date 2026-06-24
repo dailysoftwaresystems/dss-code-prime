@@ -49,6 +49,23 @@ void reportDriver(DiagnosticReporter& rep,
     rep.report(std::move(d));
 }
 
+// Build the ParserConfig for parsing `schema`'s sources, applying the
+// language's config-driven knobs. Today the only such knob is the
+// expression-nesting cap (`parser.maxExpressionDepth` in the `.lang.json`):
+// when the config declares it, it overrides the `ParserConfig` C++ fallback
+// default; when omitted, the fallback (256) stands. This is THE single
+// chokepoint that makes the cap config-driven — every real parse in this file
+// routes through it. (`P_ExpressionTooDeep` remains the fail-loud backstop at
+// whatever value results.) AGNOSTIC: reads the schema's own value; no
+// language/target/format branch.
+[[nodiscard]] ParserConfig parserConfigFor(GrammarSchema const& schema) {
+    ParserConfig cfg;
+    if (auto cap = schema.maxExpressionDepth()) {
+        cfg.maxExpressionDepth = *cap;
+    }
+    return cfg;
+}
+
 } // namespace
 
 // ── CompilationUnit::nextId ───────────────────────────────────────────────
@@ -246,7 +263,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
             ppFatal
                 ? TokenStream::fromTokens({pp.tokens.back()})
                 : TokenStream::fromTokens(pp.tokens);
-        Parser p{synth, schema, std::move(stream), {},
+        Parser p{synth, schema, std::move(stream), parserConfigFor(*schema),
                  std::move(pp.diagnostics)};
         ParseResult result = std::move(p).parse();
         // Remap the produced tree's diagnostics off the synth buffer onto the
@@ -272,7 +289,8 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
     }
     Tokenizer tk{src, schema};
     auto [stream, lexDiags] = std::move(tk).tokenize();
-    Parser p{src, schema, std::move(stream), {}, std::move(lexDiags)};
+    Parser p{src, schema, std::move(stream), parserConfigFor(*schema),
+             std::move(lexDiags)};
     ParseResult result = std::move(p).parse();
     addTree(std::move(result.tree));
     // FC2: fill the sidecar addTree just pushed — the parse's ambiguous
@@ -536,7 +554,11 @@ CompilationUnit UnitBuilder::finish() && {
                     cuFatal("UnitBuilder::finish: type-name candidates on "
                             "a tree with no reparse handles");
                 }
-                ParserConfig cfg;
+                // Same config-driven cap as the first parse — the reparse
+                // re-walks the SAME (possibly deep) tree, so it must admit the
+                // identical nesting depth or a clean first parse would fail the
+                // oracle reparse.
+                ParserConfig cfg = parserConfigFor(*sc.schema);
                 cfg.seedGlobalTypeNames = std::move(seeds);
                 // Build the reparse result. When this tree was preprocessed
                 // (FC13), `sc.source` is the synthesized buffer and

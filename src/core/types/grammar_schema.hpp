@@ -281,6 +281,18 @@ struct DSS_EXPORT GrammarSchemaData {
     // no declared `tokens` entries.
     std::size_t                                       maxLexemeLength = 0;
 
+    // Config-driven parser expression-nesting cap (optional top-level
+    // `parser.maxExpressionDepth`, additive — every schema version may
+    // declare it). `nullopt` when the config omits the field — the
+    // driver then leaves `ParserConfig::maxExpressionDepth` at its C++
+    // fallback default (256). When present, the loader validated it is a
+    // positive integer; the CU build copies it onto the `ParserConfig`
+    // for every parse of this language so the cap is 100% config-driven,
+    // not a hardcoded engine constant. The parser keeps `P_ExpressionTooDeep`
+    // as the fail-loud backstop at WHATEVER this value is — a nest beyond
+    // it still fails loud, never crashes. See `maxExpressionDepth()`.
+    std::optional<std::size_t>                        maxExpressionDepth;
+
     // Panic-mode sync tokens declared at the schema level — token
     // kinds the parser treats as "safe resync points" when the input
     // is broken. Sorted ascending by `id.v` so callers can use
@@ -388,6 +400,16 @@ public:
     // silently truncate. Computed at load time; zero only for an
     // empty lexemeTable.
     [[nodiscard]] std::size_t maxLexemeLength() const noexcept { return d_.maxLexemeLength; }
+
+    // Config-driven parser expression-nesting cap (`parser.maxExpressionDepth`).
+    // `nullopt` when the config omits the field — the CU build then keeps the
+    // `ParserConfig` C++ fallback default. When present, a loader-validated
+    // positive value the CU build copies onto `ParserConfig::maxExpressionDepth`
+    // so the cap is config-driven, not a hardcoded engine constant. Names no
+    // language — every shipped grammar reads its own value (or the fallback).
+    [[nodiscard]] std::optional<std::size_t> maxExpressionDepth() const noexcept {
+        return d_.maxExpressionDepth;
+    }
 
     // ── Operators ──
     [[nodiscard]] OperatorTable const& operatorTable() const noexcept { return d_.operators; }
