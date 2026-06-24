@@ -69,6 +69,17 @@ Each FC phase is one or more `/dss-cycle` cycles ending at a green push with a r
 | **FC17** ⏳ | C23-specific modern: `[[attributes]]` semantics, `typeof`/`typeof_unqual`, `constexpr`, `nullptr`/`nullptr_t`, enums with explicit underlying type | — |
 | **FC18** ⏳ | A broad runnable C23 corpus (real-ish programs across all targets, §A.5) + positioned-diagnostic assertions for the new error classes (REUSES the V2-4 Part C `expectDiagnostics` harness); grows the golden diagnostic corpus | `D-DIAG-CORPUS-EVERY-CODE` (grows toward closure) |
 
+### Cluster F — SQLite-readiness (FC16-pre) *(USER-PRIORITIZED 2026-06-24)*
+> **Goal:** clear the cheap, pervasive gaps blocking the first REAL-WORLD program (SQLite / `sqlite3.c`). Each is a single narrow gap from the live `dss-state` 104-probe battery failing-list; NOT phase-gated. **User priority order (2026-06-24, set during the autonomous /loop):** (1) **FC15 fully delivered — NO deferrals** (close the FC15a paste residuals: object-like `##`, placemarker, GNU comma-elision), THEN (2) **this Cluster F**, THEN (3) the rest of C23 (FC16→FC18). Each item is a normal /dss-cycle (best-long-term, agnostic, fail-loud, strict red-on-disable + runnable corpus where observable).
+
+| Item | What (the gap + the agnostic fix) | Battery probe(s) |
+|---|---|---|
+| **F1 — `++`/`--`** | pre/post increment + decrement. Dies at PARSE today. Add the operators to the c-subset `.lang.json` grammar + lower the pre/post lvalue-read-modify-write semantics AGNOSTICALLY (HIR/MIR — load, ±1, store; pre returns new, post returns old). Table-stakes; pervasive in `sqlite3.c`. | `core_incdec` |
+| **F2 — bitwise encodings** | `A_NoEncodingDeclared`. Declare the missing x86 encoding row(s) in `x86_64.target.json` (+ arm64 parity). | `core_bitwise` |
+| **F3 — float mul/sub** | `A_NoEncodingDeclared`. `float_add` works; MIRROR its SSE encoding rows for `mul`/`sub` in `x86_64.target.json` (+ arm64). | `float_mul`, `float_sub` |
+| **F4 — integer promotions** | C 6.3.1.1 integer promotions (`short`/`char` → `int`) through the existing FC3 UAC (usual-arithmetic-conversions) engine. | `int_short_char_promote` |
+| **F5 — string index + global** | string-literal indexing (`"abc"[i]`) + string-global emission (SQLite is string-dense; the rodata/section path is `.target.json`/`.format.json`-declared). | `agg_string_index`, `decl_string_global` |
+
 ---
 
 ## 0.2 Scope & design decisions (the user §B answers + the plan-lock locks, 2026-06-10)
