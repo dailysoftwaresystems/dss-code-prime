@@ -231,6 +231,32 @@ namespace detail::type_rules {
             return true;
         }
     }
+    // C-standard function-to-pointer decay (C 6.3.2.1p4): a function
+    // designator of type `FnSig` is implicitly assignable to a
+    // `Ptr<FnSig>` of the SAME signature — `int (*fp)(int,int); fp = add;`,
+    // the most common function-pointer idiom (vtables / callbacks /
+    // dispatch tables). This is the SIBLING of the array-to-pointer decay
+    // above and part of the SAME shared-lattice structural-decay family
+    // (D-LANG-STRUCTURAL-DECAY-OPT-OUT) — ungated, because a function name
+    // has no other use as an rvalue (a function value cannot be copied), so
+    // admitting the decay never masks a real mismatch. UNLIKE array decay,
+    // NO synthetic HIR decay node is needed: a bare function Ref inherently
+    // lowers to the function's ADDRESS at MIR time (which is why `fp = add`
+    // compiled AND ran correctly before the assign-stmt assignability check
+    // existed — only the new SEMANTIC check rejected it). Pinned to the SAME
+    // signature (the lhs pointee FnSig == the rhs FnSig, by interner
+    // identity): an incompatible-signature assignment (`int (*g)(int) = add`
+    // where add is `int(int,int)`) interns a DISTINCT FnSig and stays a loud
+    // mismatch. The arm is the shared `isAssignable` chokepoint, so it fixes
+    // assignment, initialization, call-argument, and return positions at
+    // once. Closes the `fp = add` regression of
+    // D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS.
+    if (lk == TypeKind::Ptr && rk == TypeKind::FnSig) {
+        auto const lhsElem = interner.operands(lhs);
+        if (!lhsElem.empty() && lhsElem[0] == rhs) {
+            return true;
+        }
+    }
     // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): the two
     // directions of `void*` ↔ `T*` conversion are configured
     // INDEPENDENTLY — they carry different safety characteristics:

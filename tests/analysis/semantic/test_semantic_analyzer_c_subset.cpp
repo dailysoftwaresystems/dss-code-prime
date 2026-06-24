@@ -2507,6 +2507,60 @@ TEST(SemanticAnalyzerCSubset, BareFnPtrCallTypesAndChecks) {
         << "indirect calls must get the SAME per-arg checking as direct";
 }
 
+// Bare function-to-pointer DECAY (C 6.3.2.1p4): a function NAME (no `&`)
+// assigned / initialized / passed where a `Ptr<FnSig>` is expected decays to
+// the function's address and type-checks. This is the `fp = add` regression of
+// D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS (commit 901fe89): the new
+// assign-stmt assignability check rejected bare decay (S_TypeMismatch / S0003)
+// while `fp = &add` passed. The fix is the function-to-pointer decay arm in the
+// SHARED `isAssignable` chokepoint, so the assignment, initializer, and
+// call-argument positions all clear at once. CRITICAL: the WHOLE existing
+// fnptr corpus uses `&fn`, so NO test covered the bare form — this is that pin.
+// RED-ON-DISABLE: revert the isAssignable fn-decay arm and (a)/(b)/(c) each
+// report S_TypeMismatch (and the corpus example fails to BUILD).
+TEST(SemanticAnalyzerCSubset, BareFunctionNameDecaysToPointerInEveryPosition) {
+    // (a) bare ASSIGNMENT — the exact regression.
+    auto assign = analyzeShipped("c-subset", {
+        "int add(int a, int b) { return a + b; }\n"
+        "int main() { int (*fp)(int, int); fp = add; return fp(40, 2); }\n",
+    });
+    EXPECT_EQ(countCode(assign.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "a bare function name assigned to a matching function pointer "
+           "(`fp = add`) must decay to its address, not fail S_TypeMismatch";
+
+    // (b) bare INITIALIZER (no `&`).
+    auto init = analyzeShipped("c-subset", {
+        "int add(int a, int b) { return a + b; }\n"
+        "int main() { int (*fp)(int, int) = add; return fp(40, 2); }\n",
+    });
+    EXPECT_EQ(countCode(init.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "a bare function name in an initializer must decay";
+
+    // (c) bare CALL-ARGUMENT (the callback position — `fn_fnptr_callback`).
+    auto callback = analyzeShipped("c-subset", {
+        "int add(int a, int b) { return a + b; }\n"
+        "int apply(int (*f)(int, int), int x, int y) { return f(x, y); }\n"
+        "int main() { return apply(add, 40, 2); }\n",
+    });
+    EXPECT_EQ(countCode(callback.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "a bare function name as a call argument must decay";
+
+    // NEGATIVE (fail-loud preserved): an INCOMPATIBLE-signature decay must
+    // STILL be rejected — the decay is pinned to the SAME interned FnSig, so a
+    // different parameter list interns a distinct FnSig and stays a mismatch.
+    auto mismatch = analyzeShipped("c-subset", {
+        "int add(int a, int b) { return a + b; }\n"
+        "int main() { int (*fp)(int) = add; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(mismatch.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "decay does NOT relax signature compatibility — `int (*)(int) = add` "
+           "(add is int(int,int)) stays a loud mismatch";
+}
+
 // (b) non-identifier callee whose STAMPED type is Ptr<FnSig> (the cast
 // form `((H)fp)(3)`) — clean, plus the arity-error sibling. (c1
 // predecessor: CastFnPtrCalleeFiresIndirectGate pinned the wall.)

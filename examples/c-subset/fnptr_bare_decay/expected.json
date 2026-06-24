@@ -1,0 +1,17 @@
+{
+  "$comment": "Bare function-to-pointer decay (C 6.3.2.1p4): a function NAME (no `&`) assigned/initialized/passed where a function pointer is expected decays to the function's address. Closes the `fp = add` regression of D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS (901fe89) — the new assign-stmt assignability check rejected bare decay (S0003) while `fp = &add` passed. Fixed by the function-to-pointer decay arm in isAssignable (the SHARED chokepoint), so assignment + initializer + call-argument all type-check at once. RED-ON-DISABLE: revert the isAssignable fn-decay arm and the bare-name uses fail to compile -> the example no longer BUILDS (compile failure, not a wrong exit). The whole existing fnptr corpus uses `&fn`, so this bare form is the coverage the suite lacked. Exit: fp(10,5)=15 + gp(3,4)=12 + apply(add,1,10,5)=15 = 42. Fold-resistant: apply is self-recursive (never inlined), the fn-ptr stays an indirect Arg call in baseline AND release. arm64 under qemu; macho on the macos-latest leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
