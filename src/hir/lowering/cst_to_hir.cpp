@@ -2628,51 +2628,357 @@ struct Lowerer {
     }
 
     // ── statements ────────────────────────────────────────────────────────────
+    //
+    // D-PARSE-DEEP-NEST-RECURSION-MEMORY (plan 24 Stage 3b): `lowerStmt` is an
+    // EXPLICIT HEAP WORK-STACK driver — NOT host recursion — for the DEEP
+    // statement forms that nest child STATEMENTS (the transparent wrapper, Block,
+    // If, While/DoWhile, For, Label). A deeply-nested statement tree — 256 nested
+    // `{ }` blocks, or nested `if`/`while`/`for` bodies, or a long statement list
+    // — therefore carries flat O(N) host-stack cost (only the worker thread's
+    // heap-backed `work` vector grows). EVERY OTHER form (VarDecl/TypeDecl/
+    // ExprStmt/Return/Break/Continue/Goto/IndirectGoto/Skip/Extension and SWITCH)
+    // computes its `HirNodeId` synchronously (terminal: it does not nest a child
+    // statement; Switch: its arm-grouping stays recursive but RE-ENTERS this
+    // driver for each `lowerStmt(body)` call, so a deep statement nested inside a
+    // switch arm still flattens). **OUTPUT-IDENTITY is THE gate** (the full ctest
+    // suite is the oracle): the emitted HIR — nodes, types, span-table order,
+    // arena order — is byte-for-byte identical to the prior recursive form. The
+    // recursive form built a parent statement's CHILDREN first (depositing their
+    // subtrees into the arena) and the parent `makeX` node LAST; the driver
+    // preserves that exactly — each frame enters its child statements in source
+    // order (so their `track`/arena ids precede the parent's), then runs the
+    // form's epilogue (`makeBlock`/`makeIfStmt`/… + `wrapIfProvablyInfinite`) when
+    // the children are collected. Conditions / for-clauses are NOT child
+    // statements — they lower INLINE in phase 0 (via the now-flat `lowerExpr` /
+    // `lowerForClause`), at the SAME point the recursive form lowered them, so the
+    // cond/init/update arena ids precede the body's exactly as before. The
+    // parser's `P_ExpressionTooDeep` cap is UNCHANGED.
+
+    // One statement work-stack frame. Only the DEEP forms allocate a frame; the
+    // per-form `phase` machine enters ONE child statement (via `enterStmt`, which
+    // only ever PUSHES — it does not recurse — so the descent is driven by the
+    // loop, keeping host-stack cost flat O(1) per level) or finishes and delivers
+    // its `HirNodeId` into the shared `stmtResult` slot. A frame reference
+    // `f = work.back()` DANGLES after any `enterStmt`/`push_back`, so each phase
+    // reads/copies every field it needs OUT of `f` and advances `f.phase` BEFORE
+    // calling `enterStmt` (the Stage-1/2/3 realloc-safe idiom). Block (an unbounded
+    // statement list) keeps its accumulating `stmts` vector in a `blockCtxs` LIFO
+    // stack LOCAL to `lowerStmt` (referenced by stable INDEX `aux`, exactly like
+    // the Call frame's `callCtxs`) — the `work` vector reallocs across the per-item
+    // `enterStmt`, so a held `vector&` would dangle but an index never does. The
+    // bounded forms (If ≤2 bodies, While/For/Label = 1 body) store child results
+    // in the frame fields `c0`/`c1`.
+    struct StmtFrame {
+        enum class Kind : std::uint8_t { PassThrough, Block, If, While, For,
+                                         Label } kind;
+        NodeId        node;     // the source node (provenance / combine anchor)
+        std::uint8_t  phase;
+        bool          doWhile;  // While frame: DoWhileStmt vs WhileStmt
+        NodeId        n0;       // PassThrough inner / If+While+For+Label body / If then
+        NodeId        n1;       // If else body (if present)
+        NodeId        condNode; // While/For: the cond CST node (provably-infinite probe), invalid if none
+        HirNodeId     condId;   // If/While: the lowered+coerced condition id
+        std::optional<HirNodeId> initId, condOpt, updateId;  // For: header clause ids
+        std::uint32_t labelOrd; // Label: the pre-scanned label ordinal
+        HirNodeId     c0;       // first collected child-stmt result (If then)
+        HirNodeId     c1;       // second collected child-stmt result (If else)
+        bool          haveC1;   // If: an else body exists
+        std::uint32_t aux;      // Block: index into the local `blockCtxs` stack
+    };
+
+    // The accumulating Block state (its `stmts` list + the next item to process).
+    // Lives in a `blockCtxs` stack LOCAL to `lowerStmt` (NOT in `StmtFrame` — the
+    // `stmts` vector must survive across the per-item `enterStmt` calls while the
+    // `work` vector reallocs). A Block frame holds only an INDEX (`aux`); indices
+    // are stable because nested blocks finish inner-first (LIFO push/pop the back).
+    struct BlockCtx {
+        std::vector<NodeId>     itemNodes;   // the block's statement children (source order)
+        std::size_t             itemIdx{};   // next item to process
+        std::vector<HirNodeId>  stmts;       // accumulated lowered statement ids
+    };
+
+    // The public statement-lowering entry: a driver over an explicit work-stack.
+    // `enterStmt` classifies a node (TERMINAL / Switch → set `stmtResult`; DEEP
+    // form → push a phase-0 frame and return WITHOUT recursing); the loop runs
+    // each frame's phase machine, calling `enterStmt` for the next child statement.
+    // Dispatch ORDER matches the prior recursive `lowerStmt` exactly →
+    // byte-identical.
     HirNodeId lowerStmt(NodeId node) {
-        HirRuleMapping const* m = mappingFor(node);
-        if (m == nullptr) {
-            // Transparent wrapper (e.g. `varDecl = [varDeclHead, ';']`): descend.
-            NodeId only = soleMeaningfulChild(node);
-            if (only.valid()) return lowerStmt(only);
-            unsupported(node, "statement has no hirLowering mapping");
-            return errorNode(node);
+        std::vector<StmtFrame> work;
+        std::vector<BlockCtx>  blockCtxs;   // accumulators for flattened Blocks
+        // Default-init: `enterStmt` ALWAYS assigns `stmtResult` for a terminal,
+        // and every pushed frame delivers into `stmtResult` before it is read.
+        HirNodeId stmtResult{};
+
+        auto const enterStmt = [&](NodeId n) {
+            HirRuleMapping const* m = mappingFor(n);
+            if (m == nullptr) {
+                // Transparent wrapper (e.g. `varDecl = [varDeclHead, ';']`):
+                // descend into its sole meaningful child via the work-stack.
+                NodeId only = soleMeaningfulChild(n);
+                if (only.valid()) {
+                    work.push_back({.kind = StmtFrame::Kind::PassThrough,
+                                    .node = n, .n0 = only});
+                    return;
+                }
+                unsupported(n, "statement has no hirLowering mapping");
+                stmtResult = errorNode(n);
+                return;
+            }
+            std::string const& k = m->hirKind;
+            // ── DEEP forms (flattened through a frame) ────────────────────────
+            if (k == "Block") {
+                std::uint32_t const ctxIdx = static_cast<std::uint32_t>(blockCtxs.size());
+                blockCtxs.push_back(BlockCtx{.itemNodes = blockChildNodes(n)});
+                work.push_back({.kind = StmtFrame::Kind::Block, .node = n, .aux = ctxIdx});
+                return;
+            }
+            if (k == "IfStmt") {
+                StmtFrame fr{.kind = StmtFrame::Kind::If, .node = n};
+                ifPrologue(n, fr.condId, fr.n0, fr.n1);   // cond lowered INLINE here
+                work.push_back(fr);
+                return;
+            }
+            if (k == "WhileStmt" || k == "DoWhileStmt") {
+                StmtFrame fr{.kind = StmtFrame::Kind::While, .node = n,
+                             .doWhile = (k == "DoWhileStmt")};
+                whilePrologue(n, fr.condId, fr.condNode, fr.n0);   // cond lowered INLINE
+                work.push_back(fr);
+                return;
+            }
+            if (k == "ForStmt") {
+                StmtFrame fr{.kind = StmtFrame::Kind::For, .node = n};
+                if (forPrologue(n, fr.initId, fr.condOpt, fr.updateId,
+                                fr.condNode, fr.n0)) {   // header clauses lowered INLINE
+                    work.push_back(fr);
+                    return;
+                }
+                stmtResult = errorNode(n);   // malformed `for` (no body)
+                return;
+            }
+            if (k == "LabelStmt") {
+                StmtFrame fr{.kind = StmtFrame::Kind::Label, .node = n};
+                if (labelPrologue(n, fr.labelOrd, fr.n0)) {
+                    work.push_back(fr);
+                    return;
+                }
+                stmtResult = errorNode(n);   // malformed / un-prescanned label
+                return;
+            }
+            // ── TERMINAL / synchronous forms (no nested child statement) ──────
+            if (k == "VarDecl")     { stmtResult = lowerVarDecl(n); return; }
+            if (k == "TypeDecl")    { stmtResult = lowerTypeDecl(n); return; }
+            if (k == "ExprStmt")    { stmtResult = lowerExprStmt(n); return; }
+            if (k == "ReturnStmt")  { stmtResult = lowerReturn(n); return; }
+            if (k == "BreakStmt")    { stmtResult = track(builder.makeBreak(0), n); return; }
+            if (k == "ContinueStmt") { stmtResult = track(builder.makeContinue(0), n); return; }
+            // Switch's arm-grouping stays recursive (it re-enters this driver for
+            // each `lowerStmt(body)`, so deep statements in arms still flatten).
+            if (k == "SwitchStmt")  { stmtResult = lowerSwitch(n); return; }
+            if (k == "GotoStmt")    { stmtResult = lowerGoto(n); return; }
+            if (k == "IndirectGotoStmt") { stmtResult = lowerIndirectGoto(n); return; }
+            // D-CSUBSET-LABEL-BEFORE-CASE: a `case`/`default` labeled statement (the
+            // `caseStmt` form that lets a goto-label precede a case) reaches the
+            // statement dispatch ONLY when it is NOT a direct switch-body item —
+            // lowerSwitch consumes the in-switch (label-wrapped) ones first. So this
+            // is a case outside any switch, or nested in an inner block of a switch
+            // arm (the flat-switch model groups only top-level items). Fail loud
+            // (C 6.8.1) rather than emit a stray arm-less case.
+            if (k == "CaseStmt") {
+                emitH(DiagnosticCode::S_CaseLabelNotInSwitch, n,
+                      "'case'/'default' label is not a direct switch-body item (C 6.8.1)");
+                stmtResult = errorNode(n);
+                return;
+            }
+            // FC5: an empty statement `;` lowers to a no-op (an empty Block: it
+            // lowers to nothing in MIR, doesn't terminate, and emits no warning).
+            // `Skip` is also the include-directive's kind, handled at the top-level
+            // decl path.
+            if (k == "Skip")        { stmtResult = track(builder.makeBlock({}), n); return; }
+            // HR10: a rule mapped to a registered extension kind → an Extension node.
+            if (extKindByName_.count(k)) { stmtResult = lowerExtensionNode(n, *m); return; }
+            unsupported(n, std::format("statement maps to unsupported HIR kind '{}'", k));
+            stmtResult = errorNode(n);
+        };
+
+        // The per-item pump for a flattened Block (ctx at stable index `ctxIdx`):
+        // enter the next statement item; returns true iff it entered one (the
+        // caller waits for it), false when all items are consumed (the caller
+        // finishes the block). Re-addresses `blockCtxs[ctxIdx]` fresh each access
+        // — a nested block (an item that is itself a Block) grows `blockCtxs`, so a
+        // held reference could dangle; the INDEX is stable. `enterStmt` is the LAST
+        // action, respecting the dangling-`work.back()` rule. Items are entered
+        // LEFT-TO-RIGHT (a sequential loop — exactly `lowerBlock`'s recursive
+        // `for (c : visible) stmts.push_back(lowerStmt(c))`), platform-independent.
+        auto const pumpBlock = [&](std::uint32_t ctxIdx) -> bool {
+            if (blockCtxs[ctxIdx].itemIdx >= blockCtxs[ctxIdx].itemNodes.size())
+                return false;   // all items consumed → finish
+            NodeId const item = blockCtxs[ctxIdx].itemNodes[blockCtxs[ctxIdx].itemIdx];
+            enterStmt(item);
+            return true;
+        };
+
+        enterStmt(node);
+        while (!work.empty()) {
+            StmtFrame& f = work.back();
+            switch (f.kind) {
+            case StmtFrame::Kind::PassThrough:
+                // A transparent wrapper: descend into the inner node (phase 0),
+                // then pass its `HirNodeId` through unchanged (phase 1).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const inner = f.n0;
+                    enterStmt(inner);       // may invalidate `f`
+                } else {
+                    work.pop_back();        // `stmtResult` already holds the inner id
+                }
+                break;
+            case StmtFrame::Kind::Block:
+                // A `{ … }` block: enter each statement item left-to-right (one at
+                // a time), collecting its id; when all are consumed, makeBlock.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    std::uint32_t const ctxIdx = f.aux;
+                    if (pumpBlock(ctxIdx)) break;       // entered the first item — wait
+                    finishBlock(work, blockCtxs, ctxIdx, stmtResult);   // empty block
+                } else {
+                    // A block item just completed (`stmtResult` holds it). Collect
+                    // it, advance, enter the next — or finish.
+                    std::uint32_t const ctxIdx = f.aux;
+                    blockCtxs[ctxIdx].stmts.push_back(stmtResult);
+                    ++blockCtxs[ctxIdx].itemIdx;
+                    if (pumpBlock(ctxIdx)) break;       // entered the next item — wait
+                    finishBlock(work, blockCtxs, ctxIdx, stmtResult);   // all consumed
+                }
+                break;
+            case StmtFrame::Kind::If:
+                // cond lowered in the prologue; now the then-body (phase 0→1, only
+                // if present), then the else-body if present (phase 1→2), then the
+                // SAME finish tail as `lowerIf` (deferred missing-cond/missing-then
+                // errors emit HERE, after the bodies — matching the recursive span
+                // order). Children entered in SOURCE order (then before else).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const thenN = f.n0;
+                    if (thenN.valid()) { enterStmt(thenN); break; }  // may invalidate `f`
+                    // No then-branch: `stmtResult` is unused for `c0` (the finish
+                    // substitutes a reportedError); fall through to phase 1.
+                }
+                if (f.phase == 1) {
+                    f.phase = 2;
+                    if (f.n0.valid()) f.c0 = stmtResult;   // then-body result
+                    NodeId const elseN = f.n1;
+                    if (elseN.valid()) { f.haveC1 = true; enterStmt(elseN); break; }
+                    // no else
+                }
+                {
+                    NodeId const node2 = f.node;
+                    bool const haveThen = f.n0.valid();
+                    HirNodeId const thenH = f.c0;
+                    HirNodeId const condIn = f.condId;
+                    std::optional<HirNodeId> els;
+                    if (f.haveC1) { f.c1 = stmtResult; els = f.c1; }
+                    work.pop_back();
+                    // Match `lowerIf`'s finish ORDER exactly: missing-cond error
+                    // first, then missing-then error.
+                    HirNodeId const condFinal =
+                        condIn.valid() ? condIn
+                                       : orError(std::nullopt, node2, "if statement has no condition");
+                    HirNodeId const thenFinal =
+                        haveThen ? thenH
+                                 : reportedError(node2, "if statement has no then-branch");
+                    stmtResult = track(builder.makeIfStmt(condFinal, thenFinal, els), node2);
+                }
+                break;
+            case StmtFrame::Kind::While:
+                // cond lowered in the prologue; now the body (phase 0→1), then
+                // makeWhileStmt/makeDoWhileStmt + wrapIfProvablyInfinite.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const bodyN = f.n0;
+                    if (bodyN.valid()) { enterStmt(bodyN); break; }
+                    // No body: leave `stmtResult` (the finish substitutes an
+                    // orError — emitted AFTER the missing-cond error, matching
+                    // `lowerWhile`'s span order). Fall through to phase 1.
+                }
+                {
+                    NodeId const node2   = f.node;
+                    bool const   doWhile = f.doWhile;
+                    bool const   haveBody = f.n0.valid();
+                    HirNodeId const condIn = f.condId;
+                    std::optional<NodeId> const condNode =
+                        f.condNode.valid() ? std::optional<NodeId>{f.condNode} : std::nullopt;
+                    std::optional<HirNodeId> const body =
+                        haveBody ? std::optional<HirNodeId>{stmtResult} : std::nullopt;
+                    work.pop_back();
+                    // Match `lowerWhile`'s finish ORDER: missing-cond error first,
+                    // then missing-body error.
+                    HirNodeId const condFinal =
+                        condIn.valid() ? condIn
+                                       : orError(std::nullopt, node2, "loop has no condition");
+                    HirNodeId const bodyId = orError(body, node2, "loop has no body");
+                    HirNodeId const loop =
+                        doWhile ? track(builder.makeDoWhileStmt(bodyId, condFinal), node2)
+                                : track(builder.makeWhileStmt(condFinal, bodyId), node2);
+                    stmtResult = wrapIfProvablyInfinite(node2, loop, condNode, bodyId);
+                }
+                break;
+            case StmtFrame::Kind::For:
+                // init/cond/update lowered in the prologue; now the body
+                // (phase 0→1), then makeForStmt + wrapIfProvablyInfinite.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const bodyN = f.n0;
+                    enterStmt(bodyN);           // for always has a body here
+                    break;
+                }
+                {
+                    NodeId const node2 = f.node;
+                    std::optional<HirNodeId> const initId   = f.initId;
+                    std::optional<HirNodeId> const condOpt  = f.condOpt;
+                    std::optional<HirNodeId> const updateId = f.updateId;
+                    std::optional<NodeId> const condNode =
+                        f.condNode.valid() ? std::optional<NodeId>{f.condNode} : std::nullopt;
+                    HirNodeId const bodyH = stmtResult;
+                    work.pop_back();
+                    HirNodeId const loop =
+                        track(builder.makeForStmt(initId, condOpt, updateId, bodyH), node2);
+                    stmtResult = wrapIfProvablyInfinite(node2, loop, condNode, bodyH);
+                }
+                break;
+            case StmtFrame::Kind::Label:
+                // `label: stmt` — enter the labeled statement (phase 0→1), then
+                // makeLabelStmt carrying the pre-scanned ordinal.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const bodyN = f.n0;
+                    enterStmt(bodyN);           // may invalidate `f`
+                } else {
+                    NodeId const node2 = f.node;
+                    std::uint32_t const ord = f.labelOrd;
+                    HirNodeId const bodyH = stmtResult;
+                    work.pop_back();
+                    stmtResult = track(builder.makeLabelStmt(ord, bodyH), node2);
+                }
+                break;
+            }
         }
-        std::string const& k = m->hirKind;
-        if (k == "VarDecl")     return lowerVarDecl(node);
-        if (k == "TypeDecl")    return lowerTypeDecl(node);
-        if (k == "Block")       return lowerBlock(node);
-        if (k == "ExprStmt")    return lowerExprStmt(node);
-        if (k == "ReturnStmt")  return lowerReturn(node);
-        if (k == "BreakStmt")    return track(builder.makeBreak(0), node);
-        if (k == "ContinueStmt") return track(builder.makeContinue(0), node);
-        if (k == "IfStmt")      return lowerIf(node);
-        if (k == "WhileStmt")   return lowerWhile(node, /*doWhile=*/false);
-        if (k == "DoWhileStmt") return lowerWhile(node, /*doWhile=*/true);
-        if (k == "ForStmt")     return lowerFor(node);
-        if (k == "SwitchStmt")  return lowerSwitch(node);
-        if (k == "GotoStmt")    return lowerGoto(node);
-        if (k == "IndirectGotoStmt") return lowerIndirectGoto(node);
-        if (k == "LabelStmt")   return lowerLabel(node);
-        // D-CSUBSET-LABEL-BEFORE-CASE: a `case`/`default` labeled statement (the
-        // `caseStmt` form that lets a goto-label precede a case) reaches the
-        // statement dispatch ONLY when it is NOT a direct switch-body item —
-        // lowerSwitch consumes the in-switch (label-wrapped) ones first. So this
-        // is a case outside any switch, or nested in an inner block of a switch
-        // arm (the flat-switch model groups only top-level items). Fail loud
-        // (C 6.8.1) rather than emit a stray arm-less case.
-        if (k == "CaseStmt") {
-            emitH(DiagnosticCode::S_CaseLabelNotInSwitch, node,
-                  "'case'/'default' label is not a direct switch-body item (C 6.8.1)");
-            return errorNode(node);
-        }
-        // FC5: an empty statement `;` lowers to a no-op (an empty Block: it lowers
-        // to nothing in MIR, doesn't terminate, and emits no warning). `Skip` is
-        // also the include-directive's kind, handled at the top-level decl path.
-        if (k == "Skip")        return track(builder.makeBlock({}), node);
-        // HR10: a rule mapped to a registered extension kind → an Extension node.
-        if (extKindByName_.count(k)) return lowerExtensionNode(node, *m);
-        unsupported(node, std::format("statement maps to unsupported HIR kind '{}'", k));
-        return errorNode(node);
+        return stmtResult;
+    }
+
+    // Finish a flattened Block: emit makeBlock from the (now-complete) ctx, pop the
+    // Block frame and its ctx (the top of each — nested blocks finished inner-first,
+    // so the LIFO `pop_back` removes exactly this block's frame + ctx), and deliver
+    // the Block `HirNodeId` into `stmtResult`. Out-of-line so the empty-block and
+    // all-items-consumed paths share one finish. Byte-identical to `lowerBlock`'s
+    // `track(makeBlock(stmts), node)`.
+    void finishBlock(std::vector<StmtFrame>& work, std::vector<BlockCtx>& blockCtxs,
+                     std::uint32_t ctxIdx, HirNodeId& stmtResult) {
+        NodeId const blockNode = work.back().node;   // the Block node (provenance)
+        HirNodeId const blockH = track(builder.makeBlock(blockCtxs[ctxIdx].stmts), blockNode);
+        work.pop_back();
+        blockCtxs.pop_back();
+        stmtResult = blockH;
     }
 
     // FC5 — pre-assign a per-function ordinal to every label in `node`'s subtree
@@ -2702,24 +3008,43 @@ struct Lowerer {
             if (!isToken(c)) prescanLabels(c);
     }
 
-    // `label: stmt` — carry the pre-scanned ordinal; lower the labeled statement
-    // (the sole non-token child). The shared ordinal links it to its goto(s).
-    HirNodeId lowerLabel(NodeId node) {
+    // `label: stmt` PROLOGUE shared by `lowerLabel` (the recursive entry) and the
+    // `lowerStmt` driver's Label frame: extract the name token + the labeled
+    // statement (the sole non-token child) and resolve the pre-scanned ordinal. On
+    // success sets `ord`/`bodyN` and returns true; on a malformed / un-prescanned
+    // label emits the SAME positioned diagnostic and returns false. All reads (no
+    // HIR emission of the label itself), so resolving the ordinal here — BEFORE the
+    // body lowers — is byte-identical to the recursive form's order.
+    [[nodiscard]] bool labelPrologue(NodeId node, std::uint32_t& ord, NodeId& bodyN) {
         NodeId const nameTok = firstIdentifierToken(node);
         NodeId bodyStmt{};
         for (NodeId c : visible(node)) { if (!isToken(c)) { bodyStmt = c; break; } }
         if (!nameTok.valid() || !bodyStmt.valid()) {
             unsupported(node, "malformed labeled statement");
-            return errorNode(node);
+            return false;
         }
         auto it = labelOrdinals_.find(std::string{tree().text(nameTok)});
         if (it == labelOrdinals_.end()) {        // pre-scan covers every label
             unsupported(node, std::format("label '{}' was not pre-scanned",
                                           tree().text(nameTok)));
-            return errorNode(node);
+            return false;
         }
-        HirNodeId const bodyH = lowerStmt(bodyStmt);
-        return track(builder.makeLabelStmt(it->second, bodyH), node);
+        ord = it->second;
+        bodyN = bodyStmt;
+        return true;
+    }
+
+    // `label: stmt` — carry the pre-scanned ordinal; lower the labeled statement
+    // (the sole non-token child). The shared ordinal links it to its goto(s).
+    // The `lowerStmt` driver flattens this through a Label frame; this recursive
+    // entry is retained for completeness (byte-identical to the prior form via the
+    // shared prologue).
+    HirNodeId lowerLabel(NodeId node) {
+        std::uint32_t ord{};
+        NodeId bodyN{};
+        if (!labelPrologue(node, ord, bodyN)) return errorNode(node);
+        HirNodeId const bodyH = lowerStmt(bodyN);
+        return track(builder.makeLabelStmt(ord, bodyH), node);
     }
 
     // `goto label;` — resolve the target name to its pre-scanned ordinal. A miss
@@ -3985,12 +4310,24 @@ struct Lowerer {
         return errorNode(node);
     }
 
-    HirNodeId lowerBlock(NodeId node) {
-        std::vector<HirNodeId> stmts;
+    // The statement children of a `{ … }` block, in source order (the visible
+    // non-token children). Shared by `lowerBlock` (recursive) and the `lowerStmt`
+    // driver's Block frame so both walk the SAME item set in the SAME order.
+    [[nodiscard]] std::vector<NodeId> blockChildNodes(NodeId node) {
+        std::vector<NodeId> items;
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;  // { }
-            stmts.push_back(lowerStmt(c));
+            items.push_back(c);
         }
+        return items;
+    }
+
+    // The `lowerStmt` driver flattens a block through a Block frame; this recursive
+    // entry is retained for completeness (byte-identical: same items, same order,
+    // same `makeBlock`).
+    HirNodeId lowerBlock(NodeId node) {
+        std::vector<HirNodeId> stmts;
+        for (NodeId c : blockChildNodes(node)) stmts.push_back(lowerStmt(c));
         return track(builder.makeBlock(stmts), node);
     }
 
@@ -4010,24 +4347,51 @@ struct Lowerer {
         return track(builder.makeReturn(std::nullopt), node);
     }
 
-    HirNodeId lowerIf(NodeId node) {
-        std::optional<HirNodeId> cond;
-        std::vector<HirNodeId> bodies;
+    // The `if` PROLOGUE shared by `lowerIf` (recursive) and the `lowerStmt`
+    // driver's If frame: scan the children, lower the condition INLINE (matching
+    // the recursive form — the cond is the first `Role::Expr` child and lowers at
+    // its source position, BEFORE any body), and collect the (≤2) body statement
+    // nodes in source order. `condId` is left INVALID when there is no condition
+    // (the recursive form's `orError("if statement has no condition")` fires AFTER
+    // the bodies lower, so the caller defers that emission to the finish — keeping
+    // span-table order identical). `thenN`/`elseN` are the first/second `Role::Stmt`
+    // children (invalid when absent — the finish emits the same "no then-branch"
+    // error there). No HIR is emitted for the If node itself here.
+    void ifPrologue(NodeId node, HirNodeId& condId, NodeId& thenN, NodeId& elseN) {
+        bool haveCond = false;
+        int bodyCount = 0;
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
             Role const role = classify(c);
-            if (role == Role::Expr && !cond) {
+            if (role == Role::Expr && !haveCond) {
                 E const condE = lowerExpr(c);
-                cond = coerceCondition(condE, c).id;
+                condId = coerceCondition(condE, c).id;
+                haveCond = true;
             }
-            else if (role == Role::Stmt)     bodies.push_back(lowerStmt(c));
+            else if (role == Role::Stmt) {
+                if (bodyCount == 0) thenN = c;
+                else if (bodyCount == 1) elseN = c;
+                ++bodyCount;
+            }
         }
-        HirNodeId condId = orError(cond, node, "if statement has no condition");
-        HirNodeId then = bodies.empty() ? reportedError(node, "if statement has no then-branch")
-                                        : bodies[0];
+        if (!haveCond) condId = HirNodeId{};   // invalid → finish emits orError
+    }
+
+    // The `lowerStmt` driver flattens `if` through an If frame; this recursive
+    // entry is retained for completeness (byte-identical via the shared prologue +
+    // the same finish tail).
+    HirNodeId lowerIf(NodeId node) {
+        HirNodeId condId{};
+        NodeId thenN{}, elseN{};
+        ifPrologue(node, condId, thenN, elseN);
+        HirNodeId const then = thenN.valid() ? lowerStmt(thenN) : HirNodeId{};
         std::optional<HirNodeId> els;
-        if (bodies.size() >= 2) els = bodies[1];
-        return track(builder.makeIfStmt(condId, then, els), node);
+        if (elseN.valid()) els = lowerStmt(elseN);
+        HirNodeId const condFinal =
+            condId.valid() ? condId : orError(std::nullopt, node, "if statement has no condition");
+        HirNodeId const thenFinal =
+            thenN.valid() ? then : reportedError(node, "if statement has no then-branch");
+        return track(builder.makeIfStmt(condFinal, thenFinal, els), node);
     }
 
     // ── provably-infinite-loop detection (D-HIR-INFINITE-LOOP-NOT-TERMINATING) ──
@@ -4131,30 +4495,60 @@ struct Lowerer {
         return track(builder.makeBlock(wrapped, HirFlags::Synthetic), node);
     }
 
-    HirNodeId lowerWhile(NodeId node, bool doWhile) {
-        std::optional<HirNodeId> cond, body;
-        std::optional<NodeId>    condNode;
+    // The while/do-while PROLOGUE shared by `lowerWhile` (recursive) and the
+    // `lowerStmt` driver's While frame: lower the condition INLINE (at its source
+    // position, matching the recursive form) and record the cond CST node (for the
+    // provably-infinite probe) + the body statement node. `condId` is left INVALID
+    // when there is no condition (the recursive `orError("loop has no condition")`
+    // fires AFTER the body lowers, so the caller defers it to the finish). `bodyN`
+    // is invalid when absent (the finish emits the same "loop has no body" error).
+    void whilePrologue(NodeId node, HirNodeId& condId, NodeId& condNode, NodeId& bodyN) {
+        bool haveCond = false;
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
             Role const role = classify(c);
-            if (role == Role::Expr && !cond) {
+            if (role == Role::Expr && !haveCond) {
                 condNode = c;
                 E const condE = lowerExpr(c);
-                cond = coerceCondition(condE, c).id;
+                condId = coerceCondition(condE, c).id;
+                haveCond = true;
             }
-            else if (role == Role::Stmt && !body) body = lowerStmt(c);
+            else if (role == Role::Stmt && !bodyN.valid()) bodyN = c;
         }
-        HirNodeId condId = orError(cond, node, "loop has no condition");
-        HirNodeId bodyId = orError(body, node, "loop has no body");
-        HirNodeId const loop =
-            doWhile ? track(builder.makeDoWhileStmt(bodyId, condId), node)
-                    : track(builder.makeWhileStmt(condId, bodyId), node);
-        return wrapIfProvablyInfinite(node, loop, condNode, bodyId);
+        if (!haveCond) condId = HirNodeId{};
     }
 
-    HirNodeId lowerFor(NodeId node) {
-        // for ( init? ; cond? ; update? ) body  — segment the header by the
-        // `;` separator; the body is the last meaningful child (after `)`).
+    // The `lowerStmt` driver flattens while/do-while through a While frame; this
+    // recursive entry is retained for completeness (byte-identical via the shared
+    // prologue + the same finish tail).
+    HirNodeId lowerWhile(NodeId node, bool doWhile) {
+        HirNodeId condId{};
+        NodeId condNode{}, bodyN{};
+        whilePrologue(node, condId, condNode, bodyN);
+        std::optional<HirNodeId> body;
+        if (bodyN.valid()) body = lowerStmt(bodyN);
+        HirNodeId const condFinal =
+            condId.valid() ? condId : orError(std::nullopt, node, "loop has no condition");
+        HirNodeId const bodyId = orError(body, node, "loop has no body");
+        std::optional<NodeId> const condNodeOpt =
+            condNode.valid() ? std::optional<NodeId>{condNode} : std::nullopt;
+        HirNodeId const loop =
+            doWhile ? track(builder.makeDoWhileStmt(bodyId, condFinal), node)
+                    : track(builder.makeWhileStmt(condFinal, bodyId), node);
+        return wrapIfProvablyInfinite(node, loop, condNodeOpt, bodyId);
+    }
+
+    // The `for` PROLOGUE shared by `lowerFor` (recursive) and the `lowerStmt`
+    // driver's For frame: segment the header by the `;` separator and lower the
+    // init/cond/update clauses INLINE in segment order (init → cond → update,
+    // exactly as the recursive form — these are NOT child statements, they build
+    // their nodes BEFORE the body). Sets `bodyN` to the body (the last meaningful
+    // child) + `condNode` for the provably-infinite probe. Returns false (after
+    // emitting the SAME "for has no body" error) for a clause-less malformed `for`.
+    [[nodiscard]] bool forPrologue(NodeId node, std::optional<HirNodeId>& init,
+                                   std::optional<HirNodeId>& cond,
+                                   std::optional<HirNodeId>& update,
+                                   NodeId& condNode, NodeId& bodyN) {
         std::vector<std::pair<int, NodeId>> clauses;
         int seg = 0;
         for (NodeId c : visible(node)) {
@@ -4165,11 +4559,9 @@ struct Lowerer {
             }
             clauses.push_back({seg, c});
         }
-        if (clauses.empty()) { unsupported(node, "for has no body"); return errorNode(node); }
-        NodeId bodyN = clauses.back().second;
+        if (clauses.empty()) { unsupported(node, "for has no body"); return false; }
+        bodyN = clauses.back().second;
         clauses.pop_back();
-        std::optional<HirNodeId> init, cond, update;
-        std::optional<NodeId>    condNode;   // nullopt for a clause-less `for(;;)`
         for (auto const& [s, c] : clauses) {
             if (s == 0)      init   = lowerForClause(c);
             else if (s == 1) {
@@ -4179,9 +4571,21 @@ struct Lowerer {
             }
             else if (s == 2) update = lowerForClause(c);
         }
+        return true;
+    }
+
+    // The `lowerStmt` driver flattens `for` through a For frame; this recursive
+    // entry is retained for completeness (byte-identical via the shared prologue +
+    // the same finish tail).
+    HirNodeId lowerFor(NodeId node) {
+        std::optional<HirNodeId> init, cond, update;
+        NodeId condNode{}, bodyN{};
+        if (!forPrologue(node, init, cond, update, condNode, bodyN)) return errorNode(node);
         HirNodeId body = lowerStmt(bodyN);
+        std::optional<NodeId> const condNodeOpt =
+            condNode.valid() ? std::optional<NodeId>{condNode} : std::nullopt;
         HirNodeId const loop = track(builder.makeForStmt(init, cond, update, body), node);
-        return wrapIfProvablyInfinite(node, loop, condNode, body);
+        return wrapIfProvablyInfinite(node, loop, condNodeOpt, body);
     }
 
     // A for init/update clause: a varDeclHead → VarDecl; an assignment → AssignStmt;
