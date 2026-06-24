@@ -3765,6 +3765,39 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     }
                 }
             }
+            // `stringizeToken` (C's `#` -> "HashOp", C 6.10.3.2) is OPTIONAL:
+            // empty means the language declares NO stringize operator. The macro
+            // engine reads it to RECOGNISE a `#param` stringize in a replacement
+            // list by token KIND rather than the hard-coded `#` lexeme -- a
+            // second preprocess-opting language whose stringize operator is
+            // spelled differently is then handled correctly (agnosticism).
+            // Validated like the other token-name fields when present. (FC15a.)
+            if (pp.contains("stringizeToken")) {
+                if (!pp.at("stringizeToken").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/stringizeToken",
+                              "'preprocess.stringizeToken' must be a string");
+                } else {
+                    cfg.stringizeToken =
+                        pp.at("stringizeToken").get<std::string>();
+                    checkToken(cfg.stringizeToken, "stringizeToken");
+                }
+            }
+            // `pasteToken` (C's `##` -> "HashHashOp", C 6.10.3.3) is OPTIONAL:
+            // empty means the language declares NO token-paste operator. Read by
+            // the macro engine to RECOGNISE a `##` paste by token KIND, never the
+            // hard-coded `##` lexeme. Validated like the other token-name fields
+            // when present. (FC15a.)
+            if (pp.contains("pasteToken")) {
+                if (!pp.at("pasteToken").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/pasteToken",
+                              "'preprocess.pasteToken' must be a string");
+                } else {
+                    cfg.pasteToken = pp.at("pasteToken").get<std::string>();
+                    checkToken(cfg.pasteToken, "pasteToken");
+                }
+            }
 
             data.preprocess = std::move(cfg);
         }

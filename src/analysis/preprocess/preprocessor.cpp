@@ -417,11 +417,27 @@ struct MacroDef {
 
 class MacroExpander {
 public:
+    // `synth` is the PREFIX buffer (the synthesized text BEFORE any `#`/`##`
+    // product is appended); `prefixLen` is its byte length. FC15a (A2): a `#`/`##`
+    // product's spelling is accumulated into `productText_` and a product token's
+    // span points at `[prefixLen + offsetInProductText, ...)`. After `run()`,
+    // `preprocess()` appends `productText()` to the synth text and freezes the
+    // FINAL buffer (prefix unchanged + products in the appended tail) -- so every
+    // token (original prefix span OR product tail span) slices to its real text in
+    // that ONE final buffer, exactly what the parser parses.
     MacroExpander(std::shared_ptr<SourceBuffer> synth,
                   std::shared_ptr<GrammarSchema const> schema,
-                  DiagnosticReporter& rep)
-        : synth_(std::move(synth)), schema_(std::move(schema)), rep_(rep) {
+                  DiagnosticReporter& rep, ByteOffset prefixLen)
+        : synth_(std::move(synth)), schema_(std::move(schema)), rep_(rep),
+          prefixLen_(prefixLen) {
         hashKind_  = schema_->schemaTokens().find(cfg().directiveIntroToken);
+        // FC15a: the STRINGIZE (`#`) and TOKEN-PASTE (`##`) operator kinds are
+        // CONFIG lexemes (agnosticism), resolved from `stringizeToken` /
+        // `pasteToken`. OPTIONAL: an empty config field leaves the kind
+        // InvalidSchemaToken, so `isStringize`/`isPaste` (`.valid()`-guarded)
+        // never fire and the engine is a strict FC14 (no `#`/`##` handling).
+        stringizeKind_ = schema_->schemaTokens().find(cfg().stringizeToken);
+        pasteKind_     = schema_->schemaTokens().find(cfg().pasteToken);
         // The function-like-macro `(` is a CONFIG lexeme, not a hard-coded
         // name (agnosticism: a language whose paren token is named differently
         // would otherwise mis-classify `#define F(x)` as object-like). The
@@ -454,6 +470,14 @@ public:
 
     // TRUE iff a fatal nesting-backstop truncated the expansion.
     [[nodiscard]] bool truncated() const noexcept { return truncated_; }
+
+    // FC15a (A2): the accumulated `#`/`##` PRODUCT spellings, to be appended to
+    // the synth text (AFTER `synth_`'s prefix) before the FINAL buffer is frozen.
+    // Empty when no product was generated (then the final buffer == the prefix,
+    // byte-identical to the FC14 behavior).
+    [[nodiscard]] std::string const& productText() const noexcept {
+        return productText_;
+    }
 
     std::vector<Token> run(std::vector<Token> const& in) {
         std::vector<Token> body;
@@ -497,11 +521,32 @@ public:
 
 private:
     PreprocessConfig const& cfg() const { return schema_->preprocess(); }
+    // Slice a token's lexeme. FC15a (A2): a token whose span begins at-or-after
+    // the prefix length is a `#`/`##` PRODUCT -- its bytes live in `productText_`
+    // (offset by `prefixLen_`), not yet in `synth_`. Every ORIGINAL token spans
+    // the prefix (`< prefixLen_`) and slices `synth_` as before. (When no product
+    // exists `productText_` is empty and this is byte-identical to the prior
+    // single-slice form.)
     std::string_view text(Token const& t) const {
+        if (t.span.start() >= prefixLen_) {
+            const ByteOffset s = t.span.start() - prefixLen_;
+            const ByteOffset e = t.span.end() - prefixLen_;
+            if (e <= productText_.size()) {
+                return std::string_view{productText_}.substr(s, e - s);
+            }
+            return {};   // defensive: never UB on a malformed product span
+        }
         return synth_->slice(t.span);
     }
     bool isHash(Token const& t) const {
         return hashKind_.valid() && t.schemaKind == hashKind_;
+    }
+    // FC15a: the STRINGIZE (`#`) / TOKEN-PASTE (`##`) operators, by config kind.
+    bool isStringize(Token const& t) const {
+        return stringizeKind_.valid() && t.schemaKind == stringizeKind_;
+    }
+    bool isPaste(Token const& t) const {
+        return pasteKind_.valid() && t.schemaKind == pasteKind_;
     }
     // A macro NAME / invocation is an identifier-like word. The tokenizer
     // leaves a plain word's schemaKind == InvalidSchemaToken (the PARSER
@@ -1076,64 +1121,287 @@ private:
         return std::nullopt;
     }
 
-    // Build the substituted replacement list for a function-like call: each
-    // replacement token that IS a NAMED parameter is replaced by that
-    // parameter's PRE-EXPANDED argument tokens (C 6.10.3.1); in a VARIADIC macro,
-    // a replacement `Word` whose text == the configured `variadicArgsName`
-    // (`__VA_ARGS__`) is replaced by the PRE-EXPANDED, comma-joined trailing
-    // arguments (`vaArgs`, possibly EMPTY -> substitutes to nothing, C23); every
-    // other replacement token passes through unchanged, stamped with `hs`. No
-    // `#`/`##` handling (FC15). `expandedArgs[k]` is the fully-expanded argument
-    // for `params[k]`.
+    // Map a replacement token that names a NAMED parameter to its parameter
+    // index, or -1. (`def.replacement` carries only significant tokens -- trivia
+    // was dropped at #define time -- so a parameter is always a bare `Word`.)
+    [[nodiscard]] int paramIndexOf(Token const& r, MacroDef const& def) const {
+        if (!isWord(r)) return -1;
+        std::string_view rt = text(r);
+        for (std::size_t k = 0; k < def.params.size(); ++k) {
+            if (def.params[k] == rt) return static_cast<int>(k);
+        }
+        return -1;
+    }
+    [[nodiscard]] bool isVaArgsName(Token const& r, MacroDef const& def) const {
+        return def.isVariadic && isWord(r) && !cfg().variadicArgsName.empty()
+            && text(r) == cfg().variadicArgsName;
+    }
+
+    // Build the substituted replacement list for a function-like call (C 6.10.3).
+    // A replacement token that names a parameter (or `__VA_ARGS__`) is replaced by
+    // that argument's tokens; every other token passes through stamped with `hs`.
+    // FC15a adds the `#` (stringize, C 6.10.3.2) and `##` (token-paste, C 6.10.3.3)
+    // operators in TWO phases:
+    //   PHASE A -- substitution. A normal parameter substitutes its PRE-EXPANDED
+    //   argument (`expandedArgs[k]` / `vaArgs`, C 6.10.3.1). A `#` immediately
+    //   followed by a parameter is replaced by ONE string-literal product
+    //   (`stringizeArg`, F2) built from that parameter's RAW argument
+    //   (`rawArgs[k]` / `rawVaArgs`). A parameter that is an OPERAND of a `##`
+    //   (its adjacent significant replacement token is a `##`) substitutes its RAW
+    //   argument (C 6.10.3.1: `#`/`##` operands are NOT pre-expanded). `##` tokens
+    //   are kept verbatim as MARKERS for phase B.
+    //   PHASE B -- paste. Each `##` MARKER is collapsed LEFT-TO-RIGHT: the last
+    //   significant token to its left and the first to its right are concatenated
+    //   into a single re-tokenized product (`pasteTokens`, F1), then a rescan
+    //   continues from that product (so `a##b##c` chains).
+    // Fail-loud (each with best-effort recovery): a `#` not followed by a
+    // parameter -> P_PreprocessorStringize; a `##` at the start/end of the list,
+    // or a paste whose spelling is not a single token -> P_PreprocessorPaste.
     //
     // HIDE-SET stamping (Prosser, C 6.10.3.4): EVERY token of the substituted
     // result carries `hs` = (hideset(name) ∩ hideset(close-paren)) ∪ {M}. A
-    // replacement token NOT from an argument is stamped with exactly `hs`. An
-    // argument's tokens already carry their OWN hide sets (accreted while the arg
-    // was pre-expanded in the caller's context); each is UNIONED with `hs` so the
-    // invoked macro (and the surviving intersection) is added without dropping
-    // what the argument expansion already hid. The `__VA_ARGS__` check precedes
-    // the named-parameter scan, but they cannot collide -- `__VA_ARGS__` is not a
-    // valid parameter NAME, and a non-variadic macro that mentions it was already
-    // rejected at definition time.
+    // replacement-origin token (plain, or a `#`/`##` product) is stamped with
+    // exactly `hs`; an argument token already carries its own (accreted) hide set,
+    // UNIONED with `hs`.
     std::vector<ExpToken> substitute(
         MacroDef const& def,
         std::vector<std::vector<ExpToken>> const& expandedArgs,
         std::vector<ExpToken> const& vaArgs,
+        std::vector<std::vector<ExpToken>> const& rawArgs,
+        std::vector<ExpToken> const& rawVaArgs,
         HideSet const& hs) {
-        std::vector<ExpToken> outTokens;
-        auto appendArg = [&](std::vector<ExpToken> const& a) {
+        auto stampArg = [&](std::vector<ExpToken> const& a,
+                            std::vector<ExpToken>& outTokens) {
             for (ExpToken const& e : a) {
-                // An argument token already carries its own (accreted) hide set;
-                // UNION the invocation hide set `hs` on top.
                 outTokens.push_back(ExpToken{e.tok, hideUnionAll(e.hide, hs)});
             }
         };
-        for (Token const& r : def.replacement) {
-            if (def.isVariadic && isWord(r) && !cfg().variadicArgsName.empty()
-                && text(r) == cfg().variadicArgsName) {
-                appendArg(vaArgs);
-                continue;
-            }
-            int paramIdx = -1;
-            if (isWord(r)) {
-                std::string_view rt = text(r);
-                for (std::size_t k = 0; k < def.params.size(); ++k) {
-                    if (def.params[k] == rt) {
-                        paramIdx = static_cast<int>(k);
-                        break;
+        // The RAW token run for a `#`/`##` operand at replacement index `i`
+        // (a named parameter or `__VA_ARGS__`). Returns nullptr if `i` is not a
+        // parameter position.
+        auto rawArgAt =
+            [&](std::size_t i) -> std::vector<ExpToken> const* {
+            Token const& r = def.replacement[i];
+            if (isVaArgsName(r, def)) return &rawVaArgs;
+            int const pi = paramIndexOf(r, def);
+            if (pi >= 0) return &rawArgs[static_cast<std::size_t>(pi)];
+            return nullptr;
+        };
+
+        // ── PHASE A: substitution (keeping `##` markers verbatim). ──
+        std::vector<ExpToken> items;
+        const std::size_t n = def.replacement.size();
+        for (std::size_t i = 0; i < n; ++i) {
+            Token const& r = def.replacement[i];
+            if (isStringize(r)) {
+                // `#` operand is the NEXT significant token, which MUST be a
+                // parameter (or `__VA_ARGS__`).
+                if (i + 1 < n) {
+                    if (auto const* raw = rawArgAt(i + 1)) {
+                        stringizeArg(*raw, hs, items);
+                        ++i;   // consume the parameter operand
+                        continue;
                     }
                 }
+                emitPP(rep_, DiagnosticCode::P_PreprocessorStringize, synth_->id(),
+                       r.span,
+                       "'#' in a macro replacement must be followed by a "
+                       "parameter");
+                items.push_back(ExpToken{r, hs});   // recovery: emit `#` verbatim
+                continue;
             }
-            if (paramIdx >= 0) {
-                appendArg(expandedArgs[static_cast<std::size_t>(paramIdx)]);
-            } else {
-                // A plain replacement token gets EXACTLY hs (it has no prior
-                // hide set of its own -- it comes straight from the #define).
-                outTokens.push_back(ExpToken{r, hs});
+            if (isPaste(r)) {
+                items.push_back(ExpToken{r, hs});    // marker for phase B
+                continue;
             }
+            if (isVaArgsName(r, def)) {
+                // RAW iff this `__VA_ARGS__` is a `##` operand (adjacent `##`).
+                bool const pasteOperand =
+                    (i > 0 && isPaste(def.replacement[i - 1]))
+                    || (i + 1 < n && isPaste(def.replacement[i + 1]));
+                stampArg(pasteOperand ? rawVaArgs : vaArgs, items);
+                continue;
+            }
+            int const pi = paramIndexOf(r, def);
+            if (pi >= 0) {
+                bool const pasteOperand =
+                    (i > 0 && isPaste(def.replacement[i - 1]))
+                    || (i + 1 < n && isPaste(def.replacement[i + 1]));
+                stampArg(pasteOperand
+                             ? rawArgs[static_cast<std::size_t>(pi)]
+                             : expandedArgs[static_cast<std::size_t>(pi)],
+                         items);
+                continue;
+            }
+            // A plain replacement token gets EXACTLY hs (no prior hide set).
+            items.push_back(ExpToken{r, hs});
         }
-        return outTokens;
+
+        // ── PHASE B: collapse every `##` marker LEFT-TO-RIGHT. ──
+        return collapsePastes(std::move(items), hs);
+    }
+
+    // Phase B of `substitute`: walk `items`, and at each `##` MARKER concatenate
+    // the token immediately before it with the one immediately after into a
+    // single re-tokenized product (F1), splicing `[i-1, i, i+1)` -> product and
+    // RESCANNING from there (so `a##b##c` collapses left-to-right to one token).
+    // A `##` at the very start or end of the list (no operand on one side) is a
+    // constraint violation (C 6.10.3.3p1) -> P_PreprocessorPaste, recovery: drop
+    // the dangling `##` and keep the lone operand. A product that is not exactly
+    // one token (F1) -> P_PreprocessorPaste, recovery: emit both operands verbatim.
+    std::vector<ExpToken> collapsePastes(std::vector<ExpToken> items,
+                                         HideSet const& hs) {
+        std::size_t i = 0;
+        while (i < items.size()) {
+            if (!isPaste(items[i].tok)) { ++i; continue; }
+            SourceSpan const opSpan = items[i].tok.span;
+            const bool hasLeft  = (i > 0);
+            const bool hasRight = (i + 1 < items.size());
+            if (!hasLeft || !hasRight) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorPaste, synth_->id(),
+                       opSpan,
+                       std::string{"'##' must not appear at the "}
+                           + (!hasLeft ? "start" : "end")
+                           + " of a macro replacement list");
+                items.erase(items.begin() + static_cast<std::ptrdiff_t>(i));
+                // Resume at the operand that now occupies `i` (or end).
+                continue;
+            }
+            // Concatenate the spellings of the two operands.
+            std::string spelling{text(items[i - 1].tok)};
+            spelling += text(items[i + 1].tok);
+            auto product = pasteTokens(spelling, opSpan);
+            if (!product) {
+                // F1 failure (zero or >1 tokens) already reported; recover by
+                // dropping the `##` and leaving BOTH operands verbatim. Advance
+                // past the left operand so we don't re-paste it.
+                items.erase(items.begin() + static_cast<std::ptrdiff_t>(i));
+                ++i;   // step past the (now adjacent) left operand
+                continue;
+            }
+            // Replace [i-1, i, i+1) with the single product token (hide set hs --
+            // a fresh replacement-origin token), then rescan from i-1 so a
+            // chained `##` to its right pastes against this product.
+            const std::size_t lo = i - 1;
+            items.erase(items.begin() + static_cast<std::ptrdiff_t>(lo),
+                        items.begin() + static_cast<std::ptrdiff_t>(i + 2));
+            items.insert(items.begin() + static_cast<std::ptrdiff_t>(lo),
+                         ExpToken{*product, hs});
+            i = lo;   // rescan from the product
+        }
+        return items;
+    }
+
+    // FC15a (F2, C 6.10.3.2): STRINGIZE the RAW argument token run `raw` into a
+    // string-literal product, appending the resulting token(s) to `out`. Per
+    // C 6.10.3.2p2 the spelling is the argument's SOURCE text with: every run of
+    // white space (incl. between tokens) collapsed to a single space and
+    // leading/trailing space deleted; and a `\` inserted before each `"` and `\`
+    // (the chars of a string/char literal -- in valid C those characters appear
+    // ONLY inside such a literal, so escaping every occurrence is exact). The
+    // result is wrapped in `"..."`, appended to `productText_` (A2), and
+    // RE-TOKENIZED so the product is a real StringStart + StringLiteral pair
+    // (a single fabricated token would not satisfy the grammar's
+    // `stringLiteralExpr = StringStart StringLiteral`) whose spans point at the
+    // appended region. Each product token is stamped with `hs`.
+    void stringizeArg(std::vector<ExpToken> const& raw, HideSet const& hs,
+                      std::vector<ExpToken>& out) {
+        std::string inner = "\"";
+        if (!raw.empty()) {
+            // The raw operand's tokens are un-pre-expanded args from the CALL
+            // site, so they are contiguous in the prefix buffer: one slice
+            // recovers the exact source spelling (incl. interior string quotes
+            // and whitespace). The CLOSING delimiter of a string/char literal
+            // that ENDS the argument was consumed by the tokenizer (no token
+            // covers it), so extend the slice by one byte when it is a `"`/`'`.
+            const ByteOffset s = raw.front().tok.span.start();
+            ByteOffset e = raw.back().tok.span.end();
+            if (e < prefixLen_) {
+                const std::string_view tail = synth_->slice(e, e + 1);
+                if (tail.size() == 1 && (tail[0] == '"' || tail[0] == '\'')) ++e;
+            }
+            appendStringized(synth_->slice(s, e), inner);
+        }
+        inner.push_back('"');
+        for (Token const& t : materializeSignificant(inner)) {
+            out.push_back(ExpToken{t, hs});
+        }
+    }
+
+    // Append `src` to `out` realizing C 6.10.3.2's stringize transform: collapse
+    // each run of source white space to a single space and drop leading/trailing
+    // space; insert a `\` before each `"` and `\`.
+    static void appendStringized(std::string_view src, std::string& out) {
+        std::size_t i = 0;
+        const std::size_t nbytes = src.size();
+        // Skip leading white space.
+        auto isWs = [](char c) {
+            return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+                || c == '\f' || c == '\v';
+        };
+        while (i < nbytes && isWs(src[i])) ++i;
+        bool pendingSpace = false;
+        for (; i < nbytes; ++i) {
+            char const c = src[i];
+            if (isWs(c)) { pendingSpace = true; continue; }
+            if (pendingSpace) { out.push_back(' '); pendingSpace = false; }
+            if (c == '"' || c == '\\') out.push_back('\\');
+            out.push_back(c);
+        }
+    }
+
+    // FC15a (A2 -- the load-bearing buffer mechanism): MATERIALIZE a `#`/`##`
+    // product whose spelling is `spelling`. The spelling is APPENDED to
+    // `productText_` (which `preprocess()` later concatenates onto the synth text
+    // before freezing the FINAL buffer), then re-tokenized; each resulting
+    // SIGNIFICANT token (non-trivia, non-Eof) is returned with its span REWRITTEN
+    // to point at the appended region of the (eventual) final buffer
+    // (`prefixLen_ + productBase + tokenOffset`). So a product token slices to its
+    // real spelling -- `add3` / `"hello"` -- from the SAME buffer the parser
+    // parses, never to `##`/`#`. The re-tokenization uses a throwaway reporter so
+    // a malformed product does not pollute the user diagnostics here (the caller's
+    // F1/F2 logic owns the user-facing fail-loud).
+    std::vector<Token> materializeSignificant(std::string_view spelling) {
+        const ByteOffset productBase =
+            static_cast<ByteOffset>(productText_.size());
+        productText_.append(spelling);
+        auto tiny = SourceBuffer::fromString(std::string{spelling}, "<pp-product>");
+        DiagnosticReporter scratch;
+        auto ppToks = tokenizeToPP(tiny, schema_, scratch);
+        std::vector<Token> out;
+        for (PPToken const& pt : ppToks) {
+            if (isTrivia(pt.tok) || isNewline(pt.tok)) continue;
+            if (pt.tok.coreKind == CoreTokenKind::Eof) continue;
+            Token t = pt.tok;
+            // Rewrite the tiny-buffer span into the final-buffer product region.
+            t.span = SourceSpan::of(
+                prefixLen_ + productBase + pt.tok.span.start(),
+                prefixLen_ + productBase + pt.tok.span.end());
+            out.push_back(t);
+        }
+        return out;
+    }
+
+    // FC15a (F1, C 6.10.3.3p3): build the single TOKEN produced by pasting the
+    // spelling `spelling` (the left operand's spelling concatenated with the
+    // right's). The pasted text MUST re-tokenize to EXACTLY ONE significant token
+    // -- `lookupLexeme` alone is insufficient (it would silently accept `1##"x"`
+    // -> `1"x"` or `)##(` -> `)(`). Zero or more-than-one significant tokens is a
+    // constraint violation -> fail loud P_PreprocessorPaste (positioned at the
+    // `##`), returning nullopt; the caller recovers by emitting both operands.
+    std::optional<Token> pasteTokens(std::string_view spelling,
+                                     SourceSpan opSpan) {
+        // NOTE: materializeSignificant appends to productText_ unconditionally,
+        // so a REJECTED paste still occupies a few bytes of the product tail --
+        // harmless (no token references them; the buffer only grows).
+        std::vector<Token> toks = materializeSignificant(spelling);
+        if (toks.size() != 1) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPaste, synth_->id(), opSpan,
+                   std::string{"pasting formed '"} + std::string{spelling}
+                       + "', which is not a single valid token");
+            return std::nullopt;
+        }
+        return toks.front();
     }
 
     // Union of an argument token's own (accreted) hide set with the invocation
@@ -1284,6 +1552,25 @@ private:
             // rest are gathered into __VA_ARGS__.
             const std::size_t namedCount =
                 def.isVariadic ? def.params.size() : args.size();
+            // FC15a (C 6.10.3.2 / 6.10.3.3p1): a `#`/`##` OPERAND uses the RAW
+            // (un-pre-expanded) argument. Capture each named arg's raw tokens AND
+            // the raw trailing `__VA_ARGS__` run BEFORE the pre-expansion move
+            // below consumes `args[k]`. `substitute` chooses raw-vs-expanded per
+            // operand position. (Cheap: only the call's own arg tokens; the common
+            // no-`#`/`##` macro never reads these.)
+            std::vector<std::vector<ExpToken>> rawArgs;
+            rawArgs.reserve(namedCount);
+            for (std::size_t k = 0; k < namedCount; ++k) rawArgs.push_back(args[k]);
+            std::vector<ExpToken> rawVaArgs;
+            if (def.isVariadic) {
+                for (std::size_t k = def.params.size(); k < args.size(); ++k) {
+                    if (k > def.params.size() && k - 1 < separators.size()) {
+                        rawVaArgs.push_back(separators[k - 1]);
+                    }
+                    rawVaArgs.insert(rawVaArgs.end(), args[k].begin(),
+                                     args[k].end());
+                }
+            }
             std::vector<std::vector<ExpToken>> expandedArgs;
             expandedArgs.reserve(namedCount);
             for (std::size_t k = 0; k < namedCount; ++k) {
@@ -1311,7 +1598,7 @@ private:
                 }
             }
             std::vector<ExpToken> substituted =
-                substitute(def, expandedArgs, vaArgs, hs);
+                substitute(def, expandedArgs, vaArgs, rawArgs, rawVaArgs, hs);
             // Splice the substituted result over the WHOLE call `[i, past)` and
             // RESCAN from i: the invoked macro M is in every substituted token's
             // hide set, so a self-reference is frozen; a function-like name newly
@@ -1346,6 +1633,18 @@ private:
     SchemaTokenId                        parenClose_{};
     SchemaTokenId                        argSep_{};
     SchemaTokenId                        variadicMarker_{};
+    // FC15a: the `#`/`##` operator kinds (config-resolved; InvalidSchemaToken
+    // when the language declares neither -- then the engine never produces a
+    // product).
+    SchemaTokenId                        stringizeKind_{};
+    SchemaTokenId                        pasteKind_{};
+    // FC15a (A2): byte length of the PREFIX buffer (`synth_`), and the
+    // accumulated `#`/`##` PRODUCT spellings appended AFTER it. A product token's
+    // span is `[prefixLen_ + offsetInProductText_, ...)`; `text()` dispatches a
+    // span at-or-after `prefixLen_` to `productText_`. The final synth buffer is
+    // `synth_->text() + productText_` (built by `preprocess()` after `run()`).
+    ByteOffset                           prefixLen_{};
+    std::string                          productText_;
     std::unordered_map<std::string, MacroDef> table_;
     // FC14: the conditional-compilation frame stack (one frame per open
     // `#if`/`#ifdef`/`#ifndef`). See CondFrame + handleIf/Elif/Else/Endif.
@@ -1378,9 +1677,38 @@ PreprocessResult preprocess(
                          includeStack, result.fatal};
     builder.build(mainSource, synthText, result.lineMap);
 
+    // FC15a (A2 reorder): the `#`/`##` operators produce SYNTHETIC tokens whose
+    // text does not exist in the spliced prefix. Their spelling must reach the
+    // PARSER via a real span, so it is APPENDED to the synth text and the FINAL
+    // buffer is frozen AFTER expansion. Until then, tokenization + the macro
+    // expander read the spliced text via a PROVISIONAL PREFIX buffer (the same
+    // bytes as the final buffer's leading prefix, so every original-token span
+    // resolves identically in both). `prefixLen` is the byte length of that
+    // prefix; a product token's span points at `[prefixLen + productOffset, ...)`.
+    const ByteOffset prefixLen = static_cast<ByteOffset>(synthText.size());
+    auto prefixBuffer = SourceBuffer::fromString(
+        synthText, std::string{mainSource->name()});
+    result.mainSourceId = mainSource->id();
+
+    auto ppToks = tokenizeToPP(prefixBuffer, schema, *result.diagnostics);
+    std::vector<Token> synthTokens;
+    synthTokens.reserve(ppToks.size());
+    for (auto const& tk : ppToks) synthTokens.push_back(tk.tok);
+
+    MacroExpander expander{prefixBuffer, schema, *result.diagnostics, prefixLen};
+    std::vector<Token> finalTokens = expander.run(synthTokens);
+    // OR in the macro-expansion truncation; the SynthBuilder already wrote
+    // `result.fatal` by reference for an include-nesting truncation.
+    result.fatal = result.fatal || expander.truncated();
+
+    // Append the accumulated `#`/`##` product spellings AFTER the prefix, then
+    // freeze the FINAL buffer: ONE buffer whose unchanged leading prefix backs
+    // every original token and whose appended tail backs every product token
+    // (A2 -- no side-vector). When no product was generated this is byte-identical
+    // to the prefix (the FC14 single-buffer behavior).
+    synthText.append(expander.productText());
     result.synthBuffer = SourceBuffer::fromString(
         std::move(synthText), std::string{mainSource->name()});
-    result.mainSourceId = mainSource->id();
 
     // Collect the DISTINCT origin buffers the line-map references (the original
     // main file + every spliced header), EXCLUDING the synth buffer. The
@@ -1398,23 +1726,17 @@ PreprocessResult preprocess(
         }
     }
 
-    // Build-phase diagnostics were stamped with BufferId{} (the synth id did
-    // not exist yet); rewrite them to the real synth buffer so the later
-    // remap can attribute them.
+    // Diagnostics emitted during the build (BufferId{}, the synth id did not
+    // exist yet) AND during tokenize/expansion (stamped with the PROVISIONAL
+    // PREFIX buffer id) both belong on the FINAL synth buffer: every such span is
+    // a prefix span, byte-identical in the final buffer (a strict prefix). Rewrite
+    // both to the final synth id so the later `makeRemap` can attribute them.
+    BufferId const prefixId = prefixBuffer->id();
     result.diagnostics->remapBuffers([&](BufferId& bid, SourceSpan&) {
-        if (bid == BufferId{}) bid = result.synthBuffer->id();
+        if (bid == BufferId{} || bid == prefixId) {
+            bid = result.synthBuffer->id();
+        }
     });
-
-    auto ppToks = tokenizeToPP(result.synthBuffer, schema, *result.diagnostics);
-    std::vector<Token> synthTokens;
-    synthTokens.reserve(ppToks.size());
-    for (auto const& tk : ppToks) synthTokens.push_back(tk.tok);
-
-    MacroExpander expander{result.synthBuffer, schema, *result.diagnostics};
-    std::vector<Token> finalTokens = expander.run(synthTokens);
-    // OR in the macro-expansion truncation; the SynthBuilder already wrote
-    // `result.fatal` by reference for an include-nesting truncation.
-    result.fatal = result.fatal || expander.truncated();
 
     Token eof;
     eof.coreKind = CoreTokenKind::Eof;

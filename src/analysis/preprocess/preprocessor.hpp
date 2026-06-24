@@ -37,12 +37,27 @@
 // `pp_if_eval` (config-driven precedence + the shared const-eval arithmetic
 // core). The whole vocabulary (directive words + `defined`) is config-driven.
 //
+// FC15a (`#`/`##` operators) adds the STRINGIZE (`#`, C 6.10.3.2) and
+// TOKEN-PASTE (`##`, C 6.10.3.3) operators to a function-like macro's
+// replacement list. Their OPERANDS use the RAW (un-pre-expanded) argument:
+// `#param` produces a single string-literal of the argument's source spelling
+// (white space collapsed, `"`/`\` escaped); `a##b` concatenates the two
+// adjacent tokens' spellings into ONE re-tokenized token (left-to-right, so
+// `a##b##c` chains). A `#`/`##` product is a SYNTHETIC token: its spelling is
+// appended to the synth text BEFORE the final buffer is frozen (config A2), so
+// the product token's span slices to its real text (`"hello"` / `add3`) from
+// the SAME single buffer the parser parses -- never to `#`/`##`. The `#`/`##`
+// vocabulary is config-driven (`preprocess.stringizeToken`/`pasteToken`),
+// default-absent for a non-C language. GNU `,##__VA_ARGS__` comma-elision is
+// DEFERRED (D-PP-VARIADIC-GNU-COMMA-ELISION, FC15b).
+//
 // FAIL-LOUD on every unsupported construct (function-like macro arity mismatch,
 // unterminated invocation, variadic/duplicate-parameter/malformed parameter
 // list, incompatible redefinition, missing quote include, include recursion
 // overflow, an unterminated/mismatched conditional, a non-ICE / sizeof / float /
-// string operand in `#if`) -- never a silent pass-through or miscompile. Out of
-// scope (pinned, not built): `##`/`#`/predefined macros (FC15-area).
+// string operand in `#if`, a `#` not followed by a parameter, a `##` at the
+// start/end of a replacement list, a `##` product that is not a single token)
+// -- never a silent pass-through or miscompile.
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"

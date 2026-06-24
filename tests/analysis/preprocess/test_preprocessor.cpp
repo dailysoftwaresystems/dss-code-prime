@@ -7,6 +7,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/preprocess/preprocessor.hpp"
+#include "core/types/char_decode.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -1587,4 +1588,216 @@ TEST(Preprocessor, ConditionalDirectiveWordIsConfigDrivenNotHardcoded) {
             << "with `if` rebound to `whenever`, a literal `#if` is an unknown "
                "directive -- proving the conditional word is read from config";
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FC15a (`#`/`##` operators -- C 6.10.3.2 stringize, 6.10.3.3 token-paste).
+//
+// A stringize product (`#x` -> `"..."`) is, by GRAMMAR REALITY, the string
+// literal's StringStart + StringLiteral pair (`stringLiteralExpr = StringStart
+// StringLiteral`), NOT a single fabricated token -- so `ppLexemes` yields TWO
+// entries for it: the opening `"` (StringStart) then the body (StringLiteral,
+// whose span excludes the consumed closing `"`). `reconstructStringLiteral`
+// joins them back into the full `"..."` for readable assertions. A paste product
+// (`a##b` -> `ab`) is exactly ONE token (F1) and yields ONE lexeme.
+// Every assertion is RED-ON-DISABLE: without the `#` handling `#x` emits the
+// literal `#` token (lexs[0]=="#" not "\""); without the `##` handling `a##b`
+// emits three tokens (`a`, `##`, `b`) instead of the single `ab`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Join a StringStart (`"`) + StringLiteral (body, no closing quote) pair from the
+// pp lexemes at index `i` back into the full source-form literal `"...body..."`.
+[[nodiscard]] std::string reconstructStringLiteral(
+    std::vector<std::string> const& lexs, std::size_t i) {
+    if (i + 1 >= lexs.size()) return "<malformed-string-product>";
+    return lexs[i] + lexs[i + 1] + "\"";   // StringStart + body + implied close
+}
+
+TEST(Preprocessor, FC15aStringizeSimple) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define STR(x) #x\nSTR(hello)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // The product `"hello"` is StringStart `"` + StringLiteral `hello`.
+    ASSERT_EQ(lexs.size(), 2u) << "expected the string-literal pair: \" hello";
+    EXPECT_EQ(lexs[0], "\"") << "stringize must produce a string-literal opener "
+                                "(red-on-disable: a literal `#` here)";
+    EXPECT_EQ(lexs[1], "hello");
+    EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"hello\"");
+}
+
+TEST(Preprocessor, FC15aStringizeEscapes) {
+    // C 6.10.3.2p2: a `\` is inserted before each `"` and `\` of a string/char
+    // literal in the argument. STR(a "b\c") -> "a \"b\\c\"".
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define STR(x) #x\nSTR(a \"b\\c\")\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 2u);
+    EXPECT_EQ(lexs[0], "\"");
+    // Body (StringStart consumed the opening `"`, the close `"` is consumed):
+    //   a <space> \ " b \ \ c \ "   (the escaped inner text).
+    EXPECT_EQ(lexs[1], "a \\\"b\\\\c\\\"")
+        << "interior `\"` and `\\` of the string arg must be backslash-escaped";
+    EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"a \\\"b\\\\c\\\"\"");
+    // The product must round-trip: decoding the body recovers the raw arg text.
+    auto decoded = decodeStringLiteralBody(lexs[1]);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(*decoded, "a \"b\\c\"");
+}
+
+TEST(Preprocessor, FC15aStringizeUsesUnexpandedArg) {
+    // C 6.10.3.2p2: the `#` operand uses the RAW (un-pre-expanded) argument. With
+    // `#define X hello`, STR(X) stringizes to "X", NOT "hello".
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define X hello\n#define STR(x) #x\nSTR(X)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 2u);
+    EXPECT_EQ(lexs[1], "X")
+        << "stringize uses the RAW arg `X`, not its expansion `hello`";
+    EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"X\"");
+}
+
+TEST(Preprocessor, FC15aPasteIdentifiers) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define PASTE(a,b) a ## b\nPASTE(foo,bar)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 1u) << "the paste product is exactly ONE token";
+    EXPECT_EQ(lexs[0], "foobar");
+}
+
+TEST(Preprocessor, FC15aPasteResultIsExpanded) {
+    // The paste product is RESCANNED: `foobar` becomes a macro use of `foobar`.
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define PASTE(a,b) a ## b\n#define foobar 42\nint v = PASTE(foo,bar);\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int v = 42 ;
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int v = 42 ;";
+    EXPECT_EQ(lexs[3], "42")
+        << "the paste product `foobar` must be rescanned and expand to 42";
+}
+
+TEST(Preprocessor, FC15aPasteInvalidFailsLoud) {
+    // F1 (C 6.10.3.3p3): a `##` product that is NOT a single token fails loud.
+    // BAD(a,!b) pastes `a` ## `!` -> `a!`, which re-tokenizes to TWO tokens.
+    PreprocessResult r;
+    (void)ppLexemes("#define BAD(a,b) a ## b\nint v = BAD(a,!b);\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste))
+        << "a `##` product that is not a single token must fail loud (F1)";
+}
+
+TEST(Preprocessor, FC15aPasteAtStartFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define BAD(a) ## a\nint v = BAD(1);\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste))
+        << "a `##` at the START of a replacement list must fail loud";
+}
+
+TEST(Preprocessor, FC15aPasteAtEndFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define BAD(a) a ##\nint v = BAD(1);\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste))
+        << "a `##` at the END of a replacement list must fail loud";
+}
+
+TEST(Preprocessor, FC15aStringizeNotFollowedByParamFailsLoud) {
+    // C 6.10.3.2p1: in a function-like macro, `#` must be followed by a
+    // parameter. `#define BAD(a) # 1` -> `#` precedes a non-parameter.
+    PreprocessResult r;
+    (void)ppLexemes("#define BAD(a) # 1\nint v = BAD(0);\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorStringize))
+        << "a `#` not followed by a parameter must fail loud";
+}
+
+TEST(Preprocessor, FC15aStringizeVaArgs) {
+    // `#__VA_ARGS__` stringizes the RAW joined trailing args. S(a,b) -> "a,b".
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define S(...) #__VA_ARGS__\nS(a,b)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 2u);
+    EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"a,b\"")
+        << "#__VA_ARGS__ stringizes the raw comma-joined trailing args";
+}
+
+TEST(Preprocessor, FC15aPasteUsesRawOperand) {
+    // C 6.10.3.3p1: a `##` operand uses the RAW argument. With `#define X foo`,
+    // PASTE(X,bar) pastes RAW `X` ## `bar` -> `Xbar`, NOT `foobar`.
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#define X foo\n#define PASTE(a,b) a ## b\nPASTE(X,bar)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 1u);
+    EXPECT_EQ(lexs[0], "Xbar")
+        << "paste uses the RAW operand `X`, not its expansion `foo`";
+}
+
+// F4 (NOT an order claim -- `##` is associative for the product spelling):
+// `a##b##c` collapses BOTH `##` operators into ONE final single token, and the
+// two paste operators reduce to one product. We pin the FINAL token + that the
+// operators all collapsed (no leftover `##`), NOT any evaluation order.
+TEST(Preprocessor, FC15aChainedPasteCollapsesToOneToken) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#define CAT3(a,b,c) a ## b ## c\nCAT3(foo,bar,baz)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 1u)
+        << "two `##` operators collapse to ONE product token";
+    EXPECT_EQ(lexs[0], "foobarbaz");
+    // No `##` operator survives in the output.
+    for (auto const& s : lexs) EXPECT_NE(s, "##");
+}
+
+// AGNOSTICISM (opt-OUT): a language with NO preprocess block declares neither the
+// stringize nor the paste token, so the config fields are empty and the engine
+// produces no products -- zero behavior change for toy/tsql.
+TEST(Preprocessor, FC15aStringizePasteAreOptOutPerLanguage) {
+    auto toy = GrammarSchema::loadShipped("toy");
+    ASSERT_TRUE(toy.has_value());
+    EXPECT_TRUE((*toy)->preprocess().stringizeToken.empty());
+    EXPECT_TRUE((*toy)->preprocess().pasteToken.empty());
+
+    auto tsql = GrammarSchema::loadShipped("tsql-subset");
+    ASSERT_TRUE(tsql.has_value());
+    EXPECT_TRUE((*tsql)->preprocess().stringizeToken.empty());
+    EXPECT_TRUE((*tsql)->preprocess().pasteToken.empty());
+}
+
+// CONFIG-READ: c-subset declares the `#`/`##` operator kinds from config.
+TEST(Preprocessor, FC15aStringizePasteTokensAreConfigRead) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ((*c)->preprocess().stringizeToken, "HashOp");
+    EXPECT_EQ((*c)->preprocess().pasteToken, "HashHashOp");
+}
+
+// F3 (HashOp non-contamination): a macro USE immediately followed by a
+// `#`-introduced DIRECTIVE line. The directive-introducing `#` (peeled at top
+// level via firstOnLine, BEFORE expansion) and an in-replacement stringize `#`
+// (handled only inside `substitute`) live in structurally separate phases, so
+// they must NOT cross-contaminate: the `#define` directive is consumed (NOT
+// mis-read as a stringize), and the stringize `#x` in STR's replacement still
+// produces a string literal. (Uses a benign `#define` rather than `#undef STR`
+// so STR stays defined when STR(a) is expanded -- directives are processed in a
+// single pre-pass, so a later `#undef STR` would undefine it before any body
+// expansion, a pre-existing architecture property unrelated to FC15a.)
+TEST(Preprocessor, FC15aHashOpDirectiveVsStringizeNoContamination) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define STR(x) #x\n"
+        "STR(a)\n"
+        "#define UNUSED 1\n"
+        "int after;\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "the directive `#define` must be consumed, not treated as a stringize";
+    // Output: "a" (StringStart+body)  then  int after ;
+    ASSERT_EQ(lexs.size(), 5u) << "expected: \" a int after ;";
+    EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"a\"");
+    EXPECT_EQ(lexs[2], "int");
+    EXPECT_EQ(lexs[3], "after");
+    EXPECT_EQ(lexs[4], ";");
+    // The directive-introducing `#` never leaked a stringize diagnostic.
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorStringize));
 }

@@ -151,6 +151,34 @@ struct DSS_EXPORT PreprocessConfig {
     // validated as a NON-EMPTY string at load (C_InvalidPreprocess). (FC13
     // cycle 3 -- D-PP-VARIADIC-MACRO.)
     std::string variadicArgsName;
+
+    // FC15a (`#`/`##` operators): the token KIND of the STRINGIZE operator (C's
+    // `#` -> "HashOp", C 6.10.3.2). In a function-like macro's REPLACEMENT list,
+    // a `#` immediately followed by a parameter stringizes that parameter's RAW
+    // (un-pre-expanded) argument into a single string literal. The macro engine
+    // detects it by this token KIND -- which, in c-subset, is the SAME `HashOp`
+    // as `directiveIntroToken`: directives are peeled at top level (firstOnLine)
+    // BEFORE expansion, so every `#` a replacement list carries IS a stringize
+    // operator (no ambiguity). Per-language CONFIG kind, never a hard-coded `#`:
+    // a second preprocess-opting language whose stringize operator is spelled
+    // differently is then detected correctly. OPTIONAL -- empty means the
+    // language declares NO stringize operator (the engine's `.valid()` guard
+    // never treats any token as `#`). `checkToken`-validated at load when
+    // present (like `variadicMarkerToken`).
+    std::string stringizeToken;
+
+    // FC15a: the token KIND of the TOKEN-PASTE operator (C's `##` -> "HashHashOp",
+    // C 6.10.3.3). In a replacement list, `a##b` concatenates the spelling of the
+    // token to its left with the token to its right into a single new token
+    // (re-tokenized + required to be exactly one token, C 6.10.3.3p3). A `##`
+    // OPERAND that is a parameter uses the RAW argument. Detected by this token
+    // KIND -- a DISTINCT lexeme from the single `#` (the loader/lexer's
+    // longest-match wins `##` over two `#`), never hard-coded. Per-language
+    // CONFIG kind: a second preprocess-opting language whose paste operator is
+    // spelled differently is detected correctly. OPTIONAL -- empty means the
+    // language declares NO paste operator. `checkToken`-validated at load when
+    // present (like `variadicMarkerToken`).
+    std::string pasteToken;
 };
 
 } // namespace dss

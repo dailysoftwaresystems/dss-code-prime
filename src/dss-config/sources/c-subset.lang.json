@@ -41,7 +41,9 @@
     "functionLikeCloseToken": "ParenClose",
     "functionLikeArgSeparatorToken": "Comma",
     "variadicMarkerToken": "EllipsisOp",
-    "variadicArgsName": "__VA_ARGS__"
+    "variadicArgsName": "__VA_ARGS__",
+    "stringizeToken": "HashOp",
+    "pasteToken": "HashHashOp"
   },
 
   "lexerModes": {
@@ -114,6 +116,7 @@
     ":":  [{ "kind": "Colon" }],
 
     "#": [{ "kind": "HashOp", "modeOp": "pushMode", "modeArg": "directive" }],
+    "##": [{ "kind": "HashHashOp" }],
     "\"": [{
       "kind": "StringStart",
       "modeOp": "pushMode", "modeArg": "string",

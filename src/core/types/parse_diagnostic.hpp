@@ -66,6 +66,15 @@ enum class DiagnosticCode : std::uint16_t {
     P_PreprocessorUnsupported     = 0x0015,  // a recognised-but-unimplemented directive form (variadic macro def)
     P_PreprocessorIncludeError    = 0x0016,  // quote-`#include` target not found / unreadable / recursion overflow
     P_PreprocessorMacroArgument   = 0x0017,  // function-like macro INVOCATION error (arity mismatch / unterminated arg list)
+    // FC15a (`#`/`##` operators): the STRINGIZE (`#`, C 6.10.3.2) operator is
+    // malformed -- a `#` in a function-like macro's replacement list is not
+    // followed by a parameter (the only valid `#` operand).
+    P_PreprocessorStringize       = 0x0019,
+    // FC15a: the TOKEN-PASTE (`##`, C 6.10.3.3) operator is malformed -- a `##`
+    // at the start or end of a replacement list (no operand on one side), OR a
+    // paste whose concatenated spelling is NOT a single valid token
+    // (C 6.10.3.3p3: the result must be a single preprocessing token).
+    P_PreprocessorPaste           = 0x001A,
 
     // Expression-nesting depth guard (Pratt walker). A too-deeply-nested
     // expression (parens / right-assoc / prefix / ternary recursion past
