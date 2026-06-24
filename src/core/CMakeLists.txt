@@ -47,6 +47,20 @@ target_compile_definitions(core PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 # of `core`) sees just our public headers, never <nlohmann/json.hpp>.
 target_link_libraries(core PRIVATE nlohmann_json::nlohmann_json)
 
+# Big-object assembler flag for the large auto-generated grammar-schema TU.
+# grammar_schema_json.cpp is a big generated translation unit that, under the
+# MinGW/binutils toolchain, overflows the Windows COFF object-section count on a
+# from-scratch build ("file too big"). `-Wa,-mbig-obj` is the standard binutils
+# remedy (it raises the COFF section limit). The MSVC PE backend and the
+# Linux-GCC ELF backend are NOT affected by this COFF limit, so the flag is
+# scoped two ways: (1) per-FILE via set_source_files_properties — it touches only
+# this one TU, every other `core` source is byte-identical; (2) per-COMPILER via
+# the $<$<CXX_COMPILER_ID:GNU>:...> generator expression — it expands to NOTHING
+# for MSVC and Clang, so their compile lines provably cannot change. This is a
+# toolchain-object-size accommodation, not a language/CPU/format identity branch.
+set_source_files_properties(types/grammar_schema_json.cpp PROPERTIES
+    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU>:-Wa,-mbig-obj>")
+
 # D-DIAG-CODENAME-EXHAUSTIVE-WARN (2026-06-09): enforce EXHAUSTIVE
 # DiagnosticCode / DiagnosticSeverity dispatch in parse_diagnostic.cpp. Both
 # switches (`diagnosticCodeName`, `severityName`) are written with NO
