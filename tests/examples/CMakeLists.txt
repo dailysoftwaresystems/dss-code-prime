@@ -33,6 +33,7 @@ target_include_directories(dss_examples_runner
 # nlohmann_json include dir on this target is additive and does not affect the
 # precompiled STL/gtest set. No-op in Debug (PCH disabled).
 target_precompile_headers(dss_examples_runner REUSE_FROM dss_test_pch)
+dss_pch_reproducible(dss_examples_runner)  # consumer must match producer's PCH flags
 
 file(GLOB_RECURSE EXAMPLE_MANIFESTS
     CONFIGURE_DEPENDS

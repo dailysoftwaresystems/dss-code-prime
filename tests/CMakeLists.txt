@@ -24,6 +24,7 @@ function(dss_add_test)
     # valid for every one of them. No-op in Debug (CMAKE_DISABLE_PRECOMPILE_
     # HEADERS), so the linux-clang-asan leg builds PCH-free.
     target_precompile_headers(${target} REUSE_FROM dss_test_pch)
+    dss_pch_reproducible(${target})  # consumer must match producer's PCH flags
 
     add_test(NAME ${DSS_NAME} COMMAND ${target})
 endfunction()
@@ -44,6 +45,7 @@ target_include_directories(dss_test_pch
         ${CMAKE_SOURCE_DIR}/tests/test_support
 )
 target_precompile_headers(dss_test_pch PRIVATE ${DSS_PCH_HEADERS} <gtest/gtest.h>)
+dss_pch_reproducible(dss_test_pch)  # producer: timestamp-free PCH → ccache hits
 
 add_subdirectory(core)
 add_subdirectory(test_support)

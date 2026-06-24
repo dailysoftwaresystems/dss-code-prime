@@ -130,6 +130,43 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
 endif()
 
+# ── Reproducible PCH binaries for cross-run ccache hits (Clang + MSVC) ──
+# ccache hashes the precompiled header as an input to EVERY dependent TU, so a
+# PCH that is not byte-reproducible across CI runs makes every compile look new.
+# Measured on PR #30 (run 28060528181): GCC's `.gch` is already reproducible
+# (linux-gcc / linux-arm64 ≈ 99.7% cross-run hits) but Clang and MSVC bake a
+# build TIMESTAMP into the PCH → macOS ≈ 1.2% hits, Windows ≈ 6.9% hits → cold
+# rebuilds every run. The fix is per-compiler, applied where PCH is active:
+#   * Clang / AppleClang — `-Xclang -fno-pch-timestamp` strips the timestamp
+#     Clang embeds in the `.pch` (the documented ccache+Clang+PCH remedy).
+#   * MSVC — `/Brepro` zeros the embedded TIMESTAMP, but a LOCAL measurement
+#     (two clean PCH builds on VS18/MSVC, this change) shows ~36 residual
+#     non-deterministic bytes per 178 MB `.pch` — ASLR-influenced absolute
+#     addresses in MSVC's memory-image PCH that `/Brepro` does not touch. ccache
+#     hashes the WHOLE `.pch`, so 36 bytes ≠ 0 ⇒ Windows STILL misses. `/Brepro`
+#     is kept as the harmless, documented best-effort (and the prerequisite for a
+#     future `/experimental:deterministic` attempt); the Windows-leg caching
+#     strategy is a pending HUMAN decision (drop PCH on the MSVC leg so ccache
+#     caches normally · MinGW-GCC for PCH+cache but no MSVC coverage · status
+#     quo). It compiles + links clean, so carrying it is no-harm.
+# GCC is deliberately UNTOUCHED (already optimal). The flag goes on every PCH
+# producer AND every REUSE_FROM consumer: Clang/MSVC validate the PCH against the
+# consumer's compile line, so a producer-only flag would make the consumer
+# REJECT the timestamp-free PCH ("file modified since PCH was built") and break
+# the build — both sides must carry it. No-op when PCH is disabled (the Debug
+# canary leg) and on any compiler that is neither Clang nor MSVC, and each flag
+# is per-compiler-guarded so it never leaks to a toolchain that would reject it.
+function(dss_pch_reproducible target)
+    if(CMAKE_DISABLE_PRECOMPILE_HEADERS)
+        return()  # PCH off (Debug canary) — there is no PCH binary to stabilize
+    endif()
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")        # Clang AND AppleClang
+        target_compile_options(${target} PRIVATE -Xclang -fno-pch-timestamp)
+    elseif(MSVC)
+        target_compile_options(${target} PRIVATE /Brepro)
+    endif()
+endfunction()
+
 add_subdirectory(src)
 
 if(DSS_BUILD_TESTS)

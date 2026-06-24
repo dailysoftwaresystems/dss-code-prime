@@ -49,6 +49,7 @@ foreach(_dss_obj_lib
     list(LENGTH _dss_obj_srcs _dss_obj_nsrc)
     if(_dss_obj_nsrc GREATER 2)
         target_precompile_headers(${_dss_obj_lib} PRIVATE ${DSS_PCH_HEADERS})
+        dss_pch_reproducible(${_dss_obj_lib})  # timestamp-free PCH → ccache hits
     endif()
 endforeach()
 
