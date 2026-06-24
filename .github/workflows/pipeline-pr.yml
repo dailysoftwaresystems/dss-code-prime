@@ -36,6 +36,17 @@ jobs:
       # x86_64 host (e.g. local dev) — CI does not use QEMU. Native arm64
       # execution-verifies the whole ARM64 backend end-to-end.
       run-linux-arm64: true
+      # The Windows/MSVC PCH is not byte-reproducible (a memory image with
+      # ASLR/GC-randomized embedded addresses), so a freshly-built PCH each run
+      # busts ccache — the PCH is hashed into every dependent TU's key, leaving
+      # the windows-msvc leg at ~7% hits / ~40 min every run while Linux GCC
+      # (reproducible .gch) sits at ~99.7%. Opt that ONE leg into the reusable
+      # workflow's PCH-binary cache: it caches + restores the byte-identical PCH
+      # across runs so the key stays stable -> warm runs hit, with PCH still ON
+      # for fast cold builds (no D-CI-WINDOWS-MSVC-BUILD-TIME-CEILING regression).
+      # macOS already hits via the committed -Xclang -fno-pch-timestamp fix, so
+      # only the MSVC leg is listed.
+      cache-pch-on: "windows-msvc-release"
     secrets:
       DSS_BOTS_CLIENT_ID: ${{ secrets.DSS_BOTS_CLIENT_ID }}
       DSS_BOTS_APP_PRIVATE_KEY: ${{ secrets.DSS_BOTS_APP_PRIVATE_KEY }}
