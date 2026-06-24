@@ -4951,9 +4951,636 @@ struct Lowerer {
         return mir.addPhi(voidPtr, incomings);
     }
 
-    // Lower a single HIR statement in the currently-open MIR block.
-    // Returns true on success, false on a hard error (caller bails).
-    bool lowerStmt(HirNodeId node) {
+    // ── Plan 24 Stage 4b — the iterative statement-lowering driver ─────────
+    // A POD work-stack frame for ONE flattened control-flow statement arm.
+    // `phase` advances the per-arm machine across resumes (each resume runs the
+    // emission slice up to the next sub-statement request, then re-enters the
+    // driver for that sub-statement). The block handles a control-flow arm mints
+    // + the per-arm bookkeeping it carries across phases live in dedicated POD
+    // fields (NEVER a `work.back()` reference that dangles after a sub-push) — the
+    // realloc-safe rule from the expression driver: copy frame fields to locals
+    // and advance `phase` BEFORE any `enterStmt`/`push_back`. `ok` carries the
+    // bool a finished sub-statement delivered (the analogue of the expression
+    // driver's `result` slot). For the unbounded child-statement lists (Block's
+    // stmts, a switch arm's body), the iteration cursor lives in a SEPARATE LIFO
+    // accumulator `blockCtxs` referenced by the stable index `aux` (the
+    // `callCtxs` pattern) — a nested block grows `blockCtxs`, so a held reference
+    // would dangle; the index does not.
+    struct StmtFrame {
+        enum class Kind : std::uint8_t {
+            Block, If, While, DoWhile, For, Label, Switch
+        } kind;
+        HirNodeId node;
+        std::uint8_t phase;
+        // Block handles minted by a control-flow arm, carried across phases.
+        // If    : bb0=thenBB, bb1=elseBB(invalid if no else), bb2=joinBB.
+        // While : bb0=header, bb1=body, bb2=exit.
+        // DoWhile: bb0=body, bb1=continueBB, bb2=exit.
+        // For   : bb0=header, bb1=body, bb2=update(invalid if none), bb3=exit,
+        //         bb4=backTarget.
+        // Label : bb0=label block.
+        // Switch: bb0=exitBB (per-arm + case blocks live in blockCtxs/exprdata).
+        MirBlockId bb0{};
+        MirBlockId bb1{};
+        MirBlockId bb2{};
+        MirBlockId bb3{};
+        MirBlockId bb4{};
+        // If: tracks whether any path reaches the join (the recursive
+        // `joinReached`). While/For/DoWhile: unused.
+        bool flag0{};
+        // Block: index into `blockCtxs` (the child cursor). Switch: index into
+        // `switchData` (the minted arm blocks). Unused (0) by the others.
+        std::uint32_t aux{};
+        // Switch only: index into `blockCtxs` (the arm + within-arm cursor).
+        // Block keeps its cursor in `aux`; Switch needs BOTH accumulators, so
+        // its blockCtxs index lives here. Unused (0) by the others.
+        std::uint32_t aux2BlockCtx{};
+    };
+
+    // Per-switch state: the minted arm blocks (one per arm, in declaration
+    // order). Lives in a LIFO accumulator (a nested switch pushes its own) —
+    // the owning frame re-addresses `switchData[aux]` by index, never holds a
+    // reference across a sub-statement push.
+    struct SwitchData {
+        std::vector<MirBlockId> armBlocks;
+    };
+    std::vector<SwitchData> switchData;
+
+    // LIFO cursor for an unbounded child-statement list (a Block's stmts, or a
+    // switch arm's body). Created when the arm starts iterating, popped when it
+    // finishes. A nested Block/Switch pushes its OWN ctx on top, so the vector
+    // grows — the owning frame re-addresses `blockCtxs[aux]` by INDEX each
+    // resume (never holds a reference across a sub-statement push).
+    struct BlockIterCtx {
+        std::uint32_t idx{};   // next child index to lower
+        // Switch only: the current arm index (into the arm list); the inner
+        // `idx` walks that arm's body statements. `armIdx == kNotSwitch` marks a
+        // plain Block ctx.
+        std::uint32_t armIdx{};
+    };
+    std::vector<BlockIterCtx> blockCtxs;
+    static constexpr std::uint32_t kNotSwitch =
+        (std::numeric_limits<std::uint32_t>::max)();
+
+    // The public statement-lowering entry: a driver over an explicit heap
+    // work-stack. For each node, `enterStmt` either PUSHES a frame for a
+    // deeply-nesting control-flow arm or delegates to `lowerStmtNode` (which
+    // lowers that one node; for a non-flattened LEAF arm it does NOT recurse
+    // into `lowerStmt`). Returns the success/failure bool. Output-identity: the
+    // flattened arms reproduce the recursive `lowerStmtNode` createBlock order,
+    // branch successors, and sub-statement lowering order EXACTLY, so the
+    // emitted MIR (block ids, branch targets, op order, vreg ids) is
+    // byte-identical to the recursive `lowerStmt`.
+    //
+    // NOTE — the EXTERNAL callers (`lowerFunction`'s body, `lowerForClauseNode`,
+    // the expression driver's SeqExpr arm) call this driver; each spins up its
+    // OWN local work-stack, so a for-init/SeqExpr statement subtree drains fully
+    // before its caller resumes — identical ordering to the recursive nesting.
+    [[nodiscard]] bool lowerStmt(HirNodeId node) {
+        std::vector<StmtFrame> work;
+        // `enterStmt` ALWAYS assigns `ok` for a delegated node, and every pushed
+        // frame delivers into `ok` before it is read (then popped), so this
+        // sentinel never leaks.
+        bool ok = false;
+
+        // Classify `n`: push a frame for a flattenable control-flow arm (and
+        // return), else lower it here via `lowerStmtNode` (a leaf arm — it does
+        // not recurse into `lowerStmt`). A frame is pushed ONLY for the seven
+        // arms whose recursion is `lowerStmt(child)`. `enterStmt` (push) MUST be
+        // the LAST action of any caller path that copied out its frame fields —
+        // `work.back()` may dangle after.
+        auto const enterStmt = [&](HirNodeId n) {
+            switch (hir.kind(n)) {
+                case HirKind::Block:
+                    work.push_back({.kind = StmtFrame::Kind::Block,
+                                    .node = n, .phase = 0});
+                    return;
+                case HirKind::IfStmt:
+                    work.push_back({.kind = StmtFrame::Kind::If,
+                                    .node = n, .phase = 0});
+                    return;
+                case HirKind::WhileStmt:
+                    work.push_back({.kind = StmtFrame::Kind::While,
+                                    .node = n, .phase = 0});
+                    return;
+                case HirKind::DoWhileStmt:
+                    work.push_back({.kind = StmtFrame::Kind::DoWhile,
+                                    .node = n, .phase = 0});
+                    return;
+                case HirKind::ForStmt:
+                    work.push_back({.kind = StmtFrame::Kind::For,
+                                    .node = n, .phase = 0});
+                    return;
+                case HirKind::LabelStmt:
+                    work.push_back({.kind = StmtFrame::Kind::Label,
+                                    .node = n, .phase = 0});
+                    return;
+                case HirKind::SwitchStmt:
+                    work.push_back({.kind = StmtFrame::Kind::Switch,
+                                    .node = n, .phase = 0});
+                    return;
+                default: break;
+            }
+            ok = lowerStmtNode(n);   // leaf (Return/ExprStmt/VarDecl/Assign/…)
+        };
+
+        enterStmt(node);
+        while (!work.empty()) {
+            StmtFrame& f = work.back();
+            switch (f.kind) {
+            // ── Block: lower each child in order, minting a fresh dead Linear
+            // block between a sealed child and its next sibling (byte-identical
+            // to the recursive loop). The child cursor is in `blockCtxs[aux]`.
+            case StmtFrame::Kind::Block: {
+                if (f.phase == 0) {
+                    f.aux = static_cast<std::uint32_t>(blockCtxs.size());
+                    blockCtxs.push_back({.idx = 0, .armIdx = kNotSwitch});
+                    f.phase = 1;
+                    // fall into phase 1 below (no sub-request yet)
+                }
+                // phase 1: dispatch the next child (or finish). Re-address the
+                // ctx by index — a nested block grew `blockCtxs`.
+                std::uint32_t const ctxIdx = f.aux;
+                HirNodeId const node2 = f.node;
+                if (f.phase == 2) {
+                    // Resuming after a child finished. Bail on failure.
+                    if (!ok) { blockCtxs.pop_back(); work.pop_back(); break; }
+                    auto kids = hir.children(node2);
+                    std::uint32_t const justDone = blockCtxs[ctxIdx].idx;
+                    // A child may have sealed the open block mid-block; a
+                    // FOLLOWING sibling needs a fresh dead block to lower into.
+                    if (justDone + 1u < kids.size()
+                        && mir.openBlockHasTerminator()) {
+                        MirBlockId const dead =
+                            mir.createBlock(StructCfMarker::Linear);
+                        mir.beginBlock(dead);
+                    }
+                    blockCtxs[ctxIdx].idx = justDone + 1u;
+                    f.phase = 1;
+                }
+                // phase 1: request the child at the cursor, or finish.
+                auto kids = hir.children(node2);
+                std::uint32_t const i = blockCtxs[ctxIdx].idx;
+                if (i >= kids.size()) {
+                    blockCtxs.pop_back();
+                    work.pop_back();
+                    ok = true;
+                    break;
+                }
+                HirNodeId const childN = kids[i];
+                f.phase = 2;
+                enterStmt(childN);   // lower child — may invalidate `f`
+                break;
+            }
+            // ── IfStmt: diamond. phase 0 lowers cond (via lowerExpr — already
+            // flat), mints then/else?/join IN ORDER, CondBr, beginBlock(then),
+            // requests then. phase 1 (after then): Br(join) if fell through,
+            // then if else exists beginBlock(else)+request else, else finalize.
+            // phase 2 (after else): Br(join) if fell through, finalize join.
+            case StmtFrame::Kind::If: {
+                if (f.phase == 0) {
+                    HirNodeId const node2 = f.node;
+                    HirNodeId const condN = hir.ifCondition(node2);
+                    auto const elseN = hir.ifElse(node2);
+                    MirInstId const cond = lowerExpr(condN);
+                    if (!cond.valid()) { work.pop_back(); ok = false; break; }
+                    MirBlockId const thenBB =
+                        mir.createBlock(StructCfMarker::IfThen);
+                    MirBlockId const elseBB = elseN.has_value()
+                        ? mir.createBlock(StructCfMarker::IfElse)
+                        : MirBlockId{};
+                    MirBlockId const joinBB =
+                        mir.createBlock(StructCfMarker::IfJoin);
+                    MirBlockId const falseTarget =
+                        elseN.has_value() ? elseBB : joinBB;
+                    mir.addCondBr(cond, thenBB, falseTarget);
+                    mir.beginBlock(thenBB);
+                    f.bb0 = thenBB; f.bb1 = elseBB; f.bb2 = joinBB;
+                    f.flag0 = false;   // joinReached
+                    f.phase = 1;
+                    HirNodeId const thenN = hir.ifThen(node2);
+                    enterStmt(thenN);   // lower then — may invalidate `f`
+                } else if (f.phase == 1) {
+                    MirBlockId const elseBB = f.bb1;
+                    MirBlockId const joinBB = f.bb2;
+                    if (!ok) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(elseBB);
+                        sealCreatedAsUnreachable(joinBB);
+                        work.pop_back(); ok = false; break;
+                    }
+                    if (!mir.openBlockHasTerminator()) {
+                        mir.addBr(joinBB);
+                        f.flag0 = true;   // joinReached
+                    }
+                    auto const elseN = hir.ifElse(f.node);
+                    if (elseN.has_value()) {
+                        mir.beginBlock(elseBB);
+                        f.phase = 2;
+                        enterStmt(*elseN);   // lower else — may invalidate `f`
+                    } else {
+                        // No else: the false edge targets join directly.
+                        f.flag0 = true;   // joinReached
+                        mir.beginBlock(joinBB);
+                        work.pop_back(); ok = true;
+                    }
+                } else {  // phase 2: after else
+                    MirBlockId const joinBB = f.bb2;
+                    bool joinReached = f.flag0;
+                    if (!ok) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(joinBB);
+                        work.pop_back(); ok = false; break;
+                    }
+                    if (!mir.openBlockHasTerminator()) {
+                        mir.addBr(joinBB);
+                        joinReached = true;
+                    }
+                    mir.beginBlock(joinBB);
+                    if (!joinReached) mir.addUnreachable();
+                    work.pop_back(); ok = true;
+                }
+                break;
+            }
+            // ── WhileStmt: header CondBr(body,exit); body Br(header); exit.
+            // phase 0: mint header/body/exit, Br(header), beginBlock(header),
+            //          lower cond (flat), CondBr(cond,body,exit),
+            //          beginBlock(body), push BranchFrame{header,exit},
+            //          request body. phase 1 (after body): pop BranchFrame,
+            //          Br(header) if fell through, beginBlock(exit).
+            case StmtFrame::Kind::While: {
+                if (f.phase == 0) {
+                    HirNodeId const node2 = f.node;
+                    HirNodeId const condN = *hir.loopCondition(node2);
+                    MirBlockId const header =
+                        mir.createBlock(StructCfMarker::LoopHeader);
+                    MirBlockId const body =
+                        mir.createBlock(StructCfMarker::Linear);
+                    MirBlockId const exit =
+                        mir.createBlock(StructCfMarker::LoopExit);
+                    mir.addBr(header);
+                    mir.beginBlock(header);
+                    MirInstId const cond = lowerExpr(condN);
+                    if (!cond.valid()) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(body);
+                        sealCreatedAsUnreachable(exit);
+                        work.pop_back(); ok = false; break;
+                    }
+                    mir.addCondBr(cond, body, exit);
+                    mir.beginBlock(body);
+                    branchStack.push_back({header, exit});
+                    f.bb0 = header; f.bb1 = body; f.bb2 = exit;
+                    f.phase = 1;
+                    HirNodeId const bodyN = hir.loopBody(node2);
+                    enterStmt(bodyN);   // lower body — may invalidate `f`
+                } else {  // phase 1: after body
+                    MirBlockId const header = f.bb0;
+                    MirBlockId const exit   = f.bb2;
+                    branchStack.pop_back();
+                    if (!ok) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(exit);
+                        work.pop_back(); ok = false; break;
+                    }
+                    if (!mir.openBlockHasTerminator()) mir.addBr(header);
+                    mir.beginBlock(exit);
+                    work.pop_back(); ok = true;
+                }
+                break;
+            }
+            // ── DoWhileStmt: body; contBB CondBr(cond,body,exit); exit.
+            // phase 0: mint body/continueBB/exit, Br(body), beginBlock(body),
+            //          push BranchFrame{continueBB,exit,false}, request body.
+            // phase 1 (after body): read continueReferenced from the frame,
+            //          pop BranchFrame, Br(continueBB) if body fell through;
+            //          then if (continueReferenced || bodyFellThrough)
+            //          beginBlock(continueBB)+lower cond (flat)+CondBr, else
+            //          seal continueBB unreachable; beginBlock(exit).
+            case StmtFrame::Kind::DoWhile: {
+                if (f.phase == 0) {
+                    HirNodeId const node2 = f.node;
+                    MirBlockId const body =
+                        mir.createBlock(StructCfMarker::LoopHeader);
+                    MirBlockId const continueBB =
+                        mir.createBlock(StructCfMarker::LoopLatch);
+                    MirBlockId const exit =
+                        mir.createBlock(StructCfMarker::LoopExit);
+                    mir.addBr(body);
+                    mir.beginBlock(body);
+                    branchStack.push_back({continueBB, exit, false});
+                    f.bb0 = body; f.bb1 = continueBB; f.bb2 = exit;
+                    f.phase = 1;
+                    HirNodeId const bodyN = hir.loopBody(node2);
+                    enterStmt(bodyN);   // lower body — may invalidate `f`
+                } else {  // phase 1: after body
+                    MirBlockId const body       = f.bb0;
+                    MirBlockId const continueBB = f.bb1;
+                    MirBlockId const exit       = f.bb2;
+                    bool const continueReferenced =
+                        branchStack.back().continueReferenced;
+                    branchStack.pop_back();
+                    if (!ok) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(continueBB);
+                        sealCreatedAsUnreachable(exit);
+                        work.pop_back(); ok = false; break;
+                    }
+                    bool const bodyFellThrough = !mir.openBlockHasTerminator();
+                    if (bodyFellThrough) mir.addBr(continueBB);
+                    if (continueReferenced || bodyFellThrough) {
+                        mir.beginBlock(continueBB);
+                        MirInstId const cond =
+                            lowerExpr(*hir.loopCondition(f.node));
+                        if (!cond.valid()) {
+                            if (!mir.openBlockHasTerminator())
+                                mir.addUnreachable();
+                            sealCreatedAsUnreachable(exit);
+                            work.pop_back(); ok = false; break;
+                        }
+                        mir.addCondBr(cond, body, exit);
+                    } else {
+                        sealCreatedAsUnreachable(continueBB);
+                    }
+                    mir.beginBlock(exit);
+                    work.pop_back(); ok = true;
+                }
+                break;
+            }
+            // ── ForStmt: init?; header <cond?CondBr:Br>; body Br(backTarget);
+            // update? Br(header); exit. The init/update CLAUSES lower via
+            // `lowerForClauseNode` (which re-enters this driver for a Block/
+            // VarDecl/Assign init — a bounded, shallow subtree) BEFORE/at the
+            // back-edge; only the BODY is flattened onto THIS work-stack.
+            // phase 0: lower init?, mint header/body/update?/exit, Br(header),
+            //          beginBlock(header), lower cond? (flat) + CondBr/Br(body),
+            //          beginBlock(body), push BranchFrame{backTarget,exit},
+            //          request body. phase 1 (after body): pop BranchFrame,
+            //          Br(backTarget) if fell through; if update beginBlock+
+            //          lower update + Br(header); beginBlock(exit).
+            case StmtFrame::Kind::For: {
+                if (f.phase == 0) {
+                    HirNodeId const node2 = f.node;
+                    auto const initN   = hir.forInit(node2);
+                    auto const condN   = hir.loopCondition(node2);
+                    auto const updateN = hir.forUpdate(node2);
+                    if (initN.has_value()) {
+                        if (!lowerForClauseNode(*initN)) {
+                            if (!mir.openBlockHasTerminator())
+                                mir.addUnreachable();
+                            work.pop_back(); ok = false; break;
+                        }
+                    }
+                    MirBlockId const header =
+                        mir.createBlock(StructCfMarker::LoopHeader);
+                    MirBlockId const body =
+                        mir.createBlock(StructCfMarker::Linear);
+                    MirBlockId const update = updateN.has_value()
+                        ? mir.createBlock(StructCfMarker::LoopLatch)
+                        : MirBlockId{};
+                    MirBlockId const exit =
+                        mir.createBlock(StructCfMarker::LoopExit);
+                    MirBlockId const backTarget =
+                        updateN.has_value() ? update : header;
+                    mir.addBr(header);
+                    mir.beginBlock(header);
+                    if (condN.has_value()) {
+                        MirInstId const cond = lowerExpr(*condN);
+                        if (!cond.valid()) {
+                            if (!mir.openBlockHasTerminator())
+                                mir.addUnreachable();
+                            sealCreatedAsUnreachable(body);
+                            sealCreatedAsUnreachable(update);
+                            sealCreatedAsUnreachable(exit);
+                            work.pop_back(); ok = false; break;
+                        }
+                        mir.addCondBr(cond, body, exit);
+                    } else {
+                        mir.addBr(body);  // for(;;)
+                    }
+                    mir.beginBlock(body);
+                    branchStack.push_back({backTarget, exit});
+                    f.bb0 = header; f.bb1 = body; f.bb2 = update;
+                    f.bb3 = exit;   f.bb4 = backTarget;
+                    f.phase = 1;
+                    HirNodeId const bodyN = hir.loopBody(node2);
+                    enterStmt(bodyN);   // lower body — may invalidate `f`
+                } else {  // phase 1: after body
+                    HirNodeId const node2     = f.node;
+                    MirBlockId const header     = f.bb0;
+                    MirBlockId const update     = f.bb2;
+                    MirBlockId const exit       = f.bb3;
+                    MirBlockId const backTarget = f.bb4;
+                    branchStack.pop_back();
+                    if (!ok) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(update);
+                        sealCreatedAsUnreachable(exit);
+                        work.pop_back(); ok = false; break;
+                    }
+                    if (!mir.openBlockHasTerminator()) mir.addBr(backTarget);
+                    auto const updateN = hir.forUpdate(node2);
+                    if (updateN.has_value()) {
+                        mir.beginBlock(update);
+                        if (!lowerForClauseNode(*updateN)) {
+                            if (!mir.openBlockHasTerminator())
+                                mir.addUnreachable();
+                            sealCreatedAsUnreachable(exit);
+                            work.pop_back(); ok = false; break;
+                        }
+                        mir.addBr(header);
+                    }
+                    mir.beginBlock(exit);
+                    work.pop_back(); ok = true;
+                }
+                break;
+            }
+            // ── LabelStmt: `label: stmt`. phase 0: getOrCreate label block,
+            // Br into it if the open block fell through, beginBlock(label),
+            // request the labeled statement. phase 1: deliver its result.
+            // (The recursive arm tail-returns `lowerStmt(labelBody)`, so the
+            // labeled statement's bool IS the label's bool.)
+            case StmtFrame::Kind::Label: {
+                if (f.phase == 0) {
+                    HirNodeId const node2 = f.node;
+                    MirBlockId const lb =
+                        getOrCreateLabelBlock(hir.labelOrdinal(node2));
+                    if (!mir.openBlockHasTerminator()) mir.addBr(lb);
+                    mir.beginBlock(lb);
+                    f.phase = 1;
+                    HirNodeId const bodyN = hir.labelBody(node2);
+                    enterStmt(bodyN);   // lower labeled stmt — may invalidate `f`
+                } else {  // phase 1: deliver labeled-stmt result
+                    // `ok` already holds the labeled statement's result.
+                    work.pop_back();
+                }
+                break;
+            }
+            // ── SwitchStmt: lower discriminant (flat), mint exit + one block
+            // per arm IN ORDER, resolve cases + default, addSwitch, then lower
+            // each arm's body list (falling through to the next arm). The
+            // discriminant + block layout are emitted in phase 0; the per-arm
+            // body iteration is driven across phases via `blockCtxs[aux]`
+            // (arm cursor + within-arm statement cursor). switchData[aux] holds
+            // the minted arm blocks (re-addressed by index, realloc-safe).
+            case StmtFrame::Kind::Switch: {
+                if (f.phase == 0) {
+                    HirNodeId const node2 = f.node;
+                    HirNodeId const discN = hir.switchDiscriminant(node2);
+                    auto       const arms  = hir.switchArms(node2);
+                    MirInstId const disc = lowerExpr(discN);
+                    if (!disc.valid()) { work.pop_back(); ok = false; break; }
+                    MirBlockId const exitBB =
+                        mir.createBlock(StructCfMarker::SwitchJoin);
+                    std::vector<MirBlockId> armBlocks;
+                    armBlocks.reserve(arms.size());
+                    for (std::size_t i = 0; i < arms.size(); ++i) {
+                        armBlocks.push_back(
+                            mir.createBlock(StructCfMarker::SwitchCase));
+                    }
+                    // Build (caseValue,target) list and resolve defaultBB.
+                    std::vector<std::pair<MirInstId, MirBlockId>> cases;
+                    cases.reserve(arms.size());
+                    MirBlockId defaultBB{};
+                    bool failed = false;
+                    for (std::size_t i = 0; i < arms.size(); ++i) {
+                        HirNodeId const arm = arms[i];
+                        if (hir.caseArmIsDefault(arm)) {
+                            if (defaultBB.valid()) {
+                                unsupported(arm, "switch has more than one "
+                                                  "default arm (HIR verifier "
+                                                  "should have flagged this)");
+                                failed = true; break;
+                            }
+                            defaultBB = armBlocks[i];
+                            continue;
+                        }
+                        auto const valN = hir.caseArmValue(arm);
+                        if (!valN.has_value()) {
+                            unsupported(arm, "non-default CaseArm without "
+                                              "match value (HIR verifier "
+                                              "should have flagged this)");
+                            failed = true; break;
+                        }
+                        MirInstId const caseVal = lowerExpr(*valN);
+                        if (!caseVal.valid()) { failed = true; break; }
+                        cases.emplace_back(caseVal, armBlocks[i]);
+                    }
+                    if (failed) {
+                        sealCreatedAsUnreachable(exitBB);
+                        for (MirBlockId b : armBlocks)
+                            sealCreatedAsUnreachable(b);
+                        work.pop_back(); ok = false; break;
+                    }
+                    if (!defaultBB.valid()) defaultBB = exitBB;
+                    mir.addSwitch(disc, cases, defaultBB);
+                    // Push the break-frame ONCE for the whole switch (all arms
+                    // share it) — matches the recursive single push/pop around
+                    // the arm loop.
+                    branchStack.push_back({MirBlockId{}, exitBB});
+                    f.aux = static_cast<std::uint32_t>(switchData.size());
+                    switchData.push_back({std::move(armBlocks)});
+                    f.bb0 = exitBB;
+                    f.aux2BlockCtx =
+                        static_cast<std::uint32_t>(blockCtxs.size());
+                    blockCtxs.push_back({.idx = 0, .armIdx = 0});
+                    f.phase = 1;
+                    // fall through into phase 1 (begin arm 0).
+                }
+                // phase 1: begin the current arm's block + request its first
+                // body statement (or advance to the next arm / finish).
+                // phase 2: a body statement finished — handle fall-through /
+                // failure, advance the within-arm cursor or the arm cursor.
+                std::uint32_t const ctxIdx = f.aux2BlockCtx;
+                std::uint32_t const dataIdx = f.aux;
+                HirNodeId const node2 = f.node;
+                auto const arms = hir.switchArms(node2);
+                if (f.phase == 2) {
+                    if (!ok) {
+                        // Seal the remaining arm blocks + exit, pop frame.
+                        std::uint32_t const ai = blockCtxs[ctxIdx].armIdx;
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        for (std::size_t j = ai + 1u;
+                             j < switchData[dataIdx].armBlocks.size(); ++j) {
+                            sealCreatedAsUnreachable(
+                                switchData[dataIdx].armBlocks[j]);
+                        }
+                        sealCreatedAsUnreachable(f.bb0);
+                        branchStack.pop_back();
+                        blockCtxs.pop_back();
+                        switchData.pop_back();
+                        work.pop_back(); ok = false; break;
+                    }
+                    blockCtxs[ctxIdx].idx += 1u;
+                    f.phase = 1;
+                }
+                // phase 1: dispatch within the current arm.
+                std::uint32_t const ai = blockCtxs[ctxIdx].armIdx;
+                if (ai >= arms.size()) {
+                    // All arms lowered. (The per-arm fall-through Br was emitted
+                    // when each arm's body ran out — see below.)
+                    branchStack.pop_back();
+                    mir.beginBlock(f.bb0);
+                    blockCtxs.pop_back();
+                    switchData.pop_back();
+                    work.pop_back(); ok = true;
+                    break;
+                }
+                {
+                    std::uint32_t const within = blockCtxs[ctxIdx].idx;
+                    HirNodeId const arm = arms[ai];
+                    auto const body = hir.caseArmBody(arm);
+                    if (within == 0u) {
+                        // First entry into this arm: open its block.
+                        mir.beginBlock(switchData[dataIdx].armBlocks[ai]);
+                    }
+                    if (within >= body.size()) {
+                        // Arm body exhausted: fall through to the next arm's
+                        // first block (or exit if this is the last arm).
+                        if (!mir.openBlockHasTerminator()) {
+                            MirBlockId const fall =
+                                (ai + 1u < arms.size())
+                                    ? switchData[dataIdx].armBlocks[ai + 1u]
+                                    : f.bb0;
+                            mir.addBr(fall);
+                        }
+                        blockCtxs[ctxIdx].armIdx = ai + 1u;
+                        blockCtxs[ctxIdx].idx = 0u;
+                        // loop again (no sub-request) — re-enter phase 1.
+                        break;
+                    }
+                    HirNodeId const stmt = body[within];
+                    f.phase = 2;
+                    enterStmt(stmt);   // lower arm-body stmt — may invalidate `f`
+                }
+                break;
+            }
+            }
+        }
+        return ok;
+    }
+
+    // Lower ONE HIR statement node in the currently-open MIR block, given that
+    // its child SUB-STATEMENTS are lowered by RE-ENTERING `lowerStmt` (the
+    // driver below). Returns true on success, false on a hard error (caller
+    // bails).
+    //
+    // Plan 24 Stage 4b (D-PARSE-DEEP-NEST-RECURSION-MEMORY): the public entry
+    // `lowerStmt` is now an explicit heap work-stack DRIVER. The deeply-nesting
+    // control-flow arms — Block (its child list), IfStmt (then/else), While/
+    // DoWhile/For (body), LabelStmt (labeled stmt), SwitchStmt (each arm's body
+    // list) — are flattened onto that work-stack so a deeply-nested `{{{…}}}` /
+    // `if(if(if(…)))` / `while(while(…))` / `label: label: …` nest carries FLAT
+    // O(1) host-stack cost per nesting level. This per-NODE handler is the
+    // byte-identical emission body for EVERY arm: the LEAF arms (Return,
+    // Unreachable, ExprStmt, VarDecl, AssignStmt, Break, Continue, Goto,
+    // IndirectGoto) are reached through the driver UNCHANGED, and the flattened
+    // control-flow arms here are retained as the dead-via-driver recursive
+    // fallback (the driver's `StmtFrame` machine reproduces their createBlock
+    // order, branch successors, and sub-statement lowering order BYTE-FOR-BYTE;
+    // the EXPRESSION lowering inside any statement — conditions, rhs, discrim —
+    // still flattens via `lowerExpr`/`runExprDriver`, called exactly as today).
+    bool lowerStmtNode(HirNodeId node) {
         HirKind const k = hir.kind(node);
         switch (k) {
             case HirKind::Block: {

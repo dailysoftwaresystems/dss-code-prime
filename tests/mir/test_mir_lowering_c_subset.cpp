@@ -6611,3 +6611,108 @@ TEST(MirLoweringCSubset, IterativeDeepCallChainLowersFlatAndByteIdentical) {
     EXPECT_EQ(m.instOperands(ret)[0], prevValue) << "Return takes the outermost Call";
         });  // runOnLargeStack
 }
+
+// ─── Plan 24 Stage 4b — iterative HIR→MIR STATEMENT driver ──────────────────
+//
+// SF-4 differential pin for the flattened control-flow STATEMENT arms (the
+// `lowerStmt` driver). A DEEPLY-nested if-chain `if(a){ if(a){ if(a){ … return
+// b; } } }` — each level's THEN body IS the next nested `if`, so the recursion
+// the recursive `lowerStmtNode` IfStmt arm would otherwise cost (`lowerStmt(
+// thenN)` once per nesting level, ~600 host frames deep during HIR→MIR) is the
+// axis the explicit `StmtFrame` work-stack flattens to FLAT O(1) host-stack cost
+// per level. (No `else`, so each level is the minimal 2-block diamond — thenBB +
+// joinBB — the crispest statement backbone to pin.)
+//
+// BYTE-IDENTITY backbone (block id == creation order == single-chokepoint
+// monotonic): entry == block 0 evaluates level 0's cond; level i's cond is
+// evaluated in level (i-1)'s thenBB. Each level i mints thenBB == block(2i+1)
+// then joinBB == block(2i+2) IN THAT ORDER, and a CondBr(cond, thenBB, joinBB).
+// So the block CONTAINING level i's cond (entry for i==0, else block 2i-1) ends
+// in a CondBr whose successors are EXACTLY {block 2i+1, block 2i+2} — a swapped
+// successor or a block minted out of order (the silent-miscompile class this
+// gate guards) moves these. The innermost thenBB (block 2N-1) holds `return b`,
+// so its terminator is Return. Total blocks = 2N+1.
+//
+// The WITNESS SPLIT mirrors the IterativeDeep expression pins: the flat/host-
+// stack-overflow RUN witness lives in the corpus example `deep_stmt_mir` (a deep
+// nested-control-flow program through the real pipeline that crashes if the
+// statement lowering recurses); THIS unit pin asserts the orthogonal CFG
+// byte-identity half. Build/lower/teardown run on the 64 MiB worker
+// (kDeepRecursionStackBytes) so the deep HIR-tree teardown does not depend on
+// the host's small main-stack budget (stock MSVC Debug main stack = 1 MiB).
+//
+// Synthetic (SF-4): the parser's 256 maxStatementDepth cap forbids a 600-deep
+// nest in source, so the deep input is built via the public `HirBuilder`.
+TEST(MirLoweringCSubset, IterativeDeepIfNestLowersFlatAndByteIdentical) {
+    constexpr std::uint32_t kDepth = 600;  // # of nested `if` levels
+
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    // `int f(int a, int b)` — `a` (Arg 0) is every level's condition, `b`
+    // (Arg 1) the innermost return value. Both are pure-SSA Args (no emitted
+    // instruction), so the diamond scaffolding is the ONLY per-level MIR.
+    TypeId const fnTy = ti.fnSig(std::array{i32, i32}, i32, CallConv::CcSysV);
+
+    HirBuilder b{"c-subset"};
+    HirNodeId const pa = b.makeVarDecl(i32, /*sym=*/1);
+    HirNodeId const pb = b.makeVarDecl(i32, /*sym=*/2);
+    auto refA = [&] { return b.makeRef(i32, /*sym=*/1); };
+    // Build innermost-first: the deepest THEN is `return b`; each outer level
+    // wraps the prior `if` as its (else-less) THEN statement, so the nesting
+    // grows down the THEN spine — the deep-recursion axis the frame flattens.
+    HirNodeId cur = b.makeReturn(b.makeRef(i32, /*sym=*/2));   // innermost then
+    for (std::uint32_t i = 0; i < kDepth; ++i)
+        cur = b.makeIfStmt(refA(), cur, /*elseStmt=*/std::nullopt);
+    // The function body must end in a terminator on every path; the outermost
+    // `if` falls through its join, so append a trailing `return b`.
+    HirNodeId const body = b.makeBlock(std::array{
+        cur, b.makeReturn(b.makeRef(i32, /*sym=*/2))});
+    HirNodeId const fn   =
+        b.makeFunction(fnTy, /*sym=*/7, std::array{pa, pb}, body);
+    HirNodeId const root = b.makeModule(std::array{fn});
+    Hir hir = std::move(b).finish(root);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
+                             MirLoweringConfig{});
+    ASSERT_TRUE(result.ok)
+        << "deep if nest must lower clean: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Mir const& m = result.mir;
+    MirFuncId const f = m.funcAt(0);
+    // entry + 2 blocks (then/join) per `if` level.
+    ASSERT_EQ(m.funcBlockCount(f), 2u * kDepth + 1u);
+    MirBlockId const entry = m.funcEntry(f);
+
+    // Walk every level and assert its CondBr successors are EXACTLY this level's
+    // {thenBB == 2i+1, joinBB == 2i+2}, in that order (the precise thing a phase
+    // bug — a swapped CondBr target or an out-of-order createBlock — corrupts).
+    // Block index == creation order == id, so `funcBlockAt(f, n)` resolves it.
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        // The block holding level i's cond: entry for level 0, else the PRIOR
+        // level's thenBB == block 2(i-1)+1 == 2i-1.
+        MirBlockId const condBlock =
+            (i == 0u) ? entry : m.funcBlockAt(f, 2u * i - 1u);
+        MirBlockId const thenBB = m.funcBlockAt(f, 2u * i + 1u);
+        MirBlockId const joinBB = m.funcBlockAt(f, 2u * i + 2u);
+        MirInstId const term = m.blockTerminator(condBlock);
+        ASSERT_EQ(m.instOpcode(term), MirOpcode::CondBr) << "level " << i;
+        auto succs = m.blockSuccessors(condBlock);
+        ASSERT_EQ(succs.size(), 2u) << "level " << i;
+        EXPECT_EQ(succs[0], thenBB)
+            << "level " << i << " CondBr true-edge → this level's thenBB "
+               "(red on a swapped successor or out-of-order createBlock)";
+        EXPECT_EQ(succs[1], joinBB)
+            << "level " << i << " CondBr false-edge → this level's joinBB";
+    }
+
+    // The innermost thenBB (block 2N-1) holds `return b` → Return terminator.
+    MirBlockId const innermostThen = m.funcBlockAt(f, 2u * kDepth - 1u);
+    EXPECT_EQ(m.instOpcode(m.blockTerminator(innermostThen)), MirOpcode::Return)
+        << "the deepest THEN body is `return b`";
+        });  // runOnLargeStack
+}
