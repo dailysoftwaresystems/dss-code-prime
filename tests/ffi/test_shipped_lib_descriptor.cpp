@@ -22,6 +22,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -281,6 +282,149 @@ TEST(ShippedLibDescriptor, MissingHeaderFailsLoud) {
         here = parent;
     }
     return {};
+}
+
+// ── Item 1: constants + typedefs decode (neutral shipped-header content) ─────
+
+// Happy path: a constants-only descriptor (the <limits.h> shape — no symbols)
+// decodes its named integer constants + typedefs structurally. RED-ON-DISABLE:
+// the relaxed "symbols OPTIONAL" rule — a pre-change reader rejected a no-symbols
+// descriptor.
+TEST(ShippedLibDescriptor, ConstantsAndTypedefsDecode) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "limits.json", R"({
+        "header": "limits.h",
+        "constants": [
+            { "name": "CHAR_BIT", "value": 8,           "type": "i32" },
+            { "name": "INT_MIN",  "value": -2147483648, "type": "i32" },
+            { "name": "UINT_MAX", "value": 4294967295,  "type": "u32" }
+        ],
+        "typedefs": [ { "name": "my_size_t", "type": "u64" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(desc->symbols.empty());   // a constants-only descriptor: no link surface
+    ASSERT_EQ(desc->constants.size(), 3u);
+    EXPECT_EQ(desc->constants[0].name, "CHAR_BIT");
+    EXPECT_EQ(desc->constants[0].value, 8);
+    EXPECT_EQ(interner.kind(desc->constants[0].type), TypeKind::I32);
+    EXPECT_EQ(desc->constants[1].name, "INT_MIN");
+    EXPECT_EQ(desc->constants[1].value, std::int64_t{-2147483648});
+    EXPECT_EQ(desc->constants[2].name, "UINT_MAX");
+    EXPECT_EQ(desc->constants[2].value, std::int64_t{4294967295});
+    EXPECT_EQ(interner.kind(desc->constants[2].type), TypeKind::U32);
+    ASSERT_EQ(desc->typedefs.size(), 1u);
+    EXPECT_EQ(desc->typedefs[0].name, "my_size_t");
+    EXPECT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::U64);
+}
+
+// MF-2: an unsigned constant at the TOP of its range (ULLONG_MAX) round-trips
+// losslessly — stored as the int64 BIT-PATTERN (UINT64_MAX reinterpreted == -1),
+// which the HIR fold re-reads as uint64. RED-ON-DISABLE: a naive get<int64_t>
+// decode cannot represent ULLONG_MAX.
+TEST(ShippedLibDescriptor, UnsignedConstantMaxRoundTrips) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "x.json", R"({
+        "header": "x.h",
+        "constants": [ { "name": "ULLONG_MAX", "value": 18446744073709551615, "type": "u64" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    ASSERT_EQ(desc->constants.size(), 1u);
+    EXPECT_EQ(static_cast<std::uint64_t>(desc->constants[0].value),
+              0xFFFFFFFFFFFFFFFFull);
+}
+
+// Fail-loud: a constant whose `type` is not an integer scalar (a float here) is
+// out of scope — F_ShippedLibUnsupportedType, descriptor unusable.
+TEST(ShippedLibDescriptor, NonIntegerConstantTypeFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "x.json", R"({
+        "header": "x.h",
+        "constants": [ { "name": "PI", "value": 3, "type": "f64" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibUnsupportedType), 1u);
+}
+
+// Fail-loud: a value that does not fit its declared width (300 in an i8). The
+// valid sibling (`OK`) keeps the descriptor from ALSO tripping the "declares
+// nothing" rule, isolating the single out-of-range diagnostic.
+TEST(ShippedLibDescriptor, OutOfRangeConstantValueFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "x.json", R"({
+        "header": "x.h",
+        "constants": [ { "name": "OK",  "value": 1,   "type": "i32" },
+                       { "name": "BAD", "value": 300, "type": "i8"  } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
+}
+
+// Fail-loud: a negative value for an unsigned type (the `OK` sibling isolates
+// the single diagnostic, as above).
+TEST(ShippedLibDescriptor, NegativeUnsignedConstantFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "x.json", R"({
+        "header": "x.h",
+        "constants": [ { "name": "OK",  "value": 1,  "type": "i32" },
+                       { "name": "BAD", "value": -1, "type": "u32" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
+}
+
+// Fail-loud: an unknown per-constant key (closed key set {name,value,type}).
+TEST(ShippedLibDescriptor, UnknownConstantKeyFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "x.json", R"({
+        "header": "x.h",
+        "constants": [ { "name": "K", "value": 1, "type": "i32", "extra": 2 } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
+}
+
+// Fail-loud: a descriptor that declares NOTHING (no symbols/constants/typedefs)
+// is a no-op artifact — the relaxed "at least one non-empty" rule (replaces the
+// old symbols-required rule). RED-ON-DISABLE: the combined non-empty check.
+TEST(ShippedLibDescriptor, EmptyDescriptorFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "x.json", R"({ "header": "x.h" })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
 }
 
 // Every descriptor SHIPPED under src/dss-config/shippedLibs/*.json (Model 3: a

@@ -1,0 +1,23 @@
+{
+  "$comment": "D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB runtime witness: a function whose frame (20,000,000B, `int big[5000000]`) exceeds the AArch64 2-word shifted-imm12 reach (0xFFFFFF = 16 MiB). The prologue/epilogue SP adjust AND the &big[4999999] address (sp+19,999,996) must use the 3-word MOVZ/MOVK + EXTENDED-register macro (`MOVZ Xs,#lo` + `MOVK Xs,#hi,LSL#16` + `sub/add sp,sp,x16` for the frame, scratch-free `add Xd,sp,Xd` for the lea). seed is a mutable global so the store->load round-trip survives ConstFold/Mem2Reg/DCE. big[4999999] is read back to exercise the high-element lea tier. Exit 42. The `{shippedPipeline:release}` arm surfaces the lea + sp-adjust 3-word split under the REAL release composition (Inlining ON); the full-release-like arm exercises the same under an explicit pass list. RED-ON-DISABLE: revert the encoder's imm32.movzmovk split (or the variant immMin/immMax routing) -> the >16MiB sp-adjust + lea fail loud at the assembler (A_NoMatchingEncodingVariant) and the arm64 leg cannot produce a binary. NOTE on stack size: a 20MB stack frame SIGSEGVs under the default 8MB ulimit; the examples runner sets QEMU_STACK_SIZE=268435456 (256 MB) + RLIMIT_STACK in the PARENT before spawning, so both the qemu-aarch64 child AND the native x86_64 leg inherit a generous stack. NOTE on the missing x86_64:pe (Windows) target: a >4KB Windows stack frame needs an inline guard-page stack-probe loop (D-WIN64-LARGE-FRAME-STACK-PROBE, covered by large_frame_win64); this beyond-16MiB example is arm64-focused and uses x86_64:elf (Linux auto-grows the stack via demand paging) as the non-Windows control leg. x86_64 has no imm12/movzmovk slot so its codegen here is byte-identical to a normal large frame.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

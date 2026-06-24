@@ -82,6 +82,69 @@ enum class StepOutcome {
     Done,
 };
 
+// Bundles the wrapper rule ids resolved once per `walkExpression`
+// entry. Threading these through avoids re-doing the same `rules()
+// .find(...)` lookup at every climb level + makes the dependency on
+// the loader's auto-intern explicit. Field names mirror the
+// schema-side `ExprWrapperRules` (binary/unary/postfix) so there's
+// no translation layer between schema and walker.
+//
+// Defined here (above `Impl`) so `ExprFrame` — the explicit
+// expression-descent work-stack element — can hold one by value and
+// `Impl` can own the `std::vector<ExprFrame>` work-stack.
+struct PrattRules {
+    RuleId atom;
+    RuleId binary;
+    RuleId unary;
+    RuleId postfix;
+    RuleId ternary;   // optional (invalid when the language has no `?:`)
+};
+
+// One level of the EXPLICIT expression-descent work-stack
+// (D-PARSE-DEEP-NEST-RECURSION-MEMORY). Each entry is exactly the
+// host-stack state a former recursive `parseExpressionAt` call carried
+// ACROSS a deepening re-entry: the `rules` bundle, the level's `minPrec`,
+// a `phase` recording where in the level we are so the driver can resume
+// after a CHILD frame (a former recursion arm) pops, and — only while a
+// ternary child is in flight — the ternary clause contract. (The per-climb
+// trivia hold is purely iteration-local and stays a local in
+// `exprClimbStep`, never needing to cross a push.)
+//
+// The five former deepening re-entries become a `push` + a resume
+// `phase` instead of a C++ call:
+//   * prefix operand    → `AfterPrefixOperand`
+//   * ternary middle    → `AfterTernaryMiddle`
+//   * ternary else      → `AfterTernaryElse`
+//   * infix RHS         → `AfterInfixRhs`
+// (the paren / postfix-body atom re-entry stays a `walkExpression`
+// call, which opens a FRESH driver baseline on the SAME work-stack —
+// see `driveExprWorkStack`). Left/None-assoc chains never push a child:
+// they wrap in place inside `Climb`, exactly as before.
+struct ExprFrame {
+    enum class Phase : std::uint8_t {
+        Primary,             // parse the primary (prefix op or atom)
+        Climb,               // run one operator-climb iteration
+        AfterPrefixOperand,  // resume: close the unary wrapper
+        AfterTernaryMiddle,  // resume: check `:`, parse the else clause
+        AfterTernaryElse,    // resume: close the ternary wrapper
+        AfterInfixRhs,       // resume: close the binary wrapper
+    };
+
+    PrattRules         rules;
+    std::int32_t       minPrec;
+    Phase              phase = Phase::Primary;
+    // Ternary-clause contract, captured at the `?` site so the
+    // `AfterTernaryMiddle` resume (which runs after the token stream has
+    // advanced past `?`) can verify the `:` separator and parse the else
+    // clause at the operator's own precedence — exactly the two facts the
+    // recursive form read off the `ternary` operator-table entry it held in
+    // scope across the middle recursion. Only meaningful while a ternary
+    // child is in flight (set immediately before the `AfterTernaryMiddle`
+    // transition); ignored otherwise.
+    SchemaTokenId      ternaryMiddleTok{};   // the `:` separator token id
+    std::int32_t       ternaryElsePrec = 0;  // the else clause's minPrec
+};
+
 } // namespace
 
 // ── Impl ────────────────────────────────────────────────────────────────
@@ -205,16 +268,29 @@ struct Parser::Impl {
     // indefinitely would otherwise stack-loop the call stack.
     std::size_t speculationDepth = 0;
 
-    // Pratt-walker recursion depth. Incremented on every entry to
-    // `parseExpressionAt` (the single chokepoint all expression-
-    // deepening funnels through) and decremented by its RAII guard on
-    // return. When it would exceed `config.maxExpressionDepth` the
-    // walker emits a positioned `P_ExpressionTooDeep` diagnostic and
-    // recovers (it does NOT abort). Bounds C++ stack growth for
-    // adversarial right-recursion (deeply nested parens, long right-
-    // assoc chains, deep prefix/ternary) — fail loud + recover rather
-    // than risk a silent stack overflow.
+    // Pratt-walker expression-nesting depth. Incremented on every PUSH
+    // onto `exprWorkStack` (each push = one logical level the recursive
+    // walker formerly entered `parseExpressionAt` for) and decremented on
+    // every pop. Equal to `exprWorkStack.size()` by construction; kept as
+    // an explicit counter for a self-documenting cap check at the push
+    // site. When it would exceed `config.maxExpressionDepth` the walker
+    // emits a positioned `P_ExpressionTooDeep` diagnostic and recovers (it
+    // does NOT abort) — the descent is now FLAT (an explicit heap work-
+    // stack, see `ExprFrame` / `driveExprWorkStack`), so the cap is a
+    // SEMANTIC nesting limit, no longer a host-stack-overflow backstop.
     std::size_t expressionDepth = 0;
+
+    // The EXPLICIT expression-descent work-stack (D-PARSE-DEEP-NEST-
+    // RECURSION-MEMORY). Replaces the recursive `parseExpressionAt`
+    // re-entries with heap frames so a deeply-nested expression carries
+    // FLAT O(1) host-stack cost. `driveExprWorkStack(baseline)` processes
+    // frames until the stack returns to `baseline`; each `walkExpression`
+    // entry records a baseline, pushes its root frame, and drives down to
+    // it — so re-entrant `walkExpression` (a paren / postfix-rule body)
+    // nests cleanly on the SAME vector. A `SpeculationProbe` that rolls
+    // back mid-expression truncates this back to its pre-probe size
+    // (`exprWorkStackSizeBefore_`), exactly as it pops `frames`.
+    std::vector<ExprFrame> exprWorkStack;
 
     // Operator-precedence walker, looked up once per `expr`-rule
     // dispatch. Owned by Impl — either moved out of
@@ -928,22 +1004,16 @@ struct Parser::Impl {
     // reports its KEYWORD kind here, even though the builder may later demote
     // it to Identifier against the live cursor expectedSet + scope stack. So
     // at an offset whose admissible set holds the demotion target (Identifier)
-    // the prune could wrongly drop a candidate that the demoted token would in
-    // fact match — a silent mis-parse. The prune is therefore SOUND ONLY for
-    // grammars with NO contextual / scope-resolvable kind in a speculative
-    // candidate's FIXED prefix. This holds for every shipped speculative-alt
-    // grammar today (c-subset's speculative prefixes are all hard keywords /
-    // punctuation; tsql is `reservedWordPolicy: "contextual"` but its
-    // `nameOrCall` candidates discriminate at offset 1 on `(` /
-    // qualified-name punctuation, not on a soft-keyword Identifier slot). The
-    // conservative closing fix — skip the prune at an offset whose observed
-    // token has a contextual/scope-resolvable kind — is deferred behind the
-    // anchor because no token-id-keyed "is this kind contextual" query exists
-    // today (the `contextual` flag is per-LexemeMeaning, lexeme-string-keyed;
-    // only the grammar-wide `reservedWordPolicy()` lever is exposed, which
-    // would not cover a per-keyword `contextual: true` under a Strict policy).
-    // The anchor's trigger is the first contextual-keyword speculative-alt
-    // consumer that puts a soft keyword in a candidate's fixed prefix.
+    // the prune WOULD wrongly drop a candidate that the demoted token matches.
+    // ✅ CLOSED (cycle 13): the loop body SKIPS the prune at any offset whose
+    // observed token `schema->isContextualKind(got)` — a soft keyword / any
+    // keyword under `reservedWordPolicy: "contextual"` (the loader derives the
+    // token-id-keyed `contextualKinds` set from the per-LexemeMeaning `contextual`
+    // flags, the query that didn't exist before). So the prune never drops a
+    // candidate a contextual demotion would match. EMPTY contextualKinds for a
+    // non-contextual grammar (every shipped c-subset speculative alt) ⇒ the
+    // deep-nest O(N) win is unaffected. Pinned by the synthetic contextual-keyword
+    // speculative-alt schemas in test_parser_speculation.cpp (RED-on-disable).
     [[nodiscard]] bool
     predictivePrefixPrunes(RuleId candidate, std::size_t k) const noexcept {
         const std::size_t prefixLen = schema->predictivePrefixLen(candidate);
@@ -953,6 +1023,14 @@ struct Parser::Impl {
             const auto admissible = schema->predictivePrefixAt(candidate, i);
             if (admissible.empty()) continue;  // no constraint at this offset
             const SchemaTokenId got = peekSignificantKind(i);
+            // D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD: a CONTEXTUAL observed
+            // kind (a soft keyword) may DEMOTE to Identifier in the builder, so
+            // its `effectiveKind` here understates what the candidate can match.
+            // Skip the prune at this offset rather than wrongly drop a candidate
+            // the demoted token would in fact match (a silent mis-parse). O(1);
+            // empty contextualKinds for non-contextual grammars ⇒ deep-nest O(N)
+            // win preserved.
+            if (schema->isContextualKind(got)) continue;
             if (std::ranges::find(admissible, got) == admissible.end()) {
                 return true;  // observed token outside the exact set ⇒ prune
             }
@@ -981,6 +1059,16 @@ struct Parser::Impl {
             , cp_(impl.builder->checkpoint())
             , walkerSnap_(impl.walker.snapshot())
             , targetDepth_(impl.frames.size())
+            // SF-2 (D-PARSE-DEEP-NEST-RECURSION-MEMORY): snapshot the explicit
+            // expression-descent work-stack size + its paired depth counter so
+            // the dtor can restore them on rollback. A probe CAN be constructed
+            // while a descent is in flight (speculation reached from a paren-
+            // atom `stepOnce`), so the snapshot is taken against whatever is
+            // live. See the dtor for why this restore is defense-in-depth
+            // rather than load-bearing (the descent self-balances to baseline
+            // at every speculation boundary, verified green-on-disable).
+            , exprWorkStackSizeBefore_(impl.exprWorkStack.size())
+            , expressionDepthBefore_(impl.expressionDepth)
             , diagsBefore_(impl.diagsEmitted)
             , probeStartPos_(impl.tokens.position())
             // Capture the desync latch as a delta baseline.
@@ -1049,6 +1137,29 @@ struct Parser::Impl {
                         impl_.frameRules.pop_back();
                     }
                 }
+                // SF-2: truncate the expression work-stack back to its pre-
+                // probe size and restore the paired depth counter, mirroring
+                // the `frames` pop above. `ExprFrame` is trivially destructible
+                // bookkeeping (its builder-side OpenScope guards live in
+                // `impl_.frames`, popped above), so a plain `resize` is the
+                // complete restore.
+                //
+                // DEFENSE-IN-DEPTH, not currently load-bearing: every entry into
+                // the expression descent (`DefaultPrattWalker::walkExpression`,
+                // including the re-entrant paren / postfix-body atom) records a
+                // baseline and `driveExprWorkStack`s the stack back DOWN to it
+                // before returning — so the work-stack (and `expressionDepth`)
+                // is BALANCED at every speculation boundary, exactly as the
+                // recursive predecessor's RAII `DepthGuard` kept `expressionDepth`
+                // balanced (that probe restored neither, correctly). Verified:
+                // disabling these two lines leaves the whole speculation + cast
+                // suite green, including the deep speculate-rollback pin. They
+                // are retained so a FUTURE change to the drive/speculation
+                // boundary that breaks the balance invariant cannot silently
+                // desync the parser — the restore makes the invariant a
+                // guarantee rather than a coincidence.
+                impl_.exprWorkStack.resize(exprWorkStackSizeBefore_);
+                impl_.expressionDepth = expressionDepthBefore_;
                 impl_.walker.restore(std::move(*walkerSnap_));
                 impl_.builder->rollback(std::move(*cp_));
                 impl_.tokens.restore(bookmark_);
@@ -1115,6 +1226,11 @@ struct Parser::Impl {
         std::optional<TreeBuilder::Checkpoint> cp_;
         std::optional<SchemaWalker::Snapshot>  walkerSnap_;
         std::size_t                            targetDepth_;
+        // SF-2: the Pratt expression work-stack size + paired depth counter
+        // at probe start (restored on rollback). Declared adjacent to
+        // `targetDepth_` since they restore the same class of frame state.
+        std::size_t                            exprWorkStackSizeBefore_;
+        std::size_t                            expressionDepthBefore_;
         std::size_t                            diagsBefore_;
         std::size_t                            probeStartPos_;
         bool                                   desyncedBefore_;
@@ -1477,13 +1593,38 @@ struct Parser::Impl {
             const auto expected = walker.expectedSet();
             const SchemaTokenId tokKind =
                 effectiveKind(peek, identifierKind, errorKind);
-            const bool matches = !expected.empty()
+            bool matches = !expected.empty()
                 && std::ranges::find(expected, tokKind) != expected.end();
+
+            // D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD (probe-demotion
+            // half): a CONTEXTUAL keyword whose own kind is not admissible
+            // here DEMOTES to the identifier kind when THAT is admissible —
+            // exactly the builder's `pushToken` demotion (tree_builder.cpp
+            // "contextual keyword resolution"). The parser's match gate
+            // tests the UN-demoted `tokKind` (effectiveKind by design does
+            // not model the demotion), so without this mirror the gate
+            // rejects the token (`recoverAt`) BEFORE the builder ever
+            // demotes — and a speculative candidate the demotion would
+            // satisfy is lost (its probe emits P_UnexpectedToken → fails).
+            // Mirror it: consume the token AND advance the parser's walker
+            // with the SAME demoted kind the builder's walker takes, so the
+            // two cursors stay in lockstep (no spurious desync). Gated on
+            // `identifierKind` actually being admissible — if it is not, the
+            // demotion would not match either, so `recoverAt` is correct.
+            // O(1); for a non-contextual grammar `isContextualKind` is always
+            // false ⇒ this arm never fires ⇒ zero behavior change.
+            SchemaTokenId advanceKind = tokKind;
+            if (!matches && schema->isContextualKind(tokKind)
+                && std::ranges::find(expected, identifierKind)
+                       != expected.end()) {
+                matches     = true;
+                advanceKind = identifierKind;
+            }
 
             if (matches) {
                 const Token tok = tokens.advance();
                 builder->pushToken(tok);
-                walker.advance(tokKind, tok.span,
+                walker.advance(advanceKind, tok.span,
                                std::optional<RuleId>{builder->currentRule()});
                 return StepOutcome::Continue;
             }
@@ -1931,38 +2072,34 @@ ParseResult Parser::parse() && {
 // `associativity` is consumed HERE, by the walker, when it picks the
 // RHS minimum precedence for an infix wrap: Left (and None, the
 // loader's omitted-field default) chains build ITERATIVELY — O(n)
-// wraps, no per-operator recursion, stack-friendly — nesting LEFT;
-// Right-assoc chains recurse via the RHS parse at the operator's own
-// precedence, nesting RIGHT.
+// wraps, no descent, stack-friendly — nesting LEFT; Right-assoc chains
+// DESCEND via the RHS parse at the operator's own precedence, nesting
+// RIGHT.
 //
-// Each `parseExpressionAt(minPrec)` call:
-//   1. Parses a primary (prefix-op + nested expression OR the atom).
-//   2. Loops: while peek is an op at >= minPrec, wraps the already-
-//      built last child in the matching wrapper frame
-//      (`TreeBuilder::wrapLastChildInFrame`) and parses the operator's
+// FLAT DESCENT (D-PARSE-DEEP-NEST-RECURSION-MEMORY, Stage 5): the walker
+// is an explicit-stack driver over `Impl::exprWorkStack`, NOT host
+// recursion. Each former recursive `parseExpressionAt(minPrec)` level is a
+// heap `ExprFrame`; a deepening operand is a `pushExprFrame` + a resume
+// `phase` rather than a C++ call. One logical level:
+//   1. `Primary` — parse a primary (prefix-op + nested operand OR the atom).
+//      A prefix operand becomes a child frame (resume `AfterPrefixOperand`).
+//   2. `Climb` — while peek is an op at >= minPrec, wrap the already-built
+//      last child in the matching wrapper frame
+//      (`TreeBuilder::wrapLastChildInFrame`) and gather the operator's
 //      remaining operands inside the still-open wrapper:
-//        - infix: RHS at `prec + 1` for Left/None (the next same-prec
-//          op returns to THIS loop and wraps THIS wrapper → left
-//          nesting), at `prec` for Right (the RHS recursion consumes
-//          the chain → right nesting).
-//        - postfix: no further operand (or a grouped/follower body).
-//        - ternary: middle at 0, else at `prec` (right-assoc chain).
-//      Each iteration strictly extends the consumed range — no loop.
+//        - infix: RHS at `prec + 1` for Left/None (the next same-prec op
+//          returns to THIS frame's climb and wraps THIS wrapper → left
+//          nesting, NO child pushed), at `prec` for Right (the RHS child
+//          consumes the chain → right nesting).
+//        - postfix: no further operand (or a grouped/follower body parsed by
+//          a balanced `walkExpression` / sub-drive — stays in this frame).
+//        - ternary: middle at 0, else at `prec` (right-assoc) — each clause
+//          a child frame (resume `AfterTernaryMiddle` / `AfterTernaryElse`).
+//      Each iteration strictly extends the consumed range — terminates.
+// The driver runs until the work-stack returns to the entering
+// `walkExpression`'s baseline; re-entry (a paren / postfix-body atom) nests
+// on the SAME vector (see `driveExprWorkStack`).
 namespace {
-
-// Bundles the wrapper rule ids resolved once per `walkExpression`
-// entry. Threading these through avoids re-doing the same `rules()
-// .find(...)` lookup at every climb level + makes the dependency on
-// the loader's auto-intern explicit. Field names mirror the
-// schema-side `ExprWrapperRules` (binary/unary/postfix) so there's
-// no translation layer between schema and walker.
-struct PrattRules {
-    RuleId atom;
-    RuleId binary;
-    RuleId unary;
-    RuleId postfix;
-    RuleId ternary;   // optional (invalid when the language has no `?:`)
-};
 
 // Push trivia tokens through the builder until peek is meaningful.
 // Mirrors the main dispatch loop's TokenLeaf-trivia passthrough so
@@ -1973,13 +2110,62 @@ void pumpTrivia(Parser::Impl& I) {
     }
 }
 
-void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
-                       std::int32_t minPrec);
+// ── Explicit expression-descent work-stack (D-PARSE-DEEP-NEST-RECURSION-
+//    MEMORY) ────────────────────────────────────────────────────────────
+//
+// The former recursive `parseExpressionAt` is now a FLAT driver over the
+// `I.exprWorkStack` member: each former re-entry is a `pushExprFrame`
+// (heap) + a resume `phase`, so a deeply-nested expression carries O(1)
+// host-stack cost. The driver `driveExprWorkStack(I, baseline)` runs until
+// the work-stack returns to `baseline`. `walkExpression` (the sole entry,
+// and the re-entrant paren / postfix-body atom path) records a baseline,
+// pushes its root frame, and drives down to it — so re-entry nests cleanly
+// on the SAME vector.
+//
+// OUTPUT-IDENTITY: this is a control-flow transform only. Each former
+// `return`/`continue`/recursive-call maps 1:1 (a `return` → pop the frame,
+// a `continue` → re-run the same frame, a recursion → push a child frame +
+// resume phase). The wrap-in-place left/none-assoc climb is UNCHANGED (it
+// never pushed a child and still doesn't); the trivia hold/place discipline
+// is preserved verbatim (held trivia is placed BEFORE any child push, as
+// the recursive form placed it before the operator token + recursion).
 
-// Emit one primary as a child of the current frame: either a
-// prefix-op + nested expression, or the schema's atom rule.
-void parsePrimary(Parser::Impl& I, PrattRules const& rules,
-                  std::int32_t minPrec) {
+// Push one CHILD expression frame (a former `parseExpressionAt` re-entry).
+// Enforces the depth cap at the push site — the SAME logical point the
+// recursive guard fired (one push == one former recursive entry). On trip:
+// emit the positioned `P_ExpressionTooDeep`, recover, and return false WITHOUT
+// pushing (the caller leaves its wrapper frame open; the driver's resume
+// phase closes it on the next turn, mirroring the recursive form where the
+// guarded callee returned immediately and the caller ran `closeFrameOnce`).
+[[nodiscard]] bool pushExprFrame(Parser::Impl& I, PrattRules const& rules,
+                                 std::int32_t minPrec) {
+    if (I.expressionDepth >= I.config.maxExpressionDepth) {
+        I.recoverExpressionTooDeep_(I.tokens.peek());
+        return false;
+    }
+    ++I.expressionDepth;
+    // Realloc-safe by contract: every caller copies the fields it still
+    // needs to locals and advances its own `phase` BEFORE calling this —
+    // never holding a `exprWorkStack.back()` reference across the push.
+    I.exprWorkStack.push_back(ExprFrame{
+        .rules   = rules,
+        .minPrec = minPrec,
+        .phase   = ExprFrame::Phase::Primary,
+    });
+    return true;
+}
+
+// Run the `Primary` phase for the top frame: parse the prefix-op + nested
+// operand, or the schema's atom rule. Returns true if it pushed a CHILD
+// frame (the prefix operand) — the driver must then re-loop without
+// touching the (possibly reallocated) frame. Returns false if the primary
+// completed in place (atom, or a prefix whose operand tripped the cap) and
+// the caller should advance the SAME frame to `Climb`.
+[[nodiscard]] bool exprPrimaryStep(Parser::Impl& I) {
+    // Copy the fields we need BEFORE any push (realloc-safety).
+    const PrattRules rules = I.exprWorkStack.back().rules;
+    const std::int32_t minPrec = I.exprWorkStack.back().minPrec;
+
     pumpTrivia(I);
     Token const& peek = I.tokens.peek();
     const SchemaTokenId kind =
@@ -1993,293 +2179,350 @@ void parsePrimary(Parser::Impl& I, PrattRules const& rules,
         // happen here — we already inspected peek via effectiveKind
         // and got a real Prefix entry from the operator table.
         (void)I.pushOperatorToken();
-        // Recurse at the prefix's own precedence so tighter ops bind
+        // Descend at the prefix's own precedence so tighter ops bind
         // inside the operand (e.g. `-a * b` parses as
         // unary[-, binary[a, *, b]] when `*` is tighter — wrapper
-        // rule names come from `expr.wrapperRules`).
-        parseExpressionAt(I, rules, prefix->precedence);
-        I.closeFrameOnce();
-        return;
+        // rule names come from `expr.wrapperRules`). FLAT: advance THIS
+        // frame to resume at `AfterPrefixOperand`, then push the operand
+        // child. On a cap trip the child is NOT pushed; the resume phase
+        // still runs and closes the unary wrapper (mirrors the recursive
+        // form: the guarded callee returned, then `closeFrameOnce`).
+        I.exprWorkStack.back().phase = ExprFrame::Phase::AfterPrefixOperand;
+        (void)pushExprFrame(I, rules, prefix->precedence);
+        return true;
     }
 
     const std::size_t depthBeforeAtom = I.frames.size();
     I.openExprFrame(rules.atom);
     I.parseUntilFrameDepth(depthBeforeAtom);
+    return false;
 }
 
-void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
-                       std::int32_t minPrec) {
-    // Depth guard: recursion occurs only through OPERANDS (nested
-    // parens, prefix operands, grouped-postfix bodies, ternary
-    // clauses) and RIGHT-associative RHS chains — Left/None-assoc
-    // chains build iteratively in the climb loop below and never
-    // deepen the C++ stack. This is the SINGLE chokepoint every
-    // deepening path funnels through: prefix operands, the paren/atom
-    // re-entry (parsePrimary -> parseUntilFrameDepth -> stepOnce ->
-    // walkExpression -> here), ternary clauses, and infix RHS all
-    // recurse back into parseExpressionAt, so the cap covers them ALL
-    // by construction. On trip we FAIL LOUD with a positioned
-    // diagnostic + recover (Error leaf + panic-scan + graceful unwind)
-    // rather than recursing one level deeper into a C++ stack overflow.
-    //
-    // PERF (D-PARSE-DEEP-NEST-RECURSION-MEMORY): this per-OPERAND host
-    // recursion is the source of the residual ~exp-1.7 WALL-CLOCK super-
-    // linearity on deeply-nested input (e.g. `((((0))))`). The parse WORK is
-    // O(N) — a flat `0+0+…+0` chain of the same node count parses with a FLAT
-    // per-element cost (pinned by `FlatChainParseWorkIsLinear`) — so the
-    // residual is a memory-hierarchy constant (live call-stack working set +
-    // strided unwind re-access of the depth-indexed frame/cursor vectors),
-    // NOT an algorithmic O(N²) term. It is bounded/moot: `maxExpressionDepth`
-    // caps depth (default 256) and the whole downstream frontend is itself
-    // recursion-bound to that cap (D-PARSE-DEEP-FRONTEND-STACK), so flattening
-    // it would need an explicit-stack iterative rewrite of the WHOLE frontend
-    // for zero in-cap benefit. Deferred (trigger-gated) — see the registry.
-    if (I.expressionDepth >= I.config.maxExpressionDepth) {
-        I.recoverExpressionTooDeep_(I.tokens.peek());
-        return;
-    }
-    ++I.expressionDepth;
-    struct DepthGuard {
-        std::size_t& depth;
-        ~DepthGuard() { --depth; }
-    } guard{I.expressionDepth};
-
-    parsePrimary(I, rules, minPrec);
-
-    // Operator climb — wrap-in-place for ALL three arms (postfix /
-    // ternary / infix): the already-built previous child is adopted by
-    // the new wrapper via `wrapLastChildExprFrame`, and the remaining
-    // operands parse inside the still-open wrapper. There is no
-    // snapshot / rollback-replay here (the former WalkerSnapshot
-    // mechanism is deleted). Behavior preservation vs that design:
-    //   (a) diagnostics: the replay rolled diagnostics back with the
-    //       builder (TreeBuilder::CheckpointSnapshot carries a
-    //       DiagnosticReporter::Snapshot) and re-emitted them on the
-    //       replay — emitting ONCE under wrap-in-place produces the
-    //       identical diagnostic stream.
-    //   (b) binder sketch: snapshot restore was truncate-to-count and
-    //       the replay re-recorded the same bindings/candidates ⇒
-    //       convergent — recording once reaches the same final state.
+// Run ONE operator-climb iteration for the top frame. Returns:
+//   Done     — the climb terminated (EOF or no in-precedence operator):
+//              held trivia placed; the driver pops this frame.
+//   Continue — either a postfix/grouped arm handled in place (re-run this
+//              frame), OR a ternary/infix arm pushed a CHILD frame + set a
+//              resume phase (the driver processes the child first).
+// Realloc-safety: a `&heldTrivia` reference is taken on the frame and used
+// ONLY up to (and including) `placeHeldTrivia()`, which always runs BEFORE
+// any child push. After a push the frame reference must not be touched.
+[[nodiscard]] StepOutcome exprClimbStep(Parser::Impl& I) {
+    const PrattRules rules = I.exprWorkStack.back().rules;
+    const std::int32_t minPrec = I.exprWorkStack.back().minPrec;
+    // `heldTrivia` is ITERATION-LOCAL — every path through this function places
+    // it (pushes it to the builder) before returning, so it never needs to
+    // survive a child push. Keeping it a LOCAL (not a frame field) makes the
+    // realloc-safety structural: a `pushExprFrame` (or the postfix-body
+    // `walkExpression` re-entry) that reallocates `exprWorkStack` cannot
+    // invalidate it, and the `placeHeldTrivia` lambda's captured reference
+    // stays valid regardless of work-stack growth.
     std::vector<Token> heldTrivia;
     auto const placeHeldTrivia = [&I, &heldTrivia] {
         for (Token const& t : heldTrivia) I.builder->pushToken(t);
     };
-    while (true) {
-        // Hold-then-place trivia: collect the trivia run (same
-        // token-level classification `pumpTrivia` uses) WITHOUT
-        // pushing it, so the wrap decision below sees the real
-        // expression subtree — never a whitespace/comment leaf — as
-        // the open frame's last pending child (`f (x)` must wrap `f`,
-        // not the space). If an arm fires, the held run is pushed into
-        // the just-opened wrapper, before the operator token; if the
-        // loop exits, it's pushed into the current frame. Both
-        // reproduce the token-ordered leaf stream byte-for-byte.
-        heldTrivia.clear();
-        while (!I.tokens.isAtEnd() && isSkippableTrivia(I.tokens.peek())) {
-            heldTrivia.push_back(I.tokens.advance());
+
+    // Hold-then-place trivia: collect the trivia run (same token-level
+    // classification `pumpTrivia` uses) WITHOUT pushing it, so the wrap
+    // decision below sees the real expression subtree — never a
+    // whitespace/comment leaf — as the open frame's last pending child
+    // (`f (x)` must wrap `f`, not the space). If an arm fires, the held run
+    // is pushed into the just-opened wrapper, before the operator token; if
+    // the climb ends, it's pushed into the current frame. Both reproduce the
+    // token-ordered leaf stream byte-for-byte.
+    while (!I.tokens.isAtEnd() && isSkippableTrivia(I.tokens.peek())) {
+        heldTrivia.push_back(I.tokens.advance());
+    }
+
+    Token const& peek = I.tokens.peek();
+    if (peek.coreKind == CoreTokenKind::Eof) {
+        placeHeldTrivia();
+        return StepOutcome::Done;
+    }
+    const SchemaTokenId kind =
+        effectiveKind(peek, I.identifierKind, I.errorKind);
+
+    const auto infix = I.schema->operatorTable().lookup(
+        kind, OperatorArity::Infix);
+    const auto postfix = I.schema->operatorTable().lookup(
+        kind, OperatorArity::Postfix);
+    const auto ternary = I.schema->operatorTable().lookup(
+        kind, OperatorArity::Ternary);
+
+    const bool postfixInClimb =
+        postfix && postfix->precedence >= minPrec;
+    const bool infixInClimb =
+        infix && infix->precedence >= minPrec;
+    // A ternary operator only participates when the schema also declared a
+    // `wrapperRules.ternary` rule to wrap it; without one the `?` falls
+    // through and the parent surfaces a parse error (rather than silently
+    // dropping it).
+    const bool ternaryInClimb =
+        ternary && ternary->precedence >= minPrec && rules.ternary.valid();
+
+    if (!postfixInClimb && !infixInClimb && !ternaryInClimb) {
+        placeHeldTrivia();
+        return StepOutcome::Done;
+    }
+
+    // Postfix wins ties with infix at the same precedence — it binds the
+    // lhs alone (no further operand to gather), so structurally it's the
+    // more local binding. Grouped postfix (`grouped.has_value()`) extends
+    // the simple `++` case with a body-rule frame parsed between opener and
+    // closer.
+    //
+    // Postfix is LEFT-associative: iterative wrapping via
+    // `wrapLastChildExprFrame` wraps the previously-built primary (or a
+    // prior chain wrap) as the new postfix-wrapper's first child. The body
+    // (a follower / grouped rule) is parsed by a `walkExpression` call or a
+    // `parseUntilFrameDepth` drive that BALANCES its own frames before
+    // returning — no child pushed onto THIS work-stack — so the postfix arm
+    // stays in place and the driver simply re-runs this frame.
+    if (postfixInClimb) {
+        I.wrapLastChildExprFrame(rules.postfix);
+        placeHeldTrivia();
+        if (!I.pushOperatorToken()) {
+            // Truly defensive: peek was non-Eof when we entered this
+            // iteration, so pushOperatorToken should have succeeded. If it
+            // fails here something has corrupted the token stream — emit a
+            // diagnostic so the failure is observable rather than producing
+            // a silently half-built wrap.
+            I.emitParserError(
+                DiagnosticCode::P_PrematureEndOfInput,
+                peek.span,
+                "expression ended before postfix operator");
+            I.closeFrameOnce();
+            return StepOutcome::Done;
         }
-
-        Token const& peek = I.tokens.peek();
-        if (peek.coreKind == CoreTokenKind::Eof) {
-            placeHeldTrivia();
-            return;
-        }
-        const SchemaTokenId kind =
-            effectiveKind(peek, I.identifierKind, I.errorKind);
-
-        const auto infix = I.schema->operatorTable().lookup(
-            kind, OperatorArity::Infix);
-        const auto postfix = I.schema->operatorTable().lookup(
-            kind, OperatorArity::Postfix);
-        const auto ternary = I.schema->operatorTable().lookup(
-            kind, OperatorArity::Ternary);
-
-        const bool postfixInClimb =
-            postfix && postfix->precedence >= minPrec;
-        const bool infixInClimb =
-            infix && infix->precedence >= minPrec;
-        // A ternary operator only participates when the schema also declared a
-        // `wrapperRules.ternary` rule to wrap it; without one the `?` falls
-        // through and the parent surfaces a parse error (rather than silently
-        // dropping it).
-        const bool ternaryInClimb =
-            ternary && ternary->precedence >= minPrec && rules.ternary.valid();
-
-        if (!postfixInClimb && !infixInClimb && !ternaryInClimb) {
-            placeHeldTrivia();
-            return;
-        }
-
-        // Postfix wins ties with infix at the same precedence — it
-        // binds the lhs alone (no further operand to gather), so
-        // structurally it's the more local binding. Grouped postfix
-        // (`grouped.has_value()`) extends the simple `++` case with a
-        // body-rule frame parsed between opener and closer.
-        //
-        // Postfix is LEFT-associative: iterative wrapping via
-        // `wrapLastChildExprFrame` wraps the previously-built primary
-        // (or a prior chain wrap) as the new postfix-wrapper's first
-        // child.
-        if (postfixInClimb) {
-            I.wrapLastChildExprFrame(rules.postfix);
-            placeHeldTrivia();
-            if (!I.pushOperatorToken()) {
-                // Truly defensive: peek was non-Eof when we entered
-                // this iteration, so pushOperatorToken should have
-                // succeeded. If it fails here something has corrupted
-                // the token stream — emit a diagnostic so the failure
-                // is observable rather than producing a silently
-                // half-built wrap.
-                I.emitParserError(
-                    DiagnosticCode::P_PrematureEndOfInput,
-                    peek.span,
-                    "expression ended before postfix operator");
-                I.closeFrameOnce();
-                return;
-            }
-            if (postfix->followerRule.has_value()) {
-                // D5.1: follower-rule postfix — operator + exactly one
-                // occurrence of a named rule (e.g. `.field` is `DotOp` +
-                // `memberFollower` wrapping `Identifier`). No closer; the
-                // rule's own shape terminates the body. Mutually exclusive
-                // with `grouped` (loader enforces).
-                RuleId const fr = *postfix->followerRule;
-                if (I.schema->isExprRule(fr)) {
-                    I.prattWalker->walkExpression(
-                        *I.outer, fr,
-                        I.schema->exprMinPrecedence(fr));
-                } else {
-                    const std::size_t bodyDepth = I.frames.size();
-                    I.openExprFrame(fr);
-                    I.parseUntilFrameDepth(bodyDepth);
-                }
-                I.closeFrameOnce();
-                continue;
-            }
-            if (postfix->grouped) {
-                auto const& gp = *postfix->grouped;
-                // Type-level invariant pinned at the deref site: the
-                // loader (`grammar_schema_json.cpp`) only constructs
-                // `grouped` when `endsAtId.valid()`, but the struct
-                // shape doesn't enforce that on aggregate init. Catch
-                // any future producer that bypasses the loader.
-                if (!gp.endsAt.valid()) {
-                    fatal("dss::DefaultPrattWalker: grouped postfix "
-                          "entry has invalid endsAt — loader contract "
-                          "violated");
-                }
-                // Grouped postfix: drive the body until the closer.
-                // An expr-rule body (e.g. `[expression]` for indexing)
-                // must run through the Pratt walker so operator climb
-                // applies inside the brackets; calling `openExprFrame`
-                // directly would skip precedence and produce a flat
-                // tree. Same routing rule as `stepOnce`'s AltChoice→
-                // RuleLeaf path for expr-rules.
-                if (gp.bodyRule.valid()) {
-                    if (I.schema->isExprRule(gp.bodyRule)) {
-                        I.prattWalker->walkExpression(
-                            *I.outer, gp.bodyRule,
-                            I.schema->exprMinPrecedence(gp.bodyRule));
-                    } else {
-                        const std::size_t bodyDepth = I.frames.size();
-                        I.openExprFrame(gp.bodyRule);
-                        I.parseUntilFrameDepth(bodyDepth);
-                    }
-                }
-                pumpTrivia(I);
-                Token const& closerPeek = I.tokens.peek();
-                const SchemaTokenId closerKind = effectiveKind(
-                    closerPeek, I.identifierKind, I.errorKind);
-                if (closerKind.v != gp.endsAt.v) {
-                    // Closer missing. Emit the diagnostic AND drop an
-                    // Error leaf at the missing-closer position so the
-                    // HasError flag propagates up through the
-                    // postfix wrapper and the tree carries the
-                    // structural signal (not just a sidecar diagnostic).
-                    // We do NOT consume `closerPeek` — the parent
-                    // dispatch resumes from it (typically `recoverAt`
-                    // scans to the next sync token).
-                    I.emitParserError(
-                        DiagnosticCode::P_MissingRequiredChild,
-                        closerPeek.span,
-                        I.renderActual(closerPeek),
-                        std::span<SchemaTokenId const>{&gp.endsAt, 1});
-                    I.builder->pushErrorNode(closerPeek.span);
-                } else {
-                    (void)I.pushOperatorToken();
-                }
+        if (postfix->followerRule.has_value()) {
+            // D5.1: follower-rule postfix — operator + exactly one
+            // occurrence of a named rule (e.g. `.field` is `DotOp` +
+            // `memberFollower` wrapping `Identifier`). No closer; the rule's
+            // own shape terminates the body. Mutually exclusive with
+            // `grouped` (loader enforces).
+            RuleId const fr = *postfix->followerRule;
+            if (I.schema->isExprRule(fr)) {
+                I.prattWalker->walkExpression(
+                    *I.outer, fr,
+                    I.schema->exprMinPrecedence(fr));
+            } else {
+                const std::size_t bodyDepth = I.frames.size();
+                I.openExprFrame(fr);
+                I.parseUntilFrameDepth(bodyDepth);
             }
             I.closeFrameOnce();
-            continue;
+            return StepOutcome::Continue;
         }
-
-        // Ternary (mixfix `cond ? then : else`). Wraps the already-built
-        // chain in place as its condition, then parses the middle clause
-        // (to the `:` separator) and the else operand inside the wrapper.
-        // The middle parses at minPrec 0 — between `?` and `:` anything binds
-        // (assignment, even a nested ternary); the climb naturally stops at `:`
-        // (which carries no operator-table entry). The else parses at the
-        // ternary's own precedence → right-associative (`a?b:c?d:e` = a?b:(c?d:e)).
-        if (ternaryInClimb) {
-            I.wrapLastChildExprFrame(rules.ternary);
-            placeHeldTrivia();
-            if (!I.pushOperatorToken()) {                            // `?`
-                // Defensive — same contract as the postfix arm's
-                // pushOperatorToken failure path.
-                I.emitParserError(DiagnosticCode::P_PrematureEndOfInput, peek.span,
-                                  "expression ended before ternary '?'");
-                I.closeFrameOnce();
-                return;
+        if (postfix->grouped) {
+            auto const& gp = *postfix->grouped;
+            // Type-level invariant pinned at the deref site: the loader
+            // (`grammar_schema_json.cpp`) only constructs `grouped` when
+            // `endsAtId.valid()`, but the struct shape doesn't enforce that
+            // on aggregate init. Catch any future producer that bypasses the
+            // loader.
+            if (!gp.endsAt.valid()) {
+                fatal("dss::DefaultPrattWalker: grouped postfix "
+                      "entry has invalid endsAt — loader contract "
+                      "violated");
             }
-            parseExpressionAt(I, rules, 0);                          // then (middle)
+            // Grouped postfix: drive the body until the closer. An expr-rule
+            // body (e.g. `[expression]` for indexing) must run through the
+            // Pratt walker so operator climb applies inside the brackets;
+            // calling `openExprFrame` directly would skip precedence and
+            // produce a flat tree. Same routing rule as `stepOnce`'s
+            // AltChoice→RuleLeaf path for expr-rules.
+            if (gp.bodyRule.valid()) {
+                if (I.schema->isExprRule(gp.bodyRule)) {
+                    I.prattWalker->walkExpression(
+                        *I.outer, gp.bodyRule,
+                        I.schema->exprMinPrecedence(gp.bodyRule));
+                } else {
+                    const std::size_t bodyDepth = I.frames.size();
+                    I.openExprFrame(gp.bodyRule);
+                    I.parseUntilFrameDepth(bodyDepth);
+                }
+            }
+            pumpTrivia(I);
+            Token const& closerPeek = I.tokens.peek();
+            const SchemaTokenId closerKind = effectiveKind(
+                closerPeek, I.identifierKind, I.errorKind);
+            if (closerKind.v != gp.endsAt.v) {
+                // Closer missing. Emit the diagnostic AND drop an Error leaf
+                // at the missing-closer position so the HasError flag
+                // propagates up through the postfix wrapper and the tree
+                // carries the structural signal (not just a sidecar
+                // diagnostic). We do NOT consume `closerPeek` — the parent
+                // dispatch resumes from it (typically `recoverAt` scans to
+                // the next sync token).
+                I.emitParserError(
+                    DiagnosticCode::P_MissingRequiredChild,
+                    closerPeek.span,
+                    I.renderActual(closerPeek),
+                    std::span<SchemaTokenId const>{&gp.endsAt, 1});
+                I.builder->pushErrorNode(closerPeek.span);
+            } else {
+                (void)I.pushOperatorToken();
+            }
+        }
+        I.closeFrameOnce();
+        return StepOutcome::Continue;
+    }
+
+    // Ternary (mixfix `cond ? then : else`). Wraps the already-built chain
+    // in place as its condition, pushes `?`, then DESCENDS into the middle
+    // clause (to the `:` separator) as a child frame and resumes at
+    // `AfterTernaryMiddle`. The middle parses at minPrec 0 — between `?` and
+    // `:` anything binds (assignment, even a nested ternary); the climb
+    // naturally stops at `:` (which carries no operator-table entry).
+    if (ternaryInClimb) {
+        I.wrapLastChildExprFrame(rules.ternary);
+        placeHeldTrivia();
+        if (!I.pushOperatorToken()) {                            // `?`
+            // Defensive — same contract as the postfix arm's
+            // pushOperatorToken failure path.
+            I.emitParserError(DiagnosticCode::P_PrematureEndOfInput, peek.span,
+                              "expression ended before ternary '?'");
+            I.closeFrameOnce();
+            return StepOutcome::Done;
+        }
+        // FLAT: capture the clause contract (the `:` separator token + the
+        // else-clause precedence) on THIS frame so the `AfterTernaryMiddle`
+        // resume can verify `:` and parse the else at the operator's own
+        // precedence — the recursive form held the `ternary` entry in scope
+        // across the middle recursion; here it crosses the child push via
+        // the frame. An absent `ternaryMiddle` records InvalidSchemaToken,
+        // which the resume treats as "missing `:`" (the same fail-loud arm).
+        // Then resume at the middle-done phase and push the middle child
+        // (minPrec 0). `heldTrivia` must not be touched after this push.
+        I.exprWorkStack.back().ternaryMiddleTok =
+            ternary->ternaryMiddle ? *ternary->ternaryMiddle
+                                   : InvalidSchemaToken;
+        I.exprWorkStack.back().ternaryElsePrec = ternary->precedence;
+        I.exprWorkStack.back().phase = ExprFrame::Phase::AfterTernaryMiddle;
+        (void)pushExprFrame(I, rules, 0);                        // then (middle)
+        return StepOutcome::Continue;
+    }
+
+    // Infix: wrap the already-built chain in place as the LHS, push the
+    // operator, then DESCEND into the RHS as a child frame and resume at
+    // `AfterInfixRhs`. The RHS minimum precedence encodes the operator's
+    // DECLARED associativity:
+    //   - Left (and None, the loader's omitted-field default): prec + 1 —
+    //     the next same-prec operator does NOT bind inside the RHS; it
+    //     returns to THIS frame's climb and wraps THIS wrapper → chains
+    //     nest LEFT, iteratively (no child re-pushed for the chain step).
+    //   - Right: prec — the next same-prec operator binds inside the RHS
+    //     child → chains nest RIGHT.
+    I.wrapLastChildExprFrame(rules.binary);
+    placeHeldTrivia();
+    if (!I.pushOperatorToken()) {
+        // Defensive — same contract as the postfix arm's pushOperatorToken
+        // failure path.
+        I.emitParserError(
+            DiagnosticCode::P_PrematureEndOfInput,
+            peek.span,
+            "expression ended before infix operator");
+        I.closeFrameOnce();
+        return StepOutcome::Done;
+    }
+    const std::int32_t rhsMin =
+        (infix->associativity == OperatorAssoc::Right)
+            ? infix->precedence
+            : infix->precedence + 1;
+    I.exprWorkStack.back().phase = ExprFrame::Phase::AfterInfixRhs;
+    (void)pushExprFrame(I, rules, rhsMin);
+    return StepOutcome::Continue;
+}
+
+// The FLAT expression-descent driver. Processes `I.exprWorkStack` until it
+// returns to `baseline` (the size recorded by the entering `walkExpression`).
+// Each iteration dispatches the TOP frame on its `phase`:
+//   Primary            → parse the primary; on a prefix-operand child push,
+//                        re-loop (the child runs first); else advance to Climb.
+//   Climb              → one climb iteration; Done pops this frame, Continue
+//                        re-loops (either a postfix re-run or a pushed child).
+//   AfterPrefixOperand → the prefix operand finished → close the unary
+//                        wrapper, advance to Climb.
+//   AfterTernaryMiddle → the middle finished → check `:`; on success push the
+//                        else child (resume AfterTernaryElse); on a missing
+//                        `:`, recover + close the ternary wrapper + pop.
+//   AfterTernaryElse   → the else finished → close the ternary wrapper, Climb.
+//   AfterInfixRhs      → the RHS finished → close the binary wrapper, Climb.
+//
+// Popping a frame decrements `expressionDepth` (the cap counter) — the FLAT
+// analogue of the recursive `DepthGuard` destructor.
+void driveExprWorkStack(Parser::Impl& I, std::size_t baseline) {
+    while (I.exprWorkStack.size() > baseline) {
+        const ExprFrame::Phase phase = I.exprWorkStack.back().phase;
+        switch (phase) {
+        case ExprFrame::Phase::Primary:
+            if (exprPrimaryStep(I)) {
+                continue;   // pushed a prefix-operand child — run it first
+            }
+            I.exprWorkStack.back().phase = ExprFrame::Phase::Climb;
+            continue;
+
+        case ExprFrame::Phase::Climb:
+            if (exprClimbStep(I) == StepOutcome::Done) {
+                I.exprWorkStack.pop_back();
+                --I.expressionDepth;
+            }
+            // Continue: either a postfix re-run (same frame) or a pushed
+            // child (its frame is now on top) — either way, re-loop.
+            continue;
+
+        case ExprFrame::Phase::AfterPrefixOperand:
+            // The prefix operand child completed (or tripped the cap and was
+            // never pushed). Close the unary wrapper, then climb.
+            I.closeFrameOnce();
+            I.exprWorkStack.back().phase = ExprFrame::Phase::Climb;
+            continue;
+
+        case ExprFrame::Phase::AfterTernaryMiddle: {
+            // The middle clause completed. Verify the `:` separator (the token
+            // captured on the frame at the `?` site), then push the else child
+            // at the operator's own precedence — or recover on a missing `:`.
+            // Copy the fields we need BEFORE the else-child push (realloc-
+            // safety): rules, the `:` token id, and the else precedence.
+            const PrattRules rules = I.exprWorkStack.back().rules;
+            const SchemaTokenId midSep = I.exprWorkStack.back().ternaryMiddleTok;
+            const std::int32_t elsePrec = I.exprWorkStack.back().ternaryElsePrec;
             pumpTrivia(I);
             Token const& midPeek = I.tokens.peek();
             const SchemaTokenId midKind =
                 effectiveKind(midPeek, I.identifierKind, I.errorKind);
-            if (!ternary->ternaryMiddle || midKind.v != ternary->ternaryMiddle->v) {
+            if (!midSep.valid() || midKind.v != midSep.v) {
                 // Missing `:`. Emit a diagnostic + an Error leaf so HasError
-                // propagates through the ternary wrapper; don't consume midPeek
-                // (parent recovery resumes from it).
-                I.emitParserError(DiagnosticCode::P_MissingRequiredChild, midPeek.span,
-                                  "ternary expression is missing its ':' separator");
+                // propagates through the ternary wrapper; don't consume
+                // midPeek (parent recovery resumes from it).
+                I.emitParserError(DiagnosticCode::P_MissingRequiredChild,
+                                  midPeek.span,
+                                  "ternary expression is missing its ':' "
+                                  "separator");
                 I.builder->pushErrorNode(midPeek.span);
                 I.closeFrameOnce();
-                return;
+                I.exprWorkStack.pop_back();
+                --I.expressionDepth;
+                continue;
             }
-            (void)I.pushOperatorToken();                             // `:`
-            parseExpressionAt(I, rules, ternary->precedence);        // else
-            I.closeFrameOnce();
+            (void)I.pushOperatorToken();                         // `:`
+            I.exprWorkStack.back().phase = ExprFrame::Phase::AfterTernaryElse;
+            (void)pushExprFrame(I, rules, elsePrec);             // else
             continue;
         }
 
-        // Infix: wrap the already-built chain in place as the LHS,
-        // then parse the RHS inside the still-open wrapper. The RHS
-        // minimum precedence encodes the operator's DECLARED
-        // associativity:
-        //   - Left (and None, the loader's omitted-field default):
-        //     prec + 1 — the next same-prec operator does NOT bind
-        //     inside the RHS; it returns to this loop and wraps THIS
-        //     wrapper → chains nest LEFT, iteratively.
-        //   - Right: prec — the next same-prec operator binds inside
-        //     the RHS recursion → chains nest RIGHT.
-        I.wrapLastChildExprFrame(rules.binary);
-        placeHeldTrivia();
-        if (!I.pushOperatorToken()) {
-            // Defensive — same contract as the postfix arm's
-            // pushOperatorToken failure path.
-            I.emitParserError(
-                DiagnosticCode::P_PrematureEndOfInput,
-                peek.span,
-                "expression ended before infix operator");
+        case ExprFrame::Phase::AfterTernaryElse:
+            // The else clause completed. Close the ternary wrapper, climb.
             I.closeFrameOnce();
-            return;
+            I.exprWorkStack.back().phase = ExprFrame::Phase::Climb;
+            continue;
+
+        case ExprFrame::Phase::AfterInfixRhs:
+            // The RHS completed. Close the binary wrapper, climb.
+            I.closeFrameOnce();
+            I.exprWorkStack.back().phase = ExprFrame::Phase::Climb;
+            continue;
         }
-        const std::int32_t rhsMin =
-            (infix->associativity == OperatorAssoc::Right)
-                ? infix->precedence
-                : infix->precedence + 1;
-        parseExpressionAt(I, rules, rhsMin);
-        I.closeFrameOnce();
     }
 }
 
@@ -2326,7 +2569,24 @@ void DefaultPrattWalker::walkExpression(Parser& parser,
     }
 
     I.openExprFrame(exprRule);
-    parseExpressionAt(I, rules, minPrec);
+    // FLAT expression descent (D-PARSE-DEEP-NEST-RECURSION-MEMORY): record
+    // the current work-stack size as this entry's baseline, push the root
+    // expression frame, and drive the explicit work-stack down to the
+    // baseline. This replaces the recursive `parseExpressionAt(I, rules,
+    // minPrec)` call — and because the baseline is captured per entry, a
+    // RE-ENTRANT `walkExpression` (a parenthesized atom, or a postfix
+    // follower/grouped expr-rule body, which reach here through
+    // `parseUntilFrameDepth`→`stepOnce`) nests cleanly on the SAME vector:
+    // it pushes its own frames above the caller's and drives only its own
+    // sub-stack. The host stack stays FLAT for the direct re-entries
+    // (prefix/ternary/infix) that the work-stack absorbs.
+    const std::size_t baseline = I.exprWorkStack.size();
+    if (pushExprFrame(I, rules, minPrec)) {
+        driveExprWorkStack(I, baseline);
+    }
+    // else: the depth cap tripped at the root push — `recoverExpressionTooDeep_`
+    // already emitted + recovered (nothing was pushed), mirroring the recursive
+    // form where the guarded `parseExpressionAt` returned immediately.
     I.closeFrameOnce();
 }
 

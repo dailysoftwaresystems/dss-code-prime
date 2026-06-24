@@ -175,9 +175,25 @@ enum class SymbolVisibility : std::uint8_t;
 // value (so `static` sets only `binding`; `visibility("hidden")` sets only
 // `visibility`). Agnostic: the engine performs the lookup; WHICH texts exist and
 // what binding/visibility they mean are entirely per-language config.
+//
+// D-CSUBSET-LOCAL-STATIC (2026-06-22): the same per-(rule,token) effect map also
+// carries a STORAGE-DURATION axis (`staticStorage`). A C `static` storage-class
+// specifier confers different effects by scope: at FILE scope it sets `binding`
+// (internal linkage); at BLOCK scope it confers STATIC storage duration (the
+// object lives in `.data`/`.bss`, not the stack frame) AND, for the emitted
+// hidden global, internal (`local`) binding. Both are folded from the ONE
+// specifier-prefix scan (`linkageFrom`); the block-scope `static` row therefore
+// declares `{ "binding": "local", "staticStorage": true }`. Naming note: the map
+// is the declaration-SPECIFIER effect map (linkage is one axis of several), not
+// linkage-only — kept under the existing `linkageSpecifiers` facet so a single
+// scan folds every axis rather than duplicating the prefix walk.
 struct DSS_EXPORT LinkageSpecifierEffect {
     std::optional<SymbolBinding>    binding;
     std::optional<SymbolVisibility> visibility;
+    // Block-scope static storage duration (C 6.2.4/6.7.1): the object gets
+    // static (module-global) storage, not an automatic stack slot. Folded by
+    // CST→HIR to route the local declaration down the global-emission path.
+    bool                            staticStorage = false;
 };
 
 // FC4 c1 (M5): a config-driven fail-loud gate on a declaration form. When the
@@ -376,6 +392,17 @@ struct DSS_EXPORT DeclarationRule {
     // params are intentional) or globals/columns. Default false ⇒ no
     // unused check for this declaration form.
     bool            warnIfUnused = false;
+    // D-CSUBSET-EXTERN-DEFINITION-MERGE: when true, a symbol minted by this
+    // declaration is a NON-DEFINING declaration — it announces a name whose
+    // storage/body lives in another translation unit (an `extern` declaration in
+    // C). Such a declaration MERGES with an in-TU DEFINITION of the same name: the
+    // definition WINS the binding and this non-defining declaration is absorbed
+    // (its HIR ExternFunction/ExternGlobal node is suppressed). Two non-defining
+    // declarations of the same name are idempotent; two definitions still collide
+    // (S_RedeclaredSymbol). Per-declaration opt-in (c-subset's `externDecl`),
+    // source-agnostic — the engine never hardcodes a rule name. Default false ⇒
+    // an ordinary defining declaration (a redeclaration collides as before).
+    bool            nonDefiningDeclaration = false;
     // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN: HIR-tier implicit-return
     // insertion rule (source-agnostic). When this declaration is a
     // FUNCTION declaration AND the declared symbol's name appears
@@ -608,6 +635,18 @@ struct DSS_EXPORT ReferenceRule {
     // A resolvable name always binds regardless of position.
     std::vector<RuleId>      hardParents;
     std::vector<std::string> hardParentNames;   // source names, for diagnostics
+    // C 6.2.3 tag namespace: when set, a USE of this reference rule resolves
+    // against the TAG namespace (`struct Foo` / `union Foo` / `enum Foo` —
+    // the tag identifier), NOT the ordinary-identifier namespace. The matching
+    // composite TAG BIND is namespace-routed by the existing `fieldChildren`
+    // gate (a declaration WITH a field-body binds Tag); this flag is the
+    // LOOKUP counterpart, so a tag reference and a same-named ordinary symbol
+    // (`typedef struct Pair {…} Pair;`) resolve independently. Default false —
+    // every reference rule resolves Ordinary unless a language opts a
+    // tag-reference rule in. Engine-generic: WHICH rule is a tag reference is
+    // per-language config (c-subset's structTypeRef/unionTypeRef/enumTypeRef),
+    // never a hardcoded keyword.
+    bool isTagReference = false;
 };
 
 // Source built-in type name → lattice type mapping. Used during
@@ -778,8 +817,22 @@ struct DSS_EXPORT FloatLiteralTypingRule {
 //   * `promoteComparisons` — when true (C), comparison operands run the
 //     same conversion (so `-1 > 0ul` compares as U64); the result stays
 //     Bool. When false, comparisons keep their raw operand types.
+//   * `shiftResult` — closed verb for the C 6.5.7 shift-result discipline
+//     (D-UAC-SHIFT-RESULT-RULE-CONFIG). `promotedLeft` (C): a shift's result
+//     is the integer-PROMOTED LEFT operand's type; the right operand never
+//     contributes (`i32 << i64` is I32). `commonType`: the shift is typed
+//     like an ordinary binary op — both operands run the usual conversions
+//     and the result is their common type (`i32 << i64` is I64). The engine
+//     reads this verb instead of hardcoding C's special shift rule; the
+//     loader rejects an unknown verb. Default `promotedLeft` (a block WITHOUT
+//     it keeps C's rule, so existing adopters are byte-identical).
 enum class MixedSignednessRule : std::uint8_t {
     RankPreferUnsigned = 1,   // C 6.3.1.8
+};
+
+enum class ShiftResultRule : std::uint8_t {
+    PromotedLeft = 1,   // C 6.5.7 — result = the promoted LEFT operand
+    CommonType   = 2,   // symmetric — result = the usual-arithmetic common type
 };
 
 struct DSS_EXPORT ArithmeticConversions {
@@ -787,6 +840,7 @@ struct DSS_EXPORT ArithmeticConversions {
     std::vector<DataModelTypeRef> alsoPromote;          // e.g. ["char", "bool"]
     MixedSignednessRule mixedSignedness = MixedSignednessRule::RankPreferUnsigned;
     bool                promoteComparisons = true;
+    ShiftResultRule     shiftResult = ShiftResultRule::PromotedLeft;  // C 6.5.7
 };
 
 // Type-expression constructors. When a type-position subtree matches
@@ -1147,6 +1201,19 @@ struct DSS_EXPORT SemanticConfig {
     // narrowing). Default false → a non-C schema (toy/tsql) keeps `Enum` strictly
     // distinct from the integer ranks. Closes D-CSUBSET-ENUM-INT-CONVERSION.
     bool enumConvertsToArith = false;
+
+    // C 6.3.1.3 / 6.5.16.1 (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT): a signed↔unsigned
+    // implicit conversion in an ASSIGNMENT context — `int x = u;`, `x = u;`,
+    // `return i;` from an int-returning fn with an unsigned `i`, `f(u)` to an int
+    // param — is value-preserving in range / modular out of range. Read by
+    // `isAssignable`'s cross-signedness arm, which admits signed↔unsigned WITHIN the
+    // integer ranks in BOTH directions and at ANY width (incl. cross-signedness
+    // narrowing like `int x = sizeUL`); the HIR `coerce()` arithmetic-core arm already
+    // materializes the width-exact Cast. Default false → a non-C schema (toy/tsql) keeps
+    // signed/unsigned strictly distinct. SCOPE: signed↔unsigned only — SAME-signedness
+    // narrowing (`int x = aLong`) stays its strict widening-only rank rule (a separate
+    // deliberate choice, pinned by test_type_rules `isAssignable(i16,i32)==false`).
+    bool intCrossSignednessConverts = false;
 
     // Two orthogonal per-language alias-analysis opt-ins, both threaded
     // through `MirLoweringConfig` → `Mir` and read by CSE/LICM Load

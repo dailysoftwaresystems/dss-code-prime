@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <limits>
 #include <span>
 #include <sstream>
 #include <unordered_map>
@@ -142,6 +143,37 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         }
         for (std::size_t vi = 0; vi < o.encoding.variants.size(); ++vi) {
             auto const& v = o.encoding.variants[vi];
+            // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: immMin/immMax
+            // coherence. (a) Both present ⇒ immMin <= immMax (an inverted
+            // range matches NOTHING — a silent dead variant). (b) Either
+            // present ⇒ the guard MUST declare an immediate-bearing operand
+            // (ImmInt or MemOffset) for the magnitude matcher to read;
+            // otherwise the bound keys on a value that does not exist and
+            // the variant would match nothing (or match-any inconsistently).
+            if (v.immMin.has_value() && v.immMax.has_value()
+                && *v.immMin > *v.immMax) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}/guard", i, vi),
+                     std::format("opcode '{}' variant {}: immMin ({}) > immMax "
+                                 "({}) — an inverted magnitude range matches no "
+                                 "instruction (silent dead variant)",
+                                 o.mnemonic, vi, *v.immMin, *v.immMax));
+            }
+            if (v.immMin.has_value() || v.immMax.has_value()) {
+                bool const hasImmOperand = std::any_of(
+                    v.operandKinds.begin(), v.operandKinds.end(),
+                    [](OperandKindFilter f) {
+                        return f == OperandKindFilter::ImmInt
+                            || f == OperandKindFilter::MemOffset;
+                    });
+                if (!hasImmOperand) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/guard", i, vi),
+                         std::format("opcode '{}' variant {}: declares "
+                                     "immMin/immMax but its operandKinds carry "
+                                     "no 'imm32' or 'memoffset' operand — there "
+                                     "is no immediate magnitude to key on",
+                                     o.mnemonic, vi));
+                }
+            }
             // `opcodeBytes` is meaningful only for the x86-variable
             // shape. fixed32 carries the analog as `fixedWord` (a
             // 32-bit base bit pattern). The "non-empty" rule
@@ -385,12 +417,30 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             // A variant whose `operandKinds` declares N positions but
             // whose `wires` covers only K<N would match an N-operand
             // LIR inst then silently drop the unwired operand.
+            //
+            // D-CSUBSET-COMPUTED-GOTO (operand-aware exemption, mirroring
+            // the BlockRef-aware exemption the relocationKind rule above
+            // already applies): a `BlockRef` guard position is EXEMPT. A
+            // block reference is never byte-encoded data — it is either
+            // wired to a block-relative displacement slot (jmp/jcc,
+            // resolved at assemble time) OR it is the SYMBOL ↔ BLOCK
+            // binding directive carried by the block-address `lea` (its
+            // trailing BlockRef, intentionally UNWIRED — the encoder reads
+            // it from the operand list and records a `BlockSymPatch`, NOT a
+            // byte). In neither case is anything "silently dropped from the
+            // encoding" in the sense this rule guards (a dropped register /
+            // immediate / displacement that should have contributed bytes).
+            // The encoder fail-loud handles a BlockRef it cannot consume,
+            // so this exemption never hides a real drop.
             {
                 std::vector<bool> covered(v.operandKinds.size(), false);
                 for (auto const& w : v.wires) {
                     if (w.index < covered.size()) covered[w.index] = true;
                 }
                 for (std::size_t gi = 0; gi < covered.size(); ++gi) {
+                    if (v.operandKinds[gi] == OperandKindFilter::BlockRef) {
+                        continue;  // BlockRef positions carry no bytes (see above)
+                    }
                     if (!covered[gi]) {
                         fail(std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi),
                              std::format("opcode '{}' variant {}: guard "
@@ -582,6 +632,24 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                    return w.index == 0
                                        && isDestSlot(w.slotKind);
                                });
+            // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: a variant that wires
+            // an operand to the `Imm32MovzMovk` slot materializes its value
+            // into a scratch register (MOVZ/MOVK) and applies an EXTENDED-
+            // register operation whose destination is BAKED into the
+            // template's operation word (the sp-adjust `sub sp,sp,x16` /
+            // `add sp,sp,x16` bake Rd=sp=31 — there is no result-register
+            // FIELD for a `resultSlot` to fill). The result is architecturally
+            // implicit, exactly like the `isCall` rationale below: the byte
+            // encoding carries it via the baked register, not a routed slot.
+            // (The lea form of this slot DOES route its dest via resultSlot/
+            // extraResultSlots — scratch-free into Xd — so this exemption
+            // only relaxes the sp-adjust form that has no dest field to fill.)
+            bool const hasMovzMovkBakedDest =
+                std::any_of(v.wires.begin(), v.wires.end(),
+                            [&](TargetEncodingWire const& w) {
+                                return w.slotKind
+                                    == EncodingSlotKind::Imm32MovzMovk;
+                            });
             // `isCall` opcodes declare `result: optional` in LIR for
             // callee-returns-a-value semantics, but the byte
             // encoding doesn't carry the result — ML7 callconv
@@ -596,13 +664,15 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 && !v.resultSlot.has_value()
                 && !v.tmpl.modrmRegExt.has_value()
                 && !has2AddrDestWire
+                && !hasMovzMovkBakedDest
                 && !o.isCall) {
                 fail(std::format("/opcodes/{}/encoding/variants/{}", i, vi),
                      std::format("opcode '{}' variant {}: opcode has "
                                  "`result='{}'` but variant declares "
                                  "none of `resultSlot` / "
                                  "`template.modrmRegExt` / "
-                                 "(`requires2Address` + wire on operand 0) "
+                                 "(`requires2Address` + wire on operand 0) / "
+                                 "(`imm32.movzmovk` baked-dest) "
                                  "— destination register would be "
                                  "silently dropped",
                                  o.mnemonic, vi,
@@ -638,11 +708,32 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         // widths the keyed one does NOT declare (if last) — both are
         // config bugs; the author must key EVERY same-kind sibling
         // once any of them is width-discriminated.
+        // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the immediate-magnitude
+        // axis is a SECOND disambiguator. Two same-operandKinds variants
+        // whose [immMin,immMax] ranges are DISJOINT are unambiguously
+        // selectable by VALUE (a frame ≤4095 → the single-word imm12
+        // variant; >4095 → the shifted-imm12 variant), so they do NOT
+        // overlap — regardless of width. Only when the imm-ranges OVERLAP
+        // (or both are absent ⇒ both match-any) does the width check below
+        // decide reachability. Effective range: absent immMin ⇒ 0, absent
+        // immMax ⇒ UINT32_MAX (the match-any bounds).
+        auto const effLo = [](TargetEncodingVariant const& v) -> std::uint32_t {
+            return v.immMin.value_or(0u);
+        };
+        auto const effHi = [](TargetEncodingVariant const& v) -> std::uint32_t {
+            return v.immMax.value_or(std::numeric_limits<std::uint32_t>::max());
+        };
         for (std::size_t a = 0; a < o.encoding.variants.size(); ++a) {
             for (std::size_t b = a + 1; b < o.encoding.variants.size(); ++b) {
                 auto const& va = o.encoding.variants[a];
                 auto const& vb = o.encoding.variants[b];
                 if (va.operandKinds != vb.operandKinds) continue;
+                // Disjoint imm-ranges ⇒ value-distinguishable, never a
+                // shadow. `[loA,hiA]` and `[loB,hiB]` are disjoint iff
+                // hiA < loB or hiB < loA.
+                if (effHi(va) < effLo(vb) || effHi(vb) < effLo(va)) {
+                    continue;
+                }
                 if (va.guardWidthBits == vb.guardWidthBits) {
                     fail(std::format("/opcodes/{}/encoding/variants/{}", i, b),
                          std::format("opcode '{}': variant {} has the "
@@ -1168,8 +1259,25 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                               // callPushBytes field (a cc declaring
                               // only callPushBytes would bypass the
                               // multiple-of-alignment check below).
-                              || cc.callPushBytes != 0;
+                              || cc.callPushBytes != 0
+                              // D-WIN64-LARGE-FRAME-STACK-PROBE: same
+                              // protection for stackProbePageBytes (a cc
+                              // declaring only it would bypass the
+                              // power-of-two check below).
+                              || cc.stackProbePageBytes != 0;
         if (hasAbiInfo) {
+            // D-WIN64-LARGE-FRAME-STACK-PROBE: the probe page size IS the
+            // loop's per-iteration step; if it is not a power of two the
+            // guard-page geometry is wrong and a typo'd 4000 would
+            // silently skip a guard page. Independent of stackAlignment
+            // (checked unconditionally so a malformed stackAlignment does
+            // not also mask this).
+            if (cc.stackProbePageBytes != 0
+                && !isPow2Nonzero(cc.stackProbePageBytes)) {
+                fail(std::format("/callingConventions/{}/stackProbePageBytes", i),
+                     std::format("callingConvention '{}': stackProbePageBytes ({}) must be a power of two",
+                                 cc.name, cc.stackProbePageBytes));
+            }
             if (!isPow2Nonzero(cc.stackAlignment)) {
                 fail(std::format("/callingConventions/{}/stackAlignment", i),
                      std::format("callingConvention '{}': stackAlignment ({}) must be a non-zero power of two",

@@ -40,13 +40,20 @@ namespace dss::substrate {
 
 // Reserved worker-thread stack for the frontend's deep-recursion stages.
 //
-// Sizing rationale: the parser caps expression nesting at 256 levels and
-// the heaviest downstream walk costs on the order of ~40 KB of stack per
-// level, so the worst legal tree needs ~256 * 40 KB ≈ 10 MB. 64 MiB is a
-// generous headroom multiple. A *reserved* stack of this size costs almost
-// nothing until touched — the OS commits pages lazily as the stack grows —
-// so a shallow expression (the overwhelming common case) pays ~one page,
-// not 64 MiB.
+// Sizing rationale (post plan-24): the frontend's expression/statement passes
+// are now FLAT (explicit work-stacks, O(1) host-stack per nesting level), so
+// they no longer dominate this budget. The binding consumer is the parser's
+// ONE residual recursion — the paren/postfix-body arm (deferred plan-24 Stage
+// 5b) — which costs a host frame per nested `(`. Its measured crash floor on
+// THIS 64 MiB worker is ~3000 nested parens on the tightest build (MSVC Debug),
+// far higher on Release/MinGW. The parser's per-language `maxExpressionDepth`
+// cap is deliberately sized to fail loud BELOW that floor (c-subset = 1024), so
+// the worker never actually overflows — this reserve is the headroom that makes
+// the cap (not a stack crash) the real ceiling. A *reserved* stack of this size
+// costs almost nothing until touched — the OS commits pages lazily as the stack
+// grows — so a shallow expression (the overwhelming common case) pays ~one page,
+// not 64 MiB. NOTE: this value is load-bearing for the cap choice — lowering it
+// would lower the paren crash floor below the configured caps. Keep them in sync.
 inline constexpr std::size_t kDeepRecursionStackBytes =
     std::size_t{64} * 1024 * 1024;
 

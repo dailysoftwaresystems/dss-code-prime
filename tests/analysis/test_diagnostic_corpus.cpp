@@ -100,9 +100,10 @@ namespace {
 
     // D-PARSE-DEEP-FRONTEND-STACK: build the CU on the large worker stack
     // exactly as the production driver does (Program::compileFiles). A
-    // deeply-nested corpus fixture (e.g. expression_too_deeply_nested.c,
-    // >256 parens to trip the depth cap) parses a ~256-deep tree, which
-    // would overflow this test thread's default stack if built inline.
+    // deeply-nested corpus fixture (e.g. expression_too_deeply_nested.c, whose
+    // paren nest exceeds the c-subset config cap `parser.maxExpressionDepth`
+    // = 1024 to trip the depth guard) parses a ~1024-deep tree, which would
+    // overflow this test thread's default stack if built inline.
     auto cu = dss::substrate::callOnLargeStack(
         dss::substrate::kDeepRecursionStackBytes,
         [&]() -> std::shared_ptr<CompilationUnit> {

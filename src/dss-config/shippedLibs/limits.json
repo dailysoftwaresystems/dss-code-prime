@@ -1,0 +1,16 @@
+{
+  "$comment": "Neutral shipped <limits.h> (Item 1, 2026-06-22). C 5.2.4.2.1 integer width macros. A C `.h` would be language-specific TEXT and couple the shipped config to C; instead each object-like `#define` that IS a compile-time constant is expressed as a NEUTRAL typed named constant (name + value + hir-text type) and INJECTED by the semantic phase, exactly like the descriptor's extern symbols. The constant folds to a literal at HIR lowering AND in constant-expression position (`int a[CHAR_BIT]`). No `symbols`/`library` — <limits.h> has no linkable surface, only macros.",
+  "header": "limits.h",
+  "standard": "c89",
+  "constants": [
+    { "name": "CHAR_BIT",  "value": 8,          "type": "i32" },
+    { "name": "SCHAR_MIN", "value": -128,       "type": "i32" },
+    { "name": "SCHAR_MAX", "value": 127,        "type": "i32" },
+    { "name": "UCHAR_MAX", "value": 255,        "type": "i32" },
+    { "name": "SHRT_MIN",  "value": -32768,     "type": "i32" },
+    { "name": "SHRT_MAX",  "value": 32767,      "type": "i32" },
+    { "name": "INT_MIN",   "value": -2147483648, "type": "i32" },
+    { "name": "INT_MAX",   "value": 2147483647, "type": "i32" },
+    { "name": "UINT_MAX",  "value": 4294967295, "type": "u32" }
+  ]
+}

@@ -43,6 +43,10 @@
 #include <string_view>
 #include <vector>
 
+#if !defined(_WIN32)
+  #include <sys/resource.h>  // RLIMIT_STACK assertion in the harness-wiring pin
+#endif
+
 namespace fs = std::filesystem;
 using namespace dss;
 using namespace dss::test_support;
@@ -817,4 +821,39 @@ TEST(Examples, RunFromManifest) {
             runErrorTarget(exampleDir, m, t);
         }
     }
+}
+
+// D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (harness-wiring pin): the shared
+// spawn chokepoint `runBinary` must apply the generous-stack bump so BOTH
+// harnesses that spawn through it — this in-process runner AND the separate
+// `integrated_tests` CLI-subprocess runner — inherit it. The integrated_tests
+// runner originally LACKED the bump, so the native arm64-Linux leg SIGSEGV'd
+// (exit 139) on the ~20 MB-frame `large_frame_beyond_16mib` example, while
+// every other leg skipped that target as cross-arch/cross-format and stayed
+// green. This pin is the EVERY-LEG wiring guard (the native arm64 leg running
+// the example to exit 42 is the runtime witness for the load-bearing rlimit
+// raise). Red-on-disable: drop the `ensureGenerousSpawnStack()` call in
+// `runBinary` → QEMU_STACK_SIZE unset here AND the native large-frame run
+// crashes on the arm64 leg.
+TEST(RunHarnessStack, GenerousSpawnStackBumpIsWired) {
+    dss::test_support::ensureGenerousSpawnStack();
+
+    char const* const qss = std::getenv("QEMU_STACK_SIZE");
+    ASSERT_NE(qss, nullptr)
+        << "the qemu cross-arch corpus path needs QEMU_STACK_SIZE set";
+    EXPECT_STREQ(qss, "268435456");
+
+#if !defined(_WIN32)
+    // The load-bearing mechanism for the NATIVE large-frame run: the parent's
+    // RLIMIT_STACK soft limit is raised toward 256 MiB so a posix_spawn child
+    // inherits a stack large enough for the ~20 MB frame.
+    struct rlimit rl{};
+    ASSERT_EQ(::getrlimit(RLIMIT_STACK, &rl), 0);
+    rlim_t const want = static_cast<rlim_t>(268435456);  // 256 MiB
+    rlim_t const atLeast =
+        (rl.rlim_max == RLIM_INFINITY) ? want
+                                       : std::min<rlim_t>(want, rl.rlim_max);
+    EXPECT_GE(rl.rlim_cur, atLeast)
+        << "RLIMIT_STACK soft limit must be raised toward 256 MiB";
+#endif
 }

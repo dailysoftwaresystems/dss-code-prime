@@ -83,6 +83,12 @@ lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target,
         mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
         mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
         mirCfg.argSlotAligned            = cc->slotAligned;
+        mirCfg.argGprCount               =
+            static_cast<std::uint32_t>(cc->argGprs.size());
+        mirCfg.argFprCount               =
+            static_cast<std::uint32_t>(cc->argFprs.size());
+        mirCfg.aggregateStackExhaustsRegisters =
+            cc->aggregateStackExhaustsRegisters;
         mirCfg.vaListLayout              = cc->vaListLayout;
     }
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,

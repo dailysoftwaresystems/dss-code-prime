@@ -8,14 +8,19 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "analysis/syntactic/parser.hpp"
+#include "core/substrate/large_stack_call.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/source_buffer.hpp"
 #include "hir/const_eval.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_intrinsic_registry.hpp"
 #include "hir/hir_text.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "tokenizer/token_stream.hpp"
+#include "tokenizer/tokenizer.hpp"
 
 #include <gtest/gtest.h>
 
@@ -52,6 +57,35 @@ namespace {
     return analyze(cu);
 }
 
+// Drive c-subset → SemanticModel with the parser's expression-depth cap RAISED to
+// `cap` (the default is 256), so a deep-but-legal nesting beyond the cap parses to
+// completion — the DEEP-NEST-RECURSION lowering pins need an input deeper than any
+// program the shipped cap admits. The deep CST's parse + the orthogonal recursive
+// analyze + the deep tree's teardown all run on the 64 MiB worker (the standard
+// pipeline stack); `lowerToHir` is then called by the test ON ITS OWN MAIN STACK,
+// which is the flat-property witness for the lowerer. A bare `int main(){…}`
+// program (no `#include`) parses via Tokenizer+Parser directly (skipping the PP)
+// and is ingested via `UnitBuilder::addTree` — exactly the construct these pins use.
+[[nodiscard]] SemanticModel analyzeCSubsetRaisedCap(std::string src, std::size_t cap) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    auto srcBuf = SourceBuffer::fromString(std::move(src), "<deepmem>");
+    Tokenizer tk{srcBuf, schema};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+    ParserConfig cfg;
+    cfg.maxExpressionDepth = cap;
+    Parser p{srcBuf, schema, std::move(stream), std::move(cfg), std::move(lexDiags)};
+    ParseResult result = std::move(p).parse();
+    if (result.tree.diagnostics().hasErrors()) {
+        ADD_FAILURE() << "raised-cap parse produced errors (cap=" << cap << ")";
+    }
+    UnitBuilder builder{schema};
+    builder.addTree(std::move(result.tree));
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    return analyze(cu);
+}
+
 [[nodiscard]] std::vector<std::string> symbolNames(SemanticModel const& m) {
     std::vector<std::string> names;
     auto const& syms = m.symbols();
@@ -65,6 +99,87 @@ namespace {
         if (hir.kind(d) == HirKind::Function) return d;
     }
     return HirNodeId{};
+}
+
+// First node of `want` kind in the subtree rooted at `n` (pre-order). Used to
+// reach the shift BinaryOp past whatever statement wrapper holds it.
+[[nodiscard]] HirNodeId findFirstByKind(Hir const& hir, HirNodeId n, HirKind want) {
+    if (!n.valid()) return {};
+    if (hir.kind(n) == want) return n;
+    for (HirNodeId c : hir.children(n)) {
+        if (HirNodeId r = findFirstByKind(hir, c, want); r.valid()) return r;
+    }
+    return {};
+}
+
+// The shipped c-subset JSON text (for shiftResult perturbation), found by
+// walking up from cwd exactly as loadShipped does. Returned as raw text so the
+// perturbation is a surgical textual swap of the closed verb value — no JSON
+// library dependency in this target.
+[[nodiscard]] std::string shippedCSubsetText() {
+    fs::path dir = fs::current_path();
+    for (int i = 0; i < 12; ++i) {
+        fs::path const cand =
+            dir / "src" / "dss-config" / "sources" / "c-subset.lang.json";
+        if (fs::exists(cand)) {
+            std::ifstream in{cand, std::ios::binary};
+            std::stringstream ss;
+            ss << in.rdbuf();
+            return ss.str();
+        }
+        if (!dir.has_parent_path() || dir.parent_path() == dir) break;
+        dir = dir.parent_path();
+    }
+    ADD_FAILURE() << "could not locate shipped c-subset.lang.json above cwd";
+    return {};
+}
+
+// Lower `void f(int a, long b) { a << b; }` under a schema whose
+// arithmeticConversions.shiftResult is `verb`, and return the TypeKind the
+// shift BinaryOp carries. The shift is an EXPRESSION STATEMENT (no return/assign
+// coercion), so the BinaryOp's own type IS the shift's result type:
+// `promotedLeft` (C 6.5.7) → the promoted left operand int (I32); `commonType`
+// → the usual-arithmetic common type of (int, long) = long (I64). Exercises the
+// cst_to_hir shift arm — the site D-UAC-SHIFT-RESULT-RULE-CONFIG names.
+[[nodiscard]] TypeKind shiftResultKind(std::string const& verb) {
+    std::string text = shippedCSubsetText();
+    // The shipped config declares `promotedLeft`; swap ONLY that closed-verb
+    // value (unique in the file — the doc comment uses backticks, not quotes).
+    std::string const needle = "\"shiftResult\": \"promotedLeft\"";
+    auto const pos = text.find(needle);
+    if (pos == std::string::npos) {
+        ADD_FAILURE() << "shiftResult key not found in shipped c-subset config";
+        std::abort();
+    }
+    text.replace(pos, needle.size(), "\"shiftResult\": \"" + verb + "\"");
+    auto schema = GrammarSchema::loadFromText(text,
+                                              "<shiftResult-" + verb + ">");
+    if (!schema) {
+        ADD_FAILURE() << "perturbed schema (shiftResult=" << verb << ") failed";
+        std::abort();
+    }
+    UnitBuilder builder{*schema};
+    builder.addInMemory("void f(int a, long b) { a << b; }\n", "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    SemanticModel model = analyze(cu);
+    if (model.hasErrors()) {
+        ADD_FAILURE() << "front-end errors under shiftResult=" << verb;
+        std::abort();
+    }
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    if (!res->ok) {
+        ADD_FAILURE() << "lowering failed under shiftResult=" << verb;
+        std::abort();
+    }
+    HirNodeId const fn = firstFunction(res->hir);
+    HirNodeId const shift =
+        findFirstByKind(res->hir, res->hir.functionBody(fn), HirKind::BinaryOp);
+    if (!shift.valid()) {
+        ADD_FAILURE() << "no BinaryOp in body under shiftResult=" << verb;
+        std::abort();
+    }
+    return model.lattice().interner().kind(res->hir.typeId(shift));
 }
 
 } // namespace
@@ -115,6 +230,24 @@ TEST(HirLoweringCSubset, ArithmeticAndParams) {
     EXPECT_EQ(res->hir.kind(ret), HirKind::BinaryOp);           // a + b
 }
 
+// D-UAC-SHIFT-RESULT-RULE-CONFIG: the C 6.5.7 shift-result rule is the config
+// verb `shiftResult`, read by the cst_to_hir shift arm (the site the anchor
+// names). `promotedLeft` types `int << long` as the promoted left operand (I32);
+// `commonType` types it like an ordinary binary op (common(int,long) = I64). The
+// I32↔I64 flip when ONLY the verb changes is the red-on-disable proof the engine
+// reads the verb at the HIR-lowering tier (the const-context sibling site is
+// pinned in test_fc3_width_semantics.cpp).
+TEST(HirLoweringCSubset, ShiftResultPromotedLeftIsLeftType) {
+    EXPECT_EQ(shiftResultKind("promotedLeft"), TypeKind::I32)
+        << "promotedLeft (C 6.5.7): (int << long) lowers to a BinaryOp typed I32";
+}
+
+TEST(HirLoweringCSubset, ShiftResultCommonTypeIsCommonType) {
+    EXPECT_EQ(shiftResultKind("commonType"), TypeKind::I64)
+        << "commonType: (int << long) lowers to a BinaryOp typed I64 — the "
+           "red-on-disable flip at the cst_to_hir site";
+}
+
 TEST(HirLoweringCSubset, ControlFlowAndAssignment) {
     SemanticModel model = analyzeCSubset(
         "void f(int x) {\n"
@@ -132,6 +265,55 @@ TEST(HirLoweringCSubset, ControlFlowAndAssignment) {
     auto stmts = res->hir.children(body);
     ASSERT_EQ(stmts.size(), 1u);
     EXPECT_EQ(res->hir.kind(stmts[0]), HirKind::WhileStmt);
+}
+
+// D-CSUBSET-LOCAL-STATIC: a block-scope `static` lowers to a hidden module
+// GLOBAL (static storage duration, C 6.2.4), NOT a function-body VarDecl (a
+// stack slot). The name stays block-scoped; the STORAGE is global → the value
+// persists across calls. RED-ON-DISABLE: revert the cst_to_hir staticStorage
+// arm → `n` lowers to a body VarDecl → moduleDecls carries only the Function
+// (zero Globals) and the body's first statement is a VarDecl, not the empty
+// Block placeholder. This is the host-independent guard the runtime corpus
+// (`local_static`) pairs with.
+TEST(HirLoweringCSubset, StaticLocalLowersToModuleGlobal) {
+    SemanticModel model = analyzeCSubset(
+        "int f(void) { static int n = 0; n = n + 1; return n; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t fns = 0, globals = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) == HirKind::Function) ++fns;
+        if (res->hir.kind(d) == HirKind::Global)   ++globals;
+    }
+    EXPECT_EQ(fns, 1u);
+    EXPECT_EQ(globals, 1u)
+        << "the static local must lower to ONE hidden module Global";
+    // No stack VarDecl for `n` survives in the function body.
+    HirNodeId fn = firstFunction(res->hir);
+    for (HirNodeId s : res->hir.children(res->hir.functionBody(fn)))
+        EXPECT_NE(res->hir.kind(s), HirKind::VarDecl)
+            << "a static local must not leave a stack VarDecl in the body";
+}
+
+// Two SIBLING statics with the SAME source name in distinct blocks get DISTINCT
+// module globals (distinct SymbolIds — no mangling needed; internal-linkage
+// globals are intra-module by id). RED-ON-DISABLE: the revert collapses both to
+// body VarDecls → zero module Globals.
+TEST(HirLoweringCSubset, SiblingStaticLocalsGetDistinctGlobals) {
+    SemanticModel model = analyzeCSubset(
+        "int f(void) { { static int x = 1; x = x + 1; } "
+        "{ static int x = 2; x = x + 1; } return 0; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t globals = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root()))
+        if (res->hir.kind(d) == HirKind::Global) ++globals;
+    EXPECT_EQ(globals, 2u)
+        << "two sibling statics must mint two DISTINCT module globals";
 }
 
 TEST(HirLoweringCSubset, ForLoop) {
@@ -166,6 +348,107 @@ TEST(HirLoweringCSubset, SwitchGroupsFlatCases) {
     ASSERT_EQ(arms.size(), 2u);
     EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));   // case 1
     EXPECT_TRUE(res->hir.caseArmIsDefault(arms[1]));     // default
+}
+
+// D-CSUBSET-LABEL-BEFORE-CASE — the load-bearing equivalence (MF-3): a goto-label
+// BEFORE a case (`foo: case 1: S`) lowers to the SAME HIR as the long-supported
+// label AFTER the colon (`case 1: foo: S`) — arm(value 1, body=[LabelStmt(foo, S), …]).
+// The label stays a real LabelStmt node (so it is pre-scanned + goto-resolvable).
+TEST(HirLoweringCSubset, LabelBeforeCaseNestsLikeLabelAfterColon) {
+    struct Shape { std::size_t arms; bool def0; HirKind body0; std::uint32_t ord; bool ok; };
+    auto shapeOf = [](std::string src) -> Shape {
+        SemanticModel model = analyzeCSubset(std::move(src));
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        if (model.hasErrors() || !res->ok) return {0, false, HirKind::Error, 0, false};
+        HirNodeId fn = firstFunction(res->hir);
+        HirNodeId sw = res->hir.children(res->hir.functionBody(fn))[0];
+        if (res->hir.kind(sw) != HirKind::SwitchStmt) return {0, false, HirKind::Error, 0, false};
+        auto arms = res->hir.switchArms(sw);
+        if (arms.empty()) return {0, false, HirKind::Error, 0, false};
+        auto body0 = res->hir.caseArmBody(arms[0]);
+        HirKind const b0 = body0.empty() ? HirKind::Error : res->hir.kind(body0[0]);
+        std::uint32_t const ord = (b0 == HirKind::LabelStmt) ? res->hir.labelOrdinal(body0[0]) : 9999u;
+        return { arms.size(), res->hir.caseArmIsDefault(arms[0]), b0, ord, true };
+    };
+    Shape const before = shapeOf("void f(int x){ switch(x){ foo: case 1: x=x+1; break; default: break; } }");
+    Shape const after  = shapeOf("void f(int x){ switch(x){ case 1: foo: x=x+1; break; default: break; } }");
+    ASSERT_TRUE(before.ok);
+    ASSERT_TRUE(after.ok);
+    EXPECT_EQ(before.arms, 2u);
+    EXPECT_EQ(before.arms, after.arms);
+    EXPECT_FALSE(before.def0);
+    EXPECT_FALSE(after.def0);
+    EXPECT_EQ(before.body0, HirKind::LabelStmt);     // label nests at the arm's entry
+    EXPECT_EQ(after.body0,  HirKind::LabelStmt);
+    EXPECT_EQ(before.ord, after.ord);                // same label, same arm entry
+}
+
+// D-CSUBSET-LABEL-BEFORE-CASE Finding 2 — the speculative switchBodyItem must keep
+// the FLAT reading for a BARE case: `case 1: x=…;` groups as caseLabel + a plain
+// body stmt, NEVER a LabelStmt- or caseStmt-wrapped arm. Guards MF-3 against a
+// future reorder of the speculative branches.
+TEST(HirLoweringCSubset, BareCaseStaysFlatNoLabelWrapper) {
+    SemanticModel model = analyzeCSubset(
+        "void f(int x){ switch(x){ case 1: x=x+1; break; default: break; } }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId sw = res->hir.children(res->hir.functionBody(fn))[0];
+    ASSERT_EQ(res->hir.kind(sw), HirKind::SwitchStmt);
+    auto arms = res->hir.switchArms(sw);
+    ASSERT_EQ(arms.size(), 2u);
+    auto body0 = res->hir.caseArmBody(arms[0]);
+    ASSERT_FALSE(body0.empty());
+    EXPECT_NE(res->hir.kind(body0[0]), HirKind::LabelStmt);   // NOT label-wrapped
+}
+
+// D-CSUBSET-LABEL-BEFORE-CASE guard — a `caseStmt` that is not a direct switch-body
+// item (here: outside any switch) fails loud S_CaseLabelNotInSwitch (C 6.8.1),
+// never a stray arm-less case. Red-on-disable: drop the lowerStmt CaseStmt guard.
+TEST(HirLoweringCSubset, CaseLabelOutsideSwitchFailsLoud) {
+    SemanticModel model = analyzeCSubset("int f(void){ case 1: return 0; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_GE(countCode(r, DiagnosticCode::S_CaseLabelNotInSwitch), 1u);
+}
+
+// D-CSUBSET-LABEL-BEFORE-CASE — the multi-label ADJACENT-case chain (the iterative
+// lowerCaseChain `continue` + empty-arm makeSkip path) AND a label before `default`,
+// the two forms the corpus/equivalence pins do not exercise. `foo: case 1: case 2: S`
+// → arm(1, [LabelStmt(foo, {})]) (empty, label-marked) + arm(2, [S, …]); `bar: default:`
+// → the default arm's body starts with LabelStmt(bar).
+TEST(HirLoweringCSubset, LabelBeforeAdjacentCasesAndDefaultChainArms) {
+    SemanticModel model = analyzeCSubset(
+        "void f(int x){ switch(x){ foo: case 1: case 2: x=x+1; break; "
+        "bar: default: x=x+9; break; } }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId sw = res->hir.children(res->hir.functionBody(fn))[0];
+    ASSERT_EQ(res->hir.kind(sw), HirKind::SwitchStmt);
+    auto arms = res->hir.switchArms(sw);
+    ASSERT_EQ(arms.size(), 3u);                          // case 1, case 2, default
+    // arm 0 = case 1: empty body, label-marked at entry (LabelStmt(foo, {}))
+    EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));
+    auto b0 = res->hir.caseArmBody(arms[0]);
+    ASSERT_FALSE(b0.empty());
+    EXPECT_EQ(res->hir.kind(b0[0]), HirKind::LabelStmt);
+    // arm 1 = case 2: the real body statement, NOT label-wrapped
+    EXPECT_FALSE(res->hir.caseArmIsDefault(arms[1]));
+    auto b1 = res->hir.caseArmBody(arms[1]);
+    ASSERT_FALSE(b1.empty());
+    EXPECT_NE(res->hir.kind(b1[0]), HirKind::LabelStmt);
+    // arm 2 = default: label-before-default → body starts with LabelStmt(bar)
+    EXPECT_TRUE(res->hir.caseArmIsDefault(arms[2]));
+    auto b2 = res->hir.caseArmBody(arms[2]);
+    ASSERT_FALSE(b2.empty());
+    EXPECT_EQ(res->hir.kind(b2[0]), HirKind::LabelStmt);
 }
 
 TEST(HirLoweringCSubset, CallAndTypedef) {
@@ -589,25 +872,22 @@ TEST(HirLoweringCSubset, MemberAccessLowersToHirMemberAccess) {
     EXPECT_EQ(interner.kind(res->hir.typeId(kids[0])), TypeKind::Struct);
 }
 
-// D5.2 cycle 1: adding `Identifier` to `typeBase` lets typedef'd / struct-tag
-// names work bare in type position at top level. The engine's `resolveTypeNode`
-// already resolved Identifier-in-type-position via the SE5 alias path
-// (Type-kind symbol → its `.type`); this cycle's contribution is the schema
-// change that lets the parser accept the form. Block-scope alias (`{ Foo x; }`)
-// is intentionally deferred — it collides with `exprStmt` at the statement
-// alt and needs speculative-alt support (later cycle).
+// D5.2 cycle 1: adding `Identifier` to `typeBase` lets a typedef-name work
+// bare in type position at top level. The engine's `resolveTypeNode` resolves
+// Identifier-in-type-position via the SE5 alias path (an ORDINARY Type-kind
+// symbol → its `.type`); this cycle's contribution is the schema change that
+// lets the parser accept the form. Block-scope alias (`{ Foo x; }`) is
+// intentionally deferred — it collides with `exprStmt` at the statement alt
+// and needs speculative-alt support (later cycle).
 //
-// **Known C divergence**: c-subset has a single identifier namespace (no
-// separate "tag namespace"), and `resolveTypeNode`'s alias lookup doesn't
-// distinguish typedef-minted Type symbols from struct-tag Type symbols.
-// Consequence: after `struct Foo { ... };` alone (no typedef), `Foo x;` ALSO
-// lowers cleanly — i.e. every struct tag is implicitly usable as a bare type
-// name. Real C requires `struct Foo` or an explicit typedef. The two tests
-// below pin both shapes honestly.
+// C 6.2.3 tag namespace (now SEPARATED): a bare `Foo` resolves ONLY an
+// ordinary typedef-name — a struct TAG `Foo` is reachable only as `struct Foo`
+// (see `BareStructTagNotUsableAsTypeName` below). Here the alias `FooT` is a
+// genuine typedef (Ordinary), so `FooT origin;` resolves it directly.
 TEST(HirLoweringCSubset, TypedefStructAliasAtTopLevel) {
-    // The alias name must differ from the struct tag because the single
-    // identifier namespace rejects same-name redeclaration. See the negative
-    // test `TypedefSameNameAsTagRedeclaresInSingleNamespace` below.
+    // The alias name differs from the struct tag here purely for clarity; with
+    // the separate tag namespace a SAME-named alias is now also legal (see
+    // `TypedefSameNameAsTagCoexistsAcrossNamespaces`).
     SemanticModel model = analyzeCSubset(
         "struct Foo { int x; };\n"
         "typedef struct Foo FooT;\n"
@@ -632,15 +912,29 @@ TEST(HirLoweringCSubset, TypedefStructAliasAtTopLevel) {
     EXPECT_EQ(interner.name(originType), "Foo");
 }
 
-// D5.2 cycle 1 (review-fix): pin the bare-struct-tag-as-type-name behavior
-// that falls out of the schema change. Without a typedef, `Foo x;` ALSO
-// works — the resolveTypeNode SE5 alias path doesn't distinguish struct
-// tags from typedef'd Type symbols. Documented as a known C divergence; this
-// test pins it so a future cycle that separates the namespaces fails loud.
-TEST(HirLoweringCSubset, BareStructTagUsableAsTypeName) {
+// C 6.2.3 tag namespace (closes the tag-namespace residue of
+// D-CSUBSET-DECL-GRAMMAR-LOW-RESIDUES): a struct TAG is NOT a bare type name.
+// `Foo bare;` (no `struct`, no typedef) must FAIL — the tag `Foo` lives in the
+// Tag namespace and an ordinary type-position lookup of the bare identifier
+// misses it. `struct Foo bare;` IS the valid spelling and resolves the tag.
+// This was previously a DOCUMENTED C DIVERGENCE (the old single-namespace
+// resolveTypeNode treated a tag as a bare typedef-name); this cycle is the
+// "future cycle that separates the namespaces" the prior pin anticipated.
+// RED-ON-DISABLE: with the tag bound Ordinary (pre-change), `Foo bare;`
+// resolves and `hasErrors()` is false → the first EXPECT_TRUE fails.
+TEST(HirLoweringCSubset, BareStructTagNotUsableAsTypeName) {
+    SemanticModel bareModel = analyzeCSubset(
+        "struct Foo { int x; };\n"
+        "Foo bare;\n");                  // no `struct`, no typedef — invalid in C
+    EXPECT_TRUE(bareModel.hasErrors())
+        << "a bare struct tag `Foo` is NOT a type name — `struct Foo` is required";
+    EXPECT_EQ(countCode(bareModel.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "the bare tag name misses the ordinary namespace → S_UnknownType";
+
+    // The valid spelling — `struct Foo bare;` — resolves the tag and lowers.
     SemanticModel model = analyzeCSubset(
         "struct Foo { int x; };\n"
-        "Foo bare;\n");                  // no typedef
+        "struct Foo bare;\n");
     ASSERT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
               ? "" : model.diagnostics().all()[0].actual);
@@ -658,20 +952,22 @@ TEST(HirLoweringCSubset, BareStructTagUsableAsTypeName) {
     EXPECT_EQ(interner.name(bareType), "Foo");
 }
 
-// D5.2 cycle 1 (review-fix): pin the negative — same-name typedef of a
-// struct tag fires S_RedeclaredSymbol (single namespace). Catches any
-// future cycle that mistakenly relaxes the same-scope dup check.
-TEST(HirLoweringCSubset, TypedefSameNameAsTagRedeclaresInSingleNamespace) {
+// C 6.2.3 tag namespace: `typedef struct Foo Foo;` is LEGAL — the tag `Foo`
+// (Tag namespace) and the typedef alias `Foo` (Ordinary namespace) coexist,
+// so NO S_RedeclaredSymbol fires. This INVERTS the prior pin
+// (TypedefSameNameAsTagRedeclaresInSingleNamespace), which asserted the old
+// single-namespace COLLISION the prior cycle documented as a C divergence.
+// RED-ON-DISABLE: route the composite tag BIND Ordinary (drop the
+// fieldChildren→Tag gate) and the alias collides with the tag →
+// S_RedeclaredSymbol reappears and this count rises above 0.
+TEST(HirLoweringCSubset, TypedefSameNameAsTagCoexistsAcrossNamespaces) {
     SemanticModel model = analyzeCSubset(
         "struct Foo { int x; };\n"
-        "typedef struct Foo Foo;\n");    // same name as the tag — collides
-    EXPECT_TRUE(model.hasErrors());
-    bool sawRedecl = false;
-    for (auto const& d : model.diagnostics().all()) {
-        if (d.code == DiagnosticCode::S_RedeclaredSymbol) { sawRedecl = true; break; }
-    }
-    EXPECT_TRUE(sawRedecl)
-        << "expected S_RedeclaredSymbol on `typedef struct Foo Foo;`";
+        "typedef struct Foo Foo;\n");    // tag Foo (Tag) + typedef Foo (Ordinary)
+    EXPECT_FALSE(model.hasErrors())
+        << "C 6.2.3: a typedef alias may share a struct tag's name";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "the tag and the typedef are in separate namespaces — no collision";
 }
 
 // D5.1 cycle 4 review fix: the DOT form goes through a different lowering
@@ -901,6 +1197,38 @@ TEST(HirLoweringCSubset, ComplexLvalueCompoundAssignUsesTempPointer) {
     // the temp pointer's type is Ptr<I32>
     auto const& ti = model.lattice().interner();
     EXPECT_EQ(ti.kind(res->hir.varDeclType(inner[0])), TypeKind::Ptr);
+}
+
+// A COMPOUND assignment USED AS A VALUE (`y = (x += 2)`) — the path the Assign
+// frame's `compound` branch handles, which the statement-position compound tests
+// above do NOT exercise (those route through the separate `lowerCompoundAssign`).
+// `(x += 2)` lowers to `SeqExpr([AssignStmt(Ref x, BinaryOp(Ref x, 2))], yield Ref
+// x)`: the stored value is `lvRead(x) + 2` with operand[0] = the lvalue read,
+// operand[1] = the rhs (`2`). This pins the flattened frame builds the SAME
+// structure (and ordering: the lvRead is emitted before the rhs) as the recursive
+// `lowerBinary` Assign arm. Guards the byte-identity of the compound-as-value arm.
+TEST(HirLoweringCSubset, CompoundAssignAsSubExpressionLowersToSeqExpr) {
+    SemanticModel model = analyzeCSubset(
+        "void f(int x) { int y; y = (x += 2); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    // children: [VarDecl y, AssignStmt(y, <value of (x += 2)>)].
+    HirNodeId outer = res->hir.children(body)[1];
+    ASSERT_EQ(res->hir.kind(outer), HirKind::AssignStmt);
+    HirNodeId val = res->hir.assignValue(outer);             // the (x += 2) value
+    ASSERT_EQ(res->hir.kind(val), HirKind::SeqExpr);
+    auto const stmts = res->hir.seqExprStmts(val);
+    ASSERT_EQ(stmts.size(), 1u);
+    ASSERT_EQ(res->hir.kind(stmts[0]), HirKind::AssignStmt);  // x = (x + 2)
+    HirNodeId stored = res->hir.assignValue(stmts[0]);
+    ASSERT_EQ(res->hir.kind(stored), HirKind::BinaryOp);      // x + 2
+    auto const ops = res->hir.children(stored);
+    ASSERT_EQ(ops.size(), 2u);
+    EXPECT_EQ(res->hir.kind(ops[0]), HirKind::Ref);           // operand[0] = lvRead(x)
+    EXPECT_EQ(res->hir.kind(res->hir.seqExprResult(val)), HirKind::Ref);  // yield Ref x
 }
 
 TEST(HirLoweringCSubset, ArrayDeclarationLowersToArrayType) {
@@ -2977,4 +3305,134 @@ TEST(HirLoweringCSubset, NoShippedConstructLowersToIntrinsic) {
                "the inliner's blanket IntrinsicCall admission, gate it on per-"
                "intrinsic inline-safety: D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.";
     }
+}
+
+// ── plan 24 (cst_to_hir residuals): the Assign + Switch arms are now flattened
+// onto the existing ExprFrame/StmtFrame work-stack drivers. These two strict pins
+// witness the FLAT-on-the-main-stack property (RED-on-disable: revert the
+// flattening → host recursion overflows the test's normal stack at the chain
+// depth → crash) AND the exact byte-identical HIR shape (a flattening that parsed
+// without crashing but produced the WRONG structure fails the shape assertions).
+// They run the LOWERING on the default test main stack (NO large-stack wrapper) —
+// that is the whole point — while the orthogonal recursive parse/analyze of the
+// deep tree runs on the 64 MiB worker (the parser's assign-RHS arm is flat since
+// plan-24 Stage 5; `analyze` wraps itself in `callOnLargeStack`). The Tree/Hir
+// arenas tear down FLATLY (dense ArenaContainer, not a recursive node graph), so
+// the deep tree's destruction never overflows the main stack. The cap is raised
+// above the depth so the SEMANTIC P_ExpressionTooDeep does not fire (the separate
+// too-deep pins prove the cap still fires at its configured point).
+
+// A ~2000-deep RIGHT-assoc assignment chain `a=a=…=a;` lowers (CST→HIR) flat on the
+// normal stack to the nested-SeqExpr backbone. Each `=` USED AS A VALUE lowers to
+// `SeqExpr([AssignStmt(Ref a, ·)], yield = Ref a)`; the outermost `=` is in
+// statement position (an AssignStmt whose value is the (N-1)-op sub-chain). The
+// Assign frame turns the deep RHS re-entry into a heap work-stack push, so the
+// descent carries flat O(1) host-stack cost. RED-on-disable: restore the recursive
+// `lowerBinary` Assign arm → the deep RHS recurses ~2000 host frames → overflow.
+TEST(HirLoweringCSubset, DeepRightAssocAssignChainLowersFlatOnNormalStack) {
+    constexpr int kOps = 2000;   // 2000 `=` ops → a 2000-deep right-assoc chain
+
+    // `int main(void){ int a; a=a=…=a; return 0; }` — `a` is a simple int lvalue,
+    // so the chain recurses PURELY through the value-yielding Assign RHS arm (no
+    // prep, no other nesting). Built once; parsed with the cap raised.
+    std::string src = "int main(void){ int a; a";
+    for (int i = 0; i < kOps; ++i) src += "=a";
+    src += "; return 0; }";
+
+    SemanticModel model = analyzeCSubsetRaisedCap(std::move(src), kOps + 1000);
+    ASSERT_FALSE(model.hasErrors());
+
+    DiagnosticReporter r;
+    // Lower on THIS (main) stack — the flat-property witness. A revert recurses
+    // here and overflows.
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    // Shape walk: the function body's first statement is the outermost AssignStmt;
+    // its value is the (N-1)-op sub-chain = exactly kOps-1 nested SeqExprs, each
+    // holding one AssignStmt whose stored value is the next-deeper SeqExpr, the
+    // innermost storing a bare Ref. A left-nested or level-dropping mis-lowering
+    // breaks the count/shape here (not merely "didn't crash").
+    HirNodeId const fnBody =
+        res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    // children: [VarDecl a, AssignStmt(...)] (the ExprStmt-position assign lowers
+    // to a bare AssignStmt statement).
+    auto const bodyStmts = res->hir.children(fnBody);
+    ASSERT_GE(bodyStmts.size(), 2u);
+    HirNodeId const outerAssign = bodyStmts[1];
+    ASSERT_EQ(res->hir.kind(outerAssign), HirKind::AssignStmt);
+    EXPECT_EQ(res->hir.kind(res->hir.assignTarget(outerAssign)), HirKind::Ref);
+
+    int seqLevels = 0;
+    HirNodeId cur = res->hir.assignValue(outerAssign);   // the (N-1)-op value chain
+    while (res->hir.kind(cur) == HirKind::SeqExpr) {
+        ++seqLevels;
+        // Each value-`=` is `SeqExpr([AssignStmt(Ref a, stored)], yield Ref a)`.
+        auto const stmts = res->hir.seqExprStmts(cur);
+        ASSERT_EQ(stmts.size(), 1u) << "value-assign SeqExpr has exactly one stmt";
+        ASSERT_EQ(res->hir.kind(stmts[0]), HirKind::AssignStmt);
+        EXPECT_EQ(res->hir.kind(res->hir.seqExprResult(cur)), HirKind::Ref)
+            << "the SeqExpr yields the re-read lvalue";
+        cur = res->hir.assignValue(stmts[0]);            // descend to the next level
+    }
+    // The innermost stored value is the bare `a` Ref (the chain's tail operand).
+    EXPECT_EQ(res->hir.kind(cur), HirKind::Ref);
+    EXPECT_EQ(seqLevels, kOps - 1)
+        << "exactly one nested value-SeqExpr per `=` below the statement-position "
+           "outermost assign";
+}
+
+// A deeply-NESTED switch (`switch(x){ case 1: switch(x){ case 1: … default: …} … }`)
+// lowers (CST→HIR) flat on the normal stack to a SwitchStmt whose single case-arm
+// body is the next-inner SwitchStmt, nested kDepth deep. The Switch frame turns the
+// per-arm-body `lowerStmt` re-entry into a heap work-stack push, so a switch nested
+// in a switch-arm body carries flat O(1) host-stack cost (the recursive form
+// recursed `lowerStmt → lowerSwitch → lowerStmt` once per level). RED-on-disable:
+// restore the recursive `lowerSwitch` body re-entries → ~kDepth host frames →
+// overflow. The shape walk pins the exact innermost-SwitchStmt backbone.
+TEST(HirLoweringCSubset, DeepNestedSwitchLowersFlatOnNormalStack) {
+    constexpr int kDepth = 1200;   // nesting levels of switch-in-case-body
+
+    // `int main(void){ int x=0; switch(x){case 1: switch(x){case 1: … case 0:
+    // return 0; …} default: break;} … return 0; }` — each level is a switch whose
+    // `case 1:` body is the next-inner switch; the innermost returns. Each switch
+    // also has a `default: break;` so every level is a real multi-arm switch.
+    std::string src = "int main(void){ int x=0; ";
+    for (int i = 0; i < kDepth; ++i) src += "switch(x){ case 1: ";
+    src += "return 0;";                          // innermost case-1 body
+    for (int i = 0; i < kDepth; ++i) src += " default: break; }";
+    src += " return 0; }";
+
+    SemanticModel model = analyzeCSubsetRaisedCap(std::move(src), kDepth + 1000);
+    ASSERT_FALSE(model.hasErrors());
+
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);   // lower on THIS (main) stack — flat witness
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    // Shape walk: descend the SwitchStmt backbone. The body's switch is level 0;
+    // each level's FIRST arm (case 1) body's first statement is the next switch,
+    // kDepth deep, the innermost arm body holding the `return`. A dropped level or
+    // mis-grouped arm breaks the count here.
+    HirNodeId const fnBody =
+        res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    auto const bodyStmts = res->hir.children(fnBody);
+    // children: [VarDecl x, SwitchStmt, ReturnStmt].
+    ASSERT_GE(bodyStmts.size(), 2u);
+    HirNodeId cur = bodyStmts[1];
+    int switchLevels = 0;
+    while (res->hir.kind(cur) == HirKind::SwitchStmt) {
+        ++switchLevels;
+        auto const arms = res->hir.switchArms(cur);
+        ASSERT_GE(arms.size(), 2u) << "each level is case 1 + default";
+        EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));   // arm 0 = case 1
+        EXPECT_TRUE(res->hir.caseArmIsDefault(arms[1]));     // arm 1 = default
+        auto const arm0Body = res->hir.caseArmBody(arms[0]);
+        ASSERT_FALSE(arm0Body.empty());
+        cur = arm0Body[0];                                   // descend into case 1's body
+    }
+    // The innermost case-1 body is the `return 0;`.
+    EXPECT_EQ(res->hir.kind(cur), HirKind::ReturnStmt);
+    EXPECT_EQ(switchLevels, kDepth)
+        << "exactly one nested SwitchStmt per source `switch`";
 }

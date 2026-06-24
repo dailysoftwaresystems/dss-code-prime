@@ -1290,6 +1290,22 @@ void recomputeAltExpectedSets(GrammarSchemaData& data) {
 // `Parser::predictivePrefixPrunes`. This prefix table itself is unconditionally
 // exact; the precondition is purely about how the parser interprets the
 // observed token against it.
+// D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD. Derive the token-id-keyed set of
+// CONTEXTUAL/scope-resolvable kinds from the `contextual` LexemeMeaning flags
+// (already forced on every keyword under `reservedWordPolicy: "contextual"`).
+// `LexemeMeaning::id` is the SchemaTokenId the lexeme produces; a kind is
+// contextual iff ANY of its meanings is a soft keyword. The parser-side prune
+// (`predictivePrefixPrunes`) queries this O(1) to skip a contextual offset.
+// AGNOSTIC + config-derived: walks the lexeme table, names no token/language.
+void computeContextualKinds(GrammarSchemaData& data) {
+    data.contextualKinds.clear();
+    for (auto const& [_, meanings] : data.lexemeTable) {
+        for (auto const& m : meanings) {
+            if (m.contextual && m.id.valid()) data.contextualKinds.insert(m.id.v);
+        }
+    }
+}
+
 void computePredictivePrefixes(GrammarSchemaData& data) {
     // A defensive cap on prefix length. The walk self-terminates at the
     // first non-terminal, so a realistic prefix is 1-3 entries; this only
@@ -1911,6 +1927,41 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             else {
                 coll.emit(DiagnosticCode::C_MissingField, "/reservedWordPolicy",
                           std::format("unknown reservedWordPolicy '{}' (expected 'strict' or 'contextual')", v));
+            }
+        }
+    }
+
+    // parser: optional top-level block carrying engine-parser tunables the
+    // language wants config-driven rather than baked into a C++ default. Today
+    // the only field is `maxExpressionDepth` — the Pratt walker's
+    // expression-nesting cap (the positioned `P_ExpressionTooDeep` backstop's
+    // threshold). Omitting the block (or the field) leaves the cap at the
+    // `ParserConfig` C++ fallback (256); declaring it makes the cap 100%
+    // config-driven. The value must be a positive integer; the cap is still a
+    // hard fail-loud ceiling (a deeper nest emits the positioned diagnostic and
+    // recovers — never a crash) — declaring a high value just raises HOW deep a
+    // legal nest the engine admits before the backstop trips, bounded by the
+    // worker stack the still-recursive paren arm runs on. AGNOSTIC: every
+    // language reads its own value; the loader names no language.
+    if (doc.contains("parser")) {
+        json const& parserObj = doc.at("parser");
+        if (!parserObj.is_object()) {
+            coll.emit(DiagnosticCode::C_ConflictingField, "/parser",
+                      "'parser' must be an object");
+        } else if (parserObj.contains("maxExpressionDepth")) {
+            json const& med = parserObj.at("maxExpressionDepth");
+            // Must be a positive integer. `is_number_unsigned` rejects negatives
+            // and floats; the explicit `> 0` rejects an authored 0 (which would
+            // make every expression — even a bare identifier, depth 1 — trip the
+            // cap, never producing a usable parse). Mirrors the runtime guard in
+            // the Parser ctor (`maxExpressionDepth must be >= 1`).
+            if (!med.is_number_unsigned() || med.get<std::uint64_t>() == 0) {
+                coll.emit(DiagnosticCode::C_ConflictingField,
+                          "/parser/maxExpressionDepth",
+                          "'maxExpressionDepth' must be a positive integer");
+            } else {
+                data.maxExpressionDepth =
+                    static_cast<std::size_t>(med.get<std::uint64_t>());
             }
         }
     }
@@ -2980,6 +3031,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 computeNullableTails       (data);
                 recomputeAltExpectedSets   (data);
                 computePredictivePrefixes  (data);
+                computeContextualKinds     (data);
                 computeFollowSets          (data, coll);
                 validateBodyDefaultKindsOffGrammar(data, coll);
                 validateOperatorBodyRules  (data, coll);
@@ -3611,6 +3663,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readField("defineDirective",      cfg.defineDirective);
             readField("undefDirective",       cfg.undefDirective);
             readField("includeDirective",     cfg.includeDirective);
+            // FC14 (D-PP-CONDITIONAL-COMPILATION): the conditional-compilation
+            // directive WORDS + the `defined` operator are matched by lexeme
+            // TEXT (like define/undef/include), so they are REQUIRED + validated
+            // NON-EMPTY (readField) but NOT `checkToken`-resolved (there is no
+            // token kind -- they lex as plain Identifier). Required-when-block-
+            // present so an opt-in language declares the whole conditional
+            // vocabulary; the engine never hard-codes a directive spelling.
+            readField("ifDirective",          cfg.ifDirective);
+            readField("ifdefDirective",       cfg.ifdefDirective);
+            readField("ifndefDirective",      cfg.ifndefDirective);
+            readField("elifDirective",        cfg.elifDirective);
+            readField("elseDirective",        cfg.elseDirective);
+            readField("endifDirective",       cfg.endifDirective);
+            readField("definedOperator",      cfg.definedOperator);
             readField("quoteIncludeToken",    cfg.quoteIncludeToken);
             // `functionLikeOpenToken` (C's `(`) is REQUIRED + validated: the
             // macro engine reads it to tell `#define F(x)` (function-like, the
@@ -4269,11 +4335,28 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                         effect.visibility = *v;
                                         any = true;
                                     }
+                                    // D-CSUBSET-LOCAL-STATIC: the storage-duration
+                                    // axis — a block-scope `static` confers static
+                                    // storage (the engine routes the local decl to
+                                    // the global-emission path). Optional bool.
+                                    if (eff.contains("staticStorage")) {
+                                        if (!eff.at("staticStorage").is_boolean()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'staticStorage' must be a "
+                                                      "boolean");
+                                            continue;
+                                        }
+                                        effect.staticStorage =
+                                            eff.at("staticStorage").get<bool>();
+                                        if (effect.staticStorage) any = true;
+                                    }
                                     if (!any) {
                                         coll.emit(DiagnosticCode::C_InvalidSemantics,
                                                   effPath,
                                                   "linkage effect must set at least "
-                                                  "one of 'binding' or 'visibility'");
+                                                  "one of 'binding', 'visibility', or "
+                                                  "'staticStorage'");
                                         continue;
                                     }
                                     rule.linkageSpecifiers.emplace(specText, effect);
@@ -4644,6 +4727,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             } else {
                                 rule.warnIfUnused =
                                     entry.at("warnIfUnused").get<bool>();
+                            }
+                        }
+
+                        // D-CSUBSET-EXTERN-DEFINITION-MERGE: optional
+                        // `nonDefiningDeclaration` flag (default false). A
+                        // declaration that announces a symbol defined elsewhere
+                        // (c-subset's `externDecl`); it merges with an in-TU
+                        // definition of the same name (the definition wins).
+                        if (entry.contains("nonDefiningDeclaration")) {
+                            if (!entry.at("nonDefiningDeclaration").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/nonDefiningDeclaration",
+                                          "'nonDefiningDeclaration' must be a boolean");
+                            } else {
+                                rule.nonDefiningDeclaration =
+                                    entry.at("nonDefiningDeclaration").get<bool>();
                             }
                         }
 
@@ -5182,6 +5281,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     rule.hardParents.push_back(data.rules->find(name));
                                     rule.hardParentNames.push_back(std::move(name));
                                 }
+                            }
+                        }
+                        // C 6.2.3 tag namespace: an opt-in flag marking this
+                        // reference rule as a TAG reference (`struct Foo`),
+                        // resolved against the Tag namespace at lookup time.
+                        if (entry.contains("isTagReference")) {
+                            if (!entry.at("isTagReference").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/isTagReference",
+                                          "'isTagReference' must be a boolean");
+                            } else {
+                                rule.isTagReference =
+                                    entry.at("isTagReference").get<bool>();
                             }
                         }
                         cfg.references.push_back(std::move(rule));
@@ -6206,15 +6318,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     bool ok = true;
                     for (auto const& [key, _] : obj.items()) {
                         if (key != "integerPromotion" && key != "mixedSignedness"
-                            && key != "promoteComparisons"
+                            && key != "promoteComparisons" && key != "shiftResult"
                             && key.rfind("$", 0) != 0) {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                       "/semantics/arithmeticConversions/" + key,
                                       std::format("unknown 'arithmeticConversions' "
                                                   "field '{}' — expected "
                                                   "'integerPromotion', "
-                                                  "'mixedSignedness', or "
-                                                  "'promoteComparisons'", key));
+                                                  "'mixedSignedness', "
+                                                  "'promoteComparisons', or "
+                                                  "'shiftResult'", key));
                             ok = false;
                         }
                     }
@@ -6354,6 +6467,35 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         } else {
                             ac.promoteComparisons =
                                 obj.at("promoteComparisons").get<bool>();
+                        }
+                    }
+                    // `shiftResult` (C 6.5.7) — optional closed verb; absent
+                    // means `promotedLeft` (the struct default, C's rule), so a
+                    // block written before this field keeps C's behavior. An
+                    // unknown spelling fails loud (never a silent default).
+                    if (obj.contains("shiftResult")) {
+                        if (!obj.at("shiftResult").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/arithmeticConversions/"
+                                      "shiftResult",
+                                      "'shiftResult' must be a string (closed verb)");
+                            ok = false;
+                        } else {
+                            auto const verb =
+                                obj.at("shiftResult").get<std::string>();
+                            if (verb == "promotedLeft") {
+                                ac.shiftResult = ShiftResultRule::PromotedLeft;
+                            } else if (verb == "commonType") {
+                                ac.shiftResult = ShiftResultRule::CommonType;
+                            } else {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/arithmeticConversions/"
+                                          "shiftResult",
+                                          std::format("unknown 'shiftResult' verb "
+                                                      "'{}' — expected 'promotedLeft' "
+                                                      "or 'commonType'", verb));
+                                ok = false;
+                            }
                         }
                     }
                     if (ok) cfg.arithmeticConversions = std::move(ac);
@@ -7173,6 +7315,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     cfg.enumConvertsToArith = v.get<bool>();
                 }
             }
+            // C 6.3.1.3/6.5.16.1 signed↔unsigned implicit assignment conversion (read
+            // by `isAssignable`'s cross-signedness arm). Opt-in (default false → a
+            // non-C schema keeps signed/unsigned strictly distinct).
+            if (sem.contains("intCrossSignednessConverts")) {
+                auto const& v = sem.at("intCrossSignednessConverts");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/intCrossSignednessConverts",
+                              "'intCrossSignednessConverts' must be a boolean");
+                } else {
+                    cfg.intCrossSignednessConverts = v.get<bool>();
+                }
+            }
 
             // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d):
             // per-language `pointerAliasing` block. Single bool field
@@ -7415,6 +7570,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readExprRule("vaStartRule",         cfg.vaStartRule,         cfg.vaStartRuleName);
             readExprRule("vaArgRule",           cfg.vaArgRule,           cfg.vaArgRuleName);
             readExprRule("vaEndRule",           cfg.vaEndRule,           cfg.vaEndRuleName);
+            // D-CSUBSET-COMPUTED-GOTO: `&&label` → core HirKind::LabelAddressOf.
+            readExprRule("labelAddressRule",    cfg.labelAddressRule,    cfg.labelAddressRuleName);
 
             // ── HR10: extensionKinds [{ name, lang }] ──
             if (hl.contains("extensionKinds")) {
@@ -7597,6 +7754,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             if (hl.contains("caseLabelRule")) {
                 (void)resolveRuleField(hl, "caseLabelRule", "/hirLowering",
                                        cfg.caseLabelRule, cfg.caseLabelRuleName);
+            }
+            if (hl.contains("caseStmtRule")) {   // D-CSUBSET-LABEL-BEFORE-CASE (optional)
+                (void)resolveRuleField(hl, "caseStmtRule", "/hirLowering",
+                                       cfg.caseStmtRule, cfg.caseStmtRuleName);
             }
 
             // Char / string literal lowering blocks:

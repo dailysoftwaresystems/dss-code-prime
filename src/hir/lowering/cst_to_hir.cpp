@@ -1,6 +1,7 @@
 #include "hir/lowering/cst_to_hir.hpp"
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
+#include "analysis/semantic/constant_symbol_fold.hpp" // Item 1: shared enum/constant Ref->literal builder
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/type_rules.hpp"      // FC3 c1: usualArithmeticCommonType / resolveArithmeticRules
 #include "core/types/data_model.hpp"
@@ -202,6 +203,15 @@ struct Lowerer {
     // side-table stays sparse and a wrongly-defaulted global fails SAFE (writable
     // never re-introduces the read-only-store crash).
     std::vector<std::pair<HirNodeId, MutabilityAttr>>& mutability;
+
+    // D-CSUBSET-LOCAL-STATIC: the module-level decls accumulator (the SAME
+    // vector `lowerTree` appends top-level decls to). A block-scope `static`
+    // local lowers to a hidden module-global appended HERE — not to the
+    // enclosing function body — so its symbol joins `globalSymbols` and its
+    // references route through GlobalAddr (static storage), while its NAME
+    // stays block-scoped. Set at each `lowerTree` entry; null outside a tree
+    // walk (the static-emit site fails loud on null — never a silent drop).
+    std::vector<HirNodeId>* moduleDecls_ = nullptr;
 
     // O(1) lookups.
     std::unordered_map<std::uint32_t, std::size_t> ruleMap_;     // RuleId.v → ruleMappings idx
@@ -670,7 +680,8 @@ struct Lowerer {
     // (D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC). Agnostic: BOTH the effect
     // map and the ignored-kind set are per-language config; the engine compares
     // resolved SchemaTokenIds + source text, never a hardcoded kind/identity.
-    [[nodiscard]] LinkageAttr linkageFrom(NodeId prefixNode, DeclarationRule const& decl) {
+    [[nodiscard]] LinkageAttr linkageFrom(NodeId prefixNode, DeclarationRule const& decl,
+                                          bool* staticStorageOut = nullptr) {
         LinkageAttr attr{};
         if (!prefixNode.valid() || decl.linkageSpecifiers.empty()) return attr;
         // Collect the prefix's tokens in SOURCE order (the composite-key
@@ -757,6 +768,8 @@ struct Lowerer {
             if (it != decl.linkageSpecifiers.end()) {
                 if (it->second.binding)    attr.binding    = *it->second.binding;
                 if (it->second.visibility) attr.visibility = *it->second.visibility;
+                if (it->second.staticStorage && staticStorageOut != nullptr)
+                    *staticStorageOut = true;
             } else {
                 emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
                       std::format("'{}' is not a recognized linkage specifier",
@@ -791,6 +804,10 @@ struct Lowerer {
             || (cfg.ternaryExprRule.valid() && r == cfg.ternaryExprRule.v);
     }
     [[nodiscard]] TypeId boolType() { return interner.primitive(TypeKind::Bool); }
+    // D-CSUBSET-COMPUTED-GOTO: `void*` — the type of a `&&label` code address.
+    [[nodiscard]] TypeId voidPtrType() {
+        return interner.pointer(interner.primitive(TypeKind::Void));
+    }
     [[nodiscard]] TypeId typeAtOr(NodeId n, TypeId fallback) const {
         TypeId t = model.typeAt(n);
         return t.valid() ? t : fallback;
@@ -896,25 +913,617 @@ struct Lowerer {
     }
 
     // ── expressions ───────────────────────────────────────────────────────────
+    //
+    // D-PARSE-DEEP-NEST-RECURSION-MEMORY (plan 24 Stage 3): `lowerExpr` is an
+    // EXPLICIT HEAP WORK-STACK driver — NOT host recursion — for the DEEP arms
+    // (parenthesized/wrapper descent, the PLAIN binary operands, and the unary
+    // operand). A deeply-nested chain of those forms therefore carries flat O(N)
+    // host-stack cost (only the worker thread's heap-backed `work` vector grows),
+    // closing the dominant deep cases. EVERY OTHER arm (Comma/Assign in
+    // lowerBinary, ternary, postfix incl. Call/Index/Member/PostInc, cast,
+    // sizeof, the operand leaf/identifier terminals, classifyLvalue, lowerFlatExpr)
+    // DELEGATES to its existing recursive helper UNCHANGED — those helpers call
+    // `lowerExpr` for their own operands, which re-enters this driver, so a deep
+    // operand nested inside a shallow complex arm still flattens. **OUTPUT-IDENTITY
+    // is THE gate** (the full ctest suite is the oracle): the emitted HIR — nodes,
+    // types, literal-pool order, arena order — is byte-for-byte identical to the
+    // prior recursive form. The plain-binary frame builds the RHS subtree BEFORE
+    // the LHS (the recursive form was `combineBinary(node, e, lowerExpr(lhs),
+    // lowerExpr(rhs))`, whose argument evaluation builds rhs-then-lhs on the host
+    // toolchain) so the literal pool / arena fill in the SAME order. The parser's
+    // `P_ExpressionTooDeep` cap is UNCHANGED and still the positioned backstop.
+
+    // A resolved lvalue: how to READ its current value and WRITE a new one, plus
+    // the prep statements that must run FIRST. A SIMPLE variable lvalue needs no
+    // prep (reading a `Ref` is side-effect-free, so it can be read repeatedly). A
+    // COMPLEX lvalue (an index / deref whose address sub-expressions may have
+    // side effects) binds its ADDRESS into a temp pointer once in `prep`, then
+    // reads/writes through `*ptr` — so `a[f()] += 1` evaluates `f()` exactly
+    // once. This is what makes compound-assign / ++ / assignment-as-value correct
+    // for every lvalue, not just simple variables. (Defined HERE — ahead of its
+    // natural home near `classifyLvalue` — so the `AssignCtx` below can embed it.)
+    struct Lvalue {
+        bool                   simple = true;
+        TypeId                 type{};       // the lvalue's value type
+        SymbolId               sym{};        // simple: the variable; via-ptr: the temp pointer
+        TypeId                 ptrType{};    // via-ptr only: interner.pointer(type)
+        std::vector<HirNodeId> prep;         // via-ptr only: [ var ptr = &<lvalue> ]
+    };
+
+    // One work-stack frame. Only the DEEP arms allocate a frame; the per-arm
+    // `phase` machine pushes ONE child (via `enter`, which only ever PUSHES — it
+    // does not recurse — so the descent is driven by the loop, keeping host-stack
+    // cost flat O(1) per level) or finishes and delivers its `E` into the shared
+    // `result` slot. A frame reference `f = work.back()` DANGLES after any
+    // `enter`/`push_back`, so each phase reads/copies every field it needs OUT of
+    // `f` and advances `f.phase` BEFORE calling `enter` (the Stage-1/2 idiom).
+    struct ExprFrame {
+        enum class Kind : std::uint8_t { PassThrough, Binary, Unary, Cast, Postfix,
+                                         Ternary, Comma, Call, Assign } kind;
+        NodeId                  node;    // the source node (provenance / combine anchor)
+        std::uint8_t            phase;
+        NodeId                  n0;      // PassThrough inner / binary+comma lhs / unary+cast operand / postfix+call base / ternary cond
+        NodeId                  n1;      // binary+comma rhs / postfix Index subscript / ternary then
+        NodeId                  n2;      // ternary else
+        HirOperatorEntry const* e;       // binary / unary / postfix op entry
+        E                       c0;      // first child result (binary rhs / postfix base / ternary coerced cond / comma ExprStmt effect in .id)
+        E                       c1;      // second child result (ternary then)
+        TypeId                  target;  // cast target type
+        std::uint32_t           aux;     // Call: index into the local `callCtxs` stack
+    };
+
+    // The per-call accumulating state for a flattened postfix Call. Lives in a
+    // `callCtxs` stack LOCAL to `lowerExpr` (NOT in `ExprFrame` — the `args`
+    // vector must survive across the per-arg `enter` calls, and the `work` vector
+    // reallocs). A Call frame holds only an INDEX into `callCtxs` (`aux`); indices
+    // are stable because nested calls finish inner-first (LIFO) — we only ever
+    // push and pop the back, never erase from the middle. `paramTypes` is the M2
+    // stable owned copy of the callee's `interner.fnParams()` span (the span would
+    // dangle if a later arg's lowering grows the interner's operand pool).
+    struct CallCtx {
+        NodeId                  base;        // the callee CST node
+        std::vector<NodeId>     argNodes;    // the argument expression CST nodes (left→right)
+        std::size_t             argIdx{};    // next argument to process
+        std::vector<TypeId>     paramTypes;  // stable copy of the callee FnSig params
+        TypeId                  resultType{};// the call's result type
+        E                       baseE{};     // the lowered callee value
+        std::vector<HirNodeId>  args;        // accumulated lowered+coerced argument ids
+    };
+
+    // The accumulating state for a flattened assignment sub-expression (`lhs = rhs`
+    // / `lhs OP= rhs` used as a VALUE — `lowerBinary`'s `Assign` arm). Lives in an
+    // `assignCtxs` stack LOCAL to `lowerExpr` (NOT in `ExprFrame` — the `Lvalue`
+    // carries a `prep` vector, and `work` reallocs across the rhs `enter`). An
+    // Assign frame holds only an INDEX (`aux`); indices are stable because a
+    // right-assoc chain `a=b=c=…` finishes inner-first (LIFO push/pop the back).
+    // The lhs lvalue is CLASSIFIED in the `enter` classifier BEFORE the frame is
+    // pushed (so a complex lhs's `prep` AddressOf/VarDecl emit before the rhs, as
+    // the recursive arm does); the frame then flattens ONLY the rhs through the
+    // work-stack — which is the sole deep-recursion axis of an assign chain. For a
+    // COMPOUND `OP=`, the lvalue READ (`compoundLhsRead`) is also emitted in `enter`
+    // (BEFORE the rhs) — the recursive `addParent(BinaryOp, std::array{lvRead(*lv),
+    // lowerExpr(rhsN).id}, …)` evaluates the braced-init-list LEFT-TO-RIGHT with a
+    // sequence point ([dcl.init.list]/4, NOT the unsequenced function-arg rule), so
+    // lvRead's node precedes the rhs subtree on EVERY conforming compiler. Emitting
+    // it in `enter` reproduces that arena order exactly (prep → lvRead → rhs → op).
+    struct AssignCtx {
+        Lvalue       lv;              // the classified lhs (simple sym OR temp-ptr + prep)
+        bool         compound{};      // true for `OP=` (compound assignment)
+        HirOpKind    baseOp{};        // compound only: the core binary op
+        HirNodeId    compoundLhsRead{}; // compound only: the lvRead emitted BEFORE the rhs
+    };
+
+    // The public expression-lowering entry: a driver over an explicit work-stack.
+    // `enter` classifies a node (TERMINAL → set `result`; DEEP arm → push a
+    // phase-0 frame and return WITHOUT recursing); the loop runs each frame's
+    // phase machine, calling `enter` for the next child. Dispatch ORDER matches
+    // the prior recursive `lowerExpr` / `lowerOperand` exactly → byte-identical.
     E lowerExpr(NodeId node) {
-        if (auto npc = nullPointerConstantLiteral(node)) return *npc;
-        if (tree().kind(node) == NodeKind::Internal) {
-            std::uint32_t const r = tree().rule(node).v;
-            if (cfg.flatExprRule.valid() && r == cfg.flatExprRule.v)
-                return lowerFlatExpr(node);   // HR10: SQL-style flat expression
-            if (r == cfg.operandRule.v)     return lowerOperand(node);
-            if (r == cfg.binaryExprRule.v)  return lowerBinary(node);
-            if (r == cfg.unaryExprRule.v)   return lowerUnary(node);
-            if (r == cfg.postfixExprRule.v) return lowerPostfix(node);
-            if (cfg.ternaryExprRule.valid() && r == cfg.ternaryExprRule.v)
-                return lowerTernary(node);
-            // Unknown wrapper (e.g. an `expression` node): descend through a
-            // single meaningful child.
-            NodeId only = soleMeaningfulChild(node);
-            if (only.valid()) return lowerExpr(only);
+        std::vector<ExprFrame> work;
+        // The flattened postfix-Call accumulators (see `CallCtx`). A LIFO stack
+        // parallel to `work`; a Call frame references its ctx by stable index.
+        std::vector<CallCtx> callCtxs;
+        // The flattened assignment accumulators (see `AssignCtx`). A LIFO stack
+        // parallel to `work`; an Assign frame references its ctx by stable index.
+        // Separate from `callCtxs` (a frame is Call XOR Assign, but each space is
+        // independent); a right-assoc `a=b=c=…` chain pushes one per `=`.
+        std::vector<AssignCtx> assignCtxs;
+        // Default-init (no node emitted): `enter` ALWAYS assigns `result` for a
+        // terminal, and every pushed frame eventually delivers into `result`
+        // before it is read, so this never leaks an Error node.
+        E result{};
+
+        auto const enter = [&](NodeId n) {
+            if (auto npc = nullPointerConstantLiteral(n)) { result = *npc; return; }
+            if (tree().kind(n) == NodeKind::Internal) {
+                std::uint32_t const r = tree().rule(n).v;
+                if (cfg.flatExprRule.valid() && r == cfg.flatExprRule.v) {
+                    result = lowerFlatExpr(n); return;   // HR10: SQL flat expression
+                }
+                if (r == cfg.operandRule.v) {
+                    // The operand TERMINAL forms (leaf literal / sizeof /
+                    // compound-literal / va_* / label-address routing / identifier)
+                    // resolve here; the plain `( expression )` wrapper and the
+                    // explicit cast `(T)expr` return nullopt → flatten their operand
+                    // recursion via the work-stack (a PassThrough or Cast frame).
+                    NodeId inner{}, castN{};
+                    if (auto term = lowerOperandTerminal(n, inner, castN)) { result = *term; return; }
+                    if (castN.valid()) {
+                        // Resolve the cast target (a pure read of the semantic
+                        // stamps) BEFORE entering the operand — matching the
+                        // source `(T)expr` order — then flatten the operand.
+                        NodeId castOperandN{};
+                        TypeId castTarget{};
+                        if (auto err = castPrologue(castN, castOperandN, castTarget)) {
+                            result = *err; return;
+                        }
+                        work.push_back({.kind = ExprFrame::Kind::Cast, .node = castN,
+                                        .n0 = castOperandN, .target = castTarget});
+                        return;
+                    }
+                    work.push_back({.kind = ExprFrame::Kind::PassThrough, .node = n,
+                                    .n0 = inner});
+                    return;
+                }
+                if (r == cfg.binaryExprRule.v) {
+                    // The PLAIN binary operands flatten through a Binary frame; the
+                    // COMMA operator (whose `ExprStmt(lhs)` emits between lhs and
+                    // rhs) flattens through a Comma frame. ASSIGN (`lhs = rhs` /
+                    // `lhs OP= rhs` as a value) flattens its RHS through an Assign
+                    // frame so a right-assoc chain `a=b=c=…` carries flat host-stack
+                    // cost (the lhs is classified inline here, before the frame —
+                    // its prep emits before the rhs, as the recursive arm does).
+                    NodeId lhsN{}, rhsN{}, opTok{};
+                    for (NodeId c : visible(n)) {
+                        if (isToken(c)) { if (!opTok.valid()) opTok = c; continue; }
+                        if (!lhsN.valid()) lhsN = c; else if (!rhsN.valid()) rhsN = c;
+                    }
+                    HirOperatorEntry const* e = plainBinaryEntry(n, opTok, lhsN, rhsN);
+                    if (e != nullptr) {
+                        work.push_back({.kind = ExprFrame::Kind::Binary, .node = n,
+                                        .n0 = lhsN, .n1 = rhsN, .e = e});
+                        return;
+                    }
+                    if (commaBinary(opTok, lhsN, rhsN)) {
+                        work.push_back({.kind = ExprFrame::Kind::Comma, .node = n,
+                                        .n0 = lhsN, .n1 = rhsN});
+                        return;
+                    }
+                    // ASSIGN: classify the lhs lvalue + resolve the (compound) op
+                    // EXACTLY as `lowerBinary`'s Assign arm — same order, same
+                    // diagnostics, so a complex lhs's prep AddressOf/VarDecl emit
+                    // here (before the rhs). On success push an Assign frame whose
+                    // ctx carries the lvalue; phase 0 enters the rhs. Malformed /
+                    // non-assign nodes fall through to `lowerBinary` unchanged.
+                    if (HirOperatorEntry const* ae =
+                            assignBinaryEntry(n, opTok, lhsN, rhsN)) {
+                        AssignCtx ctx;
+                        auto lv = lhsN.valid() ? classifyLvalue(lhsN) : std::nullopt;
+                        if (!lv || !rhsN.valid()) {
+                            result = exprError(n, "assignment sub-expression needs an "
+                                                  "lvalue and a value");
+                            return;
+                        }
+                        ctx.lv = std::move(*lv);
+                        if (!ae->compoundBase.empty()) {
+                            auto op = coreOpFromName(ae->compoundBase);
+                            if (!op || arityOf(*op) != HirOpArity::Binary) {
+                                result = exprError(n, std::format(
+                                    "compound base op '{}' is not binary",
+                                    ae->compoundBase));
+                                return;
+                            }
+                            ctx.compound = true;
+                            ctx.baseOp   = *op;
+                            // Emit the lvalue READ HERE — BEFORE entering the rhs —
+                            // to match the recursive arm's L-to-R braced-init order
+                            // (lvRead's node precedes the rhs subtree). See AssignCtx.
+                            ctx.compoundLhsRead = lvRead(ctx.lv);
+                        }
+                        std::uint32_t const ctxIdx =
+                            static_cast<std::uint32_t>(assignCtxs.size());
+                        assignCtxs.push_back(std::move(ctx));
+                        work.push_back({.kind = ExprFrame::Kind::Assign, .node = n,
+                                        .n0 = rhsN, .aux = ctxIdx});
+                        return;   // phase 0 enters the rhs
+                    }
+                    result = lowerBinary(n); return;  // malformed (non-assign)
+                }
+                if (r == cfg.unaryExprRule.v) {
+                    NodeId opTok{}, operandN{};
+                    for (NodeId c : visible(n)) {
+                        if (isToken(c)) { if (!opTok.valid()) opTok = c; continue; }
+                        if (!operandN.valid()) operandN = c;
+                    }
+                    HirOperatorEntry const* e = unaryEntry(n, opTok, operandN);
+                    if (e == nullptr) { result = lowerUnary(n); return; }  // malformed/unmapped
+                    work.push_back({.kind = ExprFrame::Kind::Unary, .node = n,
+                                    .n0 = operandN, .e = e});
+                    return;
+                }
+                if (r == cfg.postfixExprRule.v) {
+                    // Call flattens its callee + each scalar arg through a Call
+                    // frame (so `f(g(h(...)))` chains carry flat host-stack cost);
+                    // Index / Member flatten their base (and Index's subscript).
+                    // PostInc / PostDec keep DELEGATING to `lowerPostfix` (their
+                    // bespoke classifyLvalue + temp-SeqExpr): unlike Assign they
+                    // CANNOT chain deeply — `x++` is not an lvalue, so it can never
+                    // be the operand of another `++`. Their sole `classifyLvalue`
+                    // re-entry lowers the (already-flat) lvalue operand via this
+                    // driver, so they carry only O(1) host-stack frames. Flattening
+                    // them would add byte-identity risk for zero depth payoff.
+                    NodeId callBaseN{};
+                    std::vector<NodeId> callArgNodes;
+                    if (callBaseAndArgs(n, callBaseN, callArgNodes)) {
+                        std::uint32_t const ctxIdx =
+                            static_cast<std::uint32_t>(callCtxs.size());
+                        callCtxs.push_back(CallCtx{.base = callBaseN,
+                                                   .argNodes = std::move(callArgNodes)});
+                        work.push_back({.kind = ExprFrame::Kind::Call, .node = n,
+                                        .n0 = callBaseN, .aux = ctxIdx});
+                        return;   // phase 0 enters the callee
+                    }
+                    NodeId postBaseN{}, postSubN{};
+                    HirOperatorEntry const* postE = nullptr;
+                    PostfixFlatten const plan =
+                        postfixFlattenPlan(n, postBaseN, postSubN, postE);
+                    if (plan == PostfixFlatten::Delegate) { result = lowerPostfix(n); return; }
+                    work.push_back({.kind = ExprFrame::Kind::Postfix, .node = n,
+                                    .n0 = postBaseN, .n1 = postSubN, .e = postE});
+                    return;
+                }
+                if (cfg.ternaryExprRule.valid() && r == cfg.ternaryExprRule.v) {
+                    // `cond ? then : else`: flatten cond/then/else through a frame
+                    // (the coerceCondition + arm coercions emit BETWEEN/AFTER child
+                    // lowerings — preserved as phase transitions). Malformed ternary
+                    // (≠3 operands) delegates to lowerTernary's diagnostic.
+                    NodeId condN{}, thenN{}, elseN{};
+                    if (!ternaryOperands(n, condN, thenN, elseN)) {
+                        result = lowerTernary(n); return;
+                    }
+                    work.push_back({.kind = ExprFrame::Kind::Ternary, .node = n,
+                                    .n0 = condN, .n1 = thenN, .n2 = elseN});
+                    return;
+                }
+                // Unknown wrapper (e.g. an `expression` node): descend through a
+                // single meaningful child via the work-stack.
+                NodeId only = soleMeaningfulChild(n);
+                if (only.valid()) {
+                    work.push_back({.kind = ExprFrame::Kind::PassThrough, .node = n,
+                                    .n0 = only});
+                    return;
+                }
+            }
+            unsupported(n, "expression form has no hirLowering mapping");
+            result = {errorNode(n), InvalidType};
+        };
+
+        // The per-arg pump for a flattened Call (ctx at stable index `ctxIdx`):
+        // process arguments from `ctx.argIdx` forward, lowering each BRACE-INIT
+        // arg INLINE (`lowerExprOrBraceInit` — brace lists are shallow aggregate
+        // inits, not the deep call chain) until a SCALAR arg is reached, which it
+        // routes through `enter` (the Call frame's phase 2 then coerces+collects
+        // it). Returns true iff it entered a scalar arg (the caller must wait for
+        // it); false when all args are consumed (the caller finishes the call).
+        // `ctx.argIdx` is NOT advanced for the entered scalar — it stays pointed at
+        // the in-flight arg so phase 2 derives the SAME `paramType` for its coerce.
+        // Arg lowering is left→right (a sequential loop, exactly as `lowerPostfix`'s
+        // Call arm) — platform-independent. `enter` (if called) is the LAST action,
+        // so the dangling-`work.back()` rule is respected.
+        auto const callParamType = [&](CallCtx const& ctx, std::size_t k) -> TypeId {
+            return (k < ctx.paramTypes.size()) ? ctx.paramTypes[k] : InvalidType;
+        };
+        auto const pumpCallArgs = [&](std::uint32_t ctxIdx) -> bool {
+            for (;;) {
+                // Address `callCtxs[ctxIdx]` fresh each access rather than holding a
+                // `CallCtx&`: this invocation's `callCtxs` grows whenever a SCALAR
+                // arg is itself a call (the `enter` below pushes its ctx), so a
+                // reference held across iterations could dangle; the INDEX is stable
+                // (push_back only invalidates references/pointers, never indices).
+                if (callCtxs[ctxIdx].argIdx >= callCtxs[ctxIdx].argNodes.size())
+                    return false;   // all args consumed → finish
+                std::size_t const k = callCtxs[ctxIdx].argIdx;
+                NodeId const argN = callCtxs[ctxIdx].argNodes[k];
+                NodeId const core = peelToBraceInitOrCore(argN);
+                if (isBraceInitList(core)) {
+                    // A brace-init arg lowers INLINE via its own nested `lowerExpr`
+                    // (a separate work-stack — brace lists are shallow aggregate
+                    // inits, not the deep call chain), exactly as the recursive Call
+                    // arm's `lowerExprOrBraceInit`.
+                    TypeId const paramType = callParamType(callCtxs[ctxIdx], k);
+                    HirNodeId const a = lowerExprOrBraceInit(argN, paramType);
+                    callCtxs[ctxIdx].args.push_back(a);
+                    ++callCtxs[ctxIdx].argIdx;
+                    continue;       // process the next arg
+                }
+                enter(argN);        // scalar arg — phase 2 coerces+collects it
+                return true;
+            }
+        };
+
+        enter(node);
+        while (!work.empty()) {
+            ExprFrame& f = work.back();
+            switch (f.kind) {
+            case ExprFrame::Kind::PassThrough:
+                // A paren / wrapper: descend into the inner node (phase 0), then
+                // pass its `E` through unchanged (phase 1).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const inner = f.n0;
+                    enter(inner);           // may invalidate `f`
+                } else {
+                    work.pop_back();        // `result` already holds the inner E
+                }
+                break;
+            case ExprFrame::Kind::Binary:
+                // RHS first (phase 0→1), then LHS (phase 1→2) — matching the
+                // recursive `combineBinary(node, e, lowerExpr(lhs), lowerExpr(rhs))`
+                // whose arguments build rhs-then-lhs on the host toolchain.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const rhsN = f.n1;
+                    enter(rhsN);            // build RHS — may invalidate `f`
+                } else if (f.phase == 1) {
+                    f.c0 = result;          // RHS result
+                    f.phase = 2;
+                    NodeId const lhsN = f.n0;
+                    enter(lhsN);            // build LHS — may invalidate `f`
+                } else {
+                    HirOperatorEntry const* e = f.e;
+                    NodeId const node2 = f.node;
+                    E const rhsE = f.c0;
+                    E const lhsE = result;  // LHS result
+                    work.pop_back();
+                    result = combineBinary(node2, *e, lhsE, rhsE);
+                }
+                break;
+            case ExprFrame::Kind::Unary:
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const operandN = f.n0;
+                    enter(operandN);        // build operand — may invalidate `f`
+                } else {
+                    HirOperatorEntry const* e = f.e;
+                    NodeId const node2 = f.node;
+                    work.pop_back();
+                    result = combineUnaryOp(node2, *e, result);
+                }
+                break;
+            case ExprFrame::Kind::Cast:
+                // `(T)expr`: the target was resolved at push (phase 0 enters the
+                // operand), then the cast epilogue applies (phase 1).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const operandN = f.n0;
+                    enter(operandN);        // build operand — may invalidate `f`
+                } else {
+                    NodeId const node2 = f.node;
+                    TypeId const target = f.target;
+                    work.pop_back();
+                    result = combineCast(node2, target, result);
+                }
+                break;
+            case ExprFrame::Kind::Postfix:
+                // `a.b` / `a->b` / `a[i]`: build `base` FIRST (phase 0→1), matching
+                // `lowerPostfix`'s `E base = lowerExpr(baseN)` which sequences
+                // before the subscript lowering. Member combines immediately;
+                // Index then builds the subscript (phase 1→2) before combining —
+                // base-then-subscript, the exact recursive order (two distinct
+                // statements, so platform-independent).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const baseN = f.n0;
+                    enter(baseN);           // build base — may invalidate `f`
+                } else if (f.phase == 1) {
+                    HirOperatorEntry const* e = f.e;
+                    if (e->target == "Index") {
+                        f.c0 = result;          // base result
+                        NodeId const subN = f.n1;
+                        if (subN.valid()) {
+                            f.phase = 2;
+                            enter(subN);        // build subscript — may invalidate `f`
+                        } else {
+                            // Missing subscript: emit the SAME error operand the
+                            // recursive form does (after base, before combine).
+                            NodeId const node2 = f.node;
+                            E const baseE = f.c0;
+                            work.pop_back();
+                            E const idxE{reportedError(node2, "index has no subscript expression"),
+                                         InvalidType};
+                            result = combineIndex(node2, baseE, idxE);
+                        }
+                    } else {
+                        // Member access: combine with the just-built base.
+                        NodeId const node2 = f.node;
+                        HirOperatorEntry const* const eM = f.e;
+                        E const baseE = result;
+                        work.pop_back();
+                        result = combineMember(node2, *eM, baseE);
+                    }
+                } else {
+                    // Index phase 2: subscript built; combine.
+                    NodeId const node2 = f.node;
+                    E const baseE = f.c0;
+                    E const idxE = result;
+                    work.pop_back();
+                    result = combineIndex(node2, baseE, idxE);
+                }
+                break;
+            case ExprFrame::Kind::Ternary:
+                // `cond ? then : else`, built cond→then→else (matching
+                // `lowerTernary`'s three sequential lowerExpr statements). The
+                // condition's `coerceCondition` (which may emit a Ne/Cast) runs in
+                // phase 1 — AFTER cond, BEFORE the arms — exactly as recursively.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const condN = f.n0;
+                    enter(condN);           // build cond — may invalidate `f`
+                } else if (f.phase == 1) {
+                    NodeId const condN = f.n0;
+                    f.c0 = coerceCondition(result, condN);  // coerced cond (emits Ne/Cast)
+                    f.phase = 2;
+                    NodeId const thenN = f.n1;
+                    enter(thenN);           // build then — may invalidate `f`
+                } else if (f.phase == 2) {
+                    f.c1 = result;          // then result
+                    f.phase = 3;
+                    NodeId const elseN = f.n2;
+                    enter(elseN);           // build else — may invalidate `f`
+                } else {
+                    NodeId const node2 = f.node;
+                    E const condE = f.c0;
+                    E const thenE = f.c1;
+                    E const elseE = result; // else result
+                    work.pop_back();
+                    result = combineTernary(node2, condE, thenE, elseE);
+                }
+                break;
+            case ExprFrame::Kind::Comma:
+                // `a, b`: build lhs (phase 0→1), emit `ExprStmt(lhs)` (the discard
+                // effect, BETWEEN lhs and rhs as recursively), build rhs (phase
+                // 1→2), then SeqExpr yielding rhs. lhs-then-rhs is the recursive
+                // order (two sequential statements, platform-independent).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const lhsN = f.n0;
+                    enter(lhsN);            // build lhs — may invalidate `f`
+                } else if (f.phase == 1) {
+                    HirNodeId const effect = builder.makeExprStmt(result.id);  // ExprStmt(lhs)
+                    f.c0 = E{effect, {}};   // stash the effect node id in c0.id
+                    f.phase = 2;
+                    NodeId const rhsN = f.n1;
+                    enter(rhsN);            // build rhs — may invalidate `f`
+                } else {
+                    NodeId const node2 = f.node;
+                    HirNodeId const effect = f.c0.id;
+                    E const rhsE = result;  // rhs result
+                    work.pop_back();
+                    result = combineComma(node2, effect, rhsE);
+                }
+                break;
+            case ExprFrame::Kind::Call:
+                // `f(a, b, …)`: build the callee FIRST (phase 0→1, matching
+                // `lowerPostfix`'s `E base = lowerExpr(baseN)` which sequences
+                // before the args), resolve the callee signature + stable param-type
+                // copy (M2), then lower each argument left→right — brace-init args
+                // inline, scalar args through the work-stack (phase 2, one scalar at
+                // a time). When all args are consumed, makeCall. The per-arg pump +
+                // the immediate per-arg coerce reproduce the recursive loop's order
+                // (arg[k] lower → arg[k] coerce → arg[k+1] …), platform-independent.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const baseN = f.n0;
+                    enter(baseN);           // build callee — may invalidate `f`
+                } else if (f.phase == 1) {
+                    std::uint32_t const ctxIdx = f.aux;
+                    // Store the callee value + resolve the signature. Same
+                    // discipline as `lowerPostfix`'s Call arm / `lowerSqlCall`:
+                    // copy `interner.fnParams()` to an OWNED vector BEFORE lowering
+                    // any arg (the span dangles if an arg grows the operand pool).
+                    callCtxs[ctxIdx].baseE = result;
+                    TypeId const calleeSig = calleeSigOf(result.type);
+                    if (calleeSig.valid()) {
+                        auto const paramSpan = interner.fnParams(calleeSig);
+                        callCtxs[ctxIdx].paramTypes.assign(paramSpan.begin(), paramSpan.end());
+                    }
+                    TypeId inferred = InvalidType;
+                    if (calleeSig.valid()) inferred = interner.fnResult(calleeSig);
+                    callCtxs[ctxIdx].resultType = typeAtOr(f.node, inferred);
+                    f.phase = 2;
+                    if (pumpCallArgs(ctxIdx)) break;   // entered a scalar arg — wait
+                    finishCall(work, callCtxs, ctxIdx, result);  // no scalar args left
+                } else {
+                    // A scalar arg just completed (`result` holds it). Coerce it to
+                    // its param type (immediately, before the next arg lowers —
+                    // matching `lowerExprOrBraceInit`), collect it, advance.
+                    std::uint32_t const ctxIdx = f.aux;
+                    std::size_t const k = callCtxs[ctxIdx].argIdx;   // the in-flight arg
+                    TypeId const paramType = callParamType(callCtxs[ctxIdx], k);
+                    HirNodeId const a = coerce(result, paramType).id;
+                    callCtxs[ctxIdx].args.push_back(a);
+                    ++callCtxs[ctxIdx].argIdx;
+                    if (pumpCallArgs(ctxIdx)) break;   // entered the next scalar — wait
+                    finishCall(work, callCtxs, ctxIdx, result);  // all args consumed
+                }
+                break;
+            case ExprFrame::Kind::Assign:
+                // `lhs = rhs` / `lhs OP= rhs` as a VALUE. The lhs lvalue was already
+                // classified in `enter` (its prep emitted before us); for a compound
+                // `OP=` the lvalue READ was ALSO emitted there (`compoundLhsRead`,
+                // before the rhs). Phase 0 enters the RHS through the work-stack (the
+                // sole deep axis of an assign chain → flat). Phase 1 runs the
+                // recursive tail: compute `stored` (plain = rhs; compound =
+                // `compoundLhsRead OP rhs`), then [prep…, lvWrite] + a fresh `lvRead`
+                // yield, all in a SeqExpr — byte-identical to `lowerBinary`'s Assign
+                // arm, including the prep→lvRead→rhs→op emission order.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const rhsN = f.n0;
+                    enter(rhsN);            // lower the rhs — may invalidate `f`
+                } else {
+                    std::uint32_t const ctxIdx = f.aux;
+                    finishAssign(work, assignCtxs, ctxIdx, result);
+                }
+                break;
+            }
         }
-        unsupported(node, "expression form has no hirLowering mapping");
-        return {errorNode(node), InvalidType};
+        return result;
+    }
+
+    // Finish a flattened Call: emit makeCall from the (now-complete) ctx, pop the
+    // Call frame and its ctx (the top of each — nested calls finished inner-first,
+    // so the LIFO `pop_back` removes exactly this call's frame + ctx), and deliver
+    // the call `E` into `result`. Out-of-line so phase 1 and phase 2 share the
+    // single finish path. The Call frame is `work.back()` here (the pump entered
+    // nothing, so no child frame sits above it); its `.node` is the postfix Call
+    // node, the SAME provenance as the recursive `track(makeCall(...), node)`.
+    void finishCall(std::vector<ExprFrame>& work, std::vector<CallCtx>& callCtxs,
+                    std::uint32_t ctxIdx, E& result) {
+        CallCtx const& ctx = callCtxs[ctxIdx];
+        NodeId const callNode = work.back().node;   // the postfix Call node (provenance)
+        E const callE{track(builder.makeCall(ctx.baseE.id, ctx.args, ctx.resultType), callNode),
+                      ctx.resultType};
+        work.pop_back();
+        callCtxs.pop_back();
+        result = callE;
+    }
+
+    // Finish a flattened Assign: `result` holds the lowered RHS. Build the SeqExpr
+    // EXACTLY as `lowerBinary`'s Assign arm — for plain `=` the stored value is the
+    // rhs; for `OP=` it is `lvRead OP rhs`, where `lvRead` was ALREADY emitted in
+    // `enter` (before the rhs — `compoundLhsRead`), reproducing the recursive arm's
+    // L-to-R braced-init order (prep → lvRead → rhs → op). Then `[prep…,
+    // lvWrite(stored)]` with a fresh `lvRead` yield, SeqExpr, deliver into `result`,
+    // and pop this frame + its ctx (the LIFO top — a right-assoc chain finishes
+    // inner-first). The Assign frame is `work.back()` here (phase 1 entered nothing
+    // above it); its `.node` is the binary node — the SAME provenance as the
+    // recursive `track(makeSeqExpr(...), node)`.
+    void finishAssign(std::vector<ExprFrame>& work, std::vector<AssignCtx>& assignCtxs,
+                      std::uint32_t ctxIdx, E& result) {
+        AssignCtx const& ctx = assignCtxs[ctxIdx];
+        Lvalue const& lv = ctx.lv;
+        NodeId const node = work.back().node;   // the binary (assign) node (provenance)
+        HirNodeId stored;
+        if (!ctx.compound) {
+            stored = result.id;                                       // plain `=`
+        } else {
+            // `OP=`: `compoundLhsRead OP rhs`. `compoundLhsRead` was emitted in
+            // `enter` (BEFORE the rhs), so operand[0]'s node precedes operand[1]'s —
+            // the SAME arena order as the recursive braced-init `{lvRead, rhs}`.
+            stored = builder.addParent(HirKind::BinaryOp,
+                                       std::array{ctx.compoundLhsRead, result.id},
+                                       lv.type, encodeOp(ctx.baseOp));
+        }
+        std::vector<HirNodeId> stmts = lv.prep;
+        stmts.push_back(lvWrite(lv, stored));
+        HirNodeId const yield = lvRead(lv);     // the new value (re-read of the lvalue)
+        E const seqE{track(builder.makeSeqExpr(stmts, yield, lv.type, HirFlags::Synthetic),
+                           node),
+                     lv.type};
+        work.pop_back();
+        assignCtxs.pop_back();
+        result = seqE;
     }
 
     // The single non-token child, or invalid if there isn't exactly one.
@@ -946,7 +1555,17 @@ struct Lowerer {
         return std::nullopt;
     }
 
-    E lowerOperand(NodeId node) {
+    // The TERMINAL operand forms (everything except the plain `( expression )`
+    // wrapper AND the explicit cast). Returns the lowered `E` for a leaf literal /
+    // sizeof / compound-literal / va_* / label-address / identifier / literal
+    // operand. Two deep forms instead set an out-param and return std::nullopt so
+    // the `lowerExpr` driver flattens their operand recursion via the work-stack:
+    //   • the plain `( expression )` wrapper → sets `descendInto` to the inner node
+    //   • the explicit cast `(T)expr`        → sets `castNode` to the cast node
+    // (exactly one of the two out-params is set when nullopt is returned). The
+    // dispatch ORDER is byte-identical to the prior recursive `lowerOperand`.
+    [[nodiscard]] std::optional<E> lowerOperandTerminal(NodeId node, NodeId& descendInto,
+                                                        NodeId& castNode) {
         // operand = Identifier | <literal token> | <char/string literal>
         //         | ( expression ) | compoundLiteralExpr | castExpr | ...
         if (auto lit = tryLowerLeafLiteral(node)) return *lit;
@@ -965,11 +1584,20 @@ struct Lowerer {
             }
             if (cfg.castRule.valid()
              && tree().rule(c).v == cfg.castRule.v) {
-                return lowerCast(c);
+                castNode = c;
+                return std::nullopt;   // the driver flattens the cast operand
             }
             if (cfg.sizeofRule.valid()
              && tree().rule(c).v == cfg.sizeofRule.v) {
                 return lowerSizeof(c);
+            }
+            // D-CSUBSET-COMPUTED-GOTO: `&&label` — its Identifier child is a RAW
+            // label name (the label namespace), NOT a value to resolve, so it
+            // routes to a dedicated lowering (the sizeof precedent) before any
+            // attempt to type the operand as an expression.
+            if (cfg.labelAddressRule.valid()
+             && tree().rule(c).v == cfg.labelAddressRule.v) {
+                return lowerLabelAddress(c);
             }
             // FC12a-core: the three variadic intrinsics route to their dedicated
             // lowerings (their type child must NOT be lowered as an expression,
@@ -989,7 +1617,10 @@ struct Lowerer {
             }
         }
         for (NodeId c : visible(node)) {
-            if (tree().kind(c) == NodeKind::Internal) return lowerExpr(c);  // paren-wrapped
+            if (tree().kind(c) == NodeKind::Internal) {   // paren-wrapped
+                descendInto = c;
+                return std::nullopt;   // the driver descends into `c` via the work-stack
+            }
         }
         for (NodeId c : visible(node)) {
             if (!isToken(c)) continue;
@@ -1009,30 +1640,28 @@ struct Lowerer {
                 // the enum `type` so downstream coerce / UAC see the enum and
                 // resolve it via enumUnderlyingOrSelf. The makeRef below is the
                 // fallback for every non-enumerator identifier.
-                if (auto const* erec = model.recordFor(sym);
-                    erec != nullptr && erec->isEnumerator) {
-                    TypeKind core = TypeKind::I32;
-                    if (type.valid() && interner.kind(type) == TypeKind::Enum) {
-                        auto const sc = interner.scalars(type);
-                        if (!sc.empty()) core = static_cast<TypeKind>(sc[0]);
+                // A named integer CONSTANT (enum enumerator OR shipped-descriptor
+                // constant) folds its Ref to a literal via the ONE shared builder
+                // (constant_symbol_fold.hpp) — the same builder both const-eval
+                // engines use, so value- and const-expr-position agree. The
+                // literal keeps the node `type` (an enumerator's enum type flows
+                // to downstream coerce/UAC); the builder derives the literal CORE
+                // from the symbol's type (enum underlying / the constant's own
+                // scalar).
+                if (auto const* erec = model.recordFor(sym)) {
+                    if (auto lv = constantLiteralForSymbol(*erec, interner)) {
+                        return E{track(builder.makeLiteral(
+                                          type, literals.add(std::move(*lv))), node),
+                                 type};
                     }
-                    HirLiteralValue lv;
-                    lv.core = core;
-                    if (isSignedCore(core))
-                        lv.value = static_cast<std::int64_t>(erec->enumValue);
-                    else
-                        lv.value = static_cast<std::uint64_t>(erec->enumValue);
-                    return {track(builder.makeLiteral(
-                                      type, literals.add(std::move(lv))), node),
-                            type};
                 }
-                return {track(builder.makeRef(type, sym.v), node), type};
+                return E{track(builder.makeRef(type, sym.v), node), type};
             }
             auto lit = litType_.find(tk.v);
             if (lit != litType_.end()) return lowerLiteral(node, c, tk, lit->second);
         }
         unsupported(node, "operand has no Identifier / literal / parenthesized child");
-        return {errorNode(node), InvalidType};
+        return E{errorNode(node), InvalidType};
     }
 
     // The child rule node of `operand` whose first visible child is `startTok`
@@ -1548,24 +2177,27 @@ struct Lowerer {
             unsupported(anchor, std::format("binary target '{}' is not a core binary operator", e.target));
             return {errorNode(anchor), InvalidType};
         }
-        // FC3 c1 shifts under the `arithmeticConversions` block: C 6.5.7
-        // — each operand integer-promotes INDEPENDENTLY and the result
-        // type is the PROMOTED LEFT operand only (the count's type never
-        // contributes; `i64 << u32` is I64, `u32 >> 1` is U32 → LShr).
-        // The count is ALSO coerced to the compute type so both register
-        // operands share a width (value-preserving for any in-range
-        // count; an out-of-range count is UB in C). Block-less languages
-        // keep the legacy both-coerce-to-common path below EXACTLY.
+        // FC3 c1 shifts under the `arithmeticConversions` block: the result
+        // type follows the config verb `shiftResult` via the shared
+        // `shiftResultType` chokepoint (D-UAC-SHIFT-RESULT-RULE-CONFIG) — the
+        // SAME function the semantic typer calls, so the two tiers can never
+        // diverge on the verb. `promotedLeft` (C 6.5.7): the PROMOTED LEFT
+        // operand only (the count's type never contributes; `i64 << u32` is
+        // I64, `u32 >> 1` is U32 → LShr). `commonType`: the usual-arithmetic
+        // common type (a shift typed like an ordinary binary op). Both operands
+        // are coerced to that result so the two register operands share a width
+        // (value-preserving for any in-range count; an out-of-range count is UB
+        // in C). A block-less language has no `arith_` and falls through to the
+        // legacy both-coerce-to-common path below EXACTLY.
         if (arith_.has_value()
             && (*op == HirOpKind::Shl || *op == HirOpKind::Shr)) {
-            TypeId const lp = integerPromotedType(interner, lhs.type, *arith_);
-            E lc = lhs, rc = rhs;
-            if (lp.valid()) {
-                lc = coerce(lhs, lp);
-                rc = coerce(rhs, lp);
-            }
             TypeId const result =
-                lp.valid() ? lp : (lhs.type.valid() ? lhs.type : rhs.type);
+                shiftResultType(interner, lhs.type, rhs.type, *arith_);
+            E lc = lhs, rc = rhs;
+            if (result.valid()) {
+                lc = coerce(lhs, result);
+                rc = coerce(rhs, result);
+            }
             return {track(builder.addParent(HirKind::BinaryOp,
                                             std::array{lc.id, rc.id},
                                             result, encodeOp(*op)), anchor),
@@ -1655,13 +2287,21 @@ struct Lowerer {
         // evaluate a, b (discard), value c — correct C semantics.
         if (e.target == "Comma") {
             E lhsE = lowerExpr(lhsN);
-            HirNodeId const effect = builder.makeExprStmt(lhsE.id);
+            HirNodeId const effect = builder.makeExprStmt(lhsE.id);  // emitted BETWEEN lhs and rhs
             E rhsE = lowerExpr(rhsN);
-            std::array<HirNodeId, 1> const stmts{effect};
-            return {track(builder.makeSeqExpr(stmts, rhsE.id, rhsE.type, HirFlags::None), node),
-                    rhsE.type};
+            return combineComma(node, effect, rhsE);
         }
         return combineBinary(node, e, lowerExpr(lhsN), lowerExpr(rhsN));
+    }
+
+    // The COMMA epilogue given the lhs `effect` (the `ExprStmt(lhs)` already
+    // emitted between lhs and rhs) and the lowered `rhsE`. Shared by `lowerBinary`
+    // and the `lowerExpr` driver's Comma frame. Byte-identical to the prior inline
+    // tail: `a, b` = SeqExpr([ExprStmt a], b) yielding b's value+type.
+    E combineComma(NodeId node, HirNodeId effect, E rhsE) {
+        std::array<HirNodeId, 1> const stmts{effect};
+        return {track(builder.makeSeqExpr(stmts, rhsE.id, rhsE.type, HirFlags::None), node),
+                rhsE.type};
     }
 
     E lowerUnary(NodeId node) {
@@ -1681,8 +2321,16 @@ struct Lowerer {
                                           tree().text(opTok)));
             return {errorNode(node), InvalidType};
         }
-        E operand = lowerExpr(operandN);
         HirOperatorEntry const& e = cfg.unaryOps[it->second];
+        return combineUnaryOp(node, e, lowerExpr(operandN));
+    }
+
+    // The unary OP/operand combine, given the ALREADY-lowered operand `E`. Shared
+    // by `lowerUnary` (the recursive entry) and the `lowerExpr` driver's Unary
+    // frame, so the AddressOf / Deref-fold / Not / Neg combine is identical
+    // regardless of how the operand was produced. Byte-identical to the prior
+    // inline tail of `lowerUnary`.
+    E combineUnaryOp(NodeId node, HirOperatorEntry const& e, E operand) {
         if (e.target == "AddressOf") {
             TypeId const result = operand.type.valid() ? interner.pointer(operand.type) : InvalidType;
             return {track(builder.makeAddressOf(operand.id, result), node), result};
@@ -1726,25 +2374,109 @@ struct Lowerer {
                                         result, encodeOp(*op)), node), result};
     }
 
+    // The operator entry for a UNARY node, or nullptr when the driver must fall
+    // back to `lowerUnary` (malformed node / unmapped operator — both of which
+    // emit the same diagnostic there). Mirrors `lowerUnary`'s extraction + lookup.
+    [[nodiscard]] HirOperatorEntry const*
+    unaryEntry(NodeId node, NodeId opTok, NodeId operandN) {
+        if (!opTok.valid() || !operandN.valid()) return nullptr;   // malformed
+        auto it = unOp_.find(tree().tokenKind(opTok).v);
+        if (it == unOp_.end()) return nullptr;                     // unmapped operator
+        return &cfg.unaryOps[it->second];
+    }
+
+    // The operator entry for a PLAIN binary node — i.e. one whose operands the
+    // driver flattens through a frame (arithmetic / comparison / shift / logical
+    // and-or, all combined by `combineBinary`). Returns nullptr for the bespoke
+    // forms `lowerBinary` owns (Assign → SeqExpr store, Comma → ExprStmt+SeqExpr)
+    // and for malformed/unmapped nodes — the driver then delegates the whole node
+    // to `lowerBinary` unchanged. Mirrors `lowerBinary`'s extraction + lookup so
+    // the same node routes the same way.
+    [[nodiscard]] HirOperatorEntry const*
+    plainBinaryEntry(NodeId node, NodeId opTok, NodeId lhsN, NodeId rhsN) {
+        if (!opTok.valid() || !lhsN.valid() || !rhsN.valid()) return nullptr;  // malformed
+        auto it = binOp_.find(tree().tokenKind(opTok).v);
+        if (it == binOp_.end()) return nullptr;                               // unmapped
+        HirOperatorEntry const& e = cfg.binaryOps[it->second];
+        if (e.target == "Assign" || e.target == "Comma") return nullptr;      // bespoke
+        return &e;
+    }
+
+    // True iff `node` is a well-formed COMMA binary (both operands present, the op
+    // maps to the `Comma` target) — the form the driver flattens through a Comma
+    // frame. Assign / malformed / non-comma return false and keep delegating to
+    // `lowerBinary`. Mirrors `lowerBinary`'s extraction + lookup. On success sets
+    // `lhsN`/`rhsN` to the operands (already extracted by the caller's scan).
+    [[nodiscard]] bool commaBinary(NodeId opTok, NodeId lhsN, NodeId rhsN) {
+        if (!opTok.valid() || !lhsN.valid() || !rhsN.valid()) return false;  // malformed
+        auto it = binOp_.find(tree().tokenKind(opTok).v);
+        if (it == binOp_.end()) return false;                                // unmapped
+        return cfg.binaryOps[it->second].target == "Comma";
+    }
+
+    // The operator entry for an ASSIGNMENT binary (`=` or a compound `OP=`) — the
+    // form the driver flattens through an Assign frame (its RHS re-enters the
+    // work-stack). Returns nullptr for the plain/comma forms the other classifiers
+    // own and for malformed/unmapped nodes, so the driver delegates the whole node
+    // to `lowerBinary` unchanged. Mirrors `lowerBinary`'s extraction + lookup so
+    // the same node routes the same way; `e.compoundBase` (empty for plain `=`)
+    // distinguishes plain from compound, exactly as the recursive Assign arm.
+    [[nodiscard]] HirOperatorEntry const*
+    assignBinaryEntry(NodeId node, NodeId opTok, NodeId lhsN, NodeId rhsN) {
+        if (!opTok.valid() || !lhsN.valid() || !rhsN.valid()) return nullptr;  // malformed
+        auto it = binOp_.find(tree().tokenKind(opTok).v);
+        if (it == binOp_.end()) return nullptr;                                // unmapped
+        HirOperatorEntry const& e = cfg.binaryOps[it->second];
+        return e.target == "Assign" ? &e : nullptr;
+    }
+
+    // The three operands of a ternary wrapper [cond, `?`, then, `:`, else] — the
+    // visible non-token children. Returns false (and leaves the out-params
+    // untouched) when there are not exactly three, so the caller routes a
+    // malformed ternary to `lowerTernary`'s diagnostic. Shared by `lowerTernary`
+    // and the `lowerExpr` driver's Ternary classifier.
+    [[nodiscard]] bool ternaryOperands(NodeId node, NodeId& condN, NodeId& thenN,
+                                       NodeId& elseN) {
+        std::array<NodeId, 3> ops{};
+        std::size_t k = 0;
+        for (NodeId c : visible(node)) {
+            if (isToken(c)) continue;
+            if (k < ops.size()) ops[k] = c;
+            ++k;
+        }
+        if (k != 3) return false;
+        condN = ops[0]; thenN = ops[1]; elseN = ops[2];
+        return true;
+    }
+
     // `cond ? then : else` → a Ternary node. The wrapper holds
     // [cond, `?`, then, `:`, else]; the three operands are the visible non-token
     // children. Result type is the then-branch's (C requires then/else to be
     // compatible; the semantic phase already checked, and prefers a node type
     // when it set one).
     E lowerTernary(NodeId node) {
-        std::vector<NodeId> operands;
-        for (NodeId c : visible(node)) if (!isToken(c)) operands.push_back(c);
-        if (operands.size() != 3) {
+        NodeId condN{}, thenN{}, elseN{};
+        if (!ternaryOperands(node, condN, thenN, elseN)) {
             unsupported(node, "malformed ternary expression (expected cond, then, else)");
             return {errorNode(node), InvalidType};
         }
-        E cond = lowerExpr(operands[0]);
+        E cond = lowerExpr(condN);
         // Truthiness at the Ternary boundary: a non-Bool scalar cond
         // becomes `Ne(cond, 0)` (C99 6.5.15p4 "compares unequal to 0"),
         // keeping the CondBr-expects-Bool discipline at MIR.
-        cond = coerceCondition(cond, operands[0]);
-        E thenE = lowerExpr(operands[1]);
-        E elseE = lowerExpr(operands[2]);
+        cond = coerceCondition(cond, condN);
+        E thenE = lowerExpr(thenN);
+        E elseE = lowerExpr(elseN);
+        return combineTernary(node, cond, thenE, elseE);
+    }
+
+    // The ternary EPILOGUE given the ALREADY-coerced condition and the lowered
+    // then/else arms: the C99 type-balance (coerce both arms to their common type)
+    // + makeTernary. Shared by `lowerTernary` and the driver's Ternary frame.
+    // Byte-identical to the prior inline tail of `lowerTernary`. NOTE the
+    // `coerceCondition` is applied to `cond` by the CALLER, before then/else lower
+    // — so the Ne/Cast it emits lands BEFORE the arm nodes, exactly as before.
+    E combineTernary(NodeId node, E cond, E thenE, E elseE) {
         // Coerce both arms to their common type (C99 conditional-expression
         // type-balance rule — the config-driven UAC engine when the
         // language declares the block; FC3 c1). Falls back to the
@@ -1849,13 +2581,123 @@ struct Lowerer {
             return {track(builder.makeCall(base.id, args, result), node), result};
         }
         if (e.target == "Index") {
-            HirNodeId idx = rest.empty() ? reportedError(node, "index has no subscript expression")
-                                         : lowerExpr(rest.front()).id;
-            // element-of-base derivation — the SINGLE source shared with the
-            // semantic-tier typer (type_rules.hpp `indexResultType`).
-            TypeId const inferred = indexResultType(interner, base.type);
-            TypeId const result = typeAtOr(node, inferred);
-            return {track(builder.makeIndex(base.id, idx, result), node), result};
+            E idxE = rest.empty()
+                ? E{reportedError(node, "index has no subscript expression"),
+                    InvalidType}
+                : lowerExpr(rest.front());
+            return combineIndex(node, base, idxE);
+        }
+        if (e.target == "MemberAccess" || e.target == "MemberAccessThruPtr") {
+            return combineMember(node, e, base);
+        }
+        return exprError(node, std::format("postfix target '{}' has no lowering", e.target));
+    }
+
+    // Which postfix forms the `lowerExpr` driver flattens through a frame. Only
+    // Index and Member access flatten (their `base` — and Index's subscript — are
+    // the deep operands of `a[i][j]…` / `a.b.c…` chains). Call (per-arg loop) and
+    // PostInc/PostDec (classifyLvalue + SeqExpr) keep delegating to `lowerPostfix`.
+    enum class PostfixFlatten : std::uint8_t { Delegate, Index, Member };
+
+    // Classify a postfix node for the driver: on Index/Member set `baseN`, the op
+    // entry `e`, and (Index only) the `subscriptN` (invalid when the subscript is
+    // missing — combineIndex then builds the error operand, exactly as the
+    // recursive form does). Mirrors `lowerPostfix`'s extraction + op lookup so the
+    // SAME node routes the SAME way; on anything else returns Delegate and the
+    // driver hands the whole node to `lowerPostfix` unchanged.
+    [[nodiscard]] PostfixFlatten postfixFlattenPlan(NodeId node, NodeId& baseN,
+                                                    NodeId& subscriptN,
+                                                    HirOperatorEntry const*& e) {
+        NodeId opTok{};
+        std::vector<NodeId> rest;
+        for (NodeId c : visible(node)) {
+            if (!baseN.valid() && !isToken(c)) { baseN = c; continue; }
+            if (isToken(c)) { if (!opTok.valid()) opTok = c; continue; }
+            rest.push_back(c);
+        }
+        if (!baseN.valid() || !opTok.valid()) return PostfixFlatten::Delegate;  // malformed
+        auto it = postOp_.find(tree().tokenKind(opTok).v);
+        if (it == postOp_.end()) return PostfixFlatten::Delegate;               // unmapped
+        HirOperatorEntry const& entry = cfg.postfixOps[it->second];
+        if (entry.target == "Index") {
+            e = &entry;
+            subscriptN = rest.empty() ? NodeId{} : rest.front();
+            return PostfixFlatten::Index;
+        }
+        if (entry.target == "MemberAccess" || entry.target == "MemberAccessThruPtr") {
+            e = &entry;
+            return PostfixFlatten::Member;
+        }
+        return PostfixFlatten::Delegate;  // Call / PostInc / PostDec / unknown
+    }
+
+    // True iff `node` is a well-formed postfix CALL — the form the driver flattens
+    // through a Call frame. On success sets `baseN` to the callee CST node and
+    // `argNodes` to its argument expression nodes (left→right, via
+    // `argExpressions`). Mirrors `lowerPostfix`'s extraction + op lookup EXACTLY
+    // (base = first non-token, op = first token, the rest = argList) so the SAME
+    // node routes the SAME way; PostInc / PostDec / Index / Member / malformed /
+    // unmapped return false and keep their existing (delegate or flatten) routing.
+    [[nodiscard]] bool callBaseAndArgs(NodeId node, NodeId& baseN,
+                                       std::vector<NodeId>& argNodes) {
+        NodeId opTok{};
+        std::vector<NodeId> rest;
+        for (NodeId c : visible(node)) {
+            if (!baseN.valid() && !isToken(c)) { baseN = c; continue; }
+            if (isToken(c)) { if (!opTok.valid()) opTok = c; continue; }
+            rest.push_back(c);
+        }
+        if (!baseN.valid() || !opTok.valid()) { baseN = {}; return false; }  // malformed
+        auto it = postOp_.find(tree().tokenKind(opTok).v);
+        if (it == postOp_.end()) { baseN = {}; return false; }               // unmapped
+        if (cfg.postfixOps[it->second].target != "Call") { baseN = {}; return false; }
+        argNodes = argExpressions(rest);
+        return true;
+    }
+
+    // The INDEX epilogue given the ALREADY-lowered `base` and subscript `idxE`.
+    // Shared by `lowerPostfix` and the driver's Postfix frame. Byte-identical to
+    // the prior inline `Index` arm: integer-promote the subscript, derive the
+    // element type, emit makeIndex.
+    E combineIndex(NodeId node, E base, E idxE) {
+        // D-CSUBSET-INDEX-INTEGER-PROMOTION (C 6.3.1.1 / 6.5.2.1): the
+        // subscript undergoes INTEGER PROMOTION — a `char`/`short` index
+        // promotes to `int` BEFORE the index arithmetic. Without it, a narrow
+        // index forms a narrow stride-`Mul` at MIR (`scaleIndexToBytes`) that
+        // (1) OVERFLOWS — `idx * stride` wraps at the narrow width
+        // (`(char)100 * 4` = 400 mod 256) — and (2) walls at the sub-native
+        // ALU gap (`D-CSUBSET-SUBNATIVE-ALU-FORMS`). Reuse the SAME
+        // `integerPromotedType` the binary-op path uses (config-driven C
+        // 6.3.1 promotion); a block-less language (no `arithmeticConversions`)
+        // or an already-≥int index keeps the raw value (no coerce).
+        if (arith_.has_value() && idxE.type.valid()) {
+            TypeId const promoted =
+                integerPromotedType(interner, idxE.type, *arith_);
+            if (promoted.valid() && promoted.v != idxE.type.v)
+                idxE = coerce(idxE, promoted);
+        }
+        // element-of-base derivation — the SINGLE source shared with the
+        // semantic-tier typer (type_rules.hpp `indexResultType`).
+        TypeId const inferred = indexResultType(interner, base.type);
+        TypeId const result = typeAtOr(node, inferred);
+        return {track(builder.makeIndex(base.id, idxE.id, result), node),
+                result};
+    }
+
+    // The MEMBER-ACCESS epilogue given the ALREADY-lowered `base`. Shared by
+    // `lowerPostfix` and the driver's Postfix frame. Byte-identical to the prior
+    // inline `MemberAccess`/`MemberAccessThruPtr` arm. The follower (field-name
+    // subtree) is re-extracted from `node` exactly as `lowerPostfix` built `rest`:
+    // skip the first non-token (the base) and the op token, collect the remainder.
+    E combineMember(NodeId node, HirOperatorEntry const& e, E base) {
+        std::vector<NodeId> rest;
+        {
+            bool baseSeen = false;
+            for (NodeId c : visible(node)) {
+                if (!baseSeen && !isToken(c)) { baseSeen = true; continue; }
+                if (isToken(c)) continue;
+                rest.push_back(c);
+            }
         }
         // D5.1: `obj.field` and `ptr->field`. The semantic phase (Pass 2)
         // already resolved the field's SymbolId (via the `memberAccesses`
@@ -1950,38 +2792,521 @@ struct Lowerer {
     }
 
     // ── statements ────────────────────────────────────────────────────────────
+    //
+    // D-PARSE-DEEP-NEST-RECURSION-MEMORY (plan 24 Stage 3b): `lowerStmt` is an
+    // EXPLICIT HEAP WORK-STACK driver — NOT host recursion — for the DEEP
+    // statement forms that nest child STATEMENTS (the transparent wrapper, Block,
+    // If, While/DoWhile, For, Label). A deeply-nested statement tree — 256 nested
+    // `{ }` blocks, or nested `if`/`while`/`for` bodies, or a long statement list
+    // — therefore carries flat O(N) host-stack cost (only the worker thread's
+    // heap-backed `work` vector grows). EVERY OTHER form (VarDecl/TypeDecl/
+    // ExprStmt/Return/Break/Continue/Goto/IndirectGoto/Skip/Extension and SWITCH)
+    // computes its `HirNodeId` synchronously (terminal: it does not nest a child
+    // statement; Switch: its arm-grouping stays recursive but RE-ENTERS this
+    // driver for each `lowerStmt(body)` call, so a deep statement nested inside a
+    // switch arm still flattens). **OUTPUT-IDENTITY is THE gate** (the full ctest
+    // suite is the oracle): the emitted HIR — nodes, types, span-table order,
+    // arena order — is byte-for-byte identical to the prior recursive form. The
+    // recursive form built a parent statement's CHILDREN first (depositing their
+    // subtrees into the arena) and the parent `makeX` node LAST; the driver
+    // preserves that exactly — each frame enters its child statements in source
+    // order (so their `track`/arena ids precede the parent's), then runs the
+    // form's epilogue (`makeBlock`/`makeIfStmt`/… + `wrapIfProvablyInfinite`) when
+    // the children are collected. Conditions / for-clauses are NOT child
+    // statements — they lower INLINE in phase 0 (via the now-flat `lowerExpr` /
+    // `lowerForClause`), at the SAME point the recursive form lowered them, so the
+    // cond/init/update arena ids precede the body's exactly as before. The
+    // parser's `P_ExpressionTooDeep` cap is UNCHANGED.
+
+    // One statement work-stack frame. Only the DEEP forms allocate a frame; the
+    // per-form `phase` machine enters ONE child statement (via `enterStmt`, which
+    // only ever PUSHES — it does not recurse — so the descent is driven by the
+    // loop, keeping host-stack cost flat O(1) per level) or finishes and delivers
+    // its `HirNodeId` into the shared `stmtResult` slot. A frame reference
+    // `f = work.back()` DANGLES after any `enterStmt`/`push_back`, so each phase
+    // reads/copies every field it needs OUT of `f` and advances `f.phase` BEFORE
+    // calling `enterStmt` (the Stage-1/2/3 realloc-safe idiom). Block (an unbounded
+    // statement list) keeps its accumulating `stmts` vector in a `blockCtxs` LIFO
+    // stack LOCAL to `lowerStmt` (referenced by stable INDEX `aux`, exactly like
+    // the Call frame's `callCtxs`) — the `work` vector reallocs across the per-item
+    // `enterStmt`, so a held `vector&` would dangle but an index never does. The
+    // bounded forms (If ≤2 bodies, While/For/Label = 1 body) store child results
+    // in the frame fields `c0`/`c1`.
+    struct StmtFrame {
+        enum class Kind : std::uint8_t { PassThrough, Block, If, While, For,
+                                         Label, Switch } kind;
+        NodeId        node;     // the source node (provenance / combine anchor)
+        std::uint8_t  phase;
+        bool          doWhile;  // While frame: DoWhileStmt vs WhileStmt
+        NodeId        n0;       // PassThrough inner / If+While+For+Label body / If then
+        NodeId        n1;       // If else body (if present)
+        NodeId        condNode; // While/For: the cond CST node (provably-infinite probe), invalid if none
+        HirNodeId     condId;   // If/While: the lowered+coerced condition id
+        std::optional<HirNodeId> initId, condOpt, updateId;  // For: header clause ids
+        std::uint32_t labelOrd; // Label: the pre-scanned label ordinal
+        HirNodeId     c0;       // first collected child-stmt result (If then)
+        HirNodeId     c1;       // second collected child-stmt result (If else)
+        bool          haveC1;   // If: an else body exists
+        std::uint32_t aux;      // Block: index into the local `blockCtxs` stack
+    };
+
+    // The accumulating Block state (its `stmts` list + the next item to process).
+    // Lives in a `blockCtxs` stack LOCAL to `lowerStmt` (NOT in `StmtFrame` — the
+    // `stmts` vector must survive across the per-item `enterStmt` calls while the
+    // `work` vector reallocs). A Block frame holds only an INDEX (`aux`); indices
+    // are stable because nested blocks finish inner-first (LIFO push/pop the back).
+    struct BlockCtx {
+        std::vector<NodeId>     itemNodes;   // the block's statement children (source order)
+        std::size_t             itemIdx{};   // next item to process
+        std::vector<HirNodeId>  stmts;       // accumulated lowered statement ids
+    };
+
+    // The accumulating Switch state — the full grouping machine that the recursive
+    // `lowerSwitch` ran as locals, lifted into a ctx so its TWO body-lowering
+    // re-entries (`lowerStmt(bodyCore)` in the case-chain + `lowerStmt(core)` for a
+    // plain arm body) become work-stack pushes on the OUTER `lowerStmt` driver
+    // instead of host recursion — so a switch nested in a switch-arm body carries
+    // flat O(1) host-stack cost per nesting level. Lives in a `switchCtxs` LIFO
+    // stack LOCAL to `lowerStmt` (referenced by stable INDEX `aux`, like `blockCtxs`
+    // — a nested switch grows the stack, and indices survive realloc). The
+    // bookkeeping is byte-IDENTICAL to `lowerSwitch`: `pumpSwitch` runs the same
+    // item loop + adjacent-case chain + label peeling, emitting the SAME nodes in
+    // the SAME order; the ONLY change is that a body lowers via `enterStmt` (and
+    // the Switch frame resumes the pump once `stmtResult` holds it).
+    struct SwitchCtx {
+        NodeId                  node{};        // the switch CST node (provenance anchor)
+        HirNodeId               discId{};      // the (already-lowered) discriminant
+        std::vector<NodeId>     items;         // switchBodyItem wrappers (source order)
+        std::size_t             itemIdx{};     // next top-level item to process
+        // arm-grouping accumulators (the recursive `lowerSwitch` locals):
+        std::vector<HirNodeId>  arms;          // collected CaseArm ids
+        std::optional<NodeId>   curValue;      // the open arm's match expr, if any
+        bool                    curIsDefault{};// the open arm is `default`
+        bool                    haveArm{};     // an arm is open
+        std::vector<HirNodeId>  curBody;       // the open arm's collected body stmts
+        // adjacent-case chain resumption (the `lowerCaseChain` inner `for(;;)`):
+        bool                    inChain{};     // a case-chain is in progress
+        NodeId                  chainCs{};     // the current caseStmt node in the chain
+        std::vector<NodeId>     chainLabels;   // labels to wrap this chain link's body
+        // the just-entered body's pending label-wrap (applied when it completes;
+        // EMPTY ⇒ no wrap — the plain-stmt arm body):
+        std::vector<NodeId>     pendingLabels; // labels for the pending body
+    };
+
+    // The public statement-lowering entry: a driver over an explicit work-stack.
+    // `enterStmt` classifies a node (TERMINAL / Switch → set `stmtResult`; DEEP
+    // form → push a phase-0 frame and return WITHOUT recursing); the loop runs
+    // each frame's phase machine, calling `enterStmt` for the next child statement.
+    // Dispatch ORDER matches the prior recursive `lowerStmt` exactly →
+    // byte-identical.
     HirNodeId lowerStmt(NodeId node) {
-        HirRuleMapping const* m = mappingFor(node);
-        if (m == nullptr) {
-            // Transparent wrapper (e.g. `varDecl = [varDeclHead, ';']`): descend.
-            NodeId only = soleMeaningfulChild(node);
-            if (only.valid()) return lowerStmt(only);
-            unsupported(node, "statement has no hirLowering mapping");
-            return errorNode(node);
+        std::vector<StmtFrame> work;
+        std::vector<BlockCtx>  blockCtxs;   // accumulators for flattened Blocks
+        std::vector<SwitchCtx> switchCtxs;  // accumulators for flattened Switches
+        // Default-init: `enterStmt` ALWAYS assigns `stmtResult` for a terminal,
+        // and every pushed frame delivers into `stmtResult` before it is read.
+        HirNodeId stmtResult{};
+
+        auto const enterStmt = [&](NodeId n) {
+            HirRuleMapping const* m = mappingFor(n);
+            if (m == nullptr) {
+                // Transparent wrapper (e.g. `varDecl = [varDeclHead, ';']`):
+                // descend into its sole meaningful child via the work-stack.
+                NodeId only = soleMeaningfulChild(n);
+                if (only.valid()) {
+                    work.push_back({.kind = StmtFrame::Kind::PassThrough,
+                                    .node = n, .n0 = only});
+                    return;
+                }
+                unsupported(n, "statement has no hirLowering mapping");
+                stmtResult = errorNode(n);
+                return;
+            }
+            std::string const& k = m->hirKind;
+            // ── DEEP forms (flattened through a frame) ────────────────────────
+            if (k == "Block") {
+                std::uint32_t const ctxIdx = static_cast<std::uint32_t>(blockCtxs.size());
+                blockCtxs.push_back(BlockCtx{.itemNodes = blockChildNodes(n)});
+                work.push_back({.kind = StmtFrame::Kind::Block, .node = n, .aux = ctxIdx});
+                return;
+            }
+            if (k == "IfStmt") {
+                StmtFrame fr{.kind = StmtFrame::Kind::If, .node = n};
+                ifPrologue(n, fr.condId, fr.n0, fr.n1);   // cond lowered INLINE here
+                work.push_back(fr);
+                return;
+            }
+            if (k == "WhileStmt" || k == "DoWhileStmt") {
+                StmtFrame fr{.kind = StmtFrame::Kind::While, .node = n,
+                             .doWhile = (k == "DoWhileStmt")};
+                whilePrologue(n, fr.condId, fr.condNode, fr.n0);   // cond lowered INLINE
+                work.push_back(fr);
+                return;
+            }
+            if (k == "ForStmt") {
+                StmtFrame fr{.kind = StmtFrame::Kind::For, .node = n};
+                if (forPrologue(n, fr.initId, fr.condOpt, fr.updateId,
+                                fr.condNode, fr.n0)) {   // header clauses lowered INLINE
+                    work.push_back(fr);
+                    return;
+                }
+                stmtResult = errorNode(n);   // malformed `for` (no body)
+                return;
+            }
+            if (k == "LabelStmt") {
+                StmtFrame fr{.kind = StmtFrame::Kind::Label, .node = n};
+                if (labelPrologue(n, fr.labelOrd, fr.n0)) {
+                    work.push_back(fr);
+                    return;
+                }
+                stmtResult = errorNode(n);   // malformed / un-prescanned label
+                return;
+            }
+            // ── TERMINAL / synchronous forms (no nested child statement) ──────
+            if (k == "VarDecl")     { stmtResult = lowerVarDecl(n); return; }
+            if (k == "TypeDecl")    { stmtResult = lowerTypeDecl(n); return; }
+            if (k == "ExprStmt")    { stmtResult = lowerExprStmt(n); return; }
+            if (k == "ReturnStmt")  { stmtResult = lowerReturn(n); return; }
+            if (k == "BreakStmt")    { stmtResult = track(builder.makeBreak(0), n); return; }
+            if (k == "ContinueStmt") { stmtResult = track(builder.makeContinue(0), n); return; }
+            // Switch is a DEEP form: its arm-grouping re-enters the driver for each
+            // arm body (`lowerStmt(body)`), so a switch nested in a switch-arm body
+            // would recurse on the host stack. Flatten it through a Switch frame —
+            // the discriminant + item list lower INLINE here (the prologue,
+            // matching `lowerSwitch`'s opening scan), then the body re-entries go
+            // through the work-stack. `switchPrologue` is byte-identical to the
+            // recursive scan (discriminant first, then collect switchBodyItems).
+            if (k == "SwitchStmt") {
+                std::uint32_t const ctxIdx = static_cast<std::uint32_t>(switchCtxs.size());
+                switchCtxs.push_back(switchPrologue(n));
+                work.push_back({.kind = StmtFrame::Kind::Switch, .node = n, .aux = ctxIdx});
+                return;
+            }
+            if (k == "GotoStmt")    { stmtResult = lowerGoto(n); return; }
+            if (k == "IndirectGotoStmt") { stmtResult = lowerIndirectGoto(n); return; }
+            // D-CSUBSET-LABEL-BEFORE-CASE: a `case`/`default` labeled statement (the
+            // `caseStmt` form that lets a goto-label precede a case) reaches the
+            // statement dispatch ONLY when it is NOT a direct switch-body item —
+            // lowerSwitch consumes the in-switch (label-wrapped) ones first. So this
+            // is a case outside any switch, or nested in an inner block of a switch
+            // arm (the flat-switch model groups only top-level items). Fail loud
+            // (C 6.8.1) rather than emit a stray arm-less case.
+            if (k == "CaseStmt") {
+                emitH(DiagnosticCode::S_CaseLabelNotInSwitch, n,
+                      "'case'/'default' label is not a direct switch-body item (C 6.8.1)");
+                stmtResult = errorNode(n);
+                return;
+            }
+            // FC5: an empty statement `;` lowers to a no-op (an empty Block: it
+            // lowers to nothing in MIR, doesn't terminate, and emits no warning).
+            // `Skip` is also the include-directive's kind, handled at the top-level
+            // decl path.
+            if (k == "Skip")        { stmtResult = track(builder.makeBlock({}), n); return; }
+            // HR10: a rule mapped to a registered extension kind → an Extension node.
+            if (extKindByName_.count(k)) { stmtResult = lowerExtensionNode(n, *m); return; }
+            unsupported(n, std::format("statement maps to unsupported HIR kind '{}'", k));
+            stmtResult = errorNode(n);
+        };
+
+        // The per-item pump for a flattened Block (ctx at stable index `ctxIdx`):
+        // enter the next statement item; returns true iff it entered one (the
+        // caller waits for it), false when all items are consumed (the caller
+        // finishes the block). Re-addresses `blockCtxs[ctxIdx]` fresh each access
+        // — a nested block (an item that is itself a Block) grows `blockCtxs`, so a
+        // held reference could dangle; the INDEX is stable. `enterStmt` is the LAST
+        // action, respecting the dangling-`work.back()` rule. Items are entered
+        // LEFT-TO-RIGHT (a sequential loop — exactly `lowerBlock`'s recursive
+        // `for (c : visible) stmts.push_back(lowerStmt(c))`), platform-independent.
+        auto const pumpBlock = [&](std::uint32_t ctxIdx) -> bool {
+            if (blockCtxs[ctxIdx].itemIdx >= blockCtxs[ctxIdx].itemNodes.size())
+                return false;   // all items consumed → finish
+            NodeId const item = blockCtxs[ctxIdx].itemNodes[blockCtxs[ctxIdx].itemIdx];
+            enterStmt(item);
+            return true;
+        };
+
+        // The Switch arm-grouping PUMP (ctx at stable index `ctxIdx`): runs the
+        // SAME item loop + adjacent-case chain + label peeling as the recursive
+        // `lowerSwitch`, emitting the SAME nodes in the SAME order — but each time
+        // it reaches a BODY to lower it `enterStmt`s the body and returns `true`
+        // (suspended; the Switch frame collects `stmtResult` on resume, applies the
+        // pending label-wrap, then calls this again). Returns `false` when all
+        // top-level items are consumed (the caller finishes the switch). The ctx is
+        // re-addressed fresh each access (a body that is itself a switch grows
+        // `switchCtxs` via `enterStmt`, so a held reference could dangle; the INDEX
+        // is stable). `enterStmt` is the LAST action before a `return true`, so the
+        // dangling-`work.back()` rule holds. The in-flight body's labels are stashed
+        // in `pendingLabels` (empty ⇒ no wrap — the plain-stmt arm body).
+        auto const pumpSwitch = [&](std::uint32_t ctxIdx) -> bool {
+            for (;;) {
+                if (switchCtxs[ctxIdx].inChain) {
+                    // One iteration of `lowerCaseChain`'s `for(;;)` for the current
+                    // chain link (`chainCs` / `chainLabels`).
+                    NodeId const cs = switchCtxs[ctxIdx].chainCs;
+                    std::vector<NodeId> labels = std::move(switchCtxs[ctxIdx].chainLabels);
+                    NodeId caseLabelNode{}, caseBody{};
+                    bool seenFirst = false;
+                    for (NodeId c : visible(cs)) {
+                        if (isToken(c)) continue;
+                        if (!seenFirst) { caseLabelNode = c; seenFirst = true; }
+                        else { caseBody = c; break; }
+                    }
+                    switchStartArm(switchCtxs[ctxIdx], switchCtxs[ctxIdx].node, caseLabelNode);
+                    if (!caseBody.valid()) {                       // empty case body (defensive)
+                        if (!labels.empty())
+                            switchCtxs[ctxIdx].curBody.push_back(switchWrapLabels(
+                                switchCtxs[ctxIdx].node, labels,
+                                switchMakeSkip(switchCtxs[ctxIdx].node)));
+                        switchCtxs[ctxIdx].inChain = false;
+                        continue;                                  // chain done → next top-level item
+                    }
+                    NodeId bodyCore = peelToCore(caseBody);
+                    std::vector<NodeId> innerLabels;
+                    NodeId bodyProbe = switchPeelLabels(bodyCore, innerLabels);
+                    if (switchIsRuleNode(bodyProbe, cfg.caseStmtRule)) {  // adjacent case
+                        if (!labels.empty())
+                            switchCtxs[ctxIdx].curBody.push_back(switchWrapLabels(
+                                switchCtxs[ctxIdx].node, labels,
+                                switchMakeSkip(switchCtxs[ctxIdx].node)));
+                        switchCtxs[ctxIdx].chainCs = bodyProbe;
+                        switchCtxs[ctxIdx].chainLabels = std::move(innerLabels);
+                        continue;                                  // → next chain link (stay inChain)
+                    }
+                    // The real body of this chain link → SUSPEND. The chain ends
+                    // after it (the recursive `lowerCaseChain` returns here).
+                    switchCtxs[ctxIdx].inChain = false;
+                    switchCtxs[ctxIdx].pendingLabels = std::move(labels);
+                    enterStmt(bodyCore);   // LAST action — may grow switchCtxs
+                    return true;
+                }
+                // The top-level item loop (`for (raw : items)`).
+                if (switchCtxs[ctxIdx].itemIdx >= switchCtxs[ctxIdx].items.size())
+                    return false;          // all items consumed → finish
+                NodeId const raw = switchCtxs[ctxIdx].items[switchCtxs[ctxIdx].itemIdx];
+                ++switchCtxs[ctxIdx].itemIdx;
+                NodeId core = peelToCore(raw);
+                std::vector<NodeId> labelToks;
+                NodeId probe = switchPeelLabels(core, labelToks);
+                if (switchIsRuleNode(probe, cfg.caseStmtRule)) {   // (label-wrapped) case statement
+                    switchCtxs[ctxIdx].inChain = true;
+                    switchCtxs[ctxIdx].chainCs = probe;
+                    switchCtxs[ctxIdx].chainLabels = std::move(labelToks);
+                    continue;                                      // enter the chain
+                } else if (switchIsRuleNode(core, cfg.caseLabelRule)) {  // bare flat case
+                    switchStartArm(switchCtxs[ctxIdx], switchCtxs[ctxIdx].node, core);
+                    continue;
+                } else if (switchCtxs[ctxIdx].haveArm) {           // plain stmt body → SUSPEND (no wrap)
+                    switchCtxs[ctxIdx].pendingLabels.clear();
+                    enterStmt(core);       // LAST action — may grow switchCtxs
+                    return true;
+                }
+                // not haveArm and not a case → nothing to emit; next item.
+            }
+        };
+
+        enterStmt(node);
+        while (!work.empty()) {
+            StmtFrame& f = work.back();
+            switch (f.kind) {
+            case StmtFrame::Kind::PassThrough:
+                // A transparent wrapper: descend into the inner node (phase 0),
+                // then pass its `HirNodeId` through unchanged (phase 1).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const inner = f.n0;
+                    enterStmt(inner);       // may invalidate `f`
+                } else {
+                    work.pop_back();        // `stmtResult` already holds the inner id
+                }
+                break;
+            case StmtFrame::Kind::Block:
+                // A `{ … }` block: enter each statement item left-to-right (one at
+                // a time), collecting its id; when all are consumed, makeBlock.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    std::uint32_t const ctxIdx = f.aux;
+                    if (pumpBlock(ctxIdx)) break;       // entered the first item — wait
+                    finishBlock(work, blockCtxs, ctxIdx, stmtResult);   // empty block
+                } else {
+                    // A block item just completed (`stmtResult` holds it). Collect
+                    // it, advance, enter the next — or finish.
+                    std::uint32_t const ctxIdx = f.aux;
+                    blockCtxs[ctxIdx].stmts.push_back(stmtResult);
+                    ++blockCtxs[ctxIdx].itemIdx;
+                    if (pumpBlock(ctxIdx)) break;       // entered the next item — wait
+                    finishBlock(work, blockCtxs, ctxIdx, stmtResult);   // all consumed
+                }
+                break;
+            case StmtFrame::Kind::Switch:
+                // The discriminant + items lowered in the prologue; now the
+                // arm-grouping pump (phase 0), suspending at each body so it lowers
+                // through the work-stack. On resume (else) a body just completed
+                // (`stmtResult`): apply its pending label-wrap, collect it into the
+                // open arm's body, then pump again — or finish (flush + makeSwitch).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    std::uint32_t const ctxIdx = f.aux;
+                    if (pumpSwitch(ctxIdx)) break;      // entered the first body — wait
+                    finishSwitch(work, switchCtxs, ctxIdx, stmtResult);   // no bodies
+                } else {
+                    // A body just completed (`stmtResult`). Wrap it in its pending
+                    // goto-labels (empty ⇒ unchanged — the plain-stmt arm body) and
+                    // collect it, exactly as the recursive `curBody.push_back(
+                    // wrapLabels(labels, lowerStmt(body)))`. Then pump the next.
+                    std::uint32_t const ctxIdx = f.aux;
+                    NodeId const node2 = switchCtxs[ctxIdx].node;
+                    HirNodeId const wrapped = switchWrapLabels(
+                        node2, switchCtxs[ctxIdx].pendingLabels, stmtResult);
+                    switchCtxs[ctxIdx].curBody.push_back(wrapped);
+                    switchCtxs[ctxIdx].pendingLabels.clear();
+                    if (pumpSwitch(ctxIdx)) break;      // entered the next body — wait
+                    finishSwitch(work, switchCtxs, ctxIdx, stmtResult);   // all consumed
+                }
+                break;
+            case StmtFrame::Kind::If:
+                // cond lowered in the prologue; now the then-body (phase 0→1, only
+                // if present), then the else-body if present (phase 1→2), then the
+                // SAME finish tail as `lowerIf` (deferred missing-cond/missing-then
+                // errors emit HERE, after the bodies — matching the recursive span
+                // order). Children entered in SOURCE order (then before else).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const thenN = f.n0;
+                    if (thenN.valid()) { enterStmt(thenN); break; }  // may invalidate `f`
+                    // No then-branch: `stmtResult` is unused for `c0` (the finish
+                    // substitutes a reportedError); fall through to phase 1.
+                }
+                if (f.phase == 1) {
+                    f.phase = 2;
+                    if (f.n0.valid()) f.c0 = stmtResult;   // then-body result
+                    NodeId const elseN = f.n1;
+                    if (elseN.valid()) { f.haveC1 = true; enterStmt(elseN); break; }
+                    // no else
+                }
+                {
+                    NodeId const node2 = f.node;
+                    bool const haveThen = f.n0.valid();
+                    HirNodeId const thenH = f.c0;
+                    HirNodeId const condIn = f.condId;
+                    std::optional<HirNodeId> els;
+                    if (f.haveC1) { f.c1 = stmtResult; els = f.c1; }
+                    work.pop_back();
+                    // Match `lowerIf`'s finish ORDER exactly: missing-cond error
+                    // first, then missing-then error.
+                    HirNodeId const condFinal =
+                        condIn.valid() ? condIn
+                                       : orError(std::nullopt, node2, "if statement has no condition");
+                    HirNodeId const thenFinal =
+                        haveThen ? thenH
+                                 : reportedError(node2, "if statement has no then-branch");
+                    stmtResult = track(builder.makeIfStmt(condFinal, thenFinal, els), node2);
+                }
+                break;
+            case StmtFrame::Kind::While:
+                // cond lowered in the prologue; now the body (phase 0→1), then
+                // makeWhileStmt/makeDoWhileStmt + wrapIfProvablyInfinite.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const bodyN = f.n0;
+                    if (bodyN.valid()) { enterStmt(bodyN); break; }
+                    // No body: leave `stmtResult` (the finish substitutes an
+                    // orError — emitted AFTER the missing-cond error, matching
+                    // `lowerWhile`'s span order). Fall through to phase 1.
+                }
+                {
+                    NodeId const node2   = f.node;
+                    bool const   doWhile = f.doWhile;
+                    bool const   haveBody = f.n0.valid();
+                    HirNodeId const condIn = f.condId;
+                    std::optional<NodeId> const condNode =
+                        f.condNode.valid() ? std::optional<NodeId>{f.condNode} : std::nullopt;
+                    std::optional<HirNodeId> const body =
+                        haveBody ? std::optional<HirNodeId>{stmtResult} : std::nullopt;
+                    work.pop_back();
+                    // Match `lowerWhile`'s finish ORDER: missing-cond error first,
+                    // then missing-body error.
+                    HirNodeId const condFinal =
+                        condIn.valid() ? condIn
+                                       : orError(std::nullopt, node2, "loop has no condition");
+                    HirNodeId const bodyId = orError(body, node2, "loop has no body");
+                    HirNodeId const loop =
+                        doWhile ? track(builder.makeDoWhileStmt(bodyId, condFinal), node2)
+                                : track(builder.makeWhileStmt(condFinal, bodyId), node2);
+                    stmtResult = wrapIfProvablyInfinite(node2, loop, condNode, bodyId);
+                }
+                break;
+            case StmtFrame::Kind::For:
+                // init/cond/update lowered in the prologue; now the body
+                // (phase 0→1), then makeForStmt + wrapIfProvablyInfinite.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const bodyN = f.n0;
+                    enterStmt(bodyN);           // for always has a body here
+                    break;
+                }
+                {
+                    NodeId const node2 = f.node;
+                    std::optional<HirNodeId> const initId   = f.initId;
+                    std::optional<HirNodeId> const condOpt  = f.condOpt;
+                    std::optional<HirNodeId> const updateId = f.updateId;
+                    std::optional<NodeId> const condNode =
+                        f.condNode.valid() ? std::optional<NodeId>{f.condNode} : std::nullopt;
+                    HirNodeId const bodyH = stmtResult;
+                    work.pop_back();
+                    HirNodeId const loop =
+                        track(builder.makeForStmt(initId, condOpt, updateId, bodyH), node2);
+                    stmtResult = wrapIfProvablyInfinite(node2, loop, condNode, bodyH);
+                }
+                break;
+            case StmtFrame::Kind::Label:
+                // `label: stmt` — enter the labeled statement (phase 0→1), then
+                // makeLabelStmt carrying the pre-scanned ordinal.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const bodyN = f.n0;
+                    enterStmt(bodyN);           // may invalidate `f`
+                } else {
+                    NodeId const node2 = f.node;
+                    std::uint32_t const ord = f.labelOrd;
+                    HirNodeId const bodyH = stmtResult;
+                    work.pop_back();
+                    stmtResult = track(builder.makeLabelStmt(ord, bodyH), node2);
+                }
+                break;
+            }
         }
-        std::string const& k = m->hirKind;
-        if (k == "VarDecl")     return lowerVarDecl(node);
-        if (k == "TypeDecl")    return lowerTypeDecl(node);
-        if (k == "Block")       return lowerBlock(node);
-        if (k == "ExprStmt")    return lowerExprStmt(node);
-        if (k == "ReturnStmt")  return lowerReturn(node);
-        if (k == "BreakStmt")    return track(builder.makeBreak(0), node);
-        if (k == "ContinueStmt") return track(builder.makeContinue(0), node);
-        if (k == "IfStmt")      return lowerIf(node);
-        if (k == "WhileStmt")   return lowerWhile(node, /*doWhile=*/false);
-        if (k == "DoWhileStmt") return lowerWhile(node, /*doWhile=*/true);
-        if (k == "ForStmt")     return lowerFor(node);
-        if (k == "SwitchStmt")  return lowerSwitch(node);
-        if (k == "GotoStmt")    return lowerGoto(node);
-        if (k == "LabelStmt")   return lowerLabel(node);
-        // FC5: an empty statement `;` lowers to a no-op (an empty Block: it lowers
-        // to nothing in MIR, doesn't terminate, and emits no warning). `Skip` is
-        // also the include-directive's kind, handled at the top-level decl path.
-        if (k == "Skip")        return track(builder.makeBlock({}), node);
-        // HR10: a rule mapped to a registered extension kind → an Extension node.
-        if (extKindByName_.count(k)) return lowerExtensionNode(node, *m);
-        unsupported(node, std::format("statement maps to unsupported HIR kind '{}'", k));
-        return errorNode(node);
+        return stmtResult;
+    }
+
+    // Finish a flattened Block: emit makeBlock from the (now-complete) ctx, pop the
+    // Block frame and its ctx (the top of each — nested blocks finished inner-first,
+    // so the LIFO `pop_back` removes exactly this block's frame + ctx), and deliver
+    // the Block `HirNodeId` into `stmtResult`. Out-of-line so the empty-block and
+    // all-items-consumed paths share one finish. Byte-identical to `lowerBlock`'s
+    // `track(makeBlock(stmts), node)`.
+    void finishBlock(std::vector<StmtFrame>& work, std::vector<BlockCtx>& blockCtxs,
+                     std::uint32_t ctxIdx, HirNodeId& stmtResult) {
+        NodeId const blockNode = work.back().node;   // the Block node (provenance)
+        HirNodeId const blockH = track(builder.makeBlock(blockCtxs[ctxIdx].stmts), blockNode);
+        work.pop_back();
+        blockCtxs.pop_back();
+        stmtResult = blockH;
+    }
+
+    // Finish a flattened Switch: flush the last open arm (the match VALUE lowers
+    // HERE, after its body — exactly as the recursive `lowerSwitch`'s trailing
+    // `flush()`), emit makeSwitchStmt, pop the Switch frame + its ctx (LIFO top — a
+    // nested switch finished inner-first), and deliver into `stmtResult`. Shared by
+    // the no-bodies and all-items-consumed paths. Byte-identical to `lowerSwitch`'s
+    // `track(makeSwitchStmt(discId, arms), node)`.
+    void finishSwitch(std::vector<StmtFrame>& work, std::vector<SwitchCtx>& switchCtxs,
+                      std::uint32_t ctxIdx, HirNodeId& stmtResult) {
+        SwitchCtx& ctx = switchCtxs[ctxIdx];
+        switchFlush(ctx, ctx.node);
+        HirNodeId const swH = track(builder.makeSwitchStmt(ctx.discId, ctx.arms), ctx.node);
+        work.pop_back();
+        switchCtxs.pop_back();
+        stmtResult = swH;
     }
 
     // FC5 — pre-assign a per-function ordinal to every label in `node`'s subtree
@@ -2011,24 +3336,43 @@ struct Lowerer {
             if (!isToken(c)) prescanLabels(c);
     }
 
-    // `label: stmt` — carry the pre-scanned ordinal; lower the labeled statement
-    // (the sole non-token child). The shared ordinal links it to its goto(s).
-    HirNodeId lowerLabel(NodeId node) {
+    // `label: stmt` PROLOGUE shared by `lowerLabel` (the recursive entry) and the
+    // `lowerStmt` driver's Label frame: extract the name token + the labeled
+    // statement (the sole non-token child) and resolve the pre-scanned ordinal. On
+    // success sets `ord`/`bodyN` and returns true; on a malformed / un-prescanned
+    // label emits the SAME positioned diagnostic and returns false. All reads (no
+    // HIR emission of the label itself), so resolving the ordinal here — BEFORE the
+    // body lowers — is byte-identical to the recursive form's order.
+    [[nodiscard]] bool labelPrologue(NodeId node, std::uint32_t& ord, NodeId& bodyN) {
         NodeId const nameTok = firstIdentifierToken(node);
         NodeId bodyStmt{};
         for (NodeId c : visible(node)) { if (!isToken(c)) { bodyStmt = c; break; } }
         if (!nameTok.valid() || !bodyStmt.valid()) {
             unsupported(node, "malformed labeled statement");
-            return errorNode(node);
+            return false;
         }
         auto it = labelOrdinals_.find(std::string{tree().text(nameTok)});
         if (it == labelOrdinals_.end()) {        // pre-scan covers every label
             unsupported(node, std::format("label '{}' was not pre-scanned",
                                           tree().text(nameTok)));
-            return errorNode(node);
+            return false;
         }
-        HirNodeId const bodyH = lowerStmt(bodyStmt);
-        return track(builder.makeLabelStmt(it->second, bodyH), node);
+        ord = it->second;
+        bodyN = bodyStmt;
+        return true;
+    }
+
+    // `label: stmt` — carry the pre-scanned ordinal; lower the labeled statement
+    // (the sole non-token child). The shared ordinal links it to its goto(s).
+    // The `lowerStmt` driver flattens this through a Label frame; this recursive
+    // entry is retained for completeness (byte-identical to the prior form via the
+    // shared prologue).
+    HirNodeId lowerLabel(NodeId node) {
+        std::uint32_t ord{};
+        NodeId bodyN{};
+        if (!labelPrologue(node, ord, bodyN)) return errorNode(node);
+        HirNodeId const bodyH = lowerStmt(bodyN);
+        return track(builder.makeLabelStmt(ord, bodyH), node);
     }
 
     // `goto label;` — resolve the target name to its pre-scanned ordinal. A miss
@@ -2049,6 +3393,32 @@ struct Lowerer {
             return errorNode(node);
         }
         return track(builder.makeGotoStmt(it->second), node);
+    }
+
+    // D-CSUBSET-COMPUTED-GOTO: `goto *expr;` (GNU). The CST shape is
+    // [GotoKeyword, StarOp, expression, EndStatement] — the `*` is GOTO syntax
+    // (consumed by the grammar), so the sole visible non-token child is the
+    // pointer EXPRESSION (lowered as a value, not via the prefix-deref path).
+    // The pointer-operand requirement is enforced by the semantic typer; here we
+    // only build the node. Successors (every address-taken label) are realized at
+    // the MIR tier by IndirectBr.
+    HirNodeId lowerIndirectGoto(NodeId node) {
+        NodeId addrN{};
+        for (NodeId c : visible(node)) { if (!isToken(c)) { addrN = c; break; } }
+        if (!addrN.valid()) {
+            unsupported(node, "computed goto is missing a target address expression");
+            return errorNode(node);
+        }
+        E addr = lowerExpr(addrN);
+        // C/GNU: the operand of `goto *expr` must be a pointer (the computed code
+        // address; `void*` from `&&label` or any object pointer). Fail loud on a
+        // non-pointer rather than silently jumping to a garbage address.
+        if (addr.type.valid() && interner.kind(addr.type) != TypeKind::Ptr) {
+            emitH(DiagnosticCode::S_NotAPointer, addrN,
+                  "the operand of computed `goto *` must be a pointer");
+            return errorNode(node);
+        }
+        return track(builder.makeIndirectGotoStmt(addr.id), node);
     }
 
     // A statement-context expression: an assignment becomes an AssignStmt (HIR
@@ -2336,6 +3706,31 @@ struct Lowerer {
         return {track(builder.makeSizeOf(tref, u64), node), u64};
     }
 
+    // D-CSUBSET-COMPUTED-GOTO: `&&label` → core `HirKind::LabelAddressOf`. The
+    // grammar (`labelAddressExpr = AndAndOp Identifier`) carries the target label
+    // as a RAW Identifier token (the label namespace — NOT a value symbol). Resolve
+    // it to the label's per-function ordinal (the SAME `labelOrdinals_` map
+    // GotoStmt/LabelStmt use; `prescanLabels` collected every label DEFINITION, so
+    // a forward `&&end` before `end:` resolves), stamp the result `void*`, and emit
+    // the leaf. A reference to a label NOT defined in this function is C/GNU-invalid
+    // → fail loud (never a silent bad ordinal).
+    [[nodiscard]] E lowerLabelAddress(NodeId node) {
+        NodeId const nameTok = firstIdentifierToken(node);
+        if (!nameTok.valid()) {
+            return exprError(node, "&&label is missing a target label identifier");
+        }
+        auto it = labelOrdinals_.find(std::string{tree().text(nameTok)});
+        if (it == labelOrdinals_.end()) {
+            emitH(DiagnosticCode::S_UndefinedLabel, nameTok,
+                  std::format("'&&{}' references label '{}' which is not defined "
+                              "in this function",
+                              tree().text(nameTok), tree().text(nameTok)));
+            return {errorNode(node), InvalidType};
+        }
+        TypeId const result = voidPtrType();
+        return {track(builder.makeLabelAddressOf(it->second, result), node), result};
+    }
+
     // FC12a-core: `va_start ( ap, last )` → core `HirKind::VaStart`. The grammar
     // (`vaStartExpr = VaStartKeyword '(' assignExpr [',' assignExpr] ')'`) carries
     // the `va_list` lvalue `ap` as the FIRST internal child; the optional `last`
@@ -2380,7 +3775,7 @@ struct Lowerer {
     // carries the `va_list` lvalue `ap` as the FIRST internal child (value-lowered
     // to its address) and the read TYPE `T` as the SECOND (a `castTypeRef` that is
     // NEVER value-lowered — the SizeOf precedent: `resolveStampedTypeBelow`
-    // recovers T from the semantic phase's per-node stamp). Mirrors `lowerCast`'s
+    // recovers T from the semantic phase's per-node stamp). Mirrors `castPrologue`'s
     // type-child/operand-child split, just in the opposite order (cast = type
     // first; va_arg = operand first).
     [[nodiscard]] E lowerVaArg(NodeId node) {
@@ -2408,17 +3803,25 @@ struct Lowerer {
     // parses `castExpr = ParenOpen typeRef ParenClose operandExpr`; the
     // FIRST internal child is the type-ref (its target type comes from
     // the semantic phase's per-node stamp — same probe as the compound
-    // literal above), the SECOND is the operand expression. Lowers to a
-    // core `HirKind::Cast` with EXPLICIT flags (HirFlags::None — NOT
-    // Synthetic, which marks compiler-inserted coercions; an explicit
-    // cast is programmer-written source). The semantic phase already
-    // validated the (target, operand) pair against the explicit-cast
-    // matrix (S_InvalidCast), so an unlowerable pair never reaches the
-    // MIR mapCast lattice. Fail-loud on a missing stamp or child — a
-    // castRule subtree the analyzer didn't type is a phase-ordering bug,
-    // not a recoverable shape.
-    [[nodiscard]] E lowerCast(NodeId castNode) {
-        NodeId typeRefN{}, operandN{};
+    // literal above), the SECOND is the operand expression. The driver's
+    // Cast frame lowers this to a core `HirKind::Cast` with EXPLICIT flags
+    // (HirFlags::None — NOT Synthetic, which marks compiler-inserted
+    // coercions; an explicit cast is programmer-written source). The
+    // semantic phase already validated the (target, operand) pair against
+    // the explicit-cast matrix (S_InvalidCast), so an unlowerable pair
+    // never reaches the MIR mapCast lattice. Fail-loud on a missing stamp
+    // or child — a castRule subtree the analyzer didn't type is a
+    // phase-ordering bug, not a recoverable shape.
+    //
+    // The cast PROLOGUE for the driver's Cast frame: extract the type-ref +
+    // operand children and resolve the stamped target type. On success sets
+    // `operandN`/`target` and returns nullopt; on a malformed/unresolved cast
+    // returns the (already-emitted) error `E`. `resolveStampedTypeBelow` is a
+    // pure read of the semantic stamps (no HIR emission), so resolving the target
+    // here — BEFORE the operand lowers — matches the source evaluation order.
+    [[nodiscard]] std::optional<E> castPrologue(NodeId castNode, NodeId& operandN,
+                                                TypeId& target) {
+        NodeId typeRefN{};
         for (NodeId c : visible(castNode)) {
             if (isToken(c)) continue;
             if (tree().kind(c) != NodeKind::Internal) continue;
@@ -2429,12 +3832,18 @@ struct Lowerer {
             return exprError(castNode,
                 "cast expression is missing its type-ref or operand");
         }
-        TypeId const target = resolveStampedTypeBelow(typeRefN);
+        target = resolveStampedTypeBelow(typeRefN);
         if (!target.valid()) {
             return exprError(castNode,
                 "cast type-ref did not resolve to a type");
         }
-        E operand = lowerExpr(operandN);
+        return std::nullopt;
+    }
+
+    // The cast EPILOGUE given the ALREADY-lowered operand `E`: void-discard /
+    // array-decay / makeCast. Used by the driver's Cast frame; the conversion is
+    // identical regardless of how the operand was produced.
+    E combineCast(NodeId castNode, TypeId target, E operand) {
         // The operand failed to lower (its diagnostic is ALREADY emitted — e.g. a
         // `sizeof` of an un-typeable operand returned `{errorNode, InvalidType}`).
         // Propagate the error rather than inspecting its type: `interner.kind()` on
@@ -2520,6 +3929,17 @@ struct Lowerer {
         // the resolver signature; the returned `initScopeOpaque`
         // is set to the symbol's own scope for parity with the
         // semantic-side resolver.
+        // Item 1: an inline-valued named constant (enum enumerator / shipped-
+        // descriptor constant) resolves DIRECTLY to its literal — no init-CST.
+        // Tried before resolveSymbolInit so `int a[CHAR_BIT]` folds.
+        env.resolveSymbolValue = [this](NodeId identTok, std::uint32_t /*curScope*/)
+            -> std::optional<HirLiteralValue> {
+            SymbolId const sym = model.symbolAt(identTok);
+            if (!sym.valid()) return std::nullopt;
+            SymbolRecord const* rec = model.recordFor(sym);
+            if (rec == nullptr) return std::nullopt;
+            return constantLiteralForSymbol(*rec, interner);
+        };
         env.resolveSymbolInit = [this](NodeId identTok, std::uint32_t /*curScope*/)
             -> std::optional<CstResolvedSymbol> {
             SymbolId const sym = model.symbolAt(identTok);
@@ -3066,21 +4486,7 @@ struct Lowerer {
     }
     std::uint32_t nextSyntheticSym_ = 0;
 
-    // A resolved lvalue: how to READ its current value and WRITE a new one, plus
-    // the prep statements that must run FIRST. A SIMPLE variable lvalue needs no
-    // prep (reading a `Ref` is side-effect-free, so it can be read repeatedly). A
-    // COMPLEX lvalue (an index / deref whose address sub-expressions may have
-    // side effects) binds its ADDRESS into a temp pointer once in `prep`, then
-    // reads/writes through `*ptr` — so `a[f()] += 1` evaluates `f()` exactly
-    // once. This is what makes compound-assign / ++ / assignment-as-value correct
-    // for every lvalue, not just simple variables.
-    struct Lvalue {
-        bool                   simple = true;
-        TypeId                 type{};       // the lvalue's value type
-        SymbolId               sym{};        // simple: the variable; via-ptr: the temp pointer
-        TypeId                 ptrType{};    // via-ptr only: interner.pointer(type)
-        std::vector<HirNodeId> prep;         // via-ptr only: [ var ptr = &<lvalue> ]
-    };
+    // (`struct Lvalue` is defined up near `ExprFrame`/`AssignCtx`, which embeds it.)
 
     [[nodiscard]] HirNodeId lvRead(Lvalue const& lv) {
         if (lv.simple) return builder.makeRef(lv.type, lv.sym.v);
@@ -3218,12 +4624,24 @@ struct Lowerer {
         return errorNode(node);
     }
 
-    HirNodeId lowerBlock(NodeId node) {
-        std::vector<HirNodeId> stmts;
+    // The statement children of a `{ … }` block, in source order (the visible
+    // non-token children). Shared by `lowerBlock` (recursive) and the `lowerStmt`
+    // driver's Block frame so both walk the SAME item set in the SAME order.
+    [[nodiscard]] std::vector<NodeId> blockChildNodes(NodeId node) {
+        std::vector<NodeId> items;
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;  // { }
-            stmts.push_back(lowerStmt(c));
+            items.push_back(c);
         }
+        return items;
+    }
+
+    // The `lowerStmt` driver flattens a block through a Block frame; this recursive
+    // entry is retained for completeness (byte-identical: same items, same order,
+    // same `makeBlock`).
+    HirNodeId lowerBlock(NodeId node) {
+        std::vector<HirNodeId> stmts;
+        for (NodeId c : blockChildNodes(node)) stmts.push_back(lowerStmt(c));
         return track(builder.makeBlock(stmts), node);
     }
 
@@ -3243,24 +4661,51 @@ struct Lowerer {
         return track(builder.makeReturn(std::nullopt), node);
     }
 
-    HirNodeId lowerIf(NodeId node) {
-        std::optional<HirNodeId> cond;
-        std::vector<HirNodeId> bodies;
+    // The `if` PROLOGUE shared by `lowerIf` (recursive) and the `lowerStmt`
+    // driver's If frame: scan the children, lower the condition INLINE (matching
+    // the recursive form — the cond is the first `Role::Expr` child and lowers at
+    // its source position, BEFORE any body), and collect the (≤2) body statement
+    // nodes in source order. `condId` is left INVALID when there is no condition
+    // (the recursive form's `orError("if statement has no condition")` fires AFTER
+    // the bodies lower, so the caller defers that emission to the finish — keeping
+    // span-table order identical). `thenN`/`elseN` are the first/second `Role::Stmt`
+    // children (invalid when absent — the finish emits the same "no then-branch"
+    // error there). No HIR is emitted for the If node itself here.
+    void ifPrologue(NodeId node, HirNodeId& condId, NodeId& thenN, NodeId& elseN) {
+        bool haveCond = false;
+        int bodyCount = 0;
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
             Role const role = classify(c);
-            if (role == Role::Expr && !cond) {
+            if (role == Role::Expr && !haveCond) {
                 E const condE = lowerExpr(c);
-                cond = coerceCondition(condE, c).id;
+                condId = coerceCondition(condE, c).id;
+                haveCond = true;
             }
-            else if (role == Role::Stmt)     bodies.push_back(lowerStmt(c));
+            else if (role == Role::Stmt) {
+                if (bodyCount == 0) thenN = c;
+                else if (bodyCount == 1) elseN = c;
+                ++bodyCount;
+            }
         }
-        HirNodeId condId = orError(cond, node, "if statement has no condition");
-        HirNodeId then = bodies.empty() ? reportedError(node, "if statement has no then-branch")
-                                        : bodies[0];
+        if (!haveCond) condId = HirNodeId{};   // invalid → finish emits orError
+    }
+
+    // The `lowerStmt` driver flattens `if` through an If frame; this recursive
+    // entry is retained for completeness (byte-identical via the shared prologue +
+    // the same finish tail).
+    HirNodeId lowerIf(NodeId node) {
+        HirNodeId condId{};
+        NodeId thenN{}, elseN{};
+        ifPrologue(node, condId, thenN, elseN);
+        HirNodeId const then = thenN.valid() ? lowerStmt(thenN) : HirNodeId{};
         std::optional<HirNodeId> els;
-        if (bodies.size() >= 2) els = bodies[1];
-        return track(builder.makeIfStmt(condId, then, els), node);
+        if (elseN.valid()) els = lowerStmt(elseN);
+        HirNodeId const condFinal =
+            condId.valid() ? condId : orError(std::nullopt, node, "if statement has no condition");
+        HirNodeId const thenFinal =
+            thenN.valid() ? then : reportedError(node, "if statement has no then-branch");
+        return track(builder.makeIfStmt(condFinal, thenFinal, els), node);
     }
 
     // ── provably-infinite-loop detection (D-HIR-INFINITE-LOOP-NOT-TERMINATING) ──
@@ -3364,30 +4809,60 @@ struct Lowerer {
         return track(builder.makeBlock(wrapped, HirFlags::Synthetic), node);
     }
 
-    HirNodeId lowerWhile(NodeId node, bool doWhile) {
-        std::optional<HirNodeId> cond, body;
-        std::optional<NodeId>    condNode;
+    // The while/do-while PROLOGUE shared by `lowerWhile` (recursive) and the
+    // `lowerStmt` driver's While frame: lower the condition INLINE (at its source
+    // position, matching the recursive form) and record the cond CST node (for the
+    // provably-infinite probe) + the body statement node. `condId` is left INVALID
+    // when there is no condition (the recursive `orError("loop has no condition")`
+    // fires AFTER the body lowers, so the caller defers it to the finish). `bodyN`
+    // is invalid when absent (the finish emits the same "loop has no body" error).
+    void whilePrologue(NodeId node, HirNodeId& condId, NodeId& condNode, NodeId& bodyN) {
+        bool haveCond = false;
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
             Role const role = classify(c);
-            if (role == Role::Expr && !cond) {
+            if (role == Role::Expr && !haveCond) {
                 condNode = c;
                 E const condE = lowerExpr(c);
-                cond = coerceCondition(condE, c).id;
+                condId = coerceCondition(condE, c).id;
+                haveCond = true;
             }
-            else if (role == Role::Stmt && !body) body = lowerStmt(c);
+            else if (role == Role::Stmt && !bodyN.valid()) bodyN = c;
         }
-        HirNodeId condId = orError(cond, node, "loop has no condition");
-        HirNodeId bodyId = orError(body, node, "loop has no body");
-        HirNodeId const loop =
-            doWhile ? track(builder.makeDoWhileStmt(bodyId, condId), node)
-                    : track(builder.makeWhileStmt(condId, bodyId), node);
-        return wrapIfProvablyInfinite(node, loop, condNode, bodyId);
+        if (!haveCond) condId = HirNodeId{};
     }
 
-    HirNodeId lowerFor(NodeId node) {
-        // for ( init? ; cond? ; update? ) body  — segment the header by the
-        // `;` separator; the body is the last meaningful child (after `)`).
+    // The `lowerStmt` driver flattens while/do-while through a While frame; this
+    // recursive entry is retained for completeness (byte-identical via the shared
+    // prologue + the same finish tail).
+    HirNodeId lowerWhile(NodeId node, bool doWhile) {
+        HirNodeId condId{};
+        NodeId condNode{}, bodyN{};
+        whilePrologue(node, condId, condNode, bodyN);
+        std::optional<HirNodeId> body;
+        if (bodyN.valid()) body = lowerStmt(bodyN);
+        HirNodeId const condFinal =
+            condId.valid() ? condId : orError(std::nullopt, node, "loop has no condition");
+        HirNodeId const bodyId = orError(body, node, "loop has no body");
+        std::optional<NodeId> const condNodeOpt =
+            condNode.valid() ? std::optional<NodeId>{condNode} : std::nullopt;
+        HirNodeId const loop =
+            doWhile ? track(builder.makeDoWhileStmt(bodyId, condFinal), node)
+                    : track(builder.makeWhileStmt(condFinal, bodyId), node);
+        return wrapIfProvablyInfinite(node, loop, condNodeOpt, bodyId);
+    }
+
+    // The `for` PROLOGUE shared by `lowerFor` (recursive) and the `lowerStmt`
+    // driver's For frame: segment the header by the `;` separator and lower the
+    // init/cond/update clauses INLINE in segment order (init → cond → update,
+    // exactly as the recursive form — these are NOT child statements, they build
+    // their nodes BEFORE the body). Sets `bodyN` to the body (the last meaningful
+    // child) + `condNode` for the provably-infinite probe. Returns false (after
+    // emitting the SAME "for has no body" error) for a clause-less malformed `for`.
+    [[nodiscard]] bool forPrologue(NodeId node, std::optional<HirNodeId>& init,
+                                   std::optional<HirNodeId>& cond,
+                                   std::optional<HirNodeId>& update,
+                                   NodeId& condNode, NodeId& bodyN) {
         std::vector<std::pair<int, NodeId>> clauses;
         int seg = 0;
         for (NodeId c : visible(node)) {
@@ -3398,11 +4873,9 @@ struct Lowerer {
             }
             clauses.push_back({seg, c});
         }
-        if (clauses.empty()) { unsupported(node, "for has no body"); return errorNode(node); }
-        NodeId bodyN = clauses.back().second;
+        if (clauses.empty()) { unsupported(node, "for has no body"); return false; }
+        bodyN = clauses.back().second;
         clauses.pop_back();
-        std::optional<HirNodeId> init, cond, update;
-        std::optional<NodeId>    condNode;   // nullopt for a clause-less `for(;;)`
         for (auto const& [s, c] : clauses) {
             if (s == 0)      init   = lowerForClause(c);
             else if (s == 1) {
@@ -3412,9 +4885,21 @@ struct Lowerer {
             }
             else if (s == 2) update = lowerForClause(c);
         }
+        return true;
+    }
+
+    // The `lowerStmt` driver flattens `for` through a For frame; this recursive
+    // entry is retained for completeness (byte-identical via the shared prologue +
+    // the same finish tail).
+    HirNodeId lowerFor(NodeId node) {
+        std::optional<HirNodeId> init, cond, update;
+        NodeId condNode{}, bodyN{};
+        if (!forPrologue(node, init, cond, update, condNode, bodyN)) return errorNode(node);
         HirNodeId body = lowerStmt(bodyN);
+        std::optional<NodeId> const condNodeOpt =
+            condNode.valid() ? std::optional<NodeId>{condNode} : std::nullopt;
         HirNodeId const loop = track(builder.makeForStmt(init, cond, update, body), node);
-        return wrapIfProvablyInfinite(node, loop, condNode, body);
+        return wrapIfProvablyInfinite(node, loop, condNodeOpt, body);
     }
 
     // A for init/update clause: a varDeclHead → VarDecl; an assignment → AssignStmt;
@@ -3426,53 +4911,152 @@ struct Lowerer {
         return lowerStmtExprCore(core, /*wrapBare=*/false);
     }
 
-    HirNodeId lowerSwitch(NodeId node) {
+    // ── Switch arm-grouping: SHARED bookkeeping (the recursive `lowerSwitch`
+    // locals/lambdas, lifted to members so BOTH the retained recursive oracle AND
+    // the `lowerStmt` driver's Switch frame run the SAME logic → byte-identical).
+    // Only the two BODY-lowering re-entries differ between them (the oracle uses
+    // `lowerStmt` recursion; the driver's `pumpSwitch` uses `enterStmt`). All node
+    // emission below is unchanged from the prior inline form. ─────────────────────
+
+    // A goto-label before a case (`foo: case 1: stmt`) parses as
+    // labelStmt(foo, caseStmt(caseLabel(1), stmt)) — the label STAYS a real
+    // labelStmt node (pre-scanned + goto-resolvable). `D-CSUBSET-LABEL-BEFORE-CASE`.
+    [[nodiscard]] bool switchIsLabelStmtNode(NodeId n) {
+        HirRuleMapping const* m = mappingFor(n);
+        return m != nullptr && m->hirKind == "LabelStmt";
+    }
+    [[nodiscard]] bool switchIsRuleNode(NodeId n, RuleId r) const {
+        return r.valid() && tree().kind(n) == NodeKind::Internal
+            && tree().rule(n).v == r.v;
+    }
+    [[nodiscard]] NodeId switchFirstNonToken(NodeId n) const {
+        for (NodeId c : visible(n)) if (!isToken(c)) return c;
+        return NodeId{};
+    }
+    [[nodiscard]] HirNodeId switchMakeSkip(NodeId node) {
+        return track(builder.makeBlock({}), node);
+    }
+    // Flush the open arm into a CaseArm. The match VALUE lowers HERE (at flush time,
+    // exactly as the recursive form — after the arm's body statements).
+    void switchFlush(SwitchCtx& ctx, NodeId node) {
+        if (!ctx.haveArm) return;
+        std::optional<HirNodeId> value;
+        if (!ctx.curIsDefault && ctx.curValue) value = lowerExpr(*ctx.curValue).id;
+        ctx.arms.push_back(track(builder.makeCaseArm(value, ctx.curBody), node));
+        ctx.curBody.clear();
+    }
+    // Open a new arm from a `caseLabel` node (the SAME match-value/default
+    // extraction the bare flat path uses).
+    void switchStartArm(SwitchCtx& ctx, NodeId node, NodeId caseLabelNode) {
+        switchFlush(ctx, node);
+        ctx.haveArm = true;
+        ctx.curIsDefault = false;
+        ctx.curValue = std::nullopt;
+        for (NodeId lc : visible(caseLabelNode)) {
+            if (isToken(lc)) {
+                if (cfg.caseDefaultToken.valid()
+                    && tree().tokenKind(lc).v == cfg.caseDefaultToken.v)
+                    ctx.curIsDefault = true;
+            } else {
+                ctx.curValue = lc;   // the case match expression
+            }
+        }
+    }
+    // Peel leading LabelStmt layers off `core`, collecting their name tokens;
+    // return the innermost peeled core.
+    [[nodiscard]] NodeId switchPeelLabels(NodeId core, std::vector<NodeId>& outToks) {
+        while (switchIsLabelStmtNode(core)) {
+            NodeId body = switchFirstNonToken(core);
+            if (!body.valid()) break;
+            outToks.push_back(firstIdentifierToken(core));
+            core = peelToCore(body);
+        }
+        return core;
+    }
+    // Wrap `inner` in the collected goto-labels (outermost first). Each is a real
+    // pre-scanned LabelStmt so `goto foo` resolves to this arm's entry exactly as
+    // `case 1: foo: stmt` would (C 6.8.1). EMPTY `toks` ⇒ returns `inner` unchanged.
+    [[nodiscard]] HirNodeId switchWrapLabels(NodeId node, std::vector<NodeId> const& toks,
+                                             HirNodeId inner) {
+        HirNodeId result = inner;
+        for (auto it = toks.rbegin(); it != toks.rend(); ++it) {
+            auto found = labelOrdinals_.find(std::string{tree().text(*it)});
+            if (found == labelOrdinals_.end()) continue;   // pre-scan covers all
+            result = track(builder.makeLabelStmt(found->second, result), node);
+        }
+        return result;
+    }
+
+    // The Switch PROLOGUE shared by `lowerSwitch` (recursive oracle) and the
+    // `lowerStmt` driver's Switch frame: lower the discriminant INLINE (the first
+    // `Role::Expr` child, at its source position — matching the recursive scan) and
+    // collect the switchBodyItem wrappers in source order. Byte-identical to the
+    // recursive opening scan; builds the ctx the grouping machine then consumes.
+    [[nodiscard]] SwitchCtx switchPrologue(NodeId node) {
+        SwitchCtx ctx;
+        ctx.node = node;
         std::optional<HirNodeId> disc;
-        std::vector<NodeId> items;
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
             if (!disc && classify(c) == Role::Expr) { disc = lowerExpr(c).id; continue; }
-            items.push_back(c);   // switchBodyItem wrappers (caseLabel | statement)
+            ctx.items.push_back(c);   // switchBodyItem wrappers (caseLabel | statement)
         }
-        HirNodeId discId = orError(disc, node, "switch has no discriminant");
+        ctx.discId = orError(disc, node, "switch has no discriminant");
+        return ctx;
+    }
 
-        std::vector<HirNodeId> arms;
-        std::optional<NodeId>  curValue;       // the case match expression, if any
-        bool                   curIsDefault = false;
-        bool                   haveArm = false;
-        std::vector<HirNodeId> curBody;
-        auto flush = [&]() {
-            if (!haveArm) return;
-            std::optional<HirNodeId> value;
-            if (!curIsDefault && curValue) value = lowerExpr(*curValue).id;
-            arms.push_back(track(builder.makeCaseArm(value, curBody), node));
-            curBody.clear();
-        };
-        for (NodeId raw : items) {
-            NodeId core = peelToCore(raw);
-            bool const isLabel = cfg.caseLabelRule.valid()
-                && tree().kind(core) == NodeKind::Internal
-                && tree().rule(core).v == cfg.caseLabelRule.v;
-            if (isLabel) {
-                flush();
-                haveArm = true;
-                curIsDefault = false;
-                curValue = std::nullopt;
-                for (NodeId lc : visible(core)) {
-                    if (isToken(lc)) {
-                        if (cfg.caseDefaultToken.valid()
-                            && tree().tokenKind(lc).v == cfg.caseDefaultToken.v)
-                            curIsDefault = true;
-                    } else {
-                        curValue = lc;   // the case match expression
-                    }
+    // The retained RECURSIVE `lowerSwitch` (now dead via the driver, like
+    // `lowerBlock`/`lowerIf` — kept as the single-source ORACLE the goldens pin
+    // against). Drives the SHARED grouping members; the body re-entries use
+    // `lowerStmt` recursion. The `lowerStmt` driver flattens the SAME logic via
+    // `pumpSwitch` (its body re-entries push onto the work-stack instead).
+    HirNodeId lowerSwitch(NodeId node) {
+        SwitchCtx ctx = switchPrologue(node);
+        // Lower a (label-wrapped) `caseStmt` chain into arms (adjacent
+        // `foo: case 1: case 2: stmt` → empty label-marked arms + the real body).
+        auto lowerCaseChain = [&](NodeId cs, std::vector<NodeId> labels) {
+            for (;;) {
+                NodeId caseLabelNode{}, caseBody{};
+                bool seenFirst = false;
+                for (NodeId c : visible(cs)) {
+                    if (isToken(c)) continue;
+                    if (!seenFirst) { caseLabelNode = c; seenFirst = true; }
+                    else { caseBody = c; break; }
                 }
-            } else if (haveArm) {
-                curBody.push_back(lowerStmt(core));
+                switchStartArm(ctx, node, caseLabelNode);
+                if (!caseBody.valid()) {                          // empty case body (defensive)
+                    if (!labels.empty())
+                        ctx.curBody.push_back(switchWrapLabels(node, labels, switchMakeSkip(node)));
+                    return;
+                }
+                NodeId bodyCore = peelToCore(caseBody);
+                std::vector<NodeId> innerLabels;
+                NodeId bodyProbe = switchPeelLabels(bodyCore, innerLabels);
+                if (switchIsRuleNode(bodyProbe, cfg.caseStmtRule)) {  // adjacent case
+                    if (!labels.empty())
+                        ctx.curBody.push_back(switchWrapLabels(node, labels, switchMakeSkip(node)));
+                    cs = bodyProbe;
+                    labels = std::move(innerLabels);
+                    continue;                                      // → next arm
+                }
+                ctx.curBody.push_back(switchWrapLabels(node, labels, lowerStmt(bodyCore)));
+                return;
+            }
+        };
+        for (NodeId raw : ctx.items) {
+            NodeId core = peelToCore(raw);
+            std::vector<NodeId> labelToks;
+            NodeId probe = switchPeelLabels(core, labelToks);
+            if (switchIsRuleNode(probe, cfg.caseStmtRule)) {      // (label-wrapped) case statement
+                lowerCaseChain(probe, std::move(labelToks));
+            } else if (switchIsRuleNode(core, cfg.caseLabelRule)) {  // bare flat case
+                switchStartArm(ctx, node, core);
+            } else if (ctx.haveArm) {                             // plain stmt
+                ctx.curBody.push_back(lowerStmt(core));
             }
         }
-        flush();
-        return track(builder.makeSwitchStmt(discId, arms), node);
+        switchFlush(ctx, node);
+        return track(builder.makeSwitchStmt(ctx.discId, ctx.arms), node);
     }
 
     // ── declarations ──────────────────────────────────────────────────────────
@@ -3489,8 +5073,29 @@ struct Lowerer {
         auto it = declMap_.find(tree().rule(node).v);
         DeclarationRule const* decl =
             (it != declMap_.end()) ? &sem.declarations[it->second] : nullptr;
+        // D-CSUBSET-LOCAL-STATIC: a block-scope `static` confers static storage
+        // duration — fold it from the SAME specifier-prefix scan linkageFrom
+        // uses (the `staticStorage` axis), and the LinkageAttr it returns
+        // ({Local, Default}) is the internal linkage the emitted hidden global
+        // carries. Only meaningful for a LOCAL decl: a top-level `static` is
+        // already a global (file-scope `binding:local`, handled by asGlobal).
+        bool staticStorage = false;
+        LinkageAttr staticLinkage{};
+        if (!asGlobal && decl != nullptr) {
+            staticLinkage = linkageFrom(specifierPrefixChild(tree(), node, *decl),
+                                        *decl, &staticStorage);
+        }
         if (decl == nullptr || !decl->isDeclaratorMode()
             || !sem.declarators.has_value()) {
+            // MF-3: a static local can only flow through the declarator-mode
+            // path (no shipped non-declarator language admits `static` locals).
+            // Never silently lower it as an automatic local on the legacy path.
+            if (staticStorage) {
+                out.push_back(reportedError(node,
+                    "static-storage-duration local declarations require "
+                    "declarator-mode lowering"));
+                return;
+            }
             out.push_back(lowerVarLikeLegacy(node, asGlobal, decl));
             return;
         }
@@ -3542,6 +5147,23 @@ struct Lowerer {
                 continue;
             }
             SymbolId const sym = model.symbolAt(nameNode);
+            // D-CSUBSET-FN-PROTOTYPE: a bare function prototype declarator
+            // (`int f(int);`) emits NO HIR node — it is a function DECLARATION,
+            // not an object. The merged DEFINITION (a separate declarator with a
+            // body) emits the Function; an unabsorbed proto (declared, never
+            // defined) emits nothing AND is never registered as a global/
+            // function symbol, so a call to it fails loud at HIR→MIR (a Ref to
+            // an unbound symbol). Emitting a Global here would create a spurious
+            // FnSig-typed data global (a miscompile). Covers BOTH the absorbed
+            // proto (`isAbsorbedProto`, superseded by a def/redundant decl) and
+            // a standalone proto (`isProtoDeclaration`). A static-storage axis is
+            // per-declaration, so a proto can never share a declarator with a
+            // non-proto object — but the check is per-declarator regardless.
+            if (auto const* pr = model.recordFor(sym);
+                pr != nullptr
+                && (pr->isProtoDeclaration || pr->isAbsorbedProto)) {
+                continue;
+            }
             TypeId type = InvalidType;
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
             // The init = the init-declarator's visible Internal child that
@@ -3554,6 +5176,29 @@ struct Lowerer {
                     init = lowerExprOrBraceInit(c, type);
                     break;
                 }
+            }
+            // D-CSUBSET-LOCAL-STATIC: a `static` local is a hidden module-global.
+            // Emit makeGlobal + internal ({Local}) linkage + const-ness, append
+            // it to the MODULE decls (so collectGlobals sees it → its Ref routes
+            // through GlobalAddr, static storage), and append NOTHING to the
+            // function body's `out`: the storage IS the global and the init is
+            // load-time (like any global), so the body holds no runtime stmt for
+            // it. A non-constant initializer fails loud downstream at the asm
+            // tier (D-LK4-RODATA-PRODUCER-RUNTIME-INIT), never a silent accept.
+            if (staticStorage) {
+                // MF-3: the module-decls accumulator is set at lowerTree entry;
+                // a static seen outside a tree walk is a bug — fail loud.
+                if (moduleDecls_ == nullptr) {
+                    out.push_back(reportedError(d,
+                        "static local lowered with no module-decls accumulator "
+                        "(outside a module tree walk)"));
+                    continue;
+                }
+                HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), d);
+                recordMutability(g, sym);
+                recordLinkage(g, staticLinkage);  // {Local, Default} — internal
+                moduleDecls_->push_back(g);
+                continue;
             }
             HirNodeId const lowered = asGlobal
                 ? track(builder.makeGlobal(type, sym.v, init), d)
@@ -4024,6 +5669,19 @@ struct Lowerer {
             sym = model.symbolAt(vis[*decl.nameChild]);
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
         }
+        // D-CSUBSET-EXTERN-DEFINITION-MERGE: an `extern` declaration that an in-TU
+        // DEFINITION superseded (`isAbsorbedProto` set by the Pass-1 merge — the
+        // definition won the binding) emits NO HIR node and registers NO extern
+        // import row. The definition carries the symbol (a Function body or a
+        // Global with storage); emitting an ExternFunction/ExternGlobal here would
+        // create a spurious duplicate import for a symbol defined locally. Returns
+        // an invalid HirNodeId; the dispatch (lowerDecl) skips pushing it. Mirrors
+        // the topLevelDecl proto-skip (`isProtoDeclaration || isAbsorbedProto`),
+        // here on the extern-lowering path.
+        if (auto const* rec = model.recordFor(sym);
+            rec != nullptr && rec->isAbsorbedProto) {
+            return HirNodeId{};
+        }
         // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3,
         // 2026-06-02): scan the tail subtree (varDeclTail or
         // externFuncTail) for an optional trailing `stringLiteralExpr`
@@ -4308,7 +5966,13 @@ struct Lowerer {
         if (m->hirKind == "Decl")       { lowerTopLevelInto(core, out); return; }
         if (m->hirKind == "Function")   { out.push_back(lowerFunctionDecl(core)); return; }
         if (m->hirKind == "TypeDecl")   { out.push_back(lowerTypeDecl(core)); return; }
-        if (m->hirKind == "ExternDecl") { out.push_back(lowerExternDecl(core)); return; }
+        if (m->hirKind == "ExternDecl") {
+            // D-CSUBSET-EXTERN-DEFINITION-MERGE: an absorbed extern (superseded by
+            // an in-TU definition) returns an invalid node — push nothing.
+            HirNodeId const e = lowerExternDecl(core);
+            if (e.valid()) out.push_back(e);
+            return;
+        }
         // A `var`-style declaration at module scope is a Global (the same rule
         // is a local VarDecl inside a block — see lowerVarLike). Declarator-
         // mode rows append one Global per declarator (flat).
@@ -4323,6 +5987,10 @@ struct Lowerer {
     // this tree (HR11), so `lowerDecl` always reads this tree's own language config.
     void lowerTree(Tree const& t, std::vector<HirNodeId>& decls) {
         t_ = &t;
+        // D-CSUBSET-LOCAL-STATIC: expose the module-decls accumulator so a
+        // block-scope `static` lowered deep in a function body can append its
+        // hidden global here (collectGlobals reads `hir.moduleDecls`).
+        moduleDecls_ = &decls;
         if (!t.root().valid()) return;
         for (NodeId top : visible(t.root())) {
             if (isToken(top)) continue;

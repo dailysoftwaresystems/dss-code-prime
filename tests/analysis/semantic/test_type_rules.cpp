@@ -64,14 +64,40 @@ TEST(TypeRules, IsAssignableWidensWithinSigned) {
     EXPECT_FALSE(isAssignable(in, i16, i32)) << "I32 does NOT narrow to I16";
 }
 
-// Cross-signedness is NOT assignable (caller-declared explicit cast is
-// the only path — no silent C-style I32 ↔ U32).
+// Cross-signedness is NOT assignable by DEFAULT (caller-declared explicit cast is
+// the only path — no silent C-style I32 ↔ U32 for a non-C schema).
 TEST(TypeRules, IsAssignableRejectsCrossSignedness) {
     auto in  = makeInterner();
     auto i32 = in.primitive(TypeKind::I32);
     auto u32 = in.primitive(TypeKind::U32);
     EXPECT_FALSE(isAssignable(in, i32, u32));
     EXPECT_FALSE(isAssignable(in, u32, i32));
+}
+
+// D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT: with the `intCrossSignednessConverts` gate ON
+// (c-subset), signed↔unsigned IS assignable in BOTH directions and at ANY width (incl.
+// cross-signedness narrowing U64→I32) — C 6.3.1.3 / 6.5.16.1. coerce() materializes the
+// width-exact Cast. RED-ON-DISABLE: revert the isAssignable cross-signedness arm → the
+// four EXPECT_TRUE flip to false. SCOPE GUARD: the gate is signed↔unsigned ONLY — a
+// SAME-signedness narrowing stays strictly rejected even with the gate on.
+TEST(TypeRules, IsAssignableAdmitsCrossSignednessWhenGated) {
+    auto in  = makeInterner();
+    auto i16 = in.primitive(TypeKind::I16);
+    auto i32 = in.primitive(TypeKind::I32);
+    auto u32 = in.primitive(TypeKind::U32);
+    auto i64 = in.primitive(TypeKind::I64);
+    auto u64 = in.primitive(TypeKind::U64);
+    auto const G = [&](TypeId l, TypeId r) {
+        return isAssignable(in, l, r, {}, /*boolWidensToArith=*/false,
+                            /*charConvertsToArith=*/false, /*enumConvertsToArith=*/false,
+                            /*intCrossSignednessConverts=*/true);
+    };
+    EXPECT_TRUE(G(i32, u32)) << "U32 -> I32 (same width)";
+    EXPECT_TRUE(G(u32, i32)) << "I32 -> U32";
+    EXPECT_TRUE(G(i32, u64)) << "U64 -> I32 (cross-signedness NARROWING, C 6.3.1.3)";
+    EXPECT_TRUE(G(i64, u32)) << "U32 -> I64 (cross-signedness widening)";
+    EXPECT_FALSE(G(i16, i32))
+        << "I32 -> I16 SAME-signedness narrowing stays rejected (gate is cross-only)";
 }
 
 // Int ↔ Float is NOT assignable.
@@ -139,6 +165,28 @@ TEST(TypeRules, EnumPromotesToUnderlyingInArith) {
         << "enum + int → the underlying int (C 6.7.2.2 promotion)";
     EXPECT_EQ(usualArithmeticCommonType(in, color, color, rules), i32)
         << "enum + same-enum → the underlying int";
+}
+
+// D-UAC-SHIFT-RESULT-RULE-CONFIG: `shiftResultType` is the SINGLE chokepoint
+// both the CST→HIR shift lowering and the semantic-tier expression typer route
+// through, so the config verb `shiftResult` cannot be read inconsistently. The
+// verb picks the result type: `promotedLeft` (C 6.5.7) → the promoted LEFT
+// operand (`i32 << i64` is I32, the count's type never contributes);
+// `commonType` → the usual-arithmetic common type (`i32 << i64` is I64). RED-ON-
+// DISABLE: the I32↔I64 flip when ONLY the verb changes — a dead read would peg
+// both arms at promotedLeft's I32 (or a divergent edit to one tier would let
+// the two disagree; routing both through this one function forecloses that).
+TEST(TypeRules, ShiftResultRuleSelectsByVerb) {
+    auto in  = makeInterner();
+    auto i32 = in.primitive(TypeKind::I32);
+    auto i64 = in.primitive(TypeKind::I64);
+    ResolvedArithmeticRules rules{};   // default integer-promotion floor = I32
+    rules.shiftResult = ShiftResultRule::PromotedLeft;
+    EXPECT_EQ(shiftResultType(in, i32, i64, rules).v, i32.v)
+        << "promotedLeft: i32 << i64 → the promoted LEFT operand i32";
+    rules.shiftResult = ShiftResultRule::CommonType;
+    EXPECT_EQ(shiftResultType(in, i32, i64, rules).v, i64.v)
+        << "commonType: i32 << i64 → common(i32,i64) = i64 (red-on-disable flip)";
 }
 
 // unify picks the wider operand within a lattice; returns Invalid when

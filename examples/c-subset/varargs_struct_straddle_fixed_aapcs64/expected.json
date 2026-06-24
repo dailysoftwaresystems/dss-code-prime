@@ -1,0 +1,18 @@
+{
+  "$comment": "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS (CLOSED): AAPCS64 all-or-nothing fixed-HFA STRADDLE (qemu-aarch64). f(double a..g(6), struct H3 h, ...) — the 6 doubles fill v0..v5, H3={double×3} straddles (needs 3 VR, 2 left) → the WHOLE 24B HFA goes to memory (not split) and AAPCS64 EXHAUSTS the VR class (NSRN←8), so __vr_offs clamps to 0 and va_arg routes to the overflow PAST the 24B HFA. a+h.a+h.b+h.c+v = 1+10+20+30+100 = 161. RED-ON-DISABLE: a split HFA mis-reads h.a/b/c; reverting the exhaust leaves __vr_offs=-32 (reads v6, but the caller stacked vv → garbage); a wrong overflow base reads h.a(10) as the vararg → 71 not 161. Values ride mutable globals (anti-fold). The release arm re-witnesses under Inlining ON (FC7-C3 lesson).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 161,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

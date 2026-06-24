@@ -75,6 +75,9 @@ template <typename Source>
         // it terminates iff its labeled statement does (so `end: return 0;` as a
         // function's last statement still terminates).
         case HirKind::GotoStmt:
+        // D-CSUBSET-COMPUTED-GOTO: `goto *expr;` also transfers unconditionally —
+        // it never falls through (same fall-off-end soundness as plain goto).
+        case HirKind::IndirectGotoStmt:
             return true;
         case HirKind::Block:
         case HirKind::LabelStmt: {

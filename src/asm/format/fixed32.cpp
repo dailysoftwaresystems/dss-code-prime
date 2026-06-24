@@ -99,6 +99,22 @@ windowFor(EncodingSlotKind s) noexcept {
         // raw byte value). Distinct slot, identical window — the encode
         // arithmetic differs, not the placement.
         case EncodingSlotKind::Imm12Scaled: return SlotBitWindow{ 10, 12 };
+        // Imm12HiLo24 (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12): the SAME
+        // bits 10..21 window as Imm12. `windowFor` returns the per-WORD
+        // window (the low 12 bits in word0, the high 12 bits in word1
+        // both land in this same bit-window); the wire arm performs the
+        // value SPLIT and calls `orInto` twice with this window — once
+        // per word. Identical placement to Imm12, distinct slot + distinct
+        // (word-pair) encode arithmetic.
+        case EncodingSlotKind::Imm12HiLo24: return SlotBitWindow{ 10, 12 };
+        // Imm32MovzMovk (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB): the
+        // MOVZ/MOVK halfword window — bits 5..20, the SAME window as Imm16
+        // (AArch64 MOVZ/MOVK both carry imm16 at [20:5], Rd at [4:0]).
+        // `windowFor` returns the per-WORD window; the wire arm (writeMovzMovk
+        // helper) splits the 32-bit value lo16→word0 / hi16→word1 and calls
+        // `orInto` twice with this window — once per MOVZ/MOVK word. The
+        // third (operation) word carries no Imm32MovzMovk bits.
+        case EncodingSlotKind::Imm32MovzMovk: return SlotBitWindow{ 5, 16 };
         // SymbolPatchMarker (D-AS4-3): width-0 symbol-patch marker, like
         // MemBaseNoScale. The walker writes NO bits (the linker patches
         // the whole field via the wire's relocationKind); the slot only
@@ -164,6 +180,7 @@ bool encode(Lir const&                  lir,
             // asm.cpp resolver patches the bit-field (different
             // arithmetic from x86's BlockRel32 — no +4 bias, /4 scale).
             std::vector<walker_util::BlockRelPatch>& blockPatches,
+            std::vector<walker_util::BlockSymPatch>& blockSymPatches,
             DiagnosticReporter&         reporter) {
     assert(info != nullptr && "fixed32::encode requires non-null info");
 
@@ -338,6 +355,97 @@ bool encode(Lir const&                  lir,
             (static_cast<std::uint32_t>(value) & ((1u << w->width) - 1u))
             << w->lsb;
         words[wordIndex] = (words[wordIndex] & ~mask) | bits;
+        return true;
+    };
+
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: write a value V into the
+    // shifted-imm12 word-pair slot. V must be NON-NEGATIVE and fit
+    // 0..0xFFFFFF (16 MiB-1); the low 12 bits go into `word[wordIndex]`'s
+    // imm12 window (sh=0, the base word) and the high 12 bits into
+    // `word[wordIndex+1]`'s imm12 window (sh=1, the LSL #12 word — its
+    // fixedWords[wordIndex+1] sets bit 22). The two words form `op
+    // Xd,Xn,#lo` then `op Xd,Xd,#hi,LSL #12` (the Rd-threading is the
+    // variant's extraResultSlots, NOT this helper's concern). SCRATCH-
+    // FREE: word1 reads its own dest. A value > 0xFFFFFF fails loud
+    // (the residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB). `valueDesc`
+    // names the operand (immediate vs memory offset) for the diagnostic.
+    // Both halves OR through `orInto`, so the per-word wroteSlot collision
+    // guard fires if a malformed schema double-writes either word.
+    constexpr std::uint32_t kImm12HiLo24Max = 0xFFFFFFu;  // 16 MiB - 1
+    auto const writeHiLo24 = [&](std::int64_t value,
+                                 std::uint8_t wordIndex,
+                                 std::string_view valueDesc) -> bool {
+        if (value < 0 || value > static_cast<std::int64_t>(kImm12HiLo24Max)) {
+            report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': {} {} is out of range for the "
+                               "shifted 'imm12.hilo24' word-pair (valid "
+                               "0..{}, i.e. 24 bits / 16 MiB) — a larger "
+                               "frame needs a third word or a MOVZ/MOVK "
+                               "scratch materialization (not yet supported, "
+                               "D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB)",
+                               info->mnemonic, valueDesc, value,
+                               kImm12HiLo24Max));
+            return false;
+        }
+        // word[wordIndex+1] must exist — the variant's template MUST be a
+        // 2-word macro whose word1 carries sh=1. A schema wiring this slot
+        // into a single-word template is a config bug; orInto's wordIndex
+        // bound check fails loud on the hi half. (Belt-and-suspenders: the
+        // lo orInto already validates wordIndex itself.)
+        std::uint32_t const v   = static_cast<std::uint32_t>(value);
+        std::uint32_t const lo  = v & 0xFFFu;
+        std::uint32_t const hi  = (v >> 12) & 0xFFFu;
+        if (!orInto(EncodingSlotKind::Imm12HiLo24, lo, wordIndex)) return false;
+        if (!orInto(EncodingSlotKind::Imm12HiLo24, hi,
+                    static_cast<std::uint8_t>(wordIndex + 1)))
+            return false;
+        return true;
+    };
+
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: write a value V into the
+    // MOVZ/MOVK 3-word materialization slot. V must be NON-NEGATIVE and fit
+    // 0..0x7FFFFFFF (the int32 frame-size ceiling — a frame > 2 GiB flows
+    // through `int32_t` as a NEGATIVE magnitude and never reaches this slot,
+    // the residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-2GIB). The low 16 bits
+    // go into `word[wordIndex]`'s imm16 window (the MOVZ word — its
+    // fixedWords[wordIndex] is the `MOVZ Xs,#imm16` base) and the high 16
+    // bits into `word[wordIndex+1]`'s imm16 window (the MOVK word — its
+    // fixedWords[wordIndex+1] is the `MOVK Xs,#imm16,LSL #16` base, hw=01).
+    // The scratch register Xs (x16 baked into the sub/add base words, or the
+    // lea's threaded dest reg) is the variant's concern via the base words +
+    // resultSlot/extraResultSlots, NOT this helper's — exactly like
+    // `writeHiLo24` writes only the value split, never the Rd thread. The
+    // THIRD word (the extended-register operation) carries no Imm32MovzMovk
+    // bits. The halfword split mirrors `materializeViaMovkLadder`
+    // (mir_to_lir.cpp): `chunk[k] = (V >> 16*k) & 0xFFFF`. `valueDesc` names
+    // the operand (immediate vs memory offset) for the diagnostic. Both
+    // halves OR through `orInto`, so the per-word wroteSlot collision guard
+    // fires if a malformed schema double-writes either MOVZ/MOVK word.
+    constexpr std::int64_t kMovzMovkMax = 0x7FFFFFFF;  // int32 frame ceiling
+    auto const writeMovzMovk = [&](std::int64_t value,
+                                   std::uint8_t wordIndex,
+                                   std::string_view valueDesc) -> bool {
+        if (value < 0 || value > kMovzMovkMax) {
+            report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': {} {} is out of range for the "
+                               "MOVZ/MOVK 3-word materialization (valid "
+                               "0..{}, i.e. the non-negative int32 frame "
+                               "ceiling) — a frame > 2 GiB has no encoding "
+                               "(D-ASM-AARCH64-FRAME-OFFSET-BEYOND-2GIB)",
+                               info->mnemonic, valueDesc, value,
+                               kMovzMovkMax));
+            return false;
+        }
+        std::uint32_t const v   = static_cast<std::uint32_t>(value);
+        std::uint32_t const lo  = v & 0xFFFFu;          // chunk 0 → MOVZ word
+        std::uint32_t const hi  = (v >> 16) & 0xFFFFu;  // chunk 1 → MOVK word
+        if (!orInto(EncodingSlotKind::Imm32MovzMovk, lo, wordIndex))
+            return false;
+        if (!orInto(EncodingSlotKind::Imm32MovzMovk, hi,
+                    static_cast<std::uint8_t>(wordIndex + 1)))
+            return false;
         return true;
     };
 
@@ -535,6 +643,39 @@ bool encode(Lir const&                  lir,
             pendingBlockPatches.push_back(PendingBlockPatch{
                 srcOp.blockSlot, patchKind, wire.wordIndex});
         } else if (srcOp.kind == LirOperandKind::ImmInt) {
+            // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the shifted-imm12
+            // word-pair slot. The callconv's prologue/epilogue `sub/add
+            // sp,#frame` (an [reg, ImmInt] form) wires its frame size here
+            // when it exceeds the single-word imm12 reach (4095). The
+            // value is split lo/hi and written into BOTH words of the
+            // 2-word macro (`sub sp,sp,#lo` then `sub sp,sp,#hi,LSL #12`).
+            // Handled in its own arm BEFORE the Imm16/Imm12 reject so it
+            // does not leak into the single-word range logic. The variant
+            // selector (immMin/immMax magnitude key) routes a >4095 frame
+            // to this 2-word variant and a ≤4095 frame to the single-word
+            // Imm12 variant — the encoder writes whichever it is handed.
+            if (wire.slotKind == EncodingSlotKind::Imm12HiLo24) {
+                if (!writeHiLo24(static_cast<std::int64_t>(srcOp.immInt32),
+                                 wire.wordIndex, "immediate"))
+                    return false;
+                continue;
+            }
+            // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: the MOVZ/MOVK 3-word
+            // form. The callconv's prologue/epilogue `sub/add sp,#frame`
+            // (an [reg, ImmInt] form) wires its frame size here when it
+            // exceeds the 2-word shifted-imm12 reach (0xFFFFFF). The value
+            // materializes into the x16 scratch (MOVZ x16 + MOVK x16) across
+            // words 0/1, and word2 is the extended-register `sub/add sp,sp,
+            // x16`. Handled BEFORE the Imm16/Imm12 reject so the 3-word slot
+            // never leaks into the single-word range logic. The variant
+            // selector (immMin:0x1000000 magnitude key) routes a >16MiB
+            // frame here; the encoder writes whichever it is handed.
+            if (wire.slotKind == EncodingSlotKind::Imm32MovzMovk) {
+                if (!writeMovzMovk(static_cast<std::int64_t>(srcOp.immInt32),
+                                   wire.wordIndex, "immediate"))
+                    return false;
+                continue;
+            }
             // Immediate operand → an UNSIGNED immediate fixed32 slot.
             // Cycle scope (D-LK10-ENTRY-ARM64): Imm16 (AArch64 MOVZ
             // wide-immediate) or Imm12 (AArch64 ADD/SUB-immediate frame
@@ -723,6 +864,40 @@ bool encode(Lir const&                  lir,
                     return false;
                 continue;
             }
+            // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the shifted-imm12
+            // word-pair form for a frame-relative `lea Xd,[base,#disp]`
+            // (the callconv's `emitFrameAddr` → `ADD Xd,Xn,#imm`). When the
+            // frame offset exceeds the single-word imm12 reach (4095), the
+            // variant selector routes the GEP/alloca-base lea to the 2-word
+            // ADD-imm macro; the displacement is split lo/hi and written
+            // into BOTH words (`ADD Xd,Xn,#lo` then `ADD Xd,Xd,#hi,LSL
+            // #12`). The lea's RESULT register threads through word1 (Rd
+            // AND Rn) via the variant's extraResultSlots — scratch-free.
+            // Handled BEFORE the Imm9/Imm12 reject so the word-pair slot
+            // never leaks into the single-word range logic. `writeHiLo24`
+            // owns the non-negative + 24-bit-magnitude fail-loud gate.
+            if (wire.slotKind == EncodingSlotKind::Imm12HiLo24) {
+                if (!writeHiLo24(static_cast<std::int64_t>(srcOp.offset),
+                                 wire.wordIndex, "memory offset"))
+                    return false;
+                continue;
+            }
+            // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: the MOVZ/MOVK 3-word
+            // form for a frame-relative `lea Xd,[base,#disp]` whose disp
+            // exceeds the 2-word shifted-imm12 reach (0xFFFFFF). The GEP's
+            // high-element address (e.g. `int big[5000000]; big[4999999]` at
+            // sp+~20MB). SCRATCH-FREE: the displacement materializes into the
+            // lea's DEST reg Xd (MOVZ Xd + MOVK Xd, threaded via resultSlot/
+            // extraResultSlots), then word2 is `add Xd, sp, Xd` (extended,
+            // Rn=sp). Handled BEFORE the Imm9/Imm12 reject so the 3-word slot
+            // never leaks into the single-word range logic. `writeMovzMovk`
+            // owns the non-negative + int32-ceiling fail-loud gate.
+            if (wire.slotKind == EncodingSlotKind::Imm32MovzMovk) {
+                if (!writeMovzMovk(static_cast<std::int64_t>(srcOp.offset),
+                                   wire.wordIndex, "memory offset"))
+                    return false;
+                continue;
+            }
             bool const isSignedSlot = wire.slotKind == EncodingSlotKind::Imm9;
             bool const isUnsignedSlot = wire.slotKind == EncodingSlotKind::Imm12;
             if (!isSignedSlot && !isUnsignedSlot) {
@@ -838,6 +1013,48 @@ bool encode(Lir const&                  lir,
                                static_cast<int>(srcOp.kind)));
             return false;
         }
+    }
+
+    // D-CSUBSET-COMPUTED-GOTO: a block-address `lea` carries a trailing
+    // UNWIRED BlockRef operand (naming the target LIR block) ALONGSIDE its
+    // SymbolRef (the synthetic per-block symbol, captured into
+    // `pendingRelocs` as the relocation source above — on arm64 the
+    // ADRP+ADD pair yields TWO relocs, both against the SAME synthetic
+    // symbol). That BlockRef contributes NO bytes (a block reference is
+    // never byte-encoded data); it is the SYMBOL ↔ BLOCK binding the
+    // assembler records so the synthetic symbol can be assigned that
+    // block's interior VA at link time. Scan for an UNWIRED BlockRef and
+    // pair it with the captured symbol.
+    //
+    // CRUCIAL: only an UNWIRED BlockRef is the block-address binding. A
+    // WIRED BlockRef is a branch displacement (jmp's Imm26 / jcc's Imm19),
+    // already consumed by the wire loop above as an intra-function branch
+    // patch — it has no SymbolRef and is NOT a block-sym binding. Skipping
+    // wired BlockRefs keeps this scan from firing on every branch
+    // instruction (which would fail-loud spuriously). The block-address
+    // `lea` is the only opcode that carries an UNWIRED BlockRef. A binding
+    // BlockRef WITHOUT a captured SymbolRef is malformed (no symbol to
+    // bind) — fail loud. Byte-identical mirror of x86_variable's scan.
+    std::vector<bool> wiredOperand(instOps.size(), false);
+    for (auto const& wire : selected->wires) {
+        if (wire.index < wiredOperand.size()) wiredOperand[wire.index] = true;
+    }
+    for (std::size_t oi = 0; oi < instOps.size(); ++oi) {
+        if (instOps[oi].kind != LirOperandKind::BlockRef) continue;
+        if (wiredOperand[oi]) continue;  // wired BlockRef = a branch displacement
+        if (pendingRelocs.empty()) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': an unwired BlockRef operand "
+                               "(block-address binding) appears with no "
+                               "SymbolRef operand to bind — a block-address "
+                               "`lea` must carry the synthetic per-block "
+                               "symbol as its relocation source",
+                               info->mnemonic));
+            return false;
+        }
+        blockSymPatches.push_back(walker_util::BlockSymPatch{
+            pendingRelocs.front().target, instOps[oi].blockSlot});
     }
 
     // Emit each word LE, stamping that word's relocations at the word's

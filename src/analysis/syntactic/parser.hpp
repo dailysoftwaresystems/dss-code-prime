@@ -57,20 +57,23 @@ struct DSS_EXPORT ParserConfig {
     // nesting independently of the builder's checkpoint cap.
     std::size_t maxSpeculationDepth = 8;
 
-    // Recursion-depth cap for the Pratt walker's C++-stack recursion.
-    // EVERY expression-deepening path funnels through one chokepoint
-    // (`parseExpressionAt`): nested parens (via the atom re-entry),
-    // right-assoc RHS chains, prefix operands, and ternary clauses.
-    // Pathological input would otherwise blow the C++ call stack. When
-    // this cap is reached the walker FAILS LOUD with a positioned
-    // `P_ExpressionTooDeep` diagnostic at the offending token and
-    // RECOVERS (Error leaf + panic-scan + graceful unwind) — it does
-    // NOT abort and never risks a raw stack overflow. (Left/None-assoc
-    // chains build ITERATIVELY in the climb loop and never deepen the
-    // stack, so they do not count against this cap regardless of length.)
+    // Nesting-depth cap for the Pratt walker's expression descent. EVERY
+    // expression-deepening path funnels through one chokepoint — a PUSH onto
+    // the parser's explicit `ExprFrame` work-stack: nested parens (via the
+    // atom re-entry), right-assoc RHS chains, prefix operands, and ternary
+    // clauses. The descent is FLAT (D-PARSE-DEEP-NEST-RECURSION-MEMORY, Stage
+    // 5): it carries O(1) host-stack cost, so this cap is no longer a stack-
+    // overflow backstop but a SEMANTIC limit on nesting depth (the work-stack
+    // would otherwise grow heap-unbounded on adversarial input, and the
+    // DOWNSTREAM frontend below still recurses per level). When the cap is
+    // reached the walker FAILS LOUD with a positioned `P_ExpressionTooDeep`
+    // diagnostic at the offending token and RECOVERS (Error leaf + panic-scan
+    // + graceful unwind) — it does NOT abort. (Left/None-assoc chains build
+    // ITERATIVELY in the climb loop and never deepen, so they do not count
+    // against this cap regardless of length.)
     //
-    // The cap (256) is now a real SEMANTIC limit on nesting depth, not a
-    // host-stack artifact. Both former blockers to a high cap are resolved:
+    // The cap is a real SEMANTIC limit on nesting depth, not a host-stack
+    // artifact. Both former blockers to a high cap are resolved:
     // (1) the c-subset `operand` rule's speculative cast-vs-paren probe is
     // no longer super-linear — a config-driven LL(k) predictive prune makes
     // the parse O(N) in nesting depth (D-PARSE-SPECULATION-OPERAND-QUADRATIC,
@@ -78,16 +81,22 @@ struct DSS_EXPORT ParserConfig {
     // parse's DOWNSTREAM consumer that overflowed the host's ~1 MB main
     // thread stack at ~25 levels — semantic `analyze` — now runs on a
     // dedicated 64 MiB worker stack, as do the CU build (parse) and the
-    // HIR/MIR lowering (the `buildCuMir` BUILD half); these three frontend
-    // stages all recurse per nesting level (D-PARSE-DEEP-FRONTEND-STACK,
-    // closed; see `core/substrate/large_stack_call.hpp` and
-    // `kDeepRecursionStackBytes`).
-    // So deep-but-legal C (machine-generated nesting included) compiles end-
-    // to-end, and only genuinely pathological nesting past 256 trips this
-    // guard — a positioned `P_ExpressionTooDeep` with graceful recovery,
-    // never a raw stack overflow. 256 is deep enough for any realistic
-    // generated input while keeping the worst-case worker stack (~256 ×
-    // ~40 KB/level ≈ 10 MB) comfortably inside the 64 MiB reserve.
+    // HIR/MIR lowering (the `buildCuMir` BUILD half); these frontend stages
+    // are now FLAT (plan-24: explicit work-stacks, O(1) host-stack per level),
+    // so operator/ternary/prefix/infix chains are bounded ONLY by this cap.
+    //
+    // CONFIG-DRIVEN (plan-24 Stage 7): this is the FALLBACK default. The CU
+    // build OVERRIDES it from the language's `.lang.json`
+    // (`parser.maxExpressionDepth`) via `parserConfigFor` in
+    // compilation_unit.cpp — c-subset declares 1024; a language that omits the
+    // key keeps this 256 fallback. The value is BOUNDED, not unbounded,
+    // because ONE recursion remains: the parser's paren/postfix-body arm (the
+    // deferred plan-24 Stage 5b) still costs a host frame per nested `(` on the
+    // 64 MiB worker. The cap is the fail-loud SAFETY BACKSTOP for that arm — it
+    // must trip BEFORE the worker overflows on the worst supported build (the
+    // measured paren-crash floor is ~3000 on MSVC Debug; c-subset's 1024 sits
+    // ~3x below it). A nest past the configured cap emits a positioned
+    // `P_ExpressionTooDeep` with graceful recovery — NEVER a raw stack overflow.
     std::size_t maxExpressionDepth = 256;
 
     // Recovery strategy for unrecognized tokens. Default scans to

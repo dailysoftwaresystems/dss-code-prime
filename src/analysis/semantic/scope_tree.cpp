@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <tuple>
+#include <unordered_map>
 #include <utility>
 
 namespace dss {
@@ -39,11 +41,26 @@ ScopeId ScopeTree::pushScope(ScopeId parent, NodeId anchor, TreeId tree) {
     return id;
 }
 
-SymbolId ScopeTree::bind(ScopeId scope, std::string name, SymbolId symbol) {
+namespace {
+// Select the namespace's binding map within a scope record (C 6.2.3): Tag →
+// `tagBindings`, Ordinary → `bindings`. The const overload mirrors it for the
+// read-only lookup walk.
+std::unordered_map<std::string, SymbolId>&
+mapFor(ScopeRecord& rec, SymbolNamespace ns) {
+    return ns == SymbolNamespace::Tag ? rec.tagBindings : rec.bindings;
+}
+std::unordered_map<std::string, SymbolId> const&
+mapFor(ScopeRecord const& rec, SymbolNamespace ns) {
+    return ns == SymbolNamespace::Tag ? rec.tagBindings : rec.bindings;
+}
+} // namespace
+
+SymbolId ScopeTree::bind(ScopeId scope, std::string name, SymbolId symbol,
+                         SymbolNamespace ns) {
     if (!scope.valid() || scope.v >= scopes_.size()) {
         stFatal("bind: ScopeId out of range");
     }
-    auto& bindings = scopes_[scope.v].bindings;
+    auto& bindings = mapFor(scopes_[scope.v], ns);
     auto it = bindings.find(name);
     if (it != bindings.end()) {
         return it->second;   // redecl — caller emits S_RedeclaredSymbol
@@ -52,7 +69,8 @@ SymbolId ScopeTree::bind(ScopeId scope, std::string name, SymbolId symbol) {
     return InvalidSymbol;
 }
 
-void ScopeTree::injectBinding(ScopeId scope, std::string name, SymbolId symbol) {
+void ScopeTree::injectBinding(ScopeId scope, std::string name, SymbolId symbol,
+                              SymbolNamespace ns) {
     if (!scope.valid() || scope.v >= scopes_.size()) {
         stFatal("injectBinding: ScopeId out of range");
     }
@@ -60,33 +78,39 @@ void ScopeTree::injectBinding(ScopeId scope, std::string name, SymbolId symbol) 
     // collisions so this branch is exercised only on a deliberate
     // re-injection (a target tree appearing in two imports of the same
     // source tree).
-    scopes_[scope.v].bindings[std::move(name)] = symbol;
+    mapFor(scopes_[scope.v], ns)[std::move(name)] = symbol;
 }
 
-SymbolId ScopeTree::lookup(ScopeId scope, std::string_view name) const noexcept {
+SymbolId ScopeTree::lookup(ScopeId scope, std::string_view name,
+                           SymbolNamespace ns) const noexcept {
     while (scope.valid() && scope.v < scopes_.size()) {
         auto const& rec = scopes_[scope.v];
         // unordered_map heterogeneous lookup is C++20 with custom hash/equal;
         // a plain std::string round-trip keeps the lookup self-contained.
         std::string key{name};
-        auto it = rec.bindings.find(key);
-        if (it != rec.bindings.end()) return it->second;
+        auto const& bindings = mapFor(rec, ns);
+        auto it = bindings.find(key);
+        if (it != bindings.end()) return it->second;
         scope = rec.parent;
     }
     return InvalidSymbol;
 }
 
-std::vector<std::pair<std::string_view, SymbolId>>
+std::vector<std::tuple<std::string_view, SymbolNamespace, SymbolId>>
 ScopeTree::bindingsOf(ScopeId scope) const {
-    std::vector<std::pair<std::string_view, SymbolId>> out;
+    std::vector<std::tuple<std::string_view, SymbolNamespace, SymbolId>> out;
     if (!scope.valid() || scope.v >= scopes_.size()) return out;
-    auto const& bindings = scopes_[scope.v].bindings;
-    out.reserve(bindings.size());
+    auto const& rec = scopes_[scope.v];
+    out.reserve(rec.bindings.size() + rec.tagBindings.size());
     // The string_view aliases the key stored in the scope record; valid
     // for as long as this ScopeTree lives, which outlives the injection
-    // step that consumes it.
-    for (auto const& [name, sym] : bindings) {
-        out.emplace_back(std::string_view{name}, sym);
+    // step that consumes it. Emit BOTH namespaces so the cross-tree
+    // injection re-keys each binding on (name, namespace).
+    for (auto const& [name, sym] : rec.bindings) {
+        out.emplace_back(std::string_view{name}, SymbolNamespace::Ordinary, sym);
+    }
+    for (auto const& [name, sym] : rec.tagBindings) {
+        out.emplace_back(std::string_view{name}, SymbolNamespace::Tag, sym);
     }
     return out;
 }

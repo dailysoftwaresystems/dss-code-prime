@@ -15,8 +15,11 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
+#include "core/types/aggregate_layout.hpp"
 #include "core/types/data_model.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/tree_cursor.hpp"
+#include "core/types/tree_visitor.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "link/object_format_schema.hpp"
@@ -25,8 +28,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -86,6 +91,48 @@ namespace {
 [[nodiscard]] bool schemaLoads(nlohmann::json const& doc) {
     auto r = GrammarSchema::loadFromText(doc.dump(), "<fc3-perturbed>");
     return r.has_value();
+}
+
+// Analyze a c-subset source under a schema whose `arithmeticConversions`
+// block is `mutate`d in place first — the perturbation that proves a config
+// verb is LIVE (the engine reads it, so flipping it changes a typed result).
+[[nodiscard]] SemanticModel analyzeWithArithMutation(
+    std::string src, std::function<void(nlohmann::json&)> mutate,
+    DataModel dm = DataModel::Lp64) {
+    nlohmann::json doc = loadShippedCSubsetJson();
+    mutate(doc["semantics"]["arithmeticConversions"]);
+    auto schema = GrammarSchema::loadFromText(doc.dump(), "<arith-perturbed>");
+    if (!schema) {
+        ADD_FAILURE() << "perturbed schema failed to load";
+        std::abort();
+    }
+    UnitBuilder builder{*schema};
+    builder.addInMemory(std::move(src), "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    assertNoBuilderErrors(*cu);
+    // aggregateLayout MUST be present for an array-dim sizeof to fold (nullopt
+    // ⇒ deliberate fail-loud) — the probe folds `sizeof(EXPR)` into a dimension.
+    return analyze(cu, dm,
+                   AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+}
+
+// The folded dimension of the first array symbol named `name`. The established
+// sizeof-folding probe (`<T> <name>[sizeof(EXPR)]` → the array's scalars[0]).
+[[nodiscard]] std::int64_t arrayDimOf(SemanticModel const& m,
+                                      std::string_view name) {
+    auto const& ti = m.lattice().interner();
+    for (std::size_t i = 1; i < m.symbols().size(); ++i) {
+        if (m.symbols()[i].name != name) continue;
+        TypeId const t = m.symbols()[i].type;
+        if (!t.valid() || ti.kind(t) != TypeKind::Array
+            || ti.scalars(t).empty()) {
+            ADD_FAILURE() << "symbol '" << name << "' is not a sized array";
+            return -1;
+        }
+        return ti.scalars(t)[0];
+    }
+    ADD_FAILURE() << "array symbol '" << name << "' not found";
+    return -1;
 }
 
 } // namespace
@@ -216,42 +263,41 @@ TEST(Fc3WidthSemantics, ModelCarriesTheAnalysisDataModel) {
 // ── P3: the integer-literal ladder (C 6.4.4.1) ──────────────────────────
 
 namespace {
-// Pin the literal's ladder type through the CALL-ARG assignability check
-// (the semantic surface that consumes literal types — c-subset declares
-// no decl-init child, so the call check is the strict observable):
-// passing the literal to a SAME-kind parameter must be clean, and to the
-// CROSS-SIGNEDNESS sibling at the same width must MISMATCH (assignability
-// is same-signedness rank-based) — proving the ladder picked the exact
-// (width × signedness) type, not merely "something assignable".
+// Pin the literal's EXACT ladder type (C 6.4.4.1) by reading the TypeId the
+// semantic analyzer STAMPED on the IntLiteral leaf — the strongest possible
+// assertion: the literal's *actual decoded type* (width AND signedness), not
+// an assignability proxy.
+//
+// This supersedes the prior cross-signedness-mismatch proxy. The c-subset
+// `intCrossSignednessConverts` opt-in (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT,
+// C 6.3.1.3) admits signed<->unsigned ASSIGNMENT, so an opposite-signedness
+// parameter no longer mismatches — signedness became unobservable through
+// assignability. Reading the stamped type observes both axes directly, and is
+// the stronger pin regardless of the gate.
 void expectLiteralTypes(std::string const& literal, TypeKind want,
                         DataModel dm = DataModel::Lp64) {
-    char const* binder = nullptr;
-    switch (want) {
-        case TypeKind::I32: binder = "int";                 break;
-        case TypeKind::I64: binder = "long long";           break;
-        case TypeKind::U32: binder = "unsigned int";        break;
-        case TypeKind::U64: binder = "unsigned long long";  break;
-        default: FAIL() << "unsupported want kind"; return;
-    }
-    auto const probe = [&](char const* paramType) {
-        return std::string{"int take("} + paramType
-            + " v) { return 0; }\n"
-              "int main() { int r; r = take(" + literal + "); return 0; }\n";
-    };
-    auto clean = analyzeCSubset(probe(binder), dm);
-    EXPECT_EQ(countCode(clean.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
-        << literal << " should pass cleanly into a " << binder << " param";
-    char const* crossBinder = nullptr;
-    switch (want) {
-        case TypeKind::I32: crossBinder = "unsigned int";       break;
-        case TypeKind::I64: crossBinder = "unsigned long long"; break;
-        case TypeKind::U32: crossBinder = "int";                break;
-        case TypeKind::U64: crossBinder = "long long";          break;
-        default: return;
-    }
-    auto cross = analyzeCSubset(probe(crossBinder), dm);
-    EXPECT_EQ(countCode(cross.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-        << literal << " must NOT pass into a " << crossBinder << " param";
+    auto cu = buildShippedUnit(
+        "c-subset", {std::string{"int main() { "} + literal + "; return 0; }\n"});
+    assertNoBuilderErrors(*cu);
+    auto m = analyze(cu, dm);
+    EXPECT_FALSE(m.hasErrors()) << literal << " should analyze without error";
+    // Locate the IntLiteral leaf by its token spelling. The `return 0;`
+    // epilogue uses a distinct `0` token, so the match is unique for every
+    // laddered literal under test (none is the bare "0"). Take the FIRST hit.
+    Tree const& tree = cu->trees()[0];
+    NodeId lit{};
+    walkPreOrder(tree, [&](TreeCursor const& cursor) {
+        NodeId const n = cursor.current();
+        if (lit.valid()) return;
+        if (tree.kind(n) == NodeKind::Token && tree.text(n) == literal) lit = n;
+    });
+    ASSERT_TRUE(lit.valid())
+        << "IntLiteral leaf '" << literal << "' not found in the tree";
+    TypeId const got = m.typeAt(lit);
+    ASSERT_TRUE(got.valid()) << literal << " leaf carries no stamped type";
+    EXPECT_EQ(m.lattice().interner().kind(got), want)
+        << literal << " must type kind " << static_cast<int>(want) << " — got "
+        << static_cast<int>(m.lattice().interner().kind(got));
 }
 } // namespace
 
@@ -488,6 +534,14 @@ TEST(Fc3LoaderRejects, UnknownMixedSignednessVerbRejects) {
     EXPECT_FALSE(schemaLoads(doc));
 }
 
+TEST(Fc3LoaderRejects, UnknownShiftResultVerbRejects) {
+    // `shiftResult` (C 6.5.7) is a CLOSED verb — a typo'd spelling must fail
+    // loud at load, never silently fall back to a default discipline.
+    auto doc = loadShippedCSubsetJson();
+    doc["semantics"]["arithmeticConversions"]["shiftResult"] = "promotedRight";
+    EXPECT_FALSE(schemaLoads(doc));
+}
+
 TEST(Fc3LoaderRejects, UnknownLadderTypeNameRejects) {
     auto doc = loadShippedCSubsetJson();
     doc["semantics"]["integerLiteralTyping"][0]["decimal"][0] =
@@ -526,6 +580,54 @@ TEST(Fc3LoaderRejects, NonIntegerLadderCandidateRejects) {
     auto doc = loadShippedCSubsetJson();
     doc["semantics"]["integerLiteralTyping"][0]["decimal"][0] = "double";
     EXPECT_FALSE(schemaLoads(doc));
+}
+
+// ── D-UAC-SHIFT-RESULT-RULE-CONFIG: the shift-result rule is a config verb ──
+//
+// The closed verb `shiftResult` selects a shift's RESULT TYPE (C 6.5.7). The
+// SEMANTIC-tier site (`subtreeType`) is witnessed end-to-end by folding
+// `sizeof(a << b)` into an array dimension: `a` is `int` (I32, 4B), `b` is
+// `long long` (I64, 8B under EVERY data model). `promotedLeft` → the promoted
+// LEFT operand `int` → dim 4; `commonType` → the usual-arithmetic common type
+// `long long` → dim 8. The 4↔8 flip when ONLY the verb changes IS the red-on-
+// disable proof — a dead knob would peg both arms at 4. (Variable operands, not
+// literals: c-subset's `sizeof` of a value expression folds through `subtreeType`
+// — which routes the shift through the same `shiftResultType` chokepoint — so
+// this is the SEMANTIC tier's behavioral pin; the sibling cst_to_hir site is in
+// test_hir_lowering_c_subset.cpp and the chokepoint unit pin in test_type_rules.)
+
+TEST(Fc3ShiftResult, PromotedLeftSizesByLeftOperand) {
+    auto m = analyzeWithArithMutation(
+        "int a; long long b; char arr[sizeof(a << b)];\n",
+        [](nlohmann::json& ac) { ac["shiftResult"] = "promotedLeft"; });
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(arrayDimOf(m, "arr"), 4)
+        << "promotedLeft (C 6.5.7): (int << long long) types as the promoted "
+           "left operand int → sizeof 4";
+}
+
+TEST(Fc3ShiftResult, CommonTypeSizesByCommonType) {
+    auto m = analyzeWithArithMutation(
+        "int a; long long b; char arr[sizeof(a << b)];\n",
+        [](nlohmann::json& ac) { ac["shiftResult"] = "commonType"; });
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(arrayDimOf(m, "arr"), 8)
+        << "commonType: (int << long long) types like an ordinary binary op → "
+           "common(int,long long) = long long → sizeof 8 (the red-on-disable flip)";
+}
+
+TEST(Fc3ShiftResult, ShippedAndAbsentDefaultToPromotedLeft) {
+    // The shipped config declares promotedLeft; a block written WITHOUT the
+    // field keeps C's rule (the struct default is PromotedLeft) — both → 4.
+    auto shipped = analyzeWithArithMutation(
+        "int a; long long b; char arr[sizeof(a << b)];\n",
+        [](nlohmann::json&) { /* no mutation: shipped promotedLeft */ });
+    EXPECT_EQ(arrayDimOf(shipped, "arr"), 4) << "shipped promotedLeft → 4";
+    auto absent = analyzeWithArithMutation(
+        "int a; long long b; char arr[sizeof(a << b)];\n",
+        [](nlohmann::json& ac) { ac.erase("shiftResult"); });
+    EXPECT_EQ(arrayDimOf(absent, "arr"), 4)
+        << "absent shiftResult → default promotedLeft (back-compat) → 4";
 }
 
 // ── Format-schema dataModel fail-louds ──────────────────────────────────

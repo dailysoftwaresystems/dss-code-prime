@@ -1,0 +1,17 @@
+{
+  "$comment": "D-CSUBSET-INDEX-INTEGER-PROMOTION: a `char` subscript of a wide-element (int) array/pointer integer-promotes to int (C 6.3.1.1) before the byte-scaling Mul. Overflow-sensitive: a char index 100 of an int array (stride 4) needs offset 400 — at char width that wraps (400 mod 256) and reads the wrong element. Exercises array-base + pointer-base + a char-indexed STORE + signed-char. Exit 42 iff promotion is correct. RED-ON-DISABLE: revert the cst_to_hir Index promotion arm -> char index stays Char -> scaleIndexToBytes walls at the sub-native ALU gap (compile fail) or overflows (a[36] not a[100]) -> exit 7. The release arm re-witnesses under the shipped pipeline (runtime char-var index, loop-filled array — nothing folds).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

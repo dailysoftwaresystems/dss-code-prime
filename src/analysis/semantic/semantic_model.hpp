@@ -36,6 +36,19 @@
 
 namespace dss {
 
+// C 6.2.3 name spaces. C puts struct/union/enum TAGS (`struct Foo`) in a
+// namespace SEPARATE from ordinary identifiers (objects, functions, typedef
+// names, enumerators) — so `typedef struct Pair { … } Pair;` is legal (the
+// tag `Pair` and the typedef alias `Pair` are distinct names). Each binding
+// (and lookup) selects a namespace; the two are independent maps in a scope.
+// This is the only axis C 6.2.3 requires for this frontend's subset (label
+// and member namespaces are handled elsewhere — labels by the goto pre-scan,
+// members by the per-struct field scope).
+enum class SymbolNamespace : std::uint8_t {
+    Ordinary = 0,   // objects, functions, typedef names, enumerators
+    Tag      = 1,   // struct / union / enum TAGS
+};
+
 // A scope-tree node. ScopeId is the index into SemanticModel's scope
 // vector (slot 0 is the InvalidScope sentinel; slot 1 is the CU root).
 // Lookup walks `parent` links; `children` is retained for tooling/tests.
@@ -43,8 +56,14 @@ struct DSS_EXPORT ScopeRecord {
     ScopeId  parent{};
     NodeId   anchor{};   // tree node whose subtree opens this scope (or invalid for root)
     TreeId   tree{};
-    // name -> SymbolId. Same-scope redeclaration is caught here.
+    // name -> SymbolId, for the ORDINARY namespace. Same-scope redeclaration
+    // is caught here.
     std::unordered_map<std::string, SymbolId> bindings;
+    // C 6.2.3 tag namespace: name -> SymbolId for struct/union/enum TAGS,
+    // SEPARATE from `bindings`. A tag and an ordinary symbol of the same name
+    // (`typedef struct Pair {…} Pair;`) coexist — one lives here, one in
+    // `bindings`. Empty for any scope that declares no tags.
+    std::unordered_map<std::string, SymbolId> tagBindings;
     std::vector<ScopeId> children;
 };
 
@@ -89,12 +108,39 @@ struct DSS_EXPORT SymbolRecord {
     // TypeId → struct symbol → `structScope` → name lookup. `InvalidScope`
     // (default) for every non-composite symbol.
     ScopeId         structScope{};
-    // D5.5: the integer value of an enumerator constant. Set by Pass 1.5
-    // when the symbol is bound under a `compositeKind: "enum"` decl —
-    // explicit `= N` literal indices override the running counter;
-    // missing initializer = previous + 1 (C99 §6.7.2.2). Meaningful only
-    // for symbols whose `type.kind == Enum`; harmless 0 elsewhere.
+    // D5.5: the integer value of a named INTEGER CONSTANT symbol. Set by Pass
+    // 1.5 for an enumerator (explicit `= N` overrides the running counter;
+    // missing = previous + 1, C99 §6.7.2.2), OR at descriptor injection for a
+    // shipped CONSTANT (`isInjectedConstant`). Carries the int64 BIT-PATTERN —
+    // for an unsigned-typed constant the uint64 value reinterpreted; the HIR
+    // fold re-reads it per the type's signedness. Meaningful only when exactly
+    // one of `isEnumerator` / `isInjectedConstant` is set; harmless 0 elsewhere.
     std::int64_t    enumValue = 0;
+    // D-CSUBSET-FN-PROTOTYPE: a bare function PROTOTYPE — a function-TYPED object
+    // declaration with a function suffix on its NAME and NO body (`int f(int);`).
+    // Set by Pass 1 (effectiveKind == Variable + the name carries a function
+    // suffix); Pass 1.5 UPGRADES such a symbol's `kind` to Function (it is a
+    // function declaration, callable, mergeable with a later definition). A
+    // function POINTER (`int (*fp)(int)`) does NOT set this — its suffix sits on
+    // the outer declarator, not the name's direct declarator. Default false.
+    bool            isProtoDeclaration = false;
+    // D-CSUBSET-FN-PROTOTYPE: a proto / redundant function redeclaration that a
+    // SURVIVING declaration superseded (proto→def: the proto is absorbed and the
+    // definition wins the binding; def→proto / proto→proto: the new redundant
+    // decl is absorbed and the prior binding is kept). An absorbed declarator
+    // emits NO HIR node — the survivor carries the symbol (the definition emits
+    // the body; an unabsorbed proto emits nothing either). Default false.
+    bool            isAbsorbedProto = false;
+    // D-CSUBSET-EXTERN-DEFINITION-MERGE: TRUE iff this symbol was minted from a
+    // NON-DEFINING declaration — a declaration that announces a symbol whose
+    // storage/body lives elsewhere (an `extern` declaration in C). Set by Pass 1
+    // from the minting DeclarationRule's `nonDefiningDeclaration` flag (config-
+    // driven, no rule-name identity). A non-defining declaration of the same name
+    // as an in-TU DEFINITION MERGES: the definition WINS the binding and the
+    // extern is absorbed (`isAbsorbedProto` set, its HIR ExternFunction/
+    // ExternGlobal node suppressed). Two non-defining declarations are idempotent;
+    // two definitions still collide (S_RedeclaredSymbol). Default false.
+    bool            isExternDeclaration = false;
     // D-CSUBSET-ENUM-INT-CONVERSION (FC8): TRUE iff this symbol IS an enumerator
     // constant (bound under a `compositeKind:"enum"` decl, where `enumValue` was
     // set). DISTINGUISHES an enumerator from a storage-backed `enum E e;` local —
@@ -102,6 +148,16 @@ struct DSS_EXPORT SymbolRecord {
     // constant value at HIR Ref-lowering; folding a storage-backed local would be
     // a silent miscompile. Default false (every non-enumerator symbol).
     bool            isEnumerator = false;
+    // Item 1 (shipped-header constants): TRUE iff this symbol is a NAMED INTEGER
+    // CONSTANT injected from a neutral shipped-lib descriptor's `constants`
+    // (e.g. `CHAR_BIT` from `limits.json`). Like an enumerator it folds its Ref
+    // to `enumValue` at HIR lowering AND resolves to that value in a constant-
+    // expression context (array dim / case / global init) via the const-eval
+    // engines' direct-value arm — but its `type` is the constant's OWN integer
+    // scalar (NOT an Enum), so the fold derives the literal core from the type
+    // directly. INVARIANT: at most one of `isEnumerator` / `isInjectedConstant`
+    // is true on any symbol (they share `enumValue` but fold via different cores).
+    bool            isInjectedConstant = false;
     // D-CSUBSET-BITFIELD (FC8): the declared bit-field width of a struct/union
     // field, or nullopt for an ordinary field. A TRANSIENT carrier — set at the
     // field's Pass 1.5 resolution (the `: width` const-expr evaluated + validated

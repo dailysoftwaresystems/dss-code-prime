@@ -292,6 +292,16 @@ private:
                 src_.instFlags(id)));
             return;
         }
+        if (op == MirOpcode::BlockAddress) {
+            // D-CSUBSET-COMPUTED-GOTO: the payload is a BLOCK id, which the merge
+            // RE-NUMBERS — a generic `addInst` would copy it verbatim and point the
+            // address at the WRONG (or a stale) block (the FC7 clone-site silent-
+            // miscompile class, extended to BlockAddress). Re-map via `mapBlock`.
+            local_.emplace(id.v, dst_.addBlockAddress(
+                mapBlock(src_.blockAddressTarget(id)), reType(src_.instType(id)),
+                src_.instFlags(id)));
+            return;
+        }
         auto const ops = src_.instOperands(id);
         std::vector<MirInstId> newOps;
         newOps.reserve(ops.size());
@@ -351,6 +361,18 @@ private:
             case MirOpcode::Unreachable:
                 dst_.addUnreachable();
                 return;
+            case MirOpcode::IndirectBr: {
+                // D-CSUBSET-COMPUTED-GOTO: ★ THE SILENT-MISCOMPILE CLONE SITE (MF-A).
+                // Re-map BOTH the address operand AND every successor — dropping any
+                // successor would delete an address-taken edge (reachability/DCE
+                // would then prune a live `&&label` target). operand[0] = address;
+                // successors = all address-taken blocks.
+                std::vector<MirBlockId> targets;
+                targets.reserve(succ.size());
+                for (MirBlockId const b : succ) targets.push_back(mapBlock(b));
+                dst_.addIndirectBr(mapValue(ops[0], id), targets);
+                return;
+            }
             default:
                 std::fprintf(stderr,
                     "dss::mergeCuMirs fatal: CU %u terminator opcode %d marked "

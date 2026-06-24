@@ -78,11 +78,14 @@ constexpr std::string_view kInfixSchema = R"JSON({
 
 // Inline schema whose operand can be a PARENTHESIZED expression:
 // `operand = Identifier | ( expression )`. This is the HEAVIEST
-// expression-recursion path — a nested paren re-enters the Pratt
-// walker through the atom (parsePrimary -> parseUntilFrameDepth ->
-// stepOnce -> walkExpression -> parseExpressionAt), so it exercises
-// the depth guard's chokepoint on the path that consumes the most
-// C++ stack per level. Used by the too-deep diagnostic+recovery pins.
+// expression-nesting path — a nested paren re-enters the Pratt walker
+// through the atom (parsePrimary -> parseUntilFrameDepth -> stepOnce ->
+// walkExpression), driven by the iterative exprWorkStack rather than
+// host recursion, so it exercises the depth guard's chokepoint on the
+// path that drives the most work per level. (The paren/postfix arm is
+// the one descent the iterative driver still re-enters synchronously —
+// plan-24 Stage 5b — but the cap fires the same regardless.) Used by
+// the too-deep diagnostic+recovery pins.
 constexpr std::string_view kParenSchema = R"JSON({
   "dssSchemaVersion": 4,
   "language": { "name": "PrattParen", "version": "0.1.0" },
@@ -121,9 +124,10 @@ constexpr std::string_view kParenSchema = R"JSON({
 })JSON";
 
 // Inline schema with a RIGHT-assoc ternary `?:` (mirrors c-subset's
-// operator-table shape). The ternary else-clause recurses through
-// parseExpressionAt at the operator's own precedence — the path a deep
-// `a?b:a?b:...:c` chain stresses. Declares the `ternary` wrapper rule so
+// operator-table shape). The ternary else-clause descends at the
+// operator's own precedence via the iterative exprWorkStack driver (a
+// heap-stack push, not host recursion) — the path a deep `a?b:a?b:...:c`
+// chain stresses. Declares the `ternary` wrapper rule so
 // the `?` participates (without it the climb drops `?` to the parent).
 constexpr std::string_view kTernarySchema = R"JSON({
   "dssSchemaVersion": 4,
@@ -251,6 +255,21 @@ inline std::string prettyPrint(Tree const& t) {
     std::span<ParseDiagnostic const> diags, DiagnosticCode code) {
     return static_cast<std::size_t>(std::ranges::count_if(
         diags, [code](ParseDiagnostic const& d) { return d.code == code; }));
+}
+
+// First INTERNAL node whose rule matches `ruleName` (pre-order by id).
+// Returns an invalid NodeId when absent.
+[[nodiscard]] NodeId findFirstNodeWithRule(Tree const& t,
+                                           std::string_view ruleName) {
+    const auto ruleId = t.rules().find(ruleName);
+    if (!ruleId.valid()) return NodeId{};
+    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+        const NodeId id{i};
+        if (t.kind(id) == NodeKind::Internal && t.rule(id).v == ruleId.v) {
+            return id;
+        }
+    }
+    return NodeId{};
 }
 
 } // namespace
@@ -884,8 +903,8 @@ TEST(PrattWalker, DeeplyNestedParensDiagnoseAtDefaultCapWithoutCrashing) {
 }
 
 // Multi-form coverage: deep PREFIX (`- - - ... x`) trips the SAME guard.
-// Prefix recurses through `parsePrimary`'s prefix arm into
-// parseExpressionAt at the operator's own precedence — a distinct path
+// Prefix descends through `parsePrimary`'s prefix arm onto the iterative
+// exprWorkStack driver at the operator's own precedence — a distinct path
 // from parens/infix, proving the chokepoint covers it too. Asserts >=1
 // (not exactly 1): a long prefix run whose tail exceeds the recovery
 // scan window (`maxSyncScanTokens`) can re-trip once more as the stack
@@ -904,9 +923,9 @@ TEST(PrattWalker, DeepPrefixChainDiagnosesAndRecovers) {
 
 // Multi-form coverage: a deep RIGHT-assoc TERNARY chain
 // (`a?a:a?a:...:a`) trips the SAME guard. The ternary else-clause
-// recurses through parseExpressionAt at the operator's precedence — the
-// right-nesting path. Pinned at a lowered cap so the guard fires well
-// before any stack pressure.
+// descends at the operator's precedence via the iterative exprWorkStack
+// driver — the right-nesting path. Pinned at a lowered cap so the guard
+// fires well before the work-stack grows.
 TEST(PrattWalker, DeepTernaryChainDiagnosesAndRecovers) {
     std::string src = "a";
     for (int i = 0; i < 20; ++i) src += "?a:a";   // 20 nested ternaries
@@ -1048,4 +1067,102 @@ TEST(PrattWalker, CustomWrapperRulesAndNumberStyleE2E) {
         << "expected `$10` to tokenize as a single IntLiteral";
     EXPECT_NE(pp.find("tok:\"2.5q\""), std::string::npos)
         << "expected `2.5q` to tokenize as a single FloatLiteral";
+}
+
+// ── D-PARSE-DEEP-NEST-RECURSION-MEMORY: flat-descent depth pin (SF-1) ──────
+//
+// A ~3000-deep RIGHT-nested expression (`a=a=…=a`, right-assoc `=`) parses to
+// completion on the DEFAULT/normal test stack (NO large-stack wrapper). The
+// right-assoc RHS arm is the deepest direct `parseExpressionAt` re-entry — the
+// SF-1 flattening turns it into a heap work-stack push, so the descent carries
+// FLAT O(1) host-stack cost and clears thousands of levels. The RECURSIVE form
+// overflowed the normal stack at a few hundred levels (exactly why the
+// 1000-deep PAREN headline pin runs on a 64 MiB worker stack); this pin
+// deliberately runs OFF that worker stack so reverting the flattening
+// re-introduces the host recursion and overflows here.
+//
+// RED-on-disable: restore the recursive `parseExpressionAt` re-entries → this
+// 3000-deep parse recurses 3000 host frames on the default stack → stack
+// overflow (crash). It also asserts the exact RIGHT-nesting tree shape (depth +
+// leaf order), so a flattening that parsed without crashing but produced the
+// WRONG structure (e.g. left-nested, or a dropped level) fails too — not merely
+// "didn't crash".
+//
+// The cap is raised ABOVE the nesting depth so the SEMANTIC cap does not fire
+// (this pin proves the FLAT descent clears the depth, not the guard); the
+// separate too-deep pins above prove the cap still fires at its configured
+// point.
+TEST(PrattWalker, DeepRightAssocChainParsesFlatOnNormalStack) {
+    constexpr int kOps = 3000;   // 3000 `=` ops → 3000 right-nested binaryExpr
+
+    // `a=a=...=a;` — kInfixSchema's `=` is right-assoc, lowest precedence; its
+    // operand is a bare Identifier (no paren re-entry), so the chain recurses
+    // PURELY through the infix-RHS arm that SF-1 flattens.
+    std::string source = "a";
+    for (int i = 0; i < kOps; ++i) source += "=a";
+    source += ";";
+
+    // Raise the cap above the depth so the parse runs to completion; run on the
+    // DEFAULT stack (no callOnLargeStack) — the flatness is the whole point.
+    Tree t = parseWithCap(kInfixSchema, std::move(source), kOps + 1000);
+
+    ASSERT_NE(t.root(), InvalidNode);
+    // CLEAN: no overflow, no diagnostics, no spurious P_ExpressionTooDeep.
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_ExpressionTooDeep), 0u);
+
+    // Exactly kOps binaryExpr wrappers (one per `=`).
+    const auto binRule = t.rules().find("binaryExpr");
+    const auto operandRule = t.rules().find("operand");
+    ASSERT_TRUE(binRule.valid());
+    ASSERT_TRUE(operandRule.valid());
+    std::size_t wrappers = 0;
+    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+        const NodeId id{i};
+        if (t.kind(id) == NodeKind::Internal && t.rule(id).v == binRule.v) {
+            ++wrappers;
+        }
+    }
+    EXPECT_EQ(wrappers, static_cast<std::size_t>(kOps));
+
+    // Tree-SHAPE pin (not just "didn't crash"): walk the RIGHT spine. The
+    // `expression` rule's child is the outermost binaryExpr; descend its LAST
+    // non-trivia child exactly kOps times — each step must be a binaryExpr
+    // until the innermost, whose tail is the bare `operand`. A left-nested or
+    // level-dropping mis-parse breaks the count/shape here.
+    const NodeId exprNode = findFirstNodeWithRule(t, "expression");
+    ASSERT_TRUE(exprNode.valid());
+    auto lastInternalChild = [&](NodeId n) -> NodeId {
+        NodeId out{};
+        for (NodeId c : t.children(n)) {
+            if (t.kind(c) == NodeKind::Internal) out = c;   // last internal wins
+        }
+        return out;
+    };
+    NodeId cur = lastInternalChild(exprNode);   // outermost binaryExpr
+    int spine = 0;
+    while (cur.valid() && t.kind(cur) == NodeKind::Internal
+           && t.rule(cur).v == binRule.v) {
+        ++spine;
+        cur = lastInternalChild(cur);
+    }
+    // kOps binaryExpr nodes on the right spine, terminating in the operand.
+    EXPECT_EQ(spine, kOps);
+    ASSERT_TRUE(cur.valid());
+    EXPECT_EQ(t.rule(cur).v, operandRule.v);
+
+    // Leaf-order fidelity: concatenating EVERY CST leaf reproduces the source
+    // byte-for-byte (the flat descent preserves the trivia/operator/operand
+    // emission order — no reordering across the work-stack push/pop).
+    std::string rebuilt;
+    walkPreOrder(TreeCursor{t, t.root(), CursorMode::Cst},
+                 [&](TreeCursor const& c) {
+        const auto id = c.current();
+        if (t.kind(id) != NodeKind::Internal) rebuilt += t.text(id);
+    });
+    std::string expectedSrc = "a";
+    for (int i = 0; i < kOps; ++i) expectedSrc += "=a";
+    expectedSrc += ";";
+    EXPECT_EQ(rebuilt, expectedSrc);
 }

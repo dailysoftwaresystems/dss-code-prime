@@ -3503,3 +3503,64 @@ TEST(GrammarSchema, HirLoweringUnknownChildLowerVerbReportsInvalid) {
     ASSERT_FALSE(r.has_value());
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidHirLowering));
 }
+
+// ─── parser.maxExpressionDepth (plan-24 Stage 7: config-driven cap) ─────────
+//
+// The optional top-level `parser` block carries the expression-nesting cap.
+// These pin the loader contract: a valid positive value round-trips to the
+// schema accessor; an absent block leaves the accessor `nullopt` (so the CU
+// build keeps the ParserConfig C++ fallback); and a non-positive / wrong-type
+// value FAILS LOUD with `C_ConflictingField` rather than silently defaulting.
+
+namespace {
+// `kHappyConfig`-shaped body + an optional `parser` fragment spliced in as a
+// sibling of `language`; pass "" for no `parser` block.
+[[nodiscard]] std::string happyConfigWithParser(std::string_view parserFragment) {
+    std::string out = R"({
+  "dssSchemaVersion": 1,
+  "language": { "name": "MiniLang", "version": "1.0.0" },)";
+    out += parserFragment;
+    out += R"(
+  "tokens": { ";": [{ "kind": "EndCommand" }] },
+  "shapes": {
+    "root":       { "sequence": [{ "repeat": "statement" }] },
+    "statement":  { "sequence": ["Identifier", "EndCommand"] }
+  }
+})";
+    return out;
+}
+} // namespace
+
+TEST(GrammarSchema, ParserMaxExpressionDepthRoundTrips) {
+    auto result = GrammarSchema::loadFromText(
+        happyConfigWithParser(R"( "parser": { "maxExpressionDepth": 4096 },)"));
+    ASSERT_TRUE(result.has_value())
+        << "valid parser.maxExpressionDepth must load";
+    auto cap = (*result)->maxExpressionDepth();
+    ASSERT_TRUE(cap.has_value());
+    EXPECT_EQ(*cap, 4096u);
+}
+
+TEST(GrammarSchema, ParserBlockAbsentLeavesMaxExpressionDepthUnset) {
+    auto result = GrammarSchema::loadFromText(happyConfigWithParser(""));
+    ASSERT_TRUE(result.has_value());
+    // nullopt — the CU build then keeps the ParserConfig C++ fallback (256),
+    // NOT a silently-fabricated value.
+    EXPECT_FALSE((*result)->maxExpressionDepth().has_value());
+}
+
+TEST(GrammarSchema, ParserMaxExpressionDepthZeroReportsCode) {
+    auto result = GrammarSchema::loadFromText(
+        happyConfigWithParser(R"( "parser": { "maxExpressionDepth": 0 },)"));
+    ASSERT_FALSE(result.has_value())
+        << "a zero cap (every expression trips it) must fail loud";
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_ConflictingField));
+}
+
+TEST(GrammarSchema, ParserMaxExpressionDepthWrongTypeReportsCode) {
+    auto result = GrammarSchema::loadFromText(
+        happyConfigWithParser(R"( "parser": { "maxExpressionDepth": "lots" },)"));
+    ASSERT_FALSE(result.has_value())
+        << "a non-integer cap must fail loud, not silently default";
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_ConflictingField));
+}

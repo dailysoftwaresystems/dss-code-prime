@@ -118,6 +118,31 @@ struct DSS_EXPORT ShippedSymbol {
     ShippedSymbolLinkage linkage = ShippedSymbolLinkage::External;
 };
 
+// One decoded named CONSTANT — the neutral form of a header's object-like
+// `#define CHAR_BIT 8` surface (a macro that IS a compile-time constant). A C
+// `.h` macro is C-text and would couple the shipped config to C; the neutral
+// answer is a typed named constant that the semantic phase injects + the HIR
+// folds to a literal, exactly like an enum enumerator. Constrained to INTEGER
+// SCALARS (`type.kind` ∈ I8..U128) — a float / pointer / string macro is out of
+// scope and fails loud on read (a function-like macro is not a constant at all).
+// `value` is the int64 BIT-PATTERN: for an unsigned `type` it is the uint64
+// value reinterpreted, and the fold re-reads it per `type`'s signedness — so the
+// full unsigned range (e.g. `UINT_MAX`) round-trips losslessly.
+struct DSS_EXPORT ShippedConstant {
+    std::string  name;
+    std::int64_t value = 0;
+    TypeId       type;     // an integer scalar kind; decoded via parseTypeFromText
+};
+
+// One decoded TYPEDEF — the neutral form of a header's `typedef … name;` (e.g.
+// `size_t`). The semantic phase injects it as a `DeclarationKind::Type` symbol
+// so the name resolves in type position. `type` is any hir-text-decodable type
+// (a scalar, a pointer, a struct ref, a function pointer …).
+struct DSS_EXPORT ShippedTypedef {
+    std::string name;
+    TypeId      type;
+};
+
 // A decoded shipped-library descriptor. `header` is the authoritative
 // provenance (which header these symbols come from); `standard` is optional
 // provenance; `library` is a per-OBJECT-FORMAT map ("pe"/"elf"/"macho" → image
@@ -131,7 +156,13 @@ struct DSS_EXPORT ShippedLibDescriptor {
     // ("pe"/"elf"/"macho"). The compile pipeline selects the active target's
     // entry; a missing key inherits `externLibraryByFormat[format]`.
     std::unordered_map<std::string, std::string> library;
-    std::vector<ShippedSymbol> symbols;
+    // The full neutral surface a header provides. A descriptor must declare AT
+    // LEAST ONE of these non-empty (a descriptor that declares NOTHING is a
+    // no-op artifact and fails loud); a header may legitimately carry only
+    // `constants` (e.g. `<limits.h>`), only `symbols`, or any mix.
+    std::vector<ShippedSymbol>   symbols;     // extern functions/objects (linked)
+    std::vector<ShippedConstant> constants;   // named integer constants (folded)
+    std::vector<ShippedTypedef>  typedefs;    // type aliases (resolved in type pos)
 };
 
 // Read + decode the neutral descriptor at `path`, interning each symbol's

@@ -276,6 +276,31 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
         rewrite_.emplace(oldId.v, newId);
         return;
     }
+    if (op == MirOpcode::BlockAddress) {
+        // D-CSUBSET-COMPUTED-GOTO: the payload is a BLOCK id that this rebuild
+        // RE-NUMBERS — a verbatim `addInst` copy would carry the OLD id and point
+        // the address at the wrong/elided block (the FC7 clone-site silent-
+        // miscompile class). Re-map through blockMap_ (honoring a policy's
+        // redirectBlockTarget, exactly as the terminator successors do). MF-B
+        // guarantees an address-taken target is never elided/merged, so it is in
+        // the map; abort loud if not (a policy bug) rather than miscompile.
+        MirBlockId const oldTarget = src_.blockAddressTarget(oldId);
+        MirBlockId const redirected = policy_.redirectBlockTarget(oldTarget);
+        auto const it = blockMap_.find(redirected.v);
+        if (it == blockMap_.end()) {
+            std::fprintf(stderr,
+                "dss::opt::passes::MirFunctionRebuilder fatal: BlockAddress target "
+                "old v=%u (redirected v=%u) not in blockMap_ — an address-taken "
+                "block was elided/merged (MF-B guard missing in this pass). "
+                "Originating BlockAddress: old MirInstId v=%u.\n",
+                oldTarget.v, redirected.v, oldId.v);
+            std::abort();
+        }
+        MirInstId const newId = dst_.addBlockAddress(it->second, src_.instType(oldId),
+                                                     src_.instFlags(oldId));
+        rewrite_.emplace(oldId.v, newId);
+        return;
+    }
 
     // Per-pass full-inst-replacement hook. Returns nullopt → verbatim
     // copy. ConstFold emits a Const for foldable expressions; CopyProp
@@ -373,6 +398,18 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
         }
         case MirOpcode::Unreachable: {
             MirInstId const newId = dst_.addUnreachable();
+            remember(newId);
+            return;
+        }
+        case MirOpcode::IndirectBr: {
+            // D-CSUBSET-COMPUTED-GOTO (MF-A, 2nd clone site): re-map the address
+            // operand AND every address-taken successor through mapSucc (dropping a
+            // successor deletes a live `&&label` edge → reachability/DCE prune it).
+            MirInstId const addr = mapOperand(oldOps[0]);
+            std::vector<MirBlockId> targets;
+            targets.reserve(oldSucc.size());
+            for (MirBlockId const s : oldSucc) targets.push_back(mapSucc(s));
+            MirInstId const newId = dst_.addIndirectBr(addr, targets);
             remember(newId);
             return;
         }

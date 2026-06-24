@@ -95,6 +95,25 @@ struct DSS_EXPORT Relocation {
     std::int64_t   addend = 0;    // ABI-specific (e.g. PC-relative bias)
 };
 
+// One synthetic SYMBOL ↔ interior-block byte-offset binding (D-CSUBSET-
+// COMPUTED-GOTO `&&label`). The block-address `lea` materializes a
+// SYNTHETIC per-block local symbol's runtime address; that symbol is
+// not a function or a data item, so it gets no VA from the usual
+// function/data symbolVa population. Instead the encoder records this
+// binding — `symbol` is the synthetic local, `blockByteOffset` is the
+// target block's offset WITHIN THIS function's `bytes` — and the
+// linker computes the symbol's interior VA as `sectionVa +
+// funcTextStart[thisFn] + blockByteOffset` (the same geometry a
+// function symbol gets, but pointing at an interior block rather than
+// the function entry). `addend` would otherwise have to carry the
+// block offset off a function symbol; a synthetic own-VA symbol keeps
+// `addend == 0` so the EXISTING rel32 / adrp / add_lo12 reloc formulas
+// resolve it with no kernel change.
+struct DSS_EXPORT SyntheticBlockSymbol {
+    SymbolId      symbol{};            // the synthetic per-block local symbol
+    std::uint32_t blockByteOffset = 0; // offset of the target block within THIS fn's bytes
+};
+
 // One assembled function — bytes + symbol-relative metadata. `symbol`
 // is sourced from the originating `lir.funcSymbol(fn)` so the linker
 // can place this function's bytes in its object-file symbol table
@@ -104,6 +123,17 @@ struct DSS_EXPORT AssembledFunction {
     std::vector<std::uint8_t>   bytes;
     std::vector<Relocation>     relocations;
     std::vector<SourceMapEntry> sourceMap;
+    // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols this
+    // function's block-address `lea`s reference, each paired with the
+    // target block's byte offset within `bytes`. The encoder records a
+    // pending `walker_util::BlockSymPatch` per block-address `lea`;
+    // `asm.cpp` resolves each against the function's completed
+    // `blockOffsets` table and appends a `SyntheticBlockSymbol` here.
+    // The linker turns each into an interior-block VA in `symbolVa`
+    // before applying relocations (see
+    // `link/format/interior_block_symbol_va.hpp`). Empty for every
+    // function that takes no block address.
+    std::vector<SyntheticBlockSymbol> blockSymbols;
 };
 
 // One assembled data item — bytes + symbol identity, destined for a

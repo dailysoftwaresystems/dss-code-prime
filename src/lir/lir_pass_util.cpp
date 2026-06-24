@@ -2,6 +2,7 @@
 
 #include <format>
 #include <utility>
+#include <vector>
 
 namespace dss::lir_pass_util {
 
@@ -66,6 +67,17 @@ bool emitTerminator(LirBuilder& b, std::uint16_t op,
                                "Switch lowering)",
                                passName, static_cast<unsigned>(op)));
             return false;
+        case TargetTerminatorKind::IndirectBr: {
+            // D-CSUBSET-COMPUTED-GOTO: re-map the address operand(s) (already in
+            // `newOps`) AND resolve EVERY address-taken successor through srcToDst.
+            // Dropping a successor would delete a live `&&label` edge.
+            if (succs.empty()) break;  // an IndirectBr must have ≥1 target
+            std::vector<LirBlockId> targets;
+            targets.reserve(succs.size());
+            for (std::size_t i = 0; i < succs.size(); ++i) targets.push_back(resolveAt(i));
+            b.addIndirectBr(op, newOps, targets, payload, flags);
+            return true;
+        }
         case TargetTerminatorKind::None:
             report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
                    DiagnosticSeverity::Error,

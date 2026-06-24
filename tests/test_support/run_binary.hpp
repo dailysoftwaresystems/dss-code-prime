@@ -46,6 +46,7 @@
 #include <algorithm>  // std::min in the POSIX poll-loop arm
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>    // setenv / _putenv_s (QEMU_STACK_SIZE bump)
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -68,6 +69,7 @@
   #include <fcntl.h>
   #include <signal.h>
   #include <spawn.h>
+  #include <sys/resource.h>  // getrlimit/setrlimit RLIMIT_STACK (large-frame corpus)
   #include <sys/stat.h>
   #include <sys/wait.h>
   #include <unistd.h>
@@ -89,6 +91,51 @@ struct RunResult {
     // against an explicit expected payload, not "nonempty".
     std::string   capturedStdout;
 };
+
+// D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (harness): give EVERY spawned
+// binary a generous stack ONCE per process, in the parent, before the
+// first spawn. The `large_frame_beyond_16mib` example reserves a ~20 MB
+// stack frame that SIGSEGVs under the default 8 MB ulimit (exit 139). Two
+// mechanisms, both inherited by the child (posix_spawn / CreateProcess
+// inherit the environment + POSIX rlimits):
+//   * QEMU_STACK_SIZE=256MB — the qemu-aarch64 child reads it to size the
+//     emulated guest stack (the cross-arch run-under-emulator path).
+//   * RLIMIT_STACK=256MB (POSIX) — for the NATIVE run (e.g. the
+//     ubuntu-24.04-arm leg spawning the arm64 ELF directly): raise the
+//     soft limit toward the hard cap; the spawned child inherits it.
+// Lives HERE, at the single spawn chokepoint, so BOTH harnesses that spawn
+// through runBinary — the in-process `tests/examples/examples_runner` AND
+// the `integrated_tests` CLI-subprocess runner — get it by construction.
+// (The integrated_tests runner previously lacked the bump, so the native
+// arm64-Linux leg SIGSEGV'd on this one example while every other leg —
+// which skips the arm64 target as cross-arch/cross-format — stayed green.)
+// Harmless to every small-frame example: an idempotent env set + a one-shot
+// best-effort rlimit raise (a failure is non-fatal). Function-local static
+// ⇒ the cost is paid exactly once per test process.
+inline void ensureGenerousSpawnStack() noexcept {
+    static bool const done = [] {
+        constexpr char const* kStackBytes = "268435456";  // 256 MiB
+#if defined(_WIN32)
+        ::_putenv_s("QEMU_STACK_SIZE", kStackBytes);
+#else
+        ::setenv("QEMU_STACK_SIZE", kStackBytes, /*overwrite=*/1);
+        struct rlimit rl{};
+        if (::getrlimit(RLIMIT_STACK, &rl) == 0) {
+            rlim_t const want = static_cast<rlim_t>(268435456);  // 256 MiB
+            rlim_t const target =
+                (rl.rlim_max == RLIM_INFINITY)
+                    ? want
+                    : std::min<rlim_t>(want, rl.rlim_max);
+            if (rl.rlim_cur < target) {
+                rl.rlim_cur = target;
+                (void)::setrlimit(RLIMIT_STACK, &rl);  // best-effort
+            }
+        }
+#endif
+        return true;
+    }();
+    (void)done;
+}
 
 // Spawn `binaryPath` and wait up to `timeout` for it to exit.
 // Returns the captured exit code or a diagnostic. The child runs
@@ -124,6 +171,10 @@ runBinary(std::filesystem::path const&     binaryPath,
           bool                             captureStdout = false,
           std::vector<std::string> const&  launcherPrefix = {}) {
     RunResult out;
+
+    // Large-frame corpus needs a generous child stack (once per process,
+    // before the first spawn). See ensureGenerousSpawnStack above.
+    ensureGenerousSpawnStack();
 
 #if defined(_WIN32)
     auto const pathStr = binaryPath.string();

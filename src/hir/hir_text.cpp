@@ -648,6 +648,9 @@ private:
                 out_ += std::format(" L{}:\n", hir_.labelOrdinal(id));
                 emitNodeLine(hir_.labelBody(id), ind + 1);
                 return;
+            case HirKind::IndirectGotoStmt:
+                out_ += "goto"; out_ += flagsStr(f); out_ += " *";
+                emitExpr(hir_.indirectGotoTarget(id)); out_ += '\n'; return;
             case HirKind::Error: case HirKind::Extension:
                 emitExtOrError(id, /*inlineForm=*/false, ind); out_ += '\n'; return;
             default:
@@ -771,6 +774,12 @@ private:
             case HirKind::VaEnd:              typedCall("va_end"); return;
             case HirKind::AddressOf:          typedCall("addressof"); return;
             case HirKind::Deref:              typedCall("deref"); return;
+            case HirKind::LabelAddressOf:
+                // D-CSUBSET-COMPUTED-GOTO: `&&label` leaf — render the target label
+                // ordinal + type (no operands), mirroring goto/label's `L{ord}` form.
+                header("labeladdr");
+                out_ += std::format(" L{} : ", hir_.labelAddressOrdinal(id));
+                appendType(hir_.typeId(id)); return;
             case HirKind::SeqExpr: {
                 // `seq : type { <stmt-lines> yield <resultExpr> }` — the
                 // statement children render as normal statement lines; the

@@ -123,7 +123,8 @@ namespace detail::type_rules {
     SemanticConfig::PointerConversionRules const&      ptrRules = {},
     bool                                               boolWidensToArith = false,
     bool                                               charConvertsToArith = false,
-    bool                                               enumConvertsToArith = false) noexcept {
+    bool                                               enumConvertsToArith = false,
+    bool                                               intCrossSignednessConverts = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     if (sameType(lhs, rhs)) return true;
     auto const lk = interner.kind(lhs);
@@ -189,6 +190,24 @@ namespace detail::type_rules {
                 && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0)))) {
         return true;
     }
+    // C 6.3.1.3 / 6.5.16.1 (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT): a signed integer
+    // and an unsigned integer are mutually assignable — value-preserving in range,
+    // modular out of range (`int x = u;`, `unsigned u = i;`, `return i;`/`f(u)` across
+    // the signedness boundary), in BOTH directions and at ANY width. The same-signedness
+    // rank arms above already RETURNED for matching signedness, so this arm is reached
+    // only for a signed↔unsigned MIX (one rank is signed, the other unsigned); a
+    // non-int rhs/lhs (float/char/enum — already handled, or int↔float) fails both
+    // disjuncts and stays a loud mismatch. The HIR `coerce()` arithmetic-core arm
+    // materializes the width-exact Cast, so the post-coerce verifier (gate default
+    // false) stays strict. Gated on `intCrossSignednessConverts` (default false → a
+    // non-C schema keeps signed/unsigned strictly distinct); mirrors the
+    // charConvertsToArith / enumConvertsToArith gates. SAME-signedness narrowing
+    // (`int x = aLong`) is UNAFFECTED — it returned at the rank arms above.
+    if (intCrossSignednessConverts
+        && ((signedIntRank(lk) != 0 && unsignedIntRank(rk) != 0)
+            || (unsignedIntRank(lk) != 0 && signedIntRank(rk) != 0))) {
+        return true;
+    }
     // C-standard array-to-pointer decay (D-LK4-RODATA-PRODUCER-STRING
     // closure, 2026-06-02): `Array<T,N>` is implicitly assignable to
     // `Ptr<T>` via the address-of-first-element conversion. Pinned to
@@ -209,6 +228,32 @@ namespace detail::type_rules {
         auto const rhsElem = interner.operands(rhs);
         if (!lhsElem.empty() && !rhsElem.empty()
             && lhsElem[0] == rhsElem[0]) {
+            return true;
+        }
+    }
+    // C-standard function-to-pointer decay (C 6.3.2.1p4): a function
+    // designator of type `FnSig` is implicitly assignable to a
+    // `Ptr<FnSig>` of the SAME signature — `int (*fp)(int,int); fp = add;`,
+    // the most common function-pointer idiom (vtables / callbacks /
+    // dispatch tables). This is the SIBLING of the array-to-pointer decay
+    // above and part of the SAME shared-lattice structural-decay family
+    // (D-LANG-STRUCTURAL-DECAY-OPT-OUT) — ungated, because a function name
+    // has no other use as an rvalue (a function value cannot be copied), so
+    // admitting the decay never masks a real mismatch. UNLIKE array decay,
+    // NO synthetic HIR decay node is needed: a bare function Ref inherently
+    // lowers to the function's ADDRESS at MIR time (which is why `fp = add`
+    // compiled AND ran correctly before the assign-stmt assignability check
+    // existed — only the new SEMANTIC check rejected it). Pinned to the SAME
+    // signature (the lhs pointee FnSig == the rhs FnSig, by interner
+    // identity): an incompatible-signature assignment (`int (*g)(int) = add`
+    // where add is `int(int,int)`) interns a DISTINCT FnSig and stays a loud
+    // mismatch. The arm is the shared `isAssignable` chokepoint, so it fixes
+    // assignment, initialization, call-argument, and return positions at
+    // once. Closes the `fp = add` regression of
+    // D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS.
+    if (lk == TypeKind::Ptr && rk == TypeKind::FnSig) {
+        auto const lhsElem = interner.operands(lhs);
+        if (!lhsElem.empty() && lhsElem[0] == rhs) {
             return true;
         }
     }
@@ -283,9 +328,9 @@ namespace detail::type_rules {
 // array-to-pointer conversion BEFORE the cast applies, so
 // `(char*)"str"` is Ptr↔Ptr legality-wise (and `(long)arr` is the
 // Ptr→integer round-trip). The legality view simply re-kinds the
-// operand as Ptr; the HIR lowering (`lowerCast`) emits the SAME
-// synthetic decay Cast the implicit path uses, so the value side
-// always sees pointer-typed input.
+// operand as Ptr; the HIR cast epilogue (`combineCast`, cst_to_hir.cpp)
+// emits the SAME synthetic decay Cast the implicit path uses, so the
+// value side always sees pointer-typed input.
 [[nodiscard]] inline bool isExplicitCastable(TypeInterner const& interner,
                                              TypeId target,
                                              TypeId operand) noexcept {
@@ -320,10 +365,11 @@ namespace detail::type_rules {
 // void itself) is admissible. Kept SEPARATE from `isExplicitCastable`
 // deliberately: everything that matrix admits must be lowerable by
 // MIR's `mapCast`, while a void discard produces NO Cast node at all —
-// `lowerCast` (cst_to_hir.cpp) lowers the operand for its side effects
-// and discards the value (an expression-statement effect). The
-// analyzer's cast-legality site checks this FIRST; a void target never
-// reaches the matrix.
+// the cast epilogue `combineCast` (cst_to_hir.cpp) keeps the operand's
+// already-lowered value (lowered for its side effects) and re-types it
+// void, wrapping it in no Cast node (an expression-statement effect).
+// The analyzer's cast-legality site checks this FIRST; a void target
+// never reaches the matrix.
 [[nodiscard]] inline bool isVoidDiscardCast(TypeInterner const& interner,
                                             TypeId target) noexcept {
     return target.valid() && interner.kind(target) == TypeKind::Void;
@@ -411,6 +457,7 @@ struct ResolvedArithmeticRules {
     std::vector<TypeKind> alsoPromote;              // out-of-lattice promoted kinds
     MixedSignednessRule   mixedSignedness = MixedSignednessRule::RankPreferUnsigned;
     bool                  promoteComparisons = true;
+    ShiftResultRule       shiftResult = ShiftResultRule::PromotedLeft;  // C 6.5.7
 };
 
 [[nodiscard]] inline ResolvedArithmeticRules
@@ -421,6 +468,7 @@ resolveArithmeticRules(ArithmeticConversions const& cfg, DataModel dm) {
     for (auto const& p : cfg.alsoPromote) out.alsoPromote.push_back(p.resolveCore(dm));
     out.mixedSignedness    = cfg.mixedSignedness;
     out.promoteComparisons = cfg.promoteComparisons;
+    out.shiftResult        = cfg.shiftResult;
     return out;
 }
 
@@ -559,6 +607,26 @@ integerPromotedType(TypeInterner& interner, TypeId t,
     TypeKind const p = promoteIntegerKind(k, rules);
     if (p == k) return t;
     return interner.primitive(p);
+}
+
+// C 6.5.7 shift RESULT TYPE under the config verb `shiftResult`
+// (D-UAC-SHIFT-RESULT-RULE-CONFIG) — the SINGLE chokepoint both the CST→HIR
+// shift lowering and the semantic-tier expression typer call, so the two tiers
+// can never diverge on the verb (a regression to one is a regression to both,
+// caught by the one test). `PromotedLeft` (C): the PROMOTED LEFT operand — the
+// count's type never contributes (`i32 << i64` is I32). `CommonType`: the
+// usual-arithmetic common type — a shift typed like an ordinary binary op
+// (`i32 << i64` is I64). Either falls back to the first valid operand for a
+// non-arithmetic pair, mirroring the generic binary result rule.
+[[nodiscard]] inline TypeId
+shiftResultType(TypeInterner& interner, TypeId lhs, TypeId rhs,
+                ResolvedArithmeticRules const& rules) {
+    if (rules.shiftResult == ShiftResultRule::PromotedLeft) {
+        TypeId const lp = integerPromotedType(interner, lhs, rules);
+        return lp.valid() ? lp : (lhs.valid() ? lhs : rhs);
+    }
+    TypeId const common = usualArithmeticCommonType(interner, lhs, rhs, rules);
+    return common.valid() ? common : (lhs.valid() ? lhs : rhs);
 }
 
 // Compile-time sanity: the rank functions are pure (constexpr) and the

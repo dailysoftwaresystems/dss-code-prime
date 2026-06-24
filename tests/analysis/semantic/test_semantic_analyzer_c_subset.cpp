@@ -201,6 +201,45 @@ TEST(SemanticAnalyzerCSubset, CharStarToVoidStarArgImplicit) {
                         DiagnosticCode::S_ArgCountMismatch), 0u);
 }
 
+// D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD regression (red-on-disable on DEBUG):
+// `checkCallAgainstSig` held the callee's `fnParams()` span across the per-arg
+// `subtreeType()` loop. An `&x` argument MATERIALIZES `pointer<int>` on first use,
+// mutating the interner pool MID-LOOP, so the retained `params` span dangled — a
+// heap-use-after-free masked in Release (the guard is compiled out → exit 42 by
+// luck) and caught only on Debug. This is the `memcpy(&b,&a,4)` (`#include
+// <string.h>`) case that read "libc FFI 9/10" on Debug. A MULTI-param callee + an
+// address-of arg is the minimal trip: the FIRST `&x` interns pointer<int>, then
+// `params[1]`/`params[2]` read the now-stale span. Single-param libc fns
+// (malloc/free) never trip it — a literal `4` / an existing pointer arg interns
+// nothing. The fix copies `params` into an owned vector before the loop; WITHOUT
+// it, this `analyze()` ABORTS (the guard) on a Debug build → the test goes red.
+TEST(SemanticAnalyzerCSubset, MultiParamCallAddressOfArgsNoStaleParamSpan) {
+    // The callee params are `void*` (NOT `int*`) — this is load-bearing for the
+    // red-on-disable. The bug needs the arg's `subtreeType()` to intern a FRESH
+    // type mid-loop: `&x` is `int*`, which is NOT already interned (the params are
+    // `void*`), so checking it materializes pointer<int> and mutates the pool —
+    // exactly memcpy's `void*` params + `&b`/`&a` `int*` args. (An `int*`-param
+    // version does NOT trip it: `&x` dedups against the param's pointer<int>, no
+    // mutation.) `int*` → `void*` is implicit in c-subset, so the call is
+    // well-typed; WITHOUT the owned-copy fix this analyze() aborts (guard) on Debug.
+    auto cu = buildShippedUnit("c-subset", {
+        "void multi(void* a, void* b, int n);\n"
+        "void f(void) {\n"
+        "    int x;\n"
+        "    int y;\n"
+        "    multi(&x, &y, 4);\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // The call is well-typed (int*→void* implicit, int→int): no mismatch, no abort.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
 // D-LANG-POINTER-VOID-CONVERT: the reverse direction (`void*` →
 // `char*`) is also implicit under C semantics (c-subset declares
 // `implicitFromVoidPtr: true`) — C++ would forbid this without
@@ -301,6 +340,119 @@ TEST(SemanticAnalyzerCSubset, DistinctTypedReturnRemainsMismatch) {
                         DiagnosticCode::S_ReturnTypeMismatch), 1u)
         << "char* → int* via return must NOT be implicit even in "
            "c-subset (only void* gets the universal-pointer pass).";
+}
+
+// ── D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS — the assignment STATEMENT
+//    now runs the SAME `isAssignable` check as the init/call-arg/return sites ──
+//
+// (a) An invalid assignment STATEMENT `x = f;` (int <- float) fails loud with a
+// positioned S_TypeMismatch — the SAME diagnostic the init site `int x = f;`
+// emits. `f` is a parameter so no narrowing initializer adds a second mismatch;
+// exactly ONE fires.
+// RED-ON-DISABLE: remove the assignment-statement isAssignable arm (restore the
+// bypass) -> the assignment is silently accepted (HIR coerce truncates float ->
+// int), this count drops to 0.
+TEST(SemanticAnalyzerCSubset, AssignStmtIntFromFloatFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int sink(float f) { int x; x = f; return x; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "an int <- float assignment STATEMENT must fail loud with the same "
+           "S_TypeMismatch the int <- float INIT (`int x = f;`) emits — the "
+           "assignment-statement assignability bypass is closed";
+}
+
+// (b) PARITY pin: the init form `int x = f;` and the statement form `x = f;`
+// must behave IDENTICALLY (both reject the same incompatible pair). Reading both
+// in one TU yields exactly TWO S_TypeMismatch — one per site — proving the
+// statement is no longer the lone unchecked position.
+// RED-ON-DISABLE: with the bypass restored only the INIT fires -> count is 1.
+TEST(SemanticAnalyzerCSubset, AssignStmtAndInitRejectIncompatibleIdentically) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int sink(float f) { int x = f; x = f; return x; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 2u)
+        << "the init site AND the assignment-statement site must each reject the "
+           "int <- float pair — two positioned S_TypeMismatch, not one";
+}
+
+// (c) A VALID assignment statement stays byte-identically clean: int <- int,
+// pointer <- null-constant, and a cross-signedness assignment (the c-subset
+// `intCrossSignednessConverts` gate is ON) all pass with ZERO diagnostics. The
+// new arm must not over-reject any conversion the four checked sites admit.
+TEST(SemanticAnalyzerCSubset, ValidAssignStmtsRemainClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void) {\n"
+        "  int x; int y; unsigned u; int* p; int a;\n"
+        "  y = 7;\n"      // int <- int
+        "  x = y;\n"      // int <- int
+        "  u = y;\n"      // unsigned <- int (cross-signedness, gated ON)
+        "  p = 0;\n"      // ptr <- null pointer constant
+        "  p = &a;\n"     // ptr <- &lvalue (same typed pointer)
+        "  return x;\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "every valid assignment statement (int<-int, unsigned<-int gated, "
+           "ptr<-null, ptr<-&lvalue) must stay accepted — the new check admits "
+           "exactly what the init/call-arg/return sites admit";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// (c2) Valid assignment statements to NON-trivial LVALUES — a DEREF store
+// (`*p = v`), an ARRAY-ELEMENT store (`a[i] = v`), and a MEMBER store (`s.m = v`) —
+// stay byte-identically CLEAN (zero S_TypeMismatch). The assignability check reads
+// the LHS via subtreeType, which returns the lvalue's VALUE type for a deref /
+// index / member-access, so each compatible store is admitted. This guards the
+// lvalue-shaped LHS forms the plain-variable cases above do not exercise.
+TEST(SemanticAnalyzerCSubset, ValidLvalueStoreAssignStmtsRemainClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int m; };\n"
+        "int main(void) {\n"
+        "  int a[4]; int x; int* p; struct S s;\n"
+        "  p = &x;\n"
+        "  *p = 5;\n"        // deref store: int <- int
+        "  a[2] = 7;\n"      // array-element store: int <- int
+        "  s.m = 9;\n"       // member store: int <- int
+        "  return a[2] + s.m + *p;\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "a deref store (*p=v), an array-element store (a[i]=v), and a member "
+           "store (s.m=v) of a compatible value must each stay clean — subtreeType "
+           "returns the lvalue's value type for the assignability check";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// (d) A COMPOUND assignment is NOT routed through the plain-assignment check:
+// `x += y` is `x = x + y` whose result is the arithmetic common type converted
+// back to x (the usual-arithmetic path, not assignability). The plain-vs-compound
+// discriminator is the operator-table entry's `target == "Assign"` (config-driven,
+// the same one subtreeType uses), so a compound assignment of two ints raises NO
+// spurious S_TypeMismatch here. (c-subset does not yet LOWER compound-assign, but
+// the SEMANTIC tier must not mis-reject it.)
+TEST(SemanticAnalyzerCSubset, CompoundAssignStmtNotCheckedAsPlainAssign) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void) { int x; int y; y = 1; x = 0; x += y; return x; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "a compound assignment (`x += y`) must not run the plain-assignment "
+           "assignability check — only the plain `=` operator is checked";
 }
 
 // D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): per C §6.3.2.3.3,
@@ -1669,6 +1821,96 @@ TEST(SemanticAnalyzerCSubset, FF11AngleIncludeResolvesPutsViaDescriptor) {
     EXPECT_EQ(model.lattice().interner().kind(ext.signature), TypeKind::FnSig);
 }
 
+// ── Item 1: shipped-header CONSTANTS + TYPEDEFS via the neutral descriptor ────
+
+// A shipped CONSTANT injects + folds in CONSTANT-EXPRESSION position (an array
+// dimension) — the const-eval direct-value arm (MF-1). The descriptor CHAR_BIT
+// (=8) makes `int a[CHAR_BIT]` a valid 8-element array. RED-ON-DISABLE: remove
+// the const-eval `resolveSymbolValue` arm and `int a[CHAR_BIT]` fails loud with
+// S_NonConstantArrayLength (an injected constant has no init-CST to walk).
+TEST(SemanticAnalyzerCSubset, ShippedConstantFoldsInArrayDimension) {
+    ScratchDir sysDir{Location::Temp, "item1-const"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "limits.json",
+        R"({ "header": "limits.h",
+             "constants": [ { "name": "CHAR_BIT", "value": 8, "type": "i32" } ] })",
+        "#include <limits.h>\nint main() { int a[CHAR_BIT]; return 0; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "CHAR_BIT must resolve to the injected descriptor constant";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NonConstantArrayLength), 0u)
+        << "the injected constant must fold in array-dimension (const-expr) position";
+    // The constant folded to the RIGHT value (8) — assert the resolved array
+    // EXTENT, not merely the absence of a fail-loud (red-on-WRONG-value, not
+    // just red-on-didn't-fold).
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 8)
+        << "CHAR_BIT must fold to 8 in the array dimension";
+}
+
+// A shipped TYPEDEF injects as a Type symbol + resolves in TYPE position.
+// RED-ON-DISABLE: skip the typedef injection loop and `my_int_t x;` fails loud
+// with S_UnknownType.
+TEST(SemanticAnalyzerCSubset, ShippedTypedefResolvesInTypePosition) {
+    ScratchDir sysDir{Location::Temp, "item1-typedef"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "mytypes.json",
+        R"({ "header": "mytypes.h",
+             "typedefs": [ { "name": "my_int_t", "type": "i32" } ] })",
+        "#include <mytypes.h>\nint main() { my_int_t x; x = 5; return x; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "my_int_t must resolve via the injected descriptor typedef";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
+}
+
+// GOAL-2: a user decl of a name WINS over a descriptor constant of the same
+// name — and the skip is SELECTIVE (a different descriptor constant the user
+// does NOT declare is still injected). The descriptor declares CHAR_BIT
+// (user-overridden) + WIDTH (injected). RED if it skips nothing (CHAR_BIT
+// doubled) AND RED if it skips everything (WIDTH lost → S_UndeclaredIdentifier).
+TEST(SemanticAnalyzerCSubset, ShippedConstantUserDeclWins) {
+    ScratchDir sysDir{Location::Temp, "item1-goal2"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "limits.json",
+        R"({ "header": "limits.h",
+             "constants": [ { "name": "CHAR_BIT", "value": 8,  "type": "i32" },
+                            { "name": "WIDTH",    "value": 32, "type": "i32" } ] })",
+        "int CHAR_BIT = 9;\n"
+        "#include <limits.h>\n"
+        "int main() { return CHAR_BIT + WIDTH; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countSymbolsNamed(model, "CHAR_BIT"), 1u)
+        << "the user's CHAR_BIT wins; the descriptor's is skipped (no double-bind)";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "WIDTH (not user-declared) must still inject + resolve";
+    EXPECT_FALSE(hasCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol));
+}
+
+// MF-3: a shipped constant is `isConst` — writing to it emits S_ConstViolation
+// (a macro constant is not assignable), and the InvalidTree / no-declRuleNode
+// symbol does NOT crash the const-violation path.
+TEST(SemanticAnalyzerCSubset, WriteToShippedConstantViolatesConst) {
+    ScratchDir sysDir{Location::Temp, "item1-constviol"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "limits.json",
+        R"({ "header": "limits.h",
+             "constants": [ { "name": "CHAR_BIT", "value": 8, "type": "i32" } ] })",
+        "#include <limits.h>\nint main() { CHAR_BIT = 5; return 0; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u)
+        << "writing to a shipped constant must fail loud (it is not assignable)";
+}
+
 // GOAL-2 BEHAVIOR PIN: a program that BOTH `#include <io.h>` (descriptor
 // declares `puts`) AND writes its OWN `extern char puts(int x);` — the USER
 // DECLARATION WINS. The descriptor injection SKIPS a name a user decl already
@@ -2265,6 +2507,60 @@ TEST(SemanticAnalyzerCSubset, BareFnPtrCallTypesAndChecks) {
         << "indirect calls must get the SAME per-arg checking as direct";
 }
 
+// Bare function-to-pointer DECAY (C 6.3.2.1p4): a function NAME (no `&`)
+// assigned / initialized / passed where a `Ptr<FnSig>` is expected decays to
+// the function's address and type-checks. This is the `fp = add` regression of
+// D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS (commit 901fe89): the new
+// assign-stmt assignability check rejected bare decay (S_TypeMismatch / S0003)
+// while `fp = &add` passed. The fix is the function-to-pointer decay arm in the
+// SHARED `isAssignable` chokepoint, so the assignment, initializer, and
+// call-argument positions all clear at once. CRITICAL: the WHOLE existing
+// fnptr corpus uses `&fn`, so NO test covered the bare form — this is that pin.
+// RED-ON-DISABLE: revert the isAssignable fn-decay arm and (a)/(b)/(c) each
+// report S_TypeMismatch (and the corpus example fails to BUILD).
+TEST(SemanticAnalyzerCSubset, BareFunctionNameDecaysToPointerInEveryPosition) {
+    // (a) bare ASSIGNMENT — the exact regression.
+    auto assign = analyzeShipped("c-subset", {
+        "int add(int a, int b) { return a + b; }\n"
+        "int main() { int (*fp)(int, int); fp = add; return fp(40, 2); }\n",
+    });
+    EXPECT_EQ(countCode(assign.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "a bare function name assigned to a matching function pointer "
+           "(`fp = add`) must decay to its address, not fail S_TypeMismatch";
+
+    // (b) bare INITIALIZER (no `&`).
+    auto init = analyzeShipped("c-subset", {
+        "int add(int a, int b) { return a + b; }\n"
+        "int main() { int (*fp)(int, int) = add; return fp(40, 2); }\n",
+    });
+    EXPECT_EQ(countCode(init.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "a bare function name in an initializer must decay";
+
+    // (c) bare CALL-ARGUMENT (the callback position — `fn_fnptr_callback`).
+    auto callback = analyzeShipped("c-subset", {
+        "int add(int a, int b) { return a + b; }\n"
+        "int apply(int (*f)(int, int), int x, int y) { return f(x, y); }\n"
+        "int main() { return apply(add, 40, 2); }\n",
+    });
+    EXPECT_EQ(countCode(callback.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "a bare function name as a call argument must decay";
+
+    // NEGATIVE (fail-loud preserved): an INCOMPATIBLE-signature decay must
+    // STILL be rejected — the decay is pinned to the SAME interned FnSig, so a
+    // different parameter list interns a distinct FnSig and stays a mismatch.
+    auto mismatch = analyzeShipped("c-subset", {
+        "int add(int a, int b) { return a + b; }\n"
+        "int main() { int (*fp)(int) = add; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(mismatch.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "decay does NOT relax signature compatibility — `int (*)(int) = add` "
+           "(add is int(int,int)) stays a loud mismatch";
+}
+
 // (b) non-identifier callee whose STAMPED type is Ptr<FnSig> (the cast
 // form `((H)fp)(3)`) — clean, plus the arity-error sibling. (c1
 // predecessor: CastFnPtrCalleeFiresIndirectGate pinned the wall.)
@@ -2440,3 +2736,442 @@ TEST(SemanticAnalyzerCSubset, VaStartWithNonVaListFailsLoud) {
     EXPECT_GT(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
         << "the failure must be S_TypeMismatch on the ap operand";
 }
+
+// ── D-CSUBSET-FN-PROTOTYPE — prototype/definition merging ──────────────────
+//
+// Count the SURVIVING function symbols named `name` — Function-kind records that
+// are NOT absorbed protos. The merge keeps a SymbolRecord per declaration (proto
+// + def), but exactly one survives the binding (`!isAbsorbedProto`); that is the
+// single callable symbol. (An absorbed proto record also has its kind upgraded
+// to Function, so the `!isAbsorbedProto` filter is what isolates the survivor.)
+[[nodiscard]] inline std::size_t
+countSurvivingFns(SemanticModel const& model, std::string_view name) {
+    std::size_t n = 0;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& r = model.symbols()[i];
+        if (r.name == name && r.kind == DeclarationKind::Function
+            && !r.isAbsorbedProto) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+// (a) A prototype followed by a compatible definition MERGES: zero diagnostics,
+// and exactly one surviving Function symbol for `f` (the definition; the proto
+// is absorbed). RED-ON-DISABLE: revert the Pass-1.5 proto upgrade (restore the
+// S_InvalidFunctionDeclarator emission) -> hasErrors() becomes true and the
+// proto stays a Variable, so countSurvivingFns drops to the lone definition only
+// after a redeclaration error fires (the EXPECT_FALSE(hasErrors) flips first).
+TEST(SemanticAnalyzerCSubset, FnPrototypeThenDefinitionMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int);\n"
+        "int f(int x){return x;}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a prototype + a compatible definition must merge with no diagnostics";
+    EXPECT_EQ(countSurvivingFns(model, "f"), 1u)
+        << "exactly one surviving Function symbol for f (the definition)";
+}
+
+// (b) Proto-idempotence: multiple compatible declarations + one definition is
+// well-formed (zero diagnostics, one surviving Function). C 6.7p4 permits any
+// number of compatible declarations.
+TEST(SemanticAnalyzerCSubset, FnPrototypeIdempotentDeclarations) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int);\n"
+        "int f(int);\n"
+        "int f(int x){return x;}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "repeated compatible prototypes + a definition must merge cleanly";
+    EXPECT_EQ(countSurvivingFns(model, "f"), 1u);
+}
+
+// (c) Definition FIRST, then a redundant compatible prototype: also a clean
+// merge. The definition keeps the binding; the trailing proto is absorbed. A
+// later call resolves to the definition (use-resolution reads the final scope
+// binding) — witnessed by zero diagnostics on a call through `f`.
+TEST(SemanticAnalyzerCSubset, FnDefinitionThenPrototypeMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int x){return x;}\n"
+        "int f(int);\n"
+        "int g(void){return f(3);}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a definition followed by a redundant prototype must merge cleanly, "
+           "and the call must resolve to the definition";
+    EXPECT_EQ(countSurvivingFns(model, "f"), 1u);
+}
+
+// (d) Incompatible redeclaration: a prototype and a definition with DIFFERENT
+// signatures (return type differs) fail loud with exactly one
+// S_IncompatibleRedeclaration. RED-ON-DISABLE: make the post-1.5 sweep compare
+// nothing (skip the `.v` inequality) -> the count drops to 0 and the mismatch is
+// silently accepted (the definition's resolved signature would be wrong).
+TEST(SemanticAnalyzerCSubset, FnPrototypeIncompatibleRedeclarationFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int);\n"
+        "long f(int x){return x;}\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "an incompatible function redeclaration must fail loud exactly once";
+}
+
+// (e) A standalone prototype that is CALLED but NEVER defined is callable at the
+// semantic tier (forward reference is legal — the undefined-symbol failure lands
+// at HIR->MIR, see the CLI verification / corpus). The semantic phase itself
+// must NOT reject the prototype: it is a valid function declaration. Zero
+// diagnostics here; the call resolves to the (upgraded) Function symbol.
+TEST(SemanticAnalyzerCSubset, FnPrototypeForwardCallResolvesSemantically) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int);\n"
+        "int g(void){return f(1);}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a forward call through a prototype is legal at the semantic tier";
+    EXPECT_EQ(countSurvivingFns(model, "f"), 1u)
+        << "the prototype is upgraded to a callable Function symbol";
+}
+
+// ── D-CSUBSET-BLOCK-SCOPE-PROTOTYPE — a block-scope function prototype REFERS
+//    to (and merges with) the file-scope function (C 6.2.2p4 / 6.7.6.3) ──
+//
+// (a) A block-scope prototype + a later file-scope definition MERGE: the proto
+// is re-homed onto the file scope and absorbed by the definition. Zero
+// diagnostics, exactly one surviving Function `f` (the file definition). A call
+// inside the block resolves to it (witnessed by the corpus exit code).
+// RED-ON-DISABLE: revert the Pass-1 re-home (bind in `current`) -> the block proto
+// binds a separate block-local symbol that the file definition never absorbs, so
+// TWO records named `f` are upgraded to Function (the block proto's kind is
+// upgraded by Pass 1.5 in its own scope) -> countSurvivingFns becomes 2.
+TEST(SemanticAnalyzerCSubset, BlockScopePrototypeMergesWithFileDefinition) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void){ int f(int); return f(2); }\n"
+        "int f(int x){ return x; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a block-scope prototype + a file-scope definition must merge cleanly";
+    EXPECT_EQ(countSurvivingFns(model, "f"), 1u)
+        << "exactly one surviving Function symbol for f (the file definition); "
+           "the block-scope proto is re-homed to file scope and absorbed";
+}
+
+// (b) Definition FIRST, then a block-scope prototype of the same function: also
+// a clean merge (def keeps the binding; the block proto is absorbed). No spurious
+// S_UnusedVariable from the absorbed proto (a function declaration is never an
+// unused variable — the local decl's warnIfUnused is suppressed for a proto).
+// RED-ON-DISABLE (the warnIfUnused suppression): drop `&& !isProto` -> the
+// re-homed/absorbed block proto warns S_UnusedVariable (its own use-set is empty,
+// the call resolves to the definition) -> this count becomes 1.
+TEST(SemanticAnalyzerCSubset, BlockScopePrototypeAfterDefinitionNoUnusedWarning) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int x){ return x; }\n"
+        "int main(void){ int f(int); return f(5); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnusedVariable), 0u)
+        << "an absorbed block-scope function prototype must NOT warn as an unused "
+           "variable — it is a function declaration, not an object";
+    EXPECT_EQ(countSurvivingFns(model, "f"), 1u);
+}
+
+// (c) Mutual recursion driven by a block-scope prototype: `even` block-declares
+// `int odd(int);` and forward-calls `odd` (defined later at file scope). Both
+// calls resolve; zero diagnostics; one surviving Function each.
+TEST(SemanticAnalyzerCSubset, BlockScopePrototypeEnablesForwardMutualCall) {
+    auto model = analyzeShipped("c-subset", {
+        "int even(int n){ int odd(int); return n==0 ? 1 : odd(n-1); }\n"
+        "int odd(int n){ return n==0 ? 0 : even(n-1); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a block-scope prototype must let a function forward-call a file-scope "
+           "function defined later";
+    EXPECT_EQ(countSurvivingFns(model, "even"), 1u);
+    EXPECT_EQ(countSurvivingFns(model, "odd"), 1u);
+}
+
+// (d) Negative (fail-loud preserved): an INCOMPATIBLE block-scope prototype and a
+// file-scope definition (return type differs) fail loud with exactly one
+// S_IncompatibleRedeclaration — the merge across the block→file boundary runs the
+// same FnSig compatibility sweep, never silently picking a signature.
+TEST(SemanticAnalyzerCSubset, BlockScopePrototypeIncompatibleWithFileDefFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void){ long f(int); return 0; }\n"
+        "int f(int x){ return x; }\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "an incompatible block-scope-proto vs file-def pair must fail loud once";
+}
+
+// ── D-CSUBSET-EXTERN-DEFINITION-MERGE — an `extern` declaration MERGES with an
+//    in-TU definition of the same name (the definition wins; the extern is
+//    absorbed), for OBJECTS and FUNCTIONS, in both orders ──
+
+// Count SURVIVING (non-absorbed) symbols named `name`, any kind — used for the
+// extern-OBJECT merge where the survivor is a Variable, not a Function.
+[[nodiscard]] inline std::size_t
+countSurvivingSymbols(SemanticModel const& model, std::string_view name) {
+    std::size_t n = 0;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& r = model.symbols()[i];
+        if (r.name == name && !r.isAbsorbedProto) ++n;
+    }
+    return n;
+}
+
+// (a) extern FUNCTION declaration + a later definition MERGE: zero diagnostics,
+// exactly one surviving Function (the definition; the extern is absorbed).
+// RED-ON-DISABLE: revert the extern merge (`nonDefiningDeclaration` / the
+// mergeOrCollideRedeclaration extern arm) -> S_RedeclaredSymbol fires and the
+// merge does not happen.
+TEST(SemanticAnalyzerCSubset, ExternFunctionThenDefinitionMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "extern int f(int);\n"
+        "int f(int x){ return x; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an extern function declaration + a definition must merge cleanly";
+    EXPECT_EQ(countSurvivingFns(model, "f"), 1u);
+}
+
+// (b) Definition FIRST, then a redundant `extern` function declaration: also a
+// clean merge (the definition keeps the binding; the extern is absorbed).
+TEST(SemanticAnalyzerCSubset, ExternFunctionAfterDefinitionMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int x){ return x; }\n"
+        "extern int f(int);\n"
+        "int g(void){ return f(3); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a definition followed by a redundant extern declaration must merge";
+    EXPECT_EQ(countSurvivingFns(model, "f"), 1u);
+}
+
+// (c) extern OBJECT declaration + a definition (with initializer) MERGE: zero
+// diagnostics, exactly one surviving symbol named `g` (the definition; the extern
+// is absorbed). Pre-fix this collided S_RedeclaredSymbol.
+// RED-ON-DISABLE: revert the extern merge -> S_RedeclaredSymbol count is 1 and two
+// records named `g` survive.
+TEST(SemanticAnalyzerCSubset, ExternObjectThenDefinitionMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "extern int g;\n"
+        "int g = 5;\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an extern object declaration + a definition must merge cleanly";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u);
+    EXPECT_EQ(countSurvivingSymbols(model, "g"), 1u)
+        << "exactly one surviving symbol for g (the definition); extern absorbed";
+}
+
+// (d) Definition FIRST, then a redundant `extern` object declaration: clean merge.
+TEST(SemanticAnalyzerCSubset, ExternObjectAfterDefinitionMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "int g = 6;\n"
+        "extern int g;\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a definition followed by a redundant extern declaration must merge";
+    EXPECT_EQ(countSurvivingSymbols(model, "g"), 1u);
+}
+
+// (e) extern idempotence: multiple extern declarations + one definition is well-
+// formed (zero diagnostics, one surviving symbol).
+TEST(SemanticAnalyzerCSubset, ExternObjectIdempotentThenDefinition) {
+    auto model = analyzeShipped("c-subset", {
+        "extern int g;\n"
+        "extern int g;\n"
+        "int g = 7;\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "repeated extern declarations + a definition must merge cleanly";
+    EXPECT_EQ(countSurvivingSymbols(model, "g"), 1u);
+}
+
+// (f) Negative (fail-loud preserved): an extern declaration and an INCOMPATIBLE
+// definition (int vs long) fail loud with exactly one S_IncompatibleRedeclaration
+// — the merge runs the same type-compat sweep, never silently picking a type.
+// RED-ON-DISABLE: disable the compat sweep -> the mismatch is silently accepted.
+TEST(SemanticAnalyzerCSubset, ExternObjectIncompatibleDefinitionFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "extern int g;\n"
+        "long g = 5;\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "an incompatible extern + definition must fail loud exactly once";
+}
+
+// (g) Negative (fail-loud preserved): TWO real object definitions still collide
+// S_RedeclaredSymbol — the extern merge admits a NON-DEFINING declaration + a
+// definition, never two definitions (incl. two tentative defs).
+TEST(SemanticAnalyzerCSubset, TwoObjectDefinitionsStillCollide) {
+    auto model = analyzeShipped("c-subset", {
+        "int g = 1;\n"
+        "int g = 2;\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "two object DEFINITIONS must still collide — only an extern + a "
+           "definition merge";
+}
+
+// (h) Negative (fail-loud preserved): an extern FUNCTION and a same-named OBJECT
+// are different categories and must NOT merge — a genuine S_RedeclaredSymbol.
+TEST(SemanticAnalyzerCSubset, ExternFunctionVsObjectCrossCategoryCollides) {
+    auto model = analyzeShipped("c-subset", {
+        "extern int f(int);\n"
+        "int f;\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a function and an object of the same name are different categories — "
+           "they must collide, not merge";
+}
+
+// (i) Negative (fail-loud REGRESSION GUARD): a TYPEDEF (kind Type) and a same-named
+// extern OBJECT (kind Variable) are DIFFERENT declaration categories and must NOT
+// merge — a genuine S_RedeclaredSymbol (C 6.7p4: a typedef and an object of the same
+// name in one scope conflict). The merge-or-collide guard splits on the PRECISE
+// DeclarationKind; a coarse function-vs-non-function split would lump Type and
+// Variable together and silently absorb the extern into the typedef.
+// RED-ON-DISABLE: replace the precise `category()` with the coarse
+// `priorIsFnCategory == newIsFnCategory` (both Type and Variable are "non-function"
+// → sameCategory, extern non-defining → MERGE) and this count falls to 0 — the
+// typedef+extern pair is silently accepted.
+TEST(SemanticAnalyzerCSubset, TypedefVsExternObjectCrossCategoryCollides) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int g;\n"
+        "extern int g;\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a typedef (Type) and a same-named extern object (Variable) are different "
+           "categories — they must collide, not silently merge";
+}
+
+// (j) Same regression guard, extern FUNCTION variant: a typedef (Type) and a same-
+// named extern FUNCTION (Function) are different categories → S_RedeclaredSymbol.
+// RED-ON-DISABLE: under the coarse split Type is "non-function" and the extern
+// function is "function" → already differ → this variant would still collide even
+// pre-fix; it guards that the PRECISE split keeps the (correct) collision rather
+// than over-merging once Type stops being lumped with Variable.
+TEST(SemanticAnalyzerCSubset, TypedefVsExternFunctionCrossCategoryCollides) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int g;\n"
+        "extern int g(void);\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a typedef (Type) and a same-named extern function (Function) are "
+           "different categories — they must collide";
+}
+
+// (k) Reverse order: extern OBJECT first (Variable), then a same-named TYPEDEF
+// (Type). The category guard reads BOTH records, so the collision holds regardless
+// of which side is prior — symmetry pin for the precise-category fix.
+TEST(SemanticAnalyzerCSubset, ExternObjectThenTypedefCrossCategoryCollides) {
+    auto model = analyzeShipped("c-subset", {
+        "extern int g;\n"
+        "typedef int g;\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "extern object (Variable) then typedef (Type) of the same name — "
+           "different categories, must collide in either order";
+}
+
+// ── C 6.2.3 TAG NAMESPACE (closes the tag-namespace residue of
+//    D-CSUBSET-DECL-GRAMMAR-LOW-RESIDUES) ──
+
+// (a) `typedef struct Pair { int a; } Pair;` — the tag `Pair` (Tag namespace)
+// and the typedef alias `Pair` (Ordinary namespace) share a spelling and must
+// NOT collide. ZERO S_RedeclaredSymbol.
+// RED-ON-DISABLE: route the composite tag BIND back through the Ordinary
+// namespace (drop the `fieldChildren` → Tag gate at the bind site) and the
+// alias collides with the tag → this count becomes 1.
+TEST(SemanticAnalyzerCSubset, TypedefTagSameNameAsAliasNoCollision) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef struct Pair { int a; } Pair;\n"
+        "int main(void) { Pair p; p.a = 0; return p.a; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "C 6.2.3: a struct tag and a typedef alias of the same name are in "
+           "SEPARATE namespaces and must not collide";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// (b) Both namespaces RESOLVE: with `typedef struct Pair {…} Pair;`, a `struct
+// Pair x;` (tag, via the type-position tag-ref early-arm MF-1) AND a `Pair y;`
+// (alias, via the Ordinary leaf arm) both resolve to the struct type — NO
+// S_UnknownType.
+// RED-ON-DISABLE: remove the MF-1 tag-ref early-arm and `struct Pair x;`
+// descends to the bare identifier, looked up Ordinary; it would resolve the
+// typedef alias `Pair` (an Ordinary Type symbol) as the tag — masking the
+// namespace split. Flip the BIND to Tag WITHOUT MF-1 and `struct Pair x;`
+// misses entirely → S_UnknownType count rises.
+TEST(SemanticAnalyzerCSubset, TagAndAliasBothResolveSameType) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef struct Pair { int a; } Pair;\n"
+        "int main(void) {\n"
+        "  struct Pair x; x.a = 1;\n"
+        "  Pair y; y.a = 2;\n"
+        "  return x.a + y.a;\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "both `struct Pair` (Tag) and `Pair` (Ordinary alias) must resolve";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u)
+        << "both resolve to the SAME struct type, so member access is clean";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// (c) The negative is PRESERVED: an undeclared tag `struct Nope x;` still fails
+// loud with exactly one S_UnknownType.
+// RED-ON-DISABLE: drop the `emitOnMiss` fail-loud arm inside MF-1 (return
+// InvalidType silently on a tag miss) and this count falls to 0 — a silent
+// accept of an unknown tag.
+TEST(SemanticAnalyzerCSubset, UnknownTagFiresUnknownType) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef struct Pair { int a; } Pair;\n"
+        "int main(void) { struct Nope x; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "an undeclared struct tag must fail loud exactly once";
+}
+
+// A struct TAG `S` and an ordinary OBJECT `S` coexist in one scope chain and
+// resolve independently (the semantic-tier mirror of the tag_ordinary_coexist
+// corpus). No collision, both resolvable.
+// RED-ON-DISABLE: single-namespace table → the local `int S` collides with the
+// tag `S` → S_RedeclaredSymbol count becomes 1.
+TEST(SemanticAnalyzerCSubset, TagAndOrdinaryObjectSameNameCoexist) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int v; };\n"
+        "int main(void) { struct S a; a.v = 40; int S = 2; return a.v + S; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "a struct tag `S` and an ordinary object `S` are in separate "
+           "namespaces and must coexist";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// MF-2 cross-tree mechanism: the cross-tree import-injection conflict scan
+// re-keys `(name, namespace)`. The load-bearing substrate is exercised
+// directly at the ScopeTree level (see test_scope_tree.cpp,
+// `BindingsOfCarriesNamespaceForCrossTreeReKey`): `bindingsOf` yields each
+// binding's namespace and `injectBinding` re-injects into the matching
+// namespace, so a header's `struct Foo` tag and an including file's
+// `typedef … Foo` alias key distinctly and do NOT false-conflict. A full
+// multi-tree quote-include CU is not constructible through the in-memory
+// fixture (it has no on-disk include resolver), so the mechanism — not the
+// driver plumbing — is what these tests pin.

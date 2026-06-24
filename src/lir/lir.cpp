@@ -261,6 +261,22 @@ LirInstId LirBuilder::addCondBr(std::uint16_t opcode,
     return id;
 }
 
+LirInstId LirBuilder::addIndirectBr(std::uint16_t opcode,
+                                    std::span<LirOperand const> operands,
+                                    std::span<LirBlockId const> targets,
+                                    std::uint32_t payload, std::uint8_t flags) {
+    if (!target_.isTerminator(opcode)) {
+        lirFatal("LirBuilder::addIndirectBr: opcode is not a terminator for this target");
+    }
+    // D-CSUBSET-COMPUTED-GOTO: operand[0] = address register; successors = all
+    // address-taken blocks (variadic, like a Switch). Records them into the succ
+    // pool exactly as addCondBr does for its two successors.
+    LirInstId const id = addInst(opcode, InvalidLirReg, operands, payload, flags);
+    recordSuccessors_(targets);
+    openBlockHasTerminator_ = true;
+    return id;
+}
+
 LirInstId LirBuilder::addReturn(std::uint16_t opcode,
                                 std::span<LirOperand const> operands,
                                 std::uint32_t payload, std::uint8_t flags) {

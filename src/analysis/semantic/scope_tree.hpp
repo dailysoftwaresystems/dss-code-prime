@@ -6,6 +6,7 @@
 
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -32,27 +33,37 @@ public:
     // The root scope (always ScopeId{1}). Convenience.
     [[nodiscard]] ScopeId root() const noexcept { return ScopeId{1}; }
 
-    // Bind `name` to `symbol` in `scope`. Returns the previously-bound
-    // SymbolId if a binding for `name` already existed in this scope
-    // (the caller emits S_RedeclaredSymbol with a RelatedLocation to
-    // the prior decl); returns InvalidSymbol on success.
-    SymbolId bind(ScopeId scope, std::string name, SymbolId symbol);
+    // Bind `name` to `symbol` in `scope`, in the C 6.2.3 namespace `ns`
+    // (Ordinary by default; Tag for a struct/union/enum tag). Returns the
+    // previously-bound SymbolId if a binding for `name` already existed in
+    // this scope's `ns` namespace (the caller emits S_RedeclaredSymbol with a
+    // RelatedLocation to the prior decl); returns InvalidSymbol on success. A
+    // tag and an ordinary symbol of the same name do NOT collide — they live
+    // in separate maps.
+    SymbolId bind(ScopeId scope, std::string name, SymbolId symbol,
+                  SymbolNamespace ns = SymbolNamespace::Ordinary);
 
-    // Inject a binding (no redeclaration check). Used by cross-tree
-    // import injection where the same symbol can be visible in multiple
-    // root scopes; collisions are pre-filtered by the analyzer.
-    void injectBinding(ScopeId scope, std::string name, SymbolId symbol);
+    // Inject a binding (no redeclaration check) into namespace `ns`. Used by
+    // cross-tree import injection where the same symbol can be visible in
+    // multiple root scopes; collisions are pre-filtered by the analyzer.
+    void injectBinding(ScopeId scope, std::string name, SymbolId symbol,
+                       SymbolNamespace ns = SymbolNamespace::Ordinary);
 
-    // Walk parent chain looking for `name`. Returns InvalidSymbol on
-    // miss. The walk is left-to-right (innermost-first) so a shadowing
-    // inner binding wins.
-    [[nodiscard]] SymbolId lookup(ScopeId scope, std::string_view name) const noexcept;
+    // Walk parent chain looking for `name` in namespace `ns`. Returns
+    // InvalidSymbol on miss. The walk is left-to-right (innermost-first) so a
+    // shadowing inner binding wins.
+    [[nodiscard]] SymbolId
+    lookup(ScopeId scope, std::string_view name,
+           SymbolNamespace ns = SymbolNamespace::Ordinary) const noexcept;
 
-    // Snapshot of every (name, SymbolId) binding directly in `scope` (no
-    // parent walk). Used by the cross-tree import-injection step to copy a
-    // defining tree's root-scope symbols into a referencing tree's root
-    // scope. Returns empty on an invalid/out-of-range scope.
-    [[nodiscard]] std::vector<std::pair<std::string_view, SymbolId>>
+    // Snapshot of every (name, namespace, SymbolId) binding directly in
+    // `scope` (no parent walk), across BOTH namespaces. Used by the
+    // cross-tree import-injection step to copy a defining tree's root-scope
+    // symbols into a referencing tree's root scope — carrying the namespace
+    // so a tag re-injects as a tag (and a tag + a same-named typedef do not
+    // false-conflict). Returns empty on an invalid/out-of-range scope.
+    [[nodiscard]]
+    std::vector<std::tuple<std::string_view, SymbolNamespace, SymbolId>>
     bindingsOf(ScopeId scope) const;
 
     // Move the scope records out for embedding in SemanticModel. The

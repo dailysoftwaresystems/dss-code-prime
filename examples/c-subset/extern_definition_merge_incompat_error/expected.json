@@ -1,0 +1,7 @@
+{
+  "$comment": "D-CSUBSET-EXTERN-DEFINITION-MERGE (negative): an extern declaration (`extern int g;`) and an incompatible same-TU definition (`long g = 5;`) fail loud with S_IncompatibleRedeclaration at the absorbed extern declaration (11:12), with a related-location at the surviving definition. The merge runs the SAME type-compatibility sweep the prototype/definition merge uses; it never silently picks a type. RED-ON-DISABLE: drop the extern merge -> the pair collides S_RedeclaredSymbol instead (still loud, different code) OR with the compat sweep disabled the mismatch is silently accepted.",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [ { "spec": "x86_64:elf64-x86_64-linux-exec" } ],
+  "expectDiagnostics": [ { "code": "S_IncompatibleRedeclaration", "line": 11, "col": 12 } ]
+}

@@ -129,7 +129,112 @@ savedRegsContain(FrameLayout const& layout, std::uint16_t ord) {
     return false;
 }
 
+// D-WIN64-LARGE-FRAME-STACK-PROBE helper: count how many insts in a
+// materialized module carry the given opcode. Used by the prologue
+// structural pin to assert a `stack_probe` op is (or is NOT) emitted.
+[[nodiscard]] std::uint32_t
+countOpcodeInModule(Lir const& lir, std::uint16_t op) {
+    std::uint32_t n = 0;
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const b = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(b); ++i) {
+                if (lir.instOpcode(lir.blockInstAt(b, i)) == op) ++n;
+            }
+        }
+    }
+    return n;
+}
+
 } // namespace
+
+// ── D-WIN64-LARGE-FRAME-STACK-PROBE prologue structural pins ──────────
+//
+// The ms_x64 prologue must emit a `stack_probe` op (NOT a plain `sub rsp`)
+// when the frame exceeds the cc's stackProbePageBytes (4096). A ms_x64
+// frame ≤ 4096 keeps the plain sub; a sysv frame > 4096 ALSO keeps the
+// plain sub (sysv declares stackProbePageBytes=0 → no probing). RED-ON-
+// DISABLE: flipping the prologue's threshold branch flips the op choice
+// (the witness corpus large_frame_win64 then SIGSEGVs on Windows).
+
+TEST(LirCallconv, MsX64LargeFrameEmitsStackProbeNotPlainSub) {
+    // ms_x64 = ccIndex 1. `int big[2000]` = 8000 bytes > one 4096 guard
+    // page → the prologue must emit `stack_probe`, NOT a bare `sub rsp,F`.
+    auto bundle = lowerThroughRewrite(
+        "int f(void) { int big[2000]; big[0] = 7; return big[0]; }",
+        /*ccIndex=*/1);
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    EXPECT_TRUE(result.ok());
+    ASSERT_EQ(result.perFunc.size(), 1u);
+    // Confirm the frame really exceeds one page (the precondition).
+    auto const* cc = bundle.lowered.target->callingConvention(1);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_GT(cc->stackProbePageBytes, 0u) << "ms_x64 must declare a probe page";
+    EXPECT_GT(result.perFunc[0].totalFrameSize, cc->stackProbePageBytes);
+
+    auto const probeOp = bundle.lowered.target->opcodeByMnemonic("stack_probe");
+    ASSERT_TRUE(probeOp.has_value());
+    EXPECT_EQ(countOpcodeInModule(result.lir, *probeOp), 1u)
+        << "ms_x64 >4096 frame must emit exactly one stack_probe";
+}
+
+TEST(LirCallconv, MsX64SmallFrameEmitsPlainSubNotStackProbe) {
+    // ms_x64, a TRIVIAL frame (one int, well under 4096) → plain `sub rsp`,
+    // NO stack_probe. (The frame is rounded to stackAlignment but stays a
+    // small fraction of a page.)
+    auto bundle = lowerThroughRewrite(
+        "int f(int x) { return x + x; }", /*ccIndex=*/1);
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    EXPECT_TRUE(result.ok());
+    ASSERT_EQ(result.perFunc.size(), 1u);
+    auto const* cc = bundle.lowered.target->callingConvention(1);
+    ASSERT_NE(cc, nullptr);
+    EXPECT_LE(result.perFunc[0].totalFrameSize, cc->stackProbePageBytes);
+
+    auto const probeOp = bundle.lowered.target->opcodeByMnemonic("stack_probe");
+    ASSERT_TRUE(probeOp.has_value());
+    EXPECT_EQ(countOpcodeInModule(result.lir, *probeOp), 0u)
+        << "ms_x64 ≤4096 frame must NOT emit stack_probe (plain sub rsp)";
+}
+
+TEST(LirCallconv, SysVLargeFrameEmitsPlainSubNotStackProbe) {
+    // sysv_amd64 = ccIndex 0, declares NO stackProbePageBytes (0). Even a
+    // LARGE frame (`int big[2000]` = 8000B) must keep the plain `sub rsp`
+    // — Linux auto-grows the stack, no probe needed. This is the agnostic
+    // control: the SAME source on a non-probing CC takes the plain path.
+    auto bundle = lowerThroughRewrite(
+        "int f(void) { int big[2000]; big[0] = 7; return big[0]; }",
+        /*ccIndex=*/0);
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    EXPECT_TRUE(result.ok());
+    ASSERT_EQ(result.perFunc.size(), 1u);
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    EXPECT_EQ(cc->stackProbePageBytes, 0u) << "sysv must NOT declare a probe page";
+    // The frame is genuinely large (precondition for a meaningful control).
+    EXPECT_GT(result.perFunc[0].totalFrameSize, 4096u);
+
+    auto const probeOp = bundle.lowered.target->opcodeByMnemonic("stack_probe");
+    ASSERT_TRUE(probeOp.has_value());
+    EXPECT_EQ(countOpcodeInModule(result.lir, *probeOp), 0u)
+        << "sysv (stackProbePageBytes=0) must NEVER emit stack_probe";
+}
 
 TEST(LirCallconv, StraightLineFunctionGetsPrologueEpilogueAndZeroFrameOps) {
     auto bundle = lowerThroughRewrite("int f(int x) { return x + x; }");
@@ -334,6 +439,173 @@ TEST(LirCallconv, NonLeafAarch64FramePrologueEpilogueByteExact) {
                           kSturX30.begin(), kSturX30.end()),
               gBytes.end())
         << "leaf AAPCS64 function must NOT spill x30 — the discrimination check";
+}
+
+// D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (F4 — durable x16 safety). A
+// function whose frame EXCEEDS the 2-word shifted-imm12 reach (0xFFFFFF =
+// 16 MiB) forces the prologue `sub sp,sp,#frame` to lower to the 3-word
+// MOVZ/MOVK + EXTENDED-register macro, whose FIRST emitted word materializes
+// the frame size into x16 (the AAPCS64 IP0 scratch). This pin assembles the
+// real C→callconv→assemble pipeline and asserts the prologue's FIRST 32-bit
+// word is `MOVZ x16,#imm16` — so a future change that allocated x16 to a
+// value live across the sp-adjust (clobbering the scratch) would diverge
+// this word (red-on-disable). `int big[5000000]` ≈ 20 MB > 16 MiB.
+TEST(LirCallconv, Aarch64FrameBeyond16MiBPrologueMaterializesIntoX16) {
+    auto bundle = lowerThroughRewrite(
+        "int seed;\n"
+        "int f(void) { int big[5000000]; big[0] = seed; return big[0]; }\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter legRep;
+    auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
+                                    legRep);
+    ASSERT_TRUE(legal.ok());
+    DiagnosticReporter ccRep;
+    auto cc = materializeCallingConvention(legal.lir, *bundle.lowered.target,
+                                           bundle.alloc, ccRep);
+    ASSERT_TRUE(cc.ok());
+    ASSERT_EQ(cc.perFunc.size(), 1u);
+    // Precondition: the frame genuinely exceeds the 16 MiB shifted-imm12 reach
+    // (so the prologue MUST take the 3-word MOVZ/MOVK path, not the 2-word one).
+    EXPECT_GT(cc.perFunc[0].totalFrameSize, 0xFFFFFFu)
+        << "the 20MB array frame must exceed 16 MiB to force the 3-word form";
+
+    std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    DiagnosticReporter asmRep;
+    auto mod = assemble(cc.lir, *bundle.lowered.target, lirToMir, asmRep);
+    EXPECT_EQ(asmRep.errorCount(), 0u)
+        << "a >16MiB-frame AAPCS64 function must assemble clean (3-word sp-adjust)";
+    ASSERT_EQ(mod.functions.size(), 1u);
+    auto const& fBytes = mod.functions[0].bytes;
+    ASSERT_GE(fBytes.size(), 4u);
+    // Decode the prologue's first word LE. Mask out the imm16 field (bits
+    // 5..20, frame-size dependent) and assert the MOVZ-x16 skeleton: opcode
+    // bits + Rd=16. 0xD2800000 = MOVZ X base; |16 = Rd. The mask 0xFFE0001F
+    // keeps [31:21] (opcode+hw) and [4:0] (Rd), clearing the imm16 window.
+    std::uint32_t const w0 =
+          static_cast<std::uint32_t>(fBytes[0])
+        | (static_cast<std::uint32_t>(fBytes[1]) << 8)
+        | (static_cast<std::uint32_t>(fBytes[2]) << 16)
+        | (static_cast<std::uint32_t>(fBytes[3]) << 24);
+    EXPECT_EQ(w0 & 0xFFE0001Fu, 0xD2800000u | 16u)
+        << "the >16MiB prologue's first word must be `MOVZ x16,#imm16` — a "
+           "regalloc change clobbering x16 (the IP0 scratch) across the "
+           "sp-adjust would diverge this (red-on-disable). Got word 0x"
+        << std::hex << w0;
+
+    // Durability corroboration: x16 (hwEncoding 16) must NOT be assigned to
+    // any value across the function — it is platform scratch, baked into the
+    // 3-word macro. (A regalloc that handed x16 to a live value would both
+    // break the byte pin above AND surface here.)
+    auto const x16Ord = bundle.lowered.target->registerByName("x16");
+    ASSERT_TRUE(x16Ord.has_value());
+    Lir const& dst = cc.lir;
+    for (std::uint32_t fi = 0; fi < dst.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = dst.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < dst.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = dst.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < dst.blockInstCount(blk); ++i) {
+                LirInstId const inst = dst.blockInstAt(blk, i);
+                LirReg const r = dst.instResult(inst);
+                EXPECT_FALSE(r.valid() && r.isPhysical != 0
+                             && r.id == *x16Ord)
+                    << "x16 (IP0 scratch) must not be a value-carrying result "
+                       "in a >16MiB-frame function — it is reserved for the "
+                       "3-word sp-adjust materialization";
+            }
+        }
+    }
+}
+
+// D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 (load/store-displacement half). A
+// callee with MANY fixed params reads its high-index params from INCOMING STACK
+// slots at `[sp + totalFrameSize + (i-8)*8]`; past the 8th register param those
+// offsets exceed the unscaled imm9 ±256 reach, so the incoming-arg frame LOAD
+// MUST take the scaled-imm12 form (`load_u`, LDR [sp,#imm]) — selected at the
+// emitFrameLoad CHOKEPOINT (selectFrameMemOp). This callee shape is DETERMINISTIC
+// (no register-pressure spill → host-compiler-independent, unlike an optimizer-
+// dependent spill frame) and exercises the chokepoint directly. The pin asserts
+// a scaled load appears in the materialized arm64 module — host-independent, so
+// it guards the selection on EVERY CI leg (the qemu RUN witness is the separate
+// examples/c-subset/large_spill_frame_arm64 corpus). RED-on-disable: revert the
+// chokepoint swap (keep unscaled `load`) → the count drops to 0 here AND the
+// module fails to assemble (A_ImmediateOperandOutOfRange on the high-param load).
+TEST(LirCallconv, Aarch64HighStackParamUsesScaledImm12FrameLoad) {
+    // f takes 40 fixed int params; AAPCS64 passes the first 8 in x0..x7 and the
+    // rest (p08..p39) on the incoming stack. The body reads p08, p20, p39 — the
+    // last lands at offset totalFrameSize + (39-8)*8 = frame + 248, well past
+    // imm9 — but the body holds at most one param live at a time (no spill, no
+    // scratch exhaustion). Each high-param read is an incoming-stack-arg
+    // frame_load routed through the chokepoint.
+    auto bundle = lowerThroughRewrite(
+        "int f(int p00,int p01,int p02,int p03,int p04,int p05,int p06,int p07,\n"
+        "      int p08,int p09,int p10,int p11,int p12,int p13,int p14,int p15,\n"
+        "      int p16,int p17,int p18,int p19,int p20,int p21,int p22,int p23,\n"
+        "      int p24,int p25,int p26,int p27,int p28,int p29,int p30,int p31,\n"
+        "      int p32,int p33,int p34,int p35,int p36,int p37,int p38,int p39) {\n"
+        "  return p08 + p20 + p39;\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter legRep;
+    auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
+                                    legRep);
+    ASSERT_TRUE(legal.ok());
+    DiagnosticReporter ccRep;
+    auto cc = materializeCallingConvention(legal.lir, *bundle.lowered.target,
+                                           bundle.alloc, ccRep);
+    ASSERT_TRUE(cc.ok());
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+
+    auto const loadU = bundle.lowered.target->opcodeByMnemonic("load_u");
+    ASSERT_TRUE(loadU.has_value())
+        << "arm64 must declare load_u (D-ASM-AARCH64-LARGE-FRAME-IMM12)";
+    std::uint32_t const nLoadU = countOpcodeInModule(cc.lir, *loadU);
+    EXPECT_GT(nLoadU, 0u)
+        << "a 40-param AAPCS64 callee must emit at least one load_u (a high "
+           "incoming-stack-arg read beyond imm9, routed through the emitFrameLoad "
+           "chokepoint) — 0 means the chokepoint swap regressed (red-on-disable)";
+
+    // The module must still assemble clean (the scaled load encodes, not fail-loud).
+    std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    DiagnosticReporter asmRep;
+    (void)assemble(cc.lir, *bundle.lowered.target, lirToMir, asmRep);
+    EXPECT_EQ(asmRep.errorCount(), 0u)
+        << "the high-stack-param arm64 callee must assemble clean — every "
+           "beyond-imm9 frame load took the encodable scaled-imm12 form";
+}
+
+// AGNOSTIC corroboration: the SAME 40-param callee on x86_64 must NOT gain any
+// load_u/store_u (x86_64 declares neither — h.loadU/h.storeU are 0, so
+// selectFrameMemOp is inert and the emitted disp32 memory ops are byte-identical
+// to before the chokepoint change). Guards against the swap leaking onto a
+// target without the scaled form.
+TEST(LirCallconv, X8664HighStackParamHasNoScaledImm12FrameOps) {
+    auto bundle = lowerThroughRewrite(
+        "int f(int p00,int p01,int p02,int p03,int p04,int p05,int p06,int p07,\n"
+        "      int p08,int p09,int p10,int p11,int p12,int p13,int p14,int p15,\n"
+        "      int p16,int p17,int p18,int p19,int p20,int p21,int p22,int p23,\n"
+        "      int p24,int p25,int p26,int p27,int p28,int p29,int p30,int p31,\n"
+        "      int p32,int p33,int p34,int p35,int p36,int p37,int p38,int p39) {\n"
+        "  return p08 + p20 + p39;\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"x86_64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter legRep;
+    auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
+                                    legRep);
+    ASSERT_TRUE(legal.ok());
+    DiagnosticReporter ccRep;
+    auto cc = materializeCallingConvention(legal.lir, *bundle.lowered.target,
+                                           bundle.alloc, ccRep);
+    ASSERT_TRUE(cc.ok());
+    // x86_64 declares no load_u/store_u → the mnemonics don't resolve at all.
+    EXPECT_FALSE(bundle.lowered.target->opcodeByMnemonic("load_u").has_value())
+        << "x86_64 must NOT declare load_u — the scaled form is arm64-only";
+    EXPECT_FALSE(bundle.lowered.target->opcodeByMnemonic("store_u").has_value());
 }
 
 // D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow) byte-pin.
@@ -1054,7 +1326,7 @@ TEST(LirCallconvAbi, Win64VariadicCallDupsFpVarargIntoHomeGpr) {
     // uninitialized home GPR slot → garbage. RED-ON-DISABLE: deleting the FP-dup
     // emission removes the only `movq_xmm_to_gpr` in the call sequence.
     auto bundle = lowerThroughRewrite(
-        "double take(int n, ...);\n"
+        "double take(int n, ...) { return (double)n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE)
         "int main(void) {\n"
         "  return (int)take(1, 2.5);\n"   // one int fixed arg + one double vararg
         "}\n",
@@ -2991,9 +3263,15 @@ TEST(LirCallconvVariadicFC12c, Aapcs64VariadicStructReturnPrologueScratchAvoidsX
 // keeps it in-register. We assert via the outgoing-arg-area size: Apple reserves
 // stack overflow for the forced varargs; AAPCS64 reserves none (all args fit regs).
 TEST(LirCallconvVariadicFC12c, AppleForcesVarargToStackAapcs64KeepsInReg) {
+    // The CALLER `f` is declared FIRST so it is function index 0 (the layout query
+    // below uses forFuncByIndex(0)); `sink` is DEFINED after via a forward reference
+    // that resolves through prototype/definition merging (D-CSUBSET-FN-PROTOTYPE) —
+    // sink must be a real (defined) function so the call binds, not a bare proto
+    // (which would emit no symbol and fail loud at HIR->MIR).
     char const* src =
-        "int sink(int n, ...);\n"
-        "int f(void) { return sink(1, 7, 8); }\n";  // 1 fixed + 2 varargs, all small ints
+        "int sink(int n, ...);\n"                    // forward prototype (merges with the def below)
+        "int f(void) { return sink(1, 7, 8); }\n"   // 1 fixed + 2 varargs, all small ints — function 0
+        "int sink(int n, ...) { return n; }\n";     // the definition (function 1)
     // apple_arm64 = cc index 1; aapcs64 = cc index 0.
     auto apple = lowerThroughRewrite(src, /*ccIndex=*/1, /*targetName=*/"arm64");
     ASSERT_TRUE(apple.lowered.lir.ok);
@@ -3201,6 +3479,93 @@ TEST(LirCallconvVariadicFC12deferral4, Aapcs64VaStartFixedStackOverflowBaseCongr
 // `sawLoadUAtLargeOffset` flips false. (The corpus would then fail to encode at the
 // assembler — A_ImmediateOperandOutOfRange — but this structural pin catches it earlier
 // and host-independently, on every CI leg.)
+TEST(LirCallconvLargeFrameImm12, Aapcs64FrameBeyondImm12EmitsTwoSubTwoAdd) {
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: a function whose frame
+    // exceeds the single-word imm12 reach (4095) — `int big[9000]` is
+    // 36000B — must have a prologue that adjusts SP with the 2-word
+    // shifted-imm12 macro (TWO `sub sp` words: a sh=0 word then a sh=1
+    // word) and an epilogue with the mirror TWO `add sp` words. The
+    // LIR carries ONE `sub`/`add` instruction each; the TWO-word
+    // expansion is the encoder's doing, so this pin assembles to BYTES
+    // and counts the machine words — host-independent (no execution).
+    //
+    // RED-ON-DISABLE: revert the encoder's imm12.hilo24 split (or the
+    // variant's immMin/immMax routing) → the single `sub sp,#36016`
+    // either fails loud at the assembler (A_ImmediateOperandOutOfRange,
+    // the OLD behavior — `errorCount != 0` below catches it) or, if the
+    // variant were mis-keyed, emits ONE word → the two-word count goes red.
+    auto bundle = lowerThroughRewrite(
+        "int big_frame(void) {\n"
+        "    int big[9000];\n"          // 36000B local -> frame > 4095
+        "    big[8999] = 42;\n"
+        "    return big[8999];\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "arm64 large-frame callee lower";
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter legRep;
+    auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
+                                    legRep);
+    ASSERT_TRUE(legal.ok());
+    DiagnosticReporter ccRep;
+    auto cc = materializeCallingConvention(legal.lir, *bundle.lowered.target,
+                                           bundle.alloc, ccRep);
+    ASSERT_TRUE(cc.ok());
+    ASSERT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* layout = cc.forFuncByIndex(0);
+    ASSERT_NE(layout, nullptr);
+    ASSERT_GT(layout->totalFrameSize, 4095u)
+        << "the touched 9000-int array MUST push the frame past the single-"
+           "word imm12 reach (4095) — got " << layout->totalFrameSize;
+
+    std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    DiagnosticReporter asmRep;
+    auto mod = assemble(cc.lir, *bundle.lowered.target, lirToMir, asmRep);
+    EXPECT_EQ(asmRep.errorCount(), 0u)
+        << "a >4095-byte frame must assemble cleanly via the 2-word shifted-"
+           "imm12 SP adjust (NOT fail loud as it did before this fix)";
+    ASSERT_EQ(mod.functions.size(), 1u);
+    auto const& fnBytes = mod.functions[0].bytes;
+
+    // Derive the EXACT word pair from the resolved frame size — the same
+    // split the encoder performs (lo = V & 0xFFF, hi = (V>>12) & 0xFFF),
+    // Rd = Rn = sp = 31. Host-independent: the expected bytes follow the
+    // frame size, not a baked constant.
+    std::uint32_t const V  = layout->totalFrameSize;
+    std::uint32_t const lo = V & 0xFFFu;
+    std::uint32_t const hi = (V >> 12) & 0xFFFu;
+    auto leWord = [](std::uint32_t w) {
+        return std::array<std::uint8_t, 4>{
+            static_cast<std::uint8_t>(w & 0xFF),
+            static_cast<std::uint8_t>((w >> 8) & 0xFF),
+            static_cast<std::uint8_t>((w >> 16) & 0xFF),
+            static_cast<std::uint8_t>((w >> 24) & 0xFF)};
+    };
+    auto countWord = [&](std::uint32_t w) {
+        auto const pat = leWord(w);
+        std::uint32_t n = 0;
+        for (std::size_t i = 0; i + 4 <= fnBytes.size(); i += 4) {
+            if (std::equal(pat.begin(), pat.end(), fnBytes.begin() + i)) ++n;
+        }
+        return n;
+    };
+    // SUB sp,sp,#lo (sh=0, 0xD1000000) + SUB sp,sp,#hi,LSL#12 (sh=1, 0xD1400000).
+    std::uint32_t const subLo = 0xD1000000u | (lo << 10) | (31u << 5) | 31u;
+    std::uint32_t const subHi = 0xD1400000u | (hi << 10) | (31u << 5) | 31u;
+    // ADD sp,sp,#lo (sh=0, 0x91000000) + ADD sp,sp,#hi,LSL#12 (sh=1, 0x91400000).
+    std::uint32_t const addLo = 0x91000000u | (lo << 10) | (31u << 5) | 31u;
+    std::uint32_t const addHi = 0x91400000u | (hi << 10) | (31u << 5) | 31u;
+
+    // The leaf function adjusts SP exactly once in the prologue (one sub
+    // pair) and once in the epilogue (one add pair). Both halves of each
+    // pair must be present.
+    EXPECT_EQ(countWord(subLo), 1u) << "prologue must emit the sh=0 `sub sp,#lo` word";
+    EXPECT_EQ(countWord(subHi), 1u) << "prologue must emit the sh=1 `sub sp,#hi,LSL#12` word";
+    EXPECT_EQ(countWord(addLo), 1u) << "epilogue must emit the sh=0 `add sp,#lo` word";
+    EXPECT_EQ(countWord(addHi), 1u) << "epilogue must emit the sh=1 `add sp,#hi,LSL#12` word";
+}
+
 TEST(LirCallconvLargeFrameImm12, Aapcs64NinthFixedParamLoadUsesScaledLoadU) {
     // `long pad[40]` (320B) forces the frame > 255. An array alloca is never
     // scalar-promoted (mem2reg refuses array allocas), and this pipeline runs
@@ -3598,7 +3963,7 @@ TEST(LirCallconvAbi, SysVByValueStackAggByteCopyScratchAvoidsArgMoveSources) {
 TEST(LirCallconvVariadicFC12c, Aapcs64VarArgHfaStructInRegisters) {
     auto bundle = lowerThroughRewrite(
         "struct HFA { double a; double b; };\n"
-        "int sink(int n, ...);\n"
+        "int sink(int n, ...) { return n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE: a bare proto no longer emits a spurious FnSig global)
         "int f(void) {\n"
         "  struct HFA h; h.a = 1.0; h.b = 2.0;\n"
         "  return sink(1, h);\n"
@@ -3660,13 +4025,17 @@ TEST(LirCallconvVariadicFC12c, Aapcs64VarArgHfaStructInRegisters) {
 // after materialization the outgoing area reserves ceil(16/8)*8 = 16 bytes. RED-ON-
 // DISABLE: a missing exhaustion check emits register pieces (no carrier, no overflow).
 TEST(LirCallconvVariadicFC12c, Aapcs64VarArgNonHfaStructStackAfterExhaustion) {
+    // The CALLER `use` is declared FIRST (function index 0 for the layout query);
+    // `sink` is DEFINED after via a forward reference that merges with the leading
+    // prototype (D-CSUBSET-FN-PROTOTYPE) — a real defined function so the call binds.
     auto bundle = lowerThroughRewrite(
         "struct LL { long a; long b; };\n"
-        "long sink(int n, ...);\n"
-        "long use(void) {\n"
+        "long sink(int n, ...);\n"                     // forward prototype (merges below)
+        "long use(void) {\n"                            // the caller — function 0
         "  struct LL p; p.a = 40; p.b = 5;\n"
         "  return sink(8, 1L,2L,3L,4L,5L,6L,7L,8L, p);\n"   // 8 longs drain GR, then struct
-        "}\n",
+        "}\n"
+        "long sink(int n, ...) { return n; }\n",        // the definition (function 1)
         /*ccIndex=*/0, /*targetName=*/"arm64");   // aapcs64 = cc index 0
     ASSERT_TRUE(bundle.lowered.lir.ok)
         << (bundle.lowered.lirReporter.all().empty()

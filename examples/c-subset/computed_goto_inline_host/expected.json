@@ -1,0 +1,29 @@
+{
+  "$comment": "D-CSUBSET-COMPUTED-GOTO inline-INTO-host witness: a computed-goto threaded interpreter (`&&label`+`goto *p`) whose dispatch function `main` ALSO calls a MULTI-BLOCK inline-eligible helper `adjust` (if/else). Under the `release` shippedPipeline (Inlining ON) `main` is an inline HOST containing BlockAddress+IndirectBr with a multi-block callee in its plan — the exact shape that, before the routing fix, sent `main` through the MultiBlockInliner whose caller-host emit mis-copies the BlockAddress block-id payload (silent miscompile) and aborts on IndirectBr. The fix routes a computed-goto host to the single-block rebuilder (correct remap); `adjust` stays a call. adjust(x)=x>100?x-50:x+3; acc 1 -> adjust(1)=4 -> *2=8 -> adjust(8)=11 -> exit 11. RED-ON-DISABLE: remove the !functionHasComputedGoto guard at the inlining routing and this crashes/miscompiles under --config=release. Witnessed under baseline AND release, x86 + arm64 qemu.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 11,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

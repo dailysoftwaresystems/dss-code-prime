@@ -1,0 +1,17 @@
+{
+  "$comment": "D-CSUBSET-LOCAL-STATIC: block-scope `static` locals get static storage duration (C 6.2.4) — a hidden module-global, function-internal name, once-only load-time init — so values PERSIST across calls. Exercises scalar counter (1,2,3), static array persistence+indexing (25,30), and two SIBLING statics with the same source name in distinct blocks proving DISTINCT storage (103,105). Exit 42 iff all persist correctly. RED-ON-DISABLE: revert the cst_to_hir staticStorage arm (static -> stack VarDecl) -> each call re-inits -> tick()=1,1,1 -> exit 7. The release arm re-witnesses under the shipped pipeline (the cross-call stores survive Mem2Reg/DCE).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

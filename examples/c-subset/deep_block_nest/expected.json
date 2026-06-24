@@ -1,0 +1,15 @@
+{
+  "$comment": "D-PARSE-DEEP-NEST-RECURSION-MEMORY (plan 24 Stage 3b) end-to-end witness: the CST->HIR STATEMENT lowerer (`lowerStmt` in src/hir/lowering/cst_to_hir.cpp) is now an EXPLICIT WORK-STACK DRIVER for the deep statement forms (transparent wrapper + Block + If + While/DoWhile + For + Label), so a DEEPLY-nested statement tree lowers with FLAT O(N) host-stack cost instead of one host-recursion frame per nesting level. This program is `int main(void) { { { ... 200 nested blocks ... { return 42; } ... } } }` = 42: 200 nested `{ }` blocks (just under the parser's 256 maxExpressionDepth cap) drive the Block frame 200 levels deep (each nested block is the single statement item of its parent block), bottoming out at `return 42;`. A regression that UNWRAPPED the Block / transparent-wrapper arm back to host recursion would recurse 200 frames deep during CST->HIR statement lowering; before this stage the lowering ran on the 64 MiB worker stack (core/substrate/large_stack_call) and 200 levels was already past the host's ~1 MB main-stack crash point, so an accidental main-stack regression would crash (rc-127) here instead of exiting 42. The value 42 is miscompile-sensitive: a dropped/duplicated/mis-ordered block item would change the emitted HIR and could flip the exit code. OUTPUT-IDENTITY against the prior recursive lowerer is enforced by the full ctest suite; this example adds the deep-flatten + real-codegen run witness. The optimizedPipelines arm proves the lowered HIR survives the full release pipeline (the empty blocks collapse, leaving `return 42`). arm64 runs under qemu; macho on the macos-latest leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}

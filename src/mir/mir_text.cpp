@@ -465,6 +465,22 @@ private:
                 out_ += '}';
                 break;
             }
+            case MirOpcode::IndirectBr: {
+                // D-CSUBSET-COMPUTED-GOTO: render `indirectbr %v{addr} { %b.. }` —
+                // the address operand then the full address-taken successor list.
+                auto operands = mir_.instOperands(id);
+                auto succs = mir_.blockSuccessors(block);
+                if (!operands.empty()) out_ += std::format(" %v{}", operands[0].v);
+                out_ += " { ";
+                bool first = true;
+                for (MirBlockId const b : succs) {
+                    if (!first) out_ += ", ";
+                    out_ += std::format("%b{}", b.v);
+                    first = false;
+                }
+                out_ += " }";
+                break;
+            }
             case MirOpcode::Return: {
                 // FC7 C1c: a by-value struct returned IN REGISTERS carries N piece
                 // operands — emit ALL of them (space-separated), not just operand 0,
@@ -495,7 +511,21 @@ private:
                 // the raw payload integer if non-zero and not already
                 // covered).
                 std::uint32_t const payload = mir_.instPayload(id);
-                if (payload != 0
+                if (op == MirOpcode::BlockAddress) {
+                    // D-CSUBSET-COMPUTED-GOTO: the payload is the target BLOCK id —
+                    // render it as `%b{}` (a raw integer would read as a meaningless
+                    // value and break the block-relative reading).
+                    out_ += std::format(" %b{}", payload);
+                } else if (op == MirOpcode::ByValueStackArg) {
+                    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the payload
+                    // PACKS the byte size (low 30 bits) + the exhaust class (high 2) —
+                    // print the unpacked fields, not the raw integer (which reads as a
+                    // ~2.1e9 garbage value when an exhaust bit is set).
+                    out_ += std::format(
+                        " size {} exhaust {}",
+                        payload & kByValueStackArgSizeMask,
+                        (payload >> kByValueStackArgExhaustShift) & 0x3u);
+                } else if (payload != 0
                  && op != MirOpcode::ExtractValue
                  && op != MirOpcode::InsertValue) {
                     out_ += std::format(" payload {}", payload);

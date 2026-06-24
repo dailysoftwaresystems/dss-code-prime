@@ -4,6 +4,7 @@
 #include "link/format/byte_emit.hpp"
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
+#include "link/format/interior_block_symbol_va.hpp"
 #include "link/format/macho_chained_fixups.hpp"
 #include "link/format/macho_codesign.hpp"
 #include "link/format/string_table.hpp"
@@ -862,6 +863,16 @@ encodeExec(AssembledModule const&    module,
         symbolVa.emplace(module.functions[i].symbol,
                          sectionVa + funcTextStart[i]);
     }
+    // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols get their
+    // interior-block VAs before relocation resolution — sectionVa is the
+    // SAME base used for the function symbols above (block VA = funcVA +
+    // blockOffset). The static externless path; encodeExecDynamic below
+    // calls the same helper.
+    if (!link::format::addInteriorBlockSymbolVas(
+            module, funcTextStart, sectionVa, symbolVa,
+            "macho::encodeExec", reporter)) {
+        return {};
+    }
     if (!link::format::applyExecRelocations(
             textBody, module, funcTextStart, symbolVa,
             targetSchema, sectionVa, "macho::encodeExec", reporter)) {
@@ -1546,6 +1557,17 @@ encodeExecDynamic(AssembledModule const&    module,
         && !link::format::addDataSymbolVas(
                module.dataItems, bssLayout, bssSecVa,
                symbolVa, "macho::encodeExecDynamic", reporter)) {
+        return {};
+    }
+
+    // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols get their
+    // interior-block VAs before relocation resolution — sectionVa is the
+    // SAME base used for the function symbols above (block VA = funcVA +
+    // blockOffset). The dynamic path; encodeExec (static) calls the same
+    // helper.
+    if (!link::format::addInteriorBlockSymbolVas(
+            module, funcTextStart, sectionVa, symbolVa,
+            "macho::encodeExecDynamic", reporter)) {
         return {};
     }
 

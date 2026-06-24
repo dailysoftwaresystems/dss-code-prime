@@ -104,7 +104,14 @@ enum class LirOperandKind : std::uint8_t {
 // One slot in the operand pool. The tag picks the active field.
 struct LirOperand {
     LirOperandKind kind = LirOperandKind::None;  // 1
-    std::uint8_t   _pad[3] = {};                 // 3
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: for a ByValueStackAgg
+    // marker, which arg-register CLASS the placement EXHAUSTS once this aggregate is
+    // stacked (0 = none/BACKFILL — SysV; 1 = GPR; 2 = FPR — AAPCS64 §B). lir_callconv
+    // clamps the matching class cursor so a SUBSEQUENT arg/vararg of that class also
+    // goes to memory (matching the callee's va_start clamp). Unused (0) for any other
+    // operand kind. Repurposes one padding byte — no struct-size change.
+    std::uint8_t   byValueAggExhaust = 0;        // 1
+    std::uint8_t   _pad[2] = {};                 // 2
     union {
         LirReg        reg;        // 4 — kind == Reg
         std::int32_t  immInt32;   // 4 — kind == ImmInt (truncated; full int64 lives in scalar pool)
@@ -169,10 +176,15 @@ struct LirOperand {
     }
     // FC12a-struct: the by-value-aggregate stack-arg size marker. ALWAYS emitted
     // immediately AFTER the Reg operand holding the aggregate's temp address.
-    [[nodiscard]] static constexpr LirOperand makeByValueStackAgg(std::uint32_t bytes) noexcept {
+    // `exhaust` (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): the arg-register
+    // class lir_callconv exhausts after placing this stacked aggregate (0 none/backfill,
+    // 1 GPR, 2 FPR) — SysV passes 0, AAPCS64 passes the straddling aggregate's class.
+    [[nodiscard]] static constexpr LirOperand
+    makeByValueStackAgg(std::uint32_t bytes, std::uint8_t exhaust = 0) noexcept {
         LirOperand o{};
-        o.kind            = LirOperandKind::ByValueStackAgg;
-        o.byValueAggBytes = bytes;
+        o.kind             = LirOperandKind::ByValueStackAgg;
+        o.byValueAggExhaust = exhaust;
+        o.byValueAggBytes  = bytes;
         return o;
     }
 };

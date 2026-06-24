@@ -5,11 +5,14 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/substrate/large_stack_call.hpp"
 #include "core/types/call_payload.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/type_lattice/type_interner.hpp"
 #include "hir/hir.hpp"
+#include "hir/hir_node.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/mir_text.hpp"
@@ -91,6 +94,12 @@ struct Lowered {
             mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
             mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
             mirCfg.argSlotAligned            = cc->slotAligned;
+            mirCfg.argGprCount               =
+                static_cast<std::uint32_t>(cc->argGprs.size());
+            mirCfg.argFprCount               =
+                static_cast<std::uint32_t>(cc->argFprs.size());
+            mirCfg.aggregateStackExhaustsRegisters =
+                cc->aggregateStackExhaustsRegisters;
             // FC12a-core (D-FC12A-VARIADIC-CALLEE): thread the CC's va_list layout so
             // va_start/va_arg lower (or fail loud when the CC omits it).
             mirCfg.vaListLayout              = cc->vaListLayout;
@@ -1731,6 +1740,44 @@ TEST(MirLoweringCSubset, IndexOverIntPointerScalesIndexToByteOffset) {
         << "GEP index is the SCALED Mul result, not the raw Arg i "
            "(the scale-1 miscompile fix)";
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 5)), MirOpcode::Load);
+}
+
+// D-CSUBSET-INDEX-INTEGER-PROMOTION (C 6.3.1.1 / 6.5.2.1): a `char` subscript of
+// a WIDE-element pointer integer-PROMOTES to int BEFORE the stride `Mul` — else
+// the Mul is Char-typed and (1) OVERFLOWS (idx*stride wraps at char width) and
+// (2) walls at the sub-native ALU gap. The promotion materializes a widening
+// (SExt/ZExt) to I32 whose RESULT (not the raw char Arg) feeds the Mul, and the
+// Mul is I32-typed. RED-ON-DISABLE: revert the cst_to_hir Index promotion arm →
+// the block has no widening inst, the Mul lhs is the raw char Arg, and the Mul is
+// Char-typed (the inst-count 8→7, the opcode + I32-type assertions all flip).
+TEST(MirLoweringCSubset, CharIndexIntegerPromotesToI32BeforeStrideMul) {
+    auto L = lowerCSubset("int f(int* a, char i) { return a[i]; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto& interner = L.model.lattice().interner();
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Arg a, Arg i(char), {SExt|ZExt}(i)->i32, Const(4), Mul(promo,4), Gep, Load, Return]
+    ASSERT_EQ(m.blockInstCount(entry), 8u)
+        << "the char index adds ONE promotion (widen) inst vs the int-index 7";
+    MirInstId const argI  = m.blockInstAt(entry, 1);
+    MirInstId const promo = m.blockInstAt(entry, 2);
+    MirOpcode const pop = m.instOpcode(promo);
+    EXPECT_TRUE(pop == MirOpcode::SExt || pop == MirOpcode::ZExt)
+        << "a char index promotes via a widening (SExt/ZExt) — C 6.3.1.1";
+    EXPECT_EQ(interner.kind(m.instType(promo)), TypeKind::I32)
+        << "the promotion target is int";
+    auto promoOps = m.instOperands(promo);
+    ASSERT_EQ(promoOps.size(), 1u);
+    EXPECT_EQ(promoOps[0], argI) << "the widen source is the raw char Arg i";
+    MirInstId const mul = m.blockInstAt(entry, 4);
+    ASSERT_EQ(m.instOpcode(mul), MirOpcode::Mul);
+    EXPECT_EQ(interner.kind(m.instType(mul)), TypeKind::I32)
+        << "the stride Mul is I32-typed (promoted), NOT Char";
+    auto mulOps = m.instOperands(mul);
+    ASSERT_EQ(mulOps.size(), 2u);
+    EXPECT_EQ(mulOps[0], promo)
+        << "the Mul lhs is the PROMOTED index, not the raw char Arg";
 }
 
 // `int a[5]; a[i]` — a STORAGE array index. PRE-FC: lowered to a 3-op GEP
@@ -4570,7 +4617,7 @@ TEST(MirLoweringCSubset, Win64VaArgStructGt8DerefsPointer) {
 TEST(MirLoweringCSubset, Win64StructByValueVarargCallLeq8OneSlot) {
     auto L = lowerCSubset(
         "struct Pt { int a; int b; };\n"   // 8B → InRegisters[1], one slot by value
-        "int sink(int n, ...);\n"
+        "int sink(int n, ...) { return n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE: a bare proto no longer emits a spurious FnSig global)
         "int main(void) {\n"
         "  struct Pt p; p.a = 1; p.b = 2;\n"
         "  return sink(1, p);\n"          // struct BY VALUE to a Win64 variadic fn
@@ -4611,7 +4658,7 @@ TEST(MirLoweringCSubset, Win64StructByValueVarargCallLeq8OneSlot) {
 TEST(MirLoweringCSubset, Win64StructByValueVarargCallGt8OnePointer) {
     auto L = lowerCSubset(
         "struct Big { long a; long b; long c; };\n"  // 24B → ByReference (hidden ptr)
-        "int sink(int n, ...);\n"
+        "int sink(int n, ...) { return n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE: a bare proto no longer emits a spurious FnSig global)
         "int main(void) {\n"
         "  struct Big b; b.a = 1; b.b = 2; b.c = 3;\n"
         "  return sink(1, b);\n"          // >8B struct BY VALUE to a Win64 variadic fn
@@ -4794,17 +4841,18 @@ TEST(MirLoweringCSubset, Aapcs64VaStartMixedClassFixedStackOverflow) {
            "both-clamp witness)";
 }
 
-// FOLD 1 (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS, OPEN): a SysV variadic
-// callee whose fixed params overflow the GPR pool AND include a by-value AGGREGATE
-// that STRADDLES the register/stack boundary MUST fail loud. `f(a..e, struct S16, ...)`
-// : a..e consume 5 GPR (rdi..r8), leaving only r9; S16 = {long,long} needs 2 GPR
-// eightbytes but only 1 remains → real SysV puts the WHOLE struct in MEMORY (16B), yet
-// the per-register-slot formula (gprOver counts the straddling eightbyte that landed in
-// r9) would UNDERCOUNT the named stack bytes → a silent miscompile, rejected here.
-// RED-ON-DISABLE: remove the `currentFnHasAggregateFixedParam_` guard in lowerVaStart's
-// SysV overflow path → mir.ok flips TRUE (the function lowers with a wrong __overflow
-// displacement). Restore to make this go red again.
-TEST(MirLoweringCSubset, VaStartFixedStructStraddleOverflowFailsLoud) {
+// D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS (CLOSED): a SysV variadic callee
+// whose fixed params overflow the GPR pool AND include a by-value AGGREGATE that
+// STRADDLES the register/stack boundary now LOWERS — the WHOLE struct is received
+// ALL-OR-NOTHING from the incoming stack (a RecvByValueStackParam, the callee mirror of
+// the caller's ByValueStackArg carrier), and va_start's VaOverflowArgArea payload counts
+// its FULL 16 bytes. `f(a..e, struct S16, ...)`: a..e consume 5 GPR (rdi..r8); S16 =
+// {long,long} needs 2 GPR eightbytes but only r9 remains → SysV places the WHOLE 16B in
+// memory (NOT split), and BACKFILLS r9 for the first vararg (SysV does not exhaust on a
+// stacked aggregate). RED-ON-DISABLE: revert the caller all-or-nothing (Phase A) or the
+// callee reception (Phase B) → the struct splits and the byte cursor no longer reaches
+// 16 / no RecvByValueStackParam appears; revert Phase C → wrong payload.
+TEST(MirLoweringCSubset, VaStartFixedStructStraddleOverflowSucceeds) {
     auto L = lowerCSubset(
         "struct S16 { long x; long y; };\n"
         "long f(long a, long b, long c, long d, long e, struct S16 s, ...) {\n"
@@ -4814,24 +4862,43 @@ TEST(MirLoweringCSubset, VaStartFixedStructStraddleOverflowFailsLoud) {
         "  va_end(ap);\n"
         "  return a + s.x + v;\n"
         "}\n");
-    EXPECT_FALSE(L.mir.ok)
-        << "a SysV variadic callee with an overflowing fixed by-value aggregate "
-           "(register/stack straddle) must FAIL LOUD at va_start "
-           "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)";
-    EXPECT_TRUE(anyDiagActualContains(
-        L.mirReporter, "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS"))
-        << "the aggregate-straddle fail-loud must cite the new aggregate-overflow anchor";
+    ASSERT_TRUE(L.mir.ok)
+        << "a SysV variadic callee with a straddling fixed by-value aggregate must now "
+           "LOWER all-or-nothing (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    auto const payload = vaOverflowArgAreaPayload(m, fi);
+    ASSERT_TRUE(payload.has_value())
+        << "the lowered va_start must emit a VaOverflowArgAreaAddr leaf";
+    EXPECT_EQ(*payload, 16u)
+        << "overflow_arg_area must skip the WHOLE 16-byte stacked struct (roundUp(16,8) "
+           "= 16), NOT the per-eightbyte slot count — a 0/8 payload would read the "
+           "struct's own bytes as the first vararg (all-or-nothing, not split)";
+    EXPECT_GT(countOpcodeAllBlocks(m, fi, MirOpcode::RecvByValueStackParam), 0u)
+        << "a straddling fixed aggregate must be RECEIVED via RecvByValueStackParam "
+           "(whole-from-stack), not split into per-eightbyte Args";
+    // BACKFILL witness: SysV does NOT exhaust on a stacked aggregate, so the 5 fixed
+    // GPRs leave gp_offset = 5*8 = 40 (the trailing vararg backfills r9, save-area slot
+    // 5). The AAPCS64-style clamp would (wrongly) advance the cursor to 6 → gp_offset
+    // = 48, and the Const 40 would NOT appear. (NB: 48 itself is also the legitimate
+    // fp_offset base = gpOffsetLimit, so its PRESENCE is not a clamp signal — the
+    // backfill witness is the PRESENCE of 40, absent under a clamp.)
+    EXPECT_TRUE(funcHasConstInt(m, fi, 40))
+        << "gp_offset must be 40 (5 fixed GPRs; SysV BACKFILLS r9 — does not exhaust the "
+           "cursor on a stacked aggregate; a clamp would make it 48 and drop the 40)";
 }
 
-// FOLD 1 mirror (AAPCS64): a variadic ARM64 callee whose fixed params overflow the FP
-// pool AND include a by-value HFA (homogeneous float aggregate) straddling the
-// register/stack boundary MUST fail loud. `f(6 doubles, struct H3, ...)` where H3 =
-// {double,double,double} is a 3-element HFA (3 VR slots): the 6 fixed doubles consume
-// v0..v5, leaving v6,v7 (2 VR) but H3 needs 3 → AAPCS64 places the WHOLE HFA on the
-// stack (24B), which the per-register-slot formula undercounts → rejected.
-// RED-ON-DISABLE: remove the `currentFnHasAggregateFixedParam_` guard in the
-// Aapcs64DualCursor overflow path → mir.ok flips TRUE.
-TEST(MirLoweringCSubset, Aapcs64VaStartFixedHfaStraddleOverflowFailsLoud) {
+// D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS mirror (AAPCS64, CLOSED): a
+// variadic ARM64 callee whose fixed params overflow the FP pool AND include a by-value
+// HFA straddling the register/stack boundary now LOWERS all-or-nothing. `f(6 doubles,
+// struct H3, ...)` where H3 = {double,double,double} is a 3-element HFA: the 6 fixed
+// doubles consume v0..v5, leaving v6,v7 (2 VR) but H3 needs 3 → AAPCS64 §B places the
+// WHOLE 24B HFA in memory AND EXHAUSTS the VR class (NSRN←8), so __vr_offs clamps to 0
+// and the first FP vararg routes to __stack PAST the HFA. RED-ON-DISABLE: revert
+// Phase A/B → split / no RecvByValueStackParam; revert the AAPCS64 cursor exhaust →
+// __vr_offs is -32 (not clamped) and the vararg reads the HFA's bytes.
+TEST(MirLoweringCSubset, Aapcs64VaStartFixedHfaStraddleOverflowSucceeds) {
     auto L = lowerCSubset(
         "struct H3 { double a; double b; double c; };\n"
         "double f(double a, double b, double c, double d, double e, double g,"
@@ -4843,13 +4910,68 @@ TEST(MirLoweringCSubset, Aapcs64VaStartFixedHfaStraddleOverflowFailsLoud) {
         "  return a + h.a + v;\n"
         "}\n",
         "arm64", "aapcs64");
-    EXPECT_FALSE(L.mir.ok)
-        << "an AAPCS64 variadic callee with an overflowing fixed by-value HFA "
-           "(register/stack straddle) must FAIL LOUD at va_start "
-           "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)";
-    EXPECT_TRUE(anyDiagActualContains(
-        L.mirReporter, "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS"))
-        << "the HFA-straddle fail-loud must cite the new aggregate-overflow anchor";
+    ASSERT_TRUE(L.mir.ok)
+        << "an AAPCS64 variadic callee with a straddling fixed by-value HFA must now "
+           "LOWER all-or-nothing (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    std::uint32_t const fi = funcWithVaStart(m);
+    auto const payload = vaOverflowArgAreaPayload(m, fi);
+    ASSERT_TRUE(payload.has_value())
+        << "the lowered va_start must emit a VaOverflowArgAreaAddr (→ __stack) leaf";
+    EXPECT_EQ(*payload, 24u)
+        << "__stack must skip the WHOLE 24-byte stacked HFA (roundUp(24,8) = 24)";
+    EXPECT_GT(countOpcodeAllBlocks(m, fi, MirOpcode::RecvByValueStackParam), 0u)
+        << "the straddling HFA must be RECEIVED via RecvByValueStackParam";
+    // EXHAUST witness: the HFA consumed the VR class → __vr_offs clamps to 0. Reverting
+    // the AAPCS64 cursor exhaust leaves __vr_offs = -(8-6)*16 = -32 (not clamped).
+    EXPECT_TRUE(funcHasConstInt(m, fi, 0))
+        << "__vr_offs must be CLAMPED to 0 — the straddling HFA EXHAUSTED the VR class "
+           "(AAPCS64 §B NSRN←8)";
+    EXPECT_FALSE(funcHasConstInt(m, fi, -32))
+        << "__vr_offs must NOT be -32 — the cursor must EXHAUST (clamp), not leave 2 VR "
+           "slots as if the HFA had not consumed the class";
+}
+
+// D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS — the CALLER all-or-nothing (the
+// latent NON-variadic split this cycle ALSO repaired, previously unfiled). A non-variadic
+// call whose fixed by-value aggregate arg STRADDLES the reg/stack boundary must place the
+// WHOLE struct on the stack via a ByValueStackArg carrier, NOT split it into per-eightbyte
+// register pieces (lir_callconv would put one piece in the last register + one on the
+// stack — non-conformant to SysV §3.2.3). `g(a..e, struct S16 s)`: a..e fill 5 GPR, S16 =
+// {long,long} needs 2 but 1 remains → carrier. RED-ON-DISABLE: revert the caller's
+// `!argSlotAligned` exhaustion check (Phase A — its hoist out of `if (calleeVariadic)`)
+// → the struct splits into per-eightbyte Args → NO ByValueStackArg appears in `caller`.
+TEST(MirLoweringCSubset, CallerNonVariadicStraddlingAggregateUsesStackCarrier) {
+    auto L = lowerCSubset(
+        "struct S16 { long x; long y; };\n"
+        "long g(long a, long b, long c, long d, long e, struct S16 s) {\n"
+        "  return a + s.x;\n"
+        "}\n"
+        "long caller(void) {\n"
+        "  struct S16 s;\n"
+        "  s.x = 1; s.y = 2;\n"
+        "  return g(10, 20, 30, 40, 50, s);\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "a non-variadic call with a straddling fixed by-value aggregate must lower: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // The CALLER places the straddling struct via a ByValueStackArg carrier; the CALLEE
+    // `g` receives it via RecvByValueStackParam. Both opcodes must therefore be present
+    // in the module — count each across all functions (the carrier is the Phase-A pin).
+    std::size_t carriers = 0, receives = 0;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        carriers += countOpcodeAllBlocks(m, f, MirOpcode::ByValueStackArg);
+        receives += countOpcodeAllBlocks(m, f, MirOpcode::RecvByValueStackParam);
+    }
+    EXPECT_GT(carriers, 0u)
+        << "the straddling struct arg must be PLACED via a ByValueStackArg carrier "
+           "(whole-to-stack), NOT split into per-eightbyte register pieces — the caller "
+           "mirror of the callee RecvByValueStackParam (all-or-nothing, both sides)";
+    EXPECT_GT(receives, 0u)
+        << "the callee `g` (non-variadic) must RECEIVE the straddling struct via "
+           "RecvByValueStackParam — the all-or-nothing fix covers non-variadic too";
 }
 
 namespace {
@@ -5335,7 +5457,7 @@ TEST(MirLoweringCSubset, Aapcs64VaArgStructGathersViaDualCursor) {
 TEST(MirLoweringCSubset, Aapcs64StructByValueVarargCallPlacesInRegisters) {
     auto L = lowerCSubset(
         "struct Pt { int a; int b; };\n"
-        "int sink(int n, ...);\n"
+        "int sink(int n, ...) { return n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE: a bare proto no longer emits a spurious FnSig global)
         "int main(void) {\n"
         "  struct Pt p; p.a = 1; p.b = 2;\n"
         "  return sink(1, p);\n"          // struct BY VALUE to an AAPCS64 variadic fn
@@ -5491,7 +5613,7 @@ TEST(MirLoweringCSubset, Aapcs64VaArgByRefRegArmDerefsGrTop) {
 TEST(MirLoweringCSubset, Aapcs64CallerHfaVarargInRegisters) {
     auto L = lowerCSubset(
         "struct HFA { double a; double b; };\n"
-        "int sink(int n, ...);\n"
+        "int sink(int n, ...) { return n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE: a bare proto no longer emits a spurious FnSig global)
         "int main(void) {\n"
         "  struct HFA h; h.a = 1.0; h.b = 2.0;\n"
         "  return sink(1, h);\n"
@@ -5514,7 +5636,7 @@ TEST(MirLoweringCSubset, Aapcs64CallerHfaVarargInRegisters) {
 TEST(MirLoweringCSubset, Aapcs64CallerNonHfaVarargExhaustsGpr) {
     auto L = lowerCSubset(
         "struct LL { long a; long b; };\n"
-        "long sink(int n, ...);\n"
+        "long sink(int n, ...) { return n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE)
         "int main(void) {\n"
         "  struct LL p; p.a = 40; p.b = 5;\n"
         "  return (int)sink(8, 1L,2L,3L,4L,5L,6L,7L,8L, p);\n"
@@ -5545,7 +5667,7 @@ TEST(MirLoweringCSubset, Aapcs64CallerNonHfaVarargExhaustsGpr) {
 TEST(MirLoweringCSubset, Aapcs64CallerByRefVarargIsPositionedPointerNotCarrier) {
     auto L = lowerCSubset(
         "struct Big { long a; long b; long c; };\n"  // 24B → ByReference (hidden ptr)
-        "int sink(int n, ...);\n"
+        "int sink(int n, ...) { return n; }\n"   // DEFINED so the callee symbol binds (D-CSUBSET-FN-PROTOTYPE: a bare proto no longer emits a spurious FnSig global)
         "int main(void) {\n"
         "  struct Big b; b.a = 1; b.b = 2; b.c = 3;\n"
         "  return sink(1, b);\n"          // >16B struct BY VALUE to an AAPCS64 variadic fn
@@ -5707,4 +5829,890 @@ TEST(MirLoweringCSubset, AppleVaArgIntLowersLinearOverflowBase) {
     EXPECT_EQ(countOpcodeAllBlocks(m, afi, MirOpcode::CondBr), 0u)
         << "Apple va_arg is a LINEAR pointer bump — no diamond";
     EXPECT_EQ(countOpcodeAllBlocks(m, afi, MirOpcode::Phi), 0u);
+}
+
+// ── D-CSUBSET-COMPUTED-GOTO: HIR→MIR structural pins (MF-1 / MF-A) ──────────
+//
+// `&&label` lowers to a BlockAddress (payload = target block), and `goto *p`
+// lowers to an IndirectBr whose SUCCESSORS are EVERY address-taken block. That
+// successor set is the load-bearing CFG-correctness invariant: it is what makes
+// reachability/DCE keep the label blocks and phi-validation see the indirect
+// predecessor. These pins assert it directly off the MIR.
+
+namespace {
+// Find the single IndirectBr terminator in function `fi`, or InvalidMirInst.
+[[nodiscard]] MirInstId findIndirectBr(Mir const& m, std::uint32_t fi) {
+    MirFuncId const fn = m.funcAt(fi);
+    std::uint32_t const nb = m.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const b = m.funcBlockAt(fn, bi);
+        if (m.blockInstCount(b) == 0) continue;
+        MirInstId const term = m.blockTerminator(b);
+        if (m.instOpcode(term) == MirOpcode::IndirectBr) return term;
+    }
+    return MirInstId{};
+}
+} // namespace
+
+TEST(MirLoweringCSubset, ComputedGotoIndirectBrSuccessorsAreAllAddressTakenBlocks) {
+    // Two `&&label` + a `goto *p`: the IndirectBr must list BOTH label blocks as
+    // successors, and each must read back as address-taken. RED-ON-DISABLE: drop a
+    // successor in a clone arm (mir_merge / mir_rebuild_helper) and the count != 2;
+    // lose the BlockAddress-derived address-taken mark and isBlockAddressTaken flips.
+    auto L = lowerCSubset(
+        "int f(int s) {\n"
+        "  void *a = &&one;\n"
+        "  void *b = &&two;\n"
+        "  void *t = s ? a : b;\n"
+        "  goto *t;\n"
+        "one:\n"
+        "  return 1;\n"
+        "two:\n"
+        "  return 2;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "semantic: " << (L.model.diagnostics().all().empty()
+            ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "HIR: " << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR: " << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+
+    // Two `&&label` → two BlockAddress ops, with two DISTINCT target blocks.
+    EXPECT_EQ(countOpcodeAllBlocks(m, 0, MirOpcode::BlockAddress), 2u)
+        << "each &&label lowers to one BlockAddress";
+
+    MirInstId const ibr = findIndirectBr(m, 0);
+    ASSERT_TRUE(ibr.valid()) << "goto *p must lower to an IndirectBr terminator";
+    EXPECT_EQ(m.instOperands(ibr).size(), 1u) << "IndirectBr operand[0] = the address";
+
+    // ★ THE MF-1 PIN: successors == the FULL address-taken block set (here 2).
+    MirBlockId const ibrBlock = m.instBlock(ibr);
+    auto const succs = m.blockSuccessors(ibrBlock);
+    ASSERT_EQ(succs.size(), 2u)
+        << "IndirectBr successors must be ALL address-taken blocks (2)";
+    for (MirBlockId const s : succs) {
+        EXPECT_TRUE(m.isBlockAddressTaken(s))
+            << "every IndirectBr successor is an address-taken (&&label) block";
+    }
+    // The two successors are the two distinct BlockAddress targets.
+    EXPECT_NE(succs[0].v, succs[1].v) << "the two label blocks are distinct";
+}
+
+TEST(MirLoweringCSubset, ComputedGotoBlockAddressTargetsAreAddressTaken) {
+    // A block targeted by a BlockAddress reads back as address-taken; a block that
+    // is NOT a &&label target does not. RED-ON-DISABLE: isBlockAddressTaken is the
+    // SimplifyCfg fold-guard's source of truth — if it returned false for a real
+    // target, an address-taken block could be folded away (a silent miscompile).
+    auto L = lowerCSubset(
+        "int f(int s) {\n"
+        "  void *a = &&only;\n"
+        "  goto *a;\n"
+        "only:\n"
+        "  return 7;\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR: " << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+
+    // Find the BlockAddress and confirm its target reads back as address-taken.
+    bool sawBlockAddr = false;
+    std::uint32_t const nb = m.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const b = m.funcBlockAt(fn, bi);
+        std::uint32_t const ni = m.blockInstCount(b);
+        for (std::uint32_t ii = 0; ii < ni; ++ii) {
+            MirInstId const inst = m.blockInstAt(b, ii);
+            if (m.instOpcode(inst) != MirOpcode::BlockAddress) continue;
+            sawBlockAddr = true;
+            MirBlockId const target = m.blockAddressTarget(inst);
+            EXPECT_TRUE(m.isBlockAddressTaken(target))
+                << "a BlockAddress target IS address-taken";
+        }
+    }
+    ASSERT_TRUE(sawBlockAddr) << "&&only must lower to a BlockAddress";
+
+    // The function's ENTRY block is not a &&label target → not address-taken.
+    EXPECT_FALSE(m.isBlockAddressTaken(m.funcEntry(fn)))
+        << "a non-&&label block is not address-taken (the negative pin)";
+}
+
+// ─── Plan 24 Stage 4 — iterative HIR→MIR straight-line expression driver ────
+//
+// SF-4 differential pin (synthetic deep HIR): a DEEPLY-nested left-associative
+// `(((a+a)+a)+a)…` BinaryOp chain lowers to the EXACT SAME post-order MIR the
+// recursive lowerer would: `Arg0`, then one `Add` per chain level in deepest-
+// first order, each `Add`'s operands `[deeperResult, Mul_i]` (the leaf is a
+// `Mul(Arg0,Arg0)`), then `Return(lastAdd)`. Every `Ref(a)` resolves to the
+// single param `Arg` SSA value (no new instruction), so the body is exactly the
+// leaf Mul + N (Mul,Add) pairs + the Return.
+//
+// WITNESS SPLIT — the flat/host-stack-overflow witness (that the lowering driver
+// is an O(1)-host-stack work-stack, not host recursion) lives in the CORPUS
+// examples `deep_mir_expr` / `deep_expr_lower` (and the upcoming Stage-7 e2e),
+// which lower a deep tree through the real pipeline and would crash if the driver
+// recursed. THIS unit pin asserts the orthogonal half: byte-identity MIR
+// correctness (exact opcode/operand-order shape) at depth, which the corpus
+// (golden-MIR-free) does not. The build/lower/teardown here run on the project's
+// 64 MiB worker (callOnLargeStack) exactly as the production driver lowers — so
+// the deep-tree build and its destructors do NOT depend on the host's ~1 MiB
+// main-stack budget (an ORTHOGONAL per-node HIR-teardown recursion overflows a
+// stock Debug main stack at this depth; the worker removes that artifact).
+//
+// RED-ON-REORDER (the byte-identity guard): each Add's RHS is a fresh EMITTING
+// `a * a` Mul, so the recursive form's two SEQUENTIAL statements `lhs =
+// lowerExpr(kids[0]); rhs = lowerExpr(kids[1]);` emit the spine deepest-first
+// with each `Mul_i` lowered IMMEDIATELY before its `Add_i`. The test pins that
+// each `Add_i` is preceded by its own RHS `Mul_i`. Building RHS-before-LHS (the
+// cst_to_hir Binary-frame order — WRONG here because MIR lowers the operands as
+// sequential statements, NOT function-call arguments) emits every `Mul` before
+// the deeper spine, so `Add_i` is no longer preceded by `Mul_i` → red.
+//
+// Synthetic (SF-4): the parser cannot emit beyond its 256 cap until Stage 5, so
+// the deep input is built via the public `HirBuilder`, not by parsing.
+TEST(MirLoweringCSubset, IterativeDeepBinaryChainLowersFlatAndByteIdentical) {
+    constexpr std::uint32_t kDepth   = 4000;  // # of Add nodes (chain levels)
+    constexpr std::uint32_t kParamSym = 1;
+
+    // Build the deep tree, lower it, and assert — ALL on the 64 MiB worker
+    // (kDeepRecursionStackBytes), mirroring how Program::compileFiles lowers a
+    // CU. This keeps the deep HIR build + lowering + its per-node destructors
+    // off the host's small main stack (which a stock MSVC Debug build sizes at
+    // 1 MiB — too small for the orthogonal deep-tree-teardown recursion here).
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
+
+    HirBuilder b{"c-subset"};
+    // `int f(int a)` — the param's Refs resolve to the entry `Arg(0)` SSA value
+    // (no emitted instruction); each `a * a` emits a fresh `Mul(Arg, Arg)`.
+    HirNodeId const param = b.makeVarDecl(i32, kParamSym);
+    auto refA = [&] { return b.makeRef(i32, kParamSym); };
+    auto mulAA = [&] {
+        return b.makeBinaryOp(HirOpKind::Mul, refA(), refA(), i32);
+    };
+    // Left-assoc spine: leaf `(a*a)`, then `cur = cur + (a*a)` (kDepth times).
+    HirNodeId cur = mulAA();                                  // the deepest value
+    for (std::uint32_t i = 0; i < kDepth; ++i)
+        cur = b.makeBinaryOp(HirOpKind::Add, cur, mulAA(), i32);
+    HirNodeId const body = b.makeBlock(std::array{b.makeReturn(cur)});
+    HirNodeId const fn   = b.makeFunction(fnTy, /*sym=*/7, std::array{param}, body);
+    HirNodeId const root = b.makeModule(std::array{fn});
+    Hir hir = std::move(b).finish(root);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
+                             MirLoweringConfig{});
+    ASSERT_TRUE(result.ok)
+        << "deep BinaryOp chain must lower clean: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Mir const& m = result.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirFuncId const f = m.funcAt(0);
+    ASSERT_EQ(m.funcBlockCount(f), 1u);
+    MirBlockId const entry = m.funcEntry(f);
+
+    // Body = Arg(0) + the leaf Mul + kDepth (Mul, Add) pairs + Return.
+    ASSERT_EQ(m.blockInstCount(entry), 2u * kDepth + 3u);
+    MirInstId const arg0 = m.blockInstAt(entry, 0);
+    EXPECT_EQ(m.instOpcode(arg0), MirOpcode::Arg);
+    EXPECT_EQ(m.argIndex(arg0), 0u);
+
+    // The leaf value `a*a` (the deepest spine node) is the first emitted op.
+    MirInstId const leafMul = m.blockInstAt(entry, 1);
+    EXPECT_EQ(m.instOpcode(leafMul), MirOpcode::Mul);
+    {
+        auto ops = m.instOperands(leafMul);
+        ASSERT_EQ(ops.size(), 2u);
+        EXPECT_EQ(ops[0], arg0);
+        EXPECT_EQ(ops[1], arg0);
+    }
+
+    // Then `kDepth` (Mul_i, Add_i) pairs at positions [2..], deepest-first. The
+    // BYTE-IDENTITY guard: each Add_i's LHS is the previous spine result and its
+    // RHS is `Mul_i`, the instruction IMMEDIATELY before it (left-to-right eval:
+    // LHS spine already emitted, then this level's RHS Mul, then the Add). A
+    // RHS-before-LHS build would move every Mul ahead of the spine → this fails.
+    MirInstId prevSpine = leafMul;
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        MirInstId const mulI = m.blockInstAt(entry, 2u + 2u * i);
+        MirInstId const addI = m.blockInstAt(entry, 3u + 2u * i);
+        EXPECT_EQ(m.instOpcode(mulI), MirOpcode::Mul) << "RHS Mul at level " << i;
+        EXPECT_EQ(m.instOpcode(addI), MirOpcode::Add) << "Add at level " << i;
+        auto ops = m.instOperands(addI);
+        ASSERT_EQ(ops.size(), 2u);
+        EXPECT_EQ(ops[0], prevSpine)
+            << "Add[" << i << "] lhs is the deeper spine result";
+        EXPECT_EQ(ops[1], mulI)
+            << "Add[" << i << "] rhs is its OWN `a*a`, emitted immediately before "
+               "it (left-to-right operand order — red on a RHS-first build)";
+        prevSpine = addI;
+    }
+
+    // Return(outermost Add).
+    MirInstId const ret = m.blockInstAt(entry, 2u * kDepth + 2u);
+    EXPECT_EQ(m.instOpcode(ret), MirOpcode::Return);
+    {
+        auto ops = m.instOperands(ret);
+        ASSERT_EQ(ops.size(), 1u);
+        EXPECT_EQ(ops[0], prevSpine) << "Return takes the outermost Add";
+    }
+        });  // runOnLargeStack
+}
+
+// SF-4 companion: a DEEPLY-nested UnaryOp chain `-(-(-(…-a)))` lowers via the
+// single-child straight-line arm. Pins that the body is exactly `Arg0` followed
+// by kDepth `Neg`s (deepest-first), each taking the previous result, then Return.
+// Same byte-identity correctness guard as the BinaryOp pin for the 1-child frame
+// shape; the flat/host-stack witness lives in the corpus (see the BinaryOp pin's
+// WITNESS SPLIT note). Build/lower/teardown run on the 64 MiB worker so the deep
+// HIR tree's orthogonal per-node teardown recursion does not depend on the host
+// main-stack size (stock MSVC Debug = 1 MiB).
+TEST(MirLoweringCSubset, IterativeDeepUnaryChainLowersFlatAndByteIdentical) {
+    constexpr std::uint32_t kDepth    = 4000;  // # of Neg nodes
+    constexpr std::uint32_t kParamSym = 1;
+
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
+
+    HirBuilder b{"c-subset"};
+    HirNodeId const param = b.makeVarDecl(i32, kParamSym);
+    HirNodeId cur = b.makeRef(i32, kParamSym);
+    for (std::uint32_t i = 0; i < kDepth; ++i)
+        cur = b.makeUnaryOp(HirOpKind::Neg, cur, i32);
+    HirNodeId const body = b.makeBlock(std::array{b.makeReturn(cur)});
+    HirNodeId const fn   = b.makeFunction(fnTy, /*sym=*/7, std::array{param}, body);
+    HirNodeId const root = b.makeModule(std::array{fn});
+    Hir hir = std::move(b).finish(root);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
+                             MirLoweringConfig{});
+    ASSERT_TRUE(result.ok)
+        << "deep UnaryOp chain must lower clean: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Mir const& m = result.mir;
+    MirFuncId const f = m.funcAt(0);
+    MirBlockId const entry = m.funcEntry(f);
+    ASSERT_EQ(m.blockInstCount(entry), kDepth + 2u);
+    MirInstId const arg0 = m.blockInstAt(entry, 0);
+    EXPECT_EQ(m.instOpcode(arg0), MirOpcode::Arg);
+
+    MirInstId prev = arg0;
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        MirInstId const neg = m.blockInstAt(entry, 1u + i);
+        EXPECT_EQ(m.instOpcode(neg), MirOpcode::Neg);
+        auto ops = m.instOperands(neg);
+        ASSERT_EQ(ops.size(), 1u);
+        EXPECT_EQ(ops[0], prev) << "Neg[" << i << "] takes the deeper result";
+        prev = neg;
+    }
+    MirInstId const ret = m.blockInstAt(entry, kDepth + 1u);
+    EXPECT_EQ(m.instOpcode(ret), MirOpcode::Return);
+    EXPECT_EQ(m.instOperands(ret)[0], prev);
+        });  // runOnLargeStack
+}
+
+// ─── Plan 24 Stage 4-address — iterative HIR→MIR by-ADDRESS driver ──────────
+//
+// SF-4 differential pin for the {Address} half: a DEEPLY-nested storage-array
+// subscript chain `a[0][0][0]…[0]` (the lvalue ADDRESS axis — each level's base
+// is an ARRAY, so each recurses into the base's lvalue ADDRESS, the deep axis
+// `lowerLvalueAddress` now flattens onto the shared work-stack). It must produce
+// the EXACT SAME post-order MIR the recursive lowerer would.
+//
+// The array element is `char` (stride 1), so `scaleIndexToBytes` emits NO Mul —
+// each subscript `0` is a single `Const`, and each level emits exactly one
+// `Gep`. Emission order (proven identical iterative-vs-recursive): every level's
+// subscript `Const` is emitted BEFORE recursing into the base (the recursive arm
+// lowers `idx = lowerExpr(kids[1])` BEFORE `base = lowerLvalueAddress(kids[0])`,
+// and the iterative IndexAddr frame does phase-0 subscript before phase-1 base),
+// so the body is: the array Alloca, then kDepth subscript `Const`s OUTERMOST-
+// first, then kDepth `Gep`s INNERMOST-first (each `Gep[i]` bases on `Gep[i-1]`,
+// `Gep[0]` on the Alloca), then the `Load` of the char element, then `Return`.
+//
+// WITNESS SPLIT — the flat/host-stack-overflow witness (that `lowerLvalueAddress`
+// is an O(1)-host-stack work-stack rather than recursion) lives in the CORPUS
+// example `deep_lvalue_chain` (and the upcoming Stage-7 e2e), which lowers a deep
+// lvalue chain through the real pipeline and would crash if the {Address} axis
+// recursed. THIS unit pin asserts the orthogonal half: byte-identity MIR
+// correctness (the Gep backbone shape + stride-1 no-Mul fast path) at depth.
+// Build/lower/teardown run on the project's 64 MiB worker (callOnLargeStack)
+// exactly as the production driver lowers — so neither the deep array-type
+// `computeLayout` recursion (one frame per nested dimension, plan-24 family C-2
+// "type-node recursion, OUT of scope") NOR the deep HIR tree's per-node teardown
+// depends on the host's small main-stack budget (a stock MSVC Debug main stack
+// is 1 MiB — too small for those orthogonal recursions at this depth; the worker
+// removes that artifact while leaving the asserted MIR shape unchanged).
+//
+// RED-ON-REORDER (the byte-identity guard): the pin walks the `Gep` backbone and
+// asserts `Gep[i].base == Gep[i-1]` (innermost-first) AND that the `Gep` count
+// equals kDepth with NO Mul anywhere (the stride-1 fast path). A frame that
+// lowered the base BEFORE the subscript, or that scaled a stride-1 index, would
+// perturb the Const/Gep interleave or inject a Mul → red.
+//
+// Synthetic (SF-4): the parser's 256 maxExpressionDepth cap forbids a 1500-deep
+// subscript in source, so the deep input is built via the public `HirBuilder`.
+TEST(MirLoweringCSubset, IterativeDeepIndexAddressChainLowersFlatAndByteIdentical) {
+    constexpr std::uint32_t kDepth    = 1500;  // # of subscript levels (Index nodes)
+    constexpr std::uint32_t kArraySym = 1;
+
+    // Build the nested array types + deep subscript chain, lower it, and assert
+    // — ALL on the 64 MiB worker (kDeepRecursionStackBytes), mirroring how
+    // Program::compileFiles lowers a CU. The orthogonal per-dimension
+    // `computeLayout` recursion (~1500 frames here) and the deep HIR tree's
+    // teardown both run on the worker, off the host's small main stack.
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const ch   = ti.primitive(TypeKind::Char);
+    TypeId const fnTy = ti.fnSig(std::array<TypeId, 0>{}, i32, CallConv::CcSysV);
+
+    // Nested array types: T0 = char, T_{k} = T_{k-1}[1]. The local is typed T_N
+    // (the full kDepth-dimensional `char[1][1]…[1]`); each `[0]` peels one
+    // dimension, the innermost yielding the `char` element.
+    std::vector<TypeId> dim(kDepth + 1);
+    dim[0] = ch;
+    for (std::uint32_t k = 1; k <= kDepth; ++k) dim[k] = ti.array(dim[k - 1], 1);
+
+    HirLiteralPool pool;
+    // ONE pooled `0` int literal — every subscript Index reuses its index
+    // (HIR Literal nodes carry the pool index as payload; the value is shared,
+    // the emitted MIR `Const` per level is fresh as the recursive form emits).
+    std::uint32_t const zeroLit =
+        pool.add(HirLiteralValue{.value = std::int64_t{0}, .core = TypeKind::I32});
+
+    HirBuilder b{"c-subset"};
+    // `char a[1]…[1];` — an addressable array local (its Alloca is the chain base).
+    HirNodeId const decl = b.makeVarDecl(dim[kDepth], kArraySym);
+    // Build `a[0][0]…[0]` outermost-last: base `Ref(a):T_N`, then peel a
+    // dimension per level, the level-k Index typed T_{N-1-…} = dim[kDepth-1-i].
+    HirNodeId cur = b.makeRef(dim[kDepth], kArraySym);
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        HirNodeId const idx0 = b.makeLiteral(i32, zeroLit);
+        cur = b.makeIndex(cur, idx0, /*elemType=*/dim[kDepth - 1 - i]);
+    }
+    // The fully-subscripted lvalue is read by value (`return a[0]…[0];`): the
+    // MemberAccess/Index value arm routes the deep chain through
+    // lowerLvalueAddress, then Loads the char element.
+    HirNodeId const body =
+        b.makeBlock(std::array{decl, b.makeReturn(cur)});
+    HirNodeId const fn   = b.makeFunction(fnTy, /*sym=*/7, std::array<HirNodeId, 0>{}, body);
+    HirNodeId const root = b.makeModule(std::array{fn});
+    Hir hir = std::move(b).finish(root);
+
+    // Thread the x86_64 aggregate layout so array stride/size resolve (mirrors
+    // lowerCSubset). A char[1]…[1] is 1 byte; stride at every level is 1.
+    MirLoweringConfig mirCfg;
+    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
+        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+    }
+
+    DiagnosticReporter rep;
+    // NOTE: lowers HIR→MIR on THIS (main) stack — the flat-property witness.
+    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr, mirCfg);
+    ASSERT_TRUE(result.ok)
+        << "deep storage-Index address chain must lower clean: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Mir const& m = result.mir;
+    MirFuncId const f = m.funcAt(0);
+    MirBlockId const entry = m.funcEntry(f);
+    // Body = Alloca + kDepth subscript Consts + kDepth Geps + Load + Return.
+    ASSERT_EQ(m.blockInstCount(entry), 2u * kDepth + 3u);
+
+    MirInstId const alloca = m.blockInstAt(entry, 0);
+    EXPECT_EQ(m.instOpcode(alloca), MirOpcode::Alloca)
+        << "the array local's storage slot is the chain base";
+
+    // kDepth subscript Consts at [1..kDepth], all value 0 (outermost-first — the
+    // recursive arm lowers each level's subscript before recursing into its base,
+    // and stride-1 `char` emits NO Mul, so these are contiguous).
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        MirInstId const c = m.blockInstAt(entry, 1u + i);
+        ASSERT_EQ(m.instOpcode(c), MirOpcode::Const)
+            << "subscript Const at level " << i << " (no Mul: char stride 1)";
+        auto const& lit = m.literalValue(m.constLiteralIndex(c));
+        EXPECT_EQ(std::get<std::int64_t>(lit.value), 0);
+    }
+
+    // kDepth Geps at [kDepth+1 .. 2*kDepth], INNERMOST-first: Gep[0] bases on the
+    // Alloca, Gep[i] on Gep[i-1] (the deepest-base-first composition — red if a
+    // frame lowered the base before the subscript or perturbed the chain).
+    MirInstId prevBase = alloca;
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        MirInstId const g = m.blockInstAt(entry, 1u + kDepth + i);
+        ASSERT_EQ(m.instOpcode(g), MirOpcode::Gep) << "Gep at chain level " << i;
+        auto ops = m.instOperands(g);
+        ASSERT_EQ(ops.size(), 2u)
+            << "storage-array Gep is 2-op [base, byteIndex]";
+        EXPECT_EQ(ops[0], prevBase)
+            << "Gep[" << i << "] bases on the deeper address (Alloca then prior Gep)";
+        prevBase = g;
+    }
+    // No Mul anywhere — the stride-1 fast path (a regression scaling the index
+    // would inject one and shift every offset above).
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k)
+        EXPECT_NE(m.instOpcode(m.blockInstAt(entry, k)), MirOpcode::Mul)
+            << "char (stride 1) indexing must NOT emit a scaling Mul";
+
+    // Load(outermost Gep) then Return(load).
+    MirInstId const load = m.blockInstAt(entry, 2u * kDepth + 1u);
+    EXPECT_EQ(m.instOpcode(load), MirOpcode::Load);
+    EXPECT_EQ(m.instOperands(load)[0], prevBase)
+        << "the char element is Loaded through the outermost Gep";
+    MirInstId const ret = m.blockInstAt(entry, 2u * kDepth + 2u);
+    EXPECT_EQ(m.instOpcode(ret), MirOpcode::Return);
+    EXPECT_EQ(m.instOperands(ret)[0], load);
+        });  // runOnLargeStack
+}
+
+// ─── Plan 24 Stage 4-cfg — iterative HIR→MIR control-flow VALUE driver ──────
+//
+// SF-4 differential pin for the CFG-value half: a DEEPLY right-nested ternary
+// chain `a ? b : (c ? d : (e ? f : … ))` (each level's ELSE arm is the next
+// ternary, so the recursion goes one frame deeper per level). The Ternary value
+// arm now flattens onto the shared work-stack — each level is a 4-phase frame
+// that INTERLEAVES createBlock / addCondBr / addBr / beginBlock / addPhi with
+// its cond/then/else sub-lowerings. This pin asserts the EXACT thing a phase
+// bug corrupts: the monotonic BLOCK-ID creation sequence AND each join phi's
+// PREDECESSOR-block ids in INCOMING ORDER.
+//
+// Block-creation order (entry == block 0; createBlock id == creation order, the
+// single-chokepoint monotonic invariant): the lowering is depth-first leftmost,
+// and each ternary mints then→else→join AFTER its cond is lowered and BEFORE its
+// then/else are. So level i (outermost == 0) mints thenBB=block(3i+1),
+// elseBB=block(3i+2), joinBB=block(3i+3); the innermost level is i=kDepth-1.
+//
+// Each level's join phi predecessor order (the byte-identity guard — a swapped
+// incoming or a wrong insertion-block switch flips these):
+//   incoming[0].pred == level i's thenBB == block(3i+1)   (the THEN arm)
+//   incoming[1].pred == (i < kDepth-1) ? level (i+1)'s joinBB == block(3i+6)
+//                                      : level i's elseBB   == block(3i+2)
+// i.e. an OUTER level's else-incoming arrives from the NESTED ternary's JOIN
+// (where the inner phi lives, the open block after the inner diamond closes),
+// while the INNERMOST level's else-incoming arrives from its own elseBB. A
+// phase machine that captured `elsePred` from the wrong block, minted blocks in
+// the wrong order, or swapped the phi incomings would fail these exact asserts.
+//
+// WITNESS SPLIT — the flat/host-stack-overflow witness (that the Ternary value
+// arm is an O(1)-host-stack work-stack, not recursion) lives in the CORPUS
+// example `deep_ternary_mir`, which lowers a deep ?: chain through the real
+// pipeline and would crash if the CFG-value axis recursed. THIS unit pin asserts
+// the orthogonal half: byte-identity of the diamond/phi backbone at depth.
+// Build/lower/teardown run on the 64 MiB worker (kDeepRecursionStackBytes) so
+// neither the deep HIR-tree teardown nor any orthogonal recursion depends on the
+// host's small main-stack budget (stock MSVC Debug main stack = 1 MiB).
+//
+// Synthetic (SF-4): the parser's 256 maxExpressionDepth cap forbids a 1000-deep
+// ternary in source, so the deep input is built via the public `HirBuilder`.
+TEST(MirLoweringCSubset, IterativeDeepTernaryChainLowersFlatAndByteIdentical) {
+    constexpr std::uint32_t kDepth = 1000;  // # of nested ternary levels
+
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    // `int f(int a, int b)` — `a` is the condition value (Arg 0), `b` the arm
+    // value (Arg 1). Both are pure-SSA Args (no emitted instruction), so each
+    // ternary level's cond/then/else are the same two Args; the diamond/phi
+    // scaffolding is the ONLY per-level MIR — exactly what we pin.
+    TypeId const fnTy = ti.fnSig(std::array{i32, i32}, i32, CallConv::CcSysV);
+
+    HirBuilder b{"c-subset"};
+    HirNodeId const pa = b.makeVarDecl(i32, /*sym=*/1);
+    HirNodeId const pb = b.makeVarDecl(i32, /*sym=*/2);
+    auto refA = [&] { return b.makeRef(i32, /*sym=*/1); };
+    auto refB = [&] { return b.makeRef(i32, /*sym=*/2); };
+    // Build right-nested `a ? b : (a ? b : ( … : b))` innermost-first. The
+    // innermost else is a plain `b`; each outer level wraps the prior as its
+    // ELSE arm, so the nesting (and the recursion it would otherwise cost) grows
+    // down the ELSE spine.
+    HirNodeId cur = refB();                                   // innermost else
+    for (std::uint32_t i = 0; i < kDepth; ++i)
+        cur = b.makeTernary(refA(), refB(), cur, i32);
+    HirNodeId const body = b.makeBlock(std::array{b.makeReturn(cur)});
+    HirNodeId const fn   =
+        b.makeFunction(fnTy, /*sym=*/7, std::array{pa, pb}, body);
+    HirNodeId const root = b.makeModule(std::array{fn});
+    Hir hir = std::move(b).finish(root);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
+                             MirLoweringConfig{});
+    ASSERT_TRUE(result.ok)
+        << "deep ternary chain must lower clean: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Mir const& m = result.mir;
+    MirFuncId const f = m.funcAt(0);
+    // entry + 3 blocks (then/else/join) per ternary level.
+    ASSERT_EQ(m.funcBlockCount(f), 3u * kDepth + 1u);
+
+    // Walk every level and assert the diamond markers + the join phi's exact
+    // predecessor-block ids in incoming order (the precise thing a phase bug
+    // corrupts). Block index == creation order == id (single-chokepoint
+    // monotonic), so `funcBlockAt(f, 3i+k)` resolves level i's then/else/join.
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        MirBlockId const thenBB = m.funcBlockAt(f, 3u * i + 1u);
+        MirBlockId const elseBB = m.funcBlockAt(f, 3u * i + 2u);
+        MirBlockId const joinBB = m.funcBlockAt(f, 3u * i + 3u);
+        EXPECT_EQ(m.blockMarker(thenBB), StructCfMarker::IfThen) << "level " << i;
+        EXPECT_EQ(m.blockMarker(elseBB), StructCfMarker::IfElse) << "level " << i;
+        EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::IfJoin) << "level " << i;
+
+        // The join's first instruction is the 2-incoming phi.
+        MirInstId const phi = m.blockInstAt(joinBB, 0);
+        ASSERT_EQ(m.instOpcode(phi), MirOpcode::Phi) << "level " << i;
+        auto inc = m.phiIncomings(phi);
+        ASSERT_EQ(inc.size(), 2u) << "level " << i;
+        // incoming[0] is the THEN arm (predecessor == this level's thenBB).
+        EXPECT_EQ(inc[0].pred, thenBB)
+            << "level " << i << " phi incoming[0] must arrive from the THEN block";
+        // incoming[1] is the ELSE arm: an outer level's else-value is the NESTED
+        // ternary's result, arriving from the nested level's JOIN block; the
+        // innermost level's else-value is a plain `b`, arriving from its elseBB.
+        MirBlockId const expectedElsePred =
+            (i + 1u < kDepth) ? m.funcBlockAt(f, 3u * (i + 1u) + 3u)  // inner join
+                              : elseBB;                                // own else
+        EXPECT_EQ(inc[1].pred, expectedElsePred)
+            << "level " << i << " phi incoming[1] must arrive from "
+            << (i + 1u < kDepth ? "the NESTED ternary's JOIN" : "its own ELSE")
+            << " block (predecessor order then-then-else — red on a swap)";
+    }
+
+    // The entry block's terminator is the OUTERMOST diamond's CondBr into
+    // level-0's then/else (a sanity anchor on the top of the chain).
+    MirBlockId const entry = m.funcEntry(f);
+    EXPECT_EQ(m.instOpcode(m.blockTerminator(entry)), MirOpcode::CondBr);
+    {
+        auto succs = m.blockSuccessors(entry);
+        ASSERT_EQ(succs.size(), 2u);
+        EXPECT_EQ(succs[0], m.funcBlockAt(f, 1u)) << "entry CondBr true → then[0]";
+        EXPECT_EQ(succs[1], m.funcBlockAt(f, 2u)) << "entry CondBr false → else[0]";
+    }
+        });  // runOnLargeStack
+}
+
+// SF-4 companion for the Logical (`&&`/`||`) frame: a DEEPLY LEFT-nested
+// short-circuit chain `((…((a && b) && b) …) && b)`. Left-nesting puts the deep
+// recursion on the LHS spine — which the recursive arm lowers in the CURRENT
+// block BEFORE any block switch (`lhs = lowerExpr(kids[0])`), so it is the axis
+// the work-stack flattening removes. Each level is the 3-phase Logical frame
+// (lower lhs → mint rhsBB/joinBB + CondBr + beginBlock(rhsBB) → lower rhs → phi).
+//
+// Block-creation order (entry == block 0): the innermost `&&` (lowered first,
+// level 0) mints rhsBB=block1(IfThen), joinBB=block2(IfJoin); level i mints
+// rhsBB=block(2i+1), joinBB=block(2i+2). Each level's join phi (block 2i+2):
+//   incoming[0].pred == its LHS predecessor == (i==0 ? entry : level(i-1)'s
+//                       joinBB == block(2i))   — the SHORT-CIRCUIT/lhs edge
+//   incoming[1].pred == its own rhsBB == block(2i+1)  — the rhs edge
+// (predecessor order lhs-then-rhs — red on a swap or a wrong lhsPred capture).
+// All `&&` ⇒ the conditional ARM (rhsBB) is the TRUE-edge target; the join is
+// the FALSE/short-circuit target. Built on the 64 MiB worker (deep teardown).
+TEST(MirLoweringCSubset, IterativeDeepLogicalChainLowersFlatAndByteIdentical) {
+    constexpr std::uint32_t kDepth = 1000;  // # of `&&` levels
+
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const fnTy = ti.fnSig(std::array{i32, i32}, i32, CallConv::CcSysV);
+
+    HirBuilder b{"c-subset"};
+    HirNodeId const pa = b.makeVarDecl(i32, /*sym=*/1);
+    HirNodeId const pb = b.makeVarDecl(i32, /*sym=*/2);
+    auto refA = [&] { return b.makeRef(i32, /*sym=*/1); };
+    auto refB = [&] { return b.makeRef(i32, /*sym=*/2); };
+    // Left-nested: leaf `a`, then `cur = (cur && b)` kDepth times, so the LHS
+    // spine grows down (the deep-recursion axis the frame flattens).
+    HirNodeId cur = refA();
+    for (std::uint32_t i = 0; i < kDepth; ++i)
+        cur = b.makeLogicalAnd(cur, refB(), i32);
+    HirNodeId const body = b.makeBlock(std::array{b.makeReturn(cur)});
+    HirNodeId const fn   =
+        b.makeFunction(fnTy, /*sym=*/7, std::array{pa, pb}, body);
+    HirNodeId const root = b.makeModule(std::array{fn});
+    Hir hir = std::move(b).finish(root);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
+                             MirLoweringConfig{});
+    ASSERT_TRUE(result.ok)
+        << "deep && chain must lower clean: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Mir const& m = result.mir;
+    MirFuncId const f = m.funcAt(0);
+    MirBlockId const entry = m.funcEntry(f);
+    // entry + 2 blocks (rhs/join) per `&&` level.
+    ASSERT_EQ(m.funcBlockCount(f), 2u * kDepth + 1u);
+
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        MirBlockId const rhsBB  = m.funcBlockAt(f, 2u * i + 1u);
+        MirBlockId const joinBB = m.funcBlockAt(f, 2u * i + 2u);
+        EXPECT_EQ(m.blockMarker(rhsBB),  StructCfMarker::IfThen) << "level " << i;
+        EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::IfJoin) << "level " << i;
+
+        MirInstId const phi = m.blockInstAt(joinBB, 0);
+        ASSERT_EQ(m.instOpcode(phi), MirOpcode::Phi) << "level " << i;
+        auto inc = m.phiIncomings(phi);
+        ASSERT_EQ(inc.size(), 2u) << "level " << i;
+        // incoming[0] = lhs edge: level 0 from entry, an outer level from the
+        // nested `&&`'s JOIN block (block 2i). incoming[1] = rhs edge (rhsBB).
+        MirBlockId const expectedLhsPred =
+            (i == 0u) ? entry : m.funcBlockAt(f, 2u * i);
+        EXPECT_EQ(inc[0].pred, expectedLhsPred)
+            << "level " << i << " phi incoming[0] is the lhs/short-circuit edge";
+        EXPECT_EQ(inc[1].pred, rhsBB)
+            << "level " << i << " phi incoming[1] is the rhs edge (lhs-then-rhs "
+               "order — red on a swap)";
+    }
+        });  // runOnLargeStack
+}
+
+// ─── Plan 24 (hir_to_mir Call residual) — iterative HIR→MIR Call driver ──────
+//
+// SF-4 differential pin for the flattened Call arm: a DEEPLY-nested single-arg
+// call chain `id(id(id(…id(42)…)))` (each call's sole argument is the next inner
+// call — exactly the `f(f(f(…)))` shape the residual targets). Before this change
+// the recursive `lowerExprNode` Call arm lowered each argument via
+// `lowerExpr(arg)`, re-entering `runExprDriver` once per nesting level → 800 host
+// frames deep during HIR→MIR. Now the Call frame on the driver's explicit
+// work-stack carries that descent (callee built first, then the scalar argument
+// lowered through the SAME work-stack) with FLAT O(1) host-stack cost per level.
+//
+// BYTE-IDENTITY backbone: the OUTERMOST call lowers its callee FIRST, then its
+// arg (the next inner call), recursively — so the emission order is all D callee
+// `GlobalAddr`s OUTER→INNER, then the innermost `Const(42)`, then all D `Call`s
+// INNER→OUTER (each `Call_k` takes `Call_{k+1}` — the instruction immediately
+// before it — as its single argument operand), then `Return(Call_outer)`. A
+// dropped/duplicated callee, a callee-after-arg mis-order, or a wrong arg
+// operand would break this exact shape. The WITNESS SPLIT mirrors the other
+// IterativeDeep pins: the flat/host-stack-overflow run witness lives in the
+// corpus example `deep_call_mir` (a deep call chain through the real pipeline
+// that would crash if the Call arg-lowering recursed); THIS unit pin asserts the
+// orthogonal byte-identity half. Build/lower/teardown run on the 64 MiB worker
+// (kDeepRecursionStackBytes) so the deep HIR-tree teardown does not depend on
+// the host's small main-stack budget (stock MSVC Debug main stack = 1 MiB).
+//
+// Synthetic (SF-4): the parser's 256 maxExpressionDepth cap forbids an 800-deep
+// call in source, so the deep input is built via the public `HirBuilder`.
+TEST(MirLoweringCSubset, IterativeDeepCallChainLowersFlatAndByteIdentical) {
+    constexpr std::uint32_t kDepth   = 800;  // # of nested id() calls
+    constexpr std::uint32_t kIdSym   = 1;    // the identity function's symbol
+    constexpr std::uint32_t kDeepSym = 7;    // the caller function's symbol
+
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const idTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
+    TypeId const deepTy = ti.fnSig(std::array<TypeId, 0>{}, i32, CallConv::CcSysV);
+
+    HirLiteralPool pool;
+    std::uint32_t const lit42 =
+        pool.add(HirLiteralValue{.value = std::int64_t{42}, .core = TypeKind::I32});
+
+    HirBuilder b{"c-subset"};
+    // `int id(int x) { return x; }` — its Refs resolve to Arg(0).
+    HirNodeId const idParam = b.makeVarDecl(i32, /*sym=*/2);
+    HirNodeId const idBody =
+        b.makeBlock(std::array{b.makeReturn(b.makeRef(i32, /*sym=*/2))});
+    HirNodeId const idFn =
+        b.makeFunction(idTy, kIdSym, std::array{idParam}, idBody);
+
+    // `int deep(void) { return id(id(…id(42)…)); }` — 800 nested single-arg
+    // calls around the innermost literal `42`. Each call's callee is a fresh
+    // `Ref(id):FnSig` (lowers to GlobalAddr); the arg is the inner call.
+    HirNodeId cur = b.makeLiteral(i32, lit42);          // innermost argument
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        HirNodeId const callee = b.makeRef(idTy, kIdSym);
+        cur = b.makeCall(callee, std::array{cur}, i32);
+    }
+    HirNodeId const deepBody = b.makeBlock(std::array{b.makeReturn(cur)});
+    HirNodeId const deepFn =
+        b.makeFunction(deepTy, kDeepSym, std::array<HirNodeId, 0>{}, deepBody);
+    HirNodeId const root = b.makeModule(std::array{idFn, deepFn});
+    Hir hir = std::move(b).finish(root);
+
+    DiagnosticReporter rep;
+    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
+                             MirLoweringConfig{});
+    ASSERT_TRUE(result.ok)
+        << "deep Call chain must lower clean: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Mir const& m = result.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+    // funcAt(1) is `deep` (declared second). Its single entry block holds the
+    // whole flattened chain (no CFG — pure straight-line calls).
+    MirFuncId const f = m.funcAt(1);
+    ASSERT_EQ(m.funcBlockCount(f), 1u);
+    MirBlockId const entry = m.funcEntry(f);
+
+    // Body = D GlobalAddr (callees, outer→inner) + 1 Const(42) + D Call
+    // (inner→outer) + 1 Return.
+    ASSERT_EQ(m.blockInstCount(entry), 2u * kDepth + 2u);
+
+    // The D callee GlobalAddrs come first, in OUTER→INNER order (the outermost
+    // call lowers its callee before descending into its argument).
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        MirInstId const ga = m.blockInstAt(entry, i);
+        EXPECT_EQ(m.instOpcode(ga), MirOpcode::GlobalAddr)
+            << "callee GlobalAddr at level " << i;
+    }
+    // Then the innermost argument `Const(42)`.
+    MirInstId const konst = m.blockInstAt(entry, kDepth);
+    EXPECT_EQ(m.instOpcode(konst), MirOpcode::Const);
+
+    // Then the D Calls, INNER→OUTER. Call at position kDepth+1 is the INNERMOST
+    // (`id(42)`): its callee operand is the LAST GlobalAddr (innermost) and its
+    // arg operand is the Const. Each subsequent Call takes the PREVIOUS Call as
+    // its argument (the byte-identity guard: a call-before-callee or wrong-arg
+    // build would move these). The callee operand of Call rank j (counting from
+    // the inner) is GlobalAddr[kDepth-1-j].
+    MirInstId prevValue = konst;   // innermost arg feeds the innermost call
+    for (std::uint32_t j = 0; j < kDepth; ++j) {
+        MirInstId const call = m.blockInstAt(entry, kDepth + 1u + j);
+        EXPECT_EQ(m.instOpcode(call), MirOpcode::Call) << "Call at depth-rank " << j;
+        auto ops = m.instOperands(call);
+        ASSERT_EQ(ops.size(), 2u) << "Call[" << j << "] = (callee, arg)";
+        MirInstId const expectedCallee = m.blockInstAt(entry, kDepth - 1u - j);
+        EXPECT_EQ(ops[0], expectedCallee)
+            << "Call[" << j << "] callee is its matching GlobalAddr";
+        EXPECT_EQ(ops[1], prevValue)
+            << "Call[" << j << "] arg is the next-inner call's result "
+               "(red on a callee-after-arg or dropped-call build)";
+        prevValue = call;
+    }
+
+    // Return(outermost Call).
+    MirInstId const ret = m.blockInstAt(entry, 2u * kDepth + 1u);
+    EXPECT_EQ(m.instOpcode(ret), MirOpcode::Return);
+    ASSERT_EQ(m.instOperands(ret).size(), 1u);
+    EXPECT_EQ(m.instOperands(ret)[0], prevValue) << "Return takes the outermost Call";
+        });  // runOnLargeStack
+}
+
+// ─── Plan 24 Stage 4b — iterative HIR→MIR STATEMENT driver ──────────────────
+//
+// SF-4 differential pin for the flattened control-flow STATEMENT arms (the
+// `lowerStmt` driver). A DEEPLY-nested if-chain `if(a){ if(a){ if(a){ … return
+// b; } } }` — each level's THEN body IS the next nested `if`, so the recursion
+// the recursive `lowerStmtNode` IfStmt arm would otherwise cost (`lowerStmt(
+// thenN)` once per nesting level, ~600 host frames deep during HIR→MIR) is the
+// axis the explicit `StmtFrame` work-stack flattens to FLAT O(1) host-stack cost
+// per level. (No `else`, so each level is the minimal 2-block diamond — thenBB +
+// joinBB — the crispest statement backbone to pin.)
+//
+// BYTE-IDENTITY backbone (block id == creation order == single-chokepoint
+// monotonic): entry == block 0 evaluates level 0's cond; level i's cond is
+// evaluated in level (i-1)'s thenBB. Each level i mints thenBB == block(2i+1)
+// then joinBB == block(2i+2) IN THAT ORDER, and a CondBr(cond, thenBB, joinBB).
+// So the block CONTAINING level i's cond (entry for i==0, else block 2i-1) ends
+// in a CondBr whose successors are EXACTLY {block 2i+1, block 2i+2} — a swapped
+// successor or a block minted out of order (the silent-miscompile class this
+// gate guards) moves these. The innermost thenBB (block 2N-1) holds `return b`,
+// so its terminator is Return. Total blocks = 2N+1.
+//
+// The WITNESS SPLIT mirrors the IterativeDeep expression pins: the flat/host-
+// stack-overflow RUN witness lives in the corpus example `deep_stmt_mir` (a deep
+// nested-control-flow program through the real pipeline that crashes if the
+// statement lowering recurses); THIS unit pin asserts the orthogonal CFG
+// byte-identity half. Build/lower/teardown run on the 64 MiB worker
+// (kDeepRecursionStackBytes) so the deep HIR-tree teardown does not depend on
+// the host's small main-stack budget (stock MSVC Debug main stack = 1 MiB).
+//
+// Synthetic (SF-4): the parser's 256 maxStatementDepth cap forbids a 600-deep
+// nest in source, so the deep input is built via the public `HirBuilder`.
+TEST(MirLoweringCSubset, IterativeDeepIfNestLowersFlatAndByteIdentical) {
+    constexpr std::uint32_t kDepth = 600;  // # of nested `if` levels
+
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    // `int f(int a, int b)` — `a` (Arg 0) is every level's condition, `b`
+    // (Arg 1) the innermost return value. Both are pure-SSA Args (no emitted
+    // instruction), so the diamond scaffolding is the ONLY per-level MIR.
+    TypeId const fnTy = ti.fnSig(std::array{i32, i32}, i32, CallConv::CcSysV);
+
+    HirBuilder b{"c-subset"};
+    HirNodeId const pa = b.makeVarDecl(i32, /*sym=*/1);
+    HirNodeId const pb = b.makeVarDecl(i32, /*sym=*/2);
+    auto refA = [&] { return b.makeRef(i32, /*sym=*/1); };
+    // Build innermost-first: the deepest THEN is `return b`; each outer level
+    // wraps the prior `if` as its (else-less) THEN statement, so the nesting
+    // grows down the THEN spine — the deep-recursion axis the frame flattens.
+    HirNodeId cur = b.makeReturn(b.makeRef(i32, /*sym=*/2));   // innermost then
+    for (std::uint32_t i = 0; i < kDepth; ++i)
+        cur = b.makeIfStmt(refA(), cur, /*elseStmt=*/std::nullopt);
+    // The function body must end in a terminator on every path; the outermost
+    // `if` falls through its join, so append a trailing `return b`.
+    HirNodeId const body = b.makeBlock(std::array{
+        cur, b.makeReturn(b.makeRef(i32, /*sym=*/2))});
+    HirNodeId const fn   =
+        b.makeFunction(fnTy, /*sym=*/7, std::array{pa, pb}, body);
+    HirNodeId const root = b.makeModule(std::array{fn});
+    Hir hir = std::move(b).finish(root);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
+                             MirLoweringConfig{});
+    ASSERT_TRUE(result.ok)
+        << "deep if nest must lower clean: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Mir const& m = result.mir;
+    MirFuncId const f = m.funcAt(0);
+    // entry + 2 blocks (then/join) per `if` level.
+    ASSERT_EQ(m.funcBlockCount(f), 2u * kDepth + 1u);
+    MirBlockId const entry = m.funcEntry(f);
+
+    // Walk every level and assert its CondBr successors are EXACTLY this level's
+    // {thenBB == 2i+1, joinBB == 2i+2}, in that order (the precise thing a phase
+    // bug — a swapped CondBr target or an out-of-order createBlock — corrupts).
+    // Block index == creation order == id, so `funcBlockAt(f, n)` resolves it.
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        // The block holding level i's cond: entry for level 0, else the PRIOR
+        // level's thenBB == block 2(i-1)+1 == 2i-1.
+        MirBlockId const condBlock =
+            (i == 0u) ? entry : m.funcBlockAt(f, 2u * i - 1u);
+        MirBlockId const thenBB = m.funcBlockAt(f, 2u * i + 1u);
+        MirBlockId const joinBB = m.funcBlockAt(f, 2u * i + 2u);
+        MirInstId const term = m.blockTerminator(condBlock);
+        ASSERT_EQ(m.instOpcode(term), MirOpcode::CondBr) << "level " << i;
+        auto succs = m.blockSuccessors(condBlock);
+        ASSERT_EQ(succs.size(), 2u) << "level " << i;
+        EXPECT_EQ(succs[0], thenBB)
+            << "level " << i << " CondBr true-edge → this level's thenBB "
+               "(red on a swapped successor or out-of-order createBlock)";
+        EXPECT_EQ(succs[1], joinBB)
+            << "level " << i << " CondBr false-edge → this level's joinBB";
+    }
+
+    // The innermost thenBB (block 2N-1) holds `return b` → Return terminator.
+    MirBlockId const innermostThen = m.funcBlockAt(f, 2u * kDepth - 1u);
+    EXPECT_EQ(m.instOpcode(m.blockTerminator(innermostThen)), MirOpcode::Return)
+        << "the deepest THEN body is `return b`";
+        });  // runOnLargeStack
 }

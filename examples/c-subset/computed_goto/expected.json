@@ -1,0 +1,35 @@
+{
+  "$comment": "D-CSUBSET-COMPUTED-GOTO runtime witness: GNU `&&label` + `goto *expr` driving a threaded-dispatch bytecode interpreter. tbl[] holds three label addresses (&&op_add5/&&op_dbl/&&op_halt -> three synthetic per-block symbols); the program {add5,dbl,add5,halt} computes ((1+5)*2)+5 = 17 -> exit 17. The dispatch is `goto *tbl[prog[pc]]` (IndirectBr with all three address-taken blocks as successors). RED-ON-DISABLE: if SimplifyCfg folded/merged an address-taken target, or an opt clone dropped an IndirectBr successor (DCE then deletes the block), or the synthetic block symbol were mis-bound, the indirect jump lands on wrong/deleted code and the exit is not 17. The `release` optimizedPipeline arm runs the shipped pipeline (which runs Inlining) over the same source — the inlining gate must REFUSE this BlockAddress/IndirectBr function (fail-safe), and the SimplifyCfg address-taken-target guard must hold under real opt.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 17,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

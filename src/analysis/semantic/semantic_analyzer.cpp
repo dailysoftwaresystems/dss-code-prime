@@ -2,6 +2,7 @@
 
 #include "analysis/compilation_unit/unit_attribute.hpp"
 #include "analysis/semantic/scope_tree.hpp"
+#include "analysis/semantic/constant_symbol_fold.hpp" // Item 1: shared enum/constant Ref->literal builder
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/symbol_table.hpp"
 #include "analysis/semantic/type_rules.hpp"
@@ -191,6 +192,13 @@ struct EngineState {
     // Pass 2's member-access resolution reads this to find the field-name's
     // scope from the LHS expression's TypeId (no type-name string lookup).
     std::unordered_map<std::uint32_t /*TypeId.v*/, ScopeId> compositeScopeByType;
+    // D-CSUBSET-FN-PROTOTYPE: function REDECLARATIONS Pass 1 merged — one
+    // {survivor, absorbed} pair per (proto→def / def→proto / proto→proto /
+    // extern→proto) merge. After Pass 1.5 resolves both records' FnSig types, a
+    // compatibility sweep compares each pair's `type` (interner TypeId equality =
+    // structural signature equality) and emits S_IncompatibleRedeclaration on a
+    // mismatch. Built in Pass 1, consumed once after Pass 1.5 (before Pass 2).
+    std::vector<std::pair<SymbolId, SymbolId>> mergedFnDecls;
 
     // Select the index bundle for `schema` before processing one of its trees.
     void activate(GrammarSchema const& schema) {
@@ -229,6 +237,32 @@ visibleChildren(Tree const& tree, NodeId parent) {
         if (!isEmptySpace(tree.flags(child))) out.push_back(child);
     }
     return out;
+}
+
+// D-CSUBSET-FN-PROTOTYPE: does the declarator NAME carry a function suffix —
+// i.e. is `nameNode` the name of a function declarator (`int f(int)` /
+// `int f(int x){…}`) rather than a function POINTER (`int (*fp)(int)`)? True
+// iff the name's DIRECT declarator (its parent) is the config's `directRule`
+// AND has a `fnSuffixRule` child. For a function pointer the suffix sits on the
+// OUTER declarator (the name's direct declarator is the inner group's, which
+// carries no suffix), so this cleanly distinguishes a prototype from a fnptr.
+// Shared by Pass 1 (proto detection) and Pass 1.5 (definition's fn-declarator
+// constraint check) so the two never diverge.
+[[nodiscard]] bool
+hasFnSuffixOnName(Tree const& tree, NodeId nameNode,
+                  DeclaratorConfig const& dc) {
+    NodeId const direct = tree.parent(nameNode);
+    if (!direct.valid() || tree.kind(direct) != NodeKind::Internal
+        || tree.rule(direct) != dc.directRule) {
+        return false;
+    }
+    for (NodeId c : visibleChildren(tree, direct)) {
+        if (tree.kind(c) == NodeKind::Internal
+            && tree.rule(c) == dc.fnSuffixRule) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Follow a path of visible-child indices from `start`. Returns
@@ -718,6 +752,56 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 return InvalidType;
             }
         }
+        // C 6.2.3 tag namespace (MF-1): a TAG reference in type position —
+        // `struct Foo` / `union Foo` / `enum Foo`, the node reached by
+        // descending into a reference rule flagged `isTagReference`. Resolve
+        // the tag identifier against the TAG namespace, NOT ordinary. WITHOUT
+        // this explicit arm the generic child-descent below would bottom out
+        // at the bare Identifier token and the Token-leaf arm would look it up
+        // ORDINARY (line ~835) — which, now that composite tags bind into the
+        // Tag namespace, would miss every tag and (worse) could resolve a
+        // same-named ORDINARY typedef as the tag's type. A miss here falls
+        // through to the generic miss path so `struct Nope x;` still emits
+        // S_UnknownType. The bind side is namespace-routed by `fieldChildren`;
+        // this is its lookup counterpart, both config-driven (no hardcoded
+        // keyword). `emitOnMiss=false` recursive calls (e.g. the pointer-base
+        // descent) keep their soft-miss semantics — the arm only RESOLVES, it
+        // does not emit.
+        {
+            auto refIt = s.idx().refByRule.find(rule.v);
+            if (refIt != s.idx().refByRule.end()
+                && cfg.references[refIt->second].isTagReference
+                && scope.valid()) {
+                auto const& ref = cfg.references[refIt->second];
+                auto rn = extractNameNode(tree, node, ref.nameMatch,
+                                          cfg.identifierToken,
+                                          cfg.bracketIdentifierToken);
+                if (!rn.name.empty()) {
+                    SymbolId const tagSym =
+                        s.scopes.lookup(scope, rn.name, SymbolNamespace::Tag);
+                    if (tagSym.valid()) {
+                        auto const& rec = s.symbols.at(tagSym);
+                        if (rec.kind == DeclarationKind::Type && rec.type.valid()) {
+                            return rec.type;
+                        }
+                    }
+                }
+                // Tag miss: fall through to the generic miss arm (below) so an
+                // undeclared `struct Nope` fails loud with S_UnknownType. Do
+                // NOT descend into the StructKeyword/Identifier children (the
+                // Identifier would resolve ORDINARY and cross the namespaces).
+                if (emitOnMiss && !specifierDiagnosed) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_UnknownType;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(node);
+                    d.actual   = std::string{tree.text(node)};
+                    s.reporter.report(std::move(d));
+                }
+                return InvalidType;
+            }
+        }
         auto kids = visibleChildren(tree, node);
         // SE-pointers (G5): count `pointerToken` children at THIS node (C
         // declarator stars: `int *p`, `int **p`) and wrap the resolved base type
@@ -855,6 +939,18 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
         // from that scope, returning the resolved symbol's init AND
         // its declaring scope so the engine carries the right
         // context into the recursive evaluation.
+        // Item 1: an inline-valued named constant (enum enumerator / shipped-
+        // descriptor constant) resolves DIRECTLY to its literal — no init-CST.
+        // Tried before resolveSymbolInit so `int a[CHAR_BIT]` / `int b[ENUM_VAL]`
+        // fold at this Pass-1.5 array-dimension stage. Shares the ONE
+        // `constantLiteralForSymbol` builder with the HIR Ref fold.
+        env.resolveSymbolValue = [&s, &tree](NodeId identTok, std::uint32_t curScopeOpaque)
+            -> std::optional<HirLiteralValue> {
+            SymbolId const sym =
+                s.scopes.lookup(ScopeId{curScopeOpaque}, tree.text(identTok));
+            if (!sym.valid()) return std::nullopt;
+            return constantLiteralForSymbol(s.symbols.at(sym), s.lattice.interner());
+        };
         env.resolveSymbolInit = [&s, &tree, cfg](NodeId identTok, std::uint32_t curScopeOpaque)
             -> std::optional<CstResolvedSymbol> {
             return resolveConstSymbolInit(s, tree, *cfg, ScopeId{curScopeOpaque},
@@ -1407,11 +1503,132 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
     return scope;
 }
 
+// D-CSUBSET-BLOCK-SCOPE-PROTOTYPE: the FILE (translation-unit) scope of `tree` —
+// the scope whose anchor IS this tree's root node. Each tree's Pass 1 runs under
+// a per-tree root scope (`pushScope(builtinScope, tree.root(), tree.id())`), so
+// walking the parent chain from any interior scope until the anchor equals the
+// tree root reaches that file scope. Used to RE-HOME a block-scope function
+// declaration onto the file scope (C 6.2.2p4 — a no-linkage block-scope
+// declaration of a function refers to the file-scope function with external
+// linkage). Returns `scope` unchanged if it is already the file scope, or if the
+// chain is exhausted without a match (a malformed scope graph — fail-safe: bind
+// where we are, the prior behavior).
+[[nodiscard]] ScopeId fileScopeOf(EngineState const& s, Tree const& tree,
+                                  ScopeId scope) {
+    auto const& scs = s.scopes.scopes();
+    NodeId const treeRoot = tree.root();
+    ScopeId cur = scope;
+    while (cur.valid() && cur.v < scs.size()) {
+        auto const& rec = scs[cur.v];
+        if (rec.tree.v == tree.id().v && rec.anchor.v == treeRoot.v) return cur;
+        cur = rec.parent;
+    }
+    return scope;
+}
+
+// D-CSUBSET-FN-PROTOTYPE + D-CSUBSET-EXTERN-DEFINITION-MERGE: resolve a same-scope
+// REDECLARATION (`prior` already bound `name` in `bindScope`; `newId` is the new
+// symbol). A redeclaration MERGES instead of colliding when both sides name the
+// SAME entity (both functions OR both objects) and are NOT both definitions. A
+// NON-DEFINING declaration — a bare prototype OR an `extern` declaration — names a
+// body/storage that lives elsewhere (or later). The cases, on whether each side is
+// non-defining:
+//   nonDefining → definition : the DEFINITION wins the binding; the non-defining
+//                 decl is absorbed (proto→def, extern→def).
+//   definition → nonDefining / nonDefining → nonDefining : a redundant declaration;
+//                 KEEP the prior binding, absorb the new one (def→proto, def→extern,
+//                 proto→proto, extern→extern, proto↔extern).
+//   definition → definition : two bodies / two storage definitions (incl. two
+//                 `int g;` tentative defs) → S_RedeclaredSymbol.
+// CATEGORY GUARD: a non-defining declaration MERGES only with a declaration of the
+// SAME declaration category — Function, Variable, Type, or Table. A function and an
+// OBJECT (Variable), a typedef (Type) and an object/function, or any future Table vs
+// object of the same name are DIFFERENT categories → a genuine collision, never a
+// merge. A signature/type mismatch on a merged pair fails loud AFTER Pass 1.5
+// (S_IncompatibleRedeclaration) once both types resolve.
+//
+// The category is the PRECISE DeclarationKind, with one normalization: a bare
+// prototype is minted Variable-kind + isProtoDeclaration in Pass 1 (Pass 1.5 later
+// upgrades its KIND to Function), so the lambda maps either signal — Function-kind
+// or isProtoDeclaration — to Function. Variable / Type / Table stay DISTINCT — a coarse
+// function-vs-non-function split would lump a typedef (Type) and a same-named extern
+// object (Variable) into one category and silently absorb the extern into the typedef
+// (`typedef int g; extern int g;`), losing the C 6.7p4 fail-loud.
+//
+// Shared by BOTH Pass-1 minting paths (declarator-mode and legacy positional) so a
+// proto/extern and its definition merge regardless of which path mints each — e.g.
+// c-subset's `extern` (positional) and its definition (declarator-mode topLevelDecl).
+// Both paths mint `newId` with its final `kind`/`isProtoDeclaration` BEFORE this call,
+// so the category is read directly from each record. `newNonDef` = the new decl is
+// non-defining (proto or extern).
+void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
+                                 ScopeId bindScope, std::string const& name,
+                                 NodeId nameNode, SymbolId prior, SymbolId newId,
+                                 bool newNonDef) {
+    auto& priorRec = s.symbols.at(prior);
+    bool const priorNonDef =
+        priorRec.isProtoDeclaration || priorRec.isExternDeclaration;
+    // Precise declaration category: a proto (kind Variable + isProtoDeclaration,
+    // pre-upgrade) counts as Function; Variable / Type / Table stay distinct.
+    auto category = [](SymbolRecord const& r) {
+        if (r.kind == DeclarationKind::Function || r.isProtoDeclaration)
+            return DeclarationKind::Function;
+        return r.kind;
+    };
+    bool const sameCategory = category(priorRec) == category(s.symbols.at(newId));
+    bool const bothDefinitions = !priorNonDef && !newNonDef;
+    if (sameCategory && !bothDefinitions) {
+        if (priorNonDef && !newNonDef) {
+            // nonDefining → definition: the DEFINITION wins the binding; the prior
+            // non-defining decl is absorbed (a proto/extern declarator emits no HIR
+            // node — see the topLevelDecl proto-skip and lowerExternDecl's
+            // absorbed-skip).
+            s.scopes.injectBinding(bindScope, name, newId);
+            priorRec.isAbsorbedProto = true;
+            s.nodeToSymbol.set(nameNode, newId);
+            s.mergedFnDecls.push_back({newId, prior});
+        } else {
+            // definition → nonDefining / nonDefining → nonDefining: a redundant
+            // declaration. Keep the PRIOR binding; absorb the NEW one. Bind the
+            // absorbed declarator's NAME node to its OWN record (newId), NOT the
+            // survivor — newId carries the proto/extern flag the HIR skip reads, and
+            // Pass 1.5 resolves THIS declarator's signature into newId so the post-1.5
+            // sweep compares survivor.type vs absorbed.type with BOTH valid (catches
+            // an incompatible def→proto / def→extern). Aiming at `prior` would clobber
+            // the survivor's resolved type and hide the mismatch.
+            s.symbols.at(newId).isAbsorbedProto = true;
+            s.nodeToSymbol.set(nameNode, newId);
+            s.mergedFnDecls.push_back({prior, newId});
+        }
+    } else {
+        // Two real definitions (incl. two tentative object defs), or a cross-category
+        // (function vs object) redeclaration — a genuine collision.
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_RedeclaredSymbol;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(nameNode);
+        d.actual   = name;
+        if (priorRec.tree.v == tree.id().v) {
+            d.related.push_back(RelatedLocation{
+                tree.source().id(),
+                tree.span(priorRec.declNode),
+                "previously declared here",
+            });
+        }
+        s.reporter.report(std::move(d));
+    }
+}
+
 // ── Pass 1: pre-order — mint decls + push/pop scopes + const marking ───────
-void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-           NodeId node, ScopeId current) {
-    if (!node.valid()) return;
-    if (isEmptySpace(tree.flags(node))) return;
+// pass1 PER-NODE work for ONE node — extracted for the iterative driver below
+// (D-PARSE-DEEP-NEST-RECURSION-MEMORY plan 24 Stage 2). PRE-order: resolves this
+// node's child scope `here` (a pushScope for a scope-rule node, else `current`)
+// and binds its declarations; the driver then walks the children under the
+// returned `here`. Byte-identical to the prior pre-child body of `pass1`.
+[[nodiscard]] ScopeId
+pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+          NodeId node, ScopeId current) {
     auto const k = tree.kind(node);
 
     ScopeId here = current;
@@ -1501,7 +1718,34 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         }
                         std::string name{tree.text(nameNode)};
                         if (name.empty()) continue;
-                        ScopeId const bindScope = current;
+                        // D-CSUBSET-FN-PROTOTYPE: a bare function prototype is a
+                        // Variable-kind declarator (the kindByChild definition
+                        // discriminator did NOT match — no body) whose NAME
+                        // carries a function suffix. A fnptr (`int (*fp)(int)`)
+                        // is NOT one (its suffix sits on the outer declarator).
+                        // Computed BEFORE the bind scope is chosen because a
+                        // prototype re-homes onto the file scope (below).
+                        bool const isProto =
+                            (effectiveKind == DeclarationKind::Variable)
+                            && nameNode.valid()
+                            && hasFnSuffixOnName(tree, nameNode, *cfg.declarators);
+                        // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE: a block-scope function
+                        // declaration (`int f(int);` inside a body) has EXTERNAL
+                        // linkage and REFERS to the file-scope function of the
+                        // same name (C 6.2.2p4 / 6.7.6.3), it does NOT introduce a
+                        // distinct block-local function. Re-home the prototype onto
+                        // the file (translation-unit) scope so the existing
+                        // file-scope proto/definition MERGE (the 4-case direction
+                        // table below) resolves it — a later/earlier file-scope
+                        // definition WINS the binding and the block proto is
+                        // absorbed (a call resolves to the definition). When there
+                        // is NO file-scope definition the re-homed proto is still
+                        // an unabsorbed file-scope declaration → a call fails loud
+                        // at HIR→MIR exactly like a file-scope undefined proto
+                        // (consistent fail-loud, not a block-local shadow). A
+                        // non-proto declarator binds in `current` unchanged.
+                        ScopeId bindScope = current;
+                        if (isProto) bindScope = fileScopeOf(s, tree, current);
                         SymbolRecord rec;
                         rec.name         = name;
                         rec.scope        = bindScope;
@@ -1509,7 +1753,17 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         rec.declRuleNode = node;
                         rec.tree         = tree.id();
                         rec.kind         = effectiveKind;
-                        rec.warnIfUnused = decl.warnIfUnused;
+                        // A function PROTOTYPE is a function DECLARATION, never an
+                        // "unused variable" — suppress warnIfUnused for it. This
+                        // matters for a BLOCK-scope proto (D-CSUBSET-BLOCK-SCOPE-
+                        // PROTOTYPE), whose local declaration rule sets
+                        // warnIfUnused; re-homed to file scope and absorbed by the
+                        // definition (its own use-set stays empty — the call
+                        // resolves to the definition), it would otherwise emit a
+                        // spurious S_UnusedVariable. A file-scope proto is
+                        // unaffected (topLevelDecl already declares warnIfUnused
+                        // false), so this is byte-identical there.
+                        rec.warnIfUnused = decl.warnIfUnused && !isProto;
                         rec.fieldIndex   = static_cast<std::uint32_t>(
                             s.scopes.scopes()[bindScope.v].bindings.size());
                         if (decl.constMarker.has_value()) {
@@ -1517,25 +1771,24 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                 tree, node, *decl.constMarker,
                                 &s.idx().declByRule);
                         }
+                        rec.isProtoDeclaration = isProto;
+                        // D-CSUBSET-EXTERN-DEFINITION-MERGE: a non-defining
+                        // declaration (c-subset's `extern`) — config-driven, no
+                        // rule-name identity. Like a prototype it is a non-defining
+                        // declaration that MERGES with an in-TU definition.
+                        bool const isExtern = decl.nonDefiningDeclaration;
+                        rec.isExternDeclaration = isExtern;
                         SymbolId const newId = s.symbols.mint(rec);
                         SymbolId const prior =
                             s.scopes.bind(bindScope, name, newId);
                         if (prior.valid()) {
-                            ParseDiagnostic d;
-                            d.code     = DiagnosticCode::S_RedeclaredSymbol;
-                            d.severity = DiagnosticSeverity::Error;
-                            d.buffer   = tree.source().id();
-                            d.span     = tree.span(nameNode);
-                            d.actual   = name;
-                            auto const& priorRec = s.symbols.at(prior);
-                            if (priorRec.tree.v == tree.id().v) {
-                                d.related.push_back(RelatedLocation{
-                                    tree.source().id(),
-                                    tree.span(priorRec.declNode),
-                                    "previously declared here",
-                                });
-                            }
-                            s.reporter.report(std::move(d));
+                            // The new decl's category (Function via Function-kind or a
+                            // bare proto, else Variable/Type/Table) is read from its
+                            // record inside the helper. A real function definition is
+                            // Function-kind and non-`isExtern`.
+                            mergeOrCollideRedeclaration(
+                                s, tree, bindScope, name, nameNode, prior, newId,
+                                /*newNonDef=*/isProto || isExtern);
                         } else {
                             s.nodeToSymbol.set(nameNode, newId);
                         }
@@ -1628,24 +1881,59 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             &s.idx().declByRule);
                     }
 
+                    // D-CSUBSET-EXTERN-DEFINITION-MERGE: c-subset's `extern`
+                    // declaration mints through THIS legacy positional path (it
+                    // declares a positional `name`, not declarator-mode). Mark it
+                    // non-defining so it merges with an in-TU definition of the same
+                    // name (handled below via the shared mergeOrCollideRedeclaration).
+                    rec.isExternDeclaration = decl.nonDefiningDeclaration;
+
                     SymbolId const newId = s.symbols.mint(rec);
-                    SymbolId const prior = s.scopes.bind(bindScope, resolved.name, newId);
+                    // C 6.2.3 tag namespace: a composite-type declaration
+                    // (carries `fieldChildren`, the same gate that floats the
+                    // tag past the declarator-dominator scope) binds its tag
+                    // into the TAG namespace; a plain typedef-name / object /
+                    // function binds Ordinary. This is the ONLY tag-BIND site;
+                    // it lets `typedef struct Pair {…} Pair;` mint the tag and
+                    // the alias under the same name without collision.
+                    SymbolNamespace const bindNs =
+                        decl.fieldChildren.has_value()
+                            ? SymbolNamespace::Tag
+                            : SymbolNamespace::Ordinary;
+                    SymbolId const prior =
+                        s.scopes.bind(bindScope, resolved.name, newId, bindNs);
                     if (prior.valid()) {
-                        ParseDiagnostic d;
-                        d.code     = DiagnosticCode::S_RedeclaredSymbol;
-                        d.severity = DiagnosticSeverity::Error;
-                        d.buffer   = tree.source().id();
-                        d.span     = tree.span(resolved.node);
-                        d.actual   = resolved.name;
-                        auto const& priorRec = s.symbols.at(prior);
-                        if (priorRec.tree.v == tree.id().v) {
-                            d.related.push_back(RelatedLocation{
-                                tree.source().id(),
-                                tree.span(priorRec.declNode),
-                                "previously declared here",
-                            });
+                        // D-CSUBSET-EXTERN-DEFINITION-MERGE: in the ORDINARY
+                        // namespace, route a redeclaration through the shared
+                        // merge-or-collide so an `extern` minted here merges with a
+                        // definition (or another extern) — identical to the
+                        // declarator-mode path. A Variable/Type redeclaration with
+                        // neither side non-defining still collides (the helper's
+                        // bothDefinitions arm), byte-identical to the prior behavior.
+                        // The TAG namespace keeps the plain collision (tags have no
+                        // proto/extern axis).
+                        if (bindNs == SymbolNamespace::Ordinary) {
+                            mergeOrCollideRedeclaration(
+                                s, tree, bindScope, resolved.name, resolved.node,
+                                prior, newId,
+                                /*newNonDef=*/decl.nonDefiningDeclaration);
+                        } else {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_RedeclaredSymbol;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(resolved.node);
+                            d.actual   = resolved.name;
+                            auto const& priorRec = s.symbols.at(prior);
+                            if (priorRec.tree.v == tree.id().v) {
+                                d.related.push_back(RelatedLocation{
+                                    tree.source().id(),
+                                    tree.span(priorRec.declNode),
+                                    "previously declared here",
+                                });
+                            }
+                            s.reporter.report(std::move(d));
                         }
-                        s.reporter.report(std::move(d));
                     } else {
                         s.nodeToSymbol.set(resolved.node, newId);
                     }
@@ -1654,8 +1942,29 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         }
     }
 
-    for (auto const& child : tree.children(node)) {
-        pass1(s, cfg, tree, child, here);
+    return here;
+}
+
+// pass1 — iterative whole-tree PRE-ORDER walk (D-PARSE-DEEP-NEST-RECURSION-
+// MEMORY plan 24 Stage 2): an explicit heap work-stack replaces host recursion.
+// Each node: skip if invalid / empty-space, else run `pass1Node` (scope push +
+// declaration binding) and push its children under the returned scope `here`, in
+// SOURCE order. OUTPUT-IDENTICAL — pre-order scope/bind, left-to-right children.
+void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+           NodeId rootNode, ScopeId rootCurrent) {
+    std::vector<std::pair<NodeId, ScopeId>> stack;
+    stack.push_back({rootNode, rootCurrent});
+    while (!stack.empty()) {
+        // Copy the frame out BEFORE any push_back (which can realloc the stack).
+        auto const [node, current] = stack.back();
+        stack.pop_back();
+        if (!node.valid() || isEmptySpace(tree.flags(node))) continue;
+        ScopeId const here = pass1Node(s, cfg, tree, node, current);
+        // Push children so they POP in source (left-to-right) order.
+        std::span<NodeId const> const kids = tree.children(node);
+        for (std::size_t i = kids.size(); i-- > 0;) {
+            stack.push_back({kids[i], here});
+        }
     }
 }
 
@@ -1811,21 +2120,8 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             //    `int x { }` are not function declarators);
                             //  * no initializer on the init-declarator
                             //    (`int main() = 5 { }` parses; reject here).
-                            NodeId const direct = tree.parent(nameNode);
-                            bool fnSuffixOnName = false;
-                            if (direct.valid()
-                                && tree.kind(direct) == NodeKind::Internal
-                                && tree.rule(direct)
-                                       == cfg.declarators->directRule) {
-                                for (NodeId c : visibleChildren(tree, direct)) {
-                                    if (tree.kind(c) == NodeKind::Internal
-                                        && tree.rule(c)
-                                               == cfg.declarators->fnSuffixRule) {
-                                        fnSuffixOnName = true;
-                                        break;
-                                    }
-                                }
-                            }
+                            bool const fnSuffixOnName = hasFnSuffixOnName(
+                                tree, nameNode, *cfg.declarators);
                             if (!fnSuffixOnName) {
                                 emitInvalidFn(nameNode,
                                               "a function definition's "
@@ -1862,16 +2158,27 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                    && s.symbols.at(sym).kind
                                           == DeclarationKind::Variable) {
                             // A bare function-TYPED object declaration — a C
-                            // prototype (`int f();`). Declaration-without-
-                            // definition is NOT wired (externs carry that
-                            // role); a silent FnSig-typed data global would
-                            // miscompile, so fail loud. Pinned residue:
-                            // D-CSUBSET-FN-PROTOTYPE (stage 2b registry).
-                            emitInvalidFn(nameNode,
-                                          "function prototype declarations "
-                                          "are not supported here; use "
-                                          "'extern' for cross-unit "
-                                          "declarations");
+                            // function PROTOTYPE (`int f(int);`). D-CSUBSET-FN-
+                            // PROTOTYPE: a prototype IS a function declaration —
+                            // it is callable (forward / mutual recursion) and a
+                            // later definition MERGES with it (Pass 1 recorded
+                            // the merge). UPGRADE its kind to Function so Pass 2
+                            // resolves a call through it, and emit NOTHING. A
+                            // function-TYPED Variable that is NOT a prototype
+                            // (`isProtoDeclaration` false — e.g. a malformed
+                            // function-pointer form whose suffix landed on the
+                            // name) still fails loud: a silent FnSig-typed data
+                            // global would miscompile.
+                            if (s.symbols.at(sym).isProtoDeclaration) {
+                                s.symbols.at(sym).kind =
+                                    DeclarationKind::Function;
+                            } else {
+                                emitInvalidFn(nameNode,
+                                              "function prototype declarations "
+                                              "are not supported here; use "
+                                              "'extern' for cross-unit "
+                                              "declarations");
+                            }
                         }
                     }
                 }
@@ -2340,28 +2647,16 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
 // `loopDepth` (GAP C) is the count of enclosing `loopRules` subtrees the
 // walk is currently inside; a `loopControls` node at depth 0 is outside
 // any loop and emits S_ControlOutsideLoop.
-void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-           NodeId node, ScopeId current, int loopDepth) {
-    if (!node.valid()) return;
-    if (isEmptySpace(tree.flags(node))) return;
+// pass2 POST-CHILD work for ONE node — extracted for the iterative driver below
+// (D-PARSE-DEEP-NEST-RECURSION-MEMORY plan 24 Stage 2). Runs AFTER all
+// descendants are walked; `here` is this node's OWN resolved scope and
+// `loopDepth` its OWN enclosing-loop depth (both threaded by the driver). A
+// `return;` here ends THIS node's post-work and the driver loop continues —
+// exactly as the recursive `return;` did. The body is byte-identical to the
+// prior post-child portion of `pass2`.
+void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+               NodeId node, ScopeId here, int loopDepth) {
     auto const k = tree.kind(node);
-    ScopeId here = current;
-
-    if (k == NodeKind::Internal && s.idx().scopeByRule.contains(tree.rule(node).v)) {
-        here = childScopeFor(s, tree, node, current);
-    }
-
-    // GAP C: entering a loop-context subtree raises the depth for the
-    // children walk. Detected on the node itself; the increment applies to
-    // descendants (a break/continue is valid anywhere inside the subtree).
-    int const childLoopDepth =
-        (k == NodeKind::Internal && s.idx().loopByRule.contains(tree.rule(node).v))
-            ? loopDepth + 1
-            : loopDepth;
-
-    for (auto const& child : tree.children(node)) {
-        pass2(s, cfg, tree, child, here, childLoopDepth);
-    }
 
     // Literal typing.
     if (k == NodeKind::Token) {
@@ -2517,7 +2812,18 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     }
                 }
                 if (isIdentifier && !resolved.name.empty()) {
-                    SymbolId const found = s.scopes.lookup(here, resolved.name);
+                    // C 6.2.3 tag namespace (MF-3): a tag reference rule
+                    // (`struct Foo`) resolves against the Tag namespace; every
+                    // other reference rule resolves Ordinary. This is the
+                    // Pass-2 USE-resolution counterpart of the type-position
+                    // tag arm (MF-1) — it covers a tag reference reached
+                    // through Pass-2 reference resolution rather than
+                    // type-position resolution.
+                    SymbolNamespace const lookupNs =
+                        ref.isTagReference ? SymbolNamespace::Tag
+                                           : SymbolNamespace::Ordinary;
+                    SymbolId const found =
+                        s.scopes.lookup(here, resolved.name, lookupNs);
                     if (found.valid()) {
                         s.nodeToSymbol.set(resolved.node, found);
                         s.usesBySymbol[found.v].push_back(resolved.node);
@@ -2590,7 +2896,7 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // operand type (C 6.5.4p2 / 6.3.2.2) — checked
                     // BEFORE the castability matrix, whose entries must
                     // all be mapCast-lowerable (the discard emits no
-                    // Cast node at all; see lowerCast).
+                    // Cast node at all; see combineCast in cst_to_hir).
                     if (operandTy.valid()
                         && !isVoidDiscardCast(s.lattice.interner(), target)
                         && !isExplicitCastable(s.lattice.interner(),
@@ -2905,7 +3211,7 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith)
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts)
                                    && !admitsNullPointerConstant(
                                           s, tree, rec.type, initNode,
                                           tree.schema().semantics()
@@ -2953,7 +3259,7 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith)
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts)
                                    // D-LANG-NULL-POINTER-CONSTANT (step
                                    // 13.3): admit `T* p = 0;` initializer
                                    // per C §6.3.2.3.3.
@@ -3023,6 +3329,69 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         }
                     }
                 }
+                // D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS: an assignment
+                // (`a = b`, statement OR nested expression) must run the SAME
+                // assignability check the init / call-arg / return sites use —
+                // `subtreeType(lhs)` ←? `subtreeType(rhs)` through the shared
+                // `isAssignable` chokepoint, with the SAME conversion gates and
+                // the SAME null-pointer-constant admission. Pre-fix the
+                // assignment carried NO semantic type check (only the const
+                // check above), so `int x; float f; x = f;` was silently
+                // accepted while `int x = f;` (init) rejected S_TypeMismatch — a
+                // strictness asymmetry (the downstream HIR `coerce()` materialized
+                // a correct-but-implicit Cast). This restores parity: an invalid
+                // assignment now fails loud here, positioned at the RHS.
+                //
+                // ONLY the PLAIN assignment is checked — a COMPOUND assignment
+                // (`x += y`) is `x = x op y` whose result is the arithmetic
+                // common type converted back to `x` (the usual-arithmetic path,
+                // NOT assignability: `int x; double y; x += y;` is legal). The
+                // operator-table entry's `target == "Assign"` (with an empty
+                // `compoundBase`) is the SAME plain-vs-compound discriminator
+                // `subtreeType`'s combineBinary uses — fully config-driven, no
+                // operator-token identity hardcoded here.
+                if (assign.operatorToken.has_value()
+                    && assign.lhsChild < kids.size()
+                    && assign.rhsChild < kids.size()) {
+                    auto const& hirCfg = tree.schema().hirLowering();
+                    bool isPlainAssign = false;
+                    for (auto const& e : hirCfg.binaryOps) {
+                        if (e.token.v == assign.operatorToken->v) {
+                            isPlainAssign =
+                                (e.target == "Assign" && e.compoundBase.empty());
+                            break;
+                        }
+                    }
+                    if (isPlainAssign) {
+                        NodeId const lhsN = kids[assign.lhsChild];
+                        NodeId const rhsN = kids[assign.rhsChild];
+                        TypeId const lhsTy = subtreeType(s, tree, lhsN, here);
+                        TypeId const rhsTy = subtreeType(s, tree, rhsN, here);
+                        // Skip on either side unknown (cascade suppression — an
+                        // upstream error already fired). The conversion gates +
+                        // the null-pointer admission MIRROR the init-site call
+                        // EXACTLY so the two positions agree by construction.
+                        auto const& ptrRules =
+                            tree.schema().semantics().pointerConversions;
+                        if (lhsTy.valid() && rhsTy.valid()
+                            && !isAssignable(s.lattice.interner(), lhsTy, rhsTy,
+                                             ptrRules,
+                                             /*boolWidensToArith=*/true,
+                                             /*charConvertsToArith=*/cfg.charConvertsToArith,
+                                             /*enumConvertsToArith=*/cfg.enumConvertsToArith,
+                                             /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts)
+                            && !admitsNullPointerConstant(
+                                   s, tree, lhsTy, rhsN, ptrRules, here, cfg)) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_TypeMismatch;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(rhsN);
+                            d.actual   = std::string{tree.text(rhsN)};
+                            s.reporter.report(std::move(d));
+                        }
+                    }
+                }
                 break;  // operator matched — no further entry can apply
             }
         }
@@ -3062,6 +3431,65 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         d.span     = tree.span(node);
         d.actual   = std::string{tree.text(node)};
         s.reporter.report(std::move(d));
+    }
+}
+
+// pass2 — iterative whole-tree POST-ORDER walk (D-PARSE-DEEP-NEST-RECURSION-
+// MEMORY plan 24 Stage 2): an explicit heap work-stack replaces host recursion
+// so a deeply-nested tree (statements OR expressions) carries flat O(N)
+// host-stack cost. Two phases per node — phase 0 resolves its scope `here` +
+// `childLoopDepth` (the prior pre-child setup) and pushes its children in SOURCE
+// order; phase 1 runs `pass2Post` (the prior post-child handling). OUTPUT-
+// IDENTICAL to the recursion: same pre-order scope resolution, same left-to-
+// right child order, same post-order node handling.
+void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+           NodeId rootNode, ScopeId rootCurrent, int rootLoopDepth) {
+    struct Frame {
+        NodeId       node;
+        ScopeId      current;
+        int          loopDepth;
+        ScopeId      here;       // resolved at phase 0, consumed at phase 1
+        std::uint8_t phase;
+    };
+    std::vector<Frame> stack;
+    stack.push_back(Frame{rootNode, rootCurrent, rootLoopDepth, {}, 0});
+    while (!stack.empty()) {
+        // Copy out the fields we need BEFORE any push_back (which can realloc
+        // and dangle a reference into `stack`).
+        Frame const f = stack.back();
+        if (f.phase == 0) {
+            if (!f.node.valid() || isEmptySpace(tree.flags(f.node))) {
+                stack.pop_back();
+                continue;
+            }
+            auto const k = tree.kind(f.node);
+            ScopeId here = f.current;
+            if (k == NodeKind::Internal
+                && s.idx().scopeByRule.contains(tree.rule(f.node).v)) {
+                here = childScopeFor(s, tree, f.node, f.current);
+            }
+            // GAP C: entering a loop-context subtree raises the depth for the
+            // children walk (a break/continue is valid anywhere inside it).
+            int const childLoopDepth =
+                (k == NodeKind::Internal
+                 && s.idx().loopByRule.contains(tree.rule(f.node).v))
+                    ? f.loopDepth + 1
+                    : f.loopDepth;
+            // Record `here` + advance to the post phase BEFORE pushing children.
+            stack.back().here  = here;
+            stack.back().phase = 1;
+            // Push children so they POP in source (left-to-right) order: a LIFO
+            // stack needs reverse insertion. Each child inherits `here` as its
+            // `current` and `childLoopDepth` as its `loopDepth`, exactly as the
+            // recursive `pass2(child, here, childLoopDepth)` passed.
+            std::span<NodeId const> const kids = tree.children(f.node);
+            for (std::size_t i = kids.size(); i-- > 0;) {
+                stack.push_back(Frame{kids[i], here, childLoopDepth, {}, 0});
+            }
+        } else {
+            stack.pop_back();
+            pass2Post(s, cfg, tree, f.node, f.here, f.loopDepth);
+        }
     }
 }
 
@@ -3220,7 +3648,19 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         gatherArgExpressions(tree, kids[call.argsChild], argNodes);
     }
 
-    auto params = s.lattice.interner().fnParams(fnSig);
+    // D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD: COPY the param-type span into a
+    // stable owned vector. The per-arg assignability loop below calls subtreeType()
+    // (~line 3467), which can INTERN a fresh type mid-loop — e.g. an `&b` arg
+    // materializes pointer<int> on first use — mutating the interner pool and
+    // dangling a retained fnParams() view. That is a heap-use-after-free masked in
+    // Release (the guard is compiled out) and only caught on Debug: the ffi_memcpy
+    // multi-param shipped-FnSig case (`memcpy(&b,&a,4)`). Single-param libc fns
+    // (malloc/free) don't trip it — a literal `4` / an existing pointer arg interns
+    // nothing. Owning the params makes the loop robust against ANY downstream intern.
+    std::vector<TypeId> const params = [&] {
+        auto const sp = s.lattice.interner().fnParams(fnSig);
+        return std::vector<TypeId>(sp.begin(), sp.end());
+    }();
 
     // D-LANG-VARIADIC (step 13.4): a C-style variadic FnSig
     // (scalars[1] == 1) admits >= fixedParamCount args; a non-variadic
@@ -3271,7 +3711,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         if (!argTy.valid()) continue;  // unknown arg type — suppress cascade
         if (!isAssignable(s.lattice.interner(), params[i], argTy, ptrRules,
                           /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts)) {
             // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit literal-0
             // → Ptr<*> as null pointer constant per C §6.3.2.3.3. The
             // check lives here (NOT in isAssignable) because it is
@@ -3710,11 +4150,25 @@ admitsNullPointerConstant(EngineState& s, Tree const& tree,
 // memoize into the interner's arena), so a mutable interner reference is taken
 // once here — the same handle the lowering tier uses.
 [[nodiscard]] TypeId
-subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) {
-    if (!node.valid()) return InvalidType;
-    // Stamped type wins — Pass 2 already computed refs, member, call, cast,
-    // sizeof, literals, and compound literals onto the node itself.
-    if (TypeId t = s.typeAt(node); t.valid()) return t;
+subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId scope) {
+    // D-PARSE-DEEP-NEST-RECURSION-MEMORY (plan 24 Stage 1): this typer is an
+    // EXPLICIT HEAP WORK-STACK driver — NOT host recursion — so a deeply-nested
+    // expression carries flat O(N) host-stack cost. The five recursive arms
+    // (binary lhs/rhs, unary operand, postfix base, ternary then/else, the
+    // transparent-wrapper children) become phase-machine frames; every terminal
+    // arm and combine rule below is byte-identical to the prior recursive form
+    // (OUTPUT-IDENTITY is THE gate — the full ctest suite is the oracle). `scope`
+    // is INVARIANT across the whole traversal (every prior recursive call passed
+    // the same `scope`), so it is captured once, not carried per frame. The
+    // member-access chain (`a.b.c`) still recurses through `resolveMemberAccess`
+    // → `subtreeType` (a separate, shallow-in-practice residual).
+
+    // Stamped type wins — short-circuit on the HOT PATH (Pass-2 calls on an
+    // already-stamped node) BEFORE building the per-call closures below (notably
+    // `resolveArithmeticRules`). The driver's `enter` repeats this check for
+    // every child, so this is purely the root's fast exit (output-identical).
+    if (!rootNode.valid()) return InvalidType;
+    if (TypeId t = s.typeAt(rootNode); t.valid()) return t;
 
     // The interning derivations memoize into the interner's arena, so they need
     // a mutable handle. Sound because every caller owns a non-const EngineState
@@ -3739,13 +4193,13 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) 
         }
         return interner.commonType(a, b);
     };
+    auto const& hirCfg = tree.schema().hirLowering();
 
     // ── leaf typing: an identifier resolves to its symbol's type by scope ──
-    // A literal token is Pass-2-stamped (handled by the `typeAt` above); a
-    // Pass-1.5 `sizeof(literal)` is rare and InvalidType there is an acceptable
-    // fail-loud (the array length then reports S_NonConstantArrayLength, never a
-    // guessed size). An IDENTIFIER leaf, however, MUST resolve here — that is
-    // the Pass-1.5 `sizeof b` / `sizeof(b[0])` case the sizeof closure feeds.
+    // A literal token is Pass-2-stamped (handled by the `typeAt` short-circuit in
+    // `enter`); a Pass-1.5 `sizeof(literal)` is rare and InvalidType there is an
+    // acceptable fail-loud. An IDENTIFIER leaf MUST resolve here — the Pass-1.5
+    // `sizeof b` / `sizeof(b[0])` case the sizeof closure feeds.
     auto const leafType = [&](NodeId tok) -> TypeId {
         if (tree.kind(tok) != NodeKind::Token) return InvalidType;
         if (!sem.identifierToken.valid()
@@ -3757,21 +4211,12 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) 
         if (!sym.valid()) return InvalidType;
         return s.symbols.at(sym).type;
     };
-
-    // A token-leaf node reached directly (only at Pass 1.5; Pass 2 would have
-    // stamped it). Type it as a leaf.
-    if (tree.kind(node) != NodeKind::Internal) {
-        return leafType(node);
-    }
-
-    auto const& hirCfg = tree.schema().hirLowering();
-    RuleId const r = tree.rule(node);
-
-    // The visible operator token + its `hirLowering` op-table entry. `verb` is
-    // the entry's `target` (the HIR op NAME or special tag) the law dispatches
-    // on, matching cst_to_hir's `binOp_`/`unOp_`/`postOp_` token→entry maps.
+    // The visible operator token + its `hirLowering` op-table entry — the entry's
+    // `target` (HIR op NAME / special tag) the law dispatches on, matching
+    // cst_to_hir's `binOp_`/`unOp_`/`postOp_` token→entry maps.
     auto const opEntryFor =
-        [&](std::vector<HirOperatorEntry> const& ops) -> HirOperatorEntry const* {
+        [&](NodeId node, std::vector<HirOperatorEntry> const& ops)
+        -> HirOperatorEntry const* {
         for (NodeId c : visibleChildren(tree, node)) {
             if (tree.kind(c) != NodeKind::Token) continue;
             std::uint32_t const tk = tree.tokenKind(c).v;
@@ -3782,113 +4227,40 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) 
         return nullptr;
     };
 
-    // ── cast / sizeof / compound-literal: RE-TYPING wrappers ──
-    // Pass 2 STAMPS these (the `typeAt` above returns them there); but at Pass
-    // 1.5 — a sizeof-operand sub-expression — they are NOT stamped yet, so type
-    // them HERE exactly as the Pass-2 arms do. Without this, the transparent-
-    // wrapper fallthrough below would descend PAST the cast and return the
-    // operand's PRE-cast type — but the cast's whole purpose is to RE-TYPE, so
-    // `sizeof((char)x)` ≠ `sizeof(x)` would silently fold the WRONG size in an
-    // array dimension (the divergence-from-cst_to_hir class this typer forbids).
-    if (hirCfg.sizeofRule.valid() && r.v == hirCfg.sizeofRule.v) {
-        return interner.primitive(TypeKind::U64);                  // size_t
-    }
-    if (auto const it = s.idx().castByRule.find(r.v);
-        it != s.idx().castByRule.end()) {
-        auto const& cr = sem.castRules[it->second];
-        auto const kids = visibleChildren(tree, node);
-        if (cr.typeChild >= kids.size()) return InvalidType;
-        // emitOnMiss=false — the Pass-2 cast arm owns the S_UnknownType
-        // diagnostic; here we only need the (re-typed) target type.
-        return resolveTypeNode(const_cast<EngineState&>(s), sem, tree,
-                               kids[cr.typeChild], scope, /*emitOnMiss=*/false);
-    }
-    if (auto const it = s.idx().compoundLiteralByRule.find(r.v);
-        it != s.idx().compoundLiteralByRule.end()) {
-        auto const& cl = sem.compoundLiteralRules[it->second];
-        auto const kids = visibleChildren(tree, node);
-        if (cl.typeChild >= kids.size()) return InvalidType;
-        return resolveTypeNode(const_cast<EngineState&>(s), sem, tree,
-                               kids[cl.typeChild], scope, /*emitOnMiss=*/false);
-    }
-
-    // ── binary: mirror cst_to_hir combineBinary / lowerBinary ──
-    if (r.v == hirCfg.binaryExprRule.v) {
-        // [lhs(Internal), OP-token, rhs(Internal)]
-        NodeId lhsN{}, rhsN{};
-        for (NodeId c : visibleChildren(tree, node)) {
-            if (tree.kind(c) == NodeKind::Token) continue;
-            if (!lhsN.valid()) lhsN = c; else if (!rhsN.valid()) rhsN = c;
-        }
-        HirOperatorEntry const* e = opEntryFor(hirCfg.binaryOps);
-        if (e == nullptr) return InvalidType;
-        TypeId const lt = subtreeType(s, tree, lhsN, scope);
-        TypeId const rt = subtreeType(s, tree, rhsN, scope);
+    // ── combine helpers (each verbatim from the prior recursive arm; operate on
+    //    already-typed child results, so no recursion) ──
+    auto const combineBinary =
+        [&](HirOperatorEntry const* e, TypeId lt, TypeId rt) -> TypeId {
         if (e->target == "LogicalAnd" || e->target == "LogicalOr") return boolType();
         if (e->target == "Comma")  return rt;                       // value of RHS
-        // Assignment / compound-assignment yield the LHS (lvalue) type.
         if (e->target == "Assign" || !e->compoundBase.empty()) return lt;
         auto const op = coreOpFromNameSem(e->target);
         if (op.has_value()) {
             if (isComparison(*op)) return boolType();
-            // Shift: result is the PROMOTED LEFT operand (C 6.5.7); the count's
-            // type never contributes. Only WITH the arithmetic block (exactly as
-            // cst_to_hir's combineBinary gates its shift special-case); a block-
-            // less language falls through to the common-type path below — keeping
-            // the two tiers identical for any future shift-declaring language.
+            // Shift result type follows the config verb `shiftResult` via the
+            // shared `shiftResultType` chokepoint (D-UAC-SHIFT-RESULT-RULE-CONFIG)
+            // — the SAME function cst_to_hir's combineBinary uses.
             if ((*op == HirOpKind::Shl || *op == HirOpKind::Shr)
                 && arith.has_value()) {
-                return integerPromotedType(interner, lt, *arith);
+                return shiftResultType(interner, lt, rt, *arith);
             }
         }
-        // Arithmetic / bitwise: the usual-arithmetic common type, falling back
-        // to the first valid operand (pointer arithmetic / non-arith pairs)
-        // exactly as combineBinary's result rule.
         TypeId const common = commonArithType(lt, rt);
         if (common.valid()) return common;
         return lt.valid() ? lt : rt;
-    }
-
-    // ── unary: mirror cst_to_hir lowerUnary ──
-    if (r.v == hirCfg.unaryExprRule.v) {
-        // [OP-token, operand(Internal)]
-        NodeId opTok{}, operandN{};
-        for (NodeId c : visibleChildren(tree, node)) {
-            if (tree.kind(c) == NodeKind::Token) { if (!opTok.valid()) opTok = c; continue; }
-            if (!operandN.valid()) operandN = c;
-        }
-        HirOperatorEntry const* e = opEntryFor(hirCfg.unaryOps);
-        if (e == nullptr) return InvalidType;
-        TypeId const ot = subtreeType(s, tree, operandN, scope);
+    };
+    auto const combineUnary = [&](HirOperatorEntry const* e, TypeId ot) -> TypeId {
         if (e->target == "AddressOf") return ot.valid() ? interner.pointer(ot) : InvalidType;
         if (e->target == "Deref")     return derefResultType(interner, ot);
         auto const op = coreOpFromNameSem(e->target);
         if (op.has_value() && *op == HirOpKind::Not) return boolType();
         return ot;   // Neg / BitNot are type-preserving
-    }
-
-    // ── postfix: mirror cst_to_hir lowerPostfix ──
-    if (r.v == hirCfg.postfixExprRule.v) {
-        // [base(Internal), OP-token, rest...]
-        NodeId baseN{};
-        for (NodeId c : visibleChildren(tree, node)) {
-            if (tree.kind(c) != NodeKind::Token) { baseN = c; break; }
-        }
-        HirOperatorEntry const* e = opEntryFor(hirCfg.postfixOps);
-        if (e == nullptr) return InvalidType;
-        TypeId const bt = subtreeType(s, tree, baseN, scope);
+    };
+    auto const combinePostfix =
+        [&](NodeId node, HirOperatorEntry const* e, TypeId bt) -> TypeId {
         if (e->target == "Index")   return indexResultType(interner, bt);
         if (e->target == "PostInc" || e->target == "PostDec") return bt;
-        // Call / member access are Pass-2-stamped (the leading `typeAt` returns
-        // before here). Unstamped is only reachable at Pass 1.5; a Call resolves
-        // its result from the callee signature, and member access resolves its
-        // field type via the shared `resolveMemberAccess` (R1 — so `sizeof(s.y)`
-        // in an array dimension folds, instead of failing loud spuriously).
         if (e->target == "Call") {
-            // Unwrap the callee type to its FnSig — a direct FnSig designator or
-            // a `Ptr<FnSig>` function-pointer value (one pointer level), the same
-            // `calleeSigOf` unwrap cst_to_hir uses; then the result is its
-            // `fnResult`. InvalidType for any other callee shape.
             TypeId sig{};
             if (bt.valid()) {
                 if (interner.kind(bt) == TypeKind::FnSig) {
@@ -3902,43 +4274,189 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId node, ScopeId scope) 
             }
             return sig.valid() ? interner.fnResult(sig) : InvalidType;
         }
-        // Member access (`.` / `->`): the shared helper resolves the field type.
-        // It returns NotMemberAccess for any non-member postfix verb, yielding
-        // InvalidType — the same fail-loud as before for an unhandled verb.
+        // Member access (`.`/`->`): the shared helper resolves the field type (it
+        // re-derives the object type via subtreeType — the member-chain residual).
         auto const mr = resolveMemberAccess(s, sem, tree, node, scope);
         return mr.status == MemberResolution::Status::Ok ? mr.fieldType
                                                          : InvalidType;
-    }
-
-    // ── ternary: mirror cst_to_hir lowerTernary ──
-    if (hirCfg.ternaryExprRule.valid() && r.v == hirCfg.ternaryExprRule.v) {
-        // operands = the 3 non-token visible children [cond, then, else]
-        std::vector<NodeId> operands;
-        for (NodeId c : visibleChildren(tree, node)) {
-            if (tree.kind(c) != NodeKind::Token) operands.push_back(c);
-        }
-        if (operands.size() != 3) return InvalidType;
-        TypeId const thenT = subtreeType(s, tree, operands[1], scope);
-        TypeId const elseT = subtreeType(s, tree, operands[2], scope);
+    };
+    auto const combineTernary = [&](TypeId thenT, TypeId elseT) -> TypeId {
         TypeId const common = commonArithType(thenT, elseT);
         if (common.valid()) return common;
         return thenT.valid() ? thenT : elseT;   // non-arith arms (pointers etc.)
-    }
+    };
 
-    // Transparent / operand wrapper (paren-expression, operand alts, the
-    // primary-expression that wraps a bare literal or identifier leaf): the
-    // wrapper passes its inner expression's type through unchanged. Recurse via
-    // `subtreeType` on each visible child in order and return the first VALID
-    // result — `subtreeType` itself checks the stamped side-table first (so a
-    // Pass-2-stamped literal leaf yields its type), then a nested operator
-    // wrapper by its verb, then an identifier leaf by scope-lookup. This is the
-    // single-source equivalent of the old "first stamped descendant wins" DFS,
-    // now made operator-AWARE (a nested `&x` returns `Ptr<I32>`, not the inner
-    // leaf's I32). An EmptySpace child is already filtered by visibleChildren.
-    for (NodeId c : visibleChildren(tree, node)) {
-        if (TypeId t = subtreeType(s, tree, c, scope); t.valid()) return t;
+    // ── the explicit work-stack ──
+    struct Frame {
+        NodeId node;
+        enum class Kind : std::uint8_t {
+            Binary, Unary, Postfix, Ternary, Wrapper
+        } kind;
+        std::uint8_t           phase;
+        NodeId                  n0;     // binary lhs / unary operand / postfix base
+        NodeId                  n1;     // binary rhs
+        HirOperatorEntry const* e;      // binary / unary / postfix op entry
+        std::vector<NodeId>     list;   // ternary [cond,then,else] / wrapper children
+        std::size_t             idx;    // wrapper child cursor
+        TypeId                  c0;     // first child result (lt / thenT)
+    };
+    std::vector<Frame> work;
+    TypeId result{};
+
+    // Classify `node`: either set `result` to its type (TERMINAL — typeAt /
+    // leaf / sizeof / label / cast / compound-literal / no-op-entry), or push a
+    // Frame for one of the five recursive arms. Mirrors the prior dispatch order
+    // EXACTLY so the result is byte-identical.
+    auto const enter = [&](NodeId node) {
+        if (!node.valid()) { result = InvalidType; return; }
+        // Stamped type wins — Pass 2 already computed refs/member/call/cast/
+        // sizeof/literals/compound-literals onto the node itself.
+        if (TypeId t = s.typeAt(node); t.valid()) { result = t; return; }
+        if (tree.kind(node) != NodeKind::Internal) { result = leafType(node); return; }
+        RuleId const r = tree.rule(node);
+        // ── cast / sizeof / compound-literal: RE-TYPING wrappers (Pass-1.5; Pass 2
+        //    stamps them so the typeAt above wins there). Without this the wrapper
+        //    fallthrough would return the PRE-cast type — `sizeof((char)x)` would
+        //    fold the wrong size. ──
+        if (hirCfg.sizeofRule.valid() && r.v == hirCfg.sizeofRule.v) {
+            result = interner.primitive(TypeKind::U64); return;        // size_t
+        }
+        // D-CSUBSET-COMPUTED-GOTO: `&&label` is `void*` (a dedicated operand rule
+        // whose Identifier child is a LABEL name, never typed as an expression).
+        if (hirCfg.labelAddressRule.valid() && r.v == hirCfg.labelAddressRule.v) {
+            result = interner.pointer(interner.primitive(TypeKind::Void)); return;
+        }
+        if (auto const it = s.idx().castByRule.find(r.v);
+            it != s.idx().castByRule.end()) {
+            auto const& cr = sem.castRules[it->second];
+            auto const kids = visibleChildren(tree, node);
+            // emitOnMiss=false — the Pass-2 cast arm owns the S_UnknownType diag.
+            result = (cr.typeChild >= kids.size())
+                ? InvalidType
+                : resolveTypeNode(const_cast<EngineState&>(s), sem, tree,
+                                  kids[cr.typeChild], scope, /*emitOnMiss=*/false);
+            return;
+        }
+        if (auto const it = s.idx().compoundLiteralByRule.find(r.v);
+            it != s.idx().compoundLiteralByRule.end()) {
+            auto const& cl = sem.compoundLiteralRules[it->second];
+            auto const kids = visibleChildren(tree, node);
+            result = (cl.typeChild >= kids.size())
+                ? InvalidType
+                : resolveTypeNode(const_cast<EngineState&>(s), sem, tree,
+                                  kids[cl.typeChild], scope, /*emitOnMiss=*/false);
+            return;
+        }
+        // ── binary: [lhs(Internal), OP-token, rhs(Internal)] ──
+        if (r.v == hirCfg.binaryExprRule.v) {
+            NodeId lhsN{}, rhsN{};
+            for (NodeId c : visibleChildren(tree, node)) {
+                if (tree.kind(c) == NodeKind::Token) continue;
+                if (!lhsN.valid()) lhsN = c; else if (!rhsN.valid()) rhsN = c;
+            }
+            HirOperatorEntry const* e = opEntryFor(node, hirCfg.binaryOps);
+            if (e == nullptr) { result = InvalidType; return; }
+            work.push_back(Frame{node, Frame::Kind::Binary, 0, lhsN, rhsN, e,
+                                 {}, 0, {}});
+            return;
+        }
+        // ── unary: [OP-token, operand(Internal)] ──
+        if (r.v == hirCfg.unaryExprRule.v) {
+            NodeId operandN{};
+            for (NodeId c : visibleChildren(tree, node)) {
+                if (tree.kind(c) == NodeKind::Token) continue;
+                operandN = c; break;
+            }
+            HirOperatorEntry const* e = opEntryFor(node, hirCfg.unaryOps);
+            if (e == nullptr) { result = InvalidType; return; }
+            work.push_back(Frame{node, Frame::Kind::Unary, 0, operandN, {}, e,
+                                 {}, 0, {}});
+            return;
+        }
+        // ── postfix: [base(Internal), OP-token, rest...] ──
+        if (r.v == hirCfg.postfixExprRule.v) {
+            NodeId baseN{};
+            for (NodeId c : visibleChildren(tree, node)) {
+                if (tree.kind(c) != NodeKind::Token) { baseN = c; break; }
+            }
+            HirOperatorEntry const* e = opEntryFor(node, hirCfg.postfixOps);
+            if (e == nullptr) { result = InvalidType; return; }
+            work.push_back(Frame{node, Frame::Kind::Postfix, 0, baseN, {}, e,
+                                 {}, 0, {}});
+            return;
+        }
+        // ── ternary: operands = the 3 non-token visible children [cond,then,else] ──
+        if (hirCfg.ternaryExprRule.valid() && r.v == hirCfg.ternaryExprRule.v) {
+            std::vector<NodeId> operands;
+            for (NodeId c : visibleChildren(tree, node)) {
+                if (tree.kind(c) != NodeKind::Token) operands.push_back(c);
+            }
+            if (operands.size() != 3) { result = InvalidType; return; }
+            work.push_back(Frame{node, Frame::Kind::Ternary, 0, {}, {}, nullptr,
+                                 std::move(operands), 0, {}});
+            return;
+        }
+        // ── transparent / operand wrapper: pass the inner expression's type
+        //    through; recurse on each visible child in order, first VALID wins
+        //    (operator-AWARE via the per-child `enter`). ──
+        std::vector<NodeId> kids;
+        for (NodeId c : visibleChildren(tree, node)) kids.push_back(c);
+        work.push_back(Frame{node, Frame::Kind::Wrapper, 0, {}, {}, nullptr,
+                             std::move(kids), 0, {}});
+    };
+
+    // Driver: each frame either pushes a child (`enter`, last statement of the
+    // branch — `f` may be invalidated by the push, so nothing reads `f` after it)
+    // or, when its children are typed, combines + pops, leaving the result in
+    // `result` for the parent's next phase to consume.
+    enter(rootNode);
+    while (!work.empty()) {
+        Frame& f = work.back();
+        switch (f.kind) {
+        case Frame::Kind::Binary:
+            if (f.phase == 0) { f.phase = 1; NodeId n = f.n0; enter(n); }
+            else if (f.phase == 1) {
+                f.c0 = result; f.phase = 2; NodeId n = f.n1; enter(n);
+            } else {
+                HirOperatorEntry const* e = f.e; TypeId lt = f.c0;
+                work.pop_back(); result = combineBinary(e, lt, result);
+            }
+            break;
+        case Frame::Kind::Unary:
+            if (f.phase == 0) { f.phase = 1; NodeId n = f.n0; enter(n); }
+            else {
+                HirOperatorEntry const* e = f.e;
+                work.pop_back(); result = combineUnary(e, result);
+            }
+            break;
+        case Frame::Kind::Postfix:
+            if (f.phase == 0) { f.phase = 1; NodeId n = f.n0; enter(n); }
+            else {
+                NodeId node = f.node; HirOperatorEntry const* e = f.e;
+                work.pop_back(); result = combinePostfix(node, e, result);
+            }
+            break;
+        case Frame::Kind::Ternary:
+            if (f.phase == 0) { f.phase = 1; NodeId n = f.list[1]; enter(n); }
+            else if (f.phase == 1) {
+                f.c0 = result; f.phase = 2; NodeId n = f.list[2]; enter(n);
+            } else {
+                TypeId thenT = f.c0;
+                work.pop_back(); result = combineTernary(thenT, result);
+            }
+            break;
+        case Frame::Kind::Wrapper:
+            if (f.phase == 0) {
+                if (f.idx >= f.list.size()) { work.pop_back(); result = InvalidType; }
+                else { f.phase = 1; NodeId n = f.list[f.idx]; enter(n); }
+            } else {  // phase 1: a child just delivered `result`
+                if (result.valid()) { work.pop_back(); }  // first valid wins
+                else { ++f.idx; f.phase = 0; }             // try the next child
+            }
+            break;
+        }
     }
-    return InvalidType;
+    return result;
 }
 
 // R1: shared member-access resolver (declared after subtreeType's forward decl).
@@ -4098,7 +4616,7 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     auto const& ptrRules = tree.schema().semantics().pointerConversions;
     if (!isAssignable(s.lattice.interner(), fnResult, exprTy, ptrRules,
                       /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts)) {
         // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit `return 0;`
         // from a Ptr<*>-returning function per C §6.3.2.3.3.
         if (admitsNullPointerConstant(s, tree, fnResult,
@@ -4130,8 +4648,8 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
     // (JOIN-synchronous — no concurrency) so a deeply-nested-but-legal
     // expression tree does not overflow the host's ~1 MB main thread stack.
     // This is what lets `ParserConfig::maxExpressionDepth` be a real
-    // semantic cap (256) rather than a host-stack artifact
-    // (`D-PARSE-DEEP-FRONTEND-STACK`). The null-CU + every other contract
+    // semantic cap (config-driven: c-subset = 1024) rather than a host-stack
+    // artifact (`D-PARSE-DEEP-FRONTEND-STACK`). The null-CU + every other contract
     // check lives in `analyzeImpl`, which runs on the worker; any exception
     // it throws is re-thrown here by `callOnLargeStack`.
     return dss::substrate::callOnLargeStack(
@@ -4316,6 +4834,17 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 tagRec.kind  = DeclarationKind::Type;
                 tagRec.type  = tagTy;
                 SymbolId const tagId = s.symbols.mint(tagRec);
+                // MF-4 (C 6.2.3): builtins-as-`DeclarationKind::Type` —
+                // `__va_list_tag` here and shipped-descriptor typedefs — are
+                // injected into the ORDINARY namespace (the default param). A
+                // `struct __va_list_tag` reference therefore will NOT resolve
+                // them (the tag-namespace lookup misses → S_UnknownType). That
+                // is an INTENTIONAL fail-loud boundary, not a tag-namespace
+                // bug: these are synthesized typedef-NAMES, not C tags, and no
+                // c-subset source spells `struct __va_list_tag` (the type is
+                // reached only through the `va_list` typedef alias). If a real
+                // tagged builtin is ever needed, bind it with
+                // SymbolNamespace::Tag instead.
                 s.scopes.injectBinding(builtinScope, "__va_list_tag", tagId);
 
                 TypeId const vaListTy = in.array(tagTy, 1);
@@ -4400,25 +4929,39 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         if (srcIt == treeRootScope.end() || tgtIt == treeRootScope.end()) continue;
 
         // The source tree's OWN top-level bindings (declared in pass 1),
-        // keyed by name. An entry here whose symbol's tree is the source
-        // tree is a real user declaration; a later same-name inject is a
-        // conflict. Built once per edge from the source root scope.
-        std::unordered_map<std::string_view, SymbolId> ownByName;
-        for (auto const& [name, sym] : s.scopes.bindingsOf(srcIt->second)) {
+        // keyed by (name, namespace). An entry here whose symbol's tree is the
+        // source tree is a real user declaration; a later same-name inject in
+        // the SAME namespace is a conflict. C 6.2.3: a header's `struct Foo`
+        // tag and the including file's `typedef … Foo` are DIFFERENT
+        // namespaces — distinct keys, no false conflict — while tag+tag /
+        // ordinary+ordinary same-name still collide. Built once per edge from
+        // the source root scope. The namespace byte is appended after a NUL
+        // (never present in an identifier) so the key stays collision-free.
+        auto const nsKey = [](std::string_view name, SymbolNamespace ns) {
+            std::string key{name};
+            key.push_back('\0');
+            key.push_back(static_cast<char>(ns));
+            return key;
+        };
+        std::unordered_map<std::string, SymbolId> ownByName;
+        for (auto const& [name, ns, sym] : s.scopes.bindingsOf(srcIt->second)) {
             if (sym.valid() && s.symbols.at(sym).tree.v == edge.sourceTree.v) {
-                ownByName.emplace(name, sym);
+                ownByName.emplace(nsKey(name, ns), sym);
             }
         }
 
-        for (auto const& [name, sym] : s.scopes.bindingsOf(tgtIt->second)) {
-            if (auto it = ownByName.find(name); it != ownByName.end()) {
+        for (auto const& [name, ns, sym] : s.scopes.bindingsOf(tgtIt->second)) {
+            if (auto it = ownByName.find(nsKey(name, ns)); it != ownByName.end()) {
                 // The source file declared `name` itself AND includes a
-                // header declaring it — duplicate. Fail loud at the source,
-                // but only ONCE per (sourceTree, name): a second include of
-                // the same (or another) header re-declaring `name` is the
-                // same logical conflict, already reported.
+                // header declaring it in the SAME namespace — duplicate. Fail
+                // loud at the source, but only ONCE per (sourceTree, name,
+                // namespace): a second include of the same (or another) header
+                // re-declaring `name` is the same logical conflict, already
+                // reported. The conflict key folds the namespace byte in so a
+                // tag conflict and an ordinary conflict of the same name dedup
+                // independently.
                 if (!reportedConflicts.insert(
-                        conflictKey(edge.sourceTree.v, name)).second) {
+                        conflictKey(edge.sourceTree.v, nsKey(name, ns))).second) {
                     continue;   // already reported; still skip injection
                 }
                 auto const& srcTree = *std::find_if(
@@ -4445,7 +4988,9 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 s.reporter.report(std::move(d));
                 continue;   // do not inject the conflicting binding
             }
-            s.scopes.injectBinding(srcIt->second, std::string{name}, sym);
+            // Re-inject into the SAME namespace it came from — a tag stays a
+            // tag in the target's tagBindings.
+            s.scopes.injectBinding(srcIt->second, std::string{name}, sym, ns);
         }
     }
 
@@ -4477,7 +5022,14 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // bindings carry the DEFINING tree's id; builtins carry InvalidTree).
         std::unordered_set<std::string> userDeclaredNames;
         for (auto const& [treeV, scope] : treeRootScope) {
-            for (auto const& [name, sym] : s.scopes.bindingsOf(scope)) {
+            // Across BOTH namespaces: a user declaration of `name` (object,
+            // function, typedef, OR a struct/union/enum tag) blocks a
+            // descriptor symbol of that name — this is a NAME-level goal-2 skip
+            // (the descriptor injects ordinary names; a same-name user tag
+            // still claims the spelling, preserving the pre-tag-namespace
+            // behavior). `ns` is intentionally unused here.
+            for (auto const& [name, ns, sym] : s.scopes.bindingsOf(scope)) {
+                (void)ns;
                 if (sym.valid() && s.symbols.at(sym).tree.v == treeV) {
                     userDeclaredNames.insert(std::string{name});
                 }
@@ -4528,6 +5080,49 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     id, sym.name, sym.signature, desc->library,
                     sym.kind == ffi::ShippedSymbolKind::Function});
             }
+
+            // Item 1: inject the descriptor's CONSTANTS (the neutral form of a
+            // header's `#define` macro-constants, e.g. CHAR_BIT) as named
+            // integer-constant symbols. Goal-2 (a user decl of the name wins) +
+            // first-wins dedup share the SAME sets as symbols — constants,
+            // typedefs, and symbols are one name namespace. A constant has NO
+            // link surface, so it is NOT added to shippedExterns; it folds to
+            // its value at HIR Ref-lowering AND in constant-expression position
+            // (the const-eval direct-value arm), via `isInjectedConstant`.
+            for (auto const& c : desc->constants) {
+                if (userDeclaredNames.contains(c.name)) continue;
+                if (!injectedNames.insert(c.name).second) continue;  // first wins
+                SymbolRecord rec;
+                rec.name               = c.name;
+                rec.scope              = cuRoot;
+                rec.tree               = InvalidTree;   // not a user decl
+                rec.kind               = DeclarationKind::Variable;
+                rec.type               = c.type;
+                rec.enumValue          = c.value;       // the int64 bit-pattern
+                rec.isInjectedConstant = true;
+                rec.isConst            = true;          // a macro constant is not assignable
+                SymbolId const id = s.symbols.mint(rec);
+                s.scopes.injectBinding(cuRoot, c.name, id);
+            }
+
+            // Item 1: inject the descriptor's TYPEDEFS as `DeclarationKind::Type`
+            // symbols, so the name resolves in TYPE position (resolveTypeNode
+            // walks the scope chain). This block runs BEFORE Pass 1.5 type
+            // resolution, so a descriptor typedef is visible to a `T x;`
+            // declaration. (A builtin type of the same name wins —
+            // resolveTypeNode checks `builtinTypeIds` before the alias lookup.)
+            for (auto const& td : desc->typedefs) {
+                if (userDeclaredNames.contains(td.name)) continue;
+                if (!injectedNames.insert(td.name).second) continue;  // first wins
+                SymbolRecord rec;
+                rec.name  = td.name;
+                rec.scope = cuRoot;
+                rec.tree  = InvalidTree;   // not a user decl
+                rec.kind  = DeclarationKind::Type;
+                rec.type  = td.type;
+                SymbolId const id = s.symbols.mint(rec);
+                s.scopes.injectBinding(cuRoot, td.name, id);
+            }
         }
     }
 
@@ -4536,6 +5131,47 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         if (!tree.root().valid()) continue;
         s.activate(tree.schema());
         resolveDeclTypes(s, *s.idx().cfg, tree, tree.root(), treeRootScope.at(tree.id().v));
+    }
+
+    // D-CSUBSET-FN-PROTOTYPE: function-redeclaration COMPATIBILITY sweep. Pass 1
+    // merged each (proto/def) pair into `mergedFnDecls` {survivor, absorbed};
+    // now that Pass 1.5 has resolved both records' FnSig types, compare them.
+    // Interner TypeId equality IS structural FnSig equality (return type AND the
+    // full parameter list — the interner dedups identical signatures), so a
+    // simple `.v` inequality means an INCOMPATIBLE redeclaration (C 6.7p4 /
+    // 6.9.1: `int f(int); long f(int){…}`). Fail loud at the absorbed (later/
+    // redundant) declaration with a related-location at the survivor; do NOT
+    // silently pick one signature. Both `.type` must be valid (an unresolved
+    // type already produced its own diagnostic — don't pile on).
+    {
+        std::unordered_map<std::uint32_t /*TreeId.v*/, Tree const*> treeById;
+        for (auto const& tree : trees) treeById[tree.id().v] = &tree;
+        for (auto const& [survivor, absorbed] : s.mergedFnDecls) {
+            if (!survivor.valid() || !absorbed.valid()) continue;
+            auto const& sRec = s.symbols.at(survivor);
+            auto const& aRec = s.symbols.at(absorbed);
+            if (!sRec.type.valid() || !aRec.type.valid()) continue;
+            if (sRec.type.v == aRec.type.v) continue;   // compatible — merged
+            auto aTreeIt = treeById.find(aRec.tree.v);
+            if (aTreeIt == treeById.end()) continue;
+            Tree const& aTree = *aTreeIt->second;
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_IncompatibleRedeclaration;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = aTree.source().id();
+            d.span     = aTree.span(aRec.declNode);
+            d.actual   = aRec.name;
+            auto sTreeIt = treeById.find(sRec.tree.v);
+            if (sTreeIt != treeById.end()) {
+                Tree const& sTree = *sTreeIt->second;
+                d.related.push_back(RelatedLocation{
+                    sTree.source().id(),
+                    sTree.span(sRec.declNode),
+                    "previously declared here with a different signature",
+                });
+            }
+            s.reporter.report(std::move(d));
+        }
     }
 
     // Pass 2 per tree, against that tree's root scope. Loop-context depth

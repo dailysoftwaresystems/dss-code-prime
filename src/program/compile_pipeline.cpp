@@ -141,17 +141,19 @@ static std::optional<CuMirModule> buildCuMirImpl(
     std::uint16_t callingConventionIndex, DiagnosticReporter& reporter,
     CompileOptions const& opts);
 
-// D-PARSE-DEEP-FRONTEND-STACK: the per-CU BUILD half runs the three frontend
-// stages that recurse one host-stack frame per expression-nesting level —
-// semantic `analyze`, CST→HIR (`lowerToHir`), and HIR→MIR (`lowerToMir`). At
-// the raised parser cap (256) a deep-but-legal expression would overflow the
-// host's ~1 MB main thread mid-lowering: HIR/MIR run inline on the caller's
-// thread, AFTER `analyze`'s own worker has already joined. So the WHOLE BUILD
-// half runs on a 64 MiB worker stack (synchronous join — no concurrency).
-// NOTE: `analyze` ALSO self-wraps (it has direct callers, e.g. the diagnostic-
-// corpus test); reached through here it is a benign NESTED worker — only one
-// stack is ever live-deep at a time (analyze's, then HIR/MIR's), peak ~10 MB
-// (256 × ~40 KB) << 64 MiB. The LOWER half (MIR→LIR→codegen,
+// D-PARSE-DEEP-FRONTEND-STACK: the per-CU BUILD half runs the frontend stages
+// that traverse the expression tree — semantic `analyze`, CST→HIR
+// (`lowerToHir`), and HIR→MIR (`lowerToMir`). plan-24 flattened these onto
+// explicit work-stacks (O(1) host-stack per level), so their OWN recursion no
+// longer drives stack depth; the worker is RETAINED (BC-1) because the parser's
+// residual paren/postfix arm can still build a deep tree (bounded by the
+// config-driven cap, c-subset = 1024) and as defense-in-depth for any not-yet-
+// proven-flat recursion these stages reach. HIR/MIR run inline on the caller's
+// thread AFTER `analyze`'s own worker has joined, so the WHOLE BUILD half runs
+// on a 64 MiB worker stack (synchronous join — no concurrency). NOTE: `analyze`
+// ALSO self-wraps (it has direct callers, e.g. the diagnostic-corpus test);
+// reached through here it is a benign NESTED worker — only one stack is ever
+// live-deep at a time. The LOWER half (MIR→LIR→codegen,
 // `lowerMirModuleToAssembly`) iterates a flat SSA arena, not a tree, so it
 // needs no wrap.
 std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
@@ -365,6 +367,15 @@ static std::optional<CuMirModule> buildCuMirImpl(
         mirCfg.aggregateMaxRegBytes     = cc->aggregateMaxRegBytes;
         mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
         mirCfg.argSlotAligned           = cc->slotAligned;
+        // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the arg-register
+        // pool counts (the agnostic source for the all-or-nothing fit check on
+        // every call) + the stack-exhaust policy (SysV backfill vs AAPCS64 clamp).
+        mirCfg.argGprCount              =
+            static_cast<std::uint32_t>(cc->argGprs.size());
+        mirCfg.argFprCount              =
+            static_cast<std::uint32_t>(cc->argFprs.size());
+        mirCfg.aggregateStackExhaustsRegisters =
+            cc->aggregateStackExhaustsRegisters;
         // FC12a-core (D-FC12A-VARIADIC-CALLEE): thread the active CC's va_list layout
         // so HIR→MIR can lower va_start/va_arg (or fail loud when the CC omits it).
         mirCfg.vaListLayout             = cc->vaListLayout;

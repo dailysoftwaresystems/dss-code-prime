@@ -985,12 +985,19 @@ TEST(Arm64Encoder, BaseIndexLeaNonZeroDispFailsLoud) {
            "(memoffset.zero guard), never silently drop or mis-encode it";
 }
 
-TEST(Arm64Encoder, FrameLeaOffsetWiderThanImm12FailsLoud) {
-    // RED-on-disable for the UNSIGNED Imm12 range guard on the frame-lea:
-    // a frame offset wider than unsigned 12-bit (0..4095) must fail loud
-    // rather than silently truncate to a WRONG stack slot. 5000 > 4095.
-    // The shifted `ADD imm12<<12` form for larger frames is a future
-    // generalization — D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE.
+TEST(Arm64Encoder, FrameLeaOffsetWiderThanImm12SplitsToShifted) {
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: a frame-lea offset wider
+    // than the single-word imm12 reach (4095) is no longer fail-loud — it
+    // SPLITS into a 2-word `ADD Xd,Xn,#lo` + `ADD Xd,Xd,#hi,LSL #12` macro
+    // (the imm12.hilo24 slot). EXACT byte-pin for `lea x2, [sp + #35996]`:
+    //   35996 = 0x8C9C → lo = 0xC9C, hi = 0x8.
+    //   word0 = ADD x2, sp, #0xC9C  : 0x91000000 | (0xC9C<<10) | (31<<5) | 2
+    //         = 0x913273E2 → LE bytes E2 73 32 91
+    //   word1 = ADD x2, x2, #0x8,LSL#12 : 0x91400000 | (0x8<<10) | (2<<5) | 2
+    //         = 0x91402042 → LE bytes 42 20 40 91
+    // word1 reads its OWN dest (x2) — SCRATCH-FREE. A wrong split (lo/hi
+    // swap), a missing sh=1 bit (0x400000) in word1, or a dropped Rd-thread
+    // through word1.Rn all diverge these bytes (red-on-disable).
     auto s = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(s.has_value());
     auto const leaOp = (*s)->opcodeByMnemonic("lea");
@@ -1003,23 +1010,463 @@ TEST(Arm64Encoder, FrameLeaOffsetWiderThanImm12FailsLoud) {
     LirOperand const ops[] = {
         LirOperand::makeReg(gpr(**s, "sp")),
         LirOperand::makeMemBase(1),
-        LirOperand::makeMemOffset(5000)
+        LirOperand::makeMemOffset(35996)
     };
     (void)b.addInst(*leaOp, gpr(**s, "x2"), ops);
     (void)b.addReturn(*retOp, {});
     Lir lir = std::move(b).finish();
     DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    // word0 (E2 73 32 91)
+    EXPECT_EQ(bytes[0], 0xE2);
+    EXPECT_EQ(bytes[1], 0x73);
+    EXPECT_EQ(bytes[2], 0x32);
+    EXPECT_EQ(bytes[3], 0x91);
+    // word1 (42 20 40 91)
+    EXPECT_EQ(bytes[4], 0x42);
+    EXPECT_EQ(bytes[5], 0x20);
+    EXPECT_EQ(bytes[6], 0x40);
+    EXPECT_EQ(bytes[7], 0x91);
+}
+
+TEST(Arm64Encoder, FrameLeaOffsetBeyond16MiBSplitsToMovzMovkThreeWord) {
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (the high-element lea tier): a
+    // frame-lea offset > 0xFFFFFF SPLITS into a 3-word MOVZ/MOVK + EXTENDED-
+    // register macro. SCRATCH-FREE — the displacement materializes into the
+    // lea's DEST reg (here x2), then `add x2, sp, x2`. EXACT byte-pin for
+    // `lea x2, [sp + #0x1234000]` (lo16 = 0x4000, hi16 = 0x0123):
+    //   word0 = MOVZ x2,#0x4000       : 0xD2800000|(0x4000<<5)|2 = 0xD2880002 → 02 00 88 D2
+    //   word1 = MOVK x2,#0x123,LSL#16 : 0xF2A00000|(0x123<<5)|2  = 0xF2A02462 → 62 24 A0 F2
+    //   word2 = ADD x2,sp,x2 (EXTENDED): 0x8B2063E0|(2<<16)|2    = 0x8B2263E2 → E2 63 22 8B
+    // word2 is the EXTENDED-register ADD (Rn=sp=31, Rd=Rm=x2) — the dest reg
+    // threads through ALL THREE words (resultSlot + extraResultSlots). The
+    // FULL word2 is pinned (a shifted-register mis-encode 0x8B0263E2 would
+    // read x2 as the base instead of sp — corrupt address). Red-on-disable:
+    // revert the variant / immMax and 0x1234000 fails A_NoMatchingEncodingVariant.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(0x1234000)
+    };
+    (void)b.addInst(*leaOp, gpr(**s, "x2"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 12u);
+    // word0 — MOVZ x2,#0x4000 (02 00 88 D2)
+    EXPECT_EQ(bytes[0], 0x02);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0x88);
+    EXPECT_EQ(bytes[3], 0xD2);
+    // word1 — MOVK x2,#0x123,LSL#16 (62 24 A0 F2)
+    EXPECT_EQ(bytes[4], 0x62);
+    EXPECT_EQ(bytes[5], 0x24);
+    EXPECT_EQ(bytes[6], 0xA0);
+    EXPECT_EQ(bytes[7], 0xF2);
+    // word2 — ADD x2,sp,x2 EXTENDED (E2 63 22 8B) — full word, F1 critical
+    EXPECT_EQ(bytes[8],  0xE2);
+    EXPECT_EQ(bytes[9],  0x63);
+    EXPECT_EQ(bytes[10], 0x22);
+    EXPECT_EQ(bytes[11], 0x8B);
+}
+
+TEST(Arm64Encoder, FrameLeaOffsetAtMaxInt32EncodesThreeWord) {
+    // Boundary pin: 0x7FFFFFFF (the int32 frame ceiling) is the LARGEST
+    // offset the MOVZ/MOVK form encodes. lo16 = 0xFFFF, hi16 = 0x7FFF;
+    // `lea x2, [sp + #0x7FFFFFFF]`:
+    //   word0 = MOVZ x2,#0xFFFF       : 0xD29FFFE2 → E2 FF 9F D2
+    //   word1 = MOVK x2,#0x7FFF,LSL16 : 0xF2AFFFE2 → E2 FF AF F2
+    //   word2 = ADD x2,sp,x2          : 0x8B2263E2 → E2 63 22 8B
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(0x7FFFFFFF)
+    };
+    (void)b.addInst(*leaOp, gpr(**s, "x2"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 12u);
+    EXPECT_EQ(bytes[0], 0xE2);
+    EXPECT_EQ(bytes[1], 0xFF);
+    EXPECT_EQ(bytes[2], 0x9F);
+    EXPECT_EQ(bytes[3], 0xD2);
+    EXPECT_EQ(bytes[4], 0xE2);
+    EXPECT_EQ(bytes[5], 0xFF);
+    EXPECT_EQ(bytes[6], 0xAF);
+    EXPECT_EQ(bytes[7], 0xF2);
+    EXPECT_EQ(bytes[8],  0xE2);
+    EXPECT_EQ(bytes[9],  0x63);
+    EXPECT_EQ(bytes[10], 0x22);
+    EXPECT_EQ(bytes[11], 0x8B);
+}
+
+TEST(Arm64Encoder, SubSpFrameWiderThanImm12SplitsToShifted) {
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 (prologue): the callconv's
+    // `sub sp, sp, #frame` ([reg, ImmInt] form) splits when frame > 4095.
+    // EXACT byte-pin for `sub sp, sp, #36032` (36032 = 0x8CC0; lo = 0xCC0,
+    // hi = 0x8; Rd = Rn = sp = 31):
+    //   word0 = SUB sp,sp,#0xCC0 : 0xD1000000|(0xCC0<<10)|(31<<5)|31 = 0xD13303FF → FF 03 33 D1
+    //   word1 = SUB sp,sp,#0x8,LSL#12 : 0xD1400000|(0x8<<10)|(31<<5)|31 = 0xD14023FF → FF 23 40 D1
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subOp = (*s)->opcodeByMnemonic("sub");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(36032)
+    };
+    (void)b.addInst(*subOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0xFF);
+    EXPECT_EQ(bytes[1], 0x03);
+    EXPECT_EQ(bytes[2], 0x33);
+    EXPECT_EQ(bytes[3], 0xD1);
+    EXPECT_EQ(bytes[4], 0xFF);
+    EXPECT_EQ(bytes[5], 0x23);
+    EXPECT_EQ(bytes[6], 0x40);
+    EXPECT_EQ(bytes[7], 0xD1);
+}
+
+TEST(Arm64Encoder, AddSpFrameWiderThanImm12SplitsToShifted) {
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 (epilogue): `add sp, sp,
+    // #frame` splits when frame > 4095. EXACT byte-pin for `add sp, sp,
+    // #36032` (same 0x8CC0 split, ADD base 0x91000000 / 0x91400000):
+    //   word0 = ADD sp,sp,#0xCC0 : 0x913303FF → FF 03 33 91
+    //   word1 = ADD sp,sp,#0x8,LSL#12 : 0x914023FF → FF 23 40 91
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const addOp = (*s)->opcodeByMnemonic("add");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(addOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(36032)
+    };
+    (void)b.addInst(*addOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0xFF);
+    EXPECT_EQ(bytes[1], 0x03);
+    EXPECT_EQ(bytes[2], 0x33);
+    EXPECT_EQ(bytes[3], 0x91);
+    EXPECT_EQ(bytes[4], 0xFF);
+    EXPECT_EQ(bytes[5], 0x23);
+    EXPECT_EQ(bytes[6], 0x40);
+    EXPECT_EQ(bytes[7], 0x91);
+}
+
+TEST(Arm64Encoder, FrameSubSpAtImm12BoundaryStaysSingleWord) {
+    // Boundary pin: 4095 (the imm12 max) selects the SINGLE-word variant
+    // (immMax:4095) — 4 bytes, no shift word. `sub sp, sp, #4095`:
+    //   0xD1000000 | (4095<<10) | (31<<5) | 31 = 0xD13FFFFF → FF FF 3F D1
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subOp = (*s)->opcodeByMnemonic("sub");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(4095)
+    };
+    (void)b.addInst(*subOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // sub (4 bytes) + ret (4 bytes) = 8; the single-word sub is the FIRST 4.
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xFF);
+    EXPECT_EQ(bytes[1], 0xFF);
+    EXPECT_EQ(bytes[2], 0x3F);
+    EXPECT_EQ(bytes[3], 0xD1);
+}
+
+TEST(Arm64Encoder, FrameSubSpJustPastImm12IsTwoWord) {
+    // Boundary pin: 4096 (one past imm12 max) selects the 2-word shifted
+    // variant (immMin:4096). `sub sp, sp, #4096` (lo = 0, hi = 1):
+    //   word0 = SUB sp,sp,#0 : 0xD1000000|(0<<10)|(31<<5)|31 = 0xD10003FF → FF 03 00 D1
+    //   word1 = SUB sp,sp,#1,LSL#12 : 0xD1400000|(1<<10)|(31<<5)|31 = 0xD14007FF → FF 07 40 D1
+    // The 2-word emission (8 bytes prologue, not 4) is itself the proof the
+    // 4096 boundary routes to the shifted form.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subOp = (*s)->opcodeByMnemonic("sub");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(4096)
+    };
+    (void)b.addInst(*subOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0xFF);
+    EXPECT_EQ(bytes[1], 0x03);
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0xD1);
+    EXPECT_EQ(bytes[4], 0xFF);
+    EXPECT_EQ(bytes[5], 0x07);
+    EXPECT_EQ(bytes[6], 0x40);
+    EXPECT_EQ(bytes[7], 0xD1);
+}
+
+TEST(Arm64Encoder, FrameSubSpAt16MiBMinusOneIsTwoWord) {
+    // Boundary pin: 16777215 (0xFFFFFF, the 24-bit max) is the LARGEST
+    // value the shifted word-pair encodes. lo = 0xFFF, hi = 0xFFF:
+    //   word0 = SUB sp,sp,#0xFFF : 0xD1000000|(0xFFF<<10)|(31<<5)|31 = 0xD13FFFFF → FF FF 3F D1
+    //   word1 = SUB sp,sp,#0xFFF,LSL#12 : 0xD1400000|(0xFFF<<10)|(31<<5)|31 = 0xD17FFFFF → FF FF 7F D1
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subOp = (*s)->opcodeByMnemonic("sub");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(16777215)
+    };
+    (void)b.addInst(*subOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0xFF);
+    EXPECT_EQ(bytes[1], 0xFF);
+    EXPECT_EQ(bytes[2], 0x3F);
+    EXPECT_EQ(bytes[3], 0xD1);
+    EXPECT_EQ(bytes[4], 0xFF);
+    EXPECT_EQ(bytes[5], 0xFF);
+    EXPECT_EQ(bytes[6], 0x7F);
+    EXPECT_EQ(bytes[7], 0xD1);
+}
+
+TEST(Arm64Encoder, SubSpFrameBeyond16MiBSplitsToMovzMovkThreeWord) {
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (prologue): the callconv's
+    // `sub sp, sp, #frame` SPLITS into a 3-word MOVZ/MOVK + EXTENDED-register
+    // macro when frame > 0xFFFFFF (16 MiB). x16 (IP0) is the baked scratch.
+    // EXACT byte-pin for `sub sp, sp, #0x1234000` (lo16 = 0x4000, hi16 =
+    // 0x0123 — BOTH halves nonzero, so a lo/hi swap diverges these bytes):
+    //   word0 = MOVZ x16,#0x4000        : 0xD2800010|(0x4000<<5) = 0xD2880010 → 10 00 88 D2
+    //   word1 = MOVK x16,#0x123,LSL#16  : 0xF2A00010|(0x123<<5)  = 0xF2A02470 → 70 24 A0 F2
+    //   word2 = SUB sp,sp,x16 (EXTENDED): 0xCB3063FF             → FF 63 30 CB
+    // word2 is the EXTENDED-register form (Rd=Rn=sp=31, Rm=x16=16, opt=UXTX,
+    // bit 21 set) — NOT the shifted-register 0xCB000000 (where #31=XZR would
+    // make this `sp - 0` = corrupt frame). The FULL 32-bit word2 is pinned
+    // (a low-byte-only pin would pass the XZR mis-encode: 0xCB0063FF and
+    // 0xCB3063FF share byte[0]=0xFF). Red-on-disable: revert the variant /
+    // immMax, and 0x1234000 fails A_NoMatchingEncodingVariant.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subOp = (*s)->opcodeByMnemonic("sub");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(0x1234000)
+    };
+    (void)b.addInst(*subOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 12u);
+    // word0 — MOVZ x16,#0x4000 (10 00 88 D2)
+    EXPECT_EQ(bytes[0], 0x10);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0x88);
+    EXPECT_EQ(bytes[3], 0xD2);
+    // word1 — MOVK x16,#0x123,LSL#16 (70 24 A0 F2)
+    EXPECT_EQ(bytes[4], 0x70);
+    EXPECT_EQ(bytes[5], 0x24);
+    EXPECT_EQ(bytes[6], 0xA0);
+    EXPECT_EQ(bytes[7], 0xF2);
+    // word2 — SUB sp,sp,x16 EXTENDED (FF 63 30 CB) — full word, F1 critical
+    EXPECT_EQ(bytes[8],  0xFF);
+    EXPECT_EQ(bytes[9],  0x63);
+    EXPECT_EQ(bytes[10], 0x30);
+    EXPECT_EQ(bytes[11], 0xCB);
+}
+
+TEST(Arm64Encoder, AddSpFrameBeyond16MiBSplitsToMovzMovkThreeWord) {
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (EPILOGUE): the callconv's
+    // `add sp, sp, #frame` SPLITS to the SAME 3-word MOVZ/MOVK + EXTENDED form
+    // as the prologue sub, differing ONLY in word2's op bit (ADD=0 vs SUB=1).
+    // EXACT byte-pin for `add sp, sp, #0x1234000` — word0/word1 identical to the
+    // sub pin; word2 = ADD sp,sp,x16 EXTENDED = 0x8B3063FF → FF 63 30 8B (NOT
+    // the shifted-register 0x8B000000 where #31=XZR). Closes the dss-audit
+    // coverage gap (the epilogue add was runtime-only before).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const addOp = (*s)->opcodeByMnemonic("add");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(addOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(0x1234000)
+    };
+    (void)b.addInst(*addOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 12u);
+    EXPECT_EQ(bytes[0], 0x10); EXPECT_EQ(bytes[1], 0x00);  // MOVZ x16,#0x4000
+    EXPECT_EQ(bytes[2], 0x88); EXPECT_EQ(bytes[3], 0xD2);
+    EXPECT_EQ(bytes[4], 0x70); EXPECT_EQ(bytes[5], 0x24);  // MOVK x16,#0x123,LSL16
+    EXPECT_EQ(bytes[6], 0xA0); EXPECT_EQ(bytes[7], 0xF2);
+    // word2 — ADD sp,sp,x16 EXTENDED (FF 63 30 8B) — full word
+    EXPECT_EQ(bytes[8],  0xFF);
+    EXPECT_EQ(bytes[9],  0x63);
+    EXPECT_EQ(bytes[10], 0x30);
+    EXPECT_EQ(bytes[11], 0x8B);
+}
+
+TEST(Arm64Encoder, FrameSubSpAt16MiBSplitsToThreeWord) {
+    // Boundary pin: 16777216 (0x1000000, the 24-bit ceiling + 1) NO LONGER
+    // fails loud — it is the FIRST value routed to the 3-word MOVZ/MOVK form
+    // (immMin:16777216). lo16 = 0, hi16 = 0x0100:
+    //   word0 = MOVZ x16,#0          : 0xD2800010 → 10 00 80 D2
+    //   word1 = MOVK x16,#0x100,LSL16: 0xF2A02010 → 10 20 A0 F2
+    //   word2 = SUB sp,sp,x16        : 0xCB3063FF → FF 63 30 CB
+    // The 12-byte emission (not 8, not a diagnostic) IS the proof the
+    // 0x1000000 boundary now routes to the 3-word form.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subOp = (*s)->opcodeByMnemonic("sub");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(16777216)
+    };
+    (void)b.addInst(*subOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 12u);
+    EXPECT_EQ(bytes[0], 0x10);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0x80);
+    EXPECT_EQ(bytes[3], 0xD2);
+    EXPECT_EQ(bytes[4], 0x10);
+    EXPECT_EQ(bytes[5], 0x20);
+    EXPECT_EQ(bytes[6], 0xA0);
+    EXPECT_EQ(bytes[7], 0xF2);
+    EXPECT_EQ(bytes[8],  0xFF);
+    EXPECT_EQ(bytes[9],  0x63);
+    EXPECT_EQ(bytes[10], 0x30);
+    EXPECT_EQ(bytes[11], 0xCB);
+}
+
+TEST(Arm64Encoder, FrameSubSpAt2GiBFailsLoud) {
+    // Boundary pin (the NEW ceiling, D-ASM-AARCH64-FRAME-OFFSET-BEYOND-2GIB):
+    // 0x80000000 (2 GiB) is the first value PAST the int32 frame ceiling. The
+    // frame size flows through `emitSpAdjust`'s `static_cast<int32_t>(bytes)`
+    // and `variantImmMagnitude`'s `immInt32` — 0x80000000 as int32 is
+    // NEGATIVE, so `variantImmMagnitude` returns nullopt → NO variant matches
+    // (the 3-word variant's immMin:16777216 is never reached) → fail-loud
+    // A_NoMatchingEncodingVariant. A >2GiB frame is absurd; it must never
+    // silently wrap to a small (or negative) frame.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subOp = (*s)->opcodeByMnemonic("sub");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        // 0x80000000 stored into the int32 immInt32 field → INT32_MIN.
+        LirOperand::makeImmInt32(static_cast<std::int32_t>(0x80000000u))
+    };
+    (void)b.addInst(*subOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
     std::vector<MirInstId> lirToMir(lir.instCount());
     (void)assemble(lir, **s, lirToMir, rep);
-    bool sawOutOfRange = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange) {
-            sawOutOfRange = true;
-        }
-    }
-    EXPECT_TRUE(sawOutOfRange)
-        << "a >12-bit frame-lea offset must emit A_ImmediateOperandOutOfRange";
-    EXPECT_GT(rep.errorCount(), 0u);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a >2GiB sub-sp frame must fail loud (no matching variant), "
+           "never silently wrap the frame size";
 }
 
 // ── Shape-vs-slot validate rejection ──────────────────────────────
@@ -1938,6 +2385,155 @@ TEST(Arm64Encoder, LoadUnsignedOffsetDisassemblesRoundTrip) {
     ASSERT_TRUE(disasmed->wires[2].value.has_value());
     EXPECT_EQ(*disasmed->wires[2].value, 24)
         << "the disasm oracle pins the RAW imm12 (24), NOT the byte offset (192)";
+}
+
+// ── D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 (load/store-displacement half):
+//    imm9/scaled-imm12 BOUNDARY byte-pins ──
+//
+// The frame load/store chokepoint (selectFrameMemOp, lir_callconv.cpp) swaps
+// the UNSCALED imm9 form (LDUR/STUR, ±256) to the SCALED imm12 form (LDR/STR,
+// 0..4095×size) exactly when the offset leaves the imm9 reach. These pins lock
+// the encoder boundary the chokepoint's threshold (offset > 255) is keyed to:
+// at #255 the UNSCALED `store`/`load` (STUR/LDUR, byte[3]=0xF8) still encodes;
+// at #256 the chokepoint must pick `store_u`/`load_u` (STR/LDR, byte[3]=0xF9).
+// A regression that shifted either the encoder reach or the selection threshold
+// diverges these bytes (red-on-disable, host-independent — every CI leg).
+
+TEST(Arm64Encoder, StoreUnscaledImm9AtBoundary255Encodes) {
+    // store X1, [SP, #255] → STUR X1, [SP, #255] (imm9 max-positive). Base
+    // 0xF8000000 | (255<<12) | (31<<5) | 1 = 0xF80FF3E1; LE: E1 F3 0F F8.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const storeOp = (*s)->opcodeByMnemonic("store");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(storeOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(255)
+    };
+    (void)b.addInst(*storeOp, InvalidLirReg, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "offset 255 is the imm9 max-positive — STUR must still encode";
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE1);
+    EXPECT_EQ(bytes[1], 0xF3);
+    EXPECT_EQ(bytes[2], 0x0F);
+    EXPECT_EQ(bytes[3], 0xF8)
+        << "byte[3] must be 0xF8 (STUR, unscaled imm9) at the #255 boundary";
+}
+
+TEST(Arm64Encoder, StoreUnscaledImm9JustPast255FailsLoud) {
+    // store X1, [SP, #256] via the UNSCALED `store` (STUR imm9) fails loud —
+    // 256 is one past the imm9 +255 max. (The chokepoint would instead pick
+    // store_u; this pins that the unscaled form genuinely cannot reach #256, so
+    // the swap is load-bearing, not cosmetic.)
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const storeOp = (*s)->opcodeByMnemonic("store");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(storeOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(256)
+    };
+    (void)b.addInst(*storeOp, InvalidLirReg, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    (void)assemble(lir, **s, lirToMir, rep);
+    bool sawOutOfRange = false;
+    for (auto const& d : rep.all())
+        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange)
+            sawOutOfRange = true;
+    EXPECT_TRUE(sawOutOfRange)
+        << "the UNSCALED store (STUR imm9) must fail loud at #256 — the swap to "
+           "store_u is what makes #256 encodable";
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(Arm64Encoder, StoreScaledImm12AtBoundary256Encodes) {
+    // store_u X1, [SP, #256] → STR X1, [SP, #256] (scaled imm12 = 256/8 = 32).
+    // Base 0xF9000000 | (32<<10) | (31<<5) | 1 = 0xF90083E1; LE: E1 83 00 F9.
+    // This is the form the chokepoint picks for the same #256 the unscaled
+    // store rejects above (the boundary handoff).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const storeUOp = (*s)->opcodeByMnemonic("store_u");
+    auto const retOp    = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(storeUOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(256)
+    };
+    (void)b.addInst(*storeUOp, InvalidLirReg, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE1);
+    EXPECT_EQ(bytes[1], 0x83);
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0xF9)
+        << "byte[3] must be 0xF9 (STR, scaled imm12) at the #256 boundary — the "
+           "chokepoint's swap target";
+}
+
+TEST(Arm64Encoder, LoadScaledImm12AtImm12MaxEncodes) {
+    // load_u X1, [SP, #32760] → LDR X1, [SP, #32760] (scaled imm12 = 32760/8 =
+    // 4095, the field max). Base 0xF9400000 | (4095<<10) | (31<<5) | 1 =
+    // 0xF97FFFE1; LE: E1 FF 7F F9. One scaled step past this (#32768 → 4096)
+    // is the fail-loud LoadUnsignedOffsetTooLargeFailsLoud pin above.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const loadUOp = (*s)->opcodeByMnemonic("load_u");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(loadUOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(32760)
+    };
+    (void)b.addInst(*loadUOp, gpr(**s, "x1"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "offset 32760 scales to 4095 (the imm12 field max) — must encode";
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE1);
+    EXPECT_EQ(bytes[1], 0xFF);
+    EXPECT_EQ(bytes[2], 0x7F);
+    EXPECT_EQ(bytes[3], 0xF9);
 }
 
 // ── D-ARM64-FLOAT-SUBSTRATE: the FULL pipeline (the SSE-test mirror) ──

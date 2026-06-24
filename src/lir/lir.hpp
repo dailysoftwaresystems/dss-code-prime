@@ -208,6 +208,14 @@ public:
                         std::span<LirOperand const> operands,
                         std::uint32_t payload = 0,
                         std::uint8_t  flags   = 0);
+    // D-CSUBSET-COMPUTED-GOTO: indirect branch (x86 jmp r/m64 / arm64 BR Xn).
+    // `operands` = [the address register]; `targets` = every address-taken
+    // successor block (variadic, like a Switch). Seals the open block.
+    LirInstId addIndirectBr(std::uint16_t opcode,
+                            std::span<LirOperand const> operands,
+                            std::span<LirBlockId const> targets,
+                            std::uint32_t payload = 0,
+                            std::uint8_t  flags   = 0);
     // Zero-successor terminator that is NOT a return — separated from
     // `addReturn` so the call-site spelling matches the semantics. AS1
     // maps to x86_64 ud2 / ARM64 brk / WASM unreachable.

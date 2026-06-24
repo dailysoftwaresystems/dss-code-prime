@@ -45,6 +45,14 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
         }
     };
     for (auto const& fn : m.functions) declare(fn.symbol, SymbolKind::Defined, "function");
+    // D-CSUBSET-COMPUTED-GOTO: each function's synthetic per-block symbols (the
+    // `&&label` block-address `lea` relocation sources) are intra-module DEFINED
+    // symbols — declare them so the per-CU relocation-resolvability check below
+    // recognizes the block-address `lea`'s reloc target. The per-format walker
+    // assigns each its interior-block VA before applying relocations.
+    for (auto const& fn : m.functions)
+        for (auto const& bs : fn.blockSymbols)
+            declare(bs.symbol, SymbolKind::BlockLocal, "synthetic block symbol");
     for (auto const& di : m.dataItems) declare(di.symbol, SymbolKind::Data, "data item");
     for (std::size_t i = 0; i < m.externImports.size(); ++i) {
         auto const& ext = m.externImports[i];

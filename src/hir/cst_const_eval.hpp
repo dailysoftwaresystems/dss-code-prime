@@ -85,9 +85,23 @@ using CstSymbolInitResolver =
 using CstSizeofResolver =
     std::function<std::optional<std::uint64_t>(NodeId)>;
 
+// Item 1 (shipped-header constants / enum array-dim): DIRECT-VALUE resolver for
+// a named INTEGER CONSTANT whose value is carried inline on its symbol rather
+// than in a defining init-expression CST — an enum enumerator or a shipped-
+// descriptor-injected constant. Given the identifier-token node + current scope,
+// returns the constant's literal value DIRECTLY (no init-CST to recurse into),
+// or nullopt when the name is not such a constant. The engine tries this BEFORE
+// `resolveSymbolInit`, so `int a[CHAR_BIT]` / `int b[ENUM_VAL]` fold even though
+// neither symbol has an init-expression the init-resolver could walk. The
+// closure (supplied by each consumer) shares the ONE `constantLiteralForSymbol`
+// builder with the HIR Ref fold, so value- and const-expr-position agree.
+using CstSymbolValueResolver =
+    std::function<std::optional<HirLiteralValue>(NodeId, std::uint32_t)>;
+
 struct CstEvalEnvironment {
-    CstSymbolInitResolver resolveSymbolInit{};
-    CstSizeofResolver     resolveSizeof{};   // FC6 — sizeof in a const-expr context
+    CstSymbolInitResolver  resolveSymbolInit{};
+    CstSymbolValueResolver resolveSymbolValue{};  // Item 1 — direct inline constant value
+    CstSizeofResolver      resolveSizeof{};   // FC6 — sizeof in a const-expr context
 };
 
 // Static recognition context. All fields are non-owning references

@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-LABEL-BEFORE-CASE: a label before a case (`hop: case 0:`) parses as labelStmt(hop, caseStmt(case 0, body)); the label stays a real LabelStmt at the arm entry so `goto hop` resolves INTO the switch (pre-scan + goto-resolution work unchanged). sel=feed(1) keeps the switch live on baseline. switch(1)->case 1: acc+=20, sel=0, goto hop; hop:->case 0: acc+=5; goto out -> return 25. Robust under release: case-0 stays reachable via goto hop even if the switch is folded. RED-ON-DISABLE: drop `caseStmt` from the statement alt -> error[P0001]. Witnessed baseline AND release, x86 PE+ELF + arm64 qemu + macho.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 25,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

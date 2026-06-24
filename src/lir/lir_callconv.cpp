@@ -3,6 +3,10 @@
 #include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
+// D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the shared by-value-stack-arg
+// exhaust-class constants (the ByValueStackAgg marker's `byValueAggExhaust` values),
+// defined at the MIR-boundary alongside the op whose payload carries them.
+#include "mir/mir_opcode.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
@@ -512,6 +516,15 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
                 if (isByValCarrier) {
                     byValSlots += byValueStackAggSlots(ops[k + 1].byValueAggBytes,
                                                        outgoingSlotSize);
+                    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: AAPCS64
+                    // EXHAUSTS the carrier's class — a later same-class arg also stacks.
+                    // PAD the class count up to its pool so the "count - pool" overflow
+                    // below counts those later args (mirrors the materialize clamp).
+                    std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
+                    if (ex == kByValueStackArgExhaustGpr)
+                        gprArgs = std::max(gprArgs, gprPoolSize);
+                    else if (ex == kByValueStackArgExhaustFpr)
+                        fprArgs = std::max(fprArgs, fprPoolSize);
                     ++argRegionIdx;
                     continue;
                 }
@@ -576,30 +589,118 @@ void emitSpAdjust(LirBuilder& b, std::uint16_t op, LirReg sp,
     b.addInst(op, sp, ops);
 }
 
+// D-WIN64-LARGE-FRAME-STACK-PROBE: emit the `stack_probe` virtual op —
+// the prologue's guard-page-safe replacement for a single `sub SP, F`
+// when the frame exceeds the OS guard-page size. Operands:
+// [sp(reg), frameBytes(imm32), pageBytes(imm32)] — the x86_64 encoder
+// hand-lowers this ONE op to a page-walking loop that descends SP by
+// `pageBytes` at a time (touching/committing each page) for `frameBytes`
+// total, ending at SP = entry_SP - frameBytes. Two immediates so the
+// page step is config-driven (the encoder hardcodes NO page size). The
+// op's result is `none` — like a bare `sub SP,F`, it mutates SP in place
+// and exposes no SSA value; SP is a fixed physical reg the encoder reads
+// from operand 0.
+void emitStackProbe(LirBuilder& b, std::uint16_t op, LirReg sp,
+                    std::uint32_t frameBytes, std::uint32_t pageBytes) {
+    std::array<LirOperand, 3> ops{
+        LirOperand::makeReg(sp),
+        LirOperand::makeImmInt32(static_cast<std::int32_t>(frameBytes)),
+        LirOperand::makeImmInt32(static_cast<std::int32_t>(pageBytes))
+    };
+    b.addInst(op, InvalidLirReg, ops);
+}
+
+// D-ASM-AARCH64-LARGE-FRAME-IMM12 (chokepoint selection): pick the frame
+// load/store mnemonic from the OFFSET VALUE. The unscaled form (`load`/
+// `store`, AArch64 LDUR/STUR imm9) reaches only ±256; a frame offset beyond
+// that (a deep spill area, a ≥9-fixed-param callee's 9th incoming-stack
+// param, a high saved-reg slot) takes the SCALED unsigned-offset form
+// (`load_u`/`store_u`, LDR/STR imm12-scaled, reach 4095*accessSize). This
+// MUST be decided HERE, not in the encoder: the encoder's variant selector
+// commits on operand KINDS (both forms share [reg, membase, memoffset]) and
+// cannot inspect the offset value, and the encoder does not backtrack on an
+// encode-range failure (§B.1). Placed at the SINGLE chokepoint every frame
+// load/store funnels through (emitFrameLoad/emitFrameStore) so the swap
+// covers incoming args, spill reload/store, saved-reg save/restore, and the
+// variadic spills BY CONSTRUCTION — no per-site application to miss.
+//
+// AGNOSTIC: the swap is gated on `baseOp` BEING the universal GPR `load`/
+// `store` (`universalGprOp` — so an FPR/other-class form, fldur/fstur/fstur_q,
+// keeps its own encoding; those have no scaled twin here, and the `==` gate is
+// what makes the chokepoint SAFE to feed every class's op through), and on
+// `scaledOp != 0` (`load_u`/`store_u` absent ⇒ field 0 on a target without the
+// scaled form, e.g. x86_64 — whose memory ops already carry a disp32, so the
+// imm9 path is never hit). On x86_64 the swap is inert and the emitted bytes
+// are byte-identical. The genuinely-unencodable TAIL (negative beyond −256,
+// non-access-aligned, or scaled >4095) keeps `baseOp` and STAYS fail-loud at
+// the encoder — the narrower residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-
+// SCALED-IMM12 (register-offset / address-materialization, future).
+//
+// accessSizeBytes: the chokepoint emits a default-width (flags=0 ⇒ width 64)
+// frame op, so the encoder's `instWidth` is 64 and its scaled field is
+// byteOffset/8. The threshold here uses the SAME access size (8) — derived
+// from `lirInstWidthBits(0)` so the two stay coupled to one width axis rather
+// than a bare literal. (Every frame load/store this chokepoint emits is the
+// 8-byte slot store; a narrower-width frame op would need its width threaded
+// in, which no caller does today.)
+[[nodiscard]] std::uint16_t
+selectFrameMemOp(std::uint16_t baseOp, std::uint16_t universalGprOp,
+                 std::uint16_t scaledOp, std::int32_t offset) {
+    // Only the universal GPR load/store has the scaled twin; an FPR/other
+    // class op is never swapped (it would mis-encode as a GPR LDR/STR).
+    if (scaledOp == 0 || baseOp != universalGprOp) return baseOp;
+    bool const fitsImm9 = offset >= -256 && offset <= 255;
+    if (fitsImm9) return baseOp;
+    constexpr std::uint32_t accessSizeBytes =
+        std::max<std::uint32_t>(1u, lirInstWidthBits(0) / 8u);  // = 8
+    if (offset >= 0
+        && static_cast<std::uint32_t>(offset) % accessSizeBytes == 0
+        && static_cast<std::uint32_t>(offset) / accessSizeBytes <= 4095u) {
+        return scaledOp;
+    }
+    // Unencodable as scaled imm12 (negative beyond −256, unaligned, or
+    // >4095*accessSize): keep baseOp; the encoder fails loud
+    // (A_ImmediateOperandOutOfRange) — the unencodable-offset residual.
+    return baseOp;
+}
+
 // Emit `store reg, [SP + offset]` (saved-reg store, or frame-store
 // materialization). `store` operand layout per x86_64.target.json:
 // [value_reg, base_reg, MemBase(scale), MemOffset(disp)] — 4 ops, no result.
+// `universalStore`/`storeU` are the universal GPR `store` opcode and its
+// scaled-imm12 twin `store_u` (both 0 on a target without the scaled form);
+// the chokepoint swaps to `storeU` for an out-of-imm9 GPR-store offset (see
+// selectFrameMemOp). Threading them through the ONE store chokepoint covers
+// every frame-store caller (saved-reg, spill, va-spill, by-value copy) by
+// construction.
 void emitFrameStore(LirBuilder& b, std::uint16_t storeOp, LirReg value,
-                    LirReg sp, std::int32_t offset) {
+                    LirReg sp, std::int32_t offset,
+                    std::uint16_t universalStore = 0, std::uint16_t storeU = 0) {
     std::array<LirOperand, 4> ops{
         LirOperand::makeReg(value),
         LirOperand::makeReg(sp),
         LirOperand::makeMemBase(1),
         LirOperand::makeMemOffset(offset)
     };
-    b.addInst(storeOp, InvalidLirReg, ops);
+    b.addInst(selectFrameMemOp(storeOp, universalStore, storeU, offset),
+              InvalidLirReg, ops);
 }
 
 // Emit `result = load [SP + offset]`. `load` operand layout:
 // [base_reg, MemBase(scale), MemOffset(disp)] — 3 ops + result.
+// `universalLoad`/`loadU` are the universal GPR `load` opcode and its scaled-
+// imm12 twin `load_u` (both 0 if none); the chokepoint swaps to `loadU` for
+// an out-of-imm9 GPR-load offset (see selectFrameMemOp).
 void emitFrameLoad(LirBuilder& b, std::uint16_t loadOp, LirReg result,
-                   LirReg sp, std::int32_t offset) {
+                   LirReg sp, std::int32_t offset,
+                   std::uint16_t universalLoad = 0, std::uint16_t loadU = 0) {
     std::array<LirOperand, 3> ops{
         LirOperand::makeReg(sp),
         LirOperand::makeMemBase(1),
         LirOperand::makeMemOffset(offset)
     };
-    b.addInst(loadOp, result, ops);
+    b.addInst(selectFrameMemOp(loadOp, universalLoad, loadU, offset),
+              result, ops);
 }
 
 // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): emit
@@ -672,6 +773,13 @@ struct OpcodeHandles {
     // inst in a function is also this pass's "function called va_start" signal.
     std::uint16_t vaRegSaveArea;
     std::uint16_t vaOverflowArgArea;
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the callee-side mirror of
+    // the caller's by-value-aggregate stack carrier. Materialized into the SAME
+    // incoming-overflow address as `vaOverflowArgArea` (`lea [sp + totalFrameSize +
+    // callPushBytes + shadowSpaceBytes + payload]`) but a DISTINCT handle so it is
+    // NOT one of `functionUsesVaStart`'s signals (it occurs in non-variadic fns —
+    // a false match would wrongly trigger the variadic prologue spill).
+    std::uint16_t recvByValueStackParam;
     // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start
     // base, materialized into `lea result, [sp + totalFrameSize + callPushBytes +
     // payload*outgoingSlotSize]` (NO shadow — BLOCKER-1). Optional (only the Win64
@@ -694,16 +802,28 @@ struct OpcodeHandles {
     std::uint16_t vaVrSpillStore;
     // D-ASM-AARCH64-LARGE-FRAME-IMM12: the SCALED imm12 unsigned-offset LDR/STR
     // (`load_u`/`store_u`), the large-frame siblings of the universal `load`/`store`
-    // (unscaled imm9). The incoming-stack-arg load/store path picks these over
-    // `load`/`store` when the frame offset exceeds the imm9 ±256 reach (a ≥9-fixed-
-    // param callee). Optional — only a target with a scaled load/store form declares
-    // them (arm64 does; x86_64 does not — its memory forms already carry a disp32).
-    // Absent ⇒ field 0; the selection then keeps `load`/`store` and the encoder fails
-    // loud on an out-of-imm9 offset (the residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-
-    // IMM12). Resolved via the same optional-handle table (FOLD 2 — NOT a new
-    // RegClassOp role; the scaled form is a single-ISA concern, parallel to fstur_q).
+    // (unscaled imm9). The frame load/store CHOKEPOINT (emitFrameLoad/emitFrameStore →
+    // selectFrameMemOp) picks these over `load`/`store` when the frame offset exceeds
+    // the imm9 ±256 reach — covering EVERY frame access (incoming args, spill reload/
+    // store, saved-reg save/restore, va spills) by construction. Optional — only a
+    // target with a scaled load/store form declares them (arm64 does; x86_64 does not —
+    // its memory forms already carry a disp32). Absent ⇒ field 0; the selection then
+    // keeps `load`/`store` and the encoder fails loud on an out-of-imm9 offset (the
+    // residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-SCALED-IMM12). Resolved via the same
+    // optional-handle table (FOLD 2 — NOT a new RegClassOp role; the scaled form is a
+    // single-ISA concern, parallel to fstur_q).
     std::uint16_t loadU;
     std::uint16_t storeU;
+    // D-WIN64-LARGE-FRAME-STACK-PROBE: the `stack_probe` virtual op the
+    // prologue emits INSTEAD of a plain `sub SP, F` when the cc declares
+    // a nonzero `stackProbePageBytes` AND the frame exceeds it. The
+    // x86_64 encoder lowers it to an inline page-walking loop. Optional —
+    // only a target with a probe-needing CC declares it (x86_64 does;
+    // arm64 OMITS it so an accidental emission there fires
+    // A_NoEncodingDeclared, defense-in-depth). Absent ⇒ field 0; the
+    // prologue's emit site fails loud if a CC declares stackProbePageBytes
+    // but the schema lacks the opcode (a config mismatch).
+    std::uint16_t stackProbe;
 };
 
 // FC2 Part B: resolve the class-correct opcode for a register-data-
@@ -734,10 +854,42 @@ classOpHandle(TargetSchema const&  schema,
 }
 
 void emitPrologue(LirBuilder& b, FrameLayout const& layout,
-                  TargetSchema const& schema, LirReg sp,
-                  std::uint16_t subOp, DiagnosticReporter& reporter,
-                  bool& ok) {
-    emitSpAdjust(b, subOp, sp, layout.totalFrameSize);
+                  TargetSchema const& schema,
+                  TargetCallingConvention const& cc, LirReg sp,
+                  std::uint16_t subOp, std::uint16_t stackProbeOp,
+                  std::uint16_t gprStore, std::uint16_t gprStoreU,
+                  DiagnosticReporter& reporter, bool& ok) {
+    // D-WIN64-LARGE-FRAME-STACK-PROBE: when the cc declares a guard-page
+    // size (Windows ms_x64 = 4096) AND the frame DESCENDS past one guard
+    // page, the single `sub SP, F` would skip the OS guard page and
+    // access-violate on the first deep write. Emit the `stack_probe` op
+    // INSTEAD — the x86_64 encoder lowers it to a page-walking loop that
+    // touches every page on the way down. Every OTHER case (frame ≤ page,
+    // OR a cc with stackProbePageBytes==0 = Linux/macOS/arm64) keeps the
+    // plain `sub SP, F` below — byte-identical to before this feature.
+    // Agnostic: the decision reads cc.stackProbePageBytes (a config
+    // value), NEVER cc.name / arch / object format.
+    if (cc.stackProbePageBytes > 0
+        && layout.totalFrameSize > cc.stackProbePageBytes) {
+        if (stackProbeOp == 0) {
+            // The cc asks for probing but the schema declares no
+            // `stack_probe` opcode — a config mismatch. Fail loud rather
+            // than silently fall back to the guard-skipping `sub`.
+            report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                   DiagnosticSeverity::Error,
+                   std::format("calling convention '{}' declares "
+                               "stackProbePageBytes={} but the target "
+                               "schema has no 'stack_probe' opcode to "
+                               "emit the guard-page probe loop",
+                               cc.name, cc.stackProbePageBytes));
+            ok = false;
+            return;
+        }
+        emitStackProbe(b, stackProbeOp, sp, layout.totalFrameSize,
+                       static_cast<std::uint32_t>(cc.stackProbePageBytes));
+    } else {
+        emitSpAdjust(b, subOp, sp, layout.totalFrameSize);
+    }
     // D-ML7-2.2 audit-fold (2026-06-02 silent-failure CRITICAL C1):
     // saved regs sit at [SP + savedRegAreaOffset() + i*slotSize),
     // NOT [SP + i*slotSize). The new outgoing-args area pushes saved
@@ -757,15 +909,20 @@ void emitPrologue(LirBuilder& b, FrameLayout const& layout,
             schema, layout.savedRegs[i].regClass(), RegClassOp::Store,
             "callconv: prologue saved-reg store", reporter);
         if (!storeOp.has_value()) { ok = false; return; }
+        // Chokepoint swaps to store_u when a high saved-reg slot exceeds the
+        // imm9 reach (gprStore/gprStoreU are the GPR store + its scaled twin;
+        // an FPR saved-reg store keeps its class form — selectFrameMemOp gate).
         emitFrameStore(b, *storeOp, layout.savedRegs[i], sp,
-                       static_cast<std::int32_t>(base + i * layout.slotSize));
+                       static_cast<std::int32_t>(base + i * layout.slotSize),
+                       gprStore, gprStoreU);
     }
     ok = true;
 }
 
 void emitEpilogue(LirBuilder& b, FrameLayout const& layout,
                   TargetSchema const& schema, LirReg sp,
-                  std::uint16_t addOp, DiagnosticReporter& reporter,
+                  std::uint16_t addOp, std::uint16_t gprLoad,
+                  std::uint16_t gprLoadU, DiagnosticReporter& reporter,
                   bool& ok) {
     // Reverse the prologue: load saved regs FIRST, then restore SP.
     // Same savedRegAreaOffset() bias as the prologue (mirrored
@@ -776,8 +933,11 @@ void emitEpilogue(LirBuilder& b, FrameLayout const& layout,
             schema, layout.savedRegs[i].regClass(), RegClassOp::Load,
             "callconv: epilogue saved-reg load", reporter);
         if (!loadOp.has_value()) { ok = false; return; }
+        // Chokepoint swaps to load_u for a high saved-reg slot (mirrors the
+        // prologue store; gprLoad/gprLoadU = GPR load + its scaled twin).
         emitFrameLoad(b, *loadOp, layout.savedRegs[i], sp,
-                      static_cast<std::int32_t>(base + i * layout.slotSize));
+                      static_cast<std::int32_t>(base + i * layout.slotSize),
+                      gprLoad, gprLoadU);
     }
     emitSpAdjust(b, addOp, sp, layout.totalFrameSize);
     ok = true;
@@ -822,6 +982,7 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
                           TargetSchema const& schema,
                           TargetCallingConvention const& cc, LirReg sp,
                           std::uint16_t vaVrSpillStore, std::uint16_t addOp,
+                          std::uint16_t gprStore, std::uint16_t gprStoreU,
                           DiagnosticReporter& reporter) {
     if (!cc.vaListLayout.has_value()) return true;   // guarded by caller, defensive
     VaListLayout const& vl = *cc.vaListLayout;
@@ -864,7 +1025,8 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
             if (!reg.has_value()) return false;
             emitFrameStore(b, *gpStore, *reg, sp,
                            static_cast<std::int32_t>(
-                               homeBase + i * layout.outgoingSlotSize));
+                               homeBase + i * layout.outgoingSlotSize),
+                           gprStore, gprStoreU);
         }
         return true;
     }
@@ -963,7 +1125,8 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
                                           reporter);
             if (!reg.has_value()) return false;
             emitFrameStore(b, *gpStore, *reg, *scratch,
-                           static_cast<std::int32_t>(i * vl.gpSlotBytes));
+                           static_cast<std::int32_t>(i * vl.gpSlotBytes),
+                           gprStore, gprStoreU);
         }
         // VR block: 16-byte slots via the 128-bit `fstur_q` (the class store is the
         // 8-byte D-form, which would spill only the low half of a v-register), at
@@ -1011,7 +1174,8 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
                                       "callconv: variadic GPR save spill", reporter);
         if (!reg.has_value()) return false;
         emitFrameStore(b, *gpStore, *reg, sp,
-                       static_cast<std::int32_t>(base + i * vl.gpSlotBytes));
+                       static_cast<std::int32_t>(base + i * vl.gpSlotBytes),
+                       gprStore, gprStoreU);
     }
 
     // SSE arg regs → [sp + base + gpSaveCount*gpSlotBytes + i*fpSlotBytes] (the SSE
@@ -1280,7 +1444,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 21> const table{{
+    std::array<Entry, 23> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -1324,6 +1488,11 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         {&OpcodeHandles::vaRegSaveArea,     "va_reg_save_area",     true},
         {&OpcodeHandles::vaOverflowArgArea, "va_overflow_arg_area", true},
         {&OpcodeHandles::vaHomeArgArea,     "va_home_arg_area",     true},
+        // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: optional — only emitted
+        // when a fixed by-value aggregate param straddles the reg/stack boundary.
+        // Materialized into `lea [sp + offset]`; needs `lea` (present on any target
+        // that declares it). Absent ⇒ field 0; never matches a real input opcode.
+        {&OpcodeHandles::recvByValueStackParam, "recv_by_value_stack_param", true},
         {&OpcodeHandles::movqXmmToGpr,      "movq_xmm_to_gpr",      true},
         // FC12c (D-FC12C-AAPCS64-VARIADIC-CALLEE): optional — only the AAPCS64 dual-
         // cursor prologue's VR spill emits the 128-bit `fstur_q`. Absent ⇒ field 0;
@@ -1336,6 +1505,11 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // not per-inst (FOLD 2 — the fstur_q/lea optional-handle pattern).
         {&OpcodeHandles::loadU,             "load_u",               true},
         {&OpcodeHandles::storeU,            "store_u",              true},
+        // D-WIN64-LARGE-FRAME-STACK-PROBE: optional — only a target whose
+        // CC declares a nonzero stackProbePageBytes emits it (x86_64).
+        // Absent ⇒ field 0; the prologue emit site fails loud if a CC
+        // declares stackProbePageBytes but the schema omits the opcode.
+        {&OpcodeHandles::stackProbe,        "stack_probe",          true},
     }};
     for (auto const& [field, mnem, optional] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
@@ -1483,8 +1657,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
 
         if (bi == 0) {
             bool prologueOk = false;
-            emitPrologue(b, outLayout, schema, sp, h.sub, reporter,
-                         prologueOk);
+            emitPrologue(b, outLayout, schema, cc, sp, h.sub,
+                         h.stackProbe, h.store, h.storeU, reporter, prologueOk);
             if (!prologueOk) return false;
             // FC12a/b/c: a function that calls va_start spills its arg registers
             // immediately after the prologue's SP-adjust + saved-reg stores (so the
@@ -1493,7 +1667,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             // AAPCS64 GR+VR save / Apple no-op); straight-line stores — no CFG.
             if (usesVaStart
                 && !emitVariadicPrologueSpill(b, outLayout, schema, cc, sp,
-                                              h.vaVrSpillStore, h.add, reporter))
+                                              h.vaVrSpillStore, h.add,
+                                              h.store, h.storeU, reporter))
                 return false;
         }
 
@@ -1597,47 +1772,16 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         "materializeOneFunc: stack-resident arg load",
                         reporter);
                     if (!argLoad.has_value()) return false;
-                    // D-ASM-AARCH64-LARGE-FRAME-IMM12: pick the load
-                    // mnemonic from the OFFSET VALUE. The unscaled form
-                    // (`load`, AArch64 LDUR imm9) reaches only ±256; a
-                    // ≥9-fixed-param callee loads its 9th incoming-stack
-                    // param at `[sp + totalFrameSize + ...]`, which exceeds
-                    // imm9 once the frame (register-save-area + locals)
-                    // grows past 255. The scaled form (`load_u`, LDR
-                    // imm12-scaled) reaches 4095*accessSize. This MUST be
-                    // decided here, not in the encoder: the variant
-                    // selector commits on operand KINDS (both forms share
-                    // [reg, membase, memoffset]) and cannot inspect the
-                    // offset value, and the encoder does not backtrack on
-                    // an encode-range failure (§B.1 FORCED). Pure
-                    // arithmetic + config-handle lookup — NO arch/cc/format
-                    // identity branch: the swap is gated on the resolved
-                    // load BEING the universal `load` (so its scaled twin
-                    // `h.loadU` applies — an FPR/other-class load keeps its
-                    // class form), and `h.loadU` is 0 on a target without a
-                    // scaled form (x86_64 — whose memory ops already carry
-                    // disp32, so the imm9 path is never hit). The access
-                    // size is the scalar stack-arg stride; emitFrameLoad
-                    // builds a default-width (64-bit ⇒ 8-byte) load, so the
-                    // scale is `outgoingSlotSize`. A frame offset that fits
-                    // neither imm9 nor a scaled imm12 (e.g. unaligned, or
-                    // beyond 32760) stays fail-loud at the encoder — the
-                    // residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12.
-                    std::uint16_t loadOpcode = *argLoad;
-                    bool const fitsImm9 = offset >= -256 && offset <= 255;
-                    if (!fitsImm9 && *argLoad == h.load && h.loadU != 0) {
-                        std::uint32_t const bytes =
-                            std::max(1u, outLayout.outgoingSlotSize);
-                        if (offset >= 0
-                            && static_cast<std::uint32_t>(offset) % bytes == 0
-                            && static_cast<std::uint32_t>(offset) / bytes <= 4095u) {
-                            loadOpcode = h.loadU;
-                        }
-                        // else: leave loadOpcode = *argLoad; the encoder
-                        // fails loud (A_ImmediateOperandOutOfRange) — the
-                        // residual unencodable-offset case.
-                    }
-                    emitFrameLoad(b, loadOpcode, result, sp, offset);
+                    // D-ASM-AARCH64-LARGE-FRAME-IMM12: a ≥9-fixed-param callee
+                    // loads its 9th incoming-stack param at `[sp + totalFrame
+                    // Size + ...]`, which exceeds the unscaled imm9 ±256 reach
+                    // once the frame (register-save-area + locals) grows past
+                    // 255. The scaled-imm12 swap (load → load_u) is now done at
+                    // the emitFrameLoad CHOKEPOINT (selectFrameMemOp), so this
+                    // site — like every other frame load — just passes the GPR
+                    // load identity + its scaled twin and the chokepoint picks.
+                    emitFrameLoad(b, *argLoad, result, sp, offset,
+                                  h.load, h.loadU);
                 }
                 continue;
             }
@@ -1786,6 +1930,31 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     + static_cast<std::uint32_t>(cc.shadowSpaceBytes)
                     + fixedStackBytes);
                 emitFrameAddr(b, h.lea, result, sp, ovfOffset);
+                continue;
+            }
+            // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: a fixed by-value
+            // aggregate param received WHOLLY from the incoming stack (it straddled
+            // the reg/stack boundary). SAME incoming-overflow geometry as
+            // va_overflow_arg_area — `lea result, [sp + totalFrameSize + callPushBytes
+            // + shadowSpaceBytes + payload]` — but the payload is THIS aggregate's
+            // byte offset within the incoming overflow area (0 when it is the
+            // first/only overflowed fixed param). HIR→MIR then byte-copies from
+            // `result` into the param's local slot.
+            if (h.recvByValueStackParam != 0 && op == h.recvByValueStackParam) {
+                if (h.lea == 0 || !result.valid() || result.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                           DiagnosticSeverity::Error,
+                           "callconv: recv_by_value_stack_param materialization needs "
+                           "'lea' + a physical-reg result "
+                           "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)");
+                    return false;
+                }
+                std::int32_t const recvOffset = static_cast<std::int32_t>(
+                    outLayout.totalFrameSize
+                    + static_cast<std::uint32_t>(cc.callPushBytes)
+                    + static_cast<std::uint32_t>(cc.shadowSpaceBytes)
+                    + payload);
+                emitFrameAddr(b, h.lea, result, sp, recvOffset);
                 continue;
             }
             // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-1): the Win64
@@ -2028,6 +2197,20 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         byValStackCopies.push_back({srcReg, dstOffset, aggBytes});
                         overflowIdx += byValueStackAggSlots(
                             aggBytes, outLayout.outgoingSlotSize);
+                        // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: AAPCS64
+                        // EXHAUSTS the carrier's class (NGRN/NSRN←pool) — CLAMP the
+                        // matching arg cursor so a SUBSEQUENT same-class arg/vararg gets
+                        // argIndex >= poolSize → routed to the overflow too (matching the
+                        // callee's va_start __gr_offs/__vr_offs clamp + the pre-scan pad).
+                        // SysV (exhaust 0) leaves the cursor = backfill. Independent-
+                        // counter CCs only (a straddling carrier never arises slot-aligned).
+                        std::uint8_t const ex = ops[i + 1].byValueAggExhaust;
+                        if (ex == kByValueStackArgExhaustGpr)
+                            gprIdx = std::max(gprIdx,
+                                static_cast<std::uint32_t>(cc.argGprs.size()));
+                        else if (ex == kByValueStackArgExhaustFpr)
+                            fprIdx = std::max(fprIdx,
+                                static_cast<std::uint32_t>(cc.argFprs.size()));
                         ++argRegionIdx;
                         continue;
                     }
@@ -2278,7 +2461,11 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         "materializeOneFunc: call stack-arg store",
                         reporter);
                     if (!stkStore.has_value()) return false;
-                    emitFrameStore(b, *stkStore, s.src, sp, s.offset);
+                    // Outgoing stack-arg offsets live in the [0, outgoingArg
+                    // AreaSize) base; a call with many stack args can push them
+                    // past imm9 — the chokepoint swaps a GPR store to store_u.
+                    emitFrameStore(b, *stkStore, s.src, sp, s.offset,
+                                   h.store, h.storeU);
                 }
                 // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): emit the by-
                 // value-stack aggregate byte-copies — ALSO in the stack-store phase
@@ -2381,9 +2568,11 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         std::uint32_t off = 0;
                         for (; off < cpy.bytes; off += chunk) {
                             emitFrameLoad(b, *gpLoad, *scratch, cpy.addr,
-                                          static_cast<std::int32_t>(off));
+                                          static_cast<std::int32_t>(off),
+                                          h.load, h.loadU);
                             emitFrameStore(b, *gpStore, *scratch, sp,
-                                           cpy.dstOffset + static_cast<std::int32_t>(off));
+                                           cpy.dstOffset + static_cast<std::int32_t>(off),
+                                           h.store, h.storeU);
                         }
                     }
                 }
@@ -2584,7 +2773,13 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     schema, result.regClass(), RegClassOp::Load,
                     "materializeOneFunc: spill reload", reporter);
                 if (!spillLoad.has_value()) return false;
-                emitFrameLoad(b, *spillLoad, result, sp, offset);
+                // The spill area sits ABOVE the saved-reg area; a high spill
+                // slot (deep register pressure) exceeds the imm9 reach — the
+                // chokepoint swaps a GPR reload to load_u (the primary gap
+                // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 closes). An FPR spill
+                // reload keeps its fldur form (selectFrameMemOp gate).
+                emitFrameLoad(b, *spillLoad, result, sp, offset,
+                              h.load, h.loadU);
                 continue;
             }
             if (op == h.frameStore) {
@@ -2602,7 +2797,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     schema, ops[0].reg.regClass(), RegClassOp::Store,
                     "materializeOneFunc: spill store", reporter);
                 if (!spillStore.has_value()) return false;
-                emitFrameStore(b, *spillStore, ops[0].reg, sp, offset);
+                // Mirror of the spill reload: a high spill slot's store swaps
+                // to store_u via the chokepoint (FPR spill keeps fstur).
+                emitFrameStore(b, *spillStore, ops[0].reg, sp, offset,
+                               h.store, h.storeU);
                 continue;
             }
 
@@ -2671,8 +2869,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     }
                     // Emit epilogue BEFORE the return.
                     bool epilogueOk = false;
-                    emitEpilogue(b, outLayout, schema, sp, h.add, reporter,
-                                 epilogueOk);
+                    emitEpilogue(b, outLayout, schema, sp, h.add,
+                                 h.load, h.loadU, reporter, epilogueOk);
                     if (!epilogueOk) return false;
                 }
                 if (!lir_pass_util::emitTerminator(b, op, info, succs, newOps,

@@ -55,6 +55,11 @@ encode(Lir const&                  lir,
        std::vector<Relocation>&    relocs,
        std::vector<SourceMapEntry>& srcMap,
        std::vector<walker_util::BlockRelPatch>& blockPatches,
+       // D-CSUBSET-COMPUTED-GOTO: pending synthetic-symbol ↔ block
+       // bindings from a block-address `lea` (its trailing BlockRef
+       // operand). asm.cpp resolves each against the function's
+       // completed block-offset table into a `SyntheticBlockSymbol`.
+       std::vector<walker_util::BlockSymPatch>& blockSymPatches,
        DiagnosticReporter&         reporter);
 
 } // namespace dss::fixed32

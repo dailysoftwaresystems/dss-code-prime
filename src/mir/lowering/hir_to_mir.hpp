@@ -115,6 +115,21 @@ struct DSS_EXPORT MirLoweringConfig {
     // now its per-class index, not the param index.)
     bool               argSlotAligned             = false;
 
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the active CC's ARG
+    // register-pool counts (`argGprs.size()` / `argFprs.size()`) + the
+    // stack-exhaust policy, threaded from the resolved `TargetCallingConvention`.
+    // `argGprCount`/`argFprCount` are the agnostic source for the all-or-nothing
+    // register-exhaustion check on EVERY call (the variadic-only `vaListLayout`
+    // save-counts coincide for the shipped CCs but are the wrong semantic source
+    // for a non-variadic call). `aggregateStackExhaustsRegisters` decides what
+    // happens to the overflowed class once a by-value aggregate is placed wholly
+    // on the stack: false ⇒ BACKFILL (SysV — cursor not advanced); true ⇒ EXHAUST
+    // (AAPCS64 — cursor clamped to the pool). 0/false defaults preserve the
+    // pre-FC12 behavior (no by-value aggregate ⇒ the check never fires).
+    std::uint32_t      argGprCount                = 0;
+    std::uint32_t      argFprCount                = 0;
+    bool               aggregateStackExhaustsRegisters = false;
+
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the active CC's `__va_list_tag` layout +
     // register-save-area geometry, threaded from the resolved `TargetCallingConvention`
     // (mirrors `aggregateClassification`). ENGAGED ⇒ HIR→MIR lowers va_start (4 field

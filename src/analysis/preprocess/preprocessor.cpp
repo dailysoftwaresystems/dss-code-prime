@@ -1,5 +1,6 @@
 #include "analysis/preprocess/preprocessor.hpp"
 
+#include "analysis/preprocess/pp_if_eval.hpp"
 #include "tokenizer/tokenizer.hpp"
 
 #include <algorithm>
@@ -462,8 +463,21 @@ public:
                 i = handleDirective(in, i, body);
                 continue;
             }
-            body.push_back(in[i]);
+            // FC14: a non-directive token is emitted to the body ONLY when every
+            // enclosing conditional branch is active (C 6.10.1 conditional
+            // elision). A dead-branch token is dropped here -- so elision
+            // precedes `expand` naturally (the dead tokens never reach it).
+            if (stackActive()) body.push_back(in[i]);
             ++i;
+        }
+        // FC14: an unterminated conditional (a `#if`/`#ifdef`/`#ifndef` with no
+        // matching `#endif`) is a constraint violation (C 6.10p1) -- fail loud
+        // rather than silently eliding the rest of the file.
+        if (!condStack_.empty()) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   SourceSpan::empty(
+                       static_cast<ByteOffset>(synth_->size())),
+                   "unterminated conditional directive (missing #endif)");
         }
         // Stream-expand the whole directive-stripped body uniformly (object-
         // AND function-like macros share one cursor-walking engine). Lift the
@@ -523,11 +537,57 @@ private:
         std::size_t p = skipTrivia(in, start + 1);
         if (p >= end || isNewline(in[p])) return end;
         const std::string_view word = text(in[p]);
+
+        // FC14 (MF-3): the SIX conditional-compilation directives are dispatched
+        // UNCONDITIONALLY -- they must always update `condStack_` so nesting is
+        // tracked correctly even inside a dead branch (an `#if` nested in an
+        // elided `#if 0` still needs its matching `#endif` to balance). Their
+        // operand is evaluated ONLY when the branch should be (handled inside).
+        if (word == cfg().ifDirective) {
+            handleIf(in, p + 1, end, /*kind=*/IfKind::Expr);
+            return end;
+        }
+        if (word == cfg().ifdefDirective) {
+            handleIf(in, p + 1, end, IfKind::Ifdef);
+            return end;
+        }
+        if (word == cfg().ifndefDirective) {
+            handleIf(in, p + 1, end, IfKind::Ifndef);
+            return end;
+        }
+        if (word == cfg().elifDirective) {
+            handleElif(in, p + 1, end);
+            return end;
+        }
+        if (word == cfg().elseDirective) {
+            handleElse(in[p].span);
+            return end;
+        }
+        if (word == cfg().endifDirective) {
+            handleEndif(in[p].span);
+            return end;
+        }
+
+        // FC14 (MF-3): every NON-conditional directive -- AND its diagnostics --
+        // is GATED on the conditional stack being active. Inside a dead branch
+        // an unknown/malformed directive is NOT an error (C 6.10p1: a skipped
+        // group's directives are only parsed enough to track nesting), so the
+        // whole arm (including the unsupported-directive diagnostic) is skipped.
+        if (!stackActive()) return end;
+
         if (word == cfg().defineDirective) {
             handleDefine(in, p + 1, end);
         } else if (word == cfg().undefDirective) {
             handleUndef(in, p + 1, end);
         } else if (word == cfg().includeDirective) {
+            // NAMED EXCLUSION (D-PP-CONDITIONAL-INCLUDE-ORDERING): a quote
+            // `#include` inside a conditional was already spliced by
+            // `SynthBuilder` BEFORE this macro pass ran, so `#if 0 #include
+            // "x.h" #endif` already resolved x.h (its TEXT is then elided here,
+            // but the splice side-effect / missing-file error already happened
+            // upstream). The angle-include line is passed through to the
+            // post-parse import resolver as before. Not a silent miscompile: a
+            // missing dead-branch include errors LOUDLY at splice time.
             for (std::size_t q = start; q < end; ++q) body.push_back(in[q]);
         } else {
             emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported,
@@ -537,6 +597,167 @@ private:
                        + std::string{word});
         }
         return end;
+    }
+
+    // FC14: which `#if`-family directive opened a frame.
+    enum class IfKind { Expr, Ifdef, Ifndef };
+
+    // The condition stack (C 6.10.1). Each open `#if`/`#ifdef`/`#ifndef` pushes
+    // a frame; `#elif`/`#else` mutate the TOP; `#endif` pops. A token (or a
+    // gated directive) is live iff EVERY frame's `thisBranchActive` is true.
+    struct CondFrame {
+        bool enclosingActive;   // was the stack active when this frame opened?
+        bool anyBranchTaken;    // has any branch of this group been taken yet?
+        bool thisBranchActive;  // is the CURRENT branch the live one?
+        bool seenElse;          // has a `#else` been seen in this group?
+    };
+
+    // True iff every open conditional frame's current branch is active (empty
+    // stack => active). The gate for token emission + non-conditional
+    // directives.
+    [[nodiscard]] bool stackActive() const {
+        for (CondFrame const& f : condStack_) {
+            if (!f.thisBranchActive) return false;
+        }
+        return true;
+    }
+
+    // True iff `name` is currently a defined macro (C's `defined X` / `#ifdef`).
+    [[nodiscard]] bool isDefined(std::string_view name) const {
+        return table_.find(std::string{name}) != table_.end();
+    }
+
+    // `#if EXPR` / `#ifdef NAME` / `#ifndef NAME`: push a new frame. The branch
+    // is live iff the enclosing context is active AND the condition holds. The
+    // operand/condition is evaluated ONLY when the enclosing context is active
+    // (a dead branch's operand is NOT evaluated -- C 6.10.1p6).
+    void handleIf(std::vector<Token> const& in, std::size_t p, std::size_t end,
+                  IfKind kind) {
+        bool const enclosing = stackActive();
+        bool cond = false;
+        if (enclosing) {
+            if (kind == IfKind::Expr) {
+                cond = evalIfOperand(in, p, end);
+            } else {
+                // `#ifdef`/`#ifndef NAME`: the operand is a single macro name.
+                std::size_t q = skipTrivia(in, p);
+                if (q >= end || isNewline(in[q]) || !isWord(in[q])) {
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                           synth_->id(),
+                           (q < end ? in[q].span : SourceSpan::empty(0)),
+                           std::string{"#"}
+                               + std::string{kind == IfKind::Ifdef ? "ifdef"
+                                                                   : "ifndef"}
+                               + " requires a macro name");
+                    // Treat a malformed #ifdef as a false (inactive) branch, but
+                    // STILL push a frame so the matching #endif balances.
+                    cond = false;
+                } else {
+                    bool const def = isDefined(text(in[q]));
+                    cond = (kind == IfKind::Ifdef) ? def : !def;
+                }
+            }
+        }
+        condStack_.push_back(CondFrame{
+            /*enclosingActive=*/enclosing,
+            /*anyBranchTaken=*/enclosing && cond,
+            /*thisBranchActive=*/enclosing && cond,
+            /*seenElse=*/false});
+    }
+
+    // `#elif EXPR`: on the TOP frame, take this branch iff the enclosing context
+    // is active, NO prior branch of this group was taken, AND the expression
+    // holds. The operand is evaluated ONLY when it could be taken (C 6.10.1p6).
+    void handleElif(std::vector<Token> const& in, std::size_t p,
+                    std::size_t end) {
+        if (condStack_.empty()) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   (p <= end && p > 0 ? in[p - 1].span : SourceSpan::empty(0)),
+                   "#elif without a matching #if");
+            return;
+        }
+        CondFrame& f = condStack_.back();
+        if (f.seenElse) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   (p <= end && p > 0 ? in[p - 1].span : SourceSpan::empty(0)),
+                   "#elif after #else");
+            return;
+        }
+        // A prior active branch latches `anyBranchTaken`.
+        f.anyBranchTaken = f.anyBranchTaken || f.thisBranchActive;
+        bool const mayTake = f.enclosingActive && !f.anyBranchTaken;
+        bool cond = false;
+        if (mayTake) cond = evalIfOperand(in, p, end);
+        f.thisBranchActive = mayTake && cond;
+        f.anyBranchTaken   = f.anyBranchTaken || f.thisBranchActive;
+    }
+
+    // `#else`: take this branch iff the enclosing context is active and no prior
+    // branch of this group was taken.
+    void handleElse(SourceSpan at) {
+        if (condStack_.empty()) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   at, "#else without a matching #if");
+            return;
+        }
+        CondFrame& f = condStack_.back();
+        if (f.seenElse) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   at, "#else after #else");
+            return;
+        }
+        f.anyBranchTaken   = f.anyBranchTaken || f.thisBranchActive;
+        f.seenElse         = true;
+        f.thisBranchActive = f.enclosingActive && !f.anyBranchTaken;
+        f.anyBranchTaken   = true;
+    }
+
+    // `#endif`: pop the top frame.
+    void handleEndif(SourceSpan at) {
+        if (condStack_.empty()) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   at, "#endif without a matching #if");
+            return;
+        }
+        condStack_.pop_back();
+    }
+
+    // Evaluate an `#if`/`#elif` controlling expression: slice the operand tokens
+    // (from `p` to the line's newline), then delegate to the shared ICE
+    // evaluator (`pp_if_eval`), which reuses the const-eval arithmetic core +
+    // the existing macro expander (via the callbacks below). Returns the
+    // BRANCH-TAKEN boolean (the evaluator already emitted any fail-loud
+    // diagnostic; a nullopt -> false, the branch is not taken).
+    [[nodiscard]] bool evalIfOperand(std::vector<Token> const& in,
+                                     std::size_t p, std::size_t end) {
+        // The operand runs from `p` up to (but not including) the trailing
+        // newline that `lineEnd` consumed.
+        std::size_t last = end;
+        while (last > p && isNewline(in[last - 1])) --last;
+        std::vector<Token> operand(in.begin() + static_cast<std::ptrdiff_t>(p),
+                                   in.begin() + static_cast<std::ptrdiff_t>(last));
+        PpMacroExpand expandCb =
+            [this](std::vector<Token> const& toks) { return expandTokens(toks); };
+        PpIsDefined definedCb =
+            [this](std::string_view n) { return isDefined(n); };
+        auto v = evaluateIfExpression(operand, *schema_, expandCb, definedCb,
+                                      *synth_, rep_);
+        return v.has_value() && *v != 0;
+    }
+
+    // Macro-expand a token run with the SAME engine `run()` uses (object +
+    // function-like, hide-set-precise): lift into the ExpToken working set,
+    // expand, drop the hide sets. Used by the `#if` evaluator's callback so the
+    // controlling expression's macros expand identically to the body's.
+    std::vector<Token> expandTokens(std::vector<Token> const& toks) {
+        std::vector<ExpToken> work;
+        work.reserve(toks.size());
+        for (Token const& t : toks) work.push_back(ExpToken{t, nullptr});
+        std::vector<ExpToken> expanded = expand(std::move(work), 0);
+        std::vector<Token> out;
+        out.reserve(expanded.size());
+        for (ExpToken const& et : expanded) out.push_back(et.tok);
+        return out;
     }
 
     bool isParenOpen(Token const& t) const {
@@ -1126,6 +1347,9 @@ private:
     SchemaTokenId                        argSep_{};
     SchemaTokenId                        variadicMarker_{};
     std::unordered_map<std::string, MacroDef> table_;
+    // FC14: the conditional-compilation frame stack (one frame per open
+    // `#if`/`#ifdef`/`#ifndef`). See CondFrame + handleIf/Elif/Else/Endif.
+    std::vector<CondFrame>               condStack_;
 };
 
 } // namespace

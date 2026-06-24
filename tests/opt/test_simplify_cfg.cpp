@@ -1159,3 +1159,65 @@ TEST(SimplifyCfg, ConstantCondBrFoldPrunesDeadArmVerifierClean) {
            "per-pass verifier to reject";
     EXPECT_EQ(rep.errorCount(), 0u) << "zero error-severity diagnostics";
 }
+
+// ── D-CSUBSET-COMPUTED-GOTO (MF-B): SimplifyCfg must NOT trampoline-remove an
+// ADDRESS-TAKEN target block. Same shape as EmptyBlockJumpThreaded — an empty
+// Br-only `tramp` block — but `tramp` is the target of a BlockAddress (and an
+// IndirectBr can jump to it), so eliding it would leave the synthetic block
+// symbol pointing at deleted/moved code. The guard reads isBlockAddressTaken.
+// RED-ON-DISABLE: remove the `if (src_.isBlockAddressTaken(b)) continue;` guard
+// in simplify_cfg.cpp and `tramp` is jump-threaded away (blockCount drops). ─────
+TEST(SimplifyCfg, AddressTakenTrampolineNotElided) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const vptr  = interner.pointer(interner.primitive(TypeKind::Void));
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const disp  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const tramp = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const dst   = mb.createBlock(StructCfMarker::Linear);
+
+    // entry: ba = BlockAddress(tramp); br disp   (ba makes `tramp` address-taken)
+    mb.beginBlock(entry);
+    MirInstId const ba = mb.addBlockAddress(tramp, vptr);
+    mb.addBr(disp);
+    // disp: indirectbr ba -> [tramp]   (the computed-goto edge into the trampoline)
+    mb.beginBlock(disp);
+    std::array<MirBlockId, 1> succs{tramp};
+    mb.addIndirectBr(ba, succs);
+    // tramp: EMPTY Br-only block (the trampoline shape) -> dst
+    mb.beginBlock(tramp);
+    mb.addBr(dst);
+    // dst: return 42
+    mb.beginBlock(dst);
+    MirLiteralValue v; v.value = std::int64_t{42}; v.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    // ★ THE MF-B PIN: the address-taken trampoline is NOT jump-thread-ELIDED. (A
+    // safe single-pred merge of a NON-address-taken successor INTO it may still
+    // run — that preserves the trampoline's entry address — so we assert the
+    // jump-thread count is 0 and the address-taken block still exists, not the raw
+    // block count.) RED-ON-DISABLE: drop the isBlockAddressTaken guard in
+    // simplify_cfg.cpp's trampoline loop and `tramp` IS jump-threaded
+    // (blocksJumpThreaded == 1) → its synthetic symbol would dangle.
+    EXPECT_EQ(r.blocksJumpThreaded, 0u)
+        << "an address-taken (&&label-targeted) trampoline must NOT be jump-threaded";
+    // An address-taken block (the BlockAddress target) survives the rebuild.
+    bool anyAddressTaken = false;
+    for (std::uint32_t fi = 0; fi < mir.moduleFuncCount(); ++fi) {
+        MirFuncId const fn = mir.funcAt(fi);
+        std::uint32_t const nb = mir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            if (mir.isBlockAddressTaken(mir.funcBlockAt(fn, bi))) anyAddressTaken = true;
+        }
+    }
+    EXPECT_TRUE(anyAddressTaken)
+        << "the &&label target block survives SimplifyCfg (MF-B guard held)";
+}

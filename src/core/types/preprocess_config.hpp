@@ -50,6 +50,29 @@ struct DSS_EXPORT PreprocessConfig {
     std::string undefDirective;    // "undef"
     std::string includeDirective;  // "include"
 
+    // FC14 (D-PP-CONDITIONAL-COMPILATION): the CONDITIONAL-compilation directive
+    // WORDS (C 6.10.1), matched by lexeme TEXT against the token after `#` --
+    // exactly like define/undef/include (`if`/`elif`/`else`/`endif` lex as plain
+    // Identifier; `ifdef`/`ifndef` likewise). REQUIRED-when-the-block-is-present
+    // + validated non-empty by the loader (same fail-loud as defineDirective): an
+    // opt-in language declares the whole conditional vocabulary so the engine
+    // never hard-codes a directive spelling. A language without a preprocess
+    // block carries none of these (the pass is a strict no-op).
+    std::string ifDirective;       // "if"
+    std::string ifdefDirective;    // "ifdef"
+    std::string ifndefDirective;   // "ifndef"
+    std::string elifDirective;     // "elif"
+    std::string elseDirective;     // "else"
+    std::string endifDirective;    // "endif"
+
+    // FC14: the `defined` OPERATOR keyword (C 6.10.1p1), valid only inside an
+    // `#if`/`#elif` operand: `defined X` / `defined(X)` tests macro-definedness.
+    // Matched by lexeme TEXT (an ordinary identifier in the operand, NOT a
+    // distinct token kind -- like the directive WORDS), so a per-language
+    // CONFIG spelling, never a hard-coded "defined". REQUIRED + validated
+    // non-empty when the block is present.
+    std::string definedOperator;   // "defined"
+
     // The token kind that opens a QUOTE include target (`#include "h"` ->
     // "StringStart"). Resolved relative to the including file's directory +
     // include dirs; the PP splices the (recursively preprocessed) header

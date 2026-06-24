@@ -264,6 +264,12 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn) {
     };
     for (MirBlockId const b : rpo) {
         if (b.v == entry.v) continue;
+        // D-CSUBSET-COMPUTED-GOTO (MF-B): never trampoline-REMOVE an ADDRESS-TAKEN
+        // block. Its runtime address was captured by `&&label` and an IndirectBr
+        // may jump to it; eliding it would leave the synthetic block symbol's
+        // offset pointing at deleted/moved code — a SILENT MISCOMPILE. Keep it
+        // verbatim (the indirect edge keeps it reachable anyway).
+        if (src_.isBlockAddressTaken(b)) continue;
         if (src_.blockInstCount(b) != 1) continue;
         MirInstId const term = src_.blockInstAt(b, 0);
         if (src_.instOpcode(term) != MirOpcode::Br) continue;
@@ -304,6 +310,12 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn) {
     auto const preds = mirBuildPredecessors(src_);
     auto isCandidateForMerge = [&](MirBlockId P, MirBlockId B) -> bool {
         if (B.v == entry.v) return false;
+        // D-CSUBSET-COMPUTED-GOTO (MF-B): never MERGE an ADDRESS-TAKEN block B into
+        // its predecessor P. B's runtime address is live as data (an IndirectBr can
+        // branch to it); folding B's body into P would move B's code, so the
+        // synthetic block symbol's offset would no longer name B's first
+        // instruction — a SILENT MISCOMPILE.
+        if (src_.isBlockAddressTaken(B)) return false;
         if (jumpThreadMap_.count(P) || jumpThreadMap_.count(B)) return false;
         if (B.v >= preds.size() || preds[B.v].size() != 1) return false;
         if (preds[B.v][0].v != P.v) return false;

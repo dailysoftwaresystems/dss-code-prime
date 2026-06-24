@@ -1,0 +1,7 @@
+{
+  "$comment": "D-CSUBSET-LOCAL-STATIC (MF-2): `static` in a for-init is a C 6.8.5p3 constraint violation — fail loud S_StaticStorageInForInit (0xE021) at the `static` token, never silently lower as an automatic loop var. RED-ON-DISABLE: drop the forDecl StaticKeyword gatedMarker -> the static silently routes to a hidden global with an empty for-init clause (no diagnostic).",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [ { "spec": "x86_64:elf64-x86_64-linux-exec" } ],
+  "expectDiagnostics": [ { "code": "S_StaticStorageInForInit", "line": 9, "col": 10 } ]
+}

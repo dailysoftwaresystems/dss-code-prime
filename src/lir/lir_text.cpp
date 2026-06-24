@@ -234,6 +234,12 @@ renderOperand(LirOperand const& op, TargetSchema const& schema,
         case LirOperandKind::LiteralIndex:
             return std::format("lit#{}", op.litIndex);
         case LirOperandKind::ByValueStackAgg:
+            // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the marker's
+            // `byValueAggExhaust` (the AAPCS64 exhaust class) is NOT round-tripped in
+            // LIR text — the parser reconstructs it as 0. This is debug/fixture text
+            // only; the REAL MIR→LIR path (mir_to_lir.cpp) threads it correctly. A
+            // LIR-text fixture that needs to witness the clamp must build it via the
+            // structured operand, not the textual codec.
             return std::format("byval#{}", op.byValueAggBytes);
     }
     // Fall-through is a substrate-corruption signal — the discriminator

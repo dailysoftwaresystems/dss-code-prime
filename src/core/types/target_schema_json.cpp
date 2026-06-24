@@ -107,6 +107,36 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
                 static_cast<std::uint8_t>(w.get<std::int64_t>());
         }
     }
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: OPTIONAL `immMin`/`immMax`
+    // immediate-magnitude bounds (uint32, [0, 0xFFFFFFFF]). Absent ⇒ the
+    // variant matches any immediate magnitude (every pre-existing variant).
+    // Present ⇒ the matcher additionally requires the inst's immediate /
+    // memOffset magnitude in [immMin, immMax] — what lets one opcode carry
+    // both a single-word imm12 variant (immMax:4095) and a 2-word shifted
+    // form (immMin:4096). A non-integer or out-of-uint32 value is a load-
+    // time reject (never a silently dropped bound). `immMin > immMax` is
+    // caught at validate() (an empty range matches nothing — a config bug).
+    auto const parseImmBound = [&](char const* key, std::optional<std::uint32_t>& out) {
+        if (!g.contains(key)) return;
+        auto const& jv = g.at(key);
+        auto const path = std::format(
+            "/opcodes/{}/encoding/variants/{}/guard/{}", opIdx, vi, key);
+        if (!jv.is_number_integer()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      std::format("'{}' must be a non-negative integer", key));
+            return;
+        }
+        std::int64_t const n = jv.get<std::int64_t>();
+        if (n < 0 || n > static_cast<std::int64_t>(
+                             std::numeric_limits<std::uint32_t>::max())) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      std::format("'{}' ({}) must fit in [0, 4294967295]", key, n));
+            return;
+        }
+        out = static_cast<std::uint32_t>(n);
+    };
+    parseImmBound("immMin", variant.immMin);
+    parseImmBound("immMax", variant.immMax);
     if (!g.contains("operandKinds")) return;
     auto const& oks = g.at("operandKinds");
     if (!oks.is_array()) {
@@ -1483,6 +1513,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // contract).
                 readBoundedInt(c, coll, ccPath, "callPushBytes",
                                cc.callPushBytes);
+                // D-WIN64-LARGE-FRAME-STACK-PROBE: OS stack guard-page
+                // size + probe step. Optional (default 0 = no probing —
+                // Linux/macOS/arm64). ms_x64 declares 4096. Validated
+                // below: when nonzero MUST be a power of two.
+                readBoundedInt(c, coll, ccPath, "stackProbePageBytes",
+                               cc.stackProbePageBytes);
                 // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN):
                 // the max aggregate size passed/returned in registers (SysV 16,
                 // Win64 8, AAPCS64 16); larger ⇒ by-reference / sret.
@@ -1533,6 +1569,24 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     } else {
                         cc.variadicArgsAlwaysStack =
                             c.at("variadicArgsAlwaysStack").get<bool>();
+                    }
+                }
+                // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: optional —
+                // when true, a by-value aggregate placed wholly on the stack
+                // (it straddled the reg/stack boundary) EXHAUSTS the overflowed
+                // arg-register class (AAPCS64). Default false = BACKFILL (SysV:
+                // the leftover registers stay available for later args). Win64 is
+                // slot-aligned so it never straddles (the flag is inert).
+                if (c.contains("aggregateStackExhaustsRegisters")) {
+                    if (!c.at("aggregateStackExhaustsRegisters").is_boolean()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/aggregateStackExhaustsRegisters",
+                                              ccPath),
+                                  "'aggregateStackExhaustsRegisters' must be a "
+                                  "boolean");
+                    } else {
+                        cc.aggregateStackExhaustsRegisters =
+                            c.at("aggregateStackExhaustsRegisters").get<bool>();
                     }
                 }
                 if (c.contains("linkRegister")) {

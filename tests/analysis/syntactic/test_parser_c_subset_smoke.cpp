@@ -1,4 +1,5 @@
 #include "analysis/syntactic/parser.hpp"
+#include "core/substrate/large_stack_call.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -11,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -998,7 +1000,7 @@ TEST(ParserCSubsetSmoke, PostfixChainNestsLeftToRight) {
 // Postfix followed by infix at the same level: `f(a) + g(b)`. The
 // outer infix must roll back through the postfix wrap (postfix
 // intentionally does NOT advance the snap) so the binaryExpr frame
-// rebuilds the LHS chain via its recursive `parseExpressionAt` at
+// rebuilds the LHS chain through the iterative exprWorkStack driver at
 // `prec + 1`. Without that invariant the postfix wraps would land as
 // siblings of the binaryExpr instead of children — fib's
 // `return fib(n-1) + fib(n-2);` was the original reproducer.
@@ -1111,9 +1113,9 @@ TEST(ParserCSubsetSmoke, FunctionCallChainNests) {
 // Paren-wrapped chain: `(f(a)[i])` — the chain lives inside an
 // `operand`'s `( expression )` branch which opens a fresh
 // `expression` frame. The "snap stays valid across postfix iters"
-// invariant lives per-`parseExpressionAt` call, so the inner
-// expression frame's chain must bind to itself, not leak to the
-// outer expression.
+// invariant lives per expression-descent on the exprWorkStack driver,
+// so the inner expression frame's chain must bind to itself, not leak
+// to the outer expression.
 TEST(ParserCSubsetSmoke, ParenWrappedPostfixChainNests) {
     auto h = loadAndTokenize("int main() { (f(a)[i]); }");
     Parser p{h.src, h.schema, std::move(h.stream)};
@@ -1177,8 +1179,8 @@ TEST(ParserCSubsetSmoke, BrokenPostfixChainEmitsDiagnostic) {
 
 // Mixed chain: `*p[i]++` — left-recursive postfix chain interacts
 // with prefix `*` (lower precedence). C semantics: `*( (p[i])++ )`.
-// The prefix's recursive `parseExpressionAt(prefixPrec)` consumes
-// the full chain.
+// The prefix's operand descent at `prefixPrec` (now an iterative
+// exprWorkStack push, not host recursion) consumes the full chain.
 TEST(ParserCSubsetSmoke, PrefixOverPostfixChainNests) {
     auto h = loadAndTokenize("int main() { *p[i]++; }");
     Parser p{h.src, h.schema, std::move(h.stream)};
@@ -1388,4 +1390,122 @@ TEST(ParserCSubsetSmoke, LongInitializerRidesTheStatementProbeBudget) {
     EXPECT_TRUE(hasInternalNodeWithRule(t, "identVarDecl"))
         << "the long-initializer statement must still commit as a "
            "DECLARATION";
+}
+
+// ── plan-24 Stage 7: the config-driven expression-depth cap LIFT ────────────
+//
+// Three pins for the single change "`maxExpressionDepth` is config-driven and
+// raised": (A) the c-subset `.lang.json` `parser.maxExpressionDepth` actually
+// reaches `GrammarSchema`; (B) the LIFT — a paren nest DEEPER than the old 256
+// cap now parses CLEAN under the shipped cap; (C) the RED-on-disable BACKSTOP —
+// the SAME nest, parsed with the cap RE-IMPOSED at 256, still FAILS LOUD with a
+// positioned `P_ExpressionTooDeep` (the fail-loud ceiling is intact, never
+// removed — BC-1). (B)+(C) on the SAME input are the load-bearing pair: only
+// the raised cap distinguishes a clean parse from the depth diagnostic.
+
+namespace {
+[[nodiscard]] std::size_t countCode(Tree const& t, DiagnosticCode code) {
+    std::size_t n = 0;
+    for (auto const& d : t.diagnostics().all()) {
+        if (d.code == code) ++n;
+    }
+    return n;
+}
+
+// `int main(void){ return ((( ... 0 ... )));}` with `depth` expression parens.
+// A paren nest is the heaviest expression-DEEPENING path (each `(` counts one
+// `maxExpressionDepth` unit) AND the one the cap is sized around (the residual
+// recursive paren arm), so it is the right shape to exercise the cap. It folds
+// flat (each paren is a transparent wrapper over the inner `0`), so nothing
+// downstream cares — this pin is purely about the parser's depth gate.
+[[nodiscard]] std::string parenNest(int depth) {
+    std::string s = "int main(void){ return ";
+    s.reserve(static_cast<std::size_t>(depth) * 2 + 40);
+    for (int i = 0; i < depth; ++i) s += '(';
+    s += '0';
+    for (int i = 0; i < depth; ++i) s += ')';
+    s += "; }";
+    return s;
+}
+
+// Parse `source` against the real shipped c-subset schema with an explicit
+// `maxExpressionDepth` cap, on the production 64 MiB deep-recursion worker
+// stack (the parser's still-recursive paren arm needs it past a few hundred
+// levels — exactly as `Program::compileFiles` runs the real parse). Returns
+// the produced tree.
+[[nodiscard]] Tree parseCSubsetWithCap(std::string source, std::size_t cap) {
+    return dss::substrate::callOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&]() -> Tree {
+            auto h = loadAndTokenize(std::move(source));
+            ParserConfig cfg;
+            cfg.maxExpressionDepth = cap;
+            Parser p{h.src, h.schema, std::move(h.stream), std::move(cfg)};
+            return std::move(std::move(p).parse().tree);
+        });
+}
+} // namespace
+
+// (A) The cap is CONFIG-DRIVEN: the c-subset `.lang.json` declares
+// `parser.maxExpressionDepth`, and it round-trips to the loaded schema. If the
+// loader silently dropped the field (or the JSON omitted it), this reads
+// `nullopt` and the CU would fall back to the hardcoded 256 — defeating the
+// "100% config-driven" requirement. RED if the loader wiring regresses.
+TEST(ParserCSubsetSmoke, ExpressionDepthCapIsConfigDriven) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto cap = (*loaded)->maxExpressionDepth();
+    ASSERT_TRUE(cap.has_value())
+        << "c-subset `parser.maxExpressionDepth` must reach the schema "
+           "(config-driven, not the hardcoded ParserConfig default)";
+    // The shipped value is HIGH (raised past the old 256) and BOUNDED. Pin the
+    // exact value so a config edit that changes it must consciously update this
+    // pin (and the corpus golden) rather than drift silently.
+    EXPECT_EQ(*cap, 1024u)
+        << "shipped c-subset expression-depth cap (Debug-safe high bound)";
+    EXPECT_GT(*cap, 256u) << "the lift must raise the cap above the old 256";
+}
+
+// (B) THE LIFT: a 300-deep paren nest EXCEEDS the OLD 256 cap, yet now parses
+// CLEAN under the shipped cap (1024). Pre-lift this exact input tripped
+// `P_ExpressionTooDeep` at the 256th paren; post-lift it is a legal parse.
+TEST(ParserCSubsetSmoke, DeepParenNestParsesCleanUnderRaisedCap) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    const std::size_t shippedCap = (*loaded)->maxExpressionDepth().value_or(256);
+    ASSERT_GT(shippedCap, 300u);
+
+    // Parse with the SHIPPED cap (mirrors the production CU path).
+    Tree t = parseCSubsetWithCap(parenNest(300), shippedCap);
+    EXPECT_EQ(countCode(t, DiagnosticCode::P_ExpressionTooDeep), 0u)
+        << "a 300-deep nest (> old 256) must NOT trip the cap at the raised "
+           "value — this is the lift the stage delivers";
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "the 300-deep paren nest is legal C and must parse clean";
+}
+
+// (C) RED-on-disable BACKSTOP: the SAME 300-deep nest, parsed with the cap
+// RE-IMPOSED at the old 256, STILL fails loud with a positioned
+// `P_ExpressionTooDeep` + recovery (no crash, no silent truncation). This is
+// the proof the fail-loud ceiling was NOT removed by the lift — it fires at
+// WHATEVER cap is configured. Pairs with (B): identical input, only the cap
+// differs, so the diagnostic's presence/absence is attributable solely to the
+// cap value.
+TEST(ParserCSubsetSmoke, ExpressionDepthCapStillFiresWhenReimposedAt256) {
+    Tree t = parseCSubsetWithCap(parenNest(300), 256u);
+    // Exactly one positioned too-deep diagnostic — the deepest push trips the
+    // guard once at the 257th paren; the parse RECOVERS (returns a tree, no
+    // overflow) and flags HasError.
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_GE(countCode(t, DiagnosticCode::P_ExpressionTooDeep), 1u)
+        << "with the cap re-imposed at 256, a 300-deep nest MUST still fail "
+           "loud — the backstop is intact at whatever value is configured";
+    EXPECT_TRUE(t.diagnostics().hasErrors());
+    // The diagnostic is POSITIONED at a real `(` (line 1), at or before the
+    // innermost paren — never an unpositioned/zero span.
+    for (auto const& d : t.diagnostics().all()) {
+        if (d.code != DiagnosticCode::P_ExpressionTooDeep) continue;
+        const auto lc = t.source().lineCol(d.span.start());
+        EXPECT_EQ(lc.line, 1u);
+        EXPECT_EQ(t.source().slice(d.span), "(");
+    }
 }

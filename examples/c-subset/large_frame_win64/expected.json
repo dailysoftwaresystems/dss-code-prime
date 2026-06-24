@@ -1,0 +1,23 @@
+{
+  "$comment": "D-WIN64-LARGE-FRAME-STACK-PROBE runtime witness: a Win64 (x86_64 + PE, ms_x64) function whose frame (36000B, `int big[9000]`) EXCEEDS one Windows guard page (4096B). The ML7 prologue must emit the inline `stack_probe` loop (the new LIR op the x86_64 encoder lowers to a page-walking loop: mov r11d,frame / .L sub rsp,page / or qword[rsp],0 / sub r11d,page / cmp r11d,page / ja .L / sub rsp,r11) INSTEAD of a bare `sub rsp,36040` so the descent TOUCHES every PAGE_GUARD page on the way down. seed is a mutable global so the store->load round-trip survives ConstFold/Mem2Reg/DCE (the array cannot be optimized away). Exit 42. RED-ON-DISABLE is NATURAL + STRONG on the NATIVE Windows runner: revert the prologue's threshold branch (emit the plain `sub rsp,F`) and the deep write big[8999] faults via guard-SKIP (STATUS_GUARD_PAGE_VIOLATION -> exit 139/0xC0000005) — VERIFIED. The `release` optimizedPipeline arm exercises the probe under the REAL shipped composition (Inlining ON). The x86_64:elf (Linux) leg is the non-Windows control: stackProbePageBytes=0 there so NO probe is emitted (Linux auto-grows the 8MB stack via demand paging), proving the change is byte-identical/no-op off Windows. The arm64 large-frame path (shifted-imm12 sub sp) is covered separately by large_frame_arm64.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

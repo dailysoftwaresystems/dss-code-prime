@@ -29,12 +29,20 @@
 //      directive-line removal apply uniformly. (No `#`/`##` operators yet.)
 //   4. Re-packages the surviving tokens into a fresh TokenStream.
 //
+// FC14 (D-PP-CONDITIONAL-COMPILATION) adds CONDITIONAL compilation:
+// `#if`/`#ifdef`/`#ifndef`/`#elif`/`#else`/`#endif` + the `defined` operator. A
+// condition stack tracks branch state; a dead branch's tokens are simply NOT
+// emitted into the body (elision precedes macro expansion). The `#if`/`#elif`
+// controlling expression is an integer-constant-expression evaluated by
+// `pp_if_eval` (config-driven precedence + the shared const-eval arithmetic
+// core). The whole vocabulary (directive words + `defined`) is config-driven.
+//
 // FAIL-LOUD on every unsupported construct (function-like macro arity mismatch,
 // unterminated invocation, variadic/duplicate-parameter/malformed parameter
 // list, incompatible redefinition, missing quote include, include recursion
-// overflow) -- never a silent pass-through or miscompile. Out of scope (pinned,
-// not built): `#if`/`#ifdef`/`defined` (FC14); `##`/`#`/predefined macros +
-// VARIADIC macros (D-PP-VARIADIC-MACRO, FC15-area).
+// overflow, an unterminated/mismatched conditional, a non-ICE / sizeof / float /
+// string operand in `#if`) -- never a silent pass-through or miscompile. Out of
+// scope (pinned, not built): `##`/`#`/predefined macros (FC15-area).
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"

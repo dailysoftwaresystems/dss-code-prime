@@ -3096,3 +3096,175 @@ TEST(Inlining, CalleePhiCommonDominatorArmsPairedThroughInliner) {
         << "SOURCE-INTENT PAIRING: the else-arm (CondBr ifFalse, clone of the "
            "arm carrying Arg b) must carry b's actual value 9";
 }
+
+// ── D-CSUBSET-COMPUTED-GOTO inlining gate + routing (3 pins) ──────────────────
+
+// CALLEE direction (MF-4): a callee that contains computed goto (BlockAddress +
+// IndirectBr) is NEVER inlined — block renumbering would invalidate the &&label
+// symbols + the IndirectBr successor set. RED-ON-DISABLE: drop the BlockAddress/
+// IndirectBr arms from inlineLegalityGate.
+TEST(Inlining, ComputedGotoCalleeWithIndirectBrIsNotInlined) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const vptr  = interner.pointer(interner.primitive(TypeKind::Void));
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // callee f (SymbolId 50): a tiny computed-goto function.
+    mb.addFunction(fnSig, SymbolId{50});
+    MirBlockId const fEntry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const fTarget = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(fEntry);
+    MirInstId const fba = mb.addBlockAddress(fTarget, vptr);
+    std::array<MirBlockId, 1> fsuccs{fTarget};
+    mb.addIndirectBr(fba, fsuccs);
+    mb.beginBlock(fTarget);
+    mb.addReturn(mb.addConst(i32Lit(7), i32));
+
+    // main (SymbolId 100): calls f.
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const cmEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(cmEntry);
+    MirInstId const cAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    std::array<MirInstId, 1> cOps{cAddr};
+    mb.addReturn(mb.addInst(MirOpcode::Call, cOps, i32));
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::IndirectBr), 1u);
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "a computed-goto callee (BlockAddress + IndirectBr) MUST NOT be inlined";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::IndirectBr), 1u);
+}
+
+// CALLER direction (the pr-review's silent-miscompile catch): a HOST that itself
+// contains computed goto AND calls a MULTI-BLOCK helper must route to the single-
+// block rebuilder, NEVER the MultiBlockInliner (whose caller-host emit mis-copies
+// the BlockAddress block-id payload + aborts on IndirectBr). RED-ON-DISABLE: drop
+// the `functionHasComputedGoto` routing guard and runInlining aborts/corrupts.
+TEST(Inlining, ComputedGotoHostWithMultiBlockCalleeRoutesSafely) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const vptr  = interner.pointer(interner.primitive(TypeKind::Void));
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // MULTI-block inline-eligible helper (SymbolId 50): cond-branch to two returns.
+    mb.addFunction(fnSig, SymbolId{50});
+    MirBlockId const hEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const hThen  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const hElse  = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(hEntry);
+    mb.addCondBr(mb.addConst(i32Lit(1), i32), hThen, hElse);
+    mb.beginBlock(hThen);
+    mb.addReturn(mb.addConst(i32Lit(3), i32));
+    mb.beginBlock(hElse);
+    mb.addReturn(mb.addConst(i32Lit(4), i32));
+
+    // computed-goto HOST main (SymbolId 100): BlockAddress + IndirectBr + a call.
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mmEntry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const mmTarget = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(mmEntry);
+    MirInstId const mAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    std::array<MirInstId, 1> mOps{mAddr};
+    mb.addInst(MirOpcode::Call, mOps, i32);
+    MirInstId const mba = mb.addBlockAddress(mmTarget, vptr);
+    std::array<MirBlockId, 1> msuccs{mmTarget};
+    mb.addIndirectBr(mba, msuccs);
+    mb.beginBlock(mmTarget);
+    mb.addReturn(mb.addConst(i32Lit(9), i32));
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::IndirectBr), 1u);
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::BlockAddress), 1u);
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok)
+        << "inlining a multi-block callee INTO a computed-goto host must not abort";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::IndirectBr), 1u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::BlockAddress), 1u);
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "the multi-block helper is NOT inlined into the computed-goto host "
+           "(follow-up D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST)";
+}
+
+// The single-block-callee-INTO-host case (self-audit gap pin): the host routes to
+// the single-block rebuilder, which DOES inline a single-block-leaf callee
+// (callsInlined==1) while keeping the host's BlockAddress + IndirectBr intact
+// across the renumber.
+TEST(Inlining, ComputedGotoHostInlinesSingleBlockCalleeAndKeepsGoto) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const vptr  = interner.pointer(interner.primitive(TypeKind::Void));
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // SINGLE-block leaf helper (SymbolId 50): returns a constant (inline-eligible).
+    mb.addFunction(fnSig, SymbolId{50});
+    MirBlockId const sEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(sEntry);
+    mb.addReturn(mb.addConst(i32Lit(5), i32));
+
+    // computed-goto HOST main (SymbolId 100): BlockAddress + IndirectBr + a call.
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const smEntry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const smTarget = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(smEntry);
+    MirInstId const sAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    std::array<MirInstId, 1> sOps{sAddr};
+    mb.addInst(MirOpcode::Call, sOps, i32);
+    MirInstId const sba = mb.addBlockAddress(smTarget, vptr);
+    std::array<MirBlockId, 1> ssuccs{smTarget};
+    mb.addIndirectBr(sba, ssuccs);
+    mb.beginBlock(smTarget);
+    mb.addReturn(mb.addConst(i32Lit(9), i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "a SINGLE-block leaf callee IS inlined into a computed-goto host";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::IndirectBr), 1u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::BlockAddress), 1u);
+
+    // Stronger than the counts: the surviving BlockAddress must still name the
+    // RETURN target block AFTER the single-block splice renumbered the host's
+    // blocks — the precise "address survives renumbering correctly" property a
+    // bad rebuild-helper BlockAddress arm would break — and the whole module
+    // must stay verifier-valid post-inline.
+    bool checkedTarget = false;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < nf && !checkedTarget; ++fi) {
+        MirFuncId const fn = mir.funcAt(fi);
+        std::uint32_t const nb = mir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < nb && !checkedTarget; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(fn, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t ii = 0; ii < ni && !checkedTarget; ++ii) {
+                MirInstId const inst = mir.blockInstAt(b, ii);
+                if (mir.instOpcode(inst) != MirOpcode::BlockAddress) continue;
+                MirBlockId const tgt = mir.blockAddressTarget(inst);
+                EXPECT_EQ(mir.instOpcode(mir.blockTerminator(tgt)),
+                          MirOpcode::Return)
+                    << "the BlockAddress target must still be the Return block "
+                       "after the inline splice renumbered the host's blocks";
+                checkedTarget = true;
+            }
+        }
+    }
+    EXPECT_TRUE(checkedTarget) << "the host's BlockAddress must be locatable";
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the module must stay verifier-valid after inlining a single-block "
+           "callee into a computed-goto host";
+}

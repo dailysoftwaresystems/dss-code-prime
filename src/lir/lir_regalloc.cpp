@@ -138,26 +138,31 @@ collectCallPositions(Lir const& lir, TargetSchema const& schema,
 // every `isCall` instruction whose ops[0] is a VIRTUAL Reg (the
 // indirect-call callee, post-isel pre-regalloc), record its position
 // (EARLY slot, same 2-slot scale as collectCallPositions), the callee
-// vreg id, and the call payload's variadic bit.
+// vreg id, and the call payload's variadic + indirect-result bits.
 //
 // WHY: the callconv materializer inserts the arg-passing moves (and
-// the variadic count-reg set) POST-regalloc, BETWEEN the callee's
-// definition and its use at the call. A callee consumed AT the call
-// does not "cross" it (`rangeCrossesCall` requires `pos + 1 < r.end`),
-// so every caller-saved register — INCLUDING all arg registers — is
-// otherwise eligible for the callee vreg; fixed-def interference from
-// the not-yet-emitted moves is not modeled. A callee parked in an arg
-// register is then clobbered by its own call's arg setup → the call
-// jumps THROUGH AN ARGUMENT VALUE (silent garbage). The consumer in
+// the variadic count-reg set, and the FC7-C3 indirect-result `mov x8, R`
+// reroute) POST-regalloc, BETWEEN the callee's definition and its use at
+// the call. A callee consumed AT the call does not "cross" it
+// (`rangeCrossesCall` requires `pos + 1 < r.end`), so every caller-saved
+// register — INCLUDING all arg registers AND the cc's indirect-result
+// register (x8 on AAPCS64, caller-saved, NOT an arg reg) — is otherwise
+// eligible for the callee vreg; fixed-def interference from the
+// not-yet-emitted moves is not modeled. A callee parked in such a
+// register is then clobbered by its own call's arg/result setup → the
+// call jumps THROUGH a setup value (D-FC4-C2 silent garbage), or trips
+// the loud L_IndirectCalleeClobberedByArgSetup backstop. The consumer in
 // allocateOneFunc excludes the cc's argGprs ∪ argFprs (+ the variadic
-// vector-count register when the payload's variadic bit is set —
-// lir_callconv's count-reg ordering comment predicted exactly this
-// collision) from any range of the callee vreg covering the call.
-// Entirely cc-config-driven — no register names, no arch identity.
+// vector-count register when the payload's variadic bit is set + the
+// indirect-result register when the payload's indirect-result bit is set
+// — D-FC7-INDIRECT-X8-SRET-CALLEE-EXCLUSION) from any range of the callee
+// vreg covering the call. Entirely cc-config-driven — no register names,
+// no arch identity.
 struct IndirectCalleeAt {
     std::uint32_t position;      // call's EARLY slot
     std::uint32_t calleeVregId;
     bool          variadic;      // call payload's isVariadic bit
+    bool          indirectResult; // call payload's hasIndirectResult bit (x8 sret)
 };
 
 [[nodiscard]] std::vector<IndirectCalleeAt>
@@ -179,6 +184,8 @@ collectIndirectCalleePositions(Lir const& lir, TargetSchema const& schema,
                     out.push_back({pos,
                                    static_cast<std::uint32_t>(ops[0].reg.id),
                                    ::dss::call_payload::isVariadic(
+                                       lir.instPayload(inst)),
+                                   ::dss::call_payload::hasIndirectResult(
                                        lir.instPayload(inst))});
                 }
             }
@@ -609,6 +616,7 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         collectIndirectCalleePositions(lir, schema, flow);
     std::vector<std::uint16_t> ccArgRegOrdinals;
     std::optional<std::uint16_t> ccVariadicCountRegOrdinal;
+    std::optional<std::uint16_t> ccIndirectResultRegOrdinal;
     if (!indirectCallees.empty()) {
         auto const resolveInto = [&](std::vector<std::string> const& names)
             -> bool {
@@ -636,6 +644,14 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         }
         if (cc->variadicVectorCountReg.has_value()) {
             ccVariadicCountRegOrdinal = cc->variadicVectorCountReg->ordinal;
+        }
+        // D-FC7-INDIRECT-X8-SRET-CALLEE-EXCLUSION: an indirect call that
+        // returns a by-value aggregate via the cc's indirect-result register
+        // (x8 on AAPCS64) gets a POST-regalloc `mov x8, callee` reroute move;
+        // keep the callee vreg off that register too (it is caller-saved and
+        // NOT in argGprs, so the arg-reg exclusion above does not cover it).
+        if (cc->indirectResultRegister.has_value()) {
+            ccIndirectResultRegOrdinal = cc->indirectResultRegister->ordinal;
         }
     }
 
@@ -861,6 +877,10 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
                 }
                 if (ic.variadic && ccVariadicCountRegOrdinal.has_value()) {
                     addExcluded(*ccVariadicCountRegOrdinal);
+                }
+                if (ic.indirectResult
+                    && ccIndirectResultRegOrdinal.has_value()) {
+                    addExcluded(*ccIndirectResultRegOrdinal);
                 }
             }
         }

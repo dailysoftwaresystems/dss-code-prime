@@ -1,0 +1,15 @@
+{
+  "$comment": "D-PARSE-DEEP-NEST-RECURSION-MEMORY (plan 24 Stage 4) end-to-end witness for the now-iterative HIR->MIR expression lowerer (`lowerExpr` in src/mir/lowering/hir_to_mir.cpp). That lowerer is an EXPLICIT WORK-STACK DRIVER for the deep STRAIGHT-LINE arms (UnaryOp / BinaryOp / Deref / non-array-decay Cast — the arms whose only recursion is `lowerExpr(child)` into the same basic block, no CFG), so a deeply-nested expression lowers HIR->MIR with FLAT O(1) host-stack cost per nesting level instead of one host-recursion frame per level. This program returns `-(-(-(...-(a)...)))` with a == 42 and 120 unary negations (an EVEN count, so the value is 42) — driving the iterative UnaryOp arm 120 levels deep (the `-(X)` form costs ~2 of the parser's 256 maxExpressionDepth units per level, so ~120 levels is just under the cap). A regression that UNWRAPPED the UnaryOp arm back to host recursion would recurse 120 frames deep during HIR->MIR lowering; the lowering runs on the 64 MiB worker stack (core/substrate/large_stack_call) and 120 levels is already well past the host main-stack crash point (~25 levels for the heavy recursive lowering frame), so an accidental main-stack regression would crash (rc-127) here instead of exiting 42. The value 42 is miscompile-sensitive: a dropped/duplicated/parity-flipping negation would change the exit code. OUTPUT-IDENTITY against the prior recursive lowerer is enforced by the full ctest suite (the byte-identical MIR instruction/block goldens in tests/mir/test_mir_lowering_c_subset.cpp, plus the SF-4 strict differential pins IterativeDeepBinaryChainLowersFlatAndByteIdentical / IterativeDeepUnaryChainLowersFlatAndByteIdentical which pin the exact deep post-order vreg/op sequence on the test's main stack); this example adds the deep-flatten + real-codegen RUN witness for the MIR UnaryOp arm. The deep BinaryOp axis itself spills the register allocator at this depth (a long dependency chain — a pre-existing, orthogonal LIR limitation), so the corpus drives the pressure-free UnaryOp axis and the strict MIR pins cover deep BinaryOp directly off the MIR. The optimizedPipelines arm proves the lowered MIR survives the full release pipeline (the baseline arm is the real-codegen witness; ConstFold collapses the constant negation tree to 42 in the optimized arm). arm64 runs under qemu; macho on the macos-latest leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}

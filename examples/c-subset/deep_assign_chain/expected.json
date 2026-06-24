@@ -1,0 +1,15 @@
+{
+  "$comment": "D-PARSE-DEEP-NEST-RECURSION-MEMORY (plan 24, cst_to_hir residuals) end-to-end witness for the now-iterative ASSIGN arm of the CST->HIR expression lowerer (`lowerExpr` in src/hir/lowering/cst_to_hir.cpp). The program is a 200-deep right-associative assignment chain `a=a=...=a=42` (just under the parser's 256 maxExpressionDepth cap) then `return a`. C parses `=` right-associatively, so the chain nests as `a=(a=(...=(a=42)))`; each `=` USED AS A VALUE lowers to a `SeqExpr([AssignStmt(Ref a, inner)], yield = Ref a)`. Before this stage `lowerBinary`'s Assign arm recursed into `lowerExpr(rhs)` -> `lowerBinary` ~200 host frames deep during CST->HIR lowering; now the Assign frame on `lowerExpr`'s explicit work-stack carries that RHS descent with FLAT O(1) host-stack cost per level (only the heap `work` + `assignCtxs` vectors grow). Because every assignment targets `a` and the innermost stores 42, the whole chain leaves `a == 42` — the return value, which is miscompile-sensitive: a dropped store, a wrong SeqExpr yield, or a level-grouping error would leave `a` un-set (the slot's Mem2Reg-promoted value would not be 42) and flip the exit code. The lowering runs on the 64 MiB worker stack (core/substrate/large_stack_call) in the real pipeline, but the FLAT-on-the-MAIN-stack property + the exact nested-SeqExpr shape are the RED-on-disable levers of the strict pin HirLoweringCSubset.DeepRightAssocAssignChainLowersFlatOnNormalStack (depth 2000, lowered on the test's normal stack: revert -> rc-127 host overflow). OUTPUT-IDENTITY against the prior recursive lowerer is enforced by the full ctest suite (the assignment-as-value goldens in tests/hir/test_hir_lowering_c_subset.cpp); this example adds the deep-flatten + real-codegen run witness for the Assign arm (the companions deep_expr_lower / deep_call_chain / deep_ternary_chain cover paren/binary/unary, Call and ternary). The optimizedPipelines arm proves the lowered HIR survives the full release pipeline (Mem2Reg promotes the `a` slot, the const store/read folds to 42). arm64 runs under qemu; macho on the macos-latest leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}

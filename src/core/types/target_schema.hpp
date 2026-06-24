@@ -584,6 +584,33 @@ struct DSS_EXPORT TargetCallingConvention {
     // implementation detail.
     std::uint16_t callPushBytes = 0;
 
+    // D-WIN64-LARGE-FRAME-STACK-PROBE: the OS stack guard-page size, in
+    // bytes, AND the step granularity for the inline stack-probe loop.
+    // A function whose total frame size EXCEEDS this value must touch
+    // every guard-page-sized step on the way down (committing each page)
+    // instead of doing a single bare `sub SP, F` that skips the guard
+    // page (Windows reserves the stack lazily behind a single PAGE_GUARD
+    // page; a `sub` that jumps over it access-violates on the first deep
+    // write). The prologue reads this generically — NO arch/format/cc
+    // identity branch:
+    //   * `ms_x64` (Windows PE):  4096 — emit the probe loop for any
+    //                             frame > 4096; the encoder lowers the
+    //                             new `stack_probe` op to a page-walking
+    //                             loop with THIS value as the step.
+    //   * `sysv_amd64` (Linux ELF / Mach-O): 0 — Linux/macOS auto-grow
+    //                             the stack (the kernel faults in deeper
+    //                             pages on demand), so no probe is needed.
+    //   * the arm64 CCs: 0 — large arm64 frames are handled by the
+    //                             shifted-imm12 `sub sp` encoding, and
+    //                             those OSes auto-grow the stack too.
+    // 0 (the default) ⇒ NO probing: the prologue keeps the plain
+    // `sub SP, F` for every frame (byte-identical to before this field).
+    //
+    // Validators (target_schema.cpp::validate): when nonzero it MUST be a
+    // power of two (mirrors the stackAlignment check) — a typo'd 4000
+    // would silently skip a guard page and reintroduce the crash.
+    std::uint16_t stackProbePageBytes = 0;
+
     // D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): when true,
     // the cc uses SLOT-ALIGNED arg passing — each arg consumes ONE
     // shared slot index regardless of its register class, AND both
@@ -622,6 +649,26 @@ struct DSS_EXPORT TargetCallingConvention {
     // register-then-stack placement. This realizes the variadic half of
     // D-FF3-APPLE-ARM64-ABI-DIVERGENCE.
     bool variadicArgsAlwaysStack = false;
+
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: what happens to the
+    // ARG REGISTERS of a class once a by-value aggregate is placed WHOLLY on the
+    // stack because its pieces did not all fit (the all-or-nothing/straddle case).
+    // The two shipped ABIs DIVERGE — a documented, config-distinguishable fact,
+    // verified against gcc's own arg-advance logic (NOT an identity branch):
+    //   * false (SysV `sysv_amd64`): BACKFILL. The leftover registers stay
+    //     available for a LATER (smaller) arg — gcc `function_arg_advance_64`
+    //     leaves `cum->nregs`/`regno` untouched on the stack branch; the SysV ABI
+    //     "if registers were assigned for some eightbytes … the assignments get
+    //     reverted". The per-class cursor is NOT advanced on route-to-stack.
+    //   * true  (AAPCS64 `aapcs64`):  EXHAUST. The OVERFLOWED class is marked
+    //     full (NGRN/NSRN ← 8) so every subsequent arg of that class also goes to
+    //     memory — gcc `aarch64_layout_arg` sets `aapcs_nextncrn = NUM_ARG_REGS`
+    //     (or `nextnvrn` for an HFA). The cursor is CLAMPED to the pool size.
+    // Win64 (`ms_x64`, slotAligned) never straddles (1 struct = 1 positional
+    // slot) so the flag is inert (default false). Consumed by HIR→MIR's caller
+    // (Phase A) + callee (Phase B) cursor handling — kept in lockstep so the two
+    // sides agree AND va_start's `__gr_offs`/`__vr_offs` clamp reflects it.
+    bool aggregateStackExhaustsRegisters = false;
 
     // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the
     // classification STRATEGY for a struct/union passed/returned by value.
@@ -1087,11 +1134,69 @@ enum class EncodingSlotKind : std::uint8_t {
     // (load/store vs load_u/store_u) from the offset value — the variant
     // selector matches operand KINDS only and cannot inspect the value.
     Imm12Scaled   = 26,
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 (v0.0.2 FC12 deferral-2):
+    // the AArch64 ADD/SUB-immediate `imm12 LSL #12` shifted-immediate
+    // form, the WORD-PAIR encoding of a value V in (4095, 0xFFFFFF]
+    // (4096 .. 16 MiB-1). This is NOT a single bit-window — it is the
+    // SAME bits 10..21 window as `Imm12`, but the encoder, on matching
+    // this slot, writes BOTH words of a 2-word `add`/`sub`/`lea` macro:
+    //   word0 = `op Xd,Xn,#(V & 0xFFF)`          (sh=0, base word)
+    //   word1 = `op Xd,Xd,#((V>>12) & 0xFFF)`    (sh=1, base|0x400000)
+    // (the wire's slot lives in word0; the macro's word1 carries the
+    // high 12 bits — its fixedWords[1] sets sh=1, and its extraResult
+    // Slots thread Xd through word1's Rd+Rn so the second ADD reads its
+    // OWN dest as the source base — SCRATCH-FREE). A function with a
+    // frame > 4095 bytes (e.g. `int big[9000]` = 36000B) needs this for
+    // the prologue/epilogue `sub/add sp,#frame` AND the GEP `lea
+    // [base,#disp]`. Reaches 16 MiB (every realistic frame); a value
+    // > 0xFFFFFF stays fail-loud (A_ImmediateOperandOutOfRange — the
+    // residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB; a third word /
+    // MOVZ+MOVK scratch materialization is its future generalization).
+    // The encoder derives the split arithmetically (lo = V & 0xFFF, hi
+    // = (V>>12) & 0xFFF) and writes lo into word0's window + hi into
+    // word1's window — both via the same `imm12` bit-window (the slot
+    // is its OWN window twin of Imm12, bits 10..21). x86_64 has no
+    // imm12 slot (it uses Imm32/Disp32), so this slot is never reached
+    // on an x86 variant — the gating is slot-kind `==` + value-
+    // magnitude arithmetic, zero arch identity.
+    Imm12HiLo24   = 27,
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (v0.0.2 cycle 12): the
+    // AArch64 MOVZ/MOVK + EXTENDED-register `add`/`sub`/`lea` THREE-word
+    // materialization of a value V in (0xFFFFFF, 0x7FFFFFFF] — a frame
+    // LARGER than the 24-bit shifted-imm12 reach (16 MiB) but representable
+    // in a non-negative int32 (a frame size flows through `int32_t` →
+    // `> 0x7FFFFFFF` goes NEGATIVE and never matches this slot's
+    // `immMin:16777216` variant guard → fail-loud, the residual
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-2GIB). Like `Imm12HiLo24` this is
+    // NOT a single bit-window — the encoder, on matching this slot, writes
+    // a 3-word macro whose FIRST TWO words are `MOVZ Xs,#(V & 0xFFFF)` +
+    // `MOVK Xs,#((V>>16) & 0xFFFF),LSL #16` (materialize V into a scratch
+    // register Xs) and whose THIRD word is the operation:
+    //   * sp adjust  — `sub sp,sp,x16` / `add sp,sp,x16` (the EXTENDED-
+    //     register form 0xCB30_63FF / 0x8B30_63FF, where Rn=Rd=sp(31) is
+    //     SP not XZR — the shifted-register form would write XZR). The
+    //     scratch is x16 = AAPCS64 IP0, the architecturally-blessed intra-
+    //     procedure scratch, BAKED into the MOVZ/MOVK base words (Rd=16)
+    //     and the extended op's Rm=16. Free at the prologue (pre-arg-home)
+    //     + epilogue (post-return-value).
+    //   * lea        — `add Xd,sp,Xd` (extended, Rn=sp), SCRATCH-FREE: V
+    //     materializes into the lea's DEST reg Xd (the MOVZ/MOVK Rd + the
+    //     extended op's Rd AND Rm all thread the result register). The
+    //     value writes into both MOVZ/MOVK words' imm16 windows (bits 5..20)
+    //     — the SAME window as `Imm16`, the encoder splits lo16→word0 /
+    //     hi16→word1 (mirroring `materializeViaMovkLadder`'s chunk split).
+    // The slot's `windowFor` returns the imm16 window (bits 5..20); the
+    // encoder calls `orInto` twice (lo→word0, hi→word1). x86_64 has no
+    // imm16/movk-ladder slot → never reached on an x86 variant (gating is
+    // slot-kind `==`, zero arch identity). The x16 scratch identity is
+    // justified the same way XZR=31/sp=31 already are (a config-baked
+    // architectural register).
+    Imm32MovzMovk = 28,
     // Future fixed32 slots (paired with their consumer cycle):
-    //   ImmShift / Sf-flag / shifted imm12<<12 / etc.
+    //   Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 27> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 29> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -1119,6 +1224,8 @@ inline constexpr EnumNameTable<EncodingSlotKind, 27> kEncodingSlotKindTable{{{
     { EncodingSlotKind::OpcodePlusReg, "opcode.reg"     },
     { EncodingSlotKind::Imm64,         "imm64"          },
     { EncodingSlotKind::Imm12Scaled,   "imm12.scaled"   },
+    { EncodingSlotKind::Imm12HiLo24,   "imm12.hilo24"   },
+    { EncodingSlotKind::Imm32MovzMovk, "imm32.movzmovk" },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -1137,7 +1244,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 27,
+static_assert(kEncodingSlotKindCount == 29,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -1184,6 +1291,15 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         // validate() rejects every `load_u`/`store_u` variant that wires
         // it as a cross-shape declaration on a fixed32 opcode).
         case EncodingSlotKind::Imm12Scaled:
+        // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the shifted-imm12
+        // word-pair form is a fixed32 (AArch64) slot — same reason as
+        // Imm12 / Imm12Scaled (a cross-shape declaration on an x86
+        // opcode would be rejected by validate()).
+        case EncodingSlotKind::Imm12HiLo24:
+        // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: the MOVZ/MOVK +
+        // extended-register 3-word form is a fixed32 (AArch64) slot —
+        // same reason as Imm12 / Imm12HiLo24.
+        case EncodingSlotKind::Imm32MovzMovk:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
             return TargetEncodingShape::Fixed32;
@@ -1370,6 +1486,14 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         // D-ASM-AARCH64-LARGE-FRAME-IMM12: the scaled imm12 displacement
         // writes its immediate field directly — no linker relocation.
         case EncodingSlotKind::Imm12Scaled:
+        // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the shifted-imm12
+        // word-pair writes its (split) immediate bits directly into both
+        // words — no linker relocation.
+        case EncodingSlotKind::Imm12HiLo24:
+        // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: the MOVZ/MOVK 3-word
+        // form writes its (split) immediate halfwords directly into the
+        // MOVZ/MOVK words — no linker relocation.
+        case EncodingSlotKind::Imm32MovzMovk:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
         case EncodingSlotKind::Disp32Mem:
@@ -1484,6 +1608,26 @@ struct DSS_EXPORT TargetEncodingVariant {
     // width-keyed variant with a width-absent same-kind sibling
     // (first-match dispatch would silently shadow one of them).
     std::uint8_t                       guardWidthBits = 0;
+    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: OPTIONAL immediate-MAGNITUDE
+    // discriminators on the guard — the JSON keys `guard.immMin` /
+    // `guard.immMax`. ABSENT (nullopt) ⇒ the variant matches an
+    // instruction of ANY immediate magnitude (every pre-existing variant —
+    // full back-compat). PRESENT ⇒ the variant matches ONLY when the
+    // instruction's immediate/memOffset operand magnitude falls in
+    // [immMin, immMax] (inclusive). This is what lets ONE opcode declare
+    // a single-word imm12 variant (immMax:4095) AND a 2-word shifted-imm12
+    // variant (immMin:4096, immMax:16777215) with the SAME operandKinds —
+    // the selector routes a small frame to the 1-word form and a large
+    // frame to the 2-word form by VALUE, agnostically (any ISA can declare
+    // magnitude-keyed variants; the matcher reads the LIR operand's value,
+    // not the arch). The magnitude is the operand's unsigned value for an
+    // ImmInt, or its (signed) displacement viewed as a magnitude for a
+    // MemOffset — the matcher inspects whichever immediate-bearing operand
+    // the variant's operandKinds declares. A variant that declares NO
+    // immediate/memOffset operand but sets immMin/immMax is a config bug
+    // (validate() rejects it — there is no value to key on).
+    std::optional<std::uint32_t>       immMin;
+    std::optional<std::uint32_t>       immMax;
     TargetEncodingTemplate             tmpl;
     // Where the instruction's RESULT register goes (when the inst
     // has a result). Nullopt for value-less instructions (e.g.
@@ -1764,18 +1908,20 @@ enum class TargetTerminatorKind : std::uint8_t {
     Switch      = 3,    // >=2 successors                           (LirBuilder::addSwitch — reserved)
     Return      = 4,    // 0 successors, may carry return-value ops (LirBuilder::addReturn)
     Unreachable = 5,    // 0 successors, 0 operands                 (LirBuilder::addUnreachable)
+    IndirectBr  = 6,    // >=1 successors, 1 reg operand (the addr) (LirBuilder::addIndirectBr) — D-CSUBSET-COMPUTED-GOTO
 };
 
 // Canonical string form used by `.target.json` and `.dsslir` text.
 // Single source of truth for the loader (string → enum) and any future
 // emit-side serializer (enum → string).
-inline constexpr EnumNameTable<TargetTerminatorKind, 6> kTargetTerminatorKindTable{{{
+inline constexpr EnumNameTable<TargetTerminatorKind, 7> kTargetTerminatorKindTable{{{
     { TargetTerminatorKind::None,        "none"        },
     { TargetTerminatorKind::Br,          "br"          },
     { TargetTerminatorKind::CondBr,      "cond-br"     },
     { TargetTerminatorKind::Switch,      "switch"      },
     { TargetTerminatorKind::Return,      "return"      },
     { TargetTerminatorKind::Unreachable, "unreachable" },
+    { TargetTerminatorKind::IndirectBr,  "indirect-br" },
 }}};
 
 [[nodiscard]] constexpr std::string_view
@@ -1801,12 +1947,14 @@ struct TargetTerminatorShape {
     // treats `maxSuccessors == 255` as "no upper bound".
 };
 
-inline constexpr std::array<TargetTerminatorShape, 5> kTargetTerminatorShapes{{
+inline constexpr std::array<TargetTerminatorShape, 6> kTargetTerminatorShapes{{
     { TargetTerminatorKind::Br,          1, 1   },
     { TargetTerminatorKind::CondBr,      2, 2   },
     { TargetTerminatorKind::Switch,      2, 255 },  // 255 = unbounded sentinel
     { TargetTerminatorKind::Return,      0, 0   },
     { TargetTerminatorKind::Unreachable, 0, 0   },
+    // D-CSUBSET-COMPUTED-GOTO: >=1 address-taken successors (255 = unbounded).
+    { TargetTerminatorKind::IndirectBr,  1, 255 },
 }};
 
 [[nodiscard]] constexpr TargetTerminatorShape const*

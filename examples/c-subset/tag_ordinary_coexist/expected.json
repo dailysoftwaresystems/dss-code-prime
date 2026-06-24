@@ -1,0 +1,30 @@
+{
+  "$comment": "C 6.2.3 tag/ordinary namespace independence (companion to tag_namespace). A struct TAG `S` and an ordinary OBJECT `S` share a spelling in one scope chain WITHOUT colliding: `struct S a;` reads the tag (type-position tag-ref arm), bare `S` reads the ordinary int local. They resolve to different entities (struct type vs int object) — a.v (40) + S (2) = 42. RED-ON-DISABLE: a single-namespace table collides the local `int S` with the tag `S` (S_RedeclaredSymbol) and the compile fails loud, so the example never links.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ]
+}

@@ -595,3 +595,70 @@ TEST(ParserCastExpr, RolledBackProbeLeaksNoSketchState) {
     EXPECT_TRUE(r.typeNameCandidates.empty());
 }
 
+// ── D-PARSE-DEEP-NEST-RECURSION-MEMORY: SF-2 speculation-rollback-at-depth ──
+//
+// THE SF-2 pin. A speculative `castExpr` probe over `(q)` (an UNKNOWN
+// lone-identifier type-name site) DESCENDS the expression work-stack to a
+// non-trivial depth — its `castOperand` re-enters the Pratt walker and parses
+// the prefix `-` plus a deeply-nested parenthesized operand — and THEN ROLLS
+// BACK (rule 4: the follower `-` is an operator, so the value reading wins).
+// The tokens after the rollback (the subtraction chain, including a trailing
+// `-z`) must then parse CORRECTLY.
+//
+// This exercises the SF-2 interaction directly: the probe is constructed WHILE
+// an expression descent is in flight, descends MANY work-stack levels building
+// the doomed cast, and on rollback the parser must resume EXACTLY where it was
+// — the `SpeculationProbe` restores the builder/walker/tokens (and truncates
+// the expression work-stack + depth counter back to the pre-probe state). A
+// broken restore would mis-parse the value reading, drop the deep nesting, or
+// leak a candidate.
+//
+// SCOPE NOTE: this proves the FLAT-descent-under-speculation interaction is
+// correct end-to-end. It is NOT red-on-disable for the work-stack `.resize()`
+// specifically — by construction each `walkExpression` entry drives its sub-
+// stack back to baseline before any probe inspects the outcome, so the work-
+// stack is already balanced at rollback and the resize is a structural no-op
+// (verified: disabling it leaves this pin + the whole speculation suite green;
+// see the `SpeculationProbe` dtor comment). The pin guards the BEHAVIOR (deep
+// speculate → rollback → resume) so a future change that breaks that balance
+// invariant is caught here.
+//
+// The deep nesting is bounded well under the default 256 cap so the cap never
+// fires here (this pin is about the ROLLBACK, not the guard); the parse runs on
+// the default stack (the flat descent makes the doomed deep probe cheap).
+TEST(ParserCastExpr, DeepSpeculativeCastRollsBackAndResumesCorrectly) {
+    constexpr int kDepth = 60;   // 60-deep paren operand inside the doomed cast
+
+    // `(q) - (((…x…))) - z;` — `q` is unknown; the castExpr probe descends the
+    // prefix `-` + kDepth parens, then rolls back to the value reading.
+    std::string deep;
+    deep.append(kDepth, '(');
+    deep += "x";
+    deep.append(kDepth, ')');
+    auto r = parseCSubset(
+        "int main() { return (q)-" + deep + "-z; }");
+    auto const& t = r.tree;
+
+    // Post-rollback the parse is CLEAN and the value reading won.
+    ASSERT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_FALSE(findFirstNodeWithRule(t, "castExpr").valid());
+
+    // The deep nesting SURVIVED the rollback intact: kDepth parens for the
+    // operand + 1 for `(q)` itself = kDepth + 1 parenExpr nodes. A dropped
+    // level (stale/leaked work-stack frame) would change this count.
+    EXPECT_EQ(countNodesWithRule(t, "parenExpr"),
+              static_cast<std::size_t>(kDepth + 1));
+
+    // The rolled-back ambiguous site recorded EXACTLY ONE candidate for `q`
+    // (no leak, no double-count) — the work-stack restore left the sketch
+    // delta clean.
+    ASSERT_EQ(r.typeNameCandidates.size(), 1u);
+    EXPECT_EQ(r.typeNameCandidates[0].name, "q");
+
+    // The tokens AFTER the rollback parsed correctly: the trailing `-z` closes
+    // a left-assoc subtraction chain over the (deep) value reading. Two `-`
+    // operators ⇒ two binaryExpr wraps; the climb resumed cleanly from the
+    // restored state.
+    EXPECT_EQ(countNodesWithRule(t, "binaryExpr"), 2u);
+}
+

@@ -73,11 +73,68 @@ TEST(ScopeTree, BindingsOfSnapshotsSameScopeOnly) {
     EXPECT_FALSE(st.bind(inner, "y", SymbolId{20}).valid());
     auto rootBindings = st.bindingsOf(root);
     ASSERT_EQ(rootBindings.size(), 1u) << "parent walk excluded";
-    EXPECT_EQ(rootBindings[0].first, "x");
-    EXPECT_EQ(rootBindings[0].second.v, 10u);
+    EXPECT_EQ(std::get<0>(rootBindings[0]), "x");
+    EXPECT_EQ(std::get<1>(rootBindings[0]), SymbolNamespace::Ordinary);
+    EXPECT_EQ(std::get<2>(rootBindings[0]).v, 10u);
     auto innerBindings = st.bindingsOf(inner);
     ASSERT_EQ(innerBindings.size(), 1u);
-    EXPECT_EQ(innerBindings[0].first, "y");
+    EXPECT_EQ(std::get<0>(innerBindings[0]), "y");
+}
+
+// C 6.2.3 tag namespace: a Tag binding and an Ordinary binding of the SAME
+// name coexist in one scope without collision, and lookup honors the
+// namespace. bindingsOf enumerates both. RED-ON-DISABLE: without the
+// tagBindings map, the second bind returns the prior Ordinary SymbolId
+// (collision) and this test's first EXPECT_FALSE fails.
+TEST(ScopeTree, TagAndOrdinaryNamespacesAreIndependent) {
+    ScopeTree st;
+    const auto root = st.root();
+    EXPECT_FALSE(st.bind(root, "Pair", SymbolId{10},
+                         SymbolNamespace::Ordinary).valid());
+    // Same name, Tag namespace — must NOT collide with the Ordinary binding.
+    EXPECT_FALSE(st.bind(root, "Pair", SymbolId{20},
+                         SymbolNamespace::Tag).valid())
+        << "a tag and an ordinary symbol of the same name must not collide";
+    auto ord = st.lookup(root, "Pair", SymbolNamespace::Ordinary);
+    auto tag = st.lookup(root, "Pair", SymbolNamespace::Tag);
+    ASSERT_TRUE(ord.valid());
+    ASSERT_TRUE(tag.valid());
+    EXPECT_EQ(ord.v, 10u);
+    EXPECT_EQ(tag.v, 20u);
+    // A same-namespace redeclaration still collides (returns the prior id).
+    EXPECT_EQ(st.bind(root, "Pair", SymbolId{30}, SymbolNamespace::Tag).v, 20u);
+    EXPECT_EQ(st.bindingsOf(root).size(), 2u) << "both namespaces enumerated";
+}
+
+// MF-2 cross-tree substrate: `bindingsOf` carries each binding's namespace and
+// `injectBinding(..., ns)` re-injects into the SAME namespace — the exact
+// primitive the cross-tree import-injection conflict scan re-keys on. A tag
+// `Foo` in one scope re-injects as a tag into another scope (resolved only via
+// the Tag lookup, never Ordinary), proving the namespace survives the round
+// trip. RED-ON-DISABLE: drop the namespace from bindingsOf/injectBinding and a
+// tag would re-inject Ordinary — the Tag lookup below would miss.
+TEST(ScopeTree, BindingsOfCarriesNamespaceForCrossTreeReKey) {
+    ScopeTree st;
+    const auto src = st.pushScope(st.root(), NodeId{1, 1}, TreeId{1});
+    const auto dst = st.pushScope(st.root(), NodeId{2, 1}, TreeId{2});
+    // `Foo` exists as BOTH a tag and an ordinary symbol in the source scope.
+    EXPECT_FALSE(st.bind(src, "Foo", SymbolId{11}, SymbolNamespace::Tag).valid());
+    EXPECT_FALSE(
+        st.bind(src, "Foo", SymbolId{22}, SymbolNamespace::Ordinary).valid());
+
+    // Replay the cross-tree injection: copy each (name, ns, sym) into dst,
+    // preserving the namespace — exactly what the analyzer's re-keyed scan does.
+    for (auto const& [name, ns, sym] : st.bindingsOf(src)) {
+        st.injectBinding(dst, std::string{name}, sym, ns);
+    }
+
+    // Each namespace resolved independently in the target scope.
+    auto tag = st.lookup(dst, "Foo", SymbolNamespace::Tag);
+    auto ord = st.lookup(dst, "Foo", SymbolNamespace::Ordinary);
+    ASSERT_TRUE(tag.valid());
+    ASSERT_TRUE(ord.valid());
+    EXPECT_EQ(tag.v, 11u) << "the tag re-injected as a tag";
+    EXPECT_EQ(ord.v, 22u) << "the ordinary symbol re-injected ordinary";
 }
 
 // `injectBinding` copies a binding into a scope with no redecl check —

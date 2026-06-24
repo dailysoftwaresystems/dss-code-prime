@@ -71,6 +71,16 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): callee-side mirror of the caller's `ByValueStackArg` carrier — the ADDRESS of a FIXED by-value aggregate/HFA param placed WHOLLY on the incoming stack (it straddled the reg/stack boundary). lir_callconv materializes it into `lea result, [sp + totalFrameSize + callPushBytes + shadowSpaceBytes + payload]`; the PAYLOAD is this aggregate's byte offset within the incoming overflow area. DISTINCT from the va_* ops so it is NOT a va_start-detection signal (it occurs in non-variadic functions too). No encoding (materialized away).",
+      "mnemonic":      "recv_by_value_stack_param",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "Virtual-ISA pseudo-op (FC12b, D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start base (&home[namedArgCount]). Declared for substrate uniformity; AAPCS64 uses the dual-cursor strategy (FC12c) and never emits this op. No encoding (materialized away by lir_callconv).",
       "mnemonic":      "va_home_arg_area",
       "result":        "value",
@@ -255,13 +265,36 @@
             ]
           },
           {
-            "$comment": "ADD Xd, Xn, #imm12 (immediate). Fixed word 0x91000000 (sf=1, op=0 add, S=0, sh=0). imm12 at bits 10..21 via the Imm12 slot; Rd 0..4, Rn 5..9. Used by the callconv prologue/epilogue stack adjust (`add sp, sp, #frame`). 2-operand LIR form [reg, imm]: operand 0 → Rn (also the dest via resultSlot), operand 1 → Imm12. Range 0..4095.",
-            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64 },
+            "$comment": "ADD Xd, Xn, #imm12 (immediate, single word). Fixed word 0x91000000 (sf=1, op=0 add, S=0, sh=0). imm12 at bits 10..21 via the Imm12 slot; Rd 0..4, Rn 5..9. Used by the callconv prologue/epilogue stack adjust (`add sp, sp, #frame`) when the frame fits 0..4095. 2-operand LIR form [reg, imm]: operand 0 → Rn (also the dest via resultSlot), operand 1 → Imm12. `immMax:4095` routes ONLY a frame ≤4095 here; a larger value falls through to the 2-word shifted variant below (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12).",
+            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64, "immMax": 4095 },
             "template":   { "fixedWord": 2432696320 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn"    },
               { "index": 1, "slotKind": "imm12" }
+            ]
+          },
+          {
+            "$comment": "ADD Xd, Xn, #imm (shifted imm12 word-pair, D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12). For a frame in (4095, 0xFFFFFF] this emits TWO words: word0 = `ADD Xd, Xn, #(V & 0xFFF)` (0x91000000, sh=0), word1 = `ADD Xd, Xd, #((V>>12) & 0xFFF), LSL #12` (0x91400000 = 0x91000000|0x400000, sh=1). SCRATCH-FREE: word1 reads its OWN dest (Xd) as the source base — extraResultSlots thread the result reg into word1.Rd AND word1.Rn. The single imm12.hilo24 wire (word0) carries the VALUE; the encoder splits it and writes lo→word0 / hi→word1, both into the imm12 bit-window (10..21). `immMin:4096`/`immMax:16777215` route ONLY a >4095, ≤16MiB frame here; >16MiB stays fail-loud (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB).",
+            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64, "immMin": 4096, "immMax": 16777215 },
+            "template":   { "fixedWords": [2432696320, 2436890624] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires":      [
+              { "index": 0, "slotKind": "rn"            },
+              { "index": 1, "slotKind": "imm12.hilo24", "wordIndex": 0 }
+            ]
+          },
+          {
+            "$comment": "ADD sp, sp, #imm (MOVZ/MOVK + EXTENDED-register 3-word form, D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB). The epilogue mirror of SUB's 3-word form. word0 = `MOVZ x16, #(V & 0xFFFF)` (0xD2800010), word1 = `MOVK x16, #((V>>16) & 0xFFFF), LSL #16` (0xF2A00010), word2 = `ADD sp, sp, x16` (the EXTENDED-register form 0x8B3063FF: option=011 UXTX, bit 21 set, Rd=Rn=sp=31, Rm=x16=16). x16=IP0 scratch baked; NO resultSlot (sp=31 baked into word2 — rule-G baked-dest exemption). Same immMin/immMax routing + >2GiB fail-loud as SUB.",
+            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64, "immMin": 16777216, "immMax": 2147483647 },
+            "template":   { "fixedWords": [3531603984, 4070572048, 2335204351] },
+            "wires":      [
+              { "index": 0, "slotKind": "rn",            "wordIndex": 2 },
+              { "index": 1, "slotKind": "imm32.movzmovk", "wordIndex": 0 }
             ]
           }
         ]
@@ -295,13 +328,36 @@
             ]
           },
           {
-            "$comment": "SUB Xd, Xn, #imm12 (immediate). Fixed word 0xD1000000 (sf=1, op=1 sub, S=0, sh=0). imm12 at bits 10..21; Rd 0..4, Rn 5..9. Used by the callconv prologue stack adjust (`sub sp, sp, #frame`). Same 2-operand [reg, imm] LIR form as ADD-immediate. FC3 c2: width:64-only like add's imm12 shape (sole producer is the Ptr-width sp-adjust; a width-32 sub-imm fails loud).",
-            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64 },
+            "$comment": "SUB Xd, Xn, #imm12 (immediate, single word). Fixed word 0xD1000000 (sf=1, op=1 sub, S=0, sh=0). imm12 at bits 10..21; Rd 0..4, Rn 5..9. Used by the callconv prologue stack adjust (`sub sp, sp, #frame`) when the frame fits 0..4095. Same 2-operand [reg, imm] LIR form as ADD-immediate. FC3 c2: width:64-only like add's imm12 shape (sole producer is the Ptr-width sp-adjust; a width-32 sub-imm fails loud). `immMax:4095` routes ONLY a ≤4095 frame here; larger falls through to the 2-word shifted variant (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12).",
+            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64, "immMax": 4095 },
             "template":   { "fixedWord": 3506438144 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn"    },
               { "index": 1, "slotKind": "imm12" }
+            ]
+          },
+          {
+            "$comment": "SUB Xd, Xn, #imm (shifted imm12 word-pair, D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12). For a frame in (4095, 0xFFFFFF] this emits TWO words: word0 = `SUB Xd, Xn, #(V & 0xFFF)` (0xD1000000, sh=0), word1 = `SUB Xd, Xd, #((V>>12) & 0xFFF), LSL #12` (0xD1400000 = 0xD1000000|0x400000, sh=1). word1 reads its OWN dest (Xd) — SCRATCH-FREE via extraResultSlots. Single imm12.hilo24 wire (word0) carries the VALUE; the encoder splits lo→word0 / hi→word1. The prologue's `sub sp,sp,#frame` becomes `sub sp,sp,#lo; sub sp,sp,#hi,LSL#12` — the transient sp-lo misalignment between the two words is invisible (no access/call between them; V is 16-aligned). `immMin:4096`/`immMax:16777215`; >16MiB fail-loud.",
+            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64, "immMin": 4096, "immMax": 16777215 },
+            "template":   { "fixedWords": [3506438144, 3510632448] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires":      [
+              { "index": 0, "slotKind": "rn"            },
+              { "index": 1, "slotKind": "imm12.hilo24", "wordIndex": 0 }
+            ]
+          },
+          {
+            "$comment": "SUB sp, sp, #imm (MOVZ/MOVK + EXTENDED-register 3-word form, D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB). For a frame in (0xFFFFFF, 0x7FFFFFFF] (>16 MiB, ≤2 GiB) this emits THREE words: word0 = `MOVZ x16, #(V & 0xFFFF)` (0xD2800010, Rd=x16=16 baked), word1 = `MOVK x16, #((V>>16) & 0xFFFF), LSL #16` (0xF2A00010, hw=01, Rd=x16), word2 = `SUB sp, sp, x16` (the EXTENDED-register form 0xCB3063FF: option=011 UXTX, bit 21 set, Rd=Rn=sp=31, Rm=x16=16 — NOT the shifted-register 0xCB000000 where #31=XZR → `sp±0` corrupt frame). x16 is AAPCS64 IP0, the architecturally-blessed intra-procedure scratch, free at the prologue/epilogue; it is BAKED into all three base words (NO resultSlot — the destination sp=31 is baked into word2, validate's rule-G `imm32.movzmovk` baked-dest exemption). The single imm32.movzmovk wire (operand 1, word0) carries the VALUE; the encoder splits lo16→word0 / hi16→word1. Operand 0 (sp) wires to word2's `rn` (re-confirming the baked sp=31). `immMin:16777216`/`immMax:2147483647` route ONLY a >16MiB, ≤2GiB frame here; a frame > 2 GiB flows through int32 as NEGATIVE → magnitude nullopt → no variant matches → fail-loud (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-2GIB).",
+            "guard":      { "operandKinds": ["reg", "imm32"], "width": 64, "immMin": 16777216, "immMax": 2147483647 },
+            "template":   { "fixedWords": [3531603984, 4070572048, 3408946175] },
+            "wires":      [
+              { "index": 0, "slotKind": "rn",            "wordIndex": 2 },
+              { "index": 1, "slotKind": "imm32.movzmovk", "wordIndex": 0 }
             ]
           }
         ]
@@ -1045,14 +1101,59 @@
             ]
           },
           {
-            "$comment": "FRAME-RELATIVE lea — `lea Xd, [base + #disp]` = AArch64 `ADD Xd, Xn, #imm12`. This is the form the ML7 callconv's `emitFrameAddr` materializes from `alloca` (a body-local's effective address): 3-op no-index shape [base_reg, MemBase(scale=1), MemOffset(disp)] + result, MIRRORING x86_64's 3-op `lea` (so the callconv stays target-blind — it emits the same operand layout for both ISAs). Single fixed word 0x91000000 (2432696320, the ADD-imm base, shared with `add`'s imm variant + the SymbolRef lea's word1): base_reg→Rn (bits 5..9), result→Rd (bits 0..4), MemOffset→Imm12 (UNSIGNED, bits 10..21; frame offsets are non-negative). MemBase carries no AArch64 bits (scale must be 1; the walker validates it via membase.noscale). A frame offset >4095 fails loud at the walker (A_ImmediateOperandOutOfRange) — the shifted ADD imm12<<12 form for larger frames is a future generalization (D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE, parallel to the unscaled-vs-scaled LDR/STR split).",
-            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "$comment": "2-op block-address form — ADRP+ADD of a SYNTHETIC per-block symbol (D-CSUBSET-COMPUTED-GOTO `&&label`). Byte-IDENTICAL to the 1-op `[symbol]` ADRP+ADD form above (same fixedWords, same Rd/Rn extraResultSlots, same two sym.patch wires emitting adr_prel_pg_hi21 on word0 + add_abs_lo12_nc on word1 against the SymbolRef at operand 0). The trailing BlockRef (operand 1) is METADATA, wired to NOTHING — it names the target LIR block so the assembler can bind the synthetic symbol to that block's byte offset (recorded as a BlockSymPatch; the linker assigns the interior-block VA). Distinct guard `[symbol, blockref]` so the variant matcher routes this 2-operand `lea` here instead of failing A_NoMatchingEncodingVariant.",
+            "guard":      { "operandKinds": ["symbol", "blockref"] },
+            "template":   { "fixedWords": [2415919104, 2432696320] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "sym.patch", "wordIndex": 0, "relocationKind": "adr_prel_pg_hi21" },
+              { "index": 0, "slotKind": "sym.patch", "wordIndex": 1, "relocationKind": "add_abs_lo12_nc" }
+            ]
+          },
+          {
+            "$comment": "FRAME-RELATIVE lea (single word) — `lea Xd, [base + #disp]` = AArch64 `ADD Xd, Xn, #imm12`. This is the form the ML7 callconv's `emitFrameAddr` materializes from `alloca` (a body-local's effective address): 3-op no-index shape [base_reg, MemBase(scale=1), MemOffset(disp)] + result, MIRRORING x86_64's 3-op `lea` (so the callconv stays target-blind — it emits the same operand layout for both ISAs). Single fixed word 0x91000000 (2432696320, the ADD-imm base, shared with `add`'s imm variant + the SymbolRef lea's word1): base_reg→Rn (bits 5..9), result→Rd (bits 0..4), MemOffset→Imm12 (UNSIGNED, bits 10..21; frame offsets are non-negative). MemBase carries no AArch64 bits (scale must be 1; the walker validates it via membase.noscale). `immMax:4095` routes ONLY a frame offset ≤4095 here; a larger offset falls through to the 2-word shifted variant below (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "immMax": 4095 },
             "template":   { "fixedWord": 2432696320 },
             "resultSlot": "rd",
             "wires": [
               { "index": 0, "slotKind": "rn"              },
               { "index": 1, "slotKind": "membase.noscale" },
               { "index": 2, "slotKind": "imm12"           }
+            ]
+          },
+          {
+            "$comment": "FRAME-RELATIVE lea (shifted imm12 word-pair, D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12) — `lea Xd, [base + #disp]` with disp in (4095, 0xFFFFFF]. The GEP's array-element address (e.g. `int big[9000]; big[8999]` at sp+35996) under a >4095-byte frame. Emits TWO words reusing ADD's base: word0 = `ADD Xd, Xn, #(disp & 0xFFF)` (0x91000000, sh=0), word1 = `ADD Xd, Xd, #((disp>>12) & 0xFFF), LSL #12` (0x91400000, sh=1). SCRATCH-FREE: word0 reads the base (Xn) into Xd, word1 reads Xd→Xd (extraResultSlots thread the result reg into word1.Rd AND word1.Rn). The MemOffset (operand 2) is the VALUE-bearing operand the matcher keys on; its single imm12.hilo24 wire (word0) carries the displacement, split lo→word0 / hi→word1 by the encoder. MemBase (operand 1, scale==1) carries no bits (membase.noscale, word0). `immMin:4096`/`immMax:16777215`; a >16MiB offset stays fail-loud (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB). width:64 (a frame address is Ptr-width); the disjoint imm-range makes it unambiguous against the single-word variant above regardless of width.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64, "immMin": 4096, "immMax": 16777215 },
+            "template":   { "fixedWords": [2432696320, 2436890624] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "rn"              },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12.hilo24", "wordIndex": 0 }
+            ]
+          },
+          {
+            "$comment": "FRAME-RELATIVE lea (MOVZ/MOVK + EXTENDED-register 3-word form, D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB) — `lea Xd, [sp + #disp]` with disp in (0xFFFFFF, 0x7FFFFFFF] (>16 MiB, ≤2 GiB). The GEP's high-element address (e.g. `int big[5000000]; big[4999999]` at sp+~20MB) under a >16MiB frame. Emits THREE words, SCRATCH-FREE: the displacement materializes into the lea's DEST reg Xd, then an extended-register ADD off sp. word0 = `MOVZ Xd, #(disp & 0xFFFF)` (0xD2800000, Rd=Xd via resultSlot), word1 = `MOVK Xd, #((disp>>16) & 0xFFFF), LSL #16` (0xF2A00000, Rd=Xd via extraResultSlots word1.rd), word2 = `ADD Xd, sp, Xd` (the EXTENDED-register form 0x8B2063E0: option=011 UXTX, bit 21 set, Rn=sp=31 baked, Rd=Xd + Rm=Xd via extraResultSlots word2.rd/word2.rm). The dest reg threads through ALL THREE words (resultSlot=rd word0 + three extraResultSlots) — no separate scratch needed. The MemOffset (operand 2) is the VALUE-bearing operand the matcher keys on; its single imm32.movzmovk wire (word0) carries the displacement, split lo16→word0 / hi16→word1 by the encoder. Operand 0 (base=sp) → word2's `rn` (re-confirming the baked sp=31); operand 1 (membase, scale==1) → membase.noscale (word2, no bits). `immMin:16777216`/`immMax:2147483647`; a >2GiB offset goes negative through int32 → fail-loud (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-2GIB).",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64, "immMin": 16777216, "immMax": 2147483647 },
+            "template":   { "fixedWords": [3531603968, 4070572032, 2334155744] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rd", "wordIndex": 2 },
+              { "slotKind": "rm", "wordIndex": 2 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "rn",              "wordIndex": 2 },
+              { "index": 1, "slotKind": "membase.noscale", "wordIndex": 2 },
+              { "index": 2, "slotKind": "imm32.movzmovk",  "wordIndex": 0 }
             ]
           },
           {
@@ -1138,6 +1239,29 @@
             "template": { "fixedWord": 335544320 },
             "wires":    [
               { "index": 0, "slotKind": "imm26" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-COMPUTED-GOTO: indirect branch `BR Xn` — 0xD61F0000 | Rn<<5 (unconditional branch to a register, NO link/return-address — the BLR sibling captures one). fixedWord 3592355840 = 0xD61F0000; mirrors the BLR row (0xD63F0000, same D6 family — BR clears bit 21). Rn at bits 5..9 via the `rn` slot. The MIR IndirectBr lowers to this; the target-address register is materialized by a preceding adrp+add `lea` of the target block's synthetic symbol (BlockAddress). terminatorKind indirect-br → variadic address-taken successors.",
+      "mnemonic":      "jmp_indirect",
+      "result":        "none",
+      "terminatorKind": "indirect-br",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 1,
+      "maxSuccessors": 255,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"] },
+            "template": { "fixedWord": 3592355840 },
+            "wires":    [
+              { "index": 0, "slotKind": "rn" }
             ]
           }
         ]
@@ -1546,6 +1670,8 @@
       "$aggregateComment": "FC7 C3 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): AAPCS64 §5.4 by-value aggregates. HFA (1-4 leaves all the same FP type) → that many FPR pieces (v0..v3 / d0..d3 for returns, d0..d7 for args). A non-HFA aggregate <=16 bytes → 1-2 GPR pieces (x0..x1 returns / x0..x7 args); > 16 bytes → BY REFERENCE: a caller-allocated copy for args; for RETURNS the caller passes the result address in x8 (`indirectResultRegister`) and the callee returns VOID (it writes through x8 — distinct from SysV/Win64's hidden-arg-then-return-pointer; `aggregateSretViaHiddenArg` is false here because indirectResultRegister is set). `aapcs64_hfa` drives the bounded classifier arm; maxRegBytes = 16 (two X-registers).",
       "aggregateClassification": "aapcs64_hfa",
       "aggregateMaxRegBytes":    16,
+      "$aggregateStackExhaustsComment": "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: AAPCS64 §6.4.2 stage C — when a by-value composite/HFA does not fit the remaining arg registers it is placed WHOLLY on the stack and the overflowed class is EXHAUSTED (gcc aarch64_layout_arg sets aapcs_nextncrn=8 / aapcs_nextnvrn=8), so every subsequent arg of that class also goes to memory. true = no backfill (contrast SysV, which backfills the leftover registers). Read by HIR→MIR's caller+callee cursor handling + va_start's __gr_offs/__vr_offs clamp.",
+      "aggregateStackExhaustsRegisters": true,
       "indirectResultRegister":  "x8",
       "$callerSavedFprComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): AAPCS64 §6.1.2 — v0-v7 (args/results) and v16-v31 are caller-saved; declared here in their d views. Being listed in callerSaved is what keeps the regalloc honest about them: an allocatable register NOT in callerSaved is treated as call-safe (lir_regalloc buildFreeLists), so omitting these while argFprs makes them allocatable would let a float live across a call sit unsaved in a volatile d-register — the same reason x86_64's sysv row lists all sixteen xmm registers here.",
       "callerSaved":      ["x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x18",
@@ -1588,6 +1714,8 @@
       "$aggregateComment": "FC7 C3: Apple ARM64 by-value aggregate register-assignment is IDENTICAL to AAPCS64 (the documented Apple divergences are variadic-always-stack + small-int widening, NOT the struct/HFA/x8 rules) — so it carries the same aggregate fields. This CLOSES the struct-return / indirect-result half of D-FF3-APPLE-ARM64-ABI-DIVERGENCE (x8 sret modeled); the variadic-always-stack half stays open until a variadic arm64-Apple call.",
       "aggregateClassification": "aapcs64_hfa",
       "aggregateMaxRegBytes":    16,
+      "$aggregateStackExhaustsComment": "D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: Apple arm64 inherits AAPCS64 stage-C register assignment (the Apple divergences are variadic-always-stack + small-int widening, NOT the composite placement rule) — a stacked composite EXHAUSTS the overflowed class, same as aapcs64.",
+      "aggregateStackExhaustsRegisters": true,
       "indirectResultRegister":  "x8",
       "$fprComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): the SIMD&FP register vocabulary is IDENTICAL to AAPCS64 (Apple's documented divergences are variadic/indirect-result rules, not register assignment): args d0..d7, return d0, v0-v7/v16-v31 caller-saved, v8-v15 callee-saved in their LOW 64 BITS only (d8..d15 — same F128/SIMD-cycle caveat as the aapcs64 row's $calleeSavedFprComment).",
       "callerSaved":      ["x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x18",

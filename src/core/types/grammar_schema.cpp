@@ -375,6 +375,14 @@ GrammarSchema::predictivePrefixAt(RuleId rule, std::size_t offset) const noexcep
     return pfx[offset];
 }
 
+bool GrammarSchema::isContextualKind(SchemaTokenId kind) const noexcept {
+    // D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD. O(1); the set is EMPTY for
+    // every grammar with no contextual keyword (Strict policy + no per-keyword
+    // `contextual: true`) — so the prune's deep-nest O(N) win is unaffected for
+    // the non-contextual case (every shipped c-subset speculative alt).
+    return kind.valid() && d_.contextualKinds.contains(kind.v);
+}
+
 std::span<SchemaTokenId const> GrammarSchema::syncTokens() const noexcept {
     return d_.syncTokens;
 }

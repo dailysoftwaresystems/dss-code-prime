@@ -363,6 +363,35 @@ enum class DiagnosticCode : std::uint16_t {
     // `va_list` (which would mis-size the `ap` local and corrupt the stack). SysV
     // (register-save) + Win64 (homogeneous-pointer) are realized and never hit this.
     S_VariadicCalleeUnsupported   = 0xE020,
+    // D-CSUBSET-LOCAL-STATIC (MF-2): a `static` storage-class specifier in a
+    // for-statement init-declaration is a C 6.8.5p3 constraint violation ("the
+    // declaration part of a for statement shall only declare identifiers for
+    // objects having storage class auto or register"). The grammar admits the
+    // shared `localDeclSpecifiers` prefix (so `static` PARSES in the for-init),
+    // and a block-scope `static` IS supported — but in for-init it must fail
+    // loud, never silently lower as an automatic local. Config-driven: the
+    // for-init declaration row declares the `StaticKeyword`→this-code gated
+    // marker; nothing here hardcodes the word "static".
+    S_StaticStorageInForInit      = 0xE021,
+    // D-CSUBSET-FN-PROTOTYPE: two declarations of the same function name have
+    // INCOMPATIBLE signatures (a return-type or parameter-list mismatch — C
+    // 6.7p4 / 6.9.1). A bare prototype (`int f(int);`) merges with a later
+    // definition or a redundant declaration only when their interned FnSig
+    // TypeIds are structurally equal; a mismatch (`int f(int); long f(int){…}`)
+    // fails loud here rather than silently picking one signature. Positioned at
+    // the absorbed (later/redundant) declaration with a related-location at the
+    // surviving declaration. Emitted after Pass 1.5 (both FnSigs resolved).
+    S_IncompatibleRedeclaration   = 0xE022,
+    // D-CSUBSET-LABEL-BEFORE-CASE: a `case`/`default` labeled statement (the
+    // C 6.8.1 `caseStmt` form, which exists so a goto-label may precede a case —
+    // `foo: case 1: stmt`) appeared where it is NOT a direct switch-body item:
+    // either truly outside any switch, or nested inside an inner block of a
+    // switch arm (the flat-switch model only groups top-level switch-body items).
+    // lowerSwitch consumes a direct (label-wrapped) caseStmt before it reaches
+    // the statement dispatch; reaching the dispatch means it is misplaced -> fail
+    // loud (C 6.8.1) rather than emit a stray arm-less case. Positioned at the
+    // case/default keyword.
+    S_CaseLabelNotInSwitch        = 0xE023,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
