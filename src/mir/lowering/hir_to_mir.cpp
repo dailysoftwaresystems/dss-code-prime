@@ -400,10 +400,26 @@ struct Lowerer {
         return MirOpcode::Invalid;
     }
 
-    // Lower a single HIR expression in the currently-open MIR block.
-    // Returns the MirInstId that produces the value (`InvalidMirInst` on
-    // error — caller decides whether to keep emitting). Recursive.
-    [[nodiscard]] MirInstId lowerExpr(HirNodeId node) {
+    // Lower ONE HIR expression node in the currently-open MIR block, given
+    // that its child sub-expressions are lowered by RE-ENTERING `lowerExpr`
+    // (the driver below). Returns the MirInstId that produces the value
+    // (`InvalidMirInst` on error — caller decides whether to keep emitting).
+    //
+    // Plan 24 Stage 4 (D-PARSE-DEEP-NEST-RECURSION-MEMORY): the public entry
+    // `lowerExpr` is now an explicit heap work-stack DRIVER. The deep
+    // STRAIGHT-LINE arms (UnaryOp / BinaryOp / Deref / non-array-decay Cast —
+    // the ones whose only recursion is `lowerExpr(child)` into the SAME block,
+    // no CFG) are flattened onto that work-stack so a deeply-nested `a+b+c…` /
+    // `-(-(-x))` / `*(*(*p))` / `(T)(T)x` chain carries FLAT O(1) host-stack
+    // cost per nesting level. This per-NODE handler is the byte-identical
+    // emission body for EVERY OTHER arm (leaves, Call, the CFG arms
+    // Ternary/LogicalAnd/Or/SeqExpr, the by-address MemberAccess/Index/
+    // AddressOf delegations); `enterValue` routes those here unchanged (their
+    // own `lowerExpr(child)` calls re-enter the driver, so deep sub-expressions
+    // inside a shallow complex arm still flatten). The four flattened arms here
+    // call the SAME `combine*` epilogues the frames do (one source of truth)
+    // and are unreachable through the driver — kept as the recursive fallback.
+    [[nodiscard]] MirInstId lowerExprNode(HirNodeId node) {
         HirKind const k = hir.kind(node);
         TypeId const  t = hir.typeId(node);
         switch (k) {
@@ -544,7 +560,6 @@ struct Lowerer {
                     unsupported(node, "extension UnaryOp (post-v1)");
                     return InvalidMirInst;
                 }
-                HirOpKind const op = decodeCoreOp(payload);
                 auto kids = hir.children(node);
                 if (kids.size() != 1) {
                     unsupported(node, "malformed UnaryOp (verifier should have flagged)");
@@ -552,40 +567,7 @@ struct Lowerer {
                 }
                 MirInstId const operand = lowerExpr(kids[0]);
                 if (!operand.valid()) return InvalidMirInst;
-                TypeId const operandType = hir.typeId(kids[0]);
-                TypeKind const tk = operandType.valid()
-                    ? interner.kind(operandType) : TypeKind::Void;
-                bool const isFloat = (tk == TypeKind::F16 || tk == TypeKind::F32
-                                   || tk == TypeKind::F64 || tk == TypeKind::F128);
-                MirOpcode mop = MirOpcode::Invalid;
-                switch (op) {
-                    case HirOpKind::Neg:    mop = isFloat ? MirOpcode::FNeg : MirOpcode::Neg; break;
-                    case HirOpKind::BitNot: mop = MirOpcode::Not; break;
-                    case HirOpKind::Not: {
-                        // Logical not: MIR has no dedicated opcode. Lower as
-                        // `cmp eq operand, 0`. Policy-neutral on Bool-vs-I1
-                        // — any `==` already produces whatever type the
-                        // result-type rule says, so this is symmetric with
-                        // the cycle-1 BinaryOp Eq path. (Review I-5)
-                        MirLiteralValue zero;
-                        if (isFloat) { zero.value = 0.0; }
-                        else { zero.value = std::int64_t{0}; }
-                        zero.core = tk;
-                        MirInstId const zeroConst = mir.addConst(std::move(zero),
-                                                                  operandType);
-                        std::array<MirInstId, 2> ops2{operand, zeroConst};
-                        return mir.addInst(
-                            isFloat ? MirOpcode::FCmpOeq : MirOpcode::ICmpEq,
-                            ops2, t);
-                    }
-                    default:
-                        unsupported(node,
-                            std::format("UnaryOp '{}' not yet supported",
-                                        opName(op)));
-                        return InvalidMirInst;
-                }
-                std::array<MirInstId, 1> operands{operand};
-                return mir.addInst(mop, operands, t);
+                return combineUnary(node, operand);
             }
             case HirKind::Call: {
                 // children: [callee, args...]. Lower the callee (a Ref-to-
@@ -1162,30 +1144,18 @@ struct Lowerer {
                     unsupported(node, "extension BinaryOp (post-v1)");
                     return InvalidMirInst;
                 }
-                HirOpKind const op = decodeCoreOp(payload);
                 auto kids = hir.children(node);
                 if (kids.size() != 2) {
                     unsupported(node, "malformed BinaryOp (verifier should "
                                        "have flagged this)");
                     return InvalidMirInst;
                 }
+                // LHS then RHS — two SEQUENTIAL statements (not function-call
+                // arguments), so left-to-right and platform-independent.
                 MirInstId const lhs = lowerExpr(kids[0]);
                 MirInstId const rhs = lowerExpr(kids[1]);
                 if (!lhs.valid() || !rhs.valid()) return InvalidMirInst;
-                // Operand type drives signed/unsigned/float opcode choice.
-                TypeId const operandType = hir.typeId(kids[0]);
-                TypeKind const tk = operandType.valid()
-                    ? interner.kind(operandType) : TypeKind::Void;
-                MirOpcode const mop = mapBinaryOp(op, tk);
-                if (mop == MirOpcode::Invalid) {
-                    unsupported(node,
-                        std::format("BinaryOp '{}' on TypeKind {} not yet "
-                                    "supported", opName(op),
-                                    static_cast<unsigned>(tk)));
-                    return InvalidMirInst;
-                }
-                std::array<MirInstId, 2> operands{lhs, rhs};
-                return mir.addInst(mop, operands, t);
+                return combineBinaryOp(node, lhs, rhs);
             }
             case HirKind::AddressOf: {
                 // children: [lvalue-operand]. The address of any supported
@@ -1224,8 +1194,7 @@ struct Lowerer {
                 }
                 MirInstId const ptr = lowerExpr(kids[0]);
                 if (!ptr.valid()) return InvalidMirInst;
-                std::array<MirInstId, 1> ops{ptr};
-                return mir.addInst(MirOpcode::Load, ops, t);
+                return combineDeref(node, ptr);
             }
             case HirKind::MemberAccess:
             case HirKind::Index: {
@@ -1342,29 +1311,7 @@ struct Lowerer {
                 }
                 MirInstId const operand = lowerExpr(kids[0]);
                 if (!operand.valid()) return InvalidMirInst;
-                // C 6.7.2.2: an enum casts AS its underlying integer (the kind in
-                // the enum TypeId's `scalars[0]`). Resolve here so `mapCast`
-                // (TypeKind-only, can't read the interner) sees the real width —
-                // NO I32 assumption: a non-I32-underlying enum lowers via its
-                // declared kind. The Cast's RESULT type stays `t` (enum-typed for
-                // an int→enum cast). D-CSUBSET-ENUM-INT-CONVERSION.
-                auto const enumUnderlying =
-                    [&](TypeId ty, TypeKind k) noexcept -> TypeKind {
-                        if (k != TypeKind::Enum || !ty.valid()) return k;
-                        auto const sc = interner.scalars(ty);
-                        return sc.empty() ? k : static_cast<TypeKind>(sc[0]);
-                    };
-                MirOpcode const mop = mapCast(enumUnderlying(fromTy, fromK),
-                                              enumUnderlying(t, toK));
-                if (mop == MirOpcode::Invalid) {
-                    unsupported(node, std::format(
-                        "Cast from TypeKind {} to {} has no MIR opcode",
-                        static_cast<unsigned>(fromK),
-                        static_cast<unsigned>(toK)));
-                    return InvalidMirInst;
-                }
-                std::array<MirInstId, 1> ops{operand};
-                return mir.addInst(mop, ops, t);
+                return combineCast(node, operand);
             }
             case HirKind::SeqExpr: {
                 // Lower the side-effect statements in order, then lower the
@@ -1433,6 +1380,288 @@ struct Lowerer {
             std::format("HIR expression kind ordinal {} not yet supported "
                         "(HIR id {})", static_cast<unsigned>(k), node.v));
         return InvalidMirInst;
+    }
+
+    // ── Plan 24 Stage 4 — straight-line expression-arm epilogues ───────────
+    // Each `combine*` is the BYTE-IDENTICAL emission slice of a flattened arm
+    // AFTER its child sub-expression(s) have been lowered (their MirInstId(s)
+    // passed in). Shared by `lowerExprNode`'s recursive arms AND the driver's
+    // frames below — ONE source of truth, so the iterative path emits the exact
+    // same MIR (opcode order, operand identity, fail-loud sites) the recursive
+    // path did. They emit ONLY into the currently-open block — no CFG.
+
+    // UnaryOp epilogue (operand already lowered to `operand`). Reproduces the
+    // recursive arm exactly: Neg→Neg/FNeg, BitNot→Not, logical Not→`cmp eq
+    // operand, 0` (a zero Const THEN ICmpEq/FCmpOeq), else fail loud.
+    [[nodiscard]] MirInstId combineUnary(HirNodeId node, MirInstId operand) {
+        TypeId const   t  = hir.typeId(node);
+        HirOpKind const op = decodeCoreOp(hir.payload(node));
+        auto kids = hir.children(node);
+        TypeId const operandType = hir.typeId(kids[0]);
+        TypeKind const tk = operandType.valid()
+            ? interner.kind(operandType) : TypeKind::Void;
+        bool const isFloat = (tk == TypeKind::F16 || tk == TypeKind::F32
+                           || tk == TypeKind::F64 || tk == TypeKind::F128);
+        MirOpcode mop = MirOpcode::Invalid;
+        switch (op) {
+            case HirOpKind::Neg:    mop = isFloat ? MirOpcode::FNeg : MirOpcode::Neg; break;
+            case HirOpKind::BitNot: mop = MirOpcode::Not; break;
+            case HirOpKind::Not: {
+                // Logical not: MIR has no dedicated opcode. Lower as
+                // `cmp eq operand, 0`. Policy-neutral on Bool-vs-I1
+                // — any `==` already produces whatever type the
+                // result-type rule says, so this is symmetric with
+                // the cycle-1 BinaryOp Eq path. (Review I-5)
+                MirLiteralValue zero;
+                if (isFloat) { zero.value = 0.0; }
+                else { zero.value = std::int64_t{0}; }
+                zero.core = tk;
+                MirInstId const zeroConst = mir.addConst(std::move(zero),
+                                                          operandType);
+                std::array<MirInstId, 2> ops2{operand, zeroConst};
+                return mir.addInst(
+                    isFloat ? MirOpcode::FCmpOeq : MirOpcode::ICmpEq,
+                    ops2, t);
+            }
+            default:
+                unsupported(node,
+                    std::format("UnaryOp '{}' not yet supported",
+                                opName(op)));
+                return InvalidMirInst;
+        }
+        std::array<MirInstId, 1> operands{operand};
+        return mir.addInst(mop, operands, t);
+    }
+
+    // BinaryOp epilogue (lhs+rhs already lowered, IN THAT ORDER). The operand
+    // TypeKind (from kids[0]) drives the signed/unsigned/float opcode choice.
+    [[nodiscard]] MirInstId combineBinaryOp(HirNodeId node, MirInstId lhs,
+                                            MirInstId rhs) {
+        TypeId const   t  = hir.typeId(node);
+        HirOpKind const op = decodeCoreOp(hir.payload(node));
+        auto kids = hir.children(node);
+        TypeId const operandType = hir.typeId(kids[0]);
+        TypeKind const tk = operandType.valid()
+            ? interner.kind(operandType) : TypeKind::Void;
+        MirOpcode const mop = mapBinaryOp(op, tk);
+        if (mop == MirOpcode::Invalid) {
+            unsupported(node,
+                std::format("BinaryOp '{}' on TypeKind {} not yet "
+                            "supported", opName(op),
+                            static_cast<unsigned>(tk)));
+            return InvalidMirInst;
+        }
+        std::array<MirInstId, 2> operands{lhs, rhs};
+        return mir.addInst(mop, operands, t);
+    }
+
+    // Deref epilogue (pointer already lowered to `ptr`): `Load(ptr)` typed as
+    // the node's (pointee) type.
+    [[nodiscard]] MirInstId combineDeref(HirNodeId node, MirInstId ptr) {
+        std::array<MirInstId, 1> ops{ptr};
+        return mir.addInst(MirOpcode::Load, ops, hir.typeId(node));
+    }
+
+    // Scalar-Cast epilogue (operand already lowered): the array→pointer DECAY
+    // sub-cases are NOT routed here (they delegate in `lowerExprNode` /
+    // `castFlattens` returns false), so this is purely the `mapCast` opcode +
+    // single-operand emit. Enum operands cast AS their underlying integer.
+    [[nodiscard]] MirInstId combineCast(HirNodeId node, MirInstId operand) {
+        TypeId const t = hir.typeId(node);
+        auto kids = hir.children(node);
+        TypeId const fromTy = hir.typeId(kids[0]);
+        TypeKind const fromK = fromTy.valid()
+            ? interner.kind(fromTy) : TypeKind::Void;
+        TypeKind const toK = t.valid() ? interner.kind(t) : TypeKind::Void;
+        // C 6.7.2.2: an enum casts AS its underlying integer (the kind in
+        // the enum TypeId's `scalars[0]`). Resolve here so `mapCast`
+        // (TypeKind-only, can't read the interner) sees the real width —
+        // NO I32 assumption: a non-I32-underlying enum lowers via its
+        // declared kind. The Cast's RESULT type stays `t` (enum-typed for
+        // an int→enum cast). D-CSUBSET-ENUM-INT-CONVERSION.
+        auto const enumUnderlying =
+            [&](TypeId ty, TypeKind kk) noexcept -> TypeKind {
+                if (kk != TypeKind::Enum || !ty.valid()) return kk;
+                auto const sc = interner.scalars(ty);
+                return sc.empty() ? kk : static_cast<TypeKind>(sc[0]);
+            };
+        MirOpcode const mop = mapCast(enumUnderlying(fromTy, fromK),
+                                      enumUnderlying(t, toK));
+        if (mop == MirOpcode::Invalid) {
+            unsupported(node, std::format(
+                "Cast from TypeKind {} to {} has no MIR opcode",
+                static_cast<unsigned>(fromK),
+                static_cast<unsigned>(toK)));
+            return InvalidMirInst;
+        }
+        std::array<MirInstId, 1> ops{operand};
+        return mir.addInst(mop, ops, t);
+    }
+
+    // True iff a `Cast` node lowers as a CLEAN single-operand scalar cast (the
+    // form the driver flattens): exactly ONE child AND not an array→pointer
+    // decay. Array→pointer decay (`fromK==Array && toK==Ptr`) is NOT a plain
+    // `lowerExpr(operand)`-then-emit — it routes through `lowerLvalueAddress`
+    // (the local/global-array arm) or mints a rodata global (the string-literal
+    // arm), so it stays delegating (`lowerExprNode` keeps it intact).
+    [[nodiscard]] bool castFlattens(HirNodeId node) const {
+        auto kids = hir.children(node);
+        if (kids.size() != 1) return false;            // malformed → delegate (fail loud)
+        TypeId const fromTy = hir.typeId(kids[0]);
+        TypeKind const fromK = fromTy.valid()
+            ? interner.kind(fromTy) : TypeKind::Void;
+        TypeId const t = hir.typeId(node);
+        TypeKind const toK = t.valid() ? interner.kind(t) : TypeKind::Void;
+        return !(fromK == TypeKind::Array && toK == TypeKind::Ptr);
+    }
+
+    // ── Plan 24 Stage 4 — the iterative value-lowering driver ──────────────
+    // A POD work-stack frame for ONE flattened straight-line arm. `phase`
+    // 0 = enter the (last) child; for a 2-child arm (BinaryOp) phase 1 = enter
+    // the second child (after stashing the first in `c0`); the final phase
+    // pops and `combine*`s into `result`. (UnaryOp/Deref/Cast are single-child:
+    // phase 0 enters, phase 1 combines.) Mirrors the cst_to_hir `ExprFrame`
+    // idiom (the Stage-1/2/3 realloc-safe rule: copy frame fields to locals and
+    // advance `phase` BEFORE any `enterValue`/`push_back`; copy `result` out
+    // before `pop_back`).
+    struct ValueFrame {
+        enum class Kind : std::uint8_t { Unary, Binary, Deref, Cast } kind;
+        HirNodeId node;
+        std::uint8_t phase;
+        MirInstId c0;   // Binary: the lowered LHS (stashed between phase 1 and 2)
+    };
+
+    // The public expression-lowering entry: a driver over an explicit heap
+    // work-stack. For each node, `enterValue` either PUSHES a frame for a deep
+    // straight-line arm or delegates to `lowerExprNode` (which lowers that one
+    // node and re-enters this driver for its children). Returns the value's
+    // MirInstId. Output-identity: the flattened arms reproduce the recursive
+    // child-lowering ORDER + `combine*` exactly, so the emitted MIR (inst order,
+    // vreg ids, operands) is byte-identical to the recursive `lowerExpr`.
+    [[nodiscard]] MirInstId lowerExpr(HirNodeId node) {
+        std::vector<ValueFrame> work;
+        // Default-init: `enterValue` ALWAYS assigns `result` for a delegated
+        // node, and every pushed frame delivers into `result` before it is read
+        // (then popped), so this sentinel never leaks.
+        MirInstId result = InvalidMirInst;
+
+        // Classify `n`: push a frame for a flattenable straight-line arm (and
+        // return), else lower it here via `lowerExprNode` (delegating; its
+        // children re-enter this driver). A frame is pushed ONLY for the four
+        // arms whose sole recursion is `lowerExpr(child)` into the same block.
+        // NOTE: `enterValue` (push) MUST be the LAST action of any caller path
+        // that has copied out its frame fields — `work.back()` may dangle after.
+        auto const enterValue = [&](HirNodeId n) {
+            HirKind const nk = hir.kind(n);
+            switch (nk) {
+                case HirKind::UnaryOp:
+                    // A core UnaryOp with exactly one child flattens; an
+                    // extension op or malformed arity delegates (fail loud
+                    // there, byte-identical to the recursive guards).
+                    if (isCoreOp(hir.payload(n)) && hir.children(n).size() == 1) {
+                        work.push_back({.kind = ValueFrame::Kind::Unary,
+                                        .node = n, .phase = 0});
+                        return;
+                    }
+                    break;
+                case HirKind::BinaryOp:
+                    if (isCoreOp(hir.payload(n)) && hir.children(n).size() == 2) {
+                        work.push_back({.kind = ValueFrame::Kind::Binary,
+                                        .node = n, .phase = 0});
+                        return;
+                    }
+                    break;
+                case HirKind::Deref:
+                    if (hir.children(n).size() == 1) {
+                        work.push_back({.kind = ValueFrame::Kind::Deref,
+                                        .node = n, .phase = 0});
+                        return;
+                    }
+                    break;
+                case HirKind::Cast:
+                    if (castFlattens(n)) {
+                        work.push_back({.kind = ValueFrame::Kind::Cast,
+                                        .node = n, .phase = 0});
+                        return;
+                    }
+                    break;
+                default: break;
+            }
+            result = lowerExprNode(n);   // delegate (terminal / CFG / by-address)
+        };
+
+        enterValue(node);
+        while (!work.empty()) {
+            ValueFrame& f = work.back();
+            switch (f.kind) {
+            case ValueFrame::Kind::Unary:
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    HirNodeId const operandN = hir.children(f.node)[0];
+                    enterValue(operandN);   // build operand — may invalidate `f`
+                } else {
+                    HirNodeId const node2 = f.node;
+                    MirInstId const operand = result;
+                    work.pop_back();
+                    result = operand.valid() ? combineUnary(node2, operand)
+                                             : InvalidMirInst;
+                }
+                break;
+            case ValueFrame::Kind::Binary:
+                // LHS first (phase 0→1), then RHS (phase 1→2) — matching the
+                // recursive `lhs = lowerExpr(kids[0]); rhs = lowerExpr(kids[1]);`
+                // which are two SEQUENTIAL statements → left-to-right, NOT
+                // function-call arguments (so platform-independent; this differs
+                // from cst_to_hir's Binary frame, whose recursive form passed
+                // operands as call args and thus built rhs-then-lhs).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    HirNodeId const lhsN = hir.children(f.node)[0];
+                    enterValue(lhsN);       // build LHS — may invalidate `f`
+                } else if (f.phase == 1) {
+                    f.c0 = result;          // LHS result
+                    f.phase = 2;
+                    HirNodeId const rhsN = hir.children(f.node)[1];
+                    enterValue(rhsN);       // build RHS — may invalidate `f`
+                } else {
+                    HirNodeId const node2 = f.node;
+                    MirInstId const lhs = f.c0;
+                    MirInstId const rhs = result;
+                    work.pop_back();
+                    result = (lhs.valid() && rhs.valid())
+                                 ? combineBinaryOp(node2, lhs, rhs)
+                                 : InvalidMirInst;
+                }
+                break;
+            case ValueFrame::Kind::Deref:
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    HirNodeId const ptrN = hir.children(f.node)[0];
+                    enterValue(ptrN);       // build pointer — may invalidate `f`
+                } else {
+                    HirNodeId const node2 = f.node;
+                    MirInstId const ptr = result;
+                    work.pop_back();
+                    result = ptr.valid() ? combineDeref(node2, ptr)
+                                         : InvalidMirInst;
+                }
+                break;
+            case ValueFrame::Kind::Cast:
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    HirNodeId const operandN = hir.children(f.node)[0];
+                    enterValue(operandN);   // build operand — may invalidate `f`
+                } else {
+                    HirNodeId const node2 = f.node;
+                    MirInstId const operand = result;
+                    work.pop_back();
+                    result = operand.valid() ? combineCast(node2, operand)
+                                             : InvalidMirInst;
+                }
+                break;
+            }
+        }
+        return result;
     }
 
     // Error-recovery helper: every forward-`createBlock`'d block in a

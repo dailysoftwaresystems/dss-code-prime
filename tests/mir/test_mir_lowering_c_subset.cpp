@@ -9,7 +9,9 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/type_lattice/type_interner.hpp"
 #include "hir/hir.hpp"
+#include "hir/hir_node.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/mir_text.hpp"
@@ -5936,4 +5938,173 @@ TEST(MirLoweringCSubset, ComputedGotoBlockAddressTargetsAreAddressTaken) {
     // The function's ENTRY block is not a &&label target → not address-taken.
     EXPECT_FALSE(m.isBlockAddressTaken(m.funcEntry(fn)))
         << "a non-&&label block is not address-taken (the negative pin)";
+}
+
+// ─── Plan 24 Stage 4 — iterative HIR→MIR straight-line expression driver ────
+//
+// SF-4 differential pin (synthetic deep HIR, lowered on the test's MAIN stack):
+// a DEEPLY-nested left-associative `(((a+a)+a)+a)…` BinaryOp chain lowers to a
+// FLAT host-stack cost (the explicit work-stack driver) AND produces the EXACT
+// SAME post-order MIR the recursive lowerer would: `Arg0`, then one `Add` per
+// chain level in deepest-first order, each `Add`'s operands `[deeperResult,
+// Arg0]` (the leaf's are `[Arg0, Arg0]`), then `Return(lastAdd)`. Every `Ref(a)`
+// resolves to the single param `Arg` SSA value (no new instruction), so the body
+// is exactly N Adds + the Return.
+//
+// RED-ON-DISABLE (the flat property): the depth (4000) is far beyond the host
+// main-stack recursion limit for the heavy recursive `lowerExprNode` frame
+// (the corpus witnesses a ~25-level main-stack crash point). Revert the driver
+// so BinaryOp recurses `lowerExpr(child)` on the host stack and this test
+// STACK-OVERFLOWS (rc-127 process abort → ctest red) instead of asserting clean.
+//
+// RED-ON-REORDER (the byte-identity half): each Add's RHS is a fresh EMITTING
+// `a * a` Mul, so the recursive form's two SEQUENTIAL statements `lhs =
+// lowerExpr(kids[0]); rhs = lowerExpr(kids[1]);` emit the spine deepest-first
+// with each `Mul_i` lowered IMMEDIATELY before its `Add_i`. The test pins that
+// each `Add_i` is preceded by its own RHS `Mul_i`. Building RHS-before-LHS (the
+// cst_to_hir Binary-frame order — WRONG here because MIR lowers the operands as
+// sequential statements, NOT function-call arguments) emits every `Mul` before
+// the deeper spine, so `Add_i` is no longer preceded by `Mul_i` → red.
+//
+// Synthetic (SF-4): the parser cannot emit beyond its 256 cap until Stage 5, so
+// the deep input is built via the public `HirBuilder`, not by parsing.
+TEST(MirLoweringCSubset, IterativeDeepBinaryChainLowersFlatAndByteIdentical) {
+    constexpr std::uint32_t kDepth   = 4000;  // # of Add nodes (chain levels)
+    constexpr std::uint32_t kParamSym = 1;
+
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
+
+    HirBuilder b{"c-subset"};
+    // `int f(int a)` — the param's Refs resolve to the entry `Arg(0)` SSA value
+    // (no emitted instruction); each `a * a` emits a fresh `Mul(Arg, Arg)`.
+    HirNodeId const param = b.makeVarDecl(i32, kParamSym);
+    auto refA = [&] { return b.makeRef(i32, kParamSym); };
+    auto mulAA = [&] {
+        return b.makeBinaryOp(HirOpKind::Mul, refA(), refA(), i32);
+    };
+    // Left-assoc spine: leaf `(a*a)`, then `cur = cur + (a*a)` (kDepth times).
+    HirNodeId cur = mulAA();                                  // the deepest value
+    for (std::uint32_t i = 0; i < kDepth; ++i)
+        cur = b.makeBinaryOp(HirOpKind::Add, cur, mulAA(), i32);
+    HirNodeId const body = b.makeBlock(std::array{b.makeReturn(cur)});
+    HirNodeId const fn   = b.makeFunction(fnTy, /*sym=*/7, std::array{param}, body);
+    HirNodeId const root = b.makeModule(std::array{fn});
+    Hir hir = std::move(b).finish(root);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    // NOTE: this call recurses through HIR→MIR lowering on THIS (main) stack —
+    // the flat-property witness (no large-stack worker wraps it here).
+    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
+                             MirLoweringConfig{});
+    ASSERT_TRUE(result.ok)
+        << "deep BinaryOp chain must lower clean: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Mir const& m = result.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirFuncId const f = m.funcAt(0);
+    ASSERT_EQ(m.funcBlockCount(f), 1u);
+    MirBlockId const entry = m.funcEntry(f);
+
+    // Body = Arg(0) + the leaf Mul + kDepth (Mul, Add) pairs + Return.
+    ASSERT_EQ(m.blockInstCount(entry), 2u * kDepth + 3u);
+    MirInstId const arg0 = m.blockInstAt(entry, 0);
+    EXPECT_EQ(m.instOpcode(arg0), MirOpcode::Arg);
+    EXPECT_EQ(m.argIndex(arg0), 0u);
+
+    // The leaf value `a*a` (the deepest spine node) is the first emitted op.
+    MirInstId const leafMul = m.blockInstAt(entry, 1);
+    EXPECT_EQ(m.instOpcode(leafMul), MirOpcode::Mul);
+    {
+        auto ops = m.instOperands(leafMul);
+        ASSERT_EQ(ops.size(), 2u);
+        EXPECT_EQ(ops[0], arg0);
+        EXPECT_EQ(ops[1], arg0);
+    }
+
+    // Then `kDepth` (Mul_i, Add_i) pairs at positions [2..], deepest-first. The
+    // BYTE-IDENTITY guard: each Add_i's LHS is the previous spine result and its
+    // RHS is `Mul_i`, the instruction IMMEDIATELY before it (left-to-right eval:
+    // LHS spine already emitted, then this level's RHS Mul, then the Add). A
+    // RHS-before-LHS build would move every Mul ahead of the spine → this fails.
+    MirInstId prevSpine = leafMul;
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        MirInstId const mulI = m.blockInstAt(entry, 2u + 2u * i);
+        MirInstId const addI = m.blockInstAt(entry, 3u + 2u * i);
+        EXPECT_EQ(m.instOpcode(mulI), MirOpcode::Mul) << "RHS Mul at level " << i;
+        EXPECT_EQ(m.instOpcode(addI), MirOpcode::Add) << "Add at level " << i;
+        auto ops = m.instOperands(addI);
+        ASSERT_EQ(ops.size(), 2u);
+        EXPECT_EQ(ops[0], prevSpine)
+            << "Add[" << i << "] lhs is the deeper spine result";
+        EXPECT_EQ(ops[1], mulI)
+            << "Add[" << i << "] rhs is its OWN `a*a`, emitted immediately before "
+               "it (left-to-right operand order — red on a RHS-first build)";
+        prevSpine = addI;
+    }
+
+    // Return(outermost Add).
+    MirInstId const ret = m.blockInstAt(entry, 2u * kDepth + 2u);
+    EXPECT_EQ(m.instOpcode(ret), MirOpcode::Return);
+    {
+        auto ops = m.instOperands(ret);
+        ASSERT_EQ(ops.size(), 1u);
+        EXPECT_EQ(ops[0], prevSpine) << "Return takes the outermost Add";
+    }
+}
+
+// SF-4 companion: a DEEPLY-nested UnaryOp chain `-(-(-(…-a)))` flattens too (the
+// single-child straight-line arm). Pins that the body is exactly `Arg0` followed
+// by kDepth `Neg`s (deepest-first), each taking the previous result, then Return.
+// Same RED-ON-DISABLE flat property as the BinaryOp pin (revert the driver →
+// host-stack overflow at this depth). The two pins together cover the 1-child
+// (Unary) and 2-child (Binary) frame shapes.
+TEST(MirLoweringCSubset, IterativeDeepUnaryChainLowersFlatAndByteIdentical) {
+    constexpr std::uint32_t kDepth    = 4000;  // # of Neg nodes
+    constexpr std::uint32_t kParamSym = 1;
+
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
+
+    HirBuilder b{"c-subset"};
+    HirNodeId const param = b.makeVarDecl(i32, kParamSym);
+    HirNodeId cur = b.makeRef(i32, kParamSym);
+    for (std::uint32_t i = 0; i < kDepth; ++i)
+        cur = b.makeUnaryOp(HirOpKind::Neg, cur, i32);
+    HirNodeId const body = b.makeBlock(std::array{b.makeReturn(cur)});
+    HirNodeId const fn   = b.makeFunction(fnTy, /*sym=*/7, std::array{param}, body);
+    HirNodeId const root = b.makeModule(std::array{fn});
+    Hir hir = std::move(b).finish(root);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
+                             MirLoweringConfig{});
+    ASSERT_TRUE(result.ok)
+        << "deep UnaryOp chain must lower clean: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Mir const& m = result.mir;
+    MirFuncId const f = m.funcAt(0);
+    MirBlockId const entry = m.funcEntry(f);
+    ASSERT_EQ(m.blockInstCount(entry), kDepth + 2u);
+    MirInstId const arg0 = m.blockInstAt(entry, 0);
+    EXPECT_EQ(m.instOpcode(arg0), MirOpcode::Arg);
+
+    MirInstId prev = arg0;
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        MirInstId const neg = m.blockInstAt(entry, 1u + i);
+        EXPECT_EQ(m.instOpcode(neg), MirOpcode::Neg);
+        auto ops = m.instOperands(neg);
+        ASSERT_EQ(ops.size(), 1u);
+        EXPECT_EQ(ops[0], prev) << "Neg[" << i << "] takes the deeper result";
+        prev = neg;
+    }
+    MirInstId const ret = m.blockInstAt(entry, kDepth + 1u);
+    EXPECT_EQ(m.instOpcode(ret), MirOpcode::Return);
+    EXPECT_EQ(m.instOperands(ret)[0], prev);
 }
