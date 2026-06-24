@@ -5,6 +5,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/substrate/large_stack_call.hpp"
 #include "core/types/call_payload.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -5942,22 +5943,27 @@ TEST(MirLoweringCSubset, ComputedGotoBlockAddressTargetsAreAddressTaken) {
 
 // ─── Plan 24 Stage 4 — iterative HIR→MIR straight-line expression driver ────
 //
-// SF-4 differential pin (synthetic deep HIR, lowered on the test's MAIN stack):
-// a DEEPLY-nested left-associative `(((a+a)+a)+a)…` BinaryOp chain lowers to a
-// FLAT host-stack cost (the explicit work-stack driver) AND produces the EXACT
-// SAME post-order MIR the recursive lowerer would: `Arg0`, then one `Add` per
-// chain level in deepest-first order, each `Add`'s operands `[deeperResult,
-// Arg0]` (the leaf's are `[Arg0, Arg0]`), then `Return(lastAdd)`. Every `Ref(a)`
-// resolves to the single param `Arg` SSA value (no new instruction), so the body
-// is exactly N Adds + the Return.
+// SF-4 differential pin (synthetic deep HIR): a DEEPLY-nested left-associative
+// `(((a+a)+a)+a)…` BinaryOp chain lowers to the EXACT SAME post-order MIR the
+// recursive lowerer would: `Arg0`, then one `Add` per chain level in deepest-
+// first order, each `Add`'s operands `[deeperResult, Mul_i]` (the leaf is a
+// `Mul(Arg0,Arg0)`), then `Return(lastAdd)`. Every `Ref(a)` resolves to the
+// single param `Arg` SSA value (no new instruction), so the body is exactly the
+// leaf Mul + N (Mul,Add) pairs + the Return.
 //
-// RED-ON-DISABLE (the flat property): the depth (4000) is far beyond the host
-// main-stack recursion limit for the heavy recursive `lowerExprNode` frame
-// (the corpus witnesses a ~25-level main-stack crash point). Revert the driver
-// so BinaryOp recurses `lowerExpr(child)` on the host stack and this test
-// STACK-OVERFLOWS (rc-127 process abort → ctest red) instead of asserting clean.
+// WITNESS SPLIT — the flat/host-stack-overflow witness (that the lowering driver
+// is an O(1)-host-stack work-stack, not host recursion) lives in the CORPUS
+// examples `deep_mir_expr` / `deep_expr_lower` (and the upcoming Stage-7 e2e),
+// which lower a deep tree through the real pipeline and would crash if the driver
+// recursed. THIS unit pin asserts the orthogonal half: byte-identity MIR
+// correctness (exact opcode/operand-order shape) at depth, which the corpus
+// (golden-MIR-free) does not. The build/lower/teardown here run on the project's
+// 64 MiB worker (callOnLargeStack) exactly as the production driver lowers — so
+// the deep-tree build and its destructors do NOT depend on the host's ~1 MiB
+// main-stack budget (an ORTHOGONAL per-node HIR-teardown recursion overflows a
+// stock Debug main stack at this depth; the worker removes that artifact).
 //
-// RED-ON-REORDER (the byte-identity half): each Add's RHS is a fresh EMITTING
+// RED-ON-REORDER (the byte-identity guard): each Add's RHS is a fresh EMITTING
 // `a * a` Mul, so the recursive form's two SEQUENTIAL statements `lhs =
 // lowerExpr(kids[0]); rhs = lowerExpr(kids[1]);` emit the spine deepest-first
 // with each `Mul_i` lowered IMMEDIATELY before its `Add_i`. The test pins that
@@ -5972,6 +5978,13 @@ TEST(MirLoweringCSubset, IterativeDeepBinaryChainLowersFlatAndByteIdentical) {
     constexpr std::uint32_t kDepth   = 4000;  // # of Add nodes (chain levels)
     constexpr std::uint32_t kParamSym = 1;
 
+    // Build the deep tree, lower it, and assert — ALL on the 64 MiB worker
+    // (kDeepRecursionStackBytes), mirroring how Program::compileFiles lowers a
+    // CU. This keeps the deep HIR build + lowering + its per-node destructors
+    // off the host's small main stack (which a stock MSVC Debug build sizes at
+    // 1 MiB — too small for the orthogonal deep-tree-teardown recursion here).
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
     TypeInterner ti{CompilationUnitId{1}};
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
@@ -5995,8 +6008,6 @@ TEST(MirLoweringCSubset, IterativeDeepBinaryChainLowersFlatAndByteIdentical) {
 
     DiagnosticReporter rep;
     HirLiteralPool pool;
-    // NOTE: this call recurses through HIR→MIR lowering on THIS (main) stack —
-    // the flat-property witness (no large-stack worker wraps it here).
     auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
                              MirLoweringConfig{});
     ASSERT_TRUE(result.ok)
@@ -6054,18 +6065,23 @@ TEST(MirLoweringCSubset, IterativeDeepBinaryChainLowersFlatAndByteIdentical) {
         ASSERT_EQ(ops.size(), 1u);
         EXPECT_EQ(ops[0], prevSpine) << "Return takes the outermost Add";
     }
+        });  // runOnLargeStack
 }
 
-// SF-4 companion: a DEEPLY-nested UnaryOp chain `-(-(-(…-a)))` flattens too (the
-// single-child straight-line arm). Pins that the body is exactly `Arg0` followed
+// SF-4 companion: a DEEPLY-nested UnaryOp chain `-(-(-(…-a)))` lowers via the
+// single-child straight-line arm. Pins that the body is exactly `Arg0` followed
 // by kDepth `Neg`s (deepest-first), each taking the previous result, then Return.
-// Same RED-ON-DISABLE flat property as the BinaryOp pin (revert the driver →
-// host-stack overflow at this depth). The two pins together cover the 1-child
-// (Unary) and 2-child (Binary) frame shapes.
+// Same byte-identity correctness guard as the BinaryOp pin for the 1-child frame
+// shape; the flat/host-stack witness lives in the corpus (see the BinaryOp pin's
+// WITNESS SPLIT note). Build/lower/teardown run on the 64 MiB worker so the deep
+// HIR tree's orthogonal per-node teardown recursion does not depend on the host
+// main-stack size (stock MSVC Debug = 1 MiB).
 TEST(MirLoweringCSubset, IterativeDeepUnaryChainLowersFlatAndByteIdentical) {
     constexpr std::uint32_t kDepth    = 4000;  // # of Neg nodes
     constexpr std::uint32_t kParamSym = 1;
 
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
     TypeInterner ti{CompilationUnitId{1}};
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
@@ -6107,6 +6123,7 @@ TEST(MirLoweringCSubset, IterativeDeepUnaryChainLowersFlatAndByteIdentical) {
     MirInstId const ret = m.blockInstAt(entry, kDepth + 1u);
     EXPECT_EQ(m.instOpcode(ret), MirOpcode::Return);
     EXPECT_EQ(m.instOperands(ret)[0], prev);
+        });  // runOnLargeStack
 }
 
 // ─── Plan 24 Stage 4-address — iterative HIR→MIR by-ADDRESS driver ──────────
@@ -6114,9 +6131,8 @@ TEST(MirLoweringCSubset, IterativeDeepUnaryChainLowersFlatAndByteIdentical) {
 // SF-4 differential pin for the {Address} half: a DEEPLY-nested storage-array
 // subscript chain `a[0][0][0]…[0]` (the lvalue ADDRESS axis — each level's base
 // is an ARRAY, so each recurses into the base's lvalue ADDRESS, the deep axis
-// `lowerLvalueAddress` now flattens onto the shared work-stack). Lowered on the
-// test's MAIN stack, it must carry a FLAT host-stack cost AND produce the EXACT
-// SAME post-order MIR the recursive lowerer would.
+// `lowerLvalueAddress` now flattens onto the shared work-stack). It must produce
+// the EXACT SAME post-order MIR the recursive lowerer would.
 //
 // The array element is `char` (stride 1), so `scaleIndexToBytes` emits NO Mul —
 // each subscript `0` is a single `Const`, and each level emits exactly one
@@ -6128,16 +6144,21 @@ TEST(MirLoweringCSubset, IterativeDeepUnaryChainLowersFlatAndByteIdentical) {
 // first, then kDepth `Gep`s INNERMOST-first (each `Gep[i]` bases on `Gep[i-1]`,
 // `Gep[0]` on the Alloca), then the `Load` of the char element, then `Return`.
 //
-// RED-ON-DISABLE (the flat property): kDepth (1500) is past the recursive-
-// lowering main-stack crash floor (~900). Revert the {Address} flattening (the
-// MemberAddr/IndexAddr frames) so the Index storage-base recurses
-// `lowerLvalueAddress(kids[0])` on the host stack and this test STACK-OVERFLOWS
-// (process abort → ctest red) instead of asserting clean — demonstrated by
-// disabling the two address pushes and watching depth ≥1000 crash while the
-// flat driver clears it (and the orthogonal array-type layout recursion, also
-// ~1500 deep here, stays well under its own ~2300 ceiling).
+// WITNESS SPLIT — the flat/host-stack-overflow witness (that `lowerLvalueAddress`
+// is an O(1)-host-stack work-stack rather than recursion) lives in the CORPUS
+// example `deep_lvalue_chain` (and the upcoming Stage-7 e2e), which lowers a deep
+// lvalue chain through the real pipeline and would crash if the {Address} axis
+// recursed. THIS unit pin asserts the orthogonal half: byte-identity MIR
+// correctness (the Gep backbone shape + stride-1 no-Mul fast path) at depth.
+// Build/lower/teardown run on the project's 64 MiB worker (callOnLargeStack)
+// exactly as the production driver lowers — so neither the deep array-type
+// `computeLayout` recursion (one frame per nested dimension, plan-24 family C-2
+// "type-node recursion, OUT of scope") NOR the deep HIR tree's per-node teardown
+// depends on the host's small main-stack budget (a stock MSVC Debug main stack
+// is 1 MiB — too small for those orthogonal recursions at this depth; the worker
+// removes that artifact while leaving the asserted MIR shape unchanged).
 //
-// RED-ON-REORDER (the byte-identity half): the pin walks the `Gep` backbone and
+// RED-ON-REORDER (the byte-identity guard): the pin walks the `Gep` backbone and
 // asserts `Gep[i].base == Gep[i-1]` (innermost-first) AND that the `Gep` count
 // equals kDepth with NO Mul anywhere (the stride-1 fast path). A frame that
 // lowered the base BEFORE the subscript, or that scaled a stride-1 index, would
@@ -6146,18 +6167,16 @@ TEST(MirLoweringCSubset, IterativeDeepUnaryChainLowersFlatAndByteIdentical) {
 // Synthetic (SF-4): the parser's 256 maxExpressionDepth cap forbids a 1500-deep
 // subscript in source, so the deep input is built via the public `HirBuilder`.
 TEST(MirLoweringCSubset, IterativeDeepIndexAddressChainLowersFlatAndByteIdentical) {
-    // Depth 1500: comfortably ABOVE the recursive-lowering main-stack crash
-    // floor (~900 levels — measured: the recursive `lowerLvalueAddressNode`
-    // IndexAddr frame overflows the test's main stack at ≥1000) so the flat
-    // property is RED-on-disable, yet BELOW the ORTHOGONAL layout-engine type
-    // recursion ceiling (~2300 — `computeLayout` recurses once per nested array
-    // dimension, plan-24 family C-2 "type-node recursion, OUT of scope"; a
-    // POINTER type's layout is O(1), but a storage-ARRAY chain inherently nests
-    // its element type). The driver this pin guards is now flat; the deep
-    // ARRAY-TYPE nest is the only remaining (separate, structural) recursion.
     constexpr std::uint32_t kDepth    = 1500;  // # of subscript levels (Index nodes)
     constexpr std::uint32_t kArraySym = 1;
 
+    // Build the nested array types + deep subscript chain, lower it, and assert
+    // — ALL on the 64 MiB worker (kDeepRecursionStackBytes), mirroring how
+    // Program::compileFiles lowers a CU. The orthogonal per-dimension
+    // `computeLayout` recursion (~1500 frames here) and the deep HIR tree's
+    // teardown both run on the worker, off the host's small main stack.
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
     TypeInterner ti{CompilationUnitId{1}};
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const ch   = ti.primitive(TypeKind::Char);
@@ -6260,4 +6279,5 @@ TEST(MirLoweringCSubset, IterativeDeepIndexAddressChainLowersFlatAndByteIdentica
     MirInstId const ret = m.blockInstAt(entry, 2u * kDepth + 2u);
     EXPECT_EQ(m.instOpcode(ret), MirOpcode::Return);
     EXPECT_EQ(m.instOperands(ret)[0], load);
+        });  // runOnLargeStack
 }
