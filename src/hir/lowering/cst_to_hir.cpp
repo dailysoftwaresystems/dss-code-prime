@@ -5669,6 +5669,19 @@ struct Lowerer {
             sym = model.symbolAt(vis[*decl.nameChild]);
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
         }
+        // D-CSUBSET-EXTERN-DEFINITION-MERGE: an `extern` declaration that an in-TU
+        // DEFINITION superseded (`isAbsorbedProto` set by the Pass-1 merge — the
+        // definition won the binding) emits NO HIR node and registers NO extern
+        // import row. The definition carries the symbol (a Function body or a
+        // Global with storage); emitting an ExternFunction/ExternGlobal here would
+        // create a spurious duplicate import for a symbol defined locally. Returns
+        // an invalid HirNodeId; the dispatch (lowerDecl) skips pushing it. Mirrors
+        // the topLevelDecl proto-skip (`isProtoDeclaration || isAbsorbedProto`),
+        // here on the extern-lowering path.
+        if (auto const* rec = model.recordFor(sym);
+            rec != nullptr && rec->isAbsorbedProto) {
+            return HirNodeId{};
+        }
         // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3,
         // 2026-06-02): scan the tail subtree (varDeclTail or
         // externFuncTail) for an optional trailing `stringLiteralExpr`
@@ -5953,7 +5966,13 @@ struct Lowerer {
         if (m->hirKind == "Decl")       { lowerTopLevelInto(core, out); return; }
         if (m->hirKind == "Function")   { out.push_back(lowerFunctionDecl(core)); return; }
         if (m->hirKind == "TypeDecl")   { out.push_back(lowerTypeDecl(core)); return; }
-        if (m->hirKind == "ExternDecl") { out.push_back(lowerExternDecl(core)); return; }
+        if (m->hirKind == "ExternDecl") {
+            // D-CSUBSET-EXTERN-DEFINITION-MERGE: an absorbed extern (superseded by
+            // an in-TU definition) returns an invalid node — push nothing.
+            HirNodeId const e = lowerExternDecl(core);
+            if (e.valid()) out.push_back(e);
+            return;
+        }
         // A `var`-style declaration at module scope is a Global (the same rule
         // is a local VarDecl inside a block — see lowerVarLike). Declarator-
         // mode rows append one Global per declarator (flat).

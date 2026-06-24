@@ -1503,6 +1503,106 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
     return scope;
 }
 
+// D-CSUBSET-BLOCK-SCOPE-PROTOTYPE: the FILE (translation-unit) scope of `tree` —
+// the scope whose anchor IS this tree's root node. Each tree's Pass 1 runs under
+// a per-tree root scope (`pushScope(builtinScope, tree.root(), tree.id())`), so
+// walking the parent chain from any interior scope until the anchor equals the
+// tree root reaches that file scope. Used to RE-HOME a block-scope function
+// declaration onto the file scope (C 6.2.2p4 — a no-linkage block-scope
+// declaration of a function refers to the file-scope function with external
+// linkage). Returns `scope` unchanged if it is already the file scope, or if the
+// chain is exhausted without a match (a malformed scope graph — fail-safe: bind
+// where we are, the prior behavior).
+[[nodiscard]] ScopeId fileScopeOf(EngineState const& s, Tree const& tree,
+                                  ScopeId scope) {
+    auto const& scs = s.scopes.scopes();
+    NodeId const treeRoot = tree.root();
+    ScopeId cur = scope;
+    while (cur.valid() && cur.v < scs.size()) {
+        auto const& rec = scs[cur.v];
+        if (rec.tree.v == tree.id().v && rec.anchor.v == treeRoot.v) return cur;
+        cur = rec.parent;
+    }
+    return scope;
+}
+
+// D-CSUBSET-FN-PROTOTYPE + D-CSUBSET-EXTERN-DEFINITION-MERGE: resolve a same-scope
+// REDECLARATION (`prior` already bound `name` in `bindScope`; `newId` is the new
+// symbol). A redeclaration MERGES instead of colliding when both sides name the
+// SAME entity (both functions OR both objects) and are NOT both definitions. A
+// NON-DEFINING declaration — a bare prototype OR an `extern` declaration — names a
+// body/storage that lives elsewhere (or later). The cases, on whether each side is
+// non-defining:
+//   nonDefining → definition : the DEFINITION wins the binding; the non-defining
+//                 decl is absorbed (proto→def, extern→def).
+//   definition → nonDefining / nonDefining → nonDefining : a redundant declaration;
+//                 KEEP the prior binding, absorb the new one (def→proto, def→extern,
+//                 proto→proto, extern→extern, proto↔extern).
+//   definition → definition : two bodies / two storage definitions (incl. two
+//                 `int g;` tentative defs) → S_RedeclaredSymbol.
+// CATEGORY GUARD: a function and an OBJECT of the same name never merge — different
+// categories → a genuine collision. A signature/type mismatch on a merged pair fails
+// loud AFTER Pass 1.5 (S_IncompatibleRedeclaration) once both types resolve.
+//
+// Shared by BOTH Pass-1 minting paths (declarator-mode and legacy positional) so a
+// proto/extern and its definition merge regardless of which path mints each — e.g.
+// c-subset's `extern` (positional) and its definition (declarator-mode topLevelDecl).
+// `newIsFnCategory` = the new decl is function-category (Function-kind or a bare
+// proto); `newNonDef` = the new decl is non-defining (proto or extern).
+void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
+                                 ScopeId bindScope, std::string const& name,
+                                 NodeId nameNode, SymbolId prior, SymbolId newId,
+                                 bool newIsFnCategory, bool newNonDef) {
+    auto& priorRec = s.symbols.at(prior);
+    bool const priorNonDef =
+        priorRec.isProtoDeclaration || priorRec.isExternDeclaration;
+    bool const priorIsFnCategory =
+        priorRec.kind == DeclarationKind::Function || priorRec.isProtoDeclaration;
+    bool const sameCategory = (priorIsFnCategory == newIsFnCategory);
+    bool const bothDefinitions = !priorNonDef && !newNonDef;
+    if (sameCategory && !bothDefinitions) {
+        if (priorNonDef && !newNonDef) {
+            // nonDefining → definition: the DEFINITION wins the binding; the prior
+            // non-defining decl is absorbed (a proto/extern declarator emits no HIR
+            // node — see the topLevelDecl proto-skip and lowerExternDecl's
+            // absorbed-skip).
+            s.scopes.injectBinding(bindScope, name, newId);
+            priorRec.isAbsorbedProto = true;
+            s.nodeToSymbol.set(nameNode, newId);
+            s.mergedFnDecls.push_back({newId, prior});
+        } else {
+            // definition → nonDefining / nonDefining → nonDefining: a redundant
+            // declaration. Keep the PRIOR binding; absorb the NEW one. Bind the
+            // absorbed declarator's NAME node to its OWN record (newId), NOT the
+            // survivor — newId carries the proto/extern flag the HIR skip reads, and
+            // Pass 1.5 resolves THIS declarator's signature into newId so the post-1.5
+            // sweep compares survivor.type vs absorbed.type with BOTH valid (catches
+            // an incompatible def→proto / def→extern). Aiming at `prior` would clobber
+            // the survivor's resolved type and hide the mismatch.
+            s.symbols.at(newId).isAbsorbedProto = true;
+            s.nodeToSymbol.set(nameNode, newId);
+            s.mergedFnDecls.push_back({prior, newId});
+        }
+    } else {
+        // Two real definitions (incl. two tentative object defs), or a cross-category
+        // (function vs object) redeclaration — a genuine collision.
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_RedeclaredSymbol;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(nameNode);
+        d.actual   = name;
+        if (priorRec.tree.v == tree.id().v) {
+            d.related.push_back(RelatedLocation{
+                tree.source().id(),
+                tree.span(priorRec.declNode),
+                "previously declared here",
+            });
+        }
+        s.reporter.report(std::move(d));
+    }
+}
+
 // ── Pass 1: pre-order — mint decls + push/pop scopes + const marking ───────
 // pass1 PER-NODE work for ONE node — extracted for the iterative driver below
 // (D-PARSE-DEEP-NEST-RECURSION-MEMORY plan 24 Stage 2). PRE-order: resolves this
@@ -1601,7 +1701,34 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         }
                         std::string name{tree.text(nameNode)};
                         if (name.empty()) continue;
-                        ScopeId const bindScope = current;
+                        // D-CSUBSET-FN-PROTOTYPE: a bare function prototype is a
+                        // Variable-kind declarator (the kindByChild definition
+                        // discriminator did NOT match — no body) whose NAME
+                        // carries a function suffix. A fnptr (`int (*fp)(int)`)
+                        // is NOT one (its suffix sits on the outer declarator).
+                        // Computed BEFORE the bind scope is chosen because a
+                        // prototype re-homes onto the file scope (below).
+                        bool const isProto =
+                            (effectiveKind == DeclarationKind::Variable)
+                            && nameNode.valid()
+                            && hasFnSuffixOnName(tree, nameNode, *cfg.declarators);
+                        // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE: a block-scope function
+                        // declaration (`int f(int);` inside a body) has EXTERNAL
+                        // linkage and REFERS to the file-scope function of the
+                        // same name (C 6.2.2p4 / 6.7.6.3), it does NOT introduce a
+                        // distinct block-local function. Re-home the prototype onto
+                        // the file (translation-unit) scope so the existing
+                        // file-scope proto/definition MERGE (the 4-case direction
+                        // table below) resolves it — a later/earlier file-scope
+                        // definition WINS the binding and the block proto is
+                        // absorbed (a call resolves to the definition). When there
+                        // is NO file-scope definition the re-homed proto is still
+                        // an unabsorbed file-scope declaration → a call fails loud
+                        // at HIR→MIR exactly like a file-scope undefined proto
+                        // (consistent fail-loud, not a block-local shadow). A
+                        // non-proto declarator binds in `current` unchanged.
+                        ScopeId bindScope = current;
+                        if (isProto) bindScope = fileScopeOf(s, tree, current);
                         SymbolRecord rec;
                         rec.name         = name;
                         rec.scope        = bindScope;
@@ -1609,7 +1736,17 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         rec.declRuleNode = node;
                         rec.tree         = tree.id();
                         rec.kind         = effectiveKind;
-                        rec.warnIfUnused = decl.warnIfUnused;
+                        // A function PROTOTYPE is a function DECLARATION, never an
+                        // "unused variable" — suppress warnIfUnused for it. This
+                        // matters for a BLOCK-scope proto (D-CSUBSET-BLOCK-SCOPE-
+                        // PROTOTYPE), whose local declaration rule sets
+                        // warnIfUnused; re-homed to file scope and absorbed by the
+                        // definition (its own use-set stays empty — the call
+                        // resolves to the definition), it would otherwise emit a
+                        // spurious S_UnusedVariable. A file-scope proto is
+                        // unaffected (topLevelDecl already declares warnIfUnused
+                        // false), so this is byte-identical there.
+                        rec.warnIfUnused = decl.warnIfUnused && !isProto;
                         rec.fieldIndex   = static_cast<std::uint32_t>(
                             s.scopes.scopes()[bindScope.v].bindings.size());
                         if (decl.constMarker.has_value()) {
@@ -1617,105 +1754,26 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                 tree, node, *decl.constMarker,
                                 &s.idx().declByRule);
                         }
-                        // D-CSUBSET-FN-PROTOTYPE: a bare function prototype is a
-                        // Variable-kind declarator (the kindByChild definition
-                        // discriminator did NOT match — no body) whose NAME
-                        // carries a function suffix. A fnptr (`int (*fp)(int)`)
-                        // is NOT one (its suffix sits on the outer declarator).
-                        rec.isProtoDeclaration =
-                            (effectiveKind == DeclarationKind::Variable)
-                            && nameNode.valid()
-                            && hasFnSuffixOnName(tree, nameNode, *cfg.declarators);
+                        rec.isProtoDeclaration = isProto;
+                        // D-CSUBSET-EXTERN-DEFINITION-MERGE: a non-defining
+                        // declaration (c-subset's `extern`) — config-driven, no
+                        // rule-name identity. Like a prototype it is a non-defining
+                        // declaration that MERGES with an in-TU definition.
+                        bool const isExtern = decl.nonDefiningDeclaration;
+                        rec.isExternDeclaration = isExtern;
                         SymbolId const newId = s.symbols.mint(rec);
                         SymbolId const prior =
                             s.scopes.bind(bindScope, name, newId);
                         if (prior.valid()) {
-                            // D-CSUBSET-FN-PROTOTYPE: a function REDECLARATION
-                            // (proto/def in any order) MERGES instead of
-                            // colliding. Four cases, on whether each side is a
-                            // proto vs a real definition:
-                            //   proto → def : the DEFINITION wins the binding;
-                            //                 the proto is absorbed.
-                            //   def → proto, proto → proto, extern → proto :
-                            //                 a redundant declaration; KEEP the
-                            //                 prior binding, absorb the new one.
-                            //   def → def, extern → def (prior is a real def/
-                            //                 extern AND new is a def) :
-                            //                 two bodies / a scope-out → the
-                            //                 existing S_RedeclaredSymbol path.
-                            // A signature mismatch on a merged pair fails loud
-                            // AFTER Pass 1.5 (S_IncompatibleRedeclaration) once
-                            // both FnSigs are resolved.
-                            auto& priorRec = s.symbols.at(prior);
-                            bool const priorProto = priorRec.isProtoDeclaration;
-                            bool const priorFn =
-                                priorProto
-                                || priorRec.kind == DeclarationKind::Function;
-                            bool const newDef =
-                                (effectiveKind == DeclarationKind::Function);
-                            bool const newFn = rec.isProtoDeclaration || newDef;
-                            if (priorFn && newFn && !(!priorProto && newDef)) {
-                                if (priorProto && newDef) {
-                                    // proto → definition: the DEFINITION wins
-                                    // the binding; the proto is absorbed (its
-                                    // declarator emits no HIR node).
-                                    s.scopes.injectBinding(bindScope, name, newId);
-                                    priorRec.isAbsorbedProto = true;
-                                    s.nodeToSymbol.set(nameNode, newId);
-                                    s.mergedFnDecls.push_back({newId, prior});
-                                } else {
-                                    // def → proto / proto → proto / extern →
-                                    // proto: a redundant declaration. Keep the
-                                    // PRIOR binding; absorb the NEW one (set on
-                                    // the MINTED record's symbol — `rec` was
-                                    // moved into mint()).
-                                    //
-                                    // DEVIATION from the locked spec's
-                                    // `nodeToSymbol.set(nameNode, prior)`: bind
-                                    // the absorbed declarator's NAME node to its
-                                    // OWN record (newId), NOT the survivor. Two
-                                    // reasons, both correctness-bearing:
-                                    //  (1) HIR (Edit 4) skips this declarator by
-                                    //      reading `recordFor(symbolAt(nameNode))
-                                    //      ->isProtoDeclaration`; newId carries
-                                    //      that flag, the survivor (a real def)
-                                    //      does NOT — pointing at `prior` would
-                                    //      fail to skip → a spurious FnSig global.
-                                    //  (2) Pass 1.5 resolves THIS declarator's
-                                    //      FnSig into `symbolAt(nameNode)`. Aimed
-                                    //      at newId, the absorbed record gets its
-                                    //      OWN signature → the post-1.5 sweep
-                                    //      compares survivor.type vs absorbed.type
-                                    //      with BOTH valid (catches an incompatible
-                                    //      def→proto, e.g. `int f(int){} long
-                                    //      f(int);`). Aimed at `prior` it would
-                                    //      instead CLOBBER the survivor's resolved
-                                    //      type with the proto's and leave the
-                                    //      absorbed type invalid → the mismatch
-                                    //      goes undetected AND the definition's
-                                    //      type is silently wrong.
-                                    s.symbols.at(newId).isAbsorbedProto = true;
-                                    s.nodeToSymbol.set(nameNode, newId);
-                                    s.mergedFnDecls.push_back({prior, newId});
-                                }
-                            } else {
-                                // Two real definitions, extern+def, or a non-
-                                // function redeclaration — a genuine collision.
-                                ParseDiagnostic d;
-                                d.code     = DiagnosticCode::S_RedeclaredSymbol;
-                                d.severity = DiagnosticSeverity::Error;
-                                d.buffer   = tree.source().id();
-                                d.span     = tree.span(nameNode);
-                                d.actual   = name;
-                                if (priorRec.tree.v == tree.id().v) {
-                                    d.related.push_back(RelatedLocation{
-                                        tree.source().id(),
-                                        tree.span(priorRec.declNode),
-                                        "previously declared here",
-                                    });
-                                }
-                                s.reporter.report(std::move(d));
-                            }
+                            // A bare proto is Variable-kind until Pass 1.5 upgrades
+                            // it; an extern function is already Function-kind. Both
+                            // are function-CATEGORY. A real function definition is
+                            // Function-kind and non-`isExtern`.
+                            bool const newIsFnCategory =
+                                effectiveKind == DeclarationKind::Function || isProto;
+                            mergeOrCollideRedeclaration(
+                                s, tree, bindScope, name, nameNode, prior, newId,
+                                newIsFnCategory, /*newNonDef=*/isProto || isExtern);
                         } else {
                             s.nodeToSymbol.set(nameNode, newId);
                         }
@@ -1808,6 +1866,13 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             &s.idx().declByRule);
                     }
 
+                    // D-CSUBSET-EXTERN-DEFINITION-MERGE: c-subset's `extern`
+                    // declaration mints through THIS legacy positional path (it
+                    // declares a positional `name`, not declarator-mode). Mark it
+                    // non-defining so it merges with an in-TU definition of the same
+                    // name (handled below via the shared mergeOrCollideRedeclaration).
+                    rec.isExternDeclaration = decl.nonDefiningDeclaration;
+
                     SymbolId const newId = s.symbols.mint(rec);
                     // C 6.2.3 tag namespace: a composite-type declaration
                     // (carries `fieldChildren`, the same gate that floats the
@@ -1823,21 +1888,39 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     SymbolId const prior =
                         s.scopes.bind(bindScope, resolved.name, newId, bindNs);
                     if (prior.valid()) {
-                        ParseDiagnostic d;
-                        d.code     = DiagnosticCode::S_RedeclaredSymbol;
-                        d.severity = DiagnosticSeverity::Error;
-                        d.buffer   = tree.source().id();
-                        d.span     = tree.span(resolved.node);
-                        d.actual   = resolved.name;
-                        auto const& priorRec = s.symbols.at(prior);
-                        if (priorRec.tree.v == tree.id().v) {
-                            d.related.push_back(RelatedLocation{
-                                tree.source().id(),
-                                tree.span(priorRec.declNode),
-                                "previously declared here",
-                            });
+                        // D-CSUBSET-EXTERN-DEFINITION-MERGE: in the ORDINARY
+                        // namespace, route a redeclaration through the shared
+                        // merge-or-collide so an `extern` minted here merges with a
+                        // definition (or another extern) — identical to the
+                        // declarator-mode path. A Variable/Type redeclaration with
+                        // neither side non-defining still collides (the helper's
+                        // bothDefinitions arm), byte-identical to the prior behavior.
+                        // The TAG namespace keeps the plain collision (tags have no
+                        // proto/extern axis).
+                        if (bindNs == SymbolNamespace::Ordinary) {
+                            bool const newIsFnCategory =
+                                effectiveKind == DeclarationKind::Function;
+                            mergeOrCollideRedeclaration(
+                                s, tree, bindScope, resolved.name, resolved.node,
+                                prior, newId, newIsFnCategory,
+                                /*newNonDef=*/decl.nonDefiningDeclaration);
+                        } else {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_RedeclaredSymbol;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(resolved.node);
+                            d.actual   = resolved.name;
+                            auto const& priorRec = s.symbols.at(prior);
+                            if (priorRec.tree.v == tree.id().v) {
+                                d.related.push_back(RelatedLocation{
+                                    tree.source().id(),
+                                    tree.span(priorRec.declNode),
+                                    "previously declared here",
+                                });
+                            }
+                            s.reporter.report(std::move(d));
                         }
-                        s.reporter.report(std::move(d));
                     } else {
                         s.nodeToSymbol.set(resolved.node, newId);
                     }
@@ -3229,6 +3312,69 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             d.buffer   = tree.source().id();
                             d.span     = tree.span(resolved.node);
                             d.actual   = resolved.name;
+                            s.reporter.report(std::move(d));
+                        }
+                    }
+                }
+                // D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS: an assignment
+                // (`a = b`, statement OR nested expression) must run the SAME
+                // assignability check the init / call-arg / return sites use —
+                // `subtreeType(lhs)` ←? `subtreeType(rhs)` through the shared
+                // `isAssignable` chokepoint, with the SAME conversion gates and
+                // the SAME null-pointer-constant admission. Pre-fix the
+                // assignment carried NO semantic type check (only the const
+                // check above), so `int x; float f; x = f;` was silently
+                // accepted while `int x = f;` (init) rejected S_TypeMismatch — a
+                // strictness asymmetry (the downstream HIR `coerce()` materialized
+                // a correct-but-implicit Cast). This restores parity: an invalid
+                // assignment now fails loud here, positioned at the RHS.
+                //
+                // ONLY the PLAIN assignment is checked — a COMPOUND assignment
+                // (`x += y`) is `x = x op y` whose result is the arithmetic
+                // common type converted back to `x` (the usual-arithmetic path,
+                // NOT assignability: `int x; double y; x += y;` is legal). The
+                // operator-table entry's `target == "Assign"` (with an empty
+                // `compoundBase`) is the SAME plain-vs-compound discriminator
+                // `subtreeType`'s combineBinary uses — fully config-driven, no
+                // operator-token identity hardcoded here.
+                if (assign.operatorToken.has_value()
+                    && assign.lhsChild < kids.size()
+                    && assign.rhsChild < kids.size()) {
+                    auto const& hirCfg = tree.schema().hirLowering();
+                    bool isPlainAssign = false;
+                    for (auto const& e : hirCfg.binaryOps) {
+                        if (e.token.v == assign.operatorToken->v) {
+                            isPlainAssign =
+                                (e.target == "Assign" && e.compoundBase.empty());
+                            break;
+                        }
+                    }
+                    if (isPlainAssign) {
+                        NodeId const lhsN = kids[assign.lhsChild];
+                        NodeId const rhsN = kids[assign.rhsChild];
+                        TypeId const lhsTy = subtreeType(s, tree, lhsN, here);
+                        TypeId const rhsTy = subtreeType(s, tree, rhsN, here);
+                        // Skip on either side unknown (cascade suppression — an
+                        // upstream error already fired). The conversion gates +
+                        // the null-pointer admission MIRROR the init-site call
+                        // EXACTLY so the two positions agree by construction.
+                        auto const& ptrRules =
+                            tree.schema().semantics().pointerConversions;
+                        if (lhsTy.valid() && rhsTy.valid()
+                            && !isAssignable(s.lattice.interner(), lhsTy, rhsTy,
+                                             ptrRules,
+                                             /*boolWidensToArith=*/true,
+                                             /*charConvertsToArith=*/cfg.charConvertsToArith,
+                                             /*enumConvertsToArith=*/cfg.enumConvertsToArith,
+                                             /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts)
+                            && !admitsNullPointerConstant(
+                                   s, tree, lhsTy, rhsN, ptrRules, here, cfg)) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_TypeMismatch;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(rhsN);
+                            d.actual   = std::string{tree.text(rhsN)};
                             s.reporter.report(std::move(d));
                         }
                     }

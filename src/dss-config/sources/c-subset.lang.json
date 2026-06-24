@@ -1092,6 +1092,7 @@
         "anonymousNameAllowed": true },
       { "rule": "enumerator",  "name": 0, "kind": "variable" },
       { "rule": "externDecl", "name": 2, "type": 1, "kind": "variable",
+        "nonDefiningDeclaration": true,
         "kindByChild": {
           "childPath": [3, 0],
           "whenRule": "externFuncTail",

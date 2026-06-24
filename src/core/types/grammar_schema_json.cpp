@@ -4730,6 +4730,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // D-CSUBSET-EXTERN-DEFINITION-MERGE: optional
+                        // `nonDefiningDeclaration` flag (default false). A
+                        // declaration that announces a symbol defined elsewhere
+                        // (c-subset's `externDecl`); it merges with an in-TU
+                        // definition of the same name (the definition wins).
+                        if (entry.contains("nonDefiningDeclaration")) {
+                            if (!entry.at("nonDefiningDeclaration").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/nonDefiningDeclaration",
+                                          "'nonDefiningDeclaration' must be a boolean");
+                            } else {
+                                rule.nonDefiningDeclaration =
+                                    entry.at("nonDefiningDeclaration").get<bool>();
+                            }
+                        }
+
                         // FC4 c1 stage 2a: optional `requireNamedDeclarators`
                         // flag (default false). Declarator-mode named
                         // positions (locals/globals/typedefs) declare true so

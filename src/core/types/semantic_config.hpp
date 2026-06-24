@@ -392,6 +392,17 @@ struct DSS_EXPORT DeclarationRule {
     // params are intentional) or globals/columns. Default false ⇒ no
     // unused check for this declaration form.
     bool            warnIfUnused = false;
+    // D-CSUBSET-EXTERN-DEFINITION-MERGE: when true, a symbol minted by this
+    // declaration is a NON-DEFINING declaration — it announces a name whose
+    // storage/body lives in another translation unit (an `extern` declaration in
+    // C). Such a declaration MERGES with an in-TU DEFINITION of the same name: the
+    // definition WINS the binding and this non-defining declaration is absorbed
+    // (its HIR ExternFunction/ExternGlobal node is suppressed). Two non-defining
+    // declarations of the same name are idempotent; two definitions still collide
+    // (S_RedeclaredSymbol). Per-declaration opt-in (c-subset's `externDecl`),
+    // source-agnostic — the engine never hardcodes a rule name. Default false ⇒
+    // an ordinary defining declaration (a redeclaration collides as before).
+    bool            nonDefiningDeclaration = false;
     // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN: HIR-tier implicit-return
     // insertion rule (source-agnostic). When this declaration is a
     // FUNCTION declaration AND the declared symbol's name appears

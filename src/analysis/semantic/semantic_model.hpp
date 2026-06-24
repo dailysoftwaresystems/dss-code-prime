@@ -131,6 +131,16 @@ struct DSS_EXPORT SymbolRecord {
     // emits NO HIR node — the survivor carries the symbol (the definition emits
     // the body; an unabsorbed proto emits nothing either). Default false.
     bool            isAbsorbedProto = false;
+    // D-CSUBSET-EXTERN-DEFINITION-MERGE: TRUE iff this symbol was minted from a
+    // NON-DEFINING declaration — a declaration that announces a symbol whose
+    // storage/body lives elsewhere (an `extern` declaration in C). Set by Pass 1
+    // from the minting DeclarationRule's `nonDefiningDeclaration` flag (config-
+    // driven, no rule-name identity). A non-defining declaration of the same name
+    // as an in-TU DEFINITION MERGES: the definition WINS the binding and the
+    // extern is absorbed (`isAbsorbedProto` set, its HIR ExternFunction/
+    // ExternGlobal node suppressed). Two non-defining declarations are idempotent;
+    // two definitions still collide (S_RedeclaredSymbol). Default false.
+    bool            isExternDeclaration = false;
     // D-CSUBSET-ENUM-INT-CONVERSION (FC8): TRUE iff this symbol IS an enumerator
     // constant (bound under a `compositeKind:"enum"` decl, where `enumValue` was
     // set). DISTINGUISHES an enumerator from a storage-backed `enum E e;` local —

@@ -1,0 +1,17 @@
+{
+  "$comment": "D-CSUBSET-BLOCK-SCOPE-PROTOTYPE: a block-scope function prototype (`int odd(int);` inside `even`'s body) refers to the file-scope function (C 6.2.2p4) — re-homed onto the file scope so it merges with the later definition; the forward call resolves to the real `odd`. Value-divergent: even(10)=1, odd(7)=1 -> exit 42. RED-ON-DISABLE: revert the Pass-1 re-home (bind in `current`) -> the block proto shadows, the call hits the bodyless shadow -> H0009, the program no longer COMPILES (compile failure, not exit 42). The release arm re-witnesses under the shipped pipeline (two ordinary mutually-recursive functions; no proto node survives lowering).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
