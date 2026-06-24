@@ -49,17 +49,20 @@ target_link_libraries(core PRIVATE nlohmann_json::nlohmann_json)
 
 # Big-object assembler flag for the large auto-generated grammar-schema TU.
 # grammar_schema_json.cpp is a big generated translation unit that, under the
-# MinGW/binutils toolchain, overflows the Windows COFF object-section count on a
+# MinGW/binutils toolchain, overflows the WINDOWS COFF object-section count on a
 # from-scratch build ("file too big"). `-Wa,-mbig-obj` is the standard binutils
-# remedy (it raises the COFF section limit). The MSVC PE backend and the
-# Linux-GCC ELF backend are NOT affected by this COFF limit, so the flag is
-# scoped two ways: (1) per-FILE via set_source_files_properties — it touches only
-# this one TU, every other `core` source is byte-identical; (2) per-COMPILER via
-# the $<$<CXX_COMPILER_ID:GNU>:...> generator expression — it expands to NOTHING
-# for MSVC and Clang, so their compile lines provably cannot change. This is a
-# toolchain-object-size accommodation, not a language/CPU/format identity branch.
+# remedy (it raises the COFF section limit). CRUCIAL: `-mbig-obj` is a COFF-ONLY
+# assembler option — the Linux/macOS GNU `as` REJECTS it ("unrecognized option
+# -mbig-obj"). GNU-on-Linux (ELF) is the SAME CXX_COMPILER_ID:GNU as MinGW, so a
+# bare GNU scope wrongly breaks the Linux-GCC legs. The flag is therefore scoped
+# THREE ways: (1) per-FILE via set_source_files_properties — only this one TU,
+# every other `core` source byte-identical; (2) GNU AND (3) WINDOWS, via the
+# $<$<AND:$<CXX_COMPILER_ID:GNU>,$<PLATFORM_ID:Windows>>:...> generator expression —
+# so it is applied ONLY to a MinGW/GNU-on-Windows (COFF) build and expands to
+# NOTHING for MSVC, Clang, and Linux/macOS GCC, whose compile lines provably cannot
+# change. A toolchain-object-size accommodation, not a language/CPU/format branch.
 set_source_files_properties(types/grammar_schema_json.cpp PROPERTIES
-    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU>:-Wa,-mbig-obj>")
+    COMPILE_OPTIONS "$<$<AND:$<CXX_COMPILER_ID:GNU>,$<PLATFORM_ID:Windows>>:-Wa,-mbig-obj>")
 
 # D-DIAG-CODENAME-EXHAUSTIVE-WARN (2026-06-09): enforce EXHAUSTIVE
 # DiagnosticCode / DiagnosticSeverity dispatch in parse_diagnostic.cpp. Both
