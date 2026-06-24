@@ -2387,6 +2387,155 @@ TEST(Arm64Encoder, LoadUnsignedOffsetDisassemblesRoundTrip) {
         << "the disasm oracle pins the RAW imm12 (24), NOT the byte offset (192)";
 }
 
+// ── D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 (load/store-displacement half):
+//    imm9/scaled-imm12 BOUNDARY byte-pins ──
+//
+// The frame load/store chokepoint (selectFrameMemOp, lir_callconv.cpp) swaps
+// the UNSCALED imm9 form (LDUR/STUR, ±256) to the SCALED imm12 form (LDR/STR,
+// 0..4095×size) exactly when the offset leaves the imm9 reach. These pins lock
+// the encoder boundary the chokepoint's threshold (offset > 255) is keyed to:
+// at #255 the UNSCALED `store`/`load` (STUR/LDUR, byte[3]=0xF8) still encodes;
+// at #256 the chokepoint must pick `store_u`/`load_u` (STR/LDR, byte[3]=0xF9).
+// A regression that shifted either the encoder reach or the selection threshold
+// diverges these bytes (red-on-disable, host-independent — every CI leg).
+
+TEST(Arm64Encoder, StoreUnscaledImm9AtBoundary255Encodes) {
+    // store X1, [SP, #255] → STUR X1, [SP, #255] (imm9 max-positive). Base
+    // 0xF8000000 | (255<<12) | (31<<5) | 1 = 0xF80FF3E1; LE: E1 F3 0F F8.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const storeOp = (*s)->opcodeByMnemonic("store");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(storeOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(255)
+    };
+    (void)b.addInst(*storeOp, InvalidLirReg, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "offset 255 is the imm9 max-positive — STUR must still encode";
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE1);
+    EXPECT_EQ(bytes[1], 0xF3);
+    EXPECT_EQ(bytes[2], 0x0F);
+    EXPECT_EQ(bytes[3], 0xF8)
+        << "byte[3] must be 0xF8 (STUR, unscaled imm9) at the #255 boundary";
+}
+
+TEST(Arm64Encoder, StoreUnscaledImm9JustPast255FailsLoud) {
+    // store X1, [SP, #256] via the UNSCALED `store` (STUR imm9) fails loud —
+    // 256 is one past the imm9 +255 max. (The chokepoint would instead pick
+    // store_u; this pins that the unscaled form genuinely cannot reach #256, so
+    // the swap is load-bearing, not cosmetic.)
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const storeOp = (*s)->opcodeByMnemonic("store");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(storeOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(256)
+    };
+    (void)b.addInst(*storeOp, InvalidLirReg, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    (void)assemble(lir, **s, lirToMir, rep);
+    bool sawOutOfRange = false;
+    for (auto const& d : rep.all())
+        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange)
+            sawOutOfRange = true;
+    EXPECT_TRUE(sawOutOfRange)
+        << "the UNSCALED store (STUR imm9) must fail loud at #256 — the swap to "
+           "store_u is what makes #256 encodable";
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(Arm64Encoder, StoreScaledImm12AtBoundary256Encodes) {
+    // store_u X1, [SP, #256] → STR X1, [SP, #256] (scaled imm12 = 256/8 = 32).
+    // Base 0xF9000000 | (32<<10) | (31<<5) | 1 = 0xF90083E1; LE: E1 83 00 F9.
+    // This is the form the chokepoint picks for the same #256 the unscaled
+    // store rejects above (the boundary handoff).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const storeUOp = (*s)->opcodeByMnemonic("store_u");
+    auto const retOp    = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(storeUOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(256)
+    };
+    (void)b.addInst(*storeUOp, InvalidLirReg, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE1);
+    EXPECT_EQ(bytes[1], 0x83);
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0xF9)
+        << "byte[3] must be 0xF9 (STR, scaled imm12) at the #256 boundary — the "
+           "chokepoint's swap target";
+}
+
+TEST(Arm64Encoder, LoadScaledImm12AtImm12MaxEncodes) {
+    // load_u X1, [SP, #32760] → LDR X1, [SP, #32760] (scaled imm12 = 32760/8 =
+    // 4095, the field max). Base 0xF9400000 | (4095<<10) | (31<<5) | 1 =
+    // 0xF97FFFE1; LE: E1 FF 7F F9. One scaled step past this (#32768 → 4096)
+    // is the fail-loud LoadUnsignedOffsetTooLargeFailsLoud pin above.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const loadUOp = (*s)->opcodeByMnemonic("load_u");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(loadUOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(32760)
+    };
+    (void)b.addInst(*loadUOp, gpr(**s, "x1"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "offset 32760 scales to 4095 (the imm12 field max) — must encode";
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE1);
+    EXPECT_EQ(bytes[1], 0xFF);
+    EXPECT_EQ(bytes[2], 0x7F);
+    EXPECT_EQ(bytes[3], 0xF9);
+}
+
 // ── D-ARM64-FLOAT-SUBSTRATE: the FULL pipeline (the SSE-test mirror) ──
 
 namespace {

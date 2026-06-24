@@ -1,0 +1,10 @@
+{
+  "$comment": "D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 (load/store-displacement half) RUN witness: the AArch64 scaled-imm12 unsigned-offset frame load/store form (load_u/store_u, LDR/STR [sp,#imm]) selected at the emitFrameLoad/emitFrameStore chokepoint (selectFrameMemOp) for a frame offset beyond the unscaled imm9 ±256 reach. g takes 30 fixed int params; main calls it with 30 args, so the 9th+ outgoing args STORE past imm9 (store_u) and g's incoming-stack-arg LOAD + the caller's spill reload/store read/write past imm9 (load_u/store_u) — observed offsets 256 and 264. Returns p28+p29+p08 = 1+40+1 = 42 (miscompile-sensitive: a wrong frame offset reads a neighbouring slot). RED-on-disable: revert the chokepoint swap → arm64 fails loud A_ImmediateOperandOutOfRange at offsets 256/264 (store AND load) → cannot build. arm64-only: the un-optimized x86_64 caller exhausts its 16-GPR scratch pool materializing 30 args (a SEPARATE pre-existing regalloc limit, not this fix); the host-independent structural pin Aarch64HighStackParamUsesScaledImm12FrameLoad guards the selection on every CI leg, this adds the arm64 RUN witness. arm64 runs under qemu-aarch64 on linux and natively on the arm64 leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ]
+}

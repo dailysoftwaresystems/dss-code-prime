@@ -518,6 +518,96 @@ TEST(LirCallconv, Aarch64FrameBeyond16MiBPrologueMaterializesIntoX16) {
     }
 }
 
+// D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 (load/store-displacement half). A
+// callee with MANY fixed params reads its high-index params from INCOMING STACK
+// slots at `[sp + totalFrameSize + (i-8)*8]`; past the 8th register param those
+// offsets exceed the unscaled imm9 ±256 reach, so the incoming-arg frame LOAD
+// MUST take the scaled-imm12 form (`load_u`, LDR [sp,#imm]) — selected at the
+// emitFrameLoad CHOKEPOINT (selectFrameMemOp). This callee shape is DETERMINISTIC
+// (no register-pressure spill → host-compiler-independent, unlike an optimizer-
+// dependent spill frame) and exercises the chokepoint directly. The pin asserts
+// a scaled load appears in the materialized arm64 module — host-independent, so
+// it guards the selection on EVERY CI leg (the qemu RUN witness is the separate
+// examples/c-subset/large_spill_frame_arm64 corpus). RED-on-disable: revert the
+// chokepoint swap (keep unscaled `load`) → the count drops to 0 here AND the
+// module fails to assemble (A_ImmediateOperandOutOfRange on the high-param load).
+TEST(LirCallconv, Aarch64HighStackParamUsesScaledImm12FrameLoad) {
+    // f takes 40 fixed int params; AAPCS64 passes the first 8 in x0..x7 and the
+    // rest (p08..p39) on the incoming stack. The body reads p08, p20, p39 — the
+    // last lands at offset totalFrameSize + (39-8)*8 = frame + 248, well past
+    // imm9 — but the body holds at most one param live at a time (no spill, no
+    // scratch exhaustion). Each high-param read is an incoming-stack-arg
+    // frame_load routed through the chokepoint.
+    auto bundle = lowerThroughRewrite(
+        "int f(int p00,int p01,int p02,int p03,int p04,int p05,int p06,int p07,\n"
+        "      int p08,int p09,int p10,int p11,int p12,int p13,int p14,int p15,\n"
+        "      int p16,int p17,int p18,int p19,int p20,int p21,int p22,int p23,\n"
+        "      int p24,int p25,int p26,int p27,int p28,int p29,int p30,int p31,\n"
+        "      int p32,int p33,int p34,int p35,int p36,int p37,int p38,int p39) {\n"
+        "  return p08 + p20 + p39;\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"arm64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter legRep;
+    auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
+                                    legRep);
+    ASSERT_TRUE(legal.ok());
+    DiagnosticReporter ccRep;
+    auto cc = materializeCallingConvention(legal.lir, *bundle.lowered.target,
+                                           bundle.alloc, ccRep);
+    ASSERT_TRUE(cc.ok());
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+
+    auto const loadU = bundle.lowered.target->opcodeByMnemonic("load_u");
+    ASSERT_TRUE(loadU.has_value())
+        << "arm64 must declare load_u (D-ASM-AARCH64-LARGE-FRAME-IMM12)";
+    std::uint32_t const nLoadU = countOpcodeInModule(cc.lir, *loadU);
+    EXPECT_GT(nLoadU, 0u)
+        << "a 40-param AAPCS64 callee must emit at least one load_u (a high "
+           "incoming-stack-arg read beyond imm9, routed through the emitFrameLoad "
+           "chokepoint) — 0 means the chokepoint swap regressed (red-on-disable)";
+
+    // The module must still assemble clean (the scaled load encodes, not fail-loud).
+    std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
+    DiagnosticReporter asmRep;
+    (void)assemble(cc.lir, *bundle.lowered.target, lirToMir, asmRep);
+    EXPECT_EQ(asmRep.errorCount(), 0u)
+        << "the high-stack-param arm64 callee must assemble clean — every "
+           "beyond-imm9 frame load took the encodable scaled-imm12 form";
+}
+
+// AGNOSTIC corroboration: the SAME 40-param callee on x86_64 must NOT gain any
+// load_u/store_u (x86_64 declares neither — h.loadU/h.storeU are 0, so
+// selectFrameMemOp is inert and the emitted disp32 memory ops are byte-identical
+// to before the chokepoint change). Guards against the swap leaking onto a
+// target without the scaled form.
+TEST(LirCallconv, X8664HighStackParamHasNoScaledImm12FrameOps) {
+    auto bundle = lowerThroughRewrite(
+        "int f(int p00,int p01,int p02,int p03,int p04,int p05,int p06,int p07,\n"
+        "      int p08,int p09,int p10,int p11,int p12,int p13,int p14,int p15,\n"
+        "      int p16,int p17,int p18,int p19,int p20,int p21,int p22,int p23,\n"
+        "      int p24,int p25,int p26,int p27,int p28,int p29,int p30,int p31,\n"
+        "      int p32,int p33,int p34,int p35,int p36,int p37,int p38,int p39) {\n"
+        "  return p08 + p20 + p39;\n"
+        "}\n",
+        /*ccIndex=*/0, /*targetName=*/"x86_64");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter legRep;
+    auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
+                                    legRep);
+    ASSERT_TRUE(legal.ok());
+    DiagnosticReporter ccRep;
+    auto cc = materializeCallingConvention(legal.lir, *bundle.lowered.target,
+                                           bundle.alloc, ccRep);
+    ASSERT_TRUE(cc.ok());
+    // x86_64 declares no load_u/store_u → the mnemonics don't resolve at all.
+    EXPECT_FALSE(bundle.lowered.target->opcodeByMnemonic("load_u").has_value())
+        << "x86_64 must NOT declare load_u — the scaled form is arm64-only";
+    EXPECT_FALSE(bundle.lowered.target->opcodeByMnemonic("store_u").has_value());
+}
+
 // D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow) byte-pin.
 //
 // HAND-BUILT LIR exercising the three control-flow opcodes (cmp / jcc / jmp)
