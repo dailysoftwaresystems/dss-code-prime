@@ -1,0 +1,15 @@
+{
+  "$comment": "D-PARSE-DEEP-NEST-RECURSION-MEMORY (plan 24 Stage 4-address) end-to-end witness for the now-iterative HIR->MIR by-ADDRESS lowerer. `lowerLvalueAddress` (src/mir/lowering/hir_to_mir.cpp) is now part of the SHARED {Value,Address} explicit WORK-STACK DRIVER: the deep base-chain lvalue arms (MemberAccess base, Index storage-base — the `a.b.c.d` / `a[i][j][k]` lvalue axes) push frames instead of recursing, so a deeply-nested lvalue chain lowers HIR->MIR with FLAT O(1) host-stack cost per nesting level. This program declares `char a[1][1]...[1]` with 150 dimensions, then STORES 42 into `a[0][0]...[0]` and RETURNS `a[0][0]...[0]` — driving the iterative Index storage-address arm 150 levels deep on BOTH the store-target lvalue and the value-read (which routes the chain through lowerLvalueAddress then Loads the char element). A regression that UNWRAPPED the Index storage-base back to host recursion (`lowerLvalueAddress(kids[0])`) would recurse 150 frames deep during HIR->MIR lowering. The lowering runs on the 64 MiB worker stack (core/substrate/large_stack_call), and the recursive lowerer's main-stack crash floor for this frame is ~900 levels (measured), so 150 is a comfortable correctness depth here (NEITHER the lowering nor the orthogonal array-type layout recursion crashes); the precise flat-on-main-stack + byte-identity RED-on-disable lever is the strict MIR pin IterativeDeepIndexAddressChainLowersFlatAndByteIdentical (depth 1500, lowered on the test's main stack). The value 42 is miscompile-sensitive: a dropped/duplicated subscript GEP, a wrong base composition, or a stride miscalculation would corrupt the round-tripped byte and change the exit code. OUTPUT-IDENTITY against the prior recursive lowerer is enforced by the full ctest suite (the byte-identical MIR goldens in tests/mir/test_mir_lowering_c_subset.cpp, plus the SF-4 strict differential pin which pins the exact deepest-base-first GEP chain). The optimizedPipelines arm proves the lowered MIR survives the full release pipeline (Mem2Reg promotes the array slot, the const store/load round-trip folds to 42). arm64 runs under qemu; macho on the macos-latest leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}

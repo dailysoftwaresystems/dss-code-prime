@@ -6108,3 +6108,156 @@ TEST(MirLoweringCSubset, IterativeDeepUnaryChainLowersFlatAndByteIdentical) {
     EXPECT_EQ(m.instOpcode(ret), MirOpcode::Return);
     EXPECT_EQ(m.instOperands(ret)[0], prev);
 }
+
+// ─── Plan 24 Stage 4-address — iterative HIR→MIR by-ADDRESS driver ──────────
+//
+// SF-4 differential pin for the {Address} half: a DEEPLY-nested storage-array
+// subscript chain `a[0][0][0]…[0]` (the lvalue ADDRESS axis — each level's base
+// is an ARRAY, so each recurses into the base's lvalue ADDRESS, the deep axis
+// `lowerLvalueAddress` now flattens onto the shared work-stack). Lowered on the
+// test's MAIN stack, it must carry a FLAT host-stack cost AND produce the EXACT
+// SAME post-order MIR the recursive lowerer would.
+//
+// The array element is `char` (stride 1), so `scaleIndexToBytes` emits NO Mul —
+// each subscript `0` is a single `Const`, and each level emits exactly one
+// `Gep`. Emission order (proven identical iterative-vs-recursive): every level's
+// subscript `Const` is emitted BEFORE recursing into the base (the recursive arm
+// lowers `idx = lowerExpr(kids[1])` BEFORE `base = lowerLvalueAddress(kids[0])`,
+// and the iterative IndexAddr frame does phase-0 subscript before phase-1 base),
+// so the body is: the array Alloca, then kDepth subscript `Const`s OUTERMOST-
+// first, then kDepth `Gep`s INNERMOST-first (each `Gep[i]` bases on `Gep[i-1]`,
+// `Gep[0]` on the Alloca), then the `Load` of the char element, then `Return`.
+//
+// RED-ON-DISABLE (the flat property): kDepth (1500) is past the recursive-
+// lowering main-stack crash floor (~900). Revert the {Address} flattening (the
+// MemberAddr/IndexAddr frames) so the Index storage-base recurses
+// `lowerLvalueAddress(kids[0])` on the host stack and this test STACK-OVERFLOWS
+// (process abort → ctest red) instead of asserting clean — demonstrated by
+// disabling the two address pushes and watching depth ≥1000 crash while the
+// flat driver clears it (and the orthogonal array-type layout recursion, also
+// ~1500 deep here, stays well under its own ~2300 ceiling).
+//
+// RED-ON-REORDER (the byte-identity half): the pin walks the `Gep` backbone and
+// asserts `Gep[i].base == Gep[i-1]` (innermost-first) AND that the `Gep` count
+// equals kDepth with NO Mul anywhere (the stride-1 fast path). A frame that
+// lowered the base BEFORE the subscript, or that scaled a stride-1 index, would
+// perturb the Const/Gep interleave or inject a Mul → red.
+//
+// Synthetic (SF-4): the parser's 256 maxExpressionDepth cap forbids a 1500-deep
+// subscript in source, so the deep input is built via the public `HirBuilder`.
+TEST(MirLoweringCSubset, IterativeDeepIndexAddressChainLowersFlatAndByteIdentical) {
+    // Depth 1500: comfortably ABOVE the recursive-lowering main-stack crash
+    // floor (~900 levels — measured: the recursive `lowerLvalueAddressNode`
+    // IndexAddr frame overflows the test's main stack at ≥1000) so the flat
+    // property is RED-on-disable, yet BELOW the ORTHOGONAL layout-engine type
+    // recursion ceiling (~2300 — `computeLayout` recurses once per nested array
+    // dimension, plan-24 family C-2 "type-node recursion, OUT of scope"; a
+    // POINTER type's layout is O(1), but a storage-ARRAY chain inherently nests
+    // its element type). The driver this pin guards is now flat; the deep
+    // ARRAY-TYPE nest is the only remaining (separate, structural) recursion.
+    constexpr std::uint32_t kDepth    = 1500;  // # of subscript levels (Index nodes)
+    constexpr std::uint32_t kArraySym = 1;
+
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const ch   = ti.primitive(TypeKind::Char);
+    TypeId const fnTy = ti.fnSig(std::array<TypeId, 0>{}, i32, CallConv::CcSysV);
+
+    // Nested array types: T0 = char, T_{k} = T_{k-1}[1]. The local is typed T_N
+    // (the full kDepth-dimensional `char[1][1]…[1]`); each `[0]` peels one
+    // dimension, the innermost yielding the `char` element.
+    std::vector<TypeId> dim(kDepth + 1);
+    dim[0] = ch;
+    for (std::uint32_t k = 1; k <= kDepth; ++k) dim[k] = ti.array(dim[k - 1], 1);
+
+    HirLiteralPool pool;
+    // ONE pooled `0` int literal — every subscript Index reuses its index
+    // (HIR Literal nodes carry the pool index as payload; the value is shared,
+    // the emitted MIR `Const` per level is fresh as the recursive form emits).
+    std::uint32_t const zeroLit =
+        pool.add(HirLiteralValue{.value = std::int64_t{0}, .core = TypeKind::I32});
+
+    HirBuilder b{"c-subset"};
+    // `char a[1]…[1];` — an addressable array local (its Alloca is the chain base).
+    HirNodeId const decl = b.makeVarDecl(dim[kDepth], kArraySym);
+    // Build `a[0][0]…[0]` outermost-last: base `Ref(a):T_N`, then peel a
+    // dimension per level, the level-k Index typed T_{N-1-…} = dim[kDepth-1-i].
+    HirNodeId cur = b.makeRef(dim[kDepth], kArraySym);
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        HirNodeId const idx0 = b.makeLiteral(i32, zeroLit);
+        cur = b.makeIndex(cur, idx0, /*elemType=*/dim[kDepth - 1 - i]);
+    }
+    // The fully-subscripted lvalue is read by value (`return a[0]…[0];`): the
+    // MemberAccess/Index value arm routes the deep chain through
+    // lowerLvalueAddress, then Loads the char element.
+    HirNodeId const body =
+        b.makeBlock(std::array{decl, b.makeReturn(cur)});
+    HirNodeId const fn   = b.makeFunction(fnTy, /*sym=*/7, std::array<HirNodeId, 0>{}, body);
+    HirNodeId const root = b.makeModule(std::array{fn});
+    Hir hir = std::move(b).finish(root);
+
+    // Thread the x86_64 aggregate layout so array stride/size resolve (mirrors
+    // lowerCSubset). A char[1]…[1] is 1 byte; stride at every level is 1.
+    MirLoweringConfig mirCfg;
+    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
+        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+    }
+
+    DiagnosticReporter rep;
+    // NOTE: lowers HIR→MIR on THIS (main) stack — the flat-property witness.
+    auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr, mirCfg);
+    ASSERT_TRUE(result.ok)
+        << "deep storage-Index address chain must lower clean: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    Mir const& m = result.mir;
+    MirFuncId const f = m.funcAt(0);
+    MirBlockId const entry = m.funcEntry(f);
+    // Body = Alloca + kDepth subscript Consts + kDepth Geps + Load + Return.
+    ASSERT_EQ(m.blockInstCount(entry), 2u * kDepth + 3u);
+
+    MirInstId const alloca = m.blockInstAt(entry, 0);
+    EXPECT_EQ(m.instOpcode(alloca), MirOpcode::Alloca)
+        << "the array local's storage slot is the chain base";
+
+    // kDepth subscript Consts at [1..kDepth], all value 0 (outermost-first — the
+    // recursive arm lowers each level's subscript before recursing into its base,
+    // and stride-1 `char` emits NO Mul, so these are contiguous).
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        MirInstId const c = m.blockInstAt(entry, 1u + i);
+        ASSERT_EQ(m.instOpcode(c), MirOpcode::Const)
+            << "subscript Const at level " << i << " (no Mul: char stride 1)";
+        auto const& lit = m.literalValue(m.constLiteralIndex(c));
+        EXPECT_EQ(std::get<std::int64_t>(lit.value), 0);
+    }
+
+    // kDepth Geps at [kDepth+1 .. 2*kDepth], INNERMOST-first: Gep[0] bases on the
+    // Alloca, Gep[i] on Gep[i-1] (the deepest-base-first composition — red if a
+    // frame lowered the base before the subscript or perturbed the chain).
+    MirInstId prevBase = alloca;
+    for (std::uint32_t i = 0; i < kDepth; ++i) {
+        MirInstId const g = m.blockInstAt(entry, 1u + kDepth + i);
+        ASSERT_EQ(m.instOpcode(g), MirOpcode::Gep) << "Gep at chain level " << i;
+        auto ops = m.instOperands(g);
+        ASSERT_EQ(ops.size(), 2u)
+            << "storage-array Gep is 2-op [base, byteIndex]";
+        EXPECT_EQ(ops[0], prevBase)
+            << "Gep[" << i << "] bases on the deeper address (Alloca then prior Gep)";
+        prevBase = g;
+    }
+    // No Mul anywhere — the stride-1 fast path (a regression scaling the index
+    // would inject one and shift every offset above).
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k)
+        EXPECT_NE(m.instOpcode(m.blockInstAt(entry, k)), MirOpcode::Mul)
+            << "char (stride 1) indexing must NOT emit a scaling Mul";
+
+    // Load(outermost Gep) then Return(load).
+    MirInstId const load = m.blockInstAt(entry, 2u * kDepth + 1u);
+    EXPECT_EQ(m.instOpcode(load), MirOpcode::Load);
+    EXPECT_EQ(m.instOperands(load)[0], prevBase)
+        << "the char element is Loaded through the outermost Gep";
+    MirInstId const ret = m.blockInstAt(entry, 2u * kDepth + 2u);
+    EXPECT_EQ(m.instOpcode(ret), MirOpcode::Return);
+    EXPECT_EQ(m.instOperands(ret)[0], load);
+}

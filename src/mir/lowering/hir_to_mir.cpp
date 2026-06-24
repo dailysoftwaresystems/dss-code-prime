@@ -1515,7 +1515,67 @@ struct Lowerer {
         return !(fromK == TypeKind::Array && toK == TypeKind::Ptr);
     }
 
-    // ── Plan 24 Stage 4 — the iterative value-lowering driver ──────────────
+    // ── Plan 24 Stage 4-address — by-ADDRESS arm epilogues ─────────────────
+    // The BYTE-IDENTICAL emission slice of a flattened lvalue-address arm AFTER
+    // its base lvalue (and, for Index, its already-scaled byte index) is
+    // resolved. Shared by `lowerLvalueAddressNode`'s recursive arms AND the
+    // driver's Address frames — ONE source of truth, so the iterative path
+    // emits the exact same MIR the recursive `lowerLvalueAddress` did. They emit
+    // ONLY into the currently-open block — no CFG.
+
+    // MemberAccess address epilogue (base lvalue already resolved to `basePtr`).
+    // FC7 (D-FC7-MEMBER-ACCESS): resolve the field's BYTE OFFSET via the FC6
+    // `computeLayout` engine and emit a 2-op base+disp GEP `[basePtr,
+    // Const(byteOffset)]` (MIR→LIR → a base+disp `lea`). The aggregate TypeId is
+    // the BASE child's HIR type (`s`→struct S; `*p`→struct S; `a.b`→struct B;
+    // `arr[i]`→struct Elem) — robust across every nested/indexed base shape. The
+    // GEP result type is `pointer(fieldType)`. Emission order matches the
+    // recursive arm exactly: base chain (already in `basePtr`), THEN the offset
+    // Const, THEN the Gep.
+    [[nodiscard]] MirInstId combineMemberAddr(HirNodeId node, MirInstId basePtr) {
+        auto kids = hir.children(node);
+        std::uint32_t const fieldIdx = hir.payload(node);
+        TypeId const fieldTy = hir.typeId(node);
+        if (!fieldTy.valid()) {
+            unsupported(node, "MemberAccess with invalid field type "
+                               "(HIR verifier should have flagged)");
+            return InvalidMirInst;
+        }
+        TypeId const aggTy = hir.typeId(kids[0]);
+        if (!aggTy.valid()) {
+            unsupported(node, "MemberAccess base has no type "
+                               "(HIR verifier should have flagged)");
+            return InvalidMirInst;
+        }
+        auto const byteOffset = fieldByteOffset(aggTy, fieldIdx);
+        if (!byteOffset.has_value()) {
+            unsupported(node, "MemberAccess field-offset resolution failed "
+                               "(target lacks 'aggregateLayout', the aggregate "
+                               "is un-sizeable, or the field index is out of "
+                               "range)");
+            return InvalidMirInst;
+        }
+        MirInstId const offK =
+            constInt(static_cast<std::int64_t>(*byteOffset));
+        if (!offK.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> ops{basePtr, offK};
+        return mir.addInst(MirOpcode::Gep, ops, interner.pointer(fieldTy));
+    }
+
+    // Index address epilogue (the byte-scaled index already in `byteIdx`, the
+    // base pointer/storage-address already in `basePtr`). Both the pointer-base
+    // and storage-base sub-cases of the recursive arm end here: the single 2-op
+    // byte-offset Gep `[basePtr, byteIdx]` typed `pointer(elemTy)`. The elem
+    // type is the Index node's own type; `resTy` is recomputed here (pure, no
+    // emission) so the epilogue needs no extra plumbing.
+    [[nodiscard]] MirInstId combineIndexAddr(HirNodeId node, MirInstId byteIdx,
+                                             MirInstId basePtr) {
+        TypeId const elemTy = hir.typeId(node);
+        std::array<MirInstId, 2> ops{basePtr, byteIdx};
+        return mir.addInst(MirOpcode::Gep, ops, interner.pointer(elemTy));
+    }
+
+    // ── Plan 24 Stage 4 — the iterative value+address-lowering driver ──────
     // A POD work-stack frame for ONE flattened straight-line arm. `phase`
     // 0 = enter the (last) child; for a 2-child arm (BinaryOp) phase 1 = enter
     // the second child (after stashing the first in `c0`); the final phase
@@ -1524,35 +1584,79 @@ struct Lowerer {
     // idiom (the Stage-1/2/3 realloc-safe rule: copy frame fields to locals and
     // advance `phase` BEFORE any `enterValue`/`push_back`; copy `result` out
     // before `pop_back`).
+    // A frame requests its children as VALUEs or ADDRESSes by its KIND:
+    //   Unary/Binary/Deref/Cast  → straight-line VALUE arms (Stage 4).
+    //   MemberAddr/IndexAddr      → by-ADDRESS arms (Stage 4-address): the deep
+    //                               base-chain axes `a.b.c.d` / `a[i][j][k]`.
+    // `phase` sequences a frame's child requests; the final phase pops + emits
+    // via the matching `combine*`. `c0` stashes ONE child result across the next
+    // request (Binary: the LHS; IndexAddr: the byte-scaled index).
     struct ValueFrame {
-        enum class Kind : std::uint8_t { Unary, Binary, Deref, Cast } kind;
+        enum class Kind : std::uint8_t {
+            Unary, Binary, Deref, Cast, MemberAddr, IndexAddr
+        } kind;
         HirNodeId node;
         std::uint8_t phase;
-        MirInstId c0;   // Binary: the lowered LHS (stashed between phase 1 and 2)
+        MirInstId c0;
     };
 
-    // The public expression-lowering entry: a driver over an explicit heap
-    // work-stack. For each node, `enterValue` either PUSHES a frame for a deep
-    // straight-line arm or delegates to `lowerExprNode` (which lowers that one
-    // node and re-enters this driver for its children). Returns the value's
-    // MirInstId. Output-identity: the flattened arms reproduce the recursive
-    // child-lowering ORDER + `combine*` exactly, so the emitted MIR (inst order,
-    // vreg ids, operands) is byte-identical to the recursive `lowerExpr`.
-    [[nodiscard]] MirInstId lowerExpr(HirNodeId node) {
+    // The shared {Value,Address} expression-lowering driver over an explicit
+    // heap work-stack. `rootWantAddr` selects the ROOT request: false → the
+    // node's VALUE (`lowerExpr`), true → its lvalue ADDRESS (`lowerLvalueAddress`).
+    // `request(n, wantAddr)` either PUSHES a frame for a deep flattenable arm or
+    // delegates to the matching per-node body (`lowerExprNode` / `lowerLvalue
+    // AddressNode`), which lowers that one node and RE-ENTERS this driver for its
+    // children. The two families share ONE work-stack + ONE `result` slot, so a
+    // by-value read that needs a base address (MemberAccess/Index rvalue) and a
+    // by-address chain that needs a value (an Index subscript, a pointer base)
+    // flatten through each other. Output-identity: the flattened arms reproduce
+    // the recursive child-lowering ORDER + `combine*` exactly, so the emitted MIR
+    // (inst order, vreg ids, operands) is byte-identical to the recursive form.
+    [[nodiscard]] MirInstId runExprDriver(HirNodeId node, bool rootWantAddr) {
         std::vector<ValueFrame> work;
-        // Default-init: `enterValue` ALWAYS assigns `result` for a delegated
-        // node, and every pushed frame delivers into `result` before it is read
-        // (then popped), so this sentinel never leaks.
+        // Default-init: `request` ALWAYS assigns `result` for a delegated node,
+        // and every pushed frame delivers into `result` before it is read (then
+        // popped), so this sentinel never leaks.
         MirInstId result = InvalidMirInst;
 
-        // Classify `n`: push a frame for a flattenable straight-line arm (and
-        // return), else lower it here via `lowerExprNode` (delegating; its
-        // children re-enter this driver). A frame is pushed ONLY for the four
-        // arms whose sole recursion is `lowerExpr(child)` into the same block.
-        // NOTE: `enterValue` (push) MUST be the LAST action of any caller path
-        // that has copied out its frame fields — `work.back()` may dangle after.
-        auto const enterValue = [&](HirNodeId n) {
+        // Classify `n` under the requested kind: push a frame for a flattenable
+        // deep arm (and return), else lower it via the per-node body (delegating;
+        // its children re-enter this driver). A VALUE request flattens the four
+        // straight-line value arms; an ADDRESS request flattens MemberAccess and
+        // Index (the deep base axes). NOTE: a push MUST be the LAST action of any
+        // caller path that has copied out its frame fields — `work.back()` may
+        // dangle after.
+        auto const request = [&](HirNodeId n, bool wantAddr) {
             HirKind const nk = hir.kind(n);
+            if (wantAddr) {
+                switch (nk) {
+                    case HirKind::MemberAccess:
+                        // The plain field-of-lvalue arm: its ONLY recursion is
+                        // the base lvalue address (the deep axis). A malformed
+                        // arity delegates (fail loud, byte-identical guard).
+                        if (hir.children(n).size() == 1) {
+                            work.push_back({.kind = ValueFrame::Kind::MemberAddr,
+                                            .node = n, .phase = 0});
+                            return;
+                        }
+                        break;
+                    case HirKind::Index:
+                        // `base[idx]`: subscript VALUE then base (storage ADDRESS
+                        // or pointer VALUE) — both re-enter this driver.
+                        if (hir.children(n).size() == 2) {
+                            work.push_back({.kind = ValueFrame::Kind::IndexAddr,
+                                            .node = n, .phase = 0});
+                            return;
+                        }
+                        break;
+                    default: break;
+                }
+                // Every OTHER lvalue arm (Ref/global, Deref, Call-sret, the
+                // CFG/slot arms ConstructAggregate/Ternary/SeqExpr/VaArg) keeps
+                // its recursive body; its own re-entries still flatten.
+                result = lowerLvalueAddressNode(n);
+                return;
+            }
             switch (nk) {
                 case HirKind::UnaryOp:
                     // A core UnaryOp with exactly one child flattens; an
@@ -1590,7 +1694,7 @@ struct Lowerer {
             result = lowerExprNode(n);   // delegate (terminal / CFG / by-address)
         };
 
-        enterValue(node);
+        request(node, rootWantAddr);
         while (!work.empty()) {
             ValueFrame& f = work.back();
             switch (f.kind) {
@@ -1598,7 +1702,7 @@ struct Lowerer {
                 if (f.phase == 0) {
                     f.phase = 1;
                     HirNodeId const operandN = hir.children(f.node)[0];
-                    enterValue(operandN);   // build operand — may invalidate `f`
+                    request(operandN, false);  // build operand — may invalidate `f`
                 } else {
                     HirNodeId const node2 = f.node;
                     MirInstId const operand = result;
@@ -1617,12 +1721,12 @@ struct Lowerer {
                 if (f.phase == 0) {
                     f.phase = 1;
                     HirNodeId const lhsN = hir.children(f.node)[0];
-                    enterValue(lhsN);       // build LHS — may invalidate `f`
+                    request(lhsN, false);      // build LHS — may invalidate `f`
                 } else if (f.phase == 1) {
                     f.c0 = result;          // LHS result
                     f.phase = 2;
                     HirNodeId const rhsN = hir.children(f.node)[1];
-                    enterValue(rhsN);       // build RHS — may invalidate `f`
+                    request(rhsN, false);      // build RHS — may invalidate `f`
                 } else {
                     HirNodeId const node2 = f.node;
                     MirInstId const lhs = f.c0;
@@ -1637,7 +1741,7 @@ struct Lowerer {
                 if (f.phase == 0) {
                     f.phase = 1;
                     HirNodeId const ptrN = hir.children(f.node)[0];
-                    enterValue(ptrN);       // build pointer — may invalidate `f`
+                    request(ptrN, false);      // build pointer — may invalidate `f`
                 } else {
                     HirNodeId const node2 = f.node;
                     MirInstId const ptr = result;
@@ -1650,7 +1754,7 @@ struct Lowerer {
                 if (f.phase == 0) {
                     f.phase = 1;
                     HirNodeId const operandN = hir.children(f.node)[0];
-                    enterValue(operandN);   // build operand — may invalidate `f`
+                    request(operandN, false);  // build operand — may invalidate `f`
                 } else {
                     HirNodeId const node2 = f.node;
                     MirInstId const operand = result;
@@ -1659,9 +1763,86 @@ struct Lowerer {
                                              : InvalidMirInst;
                 }
                 break;
+            case ValueFrame::Kind::MemberAddr:
+                // Base lvalue ADDRESS (the deep axis), then offset + Gep — the
+                // recursive arm's `basePtr = lowerLvalueAddress(kids[0]);` then
+                // `combineMemberAddr`. ONE child request → phase 0 enter, phase
+                // 1 combine.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    HirNodeId const baseN = hir.children(f.node)[0];
+                    request(baseN, true);      // build base address — may invalidate `f`
+                } else {
+                    HirNodeId const node2 = f.node;
+                    MirInstId const basePtr = result;
+                    work.pop_back();
+                    result = basePtr.valid() ? combineMemberAddr(node2, basePtr)
+                                             : InvalidMirInst;
+                }
+                break;
+            case ValueFrame::Kind::IndexAddr:
+                // Subscript VALUE first (phase 0→1), then — IN THE RECURSIVE
+                // ORDER — scale the index to bytes (emit the stride Mul BEFORE
+                // the base), then the base (storage ADDRESS or pointer VALUE)
+                // (phase 1→2), then the Gep. The byte-scaled index is stashed in
+                // `c0` across the base request. This reproduces the recursive arm
+                // `idx=lowerExpr(kids[1]); byteIdx=scaleIndexToBytes(...);
+                // base=lower...(kids[0]); Gep` emission order exactly.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    HirNodeId const idxN = hir.children(f.node)[1];
+                    request(idxN, false);      // build subscript value — may invalidate `f`
+                } else if (f.phase == 1) {
+                    HirNodeId const node2 = f.node;
+                    auto kids = hir.children(node2);
+                    MirInstId const idx = result;
+                    if (!idx.valid()) { work.pop_back(); result = InvalidMirInst; break; }
+                    TypeId const elemTy  = hir.typeId(node2);
+                    TypeId const indexTy = hir.typeId(kids[1]);
+                    // Emit the stride Mul HERE (matching the recursive order:
+                    // scale BEFORE the base) — a pure helper for stride 1.
+                    MirInstId const byteIdx =
+                        scaleIndexToBytes(idx, elemTy, node2, indexTy);
+                    if (!byteIdx.valid()) { work.pop_back(); result = InvalidMirInst; break; }
+                    TypeId const baseTy = hir.typeId(kids[0]);
+                    TypeKind const baseKind = baseTy.valid()
+                        ? interner.kind(baseTy) : TypeKind::Void;
+                    // A pointer base uses its RVALUE (`int* p; p[i]` — the
+                    // pointer may be a pure-SSA Arg); a storage base uses its
+                    // lvalue ADDRESS (`int a[N]; a[i]` — the deep axis).
+                    bool const baseWantsAddr = (baseKind != TypeKind::Ptr);
+                    f.c0    = byteIdx;         // stash across the base request
+                    f.phase = 2;
+                    request(kids[0], baseWantsAddr);  // build base — may invalidate `f`
+                } else {
+                    HirNodeId const node2 = f.node;
+                    MirInstId const byteIdx = f.c0;
+                    MirInstId const basePtr = result;
+                    work.pop_back();
+                    result = basePtr.valid()
+                                 ? combineIndexAddr(node2, byteIdx, basePtr)
+                                 : InvalidMirInst;
+                }
+                break;
             }
         }
         return result;
+    }
+
+    // The public VALUE-lowering entry: lower an HIR expression to the MirInstId
+    // that produces its rvalue. A thin wrapper over the shared {Value,Address}
+    // driver (root request = VALUE).
+    [[nodiscard]] MirInstId lowerExpr(HirNodeId node) {
+        return runExprDriver(node, /*rootWantAddr=*/false);
+    }
+
+    // The public ADDRESS-lowering entry: resolve the pointer value an lvalue
+    // names (a `Store` target, an `AddressOf` result, a base for member/index).
+    // A thin wrapper over the shared {Value,Address} driver (root request =
+    // ADDRESS). Distinct from `lowerExpr` which yields the lvalue's RVALUE
+    // (`Load(ptr)`); see `lowerLvalueAddressNode` for the per-arm semantics.
+    [[nodiscard]] MirInstId lowerLvalueAddress(HirNodeId node) {
+        return runExprDriver(node, /*rootWantAddr=*/true);
     }
 
     // Error-recovery helper: every forward-`createBlock`'d block in a
@@ -1892,16 +2073,30 @@ struct Lowerer {
         return true;
     }
 
-    // Resolve the ADDRESS of an lvalue expression — the pointer value a
-    // `Store` should write into (or an `AddressOf` should yield directly).
-    // Distinct from `lowerExpr` which produces the RVALUE of the lvalue
-    // (`Load(ptr)`). Supported lvalue shapes:
+    // Resolve the ADDRESS of an lvalue expression for ONE node, given that its
+    // child lvalue/sub-expressions are resolved by RE-ENTERING the public
+    // `lowerLvalueAddress` / `lowerExpr` drivers. Distinct from `lowerExpr`
+    // which produces the RVALUE of the lvalue (`Load(ptr)`). Supported lvalue
+    // shapes:
     //   - `Ref(sym)` where sym is an addressable local → the local's alloca.
     //   - `Deref(ptr)` → the lowered pointer (no double-load).
     //   - `MemberAccess(base, .field)` → `GEP(addressOf(base), const-field)`.
     //   - `Index(base, idxExpr)` → `GEP(addressOf(base), idxValue)`.
     // Returns `InvalidMirInst` on failure.
-    [[nodiscard]] MirInstId lowerLvalueAddress(HirNodeId node) {
+    //
+    // Plan 24 Stage 4-address (D-PARSE-DEEP-NEST-RECURSION-MEMORY): the public
+    // `lowerLvalueAddress` is now the {Value,Address} work-stack DRIVER (shared
+    // with `lowerExpr`). The deep base-chain arms (MemberAccess base, Index
+    // storage-base — the `a.b.c.d` / `a[i][j][k]` lvalue axes) are flattened
+    // onto that work-stack so a deeply-nested lvalue chain carries FLAT O(1)
+    // host-stack cost per level. This per-NODE handler is the byte-identical
+    // emission body for EVERY OTHER lvalue arm (Ref/global, Deref, Call-sret,
+    // the CFG/slot arms ConstructAggregate/Ternary/SeqExpr/VaArg); the driver
+    // routes those here unchanged (their own re-entries flatten). The two
+    // flattened arms here call the SAME `combineMemberAddr`/`combineIndexAddr`
+    // epilogues the frames do (one source of truth) and are unreachable through
+    // the driver — kept as the recursive fallback.
+    [[nodiscard]] MirInstId lowerLvalueAddressNode(HirNodeId node) {
         HirKind const k = hir.kind(node);
         // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value struct/union-
         // returning CALL is an aggregate rvalue materialized into a result slot;
@@ -1972,44 +2167,7 @@ struct Lowerer {
             }
             MirInstId const basePtr = lowerLvalueAddress(kids[0]);
             if (!basePtr.valid()) return InvalidMirInst;
-            // FC7 (D-FC7-MEMBER-ACCESS): resolve the field's BYTE OFFSET via
-            // the FC6 `computeLayout` engine and emit a 2-op base+disp GEP
-            // `[basePtr, Const(byteOffset)]` — which MIR→LIR lowers to the
-            // base+disp `lea` BOTH targets ship (x86 lea [base+disp32] /
-            // arm64 ADD Xd,Xn,#imm12). The aggregate TypeId is `basePtr`'s
-            // pointee (basePtr : pointer(aggTy)); the HIR node's typeId is
-            // the FIELD type, so the GEP result is `pointer(fieldType)`.
-            // (Replaces the prior field-INDEX GEP `[basePtr, 0, fieldIdx]`,
-            // whose 3-op shape MIR→LIR never realized.)
-            std::uint32_t const fieldIdx = hir.payload(node);
-            TypeId const fieldTy = hir.typeId(node);
-            if (!fieldTy.valid()) {
-                unsupported(node, "MemberAccess with invalid field type "
-                                   "(HIR verifier should have flagged)");
-                return InvalidMirInst;
-            }
-            // The aggregate TypeId is the BASE child's HIR type (`s` →
-            // struct S; `*p` → struct S; `a.b` → struct B; `arr[i]` →
-            // struct Elem) — robust across every nested/indexed base shape.
-            TypeId const aggTy = hir.typeId(kids[0]);
-            if (!aggTy.valid()) {
-                unsupported(node, "MemberAccess base has no type "
-                                   "(HIR verifier should have flagged)");
-                return InvalidMirInst;
-            }
-            auto const byteOffset = fieldByteOffset(aggTy, fieldIdx);
-            if (!byteOffset.has_value()) {
-                unsupported(node, "MemberAccess field-offset resolution failed "
-                                   "(target lacks 'aggregateLayout', the "
-                                   "aggregate is un-sizeable, or the field "
-                                   "index is out of range)");
-                return InvalidMirInst;
-            }
-            MirInstId const offK =
-                constInt(static_cast<std::int64_t>(*byteOffset));
-            if (!offK.valid()) return InvalidMirInst;
-            std::array<MirInstId, 2> ops{basePtr, offK};
-            return mir.addInst(MirOpcode::Gep, ops, interner.pointer(fieldTy));
+            return combineMemberAddr(node, basePtr);
         }
         if (k == HirKind::Index) {
             auto kids = hir.children(node);
@@ -2048,8 +2206,7 @@ struct Lowerer {
             if (baseKind == TypeKind::Ptr) {
                 MirInstId const basePtr = lowerExpr(kids[0]);
                 if (!basePtr.valid()) return InvalidMirInst;
-                std::array<MirInstId, 2> ops{basePtr, byteIdx};
-                return mir.addInst(MirOpcode::Gep, ops, resTy);
+                return combineIndexAddr(node, byteIdx, basePtr);
             }
             // Storage (array/struct) base: the lvalue address IS the base; the
             // vestigial leading `0` of the old 3-op form (stepping through the
@@ -2059,8 +2216,7 @@ struct Lowerer {
             // fail-loud).
             MirInstId const basePtr = lowerLvalueAddress(kids[0]);
             if (!basePtr.valid()) return InvalidMirInst;
-            std::array<MirInstId, 2> ops{basePtr, byteIdx};
-            return mir.addInst(MirOpcode::Gep, ops, resTy);
+            return combineIndexAddr(node, byteIdx, basePtr);
         }
         if (k == HirKind::ConstructAggregate) {
             // D-CSUBSET-BITFIELD-RVALUE-RUNTIME (the GENERAL aggregate-rvalue
