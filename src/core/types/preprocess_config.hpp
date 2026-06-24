@@ -34,6 +34,19 @@ struct DSS_EXPORT PredefinedMacroDef {
     std::string         value;
 };
 
+// FC15c (`__has_c_attribute` -- C23 6.10.1p4): one config-declared standard
+// attribute the language KNOWS, with the C23 `__STDC_VERSION__`-style version
+// integer it reports. `__has_c_attribute(name)` materializes `version` when the
+// attribute is known, 0 otherwise. The set is config-driven (the engine never
+// hard-codes an attribute name); a malformed entry fails LOUD at load
+// (`C_InvalidPreprocess`). The lookup tries both `name` and the stripped form
+// of a `__name__` dunder spelling (C 6.10.1: the operator ignores leading and
+// trailing `__`), so a declared `deprecated` matches `__deprecated__` too.
+struct DSS_EXPORT CAttributeDef {
+    std::string name;       // the attribute identifier ("deprecated", ...)
+    int         version = 0;  // the reported version int (> 0; e.g. 202311)
+};
+
 // Config-driven C-preprocessor declaration (schema v4 `preprocess` block).
 //
 // The single language-agnostic preprocessor pass (`src/analysis/preprocess/`)
@@ -221,6 +234,54 @@ struct DSS_EXPORT PreprocessConfig {
     // `#define`/`#undef` of a predefined name is a constraint violation
     // (C 6.10.8.1) -> fail loud `P_PreprocessorPredefinedMacro`.
     std::vector<PredefinedMacroDef> predefinedMacros;
+
+    // FC15c (`#pragma`; C 6.10.6): the PRAGMA directive WORD, matched by lexeme
+    // TEXT against the token after `#` (like define/undef/include -- `pragma`
+    // lexes as a plain Identifier, NOT a grammar keyword). The preprocessor
+    // consumes-and-DROPS the whole `#pragma` line with NO error (C 6.10.6p2
+    // licenses ignoring an unrecognized pragma; DSS recognizes none, so every
+    // pragma is dropped). OPTIONAL -- empty means the language has NO `#pragma`
+    // directive, so a `#pragma` line then hits the generic unsupported-directive
+    // fail-loud (`P_PreprocessorUnsupported`). The engine matches THIS string,
+    // never a hard-coded "pragma".
+    std::string pragmaDirective;
+
+    // FC15c (`__has_include`; C23 6.10.1p4): the `__has_include` OPERATOR
+    // keyword, valid only inside a `#if`/`#elif` operand. `__has_include(<h>)` /
+    // `__has_include("h")` tests whether the named header would be found by a
+    // `#include` of the same form, yielding 1 or 0. Matched by lexeme TEXT (an
+    // ordinary identifier in the operand, like `defined`), so a per-language
+    // CONFIG spelling, never a hard-coded `__has_include`. OPTIONAL -- empty
+    // means the language declares NO such operator (`__has_include` then folds
+    // as an ordinary identifier -> 0, the identity property).
+    std::string hasIncludeOperator;
+
+    // FC15c (make-or-break agnosticism): the token KINDS that DELIMIT the angle
+    // form of a `__has_include` argument (C's `<` -> "LtOp", `>` -> "GtOp"). The
+    // `__has_include(<h>)` extraction matches the angle delimiters by SCHEMA
+    // KIND, NEVER by scanning for the literal `<`/`>` characters (input
+    // classification by hard-coded byte is the exact agnosticism trap this
+    // config forbids -- see `functionLikeOpenToken`). REQUIRED-together-with
+    // `hasIncludeOperator`: a language declaring the operator WITHOUT both angle
+    // tokens is a self-inconsistent contract -> LOAD-ERROR (`C_InvalidPreprocess`).
+    // `checkToken`-validated when present (like `stringizeToken`).
+    std::string hasIncludeAngleOpenToken;
+    std::string hasIncludeAngleCloseToken;
+
+    // FC15c (`__has_c_attribute`; C23 6.10.1p4): the `__has_c_attribute`
+    // OPERATOR keyword, valid only inside a `#if`/`#elif` operand.
+    // `__has_c_attribute(attr)` yields the version int of a KNOWN standard
+    // attribute (from `knownCAttributes`) or 0. Matched by lexeme TEXT (like
+    // `defined`/`__has_include`), a per-language CONFIG spelling. OPTIONAL --
+    // empty means the language declares NO such operator (folds to 0).
+    std::string hasCAttributeOperator;
+
+    // FC15c: the standard attributes the language KNOWS + their reported version
+    // ints (C23 6.10.1p4). Only meaningful alongside `hasCAttributeOperator`.
+    // Each entry's `name` must be non-empty and `version` > 0 (a malformed entry
+    // -> `C_InvalidPreprocess` at load). OPTIONAL -- empty means NO attribute is
+    // known (every `__has_c_attribute(x)` then yields 0).
+    std::vector<CAttributeDef> knownCAttributes;
 };
 
 } // namespace dss

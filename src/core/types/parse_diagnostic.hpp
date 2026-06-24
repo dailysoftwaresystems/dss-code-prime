@@ -82,6 +82,14 @@ enum class DiagnosticCode : std::uint16_t {
     // SET is config-driven (`predefinedMacros`); the engine never hard-codes a
     // name.
     P_PreprocessorPredefinedMacro = 0x001B,
+    // FC15c (`__has_include` -- C23 6.10.1p4): a malformed `__has_include`
+    // operator in a `#if`/`#elif` controlling expression -- a missing `(`, an
+    // empty filename, a missing closing `>`/`"`, or a missing `)`. The operator
+    // takes `(<header>)` or `("header")`; the angle delimiters are matched by
+    // config token KIND (`hasIncludeAngleOpenToken`/`...CloseToken`), never by
+    // scanning for the literal `<`/`>` bytes (agnosticism). A well-formed
+    // operator yields 1 (the header is found) or 0 -- never this diagnostic.
+    P_PreprocessorHasInclude      = 0x001C,
 
     // Expression-nesting depth guard (Pratt walker). A too-deeply-nested
     // expression (parens / right-assoc / prefix / ternary recursion past

@@ -1,6 +1,7 @@
 #include "analysis/preprocess/preprocessor.hpp"
 
 #include "analysis/preprocess/pp_if_eval.hpp"
+#include "core/types/include_path_resolve.hpp"
 #include "tokenizer/tokenizer.hpp"
 
 #include <algorithm>
@@ -449,9 +450,14 @@ public:
     MacroExpander(std::shared_ptr<SourceBuffer> synth,
                   std::shared_ptr<GrammarSchema const> schema,
                   DiagnosticReporter& rep, ByteOffset prefixLen,
-                  LineMap const* lineMap)
+                  LineMap const* lineMap,
+                  std::span<fs::path const> includeDirs = {},
+                  std::span<fs::path const> systemDirs = {},
+                  fs::path includingDir = {})
         : synth_(std::move(synth)), schema_(std::move(schema)), rep_(rep),
-          prefixLen_(prefixLen), lineMap_(lineMap) {
+          prefixLen_(prefixLen), lineMap_(lineMap),
+          includeDirs_(includeDirs), systemDirs_(systemDirs),
+          includingDir_(std::move(includingDir)) {
         // FC15b (predefined macros; C 6.10.8): seed the predefined-macro map
         // (name -> def) from config. An identifier that is NOT a `#define`d
         // macro but IS a predefined name materializes its configured value (see
@@ -665,6 +671,19 @@ private:
         // whole arm (including the unsupported-directive diagnostic) is skipped.
         if (!stackActive()) return end;
 
+        // FC15c (`#pragma`; C 6.10.6): consume-and-DROP the whole line with NO
+        // error. C 6.10.6p2 lets an implementation ignore a pragma it does not
+        // recognize; DSS recognizes none, so every `#pragma` is silently dropped
+        // (the line's tokens are NOT emitted into `body`). Placed AFTER the
+        // dead-branch gate (so a `#pragma` in an elided branch is silent too) and
+        // BEFORE the generic unsupported-directive `else`. Config-matched
+        // (`pragmaDirective`), never a hard-coded "pragma"; an empty config field
+        // (a language without `#pragma`) skips this arm -> the line falls through
+        // to the generic unsupported-directive fail-loud.
+        if (!cfg().pragmaDirective.empty() && word == cfg().pragmaDirective) {
+            return end;
+        }
+
         if (word == cfg().defineDirective) {
             handleDefine(in, p + 1, end);
         } else if (word == cfg().undefDirective) {
@@ -830,13 +849,26 @@ private:
             [this](std::vector<Token> const& toks) { return expandTokens(toks); };
         PpIsDefined definedCb =
             [this](std::string_view n) { return isDefined(n); };
+        // FC15c: `__has_include` resolves a header EXACTLY as the include
+        // machinery would (Finding 3): quote form = self-dir + includeDirs
+        // (`resolveIncludePath`); angle form = `<stem>.json` on systemDirs
+        // (`resolveSystemDescriptor` -- the SHARED mapping the import resolver
+        // also calls, so the two never disagree).
+        PpHasInclude hasIncludeCb =
+            [this](std::string_view filename, bool isAngle) -> bool {
+            if (isAngle) {
+                return resolveSystemDescriptor(filename, systemDirs_).has_value();
+            }
+            return resolveIncludePath(filename, includingDir_, includeDirs_)
+                .has_value();
+        };
         // FC15b: surface the accumulated product tail (a predefined/`#`/`##`
         // product expanded inside this `#if` operand materializes into it) so the
         // evaluator assembles a combined prefix+product buffer to slice it.
         PpProductText productCb =
             [this]() -> std::string_view { return productText_; };
         auto v = evaluateIfExpression(operand, *schema_, expandCb, definedCb,
-                                      *synth_, productCb, rep_);
+                                      hasIncludeCb, *synth_, productCb, rep_);
         return v.has_value() && *v != 0;
     }
 
@@ -1873,6 +1905,16 @@ private:
     LineMap const*                       lineMap_ = nullptr;
     std::string                          dateString_;   // "Mmm dd yyyy"
     std::string                          timeString_;   // "hh:mm:ss"
+    // FC15c (`__has_include`; C23 6.10.1p4): the include search paths +the main
+    // file's own directory, so the operator's existence test resolves a header
+    // EXACTLY as the include machinery would. `includeDirs_` = quote-form search
+    // (self-dir first); `systemDirs_` = angle-form `<stem>.json` search. Empty
+    // for a test caller that passes none -> `__has_include` then finds nothing on
+    // the path (only an absolute/self-dir hit), which is the correct answer for
+    // that input.
+    std::span<fs::path const>            includeDirs_;
+    std::span<fs::path const>            systemDirs_;
+    fs::path                             includingDir_;
     // FC14: the conditional-compilation frame stack (one frame per open
     // `#if`/`#ifdef`/`#ifndef`). See CondFrame + handleIf/Elif/Else/Endif.
     std::vector<CondFrame>               condStack_;
@@ -1883,7 +1925,8 @@ private:
 PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
-    std::span<fs::path const>            includeDirs) {
+    std::span<fs::path const>            includeDirs,
+    std::span<fs::path const>            systemDirs) {
     if (!mainSource || !schema) ppFatal("preprocess: null source or schema");
     if (!schema->preprocess().enabled) {
         ppFatal("preprocess: called with a schema whose preprocess pass is "
@@ -1925,8 +1968,14 @@ PreprocessResult preprocess(
     // FC15b: thread the synth-offset -> origin line-map into the expander so an
     // offset-derived predefined macro (`__LINE__`/`__FILE__`) resolves an
     // invocation offset to its real origin file + line.
-    MacroExpander expander{prefixBuffer, schema, *result.diagnostics, prefixLen,
-                           &result.lineMap};
+    // FC15c: thread the include search paths + the main file's own directory so
+    // `__has_include` resolves a header EXACTLY as the include machinery would
+    // (quote form = self-dir + includeDirs; angle form = `<stem>.json` on
+    // systemDirs).
+    MacroExpander expander{prefixBuffer,  schema,      *result.diagnostics,
+                           prefixLen,     &result.lineMap,
+                           includeDirs,   systemDirs,
+                           fs::path{mainSource->name()}.parent_path()};
     std::vector<Token> finalTokens = expander.run(synthTokens);
     // OR in the macro-expansion truncation; the SynthBuilder already wrote
     // `result.fatal` by reference for an include-nesting truncation.

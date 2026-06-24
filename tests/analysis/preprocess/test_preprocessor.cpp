@@ -2136,3 +2136,398 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     EXPECT_EQ((*c)->preprocess().predefinedMacros.size(), 7u)
         << "c-subset declares the 7 C 6.10.8 predefined macros";
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FC15c (`#pragma` -- C 6.10.6; `__has_include` + `__has_c_attribute` --
+// C23 6.10.1p4). `#pragma` is consumed-and-DROPPED with NO error. The two
+// operators are valid only in a `#if`/`#elif` operand; their RESULT (0/1 for
+// __has_include, a version int for __has_c_attribute) is folded by the ICE
+// evaluator. The angle delimiters of `__has_include(<h>)` are matched by CONFIG
+// token KIND, never the `<`/`>` bytes (agnosticism). Every assertion is
+// RED-ON-DISABLE.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+// Run the preprocessor over `text` with an explicit systemDirs (the angle-form
+// search path) + includeDirs (the quote-form search path) and return the
+// NON-trivia lexemes. Mirrors `ppLexemes` but threads the search paths so the
+// Finding-3 `__has_include(<stem.json>)` mapping can be exercised.
+[[nodiscard]] std::vector<std::string> ppLexemesWithDirs(
+    std::string text, PreprocessResult& out,
+    std::vector<std::filesystem::path> includeDirs,
+    std::vector<std::filesystem::path> systemDirs) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(std::move(text), "main.c");
+    out = preprocess(buf, schema, includeDirs, systemDirs);
+    std::vector<std::string> lexs;
+    for (Token const& t : out.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{out.synthBuffer->slice(t.span)});
+    }
+    return lexs;
+}
+} // namespace
+
+// `#pragma` is consumed-and-DROPPED with NO error (C 6.10.6p2). The line carries
+// a GCC-style payload; only `int v = 1 ;` survives. RED-ON-DISABLE: without the
+// `#pragma`-consume arm the directive hits the generic unsupported-directive
+// fail-loud (P_PreprocessorUnsupported).
+TEST(Preprocessor, FC15cPragmaConsumedAndDropped) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#pragma GCC optimize(\"O2\")\nint v=1;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a `#pragma` line must be silently consumed (C 6.10.6p2)";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "a `#pragma` must NOT trip the unsupported-directive fail-loud";
+    ASSERT_EQ(lexs.size(), 5u) << "only `int v = 1 ;` survives the dropped pragma";
+    EXPECT_EQ(lexs[0], "int");
+    EXPECT_EQ(lexs[1], "v");
+    EXPECT_EQ(lexs[2], "=");
+    EXPECT_EQ(lexs[3], "1");
+    EXPECT_EQ(lexs[4], ";");
+}
+
+// A `#pragma` inside a DEAD branch is silent too (the arm is past the
+// stackActive gate). `#if 0 ... #pragma ... #endif` -> no diagnostic, nothing
+// emitted from the dead group.
+TEST(Preprocessor, FC15cPragmaInDeadBranchIsSilent) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#if 0\n#pragma whatever here\nint dead;\n#endif\nint x;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "only `int x ;` survives";
+    EXPECT_EQ(lexs[0], "int");
+    EXPECT_EQ(lexs[1], "x");
+    EXPECT_EQ(lexs[2], ";");
+}
+
+// OPT-OUT (RED-ON-DISABLE for the config match): with `pragmaDirective` stripped
+// from config, `#pragma` is no longer recognized -> it hits the generic
+// unsupported-directive fail-loud. Proves the engine matches the CONFIG word,
+// not a hard-coded "pragma".
+TEST(Preprocessor, FC15cPragmaIsConfigDrivenFailsLoudWhenStripped) {
+    namespace fs = std::filesystem;
+    // Remove the pragmaDirective line entirely (so the field defaults to empty).
+    auto schema = reboundCSubset("\"pragmaDirective\":          \"pragma\",",
+                                 "",
+                                 "<no-pragma-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_TRUE(schema->preprocess().pragmaDirective.empty())
+        << "the rebound schema must declare no pragma directive";
+    auto buf = SourceBuffer::fromString(
+        std::string{"#pragma GCC optimize(\"O2\")\nint v=1;\n"}, "main.c");
+    std::vector<fs::path> noDirs;
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "with `pragmaDirective` stripped, `#pragma` must fail loud as an "
+           "unsupported directive -- proving the directive word is read from "
+           "config, not hard-coded";
+}
+
+// `__has_include("h")` quote form -> 1 when the local file exists. We write a
+// real header into a temp dir, pass it as the includeDir, and probe it. The 42
+// branch is taken (lexs == `int yes ;`). RED-ON-DISABLE: without the
+// `__has_include` arm the identifier folds to 0 -> the #else branch.
+TEST(Preprocessor, FC15cHasIncludeQuoteExistingFileIsOne) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_fc15c_has_include_q";
+    fs::create_directories(dir);
+    { std::ofstream(dir / "real_header.h", std::ios::binary) << "/* x */\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#if __has_include(\"real_header.h\")\nint yes;\n#else\nint no;\n#endif\n",
+        r, {dir}, {});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "the existing header -> the `yes` branch";
+    EXPECT_EQ(lexs[1], "yes")
+        << "__has_include of an existing quote header must be 1 (branch taken)";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// `__has_include("h")` quote form -> 0 when the file does NOT exist -> the #else
+// branch is taken.
+TEST(Preprocessor, FC15cHasIncludeQuoteMissingFileIsZero) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if __has_include(\"definitely_no_such_header_xyz.h\")\n"
+        "int yes;\n#else\nint no;\n#endif\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "the missing header -> the `no` branch";
+    EXPECT_EQ(lexs[1], "no")
+        << "__has_include of a missing quote header must be 0 (else branch)";
+}
+
+// FINDING 3 (the silent-miscompile the plan-lock caught): the ANGLE form maps
+// `<stem>.json` on the systemDirs path (DSS ships JSON descriptors, e.g.
+// `stdio.json`, NOT `stdio.h`). `__has_include(<stdio.h>)` must be 1 when
+// `stdio.json` is on the system path -- a naive `findInDirs("stdio.h", ...)`
+// returns 0 while `#include <stdio.h>` succeeds (the wrong answer). We put a
+// `stdio.json` in a temp systemDir and probe `<stdio.h>`.
+// RED-ON-DISABLE for the stem mapping: resolving the literal `stdio.h` on the
+// systemDirs (which holds only `stdio.json`) yields 0 -> the wrong branch.
+TEST(Preprocessor, FC15cHasIncludeAngleMapsStemDotJson) {
+    namespace fs = std::filesystem;
+    auto sysdir = fs::temp_directory_path() / "dss_fc15c_has_include_sys";
+    fs::create_directories(sysdir);
+    // Ship a JSON descriptor (the shape DSS ships), NOT a `.h` file.
+    { std::ofstream(sysdir / "stdio.json", std::ios::binary) << "{}\n"; }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_include(<stdio.h>)\nint yes;\n#else\nint no;\n#endif\n",
+            r, {}, {sysdir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes")
+            << "__has_include(<stdio.h>) must map to stdio.json on the system "
+               "path (Finding 3) -- a literal `stdio.h` search yields 0";
+    }
+    // A header with no shipped descriptor -> 0 (the else branch).
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_include(<nope.h>)\nint yes;\n#else\nint no;\n#endif\n",
+            r, {}, {sysdir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "no")
+            << "__has_include(<nope.h>) with no nope.json on the path must be 0";
+    }
+    std::error_code ec;
+    fs::remove_all(sysdir, ec);
+}
+
+// FAIL-LOUD (C23 6.10.1p4 well-formedness): every malformed `__has_include`
+// shape -> P_PreprocessorHasInclude (a DISTINCT, positioned diagnostic, never a
+// generic ICE fallthrough). Missing `(`, missing `>`, missing `)`, empty name.
+TEST(Preprocessor, FC15cHasIncludeMalformedFailsLoud) {
+    // Missing `(`.
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#if __has_include\nint a;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
+            << "__has_include with no `(` must fail loud";
+    }
+    // Missing closing `>`.
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#if __has_include(<stdio.h)\nint a;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
+            << "__has_include(<...  with no `>` must fail loud";
+    }
+    // Missing closing `)`.
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#if __has_include(\"h.h\"\nint a;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
+            << "__has_include(\"...\"  with no `)` must fail loud";
+    }
+    // Empty angle name `<>`.
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#if __has_include(<>)\nint a;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
+            << "__has_include(<>) (empty name) must fail loud";
+    }
+}
+
+// `__has_c_attribute(deprecated)` -> the configured version (202311, truthy) ->
+// the branch is taken. RED-ON-DISABLE: without the operator the identifier folds
+// to 0 -> the #else branch.
+TEST(Preprocessor, FC15cHasCAttributeKnownIsVersion) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if __has_c_attribute(deprecated)\nint yes;\n#else\nint no;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "a known attribute -> the `yes` branch";
+    EXPECT_EQ(lexs[1], "yes")
+        << "__has_c_attribute(deprecated) must fold to its version (202311 != 0)";
+}
+
+// The exact version reaches the ICE comparator: `__has_c_attribute(nodiscard)
+// == 202311` is true; `>= 202312` is false -- proves the minted value is the
+// configured int, not just a truthy 1.
+TEST(Preprocessor, FC15cHasCAttributeExactVersion) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#if __has_c_attribute(nodiscard) == 202311\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "a") << "the minted value is exactly 202311";
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#if __has_c_attribute(nodiscard) >= 202312\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_TRUE(lexs.empty()) << "202311 >= 202312 is false -> nothing emitted";
+    }
+}
+
+// The dunder form is accepted (C 6.10.1: the lookup ignores leading/trailing
+// `__`): `__has_c_attribute(__deprecated__)` resolves the same as `deprecated`.
+TEST(Preprocessor, FC15cHasCAttributeDunderForm) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if __has_c_attribute(__deprecated__)\nint a;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "a")
+        << "__deprecated__ must match the known `deprecated` (dunder stripped)";
+}
+
+// An UNKNOWN attribute -> 0 -> the #else branch (never an error -- C23 says
+// unknown attributes yield 0).
+TEST(Preprocessor, FC15cHasCAttributeUnknownIsZero) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if __has_c_attribute(not_a_real_attr)\nint yes;\n#else\nint no;\n#endif\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "an unknown attribute folds to 0, never an error";
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "no")
+        << "__has_c_attribute(not_a_real_attr) must be 0 (else branch)";
+}
+
+// AGNOSTICISM (opt-OUT): with `hasIncludeOperator` stripped from config,
+// `__has_include` is an ORDINARY identifier in a `#if` operand -> it folds to 0
+// (C 6.10.1p4), so `#if __has_include("x")` is `#if 0` -> the else branch. The
+// `(...)` trails as a malformed expression? No -- a folded-0 identifier followed
+// by `(` would be a call shape the ICE parser rejects; we instead pin the
+// CONFIG-READ contract directly (the operator/angle-token strings) which is the
+// load-bearing agnosticism property, plus the bare-identifier fold via a name
+// the parser accepts standalone.
+TEST(Preprocessor, FC15cHasIncludeIsConfigDrivenOptOut) {
+    // Strip the operator declaration; the angle tokens go too (the loader
+    // requires them only WHEN the operator is declared, so removing all three
+    // keeps the schema self-consistent).
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty());
+    for (std::string const& line :
+         {std::string{"\"hasIncludeOperator\":       \"__has_include\",\n"},
+          std::string{"    \"hasIncludeAngleOpenToken\":  \"LtOp\",\n"},
+          std::string{"    \"hasIncludeAngleCloseToken\": \"GtOp\",\n"}}) {
+        auto const pos = text.find(line);
+        ASSERT_NE(pos, std::string::npos) << "config no longer carries: " << line;
+        text.erase(pos, line.size());
+    }
+    auto loaded = GrammarSchema::loadFromText(text, "<no-has-include-c-subset>");
+    ASSERT_TRUE(loaded.has_value())
+        << "stripping the operator + its angle tokens must still load: "
+        << (loaded.error().empty() ? "<none>" : loaded.error()[0].message);
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    EXPECT_TRUE(schema->preprocess().hasIncludeOperator.empty());
+
+    // A BARE `__has_include` (no parens) now folds as an ordinary identifier ->
+    // 0, so `#if __has_include` is `#if 0` -> the else branch is taken. No
+    // P_PreprocessorHasInclude (the operator is gone).
+    namespace fs = std::filesystem;
+    auto buf = SourceBuffer::fromString(
+        std::string{"#if __has_include\nint yes;\n#else\nint no;\n#endif\n"},
+        "main.c");
+    std::vector<fs::path> noDirs;
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
+        << "with the operator stripped, `__has_include` is ordinary -- no "
+           "has-include diagnostic";
+    std::vector<std::string> lexs;
+    for (Token const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+    }
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "no")
+        << "a stripped __has_include folds to 0 -> the #else branch";
+}
+
+// CONFIG-READ pins: the shipped c-subset declares the operator names + the angle
+// token KINDS; toy / tsql declare none. The angle delimiters being CONFIG token
+// names (not the `<`/`>` bytes) is the make-or-break agnosticism property.
+TEST(Preprocessor, FC15cOperatorNamesAndAngleTokensAreConfigDeclared) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ((*c)->preprocess().pragmaDirective, "pragma");
+    EXPECT_EQ((*c)->preprocess().hasIncludeOperator, "__has_include");
+    EXPECT_EQ((*c)->preprocess().hasCAttributeOperator, "__has_c_attribute");
+    EXPECT_EQ((*c)->preprocess().hasIncludeAngleOpenToken, "LtOp")
+        << "the angle delimiters are matched by token KIND, declared in config";
+    EXPECT_EQ((*c)->preprocess().hasIncludeAngleCloseToken, "GtOp");
+    EXPECT_EQ((*c)->preprocess().knownCAttributes.size(), 7u);
+
+    for (char const* lang : {"toy", "tsql-subset"}) {
+        auto s = GrammarSchema::loadShipped(lang);
+        ASSERT_TRUE(s.has_value()) << lang;
+        EXPECT_TRUE((*s)->preprocess().pragmaDirective.empty()) << lang;
+        EXPECT_TRUE((*s)->preprocess().hasIncludeOperator.empty()) << lang;
+        EXPECT_TRUE((*s)->preprocess().hasCAttributeOperator.empty()) << lang;
+        EXPECT_TRUE((*s)->preprocess().knownCAttributes.empty()) << lang;
+    }
+}
+
+// FINDING 1 (RED-ON-DISABLE): the angle delimiters of `__has_include(<h>)` are
+// matched by CONFIG token KIND, not the `<`/`>` bytes. Rebind
+// `hasIncludeAngleOpenToken` from `LtOp` to a DIFFERENT real token (`LBraceOp`?
+// -- use a declared one) and the `<h>` form must NO LONGER be recognized as the
+// angle opener -> the operand `<stdio.h>` is now a malformed shape -> fail loud.
+// RED-ON-DISABLE: matching `<` by the literal byte would ignore the rebind and
+// still parse the angle form, so no diagnostic fires.
+TEST(Preprocessor, FC15cAngleDelimiterIsConfigKindNotByte) {
+    namespace fs = std::filesystem;
+    // Rebind the angle OPEN token to a real token that is NOT `<` (`TildeOp`=`~`).
+    auto schema = reboundCSubset("\"hasIncludeAngleOpenToken\":  \"LtOp\"",
+                                 "\"hasIncludeAngleOpenToken\":  \"TildeOp\"",
+                                 "<rebound-angle-open-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->preprocess().hasIncludeAngleOpenToken, "TildeOp");
+    // `__has_include(<stdio.h>)`: the `<` is no longer the configured angle
+    // opener, so the operand is neither the angle nor the quote form -> the
+    // engine must fail loud (it is NOT silently parsed via the `<` byte).
+    auto buf = SourceBuffer::fromString(
+        std::string{"#if __has_include(<stdio.h>)\nint a;\n#endif\n"}, "main.c");
+    std::vector<fs::path> noDirs;
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
+        << "with the angle-open token rebound off `<`, a `<h>` operand must fail "
+           "loud -- proving the delimiter is matched by config KIND, not the `<` "
+           "byte";
+}
+
+// LOADER (make-or-break self-consistency): a language declaring
+// `hasIncludeOperator` WITHOUT both angle tokens is a self-inconsistent contract
+// -> C_InvalidPreprocess at load. We strip ONLY the angle-open token, leaving the
+// operator declared, and assert the load FAILS.
+TEST(Preprocessor, FC15cHasIncludeWithoutAngleTokensIsLoadError) {
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty());
+    const std::string line = "\"hasIncludeAngleOpenToken\":  \"LtOp\",\n";
+    auto const pos = text.find(line);
+    ASSERT_NE(pos, std::string::npos);
+    text.erase(pos, line.size());
+    auto loaded = GrammarSchema::loadFromText(text, "<bad-has-include-c-subset>");
+    EXPECT_FALSE(loaded.has_value())
+        << "declaring hasIncludeOperator without both angle tokens must be a "
+           "load error (C_InvalidPreprocess)";
+}
+
+// LOADER: a malformed `knownCAttributes` entry (a non-positive version) ->
+// C_InvalidPreprocess at load.
+TEST(Preprocessor, FC15cKnownCAttributeBadVersionIsLoadError) {
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty());
+    const std::string from = "{ \"name\": \"deprecated\",   \"version\": 202311 }";
+    const std::string to   = "{ \"name\": \"deprecated\",   \"version\": 0 }";
+    auto const pos = text.find(from);
+    ASSERT_NE(pos, std::string::npos);
+    text.replace(pos, from.size(), to);
+    auto loaded = GrammarSchema::loadFromText(text, "<bad-attr-c-subset>");
+    EXPECT_FALSE(loaded.has_value())
+        << "a knownCAttributes entry with version <= 0 must be a load error";
+}

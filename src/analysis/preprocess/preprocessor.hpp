@@ -179,9 +179,18 @@ struct DSS_EXPORT PreprocessResult {
 // with a disabled schema is a usage error and fatal-asserted). `includeDirs`
 // is the quote-include search path (the including file's own directory is
 // always tried first, mirroring the import resolver).
+//
+// FC15c (Option A): `systemDirs` is the ANGLE-include / system-header search
+// path (the analogue of C's /usr/include; DSS ships LANGUAGE-NEUTRAL JSON
+// descriptors there, e.g. `stdio.json`). It feeds the `__has_include(<h>)`
+// existence test so it agrees with what the post-parse import resolver does for
+// `#include <h>`. Defaults to {} so the ~15 test callers + helper compile
+// unchanged; the ONE production call site (compilation_unit.cpp) threads its
+// `systemDirs_` member.
 [[nodiscard]] DSS_EXPORT PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
-    std::span<std::filesystem::path const> includeDirs);
+    std::span<std::filesystem::path const> includeDirs,
+    std::span<std::filesystem::path const> systemDirs = {});
 
 } // namespace dss

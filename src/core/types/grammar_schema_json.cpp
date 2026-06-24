@@ -3904,6 +3904,132 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // FC15c: an OPTIONAL non-empty directive/operator WORD (matched by
+            // lexeme text -- no token kind, like the directive words). Absent ->
+            // the feature is off. Present-but-empty / wrong-type ->
+            // C_InvalidPreprocess.
+            auto const readOptWord = [&](char const* key, std::string& out) {
+                if (!pp.contains(key)) return;
+                const auto fpath = std::format("/preprocess/{}", key);
+                if (!pp.at(key).is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess, fpath,
+                              std::format("'preprocess.{}' must be a string", key));
+                    return;
+                }
+                out = pp.at(key).get<std::string>();
+                if (out.empty()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess, fpath,
+                              std::format("'preprocess.{}' must be a non-empty "
+                                          "string when present", key));
+                }
+            };
+            // FC15c (`#pragma`; C 6.10.6): the pragma directive WORD. Consumed +
+            // DROPPED with no error. OPTIONAL.
+            readOptWord("pragmaDirective",       cfg.pragmaDirective);
+            // FC15c (`__has_include` / `__has_c_attribute`; C23 6.10.1p4): the
+            // operator WORDS. OPTIONAL (each folds to an ordinary identifier when
+            // absent).
+            readOptWord("hasIncludeOperator",    cfg.hasIncludeOperator);
+            readOptWord("hasCAttributeOperator", cfg.hasCAttributeOperator);
+            // FC15c (make-or-break agnosticism): the angle-delimiter token KINDS
+            // for `__has_include(<h>)`. OPTIONAL token-name fields (validated like
+            // `stringizeToken`). The make-or-break SELF-CONSISTENCY rule: a
+            // language declaring `hasIncludeOperator` MUST declare BOTH angle
+            // tokens (the engine matches the delimiters by KIND, never the `<`/`>`
+            // bytes) -- otherwise the contract is incomplete -> C_InvalidPreprocess.
+            if (pp.contains("hasIncludeAngleOpenToken")) {
+                if (!pp.at("hasIncludeAngleOpenToken").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/hasIncludeAngleOpenToken",
+                              "'preprocess.hasIncludeAngleOpenToken' must be a "
+                              "string");
+                } else {
+                    cfg.hasIncludeAngleOpenToken =
+                        pp.at("hasIncludeAngleOpenToken").get<std::string>();
+                    checkToken(cfg.hasIncludeAngleOpenToken,
+                               "hasIncludeAngleOpenToken");
+                }
+            }
+            if (pp.contains("hasIncludeAngleCloseToken")) {
+                if (!pp.at("hasIncludeAngleCloseToken").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/hasIncludeAngleCloseToken",
+                              "'preprocess.hasIncludeAngleCloseToken' must be a "
+                              "string");
+                } else {
+                    cfg.hasIncludeAngleCloseToken =
+                        pp.at("hasIncludeAngleCloseToken").get<std::string>();
+                    checkToken(cfg.hasIncludeAngleCloseToken,
+                               "hasIncludeAngleCloseToken");
+                }
+            }
+            if (!cfg.hasIncludeOperator.empty()
+                && (cfg.hasIncludeAngleOpenToken.empty()
+                    || cfg.hasIncludeAngleCloseToken.empty())) {
+                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                          "/preprocess/hasIncludeOperator",
+                          "'preprocess.hasIncludeOperator' requires both "
+                          "'hasIncludeAngleOpenToken' and "
+                          "'hasIncludeAngleCloseToken' (the angle delimiters are "
+                          "matched by token KIND, not the '<'/'>' bytes)");
+            }
+            // FC15c (`__has_c_attribute`; C23 6.10.1p4): the KNOWN standard
+            // attributes + their version ints. Each entry is `{name, version}`:
+            // `name` non-empty, `version` a positive int. OPTIONAL -- absent
+            // means no attribute is known (every query yields 0). A malformed
+            // entry -> C_InvalidPreprocess.
+            if (pp.contains("knownCAttributes")) {
+                json const& kas = pp.at("knownCAttributes");
+                if (!kas.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/knownCAttributes",
+                              "'preprocess.knownCAttributes' must be an array");
+                } else {
+                    for (std::size_t ai = 0; ai < kas.size(); ++ai) {
+                        const auto apath =
+                            std::format("/preprocess/knownCAttributes/{}", ai);
+                        json const& e = kas[ai];
+                        if (!e.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, apath,
+                                      "a 'knownCAttributes' entry must be an "
+                                      "object");
+                            continue;
+                        }
+                        CAttributeDef ka;
+                        if (!e.contains("name") || !e.at("name").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      apath + "/name",
+                                      "a 'knownCAttributes' entry requires a "
+                                      "string 'name'");
+                            continue;
+                        }
+                        ka.name = e.at("name").get<std::string>();
+                        if (ka.name.empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      apath + "/name",
+                                      "'knownCAttributes.name' must be non-empty");
+                            continue;
+                        }
+                        if (!e.contains("version")
+                            || !e.at("version").is_number_integer()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      apath + "/version",
+                                      "a 'knownCAttributes' entry requires an "
+                                      "integer 'version'");
+                            continue;
+                        }
+                        ka.version = e.at("version").get<int>();
+                        if (ka.version <= 0) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      apath + "/version",
+                                      "'knownCAttributes.version' must be > 0");
+                            continue;
+                        }
+                        cfg.knownCAttributes.push_back(std::move(ka));
+                    }
+                }
+            }
+
             data.preprocess = std::move(cfg);
         }
     }

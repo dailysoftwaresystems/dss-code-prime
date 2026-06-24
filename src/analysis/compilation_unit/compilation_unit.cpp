@@ -228,7 +228,10 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
     // tokenize->parse path below. These two are the ONLY .tokenize() sites
     // in src/ that consume C source.
     if (schema->preprocess().enabled) {
-        PreprocessResult pp = preprocess(src, schema, includeDirs_);
+        // FC15c: thread the system-header search path so `__has_include(<h>)`
+        // resolves a system descriptor (`<stem>.json`) exactly as the post-parse
+        // import resolver does for `#include <h>` (one shared mapping).
+        PreprocessResult pp = preprocess(src, schema, includeDirs_, systemDirs_);
         auto remap = pp.makeRemap();
         std::shared_ptr<SourceBuffer> synth = pp.synthBuffer;
         // The parser consumes a stream built from a COPY of the preprocessed

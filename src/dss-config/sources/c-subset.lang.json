@@ -53,6 +53,21 @@
       { "name": "__STDC_HOSTED__",     "kind": "constant", "value": "1" },
       { "name": "__DATE__",            "kind": "date" },
       { "name": "__TIME__",            "kind": "time" }
+    ],
+    "$fc15cComment": "FC15c. `#pragma` (C 6.10.6): consumed-and-DROPPED (C 6.10.6p2 licenses ignoring an unrecognized pragma; DSS recognizes none). `__has_include` (C23 6.10.1p4): tests header existence with the SAME resolution `#include` uses -- the angle delimiters are matched by TOKEN KIND (`hasIncludeAngleOpenToken`=LtOp / `hasIncludeAngleCloseToken`=GtOp), never the `<`/`>` bytes (agnosticism); the angle form maps `<stem>.json` on the system path (DSS ships JSON descriptors, e.g. `stdio.json`) so `__has_include(<stdio.h>)` agrees with `#include <stdio.h>`. `__has_c_attribute` (C23 6.10.1p4): reports the version int of a known standard attribute or 0; the lookup ignores leading/trailing `__` (so `__deprecated__` matches `deprecated`). The C23 standard attributes are 202311.",
+    "pragmaDirective":          "pragma",
+    "hasIncludeOperator":       "__has_include",
+    "hasIncludeAngleOpenToken":  "LtOp",
+    "hasIncludeAngleCloseToken": "GtOp",
+    "hasCAttributeOperator":    "__has_c_attribute",
+    "knownCAttributes": [
+      { "name": "deprecated",   "version": 202311 },
+      { "name": "nodiscard",    "version": 202311 },
+      { "name": "maybe_unused", "version": 202311 },
+      { "name": "noreturn",     "version": 202311 },
+      { "name": "fallthrough",  "version": 202311 },
+      { "name": "reproducible", "version": 202311 },
+      { "name": "unsequenced",  "version": 202311 }
     ]
   },
 
