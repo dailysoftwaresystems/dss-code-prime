@@ -12,8 +12,11 @@
 
 #include <cassert>
 #include <limits>
+#include <optional>
 #include <string>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace dss {
 
@@ -58,7 +61,197 @@ visibleChildren(Tree const& tree, NodeId parent) {
 // `hir/const_eval_operators.hpp` (see opFromName note above). Reachable here as
 // `dss::opEntryFor` (unqualified).
 
-// Internal recursive impl. `visitedInitNodes` carries the per-call
+// Forward decl: the public entry `evaluateConstantCst` drives an explicit heap
+// work-stack (plan 24 Stage 6 — D-PARSE-DEEP-NEST-RECURSION-MEMORY). The per-
+// node body (`evalNode` below) re-enters it for the children of every DELEGATED
+// arm, so a deeply-nested sub-expression inside a shallow complex arm still
+// flattens.
+[[nodiscard]] ConstEvalResult
+evalImpl(NodeId                              expr,
+         CstEvalContext const&               ctx,
+         CstEvalEnvironment const&           env,
+         EvalOptions const&                  options,
+         std::uint32_t                       currentScopeOpaque,
+         std::unordered_set<std::uint32_t> & visitedInitNodes);
+
+// ── Plan 24 Stage 6 — straight-line CST const-fold epilogues ───────────────
+// Each `combine*` is the BYTE-IDENTICAL slice of a flattened arm AFTER its
+// child operand(s) have been folded (their `ConstEvalResult`(s) passed in).
+// Shared by `evalNode`'s recursive arms AND the driver's frames — ONE source of
+// truth. A child-failure short-circuit returns the child's result VERBATIM,
+// matching the recursive `if (!x.value.has_value()) return x;`.
+
+// Plain-binary epilogue (lhs+rhs already folded, IN THAT ORDER — the recursive
+// form folds `a = evalImpl(lhsN)` then `b = evalImpl(rhsN)`, two sequential
+// statements, left-to-right). `e` is the resolved operator entry (already known
+// NOT to be Assign/compound/logical — the driver only flattens plain ops; the
+// logical/assign cases stay in `evalNode`). Mirrors the recursive plain-arith
+// tail EXACTLY (float vs int routing, result-core tagging, failure codes).
+[[nodiscard]] ConstEvalResult
+combineBinaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& options,
+                 ConstEvalResult a, ConstEvalResult b) {
+    if (!a.value.has_value()) return a;
+    if (!b.value.has_value()) return b;
+    auto opK = opFromName(e.target);
+    if (!opK.has_value()) {
+        return fail(ConstEvalFailure::UnsupportedOperator, expr);
+    }
+    bool const eitherFloat = isFloatValue(*a.value) || isFloatValue(*b.value);
+    if (eitherFloat) {
+        if (!options.allowFloat) {
+            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        }
+        ConstEvalFailure why = ConstEvalFailure::None;
+        if (auto folded = applyBinaryFloat(*opK, *a.value, *b.value, why);
+            folded.has_value()) {
+            return ok(std::move(*folded));
+        }
+        return fail(why != ConstEvalFailure::None
+                        ? why : ConstEvalFailure::UnsupportedOperator,
+                    expr);
+    }
+    if (!asInt64(*a.value).has_value() || !asInt64(*b.value).has_value()) {
+        return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+    }
+    ConstEvalFailure why = ConstEvalFailure::None;
+    if (auto folded = applyBinaryInt(*opK, *a.value, *b.value, options, why);
+        folded.has_value()) {
+        // Tag the result core. Comparisons → Bool; arithmetic
+        // inherits the LHS's core (no TypeInterner / commonType
+        // available at the CST level — semantic-time consumers
+        // only read `.value`, not `.core`).
+        if (isComparison(*opK)) folded->core = TypeKind::Bool;
+        return ok(std::move(*folded));
+    }
+    if (why != ConstEvalFailure::None) return fail(why, expr);
+    return fail(ConstEvalFailure::UnsupportedOperator, expr);
+}
+
+// Unary epilogue (operand already folded to `inner`). `e` is the resolved
+// operator entry (already known NOT to be AddressOf/Deref). Byte-identical to
+// the recursive unary tail.
+[[nodiscard]] ConstEvalResult
+combineUnaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& options,
+                ConstEvalResult inner) {
+    if (!inner.value.has_value()) return inner;
+    auto opK = opFromName(e.target);
+    if (!opK.has_value()) {
+        return fail(ConstEvalFailure::UnsupportedOperator, expr);
+    }
+    if (isFloatValue(*inner.value)) {
+        if (!options.allowFloat) {
+            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        }
+        ConstEvalFailure why = ConstEvalFailure::None;
+        if (auto folded = applyUnaryFloat(*opK, *inner.value, why);
+            folded.has_value()) {
+            return ok(std::move(*folded));
+        }
+        return fail(why != ConstEvalFailure::None
+                        ? why : ConstEvalFailure::UnsupportedOperator,
+                    expr);
+    }
+    if (!asInt64(*inner.value).has_value()) {
+        return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+    }
+    if (auto folded = applyUnaryInt(*opK, *inner.value); folded.has_value()) {
+        return ok(std::move(*folded));
+    }
+    return fail(ConstEvalFailure::UnsupportedOperator, expr);
+}
+
+// Resolve a plain-binary node to its [lhsN, rhsN] operands IFF it is a binary-
+// rule node whose operator is foldable AND NOT Assign/compound/logical — the
+// EXACT set the driver flattens. Returns nullopt for every other shape (wrong
+// rule, malformed operands, unknown operator, Assign/compound, LogicalAnd/Or),
+// which then DELEGATES to `evalNode` and is handled there byte-identically (the
+// logical-short-circuit + every fail-loud path). Shared by the driver's
+// classifier AND `evalNode`'s plain-binary fallback so the two never diverge.
+// On a flattenable hit, `outEntry` receives the resolved operator entry (so the
+// epilogue need not re-look-it-up).
+struct CstBinaryPlan { NodeId lhsN, rhsN; HirOperatorEntry const* entry; };
+[[nodiscard]] std::optional<CstBinaryPlan>
+plainBinaryPlan(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
+                std::vector<NodeId> const& kids) {
+    if (!cfg.binaryExprRule.valid() || tree.rule(expr).v != cfg.binaryExprRule.v) {
+        return std::nullopt;
+    }
+    NodeId lhsN{}, rhsN{}, opTok{};
+    for (NodeId c : kids) {
+        if (tree.kind(c) == NodeKind::Token) {
+            if (!opTok.valid()) opTok = c;
+        } else if (!lhsN.valid()) lhsN = c;
+        else if (!rhsN.valid()) rhsN = c;
+    }
+    if (!opTok.valid() || !lhsN.valid() || !rhsN.valid()) return std::nullopt;
+    HirOperatorEntry const* e = opEntryFor(cfg.binaryOps, tree.tokenKind(opTok));
+    if (e == nullptr) return std::nullopt;
+    // Assignment / compound-assign and the short-circuiting logical ops are NOT
+    // flattened (the recursive `evalNode` owns their exact semantics).
+    if (e->target == "Assign" || !e->compoundBase.empty()) return std::nullopt;
+    if (e->target == "LogicalAnd" || e->target == "LogicalOr") return std::nullopt;
+    return CstBinaryPlan{lhsN, rhsN, e};
+}
+
+// Resolve a unary node to its operand NodeId IFF it is a unary-rule node whose
+// operator is foldable AND NOT AddressOf/Deref — the set the driver flattens.
+// Returns nullopt otherwise (→ delegate, byte-identical fail-loud in evalNode).
+struct CstUnaryPlan { NodeId operandN; HirOperatorEntry const* entry; };
+[[nodiscard]] std::optional<CstUnaryPlan>
+unaryPlan(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
+          std::vector<NodeId> const& kids) {
+    if (!cfg.unaryExprRule.valid() || tree.rule(expr).v != cfg.unaryExprRule.v) {
+        return std::nullopt;
+    }
+    NodeId opTok{}, operandN{};
+    for (NodeId c : kids) {
+        if (tree.kind(c) == NodeKind::Token) {
+            if (!opTok.valid()) opTok = c;
+        } else if (!operandN.valid()) operandN = c;
+    }
+    if (!opTok.valid() || !operandN.valid()) return std::nullopt;
+    HirOperatorEntry const* e = opEntryFor(cfg.unaryOps, tree.tokenKind(opTok));
+    if (e == nullptr) return std::nullopt;
+    if (e->target == "AddressOf" || e->target == "Deref") return std::nullopt;
+    return CstUnaryPlan{operandN, e};
+}
+
+// Resolve a transparent WRAPPER node to its single child to descend into (the
+// deep-parens axis `((((expr))))`), IFF it is NOT one of the rule-dispatched
+// arms (sizeof / binary / unary / ternary) — those are matched first in
+// `evalNode` and must not be wrapper-peeled. Mirrors the recursive tail:
+// exactly one meaningful Internal child → that child; else zero internals and
+// exactly one token child → that token; else nullopt (→ delegate, which yields
+// the same NotAConstantExpression). Shared by the driver + the recursive
+// fallback so the peel decision never diverges.
+[[nodiscard]] NodeId
+wrapperChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
+             std::vector<NodeId> const& kids) {
+    RuleId const rule = tree.rule(expr);
+    bool const isDispatched =
+        (cfg.sizeofRule.valid()      && rule.v == cfg.sizeofRule.v)      ||
+        (cfg.binaryExprRule.valid()  && rule.v == cfg.binaryExprRule.v)  ||
+        (cfg.unaryExprRule.valid()   && rule.v == cfg.unaryExprRule.v)   ||
+        (cfg.ternaryExprRule.valid() && rule.v == cfg.ternaryExprRule.v);
+    if (isDispatched) return NodeId{};
+    NodeId onlyInternal{};
+    int    internalCount = 0;
+    for (NodeId c : kids) {
+        if (tree.kind(c) == NodeKind::Internal) { ++internalCount; onlyInternal = c; }
+    }
+    if (internalCount == 1) return onlyInternal;
+    if (internalCount == 0) {
+        NodeId onlyTok{};
+        int tokCount = 0;
+        for (NodeId c : kids) {
+            if (tree.kind(c) == NodeKind::Token) { ++tokCount; onlyTok = c; }
+        }
+        if (tokCount == 1) return onlyTok;
+    }
+    return NodeId{};
+}
+
+// Internal per-node fold body. `visitedInitNodes` carries the per-call
 // cycle-detection set, keyed on the RESOLVED init-expression NodeId
 // (NOT on identifier text — text-keyed detection produces
 // false-positive cycles under shadowing: outer `const X=1; const Y=X+1;`
@@ -66,8 +259,18 @@ visibleChildren(Tree const& tree, NodeId parent) {
 // when evaluating the inner X's init. Keying on init-expression
 // identity sidesteps shadowing because each distinct symbol
 // declaration has its own init NodeId.).
+//
+// Plan 24 Stage 6: the deep STRAIGHT-LINE arms (plain BinaryOp, unary, and the
+// transparent WRAPPER/paren descent) are flattened onto the `evalImpl` work-
+// stack driver and reach their epilogue THERE; this handler keeps them as the
+// dead-via-driver recursive fallback (calling the SAME epilogues / peel helper).
+// DELEGATED here (re-entering the driver for their children): the token leaves
+// (integer / direct-value / init-resolver — the cycle-set Ref analog), sizeof,
+// LogicalAnd/Or short-circuit, and ternary. Output-identity holds because the
+// delegated arms keep their subtle evaluation-order / cycle-set / short-circuit
+// semantics verbatim; only their CHILDREN re-enter the driver.
 [[nodiscard]] ConstEvalResult
-evalImpl(NodeId                              expr,
+evalNode(NodeId                              expr,
          CstEvalContext const&               ctx,
          CstEvalEnvironment const&           env,
          EvalOptions const&                  options,
@@ -209,44 +412,12 @@ evalImpl(NodeId                              expr,
             }
             return ok(makeBoolLiteral(*bIsTrueOpt ? 1 : 0));
         }
-        // Plain arithmetic / bitwise / comparison.
-        auto opK = opFromName(e->target);
-        if (!opK.has_value()) {
-            return fail(ConstEvalFailure::UnsupportedOperator, expr);
-        }
+        // Plain arithmetic / bitwise / comparison. DEAD-VIA-DRIVER fallback
+        // (the driver flattens this case): fold LHS then RHS (left-to-right)
+        // then route through the SHARED epilogue.
         ConstEvalResult a = evalImpl(lhsN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-        if (!a.value.has_value()) return a;
         ConstEvalResult b = evalImpl(rhsN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-        if (!b.value.has_value()) return b;
-        bool const eitherFloat = isFloatValue(*a.value) || isFloatValue(*b.value);
-        if (eitherFloat) {
-            if (!options.allowFloat) {
-                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-            }
-            ConstEvalFailure why = ConstEvalFailure::None;
-            if (auto folded = applyBinaryFloat(*opK, *a.value, *b.value, why);
-                folded.has_value()) {
-                return ok(std::move(*folded));
-            }
-            return fail(why != ConstEvalFailure::None
-                            ? why : ConstEvalFailure::UnsupportedOperator,
-                        expr);
-        }
-        if (!asInt64(*a.value).has_value() || !asInt64(*b.value).has_value()) {
-            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-        }
-        ConstEvalFailure why = ConstEvalFailure::None;
-        if (auto folded = applyBinaryInt(*opK, *a.value, *b.value, options, why);
-            folded.has_value()) {
-            // Tag the result core. Comparisons → Bool; arithmetic
-            // inherits the LHS's core (no TypeInterner / commonType
-            // available at the CST level — semantic-time consumers
-            // only read `.value`, not `.core`).
-            if (isComparison(*opK)) folded->core = TypeKind::Bool;
-            return ok(std::move(*folded));
-        }
-        if (why != ConstEvalFailure::None) return fail(why, expr);
-        return fail(ConstEvalFailure::UnsupportedOperator, expr);
+        return combineBinaryCst(expr, *e, options, std::move(a), std::move(b));
     }
 
     // Unary expression: [OP-token, operand (internal)].
@@ -268,32 +439,10 @@ evalImpl(NodeId                              expr,
         if (e->target == "AddressOf" || e->target == "Deref") {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
-        auto opK = opFromName(e->target);
-        if (!opK.has_value()) {
-            return fail(ConstEvalFailure::UnsupportedOperator, expr);
-        }
+        // DEAD-VIA-DRIVER fallback: fold the operand then route through the
+        // SHARED epilogue.
         ConstEvalResult inner = evalImpl(operandN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-        if (!inner.value.has_value()) return inner;
-        if (isFloatValue(*inner.value)) {
-            if (!options.allowFloat) {
-                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-            }
-            ConstEvalFailure why = ConstEvalFailure::None;
-            if (auto folded = applyUnaryFloat(*opK, *inner.value, why);
-                folded.has_value()) {
-                return ok(std::move(*folded));
-            }
-            return fail(why != ConstEvalFailure::None
-                            ? why : ConstEvalFailure::UnsupportedOperator,
-                        expr);
-        }
-        if (!asInt64(*inner.value).has_value()) {
-            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-        }
-        if (auto folded = applyUnaryInt(*opK, *inner.value); folded.has_value()) {
-            return ok(std::move(*folded));
-        }
-        return fail(ConstEvalFailure::UnsupportedOperator, expr);
+        return combineUnaryCst(expr, *e, options, std::move(inner));
     }
 
     // Ternary expression: visible children [cond, '?', then, ':', else].
@@ -352,6 +501,133 @@ evalImpl(NodeId                              expr,
         }
     }
     return fail(ConstEvalFailure::NotAConstantExpression, expr);
+}
+
+// ── Plan 24 Stage 6 — the iterative CST const-fold driver ──────────────────
+// A POD work-stack frame for ONE flattened straight-line arm. `phase`
+// 0 = enter the (last/only) child; Binary phase 1 = enter the second child
+// (after stashing the first folded result in `c0`); the final phase pops and
+// combines into `result`. PassThrough (wrapper/paren descent) and Unary are
+// single-child (phase 0 enters, phase 1 combines/forwards). `entry` points into
+// the loaded config (stable for the whole call) — safe to stash. Mirrors the
+// Stage-4 hir_to_mir `ValueFrame` idiom + realloc-safe rule (copy frame fields
+// to locals and advance `phase` BEFORE any `enter`; copy `result` out before
+// `pop_back`).
+struct CstFoldFrame {
+    enum class Kind : std::uint8_t { PassThrough, Unary, Binary } kind;
+    NodeId                  node;
+    std::uint8_t            phase;
+    HirOperatorEntry const* entry;  // Unary/Binary: resolved operator entry
+    ConstEvalResult         c0;     // Binary: the folded LHS (between phase 1 and 2)
+};
+
+[[nodiscard]] ConstEvalResult
+evalImpl(NodeId                              expr,
+         CstEvalContext const&               ctx,
+         CstEvalEnvironment const&           env,
+         EvalOptions const&                  options,
+         std::uint32_t                       currentScopeOpaque,
+         std::unordered_set<std::uint32_t> & visitedInitNodes) {
+    Tree const&              tree = ctx.tree;
+    HirLoweringConfig const& cfg  = ctx.schema.hirLowering();
+
+    std::vector<CstFoldFrame> work;
+    // `enter` ALWAYS assigns `result` for a delegated node, and every pushed
+    // frame delivers into `result` before it is read (then popped), so this
+    // sentinel never leaks.
+    ConstEvalResult result = fail(ConstEvalFailure::NotAConstantExpression, expr);
+
+    // Classify `n`: push a frame for a flattenable straight-line arm (plain
+    // BinaryOp / unary / transparent wrapper), else fold it here via `evalNode`
+    // (delegating; its children re-enter this driver). The plan helpers gate on
+    // the EXACT same conditions `evalNode`'s arms would, so a malformed /
+    // logical / assign / non-foldable shape delegates and is handled there
+    // byte-identically. NOTE: `enter` (push) MUST be the LAST action of any
+    // caller path that copied out its frame fields — `work.back()` may dangle.
+    auto const enter = [&](NodeId n) {
+        if (n.valid() && tree.kind(n) == NodeKind::Internal) {
+            auto kids = visibleChildren(tree, n);
+            if (auto bp = plainBinaryPlan(tree, cfg, n, kids)) {
+                // Operands (lhsN/rhsN) are re-derived from `node` in the loop via
+                // the SAME deterministic plan helper (realloc-safe: no dangling
+                // child NodeId stored across a `work` realloc).
+                work.push_back({.kind = CstFoldFrame::Kind::Binary,
+                                .node = n, .phase = 0, .entry = bp->entry});
+                return;
+            }
+            if (auto up = unaryPlan(tree, cfg, n, kids)) {
+                work.push_back({.kind = CstFoldFrame::Kind::Unary,
+                                .node = n, .phase = 0, .entry = up->entry});
+                return;
+            }
+            if (NodeId const child = wrapperChild(tree, cfg, n, kids); child.valid()) {
+                work.push_back({.kind = CstFoldFrame::Kind::PassThrough,
+                                .node = child, .phase = 0, .entry = nullptr});
+                return;
+            }
+        }
+        // Delegate (token leaf / sizeof / logical short-circuit / ternary /
+        // malformed straight-line arm → fail loud, byte-identical to recursive).
+        result = evalNode(n, ctx, env, options, currentScopeOpaque, visitedInitNodes);
+    };
+
+    enter(expr);
+    while (!work.empty()) {
+        CstFoldFrame& f = work.back();
+        switch (f.kind) {
+        case CstFoldFrame::Kind::PassThrough:
+            // The wrapper's single child IS `f.node` (stored at push). Enter it
+            // and pop in one step — its folded `result` is the wrapper's result.
+            {
+                NodeId const childN = f.node;
+                work.pop_back();
+                enter(childN);   // may push a deeper frame or set `result`
+            }
+            break;
+        case CstFoldFrame::Kind::Unary:
+            if (f.phase == 0) {
+                f.phase = 1;
+                // Re-derive the operand from the node (realloc-safe: kids is a
+                // fresh local; the plan helper is deterministic).
+                auto kids = visibleChildren(tree, f.node);
+                NodeId const operandN = unaryPlan(tree, cfg, f.node, kids)->operandN;
+                enter(operandN);            // build operand — may invalidate `f`
+            } else {
+                NodeId const          node2 = f.node;
+                HirOperatorEntry const* e   = f.entry;
+                ConstEvalResult operand = std::move(result);
+                work.pop_back();
+                result = combineUnaryCst(node2, *e, options, std::move(operand));
+            }
+            break;
+        case CstFoldFrame::Kind::Binary:
+            // LHS first (phase 0→1), then RHS (phase 1→2) — matching the
+            // recursive `a = evalImpl(lhsN); b = evalImpl(rhsN);` (two
+            // SEQUENTIAL statements → left-to-right, platform-independent).
+            if (f.phase == 0) {
+                f.phase = 1;
+                auto kids = visibleChildren(tree, f.node);
+                NodeId const lhsN = plainBinaryPlan(tree, cfg, f.node, kids)->lhsN;
+                enter(lhsN);                // build LHS — may invalidate `f`
+            } else if (f.phase == 1) {
+                f.c0 = std::move(result);   // LHS result
+                f.phase = 2;
+                auto kids = visibleChildren(tree, f.node);
+                NodeId const rhsN = plainBinaryPlan(tree, cfg, f.node, kids)->rhsN;
+                enter(rhsN);                // build RHS — may invalidate `f`
+            } else {
+                NodeId const          node2 = f.node;
+                HirOperatorEntry const* e   = f.entry;
+                ConstEvalResult lhs = std::move(f.c0);
+                ConstEvalResult rhs = std::move(result);
+                work.pop_back();
+                result = combineBinaryCst(node2, *e, options,
+                                          std::move(lhs), std::move(rhs));
+            }
+            break;
+        }
+    }
+    return result;
 }
 
 } // namespace

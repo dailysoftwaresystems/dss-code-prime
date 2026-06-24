@@ -2,6 +2,7 @@
 // Builds HIR programmatically (no parser dependency) and exercises each
 // foldable + each refuse-to-fold case against `evaluateConstant`.
 
+#include "core/substrate/large_stack_call.hpp"
 #include "core/types/aggregate_layout.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -1286,4 +1287,95 @@ TEST(ConstEval, SizeOfFoldsOnlyWithTypeSizeResolver) {
         EXPECT_EQ(std::get<std::uint64_t>(res.value->value), 8u);
         EXPECT_EQ(res.value->core, TypeKind::U64);
     }
+}
+
+// ── Plan 24 Stage 6 — deep const-fold flatten pins (SF-4) ──────────────────
+// `evaluateConstant` (src/hir/const_eval.cpp) is now an explicit WORK-STACK
+// DRIVER for the deep STRAIGHT-LINE arms (BinaryOp / UnaryOp / Cast — the arms
+// whose only recursion is `evalImpl(child)`), so a deeply-nested const-expr
+// folds with FLAT O(1) host-stack cost per nesting level instead of one host
+// frame per level. These pins fold a ~3000-deep chain and assert the EXACT
+// value — the byte-identity correctness witness at depth (any phase/combine-
+// order bug yields the wrong value → red).
+//
+// WITNESS SPLIT (mirrors the MIR IterativeDeep pins): the build + fold +
+// teardown run on the 64 MiB worker (runOnLargeStack) so the ORTHOGONAL
+// per-node HIR-teardown recursion (which overflows a stock main stack at this
+// depth, independent of the fold) is removed — isolating the property under
+// test (the FOLD is flat) from an unrelated destructor-recursion artifact. The
+// flat/host-stack-overflow RUN witness for the fold itself lives in the CORPUS
+// (`deep_global_const_init` folds a deep global initializer through the real
+// pipeline on the DEFAULT stack and would crash rc-127 if the driver recursed).
+//
+// RED-ON-DISABLE: reverting the driver to recursion makes the deep fold recurse
+// ~3000 frames; on the worker the value still computes (so these pins stay green
+// — they pin VALUE byte-identity, not the overflow), but the corpus crashes. A
+// combine-order regression (e.g. swapping LHS/RHS fold order, or a wrong-phase
+// pop) corrupts the folded value here → red. Depth 3000 is ~12x the parser's
+// 256 cap and far past any shallow output-identity test above.
+TEST(ConstEval, IterativeDeepBinaryChainFoldsFlatAndByteIdentical) {
+    constexpr std::int64_t kDepth = 3000;   // # of Sub nodes (chain levels)
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+        Rig r;
+        TypeId const i32 = r.intT();
+        // Left-assoc SUBTRACTION spine `((((5000 - 1) - 1) - 1) … )` (kDepth
+        // levels) → 5000 - kDepth == 2000. Subtraction is NON-commutative AND
+        // non-associative, so the value is a strict witness of BOTH the
+        // left-to-right LHS-then-RHS fold ORDER (a swapped combine `1 - prev`
+        // diverges immediately) AND every level being folded exactly once (a
+        // dropped/duplicated level drifts the result). RED on a phase/combine-
+        // order regression.
+        HirNodeId cur = r.litInt(5000, i32);
+        for (std::int64_t i = 0; i < kDepth; ++i)
+            cur = r.binary(HirOpKind::Sub, cur, r.litInt(1, i32), i32);
+        Hir hir = r.finishWith(cur);
+        auto res = evaluateConstant(hir, r.interner, r.literals, cur);
+        ASSERT_TRUE(res.value.has_value()) << "deep Sub chain must fold";
+        EXPECT_EQ(std::get<std::int64_t>(res.value->value), 5000 - kDepth);  // 2000
+    });
+}
+
+TEST(ConstEval, IterativeDeepUnaryChainFoldsFlatAndByteIdentical) {
+    constexpr std::int64_t kDepth = 3001;   // ODD # of Neg nodes → sign flips
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+        Rig r;
+        TypeId const i32 = r.intT();
+        // `-(-(-(…-(7))))` with an ODD count of negations → -7 (parity-sensitive:
+        // a single dropped/duplicated Neg level flips the sign → red).
+        HirNodeId cur = r.litInt(7, i32);
+        for (std::int64_t i = 0; i < kDepth; ++i) cur = r.unary(HirOpKind::Neg, cur, i32);
+        Hir hir = r.finishWith(cur);
+        auto res = evaluateConstant(hir, r.interner, r.literals, cur);
+        ASSERT_TRUE(res.value.has_value()) << "deep Neg chain must fold";
+        EXPECT_EQ(std::get<std::int64_t>(res.value->value), -7);
+    });
+}
+
+TEST(ConstEval, IterativeDeepCastChainFoldsFlatAndByteIdentical) {
+    constexpr std::int64_t kDepth = 3000;   // # of nested casts
+    dss::substrate::runOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes, [&] {
+        Rig r;
+        TypeId const i32 = r.intT();
+        TypeId const i64 = r.i64T();
+        // Alternate (I64)(I32)(I64)…(99) so each level is a real width conversion
+        // routed through the single-child Cast frame; the int 99 round-trips
+        // unchanged → folds to 99. NOTE (honest witness scope): a cast chain
+        // converges to a fixed point, so this pin canNOT detect a dropped Cast
+        // level by value (the Cast frame is single-child — there is no operand
+        // ORDER to corrupt either). Its job is narrower: drive the Cast frame
+        // 3000 levels deep and confirm it folds WITHOUT corruption/crash on the
+        // value path (a mis-popped frame would crash or yield garbage, not 99).
+        // The exact byte-identity of the Cast arm is covered by the shallow Cast
+        // goldens above; the BinaryOp pin is the strong combine-order witness.
+        HirNodeId cur = r.litInt(99, i32);
+        for (std::int64_t i = 0; i < kDepth; ++i)
+            cur = r.cast(cur, (i % 2 == 0) ? i64 : i32);
+        Hir hir = r.finishWith(cur);
+        auto res = evaluateConstant(hir, r.interner, r.literals, cur);
+        ASSERT_TRUE(res.value.has_value()) << "deep Cast chain must fold";
+        EXPECT_EQ(std::get<std::int64_t>(res.value->value), 99);
+    });
 }
