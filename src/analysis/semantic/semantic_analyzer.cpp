@@ -1540,25 +1540,41 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
 //                 proto→proto, extern→extern, proto↔extern).
 //   definition → definition : two bodies / two storage definitions (incl. two
 //                 `int g;` tentative defs) → S_RedeclaredSymbol.
-// CATEGORY GUARD: a function and an OBJECT of the same name never merge — different
-// categories → a genuine collision. A signature/type mismatch on a merged pair fails
-// loud AFTER Pass 1.5 (S_IncompatibleRedeclaration) once both types resolve.
+// CATEGORY GUARD: a non-defining declaration MERGES only with a declaration of the
+// SAME declaration category — Function, Variable, Type, or Table. A function and an
+// OBJECT (Variable), a typedef (Type) and an object/function, or any future Table vs
+// object of the same name are DIFFERENT categories → a genuine collision, never a
+// merge. A signature/type mismatch on a merged pair fails loud AFTER Pass 1.5
+// (S_IncompatibleRedeclaration) once both types resolve.
+//
+// The category is the PRECISE DeclarationKind, with one normalization: a bare
+// prototype is Variable-kind until Pass 1.5 upgrades it (it sets isProtoDeclaration),
+// so a proto maps to Function. Variable / Type / Table stay DISTINCT — a coarse
+// function-vs-non-function split would lump a typedef (Type) and a same-named extern
+// object (Variable) into one category and silently absorb the extern into the typedef
+// (`typedef int g; extern int g;`), losing the C 6.7p4 fail-loud.
 //
 // Shared by BOTH Pass-1 minting paths (declarator-mode and legacy positional) so a
 // proto/extern and its definition merge regardless of which path mints each — e.g.
 // c-subset's `extern` (positional) and its definition (declarator-mode topLevelDecl).
-// `newIsFnCategory` = the new decl is function-category (Function-kind or a bare
-// proto); `newNonDef` = the new decl is non-defining (proto or extern).
+// Both paths mint `newId` with its final `kind`/`isProtoDeclaration` BEFORE this call,
+// so the category is read directly from each record. `newNonDef` = the new decl is
+// non-defining (proto or extern).
 void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
                                  ScopeId bindScope, std::string const& name,
                                  NodeId nameNode, SymbolId prior, SymbolId newId,
-                                 bool newIsFnCategory, bool newNonDef) {
+                                 bool newNonDef) {
     auto& priorRec = s.symbols.at(prior);
     bool const priorNonDef =
         priorRec.isProtoDeclaration || priorRec.isExternDeclaration;
-    bool const priorIsFnCategory =
-        priorRec.kind == DeclarationKind::Function || priorRec.isProtoDeclaration;
-    bool const sameCategory = (priorIsFnCategory == newIsFnCategory);
+    // Precise declaration category: a proto (kind Variable + isProtoDeclaration,
+    // pre-upgrade) counts as Function; Variable / Type / Table stay distinct.
+    auto category = [](SymbolRecord const& r) {
+        if (r.kind == DeclarationKind::Function || r.isProtoDeclaration)
+            return DeclarationKind::Function;
+        return r.kind;
+    };
+    bool const sameCategory = category(priorRec) == category(s.symbols.at(newId));
     bool const bothDefinitions = !priorNonDef && !newNonDef;
     if (sameCategory && !bothDefinitions) {
         if (priorNonDef && !newNonDef) {
@@ -1765,15 +1781,13 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         SymbolId const prior =
                             s.scopes.bind(bindScope, name, newId);
                         if (prior.valid()) {
-                            // A bare proto is Variable-kind until Pass 1.5 upgrades
-                            // it; an extern function is already Function-kind. Both
-                            // are function-CATEGORY. A real function definition is
+                            // The new decl's category (Function via Function-kind or a
+                            // bare proto, else Variable/Type/Table) is read from its
+                            // record inside the helper. A real function definition is
                             // Function-kind and non-`isExtern`.
-                            bool const newIsFnCategory =
-                                effectiveKind == DeclarationKind::Function || isProto;
                             mergeOrCollideRedeclaration(
                                 s, tree, bindScope, name, nameNode, prior, newId,
-                                newIsFnCategory, /*newNonDef=*/isProto || isExtern);
+                                /*newNonDef=*/isProto || isExtern);
                         } else {
                             s.nodeToSymbol.set(nameNode, newId);
                         }
@@ -1898,11 +1912,9 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // The TAG namespace keeps the plain collision (tags have no
                         // proto/extern axis).
                         if (bindNs == SymbolNamespace::Ordinary) {
-                            bool const newIsFnCategory =
-                                effectiveKind == DeclarationKind::Function;
                             mergeOrCollideRedeclaration(
                                 s, tree, bindScope, resolved.name, resolved.node,
-                                prior, newId, newIsFnCategory,
+                                prior, newId,
                                 /*newNonDef=*/decl.nonDefiningDeclaration);
                         } else {
                             ParseDiagnostic d;

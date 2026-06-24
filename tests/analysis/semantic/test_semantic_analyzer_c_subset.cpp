@@ -408,6 +408,34 @@ TEST(SemanticAnalyzerCSubset, ValidAssignStmtsRemainClean) {
     EXPECT_FALSE(model.hasErrors());
 }
 
+// (c2) Valid assignment statements to NON-trivial LVALUES — a DEREF store
+// (`*p = v`), an ARRAY-ELEMENT store (`a[i] = v`), and a MEMBER store (`s.m = v`) —
+// stay byte-identically CLEAN (zero S_TypeMismatch). The assignability check reads
+// the LHS via subtreeType, which returns the lvalue's VALUE type for a deref /
+// index / member-access, so each compatible store is admitted. This guards the
+// lvalue-shaped LHS forms the plain-variable cases above do not exercise.
+TEST(SemanticAnalyzerCSubset, ValidLvalueStoreAssignStmtsRemainClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int m; };\n"
+        "int main(void) {\n"
+        "  int a[4]; int x; int* p; struct S s;\n"
+        "  p = &x;\n"
+        "  *p = 5;\n"        // deref store: int <- int
+        "  a[2] = 7;\n"      // array-element store: int <- int
+        "  s.m = 9;\n"       // member store: int <- int
+        "  return a[2] + s.m + *p;\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "a deref store (*p=v), an array-element store (a[i]=v), and a member "
+           "store (s.m=v) of a compatible value must each stay clean — subtreeType "
+           "returns the lvalue's value type for the assignability check";
+    EXPECT_FALSE(model.hasErrors());
+}
+
 // (d) A COMPOUND assignment is NOT routed through the plain-assignment check:
 // `x += y` is `x = x + y` whose result is the arithmetic common type converted
 // back to x (the usual-arithmetic path, not assignability). The plain-vs-compound
@@ -2953,6 +2981,58 @@ TEST(SemanticAnalyzerCSubset, ExternFunctionVsObjectCrossCategoryCollides) {
                         DiagnosticCode::S_RedeclaredSymbol), 1u)
         << "a function and an object of the same name are different categories — "
            "they must collide, not merge";
+}
+
+// (i) Negative (fail-loud REGRESSION GUARD): a TYPEDEF (kind Type) and a same-named
+// extern OBJECT (kind Variable) are DIFFERENT declaration categories and must NOT
+// merge — a genuine S_RedeclaredSymbol (C 6.7p4: a typedef and an object of the same
+// name in one scope conflict). The merge-or-collide guard splits on the PRECISE
+// DeclarationKind; a coarse function-vs-non-function split would lump Type and
+// Variable together and silently absorb the extern into the typedef.
+// RED-ON-DISABLE: replace the precise `category()` with the coarse
+// `priorIsFnCategory == newIsFnCategory` (both Type and Variable are "non-function"
+// → sameCategory, extern non-defining → MERGE) and this count falls to 0 — the
+// typedef+extern pair is silently accepted.
+TEST(SemanticAnalyzerCSubset, TypedefVsExternObjectCrossCategoryCollides) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int g;\n"
+        "extern int g;\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a typedef (Type) and a same-named extern object (Variable) are different "
+           "categories — they must collide, not silently merge";
+}
+
+// (j) Same regression guard, extern FUNCTION variant: a typedef (Type) and a same-
+// named extern FUNCTION (Function) are different categories → S_RedeclaredSymbol.
+// RED-ON-DISABLE: under the coarse split Type is "non-function" and the extern
+// function is "function" → already differ → this variant would still collide even
+// pre-fix; it guards that the PRECISE split keeps the (correct) collision rather
+// than over-merging once Type stops being lumped with Variable.
+TEST(SemanticAnalyzerCSubset, TypedefVsExternFunctionCrossCategoryCollides) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int g;\n"
+        "extern int g(void);\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a typedef (Type) and a same-named extern function (Function) are "
+           "different categories — they must collide";
+}
+
+// (k) Reverse order: extern OBJECT first (Variable), then a same-named TYPEDEF
+// (Type). The category guard reads BOTH records, so the collision holds regardless
+// of which side is prior — symmetry pin for the precise-category fix.
+TEST(SemanticAnalyzerCSubset, ExternObjectThenTypedefCrossCategoryCollides) {
+    auto model = analyzeShipped("c-subset", {
+        "extern int g;\n"
+        "typedef int g;\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "extern object (Variable) then typedef (Type) of the same name — "
+           "different categories, must collide in either order";
 }
 
 // ── C 6.2.3 TAG NAMESPACE (closes the tag-namespace residue of
