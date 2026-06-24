@@ -913,25 +913,165 @@ struct Lowerer {
     }
 
     // ── expressions ───────────────────────────────────────────────────────────
+    //
+    // D-PARSE-DEEP-NEST-RECURSION-MEMORY (plan 24 Stage 3): `lowerExpr` is an
+    // EXPLICIT HEAP WORK-STACK driver — NOT host recursion — for the DEEP arms
+    // (parenthesized/wrapper descent, the PLAIN binary operands, and the unary
+    // operand). A deeply-nested chain of those forms therefore carries flat O(N)
+    // host-stack cost (only the worker thread's heap-backed `work` vector grows),
+    // closing the dominant deep cases. EVERY OTHER arm (Comma/Assign in
+    // lowerBinary, ternary, postfix incl. Call/Index/Member/PostInc, cast,
+    // sizeof, the operand leaf/identifier terminals, classifyLvalue, lowerFlatExpr)
+    // DELEGATES to its existing recursive helper UNCHANGED — those helpers call
+    // `lowerExpr` for their own operands, which re-enters this driver, so a deep
+    // operand nested inside a shallow complex arm still flattens. **OUTPUT-IDENTITY
+    // is THE gate** (the full ctest suite is the oracle): the emitted HIR — nodes,
+    // types, literal-pool order, arena order — is byte-for-byte identical to the
+    // prior recursive form. The plain-binary frame builds the RHS subtree BEFORE
+    // the LHS (the recursive form was `combineBinary(node, e, lowerExpr(lhs),
+    // lowerExpr(rhs))`, whose argument evaluation builds rhs-then-lhs on the host
+    // toolchain) so the literal pool / arena fill in the SAME order. The parser's
+    // `P_ExpressionTooDeep` cap is UNCHANGED and still the positioned backstop.
+
+    // One work-stack frame. Only the DEEP arms allocate a frame; the per-arm
+    // `phase` machine pushes ONE child (via `enter`, which only ever PUSHES — it
+    // does not recurse — so the descent is driven by the loop, keeping host-stack
+    // cost flat O(1) per level) or finishes and delivers its `E` into the shared
+    // `result` slot. A frame reference `f = work.back()` DANGLES after any
+    // `enter`/`push_back`, so each phase reads/copies every field it needs OUT of
+    // `f` and advances `f.phase` BEFORE calling `enter` (the Stage-1/2 idiom).
+    struct ExprFrame {
+        enum class Kind : std::uint8_t { PassThrough, Binary, Unary } kind;
+        NodeId                  node;    // the source node (provenance / combine anchor)
+        std::uint8_t            phase;
+        NodeId                  n0;      // PassThrough inner / binary lhs / unary operand
+        NodeId                  n1;      // binary rhs
+        HirOperatorEntry const* e;       // binary / unary op entry
+        E                       c0;      // first child result delivered (binary rhs)
+    };
+
+    // The public expression-lowering entry: a driver over an explicit work-stack.
+    // `enter` classifies a node (TERMINAL → set `result`; DEEP arm → push a
+    // phase-0 frame and return WITHOUT recursing); the loop runs each frame's
+    // phase machine, calling `enter` for the next child. Dispatch ORDER matches
+    // the prior recursive `lowerExpr` / `lowerOperand` exactly → byte-identical.
     E lowerExpr(NodeId node) {
-        if (auto npc = nullPointerConstantLiteral(node)) return *npc;
-        if (tree().kind(node) == NodeKind::Internal) {
-            std::uint32_t const r = tree().rule(node).v;
-            if (cfg.flatExprRule.valid() && r == cfg.flatExprRule.v)
-                return lowerFlatExpr(node);   // HR10: SQL-style flat expression
-            if (r == cfg.operandRule.v)     return lowerOperand(node);
-            if (r == cfg.binaryExprRule.v)  return lowerBinary(node);
-            if (r == cfg.unaryExprRule.v)   return lowerUnary(node);
-            if (r == cfg.postfixExprRule.v) return lowerPostfix(node);
-            if (cfg.ternaryExprRule.valid() && r == cfg.ternaryExprRule.v)
-                return lowerTernary(node);
-            // Unknown wrapper (e.g. an `expression` node): descend through a
-            // single meaningful child.
-            NodeId only = soleMeaningfulChild(node);
-            if (only.valid()) return lowerExpr(only);
+        std::vector<ExprFrame> work;
+        // Default-init (no node emitted): `enter` ALWAYS assigns `result` for a
+        // terminal, and every pushed frame eventually delivers into `result`
+        // before it is read, so this never leaks an Error node.
+        E result{};
+
+        auto const enter = [&](NodeId n) {
+            if (auto npc = nullPointerConstantLiteral(n)) { result = *npc; return; }
+            if (tree().kind(n) == NodeKind::Internal) {
+                std::uint32_t const r = tree().rule(n).v;
+                if (cfg.flatExprRule.valid() && r == cfg.flatExprRule.v) {
+                    result = lowerFlatExpr(n); return;   // HR10: SQL flat expression
+                }
+                if (r == cfg.operandRule.v) {
+                    // The operand TERMINAL forms (leaf literal / cast / sizeof /
+                    // compound-literal / va_* / label-address routing / identifier)
+                    // resolve here; ONLY the plain `( expression )` wrapper returns
+                    // nullopt → descend into its inner node via the work-stack.
+                    NodeId inner{};
+                    if (auto term = lowerOperandTerminal(n, inner)) { result = *term; return; }
+                    work.push_back({ExprFrame::Kind::PassThrough, n, 0, inner, {}, nullptr, {}});
+                    return;
+                }
+                if (r == cfg.binaryExprRule.v) {
+                    // Comma / Assign keep their bespoke emission (ExprStmt / SeqExpr)
+                    // in `lowerBinary` — they re-enter `lowerExpr` for their operands.
+                    // Only the PLAIN binary operands flatten through a frame.
+                    NodeId lhsN{}, rhsN{}, opTok{};
+                    for (NodeId c : visible(n)) {
+                        if (isToken(c)) { if (!opTok.valid()) opTok = c; continue; }
+                        if (!lhsN.valid()) lhsN = c; else if (!rhsN.valid()) rhsN = c;
+                    }
+                    HirOperatorEntry const* e = plainBinaryEntry(n, opTok, lhsN, rhsN);
+                    if (e == nullptr) { result = lowerBinary(n); return; }  // malformed/Comma/Assign
+                    work.push_back({ExprFrame::Kind::Binary, n, 0, lhsN, rhsN, e, {}});
+                    return;
+                }
+                if (r == cfg.unaryExprRule.v) {
+                    NodeId opTok{}, operandN{};
+                    for (NodeId c : visible(n)) {
+                        if (isToken(c)) { if (!opTok.valid()) opTok = c; continue; }
+                        if (!operandN.valid()) operandN = c;
+                    }
+                    HirOperatorEntry const* e = unaryEntry(n, opTok, operandN);
+                    if (e == nullptr) { result = lowerUnary(n); return; }  // malformed/unmapped
+                    work.push_back({ExprFrame::Kind::Unary, n, 0, operandN, {}, e, {}});
+                    return;
+                }
+                if (r == cfg.postfixExprRule.v) { result = lowerPostfix(n); return; }
+                if (cfg.ternaryExprRule.valid() && r == cfg.ternaryExprRule.v) {
+                    result = lowerTernary(n); return;
+                }
+                // Unknown wrapper (e.g. an `expression` node): descend through a
+                // single meaningful child via the work-stack.
+                NodeId only = soleMeaningfulChild(n);
+                if (only.valid()) {
+                    work.push_back({ExprFrame::Kind::PassThrough, n, 0, only, {}, nullptr, {}});
+                    return;
+                }
+            }
+            unsupported(n, "expression form has no hirLowering mapping");
+            result = {errorNode(n), InvalidType};
+        };
+
+        enter(node);
+        while (!work.empty()) {
+            ExprFrame& f = work.back();
+            switch (f.kind) {
+            case ExprFrame::Kind::PassThrough:
+                // A paren / wrapper: descend into the inner node (phase 0), then
+                // pass its `E` through unchanged (phase 1).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const inner = f.n0;
+                    enter(inner);           // may invalidate `f`
+                } else {
+                    work.pop_back();        // `result` already holds the inner E
+                }
+                break;
+            case ExprFrame::Kind::Binary:
+                // RHS first (phase 0→1), then LHS (phase 1→2) — matching the
+                // recursive `combineBinary(node, e, lowerExpr(lhs), lowerExpr(rhs))`
+                // whose arguments build rhs-then-lhs on the host toolchain.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const rhsN = f.n1;
+                    enter(rhsN);            // build RHS — may invalidate `f`
+                } else if (f.phase == 1) {
+                    f.c0 = result;          // RHS result
+                    f.phase = 2;
+                    NodeId const lhsN = f.n0;
+                    enter(lhsN);            // build LHS — may invalidate `f`
+                } else {
+                    HirOperatorEntry const* e = f.e;
+                    NodeId const node2 = f.node;
+                    E const rhsE = f.c0;
+                    E const lhsE = result;  // LHS result
+                    work.pop_back();
+                    result = combineBinary(node2, *e, lhsE, rhsE);
+                }
+                break;
+            case ExprFrame::Kind::Unary:
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const operandN = f.n0;
+                    enter(operandN);        // build operand — may invalidate `f`
+                } else {
+                    HirOperatorEntry const* e = f.e;
+                    NodeId const node2 = f.node;
+                    work.pop_back();
+                    result = combineUnaryOp(node2, *e, result);
+                }
+                break;
+            }
         }
-        unsupported(node, "expression form has no hirLowering mapping");
-        return {errorNode(node), InvalidType};
+        return result;
     }
 
     // The single non-token child, or invalid if there isn't exactly one.
@@ -963,7 +1103,14 @@ struct Lowerer {
         return std::nullopt;
     }
 
-    E lowerOperand(NodeId node) {
+    // The TERMINAL operand forms (everything except the plain `( expression )`
+    // wrapper). Returns the lowered `E` for a leaf literal / cast / sizeof /
+    // compound-literal / va_* / label-address / identifier / literal operand. For
+    // the plain parenthesized wrapper it sets `descendInto` to the inner internal
+    // child and returns std::nullopt — the `lowerExpr` driver then descends into
+    // that node via the work-stack (so deep `(((...)))` nesting stays flat). The
+    // dispatch ORDER is byte-identical to the prior recursive `lowerOperand`.
+    [[nodiscard]] std::optional<E> lowerOperandTerminal(NodeId node, NodeId& descendInto) {
         // operand = Identifier | <literal token> | <char/string literal>
         //         | ( expression ) | compoundLiteralExpr | castExpr | ...
         if (auto lit = tryLowerLeafLiteral(node)) return *lit;
@@ -1014,7 +1161,10 @@ struct Lowerer {
             }
         }
         for (NodeId c : visible(node)) {
-            if (tree().kind(c) == NodeKind::Internal) return lowerExpr(c);  // paren-wrapped
+            if (tree().kind(c) == NodeKind::Internal) {   // paren-wrapped
+                descendInto = c;
+                return std::nullopt;   // the driver descends into `c` via the work-stack
+            }
         }
         for (NodeId c : visible(node)) {
             if (!isToken(c)) continue;
@@ -1044,18 +1194,28 @@ struct Lowerer {
                 // scalar).
                 if (auto const* erec = model.recordFor(sym)) {
                     if (auto lv = constantLiteralForSymbol(*erec, interner)) {
-                        return {track(builder.makeLiteral(
+                        return E{track(builder.makeLiteral(
                                           type, literals.add(std::move(*lv))), node),
-                                type};
+                                 type};
                     }
                 }
-                return {track(builder.makeRef(type, sym.v), node), type};
+                return E{track(builder.makeRef(type, sym.v), node), type};
             }
             auto lit = litType_.find(tk.v);
             if (lit != litType_.end()) return lowerLiteral(node, c, tk, lit->second);
         }
         unsupported(node, "operand has no Identifier / literal / parenthesized child");
-        return {errorNode(node), InvalidType};
+        return E{errorNode(node), InvalidType};
+    }
+
+    // Thin recursive wrapper kept for completeness (the `lowerExpr` driver no
+    // longer calls it — it routes operands through `lowerOperandTerminal` + the
+    // work-stack). Byte-identical to the prior recursive form: the terminal
+    // forms come straight from the helper, and the plain-paren case recurses.
+    E lowerOperand(NodeId node) {
+        NodeId inner{};
+        if (auto term = lowerOperandTerminal(node, inner)) return *term;
+        return lowerExpr(inner);
     }
 
     // The child rule node of `operand` whose first visible child is `startTok`
@@ -1708,7 +1868,15 @@ struct Lowerer {
             return {errorNode(node), InvalidType};
         }
         HirOperatorEntry const& e = cfg.unaryOps[it->second];
-        E operand = lowerExpr(operandN);
+        return combineUnaryOp(node, e, lowerExpr(operandN));
+    }
+
+    // The unary OP/operand combine, given the ALREADY-lowered operand `E`. Shared
+    // by `lowerUnary` (the recursive entry) and the `lowerExpr` driver's Unary
+    // frame, so the AddressOf / Deref-fold / Not / Neg combine is identical
+    // regardless of how the operand was produced. Byte-identical to the prior
+    // inline tail of `lowerUnary`.
+    E combineUnaryOp(NodeId node, HirOperatorEntry const& e, E operand) {
         if (e.target == "AddressOf") {
             TypeId const result = operand.type.valid() ? interner.pointer(operand.type) : InvalidType;
             return {track(builder.makeAddressOf(operand.id, result), node), result};
@@ -1750,6 +1918,34 @@ struct Lowerer {
         TypeId const result = (*op == HirOpKind::Not) ? boolType() : operand.type;
         return {track(builder.addParent(HirKind::UnaryOp, std::array{operand.id},
                                         result, encodeOp(*op)), node), result};
+    }
+
+    // The operator entry for a UNARY node, or nullptr when the driver must fall
+    // back to `lowerUnary` (malformed node / unmapped operator — both of which
+    // emit the same diagnostic there). Mirrors `lowerUnary`'s extraction + lookup.
+    [[nodiscard]] HirOperatorEntry const*
+    unaryEntry(NodeId node, NodeId opTok, NodeId operandN) {
+        if (!opTok.valid() || !operandN.valid()) return nullptr;   // malformed
+        auto it = unOp_.find(tree().tokenKind(opTok).v);
+        if (it == unOp_.end()) return nullptr;                     // unmapped operator
+        return &cfg.unaryOps[it->second];
+    }
+
+    // The operator entry for a PLAIN binary node — i.e. one whose operands the
+    // driver flattens through a frame (arithmetic / comparison / shift / logical
+    // and-or, all combined by `combineBinary`). Returns nullptr for the bespoke
+    // forms `lowerBinary` owns (Assign → SeqExpr store, Comma → ExprStmt+SeqExpr)
+    // and for malformed/unmapped nodes — the driver then delegates the whole node
+    // to `lowerBinary` unchanged. Mirrors `lowerBinary`'s extraction + lookup so
+    // the same node routes the same way.
+    [[nodiscard]] HirOperatorEntry const*
+    plainBinaryEntry(NodeId node, NodeId opTok, NodeId lhsN, NodeId rhsN) {
+        if (!opTok.valid() || !lhsN.valid() || !rhsN.valid()) return nullptr;  // malformed
+        auto it = binOp_.find(tree().tokenKind(opTok).v);
+        if (it == binOp_.end()) return nullptr;                               // unmapped
+        HirOperatorEntry const& e = cfg.binaryOps[it->second];
+        if (e.target == "Assign" || e.target == "Comma") return nullptr;      // bespoke
+        return &e;
     }
 
     // `cond ? then : else` → a Ternary node. The wrapper holds
