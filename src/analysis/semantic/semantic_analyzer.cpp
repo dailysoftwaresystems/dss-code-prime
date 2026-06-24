@@ -1548,8 +1548,9 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
 // (S_IncompatibleRedeclaration) once both types resolve.
 //
 // The category is the PRECISE DeclarationKind, with one normalization: a bare
-// prototype is Variable-kind until Pass 1.5 upgrades it (it sets isProtoDeclaration),
-// so a proto maps to Function. Variable / Type / Table stay DISTINCT — a coarse
+// prototype is minted Variable-kind + isProtoDeclaration in Pass 1 (Pass 1.5 later
+// upgrades its KIND to Function), so the lambda maps either signal — Function-kind
+// or isProtoDeclaration — to Function. Variable / Type / Table stay DISTINCT — a coarse
 // function-vs-non-function split would lump a typedef (Type) and a same-named extern
 // object (Variable) into one category and silently absorb the extern into the typedef
 // (`typedef int g; extern int g;`), losing the C 6.7p4 fail-loud.
