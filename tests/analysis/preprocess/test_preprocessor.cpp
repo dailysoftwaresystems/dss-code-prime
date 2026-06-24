@@ -1732,6 +1732,23 @@ TEST(Preprocessor, FC15aPasteUsesRawOperand) {
         << "paste uses the RAW operand `X`, not its expansion `foo`";
 }
 
+// audit LOW-1: `##` against `__VA_ARGS__` uses the RAW trailing-args run (the
+// rawVaArgs paste branch). With `#define Y q`, `p ## __VA_ARGS__` invoked as
+// J(x, Y) pastes RAW `x` ## `Y` -> `xY`, NOT `xq` (the raw va-arg, not its
+// expansion). RED-ON-DISABLE: routing the `## __VA_ARGS__` operand through the
+// EXPANDED va-args yields `xq`; dropping the paste leaves `x` `Y` unpasted.
+TEST(Preprocessor, FC15aPasteVaArgsUsesRawRun) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#define Y q\n#define J(p, ...) p ## __VA_ARGS__\nJ(x, Y)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 1u)
+        << "`## __VA_ARGS__` against a single raw trailing token yields one product";
+    EXPECT_EQ(lexs[0], "xY")
+        << "## __VA_ARGS__ pastes the RAW first trailing token `Y`, not its "
+           "expansion `q`";
+}
+
 // F4 (NOT an order claim -- `##` is associative for the product spelling):
 // `a##b##c` collapses BOTH `##` operators into ONE final single token, and the
 // two paste operators reduce to one product. We pin the FINAL token + that the
