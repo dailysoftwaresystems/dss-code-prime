@@ -57,20 +57,23 @@ struct DSS_EXPORT ParserConfig {
     // nesting independently of the builder's checkpoint cap.
     std::size_t maxSpeculationDepth = 8;
 
-    // Recursion-depth cap for the Pratt walker's C++-stack recursion.
-    // EVERY expression-deepening path funnels through one chokepoint
-    // (`parseExpressionAt`): nested parens (via the atom re-entry),
-    // right-assoc RHS chains, prefix operands, and ternary clauses.
-    // Pathological input would otherwise blow the C++ call stack. When
-    // this cap is reached the walker FAILS LOUD with a positioned
-    // `P_ExpressionTooDeep` diagnostic at the offending token and
-    // RECOVERS (Error leaf + panic-scan + graceful unwind) — it does
-    // NOT abort and never risks a raw stack overflow. (Left/None-assoc
-    // chains build ITERATIVELY in the climb loop and never deepen the
-    // stack, so they do not count against this cap regardless of length.)
+    // Nesting-depth cap for the Pratt walker's expression descent. EVERY
+    // expression-deepening path funnels through one chokepoint — a PUSH onto
+    // the parser's explicit `ExprFrame` work-stack: nested parens (via the
+    // atom re-entry), right-assoc RHS chains, prefix operands, and ternary
+    // clauses. The descent is FLAT (D-PARSE-DEEP-NEST-RECURSION-MEMORY, Stage
+    // 5): it carries O(1) host-stack cost, so this cap is no longer a stack-
+    // overflow backstop but a SEMANTIC limit on nesting depth (the work-stack
+    // would otherwise grow heap-unbounded on adversarial input, and the
+    // DOWNSTREAM frontend below still recurses per level). When the cap is
+    // reached the walker FAILS LOUD with a positioned `P_ExpressionTooDeep`
+    // diagnostic at the offending token and RECOVERS (Error leaf + panic-scan
+    // + graceful unwind) — it does NOT abort. (Left/None-assoc chains build
+    // ITERATIVELY in the climb loop and never deepen, so they do not count
+    // against this cap regardless of length.)
     //
-    // The cap (256) is now a real SEMANTIC limit on nesting depth, not a
-    // host-stack artifact. Both former blockers to a high cap are resolved:
+    // The cap (256) is a real SEMANTIC limit on nesting depth, not a host-
+    // stack artifact. Both former blockers to a high cap are resolved:
     // (1) the c-subset `operand` rule's speculative cast-vs-paren probe is
     // no longer super-linear — a config-driven LL(k) predictive prune makes
     // the parse O(N) in nesting depth (D-PARSE-SPECULATION-OPERAND-QUADRATIC,
