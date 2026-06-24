@@ -518,7 +518,7 @@ Mirrors plan 12 §3.1 / plan 13 §3.1. Every deferred item has an explicit owner
               │          │          │
               └──────────┼──────────┘
                          ▼
-                       LK5 ─► LK6 ─► LK10 (cycle 2 ✅ + D-LK10-ENTRY ✅ CLOSED 2026-06-09) ─► FF6 ✅ 3-OS×2-arch (puts runs) ─► [variadic printf ⏳ ─► LK10-full strict-hermetic-gate ⏳]
+                       LK5 ─► LK6 ─► LK10 (cycle 2 ✅ + D-LK10-ENTRY ✅ CLOSED 2026-06-09) ─► FF6 ✅ 3-OS×2-arch (puts runs) ─► variadic printf ✅ (FC12, hello_printf/printf_int run) ─► [LK10-full strict-hermetic-gate ⏳]
                                        │       (entry tramp +     (hello-world)   (cross-OS
                                        │        process-exit +                     acceptance)
                                        │        run-harness;
@@ -529,6 +529,6 @@ Mirrors plan 12 §3.1 / plan 13 §3.1. Every deferred item has an explicit owner
                         (WASM)    (SPIR-V)
 ```
 
-**★ D-LK10-ENTRY ✅ CLOSED 2026-06-09** (Stage 1 + ARM64 + MACHO-EXIT all landed + runtime-confirmed across the v0.0.2 cycles) — it WAS the critical-path gate between "byte-valid executable on disk" and "executable that runs"; that gate is now PASSED on all runnable targets (FF6 hello-world ✅ runs 3-OS × 2-arch). The current frontier is **V2-3 artifactProfile (AP4) / V2-4 program-api CLI**; LK10-full's only residual is the strict no-system-linker hermetic CI gate + variadic `printf`.
+**★ D-LK10-ENTRY ✅ CLOSED 2026-06-09** (Stage 1 + ARM64 + MACHO-EXIT all landed + runtime-confirmed across the v0.0.2 cycles) — it WAS the critical-path gate between "byte-valid executable on disk" and "executable that runs"; that gate is now PASSED on all runnable targets (FF6 hello-world ✅ runs 3-OS × 2-arch). The current frontier is **V2-3 artifactProfile (AP4) / V2-4 program-api CLI**; LK10-full's only residual is the strict no-system-linker hermetic CI gate (variadic `printf` landed with FC12 — `hello_printf`/`printf_int` run).
 
 LK1/LK2/LK3 are parallel. LK4 ties them together. LK5 + LK6 finish the substrate. LK10 is the hermetic acceptance gate. LK8/LK9 are skeletons unblocking 17/18. **LK11** (v1.x) ships post-LK10 — couples with [`08-compilation-unit-plan`](./08-compilation-unit-plan%20-%20tbd.md) CU6 to lift the single-CU-per-image assumption (see §2.12); trigger-gated, not on the v1 critical path.
