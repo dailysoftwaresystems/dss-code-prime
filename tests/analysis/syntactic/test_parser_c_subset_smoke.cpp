@@ -1000,7 +1000,7 @@ TEST(ParserCSubsetSmoke, PostfixChainNestsLeftToRight) {
 // Postfix followed by infix at the same level: `f(a) + g(b)`. The
 // outer infix must roll back through the postfix wrap (postfix
 // intentionally does NOT advance the snap) so the binaryExpr frame
-// rebuilds the LHS chain via its recursive `parseExpressionAt` at
+// rebuilds the LHS chain through the iterative exprWorkStack driver at
 // `prec + 1`. Without that invariant the postfix wraps would land as
 // siblings of the binaryExpr instead of children — fib's
 // `return fib(n-1) + fib(n-2);` was the original reproducer.
@@ -1113,9 +1113,9 @@ TEST(ParserCSubsetSmoke, FunctionCallChainNests) {
 // Paren-wrapped chain: `(f(a)[i])` — the chain lives inside an
 // `operand`'s `( expression )` branch which opens a fresh
 // `expression` frame. The "snap stays valid across postfix iters"
-// invariant lives per-`parseExpressionAt` call, so the inner
-// expression frame's chain must bind to itself, not leak to the
-// outer expression.
+// invariant lives per expression-descent on the exprWorkStack driver,
+// so the inner expression frame's chain must bind to itself, not leak
+// to the outer expression.
 TEST(ParserCSubsetSmoke, ParenWrappedPostfixChainNests) {
     auto h = loadAndTokenize("int main() { (f(a)[i]); }");
     Parser p{h.src, h.schema, std::move(h.stream)};
@@ -1179,8 +1179,8 @@ TEST(ParserCSubsetSmoke, BrokenPostfixChainEmitsDiagnostic) {
 
 // Mixed chain: `*p[i]++` — left-recursive postfix chain interacts
 // with prefix `*` (lower precedence). C semantics: `*( (p[i])++ )`.
-// The prefix's recursive `parseExpressionAt(prefixPrec)` consumes
-// the full chain.
+// The prefix's operand descent at `prefixPrec` (now an iterative
+// exprWorkStack push, not host recursion) consumes the full chain.
 TEST(ParserCSubsetSmoke, PrefixOverPostfixChainNests) {
     auto h = loadAndTokenize("int main() { *p[i]++; }");
     Parser p{h.src, h.schema, std::move(h.stream)};

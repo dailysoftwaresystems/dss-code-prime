@@ -2800,7 +2800,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // operand type (C 6.5.4p2 / 6.3.2.2) — checked
                     // BEFORE the castability matrix, whose entries must
                     // all be mapCast-lowerable (the discard emits no
-                    // Cast node at all; see lowerCast).
+                    // Cast node at all; see combineCast in cst_to_hir).
                     if (operandTy.valid()
                         && !isVoidDiscardCast(s.lattice.interner(), target)
                         && !isExplicitCastable(s.lattice.interner(),

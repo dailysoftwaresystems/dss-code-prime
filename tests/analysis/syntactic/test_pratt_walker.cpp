@@ -78,11 +78,14 @@ constexpr std::string_view kInfixSchema = R"JSON({
 
 // Inline schema whose operand can be a PARENTHESIZED expression:
 // `operand = Identifier | ( expression )`. This is the HEAVIEST
-// expression-recursion path — a nested paren re-enters the Pratt
-// walker through the atom (parsePrimary -> parseUntilFrameDepth ->
-// stepOnce -> walkExpression -> parseExpressionAt), so it exercises
-// the depth guard's chokepoint on the path that consumes the most
-// C++ stack per level. Used by the too-deep diagnostic+recovery pins.
+// expression-nesting path — a nested paren re-enters the Pratt walker
+// through the atom (parsePrimary -> parseUntilFrameDepth -> stepOnce ->
+// walkExpression), driven by the iterative exprWorkStack rather than
+// host recursion, so it exercises the depth guard's chokepoint on the
+// path that drives the most work per level. (The paren/postfix arm is
+// the one descent the iterative driver still re-enters synchronously —
+// plan-24 Stage 5b — but the cap fires the same regardless.) Used by
+// the too-deep diagnostic+recovery pins.
 constexpr std::string_view kParenSchema = R"JSON({
   "dssSchemaVersion": 4,
   "language": { "name": "PrattParen", "version": "0.1.0" },
@@ -121,9 +124,10 @@ constexpr std::string_view kParenSchema = R"JSON({
 })JSON";
 
 // Inline schema with a RIGHT-assoc ternary `?:` (mirrors c-subset's
-// operator-table shape). The ternary else-clause recurses through
-// parseExpressionAt at the operator's own precedence — the path a deep
-// `a?b:a?b:...:c` chain stresses. Declares the `ternary` wrapper rule so
+// operator-table shape). The ternary else-clause descends at the
+// operator's own precedence via the iterative exprWorkStack driver (a
+// heap-stack push, not host recursion) — the path a deep `a?b:a?b:...:c`
+// chain stresses. Declares the `ternary` wrapper rule so
 // the `?` participates (without it the climb drops `?` to the parent).
 constexpr std::string_view kTernarySchema = R"JSON({
   "dssSchemaVersion": 4,
@@ -899,8 +903,8 @@ TEST(PrattWalker, DeeplyNestedParensDiagnoseAtDefaultCapWithoutCrashing) {
 }
 
 // Multi-form coverage: deep PREFIX (`- - - ... x`) trips the SAME guard.
-// Prefix recurses through `parsePrimary`'s prefix arm into
-// parseExpressionAt at the operator's own precedence — a distinct path
+// Prefix descends through `parsePrimary`'s prefix arm onto the iterative
+// exprWorkStack driver at the operator's own precedence — a distinct path
 // from parens/infix, proving the chokepoint covers it too. Asserts >=1
 // (not exactly 1): a long prefix run whose tail exceeds the recovery
 // scan window (`maxSyncScanTokens`) can re-trip once more as the stack
@@ -919,9 +923,9 @@ TEST(PrattWalker, DeepPrefixChainDiagnosesAndRecovers) {
 
 // Multi-form coverage: a deep RIGHT-assoc TERNARY chain
 // (`a?a:a?a:...:a`) trips the SAME guard. The ternary else-clause
-// recurses through parseExpressionAt at the operator's precedence — the
-// right-nesting path. Pinned at a lowered cap so the guard fires well
-// before any stack pressure.
+// descends at the operator's precedence via the iterative exprWorkStack
+// driver — the right-nesting path. Pinned at a lowered cap so the guard
+// fires well before the work-stack grows.
 TEST(PrattWalker, DeepTernaryChainDiagnosesAndRecovers) {
     std::string src = "a";
     for (int i = 0; i < 20; ++i) src += "?a:a";   // 20 nested ternaries

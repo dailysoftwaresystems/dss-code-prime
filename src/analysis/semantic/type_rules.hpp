@@ -302,9 +302,9 @@ namespace detail::type_rules {
 // array-to-pointer conversion BEFORE the cast applies, so
 // `(char*)"str"` is Ptr↔Ptr legality-wise (and `(long)arr` is the
 // Ptr→integer round-trip). The legality view simply re-kinds the
-// operand as Ptr; the HIR lowering (`lowerCast`) emits the SAME
-// synthetic decay Cast the implicit path uses, so the value side
-// always sees pointer-typed input.
+// operand as Ptr; the HIR cast epilogue (`combineCast`, cst_to_hir.cpp)
+// emits the SAME synthetic decay Cast the implicit path uses, so the
+// value side always sees pointer-typed input.
 [[nodiscard]] inline bool isExplicitCastable(TypeInterner const& interner,
                                              TypeId target,
                                              TypeId operand) noexcept {
@@ -339,10 +339,11 @@ namespace detail::type_rules {
 // void itself) is admissible. Kept SEPARATE from `isExplicitCastable`
 // deliberately: everything that matrix admits must be lowerable by
 // MIR's `mapCast`, while a void discard produces NO Cast node at all —
-// `lowerCast` (cst_to_hir.cpp) lowers the operand for its side effects
-// and discards the value (an expression-statement effect). The
-// analyzer's cast-legality site checks this FIRST; a void target never
-// reaches the matrix.
+// the cast epilogue `combineCast` (cst_to_hir.cpp) keeps the operand's
+// already-lowered value (lowered for its side effects) and re-types it
+// void, wrapping it in no Cast node (an expression-statement effect).
+// The analyzer's cast-legality site checks this FIRST; a void target
+// never reaches the matrix.
 [[nodiscard]] inline bool isVoidDiscardCast(TypeInterner const& interner,
                                             TypeId target) noexcept {
     return target.valid() && interner.kind(target) == TypeKind::Void;
