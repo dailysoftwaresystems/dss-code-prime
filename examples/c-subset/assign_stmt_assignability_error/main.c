@@ -9,7 +9,7 @@
 // the init / call-arg / return sites use, positioned at the RHS.
 //
 // `f` is a PARAMETER (no narrowing initializer), so exactly ONE mismatch fires —
-// the `x = f;` statement at 12:7. A valid assignment (`x = 5;`) is unaffected
+// the `x = f;` statement at 22:9 (the RHS). A valid assignment (`x = 5;`) is unaffected
 // (same int<-int path the four checked sites accept). Front-end only
 // (semantic-tier), so any single target witnesses it.
 //
