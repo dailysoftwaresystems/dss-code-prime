@@ -941,13 +941,17 @@ struct Lowerer {
     // `enter`/`push_back`, so each phase reads/copies every field it needs OUT of
     // `f` and advances `f.phase` BEFORE calling `enter` (the Stage-1/2 idiom).
     struct ExprFrame {
-        enum class Kind : std::uint8_t { PassThrough, Binary, Unary } kind;
+        enum class Kind : std::uint8_t { PassThrough, Binary, Unary, Cast, Postfix,
+                                         Ternary, Comma } kind;
         NodeId                  node;    // the source node (provenance / combine anchor)
         std::uint8_t            phase;
-        NodeId                  n0;      // PassThrough inner / binary lhs / unary operand
-        NodeId                  n1;      // binary rhs
-        HirOperatorEntry const* e;       // binary / unary op entry
-        E                       c0;      // first child result delivered (binary rhs)
+        NodeId                  n0;      // PassThrough inner / binary+comma lhs / unary+cast operand / postfix base / ternary cond
+        NodeId                  n1;      // binary+comma rhs / postfix Index subscript / ternary then
+        NodeId                  n2;      // ternary else
+        HirOperatorEntry const* e;       // binary / unary / postfix op entry
+        E                       c0;      // first child result (binary rhs / postfix base / ternary coerced cond / comma ExprStmt effect in .id)
+        E                       c1;      // second child result (ternary then)
+        TypeId                  target;  // cast target type
     };
 
     // The public expression-lowering entry: a driver over an explicit work-stack.
@@ -970,28 +974,52 @@ struct Lowerer {
                     result = lowerFlatExpr(n); return;   // HR10: SQL flat expression
                 }
                 if (r == cfg.operandRule.v) {
-                    // The operand TERMINAL forms (leaf literal / cast / sizeof /
+                    // The operand TERMINAL forms (leaf literal / sizeof /
                     // compound-literal / va_* / label-address routing / identifier)
-                    // resolve here; ONLY the plain `( expression )` wrapper returns
-                    // nullopt → descend into its inner node via the work-stack.
-                    NodeId inner{};
-                    if (auto term = lowerOperandTerminal(n, inner)) { result = *term; return; }
-                    work.push_back({ExprFrame::Kind::PassThrough, n, 0, inner, {}, nullptr, {}});
+                    // resolve here; the plain `( expression )` wrapper and the
+                    // explicit cast `(T)expr` return nullopt → flatten their operand
+                    // recursion via the work-stack (a PassThrough or Cast frame).
+                    NodeId inner{}, castN{};
+                    if (auto term = lowerOperandTerminal(n, inner, castN)) { result = *term; return; }
+                    if (castN.valid()) {
+                        // Resolve the cast target (a pure read of the semantic
+                        // stamps) BEFORE entering the operand — matching the
+                        // recursive `lowerCast` order — then flatten the operand.
+                        NodeId castOperandN{};
+                        TypeId castTarget{};
+                        if (auto err = castPrologue(castN, castOperandN, castTarget)) {
+                            result = *err; return;
+                        }
+                        work.push_back({.kind = ExprFrame::Kind::Cast, .node = castN,
+                                        .n0 = castOperandN, .target = castTarget});
+                        return;
+                    }
+                    work.push_back({.kind = ExprFrame::Kind::PassThrough, .node = n,
+                                    .n0 = inner});
                     return;
                 }
                 if (r == cfg.binaryExprRule.v) {
-                    // Comma / Assign keep their bespoke emission (ExprStmt / SeqExpr)
-                    // in `lowerBinary` — they re-enter `lowerExpr` for their operands.
-                    // Only the PLAIN binary operands flatten through a frame.
+                    // The PLAIN binary operands flatten through a Binary frame; the
+                    // COMMA operator (whose `ExprStmt(lhs)` emits between lhs and
+                    // rhs) flattens through a Comma frame. Assign keeps its bespoke
+                    // classifyLvalue+SeqExpr emission in `lowerBinary`.
                     NodeId lhsN{}, rhsN{}, opTok{};
                     for (NodeId c : visible(n)) {
                         if (isToken(c)) { if (!opTok.valid()) opTok = c; continue; }
                         if (!lhsN.valid()) lhsN = c; else if (!rhsN.valid()) rhsN = c;
                     }
                     HirOperatorEntry const* e = plainBinaryEntry(n, opTok, lhsN, rhsN);
-                    if (e == nullptr) { result = lowerBinary(n); return; }  // malformed/Comma/Assign
-                    work.push_back({ExprFrame::Kind::Binary, n, 0, lhsN, rhsN, e, {}});
-                    return;
+                    if (e != nullptr) {
+                        work.push_back({.kind = ExprFrame::Kind::Binary, .node = n,
+                                        .n0 = lhsN, .n1 = rhsN, .e = e});
+                        return;
+                    }
+                    if (commaBinary(opTok, lhsN, rhsN)) {
+                        work.push_back({.kind = ExprFrame::Kind::Comma, .node = n,
+                                        .n0 = lhsN, .n1 = rhsN});
+                        return;
+                    }
+                    result = lowerBinary(n); return;  // Assign / malformed
                 }
                 if (r == cfg.unaryExprRule.v) {
                     NodeId opTok{}, operandN{};
@@ -1001,18 +1029,41 @@ struct Lowerer {
                     }
                     HirOperatorEntry const* e = unaryEntry(n, opTok, operandN);
                     if (e == nullptr) { result = lowerUnary(n); return; }  // malformed/unmapped
-                    work.push_back({ExprFrame::Kind::Unary, n, 0, operandN, {}, e, {}});
+                    work.push_back({.kind = ExprFrame::Kind::Unary, .node = n,
+                                    .n0 = operandN, .e = e});
                     return;
                 }
-                if (r == cfg.postfixExprRule.v) { result = lowerPostfix(n); return; }
+                if (r == cfg.postfixExprRule.v) {
+                    // Index / Member flatten their base (and Index's subscript)
+                    // through a frame; Call / PostInc / PostDec keep delegating.
+                    NodeId postBaseN{}, postSubN{};
+                    HirOperatorEntry const* postE = nullptr;
+                    PostfixFlatten const plan =
+                        postfixFlattenPlan(n, postBaseN, postSubN, postE);
+                    if (plan == PostfixFlatten::Delegate) { result = lowerPostfix(n); return; }
+                    work.push_back({.kind = ExprFrame::Kind::Postfix, .node = n,
+                                    .n0 = postBaseN, .n1 = postSubN, .e = postE});
+                    return;
+                }
                 if (cfg.ternaryExprRule.valid() && r == cfg.ternaryExprRule.v) {
-                    result = lowerTernary(n); return;
+                    // `cond ? then : else`: flatten cond/then/else through a frame
+                    // (the coerceCondition + arm coercions emit BETWEEN/AFTER child
+                    // lowerings — preserved as phase transitions). Malformed ternary
+                    // (≠3 operands) delegates to lowerTernary's diagnostic.
+                    NodeId condN{}, thenN{}, elseN{};
+                    if (!ternaryOperands(n, condN, thenN, elseN)) {
+                        result = lowerTernary(n); return;
+                    }
+                    work.push_back({.kind = ExprFrame::Kind::Ternary, .node = n,
+                                    .n0 = condN, .n1 = thenN, .n2 = elseN});
+                    return;
                 }
                 // Unknown wrapper (e.g. an `expression` node): descend through a
                 // single meaningful child via the work-stack.
                 NodeId only = soleMeaningfulChild(n);
                 if (only.valid()) {
-                    work.push_back({ExprFrame::Kind::PassThrough, n, 0, only, {}, nullptr, {}});
+                    work.push_back({.kind = ExprFrame::Kind::PassThrough, .node = n,
+                                    .n0 = only});
                     return;
                 }
             }
@@ -1069,6 +1120,118 @@ struct Lowerer {
                     result = combineUnaryOp(node2, *e, result);
                 }
                 break;
+            case ExprFrame::Kind::Cast:
+                // `(T)expr`: the target was resolved at push (phase 0 enters the
+                // operand), then the cast epilogue applies (phase 1).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const operandN = f.n0;
+                    enter(operandN);        // build operand — may invalidate `f`
+                } else {
+                    NodeId const node2 = f.node;
+                    TypeId const target = f.target;
+                    work.pop_back();
+                    result = combineCast(node2, target, result);
+                }
+                break;
+            case ExprFrame::Kind::Postfix:
+                // `a.b` / `a->b` / `a[i]`: build `base` FIRST (phase 0→1), matching
+                // `lowerPostfix`'s `E base = lowerExpr(baseN)` which sequences
+                // before the subscript lowering. Member combines immediately;
+                // Index then builds the subscript (phase 1→2) before combining —
+                // base-then-subscript, the exact recursive order (two distinct
+                // statements, so platform-independent).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const baseN = f.n0;
+                    enter(baseN);           // build base — may invalidate `f`
+                } else if (f.phase == 1) {
+                    HirOperatorEntry const* e = f.e;
+                    if (e->target == "Index") {
+                        f.c0 = result;          // base result
+                        NodeId const subN = f.n1;
+                        if (subN.valid()) {
+                            f.phase = 2;
+                            enter(subN);        // build subscript — may invalidate `f`
+                        } else {
+                            // Missing subscript: emit the SAME error operand the
+                            // recursive form does (after base, before combine).
+                            NodeId const node2 = f.node;
+                            E const baseE = f.c0;
+                            work.pop_back();
+                            E const idxE{reportedError(node2, "index has no subscript expression"),
+                                         InvalidType};
+                            result = combineIndex(node2, baseE, idxE);
+                        }
+                    } else {
+                        // Member access: combine with the just-built base.
+                        NodeId const node2 = f.node;
+                        HirOperatorEntry const* const eM = f.e;
+                        E const baseE = result;
+                        work.pop_back();
+                        result = combineMember(node2, *eM, baseE);
+                    }
+                } else {
+                    // Index phase 2: subscript built; combine.
+                    NodeId const node2 = f.node;
+                    E const baseE = f.c0;
+                    E const idxE = result;
+                    work.pop_back();
+                    result = combineIndex(node2, baseE, idxE);
+                }
+                break;
+            case ExprFrame::Kind::Ternary:
+                // `cond ? then : else`, built cond→then→else (matching
+                // `lowerTernary`'s three sequential lowerExpr statements). The
+                // condition's `coerceCondition` (which may emit a Ne/Cast) runs in
+                // phase 1 — AFTER cond, BEFORE the arms — exactly as recursively.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const condN = f.n0;
+                    enter(condN);           // build cond — may invalidate `f`
+                } else if (f.phase == 1) {
+                    NodeId const condN = f.n0;
+                    f.c0 = coerceCondition(result, condN);  // coerced cond (emits Ne/Cast)
+                    f.phase = 2;
+                    NodeId const thenN = f.n1;
+                    enter(thenN);           // build then — may invalidate `f`
+                } else if (f.phase == 2) {
+                    f.c1 = result;          // then result
+                    f.phase = 3;
+                    NodeId const elseN = f.n2;
+                    enter(elseN);           // build else — may invalidate `f`
+                } else {
+                    NodeId const node2 = f.node;
+                    E const condE = f.c0;
+                    E const thenE = f.c1;
+                    E const elseE = result; // else result
+                    work.pop_back();
+                    result = combineTernary(node2, condE, thenE, elseE);
+                }
+                break;
+            case ExprFrame::Kind::Comma:
+                // `a, b`: build lhs (phase 0→1), emit `ExprStmt(lhs)` (the discard
+                // effect, BETWEEN lhs and rhs as recursively), build rhs (phase
+                // 1→2), then SeqExpr yielding rhs. lhs-then-rhs is the recursive
+                // order (two sequential statements, platform-independent).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const lhsN = f.n0;
+                    enter(lhsN);            // build lhs — may invalidate `f`
+                } else if (f.phase == 1) {
+                    HirNodeId const effect = builder.makeExprStmt(result.id);  // ExprStmt(lhs)
+                    f.c0 = E{effect, {}};   // stash the effect node id in c0.id
+                    f.phase = 2;
+                    NodeId const rhsN = f.n1;
+                    enter(rhsN);            // build rhs — may invalidate `f`
+                } else {
+                    NodeId const node2 = f.node;
+                    HirNodeId const effect = f.c0.id;
+                    E const rhsE = result;  // rhs result
+                    work.pop_back();
+                    result = combineComma(node2, effect, rhsE);
+                }
+                break;
             }
         }
         return result;
@@ -1104,13 +1267,16 @@ struct Lowerer {
     }
 
     // The TERMINAL operand forms (everything except the plain `( expression )`
-    // wrapper). Returns the lowered `E` for a leaf literal / cast / sizeof /
-    // compound-literal / va_* / label-address / identifier / literal operand. For
-    // the plain parenthesized wrapper it sets `descendInto` to the inner internal
-    // child and returns std::nullopt — the `lowerExpr` driver then descends into
-    // that node via the work-stack (so deep `(((...)))` nesting stays flat). The
+    // wrapper AND the explicit cast). Returns the lowered `E` for a leaf literal /
+    // sizeof / compound-literal / va_* / label-address / identifier / literal
+    // operand. Two deep forms instead set an out-param and return std::nullopt so
+    // the `lowerExpr` driver flattens their operand recursion via the work-stack:
+    //   • the plain `( expression )` wrapper → sets `descendInto` to the inner node
+    //   • the explicit cast `(T)expr`        → sets `castNode` to the cast node
+    // (exactly one of the two out-params is set when nullopt is returned). The
     // dispatch ORDER is byte-identical to the prior recursive `lowerOperand`.
-    [[nodiscard]] std::optional<E> lowerOperandTerminal(NodeId node, NodeId& descendInto) {
+    [[nodiscard]] std::optional<E> lowerOperandTerminal(NodeId node, NodeId& descendInto,
+                                                        NodeId& castNode) {
         // operand = Identifier | <literal token> | <char/string literal>
         //         | ( expression ) | compoundLiteralExpr | castExpr | ...
         if (auto lit = tryLowerLeafLiteral(node)) return *lit;
@@ -1129,7 +1295,8 @@ struct Lowerer {
             }
             if (cfg.castRule.valid()
              && tree().rule(c).v == cfg.castRule.v) {
-                return lowerCast(c);
+                castNode = c;
+                return std::nullopt;   // the driver flattens the cast operand
             }
             if (cfg.sizeofRule.valid()
              && tree().rule(c).v == cfg.sizeofRule.v) {
@@ -1206,16 +1373,6 @@ struct Lowerer {
         }
         unsupported(node, "operand has no Identifier / literal / parenthesized child");
         return E{errorNode(node), InvalidType};
-    }
-
-    // Thin recursive wrapper kept for completeness (the `lowerExpr` driver no
-    // longer calls it — it routes operands through `lowerOperandTerminal` + the
-    // work-stack). Byte-identical to the prior recursive form: the terminal
-    // forms come straight from the helper, and the plain-paren case recurses.
-    E lowerOperand(NodeId node) {
-        NodeId inner{};
-        if (auto term = lowerOperandTerminal(node, inner)) return *term;
-        return lowerExpr(inner);
     }
 
     // The child rule node of `operand` whose first visible child is `startTok`
@@ -1841,13 +1998,21 @@ struct Lowerer {
         // evaluate a, b (discard), value c — correct C semantics.
         if (e.target == "Comma") {
             E lhsE = lowerExpr(lhsN);
-            HirNodeId const effect = builder.makeExprStmt(lhsE.id);
+            HirNodeId const effect = builder.makeExprStmt(lhsE.id);  // emitted BETWEEN lhs and rhs
             E rhsE = lowerExpr(rhsN);
-            std::array<HirNodeId, 1> const stmts{effect};
-            return {track(builder.makeSeqExpr(stmts, rhsE.id, rhsE.type, HirFlags::None), node),
-                    rhsE.type};
+            return combineComma(node, effect, rhsE);
         }
         return combineBinary(node, e, lowerExpr(lhsN), lowerExpr(rhsN));
+    }
+
+    // The COMMA epilogue given the lhs `effect` (the `ExprStmt(lhs)` already
+    // emitted between lhs and rhs) and the lowered `rhsE`. Shared by `lowerBinary`
+    // and the `lowerExpr` driver's Comma frame. Byte-identical to the prior inline
+    // tail: `a, b` = SeqExpr([ExprStmt a], b) yielding b's value+type.
+    E combineComma(NodeId node, HirNodeId effect, E rhsE) {
+        std::array<HirNodeId, 1> const stmts{effect};
+        return {track(builder.makeSeqExpr(stmts, rhsE.id, rhsE.type, HirFlags::None), node),
+                rhsE.type};
     }
 
     E lowerUnary(NodeId node) {
@@ -1948,25 +2113,65 @@ struct Lowerer {
         return &e;
     }
 
+    // True iff `node` is a well-formed COMMA binary (both operands present, the op
+    // maps to the `Comma` target) — the form the driver flattens through a Comma
+    // frame. Assign / malformed / non-comma return false and keep delegating to
+    // `lowerBinary`. Mirrors `lowerBinary`'s extraction + lookup. On success sets
+    // `lhsN`/`rhsN` to the operands (already extracted by the caller's scan).
+    [[nodiscard]] bool commaBinary(NodeId opTok, NodeId lhsN, NodeId rhsN) {
+        if (!opTok.valid() || !lhsN.valid() || !rhsN.valid()) return false;  // malformed
+        auto it = binOp_.find(tree().tokenKind(opTok).v);
+        if (it == binOp_.end()) return false;                                // unmapped
+        return cfg.binaryOps[it->second].target == "Comma";
+    }
+
+    // The three operands of a ternary wrapper [cond, `?`, then, `:`, else] — the
+    // visible non-token children. Returns false (and leaves the out-params
+    // untouched) when there are not exactly three, so the caller routes a
+    // malformed ternary to `lowerTernary`'s diagnostic. Shared by `lowerTernary`
+    // and the `lowerExpr` driver's Ternary classifier.
+    [[nodiscard]] bool ternaryOperands(NodeId node, NodeId& condN, NodeId& thenN,
+                                       NodeId& elseN) {
+        std::array<NodeId, 3> ops{};
+        std::size_t k = 0;
+        for (NodeId c : visible(node)) {
+            if (isToken(c)) continue;
+            if (k < ops.size()) ops[k] = c;
+            ++k;
+        }
+        if (k != 3) return false;
+        condN = ops[0]; thenN = ops[1]; elseN = ops[2];
+        return true;
+    }
+
     // `cond ? then : else` → a Ternary node. The wrapper holds
     // [cond, `?`, then, `:`, else]; the three operands are the visible non-token
     // children. Result type is the then-branch's (C requires then/else to be
     // compatible; the semantic phase already checked, and prefers a node type
     // when it set one).
     E lowerTernary(NodeId node) {
-        std::vector<NodeId> operands;
-        for (NodeId c : visible(node)) if (!isToken(c)) operands.push_back(c);
-        if (operands.size() != 3) {
+        NodeId condN{}, thenN{}, elseN{};
+        if (!ternaryOperands(node, condN, thenN, elseN)) {
             unsupported(node, "malformed ternary expression (expected cond, then, else)");
             return {errorNode(node), InvalidType};
         }
-        E cond = lowerExpr(operands[0]);
+        E cond = lowerExpr(condN);
         // Truthiness at the Ternary boundary: a non-Bool scalar cond
         // becomes `Ne(cond, 0)` (C99 6.5.15p4 "compares unequal to 0"),
         // keeping the CondBr-expects-Bool discipline at MIR.
-        cond = coerceCondition(cond, operands[0]);
-        E thenE = lowerExpr(operands[1]);
-        E elseE = lowerExpr(operands[2]);
+        cond = coerceCondition(cond, condN);
+        E thenE = lowerExpr(thenN);
+        E elseE = lowerExpr(elseN);
+        return combineTernary(node, cond, thenE, elseE);
+    }
+
+    // The ternary EPILOGUE given the ALREADY-coerced condition and the lowered
+    // then/else arms: the C99 type-balance (coerce both arms to their common type)
+    // + makeTernary. Shared by `lowerTernary` and the driver's Ternary frame.
+    // Byte-identical to the prior inline tail of `lowerTernary`. NOTE the
+    // `coerceCondition` is applied to `cond` by the CALLER, before then/else lower
+    // — so the Ne/Cast it emits lands BEFORE the arm nodes, exactly as before.
+    E combineTernary(NodeId node, E cond, E thenE, E elseE) {
         // Coerce both arms to their common type (C99 conditional-expression
         // type-balance rule — the config-driven UAC engine when the
         // language declares the block; FC3 c1). Falls back to the
@@ -2075,28 +2280,95 @@ struct Lowerer {
                 ? E{reportedError(node, "index has no subscript expression"),
                     InvalidType}
                 : lowerExpr(rest.front());
-            // D-CSUBSET-INDEX-INTEGER-PROMOTION (C 6.3.1.1 / 6.5.2.1): the
-            // subscript undergoes INTEGER PROMOTION — a `char`/`short` index
-            // promotes to `int` BEFORE the index arithmetic. Without it, a narrow
-            // index forms a narrow stride-`Mul` at MIR (`scaleIndexToBytes`) that
-            // (1) OVERFLOWS — `idx * stride` wraps at the narrow width
-            // (`(char)100 * 4` = 400 mod 256) — and (2) walls at the sub-native
-            // ALU gap (`D-CSUBSET-SUBNATIVE-ALU-FORMS`). Reuse the SAME
-            // `integerPromotedType` the binary-op path uses (config-driven C
-            // 6.3.1 promotion); a block-less language (no `arithmeticConversions`)
-            // or an already-≥int index keeps the raw value (no coerce).
-            if (arith_.has_value() && idxE.type.valid()) {
-                TypeId const promoted =
-                    integerPromotedType(interner, idxE.type, *arith_);
-                if (promoted.valid() && promoted.v != idxE.type.v)
-                    idxE = coerce(idxE, promoted);
+            return combineIndex(node, base, idxE);
+        }
+        if (e.target == "MemberAccess" || e.target == "MemberAccessThruPtr") {
+            return combineMember(node, e, base);
+        }
+        return exprError(node, std::format("postfix target '{}' has no lowering", e.target));
+    }
+
+    // Which postfix forms the `lowerExpr` driver flattens through a frame. Only
+    // Index and Member access flatten (their `base` — and Index's subscript — are
+    // the deep operands of `a[i][j]…` / `a.b.c…` chains). Call (per-arg loop) and
+    // PostInc/PostDec (classifyLvalue + SeqExpr) keep delegating to `lowerPostfix`.
+    enum class PostfixFlatten : std::uint8_t { Delegate, Index, Member };
+
+    // Classify a postfix node for the driver: on Index/Member set `baseN`, the op
+    // entry `e`, and (Index only) the `subscriptN` (invalid when the subscript is
+    // missing — combineIndex then builds the error operand, exactly as the
+    // recursive form does). Mirrors `lowerPostfix`'s extraction + op lookup so the
+    // SAME node routes the SAME way; on anything else returns Delegate and the
+    // driver hands the whole node to `lowerPostfix` unchanged.
+    [[nodiscard]] PostfixFlatten postfixFlattenPlan(NodeId node, NodeId& baseN,
+                                                    NodeId& subscriptN,
+                                                    HirOperatorEntry const*& e) {
+        NodeId opTok{};
+        std::vector<NodeId> rest;
+        for (NodeId c : visible(node)) {
+            if (!baseN.valid() && !isToken(c)) { baseN = c; continue; }
+            if (isToken(c)) { if (!opTok.valid()) opTok = c; continue; }
+            rest.push_back(c);
+        }
+        if (!baseN.valid() || !opTok.valid()) return PostfixFlatten::Delegate;  // malformed
+        auto it = postOp_.find(tree().tokenKind(opTok).v);
+        if (it == postOp_.end()) return PostfixFlatten::Delegate;               // unmapped
+        HirOperatorEntry const& entry = cfg.postfixOps[it->second];
+        if (entry.target == "Index") {
+            e = &entry;
+            subscriptN = rest.empty() ? NodeId{} : rest.front();
+            return PostfixFlatten::Index;
+        }
+        if (entry.target == "MemberAccess" || entry.target == "MemberAccessThruPtr") {
+            e = &entry;
+            return PostfixFlatten::Member;
+        }
+        return PostfixFlatten::Delegate;  // Call / PostInc / PostDec / unknown
+    }
+
+    // The INDEX epilogue given the ALREADY-lowered `base` and subscript `idxE`.
+    // Shared by `lowerPostfix` and the driver's Postfix frame. Byte-identical to
+    // the prior inline `Index` arm: integer-promote the subscript, derive the
+    // element type, emit makeIndex.
+    E combineIndex(NodeId node, E base, E idxE) {
+        // D-CSUBSET-INDEX-INTEGER-PROMOTION (C 6.3.1.1 / 6.5.2.1): the
+        // subscript undergoes INTEGER PROMOTION — a `char`/`short` index
+        // promotes to `int` BEFORE the index arithmetic. Without it, a narrow
+        // index forms a narrow stride-`Mul` at MIR (`scaleIndexToBytes`) that
+        // (1) OVERFLOWS — `idx * stride` wraps at the narrow width
+        // (`(char)100 * 4` = 400 mod 256) — and (2) walls at the sub-native
+        // ALU gap (`D-CSUBSET-SUBNATIVE-ALU-FORMS`). Reuse the SAME
+        // `integerPromotedType` the binary-op path uses (config-driven C
+        // 6.3.1 promotion); a block-less language (no `arithmeticConversions`)
+        // or an already-≥int index keeps the raw value (no coerce).
+        if (arith_.has_value() && idxE.type.valid()) {
+            TypeId const promoted =
+                integerPromotedType(interner, idxE.type, *arith_);
+            if (promoted.valid() && promoted.v != idxE.type.v)
+                idxE = coerce(idxE, promoted);
+        }
+        // element-of-base derivation — the SINGLE source shared with the
+        // semantic-tier typer (type_rules.hpp `indexResultType`).
+        TypeId const inferred = indexResultType(interner, base.type);
+        TypeId const result = typeAtOr(node, inferred);
+        return {track(builder.makeIndex(base.id, idxE.id, result), node),
+                result};
+    }
+
+    // The MEMBER-ACCESS epilogue given the ALREADY-lowered `base`. Shared by
+    // `lowerPostfix` and the driver's Postfix frame. Byte-identical to the prior
+    // inline `MemberAccess`/`MemberAccessThruPtr` arm. The follower (field-name
+    // subtree) is re-extracted from `node` exactly as `lowerPostfix` built `rest`:
+    // skip the first non-token (the base) and the op token, collect the remainder.
+    E combineMember(NodeId node, HirOperatorEntry const& e, E base) {
+        std::vector<NodeId> rest;
+        {
+            bool baseSeen = false;
+            for (NodeId c : visible(node)) {
+                if (!baseSeen && !isToken(c)) { baseSeen = true; continue; }
+                if (isToken(c)) continue;
+                rest.push_back(c);
             }
-            // element-of-base derivation — the SINGLE source shared with the
-            // semantic-tier typer (type_rules.hpp `indexResultType`).
-            TypeId const inferred = indexResultType(interner, base.type);
-            TypeId const result = typeAtOr(node, inferred);
-            return {track(builder.makeIndex(base.id, idxE.id, result), node),
-                    result};
         }
         // D5.1: `obj.field` and `ptr->field`. The semantic phase (Pass 2)
         // already resolved the field's SymbolId (via the `memberAccesses`
@@ -2723,7 +2995,22 @@ struct Lowerer {
     // castRule subtree the analyzer didn't type is a phase-ordering bug,
     // not a recoverable shape.
     [[nodiscard]] E lowerCast(NodeId castNode) {
-        NodeId typeRefN{}, operandN{};
+        NodeId operandN{};
+        TypeId target{};
+        if (auto e = castPrologue(castNode, operandN, target)) return *e;  // error
+        return combineCast(castNode, target, lowerExpr(operandN));
+    }
+
+    // The cast PROLOGUE shared by `lowerCast` (recursive entry) and the
+    // `lowerExpr` driver's Cast frame: extract the type-ref + operand children and
+    // resolve the stamped target type. On success sets `operandN`/`target` and
+    // returns nullopt; on a malformed/unresolved cast returns the (already-
+    // emitted) error `E`. `resolveStampedTypeBelow` is a pure read of the semantic
+    // stamps (no HIR emission), so resolving the target here — BEFORE the operand
+    // lowers — is byte-identical to the recursive form's evaluation order.
+    [[nodiscard]] std::optional<E> castPrologue(NodeId castNode, NodeId& operandN,
+                                                TypeId& target) {
+        NodeId typeRefN{};
         for (NodeId c : visible(castNode)) {
             if (isToken(c)) continue;
             if (tree().kind(c) != NodeKind::Internal) continue;
@@ -2734,12 +3021,19 @@ struct Lowerer {
             return exprError(castNode,
                 "cast expression is missing its type-ref or operand");
         }
-        TypeId const target = resolveStampedTypeBelow(typeRefN);
+        target = resolveStampedTypeBelow(typeRefN);
         if (!target.valid()) {
             return exprError(castNode,
                 "cast type-ref did not resolve to a type");
         }
-        E operand = lowerExpr(operandN);
+        return std::nullopt;
+    }
+
+    // The cast EPILOGUE given the ALREADY-lowered operand `E`: void-discard /
+    // array-decay / makeCast. Shared by `lowerCast` and the driver's Cast frame so
+    // the conversion is identical regardless of how the operand was produced.
+    // Byte-identical to the prior inline tail of `lowerCast`.
+    E combineCast(NodeId castNode, TypeId target, E operand) {
         // The operand failed to lower (its diagnostic is ALREADY emitted — e.g. a
         // `sizeof` of an un-typeable operand returned `{errorNode, InvalidType}`).
         // Propagate the error rather than inspecting its type: `interner.kind()` on

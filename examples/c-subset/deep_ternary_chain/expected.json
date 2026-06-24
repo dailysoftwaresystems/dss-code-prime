@@ -1,0 +1,15 @@
+{
+  "$comment": "D-PARSE-DEEP-NEST-RECURSION-MEMORY (plan 24 Stage 3, INCREMENT 2) end-to-end witness for the now-iterative TERNARY arm of the CST->HIR expression lowerer (`lowerExpr` in src/hir/lowering/cst_to_hir.cpp). The program is a 150-deep RIGHT-NESTED ternary chain `0 ? 99 : (0 ? 99 : ( ... : 42))` (just under the parser's 256 maxExpressionDepth cap). Every condition is `0` (false), so each ternary selects its ELSE arm, walking 150 levels down to the innermost `42` — the return value. Each else-operand is itself a ternary, so before inc-2 `lowerTernary` recursed into `lowerExpr(else)` -> `lowerTernary` 150 host frames deep during CST->HIR lowering; now the Ternary frame on `lowerExpr`'s explicit work-stack carries that descent with FLAT O(1) host-stack cost per level (only the heap `work` vector grows). The value 42 is miscompile-sensitive: a dropped/duplicated arm, a then/else swap, a mis-ordered cond/then/else build, or a wrong condition coercion would flip the exit code (e.g. selecting a `then` arm yields 99). OUTPUT-IDENTITY against the prior recursive lowerer is enforced by the full ctest suite; this example adds the deep-flatten + real-codegen run witness for the ternary arm specifically (the companion deep_expr_lower covers paren/binary/unary). The optimizedPipelines arm proves the lowered HIR survives the full release pipeline — ConstFold folds the whole constant ternary tree to 42 in the optimized arm; the baseline arm is the real-codegen witness. arm64 runs under qemu; macho on the macos-latest leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}
