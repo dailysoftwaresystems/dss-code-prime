@@ -942,16 +942,35 @@ struct Lowerer {
     // `f` and advances `f.phase` BEFORE calling `enter` (the Stage-1/2 idiom).
     struct ExprFrame {
         enum class Kind : std::uint8_t { PassThrough, Binary, Unary, Cast, Postfix,
-                                         Ternary, Comma } kind;
+                                         Ternary, Comma, Call } kind;
         NodeId                  node;    // the source node (provenance / combine anchor)
         std::uint8_t            phase;
-        NodeId                  n0;      // PassThrough inner / binary+comma lhs / unary+cast operand / postfix base / ternary cond
+        NodeId                  n0;      // PassThrough inner / binary+comma lhs / unary+cast operand / postfix+call base / ternary cond
         NodeId                  n1;      // binary+comma rhs / postfix Index subscript / ternary then
         NodeId                  n2;      // ternary else
         HirOperatorEntry const* e;       // binary / unary / postfix op entry
         E                       c0;      // first child result (binary rhs / postfix base / ternary coerced cond / comma ExprStmt effect in .id)
         E                       c1;      // second child result (ternary then)
         TypeId                  target;  // cast target type
+        std::uint32_t           aux;     // Call: index into the local `callCtxs` stack
+    };
+
+    // The per-call accumulating state for a flattened postfix Call. Lives in a
+    // `callCtxs` stack LOCAL to `lowerExpr` (NOT in `ExprFrame` — the `args`
+    // vector must survive across the per-arg `enter` calls, and the `work` vector
+    // reallocs). A Call frame holds only an INDEX into `callCtxs` (`aux`); indices
+    // are stable because nested calls finish inner-first (LIFO) — we only ever
+    // push and pop the back, never erase from the middle. `paramTypes` is the M2
+    // stable owned copy of the callee's `interner.fnParams()` span (the span would
+    // dangle if a later arg's lowering grows the interner's operand pool).
+    struct CallCtx {
+        NodeId                  base;        // the callee CST node
+        std::vector<NodeId>     argNodes;    // the argument expression CST nodes (left→right)
+        std::size_t             argIdx{};    // next argument to process
+        std::vector<TypeId>     paramTypes;  // stable copy of the callee FnSig params
+        TypeId                  resultType{};// the call's result type
+        E                       baseE{};     // the lowered callee value
+        std::vector<HirNodeId>  args;        // accumulated lowered+coerced argument ids
     };
 
     // The public expression-lowering entry: a driver over an explicit work-stack.
@@ -961,6 +980,9 @@ struct Lowerer {
     // the prior recursive `lowerExpr` / `lowerOperand` exactly → byte-identical.
     E lowerExpr(NodeId node) {
         std::vector<ExprFrame> work;
+        // The flattened postfix-Call accumulators (see `CallCtx`). A LIFO stack
+        // parallel to `work`; a Call frame references its ctx by stable index.
+        std::vector<CallCtx> callCtxs;
         // Default-init (no node emitted): `enter` ALWAYS assigns `result` for a
         // terminal, and every pushed frame eventually delivers into `result`
         // before it is read, so this never leaks an Error node.
@@ -984,7 +1006,7 @@ struct Lowerer {
                     if (castN.valid()) {
                         // Resolve the cast target (a pure read of the semantic
                         // stamps) BEFORE entering the operand — matching the
-                        // recursive `lowerCast` order — then flatten the operand.
+                        // source `(T)expr` order — then flatten the operand.
                         NodeId castOperandN{};
                         TypeId castTarget{};
                         if (auto err = castPrologue(castN, castOperandN, castTarget)) {
@@ -1034,8 +1056,21 @@ struct Lowerer {
                     return;
                 }
                 if (r == cfg.postfixExprRule.v) {
-                    // Index / Member flatten their base (and Index's subscript)
-                    // through a frame; Call / PostInc / PostDec keep delegating.
+                    // Call flattens its callee + each scalar arg through a Call
+                    // frame (so `f(g(h(...)))` chains carry flat host-stack cost);
+                    // Index / Member flatten their base (and Index's subscript).
+                    // PostInc / PostDec keep delegating (classifyLvalue + SeqExpr).
+                    NodeId callBaseN{};
+                    std::vector<NodeId> callArgNodes;
+                    if (callBaseAndArgs(n, callBaseN, callArgNodes)) {
+                        std::uint32_t const ctxIdx =
+                            static_cast<std::uint32_t>(callCtxs.size());
+                        callCtxs.push_back(CallCtx{.base = callBaseN,
+                                                   .argNodes = std::move(callArgNodes)});
+                        work.push_back({.kind = ExprFrame::Kind::Call, .node = n,
+                                        .n0 = callBaseN, .aux = ctxIdx});
+                        return;   // phase 0 enters the callee
+                    }
                     NodeId postBaseN{}, postSubN{};
                     HirOperatorEntry const* postE = nullptr;
                     PostfixFlatten const plan =
@@ -1069,6 +1104,49 @@ struct Lowerer {
             }
             unsupported(n, "expression form has no hirLowering mapping");
             result = {errorNode(n), InvalidType};
+        };
+
+        // The per-arg pump for a flattened Call (ctx at stable index `ctxIdx`):
+        // process arguments from `ctx.argIdx` forward, lowering each BRACE-INIT
+        // arg INLINE (`lowerExprOrBraceInit` — brace lists are shallow aggregate
+        // inits, not the deep call chain) until a SCALAR arg is reached, which it
+        // routes through `enter` (the Call frame's phase 2 then coerces+collects
+        // it). Returns true iff it entered a scalar arg (the caller must wait for
+        // it); false when all args are consumed (the caller finishes the call).
+        // `ctx.argIdx` is NOT advanced for the entered scalar — it stays pointed at
+        // the in-flight arg so phase 2 derives the SAME `paramType` for its coerce.
+        // Arg lowering is left→right (a sequential loop, exactly as `lowerPostfix`'s
+        // Call arm) — platform-independent. `enter` (if called) is the LAST action,
+        // so the dangling-`work.back()` rule is respected.
+        auto const callParamType = [&](CallCtx const& ctx, std::size_t k) -> TypeId {
+            return (k < ctx.paramTypes.size()) ? ctx.paramTypes[k] : InvalidType;
+        };
+        auto const pumpCallArgs = [&](std::uint32_t ctxIdx) -> bool {
+            for (;;) {
+                // Address `callCtxs[ctxIdx]` fresh each access rather than holding a
+                // `CallCtx&`: this invocation's `callCtxs` grows whenever a SCALAR
+                // arg is itself a call (the `enter` below pushes its ctx), so a
+                // reference held across iterations could dangle; the INDEX is stable
+                // (push_back only invalidates references/pointers, never indices).
+                if (callCtxs[ctxIdx].argIdx >= callCtxs[ctxIdx].argNodes.size())
+                    return false;   // all args consumed → finish
+                std::size_t const k = callCtxs[ctxIdx].argIdx;
+                NodeId const argN = callCtxs[ctxIdx].argNodes[k];
+                NodeId const core = peelToBraceInitOrCore(argN);
+                if (isBraceInitList(core)) {
+                    // A brace-init arg lowers INLINE via its own nested `lowerExpr`
+                    // (a separate work-stack — brace lists are shallow aggregate
+                    // inits, not the deep call chain), exactly as the recursive Call
+                    // arm's `lowerExprOrBraceInit`.
+                    TypeId const paramType = callParamType(callCtxs[ctxIdx], k);
+                    HirNodeId const a = lowerExprOrBraceInit(argN, paramType);
+                    callCtxs[ctxIdx].args.push_back(a);
+                    ++callCtxs[ctxIdx].argIdx;
+                    continue;       // process the next arg
+                }
+                enter(argN);        // scalar arg — phase 2 coerces+collects it
+                return true;
+            }
         };
 
         enter(node);
@@ -1232,9 +1310,72 @@ struct Lowerer {
                     result = combineComma(node2, effect, rhsE);
                 }
                 break;
+            case ExprFrame::Kind::Call:
+                // `f(a, b, …)`: build the callee FIRST (phase 0→1, matching
+                // `lowerPostfix`'s `E base = lowerExpr(baseN)` which sequences
+                // before the args), resolve the callee signature + stable param-type
+                // copy (M2), then lower each argument left→right — brace-init args
+                // inline, scalar args through the work-stack (phase 2, one scalar at
+                // a time). When all args are consumed, makeCall. The per-arg pump +
+                // the immediate per-arg coerce reproduce the recursive loop's order
+                // (arg[k] lower → arg[k] coerce → arg[k+1] …), platform-independent.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const baseN = f.n0;
+                    enter(baseN);           // build callee — may invalidate `f`
+                } else if (f.phase == 1) {
+                    std::uint32_t const ctxIdx = f.aux;
+                    // Store the callee value + resolve the signature. Same
+                    // discipline as `lowerPostfix`'s Call arm / `lowerSqlCall`:
+                    // copy `interner.fnParams()` to an OWNED vector BEFORE lowering
+                    // any arg (the span dangles if an arg grows the operand pool).
+                    callCtxs[ctxIdx].baseE = result;
+                    TypeId const calleeSig = calleeSigOf(result.type);
+                    if (calleeSig.valid()) {
+                        auto const paramSpan = interner.fnParams(calleeSig);
+                        callCtxs[ctxIdx].paramTypes.assign(paramSpan.begin(), paramSpan.end());
+                    }
+                    TypeId inferred = InvalidType;
+                    if (calleeSig.valid()) inferred = interner.fnResult(calleeSig);
+                    callCtxs[ctxIdx].resultType = typeAtOr(f.node, inferred);
+                    f.phase = 2;
+                    if (pumpCallArgs(ctxIdx)) break;   // entered a scalar arg — wait
+                    finishCall(work, callCtxs, ctxIdx, result);  // no scalar args left
+                } else {
+                    // A scalar arg just completed (`result` holds it). Coerce it to
+                    // its param type (immediately, before the next arg lowers —
+                    // matching `lowerExprOrBraceInit`), collect it, advance.
+                    std::uint32_t const ctxIdx = f.aux;
+                    std::size_t const k = callCtxs[ctxIdx].argIdx;   // the in-flight arg
+                    TypeId const paramType = callParamType(callCtxs[ctxIdx], k);
+                    HirNodeId const a = coerce(result, paramType).id;
+                    callCtxs[ctxIdx].args.push_back(a);
+                    ++callCtxs[ctxIdx].argIdx;
+                    if (pumpCallArgs(ctxIdx)) break;   // entered the next scalar — wait
+                    finishCall(work, callCtxs, ctxIdx, result);  // all args consumed
+                }
+                break;
             }
         }
         return result;
+    }
+
+    // Finish a flattened Call: emit makeCall from the (now-complete) ctx, pop the
+    // Call frame and its ctx (the top of each — nested calls finished inner-first,
+    // so the LIFO `pop_back` removes exactly this call's frame + ctx), and deliver
+    // the call `E` into `result`. Out-of-line so phase 1 and phase 2 share the
+    // single finish path. The Call frame is `work.back()` here (the pump entered
+    // nothing, so no child frame sits above it); its `.node` is the postfix Call
+    // node, the SAME provenance as the recursive `track(makeCall(...), node)`.
+    void finishCall(std::vector<ExprFrame>& work, std::vector<CallCtx>& callCtxs,
+                    std::uint32_t ctxIdx, E& result) {
+        CallCtx const& ctx = callCtxs[ctxIdx];
+        NodeId const callNode = work.back().node;   // the postfix Call node (provenance)
+        E const callE{track(builder.makeCall(ctx.baseE.id, ctx.args, ctx.resultType), callNode),
+                      ctx.resultType};
+        work.pop_back();
+        callCtxs.pop_back();
+        result = callE;
     }
 
     // The single non-token child, or invalid if there isn't exactly one.
@@ -2326,6 +2467,30 @@ struct Lowerer {
         return PostfixFlatten::Delegate;  // Call / PostInc / PostDec / unknown
     }
 
+    // True iff `node` is a well-formed postfix CALL — the form the driver flattens
+    // through a Call frame. On success sets `baseN` to the callee CST node and
+    // `argNodes` to its argument expression nodes (left→right, via
+    // `argExpressions`). Mirrors `lowerPostfix`'s extraction + op lookup EXACTLY
+    // (base = first non-token, op = first token, the rest = argList) so the SAME
+    // node routes the SAME way; PostInc / PostDec / Index / Member / malformed /
+    // unmapped return false and keep their existing (delegate or flatten) routing.
+    [[nodiscard]] bool callBaseAndArgs(NodeId node, NodeId& baseN,
+                                       std::vector<NodeId>& argNodes) {
+        NodeId opTok{};
+        std::vector<NodeId> rest;
+        for (NodeId c : visible(node)) {
+            if (!baseN.valid() && !isToken(c)) { baseN = c; continue; }
+            if (isToken(c)) { if (!opTok.valid()) opTok = c; continue; }
+            rest.push_back(c);
+        }
+        if (!baseN.valid() || !opTok.valid()) { baseN = {}; return false; }  // malformed
+        auto it = postOp_.find(tree().tokenKind(opTok).v);
+        if (it == postOp_.end()) { baseN = {}; return false; }               // unmapped
+        if (cfg.postfixOps[it->second].target != "Call") { baseN = {}; return false; }
+        argNodes = argExpressions(rest);
+        return true;
+    }
+
     // The INDEX epilogue given the ALREADY-lowered `base` and subscript `idxE`.
     // Shared by `lowerPostfix` and the driver's Postfix frame. Byte-identical to
     // the prior inline `Index` arm: integer-promote the subscript, derive the
@@ -2957,7 +3122,7 @@ struct Lowerer {
     // carries the `va_list` lvalue `ap` as the FIRST internal child (value-lowered
     // to its address) and the read TYPE `T` as the SECOND (a `castTypeRef` that is
     // NEVER value-lowered — the SizeOf precedent: `resolveStampedTypeBelow`
-    // recovers T from the semantic phase's per-node stamp). Mirrors `lowerCast`'s
+    // recovers T from the semantic phase's per-node stamp). Mirrors `castPrologue`'s
     // type-child/operand-child split, just in the opposite order (cast = type
     // first; va_arg = operand first).
     [[nodiscard]] E lowerVaArg(NodeId node) {
@@ -2985,29 +3150,22 @@ struct Lowerer {
     // parses `castExpr = ParenOpen typeRef ParenClose operandExpr`; the
     // FIRST internal child is the type-ref (its target type comes from
     // the semantic phase's per-node stamp — same probe as the compound
-    // literal above), the SECOND is the operand expression. Lowers to a
-    // core `HirKind::Cast` with EXPLICIT flags (HirFlags::None — NOT
-    // Synthetic, which marks compiler-inserted coercions; an explicit
-    // cast is programmer-written source). The semantic phase already
-    // validated the (target, operand) pair against the explicit-cast
-    // matrix (S_InvalidCast), so an unlowerable pair never reaches the
-    // MIR mapCast lattice. Fail-loud on a missing stamp or child — a
-    // castRule subtree the analyzer didn't type is a phase-ordering bug,
-    // not a recoverable shape.
-    [[nodiscard]] E lowerCast(NodeId castNode) {
-        NodeId operandN{};
-        TypeId target{};
-        if (auto e = castPrologue(castNode, operandN, target)) return *e;  // error
-        return combineCast(castNode, target, lowerExpr(operandN));
-    }
-
-    // The cast PROLOGUE shared by `lowerCast` (recursive entry) and the
-    // `lowerExpr` driver's Cast frame: extract the type-ref + operand children and
-    // resolve the stamped target type. On success sets `operandN`/`target` and
-    // returns nullopt; on a malformed/unresolved cast returns the (already-
-    // emitted) error `E`. `resolveStampedTypeBelow` is a pure read of the semantic
-    // stamps (no HIR emission), so resolving the target here — BEFORE the operand
-    // lowers — is byte-identical to the recursive form's evaluation order.
+    // literal above), the SECOND is the operand expression. The driver's
+    // Cast frame lowers this to a core `HirKind::Cast` with EXPLICIT flags
+    // (HirFlags::None — NOT Synthetic, which marks compiler-inserted
+    // coercions; an explicit cast is programmer-written source). The
+    // semantic phase already validated the (target, operand) pair against
+    // the explicit-cast matrix (S_InvalidCast), so an unlowerable pair
+    // never reaches the MIR mapCast lattice. Fail-loud on a missing stamp
+    // or child — a castRule subtree the analyzer didn't type is a
+    // phase-ordering bug, not a recoverable shape.
+    //
+    // The cast PROLOGUE for the driver's Cast frame: extract the type-ref +
+    // operand children and resolve the stamped target type. On success sets
+    // `operandN`/`target` and returns nullopt; on a malformed/unresolved cast
+    // returns the (already-emitted) error `E`. `resolveStampedTypeBelow` is a
+    // pure read of the semantic stamps (no HIR emission), so resolving the target
+    // here — BEFORE the operand lowers — matches the source evaluation order.
     [[nodiscard]] std::optional<E> castPrologue(NodeId castNode, NodeId& operandN,
                                                 TypeId& target) {
         NodeId typeRefN{};
@@ -3030,9 +3188,8 @@ struct Lowerer {
     }
 
     // The cast EPILOGUE given the ALREADY-lowered operand `E`: void-discard /
-    // array-decay / makeCast. Shared by `lowerCast` and the driver's Cast frame so
-    // the conversion is identical regardless of how the operand was produced.
-    // Byte-identical to the prior inline tail of `lowerCast`.
+    // array-decay / makeCast. Used by the driver's Cast frame; the conversion is
+    // identical regardless of how the operand was produced.
     E combineCast(NodeId castNode, TypeId target, E operand) {
         // The operand failed to lower (its diagnostic is ALREADY emitted — e.g. a
         // `sizeof` of an un-typeable operand returned `{errorNode, InvalidType}`).
