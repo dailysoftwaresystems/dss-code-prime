@@ -298,6 +298,30 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // forgoes the optimization, never miscompiles). Reachable under the shipped
             // release.pipeline.json (which runs Inlining), so a real fix not a guard.
             if (op == MirOpcode::RecvByValueStackParam) return std::nullopt;
+            // D-OPT-VARIADIC-RELEASE-MISCOMPILE: refuse to inline a callee that CALLS
+            // va_start. The three va_start leaves (VaRegSaveAreaAddr /
+            // VaOverflowArgAreaAddr / VaHomeArgAreaAddr) materialize in lir_callconv to
+            // `lea reg, [sp + offset]` against the CALLEE's OWN frame — its variadic-
+            // prologue register-save-area (the rdi..r9 / xmm or rcx..r9 spill) and its
+            // incoming overflow/home arg area. ONLY the callee's variadic prologue sets
+            // those up; spliced into the caller they bind to the CALLER's frame (which
+            // never spilled the varargs) → `ap` reads garbage. This is the universal "a
+            // variadic function that calls va_start is not inlinable" rule. (These three
+            // leaves ALSO triple as lir_callconv's "this function called va_start"
+            // prologue-spill signal — see mir_opcode.hpp:103,148 — so their PRESENCE is
+            // exactly the frame-binding condition; a degenerate variadic that never calls
+            // va_start has no such leaf and stays inlinable, which is safe.) Fail-SAFE
+            // (forgoes the optimization, never miscompiles); reachable under the shipped
+            // release.pipeline.json (which runs Inlining) — a REAL silent-miscompile fix,
+            // not a speculative guard (the `varargs_sum` release arm exits wrong without
+            // it). Sibling of the RecvByValueStackParam refusal above; distinct from the
+            // hypothetical-intrinsic D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC (va_start in
+            // DSS is these dedicated MIR leaves, NOT an IntrinsicCall).
+            if (op == MirOpcode::VaRegSaveAreaAddr
+                || op == MirOpcode::VaOverflowArgAreaAddr
+                || op == MirOpcode::VaHomeArgAreaAddr) {
+                return std::nullopt;
+            }
             // D-CSUBSET-COMPUTED-GOTO (MF-4): refuse to inline a callee that takes a
             // label address (`BlockAddress`) or contains an indirect branch
             // (`IndirectBr`). Inlining renumbers the callee's blocks into the caller,
