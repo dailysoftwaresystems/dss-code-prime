@@ -636,6 +636,99 @@ TEST(MirMerge, MergeRemapsGlobalInitFunc) {
     EXPECT_TRUE(verifier.verify(rep));
 }
 
+// F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): the SymbolId EMBEDDED in a
+// `MirSymbolAddrValue` global initializer must be remapped into the merged id
+// space (mir_merge.cpp `remapLiteralSymbols`). A symbol-address global defined in
+// a NON-FIRST CU has its target RENUMBERED by the merge; a verbatim literal copy
+// would carry the STALE CU-local id, so the assembler's abs64 reloc would target
+// the wrong (or undefined) symbol → linker `K_SymbolUndefined` / silent wrong VA
+// in any multi-`.c` build. This is invisible to the single-CU `decl_string_global`
+// corpus. RED-ON-DISABLE: drop the `remapLiteralSymbols(lit, plan, ci)` call →
+// `p`'s init keeps CU1's local target id (300), != the merged target id.
+TEST(MirMerge, MergeRemapsSymbolAddressGlobalTarget) {
+    // CU0: just `main` — occupies the first merged ids so CU1 is renumbered.
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32_0 = in0.primitive(TypeKind::I32);
+    TypeId const sig0  = in0.fnSig({}, i32_0, CallConv::CcSysV);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        mb.addFunction(sig0, SymbolId{1});  // main
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(0), i32_0));
+        mir0 = std::move(mb).finish();
+    }
+
+    // CU1: `int target = 42;` + `int *p = &target;` (a symbol-address global whose
+    // init literal embeds target's CU1-local SymbolId 300).
+    TypeInterner in1{CompilationUnitId{2}};
+    TypeId const i32_1 = in1.primitive(TypeKind::I32);
+    TypeId const p32_1 = in1.pointer(i32_1);
+    Mir mir1;
+    {
+        MirBuilder mb;
+        (void)mb.addGlobal(i32_1, SymbolId{300}, mb.literalPoolAdd(i32Lit(42)),
+                           MirFuncId{}, SymbolBinding::Global,
+                           SymbolVisibility::Default);
+        MirLiteralValue saLit;
+        saLit.value = MirSymbolAddrValue{/*symbol=*/300u, /*addend=*/0};
+        saLit.core  = TypeKind::Ptr;
+        (void)mb.addGlobal(p32_1, SymbolId{400}, mb.literalPoolAdd(saLit),
+                           MirFuncId{}, SymbolBinding::Global,
+                           SymbolVisibility::Default);
+        mir1 = std::move(mb).finish();
+    }
+
+    std::vector<MergeCuInput> cus = {
+        MergeCuInput{&mir0, &in0, namerOf({{1, "main"}}), {}},
+        MergeCuInput{&mir1, &in1, namerOf({{300, "target"}, {400, "p"}}), {}},
+    };
+    std::vector<std::string> const entries = {"main"};
+
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+
+    Mir const& mm = merged->mir;
+    auto globalSymNamed = [&](std::string_view want) -> std::optional<std::uint32_t> {
+        for (std::uint32_t i = 0; i < mm.moduleGlobalCount(); ++i) {
+            MirGlobalId const g = mm.globalAt(i);
+            auto const it = merged->symbolNames.find(mm.globalSymbol(g).v);
+            if (it != merged->symbolNames.end() && it->second == want)
+                return mm.globalSymbol(g).v;
+        }
+        return std::nullopt;
+    };
+    auto const mergedTarget = globalSymNamed("target");
+    ASSERT_TRUE(mergedTarget.has_value());
+    // Sanity: the merge actually RENUMBERED target away from CU1's local 300, so
+    // the equality assertion below genuinely discriminates remapped vs stale.
+    ASSERT_NE(*mergedTarget, 300u)
+        << "merge must renumber CU1's target; else the pin can't discriminate";
+
+    // `p`'s init literal must be a MirSymbolAddrValue whose `.symbol` is the MERGED
+    // target id — NOT CU1's local 300.
+    std::optional<std::uint32_t> pInitSym;
+    for (std::uint32_t i = 0; i < mm.moduleGlobalCount(); ++i) {
+        MirGlobalId const g = mm.globalAt(i);
+        auto const it = merged->symbolNames.find(mm.globalSymbol(g).v);
+        if (it == merged->symbolNames.end() || it->second != "p") continue;
+        std::uint32_t const initIdx = mm.globalInitLiteralIndex(g);
+        ASSERT_NE(initIdx, UINT32_MAX);
+        auto const* sa = std::get_if<MirSymbolAddrValue>(&mm.literalValue(initIdx).value);
+        ASSERT_NE(sa, nullptr) << "p's init must stay a MirSymbolAddrValue";
+        pInitSym = sa->symbol;
+    }
+    ASSERT_TRUE(pInitSym.has_value());
+    EXPECT_EQ(*pInitSym, *mergedTarget)
+        << "p's symbol-address init must point at the MERGED target id, not the "
+           "stale CU-local id (remapLiteralSymbols).";
+
+    MirVerifier verifier{mm, &merged->host.interner()};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
 // const-ness preservation across the cross-CU merge global-clone site
 // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL). `mergeCuMirs` rebuilds every CU's globals
 // into the merged module (mir_merge.cpp:625); it MUST carry `MirGlobal.isConst`,

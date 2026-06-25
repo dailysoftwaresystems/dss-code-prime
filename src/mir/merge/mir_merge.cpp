@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>      // std::get_if — F5 symbol-address literal remap
 #include <vector>
 
 namespace dss {
@@ -126,6 +127,25 @@ mergedSymbolOf(MergePlan const& plan, std::uint32_t cuIdx, SymbolId oldSym) {
         std::abort();
     }
     return it->second;
+}
+
+// F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): a symbol-address init literal embeds a
+// per-CU SymbolId in `MirSymbolAddrValue.symbol` (an `int* p = &target;` /
+// `char* g = "...";` / function-pointer-table global). The merge RENUMBERS
+// symbols, so this raw id must be remapped through `mergedSymbolOf` — the literal
+// analogue of `mergedGlobalAddrSymbol` for the GlobalAddr INSTRUCTION form.
+// Recurses through aggregate fields (a future `static int* a[] = {&x, &y};`).
+// WITHOUT this remap the global's abs64 reloc targets a STALE CU-local id in any
+// multi-`.c` build → linker `K_SymbolUndefined` (lucky) or a silently-wrong VA
+// (id collision) — a pointer miscompile invisible to a single-CU corpus.
+void remapLiteralSymbols(MirLiteralValue& lit, MergePlan const& plan,
+                         std::uint32_t cuIdx) {
+    if (auto* sa = std::get_if<MirSymbolAddrValue>(&lit.value)) {
+        sa->symbol = mergedSymbolOf(plan, cuIdx, SymbolId{sa->symbol}).v;
+    } else if (auto* agg = std::get_if<MirAggregateValue>(&lit.value)) {
+        for (MirLiteralValue& f : agg->fields)
+            remapLiteralSymbols(f, plan, cuIdx);
+    }
 }
 
 // ── one-function clone into the shared builder ─────────────────────
@@ -623,7 +643,13 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             std::uint32_t initLit = m.globalInitLiteralIndex(g);
             std::uint32_t newInitLit = UINT32_MAX;
             if (initLit != UINT32_MAX) {
-                newInitLit = builder.literalPoolAdd(m.literalValue(initLit));
+                // Copy the init literal so a symbol-address value's embedded
+                // per-CU SymbolId can be remapped into the merged id space
+                // (F5 — see remapLiteralSymbols). A plain by-value re-add would
+                // carry a stale id → silently-wrong abs64 reloc target.
+                MirLiteralValue lit = m.literalValue(initLit);
+                remapLiteralSymbols(lit, plan, ci);
+                newInitLit = builder.literalPoolAdd(std::move(lit));
             }
 
             MirFuncId newInitFunc{};

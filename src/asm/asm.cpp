@@ -888,7 +888,17 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                                  sym.v));
                 continue;
             }
-            // Section already chosen above (const → .rodata, mutable → .data).
+            // A symbol-address pointer is INHERENTLY load-writable: the loader
+            // writes the resolved (and, on a PIE image, slid) target address into
+            // this slot via the relocation below. It therefore MUST live in a
+            // writable-at-load section — NEVER read-only rodata — even when the
+            // source global is const-qualified (`const char* const p`, or a
+            // `const char* p` whose pointer-OBJECT DSS marks const). ELF
+            // (ET_EXEC, no slide) and PE (.rdata is load-writable) merely TOLERATE
+            // rodata; a Mach-O PIE image cannot rebase the sealed __TEXT,__const.
+            // Overriding the section-above choice to .data on every format is the
+            // agnostic root-cause placement, not a per-format special case.
+            d.section = DataSectionKind::Data;
             d.bytes.assign(8, 0);                       // pointer-width zero slot
             d.alignment = Alignment::ofRuntimePow2(8);
             d.relocations.push_back(Relocation{
