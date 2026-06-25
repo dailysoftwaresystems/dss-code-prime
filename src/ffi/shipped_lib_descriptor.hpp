@@ -160,6 +160,28 @@ struct DSS_EXPORT ShippedMacro {
     bool                                    variadic = false;
 };
 
+// One field of a shipped STRUCT — a (name, type) pair. `type` is any
+// hir-text-decodable type, spelled as its RESOLVED form (e.g. `i64` for an
+// `off_t` field — parseTypeFromText resolves hir-text builtins, NOT descriptor
+// typedef names like `off_t`).
+struct DSS_EXPORT ShippedField {
+    std::string name;
+    TypeId      type;
+};
+
+// One decoded STRUCT — the neutral form of a header's `struct tag { … };` with
+// NAMED fields (e.g. `struct timeval { i64 tv_sec; i64 tv_usec; }`). The semantic
+// phase interns the struct type and injects the tag into the TAG namespace plus a
+// field scope, so c-subset `struct tag v; v.field` resolves AND lays out at the
+// ABI offsets the layout engine DERIVES from the field sizes (the descriptor
+// declares names + types only — never explicit offsets). `typeId` is the interned
+// struct type (its identity is the name + positional field types).
+struct DSS_EXPORT ShippedStruct {
+    std::string               name;     // the struct tag, e.g. "timeval"
+    std::vector<ShippedField> fields;   // named fields, in declaration order
+    TypeId                    typeId;   // interned struct type (set on decode)
+};
+
 // A decoded shipped-library descriptor. `header` is the authoritative
 // provenance (which header these symbols come from); `standard` is optional
 // provenance; `library` is a per-OBJECT-FORMAT map ("pe"/"elf"/"macho" → image
@@ -181,6 +203,7 @@ struct DSS_EXPORT ShippedLibDescriptor {
     std::vector<ShippedConstant> constants;   // named integer constants (folded)
     std::vector<ShippedTypedef>  typedefs;    // type aliases (resolved in type pos)
     std::vector<ShippedMacro>    macros;      // preprocessor macros (injected at #include)
+    std::vector<ShippedStruct>   structs;     // named-field structs (tag + field scope)
 };
 
 // Read + decode the neutral descriptor at `path`, interning each symbol's

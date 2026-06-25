@@ -369,7 +369,7 @@ readShippedLibDescriptor(std::filesystem::path const& path,
     // accepted + ignored, never consumed by lowering.
     (void)rejectUnknownKeys(reporter, doc, "(root)",
                             {"header", "standard", "library", "symbols",
-                             "constants", "typedefs", "macros", "$comment"});
+                             "constants", "typedefs", "structs", "macros", "$comment"});
 
     // (4) Each symbol. Collect-all: a malformed symbol is reported but the
     // loop continues so the operator sees every problem in one pass; the
@@ -658,6 +658,84 @@ readShippedLibDescriptor(std::filesystem::path const& path,
         }
     }
 
+    // (6.5) STRUCTS (named-field aggregate types). Each entry interns a struct
+    // type (name + positional field types) the semantic phase injects as a TAG +
+    // a field scope; the layout engine DERIVES the ABI byte offsets from the
+    // field sizes (the descriptor declares names + types, never offsets).
+    if (doc.contains("structs")) {
+        if (!doc.at("structs").is_array()) {
+            emitMalformed(reporter, "shipped-lib descriptor '" + path.generic_string()
+                                        + "': 'structs' must be an array");
+        } else {
+            std::size_t sidx = 0;
+            for (auto const& sdef : doc.at("structs")) {
+                std::string const at =
+                    "'" + path.generic_string() + "' structs[" + std::to_string(sidx) + "]";
+                ++sidx;
+                if (!sdef.is_object()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
+                    continue;
+                }
+                (void)rejectUnknownKeys(reporter, sdef,
+                                        "structs[" + std::to_string(sidx - 1) + "]",
+                                        {"name", "fields"});
+                if (!sdef.contains("name") || !sdef.at("name").is_string()
+                    || sdef.at("name").get<std::string>().empty()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": missing or empty 'name'");
+                    continue;
+                }
+                std::string const sname = sdef.at("name").get<std::string>();
+                if (!sdef.contains("fields") || !sdef.at("fields").is_array()
+                    || sdef.at("fields").empty()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": 'fields' must be a non-empty array");
+                    continue;
+                }
+                ShippedStruct sst;
+                sst.name = sname;
+                std::vector<TypeId> fieldTypes;
+                bool okFields = true;
+                std::size_t fidx = 0;
+                for (auto const& f : sdef.at("fields")) {
+                    std::string const fat = at + " fields[" + std::to_string(fidx) + "]";
+                    ++fidx;
+                    if (!f.is_object()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + fat + ": must be an object");
+                        okFields = false; break;
+                    }
+                    (void)rejectUnknownKeys(reporter, f, "fields", {"name", "type"});
+                    if (!f.contains("name") || !f.at("name").is_string()
+                        || f.at("name").get<std::string>().empty()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + fat
+                                                    + ": missing or empty 'name'");
+                        okFields = false; break;
+                    }
+                    if (!f.contains("type") || !f.at("type").is_string()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + fat
+                                                    + ": missing or non-string 'type'");
+                        okFields = false; break;
+                    }
+                    std::string const fTypeText = f.at("type").get<std::string>();
+                    TypeId const fty = parseTypeFromText(fTypeText, interner, typeReg, reporter);
+                    if (!fty.valid() || fty == InvalidType) {
+                        dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                                    DiagnosticSeverity::Error,
+                                    "shipped-lib descriptor " + fat + ": field type '"
+                                        + fTypeText + "' failed to decode");
+                        okFields = false; break;
+                    }
+                    sst.fields.push_back(
+                        ShippedField{f.at("name").get<std::string>(), fty});
+                    fieldTypes.push_back(fty);
+                }
+                if (!okFields) continue;
+                sst.typeId = interner.structType(sname, fieldTypes);
+                out.structs.push_back(std::move(sst));
+            }
+        }
+    }
+
     // (7) MACROS (the preprocessor-macro surface, interner-free). A function-like
     // or object-like `#define` the preprocessor injects when this header is
     // included (e.g. `assert(e) -> ((void)0)`).
@@ -668,11 +746,11 @@ readShippedLibDescriptor(std::filesystem::path const& path,
     // ship silently (mirrors the old non-empty-`symbols` rule, now spanning all
     // four surfaces).
     if (out.symbols.empty() && out.constants.empty() && out.typedefs.empty()
-        && out.macros.empty()) {
+        && out.structs.empty() && out.macros.empty()) {
         emitMalformed(reporter,
             std::string{"shipped-lib descriptor '"} + path.generic_string()
                 + "': declares nothing — needs at least one of 'symbols', "
-                  "'constants', 'typedefs', or 'macros'");
+                  "'constants', 'typedefs', 'structs', or 'macros'");
         return std::nullopt;
     }
 

@@ -5050,6 +5050,10 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // is injected at most once.
         std::unordered_set<std::string> readDescriptors;
         std::unordered_set<std::string> injectedNames;
+        // Struct/union/enum TAGS live in a SEPARATE namespace (C 6.2.3): a
+        // descriptor `struct stat` does NOT collide with the ordinary `stat`
+        // function, so tag first-wins dedup uses its own set.
+        std::unordered_set<std::string> injectedTags;
         for (std::filesystem::path const& descPath :
              cu->shippedLibDescriptors()) {
             std::error_code ec;
@@ -5130,6 +5134,45 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 rec.type  = td.type;
                 SymbolId const id = s.symbols.mint(rec);
                 s.scopes.injectBinding(cuRoot, td.name, id);
+            }
+
+            // c7: inject the descriptor's STRUCTS as a TAG (so `struct tag v;`
+            // resolves) + a populated field scope (so `v.field` resolves) +
+            // `compositeScopeByType` (the member-access resolver's TypeId→scope
+            // index). Built by hand here — there is no CST node to tree-walk — and
+            // BYTE-IDENTICAL to a user-declared struct (Pass 1.5 @ the
+            // compositeScopeByType line). The layout engine DERIVES the field
+            // offsets from the field sizes; the descriptor declares no offsets.
+            // (The va_list builtin inject omits the field scope on purpose: its
+            // fields are reached only via va_* intrinsics, never by name.)
+            for (auto const& st : desc->structs) {
+                if (!injectedTags.insert(st.name).second) continue;   // first wins (tag ns)
+                // A node-independent field scope, parented at the CU root.
+                ScopeId const fieldScope =
+                    s.scopes.pushScope(cuRoot, NodeId{}, InvalidTree);
+                for (std::uint32_t i = 0; i < st.fields.size(); ++i) {
+                    SymbolRecord f;
+                    f.name       = st.fields[i].name;
+                    f.scope      = fieldScope;
+                    f.tree       = InvalidTree;   // not a user decl
+                    f.kind       = DeclarationKind::Variable;
+                    f.type       = st.fields[i].type;
+                    f.fieldIndex = i;             // == position in the interned operands
+                    SymbolId const fid = s.symbols.mint(f);
+                    s.scopes.injectBinding(fieldScope, st.fields[i].name, fid);
+                }
+                s.compositeScopeByType[st.typeId.v] = fieldScope;
+                // The struct TAG, in the TAG namespace (C 6.2.3) so a `struct tag`
+                // reference resolves; `structScope` links it to its field scope.
+                SymbolRecord tag;
+                tag.name        = st.name;
+                tag.scope       = cuRoot;
+                tag.tree        = InvalidTree;
+                tag.kind        = DeclarationKind::Type;
+                tag.type        = st.typeId;
+                tag.structScope = fieldScope;
+                SymbolId const tagId = s.symbols.mint(tag);
+                s.scopes.injectBinding(cuRoot, st.name, tagId, SymbolNamespace::Tag);
             }
         }
     }

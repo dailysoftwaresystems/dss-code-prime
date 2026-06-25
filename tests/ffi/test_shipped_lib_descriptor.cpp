@@ -257,6 +257,80 @@ TEST(ShippedLibDescriptor, ReadShippedLibMacrosHeaderlessIsLenient) {
     EXPECT_TRUE(macros->empty());      // no `macros` key -> nothing injected
 }
 
+// ── structs surface (named-field aggregate; the struct-body mechanism) ────────
+
+// A `structs` entry decodes into a ShippedStruct with named fields + an interned
+// struct TypeId (name + positional field types). Field types decode via the one
+// type-text codec (i64 here).
+TEST(ShippedLibDescriptor, StructsSurfaceParsed) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "s.json", R"JSON({
+        "header": "s.h",
+        "structs": [
+            { "name": "timeval", "fields": [
+                { "name": "tv_sec",  "type": "i64" },
+                { "name": "tv_usec", "type": "i64" }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->structs.size(), 1u);
+    EXPECT_EQ(desc->structs[0].name, "timeval");
+    ASSERT_EQ(desc->structs[0].fields.size(), 2u);
+    EXPECT_EQ(desc->structs[0].fields[0].name, "tv_sec");
+    EXPECT_EQ(desc->structs[0].fields[1].name, "tv_usec");
+    EXPECT_EQ(desc->structs[0].fields[0].type, interner.primitive(TypeKind::I64));
+    EXPECT_TRUE(desc->structs[0].typeId.valid());
+}
+
+// A structs-ONLY descriptor is VALID — the ≥1-surface check counts structs.
+// RED-ON-DISABLE: without `&& out.structs.empty()` in the check, this fails-loud
+// as "declares nothing".
+TEST(ShippedLibDescriptor, StructsOnlyDescriptorIsValid) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "so.json", R"JSON({
+        "header": "so.h",
+        "structs": [ { "name": "pt", "fields": [ { "name": "x", "type": "i32" } ] } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->structs.size(), 1u);
+}
+
+TEST(ShippedLibDescriptor, StructMissingFieldsFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad.json",
+        R"({ "header": "b.h", "structs": [ { "name": "empty", "fields": [] } ] })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+TEST(ShippedLibDescriptor, StructFieldBadTypeFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad2.json",
+        R"({ "header": "b.h", "structs": [ { "name": "s",
+             "fields": [ { "name": "f", "type": "not_a_type" } ] } ] })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
 // An "object" kind decodes to ShippedSymbolKind::Object (→ ExternGlobal).
 TEST(ShippedLibDescriptor, ObjectKindDecodes) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
