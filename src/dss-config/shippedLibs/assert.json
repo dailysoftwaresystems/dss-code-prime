@@ -1,0 +1,8 @@
+{
+  "$comment": "Neutral shipped <assert.h> (C89 7.2). `assert` is a FUNCTION-LIKE MACRO, not a typed symbol/constant — so it rides the `macros` surface (the FIRST consumer): when the c-subset preprocessor resolves `#include <assert.h>`, it injects `#define assert(e) ((void)0)` into its macro table (a synthetic define spliced into the synth buffer), so assert(expr) expands BEFORE parse. The replacement is the NDEBUG behavior C 7.2p1 mandates when NDEBUG is defined — `((void)0)`, which (per the standard) does NOT evaluate `e`; this is the default amalgamation-build behavior SQLite + most release builds use (an active-assert variant would need __assert_fail + NDEBUG conditional compilation, deferred). A no-op assert is correct for a release SQLite (asserts are pure invariant checks, never load-bearing logic). macros-only descriptor: the semantic phase injects nothing from it (no symbols/constants/typedefs).",
+  "header": "assert.h",
+  "standard": "c89",
+  "macros": [
+    { "name": "assert", "params": ["e"], "replacement": "((void)0)" }
+  ]
+}

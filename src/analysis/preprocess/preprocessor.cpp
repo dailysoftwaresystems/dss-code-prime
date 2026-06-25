@@ -2,6 +2,7 @@
 
 #include "analysis/preprocess/pp_if_eval.hpp"
 #include "core/types/include_path_resolve.hpp"
+#include "ffi/shipped_lib_descriptor.hpp"
 #include "tokenizer/tokenizer.hpp"
 
 #include <algorithm>
@@ -181,6 +182,11 @@ namespace {
 struct SynthBuilder {
     std::shared_ptr<GrammarSchema const> schema;
     std::span<fs::path const>            includeDirs;
+    // System (angle-include) descriptor dirs — threaded so an angle `#include
+    // <h>` whose shipped descriptor declares `macros` injects them at PREPROCESS
+    // time (D-PP-DESCRIPTOR-MACRO-INJECT). Empty for non-C languages / callers
+    // without a system path -> the angle-macro branch is inert.
+    std::span<fs::path const>            systemDirs;
     DiagnosticReporter&                  rep;
     int                                  depth;
     std::vector<fs::path>&               includeStack;
@@ -261,6 +267,8 @@ struct SynthBuilder {
             schema->schemaTokens().find(cfg().directiveIntroToken);
         const auto quoteKind =
             schema->schemaTokens().find(cfg().quoteIncludeToken);
+        const auto angleKind =
+            schema->schemaTokens().find(cfg().angleIncludeToken);
 
         std::size_t copiedUpTo = 0;
         fs::path const includingDir = fs::path{source->name()}.parent_path();
@@ -280,7 +288,78 @@ struct SynthBuilder {
             if (k >= toks.size()) continue;
             const bool isQuote =
                 quoteKind.valid() && toks[k].tok.schemaKind == quoteKind;
-            if (!isQuote) continue;
+            if (!isQuote) {
+                // D-PP-DESCRIPTOR-MACRO-INJECT: an ANGLE `#include <h>` whose
+                // shipped descriptor declares a `macros` surface — splice a
+                // synthetic `#define` for each into the synth buffer BEFORE the
+                // include line, so the macro is in the table for the rest of the
+                // source AND its replacement tokens carry spans valid in the final
+                // buffer (they point into the synthText prefix, like ordinary
+                // source). The include line itself is LEFT in place (copiedUpTo
+                // stays at dirStart) so the post-parse import resolver still
+                // injects the typed surfaces (symbols/constants/typedefs). Inert
+                // when the language declares no angle token or there are no
+                // systemDirs.
+                if (!angleKind.valid() || toks[k].tok.schemaKind != angleKind) {
+                    continue;
+                }
+                if (systemDirs.empty()) continue;
+                // The angle BODY is the coalesced token immediately after the
+                // opener (mirrors the quote-body extraction below).
+                const std::size_t aBody = k + 1;
+                if (aBody >= toks.size() || isTrivia(toks[aBody].tok)
+                    || isNewline(toks[aBody].tok)
+                    || toks[aBody].tok.span.start() != toks[k].tok.span.end()) {
+                    continue;  // malformed/empty angle include — leave verbatim
+                }
+                std::string const angleName{toks[aBody].text};
+                if (angleName.empty()) continue;
+                auto descPath = resolveSystemDescriptor(angleName, systemDirs);
+                if (!descPath) continue;  // no descriptor on the path — leave verbatim
+                DiagnosticReporter macroRep;
+                auto macros = ffi::readShippedLibMacros(*descPath, macroRep);
+                if (!macros) {
+                    // Malformed descriptor: fail loud (the post-parse resolver
+                    // will also error on the typed side), never silent.
+                    emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
+                           BufferId{}, SourceSpan::empty(0),
+                           std::string{"shipped-header descriptor malformed "
+                                       "(macros): "} + descPath->generic_string());
+                    continue;
+                }
+                if (macros->empty()) continue;  // typed-only descriptor (no macros)
+                const ByteOffset dStart = toks[i].tok.span.start();
+                copyVerbatim(spliced, localMap, copiedUpTo, dStart, out, map);
+                for (auto const& macro : *macros) {
+                    // Reconstruct the neutral macro as a `#define` line; the
+                    // downstream tokenizer + handleDefine build the MacroDef with
+                    // the proven function-like / param / redefinition machinery
+                    // (an identical re-define on a double-include is idempotent).
+                    std::string def = "#define " + macro.name;
+                    if (macro.params.has_value()) {
+                        def += "(";
+                        bool first = true;
+                        for (auto const& pn : *macro.params) {
+                            if (!first) def += ",";
+                            def += pn;
+                            first = false;
+                        }
+                        if (macro.variadic) {
+                            if (!macro.params->empty()) def += ",";
+                            def += "...";
+                        }
+                        def += ")";
+                    }
+                    if (!macro.replacement.empty()) {
+                        def += " ";
+                        def += macro.replacement;
+                    }
+                    def += "\n";
+                    out.append(def);
+                }
+                copiedUpTo = dStart;  // KEEP the include line — final copyVerbatim copies it
+                continue;
+            }
 
             // The quote opener (StringStart) consumed only the opening quote;
             // the coalesced string BODY is the very next token, whose text is
@@ -330,7 +409,7 @@ struct SynthBuilder {
             copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
 
             includeStack.push_back(canon);
-            SynthBuilder child{schema, includeDirs, rep, depth + 1,
+            SynthBuilder child{schema, includeDirs, systemDirs, rep, depth + 1,
                                includeStack, fatal};
             child.build(headerBuf, out, map);
             includeStack.pop_back();
@@ -2071,7 +2150,7 @@ PreprocessResult preprocess(
         fs::path canon = fs::weakly_canonical(fs::path{mainSource->name()}, ec);
         includeStack.push_back(ec ? fs::path{mainSource->name()} : canon);
     }
-    SynthBuilder builder{schema, includeDirs, *result.diagnostics, 0,
+    SynthBuilder builder{schema, includeDirs, systemDirs, *result.diagnostics, 0,
                          includeStack, result.fatal};
     builder.build(mainSource, synthText, result.lineMap);
 

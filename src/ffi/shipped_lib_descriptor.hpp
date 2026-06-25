@@ -143,6 +143,23 @@ struct DSS_EXPORT ShippedTypedef {
     TypeId      type;
 };
 
+// One decoded preprocessor MACRO — the neutral form of a header's `#define`
+// macro that is NOT a compile-time constant (e.g. `assert(e) -> ((void)0)`).
+// Unlike `constants` (injected SEMANTICALLY + folded at HIR), a macro is a
+// PREPROCESSOR substitution: when `#include <header.h>` is resolved, the
+// preprocessor injects each macro into its macro table (via a synthetic
+// `#define`) so it expands in the rest of the source BEFORE parse. `params`
+// distinguishes the two forms — ABSENT (nullopt) = object-like (`#define X 1`);
+// PRESENT (even empty `[]`) = function-like (`#define F() …` / `assert(e) …`).
+// `replacement` is the replacement token text (may be empty — a null macro).
+// `variadic` marks a trailing `...` catch-all (function-like only).
+struct DSS_EXPORT ShippedMacro {
+    std::string                             name;
+    std::optional<std::vector<std::string>> params;   // nullopt = object-like
+    std::string                             replacement;
+    bool                                    variadic = false;
+};
+
 // A decoded shipped-library descriptor. `header` is the authoritative
 // provenance (which header these symbols come from); `standard` is optional
 // provenance; `library` is a per-OBJECT-FORMAT map ("pe"/"elf"/"macho" → image
@@ -163,6 +180,7 @@ struct DSS_EXPORT ShippedLibDescriptor {
     std::vector<ShippedSymbol>   symbols;     // extern functions/objects (linked)
     std::vector<ShippedConstant> constants;   // named integer constants (folded)
     std::vector<ShippedTypedef>  typedefs;    // type aliases (resolved in type pos)
+    std::vector<ShippedMacro>    macros;      // preprocessor macros (injected at #include)
 };
 
 // Read + decode the neutral descriptor at `path`, interning each symbol's
@@ -197,6 +215,21 @@ readShippedLibDescriptor(std::filesystem::path const& path,
                          TypeRegistry&                typeReg,
                          DiagnosticReporter&          reporter,
                          DataModel                    dataModel = DataModel::Lp64);
+
+// Read ONLY the `macros` surface from the neutral descriptor at `path`, WITHOUT a
+// TypeInterner. Macros are pure preprocessor token text (no types), so the
+// preprocessor — which has no interner — can resolve a `#include <h>` to its
+// descriptor's macros at PREPROCESS time (before parse), injecting each as a
+// synthetic `#define`. Validates the same provenance gate as
+// `readShippedLibDescriptor` (top-level object + non-empty `header`) plus each
+// macro entry. Returns an EMPTY vector when the descriptor declares no `macros`
+// (a typed-surface-only descriptor — the common case); returns std::nullopt and
+// emits `F_ShippedLibDescriptorMalformed` on ANY malformed input. The typed
+// surfaces (symbols/constants/typedefs) are NOT read here — the semantic phase
+// reads those via `readShippedLibDescriptor`.
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<ShippedMacro>>
+readShippedLibMacros(std::filesystem::path const& path,
+                     DiagnosticReporter&          reporter);
 
 } // namespace ffi
 } // namespace dss

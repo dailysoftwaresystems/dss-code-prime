@@ -111,6 +111,135 @@ TEST(ShippedLibDescriptor, LibraryIsOptional) {
     EXPECT_EQ(desc->symbols[0].linkage, ShippedSymbolLinkage::External); // default
 }
 
+// ── macros surface (preprocessor-macro; D-PP-DESCRIPTOR-MACRO-INJECT) ─────────
+
+// Function-like (assert), object-like (no params), and variadic forms all parse;
+// `params` ABSENT distinguishes object-like from a zero-param function-like.
+TEST(ShippedLibDescriptor, MacrosSurfaceParsedAllForms) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "m.json", R"JSON({
+        "header": "m.h",
+        "macros": [
+            { "name": "assert", "params": ["e"], "replacement": "((void)0)" },
+            { "name": "TRUE", "replacement": "1" },
+            { "name": "LOG", "params": ["fmt"], "variadic": true, "replacement": "do{}while(0)" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->macros.size(), 3u);
+    EXPECT_EQ(desc->macros[0].name, "assert");
+    ASSERT_TRUE(desc->macros[0].params.has_value());
+    ASSERT_EQ(desc->macros[0].params->size(), 1u);
+    EXPECT_EQ(desc->macros[0].params->at(0), "e");
+    EXPECT_EQ(desc->macros[0].replacement, "((void)0)");
+    EXPECT_FALSE(desc->macros[0].variadic);
+    EXPECT_EQ(desc->macros[1].name, "TRUE");
+    EXPECT_FALSE(desc->macros[1].params.has_value());   // object-like
+    EXPECT_EQ(desc->macros[1].replacement, "1");
+    EXPECT_EQ(desc->macros[2].name, "LOG");
+    ASSERT_TRUE(desc->macros[2].params.has_value());
+    EXPECT_TRUE(desc->macros[2].variadic);
+}
+
+// A macros-ONLY descriptor is VALID — the ≥1-surface check counts macros (the
+// assert.h shape). RED-ON-DISABLE: without `&& out.macros.empty()` in the check,
+// this would fail-loud as "declares nothing".
+TEST(ShippedLibDescriptor, MacrosOnlyDescriptorIsValid) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "mo.json", R"({
+        "header": "mo.h", "macros": [ { "name": "X", "replacement": "" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->macros.size(), 1u);
+    EXPECT_TRUE(desc->macros[0].replacement.empty());   // null macro `#define X`
+}
+
+TEST(ShippedLibDescriptor, MacroMissingNameFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad.json",
+        R"({ "header": "b.h", "macros": [ { "replacement": "1" } ] })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+TEST(ShippedLibDescriptor, MacroVariadicWithoutParamsFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad2.json",
+        R"({ "header": "b.h", "macros": [ { "name": "X", "variadic": true } ] })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// readShippedLibMacros: interner-FREE (the preprocessor's path — it has no
+// TypeInterner). Decodes the macros without symbols/constants/typedefs.
+TEST(ShippedLibDescriptor, ReadShippedLibMacrosInternerFree) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "assert.json", R"JSON({
+        "header": "assert.h",
+        "macros": [ { "name": "assert", "params": ["e"], "replacement": "((void)0)" } ]
+    })JSON");
+    DiagnosticReporter rep;
+    auto macros = readShippedLibMacros(path, rep);   // NO interner / typeReg
+    ASSERT_TRUE(macros.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(macros->size(), 1u);
+    EXPECT_EQ(macros->at(0).name, "assert");
+    ASSERT_TRUE(macros->at(0).params.has_value());
+    EXPECT_EQ(macros->at(0).replacement, "((void)0)");
+}
+
+// readShippedLibMacros on a TYPED-only descriptor returns an EMPTY vector (NOT
+// nullopt) — the preprocessor injects nothing for stdint/stddef-style headers.
+TEST(ShippedLibDescriptor, ReadShippedLibMacrosEmptyForTypedOnly) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "size.json", R"({
+        "header": "size.h", "typedefs": [ { "name": "size_t", "type": "u64" } ]
+    })");
+    DiagnosticReporter rep;
+    auto macros = readShippedLibMacros(path, rep);
+    ASSERT_TRUE(macros.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(macros->empty());
+}
+
+// readShippedLibMacros is NO STRICTER than the semantic read: a HEADER-LESS
+// descriptor (the `header` provenance gate is the SEMANTIC read's job, NOT the
+// macros-only read's) reads its macros WITHOUT a new error. RED-ON-DISABLE: a
+// `header` gate here re-breaks the angle-include preprocess path for any
+// symbols-only descriptor — exactly the ImportResolver regression this guards
+// (CSubsetAngleIncludeResolvesToDescriptorOnSystemDir uses a header-less api.json
+// that the preprocessor now reads for macros while splicing).
+TEST(ShippedLibDescriptor, ReadShippedLibMacrosHeaderlessIsLenient) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "api.json", R"JSON({
+        "library": { "pe": "lib.dll" },
+        "symbols": [ { "name": "use", "signature": "fn() -> i32" } ]
+    })JSON");
+    DiagnosticReporter rep;
+    auto macros = readShippedLibMacros(path, rep);
+    ASSERT_TRUE(macros.has_value());   // NOT nullopt — header absence is not an error
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(macros->empty());      // no `macros` key -> nothing injected
+}
+
 // An "object" kind decodes to ShippedSymbolKind::Object (→ ExternGlobal).
 TEST(ShippedLibDescriptor, ObjectKindDecodes) {
     ScratchDir dir{Location::Temp, "shipped-lib"};

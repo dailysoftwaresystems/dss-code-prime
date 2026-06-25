@@ -129,6 +129,91 @@ decodeConstantValue(json const& v, TypeKind kind) {
     return static_cast<std::int64_t>(x);                   // bit-pattern (re-read per kind)
 }
 
+// Decode the optional `macros` array (the preprocessor-macro surface) into
+// `out`. Collect-all: a malformed entry is reported (the caller's errorCount
+// delta then fails the whole read) and the loop continues. Interner-FREE — a
+// macro is pure preprocessor token TEXT (no types), so the preprocessor (which
+// has no interner) reuses this. Shared by `readShippedLibDescriptor` (full read)
+// and `readShippedLibMacros` (the preprocessor's macros-only read).
+void decodeShippedMacros(json const& doc, std::string const& pathStr,
+                         DiagnosticReporter& reporter,
+                         std::vector<ShippedMacro>& out) {
+    if (!doc.contains("macros")) return;
+    if (!doc.at("macros").is_array()) {
+        emitMalformed(reporter, "shipped-lib descriptor '" + pathStr
+                                    + "': 'macros' must be an array");
+        return;
+    }
+    json const& macros = doc.at("macros");
+    out.reserve(out.size() + macros.size());
+    std::size_t midx = 0;
+    for (auto const& m : macros) {
+        std::string const at = "'" + pathStr + "' macros[" + std::to_string(midx) + "]";
+        ++midx;
+        if (!m.is_object()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
+            continue;
+        }
+        (void)rejectUnknownKeys(reporter, m, "macros[" + std::to_string(midx - 1) + "]",
+                                {"name", "params", "replacement", "variadic"});
+        if (!m.contains("name") || !m.at("name").is_string()
+            || m.at("name").get<std::string>().empty()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + at
+                                        + ": missing or empty 'name'");
+            continue;
+        }
+        ShippedMacro macro;
+        macro.name = m.at("name").get<std::string>();
+        // params: ABSENT = object-like; PRESENT (even []) = function-like.
+        if (m.contains("params")) {
+            if (!m.at("params").is_array()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": 'params' must be an array of strings");
+                continue;
+            }
+            std::vector<std::string> params;
+            bool okParams = true;
+            for (auto const& p : m.at("params")) {
+                if (!p.is_string() || p.get<std::string>().empty()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": every 'params' entry must be a non-empty "
+                                                  "string");
+                    okParams = false;
+                    break;
+                }
+                params.push_back(p.get<std::string>());
+            }
+            if (!okParams) continue;
+            macro.params = std::move(params);
+        }
+        // replacement: optional string (default empty — a null macro `#define X`).
+        if (m.contains("replacement")) {
+            if (!m.at("replacement").is_string()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": 'replacement' must be a string");
+                continue;
+            }
+            macro.replacement = m.at("replacement").get<std::string>();
+        }
+        // variadic: optional bool; an object-like macro cannot be variadic.
+        if (m.contains("variadic")) {
+            if (!m.at("variadic").is_boolean()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": 'variadic' must be a boolean");
+                continue;
+            }
+            macro.variadic = m.at("variadic").get<bool>();
+            if (macro.variadic && !macro.params.has_value()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": 'variadic' requires 'params' (an object-like "
+                                              "macro cannot be variadic)");
+                continue;
+            }
+        }
+        out.push_back(std::move(macro));
+    }
+}
+
 } // namespace
 
 std::optional<ShippedLibDescriptor>
@@ -261,7 +346,7 @@ readShippedLibDescriptor(std::filesystem::path const& path,
     // accepted + ignored, never consumed by lowering.
     (void)rejectUnknownKeys(reporter, doc, "(root)",
                             {"header", "standard", "library", "symbols",
-                             "constants", "typedefs", "$comment"});
+                             "constants", "typedefs", "macros", "$comment"});
 
     // (4) Each symbol. Collect-all: a malformed symbol is reported but the
     // loop continues so the operator sees every problem in one pass; the
@@ -550,15 +635,21 @@ readShippedLibDescriptor(std::filesystem::path const& path,
         }
     }
 
-    // (7) A descriptor must declare SOMETHING — a file with no symbols, no
-    // constants, AND no typedefs is a no-op artifact that should not ship
-    // silently (mirrors the old non-empty-`symbols` rule, now spanning all
-    // three surfaces).
-    if (out.symbols.empty() && out.constants.empty() && out.typedefs.empty()) {
+    // (7) MACROS (the preprocessor-macro surface, interner-free). A function-like
+    // or object-like `#define` the preprocessor injects when this header is
+    // included (e.g. `assert(e) -> ((void)0)`).
+    decodeShippedMacros(doc, path.generic_string(), reporter, out.macros);
+
+    // (8) A descriptor must declare SOMETHING — a file with no symbols, no
+    // constants, no typedefs, AND no macros is a no-op artifact that should not
+    // ship silently (mirrors the old non-empty-`symbols` rule, now spanning all
+    // four surfaces).
+    if (out.symbols.empty() && out.constants.empty() && out.typedefs.empty()
+        && out.macros.empty()) {
         emitMalformed(reporter,
             std::string{"shipped-lib descriptor '"} + path.generic_string()
                 + "': declares nothing — needs at least one of 'symbols', "
-                  "'constants', or 'typedefs'");
+                  "'constants', 'typedefs', or 'macros'");
         return std::nullopt;
     }
 
@@ -568,6 +659,51 @@ readShippedLibDescriptor(std::filesystem::path const& path,
     // would silently drop symbols.
     if (reporter.errorCount() != errBefore) return std::nullopt;
     return out;
+}
+
+std::optional<std::vector<ShippedMacro>>
+readShippedLibMacros(std::filesystem::path const& path,
+                     DiagnosticReporter&          reporter) {
+    std::size_t const errBefore = reporter.errorCount();
+
+    // Read + parse — same provenance gate as readShippedLibDescriptor, but the
+    // typed surfaces (which need a TypeInterner) are NOT read here; the semantic
+    // phase reads + validates those separately via readShippedLibDescriptor.
+    std::ifstream in{path, std::ios::binary};
+    if (!in) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor: failed to open '"}
+                + path.generic_string() + "' for reading");
+        return std::nullopt;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    json doc;
+    try {
+        doc = json::parse(ss.str());
+    } catch (json::parse_error const& e) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor '"} + path.generic_string()
+                + "': JSON parse error: " + e.what());
+        return std::nullopt;
+    }
+    if (!doc.is_object()) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor '"} + path.generic_string()
+                + "': top-level value must be a JSON object");
+        return std::nullopt;
+    }
+    // NOTE: the `header` provenance gate + the typed-surface validation are the
+    // SEMANTIC read's job (readShippedLibDescriptor) — NOT repeated here. The
+    // macros-only read must be no STRICTER than the full read (a header-less or
+    // symbols-only descriptor is read for its macros [usually none] WITHOUT a new
+    // error; the semantic read reports any real provenance/typed-surface defect).
+    // Only MALFORMED macros (decodeShippedMacros below) + a broken JSON fail loud.
+
+    std::vector<ShippedMacro> out;
+    decodeShippedMacros(doc, path.generic_string(), reporter, out);
+    if (reporter.errorCount() != errBefore) return std::nullopt;
+    return out;  // empty when the descriptor declares no `macros` (typed-only)
 }
 
 } // namespace dss::ffi
