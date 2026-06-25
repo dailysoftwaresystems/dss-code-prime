@@ -301,9 +301,17 @@ private:
             return;
         }
         if (op == MirOpcode::Const) {
+            // Copy + remap the literal so a symbol-address value's embedded
+            // SymbolId is rewritten into the merged id space — SYMMETRY with the
+            // step-5 global path (F5 remapLiteralSymbols). Today no value-position
+            // `Const` carries a MirSymbolAddrValue (it is only ever a global
+            // initializer), but routing BOTH literal-copy sites through the one
+            // shared remap closes the missed-site class BY CONSTRUCTION rather than
+            // leaving a silent stale-id twin (the FC7 clone-site miscompile class).
+            MirLiteralValue lit = src_.literalValue(src_.constLiteralIndex(id));
+            remapLiteralSymbols(lit, plan_, cuIdx_);
             local_.emplace(id.v, dst_.addConst(
-                src_.literalValue(src_.constLiteralIndex(id)),
-                reType(src_.instType(id)), src_.instFlags(id)));
+                std::move(lit), reType(src_.instType(id)), src_.instFlags(id)));
             return;
         }
         if (op == MirOpcode::GlobalAddr) {

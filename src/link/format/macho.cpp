@@ -2110,7 +2110,7 @@ encodeExecDynamic(AssembledModule const&    module,
     // __DATA vmaddr). __DATA is the 4th segment: __PAGEZERO=0, __TEXT=1,
     // __DATA_CONST=2 are ALL unconditional, then __DATA=3 (present whenever a
     // data item exists, which is exactly when dataRebaseSiteVas is non-empty);
-    // mirrors the bind stream's kSegIdxDataConst emission-order constant. An
+    // i.e. the bind stream's kSegIdxDataConst (=2) + 1, same emission order. An
     // empty site list yields ZERO rebase bytes — byte-identical to the no-data
     // path. dyld adds the image's load slide to each rebased pointer.
     constexpr std::uint8_t kSegIdxData = 3;
