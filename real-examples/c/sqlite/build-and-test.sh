@@ -9,11 +9,11 @@
 #
 #   1. verify the host is Linux / WSL and online
 #   2. clone-or-update  dss-code-prime   into  ~/src
-#   3. clone-or-update  sqlite/sqlite    into  ~/dss-build
+#   3. clone-or-update  sqlite/sqlite    into  ~/src
 #   4. amalgamate SQLite -> sqlite3.c    (autotools: `make sqlite3.c`, needs tclsh)
 #   5. build dss-code-prime              (its default CMake-4 Release build)
 #   6. compile sqlite3.c with dss-code-prime for windows + linux + macos
-#                                        -> ~/dss-outputs/c/sqlite/<os>/
+#                                        -> ~/src/dss-code-prime/build/real-examples/c/sqlite/<os>/
 #   7. test the linux output with a SQLite smoke unit (when it runs)
 #   8. summarise results + exit non-zero if any expected step failed
 #
@@ -37,8 +37,8 @@ DSS_REPO_URL="${DSS_REPO_URL:-git@github.com:dailysoftwaresystems/dss-code-prime
 DSS_BRANCH="${DSS_BRANCH:-main}"                 # compiler is built from main per spec; override to probe a feature branch
 SQLITE_REPO_URL="${SQLITE_REPO_URL:-git@github.com:sqlite/sqlite.git}"
 SRC_DIR="${SRC_DIR:-$HOME/src/dss-code-prime}"
-SQLITE_DIR="${SQLITE_DIR:-$HOME/dss-build/sqlite}"
-OUT_DIR="${OUT_DIR:-$HOME/dss-outputs/c/sqlite}"
+SQLITE_DIR="${SQLITE_DIR:-$HOME/src/sqlite}"
+OUT_DIR="${OUT_DIR:-$SRC_DIR/build/real-examples/c/sqlite}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 LANGUAGE="c-subset"
 MIN_CMAKE_MAJOR=4
@@ -119,7 +119,7 @@ step "2/8  Fetch dss-code-prime -> $SRC_DIR (branch: $DSS_BRANCH)"
 clone_or_update "$DSS_REPO_URL" "$SRC_DIR" "$DSS_BRANCH"
 pass "dss-code-prime ready"
 
-# ── Step 3 — sqlite -> ~/dss-build ───────────────────────────────────────────
+# ── Step 3 — sqlite -> ~/src ─────────────────────────────────────────────────
 step "3/8  Fetch sqlite/sqlite -> $SQLITE_DIR (default branch)"
 clone_or_update "$SQLITE_REPO_URL" "$SQLITE_DIR" ""
 pass "sqlite ready"
