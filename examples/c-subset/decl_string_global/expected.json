@@ -1,0 +1,33 @@
+{
+  "$comment": "Cluster-F F5 (decl_string_global): symbol-address GLOBALS — `static int *p = &target;` (&global) + `static const char *msg = \"hello\";` (string->rodata). Each global's pointer slot is filled by an abs64 RELOCATION the linker resolves to the target's VA — the new cross-format mechanism (PE .data-gate + ELF/Mach-O data-item reloc appliers; abs64 found by formula widthBytes==8 && !pcRelative). exit 143 == *p(42) + msg[1]('e'=101); an unpatched/null pointer SIGSEGVs instead. Red-on-disable: remove the MirSymbolAddrValue assembler arm -> K_NoMatchingObjectFormat. The release arm runs the shipped pipeline over the new data-item relocations.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 143,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
