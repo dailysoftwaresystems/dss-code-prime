@@ -362,7 +362,52 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
     if (promoted_.empty()) return;
     allocasPromoted_ += promoted_.size();
 
+    // Step 4b — SEMI-PRUNED SSA (Briggs/Cooper) — D-OPT-MEM2REG-LOOP-BODY-LOCAL-DEAD-PHI.
+    // Compute the set of promoted allocas that are UPWARD-EXPOSED: read (Load)
+    // before any write (Store) of the SAME alloca within SOME block — the
+    // "global" / non-block-local names. ONLY a global alloca can be live across
+    // a block boundary and thus legitimately need a Phi. A purely BLOCK-LOCAL
+    // alloca — every Load dominated by a Store of it in the SAME block, e.g. a
+    // `int iv = expr;` local declared AND used entirely inside a loop body —
+    // is NOT upward-exposed. Minimal (un-pruned) SSA still places a Phi for it
+    // at the loop HEADER (the body-Store's IDF includes the header via the
+    // back-edge), but that Phi is DEAD and its entry-predecessor incoming is
+    // genuinely undefined (the alloca was never stored before the loop) → the
+    // rename walk's empty-stack guard aborts (the bug: any loop-body-local
+    // crashed the release pipeline). Gating Phi PLACEMENT on upward-exposure
+    // removes ONLY these dead Phis: a global alloca's placement is BYTE-
+    // IDENTICAL to before (so induction vars / diamond joins are unchanged),
+    // and the genuine-uninitialized-read fatal is PRESERVED — a truly
+    // live-but-undefined alloca (`int x; if(c) x=1; use(x);`) IS upward-exposed
+    // at its use, stays global, still gets its Phi, and still aborts on the
+    // undefined path. (A block-local alloca still promotes correctly via the
+    // rename walk: its in-block Store pushes the value its in-block Load reads.)
+    std::unordered_set<std::uint32_t> upwardExposed;
+    for (MirBlockId const b : rpo) {
+        std::unordered_set<std::uint32_t> killed;  // promoted allocas Stored so far in b
+        std::uint32_t const ninst = src_.blockInstCount(b);
+        for (std::uint32_t i = 0; i < ninst; ++i) {
+            MirInstId const id = src_.blockInstAt(b, i);
+            MirOpcode const op = src_.instOpcode(id);
+            if (op == MirOpcode::Load) {
+                auto const ops = src_.instOperands(id);
+                if (ops.size() == 1 && promoted_.count(ops[0].v)
+                    && killed.find(ops[0].v) == killed.end()) {
+                    upwardExposed.insert(ops[0].v);  // Load before any Store in b
+                }
+            } else if (op == MirOpcode::Store) {
+                auto const ops = src_.instOperands(id);
+                if (ops.size() == 2 && promoted_.count(ops[1].v)) {
+                    killed.insert(ops[1].v);
+                }
+            }
+        }
+    }
+
     for (std::uint32_t aid : promoted_) {
+        if (upwardExposed.find(aid) == upwardExposed.end()) {
+            continue;  // semi-pruned: block-local alloca needs no Phi (no dead header Phi)
+        }
         auto const& defs = defBlocksOf[aid];
         if (defs.empty()) {
             // Step 1 unconditionally adds the alloca's own block as a

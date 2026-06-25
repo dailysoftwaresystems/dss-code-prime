@@ -8,5 +8,8 @@
       "artifact": "main.exe",
       "runOn": ["windows"]
     }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
   ]
 }

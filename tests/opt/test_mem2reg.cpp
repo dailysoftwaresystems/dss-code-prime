@@ -454,6 +454,85 @@ TEST(Mem2Reg, LoopInductionVariablePromoted) {
     }
 }
 
+// D-OPT-MEM2REG-LOOP-BODY-LOCAL-DEAD-PHI: an alloca declared AND used entirely
+// inside a loop body (Store-then-Load in the latch — `int iv = expr;`) is
+// BLOCK-LOCAL: not upward-exposed, so SEMI-PRUNED SSA places NO Phi for it.
+// Minimal (un-pruned) SSA would place a DEAD Phi at the loop HEADER (the body-
+// Store's IDF includes the header via the back-edge); that Phi's entry-
+// predecessor incoming is genuinely undefined (the slot was never stored before
+// the loop) → the rename walk's empty-stack guard ABORTS. That bug crashed the
+// release pipeline on ANY loop-body-local (`vsum`'s `int iv`/`double dv`, the
+// varargs_win64_sum symptom, every plain `while (...) { int x = ...; }`).
+// Here `slot` is a real induction var (Load-before-Store in the latch → upward-
+// exposed → exactly 1 header Phi) and `bl` is a body-local (Store-before-Load →
+// none). RED-ON-DISABLE: revert the upward-exposed gate in mem2reg.cpp and this
+// pass ABORTS on bl's dead header Phi (the test process crashes).
+TEST(Mem2Reg, LoopBodyLocalAllocaNeedsNoPhi) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);  // induction var → GLOBAL
+    MirInstId const bl   = mb.addInst(MirOpcode::Alloca, {}, ptr);  // loop-body-local → block-local
+    MirLiteralValue zero; zero.value = std::int64_t{0}; zero.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(zero, i32);
+    MirInstId const s0[] = {c0, slot};
+    (void)mb.addInst(MirOpcode::Store, s0, InvalidType);
+    mb.addBr(header);
+
+    mb.beginBlock(header);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    mb.addCondBr(cond, body, exitB);
+
+    mb.beginBlock(body);
+    // bl: Store THEN Load within the body (`int bl = 7;`) — block-local.
+    MirLiteralValue seven; seven.value = std::int64_t{7}; seven.core = TypeKind::I32;
+    MirInstId const c7 = mb.addConst(seven, i32);
+    MirInstId const sb[] = {c7, bl};
+    (void)mb.addInst(MirOpcode::Store, sb, InvalidType);
+    MirInstId const blLoadOps[] = {bl};
+    MirInstId const blv = mb.addInst(MirOpcode::Load, blLoadOps, i32);
+    // slot: Load BEFORE its Store in the latch → upward-exposed (induction var).
+    MirInstId const slotLoadOps[] = {slot};
+    MirInstId const ld = mb.addInst(MirOpcode::Load, slotLoadOps, i32);
+    MirInstId const addOps[] = {ld, blv};
+    MirInstId const inc = mb.addInst(MirOpcode::Add, addOps, i32);  // slot' = slot + bl
+    MirInstId const s1[] = {inc, slot};
+    (void)mb.addInst(MirOpcode::Store, s1, InvalidType);
+    mb.addBr(header);  // back-edge
+
+    mb.beginBlock(exitB);
+    MirInstId const exitLoadOps[] = {slot};
+    MirInstId const ld2 = mb.addInst(MirOpcode::Load, exitLoadOps, i32);
+    mb.addReturn(ld2);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runMem2Reg(mir, interner, rep);  // WITHOUT the fix: ABORTS here
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.allocasPromoted, 2u)
+        << "both the induction var and the loop-body-local promote";
+    // ONLY the induction var's header Phi — the block-local gets NONE.
+    EXPECT_EQ(r.phisInserted, 1u)
+        << "a loop-body-local is not upward-exposed → semi-pruned SSA inserts no "
+           "(dead) header Phi for it; only the induction var needs one";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi),    1u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Alloca), 0u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Load),   0u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Store),  0u);
+}
+
 // Alloca-as-Return-value: escapes the function. Must NOT be promoted.
 // (The function returns a pointer that the caller can read/write
 // through; promoting would erase the storage that pointer references.)
