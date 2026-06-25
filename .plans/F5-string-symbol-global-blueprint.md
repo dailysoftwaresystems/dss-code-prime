@@ -19,7 +19,7 @@ x86_64.target.json:1797 (kind 2) · arm64.target.json:1875 (kind 4) · PE IMAGE_
 
 ## Staged build (each stage independently testable)
 1. **String index** ✅ **DONE (commit pending, 404/404)** — materializeStringLiteralGlobal helper (factored from the Cast decay arm — one producer) + HirKind::Literal arm in lowerLvalueAddressNode + `agg_string_index` corpus (exit 215 x86 native + arm64 qemu). Red-on-disable: remove the arm → H0009.
-2. **MirSymbolAddrValue variant** + classifyGlobals recognition + emitGlobals_ + mir_text round-trip. (Hits a controlled fail-loud at asm until stage 3.)
+2. **MirSymbolAddrValue variant** ✅ **DONE (commit pending)** — variant arm + mir_text render arm + const_fold toHirLiteral bridge (→monostate, opaque) + PendingGlobal.symbolAddrInit + tryClassifyAsSymbolAddr (AddressOf(Ref) + Cast(string→Ptr), mints the rodata global) + emitGlobals_ arm. Classification FLOWS: `char* g="..."` / `int* p=&x` now reach the asm scalar arm (controlled fail-loud), no longer the runtime-init deferral. 404/404 (anchor guard re-greened).
 3. **Assembler dispatch** — thread TargetSchema into lowerMirGlobalsToDataItems + findAbsolutePtrRelocKind + the MirSymbolAddrValue arm. PE works end-to-end (its data-reloc loop exists, after the .data-gate extension). Test `decl_string_global` on x86 PE.
 4. **ELF data-item relocs** — extract applyDataItemRelocations shared helper (PE refactored to use it), lift D-LK1, wire encodeElfStatic + encodeElfExecDynamic. Test arm64 qemu (ELF).
 5. **Mach-O data-item relocs** — same pattern in macho.cpp encodeExec __data/__const. (macOS CI leg.)

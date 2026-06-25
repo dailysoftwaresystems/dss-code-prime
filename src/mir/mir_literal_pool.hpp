@@ -30,6 +30,19 @@ struct MirAggregateValue {
     std::vector<MirLiteralValue> fields;
 };
 
+// Symbol-address literal (F5 — D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): a global whose
+// initializer is the LINK-TIME-CONSTANT address of another symbol — a string
+// literal's rodata global (`char* g = "..."`), another global (`int* p = &x`),
+// or a function (a function-pointer table). It is NOT a runtime initializer: the
+// assembler emits a pointer-width slot + an absolute-64 RELOCATION against
+// `symbol` (+ `addend`), and the linker fills the target's VA at link time.
+// `symbol` is the target's `SymbolId` underlying value, kept raw so the pool
+// stays core-only (the assembler reconstructs `SymbolId{symbol}`).
+struct MirSymbolAddrValue {
+    std::uint32_t symbol = 0;
+    std::int64_t  addend = 0;
+};
+
 struct MirLiteralValue {
     // `monostate` = a literal whose value is unknown (carried so a malformed
     // source still lowers + diagnoses). `core` is a denormalized hint enabling
@@ -38,7 +51,7 @@ struct MirLiteralValue {
     // VARIANT ARM (uint64 vs string), never by `core`. D5.3 adds the
     // `MirAggregateValue` arm for `core` ∈ {Struct, Union, Array}.
     std::variant<std::monostate, bool, std::int64_t, std::uint64_t, double, std::string,
-                 MirAggregateValue> value;
+                 MirAggregateValue, MirSymbolAddrValue> value;
     TypeKind core = TypeKind::Void;
 };
 

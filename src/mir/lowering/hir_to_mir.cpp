@@ -6631,8 +6631,64 @@ struct Lowerer {
         // ⇒ mutable ⇒ writable `.data`/`.bss`). Stamped onto MirGlobal.isConst so
         // the assembler routes an initialized const global to read-only `.rodata`.
         bool                           isConst = false;
+        // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): init = the LINK-TIME-CONSTANT
+        // address of `symbolAddrInit` (+ addend) — a string-literal rodata global,
+        // another global, or a function. Routes to a MirSymbolAddrValue literal
+        // (an abs64 relocation), NOT __module_init__. Mutually exclusive with
+        // constInit / runtimeInit above.
+        std::optional<SymbolId>        symbolAddrInit;
+        std::int64_t                   symbolAddrAddend = 0;
     };
     std::vector<PendingGlobal> pendingGlobals;
+
+    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): recognize a LINK-TIME-CONSTANT
+    // symbol-address global initializer that const-eval cannot fold — a global
+    // pointer initialized to another symbol's ADDRESS. Two shapes:
+    //   `int* p = &x;`     → AddressOf(Ref(global-or-function)) → that symbol
+    //   `char* g = "...";` → Cast(Literal(string), Ptr<Char>)   → a freshly minted
+    //                        rodata string global (pushed to pendingGlobals so
+    //                        emitGlobals_ emits its bytes; the pointer's reloc
+    //                        targets it)
+    // Returns {targetSymbol, addend} or nullopt (the caller falls back to
+    // const-eval / runtime-init). mintSyntheticGlobalSymbol is lazy-seeded after
+    // collect*, so minting here is safe; pushing the rodata PendingGlobal mid-
+    // classify is safe (the classify loop walks moduleDecls, not pendingGlobals).
+    [[nodiscard]] std::optional<std::pair<SymbolId, std::int64_t>>
+    tryClassifyAsSymbolAddr(HirNodeId initNode) {
+        HirKind const k = hir.kind(initNode);
+        if (k == HirKind::AddressOf) {
+            auto kids = hir.children(initNode);
+            if (kids.size() == 1 && hir.kind(kids[0]) == HirKind::Ref) {
+                std::uint32_t const s = hir.payload(kids[0]);
+                if (globalSymbols.contains(s) || functionSymbols.contains(s)) {
+                    return std::make_pair(SymbolId{s}, std::int64_t{0});
+                }
+            }
+            return std::nullopt;
+        }
+        if (k == HirKind::Cast) {
+            auto kids = hir.children(initNode);
+            if (kids.size() != 1 || hir.kind(kids[0]) != HirKind::Literal)
+                return std::nullopt;
+            TypeId const ct = hir.typeId(initNode);
+            if (!ct.valid() || interner.kind(ct) != TypeKind::Ptr)
+                return std::nullopt;
+            std::uint32_t const litIdx0 = hir.payload(kids[0]);
+            HirLiteralValue const& src = literals.at(litIdx0);
+            if (!std::holds_alternative<std::string>(src.value))
+                return std::nullopt;
+            SymbolId const rodataSym = mintSyntheticGlobalSymbol();
+            if (!rodataSym.valid()) return std::nullopt;  // exhausted → fall back
+            PendingGlobal rg;
+            rg.symbol    = rodataSym;
+            rg.type      = hir.typeId(kids[0]);   // Array<Char,N+1>
+            rg.constInit = toMirLiteral(src);
+            rg.isConst   = true;                  // string literal bytes → .rodata
+            pendingGlobals.push_back(std::move(rg));
+            return std::make_pair(rodataSym, std::int64_t{0});
+        }
+        return std::nullopt;
+    }
 
     // Classify each module-level global into pendingGlobals. Called after
     // `collectGlobals` (so `globalSymbols` is already populated for any
@@ -6700,14 +6756,23 @@ struct Lowerer {
             if (mutabilityMap != nullptr)
                 if (auto const* p = mutabilityMap->tryGet(decl)) pg.isConst = p->isConst;
             if (auto initN = hir.globalInit(decl); initN.has_value()) {
-                // The resolver covers Refs to sibling globals; literal /
-                // arithmetic / Cast paths still fold per CE1.
-                ConstEvalResult const r = evaluateConstant(
-                    hir, interner, literals, *initN, env, opts);
-                if (r.value.has_value()) {
-                    pg.constInit = toMirLiteral(*r.value);
+                // F5: a symbol-ADDRESS initializer (`int* p = &x;`, `char* g =
+                // "...";`) is a LINK-TIME constant const-eval cannot fold —
+                // recognize it FIRST (and route to a MirSymbolAddrValue / abs64
+                // reloc) before falling back to const-eval / runtime-init.
+                if (auto sa = tryClassifyAsSymbolAddr(*initN)) {
+                    pg.symbolAddrInit   = sa->first;
+                    pg.symbolAddrAddend = sa->second;
                 } else {
-                    pg.runtimeInit = *initN;
+                    // The resolver covers Refs to sibling globals; literal /
+                    // arithmetic / Cast paths still fold per CE1.
+                    ConstEvalResult const r = evaluateConstant(
+                        hir, interner, literals, *initN, env, opts);
+                    if (r.value.has_value()) {
+                        pg.constInit = toMirLiteral(*r.value);
+                    } else {
+                        pg.runtimeInit = *initN;
+                    }
                 }
             }
             pendingGlobals.push_back(std::move(pg));
@@ -6759,7 +6824,20 @@ struct Lowerer {
                 ok = false;
                 continue;
             }
-            if (pg.constInit.has_value()) {
+            if (pg.symbolAddrInit.has_value()) {
+                // F5: init = link-time-constant symbol address. Emit a
+                // MirSymbolAddrValue literal; lowerMirGlobalsToDataItems (asm)
+                // emits a pointer slot + an abs64 reloc against the target symbol,
+                // NOT a __module_init__ runtime store.
+                MirLiteralValue v;
+                v.value = MirSymbolAddrValue{pg.symbolAddrInit->v,
+                                             pg.symbolAddrAddend};
+                v.core  = TypeKind::Ptr;
+                std::uint32_t const idx = mir.literalPoolAdd(std::move(v));
+                mir.addGlobal(pg.type, pg.symbol, idx, {},
+                              pg.linkage.binding, pg.linkage.visibility,
+                              pg.isConst);
+            } else if (pg.constInit.has_value()) {
                 std::uint32_t const idx = mir.literalPoolAdd(*pg.constInit);
                 mir.addGlobal(pg.type, pg.symbol, idx, {},
                               pg.linkage.binding, pg.linkage.visibility,

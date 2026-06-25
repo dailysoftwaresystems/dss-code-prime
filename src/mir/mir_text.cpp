@@ -323,6 +323,10 @@ private:
                     first = false;
                 }
                 out_ += '}';
+            } else if constexpr (std::is_same_v<T, MirSymbolAddrValue>) {
+                // F5: link-time symbol-address literal (`&sym [+ addend]`).
+                out_ += std::format("symaddr %{}", v.symbol);
+                if (v.addend != 0) out_ += std::format(" + {}", v.addend);
             }
         }, lv.value);
         out_ += " : ";
