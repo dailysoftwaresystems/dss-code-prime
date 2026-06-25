@@ -22,6 +22,7 @@
 #include "program/target_spec.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -555,6 +556,22 @@ int Program::run(int argc, char* argv[]) {
     // `--config=<debug|release>` into the kernel so the right
     // shipped pipeline gets loaded at compile_pipeline step 3.5.
     setCompileConfig(args.config);
+    // `--time`: report the compilation's wall-clock to stderr when this run
+    // returns — covers EVERY compile-producing mode (project / transpile /
+    // directory / compile) via ONE scoped reporter, no per-mode duplication.
+    // A zero-arg run never reaches here with time==true (parseCliArgs rejects
+    // options without a mode → NoModeSelected), so the destructor only emits a
+    // line for a real compile. Universal driver concern — lang/target/format-neutral.
+    struct WallTimeReporter {
+        bool const                                  enabled;
+        std::chrono::steady_clock::time_point const start;
+        ~WallTimeReporter() {
+            if (!enabled) return;
+            auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - start).count();
+            std::cerr << "dss-code-prime: compile time " << formatWallTime(ms) << "\n";
+        }
+    } const wallTimeReporter{args.time, std::chrono::steady_clock::now()};
     if (args.projectPath.has_value()) {
         return compileProject(*args.projectPath, cfg);
     }

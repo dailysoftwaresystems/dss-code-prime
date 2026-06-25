@@ -56,47 +56,12 @@ if [[ -t 1 ]]; then
 else
   C_RST=; C_RED=; C_GRN=; C_YLW=; C_BLU=
 fi
-step()  {                       # prints the prior step's elapsed (with --time), then this header
-  _flush_step
-  printf '\n%s== %s ==%s' "$C_BLU" "$*" "$C_RST"
-  [[ "${TIME_ENABLED:-0}" == "1" ]] && printf '  (started %s)' "$(now_ts)"
-  printf '\n'
-  STEP_NAME="$*"; STEP_EPOCH="$(date +%s)"
-}
+step()  { printf '\n%s== %s ==%s\n' "$C_BLU" "$*" "$C_RST"; }
 info()  { printf '   %s\n' "$*"; }
 pass()  { printf '%s ✓ %s%s\n' "$C_GRN" "$*" "$C_RST"; }
 warn()  { printf '%s ! %s%s\n' "$C_YLW" "$*" "$C_RST"; }
 die()   { printf '%s ✗ ERROR: %s%s\n' "$C_RED" "$*" "$C_RST" >&2; exit 1; }
 trap 'die "failed at line $LINENO (command: $BASH_COMMAND)"' ERR
-
-# ── CLI args + timing (--time) ───────────────────────────────────────────────
-TIME_ENABLED=0
-usage() {
-  cat <<USAGE
-Usage: build-and-test.sh [--time] [--help]
-  --time   print wall-clock start/finish timestamps + elapsed (HH:MM:SS) for each
-           step, each compile target, and a grand total. Without it: no timing.
-  --help   this help.
-Env overrides: DSS_REPO_URL DSS_BRANCH SQLITE_REPO_URL SRC_DIR SQLITE_DIR OUT_DIR JOBS
-USAGE
-}
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --time)    TIME_ENABLED=1 ;;
-    -h|--help) usage; exit 0 ;;
-    *)         die "unknown argument: '$1' (try --help)" ;;
-  esac
-  shift
-done
-now_ts()  { date '+%Y-%m-%d %H:%M:%S'; }
-fmt_dur() { local s="$1"; printf '%02d:%02d:%02d' "$((s/3600))" "$(((s%3600)/60))" "$((s%60))"; }
-STEP_NAME=""; STEP_EPOCH=0
-_flush_step() {                 # print the just-finished step's elapsed (only with --time)
-  [[ "$TIME_ENABLED" == "1" && -n "$STEP_NAME" ]] || return 0
-  printf '   %sfinished %s at %s (Time: %s)%s\n' \
-    "$C_BLU" "$STEP_NAME" "$(now_ts)" "$(fmt_dur "$(( $(date +%s) - STEP_EPOCH ))")" "$C_RST"
-}
-SCRIPT_START_EPOCH="$(date +%s)"
 
 # ── package install helpers (Debian/Ubuntu/WSL) ──────────────────────────────
 SUDO=""; [[ "$(id -u)" -eq 0 ]] || SUDO="sudo"
@@ -208,8 +173,7 @@ for entry in "${TARGETS[@]}"; do
   label="${entry%%=*}"; spec="${entry#*=}"
   outd="$OUT_DIR/$label"; mkdir -p "$outd"
   log="$outd/compile.log"
-  t0="$(date +%s)"
-  if [[ "$TIME_ENABLED" == "1" ]]; then info "[$label] $spec  (started $(now_ts))"; else info "[$label] $spec"; fi
+  info "[$label] $spec"
   # The compile is a PROBE: a non-zero exit is DATA (the frontier), not a script
   # abort. Running it as an `if` condition exempts it from `set -e` AND the ERR
   # trap, so the loop reports every target instead of dying on the first failure.
@@ -222,7 +186,6 @@ for entry in "${TARGETS[@]}"; do
     warn "[$label] compile failed (exit $rc) — first diagnostics from $log:"
     { grep -m3 -iE 'error|unsupported|fatal| D-|S0[0-9]|H0[0-9]|K_|not (yet )?supported' "$log" || head -3 "$log"; } 2>/dev/null | sed 's/^/      /'
   fi
-  if [[ "$TIME_ENABLED" == "1" ]]; then info "  finished $label at $(now_ts) (Time: $(fmt_dur "$(( $(date +%s) - t0 ))"))"; fi
 done
 
 # ── Step 7 — test the linux output with a SQLite smoke unit ──────────────────
@@ -259,10 +222,6 @@ for entry in "${TARGETS[@]}"; do
   else printf '   %-8s : %sFAILED%s (see %s/%s/compile.log)\n' "$label" "$C_RED" "$C_RST" "$OUT_DIR" "$label"; fi
 done
 printf '   smoke    : %s\n' "$SMOKE_RESULT"
-_flush_step                                    # final step's elapsed (with --time)
-if [[ "$TIME_ENABLED" == "1" ]]; then
-  printf '   %stotal    : %s%s\n' "$C_BLU" "$(fmt_dur "$(( $(date +%s) - SCRIPT_START_EPOCH ))")" "$C_RST"
-fi
 
 if [[ "$COMPILE_FAILS" -gt 0 ]]; then
   printf '\n%s%d/%d target(s) did not compile — SQLite-readiness frontier is at step 6.%s\n' "$C_YLW" "$COMPILE_FAILS" "${#TARGETS[@]}" "$C_RST"
