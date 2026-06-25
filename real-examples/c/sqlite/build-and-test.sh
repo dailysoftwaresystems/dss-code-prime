@@ -169,6 +169,15 @@ step "6/8  Compile SQLite with dss-code-prime (windows + linux + macos)"
 mkdir -p "$OUT_DIR"
 declare -A COMPILED                 # label -> 1 on success
 COMPILE_FAILS=0
+# Surface the COMPILER's own `--time` line ("dss-code-prime: compile time <dur>",
+# captured in the log) as a "(compile time <dur>)" suffix — the timing is done by
+# dss-code-prime; the harness only passes --time and echoes the result.
+compile_time_suffix() {
+  local t=""
+  t="$(grep -oE 'compile time [^[:space:]]+' "$1" 2>/dev/null)" || true
+  t="${t##*$'\n'}"                  # last match (no pipe → no SIGPIPE under pipefail)
+  [[ -n "$t" ]] && printf '  (%s)' "$t" || true
+}
 for entry in "${TARGETS[@]}"; do
   label="${entry%%=*}"; spec="${entry#*=}"
   outd="$OUT_DIR/$label"; mkdir -p "$outd"
@@ -177,13 +186,14 @@ for entry in "${TARGETS[@]}"; do
   # The compile is a PROBE: a non-zero exit is DATA (the frontier), not a script
   # abort. Running it as an `if` condition exempts it from `set -e` AND the ERR
   # trap, so the loop reports every target instead of dying on the first failure.
-  if "$DSS_BIN" --compile "$AMALGAMATION" --language "$LANGUAGE" --target "$spec" --output "$outd" >"$log" 2>&1; then
+  # `--time` asks the compiler to self-report its wall-clock (surfaced below).
+  if "$DSS_BIN" --compile "$AMALGAMATION" --language "$LANGUAGE" --target "$spec" --output "$outd" --time >"$log" 2>&1; then
     COMPILED["$label"]=1
-    pass "[$label] compiled -> $outd"
+    pass "[$label] compiled -> $outd$(compile_time_suffix "$log")"
   else
     rc=$?
     COMPILE_FAILS=$((COMPILE_FAILS + 1))
-    warn "[$label] compile failed (exit $rc) — first diagnostics from $log:"
+    warn "[$label] compile failed (exit $rc)$(compile_time_suffix "$log") — first diagnostics from $log:"
     { grep -m3 -iE 'error|unsupported|fatal| D-|S0[0-9]|H0[0-9]|K_|not (yet )?supported' "$log" || head -3 "$log"; } 2>/dev/null | sed 's/^/      /'
   fi
 done
