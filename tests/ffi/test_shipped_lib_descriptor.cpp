@@ -607,10 +607,16 @@ TEST(ShippedLibDescriptor, AllShippedDescriptorsDecode) {
             EXPECT_FALSE(desc->header.empty())
                 << "shipped descriptor has empty header: "
                 << entry.path().generic_string();
-            // Provenance integrity: `header` MUST match the filename stem the
-            // resolver routes by (RED if a clone left stdlib.json saying stdio.h).
-            EXPECT_EQ(desc->header, entry.path().stem().string() + ".h")
-                << "header provenance must match the filename stem in "
+            // Provenance integrity: `header` MUST match the descriptor's path
+            // RELATIVE to shippedRoot, subdir-PRESERVING (mirrors the resolver:
+            // `<stdio.h>`->stdio.json->"stdio.h"; `<sys/types.h>`->sys/types.json
+            // ->"sys/types.h"). RED if a clone left stdlib.json saying stdio.h, OR
+            // a `sys/*` descriptor flattens its provenance to the bare stem.
+            fs::path const rel = fs::relative(entry.path(), shippedRoot);
+            std::string const expectedHeader =
+                (rel.parent_path() / rel.stem()).generic_string() + ".h";
+            EXPECT_EQ(desc->header, expectedHeader)
+                << "header provenance must match the subdir-preserving filename in "
                 << entry.path().generic_string();
             for (auto const& s : desc->symbols) {
                 EXPECT_TRUE(s.signature.valid())
