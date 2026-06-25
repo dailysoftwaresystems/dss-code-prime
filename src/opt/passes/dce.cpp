@@ -41,8 +41,12 @@ namespace {
 // stack) are read while earlier ones are unused would, after the unused
 // `Arg`s were DCE'd, leave a surviving high-ordinal `Arg` whose payload
 // exceeds the shrunken count → a spurious `I_ArgIndexOutOfRange` reject.
-// Keeping `Arg`s costs no codegen (an unused param's value is dropped at
-// the LIR tier by register allocation / LIR DCE).
+// Keeping `Arg`s is codegen-SAFE (not codegen-free): an unused parameter's
+// `arg` lowers to a dead `mov`/`load` — a dead vreg with an empty live range,
+// so it adds NO spill pressure and has NO correctness effect, the same
+// harmless dead-definition shape the LIR layer already tolerates (there is no
+// general LIR DCE today; a future one would drop the few bytes). The contract
+// this fix protects is at the MIR tier: DCE must not elide the `Arg`.
 [[nodiscard]] bool isSideEffectRoot(MirOpcode op, MirInstFlags flags) noexcept {
     if (op == MirOpcode::Arg) return true;
     if (opcodeInfo(op).hasSideEffects) return true;
