@@ -61,7 +61,7 @@ TEST(TypeRules, IsAssignableWidensWithinSigned) {
     auto i64 = in.primitive(TypeKind::I64);
     EXPECT_TRUE(isAssignable(in, i32, i16))  << "I16 widens to I32";
     EXPECT_TRUE(isAssignable(in, i64, i32))  << "I32 widens to I64";
-    EXPECT_FALSE(isAssignable(in, i16, i32)) << "I32 does NOT narrow to I16";
+    EXPECT_FALSE(isAssignable(in, i16, i32)) << "I32 does NOT narrow to I16 (intSameSignednessNarrows gate OFF default)";
 }
 
 // Cross-signedness is NOT assignable by DEFAULT (caller-declared explicit cast is
@@ -97,7 +97,55 @@ TEST(TypeRules, IsAssignableAdmitsCrossSignednessWhenGated) {
     EXPECT_TRUE(G(i32, u64)) << "U64 -> I32 (cross-signedness NARROWING, C 6.3.1.3)";
     EXPECT_TRUE(G(i64, u32)) << "U32 -> I64 (cross-signedness widening)";
     EXPECT_FALSE(G(i16, i32))
-        << "I32 -> I16 SAME-signedness narrowing stays rejected (gate is cross-only)";
+        << "I32 -> I16 SAME-signedness narrowing NOT admitted by the cross gate "
+           "(needs the separate intSameSignednessNarrows gate, off here)";
+}
+
+// D-CSUBSET-INT-SAME-SIGN-NARROW: with `intSameSignednessNarrows` ON (c-subset), a
+// SAME-signedness integer NARROWING (`short s = anInt;`, `signed char c = anInt;`,
+// `int i = aLong;`) IS assignable — C 6.3.1.3 / 6.5.16.1, value-preserving in range,
+// truncating (modular) out of range. coerce()'s arithmetic-core arm materializes the
+// width-exact Cast (MIR Trunc) — the SAME path cross-signedness narrowing uses.
+// RED-ON-DISABLE: the SAME narrowing calls with the gate OFF (the default 9th arg) must
+// REJECT — proving the rank-arm narrowing branch actually gates. SCOPE GUARDS: WIDENING
+// stays unconditional (gate-independent), and the same-sign gate does NOT admit a
+// signed↔unsigned pair (that is intCrossSignednessConverts).
+TEST(TypeRules, IsAssignableAdmitsSameSignednessNarrowingWhenGated) {
+    auto in  = makeInterner();
+    auto i8  = in.primitive(TypeKind::I8);
+    auto i16 = in.primitive(TypeKind::I16);
+    auto i32 = in.primitive(TypeKind::I32);
+    auto i64 = in.primitive(TypeKind::I64);
+    auto u8  = in.primitive(TypeKind::U8);
+    auto u16 = in.primitive(TypeKind::U16);
+    auto u32 = in.primitive(TypeKind::U32);
+    // gate ON (9th arg true): narrowing admitted in BOTH signednesses.
+    auto const N = [&](TypeId l, TypeId r) {
+        return isAssignable(in, l, r, {}, /*boolWidensToArith=*/false,
+                            /*charConvertsToArith=*/false, /*enumConvertsToArith=*/false,
+                            /*intCrossSignednessConverts=*/false,
+                            /*intSameSignednessNarrows=*/true);
+    };
+    // gate OFF (default 9th arg): the RED-ON-DISABLE reference.
+    auto const Off = [&](TypeId l, TypeId r) {
+        return isAssignable(in, l, r, {}, false, false, false,
+                            /*intCrossSignednessConverts=*/false);
+    };
+    EXPECT_TRUE(N(i16, i32)) << "I32 -> I16 narrows (signed)";
+    EXPECT_TRUE(N(i8,  i32)) << "I32 -> I8 narrows (signed)";
+    EXPECT_TRUE(N(i32, i64)) << "I64 -> I32 narrows (signed)";
+    EXPECT_TRUE(N(u8,  u32)) << "U32 -> U8 narrows (unsigned)";
+    EXPECT_TRUE(N(u16, u32)) << "U32 -> U16 narrows (unsigned)";
+    // RED-ON-DISABLE: every narrowing above REJECTS with the gate off.
+    EXPECT_FALSE(Off(i16, i32)) << "gate off -> I32->I16 rejected";
+    EXPECT_FALSE(Off(i8,  i32)) << "gate off -> I32->I8 rejected";
+    EXPECT_FALSE(Off(u8,  u32)) << "gate off -> U32->U8 rejected";
+    // WIDENING admitted regardless of the gate (the rank arms return true first).
+    EXPECT_TRUE(N(i32, i16)) << "I16 -> I32 widens (gate-independent)";
+    EXPECT_TRUE(N(u32, u8))  << "U8 -> U32 widens (gate-independent)";
+    // SCOPE GUARD: same-sign gate does NOT cross signedness.
+    EXPECT_FALSE(N(i32, u32)) << "same-sign gate does NOT admit U32->I32 (needs cross gate)";
+    EXPECT_FALSE(N(u16, i32)) << "same-sign gate does NOT admit I32->U16 (needs cross gate)";
 }
 
 // Int ↔ Float is NOT assignable.

@@ -899,25 +899,32 @@ struct Lowerer {
                 return true;
             }
             case MirOpcode::Trunc: {
-                // Result-width gate: the 32-bit-result form (I32/U32) and
-                // the Char-result form (D-CSUBSET-CHAR-INT-WIDENING, the
-                // int→char direction). A Char Trunc routes through the
-                // SAME width-32 `mov r32,r32` realization (registerOpWidth-
-                // Flags collapses char→32): it keeps the low 32 bits, and
-                // the narrowing-to-1-byte is realized lazily at the next
-                // byte-EXACT consumer (a char→int SExt's movsx r/m8, or a
-                // byte STORE) — every char read is low-byte-only, so the
-                // value is C-correct (e.g. `char c=300` reads back 44). An
-                // I64-result Trunc cannot arise (its source would be a
-                // gated I128); I8/I16/U8/U16/Byte stay REJECTED (no value
-                // codegen this cycle — fail loud, never a silent narrow).
+                // Result-width gate: the 32-bit form (I32/U32) and the SUB-NATIVE
+                // forms (Char/I8/U8/I16/U16) — D-CSUBSET-SUBNATIVE-ALU-FORMS +
+                // D-CSUBSET-CHAR-INT-WIDENING. A sub-native Trunc routes through the
+                // SAME width-32 `mov r32,r32` realization (registerOpWidthFlags
+                // collapses the byte/half width → 32): it keeps the low 32 bits, and
+                // the narrowing-to-1/2-bytes is realized lazily at the next byte/half-
+                // EXACT consumer (a SExt/ZExt's movsx/movzx r/m8 or r/m16 / SXTH /
+                // UXTH / UXTB, or a width-exact STORE) — every narrow read is
+                // low-bits-only, so the value is C-correct (`short s=70000` reads
+                // back 4464; `char c=300` reads back 44). An I64-result Trunc cannot
+                // arise (its source would be a gated I128); Byte stays REJECTED (no C
+                // narrowing story this cycle — fail loud, never a silent narrow).
                 TypeId const ty = mir.instType(id);
                 if (ty.valid()) {
                     TypeKind const k = interner.kind(ty);
+                    // D-CSUBSET-SUBNATIVE-ALU-FORMS: a sub-native Trunc result
+                    // (I8/U8/I16/U16, joining Char) routes through
+                    // registerOpWidthFlags → the promoted width-32 `mov` (low bits
+                    // kept); the actual narrowing realizes at the byte/half-exact
+                    // consumer. An I64/I128 result cannot arise (gated sources).
                     if (k != TypeKind::I32 && k != TypeKind::U32
-                        && k != TypeKind::Char) {
+                        && k != TypeKind::Char
+                        && k != TypeKind::I8  && k != TypeKind::U8
+                        && k != TypeKind::I16 && k != TypeKind::U16) {
                         return failConv(ty, "Trunc result",
-                                        "the 32-bit- and Char-result forms");
+                                        "the 32-bit, 16-bit, and byte result forms");
                     }
                 }
                 return true;
@@ -930,11 +937,16 @@ struct Lowerer {
                 auto const operands = mir.instOperands(id);
                 if (!operands.empty()) {
                     TypeId const ty = mir.instType(operands[0]);
+                    // D-CSUBSET-SUBNATIVE-ALU-FORMS: signed narrow read-back — an I16
+                    // source → movsx r/m16 / SXTH; an I8 source → the byte form
+                    // (movsx r/m8 / SXTB, shared with Char). I32 → movsxd / SXTW.
                     if (ty.valid()
                         && interner.kind(ty) != TypeKind::I32
-                        && interner.kind(ty) != TypeKind::Char) {
+                        && interner.kind(ty) != TypeKind::Char
+                        && interner.kind(ty) != TypeKind::I8
+                        && interner.kind(ty) != TypeKind::I16) {
                         return failConv(ty, "SExt source",
-                                        "the I32- and Char-source forms");
+                                        "the I32-, I16-, and byte-source forms");
                     }
                 }
                 return true;
@@ -959,11 +971,16 @@ struct Lowerer {
                 auto const operands = mir.instOperands(id);
                 if (!operands.empty()) {
                     TypeId const ty = mir.instType(operands[0]);
+                    // D-CSUBSET-SUBNATIVE-ALU-FORMS: unsigned narrow read-back — a U16
+                    // source → movzx r/m16 / UXTH; a U8 source → movzx r/m8 / UXTB.
+                    // Bool/U32 keep their existing widener forms.
                     if (ty.valid()
                         && interner.kind(ty) != TypeKind::Bool
-                        && interner.kind(ty) != TypeKind::U32) {
+                        && interner.kind(ty) != TypeKind::U32
+                        && interner.kind(ty) != TypeKind::U8
+                        && interner.kind(ty) != TypeKind::U16) {
                         return failConv(ty, "ZExt source",
-                                        "the Bool- and U32-source forms");
+                                        "the Bool-, U32-, U16-, and U8-source forms");
                     }
                 }
                 return true;
@@ -1025,12 +1042,18 @@ struct Lowerer {
         switch (reprKind(ty)) {
             case TypeKind::I32: case TypeKind::U32: case TypeKind::F32:
                 return kLirInstFlagWidth32;
-            // C 6.2.5: `char` is a single byte. D-CSUBSET-CHAR-STRING-VALUE-CODEGEN:
-            // the byte forms (movsx/movzx r32,r/m8; mov r8; sxtb; ldrb/strb). A char
-            // memory op MUST be width-exact — a 64-bit load of a 1-byte string/array
-            // element would read 7 bytes past it.
-            case TypeKind::Char:
+            // Sub-native EXTENSION-SOURCE / memory widths (D-CSUBSET-SUBNATIVE-ALU-FORMS
+            // + D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): the byte/half-word conversion forms
+            // (movsx/movzx r32,r/m8 + r/m16; sxtb/sxth/uxtb/uxth) read EXACTLY the low
+            // 1/2 bytes of a register. `char`/`signed char`/`unsigned char` (I8/U8) are
+            // 1 byte; `short`/`unsigned short` (I16/U16) are 2 — and a memory op of one
+            // MUST be width-exact (a 64-bit load of a 1-byte element reads 7 bytes past).
+            // registerOpWidthFlags re-promotes these to 32 for register PLUMBING — only
+            // the extension SOURCE + memory access stay byte/half-exact.
+            case TypeKind::Char: case TypeKind::I8: case TypeKind::U8:
                 return kLirInstFlagWidth8;
+            case TypeKind::I16: case TypeKind::U16:
+                return kLirInstFlagWidth16;
             default:
                 return 0;
         }
@@ -1089,7 +1112,14 @@ struct Lowerer {
     // returned unchanged, so this is byte-identical for all pre-char code.)
     [[nodiscard]] std::uint8_t registerOpWidthFlags(TypeId ty) const {
         std::uint8_t const w = widthFlagsForType(ty);
-        return (w == kLirInstFlagWidth8) ? kLirInstFlagWidth32 : w;
+        // A sub-32-bit register WRITE is a partial-register hazard (stale upper
+        // bits), so a sub-native value lives PROMOTED in a 32-bit register (low
+        // bits significant — C integer promotion 6.3.1.1). BOTH the byte (Char/
+        // I8/U8) and half-word (I16/U16) widths collapse to the 32-bit plumbing
+        // form; the narrowing realizes lazily at the byte/half-exact CONSUMER
+        // (a SExt/ZExt source movsx/movzx, or a width-exact store).
+        return (w == kLirInstFlagWidth8 || w == kLirInstFlagWidth16)
+                   ? kLirInstFlagWidth32 : w;
     }
 
     // ── diagnostics ──────────────────────────────────────────────────

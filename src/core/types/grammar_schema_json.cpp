@@ -7606,6 +7606,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     cfg.intCrossSignednessConverts = v.get<bool>();
                 }
             }
+            // C 6.3.1.3/6.5.16.1 same-signedness integer NARROWING (`short s = anInt`,
+            // read by `isAssignable`'s signed/unsigned rank arms). Opt-in (default false →
+            // a non-C schema keeps the strict widening-only rank rule).
+            if (sem.contains("intSameSignednessNarrows")) {
+                auto const& v = sem.at("intSameSignednessNarrows");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/intSameSignednessNarrows",
+                              "'intSameSignednessNarrows' must be a boolean");
+                } else {
+                    cfg.intSameSignednessNarrows = v.get<bool>();
+                }
+            }
 
             // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d):
             // per-language `pointerAliasing` block. Single bool field

@@ -1,16 +1,16 @@
-// FC3 c1 — the dataModel DIAGNOSTIC arm (LLP64: the windows format).
+// FC3 c1 — the dataModel WIDTH differential, now a RUNTIME truncation witness.
 //
-// 2147483648l under LLP64: `long` is I32 (the pe64 format's declared
-// dataModel) and 2^31 does not fit — the l-suffixed decimal ladder
-// climbs to `long long` (I64). Passing that I64 literal to the I32
-// `long` parameter is a narrowing mismatch → S_TypeMismatch, and the
-// compile REJECTS. The SAME `long` vocabulary compiles AND runs under
-// the LP64 formats (the sibling `datamodel_long_width/` example).
+// Under LLP64 (the pe64 windows format's declared dataModel), `long` is I32.
+// 2147483648l: the l-suffixed decimal ladder climbs to `long long` (I64) since
+// 2^31 does not fit I32. Passing that I64 literal to the I32 `long` parameter is
+// an implicit same-signedness NARROWING (C 6.3.1.3, now admitted —
+// D-CSUBSET-INT-SAME-SIGN-NARROW) that TRUNCATES to the low 32 bits: 0x80000000,
+// which as a signed I32 `long` is NEGATIVE. So `r > 0l` is false → exit 7. The
+// sibling datamodel_long_width/ (LP64, `long` = I64 holds the value) returns 42.
 //
-// THE dataModel red-on-disable lever: stop threading the pe64 format's
-// declared LLP64 into analyze() (or mis-declare it LP64) and `long`
-// silently widens to I64 — this compile then SUCCEEDS and the
-// expectDiagnostics assertion below fails the harness.
+// THE dataModel runtime red-on-disable lever: stop threading the pe64 format's
+// declared LLP64 into the pipeline (or mis-declare it LP64) and `long` widens to
+// I64 → the literal fits → r > 0 → exit 42, and the manifest's exitCode 7 fails.
 
 long pick(long v) {
     return v;

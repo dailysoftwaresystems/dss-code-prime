@@ -720,7 +720,7 @@
       }
     },
     {
-      "$comment": "Zero-extend a 32-bit value to 64-bit — AArch64 `MOV Wd, Wm` = `ORR Wd, WZR, Wm` (a 32-bit register op auto-zeroes the upper 32 bits of the X register, so a W-form ORR IS the W→X zero-extend). Single fixed word base 0x2A0003E0 (704644064): sf=0 (32-bit), ORR opc=01, Rn=WZR=31<<5, Rd at bits 0..4, Rm (source) at bits 16..20 via the one reg wire. Mirrors x86_64's `zext` LIR shape: result=value, ONE reg operand. The natural consumer is lowerICmp's setcc→zext pair (a clean 0/1 r64); also reused by MIR ZExt. FC3.5 sweep-c1 (D-CSUBSET-ZEXT-32-TO-64): the variant stays deliberately WIDTH-ABSENT (match-any — the xor_rdx_zero precedent) because this ONE word is the correct realization for BOTH source shapes the MIR→LIR gate admits: a Bool 0/1 register AND a full U32 (the W-write zeroes bits 63:32 regardless). x86 needs two width-keyed forms (movzx byte vs mov r32,r32); arm64's realization is width-invariant. VERIFY: zext of w1→x0 (Rd=0, Rm=1) = 0x2A0103E0.",
+      "$comment": "Zero-extend a 32-bit value to 64-bit — AArch64 `MOV Wd, Wm` = `ORR Wd, WZR, Wm` (a 32-bit register op auto-zeroes the upper 32 bits of the X register, so a W-form ORR IS the W→X zero-extend). Single fixed word base 0x2A0003E0 (704644064): sf=0 (32-bit), ORR opc=01, Rn=WZR=31<<5, Rd at bits 0..4, Rm (source) at bits 16..20 via the one reg wire. Mirrors x86_64's `zext` LIR shape: result=value, ONE reg operand. The natural consumer is lowerICmp's setcc→zext pair (a clean 0/1 r64); also reused by MIR ZExt. FC3.5 sweep-c1 (D-CSUBSET-ZEXT-32-TO-64) + D-CSUBSET-SUBNATIVE-ALU-FORMS: the variants are now WIDTH-KEYED (the byte/half forms below forced the split off match-any, per the convergence rule). This mov word (0x2A0003E0) realizes BOTH Bool (width 64) and U32 (width 32) — each zero-extends via the W-write (bits 63:32 cleared). The sub-native U16/U8 sources do NOT use the mov: a promoted U16/U8 register carries STALE upper bits the mov would copy, so they MASK via UBFM (UXTH 0x53003C00 / UXTB 0x53001C00). VERIFY: zext of w1→x0 via the mov form (Rd=0, Rm=1) = 0x2A0103E0.",
       "mnemonic":      "zext",
       "result":        "value",
       "hasSideEffects": false,
@@ -732,11 +732,39 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg"] },
+            "$comment": "width 64 (Bool default, flags=0): MOV Wd, Wm = ORR Wd, WZR, Wm (0x2A0003E0). A Bool 0/1 register zero-extends to X via the W-write (bits 63:32 cleared). Width-keyed now that the byte/half forms below are declared (the convergence rule forbids a match-any sibling beside width-keyed ones).",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 704644064 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "width 32 (U32 source): the SAME MOV Wd, Wm (0x2A0003E0) — a full U32 in a W register zero-extends to X (the W-write zeroes 63:32). This IS the U32->U64 conversion.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 704644064 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "width 16 (D-CSUBSET-SUBNATIVE-ALU-FORMS): UXTH Wd, Wn = UBFM Wd, Wn, #0, #15 (0x53003C00) — zero-extend the low HALF-WORD (the x86_64 movzx r64,r/m16 peer). MASKS to the low 16 bits, so a promoted U16 register's stale bits 31:16 are cleared (UNLIKE the width-32 mov, which would copy them). UBFM source is Rn (not Rm). Selected when the ZExt source type is U16 (width 16).",
+            "guard":      { "operandKinds": ["reg"], "width": 16 },
+            "template":   { "fixedWord": 1392524288 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "width 8 (D-CSUBSET-SUBNATIVE-ALU-FORMS): UXTB Wd, Wn = UBFM Wd, Wn, #0, #7 (0x53001C00) — zero-extend the low BYTE (the x86_64 movzx r64,r/m8 peer). MASKS to the low 8 bits. UBFM source is Rn (not Rm). Selected when the ZExt source type is U8 (width 8).",
+            "guard":      { "operandKinds": ["reg"], "width": 8 },
+            "template":   { "fixedWord": 1392516096 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
             ]
           }
         ]
@@ -767,6 +795,15 @@
             "$comment": "width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): SXTB Xd, Wn = SBFM Xd, Xn, #0, #7 — sign-extend the low BYTE to 64 bits (the x86_64 `movsx r64,r/m8` peer). Word 0x93401C00 = the SXTW word with imms 31→7 (bits 15:10): sf=1 | opc=00 | 100110 | N=1 | immr=0 | imms=7 | Rn | Rd (ARM ARM C6.2.* SBFM/SXTB). Selected when the SExt source type is Char (width 8 on the LIR inst) — the char→int widening. Reads exactly the low byte (the char), so the source register's upper bits (zero-extended by the LDURB byte load) are irrelevant.",
             "guard":      { "operandKinds": ["reg"], "width": 8 },
             "template":   { "fixedWord": 2470452224 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "width 16 (D-CSUBSET-SUBNATIVE-ALU-FORMS): SXTH Xd, Wn = SBFM Xd, Xn, #0, #15 — sign-extend the low HALF-WORD to 64 bits (the x86_64 movsx r64,r/m16 peer). Word 0x93403C00 = the SXTW word with imms 31->15 (bits 15:10): sf=1 | opc=00 | 100110 | N=1 | immr=000000 | imms=001111 | Rn | Rd. Selected when the SExt source type is I16 (width 16) — the short->int widening. Reads exactly the low half-word, so the source register's upper bits are irrelevant.",
+            "guard":      { "operandKinds": ["reg"], "width": 16 },
+            "template":   { "fixedWord": 2470460416 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }

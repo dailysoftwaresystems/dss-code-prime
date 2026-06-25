@@ -932,6 +932,13 @@
             "template":   { "rexW": true, "opcode": [15, 190] },
             "resultSlot": "modrm.reg",
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "width 16 (D-CSUBSET-SUBNATIVE-ALU-FORMS): I16->int movsx r64, r/m16 (REX.W 0F BF /r). REX.W: (a) r64 dest — the low 32 hold the sign-extended halfword = the int result, consumed low-bits-only; (b) the r/m16 source reads EXACTLY the low 2 bytes, so a promoted I16 register's stale bits 31:16 are irrelevant. ModR/M.reg=dest, ModR/M.rm=src word. Selected when the SExt source type is I16 (width 16 on the LIR inst) — the short->int widening.",
+            "guard":      { "operandKinds": ["reg"], "width": 16 },
+            "template":   { "rexW": true, "opcode": [15, 191] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           }
         ]
       }
@@ -960,6 +967,20 @@
             "$comment": "FC3.5: zext-from-U32 — mov r32, r/m32 (0x8B /r WITHOUT REX.W; the SAME bytes the `trunc` opcode emits, because the ISA operation is identical: a 32-bit register write zeroes bits 63:32). Two mnemonics deliberately share the encoding — each conversion polices its own inherent (source, dest) pair at the MIR→LIR gate.",
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "opcode": [139] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "width 16 (D-CSUBSET-SUBNATIVE-ALU-FORMS): U16->int movzx r64, r/m16 (REX.W 0F B7 /r). Reads EXACTLY the low 2 bytes, zero-extending into r64 — so a promoted U16 register's stale bits 31:16 are irrelevant (UNLIKE the width-32 `mov` form, which would copy them). ModR/M.reg=dest, ModR/M.rm=src word. Selected when the ZExt source type is U16 (width 16).",
+            "guard":      { "operandKinds": ["reg"], "width": 16 },
+            "template":   { "rexW": true, "opcode": [15, 183] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "width 8 (D-CSUBSET-SUBNATIVE-ALU-FORMS): U8->int movzx r64, r/m8 (REX.W 0F B6 /r) — the SAME bytes as the Bool width-64 widener, but width-8-keyed (a U8 source). Reads exactly the low byte, zero-extending into r64; REX.W forces spl/bpl/sil/dil 8-bit access. Selected when the ZExt source type is U8 (width 8).",
+            "guard":      { "operandKinds": ["reg"], "width": 8 },
+            "template":   { "rexW": true, "opcode": [15, 182] },
             "resultSlot": "modrm.reg",
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           }
