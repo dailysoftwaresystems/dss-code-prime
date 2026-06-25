@@ -188,6 +188,23 @@ TEST(ShippedLibDescriptor, MacroVariadicWithoutParamsFailsLoud) {
     EXPECT_TRUE(rep.hasErrors());
 }
 
+// A newline in a macro field would break the spliced `#define ... \n` directive
+// (terminating it early + leaking the remainder as source) — reject fail-loud.
+// RED-ON-DISABLE: without the field-shape gate the embedded `\n` slips through to
+// the preprocessor and silently corrupts the synth buffer.
+TEST(ShippedLibDescriptor, MacroFieldWithNewlineFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad3.json",
+        "{ \"header\": \"b.h\", \"macros\": [ "
+        "{ \"name\": \"X\", \"replacement\": \"1\\nint leaked=99;\" } ] }");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
 // readShippedLibMacros: interner-FREE (the preprocessor's path — it has no
 // TypeInterner). Decodes the macros without symbols/constants/typedefs.
 TEST(ShippedLibDescriptor, ReadShippedLibMacrosInternerFree) {

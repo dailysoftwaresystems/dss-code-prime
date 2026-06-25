@@ -146,6 +146,15 @@ void decodeShippedMacros(json const& doc, std::string const& pathStr,
     }
     json const& macros = doc.at("macros");
     out.reserve(out.size() + macros.size());
+    // A macro field (name / a param / replacement) containing a newline would
+    // break the synthetic `#define name(params) replacement\n` line the
+    // preprocessor splices — terminating the directive early and leaking the
+    // remainder into the synth buffer as source. Reject it FAIL-LOUD (a `\n`/`\r`
+    // is never legitimate in a macro name/param/replacement-text), never a silent
+    // buffer corruption.
+    auto const hasLineBreak = [](std::string const& s) {
+        return s.find('\n') != std::string::npos || s.find('\r') != std::string::npos;
+    };
     std::size_t midx = 0;
     for (auto const& m : macros) {
         std::string const at = "'" + pathStr + "' macros[" + std::to_string(midx) + "]";
@@ -209,6 +218,20 @@ void decodeShippedMacros(json const& doc, std::string const& pathStr,
                                               "macro cannot be variadic)");
                 continue;
             }
+        }
+        // Final field-shape gate (covers name + every param + replacement at one
+        // chokepoint): no field may carry a directive-breaking newline.
+        bool fieldHasLineBreak = hasLineBreak(macro.name) || hasLineBreak(macro.replacement);
+        if (macro.params.has_value()) {
+            for (auto const& pn : *macro.params) {
+                if (hasLineBreak(pn)) fieldHasLineBreak = true;
+            }
+        }
+        if (fieldHasLineBreak) {
+            emitMalformed(reporter, "shipped-lib descriptor " + at
+                                        + ": a macro field ('name'/'params'/'replacement') must "
+                                          "not contain a newline");
+            continue;
         }
         out.push_back(std::move(macro));
     }
