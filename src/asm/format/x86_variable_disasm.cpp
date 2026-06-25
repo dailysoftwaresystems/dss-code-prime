@@ -336,6 +336,24 @@ disassemble(TargetSchema const&            schema,
                 case EncodingSlotKind::Rm:
                 case EncodingSlotKind::Ra:
                 case EncodingSlotKind::Imm26:
+                // D-AS-DISASM-FIXED32-SLOT-FAILLOUD: the REMAINING fixed32
+                // (ARM64) slots now converge onto this SAME fail-loud arm.
+                // The mirror site `fixed32_disasm::windowFor` needs no
+                // parallel loud arm -- there a no-window slot sets
+                // shapeOk=false -> the variant is SKIPPED -> the final
+                // no-match fail-loud fires, so a cross-shape slot can never
+                // masquerade as a VALUE; only valueForSlot, which EXTRACTS a
+                // value, carries that hazard.
+                case EncodingSlotKind::Imm16:
+                case EncodingSlotKind::Imm9:
+                case EncodingSlotKind::MemBaseNoScale:
+                case EncodingSlotKind::MemOffsetZero:
+                case EncodingSlotKind::Imm12:
+                case EncodingSlotKind::Imm12Scaled:
+                case EncodingSlotKind::Imm12HiLo24:
+                case EncodingSlotKind::Imm32MovzMovk:
+                case EncodingSlotKind::SymbolPatchMarker:
+                case EncodingSlotKind::Imm19:
                     // fixed32 slots. Validate-time rules reject
                     // cross-shape variants, but if a future variant
                     // drift reached this arm, returning nullopt
@@ -355,26 +373,18 @@ disassemble(TargetSchema const&            schema,
                                        info->mnemonic, vi,
                                        encodingSlotKindName(slot)));
                     return std::nullopt;
-                // Remaining slots disassemble to nullopt (value undefined
-                // here). Behavior-PRESERVED from the prior trailing
-                // fallback — two sub-classes, both undecoded by this x86
-                // walker today:
-                //   * x86-variable slots not yet decoded (ModRmRmMem,
-                //     Disp32Mem, SibIndex, MemBaseScale, RipRelDisp32,
-                //     CondCodeNibble, BlockRel32) — the disasm-completeness
-                //     gap tracked by D-AS5-MULTIWORD-DISASM.
-                //   * fixed32 slots (Imm16/Imm9/Imm12/Imm19/MemBaseNoScale/
-                //     SymbolPatchMarker) that the Rd/Rn/Rm/Imm26 arm above
-                //     would fail-loud on (CRITICAL-2): a silent `nullopt`
-                //     here would let such a slot masquerade as a patched
-                //     SymbolRef in `roundTripVerify` (the exact hazard the
-                //     loud arm guards). They reach here only under a cross-
-                //     shape variant validate() already rejects, so
-                //     converging them onto that fail-loud arm is a behavior
-                //     change deferred out of this hygiene cycle
-                //     (D-AS-DISASM-FIXED32-SLOT-FAILLOUD).
-                // Listed EXHAUSTIVELY (no `default:`) so a new enumerator
-                // re-triggers the -Werror=switch gate here.
+                // The x86-variable slots NOT yet decoded by this walker
+                // (ModRmRmMem, MemBaseScale, Disp32Mem, SibIndex,
+                // RipRelDisp32, CondCodeNibble, BlockRel32) legitimately
+                // disassemble to nullopt — these ARE valid x86 slots, just
+                // not consumed by the shipped round-trip oracle yet, so
+                // nullopt means "value undefined here", NOT a cross-shape
+                // violation (the disasm-completeness gap D-AS5-MULTIWORD-
+                // DISASM). The fixed32/ARM64 slots that used to share this
+                // fallback now fail loud on the arm above
+                // (D-AS-DISASM-FIXED32-SLOT-FAILLOUD). Listed EXHAUSTIVELY
+                // (no `default:`) so a new enumerator re-triggers the
+                // -Werror=switch gate here.
                 case EncodingSlotKind::ModRmRmMem:
                 case EncodingSlotKind::MemBaseScale:
                 case EncodingSlotKind::Disp32Mem:
@@ -382,16 +392,6 @@ disassemble(TargetSchema const&            schema,
                 case EncodingSlotKind::RipRelDisp32:
                 case EncodingSlotKind::CondCodeNibble:
                 case EncodingSlotKind::BlockRel32:
-                case EncodingSlotKind::Imm16:
-                case EncodingSlotKind::Imm9:
-                case EncodingSlotKind::MemBaseNoScale:
-                case EncodingSlotKind::MemOffsetZero:
-                case EncodingSlotKind::Imm12:
-                case EncodingSlotKind::Imm12Scaled:
-                case EncodingSlotKind::Imm12HiLo24:
-                case EncodingSlotKind::Imm32MovzMovk:
-                case EncodingSlotKind::SymbolPatchMarker:
-                case EncodingSlotKind::Imm19:
                     return std::nullopt;
             }
             // Unreachable for any in-range EncodingSlotKind (the switch is

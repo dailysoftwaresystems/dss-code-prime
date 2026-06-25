@@ -1103,7 +1103,16 @@ enum class DiagnosticCode : std::uint16_t {
     //   a null slot. (A target that genuinely has no abs64 reloc must add the
     //   row to its `*.target.json` before it can host cross-CU indirect calls.)
     K_AbsolutePointerRelocMissing  = 0x8013,
-    // K-NEXT-SLOT: 0x8014 — grep this marker before adding a K_* code.
+    // K_ImageExecBitFailed: setting the POSIX execute bit on a just-written
+    //   EXECUTABLE-flavor output (writer.cpp `--output` path) failed —
+    //   std::filesystem::permissions returned an error_code. The bytes ARE
+    //   on disk and correct (distinct from K_ImageWriteCloseFailed, which
+    //   signals possibly-corrupt bytes); only the `+x` add failed, so the
+    //   binary needs a manual `chmod +x` to run directly. WARNING severity:
+    //   the artifact is valid, the exec bit a best-effort convenience
+    //   (D-OUTPUT-EXEC-BIT). No-op on Windows (PE ignores Unix modes).
+    K_ImageExecBitFailed           = 0x8014,
+    // K-NEXT-SLOT: 0x8015 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

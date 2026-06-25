@@ -538,3 +538,45 @@ TEST(DisasmDefensive, RoundTripDiagnosticPrefixIsA0005) {
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::A_RoundTripMismatch),
               "A0005");
 }
+
+// D-AS-DISASM-FIXED32-SLOT-FAILLOUD: a fixed32 (ARM64) encoding slot declared
+// on an x86-variable variant is a cross-shape substrate-invariant violation
+// that schema validate() rejects upstream. But if a future variant drift
+// slipped one through, the x86-variable disasm walker's valueForSlot must FAIL
+// LOUD (A_RoundTripMismatch) rather than return a silent nullopt — which would
+// masquerade as a patched SymbolRef in roundTripVerify and let a bogus encoding
+// round-trip as "match" (the exact hazard the loud arm guards). This synthetic
+// schema is built via `detail::TargetSchemaData` DIRECTLY (bypassing the JSON
+// loader's validate(), the only way to reach this otherwise-unreachable arm).
+// RED-on-disable: before the fix the fixed32 slots returned silent nullopt (no
+// diagnostic) and this assertion fails.
+TEST(DisasmDefensive, Fixed32SlotInX86VariableWalkerFailsLoud) {
+    detail::TargetSchemaData data;
+    TargetOpcodeInfo invalid;            // slot 0 — the "invalid" sentinel
+    invalid.mnemonic = "invalid";
+    data.opcodes.push_back(std::move(invalid));
+
+    TargetOpcodeInfo op;                 // slot 1 — the malformed cross-shape op
+    op.mnemonic       = "xshape_imm16";
+    op.encoding.shape = TargetEncodingShape::X86Variable;
+    TargetEncodingVariant variant;
+    variant.tmpl.opcodeBytes = {0x90};   // a single 1-byte opcode head
+    variant.wires.push_back(
+        TargetEncodingWire{.index = 0,
+                           .slotKind = EncodingSlotKind::Imm16});  // fixed32 slot
+    op.encoding.variants.push_back(std::move(variant));
+    data.opcodes.push_back(std::move(op));
+
+    TargetSchema const schema{std::move(data)};
+    std::array<std::uint8_t, 1> const bytes{0x90};
+    DiagnosticReporter rep;
+    (void)disassembleInst(schema, /*opcode=*/1, bytes, rep);
+
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_RoundTripMismatch) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode)
+        << "a fixed32 slot reaching the x86-variable disasm walker must fail "
+           "loud (A_RoundTripMismatch), not return a silent nullopt";
+}

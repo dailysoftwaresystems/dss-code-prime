@@ -780,6 +780,40 @@ namespace {
 // with encodeExecDynamic; code-simplifier REQUIRED fold, LK6
 // cycle 2c review).
 
+// D-LK10-ENTRY-MACHO-SECTIONVA-COMPUTED: the schema's __text.virtualAddress
+// (`sectionVa`) trusts that __text loads at file offset (sectionVa -
+// pageZeroSize), but the ACTUAL __text file offset is `textFileOff =
+// alignUp(headerAndCmds, segmentPageSize)` — derived from THIS module's
+// header+load-command size. The two agree for every shipped corpus
+// (headerAndCmds << segmentPageSize), but a future darwin-exec whose
+// header+load-commands EXCEED one segmentPageSize (a huge symtab / many dylibs)
+// pushes textFileOff past the hardcoded VA's implied offset -> an inconsistent
+// section_64.addr dyld would mis-map. The existing congruence guard (sectionVa
+// >= pageZeroSize, % segmentPageSize) does NOT catch this stronger inequality.
+// ONE chokepoint shared by encodeExec + encodeExecDynamic (no per-walker drift);
+// returns true iff consistent, else fails loud. Closing this means the VA is now
+// VERIFIED-equal-to-computed, not blindly trusted.
+[[nodiscard]] bool textSegmentVaMatchesFileOff(
+    std::uint64_t sectionVa, std::uint64_t pageZeroSize,
+    std::uint64_t textFileOff, std::size_t headerAndCmds,
+    std::uint64_t segmentPageSize, std::string_view writerName,
+    DiagnosticReporter& reporter) {
+    std::uint64_t const impliedOffset = sectionVa - pageZeroSize;
+    if (impliedOffset == textFileOff) return true;
+    emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+         std::format("{}: schema __text.virtualAddress 0x{:x} implies a __text "
+                     "file offset of 0x{:x} (- pageZeroSize 0x{:x}) but this "
+                     "module's computed textFileOff is 0x{:x} "
+                     "(alignUp(headerAndCmds=0x{:x}, segmentPageSize=0x{:x})); "
+                     "the header+load-commands exceed the offset the hardcoded VA "
+                     "assumes; re-derive __text.virtualAddress = pageZeroSize + "
+                     "textFileOff, or enlarge it.",
+                     writerName, sectionVa, impliedOffset, pageZeroSize,
+                     textFileOff, static_cast<std::uint64_t>(headerAndCmds),
+                     segmentPageSize));
+    return false;
+}
+
 [[nodiscard]] std::vector<std::uint8_t>
 encodeExec(AssembledModule const&    module,
            TargetSchema const&       targetSchema,
@@ -1010,6 +1044,11 @@ encodeExec(AssembledModule const&    module,
     }
     std::uint64_t const textSegVmaddr = im.pageZeroSize;
     std::uint64_t const textSecOffsetInSeg = sectionVa - textSegVmaddr;
+    if (!textSegmentVaMatchesFileOff(sectionVa, im.pageZeroSize, textFileOff,
+                                     headerAndCmds, kPageSize,
+                                     "macho::encodeExec", reporter)) {
+        return {};
+    }
     std::uint64_t const textSegVmsize =
         alignUp(textSecOffsetInSeg + textFileSize, kPageSize);
     // __TEXT.filesize must NOT include the symtab/strtab bytes that
@@ -2186,6 +2225,11 @@ encodeExecDynamic(AssembledModule const&    module,
     // Segment VAs:
     std::uint64_t const textSegVmaddr = im.pageZeroSize;
     std::uint64_t const textSecOffsetInSeg = sectionVa - textSegVmaddr;
+    if (!textSegmentVaMatchesFileOff(sectionVa, im.pageZeroSize, textFileOff,
+                                     headerAndCmds, kPageSize,
+                                     "macho::encodeExecDynamic", reporter)) {
+        return {};
+    }
     // The __TEXT segment covers __text + __stubs, plus __const when
     // present (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror). `constEnd` already
     // equals `stubsFileOff + stubsFileSize` on the no-data path, so

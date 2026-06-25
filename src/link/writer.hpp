@@ -61,9 +61,24 @@ namespace dss::linker {
 // pick a file extension — the caller fully owns the path. This
 // keeps the substrate format-blind in the same shape as the
 // rest of plan 14's substrate.
+//
+// `executable` (D-OUTPUT-EXEC-BIT): when true, the written file is
+// marked executable (POSIX — adds owner/group/others exec via
+// std::filesystem::permissions) so a produced binary runs directly
+// (`./out`) without a manual `chmod +x`. The CALLER decides this from
+// CONFIG — `ObjectFormatSchema::isImageFlavor()` (an exec/image-flavor
+// output), never an arch/format identity branch — so `writeImage` stays
+// format-blind (it switches on a bool, not the format). A no-op on
+// Windows (PE ignores Unix modes). Default false: a plain artifact
+// (.o / non-image output) is written at the host umask, unchanged. If
+// the exec-bit add fails (rare — e.g. a read-only FS) a WARNING
+// `K_ImageExecBitFailed` surfaces but the call still returns true: the
+// bytes are valid, the exec bit a best-effort convenience (distinct
+// from the byte-integrity `K_ImageWrite*` errors).
 [[nodiscard]] DSS_EXPORT bool
 writeImage(LinkedImage const&             image,
            std::filesystem::path const&   path,
-           DiagnosticReporter&            reporter);
+           DiagnosticReporter&            reporter,
+           bool                           executable = false);
 
 } // namespace dss::linker

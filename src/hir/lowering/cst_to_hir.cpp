@@ -3316,24 +3316,47 @@ struct Lowerer {
     // Descends through nested blocks/
     // statements but does NOT cross into nested functions (the front-end has no
     // nested-function grammar; a function body subtree is self-contained).
-    void prescanLabels(NodeId node) {
-        if (!node.valid()) return;
-        HirRuleMapping const* m = mappingFor(node);
-        if (m != nullptr && m->hirKind == "LabelStmt") {
-            NodeId const nameTok = firstIdentifierToken(node);
-            if (nameTok.valid()) {
-                auto const [it, inserted] = labelOrdinals_.try_emplace(
-                    std::string{tree().text(nameTok)},
-                    static_cast<std::uint32_t>(labelOrdinals_.size()));
-                if (!inserted) {   // C 6.8.1: a label name has function scope
-                    emitH(DiagnosticCode::S_DuplicateLabel, nameTok,
-                          std::format("duplicate label '{}' in this function",
-                                      tree().text(nameTok)));
+    void prescanLabels(NodeId root) {
+        // D-PARSE-DEEP-NEST-RECURSION-MEMORY (missed site): an EXPLICIT HEAP
+        // WORK-STACK pre-order walk, NOT host recursion. The iterative-traversal arc
+        // flattened lowerExpr / lowerStmt / Assign / Switch but MISSED this label
+        // prescan, which runs in the lowerFunction prologue BEFORE the flat lowerStmt
+        // driver: a deeply-nested body expression — e.g. a right-assoc `a=a=…=a`
+        // chain (the sole deep axis the statement-position assign threads here) —
+        // recursed on the host stack and overflowed a small (~1 MiB) stack before
+        // lowering began (latent: the smaller Release / MinGW frames fit, only MSVC
+        // Debug overflowed, and no gate runs MSVC Debug). The walk visits EVERY node
+        // (a label can nest inside any statement, incl. a statement-expression under
+        // an expression node), pushing children in REVERSE so they pop LEFT-TO-RIGHT
+        // — reproducing the prior recursive descent's pre-order EXACTLY, so label
+        // ordinals (insertion order) and the S_DuplicateLabel first-definition-wins
+        // order are byte-identical.
+        std::vector<NodeId> stack;
+        if (root.valid()) stack.push_back(root);
+        while (!stack.empty()) {
+            NodeId const node = stack.back();
+            stack.pop_back();
+            HirRuleMapping const* m = mappingFor(node);
+            if (m != nullptr && m->hirKind == "LabelStmt") {
+                NodeId const nameTok = firstIdentifierToken(node);
+                if (nameTok.valid()) {
+                    auto const [it, inserted] = labelOrdinals_.try_emplace(
+                        std::string{tree().text(nameTok)},
+                        static_cast<std::uint32_t>(labelOrdinals_.size()));
+                    if (!inserted) {   // C 6.8.1: a label name has function scope
+                        emitH(DiagnosticCode::S_DuplicateLabel, nameTok,
+                              std::format("duplicate label '{}' in this function",
+                                          tree().text(nameTok)));
+                    }
                 }
             }
+            // Push this node's non-token children, then REVERSE just that new
+            // segment so they pop left-to-right (the recursive pre-order).
+            std::size_t const mark = stack.size();
+            for (NodeId c : visible(node))
+                if (!isToken(c)) stack.push_back(c);
+            std::reverse(stack.begin() + static_cast<std::ptrdiff_t>(mark), stack.end());
         }
-        for (NodeId c : visible(node))
-            if (!isToken(c)) prescanLabels(c);
     }
 
     // `label: stmt` PROLOGUE shared by `lowerLabel` (the recursive entry) and the

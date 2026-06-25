@@ -784,7 +784,11 @@ bool linkAndWrite(std::span<AssembledModule const> modules,
     if (!image.ok() || !tierClean(reporter, linkEntry)) {
         return false;
     }
-    return linker::writeImage(image, outPath, reporter);
+    // D-OUTPUT-EXEC-BIT: mark the file executable iff the active object
+    // format is an exec/image flavor (config-driven via the schema predicate,
+    // never an arch/format identity branch) so a produced binary runs
+    // directly without a manual `chmod +x`.
+    return linker::writeImage(image, outPath, reporter, format.isImageFlavor());
 }
 
 // Assemble ONE CompilationUnit to its AssembledModule (no link/write). Returns

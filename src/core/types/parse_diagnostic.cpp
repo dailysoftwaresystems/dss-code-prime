@@ -240,6 +240,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::S_NotAPointer:                  return "S_NotAPointer";
         case DiagnosticCode::A_FunctionEncodeAborted:        return "A_FunctionEncodeAborted";
         case DiagnosticCode::K_AbsolutePointerRelocMissing:  return "K_AbsolutePointerRelocMissing";
+        case DiagnosticCode::K_ImageExecBitFailed:           return "K_ImageExecBitFailed";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";
