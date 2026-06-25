@@ -331,6 +331,22 @@ TEST(ShippedLibDescriptor, StructFieldBadTypeFailsLoud) {
     EXPECT_TRUE(rep.hasErrors());
 }
 
+// Duplicate field names fail loud — a last-writer-wins scope binding would
+// silently lose a field slot (a wrong-but-runs aggregate). RED-ON-DISABLE: the
+// two `f` fields decode fine individually; only the dup guard rejects them.
+TEST(ShippedLibDescriptor, StructDuplicateFieldNameFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "dupf.json",
+        R"({ "header": "b.h", "structs": [ { "name": "s", "fields": [
+             { "name": "f", "type": "i32" }, { "name": "f", "type": "i64" } ] } ] })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
 // An "object" kind decodes to ShippedSymbolKind::Object (→ ExternGlobal).
 TEST(ShippedLibDescriptor, ObjectKindDecodes) {
     ScratchDir dir{Location::Temp, "shipped-lib"};

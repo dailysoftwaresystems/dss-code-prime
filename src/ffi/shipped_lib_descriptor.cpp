@@ -704,11 +704,24 @@ readShippedLibDescriptor(std::filesystem::path const& path,
                         emitMalformed(reporter, "shipped-lib descriptor " + fat + ": must be an object");
                         okFields = false; break;
                     }
-                    (void)rejectUnknownKeys(reporter, f, "fields", {"name", "type"});
+                    (void)rejectUnknownKeys(reporter, f, fat, {"name", "type"});
                     if (!f.contains("name") || !f.at("name").is_string()
                         || f.at("name").get<std::string>().empty()) {
                         emitMalformed(reporter, "shipped-lib descriptor " + fat
                                                     + ": missing or empty 'name'");
+                        okFields = false; break;
+                    }
+                    std::string fname = f.at("name").get<std::string>();
+                    // Reject a DUPLICATE field name (invalid C; a last-writer-wins
+                    // scope binding would silently lose a field slot — fail loud,
+                    // never a wrong-but-runs aggregate). Few fields → linear scan.
+                    bool dupField = false;
+                    for (auto const& ef : sst.fields) {
+                        if (ef.name == fname) { dupField = true; break; }
+                    }
+                    if (dupField) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + fat
+                                                    + ": duplicate field name '" + fname + "'");
                         okFields = false; break;
                     }
                     if (!f.contains("type") || !f.at("type").is_string()) {
@@ -725,8 +738,7 @@ readShippedLibDescriptor(std::filesystem::path const& path,
                                         + fTypeText + "' failed to decode");
                         okFields = false; break;
                     }
-                    sst.fields.push_back(
-                        ShippedField{f.at("name").get<std::string>(), fty});
+                    sst.fields.push_back(ShippedField{std::move(fname), fty});
                     fieldTypes.push_back(fty);
                 }
                 if (!okFields) continue;
