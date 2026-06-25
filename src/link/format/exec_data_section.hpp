@@ -4,6 +4,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/section_kind.hpp"
+#include "core/types/target_schema.hpp"   // F5: TargetSchema::relocationInfo (abs64)
 #include "link/format/byte_emit.hpp"
 
 #include <cstdint>
@@ -193,6 +194,96 @@ struct ExecDataSectionLayout {
                              "SymbolId distinct from function ids.",
                              writerName, di.symbol.v));
             return false;
+        }
+    }
+    return true;
+}
+
+// F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): patch each reloc-bearing data item's bytes
+// IN PLACE with its target symbol's absolute VA. Shared by the exec writers
+// (PE/ELF/Mach-O): an exec image has resolved VAs, so an abs64 data fixup is
+// written directly into the section bytes (no `.rela` section for an exec image; a
+// PIE image carries the loader-applied slide). `bytesOut` is the section's MUTABLE
+// byte buffer (the caller emits it); `layout` is the one buildExecDataSection
+// produced for `dataItems` + this section's kind (itemOffsets/itemIndices
+// parallel); `sectionVa` is the section base (a VA — for PE an RVA). Only ABSOLUTE
+// relocs are valid in data (a pc-relative kind is a producer bug). `siteVasOut`
+// (optional): each 8-byte-absolute fixup's `sectionVa + patchOffset` is appended —
+// PE passes it for the `.reloc` DIR64 base-relocation table; ELF / Mach-O pass
+// nullptr. Returns false + emits on any error (unresolved target, pc-relative /
+// zero-width kind, write overrun, or — when collecting sites — a non-8-byte
+// absolute reloc with no base-reloc representation).
+[[nodiscard]] inline bool applyDataItemRelocations(
+    std::vector<std::uint8_t>&                          bytesOut,
+    std::vector<AssembledData> const&                   dataItems,
+    ExecDataSectionLayout const&                        layout,
+    std::uint64_t                                       sectionVa,
+    std::unordered_map<SymbolId, std::uint64_t> const&  symbolVa,
+    TargetSchema const&                                 targetSchema,
+    std::string_view                                    writerName,
+    DiagnosticReporter&                                 reporter,
+    std::vector<std::uint64_t>*                         siteVasOut = nullptr) {
+    using ::dss::link::format::detail::emit;
+    for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
+        auto const& di = dataItems[layout.itemIndices[j]];
+        if (di.relocations.empty()) continue;
+        std::size_t const itemBaseOff =
+            static_cast<std::size_t>(layout.itemOffsets[j]);
+        for (auto const& rel : di.relocations) {
+            auto const sIt = symbolVa.find(rel.target);
+            if (sIt == symbolVa.end()) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::format("{}: data item SymbolId={{ {} }} has a relocation "
+                                 "targeting symbol #{} defined by no function / "
+                                 "extern / data item.",
+                                 writerName, di.symbol.v, rel.target.v));
+                return false;
+            }
+            auto const* tri = targetSchema.relocationInfo(rel.kind);
+            if (tri == nullptr) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("{}: data item SymbolId={{ {} }} relocation kind {} "
+                                 "has no TargetRelocationInfo on the target schema.",
+                                 writerName, di.symbol.v, rel.kind.v));
+                return false;
+            }
+            if (tri->pcRelative || tri->widthBytes == 0) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("{}: data item SymbolId={{ {} }} relocation '{}' is "
+                                 "pc-relative or zero-width — a data pointer needs an "
+                                 "absolute fixup with a concrete write width.",
+                                 writerName, di.symbol.v, tri->name));
+                return false;
+            }
+            std::size_t const patchOff = itemBaseOff + rel.offset;
+            if (patchOff + tri->widthBytes > itemBaseOff + di.bytes.size()
+                || patchOff + tri->widthBytes > bytesOut.size()) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("{}: data item SymbolId={{ {} }} relocation offset "
+                                 "{} + width {} overruns the item's {} bytes.",
+                                 writerName, di.symbol.v, rel.offset,
+                                 static_cast<int>(tri->widthBytes), di.bytes.size()));
+                return false;
+            }
+            std::uint64_t const value = static_cast<std::uint64_t>(
+                static_cast<std::int64_t>(sIt->second) + rel.addend);
+            for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {
+                bytesOut[patchOff + b] =
+                    static_cast<std::uint8_t>((value >> (8u * b)) & 0xFFu);
+            }
+            if (siteVasOut != nullptr) {
+                if (tri->widthBytes != 8) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("{}: data item SymbolId={{ {} }} absolute "
+                                     "relocation '{}' has width {} — only an 8-byte "
+                                     "absolute fixup has a base-relocation form.",
+                                     writerName, di.symbol.v, tri->name,
+                                     static_cast<int>(tri->widthBytes)));
+                    return false;
+                }
+                siteVasOut->push_back(
+                    sectionVa + static_cast<std::uint64_t>(patchOff));
+            }
         }
     }
     return true;

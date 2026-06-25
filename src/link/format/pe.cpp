@@ -698,11 +698,14 @@ encodeExec(AssembledModule const&    module,
         || !checkU32Span("bss", bssDataLayout.spanSize)) {
         return {};
     }
-    // `.rdata` bytes are MUTABLE here because PE patches data-item (cross-CU
-    // thunk-slot) relocations into them post-layout (below). `.data` bytes are
-    // const (the C frontend's mutable globals carry no data→data relocs).
+    // `.rdata` AND `.data` bytes are MUTABLE here because PE patches data-item
+    // relocations into them post-layout (below): cross-CU thunk slots + F5
+    // string-rodata pointers land in `.rdata`; F5 MUTABLE symbol-address global
+    // pointers (`char* g="..."`, `int* p=&x`) land in `.data` and carry an abs64
+    // data→data reloc to their target's VA (the patched bytes are emitted at the
+    // `.data` insert below).
     std::vector<std::uint8_t> rdataBytes = rdataDataLayout.bytes;
-    std::vector<std::uint8_t> const& dataBytes  = dataDataLayout.bytes;
+    std::vector<std::uint8_t> dataBytes  = dataDataLayout.bytes;
     // Original-dataItems-index → `.rdata` section-relative offset, for the
     // data-item-relocation patch loop below (the layout records these for the
     // items it placed; reloc-bearing thunk slots are rodata).
@@ -710,6 +713,14 @@ encodeExec(AssembledModule const&    module,
     for (std::size_t j = 0; j < rdataDataLayout.itemIndices.size(); ++j) {
         rdataOffsetByIndex.emplace(rdataDataLayout.itemIndices[j],
                                    rdataDataLayout.itemOffsets[j]);
+    }
+    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): the same index→section-offset map for
+    // `.data` items, so a MUTABLE symbol-address global pointer's abs64 reloc can
+    // be patched into `.data` (the data-item reloc loop below resolves either map).
+    std::unordered_map<std::size_t, std::uint64_t> dataOffsetByIndex;
+    for (std::size_t j = 0; j < dataDataLayout.itemIndices.size(); ++j) {
+        dataOffsetByIndex.emplace(dataDataLayout.itemIndices[j],
+                                  dataDataLayout.itemOffsets[j]);
     }
     ObjectFormatSectionInfo const* secRodata = nullptr;
     ObjectFormatSectionInfo const* secData   = nullptr;
@@ -977,22 +988,31 @@ encodeExec(AssembledModule const&    module,
     for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
         auto const& di = module.dataItems[i];
         if (di.relocations.empty()) continue;
-        // Data-item relocations are supported only on `.rdata` items (the
-        // cross-CU thunk slot is a rodata pointer). A reloc-bearing `.data`/
-        // `.bss` item is out of scope — fail loud rather than leave it
-        // unpatched (`addDataSymbolVas` placed it, but no patch site exists).
-        auto const offIt = rdataOffsetByIndex.find(i);
-        if (offIt == rdataOffsetByIndex.end()) {
+        // The reloc-bearing item lives in `.rdata` (const data / cross-CU thunk
+        // slots / F5 string-rodata pointers) or `.data` (F5 MUTABLE symbol-address
+        // global pointers `char* g="..."` / `int* p=&x`). Resolve its section-
+        // relative offset + the buffer to patch + the section base RVA. A `.bss` /
+        // unplaced reloc-bearing item has no on-disk patch site → fail loud.
+        std::vector<std::uint8_t>* patchBuf = nullptr;
+        std::size_t                itemBaseOff = 0;
+        std::uint32_t              itemSecRva  = 0;
+        if (auto it = rdataOffsetByIndex.find(i); it != rdataOffsetByIndex.end()) {
+            patchBuf    = &rdataBytes;
+            itemBaseOff = static_cast<std::size_t>(it->second);
+            itemSecRva  = rdata->rva;
+        } else if (auto it = dataOffsetByIndex.find(i);
+                   it != dataOffsetByIndex.end()) {
+            patchBuf    = &dataBytes;
+            itemBaseOff = static_cast<std::size_t>(it->second);
+            itemSecRva  = data->rva;
+        } else {
             emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                  std::string{"pe::encodeExec: data-item SymbolId #"}
                  + std::to_string(di.symbol.v)
-                 + " carries relocations but is not a .rdata item — data-item "
-                   "relocations are supported only for read-only (.rdata) "
-                   "cross-CU thunk slots.");
+                 + " carries relocations but is neither a .rdata nor .data item "
+                   "(a .bss / zero-init item has no on-disk patch site).");
             return {};
         }
-        std::size_t const itemBaseOff =
-            static_cast<std::size_t>(offIt->second);
         for (auto const& rel : di.relocations) {
             auto const sIt = symbolVa.find(rel.target);
             if (sIt == symbolVa.end()) {
@@ -1038,7 +1058,7 @@ encodeExec(AssembledModule const&    module,
                 static_cast<std::uint64_t>(
                     static_cast<std::int64_t>(sIt->second) + rel.addend);
             for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {
-                rdataBytes[patchOff + b] =
+                (*patchBuf)[patchOff + b] =
                     static_cast<std::uint8_t>((value >> (8u * b)) & 0xFFu);
             }
             // Record the base-relocation site. Only an 8-byte absolute fixup maps to
@@ -1056,7 +1076,7 @@ encodeExec(AssembledModule const&    module,
                 return {};
             }
             baseRelocSiteRvas.push_back(
-                rdata->rva + static_cast<std::uint32_t>(patchOff));
+                itemSecRva + static_cast<std::uint32_t>(patchOff));
         }
     }
 

@@ -673,22 +673,23 @@ TEST(SemanticAnalyzerCSubset, FoldedNullMarkerIsTreeKeyedAcrossSources) {
 }
 
 // The latent-bug FIX (D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS closure): a
-// mixed-width binary in a checked position is now typed against its UNIFIED
-// (UAC) type, not whichever leaf the old DFS-suppressor happened to reach. For
-// `sink(int); long a; int b; sink(a + b)` the argument `a + b` is `long` (UAC of
-// long+int), which narrows to the `int` param → S_TypeMismatch fires. Under the
-// old suppressor this was DFS-dependent: it reached the `int` leaf `b` and
-// silently ADMITTED the narrowing. RED-ON-DISABLE: revert the binary arm to a
-// leaf type and this drops to 0 diagnostics (the narrowing is silently let
-// through — the exact latent unsoundness this closure removes).
+// mixed-type binary in a checked position is typed against its UNIFIED (UAC)
+// type, not whichever leaf the old DFS-suppressor happened to reach. The
+// observable uses a FLOAT operand: D-CSUBSET-INT-SAME-SIGN-NARROW made integer
+// narrowing implicit (so the old long+int→int observable no longer fires), but
+// int↔float stays NON-implicit. For `sink(int); double a; int b; sink(a + b)`
+// the argument `a + b` is `double` (UAC of double+int) and double→int is NOT
+// assignable → S_TypeMismatch fires. Under the old suppressor it reached the
+// `int` leaf `b` and silently admitted. RED-ON-DISABLE: revert the binary arm to
+// a leaf type and this drops to 0 (the latent unsoundness this closure removes).
 TEST(SemanticAnalyzerCSubset, MixedWidthBinaryArgTypedByUacNotLeaf) {
     auto cu = buildShippedUnit("c-subset", {
         "extern int sink(int v);\n"
-        "int f(long a, int b) { return sink(a + b); }\n",
+        "int f(double a, int b) { return sink(a + b); }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    // `a + b` is `long`; the `int` param narrows → exactly one mismatch.
+    // `a + b` is `double` (UAC); the `int` param cannot take a float → one mismatch.
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 1u);
 }

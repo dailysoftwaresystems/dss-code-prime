@@ -1,11 +1,12 @@
 {
-  "$comment": "FC3 c1 dataModel diagnostic differential — the LLP64 (windows) HALF of the datamodel_long_width pair. expectDiagnostics is a MANIFEST-level field (per-target diagnostic arms are not expressible), so the reject verdict gets its own single-target example: compiling THIS source for the pe64 format (declared dataModel LLP64) must FAIL with exactly one S_TypeMismatch at 21:14 (the I64 long-long-laddered literal into the I32 long param). Host-independent: the dataModel comes from the TARGET format schema, so every CI host asserts the same reject. Red-on-disable: stop reading pe64's dataModel (or flip it to LP64) and the compile SUCCEEDS - this manifest then fails loud.",
+  "$comment": "FC3 c1 dataModel WIDTH differential — the LLP64 (windows) HALF of the datamodel_long_width pair, now a RUNTIME truncation witness (D-CSUBSET-INT-SAME-SIGN-NARROW made implicit narrowing C-conformant, so the old compile-reject verdict became an admit + truncate). Under the pe64 format's declared LLP64, `long` is I32: the I64 long-long-laddered literal 2147483648l narrows to I32 -> 0x80000000 = a NEGATIVE long, so `r > 0` is false -> exit 7. The sibling datamodel_long_width (LP64, long=I64 holds it) exits 42. Host-independent: the dataModel comes from the TARGET format schema. Red-on-disable: stop reading pe64's dataModel (or flip it to LP64) and `long` is I64 -> the literal fits -> r > 0 -> exit 42 (manifest then fails: got 42, expected 7). The release arm runs the shipped optimizing pipeline over the narrowing Trunc + the signed compare.",
   "language": "c-subset",
   "source": "main.c",
+  "exitCode": 7,
   "targets": [
-    { "spec": "x86_64:pe64-x86_64-windows-exec" }
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
   ],
-  "expectDiagnostics": [
-    { "code": "S_TypeMismatch", "line": 21, "col": 14 }
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
   ]
 }

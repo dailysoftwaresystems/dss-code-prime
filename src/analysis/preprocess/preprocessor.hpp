@@ -37,12 +37,31 @@
 // `pp_if_eval` (config-driven precedence + the shared const-eval arithmetic
 // core). The whole vocabulary (directive words + `defined`) is config-driven.
 //
+// FC15a (`#`/`##` operators) adds the STRINGIZE (`#`, C 6.10.3.2) and
+// TOKEN-PASTE (`##`, C 6.10.3.3) operators to a function-like macro's
+// replacement list. Their OPERANDS use the RAW (un-pre-expanded) argument:
+// `#param` produces a single string-literal of the argument's source spelling
+// (white space collapsed, `"`/`\` escaped); `a##b` concatenates the two
+// adjacent tokens' spellings into ONE re-tokenized token (left-to-right, so
+// `a##b##c` chains). A `#`/`##` product is a SYNTHETIC token: its spelling is
+// appended to the synth text BEFORE the final buffer is frozen (config A2), so
+// the product token's span slices to its real text (`"hello"` / `add3`) from
+// the SAME single buffer the parser parses -- never to `#`/`##`. The `#`/`##`
+// vocabulary is config-driven (`preprocess.stringizeToken`/`pasteToken`),
+// default-absent for a non-C language. The FC15 paste residuals complete `##`:
+// it also applies to OBJECT-like macros (`#define HW a##b` -> `ab`,
+// D-PP-PASTE-OBJECT-LIKE) and to EMPTY operands via PLACEMARKERS (`J(x,)` -> `x`,
+// C 6.10.3.3p2, D-PP-PASTE-PLACEMARKER); GNU `,##__VA_ARGS__` comma-elision is
+// config-gated (`preprocess.variadicCommaElision`, D-PP-VARIADIC-GNU-COMMA-ELISION).
+// A genuine dangling `##` (no operand token at all) still fails loud.
+//
 // FAIL-LOUD on every unsupported construct (function-like macro arity mismatch,
 // unterminated invocation, variadic/duplicate-parameter/malformed parameter
 // list, incompatible redefinition, missing quote include, include recursion
 // overflow, an unterminated/mismatched conditional, a non-ICE / sizeof / float /
-// string operand in `#if`) -- never a silent pass-through or miscompile. Out of
-// scope (pinned, not built): `##`/`#`/predefined macros (FC15-area).
+// string operand in `#if`, a `#` not followed by a parameter, a `##` at the
+// start/end of a replacement list, a `##` product that is not a single token)
+// -- never a silent pass-through or miscompile.
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
@@ -164,9 +183,18 @@ struct DSS_EXPORT PreprocessResult {
 // with a disabled schema is a usage error and fatal-asserted). `includeDirs`
 // is the quote-include search path (the including file's own directory is
 // always tried first, mirroring the import resolver).
+//
+// FC15c (Option A): `systemDirs` is the ANGLE-include / system-header search
+// path (the analogue of C's /usr/include; DSS ships LANGUAGE-NEUTRAL JSON
+// descriptors there, e.g. `stdio.json`). It feeds the `__has_include(<h>)`
+// existence test so it agrees with what the post-parse import resolver does for
+// `#include <h>`. Defaults to {} so the ~15 test callers + helper compile
+// unchanged; the ONE production call site (compilation_unit.cpp) threads its
+// `systemDirs_` member.
 [[nodiscard]] DSS_EXPORT PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
-    std::span<std::filesystem::path const> includeDirs);
+    std::span<std::filesystem::path const> includeDirs,
+    std::span<std::filesystem::path const> systemDirs = {});
 
 } // namespace dss

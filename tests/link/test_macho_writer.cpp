@@ -592,6 +592,114 @@ TEST(MachOExecWriter, LcMainEntryOffPointsToFirstFunction) {
     EXPECT_TRUE(sawLcMain);
 }
 
+// F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): a symbol-address DATA global must emit a
+// dyld REBASE opcode stream, so a PIE image's absolute pointer is slid at load.
+// HOST-INDEPENDENT structural pin — red-on-disable on EVERY leg: revert the
+// rebase wiring (rebaseOff/Size in LC_DYLD_INFO_ONLY) and rebase_size returns to
+// 0, failing this test even on the Windows/Linux legs that cannot RUN a Mach-O.
+// The macOS CI leg is the runtime witness; this is the always-on guard the dss
+// cross-target bar pairs with it.
+TEST(MachOExecWriter, SymbolAddressDataGlobalEmitsDyldRebaseStream) {
+    // DSS's Mach-O exec target is arm64-only (the x86_64 darwin exec format
+    // declares no __data section row); mirror the arm64-exit dynamic recipe.
+    auto targetR = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(targetR.has_value());
+    auto target = std::move(targetR).value();
+    auto formatR = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-exec");
+    ASSERT_TRUE(formatR.has_value());
+    auto format = std::move(formatR).value();
+
+    // The abs64 reloc kind, found by the SAME agnostic formula the pipeline uses
+    // (widthBytes==8 && !pcRelative) — never a hardcoded kind id.
+    RelocationKind abs64{0};
+    bool foundAbs64 = false;
+    for (auto const& r : target->relocations())
+        if (r.widthBytes == 8 && !r.pcRelative) { abs64 = r.kind; foundAbs64 = true; break; }
+    ASSERT_TRUE(foundAbs64)
+        << "arm64 target must declare an 8-byte non-pc-relative reloc (ARM64_RELOC_UNSIGNED)";
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x00, 0x00, 0x00, 0x94, 0xC0, 0x03, 0x5F, 0xD6};  // BL _abs ; RET
+    // Reference the extern (call26) so it gets a __stubs/__got slot — an
+    // unreferenced import has no binding site. kind 1 = ARM64_RELOC_BRANCH26.
+    fn.relocations.push_back(Relocation{0u, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    // An extern import forces the dynamic writer (encodeExecDynamic) — the only
+    // path that lays out __DATA and emits LC_DYLD_INFO_ONLY.
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_abs", "/usr/lib/libSystem.B.dylib"});
+    // `target` — a plain 8-byte mutable data global (NO reloc): must be SKIPPED
+    // by the rebase stream (only pointer slots are rebased).
+    AssembledData targetData;
+    targetData.symbol    = SymbolId{50};
+    targetData.section   = DataSectionKind::Data;
+    targetData.bytes.assign(8, 0);
+    targetData.alignment = Alignment::ofRuntimePow2(8);
+    mod.dataItems.push_back(std::move(targetData));
+    // `p` — a symbol-address pointer: 8-byte slot + abs64 reloc → `target`.
+    AssembledData p;
+    p.symbol    = SymbolId{51};
+    p.section   = DataSectionKind::Data;
+    p.bytes.assign(8, 0);
+    p.alignment = Alignment::ofRuntimePow2(8);
+    p.relocations.push_back(Relocation{0u, SymbolId{50}, abs64, 0});
+    mod.dataItems.push_back(std::move(p));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *target, *format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    std::uint32_t const ncmds = readU32LE(bytes, 16);
+    std::size_t off = 32;
+    bool sawDyldInfo = false;
+    for (std::uint32_t i = 0; i < ncmds; ++i) {
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
+        if (cmdsize == 0) break;
+        if (cmd == 0x80000022u) {  // LC_DYLD_INFO_ONLY
+            std::uint32_t const rebaseOff  = readU32LE(bytes, off + 8);
+            std::uint32_t const rebaseSize = readU32LE(bytes, off + 12);
+            // THE PIN: a symbol-address data global must yield a non-empty rebase
+            // stream. rebase_size==0 means the wiring regressed (red-on-disable).
+            ASSERT_GT(rebaseSize, 0u)
+                << "symbol-address data global must emit a dyld REBASE stream; "
+                   "rebase_size==0 means the PIE-rebase wiring regressed.";
+            ASSERT_LE(static_cast<std::size_t>(rebaseOff) + rebaseSize, bytes.size());
+            // Decode: SET_TYPE_IMM|POINTER (0x11), ≥1 SET_SEGMENT_AND_OFFSET (0x2X)
+            // + DO_REBASE (0x5X), terminated by DONE (0x00).
+            EXPECT_EQ(bytes[rebaseOff], 0x11u);  // SET_TYPE_IMM | REBASE_TYPE_POINTER
+            bool sawSetSeg = false, sawDoRebase = false, sawDone = false;
+            std::size_t bi = rebaseOff + 1;
+            std::size_t const end = rebaseOff + rebaseSize;
+            while (bi < end) {
+                std::uint8_t const opHi = bytes[bi] & 0xF0u;
+                bi++;
+                if (opHi == 0x20u) {            // SET_SEGMENT_AND_OFFSET_ULEB
+                    sawSetSeg = true;
+                    while (bi < end && (bytes[bi] & 0x80u)) bi++;  // skip ULEB cont.
+                    if (bi < end) bi++;                            // last ULEB byte
+                } else if (opHi == 0x50u) {     // DO_REBASE_IMM_TIMES
+                    sawDoRebase = true;
+                } else if (opHi == 0x00u) {     // DONE
+                    sawDone = true; break;
+                }
+            }
+            EXPECT_TRUE(sawSetSeg);
+            EXPECT_TRUE(sawDoRebase);
+            EXPECT_TRUE(sawDone);
+            sawDyldInfo = true;
+            break;
+        }
+        off += cmdsize;
+    }
+    EXPECT_TRUE(sawDyldInfo)
+        << "LC_DYLD_INFO_ONLY must be present on the legacy darwin exec path.";
+}
+
 TEST(MachOExecWriter, IntraModuleBranchAppliedByteForByte) {
     // Branch (rel32, kind 1) from fn[0] to fn[1].
     // sectionVa = pageZeroSize + 0x1000 = 0x100001000.

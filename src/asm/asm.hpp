@@ -471,6 +471,12 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                            TypeInterner const&                  interner,
                            std::optional<AggregateLayoutParams> aggregateLayout,
                            DataModel                            dataModel,
-                           DiagnosticReporter&                  reporter);
+                           DiagnosticReporter&                  reporter,
+                           // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): the target's
+                           // ABSOLUTE-64 pointer relocation kind, found by FORMULA
+                           // (widthBytes==8 && !pcRelative) by the caller — never a
+                           // hardcoded name/constant (agnosticism). A symbol-address
+                           // global emits this reloc; nullopt → fail loud if one exists.
+                           std::optional<RelocationKind>        absPtrRelocKind = std::nullopt);
 
 } // namespace dss

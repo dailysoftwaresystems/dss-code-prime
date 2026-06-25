@@ -7,6 +7,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/preprocess/preprocessor.hpp"
+#include "core/types/char_decode.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -478,14 +479,15 @@ TEST(Preprocessor, VariadicMacroEmptyVaArgsIsC23Allowed) {
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroArgument))
         << "an empty __VA_ARGS__ must not trip the arity floor";
     // int v = f ( 7 , ) ;  -- __VA_ARGS__ vanished; the literal comma between
-    // fmt and __VA_ARGS__ in the replacement remains (no GNU comma-elision in
-    // this cycle -- that is FC15's `,##__VA_ARGS__`).
+    // fmt and __VA_ARGS__ in the replacement remains. GNU comma-elision does NOT
+    // apply here: this replacement is `f(fmt, __VA_ARGS__)` with NO `##`, and
+    // elision fires only for the `, ## __VA_ARGS__` shape (see FC15GnuComma*).
     ASSERT_EQ(lexs.size(), 9u) << "expected: int v = f ( 7 , ) ;";
     EXPECT_EQ(lexs[3], "f");
     EXPECT_EQ(lexs[4], "(");
     EXPECT_EQ(lexs[5], "7");
-    EXPECT_EQ(lexs[6], ",") << "the replacement's literal comma stays (no GNU "
-                               "comma-elision in this cycle)";
+    EXPECT_EQ(lexs[6], ",") << "the replacement's literal comma stays (no `##` "
+                               "before __VA_ARGS__, so no comma-elision)";
     EXPECT_EQ(lexs[7], ")") << "__VA_ARGS__ with no trailing args is empty";
     EXPECT_EQ(lexs[8], ";");
 }
@@ -1587,4 +1589,1133 @@ TEST(Preprocessor, ConditionalDirectiveWordIsConfigDrivenNotHardcoded) {
             << "with `if` rebound to `whenever`, a literal `#if` is an unknown "
                "directive -- proving the conditional word is read from config";
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FC15a (`#`/`##` operators -- C 6.10.3.2 stringize, 6.10.3.3 token-paste).
+//
+// A stringize product (`#x` -> `"..."`) is, by GRAMMAR REALITY, the string
+// literal's StringStart + StringLiteral pair (`stringLiteralExpr = StringStart
+// StringLiteral`), NOT a single fabricated token -- so `ppLexemes` yields TWO
+// entries for it: the opening `"` (StringStart) then the body (StringLiteral,
+// whose span excludes the consumed closing `"`). `reconstructStringLiteral`
+// joins them back into the full `"..."` for readable assertions. A paste product
+// (`a##b` -> `ab`) is exactly ONE token (F1) and yields ONE lexeme.
+// Every assertion is RED-ON-DISABLE: without the `#` handling `#x` emits the
+// literal `#` token (lexs[0]=="#" not "\""); without the `##` handling `a##b`
+// emits three tokens (`a`, `##`, `b`) instead of the single `ab`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Join a StringStart (`"`) + StringLiteral (body, no closing quote) pair from the
+// pp lexemes at index `i` back into the full source-form literal `"...body..."`.
+[[nodiscard]] std::string reconstructStringLiteral(
+    std::vector<std::string> const& lexs, std::size_t i) {
+    if (i + 1 >= lexs.size()) return "<malformed-string-product>";
+    return lexs[i] + lexs[i + 1] + "\"";   // StringStart + body + implied close
+}
+
+TEST(Preprocessor, FC15aStringizeSimple) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define STR(x) #x\nSTR(hello)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // The product `"hello"` is StringStart `"` + StringLiteral `hello`.
+    ASSERT_EQ(lexs.size(), 2u) << "expected the string-literal pair: \" hello";
+    EXPECT_EQ(lexs[0], "\"") << "stringize must produce a string-literal opener "
+                                "(red-on-disable: a literal `#` here)";
+    EXPECT_EQ(lexs[1], "hello");
+    EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"hello\"");
+}
+
+TEST(Preprocessor, FC15aStringizeEscapes) {
+    // C 6.10.3.2p2: a `\` is inserted before each `"` and `\` of a string/char
+    // literal in the argument. STR(a "b\c") -> "a \"b\\c\"".
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define STR(x) #x\nSTR(a \"b\\c\")\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 2u);
+    EXPECT_EQ(lexs[0], "\"");
+    // Body (StringStart consumed the opening `"`, the close `"` is consumed):
+    //   a <space> \ " b \ \ c \ "   (the escaped inner text).
+    EXPECT_EQ(lexs[1], "a \\\"b\\\\c\\\"")
+        << "interior `\"` and `\\` of the string arg must be backslash-escaped";
+    EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"a \\\"b\\\\c\\\"\"");
+    // The product must round-trip: decoding the body recovers the raw arg text.
+    auto decoded = decodeStringLiteralBody(lexs[1]);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(*decoded, "a \"b\\c\"");
+}
+
+TEST(Preprocessor, FC15aStringizeUsesUnexpandedArg) {
+    // C 6.10.3.2p2: the `#` operand uses the RAW (un-pre-expanded) argument. With
+    // `#define X hello`, STR(X) stringizes to "X", NOT "hello".
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define X hello\n#define STR(x) #x\nSTR(X)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 2u);
+    EXPECT_EQ(lexs[1], "X")
+        << "stringize uses the RAW arg `X`, not its expansion `hello`";
+    EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"X\"");
+}
+
+TEST(Preprocessor, FC15aPasteIdentifiers) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define PASTE(a,b) a ## b\nPASTE(foo,bar)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 1u) << "the paste product is exactly ONE token";
+    EXPECT_EQ(lexs[0], "foobar");
+}
+
+TEST(Preprocessor, FC15aPasteResultIsExpanded) {
+    // The paste product is RESCANNED: `foobar` becomes a macro use of `foobar`.
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define PASTE(a,b) a ## b\n#define foobar 42\nint v = PASTE(foo,bar);\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int v = 42 ;
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int v = 42 ;";
+    EXPECT_EQ(lexs[3], "42")
+        << "the paste product `foobar` must be rescanned and expand to 42";
+}
+
+TEST(Preprocessor, FC15aPasteInvalidFailsLoud) {
+    // F1 (C 6.10.3.3p3): a `##` product that is NOT a single token fails loud.
+    // BAD(a,!b) pastes `a` ## `!` -> `a!`, which re-tokenizes to TWO tokens.
+    PreprocessResult r;
+    (void)ppLexemes("#define BAD(a,b) a ## b\nint v = BAD(a,!b);\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste))
+        << "a `##` product that is not a single token must fail loud (F1)";
+}
+
+TEST(Preprocessor, FC15aPasteAtStartFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define BAD(a) ## a\nint v = BAD(1);\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste))
+        << "a `##` at the START of a replacement list must fail loud";
+}
+
+TEST(Preprocessor, FC15aPasteAtEndFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define BAD(a) a ##\nint v = BAD(1);\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste))
+        << "a `##` at the END of a replacement list must fail loud";
+}
+
+TEST(Preprocessor, FC15aStringizeNotFollowedByParamFailsLoud) {
+    // C 6.10.3.2p1: in a function-like macro, `#` must be followed by a
+    // parameter. `#define BAD(a) # 1` -> `#` precedes a non-parameter.
+    PreprocessResult r;
+    (void)ppLexemes("#define BAD(a) # 1\nint v = BAD(0);\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorStringize))
+        << "a `#` not followed by a parameter must fail loud";
+}
+
+TEST(Preprocessor, FC15aStringizeVaArgs) {
+    // `#__VA_ARGS__` stringizes the RAW joined trailing args. S(a,b) -> "a,b".
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define S(...) #__VA_ARGS__\nS(a,b)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 2u);
+    EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"a,b\"")
+        << "#__VA_ARGS__ stringizes the raw comma-joined trailing args";
+}
+
+TEST(Preprocessor, FC15aPasteUsesRawOperand) {
+    // C 6.10.3.3p1: a `##` operand uses the RAW argument. With `#define X foo`,
+    // PASTE(X,bar) pastes RAW `X` ## `bar` -> `Xbar`, NOT `foobar`.
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#define X foo\n#define PASTE(a,b) a ## b\nPASTE(X,bar)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 1u);
+    EXPECT_EQ(lexs[0], "Xbar")
+        << "paste uses the RAW operand `X`, not its expansion `foo`";
+}
+
+// audit LOW-1: `##` against `__VA_ARGS__` uses the RAW trailing-args run (the
+// rawVaArgs paste branch). With `#define Y q`, `p ## __VA_ARGS__` invoked as
+// J(x, Y) pastes RAW `x` ## `Y` -> `xY`, NOT `xq` (the raw va-arg, not its
+// expansion). RED-ON-DISABLE: routing the `## __VA_ARGS__` operand through the
+// EXPANDED va-args yields `xq`; dropping the paste leaves `x` `Y` unpasted.
+TEST(Preprocessor, FC15aPasteVaArgsUsesRawRun) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#define Y q\n#define J(p, ...) p ## __VA_ARGS__\nJ(x, Y)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 1u)
+        << "`## __VA_ARGS__` against a single raw trailing token yields one product";
+    EXPECT_EQ(lexs[0], "xY")
+        << "## __VA_ARGS__ pastes the RAW first trailing token `Y`, not its "
+           "expansion `q`";
+}
+
+// F4 (NOT an order claim -- `##` is associative for the product spelling):
+// `a##b##c` collapses BOTH `##` operators into ONE final single token, and the
+// two paste operators reduce to one product. We pin the FINAL token + that the
+// operators all collapsed (no leftover `##`), NOT any evaluation order.
+TEST(Preprocessor, FC15aChainedPasteCollapsesToOneToken) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#define CAT3(a,b,c) a ## b ## c\nCAT3(foo,bar,baz)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 1u)
+        << "two `##` operators collapse to ONE product token";
+    EXPECT_EQ(lexs[0], "foobarbaz");
+    // No `##` operator survives in the output.
+    for (auto const& s : lexs) EXPECT_NE(s, "##");
+}
+
+// AGNOSTICISM (opt-OUT): a language with NO preprocess block declares neither the
+// stringize nor the paste token, so the config fields are empty and the engine
+// produces no products -- zero behavior change for toy/tsql.
+TEST(Preprocessor, FC15aStringizePasteAreOptOutPerLanguage) {
+    auto toy = GrammarSchema::loadShipped("toy");
+    ASSERT_TRUE(toy.has_value());
+    EXPECT_TRUE((*toy)->preprocess().stringizeToken.empty());
+    EXPECT_TRUE((*toy)->preprocess().pasteToken.empty());
+
+    auto tsql = GrammarSchema::loadShipped("tsql-subset");
+    ASSERT_TRUE(tsql.has_value());
+    EXPECT_TRUE((*tsql)->preprocess().stringizeToken.empty());
+    EXPECT_TRUE((*tsql)->preprocess().pasteToken.empty());
+}
+
+// CONFIG-READ: c-subset declares the `#`/`##` operator kinds from config.
+TEST(Preprocessor, FC15aStringizePasteTokensAreConfigRead) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ((*c)->preprocess().stringizeToken, "HashOp");
+    EXPECT_EQ((*c)->preprocess().pasteToken, "HashHashOp");
+}
+
+// F3 (HashOp non-contamination): a macro USE immediately followed by a
+// `#`-introduced DIRECTIVE line. The directive-introducing `#` (peeled at top
+// level via firstOnLine, BEFORE expansion) and an in-replacement stringize `#`
+// (handled only inside `substitute`) live in structurally separate phases, so
+// they must NOT cross-contaminate: the `#define` directive is consumed (NOT
+// mis-read as a stringize), and the stringize `#x` in STR's replacement still
+// produces a string literal. (Uses a benign `#define` rather than `#undef STR`
+// so STR stays defined when STR(a) is expanded -- directives are processed in a
+// single pre-pass, so a later `#undef STR` would undefine it before any body
+// expansion, a pre-existing architecture property unrelated to FC15a.)
+TEST(Preprocessor, FC15aHashOpDirectiveVsStringizeNoContamination) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define STR(x) #x\n"
+        "STR(a)\n"
+        "#define UNUSED 1\n"
+        "int after;\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "the directive `#define` must be consumed, not treated as a stringize";
+    // Output: "a" (StringStart+body)  then  int after ;
+    ASSERT_EQ(lexs.size(), 5u) << "expected: \" a int after ;";
+    EXPECT_EQ(reconstructStringLiteral(lexs, 0), "\"a\"");
+    EXPECT_EQ(lexs[2], "int");
+    EXPECT_EQ(lexs[3], "after");
+    EXPECT_EQ(lexs[4], ";");
+    // The directive-introducing `#` never leaked a stringize diagnostic.
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorStringize));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FC15b (predefined macros -- C 6.10.8): `__LINE__`/`__FILE__`/`__STDC__`/
+// `__STDC_VERSION__`/`__STDC_HOSTED__`/`__DATE__`/`__TIME__`. The set is
+// CONFIG-driven (`preprocess.predefinedMacros`); the engine dispatches ONLY on
+// the entry `kind`, never on the macro NAME. A predefined name that is NOT a
+// `#define`d macro materializes its configured value at use; `#define`/`#undef`
+// of a predefined name fails loud (C 6.10.8.1p2). The load-bearing subtlety:
+// `__LINE__`/`__FILE__` resolve against the INVOCATION offset (C 6.10.8.1) -- a
+// `__LINE__` reached through a macro replacement reports the INVOCATION line,
+// not the `#define` line. Every assertion is RED-ON-DISABLE.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// MAKE-OR-BREAK (C 6.10.8.1): `__LINE__` inside a macro replacement resolves to
+// the macro's INVOCATION line, NOT the `#define` line and NOT the replacement
+// token's own physical span. With WARN defined on line 1 and invoked on line 4,
+// `WARN` must materialize `4`. RED-ON-DISABLE: resolving via the replacement
+// token's OWN span (its physical position is the `#define` line 1) yields `1`;
+// the invocation-offset inheritance (ExpToken::invOffset threaded through the
+// object-like splice) is exactly what makes it `4`.
+TEST(Preprocessor, FC15bLineInMacroResolvesToInvocationLine) {
+    PreprocessResult r;
+    //              line: 1                    2        3        4
+    auto lexs = ppLexemes("#define WARN __LINE__\nint a;\nint b;\nint x = WARN;\n",
+                          r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int a ; int b ; int x = 4 ;   (the directive line is stripped)
+    ASSERT_EQ(lexs.size(), 11u) << "expected: int a ; int b ; int x = 4 ;";
+    EXPECT_EQ(lexs[9], "4")
+        << "__LINE__ in WARN's replacement must resolve to the INVOCATION line "
+           "(4), not the #define line (1) -- red-on-disable: the replacement "
+           "token's own span would give 1";
+    // Sanity on the surrounding shape (so a stray token can't hide a wrong [9]).
+    EXPECT_EQ(lexs[6], "int");
+    EXPECT_EQ(lexs[7], "x");
+    EXPECT_EQ(lexs[8], "=");
+    EXPECT_EQ(lexs[10], ";");
+}
+
+// The logging idiom: the SAME macro `L` (object-like -> `__LINE__`) used on two
+// DIFFERENT lines yields two DIFFERENT values (the invocation line each time).
+TEST(Preprocessor, FC15bLineMacroDiffersPerInvocationLine) {
+    PreprocessResult r;
+    //              line: 1                 2            3            4
+    auto lexs = ppLexemes("#define L __LINE__\nint a = L;\nint b = L;\nint c = L;\n",
+                          r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int a = 2 ; int b = 3 ; int c = 4 ;
+    ASSERT_EQ(lexs.size(), 15u);
+    EXPECT_EQ(lexs[3], "2") << "first L invoked on line 2";
+    EXPECT_EQ(lexs[8], "3") << "second L invoked on line 3";
+    EXPECT_EQ(lexs[13], "4") << "third L invoked on line 4";
+}
+
+// A BARE `__LINE__` (no macro) resolves to its own physical line -- the
+// degenerate case where the invocation anchor IS the token's source position.
+TEST(Preprocessor, FC15bBareLineResolvesToPhysicalLine) {
+    PreprocessResult r;
+    //              line: 1        2        3
+    auto lexs = ppLexemes("int a;\nint b;\nint x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int a ; int b ; int x = 3 ;
+    ASSERT_EQ(lexs.size(), 11u);
+    EXPECT_EQ(lexs[9], "3") << "a bare __LINE__ on line 3 resolves to 3";
+}
+
+// The `constant` kind (C 6.10.8.1): `__STDC__` -> 1, `__STDC_VERSION__` ->
+// 202311L (C23), `__STDC_HOSTED__` -> 1. The value spelling reaches the parser
+// VERBATIM as a single Number token. RED-ON-DISABLE: without the predefined hook
+// these stay ordinary identifiers (lexs would carry `__STDC__` not `1`).
+TEST(Preprocessor, FC15bStdcConstants) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("int v = __STDC__;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 5u);
+        EXPECT_EQ(lexs[3], "1") << "__STDC__ materializes its config value 1";
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("long v = __STDC_VERSION__;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 5u);
+        EXPECT_EQ(lexs[3], "202311L")
+            << "__STDC_VERSION__ materializes its config value 202311L (C23)";
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("int v = __STDC_HOSTED__;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 5u);
+        EXPECT_EQ(lexs[3], "1") << "__STDC_HOSTED__ materializes its config value 1";
+    }
+}
+
+// `__STDC_VERSION__` works in a `#if` controlling expression (it expands via the
+// SAME engine, then the ICE evaluator folds it): `#if __STDC_VERSION__ >= 201112L`
+// is true under C23. RED-ON-DISABLE: without the predefined hook the identifier
+// folds to 0 and the branch is wrongly elided.
+TEST(Preprocessor, FC15bStdcVersionInIfExpression) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if __STDC_VERSION__ >= 201112L\nint modern;\n#else\nint old;\n#endif\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "C23 version >= 201112L -> the modern branch";
+    EXPECT_EQ(lexs[1], "modern");
+}
+
+// The `file` kind (C 6.10.8.1): `__FILE__` materializes the current source file
+// name as a C string literal. The buffer is named "main.c" by ppLexemes, so the
+// product decodes to "main.c". A string-literal product is a StringStart +
+// StringLiteral pair (like a stringize product), so we reconstruct it.
+TEST(Preprocessor, FC15bFileResolvesToSourceName) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("const char* f = __FILE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // const char * f = " main.c ;   -> the string product is lexs[5]+lexs[6].
+    ASSERT_EQ(lexs.size(), 8u) << "const char * f = <str-start> <str-body> ;";
+    EXPECT_EQ(reconstructStringLiteral(lexs, 5), "\"main.c\"")
+        << "__FILE__ materializes the source file name as a string literal";
+}
+
+// `__FILE__` inside an `#include`'d HEADER reports the HEADER's name, not the
+// main file's (C 6.10.8.1: the PRESUMED name of the current source file -- which
+// after the include splice is the header). The invocation offset of the
+// `__FILE__` token lands in the header's line-map segment, so it resolves to the
+// header's origin buffer name. RED-ON-DISABLE: resolving __FILE__ to the main
+// buffer name (ignoring the line-map origin) yields "main.c" inside the header.
+TEST(Preprocessor, FC15bFileInIncludedHeaderReportsHeaderName) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_pp_file_macro_test";
+    fs::create_directories(dir);
+    // The header USES __FILE__ -- so the product must carry the HEADER's name.
+    { std::ofstream(dir / "hdr.h", std::ios::binary)
+          << "const char* h = __FILE__;\n"; }
+    auto mainPath = dir / "main.c";
+    { std::ofstream(mainPath, std::ios::binary)
+          << "#include \"hdr.h\"\nint x;\n"; }
+
+    auto schema = cSubset();
+    auto mainBuf = SourceBuffer::fromFile(mainPath);
+    ASSERT_NE(mainBuf, nullptr);
+    std::vector<fs::path> noDirs;
+    PreprocessResult r = preprocess(mainBuf, schema, noDirs);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+
+    std::vector<std::string> lexs;
+    for (Token const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+    }
+    // const char * h = " hdr.h ; int x ;  -- find the string product after `=`.
+    // The header's __FILE__ product decodes to a name ENDING in "hdr.h" (the
+    // origin buffer name is the full path passed to fromFile).
+    bool sawHeaderName = false;
+    for (std::size_t i = 0; i + 1 < lexs.size(); ++i) {
+        if (lexs[i] == "\"") {
+            auto decoded = decodeStringLiteralBody(lexs[i + 1]);
+            if (decoded.has_value()) {
+                const std::string& s = *decoded;
+                // Normalized to '/'; ends with "hdr.h" and NOT "main.c".
+                if (s.size() >= 5 && s.compare(s.size() - 5, 5, "hdr.h") == 0) {
+                    sawHeaderName = true;
+                }
+                EXPECT_EQ(s.find("main.c"), std::string::npos)
+                    << "__FILE__ in the header must NOT report the main file name";
+            }
+        }
+    }
+    EXPECT_TRUE(sawHeaderName)
+        << "__FILE__ inside an #include'd header must report the HEADER's name";
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// `__DATE__` SHAPE-ONLY (NEVER the exact value -- the build date is
+// nondeterministic). C 6.10.8.1: the product is a string literal of the form
+// `"Mmm dd yyyy"` -- a decoded body of EXACTLY 11 chars (3 month + space +
+// 2 space-padded day + space + 4 year). We pin the LENGTH + structure (a space
+// at indices 3 and 6), never the contents.
+TEST(Preprocessor, FC15bDateShapeOnly) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("const char* d = __DATE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 8u);
+    EXPECT_EQ(lexs[5], "\"") << "__DATE__ is a string-literal product";
+    auto decoded = decodeStringLiteralBody(lexs[6]);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->size(), 11u)
+        << "__DATE__ decodes to \"Mmm dd yyyy\" -- exactly 11 chars";
+    if (decoded->size() == 11u) {
+        EXPECT_EQ((*decoded)[3], ' ') << "space after the month";
+        EXPECT_EQ((*decoded)[6], ' ') << "space after the (space-padded) day";
+    }
+}
+
+// `__TIME__` SHAPE-ONLY: C 6.10.8.1 `"hh:mm:ss"` -- a decoded body of EXACTLY
+// 8 chars with `:` at indices 2 and 5. Never the exact value.
+TEST(Preprocessor, FC15bTimeShapeOnly) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("const char* t = __TIME__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 8u);
+    EXPECT_EQ(lexs[5], "\"") << "__TIME__ is a string-literal product";
+    auto decoded = decodeStringLiteralBody(lexs[6]);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->size(), 8u)
+        << "__TIME__ decodes to \"hh:mm:ss\" -- exactly 8 chars";
+    if (decoded->size() == 8u) {
+        EXPECT_EQ((*decoded)[2], ':') << "colon after hours";
+        EXPECT_EQ((*decoded)[5], ':') << "colon after minutes";
+    }
+}
+
+// FAIL-LOUD (C 6.10.8.1p2): `#define` of a predefined name is a constraint
+// violation -> P_PreprocessorPredefinedMacro, and the directive does NOT alter
+// the table (a subsequent `__LINE__` still materializes its line value).
+TEST(Preprocessor, FC15bDefineOfPredefinedFailsLoud) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define __LINE__ 5\nint x = __LINE__;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
+        << "#define of a predefined macro name must fail loud";
+    // The rejected #define did not bind __LINE__ to 5; line-2 __LINE__ is 2.
+    ASSERT_EQ(lexs.size(), 5u);
+    EXPECT_EQ(lexs[3], "2")
+        << "the rejected #define must NOT alter the table -- __LINE__ still "
+           "resolves to its invocation line (2), not the rejected value 5";
+}
+
+// FAIL-LOUD (C 6.10.8.1p2): `#undef` of a predefined name is a constraint
+// violation -> P_PreprocessorPredefinedMacro, and the name still materializes.
+TEST(Preprocessor, FC15bUndefOfPredefinedFailsLoud) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#undef __FILE__\nconst char* f = __FILE__;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
+        << "#undef of a predefined macro name must fail loud";
+    // __FILE__ still materializes (the #undef was rejected, not applied).
+    ASSERT_EQ(lexs.size(), 8u);
+    EXPECT_EQ(reconstructStringLiteral(lexs, 5), "\"main.c\"")
+        << "the rejected #undef must NOT remove the predefined macro";
+}
+
+// AGNOSTICISM (RED-ON-DISABLE): the predefined-macro set is CONFIG-driven
+// (`preprocess.predefinedMacros`), NOT hard-coded. Rebind the `__LINE__` entry's
+// name to `__CURLINE__` and reload: now `__CURLINE__` resolves to its line while
+// the OLD spelling `__LINE__` is an ordinary identifier (passes through). RED-
+// ON-DISABLE: hard-coding "__LINE__" makes `__CURLINE__` ordinary (fails (1)) and
+// keeps `__LINE__` resolving (fails (2)).
+TEST(Preprocessor, FC15bPredefinedNameIsConfigDrivenNotHardcoded) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    // Rebind ONLY the name token of the `line` entry (a minimal, unambiguous
+    // substring -- `"name": "__LINE__"` appears exactly once in the config).
+    auto schema = reboundCSubset("\"name\": \"__LINE__\"",
+                                 "\"name\": \"__CURLINE__\"",
+                                 "<rebound-line-c-subset>");
+    ASSERT_NE(schema, nullptr);
+
+    // (1) The REBOUND name resolves to its invocation line.
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"int a;\nint x = __CURLINE__;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        std::vector<std::string> lexs;
+        for (Token const& t : r.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof) continue;
+            if (t.coreKind == CoreTokenKind::Whitespace) continue;
+            if (t.coreKind == CoreTokenKind::Newline) continue;
+            lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+        }
+        ASSERT_EQ(lexs.size(), 8u);
+        EXPECT_EQ(lexs[6], "2")
+            << "the rebound __CURLINE__ resolves to its invocation line (2)";
+    }
+    // (2) The OLD spelling `__LINE__` is now an ORDINARY identifier (it passes
+    // through verbatim, not resolved to a number).
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"int x = __LINE__;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        std::vector<std::string> lexs;
+        for (Token const& t : r.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof) continue;
+            if (t.coreKind == CoreTokenKind::Whitespace) continue;
+            if (t.coreKind == CoreTokenKind::Newline) continue;
+            lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+        }
+        ASSERT_EQ(lexs.size(), 5u);
+        EXPECT_EQ(lexs[3], "__LINE__")
+            << "with __LINE__ rebound away, the literal `__LINE__` is an ordinary "
+               "identifier -- proving the predefined name is read from config";
+    }
+}
+
+// AGNOSTICISM (opt-OUT): a language with NO preprocess block declares NO
+// predefined macros, so `__LINE__` &c. stay ordinary identifiers (zero behavior
+// change for toy / tsql-subset). c-subset, by contrast, declares the 7 entries.
+TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
+    auto toy = GrammarSchema::loadShipped("toy");
+    ASSERT_TRUE(toy.has_value());
+    EXPECT_TRUE((*toy)->preprocess().predefinedMacros.empty())
+        << "toy declares no predefined macros -- __LINE__ stays ordinary";
+
+    auto tsql = GrammarSchema::loadShipped("tsql-subset");
+    ASSERT_TRUE(tsql.has_value());
+    EXPECT_TRUE((*tsql)->preprocess().predefinedMacros.empty());
+
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ((*c)->preprocess().predefinedMacros.size(), 7u)
+        << "c-subset declares the 7 C 6.10.8 predefined macros";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FC15c (`#pragma` -- C 6.10.6; `__has_include` + `__has_c_attribute` --
+// C23 6.10.1p4). `#pragma` is consumed-and-DROPPED with NO error. The two
+// operators are valid only in a `#if`/`#elif` operand; their RESULT (0/1 for
+// __has_include, a version int for __has_c_attribute) is folded by the ICE
+// evaluator. The angle delimiters of `__has_include(<h>)` are matched by CONFIG
+// token KIND, never the `<`/`>` bytes (agnosticism). Every assertion is
+// RED-ON-DISABLE.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+// Run the preprocessor over `text` with an explicit systemDirs (the angle-form
+// search path) + includeDirs (the quote-form search path) and return the
+// NON-trivia lexemes. Mirrors `ppLexemes` but threads the search paths so the
+// Finding-3 `__has_include(<stem.json>)` mapping can be exercised.
+[[nodiscard]] std::vector<std::string> ppLexemesWithDirs(
+    std::string text, PreprocessResult& out,
+    std::vector<std::filesystem::path> includeDirs,
+    std::vector<std::filesystem::path> systemDirs) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(std::move(text), "main.c");
+    out = preprocess(buf, schema, includeDirs, systemDirs);
+    std::vector<std::string> lexs;
+    for (Token const& t : out.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{out.synthBuffer->slice(t.span)});
+    }
+    return lexs;
+}
+} // namespace
+
+// `#pragma` is consumed-and-DROPPED with NO error (C 6.10.6p2). The line carries
+// a GCC-style payload; only `int v = 1 ;` survives. RED-ON-DISABLE: without the
+// `#pragma`-consume arm the directive hits the generic unsupported-directive
+// fail-loud (P_PreprocessorUnsupported).
+TEST(Preprocessor, FC15cPragmaConsumedAndDropped) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#pragma GCC optimize(\"O2\")\nint v=1;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a `#pragma` line must be silently consumed (C 6.10.6p2)";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "a `#pragma` must NOT trip the unsupported-directive fail-loud";
+    ASSERT_EQ(lexs.size(), 5u) << "only `int v = 1 ;` survives the dropped pragma";
+    EXPECT_EQ(lexs[0], "int");
+    EXPECT_EQ(lexs[1], "v");
+    EXPECT_EQ(lexs[2], "=");
+    EXPECT_EQ(lexs[3], "1");
+    EXPECT_EQ(lexs[4], ";");
+}
+
+// A `#pragma` inside a DEAD branch is silent too (the arm is past the
+// stackActive gate). `#if 0 ... #pragma ... #endif` -> no diagnostic, nothing
+// emitted from the dead group.
+TEST(Preprocessor, FC15cPragmaInDeadBranchIsSilent) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#if 0\n#pragma whatever here\nint dead;\n#endif\nint x;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "only `int x ;` survives";
+    EXPECT_EQ(lexs[0], "int");
+    EXPECT_EQ(lexs[1], "x");
+    EXPECT_EQ(lexs[2], ";");
+}
+
+// OPT-OUT (RED-ON-DISABLE for the config match): with `pragmaDirective` stripped
+// from config, `#pragma` is no longer recognized -> it hits the generic
+// unsupported-directive fail-loud. Proves the engine matches the CONFIG word,
+// not a hard-coded "pragma".
+TEST(Preprocessor, FC15cPragmaIsConfigDrivenFailsLoudWhenStripped) {
+    namespace fs = std::filesystem;
+    // Remove the pragmaDirective line entirely (so the field defaults to empty).
+    auto schema = reboundCSubset("\"pragmaDirective\":          \"pragma\",",
+                                 "",
+                                 "<no-pragma-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_TRUE(schema->preprocess().pragmaDirective.empty())
+        << "the rebound schema must declare no pragma directive";
+    auto buf = SourceBuffer::fromString(
+        std::string{"#pragma GCC optimize(\"O2\")\nint v=1;\n"}, "main.c");
+    std::vector<fs::path> noDirs;
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "with `pragmaDirective` stripped, `#pragma` must fail loud as an "
+           "unsupported directive -- proving the directive word is read from "
+           "config, not hard-coded";
+}
+
+// `__has_include("h")` quote form -> 1 when the local file exists. We write a
+// real header into a temp dir, pass it as the includeDir, and probe it. The 42
+// branch is taken (lexs == `int yes ;`). RED-ON-DISABLE: without the
+// `__has_include` arm the identifier folds to 0 -> the #else branch.
+TEST(Preprocessor, FC15cHasIncludeQuoteExistingFileIsOne) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_fc15c_has_include_q";
+    fs::create_directories(dir);
+    { std::ofstream(dir / "real_header.h", std::ios::binary) << "/* x */\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#if __has_include(\"real_header.h\")\nint yes;\n#else\nint no;\n#endif\n",
+        r, {dir}, {});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "the existing header -> the `yes` branch";
+    EXPECT_EQ(lexs[1], "yes")
+        << "__has_include of an existing quote header must be 1 (branch taken)";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// `__has_include("h")` quote form -> 0 when the file does NOT exist -> the #else
+// branch is taken.
+TEST(Preprocessor, FC15cHasIncludeQuoteMissingFileIsZero) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if __has_include(\"definitely_no_such_header_xyz.h\")\n"
+        "int yes;\n#else\nint no;\n#endif\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "the missing header -> the `no` branch";
+    EXPECT_EQ(lexs[1], "no")
+        << "__has_include of a missing quote header must be 0 (else branch)";
+}
+
+// FINDING 3 (the silent-miscompile the plan-lock caught): the ANGLE form maps
+// `<stem>.json` on the systemDirs path (DSS ships JSON descriptors, e.g.
+// `stdio.json`, NOT `stdio.h`). `__has_include(<stdio.h>)` must be 1 when
+// `stdio.json` is on the system path -- a naive `findInDirs("stdio.h", ...)`
+// returns 0 while `#include <stdio.h>` succeeds (the wrong answer). We put a
+// `stdio.json` in a temp systemDir and probe `<stdio.h>`.
+// RED-ON-DISABLE for the stem mapping: resolving the literal `stdio.h` on the
+// systemDirs (which holds only `stdio.json`) yields 0 -> the wrong branch.
+TEST(Preprocessor, FC15cHasIncludeAngleMapsStemDotJson) {
+    namespace fs = std::filesystem;
+    auto sysdir = fs::temp_directory_path() / "dss_fc15c_has_include_sys";
+    fs::create_directories(sysdir);
+    // Ship a JSON descriptor (the shape DSS ships), NOT a `.h` file.
+    { std::ofstream(sysdir / "stdio.json", std::ios::binary) << "{}\n"; }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_include(<stdio.h>)\nint yes;\n#else\nint no;\n#endif\n",
+            r, {}, {sysdir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes")
+            << "__has_include(<stdio.h>) must map to stdio.json on the system "
+               "path (Finding 3) -- a literal `stdio.h` search yields 0";
+    }
+    // A header with no shipped descriptor -> 0 (the else branch).
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_include(<nope.h>)\nint yes;\n#else\nint no;\n#endif\n",
+            r, {}, {sysdir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "no")
+            << "__has_include(<nope.h>) with no nope.json on the path must be 0";
+    }
+    std::error_code ec;
+    fs::remove_all(sysdir, ec);
+}
+
+// FAIL-LOUD (C23 6.10.1p4 well-formedness): every malformed `__has_include`
+// shape -> P_PreprocessorHasInclude (a DISTINCT, positioned diagnostic, never a
+// generic ICE fallthrough). Missing `(`, missing `>`, missing `)`, empty name.
+TEST(Preprocessor, FC15cHasIncludeMalformedFailsLoud) {
+    // Missing `(`.
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#if __has_include\nint a;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
+            << "__has_include with no `(` must fail loud";
+    }
+    // Missing closing `>`.
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#if __has_include(<stdio.h)\nint a;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
+            << "__has_include(<...  with no `>` must fail loud";
+    }
+    // Missing closing `)`.
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#if __has_include(\"h.h\"\nint a;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
+            << "__has_include(\"...\"  with no `)` must fail loud";
+    }
+    // Empty angle name `<>`.
+    {
+        PreprocessResult r;
+        (void)ppLexemes("#if __has_include(<>)\nint a;\n#endif\n", r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
+            << "__has_include(<>) (empty name) must fail loud";
+    }
+}
+
+// `__has_c_attribute(deprecated)` -> the configured version (202311, truthy) ->
+// the branch is taken. RED-ON-DISABLE: without the operator the identifier folds
+// to 0 -> the #else branch.
+TEST(Preprocessor, FC15cHasCAttributeKnownIsVersion) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if __has_c_attribute(deprecated)\nint yes;\n#else\nint no;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "a known attribute -> the `yes` branch";
+    EXPECT_EQ(lexs[1], "yes")
+        << "__has_c_attribute(deprecated) must fold to its version (202311 != 0)";
+}
+
+// The exact version reaches the ICE comparator: `__has_c_attribute(nodiscard)
+// == 202311` is true; `>= 202312` is false -- proves the minted value is the
+// configured int, not just a truthy 1.
+TEST(Preprocessor, FC15cHasCAttributeExactVersion) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#if __has_c_attribute(nodiscard) == 202311\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "a") << "the minted value is exactly 202311";
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#if __has_c_attribute(nodiscard) >= 202312\nint a;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_TRUE(lexs.empty()) << "202311 >= 202312 is false -> nothing emitted";
+    }
+}
+
+// The dunder form is accepted (C 6.10.1: the lookup ignores leading/trailing
+// `__`): `__has_c_attribute(__deprecated__)` resolves the same as `deprecated`.
+TEST(Preprocessor, FC15cHasCAttributeDunderForm) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if __has_c_attribute(__deprecated__)\nint a;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "a")
+        << "__deprecated__ must match the known `deprecated` (dunder stripped)";
+}
+
+// An UNKNOWN attribute -> 0 -> the #else branch (never an error -- C23 says
+// unknown attributes yield 0).
+TEST(Preprocessor, FC15cHasCAttributeUnknownIsZero) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if __has_c_attribute(not_a_real_attr)\nint yes;\n#else\nint no;\n#endif\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "an unknown attribute folds to 0, never an error";
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "no")
+        << "__has_c_attribute(not_a_real_attr) must be 0 (else branch)";
+}
+
+// AGNOSTICISM (opt-OUT): with `hasIncludeOperator` stripped from config,
+// `__has_include` is an ORDINARY identifier in a `#if` operand -> it folds to 0
+// (C 6.10.1p4), so `#if __has_include("x")` is `#if 0` -> the else branch. The
+// `(...)` trails as a malformed expression? No -- a folded-0 identifier followed
+// by `(` would be a call shape the ICE parser rejects; we instead pin the
+// CONFIG-READ contract directly (the operator/angle-token strings) which is the
+// load-bearing agnosticism property, plus the bare-identifier fold via a name
+// the parser accepts standalone.
+TEST(Preprocessor, FC15cHasIncludeIsConfigDrivenOptOut) {
+    // Strip the operator declaration; the angle tokens go too (the loader
+    // requires them only WHEN the operator is declared, so removing all three
+    // keeps the schema self-consistent).
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty());
+    for (std::string const& line :
+         {std::string{"\"hasIncludeOperator\":       \"__has_include\",\n"},
+          std::string{"    \"hasIncludeAngleOpenToken\":  \"LtOp\",\n"},
+          std::string{"    \"hasIncludeAngleCloseToken\": \"GtOp\",\n"}}) {
+        auto const pos = text.find(line);
+        ASSERT_NE(pos, std::string::npos) << "config no longer carries: " << line;
+        text.erase(pos, line.size());
+    }
+    auto loaded = GrammarSchema::loadFromText(text, "<no-has-include-c-subset>");
+    ASSERT_TRUE(loaded.has_value())
+        << "stripping the operator + its angle tokens must still load: "
+        << (loaded.error().empty() ? "<none>" : loaded.error()[0].message);
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    EXPECT_TRUE(schema->preprocess().hasIncludeOperator.empty());
+
+    // A BARE `__has_include` (no parens) now folds as an ordinary identifier ->
+    // 0, so `#if __has_include` is `#if 0` -> the else branch is taken. No
+    // P_PreprocessorHasInclude (the operator is gone).
+    namespace fs = std::filesystem;
+    auto buf = SourceBuffer::fromString(
+        std::string{"#if __has_include\nint yes;\n#else\nint no;\n#endif\n"},
+        "main.c");
+    std::vector<fs::path> noDirs;
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
+        << "with the operator stripped, `__has_include` is ordinary -- no "
+           "has-include diagnostic";
+    std::vector<std::string> lexs;
+    for (Token const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+    }
+    ASSERT_EQ(lexs.size(), 3u);
+    EXPECT_EQ(lexs[1], "no")
+        << "a stripped __has_include folds to 0 -> the #else branch";
+}
+
+// CONFIG-READ pins: the shipped c-subset declares the operator names + the angle
+// token KINDS; toy / tsql declare none. The angle delimiters being CONFIG token
+// names (not the `<`/`>` bytes) is the make-or-break agnosticism property.
+TEST(Preprocessor, FC15cOperatorNamesAndAngleTokensAreConfigDeclared) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ((*c)->preprocess().pragmaDirective, "pragma");
+    EXPECT_EQ((*c)->preprocess().hasIncludeOperator, "__has_include");
+    EXPECT_EQ((*c)->preprocess().hasCAttributeOperator, "__has_c_attribute");
+    EXPECT_EQ((*c)->preprocess().hasIncludeAngleOpenToken, "LtOp")
+        << "the angle delimiters are matched by token KIND, declared in config";
+    EXPECT_EQ((*c)->preprocess().hasIncludeAngleCloseToken, "GtOp");
+    EXPECT_EQ((*c)->preprocess().knownCAttributes.size(), 7u);
+
+    for (char const* lang : {"toy", "tsql-subset"}) {
+        auto s = GrammarSchema::loadShipped(lang);
+        ASSERT_TRUE(s.has_value()) << lang;
+        EXPECT_TRUE((*s)->preprocess().pragmaDirective.empty()) << lang;
+        EXPECT_TRUE((*s)->preprocess().hasIncludeOperator.empty()) << lang;
+        EXPECT_TRUE((*s)->preprocess().hasCAttributeOperator.empty()) << lang;
+        EXPECT_TRUE((*s)->preprocess().knownCAttributes.empty()) << lang;
+    }
+}
+
+// FINDING 1 (RED-ON-DISABLE): the angle delimiters of `__has_include(<h>)` are
+// matched by CONFIG token KIND, not the `<`/`>` bytes. Rebind
+// `hasIncludeAngleOpenToken` from `LtOp` to a DIFFERENT real declared token
+// (`TildeOp` = `~`) and the `<h>` form must NO LONGER be recognized as the
+// angle opener -> the operand `<stdio.h>` is now a malformed shape -> fail loud.
+// RED-ON-DISABLE: matching `<` by the literal byte would ignore the rebind and
+// still parse the angle form, so no diagnostic fires.
+TEST(Preprocessor, FC15cAngleDelimiterIsConfigKindNotByte) {
+    namespace fs = std::filesystem;
+    // Rebind the angle OPEN token to a real token that is NOT `<` (`TildeOp`=`~`).
+    auto schema = reboundCSubset("\"hasIncludeAngleOpenToken\":  \"LtOp\"",
+                                 "\"hasIncludeAngleOpenToken\":  \"TildeOp\"",
+                                 "<rebound-angle-open-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->preprocess().hasIncludeAngleOpenToken, "TildeOp");
+    // `__has_include(<stdio.h>)`: the `<` is no longer the configured angle
+    // opener, so the operand is neither the angle nor the quote form -> the
+    // engine must fail loud (it is NOT silently parsed via the `<` byte).
+    auto buf = SourceBuffer::fromString(
+        std::string{"#if __has_include(<stdio.h>)\nint a;\n#endif\n"}, "main.c");
+    std::vector<fs::path> noDirs;
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
+        << "with the angle-open token rebound off `<`, a `<h>` operand must fail "
+           "loud -- proving the delimiter is matched by config KIND, not the `<` "
+           "byte";
+}
+
+// LOADER (make-or-break self-consistency): a language declaring
+// `hasIncludeOperator` WITHOUT both angle tokens is a self-inconsistent contract
+// -> C_InvalidPreprocess at load. We strip ONLY the angle-open token, leaving the
+// operator declared, and assert the load FAILS.
+TEST(Preprocessor, FC15cHasIncludeWithoutAngleTokensIsLoadError) {
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty());
+    const std::string line = "\"hasIncludeAngleOpenToken\":  \"LtOp\",\n";
+    auto const pos = text.find(line);
+    ASSERT_NE(pos, std::string::npos);
+    text.erase(pos, line.size());
+    auto loaded = GrammarSchema::loadFromText(text, "<bad-has-include-c-subset>");
+    EXPECT_FALSE(loaded.has_value())
+        << "declaring hasIncludeOperator without both angle tokens must be a "
+           "load error (C_InvalidPreprocess)";
+}
+
+// LOADER: a malformed `knownCAttributes` entry (a non-positive version) ->
+// C_InvalidPreprocess at load.
+TEST(Preprocessor, FC15cKnownCAttributeBadVersionIsLoadError) {
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty());
+    const std::string from = "{ \"name\": \"deprecated\",   \"version\": 202311 }";
+    const std::string to   = "{ \"name\": \"deprecated\",   \"version\": 0 }";
+    auto const pos = text.find(from);
+    ASSERT_NE(pos, std::string::npos);
+    text.replace(pos, from.size(), to);
+    auto loaded = GrammarSchema::loadFromText(text, "<bad-attr-c-subset>");
+    EXPECT_FALSE(loaded.has_value())
+        << "a knownCAttributes entry with version <= 0 must be a load error";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FC15 paste residuals — object-like `##` (D-PP-PASTE-OBJECT-LIKE), placemarkers
+// for empty `##` operands (D-PP-PASTE-PLACEMARKER, C 6.10.3.3p2), and the GNU
+// `,##__VA_ARGS__` comma-elision (D-PP-VARIADIC-GNU-COMMA-ELISION). These COMPLETE
+// FC15: `##` now works in object-like macros and with empty operands, and the GNU
+// elision is config-gated (`variadicCommaElision`). A GENUINE dangling `##` (no
+// operand token in the replacement list) still fails loud (FC15aPasteAt{Start,End}
+// + the object-like pin below).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// (1) Object-like `##`: `#define HW a ## b` -> `HW` pastes to the single token
+// `ab`. RED-ON-DISABLE: without the `collapsePastes` call in the object-like
+// expand arm, `a`, `##`, `b` pass through verbatim (3 tokens; `##` then trips the
+// parser). lexs.size() != 1.
+TEST(Preprocessor, FC15ObjectLikePasteYieldsOneToken) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define HW a ## b\nHW\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 1u) << "object-like ## must yield exactly ONE token";
+    EXPECT_EQ(lexs[0], "ab");
+}
+
+// (2) Object-like `##` chains left-to-right exactly like the function-like path.
+TEST(Preprocessor, FC15ObjectLikePasteChain) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define T x ## y ## z\nT\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 1u) << "two object-like ## collapse to ONE token";
+    EXPECT_EQ(lexs[0], "xyz");
+}
+
+// (3) The object-like paste PRODUCT is rescanned: `MK` -> `foo` (paste) ->
+// rescans as a macro use of `foo` -> 7. RED-ON-DISABLE: an un-collapsed
+// `fo ## o` never forms `foo`, so the `foo`->7 expansion cannot fire.
+TEST(Preprocessor, FC15ObjectLikePasteProductRescanned) {
+    PreprocessResult r;
+    auto lexs =
+        ppLexemes("#define MK fo ## o\n#define foo 7\nint v = MK;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int v = 7 ;";
+    EXPECT_EQ(lexs[3], "7")
+        << "object-like ## product `foo` must rescan and expand to 7";
+}
+
+// (4) Placemarker, RIGHT operand empty (C 6.10.3.3p2): `J(x,)` -> `x ## <pm>` ->
+// `x`. RED-ON-DISABLE: without the placemarker, the empty `b` arg pushes nothing,
+// `items` ends `[x, ##]`, and `collapsePastes` fires P_PreprocessorPaste (dangling).
+TEST(Preprocessor, FC15PlacemarkerRightEmpty) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define J(a,b) a ## b\nJ(x,)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste))
+        << "x ## <empty> is a placemarker paste, NOT a dangling ##";
+    ASSERT_EQ(lexs.size(), 1u) << "x ## placemarker -> x";
+    EXPECT_EQ(lexs[0], "x");
+}
+
+// (5) Placemarker, LEFT operand empty: `J(,y)` -> `<pm> ## y` -> `y`.
+TEST(Preprocessor, FC15PlacemarkerLeftEmpty) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define J(a,b) a ## b\nJ(,y)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 1u) << "placemarker ## y -> y";
+    EXPECT_EQ(lexs[0], "y");
+}
+
+// (6) Placemarker, BOTH operands empty: `J(,)` -> `<pm> ## <pm>` -> a placemarker
+// -> dropped -> NO output tokens. RED-ON-DISABLE: a surviving placemarker would
+// emit a garbage token (size 1, not 0); a missing placemarker would fail loud.
+TEST(Preprocessor, FC15PlacemarkerBothEmpty) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define J(a,b) a ## b\nJ(,)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 0u) << "placemarker ## placemarker -> empty";
+}
+
+// (7) Placemarker MID-chain: `J3(x,,z)` = `x ## <pm> ## z` collapses left-to-right
+// (`x ## <pm>` -> `x`, then `x ## z` -> `xz`). RED-ON-DISABLE: the first `##` would
+// try to paste `x` with the bare `##` marker (>1 token) or fail dangling.
+TEST(Preprocessor, FC15PlacemarkerMidChain) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define J3(a,b,c) a ## b ## c\nJ3(x,,z)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 1u) << "x ## pm ## z -> xz";
+    EXPECT_EQ(lexs[0], "xz");
+}
+
+// (8) GNU comma-elision, EMPTY __VA_ARGS__ (the primary pin): `LOG(42)` ->
+// `f(42)` — the separator before `## __VA_ARGS__` is DROPPED. RED-ON-DISABLE
+// (flag off / elision block removed): the comma survives via the standard
+// placemarker rule (`, ## <pm>` -> `,`) -> 5 tokens `f ( 42 , )`.
+TEST(Preprocessor, FC15GnuCommaElisionEmptyVaArgs) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define LOG(fmt, ...) f(fmt, ## __VA_ARGS__)\nLOG(42)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 4u) << "expected: f ( 42 ) -- the comma elided";
+    EXPECT_EQ(lexs[0], "f");
+    EXPECT_EQ(lexs[1], "(");
+    EXPECT_EQ(lexs[2], "42");
+    EXPECT_EQ(lexs[3], ")");
+}
+
+// (9) GNU comma-elision, NON-empty __VA_ARGS__: `LOG(7, 1, 2)` -> `f(7, 1, 2)` —
+// the comma is KEPT and the `##` does NOT paste (`,1` would be two tokens / a
+// malformed paste). RED-ON-DISABLE: pasting `,` with `1` trips P_PreprocessorPaste
+// or mangles the stream.
+TEST(Preprocessor, FC15GnuCommaElisionNonEmptyVaArgs) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define LOG(fmt, ...) f(fmt, ## __VA_ARGS__)\nLOG(7, 1, 2)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    ASSERT_EQ(lexs.size(), 8u) << "expected: f ( 7 , 1 , 2 )";
+    EXPECT_EQ(lexs[2], "7");
+    EXPECT_EQ(lexs[3], ",") << "the separator is KEPT when __VA_ARGS__ is non-empty";
+    EXPECT_EQ(lexs[4], "1") << "no paste between the comma and the first arg";
+    EXPECT_EQ(lexs[5], ",");
+    EXPECT_EQ(lexs[6], "2");
+}
+
+// (10) MUST-FIX-1 pin: an empty `__VA_ARGS__` in a `## __VA_ARGS__` position whose
+// left neighbor is NOT a separator (so comma-elision does NOT apply) still becomes
+// a PLACEMARKER -> `K(x)` = `x ## <empty __VA_ARGS__>` -> `x`. RED-ON-DISABLE:
+// reverting the vaArgs fall-through to `stampArg` (not `stampArgOrPM`) drops the
+// empty operand -> dangling `##` -> P_PreprocessorPaste.
+TEST(Preprocessor, FC15PasteEmptyVaArgsIsPlacemarkerNotDangling) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define K(p, ...) p ## __VA_ARGS__\nK(x)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste))
+        << "x ## <empty __VA_ARGS__> is a placemarker, NOT a dangling ##";
+    ASSERT_EQ(lexs.size(), 1u) << "x ## placemarker -> x";
+    EXPECT_EQ(lexs[0], "x");
+}
+
+// (11) AGNOSTICISM pin: comma-elision is CONFIG-driven. Rebind the shipped
+// c-subset's `variadicCommaElision` to false and re-preprocess: the comma now
+// SURVIVES (standard placemarker) -> `f ( 42 , )`. RED-ON-DISABLE: if the engine
+// hardcoded the elision (ignoring the flag), the comma would vanish even at false.
+TEST(Preprocessor, FC15GnuCommaElisionIsConfigDriven) {
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty());
+    const std::string from = "\"variadicCommaElision\": true";
+    const std::string to   = "\"variadicCommaElision\": false";
+    auto const pos = text.find(from);
+    ASSERT_NE(pos, std::string::npos) << "config no longer carries the flag";
+    text.replace(pos, from.size(), to);
+    auto loaded = GrammarSchema::loadFromText(text, "<no-elision-c-subset>");
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<none>" : loaded.error()[0].message);
+    ASSERT_FALSE((*loaded)->preprocess().variadicCommaElision);
+
+    namespace fs = std::filesystem;
+    auto buf = SourceBuffer::fromString(
+        std::string{"#define LOG(fmt, ...) f(fmt, ## __VA_ARGS__)\nLOG(42)\n"},
+        "main.c");
+    std::vector<fs::path> noDirs;
+    PreprocessResult r = preprocess(buf, *loaded, noDirs);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    std::vector<std::string> lexs;
+    for (Token const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+    }
+    ASSERT_EQ(lexs.size(), 5u) << "without elision: f ( 42 , )";
+    EXPECT_EQ(lexs[3], ",") << "the separator survives without GNU comma-elision";
+}
+
+// (12) Fail-loud preserved for OBJECT-like macros: `#define OBJ a ##` (a genuine
+// dangling `##` -- no operand token at the END of the replacement list) must STILL
+// fail loud, now that the object-like arm routes through `collapsePastes`.
+TEST(Preprocessor, FC15ObjectLikeDanglingPasteFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define OBJ a ##\nOBJ\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste))
+        << "a `##` at the end of an OBJECT-like replacement must fail loud";
 }

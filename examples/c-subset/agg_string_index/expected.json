@@ -1,0 +1,33 @@
+{
+  "$comment": "Cluster-F F5 (agg_string_index): direct string-literal indexing `\"abc\"[i]`. idx() indexes with a RUNTIME index (function arg, non-foldable) so the lowering executes — materialize the rodata global + GEP + width-8 char load. Red-on-disable: remove the HirKind::Literal arm in lowerLvalueAddressNode -> H0009 compile failure. exit 215 == 'e'(101) + 'r'(114). The release arm runs the shipped optimizing pipeline over the new lvalue-address path.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 215,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -42,6 +42,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::P_PreprocessorUnsupported:  return "P_PreprocessorUnsupported";
         case DiagnosticCode::P_PreprocessorIncludeError: return "P_PreprocessorIncludeError";
         case DiagnosticCode::P_PreprocessorMacroArgument: return "P_PreprocessorMacroArgument";
+        case DiagnosticCode::P_PreprocessorStringize:    return "P_PreprocessorStringize";
+        case DiagnosticCode::P_PreprocessorPaste:        return "P_PreprocessorPaste";
+        case DiagnosticCode::P_PreprocessorPredefinedMacro: return "P_PreprocessorPredefinedMacro";
+        case DiagnosticCode::P_PreprocessorHasInclude:   return "P_PreprocessorHasInclude";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
@@ -117,6 +121,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::S_StaticStorageInForInit:   return "S_StaticStorageInForInit";
         case DiagnosticCode::S_IncompatibleRedeclaration: return "S_IncompatibleRedeclaration";
         case DiagnosticCode::S_CaseLabelNotInSwitch:     return "S_CaseLabelNotInSwitch";
+        case DiagnosticCode::S_IncDecNeedsModifiableLvalue: return "S_IncDecNeedsModifiableLvalue";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

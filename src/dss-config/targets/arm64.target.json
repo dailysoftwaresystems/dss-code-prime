@@ -424,6 +424,35 @@
       }
     },
     {
+      "$comment": "Cluster-F F2 (core_bitwise): bitwise NOT (one's complement) — MVN Xd, Xm = ORN Xd, XZR, Xm (logical shifted-register alias, Rn=XZR baked, like NEG=SUB Xd,XZR,Xm above). arm64 had NO `not` opcode (the MIR Not op's LIR mnemonic), so source-level `~` failed L_RequiredLirOpcodeMissing while x86 had it. ORN = the ORR family (opc=01) with the N bit (bit 21) set; base = 0xAA2003E0 (sf=1 | opc=01 | 01010 | shift=0 | N=1 | Rm=00000[wire] | imm6=0 | Rn=11111[XZR] | Rd=00000[result]). 3-address native (no requires2Address — Rd and Rm differ, like neg/sdiv). Slots: Rd (result), Rm (wire 0).",
+      "mnemonic":      "not",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2854224864 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "MVN Wd, Wm = ORN Wd, WZR, Wm — 0x2A2003E0 (the X-form 0xAA2003E0 with sf=0).",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 706741216 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "FC1 V2-4.X (2026-06-10): SDIV Xd, Xn, Xm — data-processing (2 source), sf=1. Base = 0x9AC00C00 (sf=1 | S=0 | 11010110 | Rm[20:16] | opcode 000011[15:10] | Rn[9:5] | Rd[4:0]). The MIR→LIR div lowering's Rule-1 NATIVE realization: result-bearing 3-address op, no implicit registers, no pre-op (contrast x86 cqo+idiv_op). ARM64 SDIV never traps — divide-by-zero yields 0 and INT_MIN/-1 wraps (A-profile), so the C-UB divide cases are non-trapping on this target. SMod has no hardware instruction: the lowering realizes rem = n - (n/d)*d via sdiv + the fused `msub` (D-LIR-MOD-MSUB-FUSION ✅ closed FC3.5 sweep-c3; the generic mul+sub expansion remains the fallback for targets without a fused op).",
       "mnemonic":      "sdiv",
       "result":        "value",
@@ -691,7 +720,7 @@
       }
     },
     {
-      "$comment": "Zero-extend a 32-bit value to 64-bit — AArch64 `MOV Wd, Wm` = `ORR Wd, WZR, Wm` (a 32-bit register op auto-zeroes the upper 32 bits of the X register, so a W-form ORR IS the W→X zero-extend). Single fixed word base 0x2A0003E0 (704644064): sf=0 (32-bit), ORR opc=01, Rn=WZR=31<<5, Rd at bits 0..4, Rm (source) at bits 16..20 via the one reg wire. Mirrors x86_64's `zext` LIR shape: result=value, ONE reg operand. The natural consumer is lowerICmp's setcc→zext pair (a clean 0/1 r64); also reused by MIR ZExt. FC3.5 sweep-c1 (D-CSUBSET-ZEXT-32-TO-64): the variant stays deliberately WIDTH-ABSENT (match-any — the xor_rdx_zero precedent) because this ONE word is the correct realization for BOTH source shapes the MIR→LIR gate admits: a Bool 0/1 register AND a full U32 (the W-write zeroes bits 63:32 regardless). x86 needs two width-keyed forms (movzx byte vs mov r32,r32); arm64's realization is width-invariant. VERIFY: zext of w1→x0 (Rd=0, Rm=1) = 0x2A0103E0.",
+      "$comment": "Zero-extend a 32-bit value to 64-bit — AArch64 `MOV Wd, Wm` = `ORR Wd, WZR, Wm` (a 32-bit register op auto-zeroes the upper 32 bits of the X register, so a W-form ORR IS the W→X zero-extend). Single fixed word base 0x2A0003E0 (704644064): sf=0 (32-bit), ORR opc=01, Rn=WZR=31<<5, Rd at bits 0..4, Rm (source) at bits 16..20 via the one reg wire. Mirrors x86_64's `zext` LIR shape: result=value, ONE reg operand. The natural consumer is lowerICmp's setcc→zext pair (a clean 0/1 r64); also reused by MIR ZExt. FC3.5 sweep-c1 (D-CSUBSET-ZEXT-32-TO-64) + D-CSUBSET-SUBNATIVE-ALU-FORMS: the variants are now WIDTH-KEYED (the byte/half forms below forced the split off match-any, per the convergence rule). This mov word (0x2A0003E0) realizes BOTH Bool (width 64) and U32 (width 32) — each zero-extends via the W-write (bits 63:32 cleared). The sub-native U16/U8 sources do NOT use the mov: a promoted U16/U8 register carries STALE upper bits the mov would copy, so they MASK via UBFM (UXTH 0x53003C00 / UXTB 0x53001C00). VERIFY: zext of w1→x0 via the mov form (Rd=0, Rm=1) = 0x2A0103E0.",
       "mnemonic":      "zext",
       "result":        "value",
       "hasSideEffects": false,
@@ -703,11 +732,39 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg"] },
+            "$comment": "width 64 (Bool default, flags=0): MOV Wd, Wm = ORR Wd, WZR, Wm (0x2A0003E0). A Bool 0/1 register zero-extends to X via the W-write (bits 63:32 cleared). Width-keyed now that the byte/half forms below are declared (the convergence rule forbids a match-any sibling beside width-keyed ones).",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 704644064 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "width 32 (U32 source): the SAME MOV Wd, Wm (0x2A0003E0) — a full U32 in a W register zero-extends to X (the W-write zeroes 63:32). This IS the U32->U64 conversion.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 704644064 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "width 16 (D-CSUBSET-SUBNATIVE-ALU-FORMS): UXTH Wd, Wn = UBFM Wd, Wn, #0, #15 (0x53003C00) — zero-extend the low HALF-WORD (the x86_64 movzx r64,r/m16 peer). MASKS to the low 16 bits, so a promoted U16 register's stale bits 31:16 are cleared (UNLIKE the width-32 mov, which would copy them). UBFM source is Rn (not Rm). Selected when the ZExt source type is U16 (width 16).",
+            "guard":      { "operandKinds": ["reg"], "width": 16 },
+            "template":   { "fixedWord": 1392524288 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "width 8 (D-CSUBSET-SUBNATIVE-ALU-FORMS): UXTB Wd, Wn = UBFM Wd, Wn, #0, #7 (0x53001C00) — zero-extend the low BYTE (the x86_64 movzx r64,r/m8 peer). MASKS to the low 8 bits. UBFM source is Rn (not Rm). Selected when the ZExt source type is U8 (width 8).",
+            "guard":      { "operandKinds": ["reg"], "width": 8 },
+            "template":   { "fixedWord": 1392516096 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
             ]
           }
         ]
@@ -738,6 +795,15 @@
             "$comment": "width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): SXTB Xd, Wn = SBFM Xd, Xn, #0, #7 — sign-extend the low BYTE to 64 bits (the x86_64 `movsx r64,r/m8` peer). Word 0x93401C00 = the SXTW word with imms 31→7 (bits 15:10): sf=1 | opc=00 | 100110 | N=1 | immr=0 | imms=7 | Rn | Rd (ARM ARM C6.2.* SBFM/SXTB). Selected when the SExt source type is Char (width 8 on the LIR inst) — the char→int widening. Reads exactly the low byte (the char), so the source register's upper bits (zero-extended by the LDURB byte load) are irrelevant.",
             "guard":      { "operandKinds": ["reg"], "width": 8 },
             "template":   { "fixedWord": 2470452224 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "width 16 (D-CSUBSET-SUBNATIVE-ALU-FORMS): SXTH Xd, Wn = SBFM Xd, Xn, #0, #15 — sign-extend the low HALF-WORD to 64 bits (the x86_64 movsx r64,r/m16 peer). Word 0x93403C00 = the SXTW word with imms 31->15 (bits 15:10): sf=1 | opc=00 | 100110 | N=1 | immr=000000 | imms=001111 | Rn | Rd. Selected when the SExt source type is I16 (width 16) — the short->int widening. Reads exactly the low half-word, so the source register's upper bits are irrelevant.",
+            "guard":      { "operandKinds": ["reg"], "width": 16 },
+            "template":   { "fixedWord": 2470460416 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }
@@ -1313,6 +1379,68 @@
             "$comment": "FC3.5: FADD Sd, Sn, Sm — ftype=00 single, base 0x1E202800.",
             "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
             "template":   { "fixedWord": 505423872 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Cluster-F F3 (float_mul_sub): FMUL Dd, Dn, Dm — scalar double, FP data-processing (2 source). The [15:10] field = {opcode[3:0], 10}; FMUL opcode=0000 -> 000010, so base = 0x1E600800 (= fadd 0x1E602800 with the opcode bits 0010->0000, i.e. clear bit 13). F32 sibling FMUL Sd,Sn,Sm = ftype=00 -> 0x1E200800 (D-form minus the ftype bit 0x400000). 3-operand NATIVE (no requires2Address, like fadd/fdiv); commutative. Mirrors fadd's wires (Rn=op0, Rm=op1).",
+      "mnemonic":      "fmul",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 509609984 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FMUL Sd, Sn, Sm — ftype=00 single, base 0x1E200800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 505415680 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Cluster-F F3 (float_mul_sub): FSUB Dd, Dn, Dm = Dn - Dm — scalar double, FP data-processing (2 source). FSUB opcode=0011 -> [15:10]=001110, base = 0x1E603800 (= fadd 0x1E602800 | 0x1000, opcode 0010->0011). F32 sibling = 0x1E203800. NON-COMMUTATIVE: op[0]=Rn (minuend), op[1]=Rm (subtrahend), Rd = Rn - Rm = a - b. 3-operand NATIVE (no requires2Address). Mirrors fadd's wire shape so the minuend/subtrahend order is preserved.",
+      "mnemonic":      "fsub",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 509622272 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FSUB Sd, Sn, Sm — ftype=00 single, base 0x1E203800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 505427968 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" },

@@ -84,11 +84,15 @@ namespace detail::type_rules {
 //   are deliberately NOT assignable; languages requiring them widen
 //   their config (typeShapes / numeric-promotion table) rather than
 //   getting silent C-style implicit conversions.
-//   NOTE (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT): c-subset's C-conformant
-//   signed↔unsigned implicit-conversion opt-in (C 6.3.1.3/6.5.16.1, needed
-//   for SQLite's int/unsigned mixing) is a DEFERRED config gate following the
-//   charConvertsToArith/enumConvertsToArith pattern — do NOT silently relax
-//   this strict default here; add the gate + thread it to the 4 callers.
+//   NOTE (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT ✅ + D-CSUBSET-INT-SAME-SIGN-NARROW ✅):
+//   c-subset's C-conformant integer implicit conversions are config opt-ins
+//   following the charConvertsToArith/enumConvertsToArith pattern, NOT silent
+//   relaxations baked into this strict default. Two gates together complete the
+//   C 6.3.1.3 integer-conversion matrix (both needed for SQLite's int/unsigned/
+//   size_t mixing): `intCrossSignednessConverts` (signed↔unsigned, any width,
+//   below) and `intSameSignednessNarrows` (same-signedness NARROWING — `short s =
+//   anInt`, `signed char c = anInt`, `int i = aLong` — gated in the rank arms
+//   below). A non-C schema (both default false) keeps strict widening-only.
 //
 // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): when the
 // caller supplies a `PointerConversionRules` block from the active
@@ -116,6 +120,16 @@ namespace detail::type_rules {
 // The default is false so the HIR VERIFIER (post-coerce, strict) still catches
 // a RAW Bool reaching an int slot uncast (a coerce-bug); the four semantic-tier
 // checks (call-arg / return / two init sites) pass `true`.
+// `intSameSignednessNarrows` (default false): admit a same-signedness integer
+// NARROWING (`short s = anInt;`, `signed char c = anInt;`, `int i = aLong;`) —
+// C 6.3.1.3 / 6.5.16.1, value-preserving in range and modular out of range.
+// WIDENING (rank(rhs) <= rank(lhs)) is admitted UNCONDITIONALLY by the rank arms
+// below; only narrowing (rank(rhs) > rank(lhs)) is newly gated here. The HIR
+// `coerce()` arithmetic-core arm materializes the width-exact Cast (MIR `Trunc`),
+// so the post-coerce verifier (gate default false) stays strict. Mirrors the
+// charConvertsToArith / enumConvertsToArith / intCrossSignednessConverts gates;
+// completes the C integer-conversion matrix alongside intCrossSignednessConverts.
+// Closes D-CSUBSET-INT-SAME-SIGN-NARROW.
 [[nodiscard]] inline bool isAssignable(
     TypeInterner const&                                interner,
     TypeId                                             lhs,
@@ -124,17 +138,20 @@ namespace detail::type_rules {
     bool                                               boolWidensToArith = false,
     bool                                               charConvertsToArith = false,
     bool                                               enumConvertsToArith = false,
-    bool                                               intCrossSignednessConverts = false) noexcept {
+    bool                                               intCrossSignednessConverts = false,
+    bool                                               intSameSignednessNarrows = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     if (sameType(lhs, rhs)) return true;
     auto const lk = interner.kind(lhs);
     auto const rk = interner.kind(rhs);
     using namespace detail::type_rules;
     if (signedIntRank(lk) != 0 && signedIntRank(rk) != 0) {
-        return signedIntRank(rk) <= signedIntRank(lk);
+        if (signedIntRank(rk) <= signedIntRank(lk)) return true;  // widening: always
+        return intSameSignednessNarrows;          // narrowing: C 6.3.1.3, gated
     }
     if (unsignedIntRank(lk) != 0 && unsignedIntRank(rk) != 0) {
-        return unsignedIntRank(rk) <= unsignedIntRank(lk);
+        if (unsignedIntRank(rk) <= unsignedIntRank(lk)) return true;  // widening: always
+        return intSameSignednessNarrows;          // narrowing: C 6.3.1.3, gated
     }
     if (floatRank(lk) != 0 && floatRank(rk) != 0) {
         return floatRank(rk) <= floatRank(lk);

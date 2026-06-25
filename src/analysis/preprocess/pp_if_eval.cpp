@@ -130,11 +130,19 @@ class IceParser {
 public:
     IceParser(std::vector<Token> toks, GrammarSchema const& schema,
               SourceBuffer const& synth, SourceBuffer const& scratch,
-              LiteralKinds const& lits, DiagnosticReporter& rep)
+              LiteralKinds const& lits, DiagnosticReporter& rep,
+              BufferId diagBufferId)
         : toks_(std::move(toks)),
           schema_(schema),
           synth_(synth),
           scratch_(scratch),
+          // FC15b: diagnostics attribute to the ORIGINAL prefix synth buffer
+          // (`diagBufferId`), even when real tokens are sliced against a COMBINED
+          // (prefix + product) buffer whose id differs. A real token's span is a
+          // valid PREFIX offset, so it positions correctly under either id; using
+          // the prefix id keeps the diagnostic on the buffer `preprocess()`
+          // remaps (the combined buffer is local + unregistered).
+          diagBufferId_(diagBufferId),
           lits_(lits),
           rep_(rep),
           binaryOps_(schema.hirLowering().binaryOps),
@@ -181,6 +189,7 @@ private:
     GrammarSchema const&          schema_;
     SourceBuffer const&           synth_;
     SourceBuffer const&           scratch_;
+    BufferId                      diagBufferId_{};
     LiteralKinds const&           lits_;
     DiagnosticReporter&           rep_;
     std::vector<HirOperatorEntry> const& binaryOps_;
@@ -216,7 +225,7 @@ private:
             onSynthetic ? SourceSpan::empty(0)
             : atEnd() ? (toks_.empty() ? SourceSpan::empty(0) : toks_.back().span)
                       : peek().span;
-        emit(rep_, code, synth_.id(), span, std::move(msg));
+        emit(rep_, code, diagBufferId_, span, std::move(msg));
     }
 
     // A token KIND -> binary operator entry (config). nullptr if not a binary
@@ -577,12 +586,40 @@ private:
 
 } // namespace
 
+// FC15c: strip the leading + trailing `__` of a `__name__` dunder spelling
+// (C 6.10.1: the `__has_c_attribute` lookup ignores a surrounding double
+// underscore, so `__deprecated__` matches a declared `deprecated`). A name
+// that is not in `__x__` form is returned unchanged.
+[[nodiscard]] std::string_view stripDunder(std::string_view name) {
+    if (name.size() >= 4 && name.substr(0, 2) == "__"
+        && name.substr(name.size() - 2) == "__") {
+        return name.substr(2, name.size() - 4);
+    }
+    return name;
+}
+
+// FC15c: look up `attr` in the schema's KNOWN-attribute set, trying both the
+// raw spelling and the dunder-stripped form. Returns the reported version int,
+// or 0 when the attribute is not known (C23 6.10.1p4).
+[[nodiscard]] std::int64_t cAttributeVersion(GrammarSchema const& schema,
+                                             std::string_view     attr) {
+    std::string_view const bare = stripDunder(attr);
+    for (CAttributeDef const& ka : schema.preprocess().knownCAttributes) {
+        if (ka.name == attr || ka.name == bare) {
+            return static_cast<std::int64_t>(ka.version);
+        }
+    }
+    return 0;
+}
+
 std::optional<std::int64_t>
 evaluateIfExpression(std::span<Token const> operandTokens,
                      GrammarSchema const&   schema,
                      PpMacroExpand const&   macroExpand,
                      PpIsDefined const&     isDefined,
+                     PpHasInclude const&    hasInclude,
                      SourceBuffer const&    synth,
+                     PpProductText const&   productText,
                      DiagnosticReporter&    rep) {
     LiteralKinds const lits = gatherLiteralKinds(schema);
 
@@ -592,20 +629,38 @@ evaluateIfExpression(std::span<Token const> operandTokens,
     SchemaTokenId const closeParen =
         schema.schemaTokens().find(pp.functionLikeCloseToken);
     std::string const& definedKw = pp.definedOperator;
+    // FC15c operator spellings (matched by TEXT, like `defined`) + the angle
+    // delimiter token KINDS for `__has_include(<h>)` (matched by SCHEMA KIND,
+    // never the `<`/`>` bytes -- the make-or-break agnosticism rule). All empty
+    // when the language declares no such operator -> the arm never fires and the
+    // identifier folds to 0 (the opt-out identity property). The string OPENER
+    // (`"` -> StringStart) for the quote form is `quoteIncludeToken`.
+    std::string const& hasIncludeKw = pp.hasIncludeOperator;
+    std::string const& hasCAttrKw   = pp.hasCAttributeOperator;
+    SchemaTokenId const angleOpen =
+        schema.schemaTokens().find(pp.hasIncludeAngleOpenToken);
+    SchemaTokenId const angleClose =
+        schema.schemaTokens().find(pp.hasIncludeAngleCloseToken);
+    SchemaTokenId const stringOpen =
+        schema.schemaTokens().find(pp.quoteIncludeToken);
 
     // ── Step 1: rewrite `defined X` / `defined(X)` -> 1/0 (MF-1: the parens
     // are the CONFIG function-like-open/close tokens, never hard-coded). The
     // operand of `defined` is NOT macro-expanded. The result is a synthetic
     // IntLiteral token sliced from `scratch` and tagged Synthetic. ──
-    std::string scratchText;            // accumulates the "0"/"1" digit bytes
+    std::string scratchText;            // accumulates the synthetic digit bytes
     std::vector<Token> afterDefined;
     afterDefined.reserve(operandTokens.size());
 
-    auto mintDigit = [&](int v) -> Token {
-        // Append the digit text and mint a Synthetic IntLiteral token spanning
-        // it in the scratch buffer (assembled after the loop).
+    // Mint a Synthetic IntLiteral token whose decimal spelling is `digits`,
+    // spanning the bytes appended to the scratch buffer (assembled after the
+    // loop). Used for `defined`->0/1, `__has_include`->0/1, and
+    // `__has_c_attribute`->version (a multi-digit value). The scratch slice
+    // lets the value reach the ICE parser as a single Number token.
+    auto mintNumber = [&](std::int64_t value) -> Token {
+        std::string const digits = std::to_string(value);
         ByteOffset const start = static_cast<ByteOffset>(scratchText.size());
-        scratchText.push_back(v != 0 ? '1' : '0');
+        scratchText.append(digits);
         ByteOffset const end = static_cast<ByteOffset>(scratchText.size());
         Token t;
         t.coreKind   = CoreTokenKind::IntLiteral;
@@ -615,53 +670,189 @@ evaluateIfExpression(std::span<Token const> operandTokens,
         return t;
     };
 
-    bool definedFailed = false;
+    // Advance past trivia from `j`.
+    auto skipFwd = [&](std::size_t j) {
+        while (j < operandTokens.size() && isTriviaTok(operandTokens[j])) ++j;
+        return j;
+    };
+
+    bool rewriteFailed = false;
+    // FC15c fail-loud helper for a malformed `__has_include` (positioned on the
+    // operator token, a DISTINCT code -- never a generic ICE fallthrough).
+    auto failHasInclude = [&](SourceSpan span, std::string msg) {
+        emit(rep, DiagnosticCode::P_PreprocessorHasInclude, synth.id(), span,
+             std::move(msg));
+        rewriteFailed = true;
+    };
+
     for (std::size_t i = 0; i < operandTokens.size(); ) {
         Token const& t = operandTokens[i];
         if (isTriviaTok(t)) { ++i; continue; }
-        if (isWordTok(t) && !definedKw.empty()
-            && synth.slice(t.span) == definedKw) {
+        std::string_view const word = isWordTok(t) ? synth.slice(t.span)
+                                                   : std::string_view{};
+
+        // ── FC15c: `__has_include(<h>)` / `__has_include("h")` (C23 6.10.1p4).
+        // The operand is NOT macro-expanded (like `defined`); the angle
+        // delimiters are matched by CONFIG token KIND, never the `<`/`>` bytes.
+        // EVERY malformed shape fails loud with P_PreprocessorHasInclude. ──
+        if (isWordTok(t) && !hasIncludeKw.empty() && word == hasIncludeKw) {
+            std::size_t j = skipFwd(i + 1);
+            if (j >= operandTokens.size() || !openParen.valid()
+                || operandTokens[j].schemaKind != openParen) {
+                failHasInclude(t.span,
+                    "operator '__has_include' requires a parenthesized header");
+                break;
+            }
+            j = skipFwd(j + 1);
+            std::string filename;
+            bool isAngle = false;
+            if (j < operandTokens.size() && angleOpen.valid()
+                && operandTokens[j].schemaKind == angleOpen) {
+                // ANGLE form `<h>`: the raw filename is the bytes between the
+                // angle-open and angle-close tokens (matched by KIND). Scan to
+                // the close token, accumulating the spelling of the interior
+                // tokens (a header name like `stdio.h` lexes as several tokens).
+                isAngle = true;
+                std::size_t k = j + 1;
+                ByteOffset const innerStart =
+                    operandTokens[j].span.end();   // just past `<`
+                bool sawClose = false;
+                ByteOffset innerEnd = innerStart;
+                for (; k < operandTokens.size(); ++k) {
+                    if (angleClose.valid()
+                        && operandTokens[k].schemaKind == angleClose) {
+                        sawClose = true;
+                        break;
+                    }
+                    innerEnd = operandTokens[k].span.end();
+                }
+                if (!sawClose) {
+                    failHasInclude(t.span,
+                        "expected '>' to close '__has_include(<...'");
+                    break;
+                }
+                // Slice the raw bytes `[innerStart, innerEnd)` from the synth
+                // buffer -- the filename verbatim, escapes NOT decoded (the
+                // include resolver reads the raw path too).
+                if (innerEnd > innerStart) {
+                    filename = std::string{
+                        synth.slice(SourceSpan::of(innerStart, innerEnd))};
+                }
+                j = k + 1;   // past the close token
+            } else if (j < operandTokens.size() && stringOpen.valid()
+                       && operandTokens[j].schemaKind == stringOpen) {
+                // QUOTE form `"h"`: the StringStart opener consumed only the
+                // opening `"`; the coalesced StringLiteral BODY is the next token
+                // and its raw text is the filename (escapes NOT decoded, like the
+                // include resolver). An empty body (`""`) leaves filename empty.
+                std::size_t k = j + 1;
+                if (k < operandTokens.size() && !isTriviaTok(operandTokens[k])
+                    && operandTokens[k].span.start()
+                           == operandTokens[j].span.end()) {
+                    filename = std::string{synth.slice(operandTokens[k].span)};
+                    ++k;
+                }
+                j = k;
+            } else {
+                failHasInclude(t.span,
+                    "operator '__has_include' requires <header> or \"header\"");
+                break;
+            }
+            if (filename.empty()) {
+                failHasInclude(t.span,
+                    "operator '__has_include' has an empty header name");
+                break;
+            }
+            j = skipFwd(j);
+            if (j >= operandTokens.size() || !closeParen.valid()
+                || operandTokens[j].schemaKind != closeParen) {
+                failHasInclude(t.span,
+                    "expected ')' to close '__has_include('");
+                break;
+            }
+            ++j;
+            bool const found = hasInclude && hasInclude(filename, isAngle);
+            afterDefined.push_back(mintNumber(found ? 1 : 0));
+            i = j;
+            continue;
+        }
+
+        // ── FC15c: `__has_c_attribute(attr)` (C23 6.10.1p4). Match the operator
+        // by TEXT, extract the attr NAME (a Word), look it up in the config's
+        // known-attribute set (raw + dunder-stripped), mint the version or 0. ──
+        if (isWordTok(t) && !hasCAttrKw.empty() && word == hasCAttrKw) {
+            std::size_t j = skipFwd(i + 1);
+            if (j >= operandTokens.size() || !openParen.valid()
+                || operandTokens[j].schemaKind != openParen) {
+                emit(rep, DiagnosticCode::P_PreprocessorDirective, synth.id(),
+                     t.span,
+                     "operator '__has_c_attribute' requires a parenthesized "
+                     "attribute name");
+                rewriteFailed = true;
+                break;
+            }
+            j = skipFwd(j + 1);
+            if (j >= operandTokens.size() || !isWordTok(operandTokens[j])) {
+                emit(rep, DiagnosticCode::P_PreprocessorDirective, synth.id(),
+                     t.span,
+                     "operator '__has_c_attribute' requires an attribute name");
+                rewriteFailed = true;
+                break;
+            }
+            std::string const attr{synth.slice(operandTokens[j].span)};
+            j = skipFwd(j + 1);
+            if (j >= operandTokens.size() || !closeParen.valid()
+                || operandTokens[j].schemaKind != closeParen) {
+                emit(rep, DiagnosticCode::P_PreprocessorDirective, synth.id(),
+                     t.span,
+                     "expected ')' to close '__has_c_attribute('");
+                rewriteFailed = true;
+                break;
+            }
+            ++j;
+            afterDefined.push_back(mintNumber(cAttributeVersion(schema, attr)));
+            i = j;
+            continue;
+        }
+
+        if (isWordTok(t) && !definedKw.empty() && word == definedKw) {
             // `defined` -- consume optional `(`, then a Word, then optional `)`.
-            std::size_t j = i + 1;
-            while (j < operandTokens.size() && isTriviaTok(operandTokens[j])) ++j;
+            std::size_t j = skipFwd(i + 1);
             bool paren = false;
             if (j < operandTokens.size() && openParen.valid()
                 && operandTokens[j].schemaKind == openParen) {
                 paren = true;
-                ++j;
-                while (j < operandTokens.size()
-                       && isTriviaTok(operandTokens[j])) ++j;
+                j = skipFwd(j + 1);
             }
             if (j >= operandTokens.size() || !isWordTok(operandTokens[j])) {
                 emit(rep, DiagnosticCode::P_PreprocessorDirective, synth.id(),
                      t.span,
                      "operator 'defined' requires an identifier operand");
-                definedFailed = true;
+                rewriteFailed = true;
                 break;
             }
             std::string const name{synth.slice(operandTokens[j].span)};
             ++j;
             if (paren) {
-                while (j < operandTokens.size()
-                       && isTriviaTok(operandTokens[j])) ++j;
+                j = skipFwd(j);
                 if (j >= operandTokens.size() || closeParen.valid() == false
                     || operandTokens[j].schemaKind != closeParen) {
                     emit(rep, DiagnosticCode::P_PreprocessorDirective,
                          synth.id(), t.span,
                          "expected ')' after 'defined(' in #if expression");
-                    definedFailed = true;
+                    rewriteFailed = true;
                     break;
                 }
                 ++j;
             }
-            afterDefined.push_back(mintDigit(isDefined(name) ? 1 : 0));
+            afterDefined.push_back(mintNumber(isDefined(name) ? 1 : 0));
             i = j;
             continue;
         }
         afterDefined.push_back(t);
         ++i;
     }
-    if (definedFailed) return std::nullopt;
+    if (rewriteFailed) return std::nullopt;
 
     // ── Step 2: macro-expand the remaining operand tokens. The synthetic
     // `defined`-result IntLiterals are NOT Words, so the expander copies them
@@ -673,6 +864,24 @@ evaluateIfExpression(std::span<Token const> operandTokens,
     // tokens' spans index into it). `SourceBuffer::fromString` copies the text.
     auto scratchBuf = SourceBuffer::fromString(scratchText, "<pp-if-scratch>");
 
+    // FC15b: a predefined / `#` / `##` PRODUCT materialized during the expansion
+    // above carries a span in the synth buffer's product TAIL (`[prefixLen + ..)`)
+    // -- bytes NOT present in the prefix-only `synth`. Assemble a COMBINED buffer
+    // `synth.text() + productText()` so the ICE parser can slice such a real token
+    // (e.g. `__STDC_VERSION__` -> `202311L`). A prefix span is byte-identical in
+    // the combined buffer (it is a strict prefix), so the operand's own tokens
+    // resolve unchanged. With no products the tail is empty -> combined == prefix.
+    std::string_view const tail = productText ? productText() : std::string_view{};
+    std::shared_ptr<SourceBuffer> combinedHolder;
+    SourceBuffer const* realSlice = &synth;
+    if (!tail.empty()) {
+        std::string combined{synth.text()};
+        combined.append(tail);
+        combinedHolder =
+            SourceBuffer::fromString(std::move(combined), std::string{synth.name()});
+        realSlice = combinedHolder.get();
+    }
+
     // ── Steps 3 + 4: drop trivia, then parse + fold (a surviving identifier ->
     // 0 happens inside the parser's primary). ──
     std::vector<Token> nonTrivia;
@@ -681,7 +890,8 @@ evaluateIfExpression(std::span<Token const> operandTokens,
         if (!isTriviaTok(t)) nonTrivia.push_back(t);
     }
 
-    IceParser parser{std::move(nonTrivia), schema, synth, *scratchBuf, lits, rep};
+    IceParser parser{std::move(nonTrivia), schema, *realSlice, *scratchBuf, lits,
+                     rep, synth.id()};
     return parser.evaluate();
 }
 

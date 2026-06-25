@@ -1211,9 +1211,21 @@ struct DSS_EXPORT SemanticConfig {
     // narrowing like `int x = sizeUL`); the HIR `coerce()` arithmetic-core arm already
     // materializes the width-exact Cast. Default false → a non-C schema (toy/tsql) keeps
     // signed/unsigned strictly distinct. SCOPE: signed↔unsigned only — SAME-signedness
-    // narrowing (`int x = aLong`) stays its strict widening-only rank rule (a separate
-    // deliberate choice, pinned by test_type_rules `isAssignable(i16,i32)==false`).
+    // narrowing (`int x = aLong`) is the SIBLING gate `intSameSignednessNarrows` below.
     bool intCrossSignednessConverts = false;
+
+    // C 6.3.1.3 / 6.5.16.1 (D-CSUBSET-INT-SAME-SIGN-NARROW): a same-signedness integer
+    // NARROWING in an ASSIGNMENT context — `short s = anInt;`, `signed char c = anInt;`,
+    // `int i = aLong;`, the same across init / assignment / call-arg / return — is
+    // value-preserving in range / modular (truncating) out of range. Read by
+    // `isAssignable`'s signed/unsigned rank arms, which admit `rank(rhs) > rank(lhs)`
+    // (narrowing) ONLY when this is true; WIDENING stays unconditionally admitted. The
+    // HIR `coerce()` arithmetic-core arm materializes the width-exact Cast (MIR `Trunc`),
+    // the SAME path cross-signedness narrowing already uses, so NO codegen change. Default
+    // false → a non-C schema (toy/tsql) keeps the strict widening-only rank rule. Together
+    // with intCrossSignednessConverts this completes the C integer-conversion matrix
+    // (needed for SQLite). Pinned by test_type_rules `IsAssignableAdmitsSameSignednessNarrowingWhenGated`.
+    bool intSameSignednessNarrows = false;
 
     // Two orthogonal per-language alias-analysis opt-ins, both threaded
     // through `MirLoweringConfig` → `Mir` and read by CSE/LICM Load

@@ -1,5 +1,6 @@
 #include "analysis/compilation_unit/import_resolver.hpp"
 
+#include "core/types/include_path_resolve.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
@@ -106,41 +107,11 @@ void reportDriver(DiagnosticReporter& reporter,
     return std::string(src.substr(open + 1, close - (open + 1)));
 }
 
-// Search `dirs` for `filename` (a relative header name). First existing
-// match wins. Absolute names resolve against the filesystem directly.
-// Shared by the quote (includeDirs) and angle (systemDirs) forms — the
-// only difference between the two is WHICH dir list is passed and the
-// self-dir prepend (quote-only), handled by the caller.
-[[nodiscard]] std::optional<fs::path> findInDirs(
-    std::string_view filename, std::span<fs::path const> dirs) {
-    fs::path const rel{filename};
-    std::error_code ec;
-    if (rel.is_absolute()) {
-        return fs::exists(rel, ec) ? std::optional{rel} : std::nullopt;
-    }
-    for (fs::path const& dir : dirs) {
-        if (auto candidate = dir / rel; fs::exists(candidate, ec)) return candidate;
-    }
-    return std::nullopt;
-}
-
-[[nodiscard]] std::optional<fs::path> resolveIncludePath(
-    std::string_view                       filename,
-    fs::path const&                        includingDir,
-    std::span<fs::path const>              includeDirs) {
-    fs::path const rel{filename};
-    std::error_code ec;
-    if (rel.is_absolute()) {
-        return fs::exists(rel, ec) ? std::optional{rel} : std::nullopt;
-    }
-    if (!includingDir.empty()) {
-        if (auto candidate = includingDir / rel; fs::exists(candidate, ec)) return candidate;
-    }
-    for (fs::path const& dir : includeDirs) {
-        if (auto candidate = dir / rel; fs::exists(candidate, ec)) return candidate;
-    }
-    return std::nullopt;
-}
+// `findInDirs` / `resolveIncludePath` now live in the SHARED
+// `core/types/include_path_resolve.hpp` (FC15c): the import resolver and the
+// preprocessor's `__has_include` operator call the SAME implementations so
+// their "does this header exist" answers can never drift. The angle/system
+// form goes through `resolveSystemDescriptor` (the `<stem>.json` mapping below).
 
 // Read the inner text of a bracket-quoted identifier opener (tsql's
 // `[Orders]` → "Orders", `[a]]b]` → "a]b"). The opener token spans only
@@ -333,9 +304,11 @@ private:
                 // requested extension spelling (`<stdio.h>`, `<stdio>` both map
                 // to `stdio.json`).
                 if (directive.isSystem) {
-                    std::string const descriptorName =
-                        fs::path(directive.filename).stem().string() + ".json";
-                    auto const resolved = findInDirs(descriptorName, context.systemDirs);
+                    // The `<stem>.json` mapping is the SHARED
+                    // `resolveSystemDescriptor` (FC15c funnel) so this resolution
+                    // and `__has_include(<h>)` agree byte-for-byte.
+                    auto const resolved = resolveSystemDescriptor(
+                        directive.filename, context.systemDirs);
                     if (!resolved) { unresolved(); continue; }
                     context.shippedLibDescriptors.push_back(*resolved);
                     continue;

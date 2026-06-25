@@ -227,14 +227,17 @@ TEST(Fc3WidthSemantics, UnsignedLongFollowsDataModel) {
     EXPECT_EQ(kindOf(analyzeCSubset(src, DataModel::Llp64), "x"), TypeKind::U32);
 }
 
-TEST(Fc3WidthSemantics, NarrowingLongLiteralRejectsOnLlp64AcceptsOnLp64) {
-    // 2147483648l passed to a `long` parameter: LP64 → the l-ladder's
-    // first candidate `long` (I64) holds it → I64 arg into I64 param,
-    // clean. LLP64 → `long` is I32 (does not hold 2^31) → the literal
-    // climbs to `long long` (I64) → an I64 arg into the I32 `long`
-    // param is a narrowing mismatch → S_TypeMismatch (the call-arg
-    // assignability check). The dataModel DIFFERENTIAL is the witness —
-    // the SAME source, two verdicts.
+TEST(Fc3WidthSemantics, NarrowingLongLiteralNowAdmittedOnBothModels) {
+    // D-CSUBSET-INT-SAME-SIGN-NARROW: implicit same-signedness integer narrowing
+    // is now C-conformant (C 6.3.1.3), so 2147483648l passed to a `long` param is
+    // ADMITTED under BOTH dataModels — LP64 (`long` is I64, holds it; identity)
+    // and LLP64 (`long` is I32; the I64 long-long-laddered literal narrows +
+    // truncates). Neither raises S_TypeMismatch any more. The dataModel WIDTH
+    // differential is still witnessed elsewhere — at the type level by
+    // UnsignedLongFollowsDataModel, and at RUNTIME by the datamodel_long_width_llp64
+    // corpus (the truncation flips the sign → exit 7 vs the LP64 sibling's 42).
+    // RED-ON-DISABLE: turn intSameSignednessNarrows off in c-subset and the LLP64
+    // arm flips back to one S_TypeMismatch.
     char const* src =
         "long pick(long v) { return v; }\n"
         "int main() { long r; r = pick(2147483648l); return 0; }\n";
@@ -242,7 +245,8 @@ TEST(Fc3WidthSemantics, NarrowingLongLiteralRejectsOnLlp64AcceptsOnLp64) {
     EXPECT_EQ(countCode(lp.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
     EXPECT_FALSE(lp.hasErrors());
     auto llp = analyzeCSubset(src, DataModel::Llp64);
-    EXPECT_EQ(countCode(llp.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+    EXPECT_EQ(countCode(llp.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_FALSE(llp.hasErrors());
 }
 
 TEST(Fc3WidthSemantics, Ilp32SelectionFailsLoud) {

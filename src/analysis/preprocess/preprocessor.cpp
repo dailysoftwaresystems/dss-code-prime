@@ -1,12 +1,14 @@
 #include "analysis/preprocess/preprocessor.hpp"
 
 #include "analysis/preprocess/pp_if_eval.hpp"
+#include "core/types/include_path_resolve.hpp"
 #include "tokenizer/tokenizer.hpp"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -362,7 +364,35 @@ using HideSet = std::shared_ptr<std::set<std::string> const>;
 struct ExpToken {
     Token   tok;
     HideSet hide;  // null == empty
+    // FC15b (predefined macros; C 6.10.8.1): the INVOCATION offset that an
+    // offset-derived predefined macro (`__LINE__`/`__FILE__`) resolves against.
+    // C 6.10.8.1: `__LINE__` is the line of the macro's INVOCATION (the current
+    // SOURCE line), NOT the `#define` site. An ORIGINAL body token carries its
+    // OWN synth offset here; a macro's spliced replacement token INHERITS the
+    // invoking token's `invOffset` (propagated DOWN through every nested/chained
+    // expansion). So a `__LINE__` that arrives via `#define WARN __LINE__` resolves
+    // against the WARN INVOCATION line, not the define line. The BARE case
+    // (`int x = __LINE__;`) is the degenerate instance: the `__LINE__` token's own
+    // `invOffset` IS its source position. Defaults to the token's own span start
+    // when a token is lifted from a plain `Token` (`fromToken` below).
+    ByteOffset invOffset = 0;
+    // FC15 paste residuals (D-PP-PASTE-PLACEMARKER, C 6.10.3.3p2): a PLACEMARKER
+    // is a sentinel for an EMPTY `##`-operand argument (`#define J(a,b) a##b`
+    // called `J(x,)` -> `x`). It is NOT a real token: `tok` is left
+    // default-constructed and is never inspected (every placemarker is consumed
+    // by `collapsePastes`'s placemarker-aware branches, then any survivor is
+    // dropped before the result leaves `substitute`). The default `false` makes
+    // every existing ExpToken construction a non-placemarker -- zero regression.
+    bool placemarker = false;
 };
+
+// Lift a plain (directive-stripped, original) body token into the expansion
+// working set: empty hide set + its OWN synth offset as the invocation anchor
+// (FC15b). Every original source token thus seeds `__LINE__`/`__FILE__` against
+// its real position; macro splices later inherit the invoking token's anchor.
+inline ExpToken fromToken(Token const& t) {
+    return ExpToken{t, nullptr, t.span.start()};
+}
 
 // M is hidden for this token iff M is a member of its hide set.
 inline bool hideContains(HideSet const& hs, std::string const& name) {
@@ -417,11 +447,52 @@ struct MacroDef {
 
 class MacroExpander {
 public:
+    // `synth` is the PREFIX buffer (the synthesized text BEFORE any `#`/`##`
+    // product is appended); `prefixLen` is its byte length. FC15a (A2): a `#`/`##`
+    // product's spelling is accumulated into `productText_` and a product token's
+    // span points at `[prefixLen + offsetInProductText, ...)`. After `run()`,
+    // `preprocess()` appends `productText()` to the synth text and freezes the
+    // FINAL buffer (prefix unchanged + products in the appended tail) -- so every
+    // token (original prefix span OR product tail span) slices to its real text in
+    // that ONE final buffer, exactly what the parser parses.
     MacroExpander(std::shared_ptr<SourceBuffer> synth,
                   std::shared_ptr<GrammarSchema const> schema,
-                  DiagnosticReporter& rep)
-        : synth_(std::move(synth)), schema_(std::move(schema)), rep_(rep) {
+                  DiagnosticReporter& rep, ByteOffset prefixLen,
+                  LineMap const* lineMap,
+                  std::span<fs::path const> includeDirs = {},
+                  std::span<fs::path const> systemDirs = {},
+                  fs::path includingDir = {})
+        : synth_(std::move(synth)), schema_(std::move(schema)), rep_(rep),
+          prefixLen_(prefixLen), lineMap_(lineMap),
+          includeDirs_(includeDirs), systemDirs_(systemDirs),
+          includingDir_(std::move(includingDir)) {
+        // FC15b (predefined macros; C 6.10.8): seed the predefined-macro map
+        // (name -> def) from config. An identifier that is NOT a `#define`d
+        // macro but IS a predefined name materializes its configured value (see
+        // `expand`). EMPTY when the language declares none (toy / tsql), so the
+        // engine is a strict identity pass for `__LINE__` &c.
+        for (PredefinedMacroDef const& pm : cfg().predefinedMacros) {
+            predefined_.emplace(pm.name, pm);
+        }
+        // FC15b: compute the translation DATE/TIME spellings ONCE (C 6.10.8.1 --
+        // both stay CONSTANT through a translation unit). `__DATE__` is
+        // `"Mmm dd yyyy"` with a SPACE-padded day (e.g. `"Jun  4 2026"`);
+        // `__TIME__` is `"hh:mm:ss"`. Computed only when at least one date/time
+        // macro is declared (no `std::time` call for a language that needs none).
+        bool needDate = false, needTime = false;
+        for (PredefinedMacroDef const& pm : cfg().predefinedMacros) {
+            if (pm.kind == PredefinedMacroKind::Date) needDate = true;
+            if (pm.kind == PredefinedMacroKind::Time) needTime = true;
+        }
+        if (needDate || needTime) computeDateTime(needDate, needTime);
         hashKind_  = schema_->schemaTokens().find(cfg().directiveIntroToken);
+        // FC15a: the STRINGIZE (`#`) and TOKEN-PASTE (`##`) operator kinds are
+        // CONFIG lexemes (agnosticism), resolved from `stringizeToken` /
+        // `pasteToken`. OPTIONAL: an empty config field leaves the kind
+        // InvalidSchemaToken, so `isStringize`/`isPaste` (`.valid()`-guarded)
+        // never fire and the engine is a strict FC14 (no `#`/`##` handling).
+        stringizeKind_ = schema_->schemaTokens().find(cfg().stringizeToken);
+        pasteKind_     = schema_->schemaTokens().find(cfg().pasteToken);
         // The function-like-macro `(` is a CONFIG lexeme, not a hard-coded
         // name (agnosticism: a language whose paren token is named differently
         // would otherwise mis-classify `#define F(x)` as object-like). The
@@ -455,6 +526,14 @@ public:
     // TRUE iff a fatal nesting-backstop truncated the expansion.
     [[nodiscard]] bool truncated() const noexcept { return truncated_; }
 
+    // FC15a (A2): the accumulated `#`/`##` PRODUCT spellings, to be appended to
+    // the synth text (AFTER `synth_`'s prefix) before the FINAL buffer is frozen.
+    // Empty when no product was generated (then the final buffer == the prefix,
+    // byte-identical to the FC14 behavior).
+    [[nodiscard]] std::string const& productText() const noexcept {
+        return productText_;
+    }
+
     std::vector<Token> run(std::vector<Token> const& in) {
         std::vector<Token> body;
         std::size_t i = 0;
@@ -487,21 +566,53 @@ public:
         // hide sets back to the plain Token stream the parser consumes.
         std::vector<ExpToken> work;
         work.reserve(body.size());
-        for (Token const& t : body) work.push_back(ExpToken{t, nullptr});
+        // FC15b: lift each original body token via fromToken() so it seeds its
+        // OWN synth offset as the invocation anchor -- a bare `__LINE__`/`__FILE__`
+        // then resolves against its real source position, and a macro splice
+        // later inherits the invoking token's anchor.
+        for (Token const& t : body) work.push_back(fromToken(t));
         std::vector<ExpToken> expanded = expand(std::move(work), 0);
         std::vector<Token> out;
         out.reserve(expanded.size());
-        for (ExpToken const& et : expanded) out.push_back(et.tok);
+        // FC15 paste residuals: a placemarker is normally consumed (or dropped
+        // at `collapsePastes` return) inside `substitute`; this is a defensive
+        // BACKSTOP so a stray placemarker never reaches the parser as a garbage
+        // (default-constructed) token. The primary drop is in `substitute`.
+        for (ExpToken const& et : expanded) {
+            if (et.placemarker) continue;
+            out.push_back(et.tok);
+        }
         return out;
     }
 
 private:
     PreprocessConfig const& cfg() const { return schema_->preprocess(); }
+    // Slice a token's lexeme. FC15a (A2): a token whose span begins at-or-after
+    // the prefix length is a `#`/`##` PRODUCT -- its bytes live in `productText_`
+    // (offset by `prefixLen_`), not yet in `synth_`. Every ORIGINAL token spans
+    // the prefix (`< prefixLen_`) and slices `synth_` as before. (When no product
+    // exists `productText_` is empty and this is byte-identical to the prior
+    // single-slice form.)
     std::string_view text(Token const& t) const {
+        if (t.span.start() >= prefixLen_) {
+            const ByteOffset s = t.span.start() - prefixLen_;
+            const ByteOffset e = t.span.end() - prefixLen_;
+            if (e <= productText_.size()) {
+                return std::string_view{productText_}.substr(s, e - s);
+            }
+            return {};   // defensive: never UB on a malformed product span
+        }
         return synth_->slice(t.span);
     }
     bool isHash(Token const& t) const {
         return hashKind_.valid() && t.schemaKind == hashKind_;
+    }
+    // FC15a: the STRINGIZE (`#`) / TOKEN-PASTE (`##`) operators, by config kind.
+    bool isStringize(Token const& t) const {
+        return stringizeKind_.valid() && t.schemaKind == stringizeKind_;
+    }
+    bool isPaste(Token const& t) const {
+        return pasteKind_.valid() && t.schemaKind == pasteKind_;
     }
     // A macro NAME / invocation is an identifier-like word. The tokenizer
     // leaves a plain word's schemaKind == InvalidSchemaToken (the PARSER
@@ -574,6 +685,19 @@ private:
         // group's directives are only parsed enough to track nesting), so the
         // whole arm (including the unsupported-directive diagnostic) is skipped.
         if (!stackActive()) return end;
+
+        // FC15c (`#pragma`; C 6.10.6): consume-and-DROP the whole line with NO
+        // error. C 6.10.6p2 lets an implementation ignore a pragma it does not
+        // recognize; DSS recognizes none, so every `#pragma` is silently dropped
+        // (the line's tokens are NOT emitted into `body`). Placed AFTER the
+        // dead-branch gate (so a `#pragma` in an elided branch is silent too) and
+        // BEFORE the generic unsupported-directive `else`. Config-matched
+        // (`pragmaDirective`), never a hard-coded "pragma"; an empty config field
+        // (a language without `#pragma`) skips this arm -> the line falls through
+        // to the generic unsupported-directive fail-loud.
+        if (!cfg().pragmaDirective.empty() && word == cfg().pragmaDirective) {
+            return end;
+        }
 
         if (word == cfg().defineDirective) {
             handleDefine(in, p + 1, end);
@@ -740,8 +864,26 @@ private:
             [this](std::vector<Token> const& toks) { return expandTokens(toks); };
         PpIsDefined definedCb =
             [this](std::string_view n) { return isDefined(n); };
+        // FC15c: `__has_include` resolves a header EXACTLY as the include
+        // machinery would (Finding 3): quote form = self-dir + includeDirs
+        // (`resolveIncludePath`); angle form = `<stem>.json` on systemDirs
+        // (`resolveSystemDescriptor` -- the SHARED mapping the import resolver
+        // also calls, so the two never disagree).
+        PpHasInclude hasIncludeCb =
+            [this](std::string_view filename, bool isAngle) -> bool {
+            if (isAngle) {
+                return resolveSystemDescriptor(filename, systemDirs_).has_value();
+            }
+            return resolveIncludePath(filename, includingDir_, includeDirs_)
+                .has_value();
+        };
+        // FC15b: surface the accumulated product tail (a predefined/`#`/`##`
+        // product expanded inside this `#if` operand materializes into it) so the
+        // evaluator assembles a combined prefix+product buffer to slice it.
+        PpProductText productCb =
+            [this]() -> std::string_view { return productText_; };
         auto v = evaluateIfExpression(operand, *schema_, expandCb, definedCb,
-                                      *synth_, rep_);
+                                      hasIncludeCb, *synth_, productCb, rep_);
         return v.has_value() && *v != 0;
     }
 
@@ -752,11 +894,18 @@ private:
     std::vector<Token> expandTokens(std::vector<Token> const& toks) {
         std::vector<ExpToken> work;
         work.reserve(toks.size());
-        for (Token const& t : toks) work.push_back(ExpToken{t, nullptr});
+        // FC15b: seed each token's own offset as its invocation anchor (a
+        // `__LINE__` in a `#if` operand resolves against that operand's line).
+        for (Token const& t : toks) work.push_back(fromToken(t));
         std::vector<ExpToken> expanded = expand(std::move(work), 0);
         std::vector<Token> out;
         out.reserve(expanded.size());
-        for (ExpToken const& et : expanded) out.push_back(et.tok);
+        // FC15 paste residuals: backstop drop of any stray placemarker (see
+        // `run()`); the primary drop is at `collapsePastes` return.
+        for (ExpToken const& et : expanded) {
+            if (et.placemarker) continue;
+            out.push_back(et.tok);
+        }
         return out;
     }
 
@@ -786,6 +935,18 @@ private:
         const std::string name{text(in[p])};
         const std::size_t nameIdx = p;
         ++p;
+
+        // FC15b (C 6.10.8.1p2): a PREDEFINED macro name shall not be the subject
+        // of a `#define`. Reject loudly and DO NOT alter the table (the predefined
+        // name keeps materializing its configured value). Looked up in the
+        // config-seeded set, so the engine never hard-codes a name.
+        if (predefined_.find(name) != predefined_.end()) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPredefinedMacro,
+                   synth_->id(), in[nameIdx].span,
+                   std::string{"'"} + name
+                       + "' is a predefined macro and may not be #defined");
+            return;
+        }
 
         MacroDef def;
         // FUNCTION-like iff the configured open-paren is IMMEDIATELY ADJACENT
@@ -978,7 +1139,18 @@ private:
                    "#undef requires a macro name");
             return;
         }
-        table_.erase(std::string{text(in[p])});
+        const std::string name{text(in[p])};
+        // FC15b (C 6.10.8.1p2): a PREDEFINED macro name shall not be the subject
+        // of a `#undef`. Reject loudly and DO NOT touch the table (config-seeded
+        // lookup, no hard-coded name).
+        if (predefined_.find(name) != predefined_.end()) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPredefinedMacro,
+                   synth_->id(), in[p].span,
+                   std::string{"'"} + name
+                       + "' is a predefined macro and may not be #undef'd");
+            return;
+        }
+        table_.erase(name);
     }
 
     // Index of the next non-trivia / non-newline token from the cursor. A
@@ -1076,64 +1248,490 @@ private:
         return std::nullopt;
     }
 
-    // Build the substituted replacement list for a function-like call: each
-    // replacement token that IS a NAMED parameter is replaced by that
-    // parameter's PRE-EXPANDED argument tokens (C 6.10.3.1); in a VARIADIC macro,
-    // a replacement `Word` whose text == the configured `variadicArgsName`
-    // (`__VA_ARGS__`) is replaced by the PRE-EXPANDED, comma-joined trailing
-    // arguments (`vaArgs`, possibly EMPTY -> substitutes to nothing, C23); every
-    // other replacement token passes through unchanged, stamped with `hs`. No
-    // `#`/`##` handling (FC15). `expandedArgs[k]` is the fully-expanded argument
-    // for `params[k]`.
+    // Map a replacement token that names a NAMED parameter to its parameter
+    // index, or -1. (`def.replacement` carries only significant tokens -- trivia
+    // was dropped at #define time -- so a parameter is always a bare `Word`.)
+    [[nodiscard]] int paramIndexOf(Token const& r, MacroDef const& def) const {
+        if (!isWord(r)) return -1;
+        std::string_view rt = text(r);
+        for (std::size_t k = 0; k < def.params.size(); ++k) {
+            if (def.params[k] == rt) return static_cast<int>(k);
+        }
+        return -1;
+    }
+    [[nodiscard]] bool isVaArgsName(Token const& r, MacroDef const& def) const {
+        return def.isVariadic && isWord(r) && !cfg().variadicArgsName.empty()
+            && text(r) == cfg().variadicArgsName;
+    }
+
+    // Build the substituted replacement list for a function-like call (C 6.10.3).
+    // A replacement token that names a parameter (or `__VA_ARGS__`) is replaced by
+    // that argument's tokens; every other token passes through stamped with `hs`.
+    // FC15a adds the `#` (stringize, C 6.10.3.2) and `##` (token-paste, C 6.10.3.3)
+    // operators in TWO phases:
+    //   PHASE A -- substitution. A normal parameter substitutes its PRE-EXPANDED
+    //   argument (`expandedArgs[k]` / `vaArgs`, C 6.10.3.1). A `#` immediately
+    //   followed by a parameter is replaced by ONE string-literal product
+    //   (`stringizeArg`, F2) built from that parameter's RAW argument
+    //   (`rawArgs[k]` / `rawVaArgs`). A parameter that is an OPERAND of a `##`
+    //   (its adjacent significant replacement token is a `##`) substitutes its RAW
+    //   argument (C 6.10.3.1: `#`/`##` operands are NOT pre-expanded). `##` tokens
+    //   are kept verbatim as MARKERS for phase B.
+    //   PHASE B -- paste. Each `##` MARKER is collapsed LEFT-TO-RIGHT: the last
+    //   significant token to its left and the first to its right are concatenated
+    //   into a single re-tokenized product (`pasteTokens`, F1), then a rescan
+    //   continues from that product (so `a##b##c` chains).
+    // Fail-loud (each with best-effort recovery): a `#` not followed by a
+    // parameter -> P_PreprocessorStringize; a `##` at the start/end of the list,
+    // or a paste whose spelling is not a single token -> P_PreprocessorPaste.
     //
     // HIDE-SET stamping (Prosser, C 6.10.3.4): EVERY token of the substituted
     // result carries `hs` = (hideset(name) ∩ hideset(close-paren)) ∪ {M}. A
-    // replacement token NOT from an argument is stamped with exactly `hs`. An
-    // argument's tokens already carry their OWN hide sets (accreted while the arg
-    // was pre-expanded in the caller's context); each is UNIONED with `hs` so the
-    // invoked macro (and the surviving intersection) is added without dropping
-    // what the argument expansion already hid. The `__VA_ARGS__` check precedes
-    // the named-parameter scan, but they cannot collide -- `__VA_ARGS__` is not a
-    // valid parameter NAME, and a non-variadic macro that mentions it was already
-    // rejected at definition time.
+    // replacement-origin token (plain, or a `#`/`##` product) is stamped with
+    // exactly `hs`; an argument token already carries its own (accreted) hide set,
+    // UNIONED with `hs`.
     std::vector<ExpToken> substitute(
         MacroDef const& def,
         std::vector<std::vector<ExpToken>> const& expandedArgs,
         std::vector<ExpToken> const& vaArgs,
-        HideSet const& hs) {
-        std::vector<ExpToken> outTokens;
-        auto appendArg = [&](std::vector<ExpToken> const& a) {
+        std::vector<std::vector<ExpToken>> const& rawArgs,
+        std::vector<ExpToken> const& rawVaArgs,
+        HideSet const& hs, ByteOffset invOffset) {
+        // FC15b: a REPLACEMENT-origin token (a plain replacement token, a `##`
+        // marker/product, a stringize product) inherits the INVOCATION offset
+        // `invOffset` (so a `__LINE__` in the replacement resolves to the
+        // invocation line). An ARGUMENT token keeps its OWN `invOffset` (it came
+        // from the call site -- its real position).
+        auto stampArg = [&](std::vector<ExpToken> const& a,
+                            std::vector<ExpToken>& outTokens) {
             for (ExpToken const& e : a) {
-                // An argument token already carries its own (accreted) hide set;
-                // UNION the invocation hide set `hs` on top.
-                outTokens.push_back(ExpToken{e.tok, hideUnionAll(e.hide, hs)});
+                outTokens.push_back(
+                    ExpToken{e.tok, hideUnionAll(e.hide, hs), e.invOffset});
             }
         };
-        for (Token const& r : def.replacement) {
-            if (def.isVariadic && isWord(r) && !cfg().variadicArgsName.empty()
-                && text(r) == cfg().variadicArgsName) {
-                appendArg(vaArgs);
-                continue;
+        // FC15 paste residuals (D-PP-PASTE-PLACEMARKER, C 6.10.3.3p2): stamp a
+        // `##`-OPERAND argument, but when that argument is EMPTY emit a single
+        // PLACEMARKER instead of nothing. This is the crux that lets Phase B tell
+        // an empty-argument operand (valid -> `x ## <empty>` = `x`) apart from a
+        // GENUINE dangling `##` (no operand token at all in the replacement list,
+        // which still trips the boundary check in `collapsePastes`). Used ONLY for
+        // `##`-operand positions; a non-operand empty arg still vanishes.
+        auto stampArgOrPM = [&](std::vector<ExpToken> const& a,
+                                std::vector<ExpToken>& outTokens) {
+            if (a.empty()) {
+                ExpToken pm{};
+                pm.hide = hs;
+                pm.invOffset = invOffset;
+                pm.placemarker = true;
+                outTokens.push_back(pm);
+            } else {
+                stampArg(a, outTokens);
             }
-            int paramIdx = -1;
-            if (isWord(r)) {
-                std::string_view rt = text(r);
-                for (std::size_t k = 0; k < def.params.size(); ++k) {
-                    if (def.params[k] == rt) {
-                        paramIdx = static_cast<int>(k);
-                        break;
+        };
+        // The RAW token run for a `#`/`##` operand at replacement index `i`
+        // (a named parameter or `__VA_ARGS__`). Returns nullptr if `i` is not a
+        // parameter position.
+        auto rawArgAt =
+            [&](std::size_t i) -> std::vector<ExpToken> const* {
+            Token const& r = def.replacement[i];
+            if (isVaArgsName(r, def)) return &rawVaArgs;
+            int const pi = paramIndexOf(r, def);
+            if (pi >= 0) return &rawArgs[static_cast<std::size_t>(pi)];
+            return nullptr;
+        };
+
+        // ── PHASE A: substitution (keeping `##` markers verbatim). ──
+        std::vector<ExpToken> items;
+        const std::size_t n = def.replacement.size();
+        for (std::size_t i = 0; i < n; ++i) {
+            Token const& r = def.replacement[i];
+            if (isStringize(r)) {
+                // `#` operand is the NEXT significant token, which MUST be a
+                // parameter (or `__VA_ARGS__`).
+                if (i + 1 < n) {
+                    if (auto const* raw = rawArgAt(i + 1)) {
+                        stringizeArg(*raw, hs, invOffset, items);
+                        ++i;   // consume the parameter operand
+                        continue;
                     }
                 }
+                emitPP(rep_, DiagnosticCode::P_PreprocessorStringize, synth_->id(),
+                       r.span,
+                       "'#' in a macro replacement must be followed by a "
+                       "parameter");
+                items.push_back(ExpToken{r, hs, invOffset});  // recovery: `#` verbatim
+                continue;
             }
-            if (paramIdx >= 0) {
-                appendArg(expandedArgs[static_cast<std::size_t>(paramIdx)]);
-            } else {
-                // A plain replacement token gets EXACTLY hs (it has no prior
-                // hide set of its own -- it comes straight from the #define).
-                outTokens.push_back(ExpToken{r, hs});
+            if (isPaste(r)) {
+                items.push_back(ExpToken{r, hs, invOffset});  // marker for phase B
+                continue;
             }
+            if (isVaArgsName(r, def)) {
+                // RAW iff this `__VA_ARGS__` is a `##` operand (adjacent `##`).
+                bool const pasteOperand =
+                    (i > 0 && isPaste(def.replacement[i - 1]))
+                    || (i + 1 < n && isPaste(def.replacement[i + 1]));
+                // FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): the GNU
+                // `sep ## __VA_ARGS__` idiom, CONFIG-gated by `variadicCommaElision`
+                // (the separator matched by the config-declared arg-separator KIND,
+                // `__VA_ARGS__` by the config `variadicArgsName` -- never a hardcoded
+                // `,` byte or name). It fires only when the `##` immediately PRECEDES
+                // this `__VA_ARGS__` (left-paste) AND the token before that just-pushed
+                // `##` marker in `items` is the separator. EMPTY __VA_ARGS__: drop BOTH
+                // the separator and the `##` (the comma vanishes -> `f(fmt)`). NON-empty:
+                // drop only the `##` (no paste) and emit the PRE-EXPANDED args after the
+                // kept separator (-> `f(fmt, a, b)`). Anything else (flag off, or
+                // `p ## __VA_ARGS__` where the left neighbor is a value not a separator)
+                // falls through to the standard path below.
+                if (cfg().variadicCommaElision
+                    && i > 0 && isPaste(def.replacement[i - 1])
+                    && items.size() >= 2
+                    && !items.back().placemarker
+                    && isPaste(items.back().tok)
+                    && isArgSeparator(items[items.size() - 2].tok)) {
+                    if (rawVaArgs.empty()) {
+                        items.pop_back();   // drop the `##` marker
+                        items.pop_back();   // drop the preceding separator
+                    } else {
+                        items.pop_back();          // drop only the `##` (no paste)
+                        stampArg(vaArgs, items);   // pre-expanded __VA_ARGS__
+                    }
+                    continue;
+                }
+                // Standard path. A `##`-operand EMPTY `__VA_ARGS__` becomes a
+                // PLACEMARKER (so `x ## __VA_ARGS__` with empty args -> `x`, and the
+                // flag-off `sep ## __VA_ARGS__` empty case -> the standard
+                // `sep ## <pm>` = `sep`); otherwise the raw run for a paste operand,
+                // else the pre-expanded run. (MUST-FIX-1: paste-operand fall-through
+                // uses stampArgOrPM, not stampArg, so an empty operand is a placemarker.)
+                if (pasteOperand) {
+                    stampArgOrPM(rawVaArgs, items);
+                } else {
+                    stampArg(vaArgs, items);
+                }
+                continue;
+            }
+            int const pi = paramIndexOf(r, def);
+            if (pi >= 0) {
+                bool const pasteOperand =
+                    (i > 0 && isPaste(def.replacement[i - 1]))
+                    || (i + 1 < n && isPaste(def.replacement[i + 1]));
+                // FC15 paste residuals: a `##`-operand parameter with an EMPTY
+                // argument becomes a PLACEMARKER (C 6.10.3.3p2) via stampArgOrPM;
+                // a non-operand parameter keeps the byte-identical pre-expanded path.
+                if (pasteOperand) {
+                    stampArgOrPM(rawArgs[static_cast<std::size_t>(pi)], items);
+                } else {
+                    stampArg(expandedArgs[static_cast<std::size_t>(pi)], items);
+                }
+                continue;
+            }
+            // A plain replacement token gets EXACTLY hs (no prior hide set) and
+            // the INVOCATION offset (FC15b: a `__LINE__` in a function-like
+            // replacement resolves to the invocation line).
+            items.push_back(ExpToken{r, hs, invOffset});
         }
-        return outTokens;
+
+        // ── PHASE B: collapse every `##` marker LEFT-TO-RIGHT. ──
+        return collapsePastes(std::move(items), hs, invOffset);
+    }
+
+    // Phase B of `substitute`: walk `items`, and at each `##` MARKER concatenate
+    // the token immediately before it with the one immediately after into a
+    // single re-tokenized product (F1), splicing `[i-1, i, i+1)` -> product and
+    // RESCANNING from there (so `a##b##c` collapses left-to-right to one token).
+    // A `##` at the very start or end of the list (no operand on one side) is a
+    // constraint violation (C 6.10.3.3p1) -> P_PreprocessorPaste, recovery: drop
+    // the dangling `##` and keep the lone operand. A product that is not exactly
+    // one token (F1) -> P_PreprocessorPaste, recovery: emit both operands verbatim.
+    std::vector<ExpToken> collapsePastes(std::vector<ExpToken> items,
+                                         HideSet const& hs,
+                                         ByteOffset invOffset) {
+        std::size_t i = 0;
+        while (i < items.size()) {
+            if (!isPaste(items[i].tok)) { ++i; continue; }
+            SourceSpan const opSpan = items[i].tok.span;
+            const bool hasLeft  = (i > 0);
+            const bool hasRight = (i + 1 < items.size());
+            if (!hasLeft || !hasRight) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorPaste, synth_->id(),
+                       opSpan,
+                       std::string{"'##' must not appear at the "}
+                           + (!hasLeft ? "start" : "end")
+                           + " of a macro replacement list");
+                items.erase(items.begin() + static_cast<std::ptrdiff_t>(i));
+                // Resume at the operand that now occupies `i` (or end).
+                continue;
+            }
+            // FC15 paste residuals (D-PP-PASTE-PLACEMARKER, C 6.10.3.3p2): when an
+            // operand is a PLACEMARKER (an empty `##`-operand argument), the paste
+            // yields the OTHER operand (`pm ## X` -> X, `X ## pm` -> X) and
+            // `pm ## pm` -> a placemarker. This runs BEFORE the spelling-concat path
+            // so a placemarker is never re-tokenized. The surviving operand is
+            // re-stamped with `hs` (the product hide set) by UNION -- mirroring how a
+            // real paste product is stamped, never DROPPING the operand's accreted
+            // hide set (a dropped name would break Prosser recursion-freezing).
+            const bool leftPM  = items[i - 1].placemarker;
+            const bool rightPM = items[i + 1].placemarker;
+            if (leftPM || rightPM) {
+                const std::size_t lo = i - 1;
+                ExpToken keep{};
+                if (leftPM && rightPM) {
+                    keep.hide = hs;
+                    keep.invOffset = invOffset;
+                    keep.placemarker = true;            // pm ## pm -> pm
+                } else if (leftPM) {
+                    keep = items[i + 1];                // pm ## X -> X
+                    keep.hide = hideUnionAll(keep.hide, hs);
+                } else {
+                    keep = items[i - 1];                // X ## pm -> X
+                    keep.hide = hideUnionAll(keep.hide, hs);
+                }
+                items.erase(items.begin() + static_cast<std::ptrdiff_t>(lo),
+                            items.begin() + static_cast<std::ptrdiff_t>(i + 2));
+                items.insert(items.begin() + static_cast<std::ptrdiff_t>(lo), keep);
+                i = lo;   // rescan from the kept operand (chains `a ## pm ## c`)
+                continue;
+            }
+            // Concatenate the spellings of the two operands.
+            std::string spelling{text(items[i - 1].tok)};
+            spelling += text(items[i + 1].tok);
+            auto product = pasteTokens(spelling, opSpan);
+            if (!product) {
+                // F1 failure (zero or >1 tokens) already reported; recover by
+                // dropping the `##` and leaving BOTH operands verbatim. Advance
+                // past the left operand so we don't re-paste it.
+                items.erase(items.begin() + static_cast<std::ptrdiff_t>(i));
+                ++i;   // step past the (now adjacent) left operand
+                continue;
+            }
+            // Replace [i-1, i, i+1) with the single product token (hide set hs --
+            // a fresh replacement-origin token), then rescan from i-1 so a
+            // chained `##` to its right pastes against this product.
+            const std::size_t lo = i - 1;
+            items.erase(items.begin() + static_cast<std::ptrdiff_t>(lo),
+                        items.begin() + static_cast<std::ptrdiff_t>(i + 2));
+            items.insert(items.begin() + static_cast<std::ptrdiff_t>(lo),
+                         ExpToken{*product, hs, invOffset});
+            i = lo;   // rescan from the product
+        }
+        // FC15 paste residuals (MUST-FIX-2): drop any PLACEMARKER that survived
+        // collapse (e.g. `J(,)` -> a lone placemarker, or a placemarker operand that
+        // never met a `##`). Every `##` marker is consumed within this single call,
+        // so a surviving placemarker is dead -- removing it HERE guarantees a
+        // placemarker never re-enters `expand`'s rescan (the `run()`/`expandTokens()`
+        // drop is a defensive backstop only).
+        items.erase(std::remove_if(items.begin(), items.end(),
+                                   [](ExpToken const& e) { return e.placemarker; }),
+                    items.end());
+        return items;
+    }
+
+    // FC15a (F2, C 6.10.3.2): STRINGIZE the RAW argument token run `raw` into a
+    // string-literal product, appending the resulting token(s) to `out`. Per
+    // C 6.10.3.2p2 the spelling is the argument's SOURCE text with: every run of
+    // white space (incl. between tokens) collapsed to a single space and
+    // leading/trailing space deleted; and a `\` inserted before each `"` and `\`
+    // (the chars of a string/char literal -- in valid C those characters appear
+    // ONLY inside such a literal, so escaping every occurrence is exact). The
+    // result is wrapped in `"..."`, appended to `productText_` (A2), and
+    // RE-TOKENIZED so the product is a real StringStart + StringLiteral pair
+    // (a single fabricated token would not satisfy the grammar's
+    // `stringLiteralExpr = StringStart StringLiteral`) whose spans point at the
+    // appended region. Each product token is stamped with `hs`.
+    void stringizeArg(std::vector<ExpToken> const& raw, HideSet const& hs,
+                      ByteOffset invOffset, std::vector<ExpToken>& out) {
+        std::string inner = "\"";
+        if (!raw.empty()) {
+            // The raw operand's tokens are un-pre-expanded args from the CALL
+            // site, so they are contiguous in the prefix buffer: one slice
+            // recovers the exact source spelling (incl. interior string quotes
+            // and whitespace). The CLOSING delimiter of a string/char literal
+            // that ENDS the argument was consumed by the tokenizer (no token
+            // covers it), so extend the slice by one byte when it is a `"`/`'`.
+            const ByteOffset s = raw.front().tok.span.start();
+            ByteOffset e = raw.back().tok.span.end();
+            if (e < prefixLen_) {
+                const std::string_view tail = synth_->slice(e, e + 1);
+                if (tail.size() == 1 && (tail[0] == '"' || tail[0] == '\'')) ++e;
+            }
+            appendStringized(synth_->slice(s, e), inner);
+        }
+        inner.push_back('"');
+        // FC15b: a stringize product is a replacement-origin token -> inherit
+        // the invocation offset (kept consistent with the other product paths).
+        for (Token const& t : materializeSignificant(inner)) {
+            out.push_back(ExpToken{t, hs, invOffset});
+        }
+    }
+
+    // Append `src` to `out` realizing C 6.10.3.2's stringize transform: collapse
+    // each run of source white space to a single space and drop leading/trailing
+    // space; insert a `\` before each `"` and `\`.
+    static void appendStringized(std::string_view src, std::string& out) {
+        std::size_t i = 0;
+        const std::size_t nbytes = src.size();
+        // Skip leading white space.
+        auto isWs = [](char c) {
+            return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+                || c == '\f' || c == '\v';
+        };
+        while (i < nbytes && isWs(src[i])) ++i;
+        bool pendingSpace = false;
+        for (; i < nbytes; ++i) {
+            char const c = src[i];
+            if (isWs(c)) { pendingSpace = true; continue; }
+            if (pendingSpace) { out.push_back(' '); pendingSpace = false; }
+            if (c == '"' || c == '\\') out.push_back('\\');
+            out.push_back(c);
+        }
+    }
+
+    // FC15b (predefined macros; C 6.10.8.1): compute the once-per-TU translation
+    // DATE / TIME spellings from the wall clock. `__DATE__` is the C-mandated
+    // `"Mmm dd yyyy"` with a SPACE-padded day of month (`"Jun  4 2026"`, two
+    // leading spaces for a single-digit day); `__TIME__` is `"hh:mm:ss"`
+    // (zero-padded). Stored WITHOUT the surrounding quotes (the materializer
+    // wraps them). Uses `std::localtime` (the translation's local date, matching
+    // a hosted C implementation). Defensive: a null `localtime` (impossible in
+    // practice) leaves the strings empty -> a synth `""` literal, never a crash.
+    void computeDateTime(bool needDate, bool needTime) {
+        const std::time_t now = std::time(nullptr);
+        const std::tm* lt = std::localtime(&now);
+        if (lt == nullptr) return;
+        if (needDate) {
+            static char const* const kMon[12] = {
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+            const int mon = (lt->tm_mon >= 0 && lt->tm_mon < 12) ? lt->tm_mon : 0;
+            char buf[16];
+            // SPACE-padded day (`%e` is not portable on MSVC), 4-digit year.
+            std::snprintf(buf, sizeof(buf), "%s %2d %04d", kMon[mon],
+                          lt->tm_mday, lt->tm_year + 1900);
+            dateString_ = buf;
+        }
+        if (needTime) {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", lt->tm_hour,
+                          lt->tm_min, lt->tm_sec);
+            timeString_ = buf;
+        }
+    }
+
+    // FC15b (predefined macros; C 6.10.8.1): MATERIALIZE the replacement token(s)
+    // of a predefined macro at an invocation whose anchor offset is `invOffset`.
+    // The spelling is built then routed through `materializeSignificant` (the
+    // FC15a A2 mechanism) so the value reaches the REAL parser via a real span in
+    // the synth buffer -- a Number for `__LINE__`/Constant, a StringStart +
+    // StringLiteral pair for `__FILE__`/`__DATE__`/`__TIME__` (exactly as a
+    // stringize product). Dispatches ONLY on `def.kind`, never the name.
+    std::vector<Token> materializePredefined(PredefinedMacroDef const& def,
+                                             ByteOffset invOffset) {
+        switch (def.kind) {
+        case PredefinedMacroKind::Line: {
+            // C 6.10.8.1: the LINE number of the macro's INVOCATION. Resolve the
+            // invocation offset through the line-map to its ORIGIN buffer +
+            // offset, then read the 1-based origin line. Null/empty line-map ->
+            // line 1 (defensive; a real TU always has a map).
+            std::uint32_t line = 1;
+            if (lineMap_ != nullptr && !lineMap_->empty()) {
+                LineMap::Resolved const r = lineMap_->resolve(invOffset);
+                if (r.origin != nullptr) line = r.origin->lineCol(r.offset).line;
+            }
+            return materializeSignificant(std::to_string(line));
+        }
+        case PredefinedMacroKind::File: {
+            // C 6.10.8.1: the presumed NAME of the current source file. Resolve
+            // the invocation offset to its ORIGIN buffer so a `__FILE__` inside an
+            // `#include`'d header reports the HEADER's name, not the main file's.
+            // `\` -> `/` normalized, then quoted as a C string literal.
+            std::string name = "<source>";   // defensive synth name
+            if (lineMap_ != nullptr && !lineMap_->empty()) {
+                LineMap::Resolved const r = lineMap_->resolve(invOffset);
+                if (r.origin != nullptr) name = std::string{r.origin->name()};
+            }
+            for (char& c : name) {
+                if (c == '\\') c = '/';
+            }
+            return materializeSignificant(quoteCString(name));
+        }
+        case PredefinedMacroKind::Constant:
+            // A static integer-constant spelling carried verbatim.
+            return materializeSignificant(def.value);
+        case PredefinedMacroKind::Date:
+            return materializeSignificant(quoteCString(dateString_));
+        case PredefinedMacroKind::Time:
+            return materializeSignificant(quoteCString(timeString_));
+        }
+        return {};   // unreachable (the kind set is closed); silence warnings
+    }
+
+    // Wrap `s` in a C string literal: surround with `"` and backslash-escape each
+    // interior `"` and `\` (C 6.4.5). Used for the `__FILE__`/`__DATE__`/`__TIME__`
+    // string-literal products. (A normalized file name or the date/time spellings
+    // contain neither in practice, but escaping is exact + future-proof.)
+    static std::string quoteCString(std::string_view s) {
+        std::string out = "\"";
+        for (char const c : s) {
+            if (c == '"' || c == '\\') out.push_back('\\');
+            out.push_back(c);
+        }
+        out.push_back('"');
+        return out;
+    }
+
+    // FC15a (A2 -- the load-bearing buffer mechanism): MATERIALIZE a `#`/`##`
+    // product whose spelling is `spelling`. The spelling is APPENDED to
+    // `productText_` (which `preprocess()` later concatenates onto the synth text
+    // before freezing the FINAL buffer), then re-tokenized; each resulting
+    // SIGNIFICANT token (non-trivia, non-Eof) is returned with its span REWRITTEN
+    // to point at the appended region of the (eventual) final buffer
+    // (`prefixLen_ + productBase + tokenOffset`). So a product token slices to its
+    // real spelling -- `add3` / `"hello"` -- from the SAME buffer the parser
+    // parses, never to `##`/`#`. The re-tokenization uses a throwaway reporter so
+    // a malformed product does not pollute the user diagnostics here (the caller's
+    // F1/F2 logic owns the user-facing fail-loud).
+    std::vector<Token> materializeSignificant(std::string_view spelling) {
+        const ByteOffset productBase =
+            static_cast<ByteOffset>(productText_.size());
+        productText_.append(spelling);
+        auto tiny = SourceBuffer::fromString(std::string{spelling}, "<pp-product>");
+        DiagnosticReporter scratch;
+        auto ppToks = tokenizeToPP(tiny, schema_, scratch);
+        std::vector<Token> out;
+        for (PPToken const& pt : ppToks) {
+            if (isTrivia(pt.tok) || isNewline(pt.tok)) continue;
+            if (pt.tok.coreKind == CoreTokenKind::Eof) continue;
+            Token t = pt.tok;
+            // Rewrite the tiny-buffer span into the final-buffer product region.
+            t.span = SourceSpan::of(
+                prefixLen_ + productBase + pt.tok.span.start(),
+                prefixLen_ + productBase + pt.tok.span.end());
+            out.push_back(t);
+        }
+        return out;
+    }
+
+    // FC15a (F1, C 6.10.3.3p3): build the single TOKEN produced by pasting the
+    // spelling `spelling` (the left operand's spelling concatenated with the
+    // right's). The pasted text MUST re-tokenize to EXACTLY ONE significant token
+    // -- `lookupLexeme` alone is insufficient (it would silently accept `1##"x"`
+    // -> `1"x"` or `)##(` -> `)(`). Zero or more-than-one significant tokens is a
+    // constraint violation -> fail loud P_PreprocessorPaste (positioned at the
+    // `##`), returning nullopt; the caller recovers by emitting both operands.
+    std::optional<Token> pasteTokens(std::string_view spelling,
+                                     SourceSpan opSpan) {
+        // NOTE: materializeSignificant appends to productText_ unconditionally,
+        // so a REJECTED paste still occupies a few bytes of the product tail --
+        // harmless (no token references them; the buffer only grows).
+        std::vector<Token> toks = materializeSignificant(spelling);
+        if (toks.size() != 1) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPaste, synth_->id(), opSpan,
+                   std::string{"pasting formed '"} + std::string{spelling}
+                       + "', which is not a single valid token");
+            return std::nullopt;
+        }
+        return toks.front();
     }
 
     // Union of an argument token's own (accreted) hide set with the invocation
@@ -1191,9 +1789,38 @@ private:
             if (!isWord(t.tok)) { out.push_back(t); ++i; continue; }
             const std::string name{text(t.tok)};
             auto it = table_.find(name);
-            // Not a macro, OR M is in THIS token's hide set (Prosser: M ∉
-            // hideset(T) required to expand) -> emit verbatim.
+            // Not a `#define`d macro, OR M is in THIS token's hide set (Prosser:
+            // M ∉ hideset(T) required to expand).
             if (it == table_.end() || hideContains(t.hide, name)) {
+                // FC15b (predefined macros; C 6.10.8): on a `#define` table MISS,
+                // an identifier that is a PREDEFINED-macro name materializes its
+                // configured value (`__LINE__`/`__FILE__`/`__STDC__`/...). The
+                // value token(s) are spliced over `[i, i+1)` and RESCANNED (a
+                // Number/Constant rescans inertly; a string-literal pair likewise)
+                // -- so the resolved value reaches the parser exactly like any
+                // other replacement. Resolved against THIS token's invocation
+                // offset, so a `__LINE__` arriving via a macro replacement reports
+                // the INVOCATION line. The hide set is irrelevant to a predefined
+                // name (it is never self-referential). Gated on a genuine `#define`
+                // table MISS (`it == table_.end()`), so a (constraint-violating,
+                // fail-loud) shadowing `#define` could never reach this arm.
+                if (it == table_.end()) {
+                    auto pit = predefined_.find(name);
+                    if (pit != predefined_.end()) {
+                        std::vector<Token> value =
+                            materializePredefined(pit->second, t.invOffset);
+                        std::vector<ExpToken> repl;
+                        repl.reserve(value.size());
+                        // A predefined product is replacement-origin: carry THIS
+                        // token's invocation offset (inert for the value kinds,
+                        // but kept consistent with every other product path).
+                        for (Token const& v : value) {
+                            repl.push_back(ExpToken{v, t.hide, t.invOffset});
+                        }
+                        spliceOver(in, i, i + 1, repl);
+                        continue;   // rescan from the materialized value
+                    }
+                }
                 out.push_back(t);
                 ++i;
                 continue;
@@ -1207,9 +1834,22 @@ private:
                 const HideSet hs = hideAdd(t.hide, name);
                 std::vector<ExpToken> repl;
                 repl.reserve(def.replacement.size());
+                // FC15b: a replacement token INHERITS the invoking name token's
+                // invocation offset, so a `__LINE__` reached via an object-like
+                // macro (`#define WARN __LINE__`) resolves to the INVOCATION line,
+                // not the `#define` line.
                 for (Token const& r : def.replacement) {
-                    repl.push_back(ExpToken{r, hs});
+                    repl.push_back(ExpToken{r, hs, t.invOffset});
                 }
+                // FC15 paste residuals (D-PP-PASTE-OBJECT-LIKE, C 6.10.3.3): `##`
+                // applies to OBJECT-like macros too. Route the replacement through
+                // the SAME `collapsePastes` chokepoint the function-like path uses
+                // (no duplicated paste logic). An object-like macro has no parameters,
+                // so no placemarker can arise here; `collapsePastes` collapses the
+                // literal `##` operators and still fail-louds a genuine dangling `##`
+                // (`#define OBJ a ##`). `#` (stringize) does NOT apply to object-like
+                // macros (C 6.10.3.2) and there is none to handle here.
+                repl = collapsePastes(std::move(repl), hs, t.invOffset);
                 spliceOver(in, i, i + 1, repl);
                 continue;          // rescan from i (the first replacement token)
             }
@@ -1284,6 +1924,25 @@ private:
             // rest are gathered into __VA_ARGS__.
             const std::size_t namedCount =
                 def.isVariadic ? def.params.size() : args.size();
+            // FC15a (C 6.10.3.2 / 6.10.3.3p1): a `#`/`##` OPERAND uses the RAW
+            // (un-pre-expanded) argument. Capture each named arg's raw tokens AND
+            // the raw trailing `__VA_ARGS__` run BEFORE the pre-expansion move
+            // below consumes `args[k]`. `substitute` chooses raw-vs-expanded per
+            // operand position. (Cheap: only the call's own arg tokens; the common
+            // no-`#`/`##` macro never reads these.)
+            std::vector<std::vector<ExpToken>> rawArgs;
+            rawArgs.reserve(namedCount);
+            for (std::size_t k = 0; k < namedCount; ++k) rawArgs.push_back(args[k]);
+            std::vector<ExpToken> rawVaArgs;
+            if (def.isVariadic) {
+                for (std::size_t k = def.params.size(); k < args.size(); ++k) {
+                    if (k > def.params.size() && k - 1 < separators.size()) {
+                        rawVaArgs.push_back(separators[k - 1]);
+                    }
+                    rawVaArgs.insert(rawVaArgs.end(), args[k].begin(),
+                                     args[k].end());
+                }
+            }
             std::vector<std::vector<ExpToken>> expandedArgs;
             expandedArgs.reserve(namedCount);
             for (std::size_t k = 0; k < namedCount; ++k) {
@@ -1310,8 +1969,14 @@ private:
                     vaArgs.insert(vaArgs.end(), ex.begin(), ex.end());
                 }
             }
+            // FC15b: the WHOLE call's replacement-origin tokens inherit the
+            // invoking NAME token's invocation offset (`invOffset`), so a
+            // `__LINE__` in a function-like replacement resolves to the
+            // invocation line. (`t` is captured before the splice below.)
+            const ByteOffset callInvOffset = t.invOffset;
             std::vector<ExpToken> substituted =
-                substitute(def, expandedArgs, vaArgs, hs);
+                substitute(def, expandedArgs, vaArgs, rawArgs, rawVaArgs, hs,
+                           callInvOffset);
             // Splice the substituted result over the WHOLE call `[i, past)` and
             // RESCAN from i: the invoked macro M is in every substituted token's
             // hide set, so a self-reference is frozen; a function-like name newly
@@ -1346,7 +2011,38 @@ private:
     SchemaTokenId                        parenClose_{};
     SchemaTokenId                        argSep_{};
     SchemaTokenId                        variadicMarker_{};
+    // FC15a: the `#`/`##` operator kinds (config-resolved; InvalidSchemaToken
+    // when the language declares neither -- then the engine never produces a
+    // product).
+    SchemaTokenId                        stringizeKind_{};
+    SchemaTokenId                        pasteKind_{};
+    // FC15a (A2): byte length of the PREFIX buffer (`synth_`), and the
+    // accumulated `#`/`##` PRODUCT spellings appended AFTER it. A product token's
+    // span is `[prefixLen_ + offsetInProductText_, ...)`; `text()` dispatches a
+    // span at-or-after `prefixLen_` to `productText_`. The final synth buffer is
+    // `synth_->text() + productText_` (built by `preprocess()` after `run()`).
+    ByteOffset                           prefixLen_{};
+    std::string                          productText_;
     std::unordered_map<std::string, MacroDef> table_;
+    // FC15b (predefined macros; C 6.10.8): the config-seeded predefined-macro
+    // set (name -> def), the synth-offset -> origin line-map (for the
+    // offset-derived `__LINE__`/`__FILE__`; may be null/empty for a no-include
+    // identity pass), and the once-computed `__DATE__`/`__TIME__` INNER spellings
+    // (without the surrounding quotes -- `materializePredefined` quotes them).
+    std::unordered_map<std::string, PredefinedMacroDef> predefined_;
+    LineMap const*                       lineMap_ = nullptr;
+    std::string                          dateString_;   // "Mmm dd yyyy"
+    std::string                          timeString_;   // "hh:mm:ss"
+    // FC15c (`__has_include`; C23 6.10.1p4): the include search paths +the main
+    // file's own directory, so the operator's existence test resolves a header
+    // EXACTLY as the include machinery would. `includeDirs_` = quote-form search
+    // (self-dir first); `systemDirs_` = angle-form `<stem>.json` search. Empty
+    // for a test caller that passes none -> `__has_include` then finds nothing on
+    // the path (only an absolute/self-dir hit), which is the correct answer for
+    // that input.
+    std::span<fs::path const>            includeDirs_;
+    std::span<fs::path const>            systemDirs_;
+    fs::path                             includingDir_;
     // FC14: the conditional-compilation frame stack (one frame per open
     // `#if`/`#ifdef`/`#ifndef`). See CondFrame + handleIf/Elif/Else/Endif.
     std::vector<CondFrame>               condStack_;
@@ -1357,7 +2053,8 @@ private:
 PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
-    std::span<fs::path const>            includeDirs) {
+    std::span<fs::path const>            includeDirs,
+    std::span<fs::path const>            systemDirs) {
     if (!mainSource || !schema) ppFatal("preprocess: null source or schema");
     if (!schema->preprocess().enabled) {
         ppFatal("preprocess: called with a schema whose preprocess pass is "
@@ -1378,9 +2075,48 @@ PreprocessResult preprocess(
                          includeStack, result.fatal};
     builder.build(mainSource, synthText, result.lineMap);
 
+    // FC15a (A2 reorder): the `#`/`##` operators produce SYNTHETIC tokens whose
+    // text does not exist in the spliced prefix. Their spelling must reach the
+    // PARSER via a real span, so it is APPENDED to the synth text and the FINAL
+    // buffer is frozen AFTER expansion. Until then, tokenization + the macro
+    // expander read the spliced text via a PROVISIONAL PREFIX buffer (the same
+    // bytes as the final buffer's leading prefix, so every original-token span
+    // resolves identically in both). `prefixLen` is the byte length of that
+    // prefix; a product token's span points at `[prefixLen + productOffset, ...)`.
+    const ByteOffset prefixLen = static_cast<ByteOffset>(synthText.size());
+    auto prefixBuffer = SourceBuffer::fromString(
+        synthText, std::string{mainSource->name()});
+    result.mainSourceId = mainSource->id();
+
+    auto ppToks = tokenizeToPP(prefixBuffer, schema, *result.diagnostics);
+    std::vector<Token> synthTokens;
+    synthTokens.reserve(ppToks.size());
+    for (auto const& tk : ppToks) synthTokens.push_back(tk.tok);
+
+    // FC15b: thread the synth-offset -> origin line-map into the expander so an
+    // offset-derived predefined macro (`__LINE__`/`__FILE__`) resolves an
+    // invocation offset to its real origin file + line.
+    // FC15c: thread the include search paths + the main file's own directory so
+    // `__has_include` resolves a header EXACTLY as the include machinery would
+    // (quote form = self-dir + includeDirs; angle form = `<stem>.json` on
+    // systemDirs).
+    MacroExpander expander{prefixBuffer,  schema,      *result.diagnostics,
+                           prefixLen,     &result.lineMap,
+                           includeDirs,   systemDirs,
+                           fs::path{mainSource->name()}.parent_path()};
+    std::vector<Token> finalTokens = expander.run(synthTokens);
+    // OR in the macro-expansion truncation; the SynthBuilder already wrote
+    // `result.fatal` by reference for an include-nesting truncation.
+    result.fatal = result.fatal || expander.truncated();
+
+    // Append the accumulated `#`/`##` product spellings AFTER the prefix, then
+    // freeze the FINAL buffer: ONE buffer whose unchanged leading prefix backs
+    // every original token and whose appended tail backs every product token
+    // (A2 -- no side-vector). When no product was generated this is byte-identical
+    // to the prefix (the FC14 single-buffer behavior).
+    synthText.append(expander.productText());
     result.synthBuffer = SourceBuffer::fromString(
         std::move(synthText), std::string{mainSource->name()});
-    result.mainSourceId = mainSource->id();
 
     // Collect the DISTINCT origin buffers the line-map references (the original
     // main file + every spliced header), EXCLUDING the synth buffer. The
@@ -1398,23 +2134,17 @@ PreprocessResult preprocess(
         }
     }
 
-    // Build-phase diagnostics were stamped with BufferId{} (the synth id did
-    // not exist yet); rewrite them to the real synth buffer so the later
-    // remap can attribute them.
+    // Diagnostics emitted during the build (BufferId{}, the synth id did not
+    // exist yet) AND during tokenize/expansion (stamped with the PROVISIONAL
+    // PREFIX buffer id) both belong on the FINAL synth buffer: every such span is
+    // a prefix span, byte-identical in the final buffer (a strict prefix). Rewrite
+    // both to the final synth id so the later `makeRemap` can attribute them.
+    BufferId const prefixId = prefixBuffer->id();
     result.diagnostics->remapBuffers([&](BufferId& bid, SourceSpan&) {
-        if (bid == BufferId{}) bid = result.synthBuffer->id();
+        if (bid == BufferId{} || bid == prefixId) {
+            bid = result.synthBuffer->id();
+        }
     });
-
-    auto ppToks = tokenizeToPP(result.synthBuffer, schema, *result.diagnostics);
-    std::vector<Token> synthTokens;
-    synthTokens.reserve(ppToks.size());
-    for (auto const& tk : ppToks) synthTokens.push_back(tk.tok);
-
-    MacroExpander expander{result.synthBuffer, schema, *result.diagnostics};
-    std::vector<Token> finalTokens = expander.run(synthTokens);
-    // OR in the macro-expansion truncation; the SynthBuilder already wrote
-    // `result.fatal` by reference for an include-nesting truncation.
-    result.fatal = result.fatal || expander.truncated();
 
     Token eof;
     eof.coreKind = CoreTokenKind::Eof;

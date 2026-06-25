@@ -41,7 +41,36 @@
     "functionLikeCloseToken": "ParenClose",
     "functionLikeArgSeparatorToken": "Comma",
     "variadicMarkerToken": "EllipsisOp",
-    "variadicArgsName": "__VA_ARGS__"
+    "variadicArgsName": "__VA_ARGS__",
+    "stringizeToken": "HashOp",
+    "pasteToken": "HashHashOp",
+    "$variadicCommaElisionComment": "FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): opt into the GNU `,##__VA_ARGS__` extension. `sep ## __VA_ARGS__` with an EMPTY variadic part drops the preceding separator (`LOG(\"x\")` -> `f(\"x\")`); non-empty keeps it. Without this flag, standard C placemarker behavior leaves the separator. The separator/__VA_ARGS__ are matched by the config KIND/name above, never hardcoded.",
+    "variadicCommaElision": true,
+    "$predefinedMacrosComment": "FC15b (C 6.10.8): the predefined macros. Each entry names the macro IDENTIFIER + a materialization `kind`; the engine keys EVERY behavior off `kind`, never the name. `line`/`file` are OFFSET-derived (resolved through the line-map against the INVOCATION offset -> the invocation line / the presumed file name); `date`/`time` are computed once at preprocess construction (`\"Mmm dd yyyy\"` / `\"hh:mm:ss\"`); `constant` carries a static `value` spelling verbatim. `#define`/`#undef` of any of these is a constraint violation (C 6.10.8.1) -> fail loud. __STDC_VERSION__ = 202311L (C23).",
+    "predefinedMacros": [
+      { "name": "__LINE__",            "kind": "line" },
+      { "name": "__FILE__",            "kind": "file" },
+      { "name": "__STDC__",            "kind": "constant", "value": "1" },
+      { "name": "__STDC_VERSION__",    "kind": "constant", "value": "202311L" },
+      { "name": "__STDC_HOSTED__",     "kind": "constant", "value": "1" },
+      { "name": "__DATE__",            "kind": "date" },
+      { "name": "__TIME__",            "kind": "time" }
+    ],
+    "$fc15cComment": "FC15c. `#pragma` (C 6.10.6): consumed-and-DROPPED (C 6.10.6p2 licenses ignoring an unrecognized pragma; DSS recognizes none). `__has_include` (C23 6.10.1p4): tests header existence with the SAME resolution `#include` uses -- the angle delimiters are matched by TOKEN KIND (`hasIncludeAngleOpenToken`=LtOp / `hasIncludeAngleCloseToken`=GtOp), never the `<`/`>` bytes (agnosticism); the angle form maps `<stem>.json` on the system path (DSS ships JSON descriptors, e.g. `stdio.json`) so `__has_include(<stdio.h>)` agrees with `#include <stdio.h>`. `__has_c_attribute` (C23 6.10.1p4): reports the version int of a known standard attribute or 0; the lookup ignores leading/trailing `__` (so `__deprecated__` matches `deprecated`). The C23 standard attributes are 202311.",
+    "pragmaDirective":          "pragma",
+    "hasIncludeOperator":       "__has_include",
+    "hasIncludeAngleOpenToken":  "LtOp",
+    "hasIncludeAngleCloseToken": "GtOp",
+    "hasCAttributeOperator":    "__has_c_attribute",
+    "knownCAttributes": [
+      { "name": "deprecated",   "version": 202311 },
+      { "name": "nodiscard",    "version": 202311 },
+      { "name": "maybe_unused", "version": 202311 },
+      { "name": "noreturn",     "version": 202311 },
+      { "name": "fallthrough",  "version": 202311 },
+      { "name": "reproducible", "version": 202311 },
+      { "name": "unsequenced",  "version": 202311 }
+    ]
   },
 
   "lexerModes": {
@@ -114,6 +143,7 @@
     ":":  [{ "kind": "Colon" }],
 
     "#": [{ "kind": "HashOp", "modeOp": "pushMode", "modeArg": "directive" }],
+    "##": [{ "kind": "HashHashOp" }],
     "\"": [{
       "kind": "StringStart",
       "modeOp": "pushMode", "modeArg": "string",
@@ -185,7 +215,7 @@
       { "precedence": 60, "associativity": "left",                       "operators": ["<<", ">>"]                             },
       { "precedence": 65, "associativity": "left",                       "operators": ["+", "-"]                               },
       { "precedence": 70, "associativity": "left",                       "operators": ["*", "/", "%"]                          },
-      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-", "*", "&"]                },
+      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-", "*", "&", "++", "--"]    },
       { "precedence": 95,                            "arity": "postfix",  "operators": ["++", "--"]                            },
       { "precedence": 100,                           "arity": "postfix",  "operators": ["("], "endsAt": ")", "bodyRule": "argList" },
       { "precedence": 100,                           "arity": "postfix",  "operators": ["["], "endsAt": "]", "bodyRule": "expression" },
@@ -1211,8 +1241,10 @@
     "$charStringLiteralComment": "C 6.4.4.4: a character constant has type `int` (so sizeof('c')==4, NOT 1) — CharLiteral→I32. C 6.4.5: a string literal has type char[N+1] — StringLiteral declares stringArray:true with element core Char, so the engine builds Array<Char, decodedLen+1> per occurrence (the HIR value path independently lowers the same Array<Char,N+1> via the shared char_decode). charConvertsToArith (below) admits the C char<->int implicit conversion in BOTH directions: int->char (`char x='c';`) and char->int widening (`int y=c;`; codegen materializes the Char->int SExt). Pinned by CharParamReturnedAsIntIsClean + the char_value corpus.",
     "charConvertsToArith": true,
     "enumConvertsToArith": true,
-    "$intCrossSignednessComment": "C 6.3.1.3/6.5.16.1 (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT): admit the signed<->unsigned implicit assignment conversion (`int x=u;`, `u=i;`, `return i;`/`f(u)` across the signedness boundary) — value-preserving in range, modular out of range; needed for full-C + SQLite's int/unsigned/size_t mixing. coerce()'s arithmetic-core arm materializes the width-exact Cast. SAME-signedness narrowing (`int x=aLong`) is NOT relaxed by this (stays the strict widening-only rank rule).",
+    "$intCrossSignednessComment": "C 6.3.1.3/6.5.16.1 (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT): admit the signed<->unsigned implicit assignment conversion (`int x=u;`, `u=i;`, `return i;`/`f(u)` across the signedness boundary) — value-preserving in range, modular out of range; needed for full-C + SQLite's int/unsigned/size_t mixing. coerce()'s arithmetic-core arm materializes the width-exact Cast. SAME-signedness narrowing (`int x=aLong`) is the SIBLING gate intSameSignednessNarrows below.",
     "intCrossSignednessConverts": true,
+    "$intSameSignNarrowComment": "C 6.3.1.3/6.5.16.1 (D-CSUBSET-INT-SAME-SIGN-NARROW): admit the same-signedness integer NARROWING implicit conversion (`short s=anInt;`, `signed char c=anInt;`, `int i=aLong;` across init/assign/call-arg/return) — value-preserving in range, truncating (modular) out of range; needed for SQLite, which narrows everywhere. The isAssignable rank arms admit rank(rhs)>rank(lhs) only when true; WIDENING stays unconditional. coerce()'s arithmetic-core arm materializes the width-exact Cast (MIR Trunc) — the SAME path cross-signedness narrowing already uses, so NO codegen change. Together with intCrossSignednessConverts this completes the C integer-conversion matrix.",
+    "intSameSignednessNarrows": true,
     "$floatLiteralTypingComment": "FC3.5 sweep-c2: C 6.4.4.2 — a floating constant's type is keyed by its SUFFIX alone (unsuffixed -> double, f/F -> float). Type names resolve through typeSpecifiers/builtinTypes at LOAD time like the integer ladder's candidates. The loader cross-checks every numberStyle.floatSuffixes spelling is covered exactly once + an unsuffixed rule exists. C's l/L long-double suffix is NOT declared in floatSuffixes (pre-existing FC1c2 note) — long double lands with its own width story, not here.",
     "floatLiteralTyping": [
       { "suffixes": [],         "type": "double" },
@@ -1333,11 +1365,13 @@
     ],
 
     "unaryOps": [
-      { "token": "BangOp",   "target": "Not"       },
-      { "token": "TildeOp",  "target": "BitNot"    },
-      { "token": "MinusOp",  "target": "Neg"       },
-      { "token": "BitAndOp", "target": "AddressOf" },
-      { "token": "StarOp",   "target": "Deref"     }
+      { "token": "BangOp",       "target": "Not"       },
+      { "token": "TildeOp",      "target": "BitNot"    },
+      { "token": "MinusOp",      "target": "Neg"       },
+      { "token": "BitAndOp",     "target": "AddressOf" },
+      { "token": "StarOp",       "target": "Deref"     },
+      { "token": "PlusPlusOp",   "target": "PreInc"    },
+      { "token": "MinusMinusOp", "target": "PreDec"    }
     ],
 
     "postfixOps": [

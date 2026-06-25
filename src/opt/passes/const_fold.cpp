@@ -37,6 +37,13 @@ HirLiteralValue toHirLiteral(MirLiteralValue const& src) {
             agg.fields.reserve(arm.fields.size());
             for (auto const& f : arm.fields) agg.fields.push_back(toHirLiteral(f));
             dst.value = std::move(agg);
+        } else if constexpr (std::is_same_v<T, MirSymbolAddrValue>) {
+            // F5: a symbol-address literal is a MIR-tier link-time constant with
+            // NO HIR representation — it arises only from global-init
+            // classification, never from foldable expressions, so it cannot reach
+            // a foldable use. Map to monostate (unknown/opaque) so the const-fold
+            // bridge treats it as non-foldable rather than failing to compile.
+            dst.value = std::monostate{};
         } else {
             dst.value = arm;
         }

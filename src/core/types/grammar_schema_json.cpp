@@ -3765,6 +3765,284 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     }
                 }
             }
+            // `stringizeToken` (C's `#` -> "HashOp", C 6.10.3.2) is OPTIONAL:
+            // empty means the language declares NO stringize operator. The macro
+            // engine reads it to RECOGNISE a `#param` stringize in a replacement
+            // list by token KIND rather than the hard-coded `#` lexeme -- a
+            // second preprocess-opting language whose stringize operator is
+            // spelled differently is then handled correctly (agnosticism).
+            // Validated like the other token-name fields when present. (FC15a.)
+            if (pp.contains("stringizeToken")) {
+                if (!pp.at("stringizeToken").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/stringizeToken",
+                              "'preprocess.stringizeToken' must be a string");
+                } else {
+                    cfg.stringizeToken =
+                        pp.at("stringizeToken").get<std::string>();
+                    checkToken(cfg.stringizeToken, "stringizeToken");
+                }
+            }
+            // `pasteToken` (C's `##` -> "HashHashOp", C 6.10.3.3) is OPTIONAL:
+            // empty means the language declares NO token-paste operator. Read by
+            // the macro engine to RECOGNISE a `##` paste by token KIND, never the
+            // hard-coded `##` lexeme. Validated like the other token-name fields
+            // when present. (FC15a.)
+            if (pp.contains("pasteToken")) {
+                if (!pp.at("pasteToken").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/pasteToken",
+                              "'preprocess.pasteToken' must be a string");
+                } else {
+                    cfg.pasteToken = pp.at("pasteToken").get<std::string>();
+                    checkToken(cfg.pasteToken, "pasteToken");
+                }
+            }
+            // FC15b (predefined macros; C 6.10.8): the `predefinedMacros` array.
+            // Each entry is `{name, kind}` (+ `value` REQUIRED iff
+            // kind=="constant"). The `kind` verb set is CLOSED -- an unknown kind
+            // fails LOUD at load (`C_InvalidPreprocess`); a constant entry missing
+            // its `value` -> `C_MissingField`. OPTIONAL -- absent means the
+            // language declares NO predefined macros (identity for `__LINE__`
+            // &c.). The names are matched by TEXT at expansion time (ordinary
+            // identifiers, like the directive words), so no `checkToken` here.
+            if (pp.contains("predefinedMacros")) {
+                json const& pms = pp.at("predefinedMacros");
+                if (!pms.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/predefinedMacros",
+                              "'preprocess.predefinedMacros' must be an array");
+                } else {
+                    for (std::size_t mi = 0; mi < pms.size(); ++mi) {
+                        const auto mpath =
+                            std::format("/preprocess/predefinedMacros/{}", mi);
+                        json const& e = pms[mi];
+                        if (!e.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, mpath,
+                                      "a 'predefinedMacros' entry must be an "
+                                      "object");
+                            continue;
+                        }
+                        PredefinedMacroDef pm;
+                        // `name` -- REQUIRED, non-empty string.
+                        if (!e.contains("name")) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      mpath + "/name",
+                                      "a 'predefinedMacros' entry requires 'name'");
+                            continue;
+                        }
+                        if (!e.at("name").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      mpath + "/name",
+                                      "'predefinedMacros.name' must be a string");
+                            continue;
+                        }
+                        pm.name = e.at("name").get<std::string>();
+                        if (pm.name.empty()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      mpath + "/name",
+                                      "'predefinedMacros.name' must be non-empty");
+                            continue;
+                        }
+                        // `kind` -- REQUIRED, one of the CLOSED verb set.
+                        if (!e.contains("kind")) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      mpath + "/kind",
+                                      "a 'predefinedMacros' entry requires 'kind'");
+                            continue;
+                        }
+                        if (!e.at("kind").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      mpath + "/kind",
+                                      "'predefinedMacros.kind' must be a string");
+                            continue;
+                        }
+                        const std::string kind = e.at("kind").get<std::string>();
+                        bool isConstant = false;
+                        if (kind == "line") {
+                            pm.kind = PredefinedMacroKind::Line;
+                        } else if (kind == "file") {
+                            pm.kind = PredefinedMacroKind::File;
+                        } else if (kind == "constant") {
+                            pm.kind = PredefinedMacroKind::Constant;
+                            isConstant = true;
+                        } else if (kind == "date") {
+                            pm.kind = PredefinedMacroKind::Date;
+                        } else if (kind == "time") {
+                            pm.kind = PredefinedMacroKind::Time;
+                        } else {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidPreprocess,
+                                mpath + "/kind",
+                                std::format("unknown predefined-macro kind '{}' "
+                                            "(expected line/file/constant/date/"
+                                            "time)",
+                                            kind));
+                            continue;
+                        }
+                        // `value` -- REQUIRED iff kind==constant; the static
+                        // replacement spelling. Ignored for the derived kinds.
+                        if (isConstant) {
+                            if (!e.contains("value")) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          mpath + "/value",
+                                          "a 'constant' predefinedMacros entry "
+                                          "requires 'value'");
+                                continue;
+                            }
+                            if (!e.at("value").is_string()) {
+                                coll.emit(
+                                    DiagnosticCode::C_InvalidPreprocess,
+                                    mpath + "/value",
+                                    "'predefinedMacros.value' must be a string");
+                                continue;
+                            }
+                            pm.value = e.at("value").get<std::string>();
+                        }
+                        cfg.predefinedMacros.push_back(std::move(pm));
+                    }
+                }
+            }
+
+            // FC15c: an OPTIONAL non-empty directive/operator WORD (matched by
+            // lexeme text -- no token kind, like the directive words). Absent ->
+            // the feature is off. Present-but-empty / wrong-type ->
+            // C_InvalidPreprocess.
+            auto const readOptWord = [&](char const* key, std::string& out) {
+                if (!pp.contains(key)) return;
+                const auto fpath = std::format("/preprocess/{}", key);
+                if (!pp.at(key).is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess, fpath,
+                              std::format("'preprocess.{}' must be a string", key));
+                    return;
+                }
+                out = pp.at(key).get<std::string>();
+                if (out.empty()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess, fpath,
+                              std::format("'preprocess.{}' must be a non-empty "
+                                          "string when present", key));
+                }
+            };
+            // FC15c (`#pragma`; C 6.10.6): the pragma directive WORD. Consumed +
+            // DROPPED with no error. OPTIONAL.
+            readOptWord("pragmaDirective",       cfg.pragmaDirective);
+            // FC15c (`__has_include` / `__has_c_attribute`; C23 6.10.1p4): the
+            // operator WORDS. OPTIONAL (each folds to an ordinary identifier when
+            // absent).
+            readOptWord("hasIncludeOperator",    cfg.hasIncludeOperator);
+            readOptWord("hasCAttributeOperator", cfg.hasCAttributeOperator);
+            // FC15c (make-or-break agnosticism): the angle-delimiter token KINDS
+            // for `__has_include(<h>)`. OPTIONAL token-name fields (validated like
+            // `stringizeToken`). The make-or-break SELF-CONSISTENCY rule: a
+            // language declaring `hasIncludeOperator` MUST declare BOTH angle
+            // tokens (the engine matches the delimiters by KIND, never the `<`/`>`
+            // bytes) -- otherwise the contract is incomplete -> C_InvalidPreprocess.
+            if (pp.contains("hasIncludeAngleOpenToken")) {
+                if (!pp.at("hasIncludeAngleOpenToken").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/hasIncludeAngleOpenToken",
+                              "'preprocess.hasIncludeAngleOpenToken' must be a "
+                              "string");
+                } else {
+                    cfg.hasIncludeAngleOpenToken =
+                        pp.at("hasIncludeAngleOpenToken").get<std::string>();
+                    checkToken(cfg.hasIncludeAngleOpenToken,
+                               "hasIncludeAngleOpenToken");
+                }
+            }
+            if (pp.contains("hasIncludeAngleCloseToken")) {
+                if (!pp.at("hasIncludeAngleCloseToken").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/hasIncludeAngleCloseToken",
+                              "'preprocess.hasIncludeAngleCloseToken' must be a "
+                              "string");
+                } else {
+                    cfg.hasIncludeAngleCloseToken =
+                        pp.at("hasIncludeAngleCloseToken").get<std::string>();
+                    checkToken(cfg.hasIncludeAngleCloseToken,
+                               "hasIncludeAngleCloseToken");
+                }
+            }
+            if (!cfg.hasIncludeOperator.empty()
+                && (cfg.hasIncludeAngleOpenToken.empty()
+                    || cfg.hasIncludeAngleCloseToken.empty())) {
+                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                          "/preprocess/hasIncludeOperator",
+                          "'preprocess.hasIncludeOperator' requires both "
+                          "'hasIncludeAngleOpenToken' and "
+                          "'hasIncludeAngleCloseToken' (the angle delimiters are "
+                          "matched by token KIND, not the '<'/'>' bytes)");
+            }
+            // FC15c (`__has_c_attribute`; C23 6.10.1p4): the KNOWN standard
+            // attributes + their version ints. Each entry is `{name, version}`:
+            // `name` non-empty, `version` a positive int. OPTIONAL -- absent
+            // means no attribute is known (every query yields 0). A malformed
+            // entry -> C_InvalidPreprocess.
+            if (pp.contains("knownCAttributes")) {
+                json const& kas = pp.at("knownCAttributes");
+                if (!kas.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/knownCAttributes",
+                              "'preprocess.knownCAttributes' must be an array");
+                } else {
+                    for (std::size_t ai = 0; ai < kas.size(); ++ai) {
+                        const auto apath =
+                            std::format("/preprocess/knownCAttributes/{}", ai);
+                        json const& e = kas[ai];
+                        if (!e.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, apath,
+                                      "a 'knownCAttributes' entry must be an "
+                                      "object");
+                            continue;
+                        }
+                        CAttributeDef ka;
+                        if (!e.contains("name") || !e.at("name").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      apath + "/name",
+                                      "a 'knownCAttributes' entry requires a "
+                                      "string 'name'");
+                            continue;
+                        }
+                        ka.name = e.at("name").get<std::string>();
+                        if (ka.name.empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      apath + "/name",
+                                      "'knownCAttributes.name' must be non-empty");
+                            continue;
+                        }
+                        if (!e.contains("version")
+                            || !e.at("version").is_number_integer()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      apath + "/version",
+                                      "a 'knownCAttributes' entry requires an "
+                                      "integer 'version'");
+                            continue;
+                        }
+                        ka.version = e.at("version").get<int>();
+                        if (ka.version <= 0) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      apath + "/version",
+                                      "'knownCAttributes.version' must be > 0");
+                            continue;
+                        }
+                        cfg.knownCAttributes.push_back(std::move(ka));
+                    }
+                }
+            }
+
+            // FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): optional bool.
+            // TRUE -> `sep ## __VA_ARGS__` with an empty variadic part drops the
+            // separator (GNU extension); default FALSE -> standard placemarker.
+            if (pp.contains("variadicCommaElision")) {
+                if (!pp.at("variadicCommaElision").is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/variadicCommaElision",
+                              "'preprocess.variadicCommaElision' must be a boolean");
+                } else {
+                    cfg.variadicCommaElision =
+                        pp.at("variadicCommaElision").get<bool>();
+                }
+            }
 
             data.preprocess = std::move(cfg);
         }
@@ -7326,6 +7604,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'intCrossSignednessConverts' must be a boolean");
                 } else {
                     cfg.intCrossSignednessConverts = v.get<bool>();
+                }
+            }
+            // C 6.3.1.3/6.5.16.1 same-signedness integer NARROWING (`short s = anInt`,
+            // read by `isAssignable`'s signed/unsigned rank arms). Opt-in (default false →
+            // a non-C schema keeps the strict widening-only rank rule).
+            if (sem.contains("intSameSignednessNarrows")) {
+                auto const& v = sem.at("intSameSignednessNarrows");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/intSameSignednessNarrows",
+                              "'intSameSignednessNarrows' must be a boolean");
+                } else {
+                    cfg.intSameSignednessNarrows = v.get<bool>();
                 }
             }
 

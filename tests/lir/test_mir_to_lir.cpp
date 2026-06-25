@@ -3738,14 +3738,25 @@ TEST(MirToLir, TruncToThirtyTwoLowersCarryingWidthFlag) {
            "variant is width-keyed so non-32 trunc matches nothing";
 }
 
-TEST(MirToLir, TruncToSixteenAndEightStayGated) {
+TEST(MirToLir, TruncToSixteenAndEightNowRealizedViaPromotedMov) {
+    // D-CSUBSET-SUBNATIVE-ALU-FORMS (was TruncToSixteenAndEightStayGated): a
+    // Trunc whose result is I16/U16/I8/U8 routes through registerOpWidthFlags →
+    // the PROMOTED width-32 `mov` (low bits kept); the narrowing realizes at the
+    // byte/half-exact consumer. RED-ON-DISABLE: drop I16/U8 from the Trunc result
+    // gate and these flip back to fail-loud (D-CSUBSET-32BIT-ALU-FORMS).
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
     auto p16 = lowerCastProbe(::dss::MirOpcode::Trunc,
                               ::dss::TypeKind::I64, ::dss::TypeKind::I16);
-    EXPECT_FALSE(p16.ok);
-    EXPECT_TRUE(sawAnchor(p16.rep, "D-CSUBSET-32BIT-ALU-FORMS"));
-    EXPECT_FALSE(lowerCastProbe(::dss::MirOpcode::Trunc,
-                                ::dss::TypeKind::I64,
-                                ::dss::TypeKind::U8).ok);
+    EXPECT_TRUE(p16.ok) << "Trunc to I16 realized via the promoted width-32 mov";
+    auto const widths = widthsOfMnemonic(p16.lir, **target, "trunc");
+    ASSERT_EQ(widths.size(), 1u);
+    EXPECT_EQ(widths[0], 32u)
+        << "the narrowing Trunc carries the PROMOTED width 32 (low bits kept)";
+    EXPECT_TRUE(lowerCastProbe(::dss::MirOpcode::Trunc,
+                               ::dss::TypeKind::I64,
+                               ::dss::TypeKind::U8).ok)
+        << "Trunc to U8 likewise realized";
 }
 
 TEST(MirToLir, ZExtFromU32SourceLowersCarryingSourceWidth) {
@@ -3772,11 +3783,13 @@ TEST(MirToLir, ZExtFromU32SourceLowersCarryingSourceWidth) {
            "the encoding variants are width-keyed";
 }
 
-TEST(MirToLir, ZExtFromBoolKeepsTheDefaultWidthAndNarrowSourcesStayGated) {
-    // The Bool 0/1 source keeps the width-default byte widener
-    // (existing consumers — lowerICmp's setcc→zext pair — must stay
-    // byte-identical), and the still-unencoded narrow sources keep
-    // failing loud.
+TEST(MirToLir, ZExtFromBoolKeepsDefaultWidthAndNarrowSourcesNowRealized) {
+    // The Bool 0/1 source keeps the width-default byte widener (existing
+    // consumers — lowerICmp's setcc→zext pair — stay byte-identical). The
+    // narrow U16 source is NOW realized (D-CSUBSET-SUBNATIVE-ALU-FORMS):
+    // it carries the SOURCE width 16, selecting the width-keyed movzx r/m16
+    // (x86) / UXTH (arm64). RED-ON-DISABLE: drop U16 from the ZExt source
+    // gate and the u16 probe fails loud again.
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto boolProbe = lowerCastProbe(::dss::MirOpcode::ZExt,
@@ -3790,17 +3803,27 @@ TEST(MirToLir, ZExtFromBoolKeepsTheDefaultWidthAndNarrowSourcesStayGated) {
     auto u16Probe = lowerCastProbe(::dss::MirOpcode::ZExt,
                                    ::dss::TypeKind::U16,
                                    ::dss::TypeKind::U64);
-    EXPECT_FALSE(u16Probe.ok);
-    EXPECT_TRUE(sawAnchor(u16Probe.rep, "D-CSUBSET-32BIT-ALU-FORMS"));
+    EXPECT_TRUE(u16Probe.ok)
+        << "ZExt from U16 realized (movzx r/m16 / UXTH)";
+    auto const u16Widths = widthsOfMnemonic(u16Probe.lir, **target, "zext");
+    ASSERT_EQ(u16Widths.size(), 1u);
+    EXPECT_EQ(u16Widths[0], 16u)
+        << "the U16-source zext carries the SOURCE width 16 (width-keyed)";
 }
 
-TEST(MirToLir, SExtFromI16SourceStaysGatedButI32Lowers) {
-    // movsxd / SXTW read a 32-bit source window — only I32 sources
-    // are realized.
+TEST(MirToLir, SExtFromI16AndI32SourcesBothRealized) {
+    // D-CSUBSET-SUBNATIVE-ALU-FORMS (was SExtFromI16SourceStaysGated…): an I16
+    // source now selects the width-16 movsx r/m16 / SXTH form; I32 keeps movsxd
+    // / SXTW (the 32-bit window). RED-ON-DISABLE: drop I16 from the SExt source
+    // gate and the I16 probe fails loud again.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
     auto p16 = lowerCastProbe(::dss::MirOpcode::SExt,
                               ::dss::TypeKind::I16, ::dss::TypeKind::I64);
-    EXPECT_FALSE(p16.ok);
-    EXPECT_TRUE(sawAnchor(p16.rep, "D-CSUBSET-32BIT-ALU-FORMS"));
+    EXPECT_TRUE(p16.ok) << "SExt from I16 realized (movsx r/m16 / SXTH)";
+    auto const w16 = widthsOfMnemonic(p16.lir, **target, "sext");
+    ASSERT_EQ(w16.size(), 1u);
+    EXPECT_EQ(w16[0], 16u) << "the I16-source sext carries the SOURCE width 16";
     EXPECT_TRUE(lowerCastProbe(::dss::MirOpcode::SExt,
                                ::dss::TypeKind::I32,
                                ::dss::TypeKind::I64).ok);

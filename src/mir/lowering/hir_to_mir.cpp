@@ -888,47 +888,11 @@ struct Lowerer {
                         std::array<MirInstId, 2> gep{arrAddr, zero};
                         return mir.addInst(MirOpcode::Gep, gep, t);
                     }
-                    std::uint32_t const litIdx0 = hir.payload(kids[0]);
-                    HirLiteralValue const& src = literals.at(litIdx0);
-                    if (!std::holds_alternative<std::string>(src.value)) {
-                        unsupported(node,
-                            "Array→Pointer decay operand is a Literal "
-                            "but its pool entry is not a string arm "
-                            "(non-string array literals anchored "
-                            "D-LK4-RODATA-PRODUCER-NONSTRING-ARRAY-"
-                            "LITERAL-DECAY)");
-                        return InvalidMirInst;
-                    }
-                    // Mint a fresh synthetic global for the literal,
-                    // register it in the MIR globals arena with the
-                    // string bytes as its constant-init, and emit a
-                    // `GlobalAddr` that returns the Ptr<T> the Cast
-                    // expression yields. The lowerMirGlobalsToDataItems
-                    // pass (asm/asm.cpp) materializes the rodata bytes
-                    // from this MirGlobal at assembly time.
-                    //
-                    // SymbolId-space-exhaustion guard (silent-failure
-                    // HIGH-1 audit fold, 2026-06-02): the minter
-                    // returns invalid SymbolId{} when the next mint
-                    // would wrap UINT32_MAX. Fail loud rather than
-                    // silently collide with SymbolId{0} (the
-                    // invalid sentinel) or user-declared symbols.
-                    SymbolId const sym = mintSyntheticGlobalSymbol();
-                    if (!sym.valid()) {
-                        unsupported(node,
-                            "string-literal promotion failed: "
-                            "synthetic SymbolId space exhausted "
-                            "(UINT32_MAX wraparound). Source has "
-                            "too many string literals OR the user "
-                            "SymbolId range already saturates the "
-                            "u32 space. Anchor: D-LK4-RODATA-"
-                            "PRODUCER-STRING space-exhaustion pin.");
-                        return InvalidMirInst;
-                    }
-                    std::uint32_t const mirLitIdx =
-                        mir.literalPoolAdd(toMirLiteral(src));
-                    (void)mir.addGlobal(fromTy, sym, mirLitIdx);
-                    return mir.addGlobalAddr(sym, t);
+                    // F5: the SINGLE rodata-string producer (shared with the
+                    // lvalue-address `"abc"[i]` arm). `t` is the Cast's Ptr<Char>
+                    // decay target. (Was inline here; factored so the value-decay
+                    // and lvalue-index paths cannot drift.)
+                    return materializeStringLiteralGlobal(kids[0], t);
                 }
                 MirInstId const operand = lowerExpr(kids[0]);
                 if (!operand.valid()) return InvalidMirInst;
@@ -2131,6 +2095,38 @@ struct Lowerer {
     // flattened arms here call the SAME `combineMemberAddr`/`combineIndexAddr`
     // epilogues the frames do (one source of truth) and are unreachable through
     // the driver — kept as the recursive fallback.
+
+    // D-LK4-RODATA-PRODUCER-STRING: materialize a STRING LITERAL into a fresh
+    // synthetic rodata MirGlobal and return a `GlobalAddr` (typed `ptrTy`) to its
+    // first byte. The SINGLE producer, shared by the array→pointer DECAY Cast arm
+    // (value position) and the lvalue-address `HirKind::Literal` arm (`"abc"[i]`
+    // — F5 agg_string_index). A non-string literal / SymbolId-space exhaustion
+    // fails loud (no silent miscompile). Each occurrence mints its own global
+    // (no cross-occurrence dedup — existing behavior).
+    [[nodiscard]] MirInstId materializeStringLiteralGlobal(HirNodeId litNode,
+                                                           TypeId ptrTy) {
+        std::uint32_t const litIdx0 = hir.payload(litNode);
+        HirLiteralValue const& src = literals.at(litIdx0);
+        if (!std::holds_alternative<std::string>(src.value)) {
+            unsupported(litNode,
+                "string-literal materialization: the Literal pool entry is not "
+                "a string arm (non-string array literals anchored "
+                "D-LK4-RODATA-PRODUCER-NONSTRING-ARRAY-LITERAL-DECAY)");
+            return InvalidMirInst;
+        }
+        SymbolId const sym = mintSyntheticGlobalSymbol();
+        if (!sym.valid()) {
+            unsupported(litNode,
+                "string-literal promotion failed: synthetic SymbolId space "
+                "exhausted (UINT32_MAX wraparound). Anchor: "
+                "D-LK4-RODATA-PRODUCER-STRING space-exhaustion pin.");
+            return InvalidMirInst;
+        }
+        std::uint32_t const mirLitIdx = mir.literalPoolAdd(toMirLiteral(src));
+        (void)mir.addGlobal(hir.typeId(litNode), sym, mirLitIdx);
+        return mir.addGlobalAddr(sym, ptrTy);
+    }
+
     [[nodiscard]] MirInstId lowerLvalueAddressNode(HirNodeId node) {
         HirKind const k = hir.kind(node);
         // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value struct/union-
@@ -2252,6 +2248,18 @@ struct Lowerer {
             MirInstId const basePtr = lowerLvalueAddress(kids[0]);
             if (!basePtr.valid()) return InvalidMirInst;
             return combineIndexAddr(node, byteIdx, basePtr);
+        }
+        if (k == HirKind::Literal) {
+            // F5 (agg_string_index): a STRING LITERAL in lvalue position — the
+            // base of `"abc"[i]`. The array decays to its rodata address (C
+            // 6.3.2.1): materialize the rodata global (the SAME producer the
+            // value-position array→pointer decay uses) and return the address of
+            // its first byte, typed as the array-pointer (matching a named global
+            // array's lvalue address). The Index storage arm above then does
+            // byte-offset arithmetic into it via combineIndexAddr. A non-string
+            // literal is not an lvalue → materializeStringLiteralGlobal fails loud.
+            return materializeStringLiteralGlobal(
+                node, interner.pointer(hir.typeId(node)));
         }
         if (k == HirKind::ConstructAggregate) {
             // D-CSUBSET-BITFIELD-RVALUE-RUNTIME (the GENERAL aggregate-rvalue
@@ -6623,8 +6631,64 @@ struct Lowerer {
         // ⇒ mutable ⇒ writable `.data`/`.bss`). Stamped onto MirGlobal.isConst so
         // the assembler routes an initialized const global to read-only `.rodata`.
         bool                           isConst = false;
+        // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): init = the LINK-TIME-CONSTANT
+        // address of `symbolAddrInit` (+ addend) — a string-literal rodata global,
+        // another global, or a function. Routes to a MirSymbolAddrValue literal
+        // (an abs64 relocation), NOT __module_init__. Mutually exclusive with
+        // constInit / runtimeInit above.
+        std::optional<SymbolId>        symbolAddrInit;
+        std::int64_t                   symbolAddrAddend = 0;
     };
     std::vector<PendingGlobal> pendingGlobals;
+
+    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): recognize a LINK-TIME-CONSTANT
+    // symbol-address global initializer that const-eval cannot fold — a global
+    // pointer initialized to another symbol's ADDRESS. Two shapes:
+    //   `int* p = &x;`     → AddressOf(Ref(global-or-function)) → that symbol
+    //   `char* g = "...";` → Cast(Literal(string), Ptr<Char>)   → a freshly minted
+    //                        rodata string global (pushed to pendingGlobals so
+    //                        emitGlobals_ emits its bytes; the pointer's reloc
+    //                        targets it)
+    // Returns {targetSymbol, addend} or nullopt (the caller falls back to
+    // const-eval / runtime-init). mintSyntheticGlobalSymbol is lazy-seeded after
+    // collect*, so minting here is safe; pushing the rodata PendingGlobal mid-
+    // classify is safe (the classify loop walks moduleDecls, not pendingGlobals).
+    [[nodiscard]] std::optional<std::pair<SymbolId, std::int64_t>>
+    tryClassifyAsSymbolAddr(HirNodeId initNode) {
+        HirKind const k = hir.kind(initNode);
+        if (k == HirKind::AddressOf) {
+            auto kids = hir.children(initNode);
+            if (kids.size() == 1 && hir.kind(kids[0]) == HirKind::Ref) {
+                std::uint32_t const s = hir.payload(kids[0]);
+                if (globalSymbols.contains(s) || functionSymbols.contains(s)) {
+                    return std::make_pair(SymbolId{s}, std::int64_t{0});
+                }
+            }
+            return std::nullopt;
+        }
+        if (k == HirKind::Cast) {
+            auto kids = hir.children(initNode);
+            if (kids.size() != 1 || hir.kind(kids[0]) != HirKind::Literal)
+                return std::nullopt;
+            TypeId const ct = hir.typeId(initNode);
+            if (!ct.valid() || interner.kind(ct) != TypeKind::Ptr)
+                return std::nullopt;
+            std::uint32_t const litIdx0 = hir.payload(kids[0]);
+            HirLiteralValue const& src = literals.at(litIdx0);
+            if (!std::holds_alternative<std::string>(src.value))
+                return std::nullopt;
+            SymbolId const rodataSym = mintSyntheticGlobalSymbol();
+            if (!rodataSym.valid()) return std::nullopt;  // exhausted → fall back
+            PendingGlobal rg;
+            rg.symbol    = rodataSym;
+            rg.type      = hir.typeId(kids[0]);   // Array<Char,N+1>
+            rg.constInit = toMirLiteral(src);
+            rg.isConst   = true;                  // string literal bytes → .rodata
+            pendingGlobals.push_back(std::move(rg));
+            return std::make_pair(rodataSym, std::int64_t{0});
+        }
+        return std::nullopt;
+    }
 
     // Classify each module-level global into pendingGlobals. Called after
     // `collectGlobals` (so `globalSymbols` is already populated for any
@@ -6692,14 +6756,23 @@ struct Lowerer {
             if (mutabilityMap != nullptr)
                 if (auto const* p = mutabilityMap->tryGet(decl)) pg.isConst = p->isConst;
             if (auto initN = hir.globalInit(decl); initN.has_value()) {
-                // The resolver covers Refs to sibling globals; literal /
-                // arithmetic / Cast paths still fold per CE1.
-                ConstEvalResult const r = evaluateConstant(
-                    hir, interner, literals, *initN, env, opts);
-                if (r.value.has_value()) {
-                    pg.constInit = toMirLiteral(*r.value);
+                // F5: a symbol-ADDRESS initializer (`int* p = &x;`, `char* g =
+                // "...";`) is a LINK-TIME constant const-eval cannot fold —
+                // recognize it FIRST (and route to a MirSymbolAddrValue / abs64
+                // reloc) before falling back to const-eval / runtime-init.
+                if (auto sa = tryClassifyAsSymbolAddr(*initN)) {
+                    pg.symbolAddrInit   = sa->first;
+                    pg.symbolAddrAddend = sa->second;
                 } else {
-                    pg.runtimeInit = *initN;
+                    // The resolver covers Refs to sibling globals; literal /
+                    // arithmetic / Cast paths still fold per CE1.
+                    ConstEvalResult const r = evaluateConstant(
+                        hir, interner, literals, *initN, env, opts);
+                    if (r.value.has_value()) {
+                        pg.constInit = toMirLiteral(*r.value);
+                    } else {
+                        pg.runtimeInit = *initN;
+                    }
                 }
             }
             pendingGlobals.push_back(std::move(pg));
@@ -6751,7 +6824,20 @@ struct Lowerer {
                 ok = false;
                 continue;
             }
-            if (pg.constInit.has_value()) {
+            if (pg.symbolAddrInit.has_value()) {
+                // F5: init = link-time-constant symbol address. Emit a
+                // MirSymbolAddrValue literal; lowerMirGlobalsToDataItems (asm)
+                // emits a pointer slot + an abs64 reloc against the target symbol,
+                // NOT a __module_init__ runtime store.
+                MirLiteralValue v;
+                v.value = MirSymbolAddrValue{pg.symbolAddrInit->v,
+                                             pg.symbolAddrAddend};
+                v.core  = TypeKind::Ptr;
+                std::uint32_t const idx = mir.literalPoolAdd(std::move(v));
+                mir.addGlobal(pg.type, pg.symbol, idx, {},
+                              pg.linkage.binding, pg.linkage.visibility,
+                              pg.isConst);
+            } else if (pg.constInit.has_value()) {
                 std::uint32_t const idx = mir.literalPoolAdd(*pg.constInit);
                 mir.addGlobal(pg.type, pg.symbol, idx, {},
                               pg.linkage.binding, pg.linkage.visibility,

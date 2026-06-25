@@ -65,8 +65,8 @@ assembleFirstFn(Lir const& lir, TargetSchema const& schema,
 
 struct SseFixture {
     std::shared_ptr<TargetSchema> schema;
-    std::uint16_t faddOp, fpToSiOp, movapsOp, movsdLoadOp, movsdStoreOp,
-                  retOp;
+    std::uint16_t faddOp, fmulOp, fsubOp, fpToSiOp, movapsOp, movsdLoadOp,
+                  movsdStoreOp, retOp;
     LirReg rax, xmm0, xmm1, xmm8, xmm9;
 };
 
@@ -84,6 +84,8 @@ struct SseFixture {
     if (!s) return f;
     f.schema      = *s;
     f.faddOp       = *f.schema->opcodeByMnemonic("fadd");
+    f.fmulOp       = *f.schema->opcodeByMnemonic("fmul");
+    f.fsubOp       = *f.schema->opcodeByMnemonic("fsub");
     f.fpToSiOp     = *f.schema->opcodeByMnemonic("fp_to_si");
     f.movapsOp     = *f.schema->opcodeByMnemonic("movaps");
     f.movsdLoadOp  = *f.schema->opcodeByMnemonic("movsd_load");
@@ -172,6 +174,47 @@ TEST(X86Sse, AddsdXmm0Xmm1Emits_F2_0F_58_C1) {
     EXPECT_EQ(bytes[0], 0xF2);
     EXPECT_EQ(bytes[1], 0x0F);
     EXPECT_EQ(bytes[2], 0x58);
+    EXPECT_EQ(bytes[3], 0xC1);
+}
+
+TEST(X86Sse, MulsdXmm0Xmm1Emits_F2_0F_59_C1) {
+    // Cluster-F F3: fmul xmm0, xmm0, xmm1 -> MULSD xmm0, xmm1:
+    //   F2 (mandatory prefix) 0F 59 (opcode, vs ADDSD's 0x58) ModR/M 0xC1.
+    auto f = loadSse();
+    DiagnosticReporter rep;
+    auto bytes = buildLegalizeAssemble(f, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(f.xmm0),
+            LirOperand::makeReg(f.xmm1)
+        };
+        (void)b.addInst(f.fmulOp, f.xmm0, ops);
+    });
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xF2);
+    EXPECT_EQ(bytes[1], 0x0F);
+    EXPECT_EQ(bytes[2], 0x59);
+    EXPECT_EQ(bytes[3], 0xC1);
+}
+
+TEST(X86Sse, SubsdXmm0Xmm1Emits_F2_0F_5C_C1) {
+    // Cluster-F F3: fsub xmm0, xmm0, xmm1 -> SUBSD xmm0, xmm1:
+    //   F2 (mandatory prefix) 0F 5C (opcode) ModR/M 0xC1. NON-COMMUTATIVE:
+    //   xmm0 (=op[0], the minuend, dest=ModR/M.reg) - xmm1 (op[1], ModR/M.rm).
+    auto f = loadSse();
+    DiagnosticReporter rep;
+    auto bytes = buildLegalizeAssemble(f, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(f.xmm0),
+            LirOperand::makeReg(f.xmm1)
+        };
+        (void)b.addInst(f.fsubOp, f.xmm0, ops);
+    });
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xF2);
+    EXPECT_EQ(bytes[1], 0x0F);
+    EXPECT_EQ(bytes[2], 0x5C);
     EXPECT_EQ(bytes[3], 0xC1);
 }
 

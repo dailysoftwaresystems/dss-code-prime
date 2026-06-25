@@ -61,16 +61,47 @@ using PpMacroExpand =
 // MacroExpander (queries its macro table).
 using PpIsDefined = std::function<bool(std::string_view)>;
 
+// FC15c (`__has_include`; C23 6.10.1p4): test whether the header `filename`
+// would be found by a `#include` of the same form. `isAngle` selects the form:
+// true = `<filename>` (the angle / system search -- DSS maps `<stem>.json` on
+// the system path); false = `"filename"` (the quote search -- self-dir +
+// includeDirs). The raw filename spelling is passed verbatim (escapes are NOT
+// decoded, mirroring the include resolver). Supplied by the MacroExpander, which
+// holds the include search paths. Returns true iff the header exists.
+using PpHasInclude = std::function<bool(std::string_view filename, bool isAngle)>;
+
+// FC15b: the MacroExpander's accumulated `#`/`##`/predefined PRODUCT text, as it
+// stands AFTER `macroExpand` runs over an `#if` operand. A predefined macro
+// (`__STDC_VERSION__` &c.) or a `#`/`##` product expanded inside a `#if`
+// controlling expression materializes a token whose span points into the synth
+// buffer's product TAIL (`[prefixLen + ..)`), which is NOT yet appended to the
+// prefix-only `synth` buffer at #if-eval time. This provider returns that tail
+// so the evaluator can assemble a COMBINED (prefix + product) buffer the ICE
+// parser slices every real token against. Returns an empty view when the
+// language produces no products (then the combined buffer == the prefix).
+using PpProductText = std::function<std::string_view()>;
+
 // Evaluate the `#if`/`#elif` operand tokens to a compile-time integer.
-// `operandTokens` are sliced against `synth`. Returns the int64 value
-// (caller: != 0 => branch taken), or nullopt on any fail-loud condition (the
-// diagnostic is already emitted into `rep`).
+// `operandTokens` are sliced against `synth` (the prefix buffer). `productText`
+// supplies any product-tail bytes materialized during expansion (FC15b) so a
+// predefined/`#`/`##` product in the operand resolves; pass a provider returning
+// "" for a language with no products. Returns the int64 value (caller: != 0 =>
+// branch taken), or nullopt on any fail-loud condition (the diagnostic is
+// already emitted into `rep`).
+// FC15c: `hasInclude` resolves a `__has_include(<h>)` / `__has_include("h")`
+// operand against the include search paths; pass a provider returning false for
+// a language with no `__has_include` operator (then a stray `__has_include`
+// folds as an ordinary identifier -> 0). The `__has_c_attribute` operator needs
+// no callback -- its known-attribute set is read directly from the schema's
+// `preprocess().knownCAttributes`.
 [[nodiscard]] std::optional<std::int64_t>
 evaluateIfExpression(std::span<Token const> operandTokens,
                      GrammarSchema const&   schema,
                      PpMacroExpand const&   macroExpand,
                      PpIsDefined const&     isDefined,
+                     PpHasInclude const&    hasInclude,
                      SourceBuffer const&    synth,
+                     PpProductText const&   productText,
                      DiagnosticReporter&    rep);
 
 } // namespace dss

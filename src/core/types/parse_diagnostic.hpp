@@ -66,6 +66,30 @@ enum class DiagnosticCode : std::uint16_t {
     P_PreprocessorUnsupported     = 0x0015,  // a recognised-but-unimplemented directive form (variadic macro def)
     P_PreprocessorIncludeError    = 0x0016,  // quote-`#include` target not found / unreadable / recursion overflow
     P_PreprocessorMacroArgument   = 0x0017,  // function-like macro INVOCATION error (arity mismatch / unterminated arg list)
+    // FC15a (`#`/`##` operators): the STRINGIZE (`#`, C 6.10.3.2) operator is
+    // malformed -- a `#` in a function-like macro's replacement list is not
+    // followed by a parameter (the only valid `#` operand).
+    P_PreprocessorStringize       = 0x0019,
+    // FC15a: the TOKEN-PASTE (`##`, C 6.10.3.3) operator is malformed -- a `##`
+    // at the start or end of a replacement list (no operand on one side), OR a
+    // paste whose concatenated spelling is NOT a single valid token
+    // (C 6.10.3.3p3: the result must be a single preprocessing token).
+    P_PreprocessorPaste           = 0x001A,
+    // FC15b (predefined macros; C 6.10.8.1): a `#define` or `#undef` of a
+    // PREDEFINED macro name (`__FILE__`/`__LINE__`/`__STDC__`/...). C 6.10.8.1p2:
+    // none of these macro names shall be the subject of a `#define` or `#undef`.
+    // The rejected directive does NOT alter the macro table. The predefined-macro
+    // SET is config-driven (`predefinedMacros`); the engine never hard-codes a
+    // name.
+    P_PreprocessorPredefinedMacro = 0x001B,
+    // FC15c (`__has_include` -- C23 6.10.1p4): a malformed `__has_include`
+    // operator in a `#if`/`#elif` controlling expression -- a missing `(`, an
+    // empty filename, a missing closing `>`/`"`, or a missing `)`. The operator
+    // takes `(<header>)` or `("header")`; the angle delimiters are matched by
+    // config token KIND (`hasIncludeAngleOpenToken`/`...CloseToken`), never by
+    // scanning for the literal `<`/`>` bytes (agnosticism). A well-formed
+    // operator yields 1 (the header is found) or 0 -- never this diagnostic.
+    P_PreprocessorHasInclude      = 0x001C,
 
     // Expression-nesting depth guard (Pratt walker). A too-deeply-nested
     // expression (parens / right-assoc / prefix / ternary recursion past
@@ -392,6 +416,15 @@ enum class DiagnosticCode : std::uint16_t {
     // loud (C 6.8.1) rather than emit a stray arm-less case. Positioned at the
     // case/default keyword.
     S_CaseLabelNotInSwitch        = 0xE023,
+    // Cluster F1 (C 6.5.2.4 / 6.5.3.1): a prefix or postfix `++`/`--` whose
+    // operand is not a modifiable lvalue. Emitted at CST→HIR lowering, where the
+    // ++/-- sites classify the operand: a manifest rvalue (e.g. a literal `5++`,
+    // `++5`) has no object to read-modify-write, so it fails loud here rather
+    // than synthesize a write-back to a non-object. (A `const`-qualified lvalue
+    // `const int x; x++;` is a SEPARATE, pre-existing gap — `classifyLvalue` does
+    // not yet model `const` — anchored as D-CSUBSET-INCDEC-CONST-LVALUE, shared
+    // with the same gap on plain assignment.) Positioned at the ++/-- expression.
+    S_IncDecNeedsModifiableLvalue = 0xE024,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

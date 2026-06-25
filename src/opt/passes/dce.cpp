@@ -179,16 +179,13 @@ struct SymbolScanResult {
         }
     }
 
-    // Phase 2: BFS — for each live function, compute its live-set
-    // ONCE + scan reachable blocks for live GlobalAddr referrals.
-    while (!funcWorklist.empty()) {
-        MirFuncId const f = funcWorklist.front();
-        funcWorklist.pop_front();
-
+    // Phase 2: BFS — for each live function, compute its live-set ONCE + scan
+    // reachable blocks for live GlobalAddr referrals (marking referenced
+    // globals/functions live + enqueueing newly-live functions).
+    auto const processFunc = [&](MirFuncId f) {
         FuncLiveSet lset;
         lset.reachable = mirReversePostOrder(mir, mir.funcEntry(f));
         lset.liveInsts = computeLiveInsts(mir, lset.reachable);
-
         for (MirBlockId const b : lset.reachable) {
             std::uint32_t const n = mir.blockInstCount(b);
             for (std::uint32_t i = 0; i < n; ++i) {
@@ -204,6 +201,46 @@ struct SymbolScanResult {
             }
         }
         out.perFunc.emplace(f.v, std::move(lset));
+    };
+    while (!funcWorklist.empty()) {
+        MirFuncId const f = funcWorklist.front();
+        funcWorklist.pop_front();
+        processFunc(f);
+    }
+
+    // Phase 3 (F5 — D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): propagate liveness through
+    // GLOBAL symbol-address initializers. `int* p = &target;` makes `target` a USE
+    // of `p`'s init — but the function BFS above scans only function GlobalAddr
+    // insts, never a global's init, so a reloc-TARGET global referenced ONLY by
+    // another (live) global's symbol-address init would be wrongly DCE'd → the
+    // linker then sees K_SymbolUndefined for the unresolved data-item reloc.
+    // Fixpoint: a live global's symbol-address target becomes live (transitively
+    // for global→global chains); a function target (a function-pointer table)
+    // re-enters the function BFS so ITS referenced globals stay live too.
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (std::uint32_t i = 0; i < ng; ++i) {
+            MirGlobalId const g = mir.globalAt(i);
+            if (!out.liveSymbols.count(mir.globalSymbol(g).v)) continue;
+            std::uint32_t const initIdx = mir.globalInitLiteralIndex(g);
+            if (initIdx == UINT32_MAX) continue;
+            auto const* sa =
+                std::get_if<MirSymbolAddrValue>(&mir.literalValue(initIdx).value);
+            if (sa == nullptr) continue;
+            if (out.liveSymbols.insert(sa->symbol).second) {
+                changed = true;
+                if (auto it = symToFunc.find(sa->symbol); it != symToFunc.end()) {
+                    funcWorklist.push_back(it->second);
+                }
+            }
+        }
+        while (!funcWorklist.empty()) {
+            MirFuncId const f = funcWorklist.front();
+            funcWorklist.pop_front();
+            processFunc(f);
+            changed = true;
+        }
     }
     return out;
 }

@@ -3,8 +3,49 @@
 #include "core/export.hpp"
 
 #include <string>
+#include <vector>
 
 namespace dss {
+
+// FC15b (`__FILE__`/`__LINE__`/`__STDC__`/...; C 6.10.8): how a PREDEFINED macro
+// materializes its replacement. The engine dispatches ONLY on this kind, NEVER
+// on the macro NAME (agnosticism: a language whose `__LINE__` is spelled
+// differently still resolves correctly because the name is config and the
+// behavior is keyed off the kind):
+//   Line     -- the line number of the macro's INVOCATION (offset-derived via
+//               the line-map), a decimal integer (C 6.10.8.1).
+//   File     -- the presumed name of the current source FILE (offset-derived via
+//               the line-map origin), a C string literal with `\`->`/` normalized.
+//   Constant -- a STATIC integer-constant spelling carried verbatim in `value`
+//               (`__STDC__`->"1", `__STDC_VERSION__`->"202311L", etc.).
+//   Date     -- the translation DATE, a string literal `"Mmm dd yyyy"` computed
+//               once at construction (C 6.10.8.1).
+//   Time     -- the translation TIME, a string literal `"hh:mm:ss"` computed once.
+enum class PredefinedMacroKind { Line, File, Constant, Date, Time };
+
+// FC15b: one config-declared predefined macro (C 6.10.8). `name` is the macro
+// identifier (matched by TEXT, like the directive words); `kind` selects the
+// materialization behavior; `value` is the literal replacement spelling and is
+// REQUIRED iff `kind == Constant` (ignored for the other kinds, whose value is
+// derived at expansion time / construction).
+struct DSS_EXPORT PredefinedMacroDef {
+    std::string         name;
+    PredefinedMacroKind kind = PredefinedMacroKind::Constant;
+    std::string         value;
+};
+
+// FC15c (`__has_c_attribute` -- C23 6.10.1p4): one config-declared standard
+// attribute the language KNOWS, with the C23 `__STDC_VERSION__`-style version
+// integer it reports. `__has_c_attribute(name)` materializes `version` when the
+// attribute is known, 0 otherwise. The set is config-driven (the engine never
+// hard-codes an attribute name); a malformed entry fails LOUD at load
+// (`C_InvalidPreprocess`). The lookup tries both `name` and the stripped form
+// of a `__name__` dunder spelling (C 6.10.1: the operator ignores leading and
+// trailing `__`), so a declared `deprecated` matches `__deprecated__` too.
+struct DSS_EXPORT CAttributeDef {
+    std::string name;       // the attribute identifier ("deprecated", ...)
+    int         version = 0;  // the reported version int (> 0; e.g. 202311)
+};
 
 // Config-driven C-preprocessor declaration (schema v4 `preprocess` block).
 //
@@ -151,6 +192,108 @@ struct DSS_EXPORT PreprocessConfig {
     // validated as a NON-EMPTY string at load (C_InvalidPreprocess). (FC13
     // cycle 3 -- D-PP-VARIADIC-MACRO.)
     std::string variadicArgsName;
+
+    // FC15a (`#`/`##` operators): the token KIND of the STRINGIZE operator (C's
+    // `#` -> "HashOp", C 6.10.3.2). In a function-like macro's REPLACEMENT list,
+    // a `#` immediately followed by a parameter stringizes that parameter's RAW
+    // (un-pre-expanded) argument into a single string literal. The macro engine
+    // detects it by this token KIND -- which, in c-subset, is the SAME `HashOp`
+    // as `directiveIntroToken`: directives are peeled at top level (firstOnLine)
+    // BEFORE expansion, so every `#` a replacement list carries IS a stringize
+    // operator (no ambiguity). Per-language CONFIG kind, never a hard-coded `#`:
+    // a second preprocess-opting language whose stringize operator is spelled
+    // differently is then detected correctly. OPTIONAL -- empty means the
+    // language declares NO stringize operator (the engine's `.valid()` guard
+    // never treats any token as `#`). `checkToken`-validated at load when
+    // present (like `variadicMarkerToken`).
+    std::string stringizeToken;
+
+    // FC15a: the token KIND of the TOKEN-PASTE operator (C's `##` -> "HashHashOp",
+    // C 6.10.3.3). In a replacement list, `a##b` concatenates the spelling of the
+    // token to its left with the token to its right into a single new token
+    // (re-tokenized + required to be exactly one token, C 6.10.3.3p3). A `##`
+    // OPERAND that is a parameter uses the RAW argument. Detected by this token
+    // KIND -- a DISTINCT lexeme from the single `#` (the loader/lexer's
+    // longest-match wins `##` over two `#`), never hard-coded. Per-language
+    // CONFIG kind: a second preprocess-opting language whose paste operator is
+    // spelled differently is detected correctly. OPTIONAL -- empty means the
+    // language declares NO paste operator. `checkToken`-validated at load when
+    // present (like `variadicMarkerToken`).
+    std::string pasteToken;
+
+    // FC15b (predefined macros; C 6.10.8): the language's PREDEFINED macros
+    // (`__FILE__`/`__LINE__`/`__STDC__`/`__STDC_VERSION__`/`__STDC_HOSTED__`/
+    // `__DATE__`/`__TIME__`). Each entry names the macro IDENTIFIER + a
+    // materialization `kind` (+ a literal `value`, REQUIRED iff kind==Constant).
+    // Pre-seeded into the macro expander at construction: an identifier that is
+    // NOT a `#define`d macro but IS a predefined-macro name materializes its
+    // configured value. The engine keys EVERY behavior off `kind`, never the
+    // name (agnosticism). OPTIONAL -- an empty list (toy / tsql-subset, which
+    // declare none) means the language has NO predefined macros, so e.g.
+    // `__LINE__` stays an ordinary identifier (the identity-pass property).
+    // `#define`/`#undef` of a predefined name is a constraint violation
+    // (C 6.10.8.1) -> fail loud `P_PreprocessorPredefinedMacro`.
+    std::vector<PredefinedMacroDef> predefinedMacros;
+
+    // FC15c (`#pragma`; C 6.10.6): the PRAGMA directive WORD, matched by lexeme
+    // TEXT against the token after `#` (like define/undef/include -- `pragma`
+    // lexes as a plain Identifier, NOT a grammar keyword). The preprocessor
+    // consumes-and-DROPS the whole `#pragma` line with NO error (C 6.10.6p2
+    // licenses ignoring an unrecognized pragma; DSS recognizes none, so every
+    // pragma is dropped). OPTIONAL -- empty means the language has NO `#pragma`
+    // directive, so a `#pragma` line then hits the generic unsupported-directive
+    // fail-loud (`P_PreprocessorUnsupported`). The engine matches THIS string,
+    // never a hard-coded "pragma".
+    std::string pragmaDirective;
+
+    // FC15c (`__has_include`; C23 6.10.1p4): the `__has_include` OPERATOR
+    // keyword, valid only inside a `#if`/`#elif` operand. `__has_include(<h>)` /
+    // `__has_include("h")` tests whether the named header would be found by a
+    // `#include` of the same form, yielding 1 or 0. Matched by lexeme TEXT (an
+    // ordinary identifier in the operand, like `defined`), so a per-language
+    // CONFIG spelling, never a hard-coded `__has_include`. OPTIONAL -- empty
+    // means the language declares NO such operator (`__has_include` then folds
+    // as an ordinary identifier -> 0, the identity property).
+    std::string hasIncludeOperator;
+
+    // FC15c (make-or-break agnosticism): the token KINDS that DELIMIT the angle
+    // form of a `__has_include` argument (C's `<` -> "LtOp", `>` -> "GtOp"). The
+    // `__has_include(<h>)` extraction matches the angle delimiters by SCHEMA
+    // KIND, NEVER by scanning for the literal `<`/`>` characters (input
+    // classification by hard-coded byte is the exact agnosticism trap this
+    // config forbids -- see `functionLikeOpenToken`). REQUIRED-together-with
+    // `hasIncludeOperator`: a language declaring the operator WITHOUT both angle
+    // tokens is a self-inconsistent contract -> LOAD-ERROR (`C_InvalidPreprocess`).
+    // `checkToken`-validated when present (like `stringizeToken`).
+    std::string hasIncludeAngleOpenToken;
+    std::string hasIncludeAngleCloseToken;
+
+    // FC15c (`__has_c_attribute`; C23 6.10.1p4): the `__has_c_attribute`
+    // OPERATOR keyword, valid only inside a `#if`/`#elif` operand.
+    // `__has_c_attribute(attr)` yields the version int of a KNOWN standard
+    // attribute (from `knownCAttributes`) or 0. Matched by lexeme TEXT (like
+    // `defined`/`__has_include`), a per-language CONFIG spelling. OPTIONAL --
+    // empty means the language declares NO such operator (folds to 0).
+    std::string hasCAttributeOperator;
+
+    // FC15c: the standard attributes the language KNOWS + their reported version
+    // ints (C23 6.10.1p4). Only meaningful alongside `hasCAttributeOperator`.
+    // Each entry's `name` must be non-empty and `version` > 0 (a malformed entry
+    // -> `C_InvalidPreprocess` at load). OPTIONAL -- empty means NO attribute is
+    // known (every `__has_c_attribute(x)` then yields 0).
+    std::vector<CAttributeDef> knownCAttributes;
+
+    // FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): opt into the GNU
+    // `,##__VA_ARGS__` extension. When TRUE, a `separator ## __VA_ARGS__` whose
+    // variadic part expands to EMPTY drops the preceding separator entirely (so
+    // with `#define LOG(fmt, ...) f(fmt, ## __VA_ARGS__)`, `LOG("x")` -> `f("x")`);
+    // a NON-empty `__VA_ARGS__` keeps the separator and does NOT paste. When FALSE
+    // (the default), standard C placemarker behavior applies and the separator
+    // survives (`sep ## <placemarker>` = `sep`). The separator is matched by the
+    // config-declared `functionLikeArgSeparatorToken` KIND and `__VA_ARGS__` by
+    // `variadicArgsName` -- never a hardcoded `,` byte or name. A language that does
+    // not opt in (every non-C grammar) leaves this FALSE -> no behavior change.
+    bool variadicCommaElision = false;
 };
 
 } // namespace dss

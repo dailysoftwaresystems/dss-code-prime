@@ -172,6 +172,20 @@ constexpr std::uint8_t BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB    = 0x70;
 constexpr std::uint8_t BIND_OPCODE_DO_BIND                        = 0x90;
 constexpr std::uint8_t BIND_TYPE_POINTER                          = 1;
 
+// dyld REBASE opcodes (<mach-o/loader.h>) — the legacy LC_DYLD_INFO_ONLY
+// rebase stream. A PIE image (MH_PIE) is mapped at a random slide; dyld must
+// add that slide to every ABSOLUTE pointer stored in the image's data
+// (F5 symbol-address globals: `int* p = &target;` stores target's link-time
+// VA in __DATA). WITHOUT a rebase entry per such site dyld leaves the stored
+// VA unbiased → the pointer is `slide` bytes off → SIGSEGV / garbage. The
+// stream sets a type (POINTER), then per site sets (segment,offset) and does
+// one rebase. The low nibble of SET_*/DO_REBASE_*_IMM_* is an immediate.
+constexpr std::uint8_t REBASE_OPCODE_DONE                         = 0x00;
+constexpr std::uint8_t REBASE_OPCODE_SET_TYPE_IMM                 = 0x10;
+constexpr std::uint8_t REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB  = 0x20;
+constexpr std::uint8_t REBASE_OPCODE_DO_REBASE_IMM_TIMES          = 0x50;
+constexpr std::uint8_t REBASE_TYPE_POINTER                        = 1;
+
 constexpr std::size_t kDyldInfoCommandSize = 48;
 constexpr std::size_t kDysymtabCommandSize = 80;
 constexpr std::size_t kGotSlotSize         = 8;
@@ -1502,18 +1516,21 @@ encodeExecDynamic(AssembledModule const&    module,
         fmt.sectionByKind(SectionKind::Data);
     ObjectFormatSectionInfo const* secBss =
         fmt.sectionByKind(SectionKind::Bss);
-    auto const constLayoutOpt = link::format::buildExecDataSection(
+    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): allowItemRelocations=true — symbol-
+    // address global pointers carry abs64 data→data relocs patched in place below
+    // (after symbolVa). MUTABLE layouts so applyDataItemRelocations fixes the bytes.
+    auto constLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Rodata,
         secConst != nullptr ? secConst->addrAlign : 1,
-        "macho::encodeExecDynamic", reporter);
+        "macho::encodeExecDynamic", reporter, /*allowItemRelocations=*/true);
     if (!constLayoutOpt.has_value()) return {};
-    auto const& constLayout = *constLayoutOpt;
-    auto const dataLayoutOpt = link::format::buildExecDataSection(
+    auto& constLayout = *constLayoutOpt;
+    auto dataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Data,
         secData != nullptr ? secData->addrAlign : 1,
-        "macho::encodeExecDynamic", reporter);
+        "macho::encodeExecDynamic", reporter, /*allowItemRelocations=*/true);
     if (!dataLayoutOpt.has_value()) return {};
-    auto const& dataLayout = *dataLayoutOpt;
+    auto& dataLayout = *dataLayoutOpt;
     auto const bssLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Bss,
         secBss != nullptr ? secBss->addrAlign : 1,
@@ -1607,6 +1624,48 @@ encodeExecDynamic(AssembledModule const&    module,
     if (!link::format::addInteriorBlockSymbolVas(
             module, funcTextStart, sectionVa, symbolVa,
             "macho::encodeExecDynamic", reporter)) {
+        return {};
+    }
+
+    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): patch each symbol-address global
+    // pointer's abs64 reloc IN PLACE with the target's resolved VA (symbolVa is
+    // fully built now), AND collect each fixup site so the LC_DYLD_INFO_ONLY
+    // REBASE stream emitted below can tell dyld to add the PIE slide. The darwin
+    // exec formats set MH_PIE, so dyld maps the image at a random slide: an
+    // in-place patch ALONE would leave these absolute pointers unbiased and
+    // `*p` would dereference `slide` bytes off the target. The section-byte
+    // emission far below reads the patched `constLayout.bytes`/`dataLayout.bytes`.
+    std::vector<std::uint64_t> constRebaseSiteVas;  // __TEXT,__const fixup VAs
+    std::vector<std::uint64_t> dataRebaseSiteVas;   // __DATA,__data  fixup VAs
+    if (hasConst
+        && !link::format::applyDataItemRelocations(
+               constLayout.bytes, module.dataItems, constLayout, constSectionVa,
+               symbolVa, targetSchema, "macho::encodeExecDynamic", reporter,
+               &constRebaseSiteVas)) {
+        return {};
+    }
+    // A reloc-bearing rodata item (a `int* const p = &x;` const pointer-to-symbol,
+    // or any future const-with-relocs like a vtable) lands in __TEXT,__const — a
+    // read-execute, code-signed segment dyld CANNOT rebase. Fail loud rather than
+    // ship a silently-wrong PIE image (the common MUTABLE case `int* p = &x;` →
+    // __DATA is rebased below). D-LK1-MACHO-RODATA-DATAITEM-RELOC: close by routing
+    // such items to a writable-at-load __DATA_CONST segment (Apple's const-reloc
+    // idiom), not the sealed __TEXT,__const.
+    if (!constRebaseSiteVas.empty()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: {} symbol-address pointer(s) "
+                         "land in read-only __TEXT,__const (a const-qualified "
+                         "pointer-to-symbol global) which dyld cannot PIE-rebase — "
+                         "not yet supported (D-LK1-MACHO-RODATA-DATAITEM-RELOC). A "
+                         "MUTABLE pointer-to-symbol global (→ __DATA) is supported.",
+                         constRebaseSiteVas.size()));
+        return {};
+    }
+    if (hasData
+        && !link::format::applyDataItemRelocations(
+               dataLayout.bytes, module.dataItems, dataLayout, dataSecVa,
+               symbolVa, targetSchema, "macho::encodeExecDynamic", reporter,
+               &dataRebaseSiteVas)) {
         return {};
     }
 
@@ -2044,6 +2103,47 @@ encodeExecDynamic(AssembledModule const&    module,
     std::uint64_t const dataSegVmaddr =
         hasDataSeg ? sectionVa + (dataSegFileOff - textFileOff) : 0;
     std::uint64_t const dataSegFileSize = hasData ? dataSecFileSize : 0;
+
+    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): the LC_DYLD_INFO_ONLY REBASE opcode
+    // stream for the __DATA abs64 pointer sites collected after symbolVa was
+    // built. Each is rebased as a POINTER at (segment __DATA, offset = siteVA −
+    // __DATA vmaddr). __DATA is the 4th segment: __PAGEZERO=0, __TEXT=1,
+    // __DATA_CONST=2 are ALL unconditional, then __DATA=3 (present whenever a
+    // data item exists, which is exactly when dataRebaseSiteVas is non-empty);
+    // i.e. the bind stream's kSegIdxDataConst (=2) + 1, same emission order. An
+    // empty site list yields ZERO rebase bytes — byte-identical to the no-data
+    // path. dyld adds the image's load slide to each rebased pointer.
+    constexpr std::uint8_t kSegIdxData = 3;
+    // The chained-fixups path (D-LK6-14) encodes rebases as inline
+    // DYLD_CHAINED_PTR_64 bitfields, NOT a rebase opcode stream — a different
+    // mechanism this writer does not yet emit for DATA sites. The shipped darwin
+    // formats use the legacy path (useChainedFixups=false), so this never fires
+    // for them; fail loud rather than drop the rebases silently if it is enabled.
+    if (useChainedFixups && !dataRebaseSiteVas.empty()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: {} symbol-address pointer "
+                         "site(s) need PIE rebasing, but the chained-fixups path "
+                         "(image.useChainedFixups=true) does not yet emit DATA "
+                         "rebases (D-LK6-14). Use the legacy LC_DYLD_INFO_ONLY "
+                         "path (useChainedFixups=false).",
+                         dataRebaseSiteVas.size()));
+        return {};
+    }
+    std::vector<std::uint8_t> dyldRebaseBlob;
+    if (!dataRebaseSiteVas.empty()) {
+        dyldRebaseBlob.push_back(static_cast<std::uint8_t>(
+            REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER));
+        for (std::uint64_t const siteVa : dataRebaseSiteVas) {
+            dyldRebaseBlob.push_back(static_cast<std::uint8_t>(
+                REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | kSegIdxData));
+            appendULEB128(dyldRebaseBlob, siteVa - dataSegVmaddr);
+            dyldRebaseBlob.push_back(static_cast<std::uint8_t>(
+                REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1u));   // rebase 1 pointer
+        }
+        dyldRebaseBlob.push_back(REBASE_OPCODE_DONE);
+        while (dyldRebaseBlob.size() % kLoadCmdAlign != 0)
+            dyldRebaseBlob.push_back(0);
+    }
     std::uint64_t const dataSegVmEnd =
         hasBss ? (bssSecVaLate + bssSecSize)
                : (hasData ? dataSecVaLate + dataSecFileSize : dataSegVmaddr);
@@ -2171,7 +2271,12 @@ encodeExecDynamic(AssembledModule const&    module,
         hasDataSeg
             ? alignUp(dataSecFileOff + dataSecFileSize, kPageSize)
             : alignUp(gotFileOff + gotFileSize, kPageSize);
-    std::uint64_t const bindOff = linkeditFileOff;
+    // F5: the REBASE stream leads __LINKEDIT (rebase, then bind, then the rest),
+    // matching dyld's LC_DYLD_INFO field order. bindOff (and every offset below)
+    // shifts up by rebaseSize, so linkeditFileSize grows by it automatically.
+    std::uint64_t const rebaseOff = linkeditFileOff;
+    std::uint64_t const rebaseSize = dyldRebaseBlob.size();
+    std::uint64_t const bindOff = rebaseOff + rebaseSize;
     std::uint64_t const bindSize = dyldBindBlob.size();
     std::uint64_t const indirectSymtabOff = bindOff + bindSize;
     std::uint64_t const indirectSymtabSize =
@@ -2484,7 +2589,10 @@ encodeExecDynamic(AssembledModule const&    module,
         // LC_DYLD_INFO_ONLY (legacy opcode-stream binding).
         appendU32LE(bytes, LC_DYLD_INFO_ONLY);
         appendU32LE(bytes, static_cast<std::uint32_t>(kDyldInfoCommandSize));
-        appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // rebase_off/size
+        // F5: rebase_off/size point at the dyld REBASE stream (PIE-rebases the
+        // __DATA symbol-address pointer sites). Zero when the module has none.
+        appendU32LE(bytes, static_cast<std::uint32_t>(rebaseSize ? rebaseOff : 0));
+        appendU32LE(bytes, static_cast<std::uint32_t>(rebaseSize));
         appendU32LE(bytes, static_cast<std::uint32_t>(bindOff));
         appendU32LE(bytes, static_cast<std::uint32_t>(bindSize));
         appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // weak_bind
@@ -2629,6 +2737,11 @@ encodeExecDynamic(AssembledModule const&    module,
 
     // Pad to linkeditFileOff
     while (bytes.size() < linkeditFileOff) bytes.push_back(0);
+
+    // __LINKEDIT: F5 dyld REBASE opcode stream — leads __LINKEDIT at
+    // rebaseOff == linkeditFileOff and PIE-rebases each __DATA abs64 pointer
+    // site (symbol-address globals). Empty for a module with none.
+    bytes.insert(bytes.end(), dyldRebaseBlob.begin(), dyldRebaseBlob.end());
 
     // __LINKEDIT: dyld binding bytes (legacy bind opcode stream
     // OR chained-fixups payload depending on useChainedFixups).

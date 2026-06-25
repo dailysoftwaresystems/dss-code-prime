@@ -3436,3 +3436,161 @@ TEST(HirLoweringCSubset, DeepNestedSwitchLowersFlatOnNormalStack) {
     EXPECT_EQ(switchLevels, kDepth)
         << "exactly one nested SwitchStmt per source `switch`";
 }
+
+// ─────────────────────────── FC-F1: ++/-- (Cluster F item F1) ───────────────
+// Prefix `++`/`--` (pre + post, integer + pointer). Postfix-int already worked
+// (IncrementInStatementPositionLowers / ValueYieldingIncrementLowersToSeqExpr);
+// these pin the NEW behavior: prefix parses+lowers, prefix yields the NEW value
+// (vs postfix's OLD), and a POINTER ++/-- scales by sizeof(*p) via the Index→Gep
+// path (NOT a bare 1-byte BinaryOp Add). Strict + red-on-disable.
+
+TEST(HirLoweringCSubset, PrefixIncrementStatementLowersToAssign) {
+    // `++x;` in statement position → a clean AssignStmt + BinaryOp (NOT a value-
+    // position SeqExpr). Proves MF-2 (the unaryExprRule arm of lowerStmtExprCore).
+    SemanticModel model = analyzeCSubset("void f(int x) { ++x; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId stmt = res->hir.children(body)[0];
+    ASSERT_EQ(res->hir.kind(stmt), HirKind::AssignStmt)
+        << "prefix ++x; must lower to an AssignStmt, not a SeqExpr";
+    // The stored value is `x + 1` (a BinaryOp), not a SeqExpr.
+    EXPECT_EQ(res->hir.kind(res->hir.assignValue(stmt)), HirKind::BinaryOp);
+}
+
+TEST(HirLoweringCSubset, PrefixIncrementValueYieldsNewValue) {
+    // `return ++x;` — prefix yields the NEW value: lowers to a SeqExpr that
+    // STORES then yields a fresh READ of the lvalue (the post-store value), with
+    // NO leading temp VarDecl (the distinguishing mark vs postfix). For a simple
+    // local, that read is a Ref to `x` ITSELF — and crucially it names the SAME
+    // symbol the store writes to (so the yield is the post-store value of x).
+    SemanticModel model = analyzeCSubset("int f(int x) { return ++x; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId ret  = res->hir.children(body)[0];
+    HirNodeId val  = *res->hir.returnValue(ret);
+    ASSERT_EQ(res->hir.kind(val), HirKind::SeqExpr);
+    // stmts: [assign x = x+1] ONLY (no tmp save).
+    ASSERT_EQ(res->hir.seqExprStmts(val).size(), 1u)
+        << "prefix has NO leading temp VarDecl (postfix saves the old value first)";
+    HirNodeId store = res->hir.seqExprStmts(val)[0];
+    ASSERT_EQ(res->hir.kind(store), HirKind::AssignStmt);
+    // The yielded value is a fresh Ref to the SAME symbol the store targets (x) —
+    // i.e. the post-store value of x, NOT a saved temp.
+    HirNodeId yield = res->hir.seqExprResult(val);
+    ASSERT_EQ(res->hir.kind(yield), HirKind::Ref);
+    EXPECT_EQ(res->hir.payload(yield), res->hir.payload(res->hir.assignTarget(store)))
+        << "prefix yields a read of x itself (the new value), not a temp";
+}
+
+TEST(HirLoweringCSubset, PrefixVsPostfixDistinctReturn) {
+    // The make-or-break: prefix and postfix value-position lowerings DIFFER.
+    // Postfix `x++`: SeqExpr stmts = [tmp = x (VarDecl), x = x+1], result = Ref(tmp)
+    //   → yields the OLD value (2 stmts; the yielded Ref names the TEMP, a symbol
+    //   distinct from x — the store target).
+    // Prefix `++x`: SeqExpr stmts = [x = x+1], result = Ref(x)
+    //   → yields the NEW value (1 stmt; the yielded Ref names x = the store target).
+    DiagnosticReporter rPost, rPre;
+    SemanticModel mPost = analyzeCSubset("int f(int x) { return x++; }");
+    SemanticModel mPre  = analyzeCSubset("int f(int x) { return ++x; }");
+    ASSERT_FALSE(mPost.hasErrors());
+    ASSERT_FALSE(mPre.hasErrors());
+    auto post = lowerToHir(mPost, rPost);
+    auto pre  = lowerToHir(mPre, rPre);
+    ASSERT_TRUE(post->ok);
+    ASSERT_TRUE(pre->ok);
+    auto seqOf = [](auto const& res) {
+        HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+        return *res->hir.returnValue(res->hir.children(body)[0]);
+    };
+    HirNodeId postSeq = seqOf(post);
+    HirNodeId preSeq  = seqOf(pre);
+    ASSERT_EQ(post->hir.kind(postSeq), HirKind::SeqExpr);
+    ASSERT_EQ(pre->hir.kind(preSeq), HirKind::SeqExpr);
+    // Distinct stmt counts: postfix saves the old value first (2), prefix does not (1).
+    EXPECT_EQ(post->hir.seqExprStmts(postSeq).size(), 2u);
+    EXPECT_EQ(pre->hir.seqExprStmts(preSeq).size(), 1u);
+    // The make-or-break value distinction, symbol-id-internals-free: in BOTH the
+    // last stmt is the store `x = x ± 1`. Prefix yields a read of the SAME symbol
+    // the store targets (x = the NEW value); postfix yields a DIFFERENT symbol
+    // (the saved temp = the OLD value).
+    auto storeTargetSym = [](auto const& res, HirNodeId seq) {
+        auto s = res->hir.seqExprStmts(seq);
+        return res->hir.payload(res->hir.assignTarget(s.back()));
+    };
+    HirNodeId postYield = post->hir.seqExprResult(postSeq);
+    HirNodeId preYield  = pre->hir.seqExprResult(preSeq);
+    ASSERT_EQ(post->hir.kind(postYield), HirKind::Ref);
+    ASSERT_EQ(pre->hir.kind(preYield), HirKind::Ref);
+    EXPECT_NE(post->hir.payload(postYield), storeTargetSym(post, postSeq))
+        << "postfix yields the OLD value (a temp), distinct from the store target";
+    EXPECT_EQ(pre->hir.payload(preYield), storeTargetSym(pre, preSeq))
+        << "prefix yields the NEW value (a read of x itself = the store target)";
+}
+
+TEST(HirLoweringCSubset, PointerPostfixIncrementScalesViaGep) {
+    // `*(p++)` on `int* p` — the pointer step must route through the Index→Gep
+    // element-scaling path (`AddressOf(Index(lvRead(p), ±1, int))`), NOT a bare
+    // `BinaryOp Add(ptr, 1)` (which would step 1 BYTE, not sizeof(int)). The
+    // lowered HIR therefore contains an Index + AddressOf for the step, and the
+    // pointer SeqExpr's stored value is NOT a BinaryOp.
+    SemanticModel model = analyzeCSubset("int f(int* p) { return *(p++); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    // The scaled-step nodes are present.
+    HirNodeId idx  = findFirstByKind(res->hir, res->hir.root(), HirKind::Index);
+    EXPECT_TRUE(idx.valid())
+        << "pointer ++ must lower through an Index node (the sizeof-scaled Gep path)";
+    // Find the SeqExpr (the p++ value) and assert its STORED value is the scaled
+    // AddressOf(Index(...)) pointer, never a bare BinaryOp Add on the pointer.
+    HirNodeId seq = findFirstByKind(res->hir, res->hir.root(), HirKind::SeqExpr);
+    ASSERT_TRUE(seq.valid());
+    auto stmts = res->hir.seqExprStmts(seq);
+    ASSERT_FALSE(stmts.empty());
+    HirNodeId store = stmts.back();   // the lvWrite (AssignStmt)
+    ASSERT_EQ(res->hir.kind(store), HirKind::AssignStmt);
+    EXPECT_EQ(res->hir.kind(res->hir.assignValue(store)), HirKind::AddressOf)
+        << "pointer step value must be AddressOf(Index(...)), not BinaryOp Add";
+    EXPECT_NE(res->hir.kind(res->hir.assignValue(store)), HirKind::BinaryOp);
+}
+
+TEST(HirLoweringCSubset, PointerIncDecStatementPositionScalesViaGep) {
+    // The plan-lock's explicit call-out: cover the OTHER two MF-1 sites
+    // (statement position) too, not only value position — `p++;` and `++p;` must
+    // ALSO route through the Index→Gep scaling, so the shared-incidental-coverage
+    // trap (only value-position exercised) cannot hide a stmt-site regression.
+    for (char const* src : {"void f(int* p) { p++; }", "void f(int* p) { ++p; }"}) {
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors()) << src;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << src << ": " << (r.all().empty() ? "" : r.all()[0].actual);
+        HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+        HirNodeId stmt = res->hir.children(body)[0];
+        ASSERT_EQ(res->hir.kind(stmt), HirKind::AssignStmt) << src;
+        // The stored value is the scaled pointer AddressOf(Index(...)), NOT a
+        // BinaryOp Add stepping a single byte.
+        EXPECT_EQ(res->hir.kind(res->hir.assignValue(stmt)), HirKind::AddressOf) << src;
+        EXPECT_TRUE(findFirstByKind(res->hir, stmt, HirKind::Index).valid()) << src;
+    }
+}
+
+TEST(HirLoweringCSubset, NonLvalueIncDecFailsLoud) {
+    // A manifest rvalue operand (`5++` / `++5`) is not a modifiable lvalue —
+    // fail loud with S_IncDecNeedsModifiableLvalue (MF-4), never a silent
+    // write-back to a non-object.
+    for (char const* src : {"int f() { return 5++; }", "int f() { return ++5; }"}) {
+        SemanticModel model = analyzeCSubset(src);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_FALSE(res->ok) << src;
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_IncDecNeedsModifiableLvalue), 1u) << src;
+    }
+}

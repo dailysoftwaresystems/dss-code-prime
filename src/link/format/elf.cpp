@@ -511,16 +511,20 @@ encodeElfExecDynamic(
         secDataDyn != nullptr ? secDataDyn->addrAlign : 1;
     std::uint64_t const bssDynAlignFloor =
         secBssDyn != nullptr ? secBssDyn->addrAlign : 1;
-    auto const rodataDynLayoutOpt = link::format::buildExecDataSection(
+    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): allowItemRelocations=true — symbol-
+    // address global pointers carry abs64 data→data relocs patched in place below
+    // (after symbolVa is built). The layouts are MUTABLE so applyDataItemRelocations
+    // can fix up their bytes; the emission below reads the patched bytes.
+    auto rodataDynLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Rodata, rodataDynAlignFloor,
-        "elf::encodeElfExecDynamic", reporter);
+        "elf::encodeElfExecDynamic", reporter, /*allowItemRelocations=*/true);
     if (!rodataDynLayoutOpt.has_value()) return {};
-    auto const& rodataDynLayout = *rodataDynLayoutOpt;
-    auto const dataDynLayoutOpt = link::format::buildExecDataSection(
+    auto& rodataDynLayout = *rodataDynLayoutOpt;
+    auto dataDynLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Data, dataDynAlignFloor,
-        "elf::encodeElfExecDynamic", reporter);
+        "elf::encodeElfExecDynamic", reporter, /*allowItemRelocations=*/true);
     if (!dataDynLayoutOpt.has_value()) return {};
-    auto const& dataDynLayout = *dataDynLayoutOpt;
+    auto& dataDynLayout = *dataDynLayoutOpt;
     auto const bssDynLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Bss, bssDynAlignFloor,
         "elf::encodeElfExecDynamic", reporter);
@@ -946,6 +950,23 @@ encodeElfExecDynamic(
     if (!link::format::addInteriorBlockSymbolVas(
             module, funcTextStart, textVa, symbolVa,
             "elf::encodeElfExecDynamic", reporter)) {
+        return {};
+    }
+    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): patch each MUTABLE symbol-address
+    // global pointer's abs64 data→data reloc IN PLACE with the target's resolved
+    // VA (symbolVa is fully built now). ELF exec is in-place — no `.rela` for an
+    // ET_EXEC / PIE image (the loader applies the PIE slide); siteVasOut=nullptr.
+    // The emission below reads `rodataDynLayout.bytes` / `dataDynLayout.bytes`.
+    if (hasRodataDyn
+        && !link::format::applyDataItemRelocations(
+               rodataDynLayout.bytes, module.dataItems, rodataDynLayout, rodataVa,
+               symbolVa, targetSchema, "elf::encodeElfExecDynamic", reporter)) {
+        return {};
+    }
+    if (hasDataDyn
+        && !link::format::applyDataItemRelocations(
+               dataDynLayout.bytes, module.dataItems, dataDynLayout, dataVa,
+               symbolVa, targetSchema, "elf::encodeElfExecDynamic", reporter)) {
         return {};
     }
     if (!link::format::applyExecRelocations(
