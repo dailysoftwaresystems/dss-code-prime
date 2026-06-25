@@ -741,11 +741,10 @@ struct Lowerer {
     // fail-loud (no encodings at any width — first-match could
     // otherwise pick a wrong-width form). Returns true (no-op) for
     // non-FPR types. Applied exactly where float encodings exist
-    // (FAdd, FDiv, FCmp operands, FPToSI source, FPTrunc/FPExt
-    // source+result, FPR-class Load); the still-encoding-less float
-    // ops (FSub/FMul/FNeg) keep their assemble-tier
-    // A_NoEncodingDeclared fail-loud and gain this gate alongside
-    // their encodings.
+    // (FAdd, FSub, FMul, FDiv, FCmp operands, FPToSI source, FPTrunc/FPExt
+    // source+result, FPR-class Load); the lone still-encoding-less float op
+    // (FNeg) keeps its assemble-tier A_NoEncodingDeclared fail-loud and will
+    // gain this gate alongside its encoding (D-CSUBSET-FLOAT-NEG-ENCODING).
     [[nodiscard]] bool requireEncodedFloatWidth(MirInstId id, TypeId ty,
                                                 std::string_view context) {
         if (!ty.valid()) return true;  // upstream diagnosed the type hole
@@ -1292,8 +1291,20 @@ struct Lowerer {
                 if (!requireEncodedFloatWidth(id, mir.instType(id),
                                               "MIR FAdd")) return;
                 return lowerBinaryOp(id, MnemonicSlot::FAdd);
-            case MirOpcode::FSub:   return lowerBinaryOp(id, MnemonicSlot::FSub);
-            case MirOpcode::FMul:   return lowerBinaryOp(id, MnemonicSlot::FMul);
+            case MirOpcode::FSub:
+                // Cluster-F F3: fsub gains its encodings (SUBSD/SUBSS, arm64
+                // FSUB D/S) — same width gate+axis as FAdd/FDiv (an F16/F128
+                // FSub would otherwise first-match the width:64 SUBSD variant —
+                // the wrong-width silent-miscompile this gate walls off).
+                if (!requireEncodedFloatWidth(id, mir.instType(id),
+                                              "MIR FSub")) return;
+                return lowerBinaryOp(id, MnemonicSlot::FSub);
+            case MirOpcode::FMul:
+                // Cluster-F F3: fmul gains its encodings (MULSD/MULSS, arm64
+                // FMUL D/S) — same gate+axis.
+                if (!requireEncodedFloatWidth(id, mir.instType(id),
+                                              "MIR FMul")) return;
+                return lowerBinaryOp(id, MnemonicSlot::FMul);
             case MirOpcode::FDiv:
                 // FC3.5 sweep-c2: fdiv gains its first encodings
                 // (DIVSD/DIVSS, arm64 FDIV D/S) — the NaN-construction
