@@ -1502,18 +1502,21 @@ encodeExecDynamic(AssembledModule const&    module,
         fmt.sectionByKind(SectionKind::Data);
     ObjectFormatSectionInfo const* secBss =
         fmt.sectionByKind(SectionKind::Bss);
-    auto const constLayoutOpt = link::format::buildExecDataSection(
+    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): allowItemRelocations=true — symbol-
+    // address global pointers carry abs64 data→data relocs patched in place below
+    // (after symbolVa). MUTABLE layouts so applyDataItemRelocations fixes the bytes.
+    auto constLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Rodata,
         secConst != nullptr ? secConst->addrAlign : 1,
-        "macho::encodeExecDynamic", reporter);
+        "macho::encodeExecDynamic", reporter, /*allowItemRelocations=*/true);
     if (!constLayoutOpt.has_value()) return {};
-    auto const& constLayout = *constLayoutOpt;
-    auto const dataLayoutOpt = link::format::buildExecDataSection(
+    auto& constLayout = *constLayoutOpt;
+    auto dataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Data,
         secData != nullptr ? secData->addrAlign : 1,
-        "macho::encodeExecDynamic", reporter);
+        "macho::encodeExecDynamic", reporter, /*allowItemRelocations=*/true);
     if (!dataLayoutOpt.has_value()) return {};
-    auto const& dataLayout = *dataLayoutOpt;
+    auto& dataLayout = *dataLayoutOpt;
     auto const bssLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Bss,
         secBss != nullptr ? secBss->addrAlign : 1,
@@ -1607,6 +1610,24 @@ encodeExecDynamic(AssembledModule const&    module,
     if (!link::format::addInteriorBlockSymbolVas(
             module, funcTextStart, sectionVa, symbolVa,
             "macho::encodeExecDynamic", reporter)) {
+        return {};
+    }
+
+    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): patch each symbol-address global
+    // pointer's abs64 reloc IN PLACE with the target's resolved VA (symbolVa is
+    // fully built now). Mach-O exec is in-place — no separate reloc section (dyld
+    // applies the slide for a PIE image); siteVasOut=nullptr. The section-byte
+    // emission below reads the patched `constLayout.bytes` / `dataLayout.bytes`.
+    if (hasConst
+        && !link::format::applyDataItemRelocations(
+               constLayout.bytes, module.dataItems, constLayout, constSectionVa,
+               symbolVa, targetSchema, "macho::encodeExecDynamic", reporter)) {
+        return {};
+    }
+    if (hasData
+        && !link::format::applyDataItemRelocations(
+               dataLayout.bytes, module.dataItems, dataLayout, dataSecVa,
+               symbolVa, targetSchema, "macho::encodeExecDynamic", reporter)) {
         return {};
     }
 
