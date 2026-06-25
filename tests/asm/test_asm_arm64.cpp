@@ -1924,6 +1924,63 @@ TEST(Arm64Encoder, FaddEncodesScalarDouble) {
     EXPECT_EQ(bytes[3], 0x1E);
 }
 
+TEST(Arm64Encoder, FmulEncodesScalarDouble) {
+    // Cluster-F F3: fmul d0, d1, d2 — FP data-proc (2 source), double:
+    //   base 0x1E600800 (FMUL opcode field [15:10]=000010, vs FADD's 001010)
+    //   | Rm=d2(2)<<16 | Rn=d1(1)<<5 = 0x1E620820 — LE bytes: 20 08 62 1E.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const fmulOp = (*s)->opcodeByMnemonic("fmul");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(fmulOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(fpr(**s, "d1")),
+                               LirOperand::makeReg(fpr(**s, "d2")) };
+    (void)b.addInst(*fmulOp, fpr(**s, "d0"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0x08);
+    EXPECT_EQ(bytes[2], 0x62);
+    EXPECT_EQ(bytes[3], 0x1E);
+}
+
+TEST(Arm64Encoder, FsubEncodesScalarDoubleNonCommutative) {
+    // Cluster-F F3: fsub d0, d1, d2 = d1 - d2 — FP data-proc (2 source), double:
+    //   base 0x1E603800 (FSUB opcode field [15:10]=001110, = FADD | 0x1000)
+    //   | Rm=d2(2)<<16 | Rn=d1(1)<<5 = 0x1E623820 — LE bytes: 20 38 62 1E.
+    //   Rn(d1)=minuend, Rm(d2)=subtrahend: a SWAPPED Rn<->Rm wire flips the sign.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const fsubOp = (*s)->opcodeByMnemonic("fsub");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(fsubOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(fpr(**s, "d1")),
+                               LirOperand::makeReg(fpr(**s, "d2")) };
+    (void)b.addInst(*fsubOp, fpr(**s, "d0"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0x38);
+    EXPECT_EQ(bytes[2], 0x62);
+    EXPECT_EQ(bytes[3], 0x1E);
+}
+
 TEST(Arm64Encoder, FaddHighRegistersPinFiveBitFields) {
     // fadd d31, d8, d15 — every operand off the low-register fast
     // path, proving each 5-bit window's full width + placement

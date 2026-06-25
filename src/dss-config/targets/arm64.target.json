@@ -1352,6 +1352,68 @@
       }
     },
     {
+      "$comment": "Cluster-F F3 (float_mul_sub): FMUL Dd, Dn, Dm — scalar double, FP data-processing (2 source). The [15:10] field = {opcode[3:0], 10}; FMUL opcode=0000 -> 000010, so base = 0x1E600800 (= fadd 0x1E602800 with the opcode bits 0010->0000, i.e. clear bit 13). F32 sibling FMUL Sd,Sn,Sm = ftype=00 -> 0x1E200800 (D-form minus the ftype bit 0x400000). 3-operand NATIVE (no requires2Address, like fadd/fdiv); commutative. Mirrors fadd's wires (Rn=op0, Rm=op1).",
+      "mnemonic":      "fmul",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 509609984 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FMUL Sd, Sn, Sm — ftype=00 single, base 0x1E200800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 505415680 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Cluster-F F3 (float_mul_sub): FSUB Dd, Dn, Dm = Dn - Dm — scalar double, FP data-processing (2 source). FSUB opcode=0011 -> [15:10]=001110, base = 0x1E603800 (= fadd 0x1E602800 | 0x1000, opcode 0010->0011). F32 sibling = 0x1E203800. NON-COMMUTATIVE: op[0]=Rn (minuend), op[1]=Rm (subtrahend), Rd = Rn - Rm = a - b. 3-operand NATIVE (no requires2Address). Mirrors fadd's wire shape so the minuend/subtrahend order is preserved.",
+      "mnemonic":      "fsub",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 509622272 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "FSUB Sd, Sn, Sm — ftype=00 single, base 0x1E203800.",
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 505427968 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "FC3.5 sweep-c2: FDIV Dd, Dn, Dm — scalar double divide, FP data-processing (2 source), opcode 000110 at [15:10]: base 0x1E601800 (ftype=01); F32 sibling FDIV Sd, Sn, Sm = 0x1E201800 (ftype=00) — ARM ARM C7.2 FDIV (scalar). 3-operand NATIVE (no requires2Address). First consumer: NaN construction (0.0/0.0) for the D-COND-FLOAT-NAN-TRUTHINESS-FCMP corpus witnesses; closes the fdiv stub on this target.",
       "mnemonic":      "fdiv",
       "result":        "value",

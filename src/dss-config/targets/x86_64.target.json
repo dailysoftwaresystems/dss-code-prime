@@ -1297,14 +1297,62 @@
       }
     },
     {
+      "$comment": "Float subtract — SUBSD xmm1, xmm2 = F2 0F 5C /r (scalar double) / SUBSS = F3 0F 5C /r (scalar single), Intel SDM SUBSD/SUBSS. Cluster-F F3 (float_mul_sub): encoding added, mirroring fadd/fdiv (opcode 0F 5C vs fadd 0F 58). NON-COMMUTATIVE: dest=op[0] (the minuend) -> ModR/M.reg, op[1] (the subtrahend) -> ModR/M.rm, so `a - b` = reg(a) - rm(b) (same dest=ModR/M.reg convention as fdiv). 2-address (requires2Address): op[0] IS the destination after lir_2addr_legalize.",
       "mnemonic": "fsub", "result": "value",
+      "requires2Address": true,
       "minOperands": 2, "maxOperands": 2,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template": { "mandatoryPrefix": [242], "opcode": [15, 92] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "SUBSS xmm1, xmm2 — F3 0F 5C /r (scalar single).",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "mandatoryPrefix": [243], "opcode": [15, 92] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
     },
     {
+      "$comment": "Float multiply — MULSD xmm1, xmm2 = F2 0F 59 /r (scalar double) / MULSS = F3 0F 59 /r (scalar single), Intel SDM MULSD/MULSS. Cluster-F F3 (float_mul_sub): encoding added, mirroring fadd (opcode 0F 59 vs fadd 0F 58). Commutative; 2-address: dest=op[0] -> ModR/M.reg.",
       "mnemonic": "fmul", "result": "value",
+      "requires2Address": true,
       "minOperands": 2, "maxOperands": 2,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template": { "mandatoryPrefix": [242], "opcode": [15, 89] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "MULSS xmm1, xmm2 — F3 0F 59 /r (scalar single).",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "mandatoryPrefix": [243], "opcode": [15, 89] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "FC3.5 sweep-c2: float divide — DIVSD xmm1, xmm2 = F2 0F 5E /r (scalar double) / DIVSS = F3 0F 5E /r (scalar single), Intel SDM DIVSD/DIVSS. Same 2-address dest=ModR/M.reg shape as fadd (division is non-commutative: op[0] IS the dividend/destination after lir_2addr_legalize, op[1] the divisor in ModR/M.rm). First consumer: NaN construction (0.0/0.0) for the D-COND-FLOAT-NAN-TRUTHINESS-FCMP corpus witnesses — this also closes the fdiv encoding stub.",
