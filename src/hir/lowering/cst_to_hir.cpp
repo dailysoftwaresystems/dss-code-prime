@@ -1137,6 +1137,16 @@ struct Lowerer {
                     }
                     HirOperatorEntry const* e = unaryEntry(n, opTok, operandN);
                     if (e == nullptr) { result = lowerUnary(n); return; }  // malformed/unmapped
+                    // FC-F1: PREFIX `++x` / `--x` is NOT flattened through a Unary
+                    // frame (which would lower the operand FIRST, then hand the
+                    // already-lowered E to `combineUnaryOp` — too late to classify
+                    // the lvalue). Like PostInc/PostDec in the Postfix arm, it
+                    // classifies the lvalue BEFORE lowering, so it is handled
+                    // inline here via `lowerPreIncDec` (the value-position SeqExpr).
+                    if (e->target == "PreInc" || e->target == "PreDec") {
+                        result = lowerPreIncDec(n, operandN, e->target == "PreInc");
+                        return;
+                    }
                     work.push_back({.kind = ExprFrame::Kind::Unary, .node = n,
                                     .n0 = operandN, .e = e});
                     return;
@@ -2322,6 +2332,11 @@ struct Lowerer {
             return {errorNode(node), InvalidType};
         }
         HirOperatorEntry const& e = cfg.unaryOps[it->second];
+        // FC-F1: PREFIX `++x` / `--x` must classify the lvalue BEFORE lowering the
+        // operand, so it is intercepted here ahead of `combineUnaryOp` (which
+        // receives the ALREADY-lowered operand). Mirrors the driver's Unary arm.
+        if (e.target == "PreInc" || e.target == "PreDec")
+            return lowerPreIncDec(node, operandN, e.target == "PreInc");
         return combineUnaryOp(node, e, lowerExpr(operandN));
     }
 
@@ -2513,21 +2528,19 @@ struct Lowerer {
         HirOperatorEntry const& e = cfg.postfixOps[it->second];
         // Value-yielding `x++` / `x--` (postfix yields the OLD value): save it in
         // a temp, mutate the lvalue, yield the temp — all in a SeqExpr. Handled
-        // before lowering `base` (classifyLvalue lowers the lvalue itself).
+        // before lowering `base` (classifyIncDecLvalue lowers the lvalue itself).
+        // FC-F1: the new-value computation is the SHARED `incDecNewValue` (pointer
+        // step → sizeof(T)-scaled Gep, else integer/enum arithmetic) — one source
+        // across the value-post / stmt / value-pre ++/-- sites.
         if (e.target == "PostInc" || e.target == "PostDec") {
-            auto lv = classifyLvalue(baseN);
-            if (!lv) return exprError(node, "++/-- needs an lvalue operand");
+            bool const isInc = (e.target == "PostInc");
+            auto lv = classifyIncDecLvalue(baseN, node);
+            if (!lv) return {errorNode(node), InvalidType};
             SymbolId const tmp = freshSymbol();
             std::vector<HirNodeId> stmts = lv->prep;
             stmts.push_back(builder.makeVarDecl(lv->type, tmp.v, lvRead(*lv), HirFlags::Synthetic));
-            TypeId const opType = incDecArithType(lv->type);   // enum → underlying int
-            HirNodeId one = synthOne(opType);
-            HirNodeId lhs = coerce(E{lvRead(*lv), lv->type}, opType).id;   // no-op if non-enum
-            HirNodeId sum = builder.addParent(HirKind::BinaryOp, std::array{lhs, one}, opType,
-                                              encodeOp(e.target == "PostInc" ? HirOpKind::Add
-                                                                             : HirOpKind::Sub));
-            HirNodeId inc = coerce(E{sum, opType}, lv->type).id;          // int → enum write-back
-            stmts.push_back(lvWrite(*lv, inc));
+            HirNodeId newVal = incDecNewValue(*lv, isInc, node);
+            stmts.push_back(lvWrite(*lv, newVal));
             HirNodeId yield = builder.makeRef(lv->type, tmp.v);
             return {track(builder.makeSeqExpr(stmts, yield, lv->type, HirFlags::Synthetic), node),
                     lv->type};
@@ -3496,6 +3509,133 @@ struct Lowerer {
         else if (isSignedCore(core)) v.value = std::int64_t{1};
         else                         v.value = std::uint64_t{1};
         return builder.makeLiteral(type, literals.add(v), HirFlags::Synthetic);
+    }
+
+    // FC-F1: a synthetic SIGNED I64 step literal (`+1` for ++, `-1` for --), used
+    // as the INDEX of the `Index` node that scales a Ptr<T> increment by sizeof(T)
+    // (`pointerIncDecStep`). The I64 type is load-bearing: `scaleIndexToBytes`
+    // widths the stride constant + the Mul from `hir.typeId(step)`, so a same-width
+    // (I64 × I64) Mul is formed — a mixed-width Mul is verifier-blind. The SIGNED
+    // -1 yields a NEGATIVE scaled Gep offset for `p--` (`-sizeof(T)` bytes).
+    [[nodiscard]] HirNodeId synthPtrStep(bool inc) {
+        HirLiteralValue v;
+        v.core  = TypeKind::I64;
+        v.value = inc ? std::int64_t{1} : std::int64_t{-1};
+        return builder.makeLiteral(interner.primitive(TypeKind::I64),
+                                   literals.add(v), HirFlags::Synthetic);
+    }
+
+    // FC-F1 (C 6.5.2.4 / 6.5.6): `++`/`--` on a Ptr<T> lvalue steps by sizeof(T),
+    // NOT 1 byte. `AddressOf(Index(lvRead(lv), ±1, T))` reuses the EXISTING Index
+    // lowering's `scaleIndexToBytes`→`Gep` path (the SAME element scaling `p[1]`
+    // uses; HIR→MIR hir_to_mir.cpp Index arm — no MIR change). `makeIndex` carries
+    // the ELEMENT type T; `makeAddressOf` re-types the scaled Gep as `Ptr<T>` = the
+    // new pointer value. A `void*` (pointee Void) / function-pointer (pointee
+    // FnSig) element has no defined sizeof — the existing `scaleIndexToBytes`
+    // ALREADY fails loud there; an early guard here gives a clearer, positioned
+    // diagnostic. The shared single source for the pointer step at all THREE
+    // ++/-- sites (lowerPostfix value-post, lowerIncDecStmt stmt, lowerPreIncDec
+    // value-pre). Returns the new Ptr<T> value (or an error node).
+    [[nodiscard]] HirNodeId pointerIncDecStep(Lvalue const& lv, bool inc, NodeId anchor) {
+        // lv.type is Ptr<T>; extract the pointee T.
+        auto const ops = interner.operands(lv.type);
+        TypeId const pointee = ops.empty() ? InvalidType : ops[0];
+        if (!pointee.valid()) return errorNode(anchor);
+        TypeKind const pk = interner.kind(pointee);
+        if (pk == TypeKind::Void || pk == TypeKind::FnSig) {
+            emitH(DiagnosticCode::H_UnsupportedLoweringForKind, anchor,
+                  "++/-- on a pointer whose pointee has no size (void* / "
+                  "function pointer) — C 6.5.6 forbids pointer arithmetic on it");
+            return errorNode(anchor);
+        }
+        HirNodeId const baseRead = lvRead(lv);                 // the current Ptr<T>
+        HirNodeId const step     = synthPtrStep(inc);          // ±1 (I64)
+        HirNodeId const idx =
+            builder.makeIndex(baseRead, step, pointee, HirFlags::Synthetic);  // T-typed
+        return builder.makeAddressOf(idx, lv.type, HirFlags::Synthetic);      // Ptr<T>
+    }
+
+    // FC-F1: the NEW value an integer/enum-typed ++/-- writes back: `lvRead OP 1`
+    // at the enum-underlying arithmetic type, coerced back to the lvalue type for
+    // the store. Byte-identical to the long-standing postfix-int arithmetic (the
+    // shared single source across the three ++/-- sites — keeps postfix-int from
+    // regressing). Pointer lvalues route to `pointerIncDecStep` instead.
+    [[nodiscard]] HirNodeId incDecArithValue(Lvalue const& lv, bool inc, NodeId anchor) {
+        TypeId const opType = incDecArithType(lv.type);   // enum → underlying int
+        HirNodeId const one = synthOne(opType);
+        HirNodeId const lhs = coerce(E{lvRead(lv), lv.type}, opType).id;  // no-op if non-enum
+        HirNodeId const sum = track(builder.addParent(
+            HirKind::BinaryOp, std::array{lhs, one}, opType,
+            encodeOp(inc ? HirOpKind::Add : HirOpKind::Sub)), anchor);
+        return coerce(E{sum, opType}, lv.type).id;        // int → enum write-back
+    }
+
+    // FC-F1: the new value `++`/`--` stores for lvalue `lv` — the scaled pointer
+    // step for a Ptr<T> lvalue, else the integer/enum arithmetic. The ONE branch
+    // that decides pointer-vs-integer, shared by all three ++/-- sites.
+    [[nodiscard]] HirNodeId incDecNewValue(Lvalue const& lv, bool inc, NodeId anchor) {
+        if (lv.type.valid() && interner.kind(lv.type) == TypeKind::Ptr)
+            return pointerIncDecStep(lv, inc, anchor);
+        return incDecArithValue(lv, inc, anchor);
+    }
+
+    // FC-F1: classify the ++/-- operand as a MODIFIABLE lvalue, or report
+    // S_IncDecNeedsModifiableLvalue and return nullopt. Mirrors `classifyLvalue`
+    // (simple variable → no prep; complex → bind &lvalue into a temp pointer) BUT
+    // adds an lvalue-SHAPE guard the bare `classifyLvalue` lacks: a manifest rvalue
+    // (a literal `5++` / `++5`, an arithmetic result) lowers to a non-addressable
+    // HIR node (Literal / BinaryOp / …), which has no object to read-modify-write —
+    // reject it here rather than synthesize a write-back to a non-object.
+    // `classifyLvalue` itself stays permissive (the same gap plain assignment has —
+    // `5 = 3`; the `const`-lvalue case `const int x; x++;` is also still
+    // unmodelled), anchored D-CSUBSET-INCDEC-CONST-LVALUE. Lowers the operand
+    // ONCE (no double-lowering) and is the single source the three ++/-- sites
+    // share, so the guard + diagnostic stay identical across pre/post/stmt.
+    [[nodiscard]] std::optional<Lvalue> classifyIncDecLvalue(NodeId operandN, NodeId anchor) {
+        if (auto s = simpleLvalue(operandN)) {     // a plain variable is always an lvalue
+            if (!s->second.valid()) return std::nullopt;
+            Lvalue lv; lv.simple = true; lv.sym = s->first; lv.type = s->second;
+            return lv;
+        }
+        E target = lowerExpr(peelToCore(operandN));
+        // An addressable lvalue lowers to Deref (`*p`), Index (`a[i]`), or
+        // MemberAccess (`s.f`/`s->f`). Anything else — Literal, BinaryOp, UnaryOp,
+        // Call, Cast, SeqExpr — is an rvalue with no modifiable object.
+        HirKind const k = target.id.valid() ? builder.kind(target.id) : HirKind::Error;
+        bool const addressable = (k == HirKind::Deref || k == HirKind::Index
+                                  || k == HirKind::MemberAccess);
+        if (!target.type.valid() || !addressable) {
+            emitH(DiagnosticCode::S_IncDecNeedsModifiableLvalue, anchor,
+                  "operand of ++/-- is not a modifiable lvalue (C 6.5.2.4 / 6.5.3.1)");
+            return std::nullopt;
+        }
+        Lvalue lv;
+        lv.simple  = false;
+        lv.type    = target.type;
+        lv.ptrType = interner.pointer(target.type);
+        lv.sym     = freshSymbol();
+        HirNodeId addr = builder.makeAddressOf(target.id, lv.ptrType, HirFlags::Synthetic);
+        lv.prep.push_back(builder.makeVarDecl(lv.ptrType, lv.sym.v, addr, HirFlags::Synthetic));
+        return lv;
+    }
+
+    // FC-F1 (C 6.5.3.1): PREFIX `++x` / `--x` in VALUE position. Unlike postfix
+    // (which saves the OLD value in a temp, mutates, then yields the temp), prefix
+    // yields the NEW value: mutate, then yield a fresh read of the lvalue (which,
+    // in the SeqExpr's sequenced order, reads the POST-store value). `classifyLvalue`
+    // runs BEFORE any lowering (it lowers the lvalue itself), exactly as
+    // `lowerPostfix` does for PostInc/PostDec — so `combineUnaryOp` (which receives
+    // an ALREADY-lowered operand) is bypassed. The new value routes through the
+    // shared `incDecNewValue` (pointer-scaled step or integer arithmetic).
+    E lowerPreIncDec(NodeId node, NodeId operandN, bool isInc) {
+        auto lv = classifyIncDecLvalue(operandN, node);
+        if (!lv) return {errorNode(node), InvalidType};
+        std::vector<HirNodeId> stmts = lv->prep;
+        HirNodeId const newVal = incDecNewValue(*lv, isInc, node);
+        stmts.push_back(lvWrite(*lv, newVal));
+        HirNodeId const yield = lvRead(*lv);   // the NEW value (re-read AFTER the store)
+        return {track(builder.makeSeqExpr(stmts, yield, lv->type, HirFlags::Synthetic), node),
+                lv->type};
     }
 
     // D5.3: synthetic zero-fill literal of `type`. For scalar types this is
@@ -4589,23 +4729,27 @@ struct Lowerer {
         return asStmt(*lv, lvWrite(*lv, narrowed.id), binNode);
     }
 
-    // `x++` / `x--` in STATEMENT position → `x = x +/- 1` (the produced value is
-    // discarded). Value-yielding ++/-- (e.g. `y = x++`) lowers via a SeqExpr in
-    // lowerPostfix.
-    HirNodeId lowerIncDecStmt(NodeId postfixNode, bool isInc) {
+    // `x++` / `x--` — AND (FC-F1) prefix `++x;` / `--x;` — in STATEMENT position →
+    // `x = x +/- step` (the produced value is discarded, so pre/post coincide here:
+    // the unaryExprRule arm of `lowerStmtExprCore` routes a prefix `++x;` here too,
+    // a clean AssignStmt rather than a value-position SeqExpr). Value-yielding ++/--
+    // (e.g. `y = x++` / `y = ++x`) lowers via a SeqExpr in lowerPostfix /
+    // lowerPreIncDec. The operandNode's first non-token child is the lvalue (a
+    // postfix node `[base, ++]` OR a prefix unary node `[++, operand]` — either way
+    // the first non-token IS the operand). The new value is the SHARED
+    // `incDecNewValue` (pointer step → sizeof(T)-scaled Gep, else integer/enum).
+    HirNodeId lowerIncDecStmt(NodeId incDecNode, bool isInc) {
         NodeId baseN{};
-        for (NodeId c : visible(postfixNode)) { if (!isToken(c)) { baseN = c; break; } }
-        auto lv = baseN.valid() ? classifyLvalue(baseN) : std::nullopt;
-        if (!lv) return reportedError(postfixNode, "++/-- needs an lvalue operand");
-        TypeId const opType = incDecArithType(lv->type);   // enum → underlying int
-        HirNodeId one = synthOne(opType);
-        HirNodeId lhs = coerce(E{lvRead(*lv), lv->type}, opType).id;   // no-op if non-enum
-        HirNodeId sum = track(builder.addParent(HirKind::BinaryOp, std::array{lhs, one},
-                                                opType,
-                                                encodeOp(isInc ? HirOpKind::Add : HirOpKind::Sub)),
-                              postfixNode);
-        HirNodeId value = coerce(E{sum, opType}, lv->type).id;         // int → enum write-back
-        return asStmt(*lv, lvWrite(*lv, value), postfixNode);
+        for (NodeId c : visible(incDecNode)) { if (!isToken(c)) { baseN = c; break; } }
+        auto lv = baseN.valid() ? classifyIncDecLvalue(baseN, incDecNode) : std::nullopt;
+        if (!lv) {
+            if (!baseN.valid())
+                emitH(DiagnosticCode::S_IncDecNeedsModifiableLvalue, incDecNode,
+                      "operand of ++/-- is not a modifiable lvalue (C 6.5.2.4 / 6.5.3.1)");
+            return errorNode(incDecNode);
+        }
+        HirNodeId const value = incDecNewValue(*lv, isInc, incDecNode);
+        return asStmt(*lv, lvWrite(*lv, value), incDecNode);
     }
 
     // The statement-position dispatch shared by exprStmt and for-init/update:
@@ -4634,6 +4778,21 @@ struct Lowerer {
                         if (t == "PostDec") return lowerIncDecStmt(core, /*isInc=*/false);
                     }
                     break;
+                }
+            } else if (rv == cfg.unaryExprRule.v) {
+                // FC-F1: a PREFIX `++x;` / `--x;` in statement position lowers to a
+                // clean AssignStmt (the produced value is discarded, so pre/post
+                // coincide) — NOT the value-position SeqExpr `lowerPreIncDec`
+                // builds. The first token is the prefix operator; map it via unOp_.
+                for (NodeId c : visible(core)) {
+                    if (!isToken(c)) continue;
+                    auto it = unOp_.find(tree().tokenKind(c).v);
+                    if (it != unOp_.end()) {
+                        std::string const& t = cfg.unaryOps[it->second].target;
+                        if (t == "PreInc") return lowerIncDecStmt(core, /*isInc=*/true);
+                        if (t == "PreDec") return lowerIncDecStmt(core, /*isInc=*/false);
+                    }
+                    break;  // first token is the operator
                 }
             }
         }

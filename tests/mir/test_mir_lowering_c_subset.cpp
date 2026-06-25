@@ -6716,3 +6716,41 @@ TEST(MirLoweringCSubset, IterativeDeepIfNestLowersFlatAndByteIdentical) {
         << "the deepest THEN body is `return b`";
         });  // runOnLargeStack
 }
+
+// FC-F1 (C 6.5.2.4 / 6.5.6): a POINTER `++`/`--` steps by sizeof(*p), NOT 1 byte.
+// The HIR lowers `p++` to `AddressOf(Index(lvRead(p), ±1, T))`, routing through
+// the SAME `scaleIndexToBytes`→Gep path `p[i]` uses — so at MIR the pointer step
+// is a Gep whose index is a byte-scaling `Mul(±1, sizeof(T))`, never a raw 1-byte
+// `Add(ptr, 1)`. This MIR-tier pin is the structural witness for the silent-
+// miscompile FIX (the end-to-end runtime witness is examples/c-subset/core_incdec,
+// exit 0). RED-ON-DISABLE: route the Ptr lvalue through the integer arithmetic
+// path → the step becomes `Add(p, 1)` (no Gep, no Mul-by-4) → these fail.
+TEST(MirLoweringCSubset, PointerIncrementScalesByElementSizeViaGep) {
+    auto L = lowerCSubset("void f(int* p) { p++; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    bool foundScaledGep = false;
+    bool sawRawAdd = false;
+    for (std::uint32_t k = 0; k < m.blockInstCount(entry); ++k) {
+        MirInstId const id = m.blockInstAt(entry, k);
+        if (m.instOpcode(id) == MirOpcode::Add) sawRawAdd = true;
+        if (m.instOpcode(id) != MirOpcode::Gep) continue;
+        auto ops = m.instOperands(id);
+        ASSERT_EQ(ops.size(), 2u) << "pointer-step GEP is [base, byteIdx]";
+        MirInstId const idxOp = ops[1];
+        ASSERT_EQ(m.instOpcode(idxOp), MirOpcode::Mul)
+            << "the pointer step index must be byte-scaled (Mul by sizeof(T))";
+        auto mulOps = m.instOperands(idxOp);
+        ASSERT_EQ(mulOps.size(), 2u);
+        auto const& strideLit = m.literalValue(m.constLiteralIndex(mulOps[1]));
+        EXPECT_EQ(std::get<std::int64_t>(strideLit.value), 4)
+            << "int* element stride is sizeof(int) = 4";
+        foundScaledGep = true;
+    }
+    EXPECT_TRUE(foundScaledGep)
+        << "pointer ++ must lower to a sizeof-scaled GEP, never a 1-byte Add";
+    EXPECT_FALSE(sawRawAdd)
+        << "pointer ++ must NOT emit a raw integer Add (the old 1-byte step)";
+}

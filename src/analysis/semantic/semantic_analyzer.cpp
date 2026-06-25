@@ -4252,6 +4252,13 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     auto const combineUnary = [&](HirOperatorEntry const* e, TypeId ot) -> TypeId {
         if (e->target == "AddressOf") return ot.valid() ? interner.pointer(ot) : InvalidType;
         if (e->target == "Deref")     return derefResultType(interner, ot);
+        // FC-F1 (C 6.5.3.1): prefix `++x`/`--x` yields the OPERAND type (a value
+        // equal to the post-increment object), exactly as postfix `combinePostfix`
+        // does. Explicit here so the type does not rely on the `coreOpFromNameSem`
+        // fall-through (PreInc/PreDec are not core unary ops) — the CST→HIR tier
+        // also lowers prefix ++/-- to a SeqExpr whose result type is the lvalue
+        // type, so the two tiers agree.
+        if (e->target == "PreInc" || e->target == "PreDec") return ot;
         auto const op = coreOpFromNameSem(e->target);
         if (op.has_value() && *op == HirOpKind::Not) return boolType();
         return ot;   // Neg / BitNot are type-preserving

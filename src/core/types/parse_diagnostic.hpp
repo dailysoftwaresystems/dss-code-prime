@@ -416,6 +416,15 @@ enum class DiagnosticCode : std::uint16_t {
     // loud (C 6.8.1) rather than emit a stray arm-less case. Positioned at the
     // case/default keyword.
     S_CaseLabelNotInSwitch        = 0xE023,
+    // Cluster F1 (C 6.5.2.4 / 6.5.3.1): a prefix or postfix `++`/`--` whose
+    // operand is not a modifiable lvalue. Emitted at CST→HIR lowering, where the
+    // ++/-- sites classify the operand: a manifest rvalue (e.g. a literal `5++`,
+    // `++5`) has no object to read-modify-write, so it fails loud here rather
+    // than synthesize a write-back to a non-object. (A `const`-qualified lvalue
+    // `const int x; x++;` is a SEPARATE, pre-existing gap — `classifyLvalue` does
+    // not yet model `const` — anchored as D-CSUBSET-INCDEC-CONST-LVALUE, shared
+    // with the same gap on plain assignment.) Positioned at the ++/-- expression.
+    S_IncDecNeedsModifiableLvalue = 0xE024,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
