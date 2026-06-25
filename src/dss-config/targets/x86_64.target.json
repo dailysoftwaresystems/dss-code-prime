@@ -1048,9 +1048,34 @@
       }
     },
     {
+      "$comment": "Bitwise XOR. Cluster-F F2 (core_bitwise): encodings added — XOR r/m64, r64 = REX.W 31 /r + the no-REX.W 32-bit sibling (Intel SDM XOR; the same 64/32 reg-reg shape as and/or, opcode 0x31 vs AND 0x21 / OR 0x09). Closes the source-level `^` assembler wall the bitwise_and_or example noted as deferred. 2-address: the r/m operand IS the destination (requires2Address legalize inserts the copy).",
       "mnemonic": "xor", "result": "value",
+      "hasSideEffects": false,
+      "requires2Address": true,
       "minOperands": 2, "maxOperands": 2,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [49] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "xor r/m32, r32 — 0x31 /r without REX.W (32-bit, zero-extends).",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "opcode": [49] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "FC3.5 sweep-c1 (D-CSUBSET-32BIT-ALU-FORMS shifts residue): logical left shift — FIRST real encodings. Intel SDM SHL: the VARIABLE-count form `SHL r/m64, CL` = REX.W D3 /4 (the count is the IMPLICIT CL register — x86 has no 3-address reg-count shift); the CONSTANT-count form `SHL r/m64, imm8` = REX.W C1 /4 ib; 32-bit siblings = the same opcodes WITHOUT REX.W per the FC3-c2 width axis (a 32-bit shift auto-zero-extends its destination). Hardware masks the count to the operand width (& 63 / & 31, SDM Vol. 2B SAL/SAR/SHL/SHR) — C declares counts >= width UB (C23 6.5.7p3), so no extra masking is emitted; whatever the hardware does to a UB count is conforming. 2-address: the r/m operand IS the destination (requires2Address legalize inserts the copy). implicitRegisters (the FC1 idiv role-contract pattern): inputs=[rcx] (the core reads CL), inputRoles={count: rcx} — the MIR->LIR shift lowering pins the count vreg BY ROLE, never by name; clobbered=[rcx] expresses that the REALIZATION's count-pin mov destroys RCX's prior value across the sequence (regalloc's covered-position exclusion keeps live ranges out of RCX across the shift — the same mechanism that keeps div operands out of RAX/RDX). The exclusion is conservatively also active at imm-form positions (the constraint is per-OPCODE; costs one register of pressure there, never correctness). The lowering selects the imm8 variant when the count is a MIR Const in [0,255] AND a [reg,imm] variant is declared; otherwise the CL pair.",
@@ -1189,10 +1214,31 @@
       }
     },
     {
-      "$comment": "Bitwise NOT — 1-operand. AS1 emits x86_64 `not`.",
+      "$comment": "Bitwise NOT — 1-operand (one's complement). Cluster-F F2 (core_bitwise): encoding added — NOT r/m64 = REX.W 0xF7 /2 + the no-REX.W 32-bit sibling (Intel SDM NOT; same F7-group unary r/m shape as NEG = 0xF7 /3, modrmRegExt 2 vs NEG's 3). Closes the source-level `~` assembler wall. requires2Address mirrors neg/sub — the operand IS the destination; the 2-addr legalize inserts a mov when result != operand[0].",
       "mnemonic": "not", "result": "value",
+      "requires2Address": true,
       "minOperands": 1, "maxOperands": 1,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [247], "modrmRegExt": 2 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "not r/m32 — 0xF7 /2 without REX.W (32-bit one's complement, zero-extends).",
+            "guard":    { "operandKinds": ["reg"], "width": 32 },
+            "template": { "opcode": [247], "modrmRegExt": 2 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "Integer two's-complement negate — REX.W 0xF7 /3 (NEG r/m64). D-CSUBSET-LOCAL-INT-CODEGEN closure (step 13.3b, 2026-06-02): encoding row added so c-subset's unary minus (`-x`) lowers through the assembler. requires2Address mirrors the sub/mul shape — the operand IS the destination, the 2-addr legalize pass guarantees this invariant before encoding (insert a mov when result != operand[0] at MIR→LIR time). modrmRegExt=3 fills ModR/M.reg with the /3 opcode-extension digit.",

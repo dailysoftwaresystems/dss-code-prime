@@ -38,7 +38,7 @@ assembleFirstFn(Lir const& lir, TargetSchema const& schema,
 
 struct X86Fixture {
     std::shared_ptr<TargetSchema> schema;
-    std::uint16_t addOp, subOp, mulOp, retOp;
+    std::uint16_t addOp, subOp, mulOp, retOp, xorOp, notOp;
     LirReg rax, rcx, r8;
 };
 
@@ -51,6 +51,8 @@ struct X86Fixture {
     f.addOp = *f.schema->opcodeByMnemonic("add");
     f.subOp = *f.schema->opcodeByMnemonic("sub");
     f.mulOp = *f.schema->opcodeByMnemonic("mul");
+    f.xorOp = *f.schema->opcodeByMnemonic("xor");
+    f.notOp = *f.schema->opcodeByMnemonic("not");
     f.retOp = *f.schema->opcodeByMnemonic("ret");
     auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
     f.rax = LirReg{
@@ -137,6 +139,44 @@ TEST(X86BinaryOps, AddMismatchedGainsImplicitMov) {
     EXPECT_EQ(bytes[3], 0x4C);
     EXPECT_EQ(bytes[4], 0x01);
     EXPECT_EQ(bytes[5], 0xC0);
+}
+
+TEST(X86BinaryOps, XorRaxRcxInPlaceEmits_48_31_C8) {
+    // Cluster-F F2 (core_bitwise): `xor rax, rax, rcx` in-place.
+    // REX.W 0x48 + opcode 0x31 (XOR r/m64, r64) + ModR/M (mod=3 reg=rcx(1)
+    // rm=rax(0)) = 0xC8. Same reg-reg shape as add/and; opcode 0x31 vs AND 0x21.
+    auto f = loadX86();
+    DiagnosticReporter rep;
+    auto bytes = buildLegalizeAssemble(f, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(f.rax),
+            LirOperand::makeReg(f.rcx)
+        };
+        (void)b.addInst(f.xorOp, f.rax, ops);
+    });
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 3u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x31);
+    EXPECT_EQ(bytes[2], 0xC8);
+}
+
+TEST(X86BinaryOps, NotRaxInPlaceEmits_48_F7_D0) {
+    // Cluster-F F2 (core_bitwise): `not rax` (1-operand, in-place one's complement).
+    // REX.W 0x48 + opcode 0xF7 + ModR/M (mod=3, /2 opcode-extension digit in reg,
+    // rm=rax(0)) = 0xD0. NEG is the sibling /3 = 0xD8 — the modrmRegExt digit (2
+    // vs 3) is the only difference, so a copied-from-neg row miswiring fails here.
+    auto f = loadX86();
+    DiagnosticReporter rep;
+    auto bytes = buildLegalizeAssemble(f, rep, [&](LirBuilder& b) {
+        LirOperand const ops[] = { LirOperand::makeReg(f.rax) };
+        (void)b.addInst(f.notOp, f.rax, ops);
+    });
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 3u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0xF7);
+    EXPECT_EQ(bytes[2], 0xD0);
 }
 
 TEST(X86BinaryOps, SubRaxRcxInPlaceEmits_48_29_C8) {

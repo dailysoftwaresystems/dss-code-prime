@@ -377,6 +377,40 @@ TEST(Arm64Encoder, NegEncodesSubFromXzr) {
     EXPECT_EQ(bytes[3], 0xCB);
 }
 
+TEST(Arm64Encoder, NotEncodesMvnFromXzr) {
+    // Cluster-F F2 (core_bitwise): not X0, X1 = MVN X0, X1 = ORN X0, XZR, X1:
+    //   base 0xAA2003E0 (ORN shifted-reg: ORR family opc=01, N bit=1, Rn=XZR=31<<5)
+    //   | Rm = X1 (enc 1) << 16 → 0x00010000
+    //   = 0xAA2103E0 — LE bytes: E0 03 21 AA. (A wrong fixedWord, a missing N bit
+    //   [→ ORR = a no-op move], or an Rn≠XZR all fail this pin.)
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const notOp = (*s)->opcodeByMnemonic("not");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(notOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const nops[] = { LirOperand::makeReg(x1) };
+    (void)b.addInst(*notOp, x0, nops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE0);
+    EXPECT_EQ(bytes[1], 0x03);
+    EXPECT_EQ(bytes[2], 0x21);
+    EXPECT_EQ(bytes[3], 0xAA);
+}
+
 // ── FC1 (V2-4.X): SDIV/UDIV — the Rule-1 native divide opcodes ─────
 // (D-MIR-TO-LIR-DIV-SEQUENCE-AGNOSTIC closure: arm64's divide is one
 // result-bearing 3-address instruction, no implicit RDX:RAX dance.)

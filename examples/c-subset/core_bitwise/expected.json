@@ -1,0 +1,33 @@
+{
+  "$comment": "Cluster-F F2 (core_bitwise): every bitwise/shift operator end-to-end. Witnesses the encodings this cycle added — x86 XOR (0x31 /r) + NOT (0xF7 /2) and arm64 MVN (ORN Xd,XZR,Xm = 0xAA2003E0) — plus the already-working & | << >> and the signed-arithmetic vs unsigned-logical right-shift distinction. Each operator is in a non-inlined function so its operands are runtime values (not const-folded), and the `release` arm runs the shipped optimizing pipeline over the same source. exit 42 == all operators correct on the target.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
