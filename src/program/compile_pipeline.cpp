@@ -558,8 +558,17 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         globalsLayout = target.aggregateLayout();
         globalsLayout->bitFieldStrategy = bitFieldStrategy;
     }
+    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): find the target's ABSOLUTE-64 pointer
+    // relocation kind by FORMULA (widthBytes==8 && !pcRelative), never by name —
+    // agnosticism (the same scan the linker uses for cross-CU thunk slots). A
+    // symbol-address global (`char* g="..."`, `int* p=&x`) emits this reloc; if
+    // the target declares none, the assembler fails loud.
+    std::optional<RelocationKind> absPtrRelocKind;
+    for (auto const& r : target.relocations()) {
+        if (r.widthBytes == 8 && !r.pcRelative) { absPtrRelocKind = r.kind; break; }
+    }
     auto dataItems = lowerMirGlobalsToDataItems(
-        mir, interner, globalsLayout, dataModel, reporter);
+        mir, interner, globalsLayout, dataModel, reporter, absPtrRelocKind);
     if (!tierClean(reporter, asmEntry)) {
         // Any per-global encoding error already raised a loud
         // diagnostic via the function's internal `emit`.

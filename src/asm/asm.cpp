@@ -713,7 +713,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                            TypeInterner const&                  interner,
                            std::optional<AggregateLayoutParams> aggregateLayout,
                            DataModel                            dataModel,
-                           DiagnosticReporter&                  reporter) {
+                           DiagnosticReporter&                  reporter,
+                           std::optional<RelocationKind>        absPtrRelocKind) {
     auto emit = [&](DiagnosticCode code, std::string msg) {
         ParseDiagnostic d;
         d.code     = code;
@@ -862,6 +863,39 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             d.bytes.assign(s.begin(), s.end());
             d.bytes.push_back(0);
             d.alignment = Alignment::of<1>();
+            out.push_back(std::move(d));
+            continue;
+        }
+
+        // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): a global initialized to the
+        // LINK-TIME-CONSTANT address of another symbol — `char* g = "...";`,
+        // `int* p = &x;`, a function-pointer table. Emit a pointer-width zero slot
+        // + an ABSOLUTE-64 relocation against the target symbol; the linker writes
+        // the target's VA into the slot. Dispatch on the literal VARIANT (the same
+        // discriminator the string / aggregate arms use), BEFORE the TypeKind-keyed
+        // primitive gate. The 8-byte width matches the abs64 reloc (widthBytes 8);
+        // all shipped targets are 64-bit-pointer (a 32-bit-pointer target would
+        // declare abs32 + a 4-byte slot — anchored future, no shipped consumer).
+        if (std::holds_alternative<MirSymbolAddrValue>(v.value)) {
+            auto const& sa = std::get<MirSymbolAddrValue>(v.value);
+            if (!absPtrRelocKind.has_value()) {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} "
+                                 "}} is initialized to a symbol address, but the "
+                                 "target declares no absolute-64 relocation "
+                                 "(widthBytes==8 && !pcRelative) — cannot emit the "
+                                 "pointer fixup (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL).",
+                                 sym.v));
+                continue;
+            }
+            // Section already chosen above (const → .rodata, mutable → .data).
+            d.bytes.assign(8, 0);                       // pointer-width zero slot
+            d.alignment = Alignment::ofRuntimePow2(8);
+            d.relocations.push_back(Relocation{
+                /*offset=*/0u,
+                /*target=*/SymbolId{sa.symbol},
+                /*kind=*/*absPtrRelocKind,
+                /*addend=*/sa.addend});
             out.push_back(std::move(d));
             continue;
         }
