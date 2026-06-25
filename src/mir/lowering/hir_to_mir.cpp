@@ -888,47 +888,11 @@ struct Lowerer {
                         std::array<MirInstId, 2> gep{arrAddr, zero};
                         return mir.addInst(MirOpcode::Gep, gep, t);
                     }
-                    std::uint32_t const litIdx0 = hir.payload(kids[0]);
-                    HirLiteralValue const& src = literals.at(litIdx0);
-                    if (!std::holds_alternative<std::string>(src.value)) {
-                        unsupported(node,
-                            "Array→Pointer decay operand is a Literal "
-                            "but its pool entry is not a string arm "
-                            "(non-string array literals anchored "
-                            "D-LK4-RODATA-PRODUCER-NONSTRING-ARRAY-"
-                            "LITERAL-DECAY)");
-                        return InvalidMirInst;
-                    }
-                    // Mint a fresh synthetic global for the literal,
-                    // register it in the MIR globals arena with the
-                    // string bytes as its constant-init, and emit a
-                    // `GlobalAddr` that returns the Ptr<T> the Cast
-                    // expression yields. The lowerMirGlobalsToDataItems
-                    // pass (asm/asm.cpp) materializes the rodata bytes
-                    // from this MirGlobal at assembly time.
-                    //
-                    // SymbolId-space-exhaustion guard (silent-failure
-                    // HIGH-1 audit fold, 2026-06-02): the minter
-                    // returns invalid SymbolId{} when the next mint
-                    // would wrap UINT32_MAX. Fail loud rather than
-                    // silently collide with SymbolId{0} (the
-                    // invalid sentinel) or user-declared symbols.
-                    SymbolId const sym = mintSyntheticGlobalSymbol();
-                    if (!sym.valid()) {
-                        unsupported(node,
-                            "string-literal promotion failed: "
-                            "synthetic SymbolId space exhausted "
-                            "(UINT32_MAX wraparound). Source has "
-                            "too many string literals OR the user "
-                            "SymbolId range already saturates the "
-                            "u32 space. Anchor: D-LK4-RODATA-"
-                            "PRODUCER-STRING space-exhaustion pin.");
-                        return InvalidMirInst;
-                    }
-                    std::uint32_t const mirLitIdx =
-                        mir.literalPoolAdd(toMirLiteral(src));
-                    (void)mir.addGlobal(fromTy, sym, mirLitIdx);
-                    return mir.addGlobalAddr(sym, t);
+                    // F5: the SINGLE rodata-string producer (shared with the
+                    // lvalue-address `"abc"[i]` arm). `t` is the Cast's Ptr<Char>
+                    // decay target. (Was inline here; factored so the value-decay
+                    // and lvalue-index paths cannot drift.)
+                    return materializeStringLiteralGlobal(kids[0], t);
                 }
                 MirInstId const operand = lowerExpr(kids[0]);
                 if (!operand.valid()) return InvalidMirInst;
@@ -2131,6 +2095,38 @@ struct Lowerer {
     // flattened arms here call the SAME `combineMemberAddr`/`combineIndexAddr`
     // epilogues the frames do (one source of truth) and are unreachable through
     // the driver — kept as the recursive fallback.
+
+    // D-LK4-RODATA-PRODUCER-STRING: materialize a STRING LITERAL into a fresh
+    // synthetic rodata MirGlobal and return a `GlobalAddr` (typed `ptrTy`) to its
+    // first byte. The SINGLE producer, shared by the array→pointer DECAY Cast arm
+    // (value position) and the lvalue-address `HirKind::Literal` arm (`"abc"[i]`
+    // — F5 agg_string_index). A non-string literal / SymbolId-space exhaustion
+    // fails loud (no silent miscompile). Each occurrence mints its own global
+    // (no cross-occurrence dedup — existing behavior).
+    [[nodiscard]] MirInstId materializeStringLiteralGlobal(HirNodeId litNode,
+                                                           TypeId ptrTy) {
+        std::uint32_t const litIdx0 = hir.payload(litNode);
+        HirLiteralValue const& src = literals.at(litIdx0);
+        if (!std::holds_alternative<std::string>(src.value)) {
+            unsupported(litNode,
+                "string-literal materialization: the Literal pool entry is not "
+                "a string arm (non-string array literals anchored "
+                "D-LK4-RODATA-PRODUCER-NONSTRING-ARRAY-LITERAL-DECAY)");
+            return InvalidMirInst;
+        }
+        SymbolId const sym = mintSyntheticGlobalSymbol();
+        if (!sym.valid()) {
+            unsupported(litNode,
+                "string-literal promotion failed: synthetic SymbolId space "
+                "exhausted (UINT32_MAX wraparound). Anchor: "
+                "D-LK4-RODATA-PRODUCER-STRING space-exhaustion pin.");
+            return InvalidMirInst;
+        }
+        std::uint32_t const mirLitIdx = mir.literalPoolAdd(toMirLiteral(src));
+        (void)mir.addGlobal(hir.typeId(litNode), sym, mirLitIdx);
+        return mir.addGlobalAddr(sym, ptrTy);
+    }
+
     [[nodiscard]] MirInstId lowerLvalueAddressNode(HirNodeId node) {
         HirKind const k = hir.kind(node);
         // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value struct/union-
@@ -2252,6 +2248,18 @@ struct Lowerer {
             MirInstId const basePtr = lowerLvalueAddress(kids[0]);
             if (!basePtr.valid()) return InvalidMirInst;
             return combineIndexAddr(node, byteIdx, basePtr);
+        }
+        if (k == HirKind::Literal) {
+            // F5 (agg_string_index): a STRING LITERAL in lvalue position — the
+            // base of `"abc"[i]`. The array decays to its rodata address (C
+            // 6.3.2.1): materialize the rodata global (the SAME producer the
+            // value-position array→pointer decay uses) and return the address of
+            // its first byte, typed as the array-pointer (matching a named global
+            // array's lvalue address). The Index storage arm above then does
+            // byte-offset arithmetic into it via combineIndexAddr. A non-string
+            // literal is not an lvalue → materializeStringLiteralGlobal fails loud.
+            return materializeStringLiteralGlobal(
+                node, interner.pointer(hir.typeId(node)));
         }
         if (k == HirKind::ConstructAggregate) {
             // D-CSUBSET-BITFIELD-RVALUE-RUNTIME (the GENERAL aggregate-rvalue
