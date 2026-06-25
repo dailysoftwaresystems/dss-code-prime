@@ -1,0 +1,13 @@
+{
+  "$comment": "Neutral shipped <stddef.h> (C89 7.17) — the common typedefs + NULL, as language-NEUTRAL data injected by the semantic phase (see README + limits.json). `size_t`/`ptrdiff_t` are pointer-width = 8 bytes on EVERY current DSS target (all 64-bit; LP64 + LLP64 agree on pointer width) -> u64/i64; an ILP32 target would make them 4-byte (deferred D-FFI-STDINT-PTR-WIDTH-ILP32, shared with stdint). `wchar_t` is i32 (the POSIX/Linux+macOS width; Windows is 16-bit, deferred D-FFI-WCHAR-WIDTH). `NULL` is the integer null-pointer constant 0 (C 6.3.2.3 — the constant 0 in pointer context is the null pointer); the `constants` surface is integer-typed, so it rides as i64 0 and converts to any pointer like a literal 0. `offsetof` is a function-like macro (no descriptor surface for it yet — deferred D-FFI-OFFSETOF-MACRO).",
+  "header": "stddef.h",
+  "standard": "c89",
+  "typedefs": [
+    { "name": "size_t",    "type": "u64" },
+    { "name": "ptrdiff_t", "type": "i64" },
+    { "name": "wchar_t",   "type": "i32" }
+  ],
+  "constants": [
+    { "name": "NULL", "value": 0, "type": "i64" }
+  ]
+}

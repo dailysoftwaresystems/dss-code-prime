@@ -1,0 +1,8 @@
+{
+  "$comment": "Neutral shipped <stdarg.h> (C89 7.15). `va_list` + `va_start`/`va_arg`/`va_end` are ALREADY BUILT IN: the c-subset grammar declares the vaArgRule, so the semantic phase injects the `va_list` builtin type (target-specific: __va_list_tag[1] on SysV, char* on Win64/Apple-arm64, __va_list on AAPCS64 — selected by VaListStrategy) and the parser lowers the va_* operations directly. So this descriptor exists ONLY to make `#include <stdarg.h>` RESOLVE (the angle-include resolver maps the header stem to <stem>.json; a missing descriptor fires F_ShippedHeaderNotFound). A descriptor must declare >=1 surface, so it carries a documentary `va_list` typedef — the builtin of the same name WINS (README: 'A builtin type of the same name wins'), so this alias is shadowed and never affects codegen; ptr<void> is a placeholder shape only.",
+  "header": "stdarg.h",
+  "standard": "c89",
+  "typedefs": [
+    { "name": "va_list", "type": "ptr<void>" }
+  ]
+}
