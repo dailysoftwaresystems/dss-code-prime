@@ -16,28 +16,33 @@
 namespace dss {
 
 // Decode C-family `\`-escapes in `body`, appending raw bytes to `out`. Returns
-// false on a malformed/unknown escape (caller fails loud); the partial output is
-// undefined on failure. Supported: \n \t \r \0 \\ \' \" \a \b \f \v and \xHH
-// (one-or-two hex digits). A backslash before any other byte is rejected rather
-// than silently passed through — no guessing.
+// false on a malformed/unknown/out-of-range escape (caller fails loud); the
+// partial output is undefined on failure. Supported: \n \t \r \\ \' \" \a \b \f
+// \v, octal \ooo (one-to-three digits, \0..\377) and \xHH (one-or-two hex
+// digits). A backslash before any other byte is rejected rather than silently
+// passed through — no guessing.
 [[nodiscard]] inline bool decodeEscapedBytes(std::string_view body, std::string& out) {
     for (std::size_t i = 0; i < body.size(); ++i) {
         char const c = body[i];
         if (c != '\\') { out.push_back(c); continue; }
         if (i + 1 >= body.size()) return false;   // trailing lone backslash
         char const e = body[++i];
-        // Octal escape `\ooo` (C 6.4.4.4): one-to-THREE octal digits, value mod
-        // 256. Handled BEFORE the named-escape switch so `\0`, `\07`, `\101`,
-        // `\301` all decode as octal (the old `case '0'` only covered a bare `\0`
-        // and would mis-split `\012` into `\0` + "12"). A lone `\8`/`\9` is NOT
-        // octal — it falls through to the switch's `default` and fails loud.
+        // Octal escape `\ooo` (C 6.4.4.4): one-to-THREE octal digits in the
+        // unsigned-char range (\0..\377). Handled BEFORE the named-escape switch
+        // so `\0`, `\07`, `\101`, `\301` all decode as octal (the old `case '0'`
+        // only covered a bare `\0` and would mis-split `\012` into `\0` + "12").
+        // An out-of-range value (\400..\777, i.e. > 255) is a constraint
+        // violation (C 6.4.4.4p9) and fails loud — NEVER silently masked. A lone
+        // `\8`/`\9` is NOT octal — it falls through to the switch's `default` and
+        // fails loud.
         if (e >= '0' && e <= '7') {
             int v = e - '0';
             for (int d = 0; d < 2 && i + 1 < body.size()
                             && body[i + 1] >= '0' && body[i + 1] <= '7'; ++d) {
                 v = v * 8 + (body[++i] - '0');
             }
-            out.push_back(static_cast<char>(static_cast<unsigned char>(v & 0xFF)));
+            if (v > 0xFF) return false;   // octal escape past unsigned-char range — fail loud
+            out.push_back(static_cast<char>(static_cast<unsigned char>(v)));
             continue;
         }
         switch (e) {

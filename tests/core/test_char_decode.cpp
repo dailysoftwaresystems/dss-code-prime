@@ -72,6 +72,36 @@ TEST(CharDecode, HexEscapeWithNoDigitFails) {
     EXPECT_FALSE(decodeStringLiteralBody("\\x").has_value());    // \x at end
 }
 
+// ── octal escapes \ooo (C 6.4.4.4) ──────────────────────────────────────────
+
+TEST(CharDecode, OctalEscapeOneToThreeDigits) {
+    // `\101` = 'A' (65), `\0` = NUL, `\7` = BEL (7), `\377` = 255 (max in range).
+    auto r = decodeStringLiteralBody("\\101\\0\\7\\377");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, std::string("A\0\a\xFF", 4));
+}
+
+TEST(CharDecode, OctalEscapeConsumesAtMostThreeDigitsNoMisSplit) {
+    // `\012` is ONE byte (octal 12 = 10 = '\n'), NOT `\0` + "12". `\1234` is
+    // `\123` (octal 123 = 83 = 'S') + the literal '4' — the loop takes at most
+    // three octal digits total.
+    auto r = decodeStringLiteralBody("\\012\\1234");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, std::string("\nS4", 3));
+}
+
+TEST(CharDecode, OctalEscapeOutOfRangeFailsLoud) {
+    // C 6.4.4.4p9: an octal escape past the unsigned-char range (\400..\777,
+    // i.e. > 255) is a constraint violation — fail loud, NEVER silently masked.
+    // RED-ON-DISABLE for the `if (v > 0xFF) return false;` guard: restore the
+    // old `v & 0xFF` and `\400` decodes to 0 → has_value() → this fails.
+    EXPECT_FALSE(decodeStringLiteralBody("\\400").has_value());   // octal 256
+    EXPECT_FALSE(decodeStringLiteralBody("\\777").has_value());   // octal 511
+    auto ok = decodeStringLiteralBody("\\377");                   // largest in range
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_EQ(*ok, std::string("\xFF", 1));
+}
+
 // ── decodeCharLiteralBody ───────────────────────────────────────────────────
 
 TEST(CharDecode, CharPlainByte) {
@@ -103,4 +133,16 @@ TEST(CharDecode, MultiCharFails) {
 
 TEST(CharDecode, CharUnknownEscapeFails) {
     EXPECT_FALSE(decodeCharLiteralBody("\\q").has_value());
+}
+
+TEST(CharDecode, CharOctalEscape) {
+    // `'\101'` is the int 65 ('A'); `'\301'` is 193 (the SQLite EBCDIC-guard
+    // value, `#if 'A' == '\301'`). An out-of-range `'\400'` fails loud.
+    auto a = decodeCharLiteralBody("\\101");
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(*a, 65u);
+    auto b = decodeCharLiteralBody("\\301");
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ(*b, 193u);
+    EXPECT_FALSE(decodeCharLiteralBody("\\400").has_value());
 }
