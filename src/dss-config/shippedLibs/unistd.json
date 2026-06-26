@@ -1,9 +1,9 @@
 {
-  "$comment": "Neutral shipped <unistd.h> (POSIX) — c14 POSIX/SQLite. The core POSIX I/O syscalls SQLite's os_unix.c routes through its aSyscall table: read/write + POSITIONED pread/pwrite (SQLite reads/writes the DB file by offset, never lseek), close, ftruncate, fsync/fdatasync (durability), unlink/rmdir (file/dir removal), access (file-exists/perm checks), readlink/getcwd (path resolution), geteuid (ownership checks), getpagesize (mmap granularity), fchmod/fchown (perm propagation), fallocate (Linux preallocation). Signatures use the LP64 widths: ssize_t/off_t = i64, size_t = u64, fd/mode/uid/gid = i32/u32. Constants: SEEK_* (whence; SQLite uses SEEK_SET-relative via pread/pwrite) + the access() mode bits F_OK/R_OK/W_OK/X_OK. Linux values (arch-invariant within linux); gated availableObjectFormats:[elf]. No over-ship: SQLite's aSyscall surface. open/fcntl/fstat/lstat/stat/mkdir/mmap live in their own headers (fcntl/sys.stat/sys.mman).",
+  "$comment": "Neutral shipped <unistd.h> (POSIX) — c14 (linux) + c15c (macOS). The core POSIX I/O syscalls SQLite's os_unix.c routes through its aSyscall table. The LP64 widths (ssize_t/off_t=i64, size_t=u64) AGREE between Linux and macOS, and SEEK_* + the access() mode bits F_OK/R_OK/W_OK/X_OK are byte-identical (verified against xnu/bsd/sys/unistd.h + _seek_set.h) — so every constant + signature stays flat (no per-format variant). fdatasync + fallocate are LINUX-ONLY (macOS uses fcntl F_FULLFSYNC / F_PREALLOCATE): they stay declared on both formats but are UNREFERENCED externs on macho (the errno-accessor pattern — only the format-referenced symbol links; SQLite guards both behind HAVE_FDATASYNC / a Linux ifdef, so neither is imported on macOS). Gated availableObjectFormats:[elf,macho] (elf=WSL run target, macho=macos-latest leg). No over-ship: SQLite's aSyscall surface. open/fcntl/fstat/lstat/stat/mkdir/mmap live in their own headers.",
   "header": "unistd.h",
   "standard": "posix",
-  "availableObjectFormats": ["elf"],
-  "library": { "elf": "libc.so.6" },
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "symbols": [
     { "name": "close",       "signature": "fn(i32) -> i32",                              "kind": "function", "linkage": "external" },
     { "name": "read",        "signature": "fn(i32, ptr<void>, u64) -> i64",              "kind": "function", "linkage": "external" },

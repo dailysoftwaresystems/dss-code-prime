@@ -1,0 +1,12 @@
+{
+  "$comment": "c15c shipped <unistd.h> + <sys/mman.h> on macOS — the libSystem linkage + per-format availability witness for the two headers whose values AGREE Linux↔macOS (no value variant; only availableObjectFormats + library diverge). getpagesize (unistd) + munmap (sys/mman) resolve from libSystem and RUN on Apple Silicon. Single arm64-macho target → runs on the macos-latest CI leg. exit 42 iff both symbols link+run and the agreeing constants are present. RED-ON-DISABLE: drop the macho availability → the #includes fail loud on macho. Release arm runs the optimizer over the calls.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

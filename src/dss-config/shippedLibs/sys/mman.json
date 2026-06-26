@@ -1,9 +1,9 @@
 {
-  "$comment": "Neutral shipped <sys/mman.h> (POSIX) — c14 POSIX/SQLite. The memory-mapped-I/O surface SQLite's os_unix.c uses for its mmap'd page cache: mmap/munmap + Linux mremap (resize, under SQLITE_MMAP_READWRITE). Constants PROT_READ/PROT_WRITE (page protections) + MAP_SHARED (the only map type SQLite uses — a shared file mapping) + MREMAP_MAYMOVE (the mremap flag). MAP_FAILED is the `((void*)-1)` sentinel mmap returns on failure — a pointer, so the MACROS surface (not an integer constant). Linux values (arch-invariant within linux); gated availableObjectFormats:[elf] (the WSL run target). off_t is i64 (LP64). No over-ship: exactly SQLite's mmap surface. macOS (different MAP_* values, no mremap) is a c14-macOS follow-on.",
+  "$comment": "Neutral shipped <sys/mman.h> (POSIX) — c14 (linux) + c15c (macOS). The memory-mapped-I/O surface SQLite's os_unix.c uses for its mmap'd page cache: mmap/munmap + Linux mremap (resize, under SQLITE_MMAP_READWRITE). PROT_READ/PROT_WRITE (page protections) + MAP_SHARED all AGREE between Linux and macOS (1/2/1 — verified against xnu/bsd/sys/mman.h), so they stay flat. mremap + MREMAP_MAYMOVE are LINUX-ONLY: macOS has no mremap(). MREMAP_MAYMOVE carries an elf-only `variants` entry so it is NOT injected on macho (a macho reference fails loud — truthful). The mremap SYMBOL stays declared on both formats but is an UNREFERENCED extern on macho (the errno __error/__errno_location pattern — only the format-referenced symbol links; SQLite guards mremap behind HAVE_MREMAP, Linux-only, so it is never imported on macOS). MAP_FAILED is the `((void*)-1)` sentinel (a pointer → the MACROS surface). off_t is i64 (LP64, both). Gated availableObjectFormats:[elf,macho]: elf=the WSL run target, macho=the macos-latest CI leg (Apple Silicon).",
   "header": "sys/mman.h",
   "standard": "posix",
-  "availableObjectFormats": ["elf"],
-  "library": { "elf": "libc.so.6" },
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "symbols": [
     { "name": "mmap",   "signature": "fn(ptr<void>, u64, i32, i32, i32, i64) -> ptr<void>", "kind": "function", "linkage": "external" },
     { "name": "munmap", "signature": "fn(ptr<void>, u64) -> i32",                           "kind": "function", "linkage": "external" },
@@ -13,9 +13,9 @@
     { "name": "MAP_FAILED", "replacement": "((void*)-1)" }
   ],
   "constants": [
-    { "name": "PROT_READ",      "value": 1, "type": "i32" },
-    { "name": "PROT_WRITE",     "value": 2, "type": "i32" },
-    { "name": "MAP_SHARED",     "value": 1, "type": "i32" },
-    { "name": "MREMAP_MAYMOVE", "value": 1, "type": "i32" }
+    { "name": "PROT_READ",  "value": 1, "type": "i32" },
+    { "name": "PROT_WRITE", "value": 2, "type": "i32" },
+    { "name": "MAP_SHARED", "value": 1, "type": "i32" },
+    { "name": "MREMAP_MAYMOVE", "variants": [ { "when": { "format": "elf" }, "value": 1, "type": "i32" } ] }
   ]
 }

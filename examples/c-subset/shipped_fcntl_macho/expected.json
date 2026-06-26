@@ -1,0 +1,12 @@
+{
+  "$comment": "c15c shipped <fcntl.h> on macOS — the O_*/F_* per-format constant variants + the reordered 24-byte struct flock variant + the variadic open/fcntl from libSystem. Single arm64-macho target → runs on the macos-latest CI leg. exit 42 iff the macho constant + struct variants were selected (O_CREAT 512, F_RDLCK 1 / F_WRLCK 3, flock sizeof 24). RED-ON-DISABLE: a broken selector hands macho the Linux values (O_CREAT 64) or the Linux flock layout (sizeof 32) → exit 1. Release arm runs the optimizer over the macro-expanded variadic calls + the constant folds.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

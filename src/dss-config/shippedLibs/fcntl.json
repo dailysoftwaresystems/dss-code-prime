@@ -1,9 +1,9 @@
 {
-  "$comment": "Neutral shipped <fcntl.h> (POSIX) — c14d POSIX/SQLite, the first VARIADIC-extern consumer (c14c). `open`/`fcntl` are variadic (`open(path, flags, ...)` — SQLite calls both 2-arg and 3-arg; `fcntl(fd, cmd, ...)` passes &flock as a vararg, so struct flock is NOT in the signature). O_* open-flags + F_* fcntl-commands + F_RDLCK/WRLCK/UNLCK lock-types + FD_CLOEXEC (Linux octal values; arch-invariant within linux). `struct flock` is a FLAT struct (short l_type/l_whence + off_t l_start/l_len + pid_t l_pid → the layout engine derives the alignment padding to 32 bytes; x86-64-linux and arm64-linux agree, so no per-target variant). Gated availableObjectFormats:[elf] (the WSL run target). The O_*/F_* VALUES are interop-critical (a wrong flag mis-opens/mis-locks) — verified against the Linux asm-generic/fcntl.h + bits/fcntl-linux.h (64-bit: O_LARGEFILE is a 0 no-op; F_GETLK/SETLK are the native 5/6/7).",
+  "$comment": "Neutral shipped <fcntl.h> (POSIX) — c14d (linux) + c15c (macOS). The first VARIADIC-extern consumer (c14c): open/fcntl are variadic (open(path,flags,...); fcntl(fd,cmd,...) passes &flock as a vararg → struct flock is NOT in the signature). The O_*/F_* VALUES are interop-CRITICAL (a wrong flag mis-opens/mis-locks) and DIVERGE heavily between Linux (asm-generic/fcntl.h) and macOS (xnu/bsd/sys/fcntl.h) — every divergent one carries per-format `variants` (verified against both header sets): O_CREAT 64/512, O_EXCL 128/2048, O_TRUNC 512/1024, O_APPEND 1024/8, O_NONBLOCK 2048/4, O_NOFOLLOW 131072/256, O_DIRECTORY 65536/1048576, O_CLOEXEC 524288/16777216; the fcntl lock cmds F_GETLK 5/7, F_SETLK 6/8, F_SETLKW 7/9; the lock TYPES F_RDLCK 0/1, F_WRLCK 1/3 (★ macOS reorders these — F_UNLCK=2 happens to agree). O_RDONLY/WRONLY/RDWR (0/1/2), F_DUPFD/GETFD/SETFD/GETFL/SETFL (0..4), F_UNLCK (2), FD_CLOEXEC (1) AGREE → flat. O_LARGEFILE is a 64-bit no-op (0) on both (Linux 64-bit defines it 0; macOS has no LFS toggle and SQLite's own fallback is 0). O_TMPFILE is LINUX-ONLY → elf-only variant (not injected on macho; a macho reference fails loud). `struct flock` DIVERGES: Linux {short l_type,l_whence; off_t l_start,l_len; pid_t l_pid}=32B vs macOS REORDERED {off_t l_start,l_len; pid_t l_pid; short l_type,l_whence}=24B → per-format struct variants. arm64/x86_64 agree within each OS (fixed-width fields). Gated availableObjectFormats:[elf,macho].",
   "header": "fcntl.h",
   "standard": "posix",
-  "availableObjectFormats": ["elf"],
-  "library": { "elf": "libc.so.6" },
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "symbols": [
     { "name": "open",  "signature": "fn(ptr<char>, i32, ...) -> i32", "kind": "function", "linkage": "external" },
     { "name": "fcntl", "signature": "fn(i32, i32, ...) -> i32",       "kind": "function", "linkage": "external" }
@@ -11,40 +11,55 @@
   "structs": [
     {
       "name": "flock",
-      "fields": [
-        { "name": "l_type",   "type": "i16" },
-        { "name": "l_whence", "type": "i16" },
-        { "name": "l_start",  "type": "i64" },
-        { "name": "l_len",    "type": "i64" },
-        { "name": "l_pid",    "type": "i32" }
+      "variants": [
+        {
+          "when": { "format": "elf" },
+          "fields": [
+            { "name": "l_type",   "type": "i16" },
+            { "name": "l_whence", "type": "i16" },
+            { "name": "l_start",  "type": "i64" },
+            { "name": "l_len",    "type": "i64" },
+            { "name": "l_pid",    "type": "i32" }
+          ]
+        },
+        {
+          "when": { "format": "macho" },
+          "fields": [
+            { "name": "l_start",  "type": "i64" },
+            { "name": "l_len",    "type": "i64" },
+            { "name": "l_pid",    "type": "i32" },
+            { "name": "l_type",   "type": "i16" },
+            { "name": "l_whence", "type": "i16" }
+          ]
+        }
       ]
     }
   ],
   "constants": [
-    { "name": "O_RDONLY",    "value": 0,       "type": "i32" },
-    { "name": "O_WRONLY",    "value": 1,       "type": "i32" },
-    { "name": "O_RDWR",      "value": 2,       "type": "i32" },
-    { "name": "O_CREAT",     "value": 64,      "type": "i32" },
-    { "name": "O_EXCL",      "value": 128,     "type": "i32" },
-    { "name": "O_TRUNC",     "value": 512,     "type": "i32" },
-    { "name": "O_APPEND",    "value": 1024,    "type": "i32" },
-    { "name": "O_NONBLOCK",  "value": 2048,    "type": "i32" },
-    { "name": "O_LARGEFILE", "value": 0,       "type": "i32" },
-    { "name": "O_DIRECTORY", "value": 65536,   "type": "i32" },
-    { "name": "O_NOFOLLOW",  "value": 131072,  "type": "i32" },
-    { "name": "O_CLOEXEC",   "value": 524288,  "type": "i32" },
-    { "name": "O_TMPFILE",   "value": 4259840, "type": "i32" },
-    { "name": "F_DUPFD",     "value": 0,       "type": "i32" },
-    { "name": "F_GETFD",     "value": 1,       "type": "i32" },
-    { "name": "F_SETFD",     "value": 2,       "type": "i32" },
-    { "name": "F_GETFL",     "value": 3,       "type": "i32" },
-    { "name": "F_SETFL",     "value": 4,       "type": "i32" },
-    { "name": "F_GETLK",     "value": 5,       "type": "i32" },
-    { "name": "F_SETLK",     "value": 6,       "type": "i32" },
-    { "name": "F_SETLKW",    "value": 7,       "type": "i32" },
-    { "name": "F_RDLCK",     "value": 0,       "type": "i32" },
-    { "name": "F_WRLCK",     "value": 1,       "type": "i32" },
-    { "name": "F_UNLCK",     "value": 2,       "type": "i32" },
-    { "name": "FD_CLOEXEC",  "value": 1,       "type": "i32" }
+    { "name": "O_RDONLY",    "value": 0, "type": "i32" },
+    { "name": "O_WRONLY",    "value": 1, "type": "i32" },
+    { "name": "O_RDWR",      "value": 2, "type": "i32" },
+    { "name": "O_LARGEFILE", "value": 0, "type": "i32" },
+    { "name": "O_CREAT",     "variants": [ { "when": { "format": "elf" }, "value": 64,      "type": "i32" }, { "when": { "format": "macho" }, "value": 512,      "type": "i32" } ] },
+    { "name": "O_EXCL",      "variants": [ { "when": { "format": "elf" }, "value": 128,     "type": "i32" }, { "when": { "format": "macho" }, "value": 2048,     "type": "i32" } ] },
+    { "name": "O_TRUNC",     "variants": [ { "when": { "format": "elf" }, "value": 512,     "type": "i32" }, { "when": { "format": "macho" }, "value": 1024,     "type": "i32" } ] },
+    { "name": "O_APPEND",    "variants": [ { "when": { "format": "elf" }, "value": 1024,    "type": "i32" }, { "when": { "format": "macho" }, "value": 8,        "type": "i32" } ] },
+    { "name": "O_NONBLOCK",  "variants": [ { "when": { "format": "elf" }, "value": 2048,    "type": "i32" }, { "when": { "format": "macho" }, "value": 4,        "type": "i32" } ] },
+    { "name": "O_NOFOLLOW",  "variants": [ { "when": { "format": "elf" }, "value": 131072,  "type": "i32" }, { "when": { "format": "macho" }, "value": 256,      "type": "i32" } ] },
+    { "name": "O_DIRECTORY", "variants": [ { "when": { "format": "elf" }, "value": 65536,   "type": "i32" }, { "when": { "format": "macho" }, "value": 1048576,  "type": "i32" } ] },
+    { "name": "O_CLOEXEC",   "variants": [ { "when": { "format": "elf" }, "value": 524288,  "type": "i32" }, { "when": { "format": "macho" }, "value": 16777216, "type": "i32" } ] },
+    { "name": "O_TMPFILE",   "variants": [ { "when": { "format": "elf" }, "value": 4259840, "type": "i32" } ] },
+    { "name": "F_DUPFD",     "value": 0, "type": "i32" },
+    { "name": "F_GETFD",     "value": 1, "type": "i32" },
+    { "name": "F_SETFD",     "value": 2, "type": "i32" },
+    { "name": "F_GETFL",     "value": 3, "type": "i32" },
+    { "name": "F_SETFL",     "value": 4, "type": "i32" },
+    { "name": "F_GETLK",     "variants": [ { "when": { "format": "elf" }, "value": 5, "type": "i32" }, { "when": { "format": "macho" }, "value": 7, "type": "i32" } ] },
+    { "name": "F_SETLK",     "variants": [ { "when": { "format": "elf" }, "value": 6, "type": "i32" }, { "when": { "format": "macho" }, "value": 8, "type": "i32" } ] },
+    { "name": "F_SETLKW",    "variants": [ { "when": { "format": "elf" }, "value": 7, "type": "i32" }, { "when": { "format": "macho" }, "value": 9, "type": "i32" } ] },
+    { "name": "F_RDLCK",     "variants": [ { "when": { "format": "elf" }, "value": 0, "type": "i32" }, { "when": { "format": "macho" }, "value": 1, "type": "i32" } ] },
+    { "name": "F_WRLCK",     "variants": [ { "when": { "format": "elf" }, "value": 1, "type": "i32" }, { "when": { "format": "macho" }, "value": 3, "type": "i32" } ] },
+    { "name": "F_UNLCK",     "value": 2, "type": "i32" },
+    { "name": "FD_CLOEXEC",  "value": 1, "type": "i32" }
   ]
 }
