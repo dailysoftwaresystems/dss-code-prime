@@ -309,17 +309,22 @@ TEST(ParserCastExpr, PlainParenStaysParenExpr) {
     EXPECT_TRUE(r.typeNameCandidates.empty());
 }
 
-// `(a) + b` — `+` is binary-only (no prefix entry), so `+b` can never
-// start a cast operand: the probe fails STRUCTURALLY, no candidate is
-// recorded, and the value reading parses as parenExpr + add.
-TEST(ParserCastExpr, ParenPlusStaysValueReadingWithNoCandidate) {
+// `(a) + b` — c12 made `+` a PREFIX operator too (unary plus), so `+b` can now
+// start a cast operand: `(a)(+b)` is structurally viable. Exactly like the
+// `(q)-x` precedent above, the value reading (`(a) + b`) still wins (rolls back
+// to parenExpr + add, no committed castExpr because `a` isn't a known type), but
+// the speculation records `a` as a type-name candidate for the cross-file oracle.
+// (Before unary `+` existed this recorded NO candidate — `+` was binary-only.)
+TEST(ParserCastExpr, ParenPlusStaysValueReadingButRecordsCandidate) {
     auto r = parseCSubset("int main() { return (a) + b; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(findFirstNodeWithRule(t, "parenExpr").valid());
     EXPECT_TRUE(findFirstNodeWithRule(t, "binaryExpr").valid());
     EXPECT_FALSE(findFirstNodeWithRule(t, "castExpr").valid());
-    EXPECT_TRUE(r.typeNameCandidates.empty());
+    ASSERT_EQ(r.typeNameCandidates.size(), 1u);
+    EXPECT_EQ(r.typeNameCandidates[0].name, "a");
+    EXPECT_EQ(t.source().slice(r.typeNameCandidates[0].span), "a");
 }
 
 // A cast operand long enough to dwarf the OLD 8-lookahead probe budget

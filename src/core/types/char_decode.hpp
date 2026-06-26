@@ -26,11 +26,24 @@ namespace dss {
         if (c != '\\') { out.push_back(c); continue; }
         if (i + 1 >= body.size()) return false;   // trailing lone backslash
         char const e = body[++i];
+        // Octal escape `\ooo` (C 6.4.4.4): one-to-THREE octal digits, value mod
+        // 256. Handled BEFORE the named-escape switch so `\0`, `\07`, `\101`,
+        // `\301` all decode as octal (the old `case '0'` only covered a bare `\0`
+        // and would mis-split `\012` into `\0` + "12"). A lone `\8`/`\9` is NOT
+        // octal — it falls through to the switch's `default` and fails loud.
+        if (e >= '0' && e <= '7') {
+            int v = e - '0';
+            for (int d = 0; d < 2 && i + 1 < body.size()
+                            && body[i + 1] >= '0' && body[i + 1] <= '7'; ++d) {
+                v = v * 8 + (body[++i] - '0');
+            }
+            out.push_back(static_cast<char>(static_cast<unsigned char>(v & 0xFF)));
+            continue;
+        }
         switch (e) {
             case 'n':  out.push_back('\n'); break;
             case 't':  out.push_back('\t'); break;
             case 'r':  out.push_back('\r'); break;
-            case '0':  out.push_back('\0'); break;
             case '\\': out.push_back('\\'); break;
             case '\'': out.push_back('\''); break;
             case '"':  out.push_back('"');  break;

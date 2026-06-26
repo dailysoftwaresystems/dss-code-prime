@@ -336,6 +336,32 @@ struct Lowerer {
                 return {decay, target};
             }
         }
+        // c12 (C 6.3.2.1p4) function-to-pointer DECAY: a function DESIGNATOR
+        // (`FnSig`) in a `Ptr<FnSig>` context decays to a pointer to the function
+        // (`&dbl`). The semantic tier's `isAssignable` already admits this on the
+        // SAME same-signature predicate (lhs is `Ptr`, rhs is `FnSig`,
+        // `operands(lhs)[0] == rhs`) — but it emits no node because a bare function
+        // Ref inherently lowers to the function's ADDRESS at MIR. That suffices for
+        // assignment/call-arg (the looser stores), but a brace-init element must
+        // carry the field's `Ptr<FnSig>` TYPE so the `ConstructAggregate` verifier's
+        // strict child==field equality holds. Emit a synthetic `Cast` (MIR
+        // `mapCast` lowers FnSig→Ptr as a representation-free Bitcast over the
+        // GlobalAddr). A SIGNATURE MISMATCH (`operands(target)[0] != child.type`)
+        // is NOT decayed here → it stays a loud mismatch at both tiers.
+        if (ck == TypeKind::FnSig && tk == TypeKind::Ptr) {
+            auto const ptrElem = interner.operands(target);
+            if (!ptrElem.empty() && ptrElem[0] == child.type) {
+                HirNodeId const decay = builder.makeCast(
+                    child.id, target, HirFlags::Synthetic);
+                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                    if (it->first == child.id) {
+                        spans.push_back({decay, it->second});
+                        break;
+                    }
+                }
+                return {decay, target};
+            }
+        }
         // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): when
         // the active language's `pointerConversions` rules admit the
         // direction-specific `Ptr<Void>` ↔ `Ptr<T>` conversion, emit
@@ -2378,6 +2404,25 @@ struct Lowerer {
             // exactly as the prior inline computation.
             TypeId const result = derefResultType(interner, operand.type);
             return {track(builder.makeDeref(operand.id, result), node), result};
+        }
+        // c12 (C 6.5.3.3p1/p2): unary `+` is the IDENTITY — it applies the integer
+        // promotions and yields the value, with NO dedicated HIR op (there is no
+        // `Pos`/`Identity` HirOpKind). Return the OPERAND node unchanged: the
+        // promotion is already realized by the lazy-consumer model (sub-int values
+        // live promoted in 32-bit regs), so `+x` ≡ `x`. The operand must be
+        // ARITHMETIC (int/float; an Enum promotes to int and is accepted) — a
+        // pointer/struct/union operand fails LOUD here, mirroring C's "operand of
+        // the unary + ... shall have arithmetic type" (this is STRICTER than unary
+        // `-`, which has no such gate today; `+` gets it because the identity fold
+        // would otherwise silently pass a pointer value straight through).
+        if (e.target == "Pos") {
+            TypeKind const otk = operand.type.valid()
+                ? interner.kind(operand.type) : TypeKind::Void;
+            if (!isArithmeticCore(otk) && otk != TypeKind::Enum) {
+                unsupported(node, "operand of unary '+' must have arithmetic type");
+                return {errorNode(node, operand.type), operand.type};
+            }
+            return operand;
         }
         auto op = coreOpFromName(e.target);
         if (!op || arityOf(*op) != HirOpArity::Unary) {

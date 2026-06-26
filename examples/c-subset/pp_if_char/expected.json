@@ -1,0 +1,15 @@
+{
+  "$comment": "c12 D-PP-IF-CHAR-CONSTANT: character constants in the `#if` const-expr (C 6.10.1p4) — `'A'` is an INT (ASCII 65). pp_if_eval's parsePrimary gained a char-literal primary (`'` opener + coalesced body via shared decodeCharLiteralBody); the shared escape decoder gained an OCTAL arm (`'\\301'`). RED-ON-DISABLE: remove the char-literal primary and `#if 'A' == 65` fails (P0013). The pe arm RUNS on the windows leg; elf/macho/arm64 on the linux/darwin/qemu legs; the release arm witnesses the optimizer.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

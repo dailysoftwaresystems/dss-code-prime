@@ -215,7 +215,7 @@
       { "precedence": 60, "associativity": "left",                       "operators": ["<<", ">>"]                             },
       { "precedence": 65, "associativity": "left",                       "operators": ["+", "-"]                               },
       { "precedence": 70, "associativity": "left",                       "operators": ["*", "/", "%"]                          },
-      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-", "*", "&", "++", "--"]    },
+      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "+", "-", "*", "&", "++", "--"] },
       { "precedence": 95,                            "arity": "postfix",  "operators": ["++", "--"]                            },
       { "precedence": 100,                           "arity": "postfix",  "operators": ["("], "endsAt": ")", "bodyRule": "argList" },
       { "precedence": 100,                           "arity": "postfix",  "operators": ["["], "endsAt": "]", "bodyRule": "expression" },
@@ -1367,6 +1367,7 @@
     "unaryOps": [
       { "token": "BangOp",       "target": "Not"       },
       { "token": "TildeOp",      "target": "BitNot"    },
+      { "token": "PlusOp",       "target": "Pos"       },
       { "token": "MinusOp",      "target": "Neg"       },
       { "token": "BitAndOp",     "target": "AddressOf" },
       { "token": "StarOp",       "target": "Deref"     },

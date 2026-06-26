@@ -4382,6 +4382,11 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // also lowers prefix ++/-- to a SeqExpr whose result type is the lvalue
         // type, so the two tiers agree.
         if (e->target == "PreInc" || e->target == "PreDec") return ot;
+        // c12 (C 6.5.3.3p2): unary `+` yields the INTEGER-PROMOTED operand value.
+        // Like Neg/BitNot the type is operand-preserving here (sub-int values live
+        // promoted in 32-bit regs — the lazy-consumer model — so the carried type
+        // is the operand's; the CST→HIR tier lowers `+x` to the operand itself).
+        if (e->target == "Pos") return ot;
         auto const op = coreOpFromNameSem(e->target);
         if (op.has_value() && *op == HirOpKind::Not) return boolType();
         return ot;   // Neg / BitNot are type-preserving

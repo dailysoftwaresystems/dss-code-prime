@@ -397,6 +397,13 @@ struct Lowerer {
         if (from == TypeKind::Ptr && isInt(to))   return MirOpcode::PtrToInt;
         if (isInt(from)   && to == TypeKind::Ptr) return MirOpcode::IntToPtr;
         if (from == TypeKind::Ptr && to == TypeKind::Ptr) return MirOpcode::Bitcast;
+        // c12 (C 6.3.2.1p4) function-to-pointer decay: a function DESIGNATOR
+        // (FnSig) reaching a Ptr<FnSig> context. CST→HIR's `coerce` emits this
+        // synthetic Cast for a brace-init element (`struct Ops a = { dbl };`); the
+        // operand is a function Ref, which already lowers to a `GlobalAddr` (the
+        // function's code address), so the conversion is representation-free — a
+        // Bitcast that just re-types the pointer-width value as `Ptr<FnSig>`.
+        if (from == TypeKind::FnSig && to == TypeKind::Ptr) return MirOpcode::Bitcast;
         return MirOpcode::Invalid;
     }
 
