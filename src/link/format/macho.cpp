@@ -2263,12 +2263,16 @@ encodeExecDynamic(AssembledModule const&    module,
         }
     }
 
-    // __LINKEDIT contents — page-aligned after the last loaded segment: __DATA
-    // (when present, D-LK4-DATA-PRODUCER) else __DATA_CONST (the GOT). __bss is
-    // S_ZEROFILL so it consumes NO file bytes; __LINKEDIT's file offset follows
-    // __data's file end (+ the GOT/data file extent), NOT the bss vm extent.
+    // __LINKEDIT contents — page-aligned after the last FILE-BACKED segment:
+    // __data (when present, D-LK4-DATA-PRODUCER) else __DATA_CONST (the GOT).
+    // ★ Gate on `hasData`, NOT `hasDataSeg`: a __DATA segment that holds ONLY
+    // __bss (S_ZEROFILL) consumes NO file bytes (`dataSecFileOff`/`dataSecFileSize`
+    // are both 0 when `!hasData`), so __LINKEDIT must follow the GOT's file end,
+    // not `dataSecFileOff + dataSecFileSize` (= 0 for a bss-only __DATA, which
+    // would put __LINKEDIT at file offset 0 — over the mach header — and produce
+    // an unspawnable binary). __bss adds VM extent only, never file extent.
     std::uint64_t const linkeditFileOff =
-        hasDataSeg
+        hasData
             ? alignUp(dataSecFileOff + dataSecFileSize, kPageSize)
             : alignUp(gotFileOff + gotFileSize, kPageSize);
     // F5: the REBASE stream leads __LINKEDIT (rebase, then bind, then the rest),
