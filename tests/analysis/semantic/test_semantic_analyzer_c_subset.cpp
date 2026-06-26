@@ -1568,6 +1568,61 @@ TEST(SemanticAnalyzerCSubset, StringLiteralIsTypedCharArrayNotUntyped) {
         << "\"abc\" is Array<Char,4> → an int* arg is an element mismatch (Char != int)";
 }
 
+// C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string literals
+// concatenate, and the WHOLE concatenated literal is typed `Array<Char, N+1>` on
+// the stringLiteralExpr RULE node (N = sum of per-segment decoded lengths) — NOT
+// per body token. `"hello" " world"` → 5 + 6 = 11 bytes + NUL = Array<Char,12>.
+// The type is read directly off the rule node (`model.typeAt`), the same place
+// `subtreeType` short-circuits on, so every downstream consumer sees the whole
+// concatenated size. RED-ON-DISABLE: reading only the first body would stamp
+// Array<Char,6> ("hello"+NUL); typing per-token (the pre-c20 shape) would leave
+// the rule node untyped. Also pins that the body TOKENS are NOT individually
+// typed (the restructure moved typing to the rule node).
+TEST(SemanticAnalyzerCSubset, AdjacentStringConcatTypesWholeCharArray) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { \"hello\" \" world\"; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    Tree const& tree = cu->trees()[0];
+    RuleId const sleRule = tree.schema().rules().find("stringLiteralExpr");
+    ASSERT_TRUE(sleRule.valid());
+
+    NodeId sle{};
+    int sleCount = 0;
+    SchemaTokenId const bodyTok = tree.schema().schemaTokens().find("StringLiteral");
+    int typedBodyTokens = 0;
+    walkPreOrder(tree, [&](TreeCursor const& cursor) {
+        NodeId const n = cursor.current();
+        if (tree.kind(n) == NodeKind::Internal && tree.rule(n).v == sleRule.v) {
+            sle = n; ++sleCount;
+        }
+        // A body TOKEN must NOT carry the per-token Array type any more — the
+        // whole-literal type lives on the rule node.
+        if (tree.kind(n) == NodeKind::Token && bodyTok.valid()
+            && tree.tokenKind(n).v == bodyTok.v && model.typeAt(n).valid()) {
+            ++typedBodyTokens;
+        }
+    });
+    EXPECT_EQ(sleCount, 1) << "the two pieces form ONE stringLiteralExpr";
+    ASSERT_TRUE(sle.valid());
+    EXPECT_EQ(typedBodyTokens, 0)
+        << "body tokens are no longer individually typed — the rule node carries "
+           "the whole concatenated Array<Char,N>";
+
+    TypeId const ty = model.typeAt(sle);
+    ASSERT_TRUE(ty.valid()) << "the stringLiteralExpr rule node must be typed";
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    ASSERT_EQ(ti.scalars(ty).size(), 1u);
+    EXPECT_EQ(ti.scalars(ty)[0], 12)
+        << "\"hello\" \" world\" = \"hello world\" = 11 bytes + NUL = 12 "
+           "(reading only the first piece would give 6)";
+    ASSERT_EQ(ti.operands(ty).size(), 1u);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::Char);
+}
+
 // R2: the int→char assignability arm (`charConvertsToArith`, C 6.3.1.1). Typing the
 // char literal `int` would otherwise REGRESS `char x = 'c';` (int → char slot, which
 // DSS's strict lattice rejects without the arm). RED-ON-DISABLE: drop the arm →

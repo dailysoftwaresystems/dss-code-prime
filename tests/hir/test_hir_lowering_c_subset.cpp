@@ -1978,6 +1978,80 @@ TEST(HirLoweringCSubset, StringEscapeDecodes) {
     EXPECT_EQ(std::get<std::string>(res->literalPool.at(0).value), std::string("a\tb"));
 }
 
+// ── C 5.1.1.2 phase 6: adjacent string-literal concatenation ────────────────
+// (D-CSUBSET-ADJACENT-STRING-CONCAT). `"a" "b"` ≡ `"ab"`. The HIR lowers the
+// WHOLE stringLiteralExpr through the `decodeAdjacentStringBodies` chokepoint:
+// every body decoded (phase 5) then byte-joined (phase 6). N = total decoded
+// bytes; the literal's type is Array<Char, N+1>.
+
+TEST(HirLoweringCSubset, AdjacentStringsConcatTwoWay) {
+    // `"a" "b"` → "ab", Array<Char,3> (2 bytes + NUL).
+    SemanticModel model = analyzeCSubset("void f() { \"a\" \"b\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u) << "the two pieces fold into ONE literal";
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::Char);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), "ab");
+
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    auto const& ti = model.lattice().interner();
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3) << "\"ab\" + NUL";
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::Char);
+}
+
+TEST(HirLoweringCSubset, AdjacentStringsConcatThreeWay) {
+    // `"a" "b" "c"` → "abc", Array<Char,4>.
+    SemanticModel model = analyzeCSubset("void f() { \"a\" \"b\" \"c\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(std::get<std::string>(v.value), "abc");
+
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    auto const& ti = model.lattice().interner();
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 4) << "\"abc\" + NUL";
+}
+
+// THE byte-level pin (mandatory): concatenation is at the DECODED-byte level —
+// each body decoded by phase 5 FIRST, THEN joined. `"\x41" "1"` must be 'A'+'1'
+// = "A1" (2 bytes), NOT a raw-token merge `\x411` (which would parse the hex
+// escape across the boundary into the single byte 0x11). RED if a consumer
+// concatenated raw bodies before decoding.
+TEST(HirLoweringCSubset, AdjacentStringsConcatEscapeBoundary) {
+    SemanticModel model = analyzeCSubset("void f() { \"\\x41\" \"1\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), "A1")
+        << "per-segment escape decode THEN byte-join: \\x41→'A', then '1' → \"A1\" "
+           "(a raw-token merge would decode \\x411 as one byte 0x11)";
+    ASSERT_EQ(std::get<std::string>(v.value).size(), 2u);
+
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    auto const& ti = model.lattice().interner();
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3) << "\"A1\" (2 bytes) + NUL";
+}
+
 // ── golden ────────────────────────────────────────────────────────────────
 
 namespace {

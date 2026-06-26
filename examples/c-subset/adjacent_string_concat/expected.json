@@ -1,0 +1,36 @@
+{
+  "$comment": "c20 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string-literal concatenation, C 5.1.1.2 phase 6. `puts(\"hel\" \"lo\")` prints the concatenated \"hello\" (then CRT text-mode \\r\\n on PE; \\n on ELF/Mach-O) and exits 42. Modeled on shipped_include_puts (4 targets, per-target expectedStdout) + decl_string_global (release shippedPipeline arm). A dropped second piece prints \"hel\"; a mis-sized Array<Char,N> over-reads past the NUL — both flip stdout and fail the harness immediately.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "hello\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "hello\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "hello\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "expectedStdout": "hello\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

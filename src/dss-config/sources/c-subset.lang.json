@@ -999,7 +999,10 @@
     "designatedIndex": { "sequence": [ "BracketOpen", "expression", "BracketClose" ] },
 
     "charLiteralExpr":   { "sequence": [ "CharStart",   "CharLiteral"   ] },
-    "stringLiteralExpr": { "sequence": [ "StringStart", "StringLiteral" ] },
+    "stringLiteralExpr": {
+      "$comment": "C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string literals concatenate — `\"a\" \"b\"` is `\"ab\"`. The first StringStart+StringLiteral pair is required; the zero-or-more repeat captures each further pair as FLAT children (sequences inline, no wrapper node), so a lone string yields exactly 2 children, byte-identical to the pre-c20 single-pair rule. Concatenation is at the DECODED-byte level (each body decoded by decodeStringLiteralBody FIRST, then the bytes joined) via the single decodeAdjacentStringBodies chokepoint that every body consumer routes through. Safe in every use site: primaryExpr, attr args (terminate at `)`), externFuncTail (terminates at `;`) — none has StringStart in its follow set.",
+      "sequence": [ "StringStart", "StringLiteral", { "repeat": { "sequence": [ "StringStart", "StringLiteral" ] } } ]
+    },
 
     "argList": {
       "$comment": "FC5: assignmentExpr (NOT expression) — the comma here is an arg SEPARATOR, never a comma-operator, so `f(a, b)` is 2 args. A comma-operator arg is written parenthesized: `f((a, b))`.",

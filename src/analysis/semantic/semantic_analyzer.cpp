@@ -23,6 +23,7 @@
 #include "core/types/type_lattice/type_lattice.hpp"
 #include "core/types/type_lattice/type_layout.hpp"  // FC6: computeLayout (sizeof in array dims)
 #include "core/types/char_decode.hpp"  // C 6.4.5: decodeStringLiteralBody (string-literal typing)
+#include "core/types/string_literal_decode.hpp"  // C 5.1.1.2 phase 6: decodeAdjacentStringBodies (THE chokepoint, shared with HIR)
 #include "ffi/shipped_lib_descriptor.hpp"   // FF11 neutral-JSON descriptor reader
 #include "hir/cst_const_eval.hpp"
 #include "hir/hir_op.hpp"   // FC6 c-subtreeType: HirOpKind / opName / isComparison (the per-verb laws cst_to_hir uses)
@@ -124,6 +125,17 @@ struct SchemaIndexes {
     // token / Void core) when the language declares no string-array row (toy/tsql).
     SchemaTokenId                                  stringLiteralBodyToken{};
     TypeKind                                       stringLiteralElementCore = TypeKind::Void;
+    // C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): the rule whose
+    // subtree is a (possibly adjacent-concatenated) string-literal expression.
+    // When valid, the string's `Array<core, N+1>` type is stamped on this RULE
+    // NODE (decoding every body child via the SHARED chokepoint), NOT on each
+    // body TOKEN — so `"a" "b"` types as ONE Array<Char,3>, not two separate
+    // single-piece arrays. `subtreeType` checks `typeAt(node)` first, so the
+    // stamped rule-node type wins and descent stops. Invalid (no such rule) ⇒
+    // the per-token fallback still fires (toy/tsql, or a future grammar with no
+    // stringLiteralExpr rule). Resolved by NAME at the index-build call site —
+    // source-agnostic (any grammar with a `stringLiteralExpr` rule opts in).
+    RuleId                                         stringLiteralExprRule{};
     // FC3 c1: type-specifier multiset resolution (C 6.7.2). The
     // VOCABULARY is every token kind appearing in any `typeSpecifiers`
     // row — `resolveTypeNode` treats an Internal node whose visible
@@ -2771,6 +2783,19 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
     }
 }
 
+// C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): is `node`'s parent the
+// stringLiteralExpr rule node? A body token under that rule is typed as part of
+// the WHOLE concatenated literal on the rule node (see pass2Post's Internal
+// branch), so its per-token typing is skipped. False when the grammar has no
+// stringLiteralExpr rule — the per-token fallback then fires (toy/tsql).
+[[nodiscard]] bool parentIsStringLiteralExprRule(EngineState const& s, Tree const& tree,
+                                                 NodeId node) {
+    if (!s.idx().stringLiteralExprRule.valid()) return false;
+    NodeId const p = tree.parent(node);
+    if (!p.valid() || tree.kind(p) != NodeKind::Internal) return false;
+    return tree.rule(p).v == s.idx().stringLiteralExprRule.v;
+}
+
 // ── Pass 2: post-order — resolve uses + literal/init typing + checks ───────
 // `loopDepth` (GAP C) is the count of enclosing `loopRules` subtrees the
 // walk is currently inside; a `loopControls` node at depth 0 is outside
@@ -2877,13 +2902,18 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             s.nodeToType.set(node, litTy);
         }
         // C 6.4.5: a string literal has type `Array<elementCore, N+1>` (N = decoded
-        // body length, +1 for the NUL). Decode via the SHARED `decodeStringLiteralBody`
-        // — the exact helper the HIR uses, so both tiers produce the IDENTICAL type.
-        // Diverted from a `stringArray` literalTypes row (the body token + element
-        // core live in the index). A malformed escape leaves the node InvalidType →
-        // a `sizeof` of it fails loud, never a guessed size.
+        // body length, +1 for the NUL). When the grammar has a stringLiteralExpr
+        // rule (C 5.1.1.2 phase 6, D-CSUBSET-ADJACENT-STRING-CONCAT), the WHOLE
+        // (possibly adjacent-concatenated) literal is typed on that RULE NODE in
+        // the Internal branch below — so a body TOKEN whose parent is that rule is
+        // SKIPPED here (typing it per-token would mis-size `"a" "b"` as two
+        // separate Array<Char,2>s and the HIR/semantic tiers would disagree on N).
+        // For a grammar with NO stringLiteralExpr rule (toy/tsql, or a body token
+        // not under that rule) the per-token fallback still fires. A malformed
+        // escape leaves the node InvalidType → a `sizeof` of it fails loud.
         else if (s.idx().stringLiteralBodyToken.valid()
-                 && tk == s.idx().stringLiteralBodyToken) {
+                 && tk == s.idx().stringLiteralBodyToken
+                 && !parentIsStringLiteralExprRule(s, tree, node)) {
             if (auto decoded = decodeStringLiteralBody(tree.text(node))) {
                 TypeId const elem = s.lattice.interner()
                                         .primitive(s.idx().stringLiteralElementCore);
@@ -2891,6 +2921,29 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     elem, static_cast<std::int64_t>(decoded->size() + 1));
                 s.nodeToType.set(node, arr);
             }
+        }
+    }
+
+    // C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): type the WHOLE
+    // (possibly adjacent-concatenated) string-literal expression on its RULE
+    // NODE. Every body child is decoded INDEPENDENTLY then byte-joined via the
+    // SHARED `decodeAdjacentStringBodies` chokepoint — the exact path the HIR
+    // tier uses, so both produce the IDENTICAL `Array<core, N+1>` (N = total
+    // decoded bytes). `subtreeType` short-circuits on `typeAt(node)`, so this
+    // rule-node type is what consumers (e.g. `sizeof`, array-dim fold) observe;
+    // descent into the body tokens stops. A malformed escape leaves the node
+    // untyped (InvalidType) → a `sizeof` of it fails loud, never a guessed size.
+    if (k == NodeKind::Internal
+        && s.idx().stringLiteralExprRule.valid()
+        && s.idx().stringLiteralBodyToken.valid()
+        && tree.rule(node).v == s.idx().stringLiteralExprRule.v) {
+        if (auto decoded = decodeAdjacentStringBodies(
+                tree, node, s.idx().stringLiteralBodyToken)) {
+            TypeId const elem = s.lattice.interner()
+                                    .primitive(s.idx().stringLiteralElementCore);
+            TypeId const arr  = s.lattice.interner().array(
+                elem, static_cast<std::int64_t>(decoded->size() + 1));
+            s.nodeToType.set(node, arr);
         }
     }
 
@@ -4856,6 +4909,11 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         registerSchemaTypeExtensions(s.lattice.registry(), sch);
         SchemaIndexes& idx = s.schemaIndexes[sch.schemaId().v];
         idx.numberStyle = sch.numberStyle();           // for constant array-length decode
+        // C 5.1.1.2 phase 6: the (possibly adjacent-concatenated) string-literal
+        // EXPR rule, resolved by name from THIS schema's rule interner — the
+        // same name HIR lowering's library-override path uses. Invalid for a
+        // grammar without the rule (the per-token typing fallback then fires).
+        idx.stringLiteralExprRule = sch.rules().find("stringLiteralExpr");
         buildIndexes(s, idx, sch.semantics());
         distinctSchemas.push_back(&sch);
     }

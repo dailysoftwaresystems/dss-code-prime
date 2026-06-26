@@ -16,6 +16,7 @@
 #include "core/types/number_decode.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
+#include "core/types/string_literal_decode.hpp" // C 5.1.1.2 phase 6: decodeAdjacentStringBodies (THE string-body chokepoint)
 #include "core/types/tree.hpp"
 #include "core/types/tree_node.hpp"             // isEmptySpace
 #include "core/types/type_lattice/core_type.hpp"
@@ -776,6 +777,25 @@ struct Lowerer {
                 if (j + 1 < toks.size()
                     && tree().tokenKind(toks[j]) == strStart
                     && tree().tokenKind(toks[j + 1]) == strBody) {
+                    // C 5.1.1.2 phase 6 adjacent concat (D-CSUBSET-ADJACENT-
+                    // STRING-CONCAT) makes `("a" "b")` grammatically valid here
+                    // too, but a CONCATENATED facet key is unreachable in any
+                    // real attribute (sqlite uses single-string args only). This
+                    // path reads ONE body; rather than SILENTLY DROP a second
+                    // piece, fail loud if another string opener follows the pair.
+                    std::size_t k2 = j + 2;
+                    while (k2 < toks.size()
+                           && isIgnoredKind(tree().tokenKind(toks[k2]))) {
+                        ++k2;
+                    }
+                    if (k2 < toks.size() && tree().tokenKind(toks[k2]) == strStart) {
+                        emitH(DiagnosticCode::H_UnknownLinkageSpecifier,
+                              toks[k2],
+                              std::format("adjacent string concatenation in a "
+                                          "linkage-specifier argument for '{}' "
+                                          "is not supported", key));
+                        continue;
+                    }
                     auto decoded =
                         decodeStringLiteralBody(tree().text(toks[j + 1]));
                     if (decoded.has_value()) {
@@ -1738,19 +1758,26 @@ struct Lowerer {
         return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
     }
 
-    // `"hello"` → an Array<Char, N+1> literal carrying the decoded bytes (NUL
-    // implied by the +1 length).
+    // `"hello"` (or adjacent-concatenated `"hel" "lo"`, C 5.1.1.2 phase 6) → an
+    // Array<Char, N+1> literal carrying the decoded bytes (NUL implied by the +1
+    // length). N is the sum of the per-segment decoded lengths.
     E lowerStringLiteral(NodeId node) {
-        NodeId const bodyTok = childTokenOfKind(node, cfg.stringBodyToken);
-        std::string_view const body = bodyTok.valid() ? tree().text(bodyTok) : std::string_view{};
         std::string bytes;
         if (cfg.stringDoubledDelimiter) {
-            // SQL `'…''…'`: doubled-delimiter escaping (never fails — pairs only).
+            // SQL `'…''…'`: doubled-delimiter escaping, single body (no phase-6
+            // concat in SQL) — never fails (pairs only).
+            NodeId const bodyTok = childTokenOfKind(node, cfg.stringBodyToken);
+            std::string_view const body =
+                bodyTok.valid() ? tree().text(bodyTok) : std::string_view{};
             bytes = decodeDoubledDelimiterBody(body, cfg.stringDelimiter);
-        } else if (auto decoded = decodeStringLiteralBody(body)) {  // C-family backslash escapes
+        } else if (auto decoded =
+                       decodeAdjacentStringBodies(tree(), node, cfg.stringBodyToken)) {
+            // C-family: every body child decoded (backslash escapes) then byte-joined
+            // — the SAME chokepoint the semantic typer uses, so both tiers agree on N.
             bytes = std::move(*decoded);
         } else {
-            unsupported(node, std::format("string literal \"{}\" has an unsupported escape", body));
+            unsupported(node, std::format("string literal {} has an unsupported escape",
+                                          std::string{tree().text(node)}));
             return {errorNode(node), InvalidType};
         }
         TypeId const type = interner.array(interner.primitive(TypeKind::Char),
@@ -5943,30 +5970,31 @@ struct Lowerer {
                 if (tree().kind(c) != NodeKind::Internal) continue;
                 if (isEmptySpace(tree().flags(c))) continue;
                 if (tree().rule(c).v != stringLitRule.v) continue;
-                // The body is the inner StringLiteral token.
-                for (auto const& gc : tree().children(c)) {
-                    if (tree().kind(gc) != NodeKind::Token) continue;
-                    if (tree().tokenKind(gc).v != stringLitTok.v) continue;
-                    auto decoded =
-                        decodeStringLiteralBody(tree().text(gc));
-                    if (decoded.has_value()) return std::move(*decoded);
-                    // F4 audit fix (6-agent 2nd-order, step 13.3a):
-                    // fail-loud on malformed escape rather than
-                    // silently falling back to the format-level
-                    // default — pre-fix a user-typed `extern void f()
-                    // "k\xZZ.dll";` would silently link against
-                    // msvcrt.dll with no breadcrumb pointing at the
-                    // malformed override. H_ExternDeclMalformed is
-                    // already used for malformed extern declarations.
-                    ParseDiagnostic d;
-                    d.code     = DiagnosticCode::H_ExternDeclMalformed;
-                    d.severity = DiagnosticSeverity::Error;
-                    d.buffer   = tree().source().id();
-                    d.span     = tree().span(gc);
-                    d.actual   = std::string{tree().text(gc)};
-                    reporter.report(std::move(d));
-                    return {};
-                }
+                // The override body is the inner StringLiteral token(s). Route
+                // through the SAME chokepoint string-literal lowering uses so an
+                // adjacent-concatenated override (`extern void f() "lib" ".dll";`,
+                // C 5.1.1.2 phase 6) decodes its WHOLE byte sequence — reading
+                // only the first body child would silently drop the rest.
+                auto decoded =
+                    decodeAdjacentStringBodies(tree(), c, stringLitTok);
+                if (decoded.has_value()) return std::move(*decoded);
+                // F4 audit fix (6-agent 2nd-order, step 13.3a): fail-loud on a
+                // malformed escape rather than silently falling back to the
+                // format-level default — pre-fix a user-typed `extern void f()
+                // "k\xZZ.dll";` would silently link against msvcrt.dll with no
+                // breadcrumb pointing at the malformed override.
+                // H_ExternDeclMalformed is already used for malformed extern
+                // declarations. The span points at the whole stringLiteralExpr
+                // node `c` (the offending override), since the failing segment
+                // is no longer singled out by the loop.
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::H_ExternDeclMalformed;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree().source().id();
+                d.span     = tree().span(c);
+                d.actual   = std::string{tree().text(c)};
+                reporter.report(std::move(d));
+                return {};
             }
             return {};
         };

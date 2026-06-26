@@ -1,0 +1,36 @@
+{
+  "$comment": "c20 (D-CSUBSET-ADJACENT-STRING-CONCAT) byte-level pin: `puts(\"\\x41\" \"1\")` → \"A1\". Each body is escape-decoded (phase 5) BEFORE the bytes are joined (phase 6): \\x41→'A', then '1'. A raw-token merge would form \\x411 (one byte 0x11) and print a control char. exit 0; stdout \"A1\" (+ CRT \\r\\n on PE, \\n elsewhere). Modeled on shipped_include_puts + decl_string_global's release arm.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 0,
+  "expectedStdout": "A1\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "A1\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "A1\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "expectedStdout": "A1\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
