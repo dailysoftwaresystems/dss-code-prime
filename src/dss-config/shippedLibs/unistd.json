@@ -1,0 +1,36 @@
+{
+  "$comment": "Neutral shipped <unistd.h> (POSIX) — c14 POSIX/SQLite. The core POSIX I/O syscalls SQLite's os_unix.c routes through its aSyscall table: read/write + POSITIONED pread/pwrite (SQLite reads/writes the DB file by offset, never lseek), close, ftruncate, fsync/fdatasync (durability), unlink/rmdir (file/dir removal), access (file-exists/perm checks), readlink/getcwd (path resolution), geteuid (ownership checks), getpagesize (mmap granularity), fchmod/fchown (perm propagation), fallocate (Linux preallocation). Signatures use the LP64 widths: ssize_t/off_t = i64, size_t = u64, fd/mode/uid/gid = i32/u32. Constants: SEEK_* (whence; SQLite uses SEEK_SET-relative via pread/pwrite) + the access() mode bits F_OK/R_OK/W_OK/X_OK. Linux values (arch-invariant within linux); gated availableObjectFormats:[elf]. No over-ship: SQLite's aSyscall surface. open/fcntl/fstat/lstat/stat/mkdir/mmap live in their own headers (fcntl/sys.stat/sys.mman).",
+  "header": "unistd.h",
+  "standard": "posix",
+  "availableObjectFormats": ["elf"],
+  "library": { "elf": "libc.so.6" },
+  "symbols": [
+    { "name": "close",       "signature": "fn(i32) -> i32",                              "kind": "function", "linkage": "external" },
+    { "name": "read",        "signature": "fn(i32, ptr<void>, u64) -> i64",              "kind": "function", "linkage": "external" },
+    { "name": "write",       "signature": "fn(i32, ptr<void>, u64) -> i64",              "kind": "function", "linkage": "external" },
+    { "name": "pread",       "signature": "fn(i32, ptr<void>, u64, i64) -> i64",         "kind": "function", "linkage": "external" },
+    { "name": "pwrite",      "signature": "fn(i32, ptr<void>, u64, i64) -> i64",         "kind": "function", "linkage": "external" },
+    { "name": "ftruncate",   "signature": "fn(i32, i64) -> i32",                         "kind": "function", "linkage": "external" },
+    { "name": "fsync",       "signature": "fn(i32) -> i32",                              "kind": "function", "linkage": "external" },
+    { "name": "fdatasync",   "signature": "fn(i32) -> i32",                              "kind": "function", "linkage": "external" },
+    { "name": "unlink",      "signature": "fn(ptr<char>) -> i32",                        "kind": "function", "linkage": "external" },
+    { "name": "rmdir",       "signature": "fn(ptr<char>) -> i32",                        "kind": "function", "linkage": "external" },
+    { "name": "access",      "signature": "fn(ptr<char>, i32) -> i32",                   "kind": "function", "linkage": "external" },
+    { "name": "readlink",    "signature": "fn(ptr<char>, ptr<char>, u64) -> i64",        "kind": "function", "linkage": "external" },
+    { "name": "getcwd",      "signature": "fn(ptr<char>, u64) -> ptr<char>",             "kind": "function", "linkage": "external" },
+    { "name": "geteuid",     "signature": "fn() -> u32",                                 "kind": "function", "linkage": "external" },
+    { "name": "getpagesize", "signature": "fn() -> i32",                                 "kind": "function", "linkage": "external" },
+    { "name": "fchmod",      "signature": "fn(i32, u32) -> i32",                         "kind": "function", "linkage": "external" },
+    { "name": "fchown",      "signature": "fn(i32, u32, u32) -> i32",                    "kind": "function", "linkage": "external" },
+    { "name": "fallocate",   "signature": "fn(i32, i32, i64, i64) -> i32",               "kind": "function", "linkage": "external" }
+  ],
+  "constants": [
+    { "name": "SEEK_SET", "value": 0, "type": "i32" },
+    { "name": "SEEK_CUR", "value": 1, "type": "i32" },
+    { "name": "SEEK_END", "value": 2, "type": "i32" },
+    { "name": "F_OK",     "value": 0, "type": "i32" },
+    { "name": "X_OK",     "value": 1, "type": "i32" },
+    { "name": "W_OK",     "value": 2, "type": "i32" },
+    { "name": "R_OK",     "value": 4, "type": "i32" }
+  ]
+}

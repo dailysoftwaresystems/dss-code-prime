@@ -1,0 +1,21 @@
+{
+  "$comment": "Neutral shipped <sys/mman.h> (POSIX) — c14 POSIX/SQLite. The memory-mapped-I/O surface SQLite's os_unix.c uses for its mmap'd page cache: mmap/munmap + Linux mremap (resize, under SQLITE_MMAP_READWRITE). Constants PROT_READ/PROT_WRITE (page protections) + MAP_SHARED (the only map type SQLite uses — a shared file mapping) + MREMAP_MAYMOVE (the mremap flag). MAP_FAILED is the `((void*)-1)` sentinel mmap returns on failure — a pointer, so the MACROS surface (not an integer constant). Linux values (arch-invariant within linux); gated availableObjectFormats:[elf] (the WSL run target). off_t is i64 (LP64). No over-ship: exactly SQLite's mmap surface. macOS (different MAP_* values, no mremap) is a c14-macOS follow-on.",
+  "header": "sys/mman.h",
+  "standard": "posix",
+  "availableObjectFormats": ["elf"],
+  "library": { "elf": "libc.so.6" },
+  "symbols": [
+    { "name": "mmap",   "signature": "fn(ptr<void>, u64, i32, i32, i32, i64) -> ptr<void>", "kind": "function", "linkage": "external" },
+    { "name": "munmap", "signature": "fn(ptr<void>, u64) -> i32",                           "kind": "function", "linkage": "external" },
+    { "name": "mremap", "signature": "fn(ptr<void>, u64, u64, i32) -> ptr<void>",           "kind": "function", "linkage": "external" }
+  ],
+  "macros": [
+    { "name": "MAP_FAILED", "replacement": "((void*)-1)" }
+  ],
+  "constants": [
+    { "name": "PROT_READ",      "value": 1, "type": "i32" },
+    { "name": "PROT_WRITE",     "value": 2, "type": "i32" },
+    { "name": "MAP_SHARED",     "value": 1, "type": "i32" },
+    { "name": "MREMAP_MAYMOVE", "value": 1, "type": "i32" }
+  ]
+}
