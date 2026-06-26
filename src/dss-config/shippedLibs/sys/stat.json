@@ -3,6 +3,41 @@
   "header": "sys/stat.h",
   "standard": "posix",
   "availableObjectFormats": ["elf"],
+  "library": { "elf": "libc.so.6" },
+  "symbols": [
+    { "name": "fstat", "signature": "fn(i32, ptr<void>) -> i32",      "kind": "function", "linkage": "external" },
+    { "name": "lstat", "signature": "fn(ptr<char>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "stat",  "signature": "fn(ptr<char>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "mkdir", "signature": "fn(ptr<char>, u32) -> i32",       "kind": "function", "linkage": "external" }
+  ],
+  "macros": [
+    { "name": "S_ISREG", "params": ["m"], "replacement": "(((m) & 61440) == 32768)" },
+    { "name": "S_ISDIR", "params": ["m"], "replacement": "(((m) & 61440) == 16384)" },
+    { "name": "S_ISLNK", "params": ["m"], "replacement": "(((m) & 61440) == 40960)" },
+    { "name": "st_atime", "replacement": "st_atim_sec" },
+    { "name": "st_mtime", "replacement": "st_mtim_sec" },
+    { "name": "st_ctime", "replacement": "st_ctim_sec" }
+  ],
+  "constants": [
+    { "name": "S_IFMT",   "value": 61440, "type": "i32" },
+    { "name": "S_IFSOCK", "value": 49152, "type": "i32" },
+    { "name": "S_IFLNK",  "value": 40960, "type": "i32" },
+    { "name": "S_IFREG",  "value": 32768, "type": "i32" },
+    { "name": "S_IFBLK",  "value": 24576, "type": "i32" },
+    { "name": "S_IFDIR",  "value": 16384, "type": "i32" },
+    { "name": "S_IFCHR",  "value": 8192,  "type": "i32" },
+    { "name": "S_IFIFO",  "value": 4096,  "type": "i32" },
+    { "name": "S_IRWXU",  "value": 448, "type": "i32" },
+    { "name": "S_IRUSR",  "value": 256, "type": "i32" },
+    { "name": "S_IWUSR",  "value": 128, "type": "i32" },
+    { "name": "S_IXUSR",  "value": 64,  "type": "i32" },
+    { "name": "S_IRGRP",  "value": 32, "type": "i32" },
+    { "name": "S_IWGRP",  "value": 16, "type": "i32" },
+    { "name": "S_IXGRP",  "value": 8,  "type": "i32" },
+    { "name": "S_IROTH",  "value": 4, "type": "i32" },
+    { "name": "S_IWOTH",  "value": 2, "type": "i32" },
+    { "name": "S_IXOTH",  "value": 1, "type": "i32" }
+  ],
   "structs": [
     {
       "name": "stat",

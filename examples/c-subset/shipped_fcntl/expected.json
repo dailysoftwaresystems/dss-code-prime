@@ -1,0 +1,13 @@
+{
+  "$comment": "c14d shipped <fcntl.h> + the first runtime exercise of the c14c variadic-externs extension. O_*/F_* constants + struct flock + the VARIADIC open (2-arg AND 3-arg) / fcntl (dynamic libc.so.6). The opens hit nonexistent paths (fail cleanly, no side effect); the constant VALUES + struct flock field access are the witness → exit 42 on a real Linux runtime. Two elf targets (POSIX header, availableObjectFormats:[elf], Linux WSL run target). Runs on linux-gcc + native arm64 CI legs; cross-compiles locally. Release arm runs the optimizer over the variadic calls. RED-ON-DISABLE: drop a surface → O_RDONLY/open/flock undefined → compile fails; revert the variadic support → the 3-arg open fails to type-check.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "$comment": "Neutral shipped <fcntl.h> (POSIX) — c14d POSIX/SQLite, the first VARIADIC-extern consumer (c14c). `open`/`fcntl` are variadic (`open(path, flags, ...)` — SQLite calls both 2-arg and 3-arg; `fcntl(fd, cmd, ...)` passes &flock as a vararg, so struct flock is NOT in the signature). O_* open-flags + F_* fcntl-commands + F_RDLCK/WRLCK/UNLCK lock-types + FD_CLOEXEC (Linux octal values; arch-invariant within linux). `struct flock` is a FLAT struct (short l_type/l_whence + off_t l_start/l_len + pid_t l_pid → the layout engine derives the alignment padding to 32 bytes; x86-64-linux and arm64-linux agree, so no per-target variant). Gated availableObjectFormats:[elf] (the WSL run target). The O_*/F_* VALUES are interop-critical (a wrong flag mis-opens/mis-locks) — verified against the Linux asm-generic/fcntl.h + bits/fcntl-linux.h (64-bit: O_LARGEFILE is a 0 no-op; F_GETLK/SETLK are the native 5/6/7).",
+  "header": "fcntl.h",
+  "standard": "posix",
+  "availableObjectFormats": ["elf"],
+  "library": { "elf": "libc.so.6" },
+  "symbols": [
+    { "name": "open",  "signature": "fn(ptr<char>, i32, ...) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "fcntl", "signature": "fn(i32, i32, ...) -> i32",       "kind": "function", "linkage": "external" }
+  ],
+  "structs": [
+    {
+      "name": "flock",
+      "fields": [
+        { "name": "l_type",   "type": "i16" },
+        { "name": "l_whence", "type": "i16" },
+        { "name": "l_start",  "type": "i64" },
+        { "name": "l_len",    "type": "i64" },
+        { "name": "l_pid",    "type": "i32" }
+      ]
+    }
+  ],
+  "constants": [
+    { "name": "O_RDONLY",    "value": 0,       "type": "i32" },
+    { "name": "O_WRONLY",    "value": 1,       "type": "i32" },
+    { "name": "O_RDWR",      "value": 2,       "type": "i32" },
+    { "name": "O_CREAT",     "value": 64,      "type": "i32" },
+    { "name": "O_EXCL",      "value": 128,     "type": "i32" },
+    { "name": "O_TRUNC",     "value": 512,     "type": "i32" },
+    { "name": "O_APPEND",    "value": 1024,    "type": "i32" },
+    { "name": "O_NONBLOCK",  "value": 2048,    "type": "i32" },
+    { "name": "O_LARGEFILE", "value": 0,       "type": "i32" },
+    { "name": "O_DIRECTORY", "value": 65536,   "type": "i32" },
+    { "name": "O_NOFOLLOW",  "value": 131072,  "type": "i32" },
+    { "name": "O_CLOEXEC",   "value": 524288,  "type": "i32" },
+    { "name": "O_TMPFILE",   "value": 4259840, "type": "i32" },
+    { "name": "F_DUPFD",     "value": 0,       "type": "i32" },
+    { "name": "F_GETFD",     "value": 1,       "type": "i32" },
+    { "name": "F_SETFD",     "value": 2,       "type": "i32" },
+    { "name": "F_GETFL",     "value": 3,       "type": "i32" },
+    { "name": "F_SETFL",     "value": 4,       "type": "i32" },
+    { "name": "F_GETLK",     "value": 5,       "type": "i32" },
+    { "name": "F_SETLK",     "value": 6,       "type": "i32" },
+    { "name": "F_SETLKW",    "value": 7,       "type": "i32" },
+    { "name": "F_RDLCK",     "value": 0,       "type": "i32" },
+    { "name": "F_WRLCK",     "value": 1,       "type": "i32" },
+    { "name": "F_UNLCK",     "value": 2,       "type": "i32" },
+    { "name": "FD_CLOEXEC",  "value": 1,       "type": "i32" }
+  ]
+}
