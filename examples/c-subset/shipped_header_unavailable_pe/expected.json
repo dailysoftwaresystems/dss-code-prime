@@ -1,0 +1,7 @@
+{
+  "$comment": "c8 per-target header availability — the dedicated FAIL-LOUD witness. <sys/time.h> ships availableObjectFormats:[elf,macho] (sys/time.json), so an #include of it for a windows-pe target FAILS LOUD at the include directive with F_ShippedHeaderUnavailableForTarget (the semantic descriptor gate, positioned on the carried #include span via ShippedDescriptorRef). The header is unused so this is the ONLY diagnostic (no struct-timeval cascade) — a clean single-entry error manifest. RED-ON-DISABLE: drop the availability gate (or sys/time.json's availableObjectFormats) and the include resolves silently -> zero diagnostics -> this manifest fails. Pairs with shipped_struct_timeval / shipped_sys_types (the elf/macho RUN arms — the same header succeeds where it IS available).",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [ { "spec": "x86_64:pe64-x86_64-windows-exec" } ],
+  "expectDiagnostics": [ { "code": "F_ShippedHeaderUnavailableForTarget", "line": 16, "col": 1 } ]
+}

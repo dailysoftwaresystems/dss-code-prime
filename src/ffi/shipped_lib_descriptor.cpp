@@ -237,6 +237,39 @@ void decodeShippedMacros(json const& doc, std::string const& pathStr,
     }
 }
 
+// Decode the optional `availableObjectFormats` array (per-target AVAILABILITY)
+// into `out`. Each entry must be a known object-format name (the SAME
+// `objectFormatKindFromName` vocabulary the `library` keys use; a typo fails loud
+// HERE). Empty/absent ⇒ available on every format. Shared chokepoint: the full
+// read AND the fast interner-free `readShippedLibAvailability` (the front-end
+// availability gate) both decode through this, so they can never drift.
+void decodeShippedAvailability(json const& doc, std::string const& pathStr,
+                               DiagnosticReporter& reporter,
+                               std::vector<std::string>& out) {
+    if (!doc.contains("availableObjectFormats")) return;
+    if (!doc.at("availableObjectFormats").is_array()) {
+        emitMalformed(reporter, "shipped-lib descriptor '" + pathStr
+                                    + "': 'availableObjectFormats' must be an array of "
+                                      "object-format names, e.g. [\"elf\",\"macho\"]");
+        return;
+    }
+    for (auto const& v : doc.at("availableObjectFormats")) {
+        if (!v.is_string()) {
+            emitMalformed(reporter, "shipped-lib descriptor '" + pathStr
+                                        + "': 'availableObjectFormats' entries must be strings");
+            continue;
+        }
+        std::string fmt = v.get<std::string>();
+        if (!objectFormatKindFromName(fmt).has_value()) {
+            emitMalformed(reporter, "shipped-lib descriptor '" + pathStr
+                                        + "': 'availableObjectFormats' has unknown object-format "
+                                          "name '" + fmt + "' (expected \"pe\"/\"elf\"/\"macho\")");
+            continue;
+        }
+        out.push_back(std::move(fmt));
+    }
+}
+
 } // namespace
 
 std::optional<ShippedLibDescriptor>
@@ -347,6 +380,13 @@ readShippedLibDescriptor(std::filesystem::path const& path,
         }
     }
 
+    // (2.5) Optional `availableObjectFormats` — the per-target AVAILABILITY set
+    // (which object-formats this header EXISTS on). Absent/empty ⇒ available on
+    // every format (back-compat). Decoded through the SHARED chokepoint so the
+    // full read + the fast front-end reader never drift.
+    decodeShippedAvailability(doc, path.generic_string(), reporter,
+                              out.availableObjectFormats);
+
     // (3) `symbols` array — OPTIONAL. A header may carry only `constants`
     // (e.g. <limits.h>, all `#define`s, no linkable symbols) or only
     // `typedefs`; the "declares SOMETHING" requirement is enforced across
@@ -368,8 +408,9 @@ readShippedLibDescriptor(std::filesystem::path const& path,
     // human note, e.g. the LP64-vs-LLP64 deferral rationale in stdio/stdlib) —
     // accepted + ignored, never consumed by lowering.
     (void)rejectUnknownKeys(reporter, doc, "(root)",
-                            {"header", "standard", "library", "symbols",
-                             "constants", "typedefs", "structs", "macros", "$comment"});
+                            {"header", "standard", "library", "availableObjectFormats",
+                             "symbols", "constants", "typedefs", "structs", "macros",
+                             "$comment"});
 
     // (4) Each symbol. Collect-all: a malformed symbol is reported but the
     // loop continues so the operator sees every problem in one pass; the
@@ -817,6 +858,46 @@ readShippedLibMacros(std::filesystem::path const& path,
     decodeShippedMacros(doc, path.generic_string(), reporter, out);
     if (reporter.errorCount() != errBefore) return std::nullopt;
     return out;  // empty when the descriptor declares no `macros` (typed-only)
+}
+
+std::optional<std::vector<std::string>>
+readShippedLibAvailability(std::filesystem::path const& path,
+                           DiagnosticReporter&          reporter) {
+    // Interner-FREE per-target AVAILABILITY read for the FRONT-END gate (the
+    // preprocessor `__has_include` callback + the import resolver's `#include`,
+    // neither of which has a TypeInterner). Returns the `availableObjectFormats`
+    // set (EMPTY ⇒ available on every format = back-compat); std::nullopt on a
+    // broken JSON / malformed availability. No `header` or typed-surface gate —
+    // the semantic read owns those (this must be no STRICTER than the full read).
+    std::size_t const errBefore = reporter.errorCount();
+    std::ifstream in{path, std::ios::binary};
+    if (!in) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor: failed to open '"}
+                + path.generic_string() + "' for reading");
+        return std::nullopt;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    json doc;
+    try {
+        doc = json::parse(ss.str());
+    } catch (json::parse_error const& e) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor '"} + path.generic_string()
+                + "': JSON parse error: " + e.what());
+        return std::nullopt;
+    }
+    if (!doc.is_object()) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor '"} + path.generic_string()
+                + "': top-level value must be a JSON object");
+        return std::nullopt;
+    }
+    std::vector<std::string> out;
+    decodeShippedAvailability(doc, path.generic_string(), reporter, out);
+    if (reporter.errorCount() != errBefore) return std::nullopt;
+    return out;  // empty ⇒ available on every format
 }
 
 } // namespace dss::ffi

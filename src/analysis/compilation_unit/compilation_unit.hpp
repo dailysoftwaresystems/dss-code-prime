@@ -49,6 +49,18 @@ struct DSS_EXPORT CrossTreeRef {
     std::optional<SourceSpan> importSpan;
 };
 
+// A recorded angle `#include <h>` → neutral shipped descriptor: the resolved
+// descriptor JSON `path` plus the include directive's `span`/`buffer`. The span +
+// buffer are carried so the PER-TARGET semantic availability gate can emit a
+// POSITIONED `F_ShippedHeaderUnavailableForTarget` on the include line — the
+// front-end is target-agnostic, so the active object-format (hence availability)
+// is only known per-target at semantic time. (D-SHIPPED-HEADER-PER-TARGET-AVAILABILITY)
+struct DSS_EXPORT ShippedDescriptorRef {
+    std::filesystem::path path;    // the resolved `<stem>.json` descriptor path
+    SourceSpan            span;    // the `#include <h>` directive span
+    BufferId              buffer;  // the buffer the include directive was found in
+};
+
 // Single CompilationUnit. Move-only, single-use (built by UnitBuilder::finish,
 // consumed by phase #8). Artifact-profile-agnostic (D8): the profile lives
 // on CompilationContext (06-artifact-profile-plan AP3), not here.
@@ -66,7 +78,7 @@ public:
                     std::vector<Tree>                    trees,
                     DiagnosticReporter                   driverDiagnostics,
                     std::vector<CrossTreeRef>            crossRefs,
-                    std::vector<std::filesystem::path>   shippedLibDescriptors,
+                    std::vector<ShippedDescriptorRef>    shippedLibDescriptors,
                     std::uint32_t                        typeNameReparseCount = 0,
                     std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers = {});
 
@@ -118,7 +130,7 @@ public:
     // descriptor is a neutral symbol table, NOT a parsed source Tree, so it
     // produces no entry in `trees()`/`crossRefs()`. CU4's ImportResolver is the
     // only producer.
-    [[nodiscard]] std::span<std::filesystem::path const>
+    [[nodiscard]] std::span<ShippedDescriptorRef const>
     shippedLibDescriptors() const noexcept;
 
     // Process-global monotonic id counter. Mirrors `TreeBuilder::nextTreeId`
@@ -155,7 +167,7 @@ private:
     std::vector<Tree>                    trees_;
     DiagnosticReporter                   driverDiagnostics_;
     std::vector<CrossTreeRef>            crossRefs_;
-    std::vector<std::filesystem::path>   shippedLibDescriptors_;  // FF11 neutral-JSON descriptor paths
+    std::vector<ShippedDescriptorRef>    shippedLibDescriptors_;  // FF11 neutral-JSON descriptor refs (path+span+buffer)
     std::uint32_t                        typeNameReparseCount_ = 0;  // FC2 oracle observability
     std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers_;    // FC13 PP origin buffers (header/main) for diagnostic rendering
 };

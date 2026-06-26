@@ -268,7 +268,7 @@ TEST(ImportResolver, CSubsetAngleIncludeResolvesToDescriptorOnSystemDir) {
     ASSERT_EQ(cu.shippedLibDescriptors().size(), 1u)
         << "the angle include must record exactly one descriptor path";
     std::error_code ec;
-    auto const got  = std::filesystem::weakly_canonical(cu.shippedLibDescriptors()[0], ec);
+    auto const got  = std::filesystem::weakly_canonical(cu.shippedLibDescriptors()[0].path, ec);
     auto const want = std::filesystem::weakly_canonical(descPath, ec);
     EXPECT_EQ(got, want)
         << "<api.h> must map to api.json on the system dir";
@@ -303,7 +303,7 @@ TEST(ImportResolver, CSubsetSubdirAngleIncludeResolvesDistinctFromTopLevel) {
     ASSERT_EQ(cu.shippedLibDescriptors().size(), 1u)
         << "the angle include must record exactly one descriptor path";
     std::error_code ec;
-    auto const got = std::filesystem::weakly_canonical(cu.shippedLibDescriptors()[0], ec);
+    auto const got = std::filesystem::weakly_canonical(cu.shippedLibDescriptors()[0].path, ec);
     EXPECT_EQ(got, std::filesystem::weakly_canonical(want, ec))
         << "<sys/time.h> must resolve to sys/time.json, NOT the top-level decoy time.json";
 }

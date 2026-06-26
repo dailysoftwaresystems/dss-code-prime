@@ -1,10 +1,9 @@
 {
-  "$comment": "The struct-body descriptor mechanism: <sys/time.h>'s `structs` surface declares `struct timeval {i64 tv_sec; i64 tv_usec}`; the semantic phase injects it (tag + field scope + compositeScopeByType) so by-name field access compiles and the layout engine derives offsets 0/8. exit 42 witnesses tag resolution + field access + correct offsets on all 4 ABIs. RED-on-disable: without the structs surface + injection, `struct timeval` is unknown → compile fails. The release arm confirms the full shipped pipeline (the optimizer over the new struct GEP/Load shapes).",
+  "$comment": "The struct-body descriptor mechanism: <sys/time.h>'s `structs` surface declares `struct timeval {i64 tv_sec; i64 tv_usec}`; the semantic phase injects it (tag + field scope + compositeScopeByType) so by-name field access compiles and the layout engine derives offsets 0/8. exit 42 witnesses tag resolution + field access + correct offsets on the unix ABIs (elf x86-64 + arm64-qemu + macho). NO windows-pe arm: <sys/time.h> is POSIX, declared `availableObjectFormats:[elf,macho]`, so a pe compile FAILS LOUD (c8 per-target availability). RED-on-disable: without the structs surface + injection, `struct timeval` is unknown → compile fails. The release arm confirms the full shipped pipeline (the optimizer over the new struct GEP/Load shapes).",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,
   "targets": [
-    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
     { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
     { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
     { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }

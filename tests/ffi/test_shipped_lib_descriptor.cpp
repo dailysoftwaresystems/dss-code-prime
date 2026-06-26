@@ -347,6 +347,108 @@ TEST(ShippedLibDescriptor, StructDuplicateFieldNameFailsLoud) {
     EXPECT_TRUE(rep.hasErrors());
 }
 
+// ── availableObjectFormats (per-target AVAILABILITY axis; c8) ─────────────────
+
+// `availableObjectFormats` decodes into the descriptor's per-format set (which
+// object-formats the header EXISTS on). The full read + the front-end reader
+// share ONE decode chokepoint (decodeShippedAvailability), so they cannot drift.
+TEST(ShippedLibDescriptor, AvailabilityDecodes) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "av.json", R"JSON({
+        "header": "sys/time.h",
+        "availableObjectFormats": ["elf", "macho"],
+        "typedefs": [ { "name": "time_t", "type": "i64" } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->availableObjectFormats.size(), 2u);
+    EXPECT_EQ(desc->availableObjectFormats[0], "elf");
+    EXPECT_EQ(desc->availableObjectFormats[1], "macho");
+}
+
+// ABSENT `availableObjectFormats` ⇒ empty set ⇒ available on EVERY format (the
+// back-compat default — every pre-c8 descriptor keeps resolving on all targets).
+TEST(ShippedLibDescriptor, AvailabilityAbsentIsEmptyAllFormats) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "noav.json", R"({
+        "header": "h.h", "typedefs": [ { "name": "t", "type": "i32" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(desc->availableObjectFormats.empty());
+}
+
+// An UNKNOWN object-format name in `availableObjectFormats` fails loud — a typo'd
+// platform would silently make the header available NOWHERE (the entry never
+// matches the active format) or, worse, mask a real availability. RED-ON-DISABLE:
+// drop the objectFormatKindFromName check and "bogus" decodes as a live format.
+TEST(ShippedLibDescriptor, AvailabilityUnknownFormatFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "badav.json", R"JSON({
+        "header": "h.h", "availableObjectFormats": ["elf", "bogus"],
+        "typedefs": [ { "name": "t", "type": "i32" } ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// readShippedLibAvailability: interner-FREE (the front-end gate's path — neither
+// the preprocessor `__has_include` nor the import resolver has a TypeInterner).
+// Decodes the SAME set the full read does, through the shared chokepoint.
+TEST(ShippedLibDescriptor, ReadShippedLibAvailabilityInternerFree) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "av2.json", R"JSON({
+        "header": "sys/time.h", "availableObjectFormats": ["elf", "macho"],
+        "structs": [ { "name": "timeval", "fields": [ { "name": "s", "type": "i64" } ] } ]
+    })JSON");
+    DiagnosticReporter rep;
+    auto avail = readShippedLibAvailability(path, rep);   // NO interner / typeReg
+    ASSERT_TRUE(avail.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(avail->size(), 2u);
+    EXPECT_EQ(avail->at(0), "elf");
+    EXPECT_EQ(avail->at(1), "macho");
+}
+
+// readShippedLibAvailability on a descriptor with NO availableObjectFormats
+// returns an EMPTY vector (NOT nullopt) — empty ⇒ available on every format. The
+// reader is no STRICTER than the full read (no header/typed-surface gate).
+TEST(ShippedLibDescriptor, ReadShippedLibAvailabilityAbsentIsEmpty) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "av3.json", R"({
+        "typedefs": [ { "name": "size_t", "type": "u64" } ]
+    })");
+    DiagnosticReporter rep;
+    auto avail = readShippedLibAvailability(path, rep);
+    ASSERT_TRUE(avail.has_value());   // NOT nullopt — absence is not an error
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(avail->empty());      // empty ⇒ every format
+}
+
+// readShippedLibAvailability fails loud (nullopt) on a malformed availability —
+// the front-end gate must never silently treat a broken descriptor as available.
+TEST(ShippedLibDescriptor, ReadShippedLibAvailabilityUnknownFormatFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "av4.json",
+        R"({ "header": "h.h", "availableObjectFormats": ["nonsense"] })");
+    DiagnosticReporter rep;
+    auto avail = readShippedLibAvailability(path, rep);
+    EXPECT_FALSE(avail.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
 // An "object" kind decodes to ShippedSymbolKind::Object (→ ExternGlobal).
 TEST(ShippedLibDescriptor, ObjectKindDecodes) {
     ScratchDir dir{Location::Temp, "shipped-lib"};

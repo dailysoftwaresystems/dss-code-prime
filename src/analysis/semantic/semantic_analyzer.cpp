@@ -177,6 +177,9 @@ struct EngineState {
     // nullopt) ⇒ `ap` is `__va_list_tag[1]`/`*`; HomogeneousPointer (Win64) ⇒ `ap`
     // is `char*`. `nullopt` ⇒ the SysV-family default (back-compat).
     std::optional<VaListStrategy> vaListStrategy;
+    // c8: the active target's object-format (`analyze()`'s param) — gates
+    // per-target shipped-header availability. `nullopt` ⇒ no gate (back-compat).
+    std::optional<ObjectFormatKind> activeFormat;
     // HR11: per-schema index bundles, keyed by SchemaId.v; `active_` is the
     // bundle for the tree currently being processed (set via `activate`).
     std::unordered_map<std::uint32_t, SchemaIndexes> schemaIndexes;
@@ -4646,12 +4649,14 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  DataModel dataModel,
                                  std::optional<AggregateLayoutParams> aggregateLayout,
-                                 std::optional<VaListStrategy> vaListStrategy);
+                                 std::optional<VaListStrategy> vaListStrategy,
+                                 std::optional<ObjectFormatKind> activeFormat);
 
 SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       DataModel dataModel,
                       std::optional<AggregateLayoutParams> aggregateLayout,
-                      std::optional<VaListStrategy> vaListStrategy) {
+                      std::optional<VaListStrategy> vaListStrategy,
+                      std::optional<ObjectFormatKind> activeFormat) {
     // Run the recursive analysis on a dedicated large-stack worker thread
     // (JOIN-synchronous — no concurrency) so a deeply-nested-but-legal
     // expression tree does not overflow the host's ~1 MB main thread stack.
@@ -4663,14 +4668,15 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
     return dss::substrate::callOnLargeStack(
         dss::substrate::kDeepRecursionStackBytes, [&] {
             return analyzeImpl(std::move(cu), dataModel, std::move(aggregateLayout),
-                               std::move(vaListStrategy));
+                               std::move(vaListStrategy), std::move(activeFormat));
         });
 }
 
 static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  DataModel dataModel,
                                  std::optional<AggregateLayoutParams> aggregateLayout,
-                                 std::optional<VaListStrategy> vaListStrategy) {
+                                 std::optional<VaListStrategy> vaListStrategy,
+                                 std::optional<ObjectFormatKind> activeFormat) {
     if (!cu) {
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();
@@ -4679,6 +4685,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     s.dataModel = dataModel;
     s.aggregateLayout = aggregateLayout;
     s.vaListStrategy = vaListStrategy;
+    s.activeFormat = activeFormat;
 
     // FC3 c1: ILP32 is DECLARED-ONLY (the wasm/spirv skeleton formats
     // carry it for honesty) — no exercised 32-bit width path exists, so
@@ -5054,8 +5061,9 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // descriptor `struct stat` does NOT collide with the ordinary `stat`
         // function, so tag first-wins dedup uses its own set.
         std::unordered_set<std::string> injectedTags;
-        for (std::filesystem::path const& descPath :
+        for (ShippedDescriptorRef const& ref :
              cu->shippedLibDescriptors()) {
+            std::filesystem::path const& descPath = ref.path;  // (ref.span/buffer: the c8 gate)
             std::error_code ec;
             auto canonical = std::filesystem::weakly_canonical(descPath, ec);
             std::string const key =
@@ -5071,6 +5079,32 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 descPath, s.lattice.interner(), s.lattice.registry(), s.reporter,
                 s.dataModel);
             if (!desc) continue;
+
+            // c8: per-target AVAILABILITY gate. When the active object-format is
+            // KNOWN (a real per-target compile — nullopt for direct-API/LSP/test
+            // callers) and the descriptor RESTRICTS its formats (non-empty
+            // `availableObjectFormats`) and the active format is NOT among them, the
+            // header does not exist on this target → FAIL LOUD (like MSVC C1083 for
+            // a POSIX `<sys/time.h>` on windows-pe), POSITIONED on the `#include`
+            // line (the carried ref.span/buffer), and inject NOTHING. AGNOSTIC: a
+            // config-declared set + a generic membership test, no `if(format==…)`.
+            if (s.activeFormat.has_value() && !desc->availableObjectFormats.empty()) {
+                std::string const activeName{objectFormatKindName(*s.activeFormat)};
+                bool const available =
+                    std::find(desc->availableObjectFormats.begin(),
+                              desc->availableObjectFormats.end(), activeName)
+                    != desc->availableObjectFormats.end();
+                if (!available) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::F_ShippedHeaderUnavailableForTarget;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = ref.buffer;
+                    d.span     = ref.span;
+                    d.actual   = desc->header;
+                    s.reporter.report(std::move(d));
+                    continue;   // unavailable for this target — inject nothing
+                }
+            }
 
             for (auto const& sym : desc->symbols) {
                 // GOAL-2: a user decl of this name wins — skip the descriptor's.

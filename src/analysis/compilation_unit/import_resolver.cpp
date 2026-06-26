@@ -311,7 +311,11 @@ private:
                     auto const resolved = resolveSystemDescriptor(
                         directive.filename, context.systemDirs);
                     if (!resolved) { unresolved(); continue; }
-                    context.shippedLibDescriptors.push_back(*resolved);
+                    // Carry the include directive's span + buffer so the per-target
+                    // SEMANTIC availability gate can position its diagnostic on the
+                    // `#include` line (the format isn't known until semantic time).
+                    context.shippedLibDescriptors.push_back(
+                        ShippedDescriptorRef{*resolved, directive.span, sourceBuffer});
                     continue;
                 }
 

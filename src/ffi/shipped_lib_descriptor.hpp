@@ -195,6 +195,16 @@ struct DSS_EXPORT ShippedLibDescriptor {
     // ("pe"/"elf"/"macho"). The compile pipeline selects the active target's
     // entry; a missing key inherits `externLibraryByFormat[format]`.
     std::unordered_map<std::string, std::string> library;
+    // Optional per-target AVAILABILITY (which object-formats this header EXISTS
+    // on), the sibling per-format axis to `library` (which IMAGE per format).
+    // EMPTY = available on EVERY format (back-compat — C-standard headers omit
+    // it). A non-empty set restricts: a POSIX header carries {"elf","macho"} (not
+    // "pe"), so `#include <sys/time.h>` fails loud for a windows-pe target and
+    // `__has_include` answers the per-target truth. Keys are the same
+    // `objectFormatKindFromName` vocabulary `library` uses (an unknown name fails
+    // loud on read). AGNOSTIC: a config-declared set the resolver tests membership
+    // against — never an `if (format == ...)`. (D-SHIPPED-HEADER-PER-TARGET-AVAILABILITY)
+    std::vector<std::string>   availableObjectFormats;
     // The full neutral surface a header provides. A descriptor must declare AT
     // LEAST ONE of these non-empty (a descriptor that declares NOTHING is a
     // no-op artifact and fails loud); a header may legitimately carry only
@@ -253,6 +263,16 @@ readShippedLibDescriptor(std::filesystem::path const& path,
 [[nodiscard]] DSS_EXPORT std::optional<std::vector<ShippedMacro>>
 readShippedLibMacros(std::filesystem::path const& path,
                      DiagnosticReporter&          reporter);
+
+// Read ONLY the `availableObjectFormats` set from the descriptor at `path`,
+// WITHOUT a TypeInterner — the FRONT-END per-target availability gate (the
+// preprocessor `__has_include` + the import resolver's `#include`). Returns the
+// set of object-format names the header exists on (EMPTY ⇒ available on every
+// format = back-compat); std::nullopt on a broken JSON / malformed availability.
+// The caller tests membership of the active target's `objectFormatKindName`.
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<std::string>>
+readShippedLibAvailability(std::filesystem::path const& path,
+                           DiagnosticReporter&          reporter);
 
 } // namespace ffi
 } // namespace dss

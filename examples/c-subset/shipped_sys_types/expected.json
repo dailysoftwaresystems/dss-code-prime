@@ -1,10 +1,9 @@
 {
-  "$comment": "Shipped <sys/types.h> POSIX typedefs + the FIRST subdirectory descriptor (sys/types.json). off_t/ssize_t -> i64, mode_t -> u32; exit 42 witnesses the subdir resolution + typedef injection on all 4 ABIs. RED-on-disable: without the resolveSystemDescriptor subdir-preserving fix, <sys/types.h> maps to a non-existent types.json and the header fails to resolve -> compile fails. The release arm confirms the full shipped pipeline.",
+  "$comment": "Shipped <sys/types.h> POSIX typedefs + the FIRST subdirectory descriptor (sys/types.json). off_t/ssize_t -> i64, mode_t -> u32; exit 42 witnesses the subdir resolution + typedef injection on the unix ABIs (elf x86-64 + arm64-qemu + macho). NO windows-pe arm: <sys/types.h> is a POSIX header now declared `availableObjectFormats:[elf,macho]`, so a pe compile FAILS LOUD (c8 per-target availability) — proven by the dedicated shipped_header_unavailable_pe error example. RED-on-disable: without the resolveSystemDescriptor subdir-preserving fix, <sys/types.h> maps to a non-existent types.json and the header fails to resolve -> compile fails. The release arm confirms the full shipped pipeline.",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,
   "targets": [
-    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
     { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
     { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
     { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }

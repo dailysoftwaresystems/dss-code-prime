@@ -1384,6 +1384,16 @@ enum class DiagnosticCode : std::uint16_t {
     //   well-formed hir-text type. Member of `kUnsuppressableCodes`.
     //   (Neutral shipped-lib descriptor, 2026-06-06.)
     F_ShippedLibUnsupportedType    = 0x501C,
+    // F_ShippedHeaderUnavailableForTarget: an angle `#include <h>` resolved to a
+    //   shipped descriptor that EXISTS, but the descriptor's
+    //   `availableObjectFormats` set excludes the active compile target's
+    //   object-format (e.g. a POSIX `<sys/time.h>` declaring {"elf","macho"}
+    //   included for a windows-pe target). Fail-loud: a header that does not
+    //   exist on the target must error like a real toolchain (MSVC C1083), never
+    //   silently resolve — and `__has_include` answers the per-target truth.
+    //   Remediation: guard the include per platform, or build for a format the
+    //   header supports. (D-SHIPPED-HEADER-PER-TARGET-AVAILABILITY, 2026-06-25.)
+    F_ShippedHeaderUnavailableForTarget = 0x501D,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

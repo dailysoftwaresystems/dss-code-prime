@@ -5,6 +5,7 @@
 #include "core/export.hpp"
 #include "core/types/aggregate_layout.hpp"
 #include "core/types/data_model.hpp"
+#include "core/types/object_format_kind.hpp"   // ObjectFormatKind (per-target availability gate)
 
 #include <memory>
 #include <optional>
@@ -58,6 +59,11 @@ namespace dss {
 analyze(std::shared_ptr<CompilationUnit const> cu,
         DataModel dataModel = DataModel::Lp64,
         std::optional<AggregateLayoutParams> aggregateLayout = std::nullopt,
-        std::optional<VaListStrategy> vaListStrategy = std::nullopt);
+        std::optional<VaListStrategy> vaListStrategy = std::nullopt,
+        // The active target's object-format — gates per-target shipped-header
+        // availability (a POSIX `<sys/time.h>` is unavailable for windows-pe).
+        // `nullopt` (direct-API / LSP / test callers) ⇒ NO availability gate (every
+        // recorded descriptor is read, as before). (D-SHIPPED-HEADER-PER-TARGET-AVAILABILITY)
+        std::optional<ObjectFormatKind> activeFormat = std::nullopt);
 
 } // namespace dss

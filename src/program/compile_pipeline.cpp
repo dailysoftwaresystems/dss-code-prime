@@ -229,7 +229,8 @@ static std::optional<CuMirModule> buildCuMirImpl(
         analyzeVaStrategy = cc->vaListLayout->strategy;
     }
     auto model = analyze(
-        std::move(borrowed), format.dataModel(), analyzeLayout, analyzeVaStrategy);
+        std::move(borrowed), format.dataModel(), analyzeLayout, analyzeVaStrategy,
+        format.kind());   // c8: the active object-format → per-target availability gate
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
         return std::nullopt;
