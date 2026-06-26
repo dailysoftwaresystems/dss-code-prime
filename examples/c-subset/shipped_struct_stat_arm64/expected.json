@@ -1,0 +1,12 @@
+{
+  "$comment": "Plan 25 per-target struct variants — arm64-linux leg + the RED-ON-DISABLE pin. <sys/stat.h>'s `struct stat` (arch=arm64, format=elf) variant is the 128-byte glibc layout (DIVERGES from x86-64's 144), so `sizeof(struct stat)` folds to 128 → st_mode(40)+st_blocks(2)=42. Runs under qemu-aarch64 on the linux CI leg; cross-compiles locally. RED-ON-DISABLE: neuter the variant selector → arm64 gets the x86-64 144-byte variant → sizeof != 128 → exit 7. The release arm runs the optimizer over the struct shapes.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

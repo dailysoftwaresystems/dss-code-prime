@@ -180,6 +180,12 @@ struct EngineState {
     // c8: the active target's object-format (`analyze()`'s param) — gates
     // per-target shipped-header availability. `nullopt` ⇒ no gate (back-compat).
     std::optional<ObjectFormatKind> activeFormat;
+    // Plan 25: the active target's ARCH NAME (`analyze()`'s param — `target.name()`).
+    // The per-target shipped-struct `variants` selector: a struct's field list is
+    // chosen by (activeTarget, activeFormat) so its byte layout is correct per
+    // target. `nullopt` ⇒ no variant selection (back-compat: flat-`fields` structs
+    // decode as before; a variants-only struct is not injected).
+    std::optional<std::string> activeTarget;
     // HR11: per-schema index bundles, keyed by SchemaId.v; `active_` is the
     // bundle for the tree currently being processed (set via `activate`).
     std::unordered_map<std::uint32_t, SchemaIndexes> schemaIndexes;
@@ -4774,13 +4780,15 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  DataModel dataModel,
                                  std::optional<AggregateLayoutParams> aggregateLayout,
                                  std::optional<VaListStrategy> vaListStrategy,
-                                 std::optional<ObjectFormatKind> activeFormat);
+                                 std::optional<ObjectFormatKind> activeFormat,
+                                 std::optional<std::string_view> activeTarget);
 
 SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       DataModel dataModel,
                       std::optional<AggregateLayoutParams> aggregateLayout,
                       std::optional<VaListStrategy> vaListStrategy,
-                      std::optional<ObjectFormatKind> activeFormat) {
+                      std::optional<ObjectFormatKind> activeFormat,
+                      std::optional<std::string_view> activeTarget) {
     // Run the recursive analysis on a dedicated large-stack worker thread
     // (JOIN-synchronous — no concurrency) so a deeply-nested-but-legal
     // expression tree does not overflow the host's ~1 MB main thread stack.
@@ -4792,7 +4800,8 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
     return dss::substrate::callOnLargeStack(
         dss::substrate::kDeepRecursionStackBytes, [&] {
             return analyzeImpl(std::move(cu), dataModel, std::move(aggregateLayout),
-                               std::move(vaListStrategy), std::move(activeFormat));
+                               std::move(vaListStrategy), std::move(activeFormat),
+                               std::move(activeTarget));
         });
 }
 
@@ -4800,7 +4809,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  DataModel dataModel,
                                  std::optional<AggregateLayoutParams> aggregateLayout,
                                  std::optional<VaListStrategy> vaListStrategy,
-                                 std::optional<ObjectFormatKind> activeFormat) {
+                                 std::optional<ObjectFormatKind> activeFormat,
+                                 std::optional<std::string_view> activeTarget) {
     if (!cu) {
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();
@@ -4810,6 +4820,9 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     s.aggregateLayout = aggregateLayout;
     s.vaListStrategy = vaListStrategy;
     s.activeFormat = activeFormat;
+    // Plan 25: own the arch-name string (the caller's string_view may be
+    // transient) so the shipped-struct variant selector reads a stable value.
+    if (activeTarget.has_value()) s.activeTarget = std::string{*activeTarget};
 
     // FC3 c1: ILP32 is DECLARED-ONLY (the wasm/spirv skeleton formats
     // carry it for honesty) — no exercised 32-bit width path exists, so
@@ -5199,9 +5212,20 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             // F_ShippedLibUnsupportedType) and returns nullopt on any problem;
             // nothing is injected in that case (the pipeline then aborts on the
             // reporter error delta — never a silent partial import).
+            // Plan 25: thread the active (arch, format) so the decoder can SELECT
+            // a struct's per-target `variants` field list (a struct's byte layout
+            // diverges per target — `struct stat` is 144B on x86_64-linux, 128B on
+            // arm64-linux). `s.activeTarget`/`s.activeFormat` are nullopt for
+            // direct-API/LSP/test callers ⇒ no variant selection (flat-`fields`
+            // structs decode as before). The string_view borrows `s.activeTarget`'s
+            // string, which outlives this call.
+            std::optional<std::string_view> const activeTargetView =
+                s.activeTarget.has_value()
+                    ? std::optional<std::string_view>{*s.activeTarget}
+                    : std::nullopt;
             auto desc = ffi::readShippedLibDescriptor(
                 descPath, s.lattice.interner(), s.lattice.registry(), s.reporter,
-                s.dataModel);
+                s.dataModel, activeTargetView, s.activeFormat);
             if (!desc) continue;
 
             // c8: per-target AVAILABILITY gate. When the active object-format is

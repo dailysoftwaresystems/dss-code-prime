@@ -12,9 +12,13 @@
 //   * a truncated / unknown signature → F_ShippedLibUnsupportedType + nullopt,
 //     and NO symbol returned with InvalidType (the CRITICAL fail-loud).
 
+#include "core/types/aggregate_layout.hpp"           // AggregateLayoutParams (variant-layout pins)
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/object_format_kind.hpp"          // ObjectFormatKind (variant selector)
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/target_schema.hpp"               // TargetSchema (crux re-verify, gate 2)
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_layout.hpp"    // computeLayout (variant offset pins)
 #include "core/types/type_lattice/type_registry.hpp"
 #include "diagnostic_count.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
@@ -25,7 +29,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
+#include <string_view>
 
 using namespace dss;
 using namespace dss::ffi;
@@ -345,6 +351,459 @@ TEST(ShippedLibDescriptor, StructDuplicateFieldNameFailsLoud) {
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
     EXPECT_FALSE(desc.has_value());
     EXPECT_TRUE(rep.hasErrors());
+}
+
+// ── per-target struct VARIANTS (per-target byte layout; plan 25) ─────────────
+//
+// A `structs` entry may declare per-target `variants` (each `when:{arch?,format?}`
+// + its own field list) INSTEAD of a flat `fields`, so a struct can carry the
+// correct per-target byte layout. The decoder selects the variant matching the
+// active (arch, format); the injection + layout engine are UNCHANGED. The CRUX
+// (gate 2 below pins it): x86_64/arm64 AggregateLayoutParams are byte-identical and
+// `computeLayout` is param-driven, so the per-target offset delta comes ENTIRELY
+// from the selected FIELD LIST.
+
+namespace {
+// The shipped-target aggregate-layout params (natural alignment, 16-byte ISA cap),
+// LP64 — the layout context the selection pins assert offsets under. Both shipped
+// ELF arches feed these identical params (gate 2 proves it from the real schemas).
+constexpr AggregateLayoutParams kNatural16{ScalarAlignmentRule::Natural, 16};
+
+// A 2-variant descriptor whose SAME named field `x` (i64) sits at a different byte
+// offset per arch: variant "archA" has a leading i32 pad → x@8; variant "archB"
+// has x alone → x@0. The format is the same (elf) for both, so only the arch
+// selects. `objectFormat` "elf".
+[[nodiscard]] std::string twoVariantDescriptor() {
+    return R"JSON({
+        "header": "v.h",
+        "structs": [
+            { "name": "S", "variants": [
+                { "when": { "arch": "archA", "format": "elf" },
+                  "fields": [ { "name": "pad", "type": "i32" }, { "name": "x", "type": "i64" } ] },
+                { "when": { "arch": "archB", "format": "elf" },
+                  "fields": [ { "name": "x", "type": "i64" } ] }
+            ] }
+        ]
+    })JSON";
+}
+} // namespace
+
+// SELECTION PIN (gate 5; closure gates 1/5). Decoding with arch=archA selects the
+// padded variant → `x`@8; with arch=archB → `x`@0. The offset is read from
+// `computeLayout` on the interned struct type — the SAME engine MIR uses. This is
+// the per-target layout proof: the ONLY difference between the two decodes is the
+// selected field list, and that flips `x`'s offset 8 → 0.
+// RED-ON-DISABLE: neuter the selector to always take variant 0 (the `matchCount`
+// machinery → "use variants[0]") and the archB assertion (x@0) fails — archB would
+// see the padded layout (x@8).
+TEST(ShippedLibDescriptor, StructVariantSelectsPerArchLayout) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "var.json", twoVariantDescriptor());
+
+    auto offsetOfX = [&](std::string_view arch) -> std::uint64_t {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, arch, ObjectFormatKind::Elf);
+        EXPECT_TRUE(desc.has_value()) << "arch=" << arch;
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_EQ(desc->structs.size(), 1u) << "arch=" << arch;
+        auto layout = computeLayout(desc->structs[0].typeId, interner, kNatural16,
+                                    DataModel::Lp64);
+        EXPECT_TRUE(layout.has_value());
+        // `x` is the LAST field in both variants (index 1 for archA, index 0 for archB).
+        return layout->fieldOffsets.back();
+    };
+
+    EXPECT_EQ(offsetOfX("archA"), 8u);   // i32 pad@0, pad[4..7], x@8
+    EXPECT_EQ(offsetOfX("archB"), 0u);   // x@0 (no pad)
+}
+
+// REAL `struct stat` per-arch LAYOUT pin (plan 25, gate 6 LOCAL proof). The
+// shipped sys/stat.json `variants` (the glibc x86-64-linux 144-byte layout vs
+// the arm64-linux 128-byte layout) are runtime-witnessed by the
+// shipped_struct_stat_{x86,arm64} corpus on the linux CI leg; THIS pins the
+// exact per-arch sizeof AND a DIVERGENT field offset (st_mode @24 on x86-64,
+// @16 on arm64 — the data-corruption case the mechanism exists to prevent)
+// LOCALLY, so a layout-authoring slip is caught here, not only on CI. The field
+// lists are the shipped sys/stat.json variants verbatim (timespec flattened to
+// _sec/_nsec i64 pairs — bit-identical layout). RED-ON-DISABLE: neuter the
+// selector → both arches see the 144-byte x86-64 layout → the arm64 asserts fail.
+TEST(ShippedLibDescriptor, RealSysStatPerArchLayoutSizesAndOffsets) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "stat.json", R"JSON({
+        "header": "sys/stat.h",
+        "structs": [
+            { "name": "stat", "variants": [
+              { "when": {"arch":"x86_64","format":"elf"}, "fields": [
+                {"name":"st_dev","type":"u64"},{"name":"st_ino","type":"u64"},
+                {"name":"st_nlink","type":"u64"},{"name":"st_mode","type":"u32"},
+                {"name":"st_uid","type":"u32"},{"name":"st_gid","type":"u32"},
+                {"name":"__pad0","type":"i32"},{"name":"st_rdev","type":"u64"},
+                {"name":"st_size","type":"i64"},{"name":"st_blksize","type":"i64"},
+                {"name":"st_blocks","type":"i64"},
+                {"name":"st_atim_sec","type":"i64"},{"name":"st_atim_nsec","type":"i64"},
+                {"name":"st_mtim_sec","type":"i64"},{"name":"st_mtim_nsec","type":"i64"},
+                {"name":"st_ctim_sec","type":"i64"},{"name":"st_ctim_nsec","type":"i64"},
+                {"name":"r0","type":"i64"},{"name":"r1","type":"i64"},{"name":"r2","type":"i64"}
+              ] },
+              { "when": {"arch":"arm64","format":"elf"}, "fields": [
+                {"name":"st_dev","type":"u64"},{"name":"st_ino","type":"u64"},
+                {"name":"st_mode","type":"u32"},{"name":"st_nlink","type":"u32"},
+                {"name":"st_uid","type":"u32"},{"name":"st_gid","type":"u32"},
+                {"name":"st_rdev","type":"u64"},{"name":"__pad1","type":"u64"},
+                {"name":"st_size","type":"i64"},{"name":"st_blksize","type":"i32"},
+                {"name":"__pad2","type":"i32"},{"name":"st_blocks","type":"i64"},
+                {"name":"st_atim_sec","type":"i64"},{"name":"st_atim_nsec","type":"i64"},
+                {"name":"st_mtim_sec","type":"i64"},{"name":"st_mtim_nsec","type":"i64"},
+                {"name":"st_ctim_sec","type":"i64"},{"name":"st_ctim_nsec","type":"i64"},
+                {"name":"r0","type":"i32"},{"name":"r1","type":"i32"}
+              ] }
+            ] }
+        ]
+    })JSON");
+
+    auto layoutFor = [&](std::string_view arch) -> std::optional<StructLayout> {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, arch, ObjectFormatKind::Elf);
+        EXPECT_TRUE(desc.has_value()) << "arch=" << arch;
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_EQ(desc->structs.size(), 1u) << "arch=" << arch;
+        return computeLayout(desc->structs[0].typeId, interner, kNatural16, DataModel::Lp64);
+    };
+
+    auto x86 = layoutFor("x86_64");
+    auto arm = layoutFor("arm64");
+    ASSERT_TRUE(x86.has_value());
+    ASSERT_TRUE(arm.has_value());
+    EXPECT_EQ(x86->size, 144u);            // glibc x86-64-linux struct stat
+    EXPECT_EQ(arm->size, 128u);            // glibc arm64-linux struct stat (DIVERGES)
+    EXPECT_EQ(x86->fieldOffsets[3], 24u);  // st_mode (index 3 on x86-64) @ 24
+    EXPECT_EQ(arm->fieldOffsets[2], 16u);  // st_mode (index 2 on arm64) @ 16
+}
+
+// AMBIGUOUS-MATCH PIN (gate 3; closure gate 3, F1). Two variants BOTH matching the
+// active (arch,format) → the read FAILS LOUD with F_ShippedStructVariantAmbiguous,
+// never silently "first wins". Here both `when`s are {arch:dup, format:elf}.
+TEST(ShippedLibDescriptor, StructVariantAmbiguousMatchFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "amb.json", R"JSON({
+        "header": "a.h",
+        "structs": [
+            { "name": "S", "variants": [
+                { "when": { "arch": "dup", "format": "elf" },
+                  "fields": [ { "name": "x", "type": "i32" } ] },
+                { "when": { "arch": "dup", "format": "elf" },
+                  "fields": [ { "name": "y", "type": "i64" } ] }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"dup"},
+                                         ObjectFormatKind::Elf);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_EQ(test_support::countCode(rep, DiagnosticCode::F_ShippedStructVariantAmbiguous),
+              1u);
+}
+
+// EAGER-DECODE PIN (gate 4; closure gate 4, F2). A NON-active variant carries an
+// undecodable field type. Even though we compile for the OTHER (active) target —
+// whose variant is well-formed — the read FAILS LOUD: every variant's field list
+// is decoded at read time, so a malformed inactive variant never lurks until its
+// target's first compile (mirrors signatureByDataModel).
+TEST(ShippedLibDescriptor, StructVariantEagerDecodeMalformedInactiveFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "eager.json", R"JSON({
+        "header": "e.h",
+        "structs": [
+            { "name": "S", "variants": [
+                { "when": { "arch": "active", "format": "elf" },
+                  "fields": [ { "name": "x", "type": "i64" } ] },
+                { "when": { "arch": "other", "format": "elf" },
+                  "fields": [ { "name": "y", "type": "not_a_type" } ] }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    // Compile for arch="active" (its variant decodes fine); the INACTIVE "other"
+    // variant's bad type still fails the whole read.
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"active"},
+                                         ObjectFormatKind::Elf);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_EQ(test_support::countCode(rep, DiagnosticCode::F_ShippedLibUnsupportedType),
+              1u);
+}
+
+// NO-MATCH → NOT INJECTED (gate 7; closure gate 7). Variants present but NONE match
+// the active target → the struct is simply not injected (no `S` in `desc->structs`).
+// A c-subset program referencing `struct S` would then emit S_UnknownType (the same
+// behavior as any undeclared struct) — never a silent wrong layout. The read itself
+// SUCCEEDS (no error): a header that doesn't define a struct for this target is not
+// an error here; the absence becomes loud at the USE site.
+TEST(ShippedLibDescriptor, StructVariantNoMatchNotInjected) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // Variant requires arch="only"; we compile for arch="elsewhere" → no match. The
+    // descriptor also carries a typedef so the "declares something" gate passes even
+    // with the struct dropped.
+    auto const path = writeTemp(dir, "nomatch.json", R"JSON({
+        "header": "n.h",
+        "typedefs": [ { "name": "t", "type": "i32" } ],
+        "structs": [
+            { "name": "S", "variants": [
+                { "when": { "arch": "only", "format": "elf" },
+                  "fields": [ { "name": "x", "type": "i64" } ] }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"elsewhere"},
+                                         ObjectFormatKind::Elf);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(desc->structs.empty()) << "no variant matched → struct not injected";
+}
+
+// NO SELECTOR (activeTarget nullopt) + variants present → not injected. The
+// direct-API/LSP/test path (no target in scope) cannot select a variant, so a
+// variants-only struct is absent — never an arbitrary pick. (Closure gate 8
+// back-compat for the nullopt caller, variant arm.)
+TEST(ShippedLibDescriptor, StructVariantNoActiveTargetNotInjected) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "nosel.json", R"JSON({
+        "header": "ns.h",
+        "typedefs": [ { "name": "t", "type": "i32" } ],
+        "structs": [
+            { "name": "S", "variants": [
+                { "when": { "arch": "archA", "format": "elf" },
+                  "fields": [ { "name": "x", "type": "i64" } ] }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    // Default activeTarget=nullopt, activeFormat=nullopt (the direct-API caller).
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(desc->structs.empty())
+        << "no active target → variants-only struct not injected (never arbitrary)";
+}
+
+// Plan 25 declares-something fix: a descriptor whose ONLY surface is per-target
+// `variants` structs (the REAL <sys/stat.h> shape — no symbols/typedefs/etc.)
+// must DECODE CLEANLY under the nullopt direct-API / LSP / AllShippedDescriptors-
+// Decode-provenance path. It DECLARES a struct surface (target-conditional), so
+// it is NOT a false "declares nothing" even though no struct injects without a
+// target. RED-ON-DISABLE: drop the `declaredStructs` term from the
+// declares-something check (shipped_lib_descriptor.cpp) → this read fails loud.
+TEST(ShippedLibDescriptor, StructVariantsOnlyDescriptorValidUnderNullopt) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "vonly.json", R"JSON({
+        "header": "vonly.h",
+        "structs": [
+            { "name": "S", "variants": [
+                { "when": { "arch": "x86_64", "format": "elf" },
+                  "fields": [ { "name": "x", "type": "i64" } ] },
+                { "when": { "arch": "arm64", "format": "elf" },
+                  "fields": [ { "name": "x", "type": "i64" } ] }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);  // nullopt target
+    ASSERT_TRUE(desc.has_value());        // declares a struct surface → NOT a no-op
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(desc->structs.empty());   // no target → nothing injected
+}
+
+// Match-ALL-SPECIFIED (F1): a variant whose `when` specifies ONLY `arch` (no
+// `format`) matches on that arch under ANY format. Here the lone variant is
+// `when:{arch:"a"}`; compiling arch="a" format=macho selects it (format unspecified
+// ⇒ unconstrained). This proves "every SPECIFIED key must match" — an unspecified
+// key is a wildcard. (The danger case — an under-specified `when` matching two
+// targets — is the ambiguity pin above; this is the legitimate single-match form.)
+TEST(ShippedLibDescriptor, StructVariantWhenArchOnlyMatchesAnyFormat) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "archonly.json", R"JSON({
+        "header": "ao.h",
+        "structs": [
+            { "name": "S", "variants": [
+                { "when": { "arch": "a" },
+                  "fields": [ { "name": "x", "type": "i32" } ] }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"a"},
+                                         ObjectFormatKind::MachO);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->structs.size(), 1u);
+    EXPECT_EQ(desc->structs[0].name, "S");
+}
+
+// A struct entry declaring BOTH `fields` and `variants` is malformed (ambiguous
+// intent) → fail loud. RED-ON-DISABLE: each surface decodes fine alone; only the
+// XOR gate rejects the pair.
+TEST(ShippedLibDescriptor, StructBothFieldsAndVariantsFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "both.json", R"JSON({
+        "header": "b.h",
+        "structs": [
+            { "name": "S",
+              "fields": [ { "name": "x", "type": "i32" } ],
+              "variants": [ { "when": { "arch": "a" },
+                              "fields": [ { "name": "x", "type": "i32" } ] } ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"a"},
+                                         ObjectFormatKind::Elf);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// An unknown `when` key fails loud against the closed vocabulary {arch,format}
+// (rejectUnknownKeys). A typo'd key (e.g. "ach") would otherwise be silently
+// ignored → the variant matches more broadly than intended.
+TEST(ShippedLibDescriptor, StructVariantUnknownWhenKeyFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "badwhen.json", R"JSON({
+        "header": "bw.h",
+        "structs": [
+            { "name": "S", "variants": [
+                { "when": { "ach": "x86_64" },
+                  "fields": [ { "name": "x", "type": "i32" } ] }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// An unknown `when.format` value fails loud against the closed object-format
+// vocabulary (objectFormatKindFromName) — a typo'd "elff" would otherwise NEVER
+// match → the struct silently vanishes on every target.
+TEST(ShippedLibDescriptor, StructVariantUnknownFormatValueFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "badfmt.json", R"JSON({
+        "header": "bf.h",
+        "structs": [
+            { "name": "S", "variants": [
+                { "when": { "arch": "x86_64", "format": "elff" },
+                  "fields": [ { "name": "x", "type": "i32" } ] }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// BACK-COMPAT (gate 8; closure gate 8). An existing flat-`fields` struct decodes
+// BYTE-IDENTICALLY whether activeTarget is nullopt (direct-API/LSP/test) or set (a
+// real per-target compile) — the flat path never consults the selector, so the
+// interned type + its layout are the same. This proves the new axis does not
+// perturb the single-layout structs that ship today (timeval / the opaque structs).
+TEST(ShippedLibDescriptor, StructFlatFieldsBackCompatRegardlessOfTarget) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "flat.json", R"JSON({
+        "header": "f.h",
+        "structs": [
+            { "name": "timeval", "fields": [
+                { "name": "tv_sec",  "type": "i64" },
+                { "name": "tv_usec", "type": "i64" }
+            ] }
+        ]
+    })JSON");
+
+    auto decodeLayout = [&](std::optional<std::string_view> arch,
+                            std::optional<ObjectFormatKind> fmt) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, arch, fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_EQ(desc->structs.size(), 1u);
+        auto layout = computeLayout(desc->structs[0].typeId, interner, kNatural16,
+                                    DataModel::Lp64);
+        EXPECT_TRUE(layout.has_value());
+        return *layout;
+    };
+
+    auto const nul = decodeLayout(std::nullopt, std::nullopt);              // direct-API
+    auto const set = decodeLayout(std::string_view{"x86_64"}, ObjectFormatKind::Elf); // per-target
+    EXPECT_EQ(nul.size, set.size);
+    ASSERT_EQ(nul.fieldOffsets.size(), set.fieldOffsets.size());
+    EXPECT_EQ(nul.fieldOffsets, set.fieldOffsets);
+    EXPECT_EQ(nul.size, 16u);                          // two i64s, no padding
+    ASSERT_EQ(nul.fieldOffsets.size(), 2u);
+    EXPECT_EQ(nul.fieldOffsets[0], 0u);
+    EXPECT_EQ(nul.fieldOffsets[1], 8u);
+}
+
+// CRUX RE-VERIFY (gate 2; closure gate 2). The plan-lock's load-bearing claim:
+// x86_64 and arm64 `.target.json` feed BYTE-IDENTICAL AggregateLayoutParams, and
+// `computeLayout` is purely param-driven (no arch branch). Therefore the ONLY
+// source of a per-target offset difference is the selected FIELD LIST — which is
+// exactly what the variant mechanism switches. This pin catches a FUTURE
+// target.json divergence that would invalidate "field-list-only" (e.g. someone
+// gives arm64 a different maxAlignment): if these params ever diverge, a struct
+// with the SAME field list could lay out differently per arch and the mechanism's
+// premise breaks. Asserted against the REAL shipped schemas, not a fixture.
+TEST(ShippedLibDescriptor, CruxX86AndArm64AggregateLayoutParamsIdentical) {
+    auto x86R = TargetSchema::loadShipped("x86_64");
+    auto arm64R = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(x86R.has_value());
+    ASSERT_TRUE(arm64R.has_value());
+    ASSERT_TRUE((*x86R)->aggregateLayoutLoaded());
+    ASSERT_TRUE((*arm64R)->aggregateLayoutLoaded());
+    auto const a = (*x86R)->aggregateLayout();
+    auto const b = (*arm64R)->aggregateLayout();
+    EXPECT_EQ(a.scalarAlignment, b.scalarAlignment)
+        << "x86_64 and arm64 must share the scalar-alignment rule (field-list-only "
+           "premise of per-target struct variants)";
+    EXPECT_EQ(a.maxAlignment, b.maxAlignment)
+        << "x86_64 and arm64 must share maxAlignment (field-list-only premise)";
+    // bitFieldStrategy on the target is the back-compat fallback; the layout-driving
+    // params above are the two the per-target-struct premise rests on.
 }
 
 // ── availableObjectFormats (per-target AVAILABILITY axis; c8) ─────────────────

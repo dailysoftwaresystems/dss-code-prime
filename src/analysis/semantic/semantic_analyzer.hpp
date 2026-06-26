@@ -9,6 +9,7 @@
 
 #include <memory>
 #include <optional>
+#include <string_view>
 
 // Phase #8 entry point: drive symbol/scope/type analysis over a built
 // CompilationUnit and return a SemanticModel. The implementation is
@@ -64,6 +65,13 @@ analyze(std::shared_ptr<CompilationUnit const> cu,
         // availability (a POSIX `<sys/time.h>` is unavailable for windows-pe).
         // `nullopt` (direct-API / LSP / test callers) ⇒ NO availability gate (every
         // recorded descriptor is read, as before). (D-SHIPPED-HEADER-PER-TARGET-AVAILABILITY)
-        std::optional<ObjectFormatKind> activeFormat = std::nullopt);
+        std::optional<ObjectFormatKind> activeFormat = std::nullopt,
+        // Plan 25: the active target's ARCH NAME (`target.name()`) — the per-target
+        // shipped-struct `variants` selector ((arch, format) selects a struct's
+        // field list so its byte layout is correct per target). `nullopt`
+        // (direct-API / LSP / test callers, no target in scope) ⇒ NO variant
+        // selection (a flat-`fields` struct decodes as before; a variants-only
+        // struct is not injected). (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH)
+        std::optional<std::string_view> activeTarget = std::nullopt);
 
 } // namespace dss

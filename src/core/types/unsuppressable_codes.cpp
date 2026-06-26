@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 63> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 64> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -94,6 +94,15 @@ constexpr std::array<DiagnosticCode, 63> kUnsuppressableCodes{{
     // platform — the exact wrong-platform silent miscompile this fail-loud
     // closes. A direct sibling of the three shipped-header surfaces above.
     DiagnosticCode::F_ShippedHeaderUnavailableForTarget,
+    // F_ShippedStructVariantAmbiguous (p18 Cluster G, plan 25, 2026-06-26): a
+    // shipped `structs` entry's per-target `variants` had MORE THAN ONE match the
+    // active (arch, format). The selection contract is exactly-one-matches;
+    // suppressing this would re-open the "pick the first" silent wrong-layout
+    // surface (e.g. an under-specified `when:{arch:"x86_64"}` matching both
+    // x86_64-elf and x86_64-pe → the linux struct layout used on windows). A
+    // direct sibling of the four shipped-lib surfaces above — its invariant is the
+    // SAME class (a wrong-bytes import must never ship green).
+    DiagnosticCode::F_ShippedStructVariantAmbiguous,
 
     // H_* HIR-lowering / verifier band — structural invariants (cannot
     // reach MIR codegen without violating downstream contracts). Post-

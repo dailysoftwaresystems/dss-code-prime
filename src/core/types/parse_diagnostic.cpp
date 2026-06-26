@@ -239,6 +239,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::F_ShippedLibUnsupportedType:    return "F_ShippedLibUnsupportedType";
         case DiagnosticCode::F_ShippedHeaderUnavailableForTarget:
             return "F_ShippedHeaderUnavailableForTarget";
+        case DiagnosticCode::F_ShippedStructVariantAmbiguous:
+            return "F_ShippedStructVariantAmbiguous";
 
         // Semantic (S_) + assembler (A_) + linker (K_) enumerators added in
         // later cycles but not mirrored here until the per-file -Werror=switch

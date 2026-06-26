@@ -55,6 +55,12 @@ TEST(UnsuppressableCodes, MembershipIncludesCoreArchitecturalCodes) {
            "must be unsuppressable (suppressing it would resume semantic "
            "analysis and inject the header's surfaces on the WRONG platform — "
            "the wrong-platform silent miscompile this gate closes)";
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::F_ShippedStructVariantAmbiguous))
+        << "plan 25: >1 per-target struct `variants` matching the active target "
+           "must be unsuppressable (suppressing it would re-open the silent "
+           "'pick the first' wrong-layout surface — e.g. an under-specified "
+           "when:{arch:\"x86_64\"} matching both x86_64-elf and x86_64-pe → the "
+           "linux struct layout used on windows)";
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::A_ImmediateOperandOutOfRange))
         << "v0.0.2 V2-1: an immediate/offset too wide for its fixed32 slot "
            "must be unsuppressable (suppressing it would silently truncate to "

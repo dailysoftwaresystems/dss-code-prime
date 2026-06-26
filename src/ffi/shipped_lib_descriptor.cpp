@@ -272,14 +272,76 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
     }
 }
 
+// Decode a struct `fields` JSON array (non-empty, each `{name,type}`) into
+// `outFields` + the parallel `outFieldTypes`. Each field type decodes via the ONE
+// `parseTypeFromText` codec; a duplicate field name or an undecodable type FAILS
+// LOUD (reported here). Returns true iff EVERY field decoded. `at` is the caller's
+// already-built diagnostic context string (e.g. "'p' structs[0]" or
+// "'p' structs[0] variants[1]"). Shared by the flat-`fields` path AND every
+// variant's field list — so a malformed field in ANY (active or inactive) variant
+// fails the same way (the F2 anti-lurking property). `fields` must be a non-empty
+// array (the caller validates that before calling).
+[[nodiscard]] bool decodeStructFieldList(json const& fields, std::string const& at,
+                                         TypeInterner& interner, TypeRegistry& typeReg,
+                                         DiagnosticReporter& reporter,
+                                         std::vector<ShippedField>& outFields,
+                                         std::vector<TypeId>& outFieldTypes) {
+    std::size_t fidx = 0;
+    for (auto const& f : fields) {
+        std::string const fat = at + " fields[" + std::to_string(fidx) + "]";
+        ++fidx;
+        if (!f.is_object()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + fat + ": must be an object");
+            return false;
+        }
+        (void)rejectUnknownKeys(reporter, f, fat, {"name", "type"});
+        if (!f.contains("name") || !f.at("name").is_string()
+            || f.at("name").get<std::string>().empty()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + fat
+                                        + ": missing or empty 'name'");
+            return false;
+        }
+        std::string fname = f.at("name").get<std::string>();
+        // Reject a DUPLICATE field name (invalid C; a last-writer-wins scope
+        // binding would silently lose a field slot — fail loud, never a
+        // wrong-but-runs aggregate). Few fields → linear scan.
+        for (auto const& ef : outFields) {
+            if (ef.name == fname) {
+                emitMalformed(reporter, "shipped-lib descriptor " + fat
+                                            + ": duplicate field name '" + fname + "'");
+                return false;
+            }
+        }
+        if (!f.contains("type") || !f.at("type").is_string()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + fat
+                                        + ": missing or non-string 'type'");
+            return false;
+        }
+        std::string const fTypeText = f.at("type").get<std::string>();
+        TypeId const fty = parseTypeFromText(fTypeText, interner, typeReg, reporter);
+        if (!fty.valid() || fty == InvalidType) {
+            dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                        DiagnosticSeverity::Error,
+                        "shipped-lib descriptor " + fat + ": field type '"
+                            + fTypeText + "' failed to decode");
+            return false;
+        }
+        outFields.push_back(ShippedField{std::move(fname), fty});
+        outFieldTypes.push_back(fty);
+    }
+    return true;
+}
+
 } // namespace
 
 std::optional<ShippedLibDescriptor>
-readShippedLibDescriptor(std::filesystem::path const& path,
-                         TypeInterner&                interner,
-                         TypeRegistry&                typeReg,
-                         DiagnosticReporter&          reporter,
-                         DataModel                    dataModel) {
+readShippedLibDescriptor(std::filesystem::path const&    path,
+                         TypeInterner&                   interner,
+                         TypeRegistry&                   typeReg,
+                         DiagnosticReporter&             reporter,
+                         DataModel                       dataModel,
+                         std::optional<std::string_view> activeTarget,
+                         std::optional<ObjectFormatKind> activeFormat) {
     std::size_t const errBefore = reporter.errorCount();
 
     // (0) Read the file. A missing/unreadable descriptor is malformed-shaped
@@ -705,6 +767,23 @@ readShippedLibDescriptor(std::filesystem::path const& path,
     // type (name + positional field types) the semantic phase injects as a TAG +
     // a field scope; the layout engine DERIVES the ABI byte offsets from the
     // field sizes (the descriptor declares names + types, never offsets).
+    //
+    // A struct entry declares EITHER a flat `fields` (single layout, back-compat)
+    // OR per-target `variants` (plan 25): a list of `{ "when": {arch?,format?},
+    // "fields":[…] }`, the variant matching the active (arch,format) selected so
+    // a struct can carry the correct per-target byte layout. The CRUX
+    // (plan-lock-VERIFIED): x86_64/arm64 AggregateLayoutParams are byte-identical +
+    // computeLayout is param-driven (no arch branch) → the per-target offset delta
+    // comes ENTIRELY from the selected FIELD LIST. The active identity is
+    // (arch = `*activeTarget`, format = `objectFormatKindName(*activeFormat)`); a
+    // variant matches iff EVERY key its `when` specifies equals the active value
+    // (GENERIC string equality — never an `if (arch == "x86_64")` here). >1 match
+    // ⇒ fail loud (F_ShippedStructVariantAmbiguous: an under-specified `when` would
+    // otherwise silently pick the first → a wrong layout). 0 match (variants
+    // present) ⇒ NOT injected (a reference fails loud as an undefined type, never a
+    // silent wrong layout). EAGER: EVERY variant's field list is decoded regardless
+    // of which is active, so a malformed INACTIVE variant fails the read on EVERY
+    // target (anti-lurking, mirrors `signatureByDataModel`).
     if (doc.contains("structs")) {
         if (!doc.at("structs").is_array()) {
             emitMalformed(reporter, "shipped-lib descriptor '" + path.generic_string()
@@ -721,7 +800,7 @@ readShippedLibDescriptor(std::filesystem::path const& path,
                 }
                 (void)rejectUnknownKeys(reporter, sdef,
                                         "structs[" + std::to_string(sidx - 1) + "]",
-                                        {"name", "fields"});
+                                        {"name", "fields", "variants"});
                 if (!sdef.contains("name") || !sdef.at("name").is_string()
                     || sdef.at("name").get<std::string>().empty()) {
                     emitMalformed(reporter, "shipped-lib descriptor " + at
@@ -729,62 +808,174 @@ readShippedLibDescriptor(std::filesystem::path const& path,
                     continue;
                 }
                 std::string const sname = sdef.at("name").get<std::string>();
-                if (!sdef.contains("fields") || !sdef.at("fields").is_array()
-                    || sdef.at("fields").empty()) {
+
+                // Exactly ONE of `fields` (flat, single layout) or `variants`
+                // (per-target). Both, or neither, is a malformed entry — fail loud
+                // (a struct with neither declares no layout; with both is ambiguous
+                // intent).
+                bool const hasFields   = sdef.contains("fields");
+                bool const hasVariants = sdef.contains("variants");
+                if (hasFields == hasVariants) {
                     emitMalformed(reporter, "shipped-lib descriptor " + at
-                                                + ": 'fields' must be a non-empty array");
+                                                + ": a struct must declare EXACTLY one of "
+                                                  "'fields' (single layout) or 'variants' "
+                                                  "(per-target layouts)");
                     continue;
                 }
+
+                // The SELECTED field list (flat path = `fields`; variant path = the
+                // matching variant's `fields`). `selected` stays false on the
+                // no-variant-matches case → the struct is simply not injected.
                 ShippedStruct sst;
                 sst.name = sname;
                 std::vector<TypeId> fieldTypes;
-                bool okFields = true;
-                std::size_t fidx = 0;
-                for (auto const& f : sdef.at("fields")) {
-                    std::string const fat = at + " fields[" + std::to_string(fidx) + "]";
-                    ++fidx;
-                    if (!f.is_object()) {
-                        emitMalformed(reporter, "shipped-lib descriptor " + fat + ": must be an object");
-                        okFields = false; break;
+                bool selected = false;
+
+                if (hasFields) {
+                    if (!sdef.at("fields").is_array() || sdef.at("fields").empty()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                    + ": 'fields' must be a non-empty array");
+                        continue;
                     }
-                    (void)rejectUnknownKeys(reporter, f, fat, {"name", "type"});
-                    if (!f.contains("name") || !f.at("name").is_string()
-                        || f.at("name").get<std::string>().empty()) {
-                        emitMalformed(reporter, "shipped-lib descriptor " + fat
-                                                    + ": missing or empty 'name'");
-                        okFields = false; break;
+                    if (!decodeStructFieldList(sdef.at("fields"), at, interner, typeReg,
+                                               reporter, sst.fields, fieldTypes)) {
+                        continue;
                     }
-                    std::string fname = f.at("name").get<std::string>();
-                    // Reject a DUPLICATE field name (invalid C; a last-writer-wins
-                    // scope binding would silently lose a field slot — fail loud,
-                    // never a wrong-but-runs aggregate). Few fields → linear scan.
-                    bool dupField = false;
-                    for (auto const& ef : sst.fields) {
-                        if (ef.name == fname) { dupField = true; break; }
+                    selected = true;
+                } else {
+                    // PER-TARGET VARIANTS. Decode EVERY variant's field list (eager —
+                    // a malformed inactive variant fails the read on every target),
+                    // then select the variant whose `when` matches the active target.
+                    if (!sdef.at("variants").is_array() || sdef.at("variants").empty()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                    + ": 'variants' must be a non-empty array");
+                        continue;
                     }
-                    if (dupField) {
-                        emitMalformed(reporter, "shipped-lib descriptor " + fat
-                                                    + ": duplicate field name '" + fname + "'");
-                        okFields = false; break;
+                    std::string const activeFormatName =
+                        activeFormat.has_value()
+                            ? std::string{objectFormatKindName(*activeFormat)}
+                            : std::string{};
+                    bool okVariants = true;
+                    std::size_t matchCount = 0;
+                    std::size_t vidx = 0;
+                    for (auto const& vdef : sdef.at("variants")) {
+                        std::string const vat = at + " variants[" + std::to_string(vidx) + "]";
+                        ++vidx;
+                        if (!vdef.is_object()) {
+                            emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                        + ": must be an object");
+                            okVariants = false; break;
+                        }
+                        (void)rejectUnknownKeys(reporter, vdef,
+                                                "structs[" + std::to_string(sidx - 1)
+                                                    + "] variants[" + std::to_string(vidx - 1) + "]",
+                                                {"when", "fields"});
+                        // `when` — the match selector. REQUIRED object; keys closed to
+                        // {arch, format}. An EMPTY `when:{}` matches every target
+                        // (always-match) — legal but typically ambiguous if any other
+                        // variant also matches (the ambiguity gate below catches it).
+                        if (!vdef.contains("when") || !vdef.at("when").is_object()) {
+                            emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                        + ": missing or non-object 'when' "
+                                                          "(e.g. {\"arch\":\"x86_64\",\"format\":\"elf\"})");
+                            okVariants = false; break;
+                        }
+                        (void)rejectUnknownKeys(reporter, vdef.at("when"),
+                                                "structs[" + std::to_string(sidx - 1)
+                                                    + "] variants[" + std::to_string(vidx - 1)
+                                                    + "].when",
+                                                {"arch", "format"});
+                        // Decode this variant's field list (eager, every variant).
+                        if (!vdef.contains("fields") || !vdef.at("fields").is_array()
+                            || vdef.at("fields").empty()) {
+                            emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                        + ": 'fields' must be a non-empty array");
+                            okVariants = false; break;
+                        }
+                        std::vector<ShippedField> vFields;
+                        std::vector<TypeId>       vFieldTypes;
+                        if (!decodeStructFieldList(vdef.at("fields"), vat, interner, typeReg,
+                                                   reporter, vFields, vFieldTypes)) {
+                            okVariants = false; break;
+                        }
+
+                        // Does this variant's `when` MATCH the active target? Every
+                        // key it SPECIFIES must equal the active value (generic string
+                        // equality). A key matched against an UNKNOWN active value
+                        // (activeTarget/activeFormat nullopt — direct-API/LSP/test
+                        // callers, no target in scope) cannot match → the struct is
+                        // not injected for those callers (no selection possible).
+                        bool matches = true;
+                        if (vdef.at("when").contains("arch")) {
+                            if (!vdef.at("when").at("arch").is_string()) {
+                                emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                            + ": 'when.arch' must be a string");
+                                okVariants = false; break;
+                            }
+                            std::string const wantArch =
+                                vdef.at("when").at("arch").get<std::string>();
+                            if (!activeTarget.has_value() || *activeTarget != wantArch)
+                                matches = false;
+                        }
+                        if (vdef.at("when").contains("format")) {
+                            if (!vdef.at("when").at("format").is_string()) {
+                                emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                            + ": 'when.format' must be a string");
+                                okVariants = false; break;
+                            }
+                            std::string const wantFormat =
+                                vdef.at("when").at("format").get<std::string>();
+                            // The format name is matched against the CLOSED object-format
+                            // vocabulary (a typo'd "elff" would otherwise silently never
+                            // match → the struct vanishes on every target). The arch name
+                            // is open (it lives only in the target schemas, which this
+                            // reader does not load) — an unknown arch simply never matches.
+                            if (!objectFormatKindFromName(wantFormat).has_value()) {
+                                emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                            + ": 'when.format' has unknown "
+                                                              "object-format name '" + wantFormat
+                                                            + "' (expected \"pe\"/\"elf\"/\"macho\")");
+                                okVariants = false; break;
+                            }
+                            if (!activeFormat.has_value() || activeFormatName != wantFormat)
+                                matches = false;
+                        }
+
+                        if (matches) {
+                            ++matchCount;
+                            if (matchCount == 1) {
+                                // First match — take its fields (and keep scanning so a
+                                // second match is detected → ambiguity fail-loud).
+                                sst.fields = std::move(vFields);
+                                fieldTypes = std::move(vFieldTypes);
+                            }
+                        }
                     }
-                    if (!f.contains("type") || !f.at("type").is_string()) {
-                        emitMalformed(reporter, "shipped-lib descriptor " + fat
-                                                    + ": missing or non-string 'type'");
-                        okFields = false; break;
-                    }
-                    std::string const fTypeText = f.at("type").get<std::string>();
-                    TypeId const fty = parseTypeFromText(fTypeText, interner, typeReg, reporter);
-                    if (!fty.valid() || fty == InvalidType) {
-                        dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                    if (!okVariants) continue;
+                    if (matchCount > 1) {
+                        // >1 variant matched the active target — a silent
+                        // wrong-layout risk (which would be picked?). Fail loud.
+                        dss::report(reporter, DiagnosticCode::F_ShippedStructVariantAmbiguous,
                                     DiagnosticSeverity::Error,
-                                    "shipped-lib descriptor " + fat + ": field type '"
-                                        + fTypeText + "' failed to decode");
-                        okFields = false; break;
+                                    "shipped-lib descriptor " + at + ": struct '" + sname
+                                        + "' has " + std::to_string(matchCount)
+                                        + " 'variants' matching the active target (arch='"
+                                        + (activeTarget.has_value() ? std::string{*activeTarget}
+                                                                    : std::string{"<none>"})
+                                        + "', format='"
+                                        + (activeFormat.has_value() ? activeFormatName
+                                                                    : std::string{"<none>"})
+                                        + "') — exactly one variant may match (refusing an "
+                                          "ambiguous per-target layout)");
+                        continue;
                     }
-                    sst.fields.push_back(ShippedField{std::move(fname), fty});
-                    fieldTypes.push_back(fty);
+                    // matchCount 0 ⇒ no variant for this target ⇒ NOT injected
+                    // (a reference fails loud as an undefined type, never a silent
+                    // wrong layout). matchCount 1 ⇒ select it.
+                    selected = (matchCount == 1);
                 }
-                if (!okFields) continue;
+
+                if (!selected) continue;   // no variant matched → inject nothing
                 sst.typeId = interner.structType(sname, fieldTypes);
                 out.structs.push_back(std::move(sst));
             }
@@ -799,9 +990,17 @@ readShippedLibDescriptor(std::filesystem::path const& path,
     // (8) A descriptor must declare SOMETHING — a file with no symbols, no
     // constants, no typedefs, AND no macros is a no-op artifact that should not
     // ship silently (mirrors the old non-empty-`symbols` rule, now spanning all
-    // four surfaces).
+    // surfaces). Plan 25: a descriptor whose ONLY surface is PER-TARGET `variants`
+    // structs injects ZERO structs when decoded with no active target (the nullopt
+    // direct-API / LSP / `AllShippedDescriptorsDecode`-provenance path) — yet it
+    // genuinely DECLARES a struct surface (target-conditional, e.g. the real
+    // variants-only <sys/stat.h>). Count the JSON DECLARATION, not the
+    // post-selection injection, so a well-formed variants-only header is not a
+    // false "declares nothing".
+    bool const declaredStructs = doc.contains("structs") && doc.at("structs").is_array()
+                                 && !doc.at("structs").empty();
     if (out.symbols.empty() && out.constants.empty() && out.typedefs.empty()
-        && out.structs.empty() && out.macros.empty()) {
+        && out.structs.empty() && out.macros.empty() && !declaredStructs) {
         emitMalformed(reporter,
             std::string{"shipped-lib descriptor '"} + path.generic_string()
                 + "': declares nothing — needs at least one of 'symbols', "

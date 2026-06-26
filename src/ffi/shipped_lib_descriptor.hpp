@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -178,9 +179,22 @@ struct DSS_EXPORT ShippedField {
 // ABI offsets the layout engine DERIVES from the field sizes (the descriptor
 // declares names + types only — never explicit offsets). `typeId` is the interned
 // struct type (its identity is the name + positional field types).
+//
+// PER-TARGET LAYOUT (plan 25, D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH): a struct's
+// byte layout can diverge per (arch, format) — x86-64-linux `struct stat` = 144B,
+// arm64-linux = 128B with a different field order, macOS differs again. The CRUX
+// (plan-lock-VERIFIED): x86_64 and arm64 `.target.json` have BYTE-IDENTICAL
+// `AggregateLayoutParams` and `computeLayout` is purely param-driven (no arch
+// branch), so the per-target offset difference comes ENTIRELY from the FIELD LIST.
+// Per-target layout is therefore per-target field-LIST SELECTION in the decoder:
+// a descriptor declares `variants` (each a `when:{arch?,format?}` + its own field
+// list) INSTEAD of a flat `fields`; the decoder selects the variant matching the
+// active target and produces THIS same single-`fields`/`typeId` shape — so the
+// injection + layout engine are UNCHANGED. A descriptor with flat `fields` (no
+// `variants`) keeps single-layout behavior (every existing descriptor untouched).
 struct DSS_EXPORT ShippedStruct {
     std::string               name;     // the struct tag, e.g. "timeval"
-    std::vector<ShippedField> fields;   // named fields, in declaration order
+    std::vector<ShippedField> fields;   // the SELECTED variant's (or flat) fields, decl order
     TypeId                    typeId;   // interned struct type (set on decode)
 };
 
@@ -244,12 +258,29 @@ struct DSS_EXPORT ShippedLibDescriptor {
 // until that model's first compile). Unknown model keys fail loud.
 // Defaulted for direct-API/unit callers (LP64 = the base-signature
 // identity); the semantic analyzer always passes its threaded model.
+// Plan-25 `activeTarget` / `activeFormat`: the ACTIVE compile target's
+// (arch name, object-format) — the per-target STRUCT-VARIANT selector. A
+// `structs` entry that declares `variants` is decoded by selecting the
+// variant whose `when:{arch?,format?}` MATCHES (arch == `*activeTarget`,
+// format == `objectFormatKindName(*activeFormat)`); EVERY specified key
+// must equal the active value (generic string equality — no arch/format
+// literal in the engine). >1 variant matches ⇒ fail loud
+// (F_ShippedStructVariantAmbiguous). 0 match (variants present) ⇒ the
+// struct is NOT injected (a later reference fails loud as an undefined
+// type). EAGER: every variant's field list is decoded regardless of which
+// is active (a malformed INACTIVE variant fails the whole read on EVERY
+// target — anti-lurking, mirrors `signatureByDataModel`). Both default to
+// nullopt for direct-API/LSP/unit callers ⇒ no variant selection (a
+// flat-`fields` struct decodes exactly as before; a struct that carries
+// ONLY `variants` is not injected when no selector is available).
 [[nodiscard]] DSS_EXPORT std::optional<ShippedLibDescriptor>
-readShippedLibDescriptor(std::filesystem::path const& path,
-                         TypeInterner&                interner,
-                         TypeRegistry&                typeReg,
-                         DiagnosticReporter&          reporter,
-                         DataModel                    dataModel = DataModel::Lp64);
+readShippedLibDescriptor(std::filesystem::path const&    path,
+                         TypeInterner&                   interner,
+                         TypeRegistry&                   typeReg,
+                         DiagnosticReporter&             reporter,
+                         DataModel                       dataModel    = DataModel::Lp64,
+                         std::optional<std::string_view> activeTarget = std::nullopt,
+                         std::optional<ObjectFormatKind> activeFormat = std::nullopt);
 
 // Read ONLY the `macros` surface from the neutral descriptor at `path`, WITHOUT a
 // TypeInterner. Macros are pure preprocessor token text (no types), so the

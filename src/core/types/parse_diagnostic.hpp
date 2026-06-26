@@ -1394,6 +1394,18 @@ enum class DiagnosticCode : std::uint16_t {
     //   Remediation: guard the include per platform, or build for a format the
     //   header supports. (D-SHIPPED-HEADER-PER-TARGET-AVAILABILITY, 2026-06-25.)
     F_ShippedHeaderUnavailableForTarget = 0x501D,
+    // F_ShippedStructVariantAmbiguous: a shipped `structs` entry declares
+    //   per-target `variants` (each a `when:{arch?,format?}` + its own field list,
+    //   so a struct can carry the correct per-target byte layout — plan 25), and
+    //   MORE THAN ONE variant matches the active compile target's (arch, format).
+    //   The selection contract is MATCH-ALL-SPECIFIED + exactly-one — an
+    //   under-specified `when` (e.g. `{"arch":"x86_64"}` matching BOTH x86_64-elf
+    //   AND x86_64-pe) would otherwise silently pick the first → a wrong struct
+    //   layout (e.g. the linux 144B `struct stat` on windows). Fail-loud: a
+    //   SILENT-MISCOMPILE guard (unsuppressable). Remediation: fully-specify each
+    //   variant's `when` so exactly one matches the target.
+    //   (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH, 2026-06-26.)
+    F_ShippedStructVariantAmbiguous = 0x501E,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
