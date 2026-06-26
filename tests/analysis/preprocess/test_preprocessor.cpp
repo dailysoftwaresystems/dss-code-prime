@@ -3082,3 +3082,171 @@ TEST(Preprocessor, DeadRegionCloseUsesConfigEndifWordNotHardcoded) {
         << "the dead-region close must use the CONFIG `#endwhile`, so the `$` "
            "AFTER it is LIVE and reports -- not a hard-coded `#endif`";
 }
+
+// ============================================================================
+// c18 (positional macro expansion, C 6.10.3): a `#define`/`#undef` affects only
+// text AFTER it. run() now FLUSHES the pending body through expand() at each
+// table-mutating directive, so a use BEFORE a later same-name `#define` is NOT
+// retroactively replaced. (Pre-c18 the whole body was expanded once at EOF with
+// the FINAL table -- the bug SQLite's declare-then-`#define name 0` omit pattern
+// exposed.) Every test is RED-ON-DISABLE: making isMutatingDirective() always
+// return false (reverting to the single end-flush) fails each one.
+// ============================================================================
+
+// ★ THE MINIMAL REPRO (confirmed via CLI on the real compiler): a `#define g 0`
+// must NOT clobber the EARLIER `int g;`. RED-ON-DISABLE: the single end-flush
+// expands `g`->`0` in the declaration -> `int 0 ;` (a parse error downstream).
+TEST(Preprocessor, MacroDefineIsNotRetroactive) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("int g;\n#define g 0\nint x;\n", r);
+    ASSERT_EQ(lexs.size(), 6u) << "expected: int g ; int x ;";
+    EXPECT_EQ(lexs[1], "g")
+        << "the `g` BEFORE `#define g 0` must stay an identifier, not expand to 0";
+    EXPECT_EQ(lexs[4], "x");
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_IllegalChar));
+}
+
+// A use BEFORE the define stays; a use AFTER expands. Pins both directions in one.
+TEST(Preprocessor, MacroDefineAfterUseDoesNotExpandEarlierUse) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("int a = g;\n#define g 0\nint b = g;\n", r);
+    ASSERT_EQ(lexs.size(), 10u) << "int a = g ; int b = 0 ;";
+    EXPECT_EQ(lexs[3], "g") << "the use BEFORE the define stays an identifier";
+    EXPECT_EQ(lexs[8], "0") << "the use AFTER the define expands";
+}
+
+// `#undef` is also positional: a use between `#define X 1` and `#undef X` sees 1;
+// a use after `#undef X` sees X again; a use before `#define X 1` stays X.
+TEST(Preprocessor, UndefBetweenTwoUsesIsPositional) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "int a = X;\n#define X 1\nint b = X;\n#undef X\nint c = X;\n", r);
+    ASSERT_EQ(lexs.size(), 15u);
+    EXPECT_EQ(lexs[3], "X")  << "before #define X 1 -> identifier";
+    EXPECT_EQ(lexs[8], "1")  << "between #define and #undef -> 1";
+    EXPECT_EQ(lexs[13], "X") << "after #undef X -> identifier again";
+}
+
+// Redefinition is positional: use after the first define -> 1, use after the
+// undef+redefine -> 2.
+TEST(Preprocessor, MacroRedefineGivesPositionalValues) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "int a = X;\n#define X 1\nint b = X;\n#undef X\n#define X 2\n"
+        "int c = X;\n",
+        r);
+    ASSERT_EQ(lexs.size(), 15u);
+    EXPECT_EQ(lexs[3], "X");
+    EXPECT_EQ(lexs[8], "1");
+    EXPECT_EQ(lexs[13], "2") << "the redefined value applies to the later use";
+}
+
+// ★ THE SQLITE OMIT PATTERN (the c18 driver): declare an API function, then
+// `#define name 0` to nullify it in a feature-omit build. The declaration must
+// survive as an identifier (a valid function decl), NOT become `void 0(void);`.
+TEST(Preprocessor, SqliteOmitPatternDeclareThenNullify) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("void f(void);\n#define f 0\nint x = 1;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "declare-then-#define-name-0 must leave the declaration intact";
+    ASSERT_GE(lexs.size(), 2u);
+    EXPECT_EQ(lexs[1], "f")
+        << "the declared function name must stay an identifier, not expand to 0";
+}
+
+// Multiple defines: uses before any define stay; uses after both expand.
+TEST(Preprocessor, MultipleDefinesGivePositionalExpansion) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "int a = X;\n#define X 1\n#define Y 2\nint b = X + Y;\n", r);
+    ASSERT_EQ(lexs.size(), 12u);
+    EXPECT_EQ(lexs[3], "X")  << "use before the defines stays an identifier";
+    EXPECT_EQ(lexs[8], "1");
+    EXPECT_EQ(lexs[10], "2");
+}
+
+// ★ THE CRUX (plan-lock fix 1): `#`/`##` PRODUCTS minted in DIFFERENT flushes must
+// all slice correctly from the final buffer. `productText_` is append-only with
+// absolute spans, so a product from flush 1 (`"aa"`) stays valid after later
+// mutations + a product from flush 3 (`foobar`). NOTE: unlike the positional tests
+// above, this one is NOT red-on-disable w.r.t. reverting the flush (a single
+// end-flush makes all products trivially valid); it is a regression guard for the
+// MULTI-flush product accounting itself -- it goes red if a refactor made
+// `productText_` reset/per-flush-local (a stale span -> empty/garbage lexeme).
+TEST(Preprocessor, ProductSpansSurviveAcrossFlush) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define STR(x) #x\n"
+        "const char *a = STR(aa);\n"   // product "aa" minted in flush 1
+        "#define BB 1\n"                // #define mutation -> flush
+        "#define CAT(x,y) x##y\n"       // #define mutation -> flush
+        "int b = CAT(foo,bar);\n"       // product foobar minted in a later flush
+        "int c = BB;\n"                 // BB -> 1
+        "#undef BB\n"                   // #undef mutation -> flush (the erase path)
+        "const char *d = STR(zz);\n",   // product "zz" minted AFTER the undef flush
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // A stringize product is tokenized as a string-literal opener `"` + a BODY
+    // token (+ implied close) -- see reconstructStringLiteral above -- so we check
+    // the distinctive product BODIES (which slice from productText_; an invalid
+    // multi-flush span would yield an empty/garbage lexeme, not the exact body).
+    auto has = [&](std::string_view s) {
+        for (auto const& l : lexs) if (l == s) return true;
+        return false;
+    };
+    EXPECT_TRUE(has("aa"))
+        << "the stringize product BODY from the FIRST flush must keep a valid span "
+           "after later flushes (and an #if-operand expansion) grow productText_";
+    EXPECT_TRUE(has("foobar"))
+        << "the paste product minted in a LATER flush must slice correctly";
+    EXPECT_TRUE(has("1")) << "BB expands to 1 in the final flush";
+    EXPECT_TRUE(has("zz"))
+        << "a stringize product minted AFTER a #undef-triggered flush (the erase "
+           "path) must also slice correctly -- #define and #undef share the flush "
+           "path";
+}
+
+// ★ THE SPANNING-CALL EDGE (plan-lock fix 2): a function-like macro CALL whose
+// argument list spans a `#define` boundary is split by the flush -> collectArgs
+// hits end-of-flush -> FAIL LOUD (unterminated argument list), never a silent
+// mis-expansion. Pins the documented edge as red-on-disable.
+TEST(Preprocessor, FunctionLikeCallSpanningDefineFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes(
+        "#define FOO(a,b) a b\nint q = FOO(1,\n#define X 9\n2);\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroArgument))
+        << "a function-like call whose args span a #define must fail loud "
+           "(unterminated argument list), never silently mis-expand";
+}
+
+// The OTHER spanning sub-case (audit follow-up): only the function-like macro NAME
+// precedes the `#define` (its `(` is after). The first flush sees the bare name
+// with no `(`, so it is emitted VERBATIM (not silently expanded); the call is then
+// rejected downstream at the parser. Pin: the name survives unexpanded at the
+// preprocess stage (no silent mis-expansion), and no unterminated-arg error fires
+// here (collectArgs is never reached -- distinguishing this from the case above).
+TEST(Preprocessor, FunctionLikeMacroNameOnlyAtDefineBoundaryNotMisexpanded) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define F(a) a\nint q = F\n#define X 1\n(5);\n", r);
+    bool sawF = false;
+    for (auto const& l : lexs) if (l == "F") sawF = true;
+    EXPECT_TRUE(sawF)
+        << "the bare macro name at a #define boundary must be emitted VERBATIM "
+           "(not silently expanded) -- its `(` is on the far side of the directive";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroArgument))
+        << "collectArgs is never reached (no `(` in the name's flush), so no "
+           "unterminated-argument error -- unlike the name+`(`-in-flush case";
+}
+
+// Positional expansion inside a LIVE `#if` branch: a use before the `#define` (but
+// inside the same live conditional) stays an identifier; a use after expands. Pins
+// that the positional flush composes with a non-empty conditional stack.
+TEST(Preprocessor, PositionalDefineInsideLiveIfBranch) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if 1\nint a = X;\n#define X 5\nint b = X;\n#endif\n", r);
+    ASSERT_EQ(lexs.size(), 10u) << "int a = X ; int b = 5 ;";
+    EXPECT_EQ(lexs[3], "X") << "use before the #define (in a live #if) stays";
+    EXPECT_EQ(lexs[8], "5") << "use after the #define (in a live #if) expands";
+}

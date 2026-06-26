@@ -1127,7 +1127,17 @@ public:
     }
 
     std::vector<Token> run(std::vector<Token> const& in) {
+        // c18 (positional macro expansion, C 6.10.3): `body` accumulates the live
+        // non-directive tokens since the LAST flush; `out` accumulates the
+        // positionally-expanded result. A `#define`/`#undef` only affects text
+        // AFTER it, so the pending `body` is FLUSHED through `expand()` (with the
+        // table as it stands BEFORE the directive mutates it) at each
+        // table-mutating directive boundary -- a use before a later same-name
+        // `#define` is then NOT retroactively replaced (the bug SQLite's
+        // declare-then-`#define name 0` omit pattern exposed). Pre-c18 this
+        // collected the WHOLE body and expanded once at EOF with the FINAL table.
         std::vector<Token> body;
+        std::vector<Token> out;
         std::size_t i = 0;
         // c17 (authoritative dead-regions): track the OPEN dead byte-span as the
         // loop crosses conditional directives. A dead span OPENS at the END of a
@@ -1147,6 +1157,25 @@ public:
         ByteOffset deadStart = 0;
         while (i < in.size()) {
             if (isHash(in[i]) && firstOnLine(in, i)) {
+                // c18: FLUSH before a directive that mutates the macro table, so
+                // the pending body expands against the PRE-directive table. Only
+                // `#define`/`#undef` (while the stack is active) mutate it -- an
+                // `#include` line is a pass-through (its descriptor macros were
+                // spliced earlier in SynthBuilder), conditionals only read the
+                // table, and a dead-branch define is not processed. A harmless
+                // over-fire is possible (a REJECTED `#define __LINE__ …` keeps
+                // `word==define` yet does not mutate the table) -- it only re-
+                // segments where expand() is called. That is output-neutral for
+                // conforming code (`productText_` is append-only and a hide set
+                // never spans a directive line); the only observable effect is on
+                // a function-like CALL whose argument list spans the directive
+                // line -- undefined behavior (C 6.10.3p11) -- which the extra
+                // flush turns from a mis-expansion into a fail-loud unterminated-
+                // argument error. Never a silent miscompile.
+                if (isMutatingDirective(in, i)) {
+                    flushExpand(body, out);
+                    body.clear();
+                }
                 bool const        wasActive = stackActive();
                 ByteOffset const  dirByte   = in[i].span.start();
                 std::size_t const next      = handleDirective(in, i, body);
@@ -1193,31 +1222,61 @@ public:
                        static_cast<ByteOffset>(synth_->size())),
                    "unterminated conditional directive (missing #endif)");
         }
-        // Stream-expand the whole directive-stripped body uniformly (object-
-        // AND function-like macros share one cursor-walking engine). Lift the
-        // plain tokens into the ExpToken working set (every token starts with an
-        // EMPTY hide set), run the precise per-token hide-set expander
-        // (Prosser's realization of C 6.10.3.4 -- see `expand`), then DROP the
-        // hide sets back to the plain Token stream the parser consumes.
+        // c18: final flush of the tokens following the last table-mutating
+        // directive (or the whole body, when there was none -- byte-identical to
+        // the pre-c18 single end-expand).
+        flushExpand(body, out);
+        return out;
+    }
+
+    // c18 (positional macro expansion): expand `pending` with the CURRENT `table_`
+    // and APPEND the non-placemarker results to `accumulated`. Called at each
+    // table-mutating directive boundary and once at EOF, so each run expands
+    // against the macro state that held AT ITS POSITION (C 6.10.3). A no-op for an
+    // empty `pending`. `productText_` is shared across every flush: it is
+    // APPEND-ONLY (a product token's span is the absolute `prefixLen_ + offset`,
+    // never rewound), and `preprocess()` appends the whole `productText_` exactly
+    // once, so a `#`/`##` product minted in one flush keeps a valid span after
+    // later flushes (or an `#if`-operand expansion inside `handleDirective`) grow
+    // the buffer further.
+    void flushExpand(std::vector<Token> const& pending,
+                     std::vector<Token>&       accumulated) {
+        if (pending.empty()) return;
+        // Lift each token via fromToken() so it seeds its OWN synth offset as the
+        // invocation anchor (a bare `__LINE__`/`__FILE__` resolves against its real
+        // source position; a macro splice inherits the invoking token's anchor) and
+        // starts with an EMPTY hide set -- a hide set is per-expansion-run and never
+        // needs to span a flush (a directive line terminates the surrounding
+        // construct; a function-like call spanning it fails loud -- in collectArgs
+        // when the name+`(` are in this flush, else at the parser when only the
+        // name precedes the directive -- never a silent mis-expansion).
         std::vector<ExpToken> work;
-        work.reserve(body.size());
-        // FC15b: lift each original body token via fromToken() so it seeds its
-        // OWN synth offset as the invocation anchor -- a bare `__LINE__`/`__FILE__`
-        // then resolves against its real source position, and a macro splice
-        // later inherits the invoking token's anchor.
-        for (Token const& t : body) work.push_back(fromToken(t));
+        work.reserve(pending.size());
+        for (Token const& t : pending) work.push_back(fromToken(t));
         std::vector<ExpToken> expanded = expand(std::move(work), 0);
-        std::vector<Token> out;
-        out.reserve(expanded.size());
-        // FC15 paste residuals: a placemarker is normally consumed (or dropped
-        // at `collapsePastes` return) inside `substitute`; this is a defensive
-        // BACKSTOP so a stray placemarker never reaches the parser as a garbage
-        // (default-constructed) token. The primary drop is in `substitute`.
+        // FC15 paste residuals: a placemarker is normally consumed inside
+        // `substitute`; this BACKSTOP drops any stray one so it never reaches the
+        // parser as a garbage (default-constructed) token.
         for (ExpToken const& et : expanded) {
             if (et.placemarker) continue;
-            out.push_back(et.tok);
+            accumulated.push_back(et.tok);
         }
-        return out;
+    }
+
+    // c18: TRUE iff the directive line at `hashIdx` is a table-MUTATING
+    // `#define`/`#undef` while the conditional stack is active (so it would
+    // actually be processed -- a dead-branch define is gated out in
+    // `handleDirective`). Pure: mirrors `handleDirective`'s own skipTrivia +
+    // word-read (so it sees the SAME directive word) without mutating any state.
+    // `run()` consults it to flush the pending body BEFORE the table changes.
+    [[nodiscard]] bool isMutatingDirective(std::vector<Token> const& in,
+                                           std::size_t hashIdx) const {
+        if (!stackActive()) return false;
+        const std::size_t end = lineEnd(in, hashIdx);
+        const std::size_t p   = skipTrivia(in, hashIdx + 1);
+        if (p >= end || isNewline(in[p])) return false;
+        const std::string_view w = text(in[p]);
+        return w == cfg().defineDirective || w == cfg().undefDirective;
     }
 
 private:

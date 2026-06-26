@@ -1,0 +1,35 @@
+{
+  "$comment": "c18 (positional macro expansion, C 6.10.3) runtime witness: a `#define name VALUE` must NOT retroactively replace a use of `name` that appears BEFORE it. SQLite's omit pattern declares a name then `#define`s it to a constant; the declaration must survive (else `int base_val;` becomes `int 40;` -> parse error -> no binary). The uses in the call args (after the #defines) expand: add(base_val,margin_val) -> add(40,2) = 42 -> exit 42. RED-ON-DISABLE: pre-c18 the whole body expanded with the final table, clobbering the earlier declarations -> build failure. base_val/margin_val reach add() as function args so the baseline arm keeps a live runtime add (not const-folded), and the optimizedPipelines `release` arm runs the shipped pipeline over the same source.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
