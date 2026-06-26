@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 67> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 68> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -249,6 +249,22 @@ constexpr std::array<DiagnosticCode, 67> kUnsuppressableCodes{{
     // truncated to a wrong machine-code constant (e.g. wrong syscall
     // number). Same bytes-on-disk-invariant band as the others above.
     DiagnosticCode::A_ImmediateOperandOutOfRange,
+
+    // S_* semantic band — silent-MISCOMPILE guards.
+    // S_VolatilePointeeNotSupported (c21, D-CSUBSET-VOLATILE-QUALIFIER,
+    // 2026-06-26): a `volatile <base> *` type-name (pointer-to-volatile-POINTEE).
+    // Model B threads `volatile` as a per-symbol/member `isVolatile` (the
+    // access's own Load/Store carries MirInstFlags::Volatile) and CANNOT express
+    // a volatile POINTEE — that volatility rides the DEREFERENCED access, which
+    // needs type-level cv-tracking (model A, deferred → D-CSUBSET-VOLATILE-
+    // POINTEE / c22). The reject fires at the type-name level, at BOTH the
+    // per-declarator typing arm AND the co-located pointer arm, so NO pointer-to-
+    // volatile-pointee TYPE can be built → no Deref can silently drop the flag.
+    // Suppressing it would let `volatile int *p; *p` compile with a NON-volatile
+    // Load that the optimizer is free to elide / cache — exactly the silent
+    // miscompile the whole cycle exists to forbid. A member of the closed table
+    // for the same reason every silent-wrong-bytes guard above is.
+    DiagnosticCode::S_VolatilePointeeNotSupported,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

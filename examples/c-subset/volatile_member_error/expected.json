@@ -1,0 +1,12 @@
+{
+  "$comment": "c21 (D-CSUBSET-VOLATILE-QUALIFIER): a pointer-to-volatile-POINTEE STRUCT MEMBER (`struct S { volatile int *p; }`) fails loud S_VolatilePointeeNotSupported via the CO-LOCATED type-resolver arm (the member head consumes the star, so the reject is position-aware on the flat `volatile int *` type node). The sibling object/param/typedef forms are caught by the per-declarator arm (see volatile_error). The reject returns InvalidType, which cascades a secondary S_UnknownType on the field at col 1 — both asserted so the full diagnostic set is pinned.",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "S_VolatilePointeeNotSupported", "line": 12, "col": 12 },
+    { "code": "S_UnknownType", "line": 12, "col": 1 }
+  ]
+}

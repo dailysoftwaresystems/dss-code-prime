@@ -310,6 +310,19 @@ struct DSS_EXPORT DeclarationRule {
     // `typeChild` is set), marks the minted symbol const. `nullopt` ⇒ the
     // language has no const marker for this declaration form.
     std::optional<SchemaTokenId> constMarker;
+    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a token kind that, when found in the
+    // `typeChild` subtree (or the whole declaration subtree when no `typeChild`),
+    // marks the minted symbol VOLATILE — mirrors `constMarker` exactly (an
+    // independent scan, so `const volatile` sets BOTH bits). Read at HIR-access
+    // lowering to thread `MirInstFlags::Volatile` onto the symbol's Load/Store so
+    // the optimizer (DCE/CSE/Mem2Reg/LICM, all already Volatile-aware) cannot
+    // elide or reorder a volatile access. `nullopt` ⇒ the language has no volatile
+    // marker for this declaration form. ALSO the per-declarator pointee-volatile
+    // reject (S_VolatilePointeeNotSupported) keys off this token: a head-position
+    // volatile + a star in the declarator forms a pointer-to-volatile-pointee,
+    // which model B cannot express and rejects loud (config-driven, no hardcoded
+    // keyword).
+    std::optional<SchemaTokenId> volatileMarker;
     // D-LANG-VARIADIC (step 13.4, 2026-06-02): a token kind that, when
     // found anywhere in this declaration's params subtree (the subtree
     // rooted at the `paramsChild` visible child), marks the declared
@@ -1032,6 +1045,20 @@ struct DSS_EXPORT SemanticConfig {
     // (InvalidSchemaToken) for languages with no pointer declarator. Full C
     // declarators (function pointers, arrays-of-pointers) stay future surface.
     std::optional<SchemaTokenId>    pointerToken;
+    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): the language's `volatile`-class
+    // qualifier token (c-subset: `VolatileKeyword`). Used by the type-position
+    // resolver's CO-LOCATED pointer arm (`typeRefAllowingStruct` / `castTypeRef`,
+    // where the qualifier + stars are siblings of ONE node, NOT split across a
+    // head + declarator) to reject a POINTER-TO-VOLATILE-POINTEE position-aware:
+    // a `volatileMarker` token BEFORE the first `pointerToken` ⇒ pointee-volatile
+    // ⇒ REJECT (S_VolatilePointeeNotSupported); AFTER the last star ⇒ the POINTER
+    // OBJECT is volatile ⇒ ACCEPT. This is the second of the two-site reject
+    // (the per-declarator typing arm covers the head+declarator decl forms via
+    // `DeclarationRule.volatileMarker`); together they make the fail-loud COMPLETE
+    // BY CONSTRUCTION. Absent (InvalidSchemaToken) ⇒ the language has no volatile
+    // qualifier and the arm never rejects. Source-agnostic: the engine reads THIS
+    // instead of hardcoding a token name.
+    std::optional<SchemaTokenId>    volatileMarker;
     // FF6 Slice 2 + audit fold (2026-06-02): per-object-format
     // runtime library identity for SOURCE-DECLARED externs. The
     // source language's grammar emits a complete `extern int

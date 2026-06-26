@@ -22,9 +22,9 @@
 // the load_u selection would silently still pass on the old path. An ARRAY alloca is
 // never scalar-promoted (mem2reg refuses array allocas — "promoting would lose memory
 // identity"), so the full 320B reservation survives; `pad[0]` is read back into the
-// result (netting zero, see below) so the array is also live against DCE. (NB: `volatile`
-// is grammar-admitted but fails LOUD in the c-subset — S_VolatileNotSupported — so it
-// cannot be used here.)
+// result (netting zero, see below) so the array is also live against DCE. (NB: an array
+// alloca survives mem2reg on its own; `volatile` — implemented since c21 — is not needed
+// here. Only a pointer-to-volatile POINTEE still fails loud, S_VolatilePointeeNotSupported.)
 //
 // RED-ON-DISABLE: revert the load_u selection in lir_callconv.cpp -> the 9th-param load
 // emits the unscaled `load` (LDUR imm9) at an offset > 255 -> the fixed32 encoder fails

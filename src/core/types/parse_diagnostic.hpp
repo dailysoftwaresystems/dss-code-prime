@@ -425,6 +425,23 @@ enum class DiagnosticCode : std::uint16_t {
     // not yet model `const` — anchored as D-CSUBSET-INCDEC-CONST-LVALUE, shared
     // with the same gap on plain assignment.) Positioned at the ++/-- expression.
     S_IncDecNeedsModifiableLvalue = 0xE024,
+    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a type-name that forms a POINTER-TO-
+    // VOLATILE-POINTEE (`volatile int *p` — a head-position volatile qualifier
+    // FOLLOWED by ≥1 pointer star). Model B threads `volatile` as a per-symbol/
+    // member `isVolatile` bool (the access's own Load/Store gets MirInstFlags::
+    // Volatile); it CANNOT express pointee-volatile (the volatility rides the
+    // DEREFERENCED access, which needs type-level cv-tracking — model A, deferred
+    // to D-CSUBSET-VOLATILE-POINTEE / c22). Rejecting at the type-name level — at
+    // BOTH the per-declarator typing arm (head volatile + declarator star) AND the
+    // co-located pointer arm (head volatile BEFORE the first star) — makes the
+    // fail-loud COMPLETE BY CONSTRUCTION: no pointer-to-volatile-pointee TYPE can
+    // be built, so no Deref can silently drop the flag (a silent miscompile). East
+    // `int * volatile p` (the POINTER OBJECT is volatile) is ACCEPTED — that
+    // volatility is the Load of `p` itself at the ref site, which model B threads.
+    // Config-driven: the reject keys off the language's `volatileMarker` +
+    // configured pointer token, never a hardcoded keyword/`*`. Unsuppressable
+    // (silent-miscompile guard).
+    S_VolatilePointeeNotSupported = 0xE025,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

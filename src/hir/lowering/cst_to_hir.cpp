@@ -204,6 +204,16 @@ struct Lowerer {
     // side-table stays sparse and a wrongly-defaulted global fails SAFE (writable
     // never re-introduces the read-only-store crash).
     std::vector<std::pair<HirNodeId, MutabilityAttr>>& mutability;
+    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared accumulator of (ACCESS HIR node
+    // → VolatileAttr) pairs, populated from the bound symbol's / field's
+    // `SymbolRecord.isVolatile` at each USER-access lowering site (object Ref,
+    // struct/union MemberAccess, VarDecl/Global init store) where the record is
+    // in hand. Applied to the result's HirVolatileMap AFTER finish() — same
+    // frozen-hir discipline as `mutability`. Only VOLATILE accesses are recorded
+    // (absence ⇒ plain memory access ⇒ optimizer may freely transform), so the
+    // side-table stays sparse; the only unsafe direction is a MISSED volatile
+    // access, which the exhaustive threading closes.
+    std::vector<std::pair<HirNodeId, VolatileAttr>>& volatileAcc;
 
     // D-CSUBSET-LOCAL-STATIC: the module-level decls accumulator (the SAME
     // vector `lowerTree` appends top-level decls to). A block-scope `static`
@@ -602,10 +612,11 @@ struct Lowerer {
             HirLiteralPool& lits, std::vector<std::pair<HirNodeId, HirSourceLoc>>& sp,
             std::vector<HirExternRecord>& ed,
             std::vector<std::pair<HirNodeId, LinkageAttr>>& lk,
-            std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut)
+            std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut,
+            std::vector<std::pair<HirNodeId, VolatileAttr>>& vol)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
-          linkage(lk), mutability(mut) {
+          linkage(lk), mutability(mut), volatileAcc(vol) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -840,6 +851,26 @@ struct Lowerer {
         auto const* rec = model.recordFor(sym);
         if (rec != nullptr && rec->isConst)
             mutability.push_back({node, MutabilityAttr{/*isConst=*/true}});
+    }
+    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): record an ACCESS HIR node's volatility
+    // from its bound symbol's `SymbolRecord.isVolatile` (sparse: only volatile
+    // accesses are stored; absence ⇒ plain access). Called at the object-Ref +
+    // VarDecl/Global lowering sites. The member-access form reads the FIELD record
+    // directly (its symbol is not the object's) — see `recordMemberVolatility`.
+    void recordVolatility(HirNodeId node, SymbolId sym) {
+        if (!node.valid() || !sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->isVolatile)
+            volatileAcc.push_back({node, VolatileAttr{/*isVolatile=*/true}});
+    }
+    // c21: record a MemberAccess HIR node's volatility from the FIELD's record
+    // (`frec->isVolatile`) — the volatile-ness is the field declaration's, not
+    // the object's. The MemberAccess node keys both the rvalue Load and (when it
+    // is an assignment target) the Store.
+    void recordMemberVolatility(HirNodeId node, SymbolRecord const* frec) {
+        if (!node.valid() || frec == nullptr) return;
+        if (frec->isVolatile)
+            volatileAcc.push_back({node, VolatileAttr{/*isVolatile=*/true}});
     }
 
     [[nodiscard]] bool isExprNode(NodeId n) const {
@@ -1711,7 +1742,12 @@ struct Lowerer {
                                  type};
                     }
                 }
-                return E{track(builder.makeRef(type, sym.v), node), type};
+                HirNodeId const refNode = track(builder.makeRef(type, sym.v), node);
+                // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a Ref to a `volatile`
+                // object/global — its Load (here) and, when this Ref is an
+                // assignment TARGET, its Store both carry the flag.
+                recordVolatility(refNode, sym);
+                return E{refNode, type};
             }
             auto lit = litType_.find(tk.v);
             if (lit != litType_.end()) return lowerLiteral(node, c, tk, lit->second);
@@ -2109,7 +2145,11 @@ struct Lowerer {
         if (!cfg.refExtensionKind.empty())
             return track(builder.addLeaf(HirKind::Extension, InvalidType,
                                          extKind(cfg.refExtensionKind).v), at);
-        return track(builder.makeRef(type, sym.v), at);
+        HirNodeId const refNode = track(builder.makeRef(type, sym.v), at);
+        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): the other object-Ref seam — a
+        // `volatile` object/global accessed via nameRefExpr.
+        recordVolatility(refNode, sym);
+        return refNode;
     }
 
     // `ext` slot: the child rule must itself be extension-mapped.
@@ -2855,9 +2895,14 @@ struct Lowerer {
                 object = track(builder.makeDeref(base.id, pointeeType,
                                                  HirFlags::Synthetic), node);
             }
-            return {track(builder.makeMemberAccess(object, fieldIndex,
-                                                   fieldType), node),
-                    fieldType};
+            HirNodeId const maNode = track(builder.makeMemberAccess(
+                                               object, fieldIndex, fieldType), node);
+            // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a `volatile` struct/union FIELD
+            // — the MemberAccess node keys both its rvalue Load and (as an assign
+            // target) its Store. The volatility is the FIELD's (`frec`), NOT the
+            // object's; a non-volatile sibling field's MemberAccess stays plain.
+            recordMemberVolatility(maNode, frec);
+            return {maNode, fieldType};
         }
         return exprError(node, std::format("postfix target '{}' has no lowering", e.target));
     }
@@ -5450,6 +5495,7 @@ struct Lowerer {
                 }
                 HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), d);
                 recordMutability(g, sym);
+                recordVolatility(g, sym);   // c21: volatile static-local global init store
                 recordLinkage(g, staticLinkage);  // {Local, Default} — internal
                 moduleDecls_->push_back(g);
                 continue;
@@ -5462,6 +5508,11 @@ struct Lowerer {
             // mutable one to writable `.data` (D-LK4-DATA-PRODUCER-MUTABLE-
             // GLOBAL). Locals are stack slots — mutability is irrelevant there.
             if (asGlobal) recordMutability(lowered, sym);
+            // c21 (D-CSUBSET-VOLATILE-QUALIFIER): volatility applies to BOTH a
+            // global's load-time init store (HIR→MIR :6886) AND a local's init
+            // store into its alloca (HIR→MIR :5712) — record unconditionally on
+            // the VarDecl/Global node (UNLIKE mutability, which is global-only).
+            recordVolatility(lowered, sym);
             out.push_back(lowered);
         }
     }
@@ -5523,9 +5574,12 @@ struct Lowerer {
         if (asGlobal) {
             HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
             recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
+            recordVolatility(g, sym);   // c21 (D-CSUBSET-VOLATILE-QUALIFIER)
             return g;
         }
-        return track(builder.makeVarDecl(type, sym.v, init), node);
+        HirNodeId const vd = track(builder.makeVarDecl(type, sym.v, init), node);
+        recordVolatility(vd, sym);      // c21: volatile local init store
+        return vd;
     }
 
     HirNodeId lowerVarDecl(NodeId node) { return lowerVarLike(node, /*asGlobal=*/false); }
@@ -6283,6 +6337,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: shared (Global node → MutabilityAttr)
     // accumulator, moved onto result->mutabilityMap after finish().
     std::vector<std::pair<HirNodeId, MutabilityAttr>> mutability;
+    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared (access node → VolatileAttr)
+    // accumulator, moved onto result->volatileMap after finish().
+    std::vector<std::pair<HirNodeId, VolatileAttr>> volatileAcc;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -6294,7 +6351,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
-            mutability));
+            mutability, volatileAcc));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -6342,6 +6399,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     for (auto& [id, loc] : spans) result->sourceMap.set(id, loc);
     for (auto& [id, attr] : linkage) result->linkageMap.set(id, attr);
     for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
+    for (auto& [id, attr] : volatileAcc) result->volatileMap.set(id, attr);  // c21
     result->externDecls = std::move(externDecls);
 
     // verify-on-load.

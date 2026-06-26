@@ -122,6 +122,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::S_IncompatibleRedeclaration: return "S_IncompatibleRedeclaration";
         case DiagnosticCode::S_CaseLabelNotInSwitch:     return "S_CaseLabelNotInSwitch";
         case DiagnosticCode::S_IncDecNeedsModifiableLvalue: return "S_IncDecNeedsModifiableLvalue";
+        case DiagnosticCode::S_VolatilePointeeNotSupported:
+            return "S_VolatilePointeeNotSupported";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

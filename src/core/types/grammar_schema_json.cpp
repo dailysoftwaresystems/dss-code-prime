@@ -4468,6 +4468,31 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): optional
+                        // volatile-marker token. Same shape as `constMarker`
+                        // above: a bad token name is C_UnknownToken; the symbol
+                        // is still minted (just never marked volatile). Source-
+                        // language agnostic — each language declares its own
+                        // marker token.
+                        if (entry.contains("volatileMarker")) {
+                            if (!entry.at("volatileMarker").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/volatileMarker",
+                                          "'volatileMarker' must be a string");
+                            } else {
+                                auto const vm = entry.at("volatileMarker").get<std::string>();
+                                if (!data.schemaTokens->contains(vm)) {
+                                    coll.emit(DiagnosticCode::C_UnknownToken,
+                                              path + "/volatileMarker",
+                                              std::format("'declarations[{}].volatileMarker' "
+                                                          "references unknown token kind '{}'",
+                                                          i, vm));
+                                } else {
+                                    rule.volatileMarker = data.schemaTokens->find(vm);
+                                }
+                            }
+                        }
+
                         // D-LANG-VARIADIC (step 13.4, 2026-06-02): optional
                         // C-style variadic-marker token. Same shape as
                         // `constMarker` above: a bad token name is
@@ -7388,6 +7413,30 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                               "token kind '{}'", name));
                     } else {
                         cfg.pointerToken = data.schemaTokens->find(name);
+                    }
+                }
+            }
+
+            // ── volatileMarker (c21, D-CSUBSET-VOLATILE-QUALIFIER) ──
+            // An OPTIONAL token: the language's `volatile`-class qualifier. Read
+            // by the type-position resolver's CO-LOCATED pointer arm to reject a
+            // pointer-to-volatile-pointee (`volatile int *`) position-aware. Same
+            // shape as `pointerToken` above.
+            if (sem.contains("volatileMarker")) {
+                json const& tok = sem.at("volatileMarker");
+                if (!tok.is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/volatileMarker",
+                              "'volatileMarker' must be a string");
+                } else {
+                    auto const name = tok.get<std::string>();
+                    if (!data.schemaTokens->contains(name)) {
+                        coll.emit(DiagnosticCode::C_UnknownToken,
+                                  "/semantics/volatileMarker",
+                                  std::format("'volatileMarker' references unknown "
+                                              "token kind '{}'", name));
+                    } else {
+                        cfg.volatileMarker = data.schemaTokens->find(name);
                     }
                 }
             }
