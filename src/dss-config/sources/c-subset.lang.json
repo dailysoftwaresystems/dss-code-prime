@@ -123,7 +123,8 @@
     "//": [{
       "kind": "LineCommentStart", "flags": ["EmptySpace"],
       "modeOp": "pushMode", "modeArg": "line-comment",
-      "stringStyle": { "escapeKind": "none", "endsAt": "\n" }
+      "$endsAtExclusiveComment": "c22 (D-PP-LINE-COMMENT-BEFORE-DIRECTIVE): a `//` comment ends AT the newline but EXCLUDES it — the newline must survive as its own Newline token, else a directive on the next line after `code // comment` loses its line boundary and the preprocessor fails to recognize it (firstOnLine sees the comment-consumed newline as a body char, not a boundary).",
+      "stringStyle": { "escapeKind": "none", "endsAt": "\n", "endsAtExclusive": true }
     }],
     "/*": [{
       "kind": "BlockCommentStart", "flags": ["EmptySpace"],

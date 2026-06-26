@@ -39,6 +39,14 @@ struct DSS_EXPORT StringStyle {
     char         escapeChar         = 0;        // ASCII byte; valid iff escapeKind == Char
     bool         endsAtLongestMatch = false;
     bool         multiline          = false;
+    // When true, the `endsAt` delimiter TERMINATES the body but is NOT consumed:
+    // the body ends just BEFORE it and the delimiter bytes are left in the stream
+    // for the main scan to re-lex as their own token. A C `//` line comment uses
+    // this with `endsAt:"\n"` so the terminating newline survives as a Newline
+    // token (significant for preprocessor directive line-boundary detection —
+    // D-PP-LINE-COMMENT-BEFORE-DIRECTIVE). Default false ⇒ the delimiter is
+    // consumed (correct for `*/`, a closing quote, `>`, etc.).
+    bool         endsAtExclusive    = false;
     std::string  endsAt;
     std::string  tagPattern;                    // non-empty ⇒ dynamic delimiter tag
 };

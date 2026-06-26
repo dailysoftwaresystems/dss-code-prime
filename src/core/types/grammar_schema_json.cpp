@@ -277,6 +277,20 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
         s.multiline = obj.at("multiline").get<bool>();
     }
 
+    // endsAtExclusive — optional bool. When true the `endsAt` delimiter
+    // terminates the body but is left in the stream (not consumed), so it is
+    // re-lexed as its own token (a `//` line comment ends AT but EXCLUDES the
+    // newline, which must survive as a Newline token).
+    if (obj.contains("endsAtExclusive")) {
+        if (!obj.at("endsAtExclusive").is_boolean()) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/endsAtExclusive", path),
+                   "'endsAtExclusive' must be a boolean");
+            return std::nullopt;
+        }
+        s.endsAtExclusive = obj.at("endsAtExclusive").get<bool>();
+    }
+
     // delimiterTag — optional. Only "matched" is recognized; presence
     // enables dynamic-tag capture. The signal at runtime is
     // `tagPattern.empty()` — non-empty pattern means dynamic tag.

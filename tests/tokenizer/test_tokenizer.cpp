@@ -901,23 +901,30 @@ namespace {
 } // namespace
 
 TEST(Tokenizer, LineCommentEmitsOpenerThenCommentCharsToNewline) {
-    // c-subset line-comment mode: `//` pushes mode; everything up to
-    // the next `\n` becomes a CommentChar; the `\n` consumed as the
-    // closer (last CommentChar in body mode). Tokenizer should then
-    // be back in main mode for any trailing source.
+    // c-subset line-comment mode: `//` pushes mode; everything up to but
+    // EXCLUDING the next `\n` becomes a CommentChar. c22
+    // (D-PP-LINE-COMMENT-BEFORE-DIRECTIVE): the `\n` is NOT consumed into the
+    // comment — the `//` mode is `endsAtExclusive`, so the terminating newline
+    // survives as its OWN Newline token (so a following `#` directive keeps its
+    // line boundary). The tokenizer is then back in main mode for the rest.
     auto h      = loadCSubset("// hi\nvar x;");
     auto result = lex(h);
-    // Tokens: LineCommentStart, ' ', 'h', 'i', '\n', Word("var"),
-    // ' ', Word("x"), Punctuation(';')  ⇒ 9
+    // Tokens: LineCommentStart, ' ', 'h', 'i', Newline('\n'), Word("var"),
+    // ' ', Word("x"), Punctuation(';')  ⇒ 9 (the `\n` is now a Newline, not a
+    // CommentChar — same count, different kind at [4]).
     ASSERT_EQ(result.tokens.size(), 9u);
     EXPECT_EQ(result.tokens[0].schemaKind,
               h.schema->schemaTokens().find("LineCommentStart"));
-    // Body chars all share the CommentChar schemaKind.
+    // The chars BEFORE the newline share the CommentChar schemaKind.
     const auto commentCharKind = h.schema->schemaTokens().find("CommentChar");
     EXPECT_EQ(result.tokens[1].schemaKind, commentCharKind);
     EXPECT_EQ(result.tokens[2].schemaKind, commentCharKind);
     EXPECT_EQ(result.tokens[3].schemaKind, commentCharKind);
-    EXPECT_EQ(result.tokens[4].schemaKind, commentCharKind);
+    // The terminating newline is its OWN Newline token (NOT a CommentChar) —
+    // the c22 line-boundary-preserving fix.
+    EXPECT_EQ(result.tokens[4].coreKind, CoreTokenKind::Newline);
+    EXPECT_EQ(result.tokens[4].schemaKind,
+              h.schema->schemaTokens().find("Newline"));
     // After the comment body closes, we're back in main mode.
     EXPECT_EQ(result.tokens[5].coreKind, CoreTokenKind::Word);
     EXPECT_EQ(textOf(*h.src, result.tokens[5]), "var");
@@ -1295,11 +1302,13 @@ TEST(Tokenizer, ModeStackResetsBetweenTopLevelStatements) {
     // After a closed comment, main mode is restored. Multiple comments
     // in sequence each open + close their own mode without leaking.
     // Token breakdown for `// one\n/* two */// three\nvar`:
-    //   `// one\n`     → 1 opener + 5 body chars (` one\n` close) = 6
+    //   `// one\n`     → 1 opener + 4 body chars (` one`) + 1 Newline = 6
     //   `/* two */`    → 1 opener + 6 body chars (` two `, `*/` close) = 7
-    //   `// three\n`   → 1 opener + 7 body chars (` three\n` close) = 8
+    //   `// three\n`   → 1 opener + 6 body chars (` three`) + 1 Newline = 8
     //   `var`          → 1 Word = 1
-    // Total = 22 tokens (Eof is not pushed into the test vector).
+    // Total = 22 tokens (Eof is not pushed into the test vector). c22: the
+    // line-comment `\n` is now a separate Newline token (endsAtExclusive), not a
+    // consumed body char — same per-comment token COUNT, so the total stays 22.
     auto h      = loadCSubset("// one\n/* two */// three\nvar");
     auto result = lex(h);
     EXPECT_TRUE(result.diags.empty());

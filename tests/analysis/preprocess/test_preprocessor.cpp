@@ -87,6 +87,62 @@ using namespace dss;
 
 } // namespace
 
+// c22 (D-PP-LINE-COMMENT-BEFORE-DIRECTIVE): assert a preprocessed buffer (a)
+// reported NO error, (b) fully consumed the `#define Z 1` directive — no `#`,
+// `define`, or unexpanded `Z` leaked into the parser-visible lexemes — and (c)
+// expanded `Z` to `1`. The line comment's own chars (`//`, `c`) are harmless
+// trivia the parser skips; the load-bearing facts are directive-removal +
+// expansion, asserted robustly rather than over-pinning the comment's spelling.
+[[nodiscard]] ::testing::AssertionResult directiveProcessedToOne(std::string text) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(std::move(text), r);
+    if (r.diagnostics->hasErrors())
+        return ::testing::AssertionFailure()
+               << "preprocess reported an error (directive leaked to the parser)";
+    bool hasOne = false;
+    for (auto const& l : lexs) {
+        if (l == "#" || l == "define")
+            return ::testing::AssertionFailure() << "directive leaked: '" << l << "'";
+        if (l == "Z")
+            return ::testing::AssertionFailure() << "Z was left unexpanded";
+        if (l == "1") hasOne = true;
+    }
+    if (!hasOne)
+        return ::testing::AssertionFailure() << "Z did not expand to 1";
+    return ::testing::AssertionSuccess();
+}
+
+// The bug case: a `//` comment SHARING a line with code, immediately before a
+// directive. The line comment must NOT swallow its terminating newline, else the
+// directive loses its line boundary (firstOnLine sees the code before the
+// comment) and leaks to the parser unrecognized.
+TEST(Preprocessor, LineCommentSharingCodeLineThenDirectiveIsRecognized) {
+    EXPECT_TRUE(directiveProcessedToOne("int a; // c\n#define Z 1\nint b=Z;\n"));
+}
+
+// Control: the forms that already worked must keep working (the fix is newline
+// preservation, not a change to comment recognition); plus a multi-line variant
+// and a line comment at EOF.
+TEST(Preprocessor, LineCommentNewlinePreservedAcrossForms) {
+    // (a) comment ALONE on its own line before a directive.
+    EXPECT_TRUE(directiveProcessedToOne("int a;\n// c\n#define Z 1\nint b=Z;\n"));
+    // (b) trailing comment ON the directive line.
+    EXPECT_TRUE(directiveProcessedToOne("#define Z 1 // c\nint b=Z;\n"));
+    // (c) TWO code lines each with a trailing comment, then a directive.
+    EXPECT_TRUE(directiveProcessedToOne(
+        "int a; // one\nint c; // two\n#define Z 1\nint b=Z;\n"));
+    // (d) a `code // comment` line followed by ordinary (non-directive) code must
+    // still preprocess cleanly — the preserved newline is benign for plain code.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("int a; // c\nint b;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        bool hasB = false;
+        for (auto const& l : lexs) if (l == "b") hasB = true;
+        EXPECT_TRUE(hasB) << "code after a `code // comment` line must survive";
+    }
+}
+
 TEST(Preprocessor, ObjectMacroExpandsAndDirectiveRemoved) {
     PreprocessResult r;
     auto lexs = ppLexemes("#define X 42\nint v = X;\n", r);

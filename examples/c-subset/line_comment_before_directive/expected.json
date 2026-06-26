@@ -1,0 +1,27 @@
+{
+  "$comment": "c22 (D-PP-LINE-COMMENT-BEFORE-DIRECTIVE): end-to-end pin that a `#` directive immediately following a `code // comment` line is recognized. main() defines ADD via a `#define` that sits right after `int r = 5; // trailing comment`, then returns r + ADD = 5 + 37 = 42. Before the fix the line comment swallowed its terminating newline, so the directive lost its line boundary and leaked to the parser (compile failure); the binary's exit 42 proves the directive was processed AND ADD expanded. No stdout (libc-free); exit code only. arm64-elf runs under qemu; macho on the macOS leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
