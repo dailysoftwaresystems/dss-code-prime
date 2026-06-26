@@ -1,6 +1,6 @@
 # Plan 25 — POSIX headers via per-target struct layouts (the SQLite os_unix surface)
 
-§0 STATUS: ✅ MECHANISM DONE (p18 Cluster G c13, 2026-06-26, 422/422 ctest Release) — `variants` decode/select + `activeTarget` thread + `sys/stat.json` struct stat (x86_64-elf 144B / arm64-elf 128B) + corpus + pins; closure gates 1-9 met. ⏳ c14+ = the full POSIX header authoring (errno/fcntl/sys.stat/unistd/sys.mman/pthread → linux then macOS). Owning the per-target-struct-layout mechanism
+§0 STATUS: ✅ MECHANISM DONE (p18 Cluster G c13, 2026-06-26, 422/422 ctest Release) — `variants` decode/select + `activeTarget` thread + `sys/stat.json` struct stat (x86_64-elf 144B / arm64-elf 128B) + corpus + pins; closure gates 1-9 met. ⏳ c14 IN PROGRESS: errno (c14a) + sys/mman + unistd (c14b) DONE; the **variadic-externs FFI extension** (c14c — `parseTypeFromText` accepts `...` → variadic FnSig + the emitter round-trips it; reuses FC12 variadic-call codegen) DONE → unblocks `open`/`fcntl`. REMAINING: fcntl (O_/F_ + struct flock + open/fcntl) + sys/stat completion (S_ + S_IS* + fstat/lstat + st_mtim field-naming) + pthread (per-arch opaque pthread_mutex_t) → then macOS variants → re-probe sqlite3.c. Owning the per-target-struct-layout mechanism
 + the full POSIX header set SQLite's `os_unix.c` needs. §B decision (2026-06-26, user): build the
 **full per-target struct-layout mechanism** (not linux-x86-64-only), so macOS/arm64 SQLite are
 reachable without reworking the descriptors. Closes the mechanism half of

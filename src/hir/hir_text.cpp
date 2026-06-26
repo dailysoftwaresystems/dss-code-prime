@@ -404,7 +404,11 @@ private:
             }
             case TypeKind::FnSig: {
                 out_ += "fn(";
-                args(in.fnParams(t));
+                auto const ps = in.fnParams(t);
+                args(ps);
+                // Emit the variadic marker so a variadic FnSig round-trips through
+                // text (the scalars[1] flag would otherwise be lost on reparse).
+                if (in.fnIsVariadic(t)) { out_ += ps.empty() ? "..." : ", ..."; }
                 out_ += ") -> ";
                 appendType(in.fnResult(t));
                 auto sc = in.scalars(t);
@@ -888,7 +892,7 @@ namespace {
 enum class Tk : std::uint8_t {
     Eof, Unknown, Ident, Int, Float, Str,
     LBrace, RBrace, LParen, RParen, LAngle, RAngle, LBrack, RBrack,
-    Colon, Comma, Percent, Hash, Equal, Arrow, Minus, DotDot, At,
+    Colon, Comma, Percent, Hash, Equal, Arrow, Minus, DotDot, Ellipsis, At,
 };
 
 struct Tok {
@@ -943,7 +947,13 @@ private:
                 else cur_.kind = Tk::Minus;
                 return;
             case '.':
-                if (p_ < s_.size() && s_[p_] == '.') { ++p_; cur_.kind = Tk::DotDot; return; }
+                if (p_ < s_.size() && s_[p_] == '.') {
+                    ++p_;   // consumed the 2nd dot
+                    // Three dots `...` = the variadic marker in a `fn(...)` type; two
+                    // dots `..` stays DotDot (span ranges). Distinct lexical contexts.
+                    if (p_ < s_.size() && s_[p_] == '.') { ++p_; cur_.kind = Tk::Ellipsis; return; }
+                    cur_.kind = Tk::DotDot; return;
+                }
                 cur_.kind = Tk::Unknown; return;   // stray '.' — distinct from EOF so it can't truncate the parse
             default: cur_.kind = Tk::Unknown; return;  // unknown byte; the parser reports + recovers, never mistakes it for EOF
         }
@@ -1748,11 +1758,23 @@ private:
             }
             return interner_.enumType(name, underlying); }
         if (kw == "fn") {
-            expect(Tk::LParen, "'('"); auto params = parseTypeListUntil(Tk::RParen); expect(Tk::RParen, "')'");
+            // Param list, handled here (not via parseTypeListUntil) so a trailing
+            // `...` variadic marker is accepted as the last "param" instead of
+            // tripping parseType's "expected a type". Shapes: `fn()`, `fn(i32)`,
+            // `fn(ptr<char>, i32, ...)` (variadic), `fn(...)` (variadic, no fixed).
+            expect(Tk::LParen, "'('");
+            std::vector<TypeId> params;
+            bool isVariadic = false;
+            while (!peekIs(Tk::RParen) && !peekIs(Tk::Eof)) {
+                if (accept(Tk::Ellipsis)) { isVariadic = true; break; }   // `...` only valid trailing
+                params.push_back(parseType());
+                if (!accept(Tk::Comma)) break;
+            }
+            expect(Tk::RParen, "')'");
             expect(Tk::Arrow, "'->'"); TypeId result = parseType();
             CallConv cc = CallConv::CcSysV;
             if (acceptKeyword("cc")) { std::string n = takeIdent(); cc = orMalformed(callConvFromName(n), n, "calling convention", CallConv::CcSysV); }
-            return interner_.fnSig(params, result, cc);
+            return interner_.fnSig(params, result, cc, isVariadic);
         }
         if (kw == "ext") {
             std::string name = takeStr();

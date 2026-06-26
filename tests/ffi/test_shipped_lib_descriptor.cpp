@@ -117,6 +117,36 @@ TEST(ShippedLibDescriptor, LibraryIsOptional) {
     EXPECT_EQ(desc->symbols[0].linkage, ShippedSymbolLinkage::External); // default
 }
 
+// c14: a VARIADIC external symbol — `vopen(path, flags, ...)` (the POSIX open/fcntl
+// shape SQLite needs) decodes; the trailing `...` in the signature text produces a
+// variadic FnSig whose declared params are the FIXED prefix. RED-ON-DISABLE: revert
+// the hir_text `...`/Ellipsis parser support and the signature fails to decode
+// (F_ShippedLibUnsupportedType → symbol dropped → read nullopt).
+TEST(ShippedLibDescriptor, SymbolVariadicSignatureDecodes) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "var_sym.json", R"JSON({
+        "header": "vs.h",
+        "library": { "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "vopen", "signature": "fn(ptr<char>, i32, ...) -> i32", "kind": "function", "linkage": "external" },
+            { "name": "fixed", "signature": "fn(i32, i32) -> i32",            "kind": "function", "linkage": "external" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->symbols.size(), 2u);
+    // vopen: variadic FnSig with 2 FIXED params (the `...` is a marker, not a param).
+    EXPECT_EQ(interner.kind(desc->symbols[0].signature), TypeKind::FnSig);
+    EXPECT_TRUE(interner.fnIsVariadic(desc->symbols[0].signature));
+    EXPECT_EQ(interner.fnParams(desc->symbols[0].signature).size(), 2u);
+    // fixed: NON-variadic (the ordinary fnSig path stays non-variadic).
+    EXPECT_FALSE(interner.fnIsVariadic(desc->symbols[1].signature));
+}
+
 // ── macros surface (preprocessor-macro; D-PP-DESCRIPTOR-MACRO-INJECT) ─────────
 
 // Function-like (assert), object-like (no params), and variadic forms all parse;
