@@ -1,0 +1,12 @@
+{
+  "$comment": "c16 shipped <dlfcn.h> on macOS — the RED-ON-DISABLE pin for the RTLD_GLOBAL per-format constant variant (8 macho / 256 elf; a collision trap with RTLD_DEEPBIND=0x8 / RTLD_FIRST=0x100). dlopen/dlsym run from libSystem. Single arm64-macho target → runs on the macos-latest CI leg. exit 42 iff the macho RTLD_GLOBAL variant (8) was selected AND dlopen/dlsym resolve. RED-ON-DISABLE: a broken selector hands macho the elf 256 != 8 → exit 1. Release arm runs the optimizer over the loader calls.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}
