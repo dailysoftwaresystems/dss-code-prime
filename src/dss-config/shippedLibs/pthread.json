@@ -1,0 +1,30 @@
+{
+  "$comment": "Neutral shipped <pthread.h> (POSIX) — c14e, the 6th and last POSIX header SQLite's os_unix.c / mutex_unix.c needs (threadsafe builds). The mutex API + pthread_self/equal. KEY DESIGN: pthread_mutex_t is an OPAQUE per-arch-sized object (glibc 40B on x86-64, 48B on arm64) that SQLite only allocates + passes &mutex to libc (never reads its bytes). Rather than a per-arch typedef variant, it is typed as a FLAT MAX-size 8-aligned buffer — `arr<i64, 6>` (48 bytes = the arm64 size, the max). On x86-64 this over-allocates 8 bytes: harmless, because libc writes/reads only its own 40 and the extra 8 are never touched; the compiler uses 48 consistently so any embedding struct stays self-consistent. (arr<i64,…> not arr<i8,…> so the buffer is 8-aligned — libc's internal long/pointer accesses must be aligned, esp. on arm64.) pthread_mutexattr_t = i32 (4-byte, 4-aligned). pthread_t = u64 (the glibc unsigned-long thread id, a value type passed to pthread_self/equal). The mutex/attr pointers are typed ptr<void> in the symbols (standard C pointer coercion) so the opaque buffer is passed without a fixed-layout signature. PTHREAD_MUTEX_INITIALIZER = {0} (glibc's all-zero default-mutex static initializer). Gated availableObjectFormats:[elf] (the Linux WSL run target; glibc 2.34+ merged libpthread into libc.so.6). macOS pthread (different opaque sizes) is a c14-macOS follow-on.",
+  "header": "pthread.h",
+  "standard": "posix",
+  "availableObjectFormats": ["elf"],
+  "library": { "elf": "libc.so.6" },
+  "symbols": [
+    { "name": "pthread_mutex_init",     "signature": "fn(ptr<void>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "pthread_mutex_destroy",  "signature": "fn(ptr<void>) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "pthread_mutex_lock",     "signature": "fn(ptr<void>) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "pthread_mutex_trylock",  "signature": "fn(ptr<void>) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "pthread_mutex_unlock",   "signature": "fn(ptr<void>) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "pthread_mutexattr_init", "signature": "fn(ptr<void>) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "pthread_mutexattr_destroy", "signature": "fn(ptr<void>) -> i32",         "kind": "function", "linkage": "external" },
+    { "name": "pthread_mutexattr_settype", "signature": "fn(ptr<void>, i32) -> i32",    "kind": "function", "linkage": "external" },
+    { "name": "pthread_self",           "signature": "fn() -> u64",                     "kind": "function", "linkage": "external" },
+    { "name": "pthread_equal",          "signature": "fn(u64, u64) -> i32",             "kind": "function", "linkage": "external" }
+  ],
+  "typedefs": [
+    { "name": "pthread_t",           "type": "u64" },
+    { "name": "pthread_mutex_t",     "type": "arr<i64, 6>" },
+    { "name": "pthread_mutexattr_t", "type": "i32" }
+  ],
+  "macros": [
+    { "name": "PTHREAD_MUTEX_INITIALIZER", "replacement": "{0}" }
+  ],
+  "constants": [
+    { "name": "PTHREAD_MUTEX_RECURSIVE", "value": 1, "type": "i32" }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "$comment": "c14e shipped <pthread.h> — the 6th/last POSIX header. The mutex lifecycle (init/lock/unlock/destroy via dynamic libc.so.6); pthread_mutex_t is an opaque 48-byte 8-aligned buffer (arr<i64,6>, the max per-arch glibc size), &mutex coerces to the symbols' void* param. lock/unlock return 0 on a real Linux runtime → exit 42. Two elf targets (POSIX header, availableObjectFormats:[elf], Linux WSL run target). Runs on linux-gcc + native arm64 CI legs; cross-compiles locally. RED-ON-DISABLE: drop a surface → pthread_mutex_t/pthread_mutex_lock undefined → compile fails.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}
