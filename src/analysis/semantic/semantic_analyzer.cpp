@@ -1230,7 +1230,8 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
 [[nodiscard]] TypeId
 declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                        Tree const& tree, NodeId node, TypeId base,
-                       ScopeId scope, bool emitOnMiss);
+                       ScopeId scope, bool emitOnMiss,
+                       bool allowFlexibleArray = false);
 
 // The declared type of ONE declaration-row node — the fn-suffix param
 // harvest's per-param resolution. Legacy rows resolve their `typeChild`
@@ -1277,7 +1278,8 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 [[nodiscard]] TypeId
 applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                       Tree const& tree, NodeId suffix, TypeId inner,
-                      ScopeId scope, bool emitOnMiss) {
+                      ScopeId scope, bool emitOnMiss,
+                      bool allowFlexibleArray = false) {
     DeclaratorConfig const& dc = *cfg.declarators;
     RuleId const r = tree.rule(suffix);
     if (r == dc.fnSuffixRule) {
@@ -1357,6 +1359,15 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             if (len.has_value()) break;
         }
         if (!len.has_value()) {
+            // c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR (FAM): an ABSENT length on
+            // a declaration form that may bear a flexible array member (a
+            // struct field) is an INCOMPLETE array (C99 §6.7.2.1), NOT an
+            // error — the declarator-mode twin of the legacy `applyArraySuffix`
+            // FAM branch. Only the field's OWN array suffix inherits this; a
+            // nested fn-ptr param's array never does (the caller passes false
+            // into the group recursion).
+            if (allowFlexibleArray)
+                return s.lattice.interner().incompleteArray(inner);
             emit(DiagnosticCode::S_NonConstantArrayLength);
             return InvalidType;
         }
@@ -1378,7 +1389,8 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
 
 TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                               Tree const& tree, NodeId node, TypeId base,
-                              ScopeId scope, bool emitOnMiss) {
+                              ScopeId scope, bool emitOnMiss,
+                              bool allowFlexibleArray) {
     if (!cfg.declarators.has_value()) return InvalidType;
     DeclaratorConfig const& dc = *cfg.declarators;
     if (!node.valid() || !base.valid()) return InvalidType;
@@ -1389,7 +1401,7 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
             TreeDeclaratorView{tree}, node, dc.declaratorRule);
         if (!inner.valid()) return InvalidType;
         return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
-                                      emitOnMiss);
+                                      emitOnMiss, allowFlexibleArray);
     }
     if (r != dc.declaratorRule) return InvalidType;
 
@@ -1429,7 +1441,7 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
     // Suffixes fold RIGHT-to-LEFT (source-first suffix = outermost type).
     for (std::size_t i = suffixes.size(); i-- > 0;) {
         t = applyDeclaratorSuffix(s, cfg, tree, suffixes[i], t, scope,
-                                  emitOnMiss);
+                                  emitOnMiss, allowFlexibleArray);
         if (!t.valid()) return InvalidType;
     }
 
@@ -1438,8 +1450,13 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
         NodeId const inner = declarator_walk_detail::firstChildOfRule(
             TreeDeclaratorView{tree}, group, dc.declaratorRule);
         if (!inner.valid()) return InvalidType;   // malformed group
+        // GOTCHA (c10 plan-lock): do NOT propagate the field's FAM-ness into a
+        // grouped/parenthesized inner declarator — a nested fn-ptr param's
+        // array (`int (*f)(int x[]))`) is its OWN declarator and must keep the
+        // ordinary `S_NonConstantArrayLength` behavior; only the field's
+        // top-level array suffix is a flexible array member.
         return declaratorDeclaredType(s, cfg, tree, inner, t, scope,
-                                      emitOnMiss);
+                                      emitOnMiss, /*allowFlexibleArray=*/false);
     }
     return t;   // abstract direct — the type itself
 }
@@ -1698,6 +1715,16 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     std::vector<NodeId> declarators;
                     collectDeclarators(tree, kids[*carrierIdx],
                                        *cfg.declarators, declarators);
+                    // c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR (anonymous fields):
+                    // flips true when this declaration binds at least one NAMED
+                    // symbol. A field row that binds NONE (every declarator
+                    // abstract — `int *;` — OR an absent declarator — `int :3;`
+                    // / `int ;`, where `declarators` is empty) re-anchors a
+                    // synthetic anonymous symbol below, mirroring the legacy
+                    // positional anonymous-field path. Other declarator-mode
+                    // rows (params/locals/globals) never set anonymousNameAllowed
+                    // so the anon block is inert for them.
+                    bool boundNamed = false;
                     for (NodeId dNode : declarators) {
                         NodeId const nameNode = declaratorNameNode(
                             tree, dNode, *cfg.declarators);
@@ -1782,6 +1809,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         bool const isExtern = decl.nonDefiningDeclaration;
                         rec.isExternDeclaration = isExtern;
                         SymbolId const newId = s.symbols.mint(rec);
+                        boundNamed = true;
                         SymbolId const prior =
                             s.scopes.bind(bindScope, name, newId);
                         if (prior.valid()) {
@@ -1795,6 +1823,40 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         } else {
                             s.nodeToSymbol.set(nameNode, newId);
                         }
+                    }
+                    // c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR: an ANONYMOUS field
+                    // (`int :3;` / `int ;` / over-admitted `int *;`) binds no
+                    // named symbol. For an `anonymousNameAllowed` row, mint a
+                    // synthetic anonymous field symbol anchored on the DECL node
+                    // (`node`) — mirroring the legacy positional anonymous path
+                    // (the `<anon:rule:node.v>` re-anchor): an anonymous bit-field
+                    // occupies a layout slot, and Pass 1.5 fails loud
+                    // (S_DeclarationDeclaresNothing) for a NON-bitfield anonymous
+                    // field. Same SymbolRecord shape as the named declarator
+                    // above, minus the proto/extern axes (an anonymous field is
+                    // never a prototype). Binds into the ENCLOSING struct scope
+                    // (`current`) under the Ordinary namespace, exactly like a
+                    // named field.
+                    if (!boundNamed && decl.anonymousNameAllowed) {
+                        SymbolRecord rec;
+                        rec.name         = std::format("<anon:{}:{}>",
+                                                       decl.ruleName, node.v);
+                        rec.scope        = current;
+                        rec.declNode     = node;
+                        rec.declRuleNode = node;
+                        rec.tree         = tree.id();
+                        rec.kind         = DeclarationKind::Variable;
+                        rec.warnIfUnused = decl.warnIfUnused;
+                        rec.fieldIndex   = static_cast<std::uint32_t>(
+                            s.scopes.scopes()[current.v].bindings.size());
+                        if (decl.constMarker.has_value()) {
+                            rec.isConst = subtreeContainsToken(
+                                tree, node, *decl.constMarker,
+                                &s.idx().declByRule);
+                        }
+                        SymbolId const newId = s.symbols.mint(rec);
+                        s.scopes.bind(current, rec.name, newId);
+                        s.nodeToSymbol.set(node, newId);
                     }
                 }
             } else if (decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
@@ -2092,10 +2154,16 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                       "a function definition declares "
                                       "exactly one declarator");
                     }
+                    // c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR (anonymous fields):
+                    // tracks whether any NAMED declarator resolved — mirrors the
+                    // Pass-1 binding loop. A field row that resolved NONE handles
+                    // its anonymous symbol after the loop (bit-field width +
+                    // declares-nothing diagnostic).
+                    bool resolvedNamed = false;
                     for (NodeId dNode : declarators) {
                         TypeId const declTy = declaratorDeclaredType(
                             s, cfg, tree, dNode, headTy, here,
-                            /*emitOnMiss=*/true);
+                            /*emitOnMiss=*/true, decl.allowFlexibleArray);
                         // SINGLE-declarator rows (param-like): also stamp
                         // the row node — an ABSTRACT param has no name
                         // node to carry the type, but its slot still
@@ -2109,9 +2177,28 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                         if (!nameNode.valid()) continue;   // abstract
                         SymbolId const sym = s.symbolAtOr(nameNode);
                         if (!sym.valid()) continue;   // redeclared-error path
+                        resolvedNamed = true;
                         if (declTy.valid()) {
                             s.symbols.at(sym).type = declTy;
                             s.nodeToType.set(nameNode, declTy);
+                        }
+                        // c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR: a NAMED
+                        // struct/union bit-field (`int x : 3;`) in declarator
+                        // mode. The legacy positional path resolved the `: W`
+                        // width here; port it. Gated on `decl.bitfieldSuffix`
+                        // so it fires ONLY for a field rule (params/locals/
+                        // globals carry no bitfieldSuffix). CRITICAL: the
+                        // `bitfieldDeclSuffix` is an OUTER SIBLING of the
+                        // declarator (`structField`'s 3rd child), so the
+                        // descendant search must start from `node` (the
+                        // structField row), NOT `dNode` (the declarator) — a
+                        // search from `dNode` would miss it.
+                        if (decl.bitfieldSuffix.has_value()) {
+                            BitfieldResolution const bf = resolveBitfieldSuffix(
+                                s, tree, decl, node, declTy, nameNode.valid(),
+                                here, &cfg);
+                            if (bf.width.has_value())
+                                s.symbols.at(sym).bitFieldWidth = bf.width;
                         }
                         bool const isFnSig = declTy.valid()
                             && s.lattice.interner().kind(declTy)
@@ -2182,6 +2269,38 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                               "'extern' for cross-unit "
                                               "declarations");
                             }
+                        }
+                    }
+                    // c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR (anonymous fields):
+                    // an ANONYMOUS field bound no named symbol — resolve its
+                    // anonymous symbol (Pass 1 minted it on `node`). Mirrors the
+                    // legacy positional anonymous-field Pass 1.5 (`fieldHasName=
+                    // false`): stamp the head as its type, resolve a `: W`
+                    // bit-field width, and — since an anonymous member is legal
+                    // ONLY as a bit-field (C 6.7.2.1) — fail loud with
+                    // S_DeclarationDeclaresNothing on `node` for an anonymous
+                    // NON-bit-field (`int ;` / `int *;`). Gated on
+                    // `bitfieldSuffix` so it fires only for a field form.
+                    if (!resolvedNamed && decl.anonymousNameAllowed
+                        && decl.bitfieldSuffix.has_value()) {
+                        SymbolId const sym = s.symbolAtOr(node);
+                        if (sym.valid() && headTy.valid()) {
+                            s.symbols.at(sym).type = headTy;
+                            s.nodeToType.set(node, headTy);
+                        }
+                        BitfieldResolution const bf = resolveBitfieldSuffix(
+                            s, tree, decl, node, headTy, /*hasName=*/false, here,
+                            &cfg);
+                        if (sym.valid() && bf.width.has_value())
+                            s.symbols.at(sym).bitFieldWidth = bf.width;
+                        if (!bf.present) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_DeclarationDeclaresNothing;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(node);
+                            d.actual   = std::string{tree.text(node)};
+                            s.reporter.report(std::move(d));
                         }
                     }
                 }

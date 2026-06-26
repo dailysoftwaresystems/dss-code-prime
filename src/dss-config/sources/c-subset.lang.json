@@ -316,11 +316,11 @@
     },
 
     "structField": {
-      "$comment": "FC8 D-CSUBSET-BITFIELD: a struct/union field gains an OPTIONAL name + an OPTIONAL `arrayDeclSuffix | bitfieldDeclSuffix` (disjoint FIRST — BracketOpen vs Colon — so the inner alt is non-speculative). The name is OPTIONAL only to admit an ANONYMOUS bit-field (`int : 3;` / zero-width `int : 0;`); the over-admitted nameless non-bitfield forms (`int;`, anonymous `int[3];`) FAIL LOUD at semantic composition (anonymous member must be a bit-field). A named bit-field is `int x : 3;`.",
+      "$comment": "c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR: a struct/union field is now a full type-specifier HEAD + an OPTIONAL shared `declarator` + an OPTIONAL `bitfieldDeclSuffix` (an outer sibling of the declarator — `int x : 3;`). Routing the member through the SAME `declarator` every other position uses (params/locals/globals) makes a function-pointer member (`int (*f)(int);` — the #1 SQLite blocker) parse + type-derive identically; the array suffix (`int arr[3];`) now lives inside the declarator's OWN directDeclarator suffix chain, not a separate alt here. The declarator is OPTIONAL only to admit an ANONYMOUS bit-field (`int : 3;` / zero-width `int : 0;`) and the `int ;` declares-nothing form; the over-admitted nameless non-bitfield forms FAIL LOUD at semantic composition (anonymous member must be a bit-field).",
       "sequence": [
         "typeRefAllowingStruct",
-        { "optional": "Identifier" },
-        { "optional": { "alt": [ "arrayDeclSuffix", "bitfieldDeclSuffix" ] } },
+        { "optional": "declarator" },
+        { "optional": "bitfieldDeclSuffix" },
         "EndStatement"
       ]
     },
@@ -335,10 +335,11 @@
     },
 
     "unionField": {
+      "$comment": "c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR: a union field mirrors `structField` — a type-specifier HEAD + an OPTIONAL shared `declarator` (function-pointer-member support: `int (*f)(int);`) + an OPTIONAL outer `bitfieldDeclSuffix`. The array suffix lives inside the declarator's directDeclarator suffix chain.",
       "sequence": [
         "typeRefAllowingStruct",
-        { "optional": "Identifier" },
-        { "optional": { "alt": [ "arrayDeclSuffix", "bitfieldDeclSuffix" ] } },
+        { "optional": "declarator" },
+        { "optional": "bitfieldDeclSuffix" },
         "EndStatement"
       ]
     },
@@ -1111,13 +1112,11 @@
         "anonymousNameAllowed": true,
         "fieldChildren": { "rule": "enumerator", "compositeKind": "enum",
                            "liftToEnclosingScope": true } },
-      { "rule": "structField", "name": 1, "type": 0, "kind": "variable",
-        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
+      { "rule": "structField", "head": 0, "declarator": 1, "kind": "variable",
         "bitfieldSuffix": { "rule": "bitfieldDeclSuffix", "widthChild": 1 },
         "anonymousNameAllowed": true,
         "allowFlexibleArray": true },
-      { "rule": "unionField",  "name": 1, "type": 0, "kind": "variable",
-        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
+      { "rule": "unionField",  "head": 0, "declarator": 1, "kind": "variable",
         "bitfieldSuffix": { "rule": "bitfieldDeclSuffix", "widthChild": 1 },
         "anonymousNameAllowed": true },
       { "rule": "enumerator",  "name": 0, "kind": "variable" },
