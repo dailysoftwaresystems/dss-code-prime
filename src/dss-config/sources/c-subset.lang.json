@@ -947,11 +947,12 @@
     },
 
     "castTypeRef": {
+      "$comment": "c11 D-CSUBSET-EAST-CONST-CAST: a cast/sizeof type-name admits const PRE-base (`const char *` — west) AND POST-base before the stars (`char const *` — EAST, the SQLite-pervasive form). In a DECLARATION the `*` lives in the declarator so the head `char const` already parsed; a cast bundles base+stars here, so the post-base const slot is what admits east-const. The const resolver IGNORES const for type identity (a cast yields an rvalue), so all forms intern the same pointer type. The two const slots straddle the REQUIRED base token (no ambiguity); a POST-stars const (`char * const`) is dropped — a useless cast form (const on an rvalue pointer ≡ no const), and a 2nd post-stars optional adjacent to the post-base one across the zero-star case is C_AmbiguousAlternatives.",
       "sequence": [
         { "optional": "ConstKeyword" },
         "castTypeBase",
-        { "repeat": "StarOp" },
-        { "optional": "ConstKeyword" }
+        { "optional": "ConstKeyword" },
+        { "repeat": "StarOp" }
       ]
     },
 
