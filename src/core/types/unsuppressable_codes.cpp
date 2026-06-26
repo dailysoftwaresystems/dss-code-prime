@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 62> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 63> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -86,6 +86,14 @@ constexpr std::array<DiagnosticCode, 62> kUnsuppressableCodes{{
     // MUST NOT reach `makeExternFunction` with InvalidType.
     DiagnosticCode::F_ShippedLibDescriptorMalformed,
     DiagnosticCode::F_ShippedLibUnsupportedType,
+    // F_ShippedHeaderUnavailableForTarget (p18 Cluster G c8, 2026-06-25):
+    // a `#include <h>` whose shipped descriptor declares the header is NOT
+    // available on the active target's object-format (POSIX <sys/time.h> on
+    // windows-pe). Suppressing it would let the semantic phase resume past the
+    // gate and INJECT the header's symbols/structs/typedefs on the wrong
+    // platform — the exact wrong-platform silent miscompile this fail-loud
+    // closes. A direct sibling of the three shipped-header surfaces above.
+    DiagnosticCode::F_ShippedHeaderUnavailableForTarget,
 
     // H_* HIR-lowering / verifier band — structural invariants (cannot
     // reach MIR codegen without violating downstream contracts). Post-

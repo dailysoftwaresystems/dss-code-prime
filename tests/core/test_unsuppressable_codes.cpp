@@ -50,6 +50,11 @@ TEST(UnsuppressableCodes, MembershipIncludesCoreArchitecturalCodes) {
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::F_ShippedLibUnsupportedType))
         << "v0.0.2 V2-2: a shipped-lib signature that fails to decode must be "
            "unsuppressable (suppressing it would silently drop the import)";
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::F_ShippedHeaderUnavailableForTarget))
+        << "p18 c8: a header unavailable on the active target's object-format "
+           "must be unsuppressable (suppressing it would resume semantic "
+           "analysis and inject the header's surfaces on the WRONG platform — "
+           "the wrong-platform silent miscompile this gate closes)";
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::A_ImmediateOperandOutOfRange))
         << "v0.0.2 V2-1: an immediate/offset too wide for its fixed32 slot "
            "must be unsuppressable (suppressing it would silently truncate to "
