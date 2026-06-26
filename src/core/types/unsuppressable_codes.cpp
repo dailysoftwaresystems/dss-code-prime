@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 64> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 67> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -103,6 +103,20 @@ constexpr std::array<DiagnosticCode, 64> kUnsuppressableCodes{{
     // direct sibling of the four shipped-lib surfaces above — its invariant is the
     // SAME class (a wrong-bytes import must never ship green).
     DiagnosticCode::F_ShippedStructVariantAmbiguous,
+    // F_ShippedConstantVariantAmbiguous / F_ShippedTypedefVariantAmbiguous /
+    // F_ShippedMacroVariantAmbiguous (p18 Cluster G, plan 25 extension,
+    // 2026-06-26): the per-target `variants` mechanism extended from `structs` to
+    // the CONSTANTS, TYPEDEFS, and MACROS surfaces — a macOS build can get a
+    // different constant VALUE / typedef WIDTH / macro REPLACEMENT than the linux
+    // build from one descriptor. Each fires when MORE THAN ONE variant matches the
+    // active target. Same selection contract + same silent-miscompile class as the
+    // struct-variant sibling above: an under-specified `when` would silently pick
+    // the first → a wrong constant value / typedef width / macro replacement on
+    // this target. Suppressing any would re-open that "pick the first" wrong-value
+    // surface — so all three are members like F_ShippedStructVariantAmbiguous.
+    DiagnosticCode::F_ShippedConstantVariantAmbiguous,
+    DiagnosticCode::F_ShippedTypedefVariantAmbiguous,
+    DiagnosticCode::F_ShippedMacroVariantAmbiguous,
 
     // H_* HIR-lowering / verifier band — structural invariants (cannot
     // reach MIR codegen without violating downstream contracts). Post-

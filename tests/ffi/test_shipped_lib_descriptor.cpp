@@ -1524,4 +1524,479 @@ TEST(ShippedLibDescriptor, StandardProvenanceRoundTripsAndTypeChecks) {
     }
 }
 
+// ── per-target CONSTANT VARIANTS (per-target VALUE/TYPE; plan 25 extension) ────
+//
+// A `constants` entry may declare per-target `variants` (each `when:{arch?,format?}`
+// + its own {value,type}) INSTEAD of a flat {value,type}, so a constant's VALUE can
+// diverge per target (the per-platform `O_NONBLOCK` case). The selection mirrors the
+// struct surface: MATCH-ALL-SPECIFIED, exactly-one, eager-decode-all, ambiguous
+// fail-loud. The result is the SAME flat ShippedConstant — no inject-path change.
+
+// SELECTION PIN: format=elf picks value A (4), format=macho picks value B (2048),
+// from ONE descriptor. RED-ON-DISABLE: neuter the selector to always take
+// variants[0] and the macho assertion (2048) fails — macho would see the elf value.
+TEST(ShippedLibDescriptor, ConstantVariantSelectsPerFormatValue) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "cvar.json", R"JSON({
+        "header": "cv.h",
+        "constants": [
+            { "name": "O_NONBLOCK", "variants": [
+                { "when": { "format": "elf" },   "value": 4,    "type": "i32" },
+                { "when": { "format": "macho" }, "value": 2048, "type": "i32" }
+            ] }
+        ]
+    })JSON");
+    auto valueFor = [&](ObjectFormatKind fmt) -> std::int64_t {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, std::string_view{"x86_64"}, fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_EQ(desc->constants.size(), 1u);
+        EXPECT_EQ(desc->constants[0].name, "O_NONBLOCK");
+        return desc->constants.empty() ? -1 : desc->constants[0].value;
+    };
+    EXPECT_EQ(valueFor(ObjectFormatKind::Elf), 4);
+    EXPECT_EQ(valueFor(ObjectFormatKind::MachO), 2048);
+}
+
+// AMBIGUOUS-MATCH PIN: two variants BOTH matching the active (arch,format) →
+// F_ShippedConstantVariantAmbiguous, never silently first-wins.
+TEST(ShippedLibDescriptor, ConstantVariantAmbiguousMatchFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "camb.json", R"JSON({
+        "header": "ca.h",
+        "constants": [
+            { "name": "K", "variants": [
+                { "when": { "format": "elf" }, "value": 1, "type": "i32" },
+                { "when": { "format": "elf" }, "value": 2, "type": "i32" }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_EQ(test_support::countCode(rep, DiagnosticCode::F_ShippedConstantVariantAmbiguous),
+              1u);
+}
+
+// EAGER-DECODE PIN: a NON-active variant carries an out-of-range value (300 in an
+// i8). Even compiling for the OTHER (active) target — whose variant is fine — the
+// read FAILS LOUD: every variant's {value,type} is decoded at read time, so a
+// malformed inactive variant never lurks until its target's first compile.
+TEST(ShippedLibDescriptor, ConstantVariantEagerDecodeMalformedInactiveFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "ceager.json", R"JSON({
+        "header": "ce.h",
+        "constants": [
+            { "name": "K", "variants": [
+                { "when": { "format": "elf" },   "value": 1,   "type": "i32" },
+                { "when": { "format": "macho" }, "value": 300, "type": "i8"  }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    // Compile for elf (its variant decodes fine); the INACTIVE macho variant's
+    // out-of-range value still fails the whole read.
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_EQ(test_support::countCode(rep, DiagnosticCode::F_ShippedLibDescriptorMalformed),
+              1u);   // out-of-range value → malformed
+}
+
+// DECLARES-SOMETHING PIN: a descriptor whose ONLY surface is constant `variants`
+// injects ZERO constants under the nullopt direct-API path, yet it DECLARES a
+// constant surface → NOT a false "declares nothing". RED-ON-DISABLE: drop the
+// `declaredConstants` term from the declares-something check → this read fails loud.
+TEST(ShippedLibDescriptor, ConstantVariantsOnlyDescriptorValidUnderNullopt) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "convonly.json", R"JSON({
+        "header": "convonly.h",
+        "constants": [
+            { "name": "K", "variants": [
+                { "when": { "format": "elf" },   "value": 1, "type": "i32" },
+                { "when": { "format": "macho" }, "value": 2, "type": "i32" }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);  // nullopt target
+    ASSERT_TRUE(desc.has_value());        // declares a constant surface → NOT a no-op
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(desc->constants.empty()); // no target → nothing injected
+}
+
+// A constant entry declaring BOTH a flat value/type AND `variants` is malformed
+// (ambiguous intent) → fail loud.
+TEST(ShippedLibDescriptor, ConstantBothFlatAndVariantsFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "cboth.json", R"JSON({
+        "header": "cb.h",
+        "constants": [
+            { "name": "K", "value": 1, "type": "i32",
+              "variants": [ { "when": { "format": "elf" }, "value": 2, "type": "i32" } ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// ── per-target TYPEDEF VARIANTS (per-target WIDTH; plan 25 extension) ──────────
+//
+// A `typedefs` entry may declare per-target `variants` (each `when` + its own
+// `type`) INSTEAD of a flat `type`; the name is invariant, only the width varies
+// (a `wchar_t` that is i32 on elf but i16 on pe). Same selection contract.
+
+// SELECTION PIN: format=elf picks i32, format=macho picks i16, from ONE descriptor.
+// RED-ON-DISABLE: neuter the selector → macho sees i32.
+TEST(ShippedLibDescriptor, TypedefVariantSelectsPerFormatType) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "tvar.json", R"JSON({
+        "header": "tv.h",
+        "typedefs": [
+            { "name": "wchar_t", "variants": [
+                { "when": { "format": "elf" },   "type": "i32" },
+                { "when": { "format": "macho" }, "type": "i16" }
+            ] }
+        ]
+    })JSON");
+    auto kindFor = [&](ObjectFormatKind fmt) -> TypeKind {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, std::string_view{"x86_64"}, fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_EQ(desc->typedefs.size(), 1u);
+        if (desc->typedefs.empty()) return TypeKind::Void;
+        EXPECT_EQ(desc->typedefs[0].name, "wchar_t");
+        return interner.kind(desc->typedefs[0].type);
+    };
+    EXPECT_EQ(kindFor(ObjectFormatKind::Elf), TypeKind::I32);
+    EXPECT_EQ(kindFor(ObjectFormatKind::MachO), TypeKind::I16);
+}
+
+// AMBIGUOUS-MATCH PIN: two typedef variants BOTH matching → F_ShippedTypedefVariantAmbiguous.
+TEST(ShippedLibDescriptor, TypedefVariantAmbiguousMatchFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "tamb.json", R"JSON({
+        "header": "ta.h",
+        "typedefs": [
+            { "name": "t", "variants": [
+                { "when": { "format": "elf" }, "type": "i32" },
+                { "when": { "format": "elf" }, "type": "i64" }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_EQ(test_support::countCode(rep, DiagnosticCode::F_ShippedTypedefVariantAmbiguous),
+              1u);
+}
+
+// EAGER-DECODE PIN: a NON-active typedef variant carries an undecodable type. Even
+// compiling for the OTHER (active) target the read FAILS LOUD (every variant's type
+// is decoded at read time).
+TEST(ShippedLibDescriptor, TypedefVariantEagerDecodeMalformedInactiveFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "teager.json", R"JSON({
+        "header": "te.h",
+        "typedefs": [
+            { "name": "t", "variants": [
+                { "when": { "format": "elf" },   "type": "i32" },
+                { "when": { "format": "macho" }, "type": "not_a_type" }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_EQ(test_support::countCode(rep, DiagnosticCode::F_ShippedLibUnsupportedType),
+              1u);
+}
+
+// DECLARES-SOMETHING PIN: a typedef-variants-only descriptor under nullopt declares
+// a typedef surface → NOT "declares nothing". RED-ON-DISABLE: drop `declaredTypedefs`.
+TEST(ShippedLibDescriptor, TypedefVariantsOnlyDescriptorValidUnderNullopt) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "tdvonly.json", R"JSON({
+        "header": "tdvonly.h",
+        "typedefs": [
+            { "name": "t", "variants": [
+                { "when": { "format": "elf" },   "type": "i32" },
+                { "when": { "format": "macho" }, "type": "i16" }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);  // nullopt target
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(desc->typedefs.empty());
+}
+
+// A typedef entry declaring BOTH a flat type AND `variants` is malformed → fail loud.
+TEST(ShippedLibDescriptor, TypedefBothFlatAndVariantsFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "tboth.json", R"JSON({
+        "header": "tb.h",
+        "typedefs": [
+            { "name": "t", "type": "i32",
+              "variants": [ { "when": { "format": "elf" }, "type": "i16" } ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// ── per-format MACRO VARIANTS (per-format REPLACEMENT; plan 25 extension) ──────
+//
+// A `macros` entry may declare per-FORMAT `variants` (each `when:{format}` + its
+// own replacement) INSTEAD of a flat body, so a macro can carry a different
+// replacement per object-format (the errno `__errno_location`/elf vs `__error`/macho
+// case). FORMAT-ONLY — arch is not threaded into the preprocessor. The full read
+// passes `activeFormat`; selection produces the SAME flat ShippedMacro.
+
+// SELECTION PIN: format=elf picks replacement A, format=macho picks replacement B,
+// from ONE descriptor. RED-ON-DISABLE: neuter the selector → macho sees the elf
+// replacement. Read via the SEMANTIC path (readShippedLibDescriptor) which threads
+// activeFormat into decodeShippedMacros.
+TEST(ShippedLibDescriptor, MacroVariantSelectsPerFormatReplacement) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "mvar.json", R"JSON({
+        "header": "mv.h",
+        "macros": [
+            { "name": "__errno_location_macro", "variants": [
+                { "when": { "format": "elf" },   "replacement": "(*__errno_location())" },
+                { "when": { "format": "macho" }, "replacement": "(*__error())" }
+            ] }
+        ]
+    })JSON");
+    auto replFor = [&](ObjectFormatKind fmt) -> std::string {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, std::string_view{"x86_64"}, fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_EQ(desc->macros.size(), 1u);
+        if (desc->macros.empty()) return {};
+        EXPECT_EQ(desc->macros[0].name, "__errno_location_macro");
+        return desc->macros[0].replacement;
+    };
+    EXPECT_EQ(replFor(ObjectFormatKind::Elf), "(*__errno_location())");
+    EXPECT_EQ(replFor(ObjectFormatKind::MachO), "(*__error())");
+}
+
+// SELECTION PIN via the INTERNER-FREE preprocessor reader: readShippedLibMacros with
+// activeFormat selects the per-format replacement WITHOUT a TypeInterner (the
+// preprocessor's actual path). Confirms the threaded activeFormat reaches the
+// interner-free reader too.
+TEST(ShippedLibDescriptor, MacroVariantSelectsViaInternerFreeReader) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "mvar2.json", R"JSON({
+        "header": "mv2.h",
+        "macros": [
+            { "name": "ERRNO", "variants": [
+                { "when": { "format": "elf" },   "replacement": "elf_errno" },
+                { "when": { "format": "macho" }, "replacement": "macho_errno" }
+            ] }
+        ]
+    })JSON");
+    {
+        DiagnosticReporter rep;
+        auto macros = readShippedLibMacros(path, rep, ObjectFormatKind::Elf);
+        ASSERT_TRUE(macros.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        ASSERT_EQ(macros->size(), 1u);
+        EXPECT_EQ(macros->at(0).replacement, "elf_errno");
+    }
+    {
+        DiagnosticReporter rep;
+        auto macros = readShippedLibMacros(path, rep, ObjectFormatKind::MachO);
+        ASSERT_TRUE(macros.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        ASSERT_EQ(macros->size(), 1u);
+        EXPECT_EQ(macros->at(0).replacement, "macho_errno");
+    }
+    // nullopt format (a test caller / no target) → a variants-only macro is NOT
+    // injected (no selection possible) — never an arbitrary pick.
+    {
+        DiagnosticReporter rep;
+        auto macros = readShippedLibMacros(path, rep);   // nullopt activeFormat
+        ASSERT_TRUE(macros.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_TRUE(macros->empty()) << "no active format → variants-only macro not injected";
+    }
+}
+
+// AMBIGUOUS-MATCH PIN: two macro variants BOTH matching the active format →
+// F_ShippedMacroVariantAmbiguous, never silently first-wins.
+TEST(ShippedLibDescriptor, MacroVariantAmbiguousMatchFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "mamb.json", R"JSON({
+        "header": "ma.h",
+        "macros": [
+            { "name": "X", "variants": [
+                { "when": { "format": "elf" }, "replacement": "1" },
+                { "when": { "format": "elf" }, "replacement": "2" }
+            ] }
+        ]
+    })JSON");
+    DiagnosticReporter rep;
+    auto macros = readShippedLibMacros(path, rep, ObjectFormatKind::Elf);
+    EXPECT_FALSE(macros.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_EQ(test_support::countCode(rep, DiagnosticCode::F_ShippedMacroVariantAmbiguous),
+              1u);
+}
+
+// EAGER-DECODE PIN: a NON-active macro variant carries a directive-breaking newline
+// in its replacement. Even compiling for the OTHER (active) format the read FAILS
+// LOUD (every variant's body is decoded at read time).
+TEST(ShippedLibDescriptor, MacroVariantEagerDecodeMalformedInactiveFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // The inactive (macho) variant's replacement carries an embedded newline.
+    auto const path = writeTemp(dir, "meager.json",
+        "{ \"header\": \"me.h\", \"macros\": [ "
+        "{ \"name\": \"X\", \"variants\": [ "
+        "{ \"when\": { \"format\": \"elf\" },   \"replacement\": \"1\" }, "
+        "{ \"when\": { \"format\": \"macho\" }, \"replacement\": \"1\\nint leaked=99;\" } "
+        "] } ] }");
+    DiagnosticReporter rep;
+    // Compile for elf (its variant is fine); the INACTIVE macho variant's newline
+    // still fails the whole read.
+    auto macros = readShippedLibMacros(path, rep, ObjectFormatKind::Elf);
+    EXPECT_FALSE(macros.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_EQ(test_support::countCode(rep, DiagnosticCode::F_ShippedLibDescriptorMalformed),
+              1u);
+}
+
+// DECLARES-SOMETHING PIN: a macro-variants-only descriptor read under nullopt format
+// (the AllShippedDescriptors / direct-API path) injects ZERO macros yet DECLARES a
+// macro surface → NOT a false "declares nothing". RED-ON-DISABLE: drop the
+// `declaredMacroVariants` term from the declares-something check → this read fails
+// loud. Read via the SEMANTIC path (which is what enforces declares-something).
+TEST(ShippedLibDescriptor, MacroVariantsOnlyDescriptorValidUnderNullopt) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "mvonly.json", R"JSON({
+        "header": "mvonly.h",
+        "macros": [
+            { "name": "X", "variants": [
+                { "when": { "format": "elf" },   "replacement": "1" },
+                { "when": { "format": "macho" }, "replacement": "2" }
+            ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);  // nullopt format
+    ASSERT_TRUE(desc.has_value());        // declares a macro surface → NOT a no-op
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(desc->macros.empty());    // no format → nothing injected
+}
+
+// FORMAT-ONLY PIN: a macro variant `when` may NOT carry `arch` (arch is not threaded
+// into the preprocessor — c9 build-key avoidance). An `arch` key fails loud against
+// the closed {format} vocabulary, never silently ignored.
+TEST(ShippedLibDescriptor, MacroVariantArchKeyFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "march.json", R"JSON({
+        "header": "mar.h",
+        "macros": [
+            { "name": "X", "variants": [
+                { "when": { "arch": "x86_64", "format": "elf" }, "replacement": "1" }
+            ] }
+        ]
+    })JSON");
+    DiagnosticReporter rep;
+    auto macros = readShippedLibMacros(path, rep, ObjectFormatKind::Elf);
+    EXPECT_FALSE(macros.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_GT(test_support::countCode(rep, DiagnosticCode::F_ShippedLibDescriptorMalformed),
+              0u);
+}
+
+// A macro entry declaring BOTH a flat body AND `variants` is malformed (ambiguous
+// intent) → fail loud.
+TEST(ShippedLibDescriptor, MacroBothFlatBodyAndVariantsFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "mboth.json", R"JSON({
+        "header": "mb.h",
+        "macros": [
+            { "name": "X", "replacement": "1",
+              "variants": [ { "when": { "format": "elf" }, "replacement": "2" } ] }
+        ]
+    })JSON");
+    DiagnosticReporter rep;
+    auto macros = readShippedLibMacros(path, rep, ObjectFormatKind::Elf);
+    EXPECT_FALSE(macros.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// NO-MATCH → NOT INJECTED: a macro whose only variant requires macho, compiled for
+// elf → the macro is simply not injected (the read SUCCEEDS; the absence becomes
+// loud at the use site if referenced). Sibling to the struct no-match pin.
+TEST(ShippedLibDescriptor, MacroVariantNoMatchNotInjected) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "mnomatch.json", R"JSON({
+        "header": "mn.h",
+        "macros": [
+            { "name": "MAC_ONLY", "variants": [
+                { "when": { "format": "macho" }, "replacement": "1" }
+            ] },
+            { "name": "ALWAYS", "replacement": "7" }
+        ]
+    })JSON");
+    DiagnosticReporter rep;
+    auto macros = readShippedLibMacros(path, rep, ObjectFormatKind::Elf);
+    ASSERT_TRUE(macros.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(macros->size(), 1u) << "macho-only macro not injected for elf; flat one stays";
+    EXPECT_EQ(macros->at(0).name, "ALWAYS");
+}
+
 } // namespace

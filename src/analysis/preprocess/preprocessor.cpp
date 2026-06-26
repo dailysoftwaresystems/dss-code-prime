@@ -331,7 +331,12 @@ struct SynthBuilder {
                     continue;
                 }
                 DiagnosticReporter macroRep;
-                auto macros = ffi::readShippedLibMacros(*descPath, macroRep);
+                // Pass the active object-format so a per-FORMAT macro variant
+                // (errno's `__errno_location`/elf vs `__error`/macho) selects the
+                // right replacement. nullopt activeFormat ⇒ a variants-only macro
+                // is not injected (a flat macro is unaffected) — same per-format
+                // truth as the availability gate above.
+                auto macros = ffi::readShippedLibMacros(*descPath, macroRep, activeFormat);
                 if (!macros) {
                     // Malformed descriptor: fail loud (the post-parse resolver
                     // will also error on the typed side), never silent.

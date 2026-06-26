@@ -1406,6 +1406,38 @@ enum class DiagnosticCode : std::uint16_t {
     //   variant's `when` so exactly one matches the target.
     //   (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH, 2026-06-26.)
     F_ShippedStructVariantAmbiguous = 0x501E,
+    // F_ShippedConstantVariantAmbiguous: a shipped `constants` entry declares
+    //   per-target `variants` (each a `when:{arch?,format?}` + its own
+    //   {value,type}), and MORE THAN ONE variant matches the active compile
+    //   target's (arch, format). Same MATCH-ALL-SPECIFIED + exactly-one contract
+    //   as the struct-variant sibling — an under-specified `when` would otherwise
+    //   silently pick the first → a WRONG constant VALUE on this target (e.g. a
+    //   per-platform `O_NONBLOCK`). Fail-loud: a SILENT-MISCOMPILE guard
+    //   (unsuppressable). Remediation: fully-specify each variant's `when` so
+    //   exactly one matches. (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH, 2026-06-26.)
+    F_ShippedConstantVariantAmbiguous = 0x501F,
+    // F_ShippedTypedefVariantAmbiguous: a shipped `typedefs` entry declares
+    //   per-target `variants` (each a `when:{arch?,format?}` + its own `type`),
+    //   and MORE THAN ONE variant matches the active compile target's
+    //   (arch, format). Same contract as the constant/struct siblings — an
+    //   under-specified `when` would silently pick the first → a WRONG typedef
+    //   WIDTH on this target (e.g. a `wchar_t` that is 32-bit on elf but 16-bit on
+    //   pe). Fail-loud: a SILENT-MISCOMPILE guard (unsuppressable). Remediation:
+    //   fully-specify each variant's `when`.
+    //   (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH, 2026-06-26.)
+    F_ShippedTypedefVariantAmbiguous = 0x5020,
+    // F_ShippedMacroVariantAmbiguous: a shipped `macros` entry declares
+    //   per-FORMAT `variants` (each a `when:{format}` + its own
+    //   {replacement, params?}), and MORE THAN ONE variant matches the active
+    //   object-format. Macros are FORMAT-ONLY (arch is not threaded into the
+    //   preprocessor — c9 build-key avoidance), so the `when` carries `format`
+    //   alone. An under-specified set (two variants both selecting the active
+    //   format) would silently pick the first → a WRONG macro REPLACEMENT on this
+    //   target (e.g. errno's `__errno_location` on elf vs `__error` on macho).
+    //   Fail-loud: a SILENT-MISCOMPILE guard (unsuppressable). Remediation:
+    //   fully-specify / de-duplicate each variant's `when.format`.
+    //   (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH, 2026-06-26.)
+    F_ShippedMacroVariantAmbiguous = 0x5021,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

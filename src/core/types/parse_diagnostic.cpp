@@ -241,6 +241,12 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "F_ShippedHeaderUnavailableForTarget";
         case DiagnosticCode::F_ShippedStructVariantAmbiguous:
             return "F_ShippedStructVariantAmbiguous";
+        case DiagnosticCode::F_ShippedConstantVariantAmbiguous:
+            return "F_ShippedConstantVariantAmbiguous";
+        case DiagnosticCode::F_ShippedTypedefVariantAmbiguous:
+            return "F_ShippedTypedefVariantAmbiguous";
+        case DiagnosticCode::F_ShippedMacroVariantAmbiguous:
+            return "F_ShippedMacroVariantAmbiguous";
 
         // Semantic (S_) + assembler (A_) + linker (K_) enumerators added in
         // later cycles but not mirrored here until the per-file -Werror=switch

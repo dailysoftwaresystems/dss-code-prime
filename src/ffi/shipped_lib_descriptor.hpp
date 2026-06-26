@@ -131,6 +131,13 @@ struct DSS_EXPORT ShippedSymbol {
 // `value` is the int64 BIT-PATTERN: for an unsigned `type` it is the uint64
 // value reinterpreted, and the fold re-reads it per `type`'s signedness — so the
 // full unsigned range (e.g. `UINT_MAX`) round-trips losslessly.
+//
+// PER-TARGET VALUE (plan 25 extension): a constant's VALUE/TYPE can diverge per
+// (arch, format) — a per-platform `O_NONBLOCK`. The descriptor declares `variants`
+// (each a `when:{arch?,format?}` + its own {value,type}) INSTEAD of a flat
+// {value,type}; the decoder selects the variant matching the active target and
+// produces THIS same flat shape — no inject-path / fold change. A flat-{value,type}
+// constant (no `variants`) keeps single-value behavior.
 struct DSS_EXPORT ShippedConstant {
     std::string  name;
     std::int64_t value = 0;
@@ -141,6 +148,12 @@ struct DSS_EXPORT ShippedConstant {
 // `size_t`). The semantic phase injects it as a `DeclarationKind::Type` symbol
 // so the name resolves in type position. `type` is any hir-text-decodable type
 // (a scalar, a pointer, a struct ref, a function pointer …).
+//
+// PER-TARGET WIDTH (plan 25 extension): a typedef's TYPE/WIDTH can diverge per
+// (arch, format) — a `wchar_t` that is i32 on elf but i16 on pe. The name is
+// invariant; the descriptor declares `variants` (each `when:{arch?,format?}` + its
+// own `type`) INSTEAD of a flat `type`; the decoder selects the matching variant
+// and produces THIS same flat shape. A flat-`type` typedef keeps single-type behavior.
 struct DSS_EXPORT ShippedTypedef {
     std::string name;
     TypeId      type;
@@ -156,6 +169,14 @@ struct DSS_EXPORT ShippedTypedef {
 // PRESENT (even empty `[]`) = function-like (`#define F() …` / `assert(e) …`).
 // `replacement` is the replacement token text (may be empty — a null macro).
 // `variadic` marks a trailing `...` catch-all (function-like only).
+//
+// PER-FORMAT REPLACEMENT (plan 25 extension): a macro's replacement can diverge
+// per OBJECT-FORMAT — errno's `(*__errno_location())` on elf vs `(*__error())` on
+// macho. The descriptor declares `variants` (each `when:{format}` + its own
+// {replacement, params?, variadic?}) INSTEAD of a flat body; the decoder selects
+// the variant matching the active format and produces THIS same flat shape.
+// FORMAT-ONLY — arch is not threaded into the preprocessor (a macro variant's
+// `when` carries `format` alone). A flat-body macro keeps single-replacement behavior.
 struct DSS_EXPORT ShippedMacro {
     std::string                             name;
     std::optional<std::vector<std::string>> params;   // nullopt = object-like
@@ -293,9 +314,19 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
 // emits `F_ShippedLibDescriptorMalformed` on ANY malformed input. The typed
 // surfaces (symbols/constants/typedefs) are NOT read here — the semantic phase
 // reads those via `readShippedLibDescriptor`.
+//
+// `activeFormat` (plan-25 extension): a macro entry may carry per-FORMAT
+// `variants` (each `when:{format}` + its own replacement — the errno
+// `__errno_location`/elf vs `__error`/macho case). The active object-format
+// selects the matching variant; macros are FORMAT-ONLY (arch is not threaded
+// into the preprocessor), so this is the only selector. nullopt (a test caller
+// / no target) ⇒ a variants-only macro is not injected; a flat macro is
+// unaffected. The single production caller (SynthBuilder::build) passes its
+// active format.
 [[nodiscard]] DSS_EXPORT std::optional<std::vector<ShippedMacro>>
-readShippedLibMacros(std::filesystem::path const& path,
-                     DiagnosticReporter&          reporter);
+readShippedLibMacros(std::filesystem::path const&    path,
+                     DiagnosticReporter&             reporter,
+                     std::optional<ObjectFormatKind> activeFormat = std::nullopt);
 
 // Read ONLY the `availableObjectFormats` set from the descriptor at `path`,
 // WITHOUT a TypeInterner — the FRONT-END per-target availability gate (the
