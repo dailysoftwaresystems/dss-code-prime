@@ -1,5 +1,5 @@
 {
-  "$comment": "Neutral shipped <unistd.h> (POSIX) — c14 (linux) + c15c (macOS). The core POSIX I/O syscalls SQLite's os_unix.c routes through its aSyscall table. The LP64 widths (ssize_t/off_t=i64, size_t=u64) AGREE between Linux and macOS, and SEEK_* + the access() mode bits F_OK/R_OK/W_OK/X_OK are byte-identical (verified against xnu/bsd/sys/unistd.h + _seek_set.h) — so every constant + signature stays flat (no per-format variant). fdatasync + fallocate are LINUX-ONLY (macOS uses fcntl F_FULLFSYNC / F_PREALLOCATE): they stay declared on both formats but are UNREFERENCED externs on macho (the errno-accessor pattern — only the format-referenced symbol links; SQLite guards both behind HAVE_FDATASYNC / a Linux ifdef, so neither is imported on macOS). Gated availableObjectFormats:[elf,macho] (elf=WSL run target, macho=macos-latest leg). No over-ship: SQLite's aSyscall surface. open/fcntl/fstat/lstat/stat/mkdir/mmap live in their own headers.",
+  "$comment": "Neutral shipped <unistd.h> (POSIX) — c14 (linux) + c15c (macOS). The core POSIX I/O syscalls SQLite's os_unix.c routes through its aSyscall table. The LP64 widths (ssize_t/off_t=i64, size_t=u64) AGREE between Linux and macOS, and SEEK_* + the access() mode bits F_OK/R_OK/W_OK/X_OK are byte-identical (verified against xnu/bsd/sys/unistd.h + _seek_set.h) — so every constant + signature stays flat (no per-format variant). fdatasync + fallocate are LINUX-ONLY (macOS uses fcntl F_FULLFSYNC / F_PREALLOCATE): each carries a per-symbol `availableObjectFormats` of elf-only so it is NOT injected on a macho target (DSS imports EVERY declared shipped extern → a macho-declared fdatasync would plant an undefined import; libSystem has no fdatasync). They ARE injected on elf for linux SQLite's use. (D-SHIPPED-SYMBOL-PER-TARGET-AVAILABILITY) Gated availableObjectFormats:[elf,macho] (elf=WSL run target, macho=macos-latest leg). No over-ship: SQLite's aSyscall surface. open/fcntl/fstat/lstat/stat/mkdir/mmap live in their own headers.",
   "header": "unistd.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho"],
@@ -12,7 +12,7 @@
     { "name": "pwrite",      "signature": "fn(i32, ptr<void>, u64, i64) -> i64",         "kind": "function", "linkage": "external" },
     { "name": "ftruncate",   "signature": "fn(i32, i64) -> i32",                         "kind": "function", "linkage": "external" },
     { "name": "fsync",       "signature": "fn(i32) -> i32",                              "kind": "function", "linkage": "external" },
-    { "name": "fdatasync",   "signature": "fn(i32) -> i32",                              "kind": "function", "linkage": "external" },
+    { "name": "fdatasync",   "signature": "fn(i32) -> i32",                              "kind": "function", "linkage": "external", "availableObjectFormats": ["elf"] },
     { "name": "unlink",      "signature": "fn(ptr<char>) -> i32",                        "kind": "function", "linkage": "external" },
     { "name": "rmdir",       "signature": "fn(ptr<char>) -> i32",                        "kind": "function", "linkage": "external" },
     { "name": "access",      "signature": "fn(ptr<char>, i32) -> i32",                   "kind": "function", "linkage": "external" },
@@ -22,7 +22,7 @@
     { "name": "getpagesize", "signature": "fn() -> i32",                                 "kind": "function", "linkage": "external" },
     { "name": "fchmod",      "signature": "fn(i32, u32) -> i32",                         "kind": "function", "linkage": "external" },
     { "name": "fchown",      "signature": "fn(i32, u32, u32) -> i32",                    "kind": "function", "linkage": "external" },
-    { "name": "fallocate",   "signature": "fn(i32, i32, i64, i64) -> i32",               "kind": "function", "linkage": "external" }
+    { "name": "fallocate",   "signature": "fn(i32, i32, i64, i64) -> i32",               "kind": "function", "linkage": "external", "availableObjectFormats": ["elf"] }
   ],
   "constants": [
     { "name": "SEEK_SET", "value": 0, "type": "i32" },

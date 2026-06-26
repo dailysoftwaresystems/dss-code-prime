@@ -147,6 +147,74 @@ TEST(ShippedLibDescriptor, SymbolVariadicSignatureDecodes) {
     EXPECT_FALSE(interner.fnIsVariadic(desc->symbols[1].signature));
 }
 
+// c15d (D-SHIPPED-SYMBOL-PER-TARGET-AVAILABILITY): a symbol may carry a per-symbol
+// `availableObjectFormats` — errno's `__error` is Darwin-only, `__errno_location`
+// glibc-only. The decode populates the per-symbol set; empty/absent = every format.
+// The membership predicate (the SAME one the semantic injection gate uses) selects
+// per active format. RED-ON-DISABLE: drop the field from the struct/decode and the
+// asserted sets go empty → the predicate admits the wrong-format accessor → an
+// undefined import at load (the run-28240524858 CI break this repairs).
+TEST(ShippedLibDescriptor, SymbolPerTargetAvailabilityDecodesAndSelects) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "errno_like.json", R"JSON({
+        "header": "errno.h",
+        "availableObjectFormats": ["elf", "macho"],
+        "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+        "symbols": [
+            { "name": "__errno_location", "signature": "fn() -> ptr<i32>", "availableObjectFormats": ["elf"] },
+            { "name": "__error",          "signature": "fn() -> ptr<i32>", "availableObjectFormats": ["macho"] },
+            { "name": "both",             "signature": "fn() -> i32" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->symbols.size(), 3u);
+    // The per-symbol sets decode exactly.
+    ASSERT_EQ(desc->symbols[0].availableObjectFormats.size(), 1u);
+    EXPECT_EQ(desc->symbols[0].availableObjectFormats[0], "elf");
+    ASSERT_EQ(desc->symbols[1].availableObjectFormats.size(), 1u);
+    EXPECT_EQ(desc->symbols[1].availableObjectFormats[0], "macho");
+    EXPECT_TRUE(desc->symbols[2].availableObjectFormats.empty());   // = every format
+    // The injection-gate predicate selects the format-correct accessor ONLY.
+    // __errno_location: elf yes, macho NO.
+    EXPECT_TRUE(objectFormatInAvailabilitySet(desc->symbols[0].availableObjectFormats,
+                                              ObjectFormatKind::Elf));
+    EXPECT_FALSE(objectFormatInAvailabilitySet(desc->symbols[0].availableObjectFormats,
+                                               ObjectFormatKind::MachO));
+    // __error: macho yes, elf NO (the bug: declaring it on elf → undefined import).
+    EXPECT_FALSE(objectFormatInAvailabilitySet(desc->symbols[1].availableObjectFormats,
+                                               ObjectFormatKind::Elf));
+    EXPECT_TRUE(objectFormatInAvailabilitySet(desc->symbols[1].availableObjectFormats,
+                                              ObjectFormatKind::MachO));
+    // empty set = injected on EVERY format (back-compat — almost every symbol).
+    EXPECT_TRUE(objectFormatInAvailabilitySet(desc->symbols[2].availableObjectFormats,
+                                              ObjectFormatKind::Elf));
+    EXPECT_TRUE(objectFormatInAvailabilitySet(desc->symbols[2].availableObjectFormats,
+                                              ObjectFormatKind::MachO));
+}
+
+// An unknown per-symbol availability format name fails loud (closed vocabulary,
+// the SAME `objectFormatKindFromName` the header-level set + `library` keys use).
+TEST(ShippedLibDescriptor, SymbolPerTargetAvailabilityUnknownFormatFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad_sym_avail.json", R"JSON({
+        "header": "x.h",
+        "symbols": [
+            { "name": "f", "signature": "fn() -> i32", "availableObjectFormats": ["elf", "bogus"] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());   // malformed → whole read fails
+    EXPECT_TRUE(rep.hasErrors());
+}
+
 // ── macros surface (preprocessor-macro; D-PP-DESCRIPTOR-MACRO-INJECT) ─────────
 
 // Function-like (assert), object-like (no params), and variadic forms all parse;

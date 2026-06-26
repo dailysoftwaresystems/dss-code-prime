@@ -119,6 +119,20 @@ struct DSS_EXPORT ShippedSymbol {
     TypeId               signature;
     ShippedSymbolKind    kind    = ShippedSymbolKind::Function;
     ShippedSymbolLinkage linkage = ShippedSymbolLinkage::External;
+    // Optional per-SYMBOL availability — which object-formats this symbol EXISTS
+    // on, the symbol-granularity sibling of the header-level `availableObjectFormats`
+    // (§ShippedLibDescriptor). EMPTY = every format (back-compat — almost every
+    // symbol). A non-empty set restricts: errno's accessor diverges by NAME per
+    // format (`__errno_location` is glibc-only ["elf"], `__error` is Darwin-only
+    // ["macho"]); the Linux-only fdatasync/fallocate/mremap carry ["elf"]. CRITICAL:
+    // DSS imports EVERY declared shipped extern (referenced or not), so a symbol
+    // absent on the active format must not be DECLARED there or its import is
+    // undefined at load (glibc has no __error; libSystem has no __errno_location).
+    // Gated at semantic injection by `activeFormat` (mirrors the header gate) — a
+    // format-absent symbol is not injected → not imported → a reference fails loud
+    // (undefined name). Keys are the `objectFormatKindFromName` vocabulary; an
+    // unknown name fails loud on read. (D-SHIPPED-SYMBOL-PER-TARGET-AVAILABILITY)
+    std::vector<std::string> availableObjectFormats;
 };
 
 // One decoded named CONSTANT — the neutral form of a header's object-like

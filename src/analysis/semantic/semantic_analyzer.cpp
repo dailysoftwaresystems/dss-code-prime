@@ -5255,6 +5255,20 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             for (auto const& sym : desc->symbols) {
                 // GOAL-2: a user decl of this name wins — skip the descriptor's.
                 if (userDeclaredNames.contains(sym.name)) continue;
+                // Per-SYMBOL availability gate (the symbol-granularity sibling of
+                // the header gate above). When the active object-format is KNOWN
+                // and the symbol RESTRICTS its formats and the active format is NOT
+                // among them, the symbol does not EXIST on this target → inject
+                // nothing (not declared → not imported → a reference fails loud as
+                // an undefined name). This is load-bearing: DSS imports EVERY
+                // declared shipped extern, so declaring errno's macho-only __error
+                // on an elf target would plant an undefined import that breaks the
+                // dynamic link at load. AGNOSTIC: the SAME config-set membership
+                // predicate the header gate + __has_include use, never if(format==).
+                if (s.activeFormat.has_value()
+                    && !ffi::objectFormatInAvailabilitySet(sym.availableObjectFormats,
+                                                           *s.activeFormat))
+                    continue;
                 if (!injectedNames.insert(sym.name).second) continue;  // first wins
 
                 SymbolRecord rec;

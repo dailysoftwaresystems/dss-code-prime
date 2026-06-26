@@ -1,5 +1,5 @@
 {
-  "$comment": "Neutral shipped <sys/mman.h> (POSIX) — c14 (linux) + c15c (macOS). The memory-mapped-I/O surface SQLite's os_unix.c uses for its mmap'd page cache: mmap/munmap + Linux mremap (resize, under SQLITE_MMAP_READWRITE). PROT_READ/PROT_WRITE (page protections) + MAP_SHARED all AGREE between Linux and macOS (1/2/1 — verified against xnu/bsd/sys/mman.h), so they stay flat. mremap + MREMAP_MAYMOVE are LINUX-ONLY: macOS has no mremap(). MREMAP_MAYMOVE carries an elf-only `variants` entry so it is NOT injected on macho (a macho reference fails loud — truthful). The mremap SYMBOL stays declared on both formats but is an UNREFERENCED extern on macho (the errno __error/__errno_location pattern — only the format-referenced symbol links; SQLite guards mremap behind HAVE_MREMAP, Linux-only, so it is never imported on macOS). MAP_FAILED is the `((void*)-1)` sentinel (a pointer → the MACROS surface). off_t is i64 (LP64, both). Gated availableObjectFormats:[elf,macho]: elf=the WSL run target, macho=the macos-latest CI leg (Apple Silicon).",
+  "$comment": "Neutral shipped <sys/mman.h> (POSIX) — c14 (linux) + c15c (macOS). The memory-mapped-I/O surface SQLite's os_unix.c uses for its mmap'd page cache: mmap/munmap + Linux mremap (resize, under SQLITE_MMAP_READWRITE). PROT_READ/PROT_WRITE (page protections) + MAP_SHARED all AGREE between Linux and macOS (1/2/1 — verified against xnu/bsd/sys/mman.h), so they stay flat. mremap + MREMAP_MAYMOVE are LINUX-ONLY: macOS has no mremap(). Neither is injected on a macho target — MREMAP_MAYMOVE via an elf-only constant `variants` entry, the mremap SYMBOL via a per-symbol `availableObjectFormats` of elf-only (DSS imports EVERY declared shipped extern, so a macho-declared mremap would plant an undefined import; libSystem has no mremap). A macho reference to either fails loud (truthful). Both are present on elf for linux SQLite's use. (D-SHIPPED-SYMBOL-PER-TARGET-AVAILABILITY) MAP_FAILED is the `((void*)-1)` sentinel (a pointer → the MACROS surface). off_t is i64 (LP64, both). Gated availableObjectFormats:[elf,macho]: elf=the WSL run target, macho=the macos-latest CI leg (Apple Silicon).",
   "header": "sys/mman.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho"],
@@ -7,7 +7,7 @@
   "symbols": [
     { "name": "mmap",   "signature": "fn(ptr<void>, u64, i32, i32, i32, i64) -> ptr<void>", "kind": "function", "linkage": "external" },
     { "name": "munmap", "signature": "fn(ptr<void>, u64) -> i32",                           "kind": "function", "linkage": "external" },
-    { "name": "mremap", "signature": "fn(ptr<void>, u64, u64, i32) -> ptr<void>",           "kind": "function", "linkage": "external" }
+    { "name": "mremap", "signature": "fn(ptr<void>, u64, u64, i32) -> ptr<void>",           "kind": "function", "linkage": "external", "availableObjectFormats": ["elf"] }
   ],
   "macros": [
     { "name": "MAP_FAILED", "replacement": "((void*)-1)" }

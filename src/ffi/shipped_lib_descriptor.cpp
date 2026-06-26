@@ -781,6 +781,17 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             linkage = *l;
         }
 
+        // Optional per-SYMBOL `availableObjectFormats` — which object-formats this
+        // symbol EXISTS on (errno's __error is ["macho"], __errno_location ["elf"];
+        // the Linux-only fdatasync/fallocate/mremap are ["elf"]). EMPTY/absent =
+        // every format. Reuses the SAME chokepoint as the header-level set (read
+        // from the per-symbol json `sym`); an unknown format name fails loud HERE.
+        // Gated at semantic injection by the active format — a format-absent symbol
+        // is never declared, so it is never imported (DSS imports every DECLARED
+        // shipped extern). (D-SHIPPED-SYMBOL-PER-TARGET-AVAILABILITY)
+        std::vector<std::string> symAvail;
+        decodeShippedAvailability(sym, at, reporter, symAvail);
+
         // FC3 c1: optional per-data-model signature override
         // (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH closure for the
         // LP64-merged libc symbols — fseek/ftell/atol/strtol/strtoul/
@@ -842,7 +853,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // Reject unknown per-symbol keys (closed key set).
         (void)rejectUnknownKeys(reporter, sym, "symbols[" + std::to_string(idx - 1) + "]",
                                 {"name", "signature", "signatureByDataModel",
-                                 "kind", "linkage"});
+                                 "kind", "linkage", "availableObjectFormats"});
 
         // Decode the signature via the ONE type-text decoder. A decode failure
         // is the CRITICAL fail-loud: F_ShippedLibUnsupportedType, and the
@@ -868,7 +879,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             if (!sig.valid() || sig == InvalidType) continue;
         }
 
-        out.symbols.push_back(ShippedSymbol{std::move(name), sig, kind, linkage});
+        out.symbols.push_back(
+            ShippedSymbol{std::move(name), sig, kind, linkage, std::move(symAvail)});
     }
 
     // (5) Optional `constants` array — the neutral form of a header's object-
