@@ -2,11 +2,13 @@
 
 #include "core/export.hpp"
 #include "core/types/data_model.hpp"   // DataModel (signatureByDataModel resolution)
+#include "core/types/object_format_kind.hpp" // ObjectFormatKind (availability predicate)
 #include "core/types/strong_ids.hpp"   // TypeId
 
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -273,6 +275,24 @@ readShippedLibMacros(std::filesystem::path const& path,
 [[nodiscard]] DSS_EXPORT std::optional<std::vector<std::string>>
 readShippedLibAvailability(std::filesystem::path const& path,
                            DiagnosticReporter&          reporter);
+
+// True iff a header carrying availability set `availableObjectFormats` is
+// available on object-format `fmt`. EMPTY set ⇒ available on EVERY format
+// (back-compat). The SINGLE membership predicate shared by the semantic
+// `#include` availability gate (semantic_analyzer) AND the preprocessor
+// consumers (`__has_include` + the macro-splice) below, so all three can never
+// disagree — the FC15c funnel principle applied to per-target availability.
+[[nodiscard]] DSS_EXPORT bool objectFormatInAvailabilitySet(
+    std::span<std::string const> availableObjectFormats, ObjectFormatKind fmt);
+
+// True iff the shipped header whose descriptor is at `descriptorPath` is
+// available on `fmt`. Reads `availableObjectFormats` interner-free
+// (`readShippedLibAvailability`) then applies `objectFormatInAvailabilitySet`.
+// A MALFORMED descriptor ⇒ available (the header EXISTS; its malformedness is
+// surfaced by the macros / typed reads on the same descriptor, NOT
+// double-reported here). The preprocessor `__has_include` + macro-splice gate.
+[[nodiscard]] DSS_EXPORT bool shippedHeaderAvailableForFormat(
+    std::filesystem::path const& descriptorPath, ObjectFormatKind fmt);
 
 } // namespace ffi
 } // namespace dss

@@ -5088,22 +5088,20 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             // a POSIX `<sys/time.h>` on windows-pe), POSITIONED on the `#include`
             // line (the carried ref.span/buffer), and inject NOTHING. AGNOSTIC: a
             // config-declared set + a generic membership test, no `if(format==…)`.
-            if (s.activeFormat.has_value() && !desc->availableObjectFormats.empty()) {
-                std::string const activeName{objectFormatKindName(*s.activeFormat)};
-                bool const available =
-                    std::find(desc->availableObjectFormats.begin(),
-                              desc->availableObjectFormats.end(), activeName)
-                    != desc->availableObjectFormats.end();
-                if (!available) {
-                    ParseDiagnostic d;
-                    d.code     = DiagnosticCode::F_ShippedHeaderUnavailableForTarget;
-                    d.severity = DiagnosticSeverity::Error;
-                    d.buffer   = ref.buffer;
-                    d.span     = ref.span;
-                    d.actual   = desc->header;
-                    s.reporter.report(std::move(d));
-                    continue;   // unavailable for this target — inject nothing
-                }
+            if (s.activeFormat.has_value()
+                && !ffi::objectFormatInAvailabilitySet(desc->availableObjectFormats,
+                                                       *s.activeFormat)) {
+                // The SHARED availability predicate (ffi) — the SAME membership
+                // test the preprocessor `__has_include` + macro-splice use, so the
+                // `#include` gate here and `__has_include` can never disagree.
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::F_ShippedHeaderUnavailableForTarget;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = ref.buffer;
+                d.span     = ref.span;
+                d.actual   = desc->header;
+                s.reporter.report(std::move(d));
+                continue;   // unavailable for this target — inject nothing
             }
 
             for (auto const& sym : desc->symbols) {

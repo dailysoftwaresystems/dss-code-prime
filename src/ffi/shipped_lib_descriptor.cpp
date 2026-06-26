@@ -11,10 +11,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <initializer_list>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -898,6 +900,26 @@ readShippedLibAvailability(std::filesystem::path const& path,
     decodeShippedAvailability(doc, path.generic_string(), reporter, out);
     if (reporter.errorCount() != errBefore) return std::nullopt;
     return out;  // empty ⇒ available on every format
+}
+
+bool objectFormatInAvailabilitySet(std::span<std::string const> availableObjectFormats,
+                                   ObjectFormatKind fmt) {
+    if (availableObjectFormats.empty()) return true;  // empty ⇒ every format
+    std::string const name{objectFormatKindName(fmt)};
+    return std::find(availableObjectFormats.begin(), availableObjectFormats.end(), name)
+           != availableObjectFormats.end();
+}
+
+bool shippedHeaderAvailableForFormat(std::filesystem::path const& descriptorPath,
+                                     ObjectFormatKind fmt) {
+    // Interner-free read with a THROWAWAY reporter: a malformed availability is
+    // surfaced by the macros / typed reads on the SAME descriptor (never silent),
+    // so __has_include / the splice must not double-report it here — and a header
+    // whose descriptor EXISTS satisfies this existence-class test regardless.
+    DiagnosticReporter throwaway;
+    auto avail = readShippedLibAvailability(descriptorPath, throwaway);
+    if (!avail) return true;
+    return objectFormatInAvailabilitySet(*avail, fmt);
 }
 
 } // namespace dss::ffi

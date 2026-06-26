@@ -4,6 +4,7 @@
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: build CUs on a large stack
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/object_format_kind.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"  // TypeLattice (fresh merge host)
@@ -24,8 +25,10 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -444,52 +447,85 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                         **targetR, **formatR, outPath, reporter);
 }
 
-// Drain N CUs' parse / driver-tier diagnostics into the run-wide reporter, then compile
-// them to each target — the linker MERGES the N CUs into ONE image per target (LK11).
-// Shared by `compileFiles` (one CU5 multi-file CU → 1-element span) and `compileUnits`
-// (N single-file CUs). The only difference between those two entries is how the CUs are
-// constructed; everything downstream (drain, per-target scratch-reporter merge, link) is
-// identical and lives here. Returns 0 on success, 1 on any error.
-int runCusToTargets(std::span<CompilationUnit const>            cus,
-                    GrammarSchema const&                        grammar,
-                    std::string const&                          sourceStem,
-                    std::vector<std::string> const&             targets,
-                    DiagnosticReporter&                         rep,
-                    std::optional<std::filesystem::path> const& outputDir,
-                    CompileConfig                               config,
-                    ::dss::opt::OptPipeline const*              pipelineOverride) {
-    // Drain each CU's driver-tier + per-Tree diagnostics (D_FileNotFound, parser/lexer
-    // errors) into the run-wide reporter. Without this drain, a missing source file
-    // produces rc=1 with ZERO stderr — the substrate silent-failure archetype.
-    // Build the BufferRegistry (BufferId -> source buffer) from the CUs' trees
-    // alongside the diagnostic drain, so positioned rendering can resolve each
-    // parser/semantic diagnostic's `buffer` to its source (plan 06 V2-4 Part A).
-    // `add` keys on the buffer's own id (the same id the parser stamped onto
-    // `ParseDiagnostic.buffer`), so the registry resolves by construction;
-    // duplicate ids (a header shared across trees) are idempotent.
-    BufferRegistry bufs;
-    for (auto const& cu : cus) {
-        copyDiagnostics(cu.driverDiagnostics(), rep);
-        for (auto const& tree : cu.trees()) {
-            copyDiagnostics(tree.diagnostics(), rep);
-            // Defense-in-depth: every driver-produced tree has a non-null
-            // source (the UnitBuilder early-returns before pushing a tree
-            // when `SourceBuffer::fromFile` fails), so this is non-null on
-            // the real path. Guard anyway — `BufferRegistry::add` THROWS on
-            // null, and a future tree-producer (or a hand-built test tree)
-            // must not abort the diagnostic drain.
-            if (auto src = tree.sourceShared()) {
-                bufs.add(std::move(src));
-            }
+// c9 (Phase-2): the ObjectFormatKind a target spec compiles to, or nullopt if the
+// spec is malformed or its object-format schema won't load — those targets group
+// under the nullopt (pure-existence) front-end build and STILL reach
+// `compileOneTarget`, which re-parses the spec and emits the authoritative
+// D_InvalidTargetSpec / D_SchemaLoadFailed (never silently dropped). Used to build
+// the front-end once per DISTINCT object-format so `__has_include` is per-target
+// truthful.
+std::optional<ObjectFormatKind> formatKindOfSpec(std::string const& spec) {
+    auto parsed = TargetSpec::parse(spec);
+    if (!parsed) return std::nullopt;
+    auto formatR = ObjectFormatSchema::loadShipped(parsed->formatName);
+    if (!formatR.has_value()) return std::nullopt;
+    return (*formatR)->kind();
+}
+
+// Build N CUs' front-end (via `buildCus`), then compile them to each target — the
+// linker MERGES the N CUs into ONE image per target (LK11). Shared by
+// `compileFiles` (one CU5 multi-file CU → 1-element vector) and `compileUnits` (N
+// single-file CUs); the only difference is the `buildCus` closure each passes.
+// c9: `buildCus(kind)` is invoked ONCE PER DISTINCT object-format-kind among the
+// targets (the front-end's `__has_include` depends on the active format), so the
+// CU is rebuilt only when the format actually changes the preprocessed source; the
+// common single-kind case builds exactly once. Returns 0 on success, 1 on any error.
+int runCusToTargets(
+    std::function<std::vector<CompilationUnit>(std::optional<ObjectFormatKind>)> buildCus,
+    GrammarSchema const&                        grammar,
+    std::string const&                          sourceStem,
+    std::vector<std::string> const&             targets,
+    DiagnosticReporter&                         rep,
+    std::optional<std::filesystem::path> const& outputDir,
+    CompileConfig                               config,
+    ::dss::opt::OptPipeline const*              pipelineOverride) {
+    // c9: build the front-end ONCE PER DISTINCT object-format-kind among the
+    // targets (≤3). A language WITHOUT a preprocess pass produces identical CUs for
+    // every format (activeFormat is inert) → a single nullopt-keyed build, no
+    // waste. The COMMON case — one target, or every target sharing one kind — is
+    // exactly ONE build, as before c9.
+    bool const ppEnabled = grammar.preprocess().enabled;
+    std::map<std::optional<ObjectFormatKind>, std::vector<CompilationUnit>> cuByKey;
+    std::vector<std::optional<ObjectFormatKind>> keyPerTarget;
+    keyPerTarget.reserve(targets.size());
+    for (auto const& spec : targets) {
+        std::optional<ObjectFormatKind> const key =
+            ppEnabled ? formatKindOfSpec(spec) : std::nullopt;
+        keyPerTarget.push_back(key);
+        if (cuByKey.find(key) == cuByKey.end()) {
+            cuByKey.emplace(key, buildCus(key));
         }
-        // FC13: also register the CU's auxiliary buffers -- the C
-        // preprocessor's origin buffers (the original main file + every
-        // quote-`#include`'d header). A header-origin (or post-splice
-        // main-origin) diagnostic was remapped onto one of these by the PP
-        // line-map, so without this it would render as `--> <unknown-buffer>`.
-        // `BufferRegistry::add` is idempotent on duplicate ids.
-        for (auto const& b : cu.auxiliaryBuffers()) {
-            if (b) bufs.add(b);
+    }
+
+    // Drain each built CU's driver-tier + per-Tree diagnostics (D_FileNotFound,
+    // parser/lexer errors) into the run-wide reporter — over EVERY distinct build,
+    // since a per-format-kind build carries its own parse diagnostics. Without this
+    // drain a missing source file produces rc=1 with ZERO stderr (the substrate
+    // silent-failure archetype). Build the BufferRegistry (BufferId -> source
+    // buffer) alongside so positioned rendering resolves each diagnostic's `buffer`
+    // (plan 06 V2-4 Part A); `add` keys on the buffer's own id, idempotent on a
+    // header shared across trees / builds.
+    BufferRegistry bufs;
+    for (auto const& kv : cuByKey) {
+        for (auto const& cu : kv.second) {
+            copyDiagnostics(cu.driverDiagnostics(), rep);
+            for (auto const& tree : cu.trees()) {
+                copyDiagnostics(tree.diagnostics(), rep);
+                // Defense-in-depth: a driver-produced tree always has a non-null
+                // source, but `BufferRegistry::add` THROWS on null — guard so a
+                // future tree-producer (or a hand-built test tree) can't abort the
+                // diagnostic drain.
+                if (auto src = tree.sourceShared()) {
+                    bufs.add(std::move(src));
+                }
+            }
+            // FC13: register the CU's auxiliary buffers — the preprocessor's origin
+            // buffers (the original main file + every quote-`#include`'d header) —
+            // so a remapped header-origin diagnostic renders against its real
+            // buffer. `BufferRegistry::add` is idempotent on duplicate ids.
+            for (auto const& b : cu.auxiliaryBuffers()) {
+                if (b) bufs.add(b);
+            }
         }
     }
     // If parsing already failed, the per-target loop would only produce derivative noise.
@@ -499,7 +535,10 @@ int runCusToTargets(std::span<CompilationUnit const>            cus,
     }
 
     int exitCode = 0;
-    for (auto const& spec : targets) {
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+        std::string const& spec = targets[i];
+        // Route this target to the CUs built for its object-format-kind (c9).
+        std::vector<CompilationUnit> const& cus = cuByKey.at(keyPerTarget[i]);
         // Per-target scratch reporter inheriting `rep`'s POLICY axes (suppress / overrides
         // / warningsAsErrors) but with the CAP/DEDUP axes RELAXED — those run-wide limits
         // are enforced once at `rep` during merge (silent-failure-hunter F9 / H1 fix; see
@@ -513,7 +552,8 @@ int runCusToTargets(std::span<CompilationUnit const>            cus,
         compileOpts.config           = config;
         compileOpts.pipelineOverride = pipelineOverride;
         bool const ok = compileOneTarget(
-            cus, grammar, sourceStem, spec, scratch,
+            std::span<CompilationUnit const>{cus.data(), cus.size()},
+            grammar, sourceStem, spec, scratch,
             outputDir, /*multiTargetBuild*/ targets.size() > 1u, compileOpts);
         mergeWithTargetContext(scratch, spec, rep);
         if (!ok || scratch.hasErrors()) exitCode = 1;
@@ -834,21 +874,34 @@ int Program::compileFiles(
     // overflow. Run it on the same 64 MiB worker stack (synchronous join) so
     // parse and analysis are BOTH deep-safe and the cap is a real semantic
     // limit end-to-end.
-    auto cu = substrate::callOnLargeStack(
-        substrate::kDeepRecursionStackBytes, [&] {
-            UnitBuilder builder{grammar};
-            applySystemDirs(builder, *grammar);
-            for (auto const& path : sourceFiles) {
-                builder.addFile(fs::path{path});
-            }
-            return std::move(builder).finish();
-        });
+    // c9 (Phase-2): the front-end build is a closure invoked once per distinct
+    // object-format-kind by `runCusToTargets`, so `__has_include` is per-target
+    // truthful. `setActiveFormat(kind)` is the only addition vs the pre-c9 build;
+    // `kind` is nullopt for a non-preprocess language / undeterminable spec
+    // (pure-existence, unchanged). The build still runs on the 64 MiB worker stack
+    // (D-PARSE-DEEP-FRONTEND-STACK).
+    auto buildCus = [&](std::optional<ObjectFormatKind> kind)
+        -> std::vector<CompilationUnit> {
+        auto cu = substrate::callOnLargeStack(
+            substrate::kDeepRecursionStackBytes, [&] {
+                UnitBuilder builder{grammar};
+                applySystemDirs(builder, *grammar);
+                if (kind) builder.setActiveFormat(*kind);
+                for (auto const& path : sourceFiles) {
+                    builder.addFile(fs::path{path});
+                }
+                return std::move(builder).finish();
+            });
+        std::vector<CompilationUnit> v;
+        v.push_back(std::move(cu));
+        return v;
+    };
 
     // Stem of the first source file names the artifact (one artifact per target). Plan 06
     // will eventually let artifact profiles override this.
     std::string const sourceStem = fs::path{sourceFiles.front()}.stem().string();
     return runCusToTargets(
-        std::span<CompilationUnit const>{&cu, 1}, *grammar, sourceStem, targets, rep,
+        buildCus, *grammar, sourceStem, targets, rep,
         outputDir_, compileConfig_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr);
 }
@@ -900,24 +953,32 @@ int Program::compileUnits(
     // into one image (CU6 + LK11). Distinct from `compileFiles` (one CU5 multi-file CU);
     // here cross-file references are resolved at LINK time (a sibling CU's definition or a
     // library import), not within a single CU.
-    std::vector<CompilationUnit> cus;
-    cus.reserve(sourceFiles.size());
-    for (auto const& path : sourceFiles) {
-        // D-PARSE-DEEP-FRONTEND-STACK: build each CU on the 64 MiB worker
-        // stack (see compileFiles for the rationale) so a deeply-nested
-        // expression parses without overflowing the host main stack.
-        cus.push_back(substrate::callOnLargeStack(
-            substrate::kDeepRecursionStackBytes, [&] {
-                UnitBuilder builder{grammar};
-                applySystemDirs(builder, *grammar);
-                builder.addFile(fs::path{path});
-                return std::move(builder).finish();
-            }));
-    }
+    // c9 (Phase-2): build N single-file CUs once per distinct object-format-kind
+    // (the closure `runCusToTargets` invokes), so `__has_include` is per-target
+    // truthful. `setActiveFormat(kind)` is the only addition vs the pre-c9 build.
+    auto buildCus = [&](std::optional<ObjectFormatKind> kind)
+        -> std::vector<CompilationUnit> {
+        std::vector<CompilationUnit> cus;
+        cus.reserve(sourceFiles.size());
+        for (auto const& path : sourceFiles) {
+            // D-PARSE-DEEP-FRONTEND-STACK: build each CU on the 64 MiB worker
+            // stack (see compileFiles for the rationale) so a deeply-nested
+            // expression parses without overflowing the host main stack.
+            cus.push_back(substrate::callOnLargeStack(
+                substrate::kDeepRecursionStackBytes, [&] {
+                    UnitBuilder builder{grammar};
+                    applySystemDirs(builder, *grammar);
+                    if (kind) builder.setActiveFormat(*kind);
+                    builder.addFile(fs::path{path});
+                    return std::move(builder).finish();
+                }));
+        }
+        return cus;
+    };
 
     std::string const sourceStem = fs::path{sourceFiles.front()}.stem().string();
     return runCusToTargets(
-        std::span<CompilationUnit const>{cus.data(), cus.size()}, *grammar, sourceStem,
+        buildCus, *grammar, sourceStem,
         targets, rep, outputDir_, compileConfig_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr);
 }

@@ -17,6 +17,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/object_format_kind.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/strong_ids.hpp"
@@ -249,6 +250,15 @@ public:
     // calls this per dir. Aborts if called after finish().
     void addSystemDir(std::filesystem::path dir);
 
+    // c9 (Phase-2): declare the active compile target's object-format so the
+    // preprocessor's `__has_include(<h>)` (and the descriptor macro-splice) report
+    // PER-TARGET availability — a header whose descriptor excludes this format is
+    // NOT available, agreeing with the `#include` semantic gate. UNSET (the
+    // default) ⇒ pure-existence `__has_include` (LSP / direct-API / tests). Because
+    // it changes the preprocessed token stream, the driver builds the CU ONCE per
+    // distinct object-format. Aborts if called after finish().
+    void setActiveFormat(ObjectFormatKind fmt);
+
     // Single-use, rvalue-qualified (L6). The `finished_` latch catches the
     // `std::move(b).finish(); std::move(b).finish();` corner case — `std::move`
     // does not consume the lvalue, so a second rvalue-qualified call is
@@ -310,6 +320,7 @@ private:
     std::unordered_map<std::string, std::size_t> pathToTreeIndex_;
     std::vector<std::filesystem::path>   includeDirs_;
     std::vector<std::filesystem::path>   systemDirs_;   // FF11 angle-include search path
+    std::optional<ObjectFormatKind>      activeFormat_; // c9: per-target __has_include
     std::vector<TreeParseSidecar>        sidecars_;     // FC2; parallel to trees_
     // FC13: the C preprocessor's origin buffers (original main + every spliced
     // header), accumulated across every preprocessed file, handed to the CU as

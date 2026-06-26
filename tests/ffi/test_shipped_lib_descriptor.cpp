@@ -449,6 +449,52 @@ TEST(ShippedLibDescriptor, ReadShippedLibAvailabilityUnknownFormatFailsLoud) {
     EXPECT_TRUE(rep.hasErrors());
 }
 
+// objectFormatInAvailabilitySet: the SHARED membership predicate (c9). The
+// semantic `#include` gate + the preprocessor `__has_include` + the macro-splice
+// ALL call this, so they can never disagree. Empty set ⇒ available everywhere.
+// RED-ON-DISABLE: the gate/__has_include behavior flips if this predicate is wrong.
+TEST(ShippedLibDescriptor, ObjectFormatInAvailabilitySetMembership) {
+    auto const elf = objectFormatKindFromName("elf").value();
+    auto const macho = objectFormatKindFromName("macho").value();
+    auto const pe = objectFormatKindFromName("pe").value();
+    std::vector<std::string> const elfMacho{"elf", "macho"};
+    EXPECT_TRUE(ffi::objectFormatInAvailabilitySet(elfMacho, elf));
+    EXPECT_TRUE(ffi::objectFormatInAvailabilitySet(elfMacho, macho));
+    EXPECT_FALSE(ffi::objectFormatInAvailabilitySet(elfMacho, pe))
+        << "pe ∉ [elf,macho] → unavailable";
+    std::vector<std::string> const empty{};
+    EXPECT_TRUE(ffi::objectFormatInAvailabilitySet(empty, pe))
+        << "empty availableObjectFormats ⇒ available on EVERY format (back-compat)";
+}
+
+// shippedHeaderAvailableForFormat: reads the descriptor's availableObjectFormats
+// (interner-free) then applies the predicate — the EXACT decision the preprocessor
+// `__has_include` + macro-splice make. RED-ON-DISABLE on the per-target gate.
+TEST(ShippedLibDescriptor, ShippedHeaderAvailableForFormatReadsDescriptor) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "av5.json", R"JSON({
+        "header": "h.h", "availableObjectFormats": ["elf", "macho"],
+        "typedefs": [ { "name": "t", "type": "i32" } ]
+    })JSON");
+    auto const elf = objectFormatKindFromName("elf").value();
+    auto const pe = objectFormatKindFromName("pe").value();
+    EXPECT_TRUE(ffi::shippedHeaderAvailableForFormat(path, elf));
+    EXPECT_FALSE(ffi::shippedHeaderAvailableForFormat(path, pe))
+        << "the descriptor excludes pe → __has_include is FALSE / the splice is skipped";
+}
+
+// A descriptor with NO availableObjectFormats is available on every format — the
+// back-compat default that keeps every pre-c8 header resolving on all targets.
+TEST(ShippedLibDescriptor, ShippedHeaderAvailableForFormatAbsentSetIsAllFormats) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "av6.json", R"({
+        "header": "h.h", "typedefs": [ { "name": "t", "type": "i32" } ]
+    })");
+    auto const pe = objectFormatKindFromName("pe").value();
+    EXPECT_TRUE(ffi::shippedHeaderAvailableForFormat(path, pe))
+        << "no availableObjectFormats ⇒ available on every format";
+}
+
 // An "object" kind decodes to ShippedSymbolKind::Object (→ ExternGlobal).
 TEST(ShippedLibDescriptor, ObjectKindDecodes) {
     ScratchDir dir{Location::Temp, "shipped-lib"};

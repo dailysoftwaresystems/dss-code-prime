@@ -187,6 +187,11 @@ struct SynthBuilder {
     // time (D-PP-DESCRIPTOR-MACRO-INJECT). Empty for non-C languages / callers
     // without a system path -> the angle-macro branch is inert.
     std::span<fs::path const>            systemDirs;
+    // c9 (Phase-2): the active object-format when known. Gates the angle-include
+    // macro-splice below to the SAME availability the `__has_include` callback and
+    // the semantic `#include` gate use — an unavailable-on-this-format header is
+    // treated like "no descriptor on the path" (left verbatim), all three agreeing.
+    std::optional<ObjectFormatKind>      activeFormat;
     DiagnosticReporter&                  rep;
     int                                  depth;
     std::vector<fs::path>&               includeStack;
@@ -316,6 +321,15 @@ struct SynthBuilder {
                 if (angleName.empty()) continue;
                 auto descPath = resolveSystemDescriptor(angleName, systemDirs);
                 if (!descPath) continue;  // no descriptor on the path — leave verbatim
+                // c9 (MUST-FIX-3): if the descriptor declares this header
+                // unavailable on the active object-format, treat it EXACTLY like
+                // "no descriptor on the path" — leave the include verbatim, splice
+                // no macros. The semantic gate then fails loud and `__has_include`
+                // returns false: all three descriptor consumers stay consistent.
+                if (activeFormat.has_value()
+                    && !ffi::shippedHeaderAvailableForFormat(*descPath, *activeFormat)) {
+                    continue;
+                }
                 DiagnosticReporter macroRep;
                 auto macros = ffi::readShippedLibMacros(*descPath, macroRep);
                 if (!macros) {
@@ -409,8 +423,8 @@ struct SynthBuilder {
             copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
 
             includeStack.push_back(canon);
-            SynthBuilder child{schema, includeDirs, systemDirs, rep, depth + 1,
-                               includeStack, fatal};
+            SynthBuilder child{schema, includeDirs, systemDirs, activeFormat, rep,
+                               depth + 1, includeStack, fatal};
             child.build(headerBuf, out, map);
             includeStack.pop_back();
 
@@ -540,10 +554,12 @@ public:
                   LineMap const* lineMap,
                   std::span<fs::path const> includeDirs = {},
                   std::span<fs::path const> systemDirs = {},
+                  std::optional<ObjectFormatKind> activeFormat = {},
                   fs::path includingDir = {})
         : synth_(std::move(synth)), schema_(std::move(schema)), rep_(rep),
           prefixLen_(prefixLen), lineMap_(lineMap),
           includeDirs_(includeDirs), systemDirs_(systemDirs),
+          activeFormat_(activeFormat),
           includingDir_(std::move(includingDir)) {
         // FC15b (predefined macros; C 6.10.8): seed the predefined-macro map
         // (name -> def) from config. An identifier that is NOT a `#define`d
@@ -951,7 +967,18 @@ private:
         PpHasInclude hasIncludeCb =
             [this](std::string_view filename, bool isAngle) -> bool {
             if (isAngle) {
-                return resolveSystemDescriptor(filename, systemDirs_).has_value();
+                auto descPath = resolveSystemDescriptor(filename, systemDirs_);
+                if (!descPath) return false;  // no descriptor on the path
+                // c9 (Phase-2): per-target truth — when the active object-format is
+                // known, a header whose descriptor excludes it reports NOT available
+                // (agreeing with the `#include` semantic gate + the macro-splice).
+                // nullopt activeFormat_ = pure existence (unchanged pre-c9 behavior).
+                if (activeFormat_.has_value()
+                    && !ffi::shippedHeaderAvailableForFormat(*descPath,
+                                                             *activeFormat_)) {
+                    return false;
+                }
+                return true;
             }
             return resolveIncludePath(filename, includingDir_, includeDirs_)
                 .has_value();
@@ -2121,6 +2148,7 @@ private:
     // that input.
     std::span<fs::path const>            includeDirs_;
     std::span<fs::path const>            systemDirs_;
+    std::optional<ObjectFormatKind>      activeFormat_;
     fs::path                             includingDir_;
     // FC14: the conditional-compilation frame stack (one frame per open
     // `#if`/`#ifdef`/`#ifndef`). See CondFrame + handleIf/Elif/Else/Endif.
@@ -2133,7 +2161,8 @@ PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
     std::span<fs::path const>            includeDirs,
-    std::span<fs::path const>            systemDirs) {
+    std::span<fs::path const>            systemDirs,
+    std::optional<ObjectFormatKind>      activeFormat) {
     if (!mainSource || !schema) ppFatal("preprocess: null source or schema");
     if (!schema->preprocess().enabled) {
         ppFatal("preprocess: called with a schema whose preprocess pass is "
@@ -2150,8 +2179,8 @@ PreprocessResult preprocess(
         fs::path canon = fs::weakly_canonical(fs::path{mainSource->name()}, ec);
         includeStack.push_back(ec ? fs::path{mainSource->name()} : canon);
     }
-    SynthBuilder builder{schema, includeDirs, systemDirs, *result.diagnostics, 0,
-                         includeStack, result.fatal};
+    SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
+                         *result.diagnostics, 0, includeStack, result.fatal};
     builder.build(mainSource, synthText, result.lineMap);
 
     // FC15a (A2 reorder): the `#`/`##` operators produce SYNTHETIC tokens whose
@@ -2181,7 +2210,7 @@ PreprocessResult preprocess(
     // systemDirs).
     MacroExpander expander{prefixBuffer,  schema,      *result.diagnostics,
                            prefixLen,     &result.lineMap,
-                           includeDirs,   systemDirs,
+                           includeDirs,   systemDirs,   activeFormat,
                            fs::path{mainSource->name()}.parent_path()};
     std::vector<Token> finalTokens = expander.run(synthTokens);
     // OR in the macro-expansion truncation; the SynthBuilder already wrote

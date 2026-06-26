@@ -1,0 +1,14 @@
+{
+  "$comment": "c9 per-target __has_include — the AVAILABLE arm. <sys/time.h> ships availableObjectFormats:[elf,macho], so __has_include(<sys/time.h>) is TRUE on the unix object-formats → the #if branch → exit 42. The IDENTICAL source compiled for windows-pe takes the #else (exit 7) — see has_include_unavailable_pe. This is the per-target preprocessing witness: ONE source, a DIFFERENT exit per object-format, which forces the front-end to be built once per distinct object-format-kind (this example spans elf+macho = 2 kinds, exercising that driver path). RED-ON-DISABLE: without the format-aware hasIncludeCb (the preprocess activeFormat), __has_include is pure-existence → always true → pe would ALSO take the #if branch (the has_include_unavailable_pe pe arm would flip 7→42 and fail). The release arm witnesses the optimizer over the selected branch.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}
