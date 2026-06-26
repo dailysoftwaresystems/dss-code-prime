@@ -137,6 +137,12 @@ export const PROBES = [
   { id: 'core_digit_separator', cat: 'core_expr', expect: 42, src:
 `int main() { return 1'042 - 1'000; }
 ` },
+  // Adjacent string-literal concatenation (C 6.4.5p5) — `"a" "b"` ≡ "ab".
+  // Pervasive in sqlite3.c error messages; its absence cascades hard
+  // (50× "expected ')' — got '\"'" in the real amalgamation log).
+  { id: 'core_string_concat', cat: 'core_expr', expect: 42, src:
+`int main() { return ("AB" "CD")[3] - 26; }
+` },
 
   // ──────────────────────── integer_model ────────────────────────
   { id: 'int_u32_wraparound', cat: 'integer_model', expect: 42, src:
@@ -457,6 +463,23 @@ int main() { return add5(37); }
     return x + 5;
 }
 ` } },
+  // Prototype with UNNAMED mixed pointer+int params (sqlite3.c API decls:
+  // `...sqlite3_column_database_name(sqlite3_stmt*,int);`). The amalgamation
+  // choked at the `int` (P0009) — pin the bare (T*, int) prototype form.
+  { id: 'fn_proto_unnamed_ptr_int', cat: 'functions', expect: 42, src:
+`int store(int*, int);
+
+int main() {
+    int x;
+    x = 0;
+    return store(&x, 42);
+}
+
+int store(int* p, int v) {
+    *p = v;
+    return *p;
+}
+` },
 
   // ───────────────────────── pointers ─────────────────────────
   { id: 'ptr_deref_load', cat: 'pointers', expect: 42, src:
@@ -649,6 +672,33 @@ int main() {
 struct Pair gp = { 40, 2 };
 
 int main() { return gp.a + gp.b; }
+` },
+  // Bitfields (C 6.7.2.1). sqlite3.c uses them throughout its parse-context
+  // structs (`bft disableTriggers:1;`); the real amalgamation cascades 50×
+  // "expected EndStatement" off this shape. Plain-type base to isolate the
+  // bitfield grammar from typedef recognition.
+  { id: 'agg_bitfield', cat: 'aggregates', expect: 42, src:
+`struct Flags { unsigned a : 4; unsigned b : 28; };
+
+int main() {
+    struct Flags f;
+    f.a = 10;
+    f.b = 32;
+    return f.a + f.b;
+}
+` },
+  // volatile-qualified struct field (sqlite3.c: `volatile int isInterrupted;`
+  // in struct Sqlite3). A walled `volatile` breaks the whole struct → its
+  // closing `};` fails to parse. Distinct from the local-var `mod_volatile_local`.
+  { id: 'agg_volatile_field', cat: 'aggregates', expect: 42, src:
+`struct S { volatile int x; int y; };
+
+int main() {
+    struct S s;
+    s.x = 40;
+    s.y = 2;
+    return s.x + s.y;
+}
 ` },
 
   // ─────────────────────── declarations ───────────────────────
