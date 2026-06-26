@@ -1,33 +1,37 @@
 {
-  "$comment": "Neutral shipped <errno.h> (POSIX) — c14 POSIX/SQLite header authoring behind the c13 per-target struct mechanism. THREE surfaces in one header: (1) the `errno` LVALUE is a function-like-free object MACRO `errno -> (*__errno_location())` (glibc/Linux thread-local errno accessor) — the macros surface (c5) splices the #define so `errno = E...` / `if (errno == E...)` expand BEFORE parse into a deref of the libc accessor (an lvalue: deref of the returned int*). (2) `__errno_location` is the libc symbol it calls (dynamically linked from libc.so.6, the FULL-UNIX-build strategy — like `puts`). (3) the E* error numbers are the constants surface (Linux asm-generic values). SCOPE: exactly the E* set SQLite's os_unix.c references (no over-ship); EDEVERR is macOS-only (SQLite #ifdef-guards it) so absent on linux. availableObjectFormats:[elf] — the Linux run target (WSL); macOS errno uses `__error` + different E* values (a c14-macOS follow-on, via a future per-target constants/macros axis), and a pe `#include <errno.h>` stays fail-loud (POSIX-on-windows is the os_win axis). The E* VALUES are interop-critical (a wrong value mis-maps SQLite's errno checks) — verified against the Linux errno-base.h / errno.h.",
+  "$comment": "Neutral shipped <errno.h> (POSIX) — c14a (linux) + c15b (macOS, via the c15a per-target const/macro/typedef variant mechanism). THREE surfaces, now PER-FORMAT: (1) the `errno` lvalue object-MACRO selects its accessor by format — `(*__errno_location())` on elf/glibc, `(*__error())` on macho/Darwin; (2) BOTH accessor symbols are declared (only the format-referenced one links — the other is an unreferenced extern, never imported), resolved from the active format's `library` (libc.so.6 elf / libSystem macho); (3) the E* numbers: the low block (EPERM..ERANGE) AGREES between Linux and Darwin so it stays flat, but the divergent ones carry per-format `variants` (Linux asm-generic vs Darwin sys/errno.h — e.g. EAGAIN 11 vs 35, ETIMEDOUT 110 vs 60, ENOTSUP 95 vs 45, EOPNOTSUPP 95 vs 102, EOVERFLOW 75 vs 84, ENOLCK 37 vs 77). Gated availableObjectFormats:[elf,macho] (the Linux WSL run target + the macos-latest CI leg, which runs Mach-O natively). The VALUES are interop-critical — verified against the Linux errno-base.h/errno.h + the Darwin xnu sys/errno.h.",
   "header": "errno.h",
   "standard": "posix",
-  "availableObjectFormats": ["elf"],
-  "library": { "elf": "libc.so.6" },
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "symbols": [
-    { "name": "__errno_location", "signature": "fn() -> ptr<i32>", "kind": "function", "linkage": "external" }
+    { "name": "__errno_location", "signature": "fn() -> ptr<i32>", "kind": "function", "linkage": "external" },
+    { "name": "__error",          "signature": "fn() -> ptr<i32>", "kind": "function", "linkage": "external" }
   ],
   "macros": [
-    { "name": "errno", "replacement": "(*__errno_location())" }
+    { "name": "errno", "variants": [
+      { "when": { "format": "elf" },   "replacement": "(*__errno_location())" },
+      { "when": { "format": "macho" }, "replacement": "(*__error())" }
+    ] }
   ],
   "constants": [
-    { "name": "EPERM",      "value": 1,   "type": "i32" },
-    { "name": "ENOENT",     "value": 2,   "type": "i32" },
-    { "name": "EINTR",      "value": 4,   "type": "i32" },
-    { "name": "EIO",        "value": 5,   "type": "i32" },
-    { "name": "ENXIO",      "value": 6,   "type": "i32" },
-    { "name": "EAGAIN",     "value": 11,  "type": "i32" },
-    { "name": "EACCES",     "value": 13,  "type": "i32" },
-    { "name": "EBUSY",      "value": 16,  "type": "i32" },
-    { "name": "EEXIST",     "value": 17,  "type": "i32" },
-    { "name": "EISDIR",     "value": 21,  "type": "i32" },
-    { "name": "EINVAL",     "value": 22,  "type": "i32" },
-    { "name": "ENOSPC",     "value": 28,  "type": "i32" },
-    { "name": "ERANGE",     "value": 34,  "type": "i32" },
-    { "name": "ENOLCK",     "value": 37,  "type": "i32" },
-    { "name": "EOVERFLOW",  "value": 75,  "type": "i32" },
-    { "name": "ENOTSUP",    "value": 95,  "type": "i32" },
-    { "name": "EOPNOTSUPP", "value": 95,  "type": "i32" },
-    { "name": "ETIMEDOUT",  "value": 110, "type": "i32" }
+    { "name": "EPERM",   "value": 1,  "type": "i32" },
+    { "name": "ENOENT",  "value": 2,  "type": "i32" },
+    { "name": "EINTR",   "value": 4,  "type": "i32" },
+    { "name": "EIO",     "value": 5,  "type": "i32" },
+    { "name": "ENXIO",   "value": 6,  "type": "i32" },
+    { "name": "EACCES",  "value": 13, "type": "i32" },
+    { "name": "EBUSY",   "value": 16, "type": "i32" },
+    { "name": "EEXIST",  "value": 17, "type": "i32" },
+    { "name": "EISDIR",  "value": 21, "type": "i32" },
+    { "name": "EINVAL",  "value": 22, "type": "i32" },
+    { "name": "ENOSPC",  "value": 28, "type": "i32" },
+    { "name": "ERANGE",  "value": 34, "type": "i32" },
+    { "name": "EAGAIN",     "variants": [ { "when": {"format":"elf"}, "value": 11,  "type": "i32" }, { "when": {"format":"macho"}, "value": 35,  "type": "i32" } ] },
+    { "name": "ENOLCK",     "variants": [ { "when": {"format":"elf"}, "value": 37,  "type": "i32" }, { "when": {"format":"macho"}, "value": 77,  "type": "i32" } ] },
+    { "name": "EOVERFLOW",  "variants": [ { "when": {"format":"elf"}, "value": 75,  "type": "i32" }, { "when": {"format":"macho"}, "value": 84,  "type": "i32" } ] },
+    { "name": "ENOTSUP",    "variants": [ { "when": {"format":"elf"}, "value": 95,  "type": "i32" }, { "when": {"format":"macho"}, "value": 45,  "type": "i32" } ] },
+    { "name": "EOPNOTSUPP", "variants": [ { "when": {"format":"elf"}, "value": 95,  "type": "i32" }, { "when": {"format":"macho"}, "value": 102, "type": "i32" } ] },
+    { "name": "ETIMEDOUT",  "variants": [ { "when": {"format":"elf"}, "value": 110, "type": "i32" }, { "when": {"format":"macho"}, "value": 60,  "type": "i32" } ] }
   ]
 }
