@@ -298,7 +298,15 @@ TEST(GrammarSchema, LoadShippedCSubset) {
                                   "kwDeclHead", "identDeclHead",
                                   "identVarDecl", "declOrExprStmt",
                                   "forDecl", "forIdentDecl", "forInitAmbig",
-                                  "typedefHead", "structSpecifierBody",
+                                  "typedefHead",
+                                  // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER:
+                                  // the unified struct/union/enum specifier rules
+                                  // (REPLACED the retired *SpecifierBody rules) +
+                                  // their factored-out member-body wrapper rules.
+                                  "structSpec", "structBody",
+                                  "unionSpec", "unionBody",
+                                  "enumSpec", "enumBody",
+                                  "structTypeRef", "unionTypeRef", "enumTypeRef",
                                   "stdAttr", "varDecl",
                                   "paramList", "param", "block", "statement",
                                   "ifStmt", "whileStmt", "doStmt", "forStmt",
@@ -311,6 +319,16 @@ TEST(GrammarSchema, LoadShippedCSubset) {
                                   // present in the rule interner.
                                   "binaryExpr", "unaryExpr", "postfixExpr"}) {
         EXPECT_TRUE(schema.rules().find(rule).valid()) << rule;
+    }
+
+    // c25: the former specifier-body rules were RETIRED (folded into the
+    // unified XxxSpec). Pin their ABSENCE so a stray re-introduction (or an
+    // incomplete unification) is visible at load.
+    for (std::string_view retired : {"structSpecifierBody",
+                                     "unionSpecifierBody",
+                                     "enumSpecifierBody"}) {
+        EXPECT_FALSE(schema.rules().find(retired).valid())
+            << "retired rule must not resolve: " << retired;
     }
 
     // BlockOpen opens Block — representative scope token.
@@ -1826,6 +1844,59 @@ TEST(GrammarSchema, SemanticsUnknownDeclKindReportsInvalid) {
     auto r = GrammarSchema::loadFromText(kCfg);
     ASSERT_FALSE(r.has_value());
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ── c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: dual-mode loader guards ──────
+//
+// `definesWhenChild` makes ONE declaration row dual-mode (a DEFINITION when the
+// named body child is present, else a tag REFERENCE resolved by a paired
+// `references[]` row). Two loader guards keep a misconfigured language config
+// from silently mis-resolving; each gets a red-on-disable negative pin (the
+// guard-needs-a-red-test discipline, cluster lessons c8/c21).
+
+// A `definesWhenChild` row with NO paired `references` row for the same rule →
+// C_InvalidSemantics (a body-absent occurrence would otherwise resolve to nothing).
+TEST(GrammarSchema, SemanticsDefinesWhenChildWithoutReferenceRowReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "{": [{ "kind": "BlockOpen" }], "}": [{ "kind": "BlockClose" }],
+                  ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root": { "sequence": [ "spec", "Semi" ] },
+        "spec": { "sequence": [ "Identifier", { "optional": "body" } ] },
+        "body": { "sequence": [ "BlockOpen", "BlockClose" ] }
+      },
+      "semantics": {
+        "declarations": [ { "rule": "spec", "name": 0, "kind": "type",
+                            "definesWhenChild": "body" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// A `definesWhenChild` naming a child rule that no shape declares → C_UnknownShape.
+// (The paired references row is present, so this isolates the child-rule guard.)
+TEST(GrammarSchema, SemanticsDefinesWhenChildUnknownChildRuleReportsUnknownShape) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root": { "sequence": [ "spec", "Semi" ] },
+        "spec": { "sequence": [ "Identifier" ] }
+      },
+      "semantics": {
+        "declarations": [ { "rule": "spec", "name": 0, "kind": "type",
+                            "definesWhenChild": "ghostBody" } ],
+        "references": [ { "rule": "spec" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
 }
 
 // ── D-LK10-ENTRY-MAIN-IMPLICIT-RETURN loader negative tests ───────

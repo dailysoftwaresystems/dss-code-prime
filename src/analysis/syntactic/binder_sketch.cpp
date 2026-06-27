@@ -59,8 +59,8 @@ BinderSketch::BinderSketch(GrammarSchema const& schema) {
     // A scope rule that ALSO carries a non-Type `declarations` row opens a
     // DECLARATOR-DOMINATOR scope (e.g. c-subset's topLevelDecl — a variable/
     // function declaration that opens a scope only to dominate its params).
-    // A composite-TYPE-body scope rule (structSpecifierBody, isType) is NOT a
-    // dominator (its tag is recorded for it, then floats past any enclosing
+    // A composite-TYPE-body scope rule (c25's unified structSpec, isType) is NOT
+    // a dominator (its tag is recorded for it, then floats past any enclosing
     // dominator). `block` and friends carry no `declarations` row at all.
     for (auto rv : scopeRules_) {
         auto it = byRule_.find(rv);
@@ -104,7 +104,7 @@ void BinderSketch::record(std::string name, bool isType) {
     // A composite/typedef TYPE tag (C11 6.2.1) belongs to the nearest enclosing
     // NAMESPACE scope (block or file), not an interior declarator-dominator
     // scope it may have been minted inside (a file-scope `struct P { … } v;`
-    // tag is recorded as structSpecifierBody's frame closes — WHILE the
+    // tag is recorded as the unified structSpec's frame closes — WHILE the
     // enclosing topLevelDecl param-dominator scope is still live — and must
     // bind at file scope so it is visible to the next declaration / exported in
     // globalTypeNames). Float TYPE bindings past dominator scopes; VALUE

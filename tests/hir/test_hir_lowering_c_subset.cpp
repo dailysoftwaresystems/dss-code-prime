@@ -767,6 +767,26 @@ TEST(HirLoweringCSubset, TopLevelDeclaresNothingFailsLoudNoCrash) {
         << "exactly one S_DeclarationDeclaresNothing for the empty `int ;` decl";
 }
 
+// c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a body-PRESENT specifier WITH a
+// declarator (`struct S { int x; } v;`) is a definition-introducing global — it
+// lowers cleanly (the `compositeSpecifierIsDefinition` gate admits it because its
+// body child is present). The body-ABSENT counterpart (`struct S;`) is a tag
+// reference that fails loud (S_UnknownType at the semantic tier) — pinned in the
+// semantic suite (SemanticAnalyzerCSubset.C25BareStructForwardDeclFailsLoud).
+// RED-on-disable: if the gate were inverted, THIS would spuriously fail-loud.
+TEST(HirLoweringCSubset, StructDefinitionWithObjectLowersClean) {
+    SemanticModel model = analyzeCSubset(
+        "struct S { int x; } v;\nint main(void) { return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 0u)
+        << "`struct S { int x; } v;` declares an object — must NOT fail loud";
+}
+
 // D5.1: a struct used as a pointer-typed parameter + member access via `->`
 // resolves the field SymbolId AND propagates the field's type to the
 // member-access node. Pins the SEMANTIC layer (Pass 1.5 struct composition +
@@ -3271,11 +3291,12 @@ TEST(HirLoweringCSubset, D5_5_LiftOptOutRespected) {
     std::string const target =
         "\"compositeKind\": \"enum\",\n"
         "                           \"liftToEnclosingScope\": true";
-    // The enum-composite lift flag now rides ONE row — the `enumSpecifierBody`
-    // (the dead statement-position `enumDecl` row was deleted in the struct-head
-    // closing cycle, D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). Flip EVERY
-    // occurrence so the opt-out is total — the bare-name `A` below (its enum is
-    // parsed via `enumSpecifierBody`) must then resolve through NO lift.
+    // The enum-composite lift flag now rides ONE row — the unified `enumSpec`
+    // (c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER REPLACED the `enumSpecifierBody`
+    // row; the dead statement-position `enumDecl` row was deleted earlier in
+    // D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). Flip EVERY occurrence so the
+    // opt-out is total — the bare-name `A` below (its enum is parsed via the
+    // unified `enumSpec`) must then resolve through NO lift.
     std::size_t flipped = 0;
     for (auto pos = text.find(target); pos != std::string::npos;
          pos = text.find(target, pos)) {

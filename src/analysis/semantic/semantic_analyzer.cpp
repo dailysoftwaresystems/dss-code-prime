@@ -260,6 +260,36 @@ visibleChildren(Tree const& tree, NodeId parent) {
     return out;
 }
 
+// c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: does this node have a VISIBLE CHILD
+// of the given rule? The dual-mode discriminator for the unified composite
+// specifier — `structSpec` is a DEFINITION when it has a `structBody` child,
+// else a tag REFERENCE. Generic + agnostic: keyed on a config-resolved RuleId,
+// never a keyword. Direct-children only (the body child is always a direct child
+// of the specifier node — never nested), matching the `definesWhenChildRule`
+// contract.
+[[nodiscard]] bool
+nodeHasVisibleChildOfRule(Tree const& tree, NodeId node, RuleId childRule) {
+    if (!childRule.valid()) return false;
+    for (NodeId c : visibleChildren(tree, node)) {
+        if (tree.kind(c) == NodeKind::Internal && tree.rule(c) == childRule) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// c25: is the declaration `decl` a DEFINITION at THIS node? A row without the
+// dual-mode gate is ALWAYS a definition (every shipped decl before c25). A gated
+// row (`definesWhenChildRule`, the unified composite specifier) is a definition
+// ONLY when the body child is present; absent ⇒ the node is a pure tag reference
+// (handled by the paired `references[]` row), so the declaration paths (mint,
+// scope-open, tag-bind, fieldChildren) MUST all skip it.
+[[nodiscard]] bool
+isDefinitionAtNode(DeclarationRule const& decl, Tree const& tree, NodeId node) {
+    if (!decl.definesWhenChildRule.has_value()) return true;
+    return nodeHasVisibleChildOfRule(tree, node, *decl.definesWhenChildRule);
+}
+
 // D-CSUBSET-FN-PROTOTYPE: does the declarator NAME carry a function suffix —
 // i.e. is `nameNode` the name of a function declarator (`int f(int)` /
 // `int f(int x){…}`) rather than a function POINTER (`int (*fp)(int)`)? True
@@ -701,11 +731,19 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // would recurse into the struct BODY and silently resolve the
         // FIRST FIELD's type as the head type. An unresolved minted
         // type returns InvalidType and the outer miss arm reports.
+        //
+        // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a dual-mode specifier
+        // (`structSpec`) in type position with its body ABSENT (`struct S v;`)
+        // is a tag REFERENCE, NOT an inline definition — it minted no symbol, so
+        // this arm must NOT fire. `isDefinitionAtNode` gates it OUT so resolution
+        // falls through to the isTagReference arm below (the body-absent form's
+        // SOLE resolution path), exactly as the former `structTypeRef` resolved.
         {
             auto declIt = s.idx().declByRule.find(rule.v);
             if (declIt != s.idx().declByRule.end()
                 && cfg.declarations[declIt->second].kind
-                       == DeclarationKind::Type) {
+                       == DeclarationKind::Type
+                && isDefinitionAtNode(cfg.declarations[declIt->second], tree, node)) {
                 auto const& drow = cfg.declarations[declIt->second];
                 SymbolId sym{};
                 auto dkids = declRoleChildren(tree, node, drow);
@@ -1740,12 +1778,26 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     if (k == NodeKind::Internal) {
         auto const rule = tree.rule(node);
 
-        if (s.idx().scopeByRule.contains(rule.v)) {
+        // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a dual-mode declaration row
+        // (`definesWhenChildRule`) is a DEFINITION at this node ONLY when its body
+        // child is present; absent ⇒ the node is a pure tag reference and the
+        // declaration paths (scope-open, mint, tag-bind) ALL skip it. Computed
+        // BEFORE the scope-open so a body-absent specifier (`struct S v;`) opens
+        // NO scope — the post-order passes re-derive scopes by anchor lookup, so
+        // they agree (no scope minted here ⇒ childScopeFor returns `current`).
+        bool declIsDefiningHere = true;
+        if (auto gIt = s.idx().declByRule.find(rule.v);
+            gIt != s.idx().declByRule.end()) {
+            declIsDefiningHere =
+                isDefinitionAtNode(cfg.declarations[gIt->second], tree, node);
+        }
+
+        if (declIsDefiningHere && s.idx().scopeByRule.contains(rule.v)) {
             here = s.scopes.pushScope(current, node, tree.id());
         }
 
         auto declIt = s.idx().declByRule.find(rule.v);
-        if (declIt != s.idx().declByRule.end()) {
+        if (declIt != s.idx().declByRule.end() && declIsDefiningHere) {
             auto const& decl = cfg.declarations[declIt->second];
             auto kids = declRoleChildren(tree, node, decl);
 
@@ -2218,7 +2270,13 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
     if (tree.kind(node) == NodeKind::Internal) {
         auto const rule = tree.rule(node);
         auto declIt = s.idx().declByRule.find(rule.v);
-        if (declIt != s.idx().declByRule.end()) {
+        if (declIt != s.idx().declByRule.end()
+            && isDefinitionAtNode(cfg.declarations[declIt->second], tree, node)) {
+            // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a dual-mode specifier with
+            // its body ABSENT is a tag reference, not a definition — it minted no
+            // symbol and opened no scope in Pass 1, so it has no declaration type
+            // to resolve here. Its type-position resolution happens via the paired
+            // tag-reference path (resolveTypeNode's isTagReference arm).
             auto const& decl = cfg.declarations[declIt->second];
             auto kids = declRoleChildren(tree, node, decl);
             // FC4 c1 (M3): declarator-mode rows — resolve the HEAD once via
@@ -3177,7 +3235,24 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     if (k == NodeKind::Internal) {
         auto const rule = tree.rule(node);
         auto refIt = s.idx().refByRule.find(rule.v);
+        // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the unified specifier rule
+        // (`structSpec`) is BOTH a declaration row and a reference row. When its
+        // body is PRESENT it is a DEFINITION (already minted + tag-bound in Pass
+        // 1) — NOT a use of its own tag, so the reference walker must skip it
+        // (else it would resolve the tag to the symbol it just defined and record
+        // a phantom self-use, suppressing the unused check / inflating use-counts).
+        // The body-ABSENT form IS a genuine tag reference and resolves normally.
+        bool refIsDefinitionHere = false;
         if (refIt != s.idx().refByRule.end()) {
+            if (auto dIt = s.idx().declByRule.find(rule.v);
+                dIt != s.idx().declByRule.end()) {
+                auto const& drow = cfg.declarations[dIt->second];
+                refIsDefinitionHere =
+                    drow.definesWhenChildRule.has_value()
+                    && isDefinitionAtNode(drow, tree, node);
+            }
+        }
+        if (refIt != s.idx().refByRule.end() && !refIsDefinitionHere) {
             bool isDeclSite = false;
             NodeId parent = tree.parent(node);
             if (parent.valid() && tree.kind(parent) == NodeKind::Internal) {

@@ -347,7 +347,22 @@
     },
 
     "structTypeRef": {
+      "$comment": "c25: the REF-ONLY struct specifier, kept for the param/cast positions (declHeadForParam, castTypeBase) where a struct type is a pure tag reference. The DECLARATION-head positions no longer use this pair-with-body form — they route through the UNIFIED `structSpec` (below), which folds body-vs-ref into ONE rule so it is the SOLE candidate for `struct` at those heads → the parser's unique-production direct descent parses the member body NON-speculatively (no probe, no token budget — the c25 fix for `struct sqlite3`).",
       "sequence": [ "StructKeyword", "Identifier" ]
+    },
+
+    "structSpec": {
+      "$comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the UNIFIED struct specifier (C 6.7.2.1 struct-or-union-specifier) — `struct {opt tag} {opt body}`. ONE rule for BOTH the type-DEFINITION form (`struct P { … }` — a `structBody` child is present) and the bare tag-REFERENCE form (`struct P` — absent). Replaces the former `structSpecifierBody | structTypeRef` SPECULATIVE pair in the 4 body-bearing declaration-head alts (topLevelCompositeSpec, typeSpecifierForDecl, typedefHead, typeBaseAllowingStruct). Because it is now the SOLE candidate keyed on StructKeyword in those alts, the parser's LL(k) unique-production DIRECT DESCENT (parser.cpp ~1804-1844) dispatches it NON-speculatively — the member list parses with NO speculation budget, so an arbitrarily large body (`struct sqlite3`) never trips the 4096-token probe cliff. The body-vs-ref split becomes an INTERNAL 1-token (`BlockOpen`) decision via the `{optional structBody}`, also non-speculative. The binder is DUAL-MODE on the SAME node (semantics: `definesWhenChild: structBody`): body present ⇒ the EXACT former `structSpecifierBody` define path (mint type, bind tag, open scope, compose fields from the `structBody` subtree); body absent ⇒ the EXACT former `structTypeRef` tag-reference path (isTagReference). FOLLOW-independent (the rejected D2): no prune of the ref candidate is needed because there IS no separate ref candidate here.",
+      "sequence": [
+        "StructKeyword", { "optional": "Identifier" }, { "optional": "structBody" }
+      ]
+    },
+
+    "structBody": {
+      "$comment": "c25: the brace-delimited struct member list, factored OUT of `structSpec` so its PRESENCE is the define-vs-reference discriminator (the binder's `definesWhenChild`). NOT a scope rule itself: the fields bind into the scope opened by the enclosing `structSpec` (the analyzer's Pass-1.5 field collection walks that scope, not direct children, so the extra nesting level is transparent). Member shape identical to the former `structSpecifierBody` tail.",
+      "sequence": [
+        "BlockOpen", { "repeat": "structField" }, "BlockClose"
+      ]
     },
 
     "unionField": {
@@ -360,7 +375,22 @@
     },
 
     "unionTypeRef": {
+      "$comment": "c25: the REF-ONLY union specifier, kept for the param/cast positions (declHeadForParam, castTypeBase). The declaration-head positions route through the UNIFIED `unionSpec` (below). Mirrors structTypeRef.",
       "sequence": [ "UnionKeyword", "Identifier" ]
+    },
+
+    "unionSpec": {
+      "$comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the UNIFIED union specifier — `union {opt tag} {opt body}`. Mirrors `structSpec`: ONE rule for define (`union U { … }`) and reference (`union U`), the SOLE UnionKeyword candidate in the 4 body-bearing alts → non-speculative direct descent (no member-body probe budget). Dual-mode binder via `definesWhenChild: unionBody`.",
+      "sequence": [
+        "UnionKeyword", { "optional": "Identifier" }, { "optional": "unionBody" }
+      ]
+    },
+
+    "unionBody": {
+      "$comment": "c25: the brace-delimited union member list, factored out of `unionSpec` as the define-vs-reference discriminator. NOT a scope rule (fields bind into the enclosing unionSpec's scope). Member shape identical to the former `unionSpecifierBody` tail.",
+      "sequence": [
+        "BlockOpen", { "repeat": "unionField" }, "BlockClose"
+      ]
     },
 
     "enumerator": {
@@ -371,7 +401,29 @@
     },
 
     "enumTypeRef": {
+      "$comment": "c25: the REF-ONLY enum specifier, kept for the param/cast positions (declHeadForParam, castTypeBase). The declaration-head positions route through the UNIFIED `enumSpec` (below). Mirrors structTypeRef.",
       "sequence": [ "EnumKeyword", "Identifier" ]
+    },
+
+    "enumSpec": {
+      "$comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the UNIFIED enum specifier — `enum {opt tag} {opt body}`. Mirrors `structSpec`: ONE rule for define (`enum E { A, B }`) and reference (`enum E`), the SOLE EnumKeyword candidate in the 4 body-bearing alts → non-speculative direct descent. Dual-mode binder via `definesWhenChild: enumBody`. The enumerator-list (with trailing comma) lives in `enumBody`.",
+      "sequence": [
+        "EnumKeyword", { "optional": "Identifier" }, { "optional": "enumBody" }
+      ]
+    },
+
+    "enumBody": {
+      "$comment": "c25: the brace-delimited enumerator list, factored out of `enumSpec` as the define-vs-reference discriminator. NOT a scope rule (enumerators bind into the enclosing enumSpec's scope, then lift to the enclosing namespace scope per fieldChildren.liftToEnclosingScope). Enumerator-list shape (optional list, trailing comma) identical to the former `enumSpecifierBody` tail.",
+      "sequence": [
+        "BlockOpen",
+        { "optional": {
+            "sequence": [
+              "enumerator",
+              { "repeat": { "sequence": [ "Comma", { "optional": "enumerator" } ] } }
+            ]
+        }},
+        "BlockClose"
+      ]
     },
 
     "memberFollower": {
@@ -393,11 +445,11 @@
     },
 
     "topLevelCompositeSpec": {
-      "$comment": "The struct/union/enum SPECIFIER at a top-level declaration head — body form (`struct P { … }`) OR bare tag reference (`struct P`). SPECULATIVE (mirrors typeSpecifierForDecl / typedefHead): body forms probe FIRST; a ref with no `{` rolls back to the `*TypeRef` form (`struct Tri mkTri(void)` / `struct Q g;`). A NAMED rule (not an inline alt) so the speculation runs at the same depth proven to work for local decls — an inline alt at the top-level-decl depth hits the FC4-c1 depth-0 candidate replay and fails to roll back. The enum body's trailing-comma enumerator-list parses cleanly here now that the schema compiler propagates nested-nullable FOLLOW (recomputeAltExpectedSets).",
+      "$comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the struct/union/enum SPECIFIER at a top-level declaration head — now ONE unified rule per keyword (`structSpec`/`unionSpec`/`enumSpec`), each covering BOTH the body form (`struct P { … }`) AND the bare tag reference (`struct P`) via an internal `{optional body}`. The three candidates have pairwise-DISJOINT 1-token FIRSTs (StructKeyword/UnionKeyword/EnumKeyword), so the predictive prune leaves EXACTLY ONE survivor for any composite lead → the parser's unique-production DIRECT DESCENT (parser.cpp ~1804-1844) dispatches it NON-speculatively. The member body therefore parses with NO speculation budget — the c25 fix for `struct sqlite3`'s large body (the former body-vs-ref probe budget-capped at 4096 tokens). `speculative`/`lookahead` are retained but moot under the unique-survivor direct descent (kept so a future non-disjoint addition still has a probe budget). The enum body's trailing-comma enumerator-list parses cleanly (the schema compiler propagates nested-nullable FOLLOW via recomputeAltExpectedSets).",
       "alt": [
-        "structSpecifierBody", "structTypeRef",
-        "unionSpecifierBody",  "unionTypeRef",
-        "enumSpecifierBody",   "enumTypeRef"
+        "structSpec",
+        "unionSpec",
+        "enumSpec"
       ],
       "speculative": true, "lookahead": 256
     },
@@ -493,9 +545,9 @@
       "$comment": "KEYWORD/composite-led type specifiers for declaration heads — deliberately NO Identifier arm (the typedef-name head is the ambiguous form, routed through identDeclHead/declOrExprStmt or the committed post-specifier/post-qualifier heads). SPECULATIVE (mirror typedefHead, D-CSUBSET-STRUCT-BODY-VARDECL-POSITION): admits the struct/union/enum BODY forms so a body-defined LOCAL (`struct P { int a; } v;` as a statement) parses; body forms probe FIRST, a ref with no `{` rolls back to the `*TypeRef` form. Single-level.",
       "alt": [
         "typeSpecifierSeq",
-        "structSpecifierBody", "structTypeRef",
-        "unionSpecifierBody",  "unionTypeRef",
-        "enumSpecifierBody",   "enumTypeRef"
+        "structSpec",
+        "unionSpec",
+        "enumSpec"
       ],
       "speculative": true, "lookahead": 256
     },
@@ -538,41 +590,12 @@
       "$comment": "SPECULATIVE: the struct/union/enum BODY forms collide with the ref forms on their lead keyword — body forms probe FIRST (declared order); `typedef struct P MyP;` rolls back to structTypeRef when no `{` follows. lookahead 256 (4096-token budget): a body probe must swallow the whole member list.",
       "alt": [
         "typeSpecifierSeq",
-        "structSpecifierBody", "structTypeRef",
-        "unionSpecifierBody",  "unionTypeRef",
-        "enumSpecifierBody",   "enumTypeRef",
+        "structSpec",
+        "unionSpec",
+        "enumSpec",
         "Identifier"
       ],
       "speculative": true, "lookahead": 256
-    },
-
-    "structSpecifierBody": {
-      "$comment": "The typedef-position struct SPECIFIER (C 6.7.2.1): optional tag + member body. Tagged form also binds the tag (a Type symbol) in the enclosing scope; the anonymous form mints an anonymous composite (semantics row: anonymousNameAllowed).",
-      "sequence": [
-        "StructKeyword", { "optional": "Identifier" },
-        "BlockOpen", { "repeat": "structField" }, "BlockClose"
-      ]
-    },
-
-    "unionSpecifierBody": {
-      "sequence": [
-        "UnionKeyword", { "optional": "Identifier" },
-        "BlockOpen", { "repeat": "unionField" }, "BlockClose"
-      ]
-    },
-
-    "enumSpecifierBody": {
-      "sequence": [
-        "EnumKeyword", { "optional": "Identifier" },
-        "BlockOpen",
-        { "optional": {
-            "sequence": [
-              "enumerator",
-              { "repeat": { "sequence": [ "Comma", { "optional": "enumerator" } ] } }
-            ]
-        }},
-        "BlockClose"
-      ]
     },
 
     "includeDirective": {
@@ -656,9 +679,9 @@
       "$comment": "FC7 D-FC7-NESTED-STRUCT-FIELD: the trailing `Identifier` alt admits a typedef-name (user struct/union type) as a struct/union FIELD type — symmetric with `typeBase` above, which already carries it. A struct/union body has no expression-statement context, so a bare Identifier in field-type position is UNAMBIGUOUSLY a type-name (no binder-sketch guard needed); a non-type name fails loud at semantic scope-lookup. Tried last, so keyword/tag/enum forms keep priority. D-CSUBSET-STRUCT-BODY-VARDECL-POSITION: also admits the struct/union/enum BODY forms (an inline nested definition `struct Inner { int x; } in;` as a field) — SPECULATIVE (mirror typedefHead), body-before-ref. This makes the body-in-head form RECURSIVE: a structSpecifierBody contains structFields, each of which may itself BE a structSpecifierBody (arbitrary nesting), the recursion falling out of the grammar — single-level speculation at each structField, never nested.",
       "alt": [
         "typeSpecifierSeq",
-        "structSpecifierBody", "structTypeRef",
-        "unionSpecifierBody",  "unionTypeRef",
-        "enumSpecifierBody",   "enumTypeRef",
+        "structSpec",
+        "unionSpec",
+        "enumSpec",
         "Identifier"
       ],
       "speculative": true, "lookahead": 256
@@ -1122,13 +1145,19 @@
       { "rule": "typedefDecl", "head": 1, "declarator": 2, "kind": "type",
         "volatileMarker": "VolatileKeyword",
         "requireNamedDeclarators": true },
-      { "rule": "structSpecifierBody", "name": 1, "kind": "type",
+      { "rule": "structSpec", "name": 1, "kind": "type",
+        "$c25Comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the DEFINITION arm of the unified `structSpec`. `definesWhenChild: structBody` makes this row a definition (mint type, bind tag in the Tag namespace, open scope, compose fields) ONLY when a `structBody` child is present (`struct S { … }` / anonymous `struct { … }`); when ABSENT (`struct S v;` / `struct S;`) the node is a pure tag reference, resolved by the paired `structSpec` references-row below (isTagReference). The DEFINE semantics are byte-identical to the former `structSpecifierBody` row — fields now live under the `structBody` child, but Pass-1.5's fieldChildren collection walks the scope this row opens (not direct children), so the extra nesting is transparent. `name: 1` still resolves the tag: structSpec's visible children at definition are [StructKeyword, Identifier, structBody] (tagged) or [StructKeyword, structBody] (anonymous → anonymousNameAllowed synthesizes the name).",
+        "definesWhenChild": "structBody",
         "anonymousNameAllowed": true,
         "fieldChildren": { "rule": "structField", "compositeKind": "struct" } },
-      { "rule": "unionSpecifierBody", "name": 1, "kind": "type",
+      { "rule": "unionSpec", "name": 1, "kind": "type",
+        "$c25Comment": "c25: the DEFINITION arm of the unified `unionSpec` (mirrors structSpec). `definesWhenChild: unionBody`.",
+        "definesWhenChild": "unionBody",
         "anonymousNameAllowed": true,
         "fieldChildren": { "rule": "unionField", "compositeKind": "union" } },
-      { "rule": "enumSpecifierBody", "name": 1, "kind": "type",
+      { "rule": "enumSpec", "name": 1, "kind": "type",
+        "$c25Comment": "c25: the DEFINITION arm of the unified `enumSpec` (mirrors structSpec). `definesWhenChild: enumBody`. The enumerator lift-to-enclosing-scope behavior is unchanged (fieldChildren.liftToEnclosingScope).",
+        "definesWhenChild": "enumBody",
         "anonymousNameAllowed": true,
         "fieldChildren": { "rule": "enumerator", "compositeKind": "enum",
                            "liftToEnclosingScope": true } },
@@ -1157,7 +1186,11 @@
       { "rule": "operand" },
       { "rule": "structTypeRef", "nameMatch": "lastIdentifier", "isTagReference": true },
       { "rule": "unionTypeRef",  "nameMatch": "lastIdentifier", "isTagReference": true },
-      { "rule": "enumTypeRef",   "nameMatch": "lastIdentifier", "isTagReference": true }
+      { "rule": "enumTypeRef",   "nameMatch": "lastIdentifier", "isTagReference": true },
+      { "$c25Comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the REFERENCE arm of the unified specifiers. A body-ABSENT `structSpec`/`unionSpec`/`enumSpec` (`struct S v;` / `struct S;`) is a TAG reference — these rows resolve its tag in the Tag namespace, exactly as the former `structTypeRef`/etc. did, via the SAME isTagReference path. The DEFINITION arm (body present) is the paired declarations-row above; the engine routes per-node on the body child's presence (`definesWhenChild`), so a definition is never double-processed as a reference. `nameMatch: lastIdentifier` extracts the tag from [Kw, Identifier].",
+        "rule": "structSpec", "nameMatch": "lastIdentifier", "isTagReference": true },
+      { "rule": "unionSpec", "nameMatch": "lastIdentifier", "isTagReference": true },
+      { "rule": "enumSpec",  "nameMatch": "lastIdentifier", "isTagReference": true }
     ],
     "memberAccesses": [
       { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,
@@ -1165,9 +1198,9 @@
       { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,
         "dereferences": true,  "operatorToken": "ArrowOp" }
     ],
-    "$scopesComment": "FC4 c1: topLevelDecl replaced funcDefTail — a function's params now live INSIDE its declarator's fnSuffix, so the scope that holds them must dominate BOTH the declarator and the block; the topLevelDecl node is that dominator (harmless for variable-kind topLevelDecls — nothing binds into the scope). The three *SpecifierBody rules are fieldChildren composites (typedef-position struct/union/enum bodies).",
+    "$scopesComment": "FC4 c1: topLevelDecl replaced funcDefTail — a function's params now live INSIDE its declarator's fnSuffix, so the scope that holds them must dominate BOTH the declarator and the block; the topLevelDecl node is that dominator (harmless for variable-kind topLevelDecls — nothing binds into the scope). c25: the unified `structSpec`/`unionSpec`/`enumSpec` rules are the fieldChildren composites (they REPLACE the retired *SpecifierBody rules). Each opens a scope ONLY in DEFINITION mode (body present) — Pass 1 gates the pushScope on the `definesWhenChild` body-child presence, so a body-absent tag reference (`struct S v;`) opens no scope. The member-body wrapper rules (structBody/unionBody/enumBody) are deliberately NOT scope rules — their fields bind into the enclosing XxxSpec scope.",
     "scopes": [ "block", "topLevelDecl",
-                "structSpecifierBody", "unionSpecifierBody", "enumSpecifierBody" ],
+                "structSpec", "unionSpec", "enumSpec" ],
     "assignments": [
       { "rule": "binaryExpr", "operatorToken": "AssignOp",       "lhs": 0, "rhs": 2 },
       { "rule": "binaryExpr", "operatorToken": "PlusAssignOp",   "lhs": 0, "rhs": 2 },

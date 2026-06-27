@@ -5620,15 +5620,40 @@ struct Lowerer {
     }
 
     // DFS for the first descendant of `root` whose rule is a composite
-    // (fieldChildren) TYPE declaration — c-subset's structSpecifierBody /
-    // unionSpecifierBody / enumSpecifierBody. Used to recover the type-
-    // declaring node of a no-object top-level declaration (`struct P { … };`),
+    // (fieldChildren) TYPE DEFINITION — c-subset's unified structSpec / unionSpec
+    // / enumSpec (which REPLACED the *SpecifierBody rules). Used to recover the
+    // type-declaring node of a no-object top-level declaration (`struct P { … };`),
     // which — since the bare top-level structDecl/unionDecl/enumDecl rules were
     // folded into topLevelDecl (D-CSUBSET-STRUCT-BODY-VARDECL-POSITION) — now
     // lives inside the head specifier rather than being the top node itself.
     // Agnostic: driven by the `fieldChildren` declarations config, not a rule-
     // name list. First-match returns the OUTERMOST body (a nested inline body
     // sits deeper), which is the one this declaration introduces.
+    //
+    // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a dual-mode specifier
+    // (`definesWhenChild`) carries `fieldChildren` whether or not its body is
+    // present — but a body-ABSENT occurrence (`struct S;` forward-decl /
+    // `struct S v;` head) is a tag REFERENCE, not a definition, so it must NOT be
+    // recovered as the type-declaring node (else `struct S;` would lower to a
+    // TypeDecl instead of keeping its current `S_DeclarationDeclaresNothing` — a
+    // regression of forward-decl behavior). Require the body child present for a
+    // gated row.
+    // c25: is a dual-mode composite specifier a DEFINITION at node `n` (its body
+    // child present)? A non-gated row is always a definition. Mirrors the
+    // analyzer's `isDefinitionAtNode` — the HIR tier keeps its own copy (it has no
+    // access to the analyzer's anonymous-namespace helpers).
+    [[nodiscard]] bool
+    compositeSpecifierIsDefinition(DeclarationRule const& decl, NodeId n) const {
+        if (!decl.definesWhenChildRule.has_value()) return true;
+        for (NodeId c : visible(n)) {
+            if (tree().kind(c) == NodeKind::Internal
+                && tree().rule(c) == *decl.definesWhenChildRule) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     NodeId findCompositeSpecifierIn(NodeId n) {
         // `visible()` yields TOKEN children too, and `tree().rule()` is valid
         // only on Internal nodes. A token is never a composite body and has no
@@ -5640,7 +5665,8 @@ struct Lowerer {
         if (!n.valid() || tree().kind(n) != NodeKind::Internal) return NodeId{};
         auto it = declMap_.find(tree().rule(n).v);
         if (it != declMap_.end()
-            && sem.declarations[it->second].fieldChildren.has_value()) {
+            && sem.declarations[it->second].fieldChildren.has_value()
+            && compositeSpecifierIsDefinition(sem.declarations[it->second], n)) {
             return n;
         }
         for (NodeId c : visible(n)) {

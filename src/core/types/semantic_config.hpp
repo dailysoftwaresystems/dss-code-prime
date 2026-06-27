@@ -502,6 +502,29 @@ struct DSS_EXPORT DeclarationRule {
     // `kind` must be `Type` and the rule must also appear in `scopes`. Generic
     // across record-bearing languages.
     std::optional<FieldChildrenDescriptor> fieldChildren;
+    // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: DUAL-MODE gate. When set, this
+    // declaration row is a DEFINITION site ONLY when the matching node has a
+    // VISIBLE CHILD of this rule; when that child is ABSENT the node is NOT a
+    // definition (it mints nothing, opens no scope, binds no tag) — it is instead
+    // a pure REFERENCE, resolved through a SEPARATE `references[]` row declared on
+    // the SAME grammar rule. This lets ONE grammar rule (C's unified
+    // `struct-or-union-specifier` — c-subset's `structSpec`/`unionSpec`/`enumSpec`,
+    // shaped `Kw {opt tag} {opt body}`) serve BOTH the type-definition form
+    // (`struct P { … }` — a `structBody` child present) and the bare tag-reference
+    // form (`struct P` — absent), so the parser can treat it as the SOLE candidate
+    // for its lead keyword (unique-production direct descent — no body-vs-ref
+    // speculation budget). Generic + agnostic: the engine keys on a CHILD RULE
+    // name (resolved loader-side to this RuleId); no keyword/language is hardcoded.
+    // `nullopt` ⇒ this declaration is ALWAYS a definition (every shipped decl
+    // before c25). The body-present semantics are EXACTLY the row's existing
+    // define path (fieldChildren / scope / tag-bind); the body-absent resolution
+    // is the existing `isTagReference` path on the paired reference row.
+    //
+    // The loader REQUIRES the paired `references[]` row to exist for the SAME rule
+    // when this is set (else a body-absent occurrence would silently resolve to
+    // nothing), and that the named child rule exists.
+    std::optional<RuleId> definesWhenChildRule;
+    std::string           definesWhenChildRuleName;   // source spelling, for diagnostics
     // FC4 c1 (M5): config-driven fail-loud marker gates. At semantic
     // analysis of this declaration (declarator-mode AND legacy rows alike),
     // each entry whose token appears in the decl subtree emits its declared

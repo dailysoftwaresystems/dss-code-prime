@@ -5073,6 +5073,36 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: optional
+                        // `definesWhenChild` — names a CHILD RULE whose PRESENCE
+                        // (as a visible child of the matched node) makes this row
+                        // a DEFINITION; when absent the node is a pure reference
+                        // (resolved by a paired `references[]` row on the same
+                        // rule). Lets ONE grammar rule serve both C's
+                        // type-definition and tag-reference forms. The paired
+                        // reference-row requirement is cross-validated below (after
+                        // references load). Here: the named child rule must exist.
+                        if (entry.contains("definesWhenChild")) {
+                            if (!entry.at("definesWhenChild").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/definesWhenChild",
+                                          "'definesWhenChild' must be a child-rule-name "
+                                          "string");
+                            } else {
+                                auto const cn =
+                                    entry.at("definesWhenChild").get<std::string>();
+                                if (!data.rules->contains(cn)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape,
+                                              path + "/definesWhenChild",
+                                              std::format("'definesWhenChild' references "
+                                                          "unknown shape '{}'", cn));
+                                } else {
+                                    rule.definesWhenChildRule = data.rules->find(cn);
+                                    rule.definesWhenChildRuleName = cn;
+                                }
+                            }
+                        }
+
                         // D8: optional `warnIfUnused` flag (default false).
                         // A non-bool value is the same C_InvalidSemantics
                         // discipline used for other declaration sub-fields.
@@ -5824,6 +5854,32 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                           "not in 'scopes' — fields must bind "
                                           "into the struct's own scope",
                                           d.ruleName));
+                }
+            }
+
+            // ── c25: cross-field validation for `definesWhenChild` ──
+            // A dual-mode declaration (a definition only when its body child is
+            // present) MUST have a paired `references[]` row for the SAME rule —
+            // otherwise a body-ABSENT occurrence (`struct S v;`) would resolve to
+            // nothing, silently. Validate after both declarations and references
+            // have loaded. (The named child rule's existence was checked at parse
+            // time above.)
+            for (std::size_t i = 0; i < cfg.declarations.size(); ++i) {
+                auto const& d = cfg.declarations[i];
+                if (!d.definesWhenChildRule.has_value()) continue;
+                const auto path = std::format("/semantics/declarations/{}", i);
+                bool hasRefRow = false;
+                for (auto const& r : cfg.references) {
+                    if (r.rule.v == d.rule.v) { hasRefRow = true; break; }
+                }
+                if (!hasRefRow) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              path + "/definesWhenChild",
+                              std::format("declaration '{}' is dual-mode "
+                                          "('definesWhenChild') but no 'references' "
+                                          "row exists for the same rule — a "
+                                          "body-absent occurrence would resolve to "
+                                          "nothing", d.ruleName));
                 }
             }
 

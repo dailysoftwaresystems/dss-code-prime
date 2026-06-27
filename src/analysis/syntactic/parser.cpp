@@ -727,17 +727,24 @@ struct Parser::Impl {
     // still Unknown → `sqlite3 *m` mis-triages as a value (a multiply) → P0009.
     // FIX: the instant the body's TAG identifier is consumed (BEFORE the member
     // list), record it as a TYPE so the mid-body lookup sees it. The tag is the
-    // ONLY identifier token that is a DIRECT child of a composite-body frame (the
-    // member-field identifiers are nested in `structField` subframes), so a single
-    // "consumed an identifier directly under a composite-body rule" test fires
-    // exactly once, on the tag. `record(name, /*isType=*/true)` floats it to the
-    // innermost non-dominator scope (the body scope itself — non-dominator since it
-    // is an isType binder), giving body visibility; the close-time record then also
-    // binds it in the enclosing scope (the body-scope binding dies with the body —
-    // a benign duplicate). Anonymous `struct { … }` has no tag identifier ⇒ no-op.
-    // Config-driven: a composite-body rule is a binder row that is BOTH isType AND
-    // a scope rule (structSpecifierBody/unionSpecifierBody/enumSpecifierBody);
-    // nothing here hardcodes a keyword.
+    // ONLY identifier token that is a DIRECT child of the composite-specifier frame
+    // (the member-field identifiers are nested in the `structBody`/`structField`
+    // subframes — c25 added the `structBody` wrapper level, but it is still a
+    // nested frame, so `currentRule()` is no longer the specifier while the body
+    // parses), so a single "consumed an identifier directly under a composite
+    // specifier rule" test fires exactly once, on the tag. `record(name,
+    // /*isType=*/true)` floats it to the innermost non-dominator scope (the spec's
+    // own scope — non-dominator since it is an isType binder), giving body
+    // visibility; the close-time record then also binds it in the enclosing scope
+    // (the inner-scope binding dies with the spec — a benign duplicate). Anonymous
+    // `struct { … }` has no tag identifier ⇒ no-op.
+    // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a composite specifier is now a
+    // binder row that is BOTH isType AND a scope rule — the unified
+    // structSpec/unionSpec/enumSpec (which REPLACED the *SpecifierBody rules).
+    // A body-ABSENT use (`struct S v;` — a tag reference) ALSO trips this and
+    // records its tag as a Type: harmless (the name DOES denote a type) and a
+    // struct-keyword-led form is already unambiguously a declaration, so it
+    // changes no decl-vs-expr triage outcome. Nothing here hardcodes a keyword.
     void recordCompositeTagIfApplicable_(SchemaTokenId consumedKind) {
         if (!sketch.enabled()) return;
         if (consumedKind.v != identifierKind.v) return;

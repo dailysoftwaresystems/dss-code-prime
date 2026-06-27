@@ -3536,3 +3536,233 @@ TEST(SemanticAnalyzerCSubset, MultiMemberDeclaresNothingStillLoud) {
                         DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
         << "`int ;` declares nothing -- must stay loud (anonymous non-bitfield)";
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: dual-mode binder pins.
+//
+// ONE grammar rule (`structSpec`/`unionSpec`/`enumSpec`) is BOTH a type
+// DEFINITION (body present) and a tag REFERENCE (body absent). These pins
+// assert the EXACT outcome of the binder's body-child-presence routing:
+// a definition MINTS the composite type and member access types through it;
+// a reference RESOLVES to the prior definition; an undefined tag fails loud;
+// a redefinition collides; the anonymous-typedef + nested-inline-body forms
+// still type. Each is red-on-disable: break iff the dual-mode mis-routes.
+// ─────────────────────────────────────────────────────────────────────────
+
+// (3a) STRUCT define mints + reference resolves + member access types.
+//   `struct S { int x; };`  — definition: mints a Struct type with one I32 field.
+//   `struct S v; v.x;`      — reference: `v` resolves to the SAME Struct type,
+//                             and `v.x` member access types to I32.
+TEST(SemanticAnalyzerCSubset, C25StructDefineMintsRefResolvesMemberTypes) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; };\n"
+        "int main() { struct S v; int y; y = v.x; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "define + reference + member access must be clean";
+    auto const& ti = model.lattice().interner();
+    // DEFINE: the tag minted a Struct type with one I32 field.
+    TypeId const s = composedAggregate(model, "S");
+    ASSERT_TRUE(s.valid()) << "struct S must mint a composite (definition arm)";
+    ASSERT_EQ(ti.kind(s), TypeKind::Struct);
+    ASSERT_EQ(ti.operands(s).size(), 1u);
+    EXPECT_EQ(ti.kind(ti.operands(s)[0]), TypeKind::I32);
+    // REFERENCE: `v` (declared via the body-ABSENT `struct S`) resolves to S.
+    SymbolRecord const* v = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "v") v = &model.symbols()[i];
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(v->type.valid()) << "`struct S v;` (reference) must resolve the tag";
+    EXPECT_EQ(v->type.v, s.v)
+        << "the reference must resolve to the SAME TypeId the definition minted";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u)
+        << "v.x where v is struct S with field x must NOT fire S_NotAComposite";
+}
+
+// (c25 SQLite-critical) FORWARD reference: a tag REFERENCED before it is DEFINED
+// — the pervasive `typedef struct Foo Foo;` … `struct Foo { … };`-later idiom that
+// every SQLite struct uses. The two-pass analyzer must resolve the forward
+// reference to the LATER definition; the unified `structSpec` reference arm must
+// preserve this EXACTLY as the former `structTypeRef` did. RED-on-disable: if the
+// dual-mode routing broke forward resolution, `v.x` would fail (S_UnknownType /
+// S_NotAComposite) and SQLite would regress FAR before `struct sqlite3`.
+TEST(SemanticAnalyzerCSubset, C25ForwardTypedefThenDefinitionResolves) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef struct Foo Foo;\n"
+        "struct Foo { int x; };\n"
+        "int main() { Foo v; int y; y = v.x; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "forward typedef + later definition + member access must resolve clean";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "the forward reference must resolve to the LATER definition (two-pass)";
+}
+
+// (c25 SQLite-critical) FORWARD pointer field / mutual recursion: a struct field
+// pointing at a not-yet-defined tag (`struct A { struct B *b; }; struct B {…};`).
+// The field's type reference (now a body-absent `structSpec`) must resolve to the
+// later `struct B` — pins that c24's self-/mutually-recursive struct support
+// survives the c25 specifier unification.
+TEST(SemanticAnalyzerCSubset, C25ForwardPointerFieldResolves) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct A { struct B *b; };\n"
+        "struct B { int x; };\n"
+        "int main() { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "a pointer field to a forward-declared tag must resolve to its later definition";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
+}
+
+// (3c) A tag reference to an UNDEFINED struct fails loud — S_UnknownType,
+// the EXACT code the former `structTypeRef` emitted (unchanged). RED-on-disable:
+// if a body-absent `structSpec` wrongly took the inline-type-definition arm
+// (which returns InvalidType silently), this would emit a DIFFERENT code / none.
+TEST(SemanticAnalyzerCSubset, C25UndefinedStructTagFailsLoudUnknownType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { struct Nope v; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "a bare `struct Nope` (undefined tag) must fail loud S_UnknownType";
+}
+
+// (3d) Redefinition of a tag collides — S_RedeclaredSymbol, exactly as today.
+TEST(SemanticAnalyzerCSubset, C25StructTagRedefinitionCollides) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; };\n"
+        "struct S { int y; };\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "two definitions of tag S must collide exactly as before c25";
+}
+
+// (3 forward-decl) A bare `struct S;` (no body, no object) — now grammar-
+// parseable as the unified `structSpec` REFERENCE form — must NOT silently
+// become a type definition. The dual-mode binder routes the body-absent spec to
+// the tag-reference path; the tag `S` is undefined (a real forward-declaration as
+// a DEFINITION is the separate deferred D-CSUBSET-FORWARD-STRUCT-DECLARATION), so
+// it FAILS LOUD with S_UnknownType. RED-on-disable: if a body-absent `structSpec`
+// wrongly took the inline-type-DEFINITION arm (minting a phantom type), no
+// S_UnknownType would fire and the bare decl would be silently accepted.
+TEST(SemanticAnalyzerCSubset, C25BareStructForwardDeclFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_TRUE(model.hasErrors())
+        << "`struct S;` (no body, no object) must fail loud, never silently mint";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "the body-absent `struct S` resolves as a reference to an UNDEFINED tag";
+}
+
+// (3b) Anonymous typedef struct: `typedef struct { int x; } T; T v; v.x;` —
+// the anonymous definition mints a Struct (via anonymousNameAllowed), the alias
+// resolves, and member access types. RED-on-disable: the anonymous mint relies
+// on the body child being present at the definition node.
+TEST(SemanticAnalyzerCSubset, C25AnonymousTypedefStructDefinesAndResolves) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef struct { int x; } T;\n"
+        "int main() { T v; int y; y = v.x; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "anonymous typedef struct define + alias use + member access clean";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
+}
+
+// (3e) Nested inline-body field: `struct Outer { struct Inner { int x; } in; };`
+// — the inner body is itself a definition (a structSpec WITH a structBody, nested
+// as a field). Both compose. RED-on-disable: the recursive define path depends on
+// the nested specifier being routed as a definition by its own body child.
+TEST(SemanticAnalyzerCSubset, C25NestedInlineBodyFieldComposes) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct Outer { struct Inner { int x; } in; };\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const inner = composedAggregate(model, "Inner");
+    TypeId const outer = composedAggregate(model, "Outer");
+    ASSERT_TRUE(inner.valid()) << "nested struct Inner must compose";
+    ASSERT_TRUE(outer.valid()) << "struct Outer must compose";
+    ASSERT_EQ(ti.operands(outer).size(), 1u) << "Outer has one member (in)";
+    EXPECT_EQ(ti.operands(outer)[0].v, inner.v)
+        << "Outer's member `in` must be the inner Struct type";
+}
+
+// (3f-union) UNION define/reference parity with struct.
+TEST(SemanticAnalyzerCSubset, C25UnionDefineMintsRefResolves) {
+    auto cu = buildShippedUnit("c-subset", {
+        "union U { int i; long l; };\n"
+        "int main() { union U u; int y; y = u.i; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const un = composedAggregate(model, "U");
+    ASSERT_TRUE(un.valid());
+    EXPECT_EQ(ti.kind(un), TypeKind::Union);
+    EXPECT_EQ(ti.operands(un).size(), 2u);
+    SymbolRecord const* u = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "u") u = &model.symbols()[i];
+    ASSERT_NE(u, nullptr);
+    ASSERT_TRUE(u->type.valid());
+    EXPECT_EQ(u->type.v, un.v) << "`union U u;` resolves to the minted union type";
+}
+
+TEST(SemanticAnalyzerCSubset, C25UndefinedUnionTagFailsLoudUnknownType) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() { union Nope u; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "a bare `union Nope` (undefined tag) must fail loud S_UnknownType";
+}
+
+// (3f-enum) ENUM define/reference parity. The enum DEFINITION mints the type
+// and (liftToEnclosingScope) publishes its enumerators; a bare `enum E` reference
+// resolves to the same type. RED-on-disable: enumerator visibility + the
+// reference-resolves leg both depend on the dual-mode routing.
+TEST(SemanticAnalyzerCSubset, C25EnumDefineMintsEnumeratorsVisibleRefResolves) {
+    auto cu = buildShippedUnit("c-subset", {
+        "enum E { A, B, C };\n"
+        "int main() { enum E e; int y; y = B; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "enum define + enumerator use (B) + bare `enum E` ref must be clean";
+    // The enumerator `B` resolved (lifted to enclosing scope) — no undeclared id.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "enumerator B must resolve (liftToEnclosingScope) — no undeclared id";
+    // The reference `enum E e;` resolved its tag — symbol `e` is typed.
+    SymbolRecord const* e = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "e") e = &model.symbols()[i];
+    ASSERT_NE(e, nullptr);
+    EXPECT_TRUE(e->type.valid())
+        << "`enum E e;` (reference) must resolve the enum tag to a type";
+}
+
+TEST(SemanticAnalyzerCSubset, C25UndefinedEnumTagFailsLoudUnknownType) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() { enum Nope e; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "a bare `enum Nope` (undefined tag) must fail loud S_UnknownType";
+}
