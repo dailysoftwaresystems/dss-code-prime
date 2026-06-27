@@ -281,8 +281,23 @@ function parseRegistry() {
   return { total, closed };
 }
 
-function parseCtestLog() {
-  const p = join(repoRoot, 'build', 'Testing', 'Temporary', 'LastTest.log');
+// The ctest axes MUST target the SAME build dir the chosen CLI came from —
+// NOT a hardcoded `build/`. The repo can carry several build dirs (the MSVC
+// `build/` is often a STALE/broken config that can't compile current src,
+// while the live work happens in a Ninja `build-dbg/`). Deriving the build
+// root from `cli` keeps the test count honest: the CLI lives at
+// `<buildRoot>/bin/dss/[Debug|Release/]dss-code-prime[.exe]`, so the build
+// root is the path component just above `bin/dss`, and a `Debug`/`Release`
+// segment after it (if present) means a multi-config generator needing `-C`.
+function buildInfoOf(cliPath) {
+  const norm = cliPath.replace(/\\/g, '/');
+  const m = norm.match(/^(.*)\/bin\/dss(?:\/(Debug|Release))?\/[^/]+$/);
+  if (!m) return { root: join(repoRoot, 'build'), config: 'Debug' }; // fallback
+  return { root: m[1], config: m[2] ?? null };
+}
+
+function parseCtestLog(buildRoot) {
+  const p = join(buildRoot, 'Testing', 'Temporary', 'LastTest.log');
   if (!existsSync(p)) return null;
   const txt = readFileSync(p, 'utf8');
   const passed = (txt.match(/^Test Passed\.\r?$/gm) ?? []).length;
@@ -290,9 +305,10 @@ function parseCtestLog() {
   return { passed, failed, asOf: statSync(p).mtime.toISOString().slice(0, 16).replace('T', ' ') };
 }
 
-async function runCtestLive() {
-  console.error('running full ctest suite (this takes a few minutes)…');
-  const r = await run('ctest', ['--test-dir', join(repoRoot, 'build'), '-C', 'Debug', '-j', String(os.availableParallelism?.() ?? 8)], { timeoutMs: 2400000 });
+async function runCtestLive(buildRoot, config) {
+  console.error(`running full ctest suite in ${buildRoot} (this takes a few minutes)…`);
+  const cArgs = config ? ['-C', config] : []; // single-config (Ninja) takes no -C
+  const r = await run('ctest', ['--test-dir', buildRoot, ...cArgs, '-j', String(os.availableParallelism?.() ?? 8)], { timeoutMs: 2400000 });
   const m = (r.out + r.err).match(/(\d+)% tests passed, (\d+) tests failed out of (\d+)/);
   if (!m) return { passed: 0, failed: -1, asOf: 'live run — SUMMARY PARSE FAILED (see ctest output)' };
   const total = Number(m[3]), failed = Number(m[2]);
@@ -363,7 +379,8 @@ const batterySecs = Math.round((Date.now() - t0) / 1000);
 
 const plan = parsePlan23();
 const registry = parseRegistry();
-const ctest = flag('--ctest') ? await runCtestLive() : parseCtestLog();
+const { root: buildRoot, config: buildConfig } = buildInfoOf(cli);
+const ctest = flag('--ctest') ? await runCtestLive(buildRoot, buildConfig) : parseCtestLog(buildRoot);
 const vel = gitVelocity();
 
 if (!flag('--keep')) { try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {} }

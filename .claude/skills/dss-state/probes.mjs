@@ -731,6 +731,24 @@ int main() {
     return v.tag + v.u.i;
 }
 ` },
+  // Self-referential struct (a struct with a pointer to its own type) —
+  // sqlite3.c: `struct sqlite3 { sqlite3 *pBlockingConnection; ... };` and
+  // every linked-list/tree node. Closed by c24 (nominal composite typing,
+  // D-CSUBSET-SELF-REFERENTIAL-STRUCT); this probe captures that win so the
+  // battery stops being blind to it.
+  { id: 'agg_self_referential_struct', cat: 'aggregates', expect: 42, src:
+`struct Node { int v; struct Node* next; };
+
+int main() {
+    struct Node b;
+    struct Node a;
+    b.v = 2;
+    b.next = 0;
+    a.v = 40;
+    a.next = &b;
+    return a.v + a.next->v;
+}
+` },
   // TRULY ANONYMOUS (unnamed) union member — C11 6.7.2.1p13, accessed as if
   // its fields belong to the enclosing struct (`v.i`, not `v.u.i`). This is
   // the FC16 anonymous-member feature and the prime suspect for the
