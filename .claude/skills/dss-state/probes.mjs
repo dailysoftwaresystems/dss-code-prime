@@ -700,6 +700,51 @@ int main() {
     return s.x + s.y;
 }
 ` },
+  // Bitfield with a TYPEDEF base type (sqlite3.c: `typedef unsigned int bft;`
+  // then `bft disableTriggers:1;` in struct Parse). Distinct from agg_bitfield
+  // (plain `unsigned`), which already passes — this isolates whether the
+  // amalgamation's 20999+ cascade is a real typedef-base-bitfield gap or just
+  // downstream of the 18907 struct-close desync.
+  { id: 'agg_bitfield_typedef', cat: 'aggregates', expect: 42, src:
+`typedef unsigned int bft;
+
+struct Flags { bft a : 4; bft b : 28; };
+
+int main() {
+    struct Flags f;
+    f.a = 10;
+    f.b = 32;
+    return f.a + f.b;
+}
+` },
+  // Anonymous/nested union member inside a struct (the sqlite3.c:18907 `};`
+  // root signature — a struct whose `};` is orphaned because a nested
+  // aggregate member consumed the closing brace). Anonymous members are an
+  // FC16 item; this pins whether the desync reproduces in the small.
+  { id: 'agg_nested_union_member', cat: 'aggregates', expect: 42, src:
+`struct V { int tag; union { int i; char c; } u; };
+
+int main() {
+    struct V v;
+    v.tag = 10;
+    v.u.i = 32;
+    return v.tag + v.u.i;
+}
+` },
+  // TRULY ANONYMOUS (unnamed) union member — C11 6.7.2.1p13, accessed as if
+  // its fields belong to the enclosing struct (`v.i`, not `v.u.i`). This is
+  // the FC16 anonymous-member feature and the prime suspect for the
+  // sqlite3.c:18907 `};` brace-desync root (named nested members already pass).
+  { id: 'agg_anon_union_member', cat: 'aggregates', expect: 42, src:
+`struct V { int tag; union { int i; char c; }; };
+
+int main() {
+    struct V v;
+    v.tag = 10;
+    v.i = 32;
+    return v.tag + v.i;
+}
+` },
 
   // ─────────────────────── declarations ───────────────────────
   { id: 'decl_init_at_decl', cat: 'declarations', expect: 42, src:
