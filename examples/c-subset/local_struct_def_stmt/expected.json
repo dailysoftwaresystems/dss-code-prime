@@ -1,0 +1,16 @@
+{
+  "$comment": "c28 D-CSUBSET-LOCAL-TYPE-DEFINITION: a BLOCK-SCOPED struct DEFINITION with NO declarator as a STATEMENT inside build() (the sqlite3.c:68508 walMergesort shape). `struct Sublist { int nList; int aList; };` defines in the block scope; `struct Sublist v;` resolves it; 30+12=42 across a non-inlined call. A file-scope `struct Sublist { int nList; }` (1 field) stays DISTINCT (decl-site identity) — a name-only merge would read .aList past the size-4 type and derail 42. Revert the optional init-declarator-list and it is a parse error (P0009). Release pipeline + all 4 targets.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

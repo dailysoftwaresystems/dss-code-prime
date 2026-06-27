@@ -3881,3 +3881,215 @@ TEST(SemanticAnalyzerCSubset, C25UndefinedEnumTagFailsLoudUnknownType) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
         << "a bare `enum Nope` (undefined tag) must fail loud S_UnknownType";
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// c28 D-CSUBSET-LOCAL-TYPE-DEFINITION: a BLOCK-SCOPED struct/union/enum
+// DEFINITION with NO declarator (`struct S { int a; };` as a STATEMENT inside
+// a function — sqlite3.c:68508 walMergesort). The varDecl init-declarator-list
+// became OPTIONAL (mirroring topLevelDecl), so the unified c25 structSpec
+// defines the type in the ENCLOSING BLOCK scope; a later `struct S v;` resolves
+// it. These pins assert the NODE SHAPE (a `varDecl` holding a `structSpec` with
+// a `structBody` child and NO initDeclaratorList), the RESOLVED type of the
+// defining tag + the later reference, the union/enum twins, BLOCK-SCOPING
+// non-leak (the c27 lesson — a same-name outer tag stays distinct), and that a
+// NON-defining no-declarator (`int;`) is NOT silently accepted at the semantic
+// tier (it parses + types clean; the loud declares-nothing is HIR-tier, pinned
+// in the HIR suite). Each is red-on-disable.
+// ─────────────────────────────────────────────────────────────────────────
+
+// (c28a) NODE SHAPE + RESOLVED TYPE: a local `struct S { int a; int b; };`
+// parses to a `varDecl` whose head holds a defining `structSpec` (a `structBody`
+// child present) and which carries NO `initDeclaratorList`; the tag mints a
+// 2-field Struct; the later `struct S v;` resolves `v` to the SAME TypeId and
+// `v.a` types I32 (no S_NotAComposite / S_UnknownType). RED-ON-DISABLE: revert
+// the optional-list grammar tweak → the bare local `struct S { … };` is a parse
+// error (P0009), so this never reaches the semantic assertions.
+TEST(SemanticAnalyzerCSubset, C28LocalStructDefineNodeShapeAndType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ struct S { int a; int b; }; struct S v; int y; "
+        "y = v.a; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "a block-scoped struct definition + later ref + member access must be clean";
+    auto const& ti = model.lattice().interner();
+    // NODE SHAPE: locate a `varDecl` that contains a `structSpec` with a
+    // `structBody` descendant and has NO `initDeclaratorList` descendant.
+    Tree const& tree = cu->trees()[0];
+    RuleId const varDeclRule  = tree.schema().rules().find("varDecl");
+    RuleId const structSpec   = tree.schema().rules().find("structSpec");
+    RuleId const structBody   = tree.schema().rules().find("structBody");
+    RuleId const initDeclList = tree.schema().rules().find("initDeclaratorList");
+    ASSERT_TRUE(varDeclRule.valid() && structSpec.valid()
+                && structBody.valid() && initDeclList.valid());
+    bool foundDefiningNoDeclaratorVarDecl = false;
+    walkPreOrder(tree, [&](TreeCursor const& cursor) {
+        NodeId const n = cursor.current();
+        if (tree.kind(n) != NodeKind::Internal || tree.rule(n).v != varDeclRule.v)
+            return;
+        bool hasStructSpec = false, hasStructBody = false, hasInitList = false;
+        walkPreOrder(tree, n, [&](TreeCursor const& inner) {
+            NodeId const m = inner.current();
+            if (tree.kind(m) != NodeKind::Internal) return;
+            if (tree.rule(m).v == structSpec.v)   hasStructSpec = true;
+            if (tree.rule(m).v == structBody.v)   hasStructBody = true;
+            if (tree.rule(m).v == initDeclList.v) hasInitList   = true;
+        });
+        if (hasStructSpec && hasStructBody && !hasInitList)
+            foundDefiningNoDeclaratorVarDecl = true;
+    });
+    EXPECT_TRUE(foundDefiningNoDeclaratorVarDecl)
+        << "the bare local `struct S { … };` must be a varDecl with a defining "
+           "structSpec (structBody present) and NO initDeclaratorList";
+    // RESOLVED TYPE: the tag minted a 2-field Struct.
+    TypeId const s = composedAggregate(model, "S");
+    ASSERT_TRUE(s.valid()) << "the block-scoped struct S must mint a composite";
+    ASSERT_EQ(ti.kind(s), TypeKind::Struct);
+    ASSERT_EQ(ti.operands(s).size(), 2u);
+    EXPECT_EQ(ti.kind(ti.operands(s)[0]), TypeKind::I32);
+    EXPECT_EQ(ti.kind(ti.operands(s)[1]), TypeKind::I32);
+    // The later `struct S v;` resolved `v` to the SAME TypeId.
+    SymbolRecord const* v = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "v") v = &model.symbols()[i];
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(v->type.valid());
+    EXPECT_EQ(v->type.v, s.v)
+        << "the in-block reference must resolve to the TypeId the local define minted";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
+}
+
+// (c28b) UNION + ENUM local definitions: the same no-declarator path covers all
+// three composite kinds (the unified c25 specifiers). RED-ON-DISABLE: the
+// optional-list tweak is shared, but the union/enum bodies exercise the
+// unionSpec/enumSpec define arms in block scope.
+TEST(SemanticAnalyzerCSubset, C28LocalUnionAndEnumDefine) {
+    auto cuU = buildShippedUnit("c-subset", {
+        "int main(void){ union U { int a; int b; }; union U v; int y; "
+        "y = v.a; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cuU);
+    auto mU = analyze(cuU);
+    EXPECT_FALSE(mU.hasErrors()) << "a block-scoped union definition + ref must be clean";
+    TypeId const u = composedAggregate(mU, "U");
+    ASSERT_TRUE(u.valid());
+    EXPECT_EQ(mU.lattice().interner().kind(u), TypeKind::Union);
+
+    auto cuE = buildShippedUnit("c-subset", {
+        "int main(void){ enum E { A, B, C }; enum E e; int y; "
+        "y = B; e = A; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cuE);
+    auto mE = analyze(cuE);
+    EXPECT_FALSE(mE.hasErrors()) << "a block-scoped enum definition + ref must be clean";
+    EXPECT_EQ(countCode(mE.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "the block-scoped enumerator B must resolve (liftToEnclosingScope)";
+    SymbolRecord const* e = nullptr;
+    for (std::size_t i = 1; i < mE.symbols().size(); ++i)
+        if (mE.symbols()[i].name == "e") e = &mE.symbols()[i];
+    ASSERT_NE(e, nullptr);
+    EXPECT_TRUE(e->type.valid());
+}
+
+// (c28c) ★ BLOCK-SCOPING NON-LEAK (the c27 lesson): a local `struct S {int a;}`
+// minted in an INNER block must NOT be visible to a SIBLING/outer scope. The
+// outer `struct S w;` (after the inner block closed) sees no S → S_UnknownType.
+// RED-ON-DISABLE: if the tag leaked to the function/module scope, the outer ref
+// would resolve and the diagnostic would vanish — a silent scope-leak miscompile.
+TEST(SemanticAnalyzerCSubset, C28LocalStructDoesNotLeakToOuterScope) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ { struct S { int a; }; } struct S w; w.a = 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_TRUE(model.hasErrors())
+        << "the outer `struct S w;` must fail — S is block-local to the inner {}";
+    EXPECT_GT(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "an inner-block struct S must NOT leak to the enclosing scope";
+}
+
+// (c28d) NOMINAL distinctness (c24 decl-site identity) across scopes: an OUTER
+// `struct S {int a;}` and an INNER same-name `struct S {long b; long c;}` with a
+// DIFFERENT layout are DISTINCT types — the inner shadows in its block, the outer
+// is unaffected. Asserts two distinct composites both compose (the inner does not
+// silently alias / redefine the outer). RED-ON-DISABLE: a leak/alias would make
+// one definition collide (S_RedeclaredSymbol) or share a TypeId.
+TEST(SemanticAnalyzerCSubset, C28InnerStructShadowsOuterDistinctType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int a; };\n"
+        "int main(void){ struct S { long b; long c; }; struct S v; "
+        "(void)v; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "an inner same-name struct must shadow (not collide with) the outer";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "a block-scoped redefinition is a SHADOW, not a redeclaration collision";
+    auto const& ti = model.lattice().interner();
+    // Collect every composite named S; the outer (1 I32 field) and inner (2 I64
+    // fields) must BOTH exist as DISTINCT TypeIds.
+    TypeId outerS{}, innerS{};
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        SymbolRecord const& r = model.symbols()[i];
+        if (r.name != "S" || !r.type.valid()) continue;
+        if (ti.kind(r.type) != TypeKind::Struct) continue;
+        if (ti.operands(r.type).size() == 1) outerS = r.type;
+        if (ti.operands(r.type).size() == 2) innerS = r.type;
+    }
+    ASSERT_TRUE(outerS.valid()) << "the outer 1-field struct S must compose";
+    ASSERT_TRUE(innerS.valid()) << "the inner 2-field struct S must compose";
+    EXPECT_NE(outerS.v, innerS.v)
+        << "the inner and outer struct S are nominally DISTINCT (c24 decl-site identity)";
+}
+
+// (c28e) The NON-defining no-declarator local (`int;`) parses + types CLEAN at
+// the semantic tier (the per-declarator declares-nothing arm never fires — the
+// list is empty). The loud declares-nothing is HIR-tier (mirroring the top-level
+// `int ;`), pinned in the HIR suite. RED-ON-DISABLE: if the semantic tier started
+// rejecting it, this flips. (Pairs with HirLoweringCSubset.LocalDeclaresNothing*.)
+TEST(SemanticAnalyzerCSubset, C28LocalIntSemicolonSemanticallyClean) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void){ int; return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "`int;` is semantically clean — the declares-nothing is owned by HIR";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeclarationDeclaresNothing), 0u);
+}
+
+// (c28f) A local ABSTRACT declarator (`int *;` — list NON-empty but unnamed) is
+// rejected by the SEMANTIC tier's requireNamedDeclarators arm — EXACTLY ONE
+// S_DeclarationDeclaresNothing, NOT double-reported by the new HIR guard (which
+// fires only for an EMPTY list). RED-ON-DISABLE: if the HIR guard fired on a
+// non-empty list, the HIR suite's companion would see a second diagnostic.
+TEST(SemanticAnalyzerCSubset, C28LocalAbstractDeclaratorSingleDiagnostic) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void){ int *; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
+        << "`int *;` (abstract declarator) is rejected ONCE at the semantic tier";
+}
+
+// (c28g) REGRESSION: making the list optional must NOT break the ordinary local
+// declaration forms (declarator present). `int x;` / `int x, y;` / `static int x;`
+// / `struct S { … } v;` still mint their symbols and stay clean.
+TEST(SemanticAnalyzerCSubset, C28OrdinaryLocalDeclsUnaffected) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void){ int x; int p, q; static int s; "
+        "struct S { int a; } v; x = 1; p = 2; q = 3; s = 4; v.a = 5; "
+        "return x + p + q + s + v.a; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "ordinary local declarations must be unaffected by the optional list";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeclarationDeclaresNothing), 0u);
+    for (char const* want : {"x", "p", "q", "s", "v"}) {
+        bool found = false;
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == want) found = true;
+        EXPECT_TRUE(found) << "local symbol `" << want << "` must be minted";
+    }
+}

@@ -706,10 +706,11 @@
     },
 
     "varDecl": {
-      "$comment": "The COMMITTED local declaration statement — its FIRST set has NO Identifier (the bare-typedef-name form lives in declOrExprStmt). Branch 1: storage-class-specifier-led (`register T x;` — the specifier commits the decl, so the head admits the typedef-name arm); branch 2: qualifier-or-keyword-led (`const T x;` / `int x;`). Inline branches keep the children flat: [localDeclSpecifiers?, head, initDeclaratorList, ;] — the row's specifierPrefix strip makes head=0/list=1 stable.",
+      "$comment": "The COMMITTED local declaration statement — its FIRST set has NO Identifier (the bare-typedef-name form lives in declOrExprStmt). Branch 1: storage-class-specifier-led (`register T x;` — the specifier commits the decl, so the head admits the typedef-name arm); branch 2: qualifier-or-keyword-led (`const T x;` / `int x;`). Inline branches keep the children flat: [localDeclSpecifiers?, head, initDeclaratorList?, ;] — the row's specifierPrefix strip makes head=0/list=1 stable.",
+      "$c28Comment": "c28 D-CSUBSET-LOCAL-TYPE-DEFINITION: the `initDeclaratorList` is OPTIONAL — mirroring the top-level `topLevelDecl` (init-declarator-list?). A bare BLOCK-SCOPED struct/union/enum DEFINITION with no declarator (`struct Sublist { int nList; ht_slot *aList; };` as a STATEMENT inside a function — sqlite3.c:68508 walMergesort) routes through the kwDeclHead branch (Struct/Union/EnumKeyword-led → the unified c25 structSpec/unionSpec/enumSpec defines the type via `definesWhenChild`, minting the tag into the ENCLOSING BLOCK scope), takes NO declarator, and ends at EndStatement. A NON-defining no-declarator local (`int;`) parses + types but FAILS LOUD at HIR lowering (S_DeclarationDeclaresNothing) — the SAME tier + diagnostic as the top-level no-declarator path (CST→HIR's lowerVarLikeInto: no named declarator AND no composite specifier in the head ⇒ declares nothing). identVarDecl's list is deliberately NOT made optional (a bare typedef-name `T;` must stay an expression statement, NOT a no-declarator decl); only the keyword/specifier-led varDecl needs it (the struct/union/enum definition is keyword-led).",
       "alt": [
-        { "sequence": [ "localDeclSpecifiers", "declHead", "initDeclaratorList", "EndStatement" ] },
-        { "sequence": [ "kwDeclHead", "initDeclaratorList", "EndStatement" ] }
+        { "sequence": [ "localDeclSpecifiers", "declHead", { "optional": "initDeclaratorList" }, "EndStatement" ] },
+        { "sequence": [ "kwDeclHead", { "optional": "initDeclaratorList" }, "EndStatement" ] }
       ]
     },
 

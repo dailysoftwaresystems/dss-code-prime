@@ -5497,6 +5497,31 @@ struct Lowerer {
             emitAbstractSlot();
             return;
         }
+        // c28 D-CSUBSET-LOCAL-TYPE-DEFINITION: a LIST-mode local declaration
+        // whose init-declarator-list is ABSENT (`struct S { … };` /  `int;` as a
+        // STATEMENT inside a block — now grammar-parseable since varDecl's list
+        // became optional, mirroring topLevelDecl). This is the LOCAL twin of the
+        // no-object branch in lowerTopLevelInto: a head that DEFINES a composite
+        // type (`struct S { … };`) already minted + interned that type at the
+        // SEMANTIC tier (the unified c25 structSpec/unionSpec/enumSpec define
+        // path, binding the tag into the ENCLOSING BLOCK scope) — so it needs NO
+        // runtime HIR node here (a later `struct S v;` resolves through the
+        // already-interned type; a TypeDecl, as the top level emits, would be
+        // redundant in a body and carries no MIR effect). A head that introduces
+        // NO composite (`int;`) declares nothing (C 6.7p2) — fail loud with the
+        // SAME diagnostic + tier as the top-level path. Gated on
+        // requireNamedDeclarators (the named-position contract — locals/globals/
+        // typedefs) AND an EMPTY list: an ABSTRACT declarator (`int *;`, list
+        // non-empty) is already rejected loud by the semantic analyzer's
+        // requireNamedDeclarators arm, so it must NOT re-report here.
+        if (!singleMode && declarators.empty() && decl->requireNamedDeclarators) {
+            NodeId const spec = findCompositeSpecifierIn(node);
+            if (!spec.valid()) {
+                emitH(DiagnosticCode::S_DeclarationDeclaresNothing, node,
+                      std::string{tree().text(node)});
+            }
+            return;
+        }
         for (NodeId d : declarators) {
             NodeId const nameNode = declaratorNameNode(tree(), d, dc);
             if (!nameNode.valid()) {

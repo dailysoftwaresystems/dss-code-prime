@@ -3689,3 +3689,69 @@ TEST(HirLoweringCSubset, NonLvalueIncDecFailsLoud) {
         EXPECT_EQ(countCode(r, DiagnosticCode::S_IncDecNeedsModifiableLvalue), 1u) << src;
     }
 }
+
+// c28 D-CSUBSET-LOCAL-TYPE-DEFINITION: a BLOCK-SCOPED struct/union/enum
+// DEFINITION with NO declarator (`struct S { … };` as a statement — sqlite3.c:
+// 68508 walMergesort) lowers CLEANLY: the type is minted + interned at the
+// SEMANTIC tier (the unified c25 define path), so the no-declarator statement
+// needs no runtime HIR node, and a later `struct S v; v.a` resolves through the
+// interned type. RED-on-disable: revert the optional-list grammar tweak → P0009
+// at parse (the front-end gate in analyzeCSubset fails first).
+TEST(HirLoweringCSubset, LocalStructDefinitionLowersClean) {
+    SemanticModel model = analyzeCSubset(
+        "int main(void){ struct S { int a; int b; }; struct S v; v.a = 1; "
+        "return v.a; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 0u)
+        << "a block-scoped struct DEFINITION declares a type — must NOT fail loud";
+}
+
+// c28: a local define+declare (`struct S { … } v;`) still lowers cleanly (the
+// declarator IS present — the ordinary path), and a local REFERENCE to an
+// outer-defined tag (`struct S v;`) resolves. RED-on-disable: if the optional
+// list mis-routed the declarator-present form, these regress.
+TEST(HirLoweringCSubset, LocalStructDefineAndDeclareAndRefLowerClean) {
+    SemanticModel m1 = analyzeCSubset(
+        "int main(void){ struct S { int a; } v; v.a = 7; return v.a; }\n");
+    ASSERT_FALSE(m1.hasErrors())
+        << (m1.diagnostics().all().empty() ? std::string{}
+            : m1.diagnostics().all()[0].actual);
+    DiagnosticReporter r1;
+    auto res1 = lowerToHir(m1, r1);
+    EXPECT_TRUE(res1->ok) << (r1.all().empty() ? "" : r1.all()[0].actual);
+
+    SemanticModel m2 = analyzeCSubset(
+        "struct S { int a; };\n"
+        "int main(void){ struct S v; v.a = 3; return v.a; }\n");
+    ASSERT_FALSE(m2.hasErrors())
+        << (m2.diagnostics().all().empty() ? std::string{}
+            : m2.diagnostics().all()[0].actual);
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(m2, r2);
+    EXPECT_TRUE(res2->ok) << (r2.all().empty() ? "" : r2.all()[0].actual);
+}
+
+// c28: a NON-defining no-declarator LOCAL (`int;`) declares nothing (C 6.7p2).
+// Mirroring the top-level `int ;` (TopLevelDeclaresNothingFailsLoudNoCrash), the
+// front end (parse + semantic) ACCEPTS it, and the HIR lowering FAILS LOUD with
+// S_DeclarationDeclaresNothing — the local twin of the top-level no-object path
+// (lowerVarLikeInto: an empty list-mode declarator carrier with NO composite
+// specifier in the head). Must NOT crash and must NOT silently accept.
+// RED-on-disable: drop the lowerVarLikeInto declares-nothing guard → res->ok
+// stays true and the count is 0 (a silent accept).
+TEST(HirLoweringCSubset, LocalDeclaresNothingFailsLoud) {
+    SemanticModel model = analyzeCSubset("int main(void){ int; return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "parse + semantic accept `int;` — the constraint is HIR-tier";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "`int;` (no declarator, no tag) declares nothing — lowering must fail loud";
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
+        << "exactly one S_DeclarationDeclaresNothing for the empty local `int;`";
+}
