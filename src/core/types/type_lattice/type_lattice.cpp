@@ -184,6 +184,37 @@ TypeId TypeInterner::optional(TypeId inner) {
     return internContent(TypeKind::Optional, {}, ops, {}, {});
 }
 
+// ── volatile qualifier (D-CSUBSET-VOLATILE-POINTEE / c27) ──
+
+TypeId TypeInterner::volatileQualified(TypeId inner) {
+    if (!inner.valid()) return InvalidType;
+    // Idempotent: a VolatileQual over a VolatileQual is the same VolatileQual.
+    // Read the RAW record kind (not the transparent `kind()`, which would see
+    // through and re-wrap). `volatile (volatile T)` ≡ `volatile T` (C 6.7.3p5).
+    if (arena_.at(inner).kind == TypeKind::VolatileQual) return inner;
+    std::array<TypeId, 1> const ops{inner};
+    return internContent(TypeKind::VolatileQual, {}, ops, {}, {});
+}
+
+TypeId TypeInterner::materialId_(TypeId id) const {
+    // Strip VolatileQual skins to the material type. Idempotency keeps the chain
+    // at one level, but loop defensively (cost: a handful of valid ids never
+    // exceed depth 1). Reads `arena_` directly so `kind()`/`operands()` can call
+    // this without recursing back into themselves.
+    while (id.valid() && arena_.at(id).kind == TypeKind::VolatileQual) {
+        id = operandPool_[arena_.at(id).operandStart];
+    }
+    return id;
+}
+
+TypeId TypeInterner::stripVolatile(TypeId id) const {
+    return materialId_(id);
+}
+
+bool TypeInterner::isVolatileQualified(TypeId id) const {
+    return id.valid() && arena_.at(id).kind == TypeKind::VolatileQual;
+}
+
 TypeId TypeInterner::array(TypeId element, std::int64_t length) {
     std::array<TypeId, 1> const ops{element};
     std::array<std::int64_t, 1> const sc{length};
@@ -200,6 +231,10 @@ TypeId TypeInterner::incompleteArray(TypeId element) {
 }
 
 bool TypeInterner::isIncompleteArray(TypeId id) const {
+    // c27: a `volatile T[]` is still an incomplete array — strip the skin first
+    // so the raw-kind check sees Array (the public `kind()` is transparent, but
+    // this reads `arena_` directly).
+    id = materialId_(id);
     if (arena_.at(id).kind != TypeKind::Array) return false;
     auto const sc = scalars(id);
     return !sc.empty() && sc[0] == kIncompleteArrayLength;
@@ -336,6 +371,9 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
 }
 
 bool TypeInterner::isIncompleteComposite(TypeId id) const {
+    // c27: a `volatile struct S` is incomplete iff S is — strip the skin so the
+    // raw-kind check + side-table key see the material composite.
+    id = materialId_(id);
     TypeKind const k = arena_.at(id).kind;
     if (k != TypeKind::Struct && k != TypeKind::Union) return false;
     auto it = compositeFields_.find(id.v);
@@ -431,8 +469,22 @@ TypeId TypeInterner::extension(TypeKindId kind, std::string_view name,
 
 // ── TypeInterner: accessors ───────────────────────────────────────────────
 
+TypeKind TypeInterner::kind(TypeId id) const {
+    // c27 VolatileQual transparency: report the MATERIAL kind so every structural
+    // consumer (layout/arith/codegen/classification — ~128 sites) dispatches on
+    // the underlying kind WITHOUT a per-site strip. The wrapper is observable only
+    // via `isVolatileQualified` / `get()`. A non-VolatileQual id is unaffected.
+    return arena_.at(materialId_(id)).kind;
+}
+
 GuardedSpan<TypeId> TypeInterner::operands(TypeId id) const {
-    TypeRecord const& record = arena_.at(id);
+    // c27: see through a VolatileQual skin to the material type's operands — a
+    // `volatile T`'s "children" ARE T's children (e.g. layout of a
+    // VolatileQual(Ptr<X>) reads [X] exactly like Ptr<X>). Resolve the material id
+    // ONCE and use it for BOTH the record read AND the composite side-table key
+    // (so `volatile struct S` redirects to S's fields). Idempotency-safe.
+    TypeId const mid = materialId_(id);
+    TypeRecord const& record = arena_.at(mid);
     // D-CSUBSET-SELF-REFERENTIAL-STRUCT: a nominal composite stores its fields in
     // the side-table, not the operand pool — redirect transparently so every
     // existing composite-operand consumer (layout/ABI/HIR-verifier/brace-init/
@@ -440,7 +492,7 @@ GuardedSpan<TypeId> TypeInterner::operands(TypeId id) const {
     // `fields` vector is pointer-stable; the GuardedSpan still rides `poolGen_`
     // (bumped on completion) so a span held across a later mutation aborts as usual.
     if (record.kind == TypeKind::Struct || record.kind == TypeKind::Union) {
-        auto it = compositeFields_.find(id.v);
+        auto it = compositeFields_.find(mid.v);
         if (it != compositeFields_.end()) {
             return guard_<TypeId>({it->second.fields.data(), it->second.fields.size()});
         }
@@ -449,12 +501,15 @@ GuardedSpan<TypeId> TypeInterner::operands(TypeId id) const {
 }
 
 GuardedSpan<std::int64_t> TypeInterner::scalars(TypeId id) const {
-    TypeRecord const& record = arena_.at(id);
+    // c27: transparent over VolatileQual (see `operands`). Material id once, used
+    // for both the record and the composite side-table key.
+    TypeId const mid = materialId_(id);
+    TypeRecord const& record = arena_.at(mid);
     // Composite bit-field widths likewise live in the side-table (read by the
     // layout engine's "any bit-field?" test + `fieldBitWidth`); redirect to keep
     // those consumers unchanged. Enum/FnSig/array scalars stay in the pool.
     if (record.kind == TypeKind::Struct || record.kind == TypeKind::Union) {
-        auto it = compositeFields_.find(id.v);
+        auto it = compositeFields_.find(mid.v);
         if (it != compositeFields_.end()) {
             return guard_<std::int64_t>(
                 {it->second.bitWidthScalars.data(), it->second.bitWidthScalars.size()});

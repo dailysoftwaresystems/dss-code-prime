@@ -1,0 +1,27 @@
+{
+  "$comment": "c27 (D-CSUBSET-VOLATILE-POINTEE): the NEGATIVE MISCOMPILE pin for a volatile POINTEE (red-on-disable: exit 3 with the flag, exit 2 without). main() reads `*p` twice (p is `volatile int *`) across an opaque poke() CALL padded above the inline threshold. CSE's load-admission scans only Stores -> a Call is not a clobber -> a NON-volatile pointee would have its 2nd `*p` FOLDED to the 1st (b==a==1 -> exit 2, the miscompile). The MirInstFlags::Volatile thread on each deref (derefResultType yields VolatileQual(int) -> volatileFlagForType sets the flag) makes CSE skip the fold -> b re-fetches 2 -> exit 3. The release shippedPipeline arm runs the real optimizer (Inlining/CSE/Mem2Reg), so this is an end-to-end witness. The pointee-specific companion to volatile_member (scalar global). No stdout (libc-free); exit code only. arm64-elf runs under qemu.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 3,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -414,3 +414,94 @@ TEST(TypeInterner, FreshSpanAndOwningCopySurviveIntern) {
     EXPECT_EQ(owned[0].v, i32.v);
     EXPECT_EQ(owned[1].v, f32.v);
 }
+
+// ── c27 (D-CSUBSET-VOLATILE-POINTEE): TypeKind::VolatileQual ──
+//
+// `volatile T` is a DISTINCT interned identity that is a TRANSPARENT skin: it has
+// its own TypeId (so `volatile int` != `int` for interning/equality — what carries
+// the volatile through a declaration's type to its access), but the `kind()` /
+// `operands()` accessors SEE THROUGH it to the material type, so every structural
+// consumer dispatches on the underlying kind WITHOUT a per-site strip. The wrapper
+// is observable only via `isVolatileQualified` / `get()`.
+
+TEST(TypeInternerVolatile, DistinctIdentityButTransparentKind) {
+    auto ti = makeInterner(1);
+    const TypeId i32  = ti.primitive(TypeKind::I32);
+    const TypeId vi32 = ti.volatileQualified(i32);
+    // DISTINCT TypeId — the wrapper is real (not a no-op that returns `i32`).
+    EXPECT_NE(vi32.v, i32.v);
+    EXPECT_TRUE(ti.isVolatileQualified(vi32));
+    EXPECT_FALSE(ti.isVolatileQualified(i32));
+    // TRANSPARENT: kind() reports the MATERIAL kind (I32, not VolatileQual) so the
+    // ~128 kind-dispatch sites are correct by construction.
+    EXPECT_EQ(ti.kind(vi32), TypeKind::I32);
+    EXPECT_EQ(ti.kind(i32), TypeKind::I32);
+    // The RAW record (get) preserves the wrapper for reintern / text round-trip.
+    EXPECT_EQ(ti.get(vi32).kind, TypeKind::VolatileQual);
+    // stripVolatile recovers the material id; idempotent on a non-qualified id.
+    EXPECT_EQ(ti.stripVolatile(vi32).v, i32.v);
+    EXPECT_EQ(ti.stripVolatile(i32).v, i32.v);
+}
+
+TEST(TypeInternerVolatile, Canonicalizes) {
+    auto ti = makeInterner(1);
+    const TypeId i32  = ti.primitive(TypeKind::I32);
+    const TypeId a = ti.volatileQualified(i32);
+    const TypeId b = ti.volatileQualified(i32);
+    EXPECT_EQ(a.v, b.v);   // `volatile int` interns to ONE TypeId
+}
+
+TEST(TypeInternerVolatile, Idempotent) {
+    auto ti = makeInterner(1);
+    const TypeId i32  = ti.primitive(TypeKind::I32);
+    const TypeId v1 = ti.volatileQualified(i32);
+    const TypeId v2 = ti.volatileQualified(v1);   // volatile (volatile int)
+    EXPECT_EQ(v1.v, v2.v);   // ≡ volatile int (C 6.7.3p5) — no double-wrap
+    EXPECT_EQ(ti.get(v2).kind, TypeKind::VolatileQual);
+    EXPECT_EQ(ti.stripVolatile(v2).v, i32.v);   // one level, fully stripped
+}
+
+TEST(TypeInternerVolatile, InvalidInnerYieldsInvalid) {
+    auto ti = makeInterner(1);
+    EXPECT_FALSE(ti.volatileQualified(InvalidType).valid());
+}
+
+TEST(TypeInternerVolatile, PointerBindsInnermostPointee) {
+    // `volatile u32 *` = Ptr<VolatileQual(u32)> (volatile binds the pointee,
+    // C 6.7.3). The outer Ptr is a REAL pointer (kind Ptr), its operand is the
+    // volatile-qualified pointee — what a deref reads to drive the access flag.
+    auto ti = makeInterner(1);
+    const TypeId u32  = ti.primitive(TypeKind::U32);
+    const TypeId vu32 = ti.volatileQualified(u32);
+    const TypeId p    = ti.pointer(vu32);
+    EXPECT_EQ(ti.kind(p), TypeKind::Ptr);          // the pointer itself is plain
+    EXPECT_FALSE(ti.isVolatileQualified(p));
+    auto const ops = ti.operands(p);
+    ASSERT_EQ(ops.size(), 1u);
+    EXPECT_TRUE(ti.isVolatileQualified(ops[0]));    // the pointee IS volatile
+    EXPECT_EQ(ti.kind(ops[0]), TypeKind::U32);      // material kind U32
+
+    // EAST `u32 * volatile` = VolatileQual(Ptr<u32>) (a volatile POINTER): the
+    // wrapper is on the OUTSIDE; kind is transparently Ptr, operand is plain u32.
+    const TypeId pu32  = ti.pointer(u32);
+    const TypeId vpu32 = ti.volatileQualified(pu32);
+    EXPECT_TRUE(ti.isVolatileQualified(vpu32));
+    EXPECT_EQ(ti.kind(vpu32), TypeKind::Ptr);       // transparent: a pointer
+    EXPECT_NE(vpu32.v, p.v);   // `volatile u32 *` != `u32 * volatile` (distinct)
+}
+
+TEST(TypeInternerVolatile, OperandsAndScalarsSeeThroughToComposite) {
+    // A `volatile struct S` redirects operands()/scalars() to S's fields, so a
+    // layout/ABI consumer reading a volatile-qualified struct sees its real shape.
+    auto ti = makeInterner(1);
+    const TypeId i32 = ti.primitive(TypeKind::I32);
+    const TypeId f32 = ti.primitive(TypeKind::F32);
+    std::array<TypeId, 2> const fields{i32, f32};
+    const TypeId s  = ti.structType("S", fields);
+    const TypeId vs = ti.volatileQualified(s);
+    EXPECT_EQ(ti.kind(vs), TypeKind::Struct);       // transparent struct
+    auto const ops = ti.operands(vs);               // redirected to S's fields
+    ASSERT_EQ(ops.size(), 2u);
+    EXPECT_EQ(ops[0].v, i32.v);
+    EXPECT_EQ(ops[1].v, f32.v);
+}

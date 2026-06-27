@@ -876,48 +876,35 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // that many times in Ptr. The stars are a flat token run in `typeRef`;
         // the base type comes from the non-star child (typeBase).
         //
-        // c21 (D-CSUBSET-VOLATILE-QUALIFIER) fix #1b: this is the CO-LOCATED arm —
+        // c27 (D-CSUBSET-VOLATILE-POINTEE): this is the CO-LOCATED arm —
         // `typeRefAllowingStruct` / `castTypeRef` where a head qualifier and the
-        // stars are FLAT siblings of THIS node (NOT split across a head + a
-        // sibling declarator subtree, the form fix #1a covers). Position-aware
-        // pointee-volatile reject: a `volatileMarker` token appearing BEFORE the
-        // first `pointerToken` (`volatile int *`) makes the POINTEE volatile —
-        // REJECT (model B cannot express it; the volatility would ride the deref).
-        // A volatile token AFTER the last star (`int * volatile`, east) makes the
-        // POINTER OBJECT volatile — ACCEPT (threaded at the ref site). The walk
-        // below tracks star position so the two are distinguished structurally,
-        // config-driven on `cfg.volatileMarker` + `cfg.pointerToken` (no hardcoded
-        // keyword). Done as a first pass so the reject fires whether or not the
-        // base type resolves.
-        if (cfg.volatileMarker.has_value() && cfg.pointerToken.has_value()) {
-            // Position-aware: walk the FLAT child run left-to-right. The first
-            // `pointerToken` direct child marks the star run; a `volatileMarker`
-            // appearing in ANY child BEFORE it (the qualifier may be wrapped in a
-            // `headQualifier`-style sub-rule, so scan each child's SUBTREE, not
-            // just direct Token children) means the POINTEE is volatile → reject.
-            // A volatile in a child AFTER the first star (east) is the pointer
-            // OBJECT's — left for the declarator/object path to thread.
-            bool sawStar = false;
-            bool volBeforeStar = false;
+        // stars are FLAT siblings of THIS node, AND the split-form HEAD subtree
+        // (`volatile u32` with the stars living in a sibling declarator the
+        // caller folds). Position-aware: a `volatileMarker` appearing in any child
+        // BEFORE the first `pointerToken` qualifies the BASE (the eventual
+        // innermost pointee, C 6.7.3) → wrap the resolved base in VolatileQual so
+        // `volatile u32 *` builds Ptr<VolatileQual(U32)> and the deref/access of it
+        // is volatile by TYPE. A volatile AFTER the last star (east `int *
+        // volatile`) is the pointer OBJECT's — NOT a base qualifier; the
+        // declarator/symbol path threads it (c21 isVolatile), so it is excluded
+        // here. With ZERO stars at this node a leading volatile makes the whole
+        // base volatile (a bare `volatile int` scalar, or the head of a
+        // split-form pointer decl) → VolatileQual(base); the declarator's pointer
+        // layers then wrap on top. Config-driven on `cfg.volatileMarker` +
+        // `cfg.pointerToken` (no hardcoded keyword). REPLACES the c21 pointee
+        // REJECT — volatile pointees now compile (model B → the type system).
+        bool baseIsVolatile = false;
+        if (cfg.volatileMarker.has_value()) {
             for (auto child : kids) {
-                bool const isStarTok = tree.kind(child) == NodeKind::Token
-                    && tree.tokenKind(child) == *cfg.pointerToken;
-                if (isStarTok) { sawStar = true; continue; }
-                if (!sawStar
-                    && subtreeContainsToken(tree, child, *cfg.volatileMarker,
-                                            &s.idx().declByRule)) {
-                    volBeforeStar = true;
+                if (cfg.pointerToken.has_value()
+                    && tree.kind(child) == NodeKind::Token
+                    && tree.tokenKind(child) == *cfg.pointerToken) {
+                    break;   // reached the star run — later volatile is the pointer object's
                 }
-            }
-            if (volBeforeStar && sawStar) {
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::S_VolatilePointeeNotSupported;
-                d.severity = DiagnosticSeverity::Error;
-                d.buffer   = tree.source().id();
-                d.span     = tree.span(node);
-                d.actual   = std::string{tree.text(node)};
-                s.reporter.report(std::move(d));
-                return InvalidType;
+                if (subtreeContainsToken(tree, child, *cfg.volatileMarker,
+                                         &s.idx().declByRule)) {
+                    baseIsVolatile = true;
+                }
             }
         }
         std::uint32_t ptrDepth = 0;
@@ -954,6 +941,13 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             }
         }
         if (inner.valid()) {
+            // c27 (D-CSUBSET-VOLATILE-POINTEE): a leading volatile qualifies the
+            // BASE (innermost pointee) — wrap BEFORE the pointer layers so
+            // `volatile u32 **` = Ptr<Ptr<VolatileQual(U32)>> (C 6.7.3). Idempotent
+            // in the interner. For zero stars this is the bare `volatile T` (the
+            // scalar / split-form head); the caller's declarator adds any pointers.
+            if (baseIsVolatile)
+                inner = s.lattice.interner().volatileQualified(inner);
             for (std::uint32_t i = 0; i < ptrDepth; ++i)
                 inner = s.lattice.interner().pointer(inner);
             // c26: fold the abstract declarator (fn-ptr / array type-name) onto the
@@ -1660,6 +1654,21 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
         RuleId const cr = tree.rule(c);
         if (cr == dc.pointerLayerRule) {
             t = s.lattice.interner().pointer(t);
+            // c27 (D-CSUBSET-VOLATILE-POINTEE): EAST volatile — a `volatile`
+            // qualifier INSIDE this pointer layer (the `*volatile` / `* volatile`
+            // ptrQualifier, AFTER the star) makes THIS pointer OBJECT volatile
+            // (C 6.7.3): wrap the just-formed pointer in VolatileQual so the
+            // symbol's type is `VolatileQual(Ptr<...>)`. This is what makes the
+            // symbol object-volatile uniformly through the TYPE (the c21
+            // isVolatile is now derived from the type's top-level VolatileQual-
+            // ness — see the binding sites). `const`/`restrict` in the layer stay
+            // ignored. Config-driven on `cfg.volatileMarker`; a layer with no
+            // volatile is byte-identical to before.
+            if (cfg.volatileMarker.has_value()
+                && subtreeContainsToken(tree, c, *cfg.volatileMarker,
+                                        &s.idx().declByRule)) {
+                t = s.lattice.interner().volatileQualified(t);
+            }
             continue;
         }
         if (cr == dc.directRule && !direct.valid()) direct = c;
@@ -2028,13 +2037,12 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                 tree, node, *decl.constMarker,
                                 &s.idx().declByRule);
                         }
-                        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): parallel volatile
-                        // scan — INDEPENDENT of isConst (`const volatile` ⇒ both).
-                        if (decl.volatileMarker.has_value()) {
-                            rec.isVolatile = subtreeContainsToken(
-                                tree, node, *decl.volatileMarker,
-                                &s.idx().declByRule);
-                        }
+                        // c27 (D-CSUBSET-VOLATILE-POINTEE): object-volatility is now
+                        // derived from the symbol's resolved TYPE (top-level
+                        // VolatileQual) at access lowering — the c21 coarse
+                        // `isVolatile` token-scan is RETIRED here (it mis-fired for a
+                        // pointer-to-volatile-POINTEE, marking the pointer OBJECT
+                        // volatile when only the pointee is). `isConst` keeps its scan.
                         rec.isProtoDeclaration = isProto;
                         // D-CSUBSET-EXTERN-DEFINITION-MERGE: a non-defining
                         // declaration (c-subset's `extern`) — config-driven, no
@@ -2088,13 +2096,9 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                 tree, node, *decl.constMarker,
                                 &s.idx().declByRule);
                         }
-                        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): anonymous-field
-                        // volatile scan — parallel to isConst (independent).
-                        if (decl.volatileMarker.has_value()) {
-                            rec.isVolatile = subtreeContainsToken(
-                                tree, node, *decl.volatileMarker,
-                                &s.idx().declByRule);
-                        }
+                        // c27: object-volatility derived from the field's resolved
+                        // TYPE (top-level VolatileQual) at access lowering — the c21
+                        // coarse token-scan is retired (see the named-declarator site).
                         SymbolId const newId = s.symbols.mint(rec);
                         s.scopes.bind(current, rec.name, newId);
                         s.nodeToSymbol.set(node, newId);
@@ -2212,18 +2216,11 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             tree, scanRoot, *decl.constMarker,
                             &s.idx().declByRule);
                     }
-                    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): same type-subtree scan
-                    // for volatile — independent of isConst (`const volatile`).
-                    if (decl.volatileMarker.has_value()) {
-                        NodeId scanRoot = node;
-                        if (decl.typeChild.has_value()
-                            && *decl.typeChild < kids.size()) {
-                            scanRoot = kids[*decl.typeChild];
-                        }
-                        rec.isVolatile = subtreeContainsToken(
-                            tree, scanRoot, *decl.volatileMarker,
-                            &s.idx().declByRule);
-                    }
+                    // c27 (D-CSUBSET-VOLATILE-POINTEE): object-volatility is derived
+                    // from the symbol's resolved TYPE (top-level VolatileQual) at
+                    // access lowering — the c21 coarse volatile token-scan is retired
+                    // here (it could not distinguish a volatile OBJECT from a
+                    // volatile POINTEE). `isConst` keeps its scan above.
 
                     // D-CSUBSET-EXTERN-DEFINITION-MERGE: c-subset's `extern`
                     // declaration mints through THIS legacy positional path (it
@@ -2445,69 +2442,22 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                     // its anonymous symbol after the loop (bit-field width +
                     // declares-nothing diagnostic).
                     bool resolvedNamed = false;
-                    // c21 (D-CSUBSET-VOLATILE-QUALIFIER) fix #1a: head-position
-                    // volatile token, hoisted out of the per-declarator loop (a
-                    // head scan is declarator-invariant). With a pointer star in a
-                    // given declarator it forms a pointer-to-volatile-POINTEE — see
-                    // the reject inside the loop below.
-                    bool const headIsVolatile =
-                        decl.volatileMarker.has_value()
-                        && decl.headChild.has_value()
-                        && *decl.headChild < kids.size()
-                        && subtreeContainsToken(
-                               tree, kids[*decl.headChild], *decl.volatileMarker,
-                               &s.idx().declByRule);
-                    // c21 (D-CSUBSET-VOLATILE-QUALIFIER) fix #1a, typedef arm: a
-                    // TYPEDEF whose aliased type carries `volatile` (head-position)
-                    // cannot be expressed by model B AT ALL — model B records
-                    // volatility per-SYMBOL (`isVolatile` on the declared object/
-                    // member), but a typedef carries volatility through the TYPE,
-                    // which users of the alias inherit; threading that needs
-                    // type-level cv-qualification (model A). Both `typedef volatile
-                    // int vint;` (the alias would silently drop volatility on every
-                    // `vint x;`) AND `typedef volatile int *vip;` (a laundered
-                    // pointer-to-volatile-pointee) are rejected loud here, so no
-                    // volatile typedef can silently mislead. Positioned at the row.
-                    if (headIsVolatile && decl.kind == DeclarationKind::Type) {
-                        ParseDiagnostic d;
-                        d.code     = DiagnosticCode::S_VolatilePointeeNotSupported;
-                        d.severity = DiagnosticSeverity::Error;
-                        d.buffer   = tree.source().id();
-                        d.span     = tree.span(node);
-                        d.actual   = std::string{tree.text(node)};
-                        s.reporter.report(std::move(d));
-                    }
+                    // c27 (D-CSUBSET-VOLATILE-POINTEE): the c21 pointer-to-volatile-
+                    // POINTEE REJECTS (the typedef arm + the per-declarator arm that
+                    // fired on a head volatile + a declarator star) are GONE. A head
+                    // `volatile <base>` now resolves to VolatileQual(base) in
+                    // `headTy` (resolveTypeNode → the co-located arm), and the
+                    // declarator's pointer layers wrap on top via
+                    // `declaratorDeclaredType` → `volatile <base> *p` =
+                    // Ptr<VolatileQual(base)>. This holds uniformly for local /
+                    // global / param / struct-member / typedef: a `typedef volatile
+                    // int vint;` aliases VolatileQual(Int), so every `vint x;`
+                    // inherits the volatile through the TYPE (no longer dropped).
+                    // East `int * volatile p` (the pointer OBJECT is volatile) stays
+                    // on the c21 symbol-isVolatile path — that volatile is a
+                    // `ptrQualifier` INSIDE the declarator (after the star), not a
+                    // base qualifier, so the co-located arm excludes it.
                     for (NodeId dNode : declarators) {
-                        // c21 (D-CSUBSET-VOLATILE-QUALIFIER) fix #1a: reject a
-                        // pointer-to-volatile-POINTEE in DECLARATION forms (local /
-                        // global / param / struct-member / typedef) — a HEAD volatile
-                        // together with a pointer star in THIS declarator forms
-                        // `volatile <base> *p`, which model B cannot express (the
-                        // volatility would ride the deref, needing type-level
-                        // cv-tracking — model A / c22). Head-scoped: the head holds
-                        // NO stars (they live in the declarator's pointerLayer), so
-                        // this does NOT fire on east `int * volatile p` (that
-                        // volatile is a `ptrQualifier` INSIDE `dNode`, after the
-                        // star — the POINTER OBJECT is volatile, which IS
-                        // expressible and is threaded at the ref site). Config-
-                        // driven: keys off `decl.volatileMarker` + the declarator
-                        // role's `pointerToken`, never a hardcoded keyword/`*`.
-                        // Per-declarator so `volatile int x, *p;` rejects only `*p`.
-                        // Positioned at the offending declarator. (A TYPEDEF is
-                        // already rejected wholesale by the typedef arm above — skip
-                        // here to avoid a double diagnostic.)
-                        if (headIsVolatile && decl.kind != DeclarationKind::Type
-                            && subtreeContainsToken(
-                                   tree, dNode, cfg.declarators->pointerToken,
-                                   &s.idx().declByRule)) {
-                            ParseDiagnostic d;
-                            d.code     = DiagnosticCode::S_VolatilePointeeNotSupported;
-                            d.severity = DiagnosticSeverity::Error;
-                            d.buffer   = tree.source().id();
-                            d.span     = tree.span(dNode);
-                            d.actual   = std::string{tree.text(dNode)};
-                            s.reporter.report(std::move(d));
-                        }
                         TypeId const declTy = declaratorDeclaredType(
                             s, cfg, tree, dNode, headTy, here,
                             /*emitOnMiss=*/true, decl.allowFlexibleArray);
@@ -5087,13 +5037,19 @@ resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
     TypeId const lhsType = subtreeType(s, tree, lhsNode, scope);
     if (!lhsType.valid()) { out.status = MemberResolution::Status::LhsUntyped; return out; }
 
-    TypeId effectiveType = lhsType;
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): strip a top-level VolatileQual so a
+    // `volatile struct S a; a.x` (effectiveType = VolatileQual(Struct)) resolves
+    // its field against the MATERIAL struct's scope. `compositeScopeByType` is
+    // keyed by the material composite TypeId, never the qualified skin.
+    TypeId effectiveType = s.lattice.interner().stripVolatile(lhsType);
     if (ma->dereferences) {
         // Arrow form `p->x` = `(*p).x`: the LHS must be `Ptr<Struct>` (one level).
         if (s.lattice.interner().kind(effectiveType) == TypeKind::Ptr) {
             auto const ops = s.lattice.interner().operands(effectiveType);
             if (ops.empty()) { out.status = MemberResolution::Status::NotAPointer; return out; }
-            effectiveType = ops[0];
+            // Strip a VolatileQual POINTEE too (`volatile struct S *p; p->x` →
+            // pointee VolatileQual(Struct)) so the field scope resolves.
+            effectiveType = s.lattice.interner().stripVolatile(ops[0]);
         } else {
             out.status = MemberResolution::Status::NotAPointer; return out;
         }

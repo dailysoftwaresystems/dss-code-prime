@@ -852,25 +852,57 @@ struct Lowerer {
         if (rec != nullptr && rec->isConst)
             mutability.push_back({node, MutabilityAttr{/*isConst=*/true}});
     }
-    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): record an ACCESS HIR node's volatility
-    // from its bound symbol's `SymbolRecord.isVolatile` (sparse: only volatile
-    // accesses are stored; absence ⇒ plain access). Called at the object-Ref +
-    // VarDecl/Global lowering sites. The member-access form reads the FIELD record
-    // directly (its symbol is not the object's) — see `recordMemberVolatility`.
+    // c21/c27: record an ACCESS HIR node's OBJECT-volatility — true iff the bound
+    // symbol's STORAGE is itself volatile, i.e. its resolved type is TOP-LEVEL
+    // VolatileQual (`volatile int x` → VolatileQual(int); east `int * volatile p`
+    // → VolatileQual(Ptr<int>)). c27 (D-CSUBSET-VOLATILE-POINTEE) DERIVES this from
+    // the TYPE rather than the c21 coarse `isVolatile` token-scan, which mis-fired
+    // for a pointer-to-volatile-POINTEE (`volatile int *p`): there the volatile
+    // qualifies the POINTEE (type `Ptr<VolatileQual(int)>`, top-level Ptr — the
+    // OBJECT `p` is NOT volatile), and reading `p` must be a PLAIN Load; the
+    // volatile rides the DEREF `*p` instead (carried by the pointee type at the
+    // access — see hir_to_mir `volatileFlagForType`). Sparse: only object-volatile
+    // symbols are annotated. Called at the object-Ref + VarDecl/Global sites.
     void recordVolatility(HirNodeId node, SymbolId sym) {
         if (!node.valid() || !sym.valid()) return;
         auto const* rec = model.recordFor(sym);
-        if (rec != nullptr && rec->isVolatile)
+        if (rec != nullptr && interner.isVolatileQualified(rec->type))
             volatileAcc.push_back({node, VolatileAttr{/*isVolatile=*/true}});
     }
-    // c21: record a MemberAccess HIR node's volatility from the FIELD's record
-    // (`frec->isVolatile`) — the volatile-ness is the field declaration's, not
-    // the object's. The MemberAccess node keys both the rvalue Load and (when it
-    // is an assignment target) the Store.
+    // c21: record a MemberAccess HIR node's FIELD-volatility — true iff the field's
+    // OWN storage is volatile (top-level VolatileQual: `volatile int m`). A
+    // `volatile int *m` field is NOT object-volatile (top-level Ptr); `p->m` reads
+    // the plain pointer, and `*p->m` is volatile via the deref's pointee type. The
+    // MemberAccess node keys both the rvalue Load and (as an assign target) the
+    // Store. CONTAINER-volatility (a member of a `volatile struct`, C 6.7.3p5) is
+    // handled ORTHOGONALLY by `volatileQualifiedAccess` qualifying the access
+    // RESULT TYPE (which the MIR sites read via `volatileFlagForType`, and which
+    // PROPAGATES through nested member/index chains) — see `combineMember`.
     void recordMemberVolatility(HirNodeId node, SymbolRecord const* frec) {
         if (!node.valid() || frec == nullptr) return;
-        if (frec->isVolatile)
+        if (interner.isVolatileQualified(frec->type))
             volatileAcc.push_back({node, VolatileAttr{/*isVolatile=*/true}});
+    }
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): the RESULT TYPE of a member/index access
+    // of a `volatile`-qualified CONTAINER is itself `volatile`-qualified (C 6.5.2.3
+    // / 6.7.3p5: a member of a `volatile struct/union` — and an element of a
+    // `volatile` array — is so-qualified). `accessedType` is the field/element
+    // type; `containerType` is the object/base type. When the container is volatile
+    // we wrap the accessed type so:
+    //   (1) the MIR access site (read Load / write Store / by-value copy) flags the
+    //       access via `volatileFlagForType` — no per-form annotation needed;
+    //   (2) the qualifier PROPAGATES — a nested `p->inner.x` makes `p->inner`
+    //       volatile-typed, so the outer `.x` container is volatile in turn;
+    //   (3) a complex lvalue (`pSum->rErr += r`, `++(p->a)`) read+written via a
+    //       temp pointer gets a `volatile T *` pointee, so its Deref carries the
+    //       flag (the Kahan-summation miscompile guard).
+    // Idempotent (volatileQualified never double-wraps); a non-volatile container
+    // returns `accessedType` unchanged (a plain access stays plain).
+    [[nodiscard]] TypeId volatileQualifiedAccess(TypeId accessedType,
+                                                 TypeId containerType) {
+        if (accessedType.valid() && interner.isVolatileQualified(containerType))
+            return interner.volatileQualified(accessedType);
+        return accessedType;
     }
 
     [[nodiscard]] bool isExprNode(NodeId n) const {
@@ -2804,9 +2836,16 @@ struct Lowerer {
         // element-of-base derivation — the SINGLE source shared with the
         // semantic-tier typer (type_rules.hpp `indexResultType`).
         TypeId const inferred = indexResultType(interner, base.type);
-        TypeId const result = typeAtOr(node, inferred);
-        return {track(builder.makeIndex(base.id, idxE.id, result), node),
-                result};
+        TypeId const elemType = typeAtOr(node, inferred);
+        // c27 (D-CSUBSET-VOLATILE-POINTEE): indexing a `volatile`-qualified
+        // CONTAINER (`volatile T va[]` / a `volatile`-array struct member) yields a
+        // volatile-qualified element type (C 6.5.2.1 / 6.7.3p5). The MIR access site
+        // reads this via `volatileFlagForType`, and it propagates through a nested
+        // `arr[i].x` chain. (An element type that is ALREADY volatile — `volatile
+        // int va[]` whose element is VolatileQual — stays so; idempotent wrap.)
+        TypeId const result = volatileQualifiedAccess(elemType, base.type);
+        HirNodeId const idxNode = track(builder.makeIndex(base.id, idxE.id, result), node);
+        return {idxNode, result};
     }
 
     // The MEMBER-ACCESS epilogue given the ALREADY-lowered `base`. Shared by
@@ -2877,10 +2916,16 @@ struct Lowerer {
             TypeId fieldType = model.typeAt(fieldNameN);
             if (!fieldType.valid()) fieldType = frec->type;
             HirNodeId object = base.id;
+            // The CONTAINER's resolved type — the object whose member is taken.
+            // `s.a` ⇒ `base.type`; `p->a` ⇒ the Deref's pointee type. Carries the
+            // top-level VolatileQual when the container is `volatile` (C 6.7.3p5).
+            TypeId containerType = base.type;
             if (e.target == "MemberAccessThruPtr") {
                 // Arrow form: dereference the LHS pointer first. The Deref's
                 // result type is the pointee type (Struct) — read from the
-                // interner via the base's Ptr operand.
+                // interner via the base's Ptr operand. (operands() sees THROUGH a
+                // VolatileQual ptr, but its operand IS the qualified pointee, so a
+                // `volatile struct S *` yields `VolatileQual(struct S)` here.)
                 TypeId pointeeType = InvalidType;
                 if (base.type.valid()
                     && interner.kind(base.type) == TypeKind::Ptr
@@ -2894,15 +2939,21 @@ struct Lowerer {
                 // requiresValidType rule will surface H_TypeUnresolved.
                 object = track(builder.makeDeref(base.id, pointeeType,
                                                  HirFlags::Synthetic), node);
+                containerType = pointeeType;
             }
+            // c27 (D-CSUBSET-VOLATILE-POINTEE): if the CONTAINER is volatile, the
+            // member's TYPE is volatile-qualified (C 6.5.2.3) — this is what flags
+            // the access at the MIR site AND propagates through nested chains (see
+            // `volatileQualifiedAccess`). The FIELD's own volatility is recorded
+            // separately on the node (c21).
+            TypeId const accessType = volatileQualifiedAccess(fieldType, containerType);
             HirNodeId const maNode = track(builder.makeMemberAccess(
-                                               object, fieldIndex, fieldType), node);
-            // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a `volatile` struct/union FIELD
-            // — the MemberAccess node keys both its rvalue Load and (as an assign
-            // target) its Store. The volatility is the FIELD's (`frec`), NOT the
-            // object's; a non-volatile sibling field's MemberAccess stays plain.
+                                               object, fieldIndex, accessType), node);
+            // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a `volatile`-declared FIELD — the
+            // MemberAccess node keys both its rvalue Load and (as an assign target)
+            // its Store. (Container-volatility rides `accessType` above instead.)
             recordMemberVolatility(maNode, frec);
-            return {maNode, fieldType};
+            return {maNode, accessType};
         }
         return exprError(node, std::format("postfix target '{}' has no lowering", e.target));
     }
@@ -4397,7 +4448,7 @@ struct Lowerer {
                     continue;
                 }
                 ScopeId const unionScope =
-                    model.compositeScopeFor(contextType);
+                    model.compositeScopeFor(interner.stripVolatile(contextType));
                 if (!unionScope.valid()) {
                     reportedError(designatorCore,
                         "could not resolve members of the target union "
@@ -4550,7 +4601,8 @@ struct Lowerer {
         if (isStruct) {
             // A field index is NAMED iff the composite's scope binds a real
             // (non-synthetic) name to it. Anonymous fields bind under `<anon:…>`.
-            ScopeId const sscope = model.compositeScopeFor(contextType);
+            ScopeId const sscope =
+                model.compositeScopeFor(interner.stripVolatile(contextType));
             // Only classify when the composite scope is resolvable — otherwise we
             // can't tell named from anonymous, so skip NOTHING (never mis-skip a
             // named bit-field; the worst case degrades to the prior behaviour).
@@ -4630,7 +4682,8 @@ struct Lowerer {
                         continue;
                     }
                     ScopeId const structScope =
-                        model.compositeScopeFor(designatorCurrentType);
+                        model.compositeScopeFor(
+                            interner.stripVolatile(designatorCurrentType));
                     if (!structScope.valid()) {
                         reportedError(designatorCore,
                             "field designator's container is not a struct");
@@ -4792,6 +4845,14 @@ struct Lowerer {
         if (!target.type.valid()) return std::nullopt;
         Lvalue lv;
         lv.simple  = false;
+        // c27 (D-CSUBSET-VOLATILE-POINTEE): `target.type` already carries the
+        // VolatileQual skin when this lvalue is a member/index access of a volatile
+        // container (`combineMember`/`combineIndex` qualify the access type). So the
+        // temp pointer `lv.ptrType = Ptr<VolatileQual(T)>` and the `*q` Deref that
+        // `lvRead`/`lvWrite` emit are flagged at the MIR site — no extra wrap is
+        // needed here. This is what makes a complex-lvalue COMPOUND-assign /
+        // inc-dec (`pSum->rErr += r`, `++(p->a)`) preserve volatility (the Kahan-sum
+        // miscompile guard).
         lv.type    = target.type;
         lv.ptrType = interner.pointer(target.type);
         lv.sym     = freshSymbol();

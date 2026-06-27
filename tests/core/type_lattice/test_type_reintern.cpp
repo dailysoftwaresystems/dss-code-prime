@@ -291,3 +291,36 @@ TEST(TypeReintern, IncompleteCompositeReinternsIncomplete) {
     EXPECT_EQ(host.interner().kind(hostFwd), TypeKind::Struct);
     EXPECT_TRUE(host.interner().isIncompleteComposite(hostFwd));
 }
+
+// c27 (D-CSUBSET-VOLATILE-POINTEE): a VolatileQual wrapper must SURVIVE re-intern.
+// RED-ON-DISABLE: reinternType reads the RAW record kind (`get().kind`), NOT the
+// transparent `kind()` — using `kind()` would reintern `volatile int` AS plain
+// `int`, silently DROPPING the qualifier (a cross-CU-merge miscompile). The
+// `assertStructurallyEqual` helper above uses the transparent `kind()` and so
+// canNOT catch this; this test checks the RAW kind + `isVolatileQualified`.
+TEST(TypeReintern, VolatileQualifierSurvivesReintern) {
+    TypeInterner src{CompilationUnitId{1}};
+    const TypeId i32   = src.primitive(TypeKind::I32);
+    const TypeId vi32  = src.volatileQualified(i32);      // volatile int
+    const TypeId pvi32 = src.pointer(vi32);                // volatile int *
+
+    TypeLattice host{CompilationUnitId{2}};
+    auto& hi = host.interner();
+    std::unordered_map<std::uint32_t, TypeId> remap;
+
+    // bare `volatile int` round-trips as a VolatileQual over I32.
+    const TypeId hvi32 = reinternType(src, vi32, host, remap);
+    EXPECT_EQ(hi.get(hvi32).kind, TypeKind::VolatileQual)
+        << "the VolatileQual wrapper must NOT be dropped (raw kind preserved)";
+    EXPECT_TRUE(hi.isVolatileQualified(hvi32));
+    EXPECT_EQ(hi.kind(hvi32), TypeKind::I32);              // transparent material kind
+    EXPECT_EQ(hi.stripVolatile(hvi32).v, hi.primitive(TypeKind::I32).v);
+
+    // `volatile int *` round-trips as Ptr<VolatileQual(I32)> (the sqlite shape).
+    const TypeId hpvi32 = reinternType(src, pvi32, host, remap);
+    EXPECT_EQ(hi.kind(hpvi32), TypeKind::Ptr);
+    EXPECT_FALSE(hi.isVolatileQualified(hpvi32));          // the pointer is plain
+    ASSERT_EQ(hi.operands(hpvi32).size(), 1u);
+    EXPECT_TRUE(hi.isVolatileQualified(hi.operands(hpvi32)[0]))
+        << "the POINTEE must stay volatile-qualified through re-intern";
+}

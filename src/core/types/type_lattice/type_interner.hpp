@@ -138,6 +138,28 @@ public:
     TypeId reference(TypeId referent);
     TypeId nullable(TypeId inner);
     TypeId optional(TypeId inner);
+
+    // ── volatile qualifier (D-CSUBSET-VOLATILE-POINTEE / c27) ──
+    // `volatile T` — a kind=VolatileQual record, operands=[inner]. DISTINCT
+    // interned identity (volatile int != int — what carries the volatile through
+    // a declaration's type to its access sites), but a TRANSPARENT skin: the
+    // `kind()` / `operands()` / `scalars()` accessors SEE THROUGH it to `inner`,
+    // so every structural consumer dispatches on the material kind with NO
+    // per-site strip (the access-volatility chokepoints query `isVolatileQualified`
+    // instead). Idempotent: `volatileQualified(VolatileQual(T)) == VolatileQual(T)`.
+    // Wrapping an INVALID id returns InvalidType. const is NOT modelled (it never
+    // affects codegen); only volatile is materialized.
+    TypeId volatileQualified(TypeId inner);
+    // The inner type if `id` is a VolatileQual, else `id` unchanged. ONE strip
+    // chokepoint for the rare consumer that must look past the skin where the
+    // transparent accessors are bypassed (e.g. the layout entry's raw incomplete
+    // checks, or building a derived type that must drop the qualifier).
+    [[nodiscard]] TypeId stripVolatile(TypeId id) const;
+    // True iff `id`'s OWN record is a VolatileQual (the access-volatility query).
+    // Reads the RAW record kind (not the transparent `kind()`), so it answers
+    // "is this exact type volatile-qualified?" — used at the deref / member /
+    // index / scalar access sites to set MirInstFlags::Volatile from the type.
+    [[nodiscard]] bool isVolatileQualified(TypeId id) const;
     // array: operands=[element], scalars=[length]. slice: operands=[element].
     TypeId array(TypeId element, std::int64_t length);
     TypeId slice(TypeId element);
@@ -236,8 +258,14 @@ public:
                      std::span<std::int64_t const> scalarArgs = {});
 
     // ── accessors ──
+    // NOTE on VolatileQual transparency (c27): `kind()` / `operands()` /
+    // `scalars()` SEE THROUGH a VolatileQual skin to its inner type, so a caller
+    // reading a possibly-volatile-qualified id gets the MATERIAL kind/shape. The
+    // RAW record (incl. a VolatileQual marker) is reachable only via `get()` (used
+    // by reintern / text round-trip, which must preserve the wrapper) and the
+    // dedicated `isVolatileQualified` / `stripVolatile` queries.
     [[nodiscard]] TypeRecord const&  get(TypeId id)      const { return arena_.at(id); }
-    [[nodiscard]] TypeKind           kind(TypeId id)     const { return arena_.at(id).kind; }
+    [[nodiscard]] TypeKind           kind(TypeId id)     const;
     [[nodiscard]] GuardedSpan<TypeId>        operands(TypeId id) const;
     [[nodiscard]] GuardedSpan<std::int64_t> scalars(TypeId id)  const;
     [[nodiscard]] std::string_view           name(TypeId id)     const;
@@ -302,6 +330,14 @@ private:
     // operand range stays empty); they arrive later via `completeComposite`.
     TypeId internComposite(TypeKind kind, std::string_view name,
                            std::uint64_t declSiteKey);
+
+    // c27 VolatileQual transparency: the material (non-VolatileQual) TypeId an
+    // id resolves to — `id` itself unless its RAW record kind is VolatileQual, in
+    // which case its single operand (recursively, though idempotency keeps it one
+    // level). The single internal chokepoint `kind()`/`operands()`/`scalars()`
+    // route through so the wrapper is transparent. Reads `arena_` directly (never
+    // the public accessors) to avoid recursion.
+    [[nodiscard]] TypeId materialId_(TypeId id) const;
 
     // Wrap a raw pool view in a GuardedSpan tagged with the current pool
     // generation (debug) — or return it unchanged (release alias). The single

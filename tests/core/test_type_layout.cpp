@@ -610,3 +610,47 @@ TEST(TypeLayout, SelfReferentialStructLaysOutWithPointerField) {
     EXPECT_EQ(l.fieldOffsets[0], 0u);   // value
     EXPECT_EQ(l.fieldOffsets[1], 8u);   // next (pointer, 8-aligned)
 }
+
+// ── c27 (D-CSUBSET-VOLATILE-POINTEE): a qualifier never changes layout ───────
+// sizeof(volatile T) == sizeof(T) and the alignment matches (C 6.7.3). The layout
+// engine strips the VolatileQual skin at entry, so a volatile scalar / pointer /
+// struct / array lays out byte-identically to its material type. RED-ON-DISABLE:
+// drop the `stripVolatile` at the top of computeLayout → a VolatileQual id hits
+// the engine's default (no scalar size, raw-kind != Struct) → nullopt → this
+// EXPECTs a layout and fails.
+TEST(TypeLayout, VolatileQualifierDoesNotChangeLayout) {
+    auto ti = makeInterner(1);
+    // scalar: volatile int ≡ int (4/4).
+    const TypeId i32  = ti.primitive(TypeKind::I32);
+    const TypeId vi32 = ti.volatileQualified(i32);
+    auto const li = layoutOf(i32, ti);
+    auto const lvi = layoutOf(vi32, ti);
+    EXPECT_EQ(lvi.size, li.size);
+    EXPECT_EQ(lvi.align.bytes(), li.align.bytes());
+    EXPECT_EQ(lvi.size, 4u);
+
+    // pointer (east `T * volatile`): VolatileQual(Ptr<int>) ≡ Ptr<int> (8/8 LP64).
+    const TypeId p  = ti.pointer(i32);
+    const TypeId vp = ti.volatileQualified(p);
+    EXPECT_EQ(layoutOf(vp, ti).size, layoutOf(p, ti).size);
+    EXPECT_EQ(layoutOf(vp, ti).size, 8u);
+
+    // struct: volatile struct S ≡ struct S (field offsets + size + align match).
+    const TypeId f32 = ti.primitive(TypeKind::F32);
+    std::array<TypeId, 2> const fields{i32, f32};
+    const TypeId s  = ti.structType("S", fields);
+    const TypeId vs = ti.volatileQualified(s);
+    auto const ls  = layoutOf(s, ti);
+    auto const lvs = layoutOf(vs, ti);
+    EXPECT_EQ(lvs.size, ls.size);
+    EXPECT_EQ(lvs.align.bytes(), ls.align.bytes());
+    ASSERT_EQ(lvs.fieldOffsets.size(), ls.fieldOffsets.size());
+    for (std::size_t i = 0; i < ls.fieldOffsets.size(); ++i)
+        EXPECT_EQ(lvs.fieldOffsets[i], ls.fieldOffsets[i]);
+
+    // array of volatile: Array<VolatileQual(int), 4> ≡ Array<int,4> (16 bytes).
+    const TypeId va  = ti.array(vi32, 4);
+    const TypeId a   = ti.array(i32, 4);
+    EXPECT_EQ(layoutOf(va, ti).size, layoutOf(a, ti).size);
+    EXPECT_EQ(layoutOf(va, ti).size, 16u);
+}

@@ -259,6 +259,15 @@ std::optional<std::uint64_t> scalarByteSize(TypeKind kind, DataModel dm) noexcep
 std::optional<StructLayout>
 computeLayout(TypeId id, TypeInterner const& interner,
               AggregateLayoutParams params, DataModel dm) {
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): a `volatile T` has the SAME layout as T
+    // (C 6.7.3 — a qualifier never changes size/alignment). Strip the VolatileQual
+    // skin ONCE here so the whole engine — incl. the raw-kind incomplete checks
+    // below and the recursive field/element layouts — operates on the material
+    // type. This single strip makes `sizeof(volatile T) == sizeof(T)` hold by
+    // construction and routes a volatile-qualified struct/array/scalar down its
+    // normal arm. (The transparent `kind()`/`operands()` would mostly suffice, but
+    // `isIncompleteComposite`/`isIncompleteArray` read the RAW record kind.)
+    id = interner.stripVolatile(id);
     TypeKind const kind = interner.kind(id);
 
     // D-CSUBSET-SELF-REFERENTIAL-STRUCT: an INCOMPLETE composite (a forward-declared

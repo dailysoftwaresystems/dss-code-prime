@@ -43,6 +43,24 @@ enum class TypeKind : std::uint16_t {
     Param, Bind,
     // ── extension marker (concrete kind lives in TypeRecord::extensionKind) ──
     Extension,
+    // ── type qualifier (D-CSUBSET-VOLATILE-POINTEE / c27) ──
+    // `volatile T` — operands=[inner]. A TRANSPARENT skin: it has a DISTINCT
+    // interned identity (so `volatile int` != `int` for equality / interning,
+    // which is what carries the volatile through a declaration's type to the
+    // access), but `kind()` / `operands()` / `scalars()` SEE THROUGH it to the
+    // inner type, so every layout / arithmetic / codegen / classification
+    // consumer that reads the kind dispatches on the MATERIAL kind WITHOUT a
+    // per-site strip — only code that explicitly asks `isVolatileQualified(id)`
+    // (the access-volatility chokepoints) observes the wrapper. `volatile u32` =
+    // VolatileQual(U32); `volatile u32 *` = Ptr<VolatileQual(U32)> (volatile
+    // binds the innermost pointee, C 6.7.3); east `u32 * volatile` =
+    // VolatileQual(Ptr<U32>) (a volatile POINTER). Idempotent (no double-wrap).
+    // const gets NO such wrapper — const stays ignored for type identity, since
+    // only volatile affects codegen (the optimizer's MirInstFlags::Volatile).
+    // Placed LAST (before Count_) so every pre-existing kind keeps its integer
+    // value — TypeKind ints appear in scalar pools (enum underlying / CallConv)
+    // and cached/round-tripped TypeIds; renumbering would silently shift them.
+    VolatileQual,
 
     Count_  // keep last — counts the core members
 };

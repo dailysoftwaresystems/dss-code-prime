@@ -141,6 +141,19 @@ namespace detail::type_rules {
     bool                                               intCrossSignednessConverts = false,
     bool                                               intSameSignednessNarrows = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): volatile is IGNORED for assignment
+    // compatibility — C 6.5.16.1 compares the UNQUALIFIED versions of compatible
+    // types (`volatile int` ↔ `int`, `int * volatile` ↔ `int *`, `volatile struct
+    // S` ↔ `struct S` all assign freely). Strip the TOP-LEVEL VolatileQual from
+    // BOTH sides so the identity (`sameType`) and every kind/pointer-element rule
+    // below sees the material type. (A volatile-POINTEE difference — `volatile int
+    // *` vs `int *` — is a pointer-element mismatch C also permits with a
+    // diagnostic-less qualifier conversion; here the element compare reads the
+    // transparent `operands`, where `Ptr<VolatileQual(int)>` and `Ptr<int>` differ
+    // only by the inner skin, so a future strict-qualifier-mismatch rule would add
+    // its own arm — today both decay to the same pointer pipeline.)
+    lhs = interner.stripVolatile(lhs);
+    rhs = interner.stripVolatile(rhs);
     if (sameType(lhs, rhs)) return true;
     auto const lk = interner.kind(lhs);
     auto const rk = interner.kind(rhs);
@@ -295,6 +308,20 @@ namespace detail::type_rules {
         auto const lhsElem = interner.operands(lhs);
         auto const rhsElem = interner.operands(rhs);
         if (!lhsElem.empty() && !rhsElem.empty()) {
+            // c27 (D-CSUBSET-VOLATILE-POINTEE): a POINTEE volatile-qualifier
+            // difference is assignment-compatible — C 6.5.16.1 lets the lhs
+            // pointee ADD qualifiers (`int *` → `volatile int *`, the sqlite WAL
+            // shape `s.p = &x`). Compare the pointees MODULO their top-level
+            // VolatileQual skin; identical material pointees ⇒ compatible. (C also
+            // diagnoses DROPPING volatile `volatile int *` → `int *`; we admit
+            // both directions for the shipped C surface — the qualifier never
+            // changes layout/codegen, only the access flag, which is keyed off the
+            // ACCESSED type, so a dropped-qualifier pointer simply yields a plain
+            // access through the lhs's stripped pointee — never a miscompile.)
+            if (interner.stripVolatile(lhsElem[0])
+                == interner.stripVolatile(rhsElem[0])) {
+                return true;
+            }
             bool const lhsIsVoidPtr =
                 interner.kind(lhsElem[0]) == TypeKind::Void;
             bool const rhsIsVoidPtr =

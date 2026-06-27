@@ -303,6 +303,22 @@ struct Lowerer {
         return MirInstFlags::None;
     }
 
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): the TYPE-derived half of the access-
+    // volatility funnel. A Load/Store whose ACCESSED type (the thing read/written
+    // — the pointee for a deref/index, the field for a member, the value for a
+    // scalar) is `volatile`-qualified IS a volatile access, regardless of any
+    // symbol-level c21 flag. Every access form's Load/Store ORs this with
+    // `volatileFlagFor(node)` so the flag's coverage is by-construction at one
+    // place per form: c21 carries volatile that lives on a SYMBOL (a `volatile`
+    // object/member/pointer-object), c27 carries volatile that lives in the TYPE
+    // (a deref/index/member through a `volatile`-pointee `Ptr<VolatileQual(T)>`).
+    // A missed OR here = a silent miscompile (the optimizer elides/caches the
+    // access), so it is threaded at the SAME sites as `volatileFlagFor`.
+    [[nodiscard]] MirInstFlags volatileFlagForType(TypeId accessedTy) const {
+        return interner.isVolatileQualified(accessedTy) ? MirInstFlags::Volatile
+                                                        : MirInstFlags::None;
+    }
+
     // Map a HIR core operator + operand TypeKind to a MIR opcode. Integer
     // signed/unsigned is type-driven (HirOpKind has only `Div`/`Rem`/`Shr`,
     // not separate signed/unsigned forms — same convention as type_lattice).
@@ -559,10 +575,13 @@ struct Lowerer {
                 if (auto it = addressableLocal.find(sym);
                     it != addressableLocal.end()) {
                     std::array<MirInstId, 1> ops{it->second};
-                    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a Ref to a `volatile`
-                    // address-taken local — its rvalue Load carries the flag.
+                    // c21/c27: a Ref to a `volatile` address-taken local — its
+                    // rvalue Load carries the flag. c21 via the node's VolatileAttr
+                    // (object-volatile symbol); c27 also OR's the value type `t`
+                    // (top-level VolatileQual) so the two halves agree by
+                    // construction.
                     return mir.addInst(MirOpcode::Load, ops, t, /*payload=*/0,
-                                       volatileFlagFor(node));
+                                       volatileFlagFor(node) | volatileFlagForType(t));
                 }
                 if (auto it = symbolToValue.find(sym); it != symbolToValue.end()) {
                     return it->second;
@@ -574,10 +593,11 @@ struct Lowerer {
                     TypeId const ptrTy = interner.pointer(t);
                     MirInstId const addr = mir.addGlobalAddr(SymbolId{sym}, ptrTy);
                     std::array<MirInstId, 1> ops{addr};
-                    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a Ref to a `volatile`
-                    // global — its rvalue Load carries the flag.
+                    // c21/c27: a Ref to a `volatile` global — its rvalue Load
+                    // carries the flag (c21 VolatileAttr OR c27 value-type
+                    // VolatileQual).
                     return mir.addInst(MirOpcode::Load, ops, t, /*payload=*/0,
-                                       volatileFlagFor(node));
+                                       volatileFlagFor(node) | volatileFlagForType(t));
                 }
                 if (functionSymbols.contains(sym)) {
                     return mir.addGlobalAddr(SymbolId{sym}, t);
@@ -860,11 +880,15 @@ struct Lowerer {
                 // FC8 D-CSUBSET-BITFIELD: a bit-field read loads the whole
                 // allocation unit (the Gep already targets the unit), then
                 // extracts the field's bits (shift + mask / sign-extend).
-                // c21 (D-CSUBSET-VOLATILE-QUALIFIER): an rvalue read of a
-                // `volatile` struct/union MEMBER (the MemberAccess node carries
-                // the flag; a plain Index / non-volatile member ⇒ None). The unit
-                // Load of a volatile bit-field member is equally volatile.
-                MirInstFlags const vf = volatileFlagFor(node);
+                // c21/c27: an rvalue read of a `volatile` struct/union MEMBER or a
+                // `volatile`-element INDEX is volatile. c21 carries an
+                // object-volatile member via the node's VolatileAttr; c27 carries
+                // a volatile ELEMENT/FIELD type via `t` (the accessed value type —
+                // e.g. `va[i]` where `va`'s element is VolatileQual, or a member
+                // whose field type is top-level VolatileQual). OR both so neither
+                // form is missed (a missed flag = silent miscompile).
+                MirInstFlags const vf =
+                    volatileFlagFor(node) | volatileFlagForType(t);
                 if (BitFieldPlacement const* bf = bitfieldPlacementOf(node)) {
                     std::array<MirInstId, 1> lo{ptr};
                     MirInstId const unit = mir.addInst(MirOpcode::Load, lo, t,
@@ -1082,9 +1106,19 @@ struct Lowerer {
 
     // Deref epilogue (pointer already lowered to `ptr`): `Load(ptr)` typed as
     // the node's (pointee) type.
+    //
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): if the pointee type is `volatile`-
+    // qualified (the pointer was `Ptr<VolatileQual(T)>`, i.e. a `volatile T *`),
+    // the Load is VOLATILE — the optimizer must not elide/cache/reorder it. The
+    // pointee type IS this node's type. OR the type-derived flag with any
+    // symbol-level c21 flag on the deref node (a deref node itself is never a
+    // c21-flagged Ref, but ORing keeps the funnel uniform).
     [[nodiscard]] MirInstId combineDeref(HirNodeId node, MirInstId ptr) {
         std::array<MirInstId, 1> ops{ptr};
-        return mir.addInst(MirOpcode::Load, ops, hir.typeId(node));
+        TypeId const pointeeTy = hir.typeId(node);
+        MirInstFlags const vf =
+            volatileFlagFor(node) | volatileFlagForType(pointeeTy);
+        return mir.addInst(MirOpcode::Load, ops, pointeeTy, /*payload=*/0, vf);
     }
 
     // Scalar-Cast epilogue (operand already lowered): the array→pointer DECAY
@@ -2616,7 +2650,10 @@ struct Lowerer {
     // only on the config-driven layout's `bitFields[]` + `fieldOffsets[]`.
     [[nodiscard]] bool lowerBitfieldAggregateInitIntoSlot(HirNodeId aggNode,
                                                           MirInstId allocaPtr,
-                                                          TypeId aggTy) {
+                                                          TypeId aggTy,
+                                                          MirInstFlags vf = MirInstFlags::None) {
+        // c27: `vf` Volatile when the destination aggregate is `volatile` — every
+        // unit-zero, ordinary-field Store, and bit-field RMW carries the flag.
         StructLayout const* layout = cachedLayout(aggTy);
         if (layout == nullptr) {
             unsupported(aggNode, "bit-field aggregate initializer: layout "
@@ -2669,7 +2706,7 @@ struct Lowerer {
             MirInstId const zero = constIntOfType(0, fieldTy);
             if (!zero.valid()) return false;
             std::array<MirInstId, 2> zst{zero, unitPtr};
-            mir.addInst(MirOpcode::Store, zst);
+            mir.addInst(MirOpcode::Store, zst, InvalidType, /*payload=*/0, vf);
         }
         // PASS 2 — write every field. Bit-fields read-modify-write their (now
         // zeroed) unit; ordinary fields store/recurse; zero-width markers carry
@@ -2696,24 +2733,24 @@ struct Lowerer {
                 TypeKind const fk = interner.kind(fieldTy);
                 if (fk == TypeKind::Struct || fk == TypeKind::Union) {
                     if (hir.kind(child) == HirKind::ConstructAggregate) {
-                        if (!lowerAggregateInitIntoSlot(child, fieldPtr, fieldTy))
+                        if (!lowerAggregateInitIntoSlot(child, fieldPtr, fieldTy, vf))
                             return false;
                     } else {
                         MirInstId const srcPtr = lowerLvalueAddress(child);
                         if (!srcPtr.valid()) return false;
-                        if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                        if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy, vf))
                             return false;
                     }
                     continue;
                 }
                 if (fk == TypeKind::Array) {
                     if (hir.kind(child) == HirKind::ConstructAggregate) {
-                        if (!lowerArrayInitIntoSlot(child, fieldPtr, fieldTy))
+                        if (!lowerArrayInitIntoSlot(child, fieldPtr, fieldTy, vf))
                             return false;
                     } else {
                         MirInstId const srcPtr = lowerLvalueAddress(child);
                         if (!srcPtr.valid()) return false;
-                        if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                        if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy, vf))
                             return false;
                     }
                     continue;
@@ -2721,7 +2758,9 @@ struct Lowerer {
                 MirInstId const v = lowerExpr(child);
                 if (!v.valid()) return false;
                 std::array<MirInstId, 2> stOps{v, fieldPtr};
-                mir.addInst(MirOpcode::Store, stOps);
+                // c27: dest-aggregate volatility OR this field's own type volatility.
+                mir.addInst(MirOpcode::Store, stOps, InvalidType, /*payload=*/0,
+                            vf | volatileFlagForType(fieldTy));
                 continue;
             }
             // Bit-field: Gep to the UNIT (already zeroed in pass 1), then RMW the
@@ -2733,7 +2772,7 @@ struct Lowerer {
             if (!unitPtr.valid()) return false;
             MirInstId const v = lowerExpr(child);
             if (!v.valid()) return false;
-            if (!emitBitfieldInsert(unitPtr, v, layout->bitFields[f], fieldTy))
+            if (!emitBitfieldInsert(unitPtr, v, layout->bitFields[f], fieldTy, vf))
                 return false;
         }
         return true;
@@ -2749,13 +2788,19 @@ struct Lowerer {
     // Returns false (fail-loud already reported) on any failure.
     [[nodiscard]] bool lowerAggregateInitIntoSlot(HirNodeId aggNode,
                                                   MirInstId allocaPtr,
-                                                  TypeId aggTy) {
+                                                  TypeId aggTy,
+                                                  MirInstFlags vf = MirInstFlags::None) {
+        // c27 (D-CSUBSET-VOLATILE-POINTEE): `vf` is Volatile when the DESTINATION
+        // aggregate is `volatile`-qualified (`volatile struct S s = {…}` — C
+        // 6.7.3p5: every member write of a volatile object is a volatile access).
+        // The VarDecl site passes the object's volatility; structural sub-recursion
+        // propagates it to nested fields/elements. A non-volatile init keeps None.
         // FC8 D-CSUBSET-BITFIELD-INIT: a struct/union initializer whose type has
         // bit-fields packs per allocation unit — a plain field-wise Store would
         // write each bit-field full-width into the shared unit, clobbering its
         // co-resident neighbours. Routed to the unit-aware initializer.
         if (hasBitfieldMember(aggTy)) {
-            return lowerBitfieldAggregateInitIntoSlot(aggNode, allocaPtr, aggTy);
+            return lowerBitfieldAggregateInitIntoSlot(aggNode, allocaPtr, aggTy, vf);
         }
         auto kids = hir.children(aggNode);
         for (std::size_t i = 0; i < kids.size(); ++i) {
@@ -2786,7 +2831,7 @@ struct Lowerer {
             TypeKind const fk = interner.kind(fieldTy);
             if (fk == TypeKind::Struct || fk == TypeKind::Union) {
                 if (hir.kind(kids[i]) == HirKind::ConstructAggregate) {
-                    if (!lowerAggregateInitIntoSlot(kids[i], fieldPtr, fieldTy))
+                    if (!lowerAggregateInitIntoSlot(kids[i], fieldPtr, fieldTy, vf))
                         return false;
                     continue;
                 }
@@ -2796,7 +2841,7 @@ struct Lowerer {
                 // address into the field's sub-slot.
                 MirInstId const srcPtr = lowerLvalueAddress(kids[i]);
                 if (!srcPtr.valid()) return false;
-                if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy, vf))
                     return false;
                 continue;
             }
@@ -2807,13 +2852,13 @@ struct Lowerer {
             // wise; an array VALUE copies byte-wise (D-FC7-AGGREGATE-COPY).
             if (fk == TypeKind::Array) {
                 if (hir.kind(kids[i]) == HirKind::ConstructAggregate) {
-                    if (!lowerArrayInitIntoSlot(kids[i], fieldPtr, fieldTy))
+                    if (!lowerArrayInitIntoSlot(kids[i], fieldPtr, fieldTy, vf))
                         return false;
                     continue;
                 }
                 MirInstId const srcPtr = lowerLvalueAddress(kids[i]);
                 if (!srcPtr.valid()) return false;
-                if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy, vf))
                     return false;
                 continue;
             }
@@ -2821,7 +2866,11 @@ struct Lowerer {
             MirInstId const v = lowerExpr(kids[i]);
             if (!v.valid()) return false;
             std::array<MirInstId, 2> stOps{v, fieldPtr};
-            mir.addInst(MirOpcode::Store, stOps);
+            // c27: flag if the dest aggregate is volatile (`vf`) OR this FIELD's own
+            // type is volatile (`struct { volatile int m; }` — `m`'s init is a
+            // volatile write even when the container is plain).
+            mir.addInst(MirOpcode::Store, stOps, InvalidType, /*payload=*/0,
+                        vf | volatileFlagForType(fieldTy));
         }
         return true;
     }
@@ -2839,7 +2888,10 @@ struct Lowerer {
     // funnels through this one helper (§A.5 by-construction coverage).
     [[nodiscard]] bool lowerArrayInitIntoSlot(HirNodeId arrNode,
                                               MirInstId basePtr,
-                                              TypeId /*arrTy*/) {
+                                              TypeId /*arrTy*/,
+                                              MirInstFlags vf = MirInstFlags::None) {
+        // c27: `vf` Volatile when the destination array is `volatile`-qualified
+        // (`volatile int va[] = {…}`); propagated to nested element inits.
         auto kids = hir.children(arrNode);
         for (std::size_t j = 0; j < kids.size(); ++j) {
             TypeId const elemTy = hir.typeId(kids[j]);
@@ -2860,25 +2912,25 @@ struct Lowerer {
             TypeKind const ek = interner.kind(elemTy);
             if (ek == TypeKind::Struct || ek == TypeKind::Union) {
                 if (hir.kind(kids[j]) == HirKind::ConstructAggregate) {
-                    if (!lowerAggregateInitIntoSlot(kids[j], elemPtr, elemTy))
+                    if (!lowerAggregateInitIntoSlot(kids[j], elemPtr, elemTy, vf))
                         return false;
                     continue;
                 }
                 MirInstId const srcPtr = lowerLvalueAddress(kids[j]);
                 if (!srcPtr.valid()) return false;
-                if (!lowerAggregateCopy(arrNode, srcPtr, elemPtr, elemTy))
+                if (!lowerAggregateCopy(arrNode, srcPtr, elemPtr, elemTy, vf))
                     return false;
                 continue;
             }
             if (ek == TypeKind::Array) {
                 if (hir.kind(kids[j]) == HirKind::ConstructAggregate) {
-                    if (!lowerArrayInitIntoSlot(kids[j], elemPtr, elemTy))
+                    if (!lowerArrayInitIntoSlot(kids[j], elemPtr, elemTy, vf))
                         return false;
                     continue;
                 }
                 MirInstId const srcPtr = lowerLvalueAddress(kids[j]);
                 if (!srcPtr.valid()) return false;
-                if (!lowerAggregateCopy(arrNode, srcPtr, elemPtr, elemTy))
+                if (!lowerAggregateCopy(arrNode, srcPtr, elemPtr, elemTy, vf))
                     return false;
                 continue;
             }
@@ -2886,7 +2938,12 @@ struct Lowerer {
             MirInstId const v = lowerExpr(kids[j]);
             if (!v.valid()) return false;
             std::array<MirInstId, 2> stOps{v, elemPtr};
-            mir.addInst(MirOpcode::Store, stOps);
+            // c27: flag the store if the dest array is volatile (`vf`) OR the
+            // ELEMENT type is volatile (`volatile int va[]` distributes the
+            // qualifier to the element type `VolatileQual(int)` — the array itself
+            // is NOT top-level-qualified, so `vf` alone would miss it).
+            mir.addInst(MirOpcode::Store, stOps, InvalidType, /*payload=*/0,
+                        vf | volatileFlagForType(elemTy));
         }
         return true;
     }
@@ -3421,7 +3478,16 @@ struct Lowerer {
                                  "layout (target 'aggregateLayout' / complete type)");
             return false;
         }
-        if (!lowerByteWiseCopy(srcAddr, temp, layout->size)) return false;
+        // c27 (D-CSUBSET-VOLATILE-POINTEE): passing a `volatile`-qualified
+        // aggregate BY VALUE reads the whole object (C 6.7.3p5: every member
+        // access of a volatile aggregate is volatile). The source's ACCESSED TYPE
+        // is `VolatileQual(...)` when the container is volatile (a `volatile struct`
+        // local, or a deref of a `volatile struct *`). Flag the source-reading
+        // Loads of the copy; the temp (a fresh private copy) is non-volatile, so
+        // its piece Loads stay plain.
+        MirInstFlags const srcVf =
+            volatileFlagFor(argNode) | volatileFlagForType(hir.typeId(argNode));
+        if (!lowerByteWiseCopy(srcAddr, temp, layout->size, srcVf)) return false;
         if (abi.kind == AbiPassing::Kind::ByReference) {
             operands.push_back(temp);   // a pointer to the callee-owned copy
             return true;
@@ -3730,13 +3796,22 @@ struct Lowerer {
         }
         MirInstId const srcAddr = lowerLvalueAddress(valNode);
         if (!srcAddr.valid()) return false;
+        // c27 (D-CSUBSET-VOLATILE-POINTEE): returning a `volatile`-qualified
+        // aggregate BY VALUE reads the whole returned object (C 6.7.3p5). The
+        // returned value's ACCESSED TYPE is `VolatileQual(...)` when it is a
+        // `volatile struct` lvalue (or a deref of a `volatile struct *`). Flag the
+        // source-reading Loads (the sret-copy halves and the in-register piece
+        // Loads); the sret destination is the CALLER's storage — keeping the
+        // dest-store flag matches the conservative whole-aggregate-copy convention.
+        MirInstFlags const srcVf =
+            volatileFlagFor(valNode) | volatileFlagForType(hir.typeId(valNode));
         if (abi->kind == AbiPassing::Kind::ByReference) {
             if (!sretPtr_.valid()) {
                 unsupported(valNode, "sret return reached without a hidden result "
                                      "pointer (lowerFunction setup invariant)");
                 return false;
             }
-            if (!lowerByteWiseCopy(srcAddr, sretPtr_, layout->size)) return false;
+            if (!lowerByteWiseCopy(srcAddr, sretPtr_, layout->size, srcVf)) return false;
             // SysV/Win64 return the result pointer in the integer return register
             // (rax/rcx). AAPCS64/Apple x8-sret returns VOID — the caller owns x8 and
             // the storage it points at; the callee must NOT also place it in x0.
@@ -3756,7 +3831,7 @@ struct Lowerer {
                 mir.addInst(MirOpcode::Gep, g, interner.pointer(pty));
             if (!gp.valid()) return false;
             std::array<MirInstId, 1> l{gp};
-            MirInstId const v = mir.addInst(MirOpcode::Load, l, pty);
+            MirInstId const v = mir.addInst(MirOpcode::Load, l, pty, /*payload=*/0, srcVf);
             if (!v.valid()) return false;
             pieces.push_back(v);
         }
@@ -5735,17 +5810,24 @@ struct Lowerer {
                     // Gep+Store per field into the slot — never as an
                     // aggregate-SSA Store (no LIR aggregate-width Store).
                     TypeKind const initKind = interner.kind(ty);
+                    // c27 (D-CSUBSET-VOLATILE-POINTEE): a `volatile`-qualified
+                    // aggregate's brace-init (`volatile struct S s = {…}`) writes
+                    // every field as a volatile access (C 6.7.3p5). The dest's
+                    // volatility = its declared type's VolatileQual (c27) OR the
+                    // VarDecl object annotation (c21) — flag every init Store.
+                    MirInstFlags const initVf =
+                        volatileFlagFor(node) | volatileFlagForType(ty);
                     if (hir.kind(*initN) == HirKind::ConstructAggregate
                         && (initKind == TypeKind::Struct
                             || initKind == TypeKind::Union)) {
-                        if (!lowerAggregateInitIntoSlot(*initN, alloca, ty))
+                        if (!lowerAggregateInitIntoSlot(*initN, alloca, ty, initVf))
                             return false;
                     } else if (hir.kind(*initN) == HirKind::ConstructAggregate
                                && initKind == TypeKind::Array) {
                         // D-MIR-ARRAY-FIELD-AGGREGATE-INIT (array-LOCAL form):
                         // `int a[3] = {1,2,3}` — element-wise into the slot via
                         // the same helper the array-field recurse-guard uses.
-                        if (!lowerArrayInitIntoSlot(*initN, alloca, ty))
+                        if (!lowerArrayInitIntoSlot(*initN, alloca, ty, initVf))
                             return false;
                     } else if (initKind == TypeKind::Struct
                                || initKind == TypeKind::Union) {
@@ -5756,25 +5838,29 @@ struct Lowerer {
                         // register.
                         MirInstId const srcPtr = lowerLvalueAddress(*initN);
                         if (!srcPtr.valid()) return false;
-                        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a WHOLE-VOLATILE
-                        // aggregate copy flags every structural Load/Store. Either
-                        // side being volatile (the dest local `node` OR the source
-                        // `*initN`) makes the copy volatile — OR them so neither
-                        // side's volatility is dropped (safe-conservative: an
-                        // extra flag only forgoes an optimization).
+                        // c21/c27: a WHOLE-VOLATILE aggregate copy flags every
+                        // structural Load/Store. Either side being volatile makes
+                        // the copy volatile: c21 via the object-volatile dest local
+                        // `node` / source `*initN`; c27 via the source's ACCESSED
+                        // TYPE being top-level VolatileQual (a `volatile struct`
+                        // value, or a deref of a `volatile struct *`). OR all so no
+                        // side's volatility is dropped (safe-conservative).
                         MirInstFlags const aggVf =
-                            volatileFlagFor(node) | volatileFlagFor(*initN);
+                            volatileFlagFor(node) | volatileFlagFor(*initN)
+                            | volatileFlagForType(ty)
+                            | volatileFlagForType(hir.typeId(*initN));
                         if (!lowerAggregateCopy(*initN, srcPtr, alloca, ty, aggVf))
                             return false;
                     } else {
                         MirInstId const initVal = lowerExpr(*initN);
                         if (!initVal.valid()) return false;
                         std::array<MirInstId, 2> ops{initVal, alloca};
-                        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): the init store into a
-                        // `volatile` local's slot carries the flag (the VarDecl node
-                        // was annotated from the object's `isVolatile`).
+                        // c21/c27: the init store into a `volatile` local's slot
+                        // carries the flag — via the VarDecl object annotation (c21)
+                        // OR the declared type's VolatileQual (c27, e.g. a `vint x`
+                        // typedef = `volatile int`). OR both so neither is missed.
                         mir.addInst(MirOpcode::Store, ops, InvalidType, /*payload=*/0,
-                                    volatileFlagFor(node));
+                                    volatileFlagFor(node) | volatileFlagForType(ty));
                     }
                 }
                 return true;
@@ -5801,25 +5887,33 @@ struct Lowerer {
                     if (!dstPtr.valid()) return false;
                     MirInstId const srcPtr = lowerLvalueAddress(valueN);
                     if (!srcPtr.valid()) return false;
-                    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a WHOLE-VOLATILE aggregate
-                    // assignment flags every structural Load/Store — either the
-                    // target or the source being volatile makes the copy volatile
-                    // (OR them so neither side's volatility is dropped).
+                    // c21/c27: a WHOLE-VOLATILE aggregate assignment flags every
+                    // structural Load/Store — either the target or source being
+                    // volatile makes the copy volatile. c21 via object-volatile
+                    // target/source; c27 via either side's ACCESSED TYPE being
+                    // top-level VolatileQual (a `volatile struct` lvalue, or a deref
+                    // of a `volatile struct *`). OR all so no side is dropped.
                     MirInstFlags const aggVf =
-                        volatileFlagFor(targetN) | volatileFlagFor(valueN);
+                        volatileFlagFor(targetN) | volatileFlagFor(valueN)
+                        | volatileFlagForType(hir.typeId(targetN))
+                        | volatileFlagForType(hir.typeId(valueN));
                     return lowerAggregateCopy(node, srcPtr, dstPtr, valTy, aggVf);
                 }
                 MirInstId const rhs = lowerExpr(valueN);
                 if (!rhs.valid()) return false;
                 MirInstId const ptr = lowerLvalueAddress(targetN);
                 if (!ptr.valid()) return false;
-                // c21 (D-CSUBSET-VOLATILE-QUALIFIER): the store's volatility is the
-                // TARGET lvalue's — `targetN` is a Ref (volatile object/global) or
-                // a MemberAccess (volatile member), both annotated at CST→HIR. A
-                // Deref target (`*p = x`) carries no flag here BY CONSTRUCTION:
-                // pointer-to-volatile-pointee is rejected upstream, and a volatile
-                // pointer OBJECT's volatility is the load of `p` (the Ref site).
-                MirInstFlags const vf = volatileFlagFor(targetN);
+                // c21/c27: the store's volatility is the TARGET lvalue's. c21:
+                // `targetN` is a Ref (object-volatile) or MemberAccess
+                // (object-volatile member), annotated at CST→HIR. c27: the target's
+                // ACCESSED TYPE is volatile — a Deref target `*p = x` where `p` is
+                // `volatile int *` (targetN's type = the pointee `VolatileQual(int)`),
+                // an Index `va[i] = x` into a volatile element, or a member whose
+                // field type is top-level VolatileQual. OR the type-derived flag so
+                // a volatile-pointee STORE is never dropped (the c21 comment's
+                // "Deref carries no flag" no longer holds — pointees compile now).
+                MirInstFlags const vf =
+                    volatileFlagFor(targetN) | volatileFlagForType(hir.typeId(targetN));
                 // FC8 D-CSUBSET-BITFIELD: a bit-field write is a READ-MODIFY-WRITE
                 // of the allocation unit (the Gep targets the unit) — clear the
                 // field's bits, OR in the new value, store back. A plain Store

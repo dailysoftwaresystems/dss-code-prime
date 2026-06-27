@@ -85,15 +85,14 @@ struct DSS_EXPORT SymbolRecord {
     // found in the type subtree. A reassignment of a const symbol emits
     // S_ConstViolation.
     bool            isConst = false;
-    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): set when the decl's `volatileMarker`
-    // token was found in the type subtree — INDEPENDENT of `isConst` (so `const
-    // volatile` sets both). Read at CST→HIR access lowering (object Ref + struct
-    // MEMBER) and recorded onto the access HIR node via `HirVolatileMap`; HIR→MIR
-    // then stamps `MirInstFlags::Volatile` on that access's Load/Store so the
-    // (already Volatile-aware) optimizer passes cannot elide or reorder it. A
-    // missed access = a silent miscompile, so the threading is exhaustive across
-    // every user Load/Store emit site. Default false ⇒ a plain memory access.
-    bool            isVolatile = false;
+    // c27 (D-CSUBSET-VOLATILE-POINTEE) RETIRED the c21 `isVolatile` bool: volatile
+    // is now a TYPE qualifier (TypeKind::VolatileQual), so OBJECT-volatility is
+    // read directly off a symbol's resolved `type` (top-level VolatileQual) at
+    // CST→HIR access lowering (`recordVolatility`), and POINTEE-volatility rides
+    // the accessed type at the deref/index/member (`volatileFlagForType` in
+    // HIR→MIR). The coarse token-scan the bool fronted could not tell a volatile
+    // OBJECT (`int * volatile p`) from a volatile POINTEE (`volatile int *p`),
+    // which c27's type model now distinguishes. No separate symbol bool remains.
     // SE6: set on a builtin-function symbol declared `variadic` — the
     // call-check skips arg-count enforcement for it.
     bool            variadicBuiltin = false;
