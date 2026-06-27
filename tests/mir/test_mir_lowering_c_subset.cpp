@@ -7049,9 +7049,11 @@ TEST(MirLoweringCSubsetVolatile, NonVolatileAggregateAssignCopyNotFlagged) {
 // the SOLE catcher for the SQLite aggregate shape; pin it directly (it was
 // only exercised end-to-end before — the c12/c13 "green over a subset of reject
 // sites" trap). Each asserts S_VolatilePointeeNotSupported AND that the model
-// stays clean (no MIR produced). The double-pointer cases pin BOTH arms across
-// the greedy-star parse (the `*` may bind to the head's `{repeat StarOp}` OR the
-// declarator's pointerLayer — either way the reject must fire).
+// stays clean (no MIR produced). NOTE (c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR):
+// member pointer stars no longer bind to a head `{repeat StarOp}` (removed so
+// `int *a, b;` types b as int) — a struct/union MEMBER `volatile int *p` is now
+// caught by the PER-DECLARATOR arm, and a TYPEDEF by its own arm; the co-located
+// head arm still serves cast/sizeof type-names. Either way the reject must fire.
 // ─────────────────────────────────────────────────────────────────────────────
 
 namespace {
@@ -7062,30 +7064,39 @@ namespace {
 }
 } // namespace
 
-// Test 10 — struct MEMBER `volatile int *p` (the co-located arm; the SQLite
-// aggregate-shape catcher). Must fail loud — AND via the CO-LOCATED arm (not the
-// per-declarator arm): the co-located arm positions at the whole type node, so
-// its diagnostic `actual` is the type-node text "volatile int *"; the per-
-// declarator arm's `actual` would be the declarator "*p". Asserting the text pins
-// WHICH arm catches the member shape (the coordinator's "verify it hits the
-// co-located arm" — a refactor that re-routed it would change this text).
-TEST(MirLoweringCSubsetVolatile, StructMemberPointeeVolatileFailsLoudViaColocatedArm) {
+// Test 10 — struct MEMBER `volatile int *p` (the SQLite aggregate-shape catcher).
+// Must fail loud. ★ c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR) moved the member
+// pointer star OUT of the head (`typeRefAllowingStruct` no longer consumes
+// `{repeat StarOp}` — stars bind PER-DECLARATOR so `int *a, b;` types b as int).
+// So a member's `volatile int *p` is now caught by the PER-DECLARATOR typing arm
+// (head `volatile` + a declarator `*`), whose diagnostic `actual` is the
+// DECLARATOR text ("*p" — a star but NO base "int"), positioned on the
+// declarator. The reject stays COMPLETE; only the arm/position changed (the
+// co-located head arm is unreachable for a member now that no star lands in the
+// head — it still serves cast/sizeof type-names). Pin the per-declarator shape.
+TEST(MirLoweringCSubsetVolatile, StructMemberPointeeVolatileFailsLoudViaPerDeclaratorArm) {
     auto L = lowerCSubset("struct S { volatile int *p; };\n"
                           "int main(void){ return 0; }\n");
-    bool sawColocated = false;
+    bool sawReject = false;
+    bool perDeclaratorShape = false;
     for (auto const& d : L.model.diagnostics().all()) {
         if (d.code != DiagnosticCode::S_VolatilePointeeNotSupported) continue;
-        // The co-located arm's `actual` is the full type-node text (contains the
-        // base "int" AND a trailing star); the per-declarator arm's would be just
-        // the declarator (no base type). Pin the co-located shape.
-        if (d.actual.find("int") != std::string::npos
-            && d.actual.find('*') != std::string::npos) {
-            sawColocated = true;
+        sawReject = true;
+        // The per-declarator arm's `actual` is the DECLARATOR text — a star but
+        // NOT the base type "int" (the head `volatile int` is a sibling). Pin
+        // that shape so a regression re-routing the reject is caught.
+        if (d.actual.find('*') != std::string::npos
+            && d.actual.find("int") == std::string::npos) {
+            perDeclaratorShape = true;
         }
     }
-    EXPECT_TRUE(sawColocated)
-        << "a `volatile int *` STRUCT MEMBER must fail loud via the CO-LOCATED arm "
-           "(diagnostic over the whole `volatile int *` type node)";
+    EXPECT_TRUE(sawReject)
+        << "a `volatile int *` STRUCT MEMBER must fail loud "
+           "(pointer-to-volatile-pointee is unsupported under model B)";
+    EXPECT_TRUE(perDeclaratorShape)
+        << "c23: the member star binds per-declarator, so the reject fires via "
+           "the per-declarator arm (diagnostic `actual` = the declarator `*p`, "
+           "not the whole `volatile int *` type node)";
 }
 
 // Test 11 — union MEMBER `volatile int *p`. Must fail loud.
@@ -7093,18 +7104,34 @@ TEST(MirLoweringCSubsetVolatile, UnionMemberPointeeVolatileFailsLoud) {
     auto L = lowerCSubset("union U { volatile int *p; int x; };\n"
                           "int main(void){ return 0; }\n");
     EXPECT_TRUE(hasVolatilePointeeReject(L.model.diagnostics()))
-        << "a `volatile int *` UNION MEMBER must fail loud (co-located arm)";
+        << "a `volatile int *` UNION MEMBER must fail loud (per-declarator arm)";
 }
 
-// Test 12 — struct MEMBER DOUBLE pointer `volatile int **pp` — pins the reject
-// across the greedy-star parse (head `{repeat StarOp}` vs declarator pointerLayer
-// ambiguity). Must fail loud regardless of which arm the parse routes through.
+// Test 12 — struct MEMBER DOUBLE pointer `volatile int **pp` — must fail loud.
+// c23: both stars bind in the declarator's pointerLayer (the head no longer
+// consumes stars), so the per-declarator arm catches it; the reject must fire.
 TEST(MirLoweringCSubsetVolatile, StructMemberDoublePointeeVolatileFailsLoud) {
     auto L = lowerCSubset("struct S { volatile int **pp; };\n"
                           "int main(void){ return 0; }\n");
     EXPECT_TRUE(hasVolatilePointeeReject(L.model.diagnostics()))
-        << "a `volatile int **` STRUCT MEMBER must fail loud (both arms / greedy "
-           "star)";
+        << "a `volatile int **` STRUCT MEMBER must fail loud (per-declarator arm)";
+}
+
+// Test 12b (c23 × c21 interaction) — a MULTI-DECLARATOR volatile-pointer LIST
+// `volatile int *a, *b;` must reject EVERY slot. c23's per-declarator arm iterates
+// each declarator; this locks the per-slot iteration so a regression that checks
+// only the first declarator (and silently compiles `*b` with a non-volatile Load)
+// is caught. Both slots are pointer-to-volatile-pointee ⇒ TWO rejects.
+TEST(MirLoweringCSubsetVolatile, StructMemberPointeeVolatileListRejectsEverySlot) {
+    auto L = lowerCSubset("struct S { volatile int *a, *b; };\n"
+                          "int main(void){ return 0; }\n");
+    int rejects = 0;
+    for (auto const& d : L.model.diagnostics().all())
+        if (d.code == DiagnosticCode::S_VolatilePointeeNotSupported) ++rejects;
+    EXPECT_EQ(rejects, 2)
+        << "each slot of `volatile int *a, *b;` is a pointer-to-volatile-pointee "
+           "and must fail loud independently (the per-declarator arm iterates all "
+           "slots — a first-slot-only check would silently miscompile `*b`)";
 }
 
 // Test 13 — TYPEDEF wholesale reject: BOTH `typedef volatile int vint;` (object —

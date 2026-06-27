@@ -3231,3 +3231,252 @@ TEST(SemanticAnalyzerCSubset, TagAndOrdinaryObjectSameNameCoexist) {
 // multi-tree quote-include CU is not constructible through the in-memory
 // fixture (it has no on-disk include resolver), so the mechanism — not the
 // driver plumbing — is what these tests pin.
+
+// ─────────────────────────────────────────────────────────────────────────
+// c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): a struct/union member is a
+// comma-separated LIST of declarators sharing ONE head base type
+// (`struct S { int *a, *b; };` — C 6.7.2.1). Each slot carries its OWN
+// pointer/array/fn suffix AND its OWN bitfield suffix; only the HEAD base
+// type is shared. These tests pin: per-slot suffix isolation (the silent
+// layout-miscompile crux), per-slot independent bitfield widths, and that
+// the single-declarator form is byte-identical (regression).
+// ─────────────────────────────────────────────────────────────────────────
+
+namespace {
+// The composed Struct/Union TypeId for the tag `name` (the symbol the
+// fieldChildren pass interned). Returns InvalidType if not found / unresolved.
+[[nodiscard]] TypeId composedAggregate(SemanticModel const& model,
+                                       std::string_view name) {
+    auto const& ti = model.lattice().interner();
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        SymbolRecord const& r = model.symbols()[i];
+        if (r.name != name || !r.type.valid()) continue;
+        TypeKind const k = ti.kind(r.type);
+        if (k == TypeKind::Struct || k == TypeKind::Union) return r.type;
+    }
+    return {};
+}
+// The minted field symbol named `field` (any scope). nullptr if absent.
+[[nodiscard]] SymbolRecord const* fieldSym(SemanticModel const& model,
+                                           std::string_view field) {
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == field) return &model.symbols()[i];
+    return nullptr;
+}
+} // namespace
+
+// (a) The suffix-leak pin: `struct S { int *a, b[4], *c; };` -> three fields
+// Ptr<int>, Array<int,4>, Ptr<int> at fieldIndex 0/1/2. Each declarator's
+// star/array binds PER-SLOT -- only `int` (the head) is shared. RED-ON-DISABLE:
+// if a slot's suffix leaked, b would be a pointer or a/c would be plain int.
+TEST(SemanticAnalyzerCSubset, MultiMemberPerSlotSuffixIsolated) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int *a, b[4], *c; };\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const s = composedAggregate(model, "S");
+    ASSERT_TRUE(s.valid()) << "struct S must compose (all three fields resolve)";
+    ASSERT_EQ(ti.operands(s).size(), 3u) << "three members in declaration order";
+    // field 0: int *a  -> Ptr<int>
+    EXPECT_EQ(ti.kind(ti.operands(s)[0]), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(ti.operands(s)[0])[0]), TypeKind::I32);
+    // field 1: int b[4] -> Array<int,4>  (the `*` did NOT leak onto b)
+    ASSERT_EQ(ti.kind(ti.operands(s)[1]), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ti.operands(s)[1])[0], 4);
+    EXPECT_EQ(ti.kind(ti.operands(ti.operands(s)[1])[0]), TypeKind::I32);
+    // field 2: int *c  -> Ptr<int>
+    EXPECT_EQ(ti.kind(ti.operands(s)[2]), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(ti.operands(s)[2])[0]), TypeKind::I32);
+    // Per-symbol fieldIndex contiguous 0..2.
+    SymbolRecord const* a = fieldSym(model, "a");
+    SymbolRecord const* b = fieldSym(model, "b");
+    SymbolRecord const* c = fieldSym(model, "c");
+    ASSERT_NE(a, nullptr); ASSERT_NE(b, nullptr); ASSERT_NE(c, nullptr);
+    EXPECT_EQ(a->fieldIndex, 0u);
+    EXPECT_EQ(b->fieldIndex, 1u);
+    EXPECT_EQ(c->fieldIndex, 2u);
+}
+
+// (b) FIX 3 -- the mixed-pointer silent-miscompile pin: `struct S { int *a, b; };`
+// -> a is Ptr<int>, b is I32, DISTINCTLY. sizeof==16 is NECESSARY-NOT-SUFFICIENT
+// (both correct Ptr8+int4->16 AND the wrong "head-star leaks to both" Ptr8+Ptr8->16
+// give 16). The load-bearing assertions are the per-field TYPES (b is I32, not a
+// second pointer). RED-ON-DISABLE: a leaked head star makes b a Ptr.
+TEST(SemanticAnalyzerCSubset, MultiMemberHeadStarBindsPerDeclaratorNotShared) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int *a, b; };\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const s = composedAggregate(model, "S");
+    ASSERT_TRUE(s.valid());
+    ASSERT_EQ(ti.operands(s).size(), 2u);
+    // a: Ptr<int>
+    ASSERT_EQ(ti.kind(ti.operands(s)[0]), TypeKind::Ptr)
+        << "the `*` binds to a";
+    EXPECT_EQ(ti.kind(ti.operands(ti.operands(s)[0])[0]), TypeKind::I32);
+    // b: I32 -- DISTINCTLY NOT a pointer (the crux: the head `*` must not leak).
+    EXPECT_EQ(ti.kind(ti.operands(s)[1]), TypeKind::I32)
+        << "b shares only the head base `int`, NOT the `*` -- a leaked star "
+           "would make b a second pointer (both give sizeof 16, so the TYPE "
+           "is the load-bearing assertion)";
+    EXPECT_NE(ti.kind(ti.operands(s)[1]), TypeKind::Ptr);
+    // Per-symbol direct type checks (independent of the composed-operand path).
+    SymbolRecord const* a = fieldSym(model, "a");
+    SymbolRecord const* b = fieldSym(model, "b");
+    ASSERT_NE(a, nullptr); ASSERT_NE(b, nullptr);
+    EXPECT_EQ(ti.kind(a->type), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(b->type), TypeKind::I32);
+}
+
+// (c) Per-slot bitfield widths: `struct S { int a : 3, b : 5; };` -> widths 3
+// and 5 INDEPENDENTLY. The bitfield suffix is now INSIDE each member-list slot,
+// so the resolve searches from the per-slot dNode. RED-ON-DISABLE: a search
+// from the whole structField (the c10 root) finds the FIRST suffix for both ->
+// a:3, b:3.
+TEST(SemanticAnalyzerCSubset, MultiMemberPerSlotBitfieldWidths) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int a : 3, b : 5; };\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const s = composedAggregate(model, "S");
+    ASSERT_TRUE(s.valid());
+    ASSERT_EQ(ti.operands(s).size(), 2u);
+    auto w0 = ti.fieldBitWidth(s, 0);
+    auto w1 = ti.fieldBitWidth(s, 1);
+    ASSERT_TRUE(w0.has_value()); ASSERT_TRUE(w1.has_value());
+    EXPECT_EQ(*w0, 3u);
+    EXPECT_EQ(*w1, 5u) << "b's width resolves from its OWN slot, not a's";
+    // Per-symbol mirror.
+    SymbolRecord const* a = fieldSym(model, "a");
+    SymbolRecord const* b = fieldSym(model, "b");
+    ASSERT_NE(a, nullptr); ASSERT_NE(b, nullptr);
+    ASSERT_TRUE(a->bitFieldWidth.has_value());
+    ASSERT_TRUE(b->bitFieldWidth.has_value());
+    EXPECT_EQ(*a->bitFieldWidth, 3u);
+    EXPECT_EQ(*b->bitFieldWidth, 5u);
+}
+
+// (d) REGRESSION: the single-declarator form is byte-identical whether written
+// as two statements or one comma list. `struct A { int a; int b; }` and
+// `struct B { int a, b; }` must compose to the SAME field types/offsets. The
+// composed interned types are content-keyed, so equal field types + equal field
+// count over the same layout ==> the multi-declarator path did not perturb the
+// single-declarator one.
+TEST(SemanticAnalyzerCSubset, MultiMemberSingleVsCommaByteIdentical) {
+    auto model = analyzeShipped("c-subset", {
+        "struct A { int a; int b; };\n"
+        "struct B { int a, b; };\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const a = composedAggregate(model, "A");
+    TypeId const b = composedAggregate(model, "B");
+    ASSERT_TRUE(a.valid()); ASSERT_TRUE(b.valid());
+    ASSERT_EQ(ti.operands(a).size(), 2u);
+    ASSERT_EQ(ti.operands(b).size(), 2u);
+    for (std::size_t i = 0; i < 2; ++i) {
+        EXPECT_EQ(ti.kind(ti.operands(a)[i]), TypeKind::I32);
+        EXPECT_EQ(ti.kind(ti.operands(b)[i]), TypeKind::I32)
+            << "field " << i << " must be I32 in BOTH the statement-per-field "
+               "and comma-list forms (single-declarator unchanged)";
+    }
+    // No bitfields in either ==> both intern with empty scalar pools (the
+    // 2-arg-overload-identical path).
+    EXPECT_FALSE(ti.fieldBitWidth(a, 0).has_value());
+    EXPECT_FALSE(ti.fieldBitWidth(b, 0).has_value());
+}
+
+// (e) The sqlite3.c:15516 frontier shape, made buildable: a multi-declarator
+// pointer PAIR (`*next, *prev`) sharing one head tag + a `void *data` + a
+// trailing `int count`. (sqlite's HashElem points at ITSELF -- `struct HashElem
+// *next`; an inline SELF-referential struct-tag pointer is a SEPARATE pre-
+// existing limitation -- the tag is bound AFTER its body's fields are
+// type-resolved in the post-order walk -- pinned as fail-loud below and tracked
+// by D-CSUBSET-SELF-REFERENTIAL-STRUCT. Here the pointer target is a distinct
+// already-defined tag, isolating the c23 multi-declarator behavior.) Four
+// fields, correct per-slot types.
+TEST(SemanticAnalyzerCSubset, MultiMemberSqliteHashElemRepro) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Elem { int k; };\n"
+        "struct HashElem { struct Elem *next, *prev; void *data; int count; };\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const h = composedAggregate(model, "HashElem");
+    ASSERT_TRUE(h.valid()) << "the HashElem multi-declarator struct must compose";
+    ASSERT_EQ(ti.operands(h).size(), 4u);
+    // next, prev: Ptr<struct Elem> (the `*` binds per-slot on BOTH).
+    EXPECT_EQ(ti.kind(ti.operands(h)[0]), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(h)[1]), TypeKind::Ptr)
+        << "prev must ALSO be a pointer -- its own `*`, not borrowed from next";
+    // data: void*
+    ASSERT_EQ(ti.kind(ti.operands(h)[2]), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(ti.operands(h)[2])[0]), TypeKind::Void);
+    // count: int
+    EXPECT_EQ(ti.kind(ti.operands(h)[3]), TypeKind::I32);
+}
+
+// (e-pin) D-CSUBSET-SELF-REFERENTIAL-STRUCT (pre-existing, ORTHOGONAL to c23):
+// an INLINE self-referential struct-tag pointer (`struct N { struct N *next; }`)
+// fails loud with S_UnknownType -- the composite TAG is bound in Pass 1 only
+// AFTER its body's fields are type-resolved (post-order visits fields before the
+// parent), so the inner `struct N` reference resolves to nothing. This holds for
+// a SINGLE declarator (the form below) AND multi-declarator alike, proving the
+// c23 work neither caused nor is blocked by it. RED-ON-DISABLE the day the
+// limitation is fixed (a forward-bind tag pre-pass): this expectation flips and
+// the anchor closes. Fail-loud, never a silent miscompile.
+TEST(SemanticAnalyzerCSubset, SelfReferentialStructStillFailsLoudPreExisting) {
+    auto model = analyzeShipped("c-subset", {
+        "struct N { struct N *next; int v; };\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "an inline self-referential struct-tag pointer is a pre-existing "
+           "fail-loud limitation (the tag is not yet bound when its own field's "
+           "type resolves); tracked by D-CSUBSET-SELF-REFERENTIAL-STRUCT";
+}
+
+// (e2) Multi-declarator UNION members route through the same member-list
+// mechanism (`union U { int *p, n; };`). A union variant per slot; p is a
+// pointer, n is int.
+TEST(SemanticAnalyzerCSubset, MultiMemberUnionPerSlotSuffixIsolated) {
+    auto model = analyzeShipped("c-subset", {
+        "union U { int *p, n; };\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const u = composedAggregate(model, "U");
+    ASSERT_TRUE(u.valid());
+    ASSERT_EQ(ti.operands(u).size(), 2u);
+    EXPECT_EQ(ti.kind(ti.operands(u)[0]), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(u)[1]), TypeKind::I32);
+}
+
+// (f) The degenerate forms still behave: an anonymous single-slot bit-field
+// (`int : 5;`) is a packing slot (no named symbol, no declares-nothing), and
+// `int ;` declares nothing (loud). These exercise the member-list slot with an
+// ABSENT inner declarator -- the c10 anonymous/declares-nothing paths preserved.
+TEST(SemanticAnalyzerCSubset, MultiMemberAnonymousBitfieldStillResolves) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int a : 3; int : 5; int b; };\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeclarationDeclaresNothing), 0u);
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* a = fieldSym(model, "a");
+    SymbolRecord const* b = fieldSym(model, "b");
+    ASSERT_NE(a, nullptr); ASSERT_NE(b, nullptr);
+    ASSERT_TRUE(a->bitFieldWidth.has_value());
+    EXPECT_EQ(*a->bitFieldWidth, 3u);
+}
+
+TEST(SemanticAnalyzerCSubset, MultiMemberDeclaresNothingStillLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int ; };\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
+        << "`int ;` declares nothing -- must stay loud (anonymous non-bitfield)";
+}

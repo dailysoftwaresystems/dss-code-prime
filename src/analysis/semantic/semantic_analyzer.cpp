@@ -1466,6 +1466,27 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
         return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
                                       emitOnMiss, allowFlexibleArray);
     }
+    // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR) FIX 1: a struct/union member-list
+    // slot wraps ONE declarator (+ its own bitfield suffix). Descend to the
+    // inner declaratorRule and recurse — identical to the initDeclaratorRule arm
+    // above. WITHOUT this arm a `structMemberDeclarator` node falls through to
+    // the `r != dc.declaratorRule` reject below → InvalidType for EVERY field →
+    // the struct never composes (H_TypeUnresolved); the feature (and every
+    // single-declarator struct now routed through the member list) is dead.
+    // Each slot takes the head `base` TypeId BY VALUE into the append-only
+    // interner, so a per-slot star (`int *a, b;` → Ptr<int> then int) cannot
+    // leak across slots — the crux is correct by construction. An ABSENT inner
+    // declarator (the anonymous bit-field `int : 3;`) yields InvalidType here,
+    // which is fine: the anonymous-field path (~2435) types it from `headTy`,
+    // never from this declTy.
+    if (dc.memberDeclaratorRule.has_value()
+        && r == *dc.memberDeclaratorRule) {
+        NodeId const inner = declarator_walk_detail::firstChildOfRule(
+            TreeDeclaratorView{tree}, node, dc.declaratorRule);
+        if (!inner.valid()) return InvalidType;
+        return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
+                                      emitOnMiss, allowFlexibleArray);
+    }
     if (r != dc.declaratorRule) return InvalidType;
 
     // Pointer layers bind FIRST (innermost): T1 = Ptr^k(base).
@@ -2333,20 +2354,23 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             s.symbols.at(sym).type = declTy;
                             s.nodeToType.set(nameNode, declTy);
                         }
-                        // c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR: a NAMED
-                        // struct/union bit-field (`int x : 3;`) in declarator
-                        // mode. The legacy positional path resolved the `: W`
-                        // width here; port it. Gated on `decl.bitfieldSuffix`
-                        // so it fires ONLY for a field rule (params/locals/
-                        // globals carry no bitfieldSuffix). CRITICAL: the
-                        // `bitfieldDeclSuffix` is an OUTER SIBLING of the
-                        // declarator (`structField`'s 3rd child), so the
-                        // descendant search must start from `node` (the
-                        // structField row), NOT `dNode` (the declarator) — a
-                        // search from `dNode` would miss it.
+                        // c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR: a NAMED
+                        // struct/union bit-field (`int x : 3;` / per-slot
+                        // `int a:3, b:5;`) in declarator mode. Gated on
+                        // `decl.bitfieldSuffix` so it fires ONLY for a field
+                        // rule (params/locals/globals carry no bitfieldSuffix).
+                        // SEARCH ROOT = `dNode` (the per-slot
+                        // `structMemberDeclarator`), NOT `node` (the whole
+                        // structField): c23 moved the `bitfieldDeclSuffix`
+                        // INSIDE each member-list slot, so each slot's width
+                        // resolves independently — a DFS from `node` would find
+                        // the FIRST slot's suffix for every declarator
+                        // (`int a:3, b:5;` → both 3). The slot's own bitfield
+                        // suffix is a sibling of its inner declarator, so the
+                        // bounded descendant search from `dNode` reaches it.
                         if (decl.bitfieldSuffix.has_value()) {
                             BitfieldResolution const bf = resolveBitfieldSuffix(
-                                s, tree, decl, node, declTy, nameNode.valid(),
+                                s, tree, decl, dNode, declTy, nameNode.valid(),
                                 here, &cfg);
                             if (bf.width.has_value())
                                 s.symbols.at(sym).bitFieldWidth = bf.width;

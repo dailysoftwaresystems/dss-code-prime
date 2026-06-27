@@ -1,0 +1,15 @@
+{
+  "$comment": "c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): comma-separated declarators sharing one head base type in a struct body -- `struct P{int *a,b;}` (the `*` binds to a only; b is int) and `struct Q{int x,y[2],*z;}`. Each field is written then read back through a non-inlined call so it round-trips through its own slot at its own byte offset. A per-slot suffix LEAK (b->int*, or y[2]/z* leaking onto a neighbor) shifts an offset and the readback drifts off 42. Release arm (optimizedPipelines) so the layout/codegen path is exercised end-to-end across all targets.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}

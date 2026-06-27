@@ -251,6 +251,20 @@ struct DSS_EXPORT DeclaratorConfig {
     RuleId        arraySuffixRule{};
     RuleId        initDeclaratorRule{};
     RuleId        listRule{};
+    // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): the OPTIONAL struct/union
+    // member-declarator roles — the member-list analogue of
+    // `initDeclaratorRule`/`listRule`. `memberDeclaratorRule` is the per-slot
+    // wrapper `{declarator? bitfieldSuffix?}` (its inner declarator carries the
+    // name + per-slot pointer/array suffixes; the bitfield suffix now lives
+    // INSIDE the slot, so `int a:3, b:5;` resolves each width independently);
+    // `memberListRule` is `memberDeclaratorRule (',' memberDeclaratorRule)*`.
+    // The shared declarator walk (`declaratorNameNode` / `collectDeclarators`)
+    // and the semantic declarator-inversion fold (`declaratorDeclaredType`)
+    // descend a `memberDeclaratorRule` to its inner `declaratorRule`. BOTH
+    // `nullopt` for languages without the feature (toy/tsql declare no
+    // `declarators` block at all) ⇒ zero behavior change.
+    std::optional<RuleId> memberDeclaratorRule;
+    std::optional<RuleId> memberListRule;
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the `...` marker token whose presence
     // in a fnSuffix's param list makes the FnSig C-style variadic. Declarator-level
     // (vs the per-`DeclarationRule` `variadicMarker`) so the SHARED declarator-suffix
@@ -273,6 +287,8 @@ struct DSS_EXPORT DeclaratorConfig {
     std::string   arraySuffixRuleName;
     std::string   initDeclaratorRuleName;
     std::string   listRuleName;
+    std::string   memberDeclaratorRuleName;   // c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR
+    std::string   memberListRuleName;         // c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR
     std::string   variadicMarkerName;
 };
 

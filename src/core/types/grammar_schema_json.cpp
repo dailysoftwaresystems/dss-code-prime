@@ -4250,7 +4250,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 12>
+                    static constexpr std::array<std::string_view, 14>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
@@ -4258,6 +4258,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             "fnSuffixRule",       "fnSuffixParamsRule",
                             "arraySuffixRule",    "initDeclaratorRule",
                             "listRule",
+                            // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): the OPTIONAL
+                            // struct/union member-declarator + member-list roles.
+                            "memberDeclaratorRule", "memberListRule",
                             // FC12a-core (D-FC12A-VARIADIC-CALLEE): declarator-level
                             // `...` marker for variadic function definitions / fn-ptr types.
                             "variadicMarker"};
@@ -4368,6 +4371,43 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
                     }
+                    // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): the two OPTIONAL
+                    // struct/union member-declarator rule roles. Each mirrors the
+                    // `fnSuffixParamsRule` optional-role discipline: absent ⇒
+                    // nullopt (the language has no struct-member lists — toy/tsql
+                    // declare no `declarators` block at all); present-but-not-a-
+                    // string ⇒ C_InvalidSemantics; present-but-dangling ⇒
+                    // C_UnknownShape. A partial / typo'd role fails the load (dOk
+                    // false) rather than silently truncating the member walk.
+                    auto const readOptionalRuleRole =
+                        [&](char const* key, std::optional<RuleId>& outId,
+                            std::string& outName) {
+                            if (!dj.contains(key)) return;
+                            if (!dj.at(key).is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          std::format("{}/{}", dPath, key),
+                                          std::format("'declarators.{}' must be "
+                                                      "a rule-name string", key));
+                                dOk = false;
+                                return;
+                            }
+                            outName = dj.at(key).get<std::string>();
+                            if (!data.rules->contains(outName)) {
+                                coll.emit(DiagnosticCode::C_UnknownShape,
+                                          std::format("{}/{}", dPath, key),
+                                          std::format("'declarators.{}' "
+                                                      "references unknown shape "
+                                                      "'{}'", key, outName));
+                                dOk = false;
+                                return;
+                            }
+                            outId = data.rules->find(outName);
+                        };
+                    readOptionalRuleRole("memberDeclaratorRule",
+                                         dc.memberDeclaratorRule,
+                                         dc.memberDeclaratorRuleName);
+                    readOptionalRuleRole("memberListRule", dc.memberListRule,
+                                         dc.memberListRuleName);
                     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the declarator-level
                     // `...` marker, so the SHARED suffix resolver builds a variadic
                     // FnSig for function DEFINITIONS + fn-pointer types (the legacy
