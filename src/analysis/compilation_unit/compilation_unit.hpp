@@ -17,6 +17,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/object_format_kind.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/strong_ids.hpp"
@@ -49,6 +50,18 @@ struct DSS_EXPORT CrossTreeRef {
     std::optional<SourceSpan> importSpan;
 };
 
+// A recorded angle `#include <h>` → neutral shipped descriptor: the resolved
+// descriptor JSON `path` plus the include directive's `span`/`buffer`. The span +
+// buffer are carried so the PER-TARGET semantic availability gate can emit a
+// POSITIONED `F_ShippedHeaderUnavailableForTarget` on the include line — the
+// front-end is target-agnostic, so the active object-format (hence availability)
+// is only known per-target at semantic time. (D-SHIPPED-HEADER-PER-TARGET-AVAILABILITY)
+struct DSS_EXPORT ShippedDescriptorRef {
+    std::filesystem::path path;    // the resolved `<stem>.json` descriptor path
+    SourceSpan            span;    // the `#include <h>` directive span
+    BufferId              buffer;  // the buffer the include directive was found in
+};
+
 // Single CompilationUnit. Move-only, single-use (built by UnitBuilder::finish,
 // consumed by phase #8). Artifact-profile-agnostic (D8): the profile lives
 // on CompilationContext (06-artifact-profile-plan AP3), not here.
@@ -66,7 +79,7 @@ public:
                     std::vector<Tree>                    trees,
                     DiagnosticReporter                   driverDiagnostics,
                     std::vector<CrossTreeRef>            crossRefs,
-                    std::vector<std::filesystem::path>   shippedLibDescriptors,
+                    std::vector<ShippedDescriptorRef>    shippedLibDescriptors,
                     std::uint32_t                        typeNameReparseCount = 0,
                     std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers = {});
 
@@ -118,7 +131,7 @@ public:
     // descriptor is a neutral symbol table, NOT a parsed source Tree, so it
     // produces no entry in `trees()`/`crossRefs()`. CU4's ImportResolver is the
     // only producer.
-    [[nodiscard]] std::span<std::filesystem::path const>
+    [[nodiscard]] std::span<ShippedDescriptorRef const>
     shippedLibDescriptors() const noexcept;
 
     // Process-global monotonic id counter. Mirrors `TreeBuilder::nextTreeId`
@@ -155,7 +168,7 @@ private:
     std::vector<Tree>                    trees_;
     DiagnosticReporter                   driverDiagnostics_;
     std::vector<CrossTreeRef>            crossRefs_;
-    std::vector<std::filesystem::path>   shippedLibDescriptors_;  // FF11 neutral-JSON descriptor paths
+    std::vector<ShippedDescriptorRef>    shippedLibDescriptors_;  // FF11 neutral-JSON descriptor refs (path+span+buffer)
     std::uint32_t                        typeNameReparseCount_ = 0;  // FC2 oracle observability
     std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers_;    // FC13 PP origin buffers (header/main) for diagnostic rendering
 };
@@ -237,6 +250,15 @@ public:
     // calls this per dir. Aborts if called after finish().
     void addSystemDir(std::filesystem::path dir);
 
+    // c9 (Phase-2): declare the active compile target's object-format so the
+    // preprocessor's `__has_include(<h>)` (and the descriptor macro-splice) report
+    // PER-TARGET availability — a header whose descriptor excludes this format is
+    // NOT available, agreeing with the `#include` semantic gate. UNSET (the
+    // default) ⇒ pure-existence `__has_include` (LSP / direct-API / tests). Because
+    // it changes the preprocessed token stream, the driver builds the CU ONCE per
+    // distinct object-format. Aborts if called after finish().
+    void setActiveFormat(ObjectFormatKind fmt);
+
     // Single-use, rvalue-qualified (L6). The `finished_` latch catches the
     // `std::move(b).finish(); std::move(b).finish();` corner case — `std::move`
     // does not consume the lvalue, so a second rvalue-qualified call is
@@ -298,6 +320,7 @@ private:
     std::unordered_map<std::string, std::size_t> pathToTreeIndex_;
     std::vector<std::filesystem::path>   includeDirs_;
     std::vector<std::filesystem::path>   systemDirs_;   // FF11 angle-include search path
+    std::optional<ObjectFormatKind>      activeFormat_; // c9: per-target __has_include
     std::vector<TreeParseSidecar>        sidecars_;     // FC2; parallel to trees_
     // FC13: the C preprocessor's origin buffers (original main + every spliced
     // header), accumulated across every preprocessed file, handed to the CU as

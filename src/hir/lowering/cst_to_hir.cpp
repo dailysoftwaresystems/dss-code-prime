@@ -16,6 +16,7 @@
 #include "core/types/number_decode.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
+#include "core/types/string_literal_decode.hpp" // C 5.1.1.2 phase 6: decodeAdjacentStringBodies (THE string-body chokepoint)
 #include "core/types/tree.hpp"
 #include "core/types/tree_node.hpp"             // isEmptySpace
 #include "core/types/type_lattice/core_type.hpp"
@@ -203,6 +204,16 @@ struct Lowerer {
     // side-table stays sparse and a wrongly-defaulted global fails SAFE (writable
     // never re-introduces the read-only-store crash).
     std::vector<std::pair<HirNodeId, MutabilityAttr>>& mutability;
+    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared accumulator of (ACCESS HIR node
+    // → VolatileAttr) pairs, populated from the bound symbol's / field's
+    // `SymbolRecord.isVolatile` at each USER-access lowering site (object Ref,
+    // struct/union MemberAccess, VarDecl/Global init store) where the record is
+    // in hand. Applied to the result's HirVolatileMap AFTER finish() — same
+    // frozen-hir discipline as `mutability`. Only VOLATILE accesses are recorded
+    // (absence ⇒ plain memory access ⇒ optimizer may freely transform), so the
+    // side-table stays sparse; the only unsafe direction is a MISSED volatile
+    // access, which the exhaustive threading closes.
+    std::vector<std::pair<HirNodeId, VolatileAttr>>& volatileAcc;
 
     // D-CSUBSET-LOCAL-STATIC: the module-level decls accumulator (the SAME
     // vector `lowerTree` appends top-level decls to). A block-scope `static`
@@ -325,6 +336,32 @@ struct Lowerer {
             auto const ptrElem = interner.operands(target);
             if (!arrElem.empty() && !ptrElem.empty()
                 && arrElem[0] == ptrElem[0]) {
+                HirNodeId const decay = builder.makeCast(
+                    child.id, target, HirFlags::Synthetic);
+                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                    if (it->first == child.id) {
+                        spans.push_back({decay, it->second});
+                        break;
+                    }
+                }
+                return {decay, target};
+            }
+        }
+        // c12 (C 6.3.2.1p4) function-to-pointer DECAY: a function DESIGNATOR
+        // (`FnSig`) in a `Ptr<FnSig>` context decays to a pointer to the function
+        // (`&dbl`). The semantic tier's `isAssignable` already admits this on the
+        // SAME same-signature predicate (lhs is `Ptr`, rhs is `FnSig`,
+        // `operands(lhs)[0] == rhs`) — but it emits no node because a bare function
+        // Ref inherently lowers to the function's ADDRESS at MIR. That suffices for
+        // assignment/call-arg (the looser stores), but a brace-init element must
+        // carry the field's `Ptr<FnSig>` TYPE so the `ConstructAggregate` verifier's
+        // strict child==field equality holds. Emit a synthetic `Cast` (MIR
+        // `mapCast` lowers FnSig→Ptr as a representation-free Bitcast over the
+        // GlobalAddr). A SIGNATURE MISMATCH (`operands(target)[0] != child.type`)
+        // is NOT decayed here → it stays a loud mismatch at both tiers.
+        if (ck == TypeKind::FnSig && tk == TypeKind::Ptr) {
+            auto const ptrElem = interner.operands(target);
+            if (!ptrElem.empty() && ptrElem[0] == child.type) {
                 HirNodeId const decay = builder.makeCast(
                     child.id, target, HirFlags::Synthetic);
                 for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
@@ -575,10 +612,11 @@ struct Lowerer {
             HirLiteralPool& lits, std::vector<std::pair<HirNodeId, HirSourceLoc>>& sp,
             std::vector<HirExternRecord>& ed,
             std::vector<std::pair<HirNodeId, LinkageAttr>>& lk,
-            std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut)
+            std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut,
+            std::vector<std::pair<HirNodeId, VolatileAttr>>& vol)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
-          linkage(lk), mutability(mut) {
+          linkage(lk), mutability(mut), volatileAcc(vol) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -750,6 +788,25 @@ struct Lowerer {
                 if (j + 1 < toks.size()
                     && tree().tokenKind(toks[j]) == strStart
                     && tree().tokenKind(toks[j + 1]) == strBody) {
+                    // C 5.1.1.2 phase 6 adjacent concat (D-CSUBSET-ADJACENT-
+                    // STRING-CONCAT) makes `("a" "b")` grammatically valid here
+                    // too, but a CONCATENATED facet key is unreachable in any
+                    // real attribute (sqlite uses single-string args only). This
+                    // path reads ONE body; rather than SILENTLY DROP a second
+                    // piece, fail loud if another string opener follows the pair.
+                    std::size_t k2 = j + 2;
+                    while (k2 < toks.size()
+                           && isIgnoredKind(tree().tokenKind(toks[k2]))) {
+                        ++k2;
+                    }
+                    if (k2 < toks.size() && tree().tokenKind(toks[k2]) == strStart) {
+                        emitH(DiagnosticCode::H_UnknownLinkageSpecifier,
+                              toks[k2],
+                              std::format("adjacent string concatenation in a "
+                                          "linkage-specifier argument for '{}' "
+                                          "is not supported", key));
+                        continue;
+                    }
                     auto decoded =
                         decodeStringLiteralBody(tree().text(toks[j + 1]));
                     if (decoded.has_value()) {
@@ -794,6 +851,26 @@ struct Lowerer {
         auto const* rec = model.recordFor(sym);
         if (rec != nullptr && rec->isConst)
             mutability.push_back({node, MutabilityAttr{/*isConst=*/true}});
+    }
+    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): record an ACCESS HIR node's volatility
+    // from its bound symbol's `SymbolRecord.isVolatile` (sparse: only volatile
+    // accesses are stored; absence ⇒ plain access). Called at the object-Ref +
+    // VarDecl/Global lowering sites. The member-access form reads the FIELD record
+    // directly (its symbol is not the object's) — see `recordMemberVolatility`.
+    void recordVolatility(HirNodeId node, SymbolId sym) {
+        if (!node.valid() || !sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->isVolatile)
+            volatileAcc.push_back({node, VolatileAttr{/*isVolatile=*/true}});
+    }
+    // c21: record a MemberAccess HIR node's volatility from the FIELD's record
+    // (`frec->isVolatile`) — the volatile-ness is the field declaration's, not
+    // the object's. The MemberAccess node keys both the rvalue Load and (when it
+    // is an assignment target) the Store.
+    void recordMemberVolatility(HirNodeId node, SymbolRecord const* frec) {
+        if (!node.valid() || frec == nullptr) return;
+        if (frec->isVolatile)
+            volatileAcc.push_back({node, VolatileAttr{/*isVolatile=*/true}});
     }
 
     [[nodiscard]] bool isExprNode(NodeId n) const {
@@ -1665,7 +1742,12 @@ struct Lowerer {
                                  type};
                     }
                 }
-                return E{track(builder.makeRef(type, sym.v), node), type};
+                HirNodeId const refNode = track(builder.makeRef(type, sym.v), node);
+                // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a Ref to a `volatile`
+                // object/global — its Load (here) and, when this Ref is an
+                // assignment TARGET, its Store both carry the flag.
+                recordVolatility(refNode, sym);
+                return E{refNode, type};
             }
             auto lit = litType_.find(tk.v);
             if (lit != litType_.end()) return lowerLiteral(node, c, tk, lit->second);
@@ -1712,19 +1794,26 @@ struct Lowerer {
         return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
     }
 
-    // `"hello"` → an Array<Char, N+1> literal carrying the decoded bytes (NUL
-    // implied by the +1 length).
+    // `"hello"` (or adjacent-concatenated `"hel" "lo"`, C 5.1.1.2 phase 6) → an
+    // Array<Char, N+1> literal carrying the decoded bytes (NUL implied by the +1
+    // length). N is the sum of the per-segment decoded lengths.
     E lowerStringLiteral(NodeId node) {
-        NodeId const bodyTok = childTokenOfKind(node, cfg.stringBodyToken);
-        std::string_view const body = bodyTok.valid() ? tree().text(bodyTok) : std::string_view{};
         std::string bytes;
         if (cfg.stringDoubledDelimiter) {
-            // SQL `'…''…'`: doubled-delimiter escaping (never fails — pairs only).
+            // SQL `'…''…'`: doubled-delimiter escaping, single body (no phase-6
+            // concat in SQL) — never fails (pairs only).
+            NodeId const bodyTok = childTokenOfKind(node, cfg.stringBodyToken);
+            std::string_view const body =
+                bodyTok.valid() ? tree().text(bodyTok) : std::string_view{};
             bytes = decodeDoubledDelimiterBody(body, cfg.stringDelimiter);
-        } else if (auto decoded = decodeStringLiteralBody(body)) {  // C-family backslash escapes
+        } else if (auto decoded =
+                       decodeAdjacentStringBodies(tree(), node, cfg.stringBodyToken)) {
+            // C-family: every body child decoded (backslash escapes) then byte-joined
+            // — the SAME chokepoint the semantic typer uses, so both tiers agree on N.
             bytes = std::move(*decoded);
         } else {
-            unsupported(node, std::format("string literal \"{}\" has an unsupported escape", body));
+            unsupported(node, std::format("string literal {} has an unsupported escape",
+                                          std::string{tree().text(node)}));
             return {errorNode(node), InvalidType};
         }
         TypeId const type = interner.array(interner.primitive(TypeKind::Char),
@@ -2056,7 +2145,11 @@ struct Lowerer {
         if (!cfg.refExtensionKind.empty())
             return track(builder.addLeaf(HirKind::Extension, InvalidType,
                                          extKind(cfg.refExtensionKind).v), at);
-        return track(builder.makeRef(type, sym.v), at);
+        HirNodeId const refNode = track(builder.makeRef(type, sym.v), at);
+        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): the other object-Ref seam — a
+        // `volatile` object/global accessed via nameRefExpr.
+        recordVolatility(refNode, sym);
+        return refNode;
     }
 
     // `ext` slot: the child rule must itself be extension-mapped.
@@ -2378,6 +2471,25 @@ struct Lowerer {
             // exactly as the prior inline computation.
             TypeId const result = derefResultType(interner, operand.type);
             return {track(builder.makeDeref(operand.id, result), node), result};
+        }
+        // c12 (C 6.5.3.3p1/p2): unary `+` is the IDENTITY — it applies the integer
+        // promotions and yields the value, with NO dedicated HIR op (there is no
+        // `Pos`/`Identity` HirOpKind). Return the OPERAND node unchanged: the
+        // promotion is already realized by the lazy-consumer model (sub-int values
+        // live promoted in 32-bit regs), so `+x` ≡ `x`. The operand must be
+        // ARITHMETIC (int/float; an Enum promotes to int and is accepted) — a
+        // pointer/struct/union operand fails LOUD here, mirroring C's "operand of
+        // the unary + ... shall have arithmetic type" (this is STRICTER than unary
+        // `-`, which has no such gate today; `+` gets it because the identity fold
+        // would otherwise silently pass a pointer value straight through).
+        if (e.target == "Pos") {
+            TypeKind const otk = operand.type.valid()
+                ? interner.kind(operand.type) : TypeKind::Void;
+            if (!isArithmeticCore(otk) && otk != TypeKind::Enum) {
+                unsupported(node, "operand of unary '+' must have arithmetic type");
+                return {errorNode(node, operand.type), operand.type};
+            }
+            return operand;
         }
         auto op = coreOpFromName(e.target);
         if (!op || arityOf(*op) != HirOpArity::Unary) {
@@ -2783,9 +2895,14 @@ struct Lowerer {
                 object = track(builder.makeDeref(base.id, pointeeType,
                                                  HirFlags::Synthetic), node);
             }
-            return {track(builder.makeMemberAccess(object, fieldIndex,
-                                                   fieldType), node),
-                    fieldType};
+            HirNodeId const maNode = track(builder.makeMemberAccess(
+                                               object, fieldIndex, fieldType), node);
+            // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a `volatile` struct/union FIELD
+            // — the MemberAccess node keys both its rvalue Load and (as an assign
+            // target) its Store. The volatility is the FIELD's (`frec`), NOT the
+            // object's; a non-volatile sibling field's MemberAccess stays plain.
+            recordMemberVolatility(maNode, frec);
+            return {maNode, fieldType};
         }
         return exprError(node, std::format("postfix target '{}' has no lowering", e.target));
     }
@@ -5378,6 +5495,7 @@ struct Lowerer {
                 }
                 HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), d);
                 recordMutability(g, sym);
+                recordVolatility(g, sym);   // c21: volatile static-local global init store
                 recordLinkage(g, staticLinkage);  // {Local, Default} — internal
                 moduleDecls_->push_back(g);
                 continue;
@@ -5390,6 +5508,11 @@ struct Lowerer {
             // mutable one to writable `.data` (D-LK4-DATA-PRODUCER-MUTABLE-
             // GLOBAL). Locals are stack slots — mutability is irrelevant there.
             if (asGlobal) recordMutability(lowered, sym);
+            // c21 (D-CSUBSET-VOLATILE-QUALIFIER): volatility applies to BOTH a
+            // global's load-time init store (HIR→MIR :6886) AND a local's init
+            // store into its alloca (HIR→MIR :5712) — record unconditionally on
+            // the VarDecl/Global node (UNLIKE mutability, which is global-only).
+            recordVolatility(lowered, sym);
             out.push_back(lowered);
         }
     }
@@ -5451,9 +5574,12 @@ struct Lowerer {
         if (asGlobal) {
             HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
             recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
+            recordVolatility(g, sym);   // c21 (D-CSUBSET-VOLATILE-QUALIFIER)
             return g;
         }
-        return track(builder.makeVarDecl(type, sym.v, init), node);
+        HirNodeId const vd = track(builder.makeVarDecl(type, sym.v, init), node);
+        recordVolatility(vd, sym);      // c21: volatile local init store
+        return vd;
     }
 
     HirNodeId lowerVarDecl(NodeId node) { return lowerVarLike(node, /*asGlobal=*/false); }
@@ -5898,30 +6024,31 @@ struct Lowerer {
                 if (tree().kind(c) != NodeKind::Internal) continue;
                 if (isEmptySpace(tree().flags(c))) continue;
                 if (tree().rule(c).v != stringLitRule.v) continue;
-                // The body is the inner StringLiteral token.
-                for (auto const& gc : tree().children(c)) {
-                    if (tree().kind(gc) != NodeKind::Token) continue;
-                    if (tree().tokenKind(gc).v != stringLitTok.v) continue;
-                    auto decoded =
-                        decodeStringLiteralBody(tree().text(gc));
-                    if (decoded.has_value()) return std::move(*decoded);
-                    // F4 audit fix (6-agent 2nd-order, step 13.3a):
-                    // fail-loud on malformed escape rather than
-                    // silently falling back to the format-level
-                    // default — pre-fix a user-typed `extern void f()
-                    // "k\xZZ.dll";` would silently link against
-                    // msvcrt.dll with no breadcrumb pointing at the
-                    // malformed override. H_ExternDeclMalformed is
-                    // already used for malformed extern declarations.
-                    ParseDiagnostic d;
-                    d.code     = DiagnosticCode::H_ExternDeclMalformed;
-                    d.severity = DiagnosticSeverity::Error;
-                    d.buffer   = tree().source().id();
-                    d.span     = tree().span(gc);
-                    d.actual   = std::string{tree().text(gc)};
-                    reporter.report(std::move(d));
-                    return {};
-                }
+                // The override body is the inner StringLiteral token(s). Route
+                // through the SAME chokepoint string-literal lowering uses so an
+                // adjacent-concatenated override (`extern void f() "lib" ".dll";`,
+                // C 5.1.1.2 phase 6) decodes its WHOLE byte sequence — reading
+                // only the first body child would silently drop the rest.
+                auto decoded =
+                    decodeAdjacentStringBodies(tree(), c, stringLitTok);
+                if (decoded.has_value()) return std::move(*decoded);
+                // F4 audit fix (6-agent 2nd-order, step 13.3a): fail-loud on a
+                // malformed escape rather than silently falling back to the
+                // format-level default — pre-fix a user-typed `extern void f()
+                // "k\xZZ.dll";` would silently link against msvcrt.dll with no
+                // breadcrumb pointing at the malformed override.
+                // H_ExternDeclMalformed is already used for malformed extern
+                // declarations. The span points at the whole stringLiteralExpr
+                // node `c` (the offending override), since the failing segment
+                // is no longer singled out by the loop.
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::H_ExternDeclMalformed;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree().source().id();
+                d.span     = tree().span(c);
+                d.actual   = std::string{tree().text(c)};
+                reporter.report(std::move(d));
+                return {};
             }
             return {};
         };
@@ -6210,6 +6337,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: shared (Global node → MutabilityAttr)
     // accumulator, moved onto result->mutabilityMap after finish().
     std::vector<std::pair<HirNodeId, MutabilityAttr>> mutability;
+    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared (access node → VolatileAttr)
+    // accumulator, moved onto result->volatileMap after finish().
+    std::vector<std::pair<HirNodeId, VolatileAttr>> volatileAcc;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -6221,7 +6351,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
-            mutability));
+            mutability, volatileAcc));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -6269,6 +6399,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     for (auto& [id, loc] : spans) result->sourceMap.set(id, loc);
     for (auto& [id, attr] : linkage) result->linkageMap.set(id, attr);
     for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
+    for (auto& [id, attr] : volatileAcc) result->volatileMap.set(id, attr);  // c21
     result->externDecls = std::move(externDecls);
 
     // verify-on-load.

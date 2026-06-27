@@ -103,6 +103,11 @@ struct DSS_EXPORT CliArgs {
     // overload.
     bool                          warningsAsErrors = false;
     std::vector<DiagnosticCode>   suppress;
+
+    // `--time` prints the compilation's wall-clock duration to stderr after the
+    // compile finishes (any compile-producing mode). Diagnostic-neutral, off by
+    // default; `--time` with no mode flag is a hard NoModeSelected error.
+    bool                          time = false;
 };
 
 // Parse-failure kinds. Mirror the `TargetSpecError` shape so the

@@ -300,9 +300,10 @@ private:
                 // + parsed as a Tree — it has no source syntax and produces no
                 // CrossTreeRef. A miss is the SAME hard F_ShippedHeaderNotFound
                 // as before (a missing system header is a fatal C error). The
-                // mapping is `stem(filename) + ".json"` — agnostic of the
-                // requested extension spelling (`<stdio.h>`, `<stdio>` both map
-                // to `stdio.json`).
+                // mapping drops the extension + PRESERVES any subdirectory
+                // (`<stdio.h>` → `stdio.json`; `<sys/types.h>` → `sys/types.json`,
+                // distinct from `<time.h>` → `time.json`) — agnostic of the
+                // requested extension spelling (`<stdio.h>`, `<stdio>` → `stdio.json`).
                 if (directive.isSystem) {
                     // The `<stem>.json` mapping is the SHARED
                     // `resolveSystemDescriptor` (FC15c funnel) so this resolution
@@ -310,7 +311,11 @@ private:
                     auto const resolved = resolveSystemDescriptor(
                         directive.filename, context.systemDirs);
                     if (!resolved) { unresolved(); continue; }
-                    context.shippedLibDescriptors.push_back(*resolved);
+                    // Carry the include directive's span + buffer so the per-target
+                    // SEMANTIC availability gate can position its diagnostic on the
+                    // `#include` line (the format isn't known until semantic time).
+                    context.shippedLibDescriptors.push_back(
+                        ShippedDescriptorRef{*resolved, directive.span, sourceBuffer});
                     continue;
                 }
 

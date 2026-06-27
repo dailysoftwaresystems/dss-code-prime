@@ -425,6 +425,32 @@ enum class DiagnosticCode : std::uint16_t {
     // not yet model `const` — anchored as D-CSUBSET-INCDEC-CONST-LVALUE, shared
     // with the same gap on plain assignment.) Positioned at the ++/-- expression.
     S_IncDecNeedsModifiableLvalue = 0xE024,
+    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a type-name that forms a POINTER-TO-
+    // VOLATILE-POINTEE (`volatile int *p` — a head-position volatile qualifier
+    // FOLLOWED by ≥1 pointer star). Model B threads `volatile` as a per-symbol/
+    // member `isVolatile` bool (the access's own Load/Store gets MirInstFlags::
+    // Volatile); it CANNOT express pointee-volatile (the volatility rides the
+    // DEREFERENCED access, which needs type-level cv-tracking — model A, deferred
+    // to D-CSUBSET-VOLATILE-POINTEE / c22). Rejecting at the type-name level — at
+    // BOTH the per-declarator typing arm (head volatile + declarator star) AND the
+    // co-located pointer arm (head volatile BEFORE the first star) — makes the
+    // fail-loud COMPLETE BY CONSTRUCTION: no pointer-to-volatile-pointee TYPE can
+    // be built, so no Deref can silently drop the flag (a silent miscompile). East
+    // `int * volatile p` (the POINTER OBJECT is volatile) is ACCEPTED — that
+    // volatility is the Load of `p` itself at the ref site, which model B threads.
+    // Config-driven: the reject keys off the language's `volatileMarker` +
+    // configured pointer token, never a hardcoded keyword/`*`. Unsuppressable
+    // (silent-miscompile guard).
+    S_VolatilePointeeNotSupported = 0xE025,
+    // D-CSUBSET-SELF-REFERENTIAL-STRUCT: a DIRECT (non-pointer) member of an
+    // INCOMPLETE composite type — `struct N { struct N n; }` (a struct cannot
+    // contain itself by value; its size would be infinite) or a member of a
+    // forward-declared-but-not-yet-defined `struct B b;` (C 6.7.2.1p3: a struct/
+    // union member shall have a COMPLETE type). A POINTER to an incomplete type
+    // (`struct N *next;`) is LEGAL (pointer size is known) and never trips this.
+    // Positioned at the offending member. Without it a self-by-value member would
+    // silently fold its size to 0 (a silent miscompile).
+    S_IncompleteTypeMember        = 0xE026,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -1384,6 +1410,60 @@ enum class DiagnosticCode : std::uint16_t {
     //   well-formed hir-text type. Member of `kUnsuppressableCodes`.
     //   (Neutral shipped-lib descriptor, 2026-06-06.)
     F_ShippedLibUnsupportedType    = 0x501C,
+    // F_ShippedHeaderUnavailableForTarget: an angle `#include <h>` resolved to a
+    //   shipped descriptor that EXISTS, but the descriptor's
+    //   `availableObjectFormats` set excludes the active compile target's
+    //   object-format (e.g. a POSIX `<sys/time.h>` declaring {"elf","macho"}
+    //   included for a windows-pe target). Fail-loud: a header that does not
+    //   exist on the target must error like a real toolchain (MSVC C1083), never
+    //   silently resolve — and `__has_include` answers the per-target truth.
+    //   Remediation: guard the include per platform, or build for a format the
+    //   header supports. (D-SHIPPED-HEADER-PER-TARGET-AVAILABILITY, 2026-06-25.)
+    F_ShippedHeaderUnavailableForTarget = 0x501D,
+    // F_ShippedStructVariantAmbiguous: a shipped `structs` entry declares
+    //   per-target `variants` (each a `when:{arch?,format?}` + its own field list,
+    //   so a struct can carry the correct per-target byte layout — plan 25), and
+    //   MORE THAN ONE variant matches the active compile target's (arch, format).
+    //   The selection contract is MATCH-ALL-SPECIFIED + exactly-one — an
+    //   under-specified `when` (e.g. `{"arch":"x86_64"}` matching BOTH x86_64-elf
+    //   AND x86_64-pe) would otherwise silently pick the first → a wrong struct
+    //   layout (e.g. the linux 144B `struct stat` on windows). Fail-loud: a
+    //   SILENT-MISCOMPILE guard (unsuppressable). Remediation: fully-specify each
+    //   variant's `when` so exactly one matches the target.
+    //   (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH, 2026-06-26.)
+    F_ShippedStructVariantAmbiguous = 0x501E,
+    // F_ShippedConstantVariantAmbiguous: a shipped `constants` entry declares
+    //   per-target `variants` (each a `when:{arch?,format?}` + its own
+    //   {value,type}), and MORE THAN ONE variant matches the active compile
+    //   target's (arch, format). Same MATCH-ALL-SPECIFIED + exactly-one contract
+    //   as the struct-variant sibling — an under-specified `when` would otherwise
+    //   silently pick the first → a WRONG constant VALUE on this target (e.g. a
+    //   per-platform `O_NONBLOCK`). Fail-loud: a SILENT-MISCOMPILE guard
+    //   (unsuppressable). Remediation: fully-specify each variant's `when` so
+    //   exactly one matches. (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH, 2026-06-26.)
+    F_ShippedConstantVariantAmbiguous = 0x501F,
+    // F_ShippedTypedefVariantAmbiguous: a shipped `typedefs` entry declares
+    //   per-target `variants` (each a `when:{arch?,format?}` + its own `type`),
+    //   and MORE THAN ONE variant matches the active compile target's
+    //   (arch, format). Same contract as the constant/struct siblings — an
+    //   under-specified `when` would silently pick the first → a WRONG typedef
+    //   WIDTH on this target (e.g. a `wchar_t` that is 32-bit on elf but 16-bit on
+    //   pe). Fail-loud: a SILENT-MISCOMPILE guard (unsuppressable). Remediation:
+    //   fully-specify each variant's `when`.
+    //   (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH, 2026-06-26.)
+    F_ShippedTypedefVariantAmbiguous = 0x5020,
+    // F_ShippedMacroVariantAmbiguous: a shipped `macros` entry declares
+    //   per-FORMAT `variants` (each a `when:{format}` + its own
+    //   {replacement, params?}), and MORE THAN ONE variant matches the active
+    //   object-format. Macros are FORMAT-ONLY (arch is not threaded into the
+    //   preprocessor — c9 build-key avoidance), so the `when` carries `format`
+    //   alone. An under-specified set (two variants both selecting the active
+    //   format) would silently pick the first → a WRONG macro REPLACEMENT on this
+    //   target (e.g. errno's `__errno_location` on elf vs `__error` on macho).
+    //   Fail-loud: a SILENT-MISCOMPILE guard (unsuppressable). Remediation:
+    //   fully-specify / de-duplicate each variant's `when.format`.
+    //   (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH, 2026-06-26.)
+    F_ShippedMacroVariantAmbiguous = 0x5021,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

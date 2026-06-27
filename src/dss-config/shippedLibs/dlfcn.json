@@ -1,0 +1,23 @@
+{
+  "$comment": "Neutral shipped <dlfcn.h> (POSIX) — c16 (SQLite extension loading, sqlite3_load_extension via os_unix unixDlOpen/Sym/Close). dlopen/dlsym/dlclose/dlerror + RTLD_NOW + RTLD_GLOBAL (the only two SQLite references). Verified against glibc bits/dlfcn.h + Darwin dyld/dlfcn.h: the prototypes are IDENTICAL on both. ★ RTLD_GLOBAL DIVERGES per object-format and there is a COLLISION TRAP — 0x100=256 is RTLD_GLOBAL on glibc but RTLD_FIRST on Darwin; 0x8 is RTLD_DEEPBIND on glibc but RTLD_GLOBAL on Darwin — so RTLD_GLOBAL MUST be a per-format `variants` (elf 256 / macho 8), never flat. RTLD_LAZY=1 + RTLD_NOW=2 AGREE → flat. RTLD_LOCAL diverges too (elf 0 / macho 4) → variant (shipped for completeness though SQLite uses NOW|GLOBAL). The dl* symbols: on Linux glibc 2.34+ MERGED libdl into libc.so.6 (the WSL run target is modern glibc) → library elf=libc.so.6; on macOS they're in libSystem (dyld-backed). Gated availableObjectFormats:[elf,macho].",
+  "header": "dlfcn.h",
+  "standard": "posix",
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "symbols": [
+    { "name": "dlopen",  "signature": "fn(ptr<char>, i32) -> ptr<void>",  "kind": "function", "linkage": "external" },
+    { "name": "dlsym",   "signature": "fn(ptr<void>, ptr<char>) -> ptr<void>", "kind": "function", "linkage": "external" },
+    { "name": "dlclose", "signature": "fn(ptr<void>) -> i32",              "kind": "function", "linkage": "external" },
+    { "name": "dlerror", "signature": "fn() -> ptr<char>",                 "kind": "function", "linkage": "external" }
+  ],
+  "constants": [
+    { "name": "RTLD_LAZY", "value": 1, "type": "i32" },
+    { "name": "RTLD_NOW",  "value": 2, "type": "i32" },
+    { "name": "RTLD_GLOBAL", "variants": [
+      { "when": { "format": "elf" },   "value": 256, "type": "i32" },
+      { "when": { "format": "macho" }, "value": 8,   "type": "i32" } ] },
+    { "name": "RTLD_LOCAL", "variants": [
+      { "when": { "format": "elf" },   "value": 0, "type": "i32" },
+      { "when": { "format": "macho" }, "value": 4, "type": "i32" } ] }
+  ]
+}

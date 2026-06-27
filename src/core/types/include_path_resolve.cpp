@@ -39,11 +39,17 @@ std::optional<fs::path> resolveIncludePath(
 std::optional<fs::path> resolveSystemDescriptor(
     std::string_view              filename,
     std::span<fs::path const>     systemDirs) {
-    // `<stem>.json` -- agnostic of the requested extension (`<stdio.h>`,
-    // `<stdio>` both map to `stdio.json`). IDENTICAL to the import resolver's
-    // angle mapping (import_resolver.cpp): the FC15c funnel that keeps
-    // `__has_include(<h>)` in lock-step with `#include <h>`.
-    std::string const descriptorName = fs::path(filename).stem().string() + ".json";
+    // `<stem>.json`, PRESERVING any subdirectory so a POSIX `sys/*` header maps
+    // to a distinct descriptor and never collides with a top-level header of the
+    // same stem: `<sys/types.h>` -> `sys/types.json`, `<sys/time.h>` ->
+    // `sys/time.json` (DISTINCT from `<time.h>` -> `time.json`). A flat header
+    // keeps its flat name (`<stdio.h>` -> `stdio.json`). Agnostic of the requested
+    // extension (`<stdio.h>`, `<stdio>` both -> `stdio.json`). This is the SINGLE
+    // FC15c funnel every consumer shares (import_resolver typed-surface +
+    // preprocessor macro inject + `__has_include`), so they stay in lock-step.
+    fs::path const requested{filename};
+    fs::path const relStem = requested.parent_path() / requested.stem();
+    std::string const descriptorName = relStem.generic_string() + ".json";
     return findInDirs(descriptorName, systemDirs);
 }
 

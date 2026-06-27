@@ -109,10 +109,14 @@ struct Lowered {
     // exactly as compile_pipeline.cpp does — so `static`/`__attribute__` source
     // flows binding/visibility into the MIR. Existing fixtures (no specifiers)
     // get an empty map ⇒ every symbol stays Global/Default (unchanged).
+    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): thread the per-access volatility
+    // side-table exactly as compile_pipeline.cpp does, so a `volatile` object/
+    // member/global access carries MirInstFlags::Volatile on its Load/Store.
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
-                                    &hir->linkageMap);
+                                    &hir->linkageMap, &hir->mutabilityMap,
+                                    &hir->volatileMap);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -6753,4 +6757,398 @@ TEST(MirLoweringCSubset, PointerIncrementScalesByElementSizeViaGep) {
         << "pointer ++ must lower to a sizeof-scaled GEP, never a 1-byte Add";
     EXPECT_FALSE(sawRawAdd)
         << "pointer ++ must NOT emit a raw integer Add (the old 1-byte step)";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// c21 (D-CSUBSET-VOLATILE-QUALIFIER) — per-form volatile threading.
+//
+// Model B: `volatile` is a per-symbol/member `isVolatile` bool that CST→HIR
+// records on the ACCESS node (object Ref / MemberAccess / VarDecl/Global) and
+// HIR→MIR ORs into `MirInstFlags::Volatile` on the access's Load/Store. Each of
+// the tests below pins ONE access form's flag (multi-site completeness = test
+// EVERY form). RED-ON-DISABLE: drop any `volatileFlagFor` thread → the matching
+// flag-count assertion fails. Backend correctness (DCE/CSE/Mem2Reg/LICM honor
+// the flag) is pre-existing; these tests pin the FRONTEND threading the cycle
+// adds. The same `volatileMap` is threaded by `lowerCSubset` above.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Count, across EVERY block of EVERY function in the module, the instructions of
+// `op` whose `MirInstFlags::Volatile` bit is (set == wantVolatile).
+[[nodiscard]] std::uint32_t countOpWithVolatile(Mir const& m, MirOpcode op,
+                                                bool wantVolatile) {
+    std::uint32_t n = 0;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        MirFuncId const fn = m.funcAt(f);
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            MirBlockId const bb = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(bb); ++i) {
+                MirInstId const id = m.blockInstAt(bb, i);
+                if (m.instOpcode(id) != op) continue;
+                bool const isVol = has(m.instFlags(id), MirInstFlags::Volatile);
+                if (isVol == wantVolatile) ++n;
+            }
+        }
+    }
+    return n;
+}
+
+} // namespace
+
+// Test 1 — a volatile LOCAL object: its Store (init) AND its Load (read) carry
+// the flag. `vx` is slot-backed (body-locals always get an alloca), so the read
+// is a real Load and the init a real Store.
+TEST(MirLoweringCSubsetVolatile, LocalObjectLoadAndStoreFlagged) {
+    auto L = lowerCSubset(
+        "int main(void) { volatile int vx = 1; return vx; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 1u)
+        << "the volatile local's init store must carry MirInstFlags::Volatile";
+    EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "the volatile local's read must carry MirInstFlags::Volatile";
+}
+
+// Test 2 — a volatile struct MEMBER (SQLite's case): `p->m` Load carries the
+// flag; the non-volatile sibling `p->n` Load does NOT. Pins that volatility is
+// per-FIELD (recorded from the field record), not per-object.
+TEST(MirLoweringCSubsetVolatile, VolatileMemberLoadFlaggedNonVolatileSiblingNot) {
+    auto L = lowerCSubset(
+        "struct S { volatile int m; int n; };\n"
+        "int rd(struct S *p) { return p->m + p->n; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // Exactly ONE volatile member Load (p->m) and at least one non-volatile Load
+    // (p->n) — the sibling read must stay plain.
+    EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "the volatile member `p->m` read must carry the flag";
+    EXPECT_GE(countOpWithVolatile(m, MirOpcode::Load, /*wantVolatile=*/false), 1u)
+        << "the non-volatile sibling `p->n` read must NOT carry the flag";
+}
+
+// Test 3 — a volatile GLOBAL: its read Load carries the flag, and a write Store
+// carries it too. `gv` is a module global, so reads/writes route through
+// GlobalAddr + Load/Store.
+TEST(MirLoweringCSubsetVolatile, VolatileGlobalLoadAndStoreFlagged) {
+    auto L = lowerCSubset(
+        "volatile int gv;\n"
+        "int main(void) { gv = 5; return gv; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 1u)
+        << "the volatile global write `gv = 5` must carry the flag";
+    EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "the volatile global read `return gv` must carry the flag";
+}
+
+// Test 4 — a volatile POINTER OBJECT (`int * volatile p`, EAST position): the
+// volatility is the POINTER's own storage, so a STORE INTO p carries the flag —
+// NOT a deref of p. Proves the east form is ACCEPTED (not rejected as a
+// pointee-volatile) and threaded at the pointer-object access.
+TEST(MirLoweringCSubsetVolatile, VolatilePointerObjectStoreFlagged) {
+    auto L = lowerCSubset(
+        "int g;\n"
+        "int main(void) { int * volatile p; p = &g; return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // The assignment `p = &g` stores the address into the volatile pointer slot.
+    EXPECT_GE(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 1u)
+        << "a store into a `int * volatile p` must carry the flag (east-volatile "
+           "pointer OBJECT is accepted, not rejected as pointee-volatile)";
+}
+
+// Test 5 — NON-volatile baseline: the SAME member program WITHOUT `volatile` has
+// ZERO volatile Loads/Stores. The non-volatile path must be byte-identical to
+// pre-c21 (the flag defaults None). The control for tests 1-3.
+TEST(MirLoweringCSubsetVolatile, NonVolatileBaselineHasNoVolatileFlags) {
+    auto L = lowerCSubset(
+        "struct S { int m; int n; };\n"
+        "int gv;\n"
+        "int rd(struct S *p) { int x = p->m; gv = x; return gv + p->n; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+        << "a program with no `volatile` must emit NO volatile Loads";
+    EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 0u)
+        << "a program with no `volatile` must emit NO volatile Stores";
+}
+
+// Test 6 — the pointer-to-volatile-POINTEE reject COMPLETENESS. Each form below
+// is a `volatile <base> *` (the volatility rides the deref — model B cannot
+// express it) and MUST fail loud S_VolatilePointeeNotSupported, never silently
+// compile a non-volatile Deref. Covers the simple local decl, a complex pointer-
+// arithmetic deref, and a function param — proving the reject is at the
+// TYPE-NAME level (decl + param), not just `*Ref(sym)`.
+TEST(MirLoweringCSubsetVolatile, PointerToVolatilePointeeFailsLoud) {
+    auto hasPointeeReject = [](DiagnosticReporter const& r) {
+        for (auto const& d : r.all())
+            if (d.code == DiagnosticCode::S_VolatilePointeeNotSupported) return true;
+        return false;
+    };
+    // 6a — simple local decl `volatile int *p;` then a deref read `*p`.
+    {
+        auto L = lowerCSubset(
+            "int main(void) { volatile int *p; return *p; }\n");
+        EXPECT_TRUE(hasPointeeReject(L.model.diagnostics()))
+            << "`volatile int *p` (pointee-volatile local) must fail loud";
+    }
+    // 6b — a COMPLEX deref through pointer arithmetic `*(p + 1)`: proves the
+    // reject is by TYPE construction (the type-name never builds), not a narrow
+    // `Deref(Ref(sym))` pattern match that `*(p+1)` would slip past.
+    {
+        auto L = lowerCSubset(
+            "int main(void) { volatile int *p; return *(p + 1); }\n");
+        EXPECT_TRUE(hasPointeeReject(L.model.diagnostics()))
+            << "a complex deref `*(p+1)` of a pointee-volatile must STILL fail "
+               "loud (the type-name reject is complete by construction)";
+    }
+    // 6c — a function PARAMETER `volatile int *p`: the param position must reject
+    // too (the declarator-mode head+declarator arm), not just object decls.
+    {
+        auto L = lowerCSubset(
+            "int rd(volatile int *p) { return *p; }\n");
+        EXPECT_TRUE(hasPointeeReject(L.model.diagnostics()))
+            << "a `volatile int *` PARAMETER must fail loud (param is a declarator "
+               "position the reject must cover)";
+    }
+}
+
+// Test 7 — MIR-tier optimizer pin: a volatile local's Load SURVIVES Mem2Reg
+// (mem2reg refuses to promote a volatile alloca). RED-ON-DISABLE of the skip:
+// if Mem2Reg promoted the volatile alloca, the Load would vanish. The end-to-end
+// witness is the `volatile_local` corpus; this isolates the IR-tier guard +
+// proves the frontend flag actually reaches the optimizer's decision.
+TEST(MirLoweringCSubsetVolatile, VolatileLocalLoadSurvivesMem2Reg) {
+    auto L = lowerCSubset(
+        "int main(void) { volatile int vx = 1; int a = vx; vx = 2; return a + vx; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir& m = L.mir.mir;
+    std::uint32_t const volLoadsBefore =
+        countOpWithVolatile(m, MirOpcode::Load, /*wantVolatile=*/true);
+    ASSERT_GE(volLoadsBefore, 1u) << "pre-Mem2Reg: the volatile reads are Loads";
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    opt::OptPipeline pipeline{"vol-mem2reg", {opt::PassId::Mem2Reg}};
+    auto const result =
+        opt::optimize(m, **targetR, L.model.lattice().interner(), pipeline, rep);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    EXPECT_GE(countOpWithVolatile(m, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "Mem2Reg must NOT promote a volatile alloca — its Load must survive";
+}
+
+// Test 8 — a `volatile` ADDRESS-TAKEN scalar PARAM: its incoming-arg→slot init
+// Store carries the flag (param is an in-scope volatile OBJECT form). `int *q =
+// &p` forces the param address-taken so it gets a slot + an init store (a non-
+// address-taken param stays a pure-SSA Arg with no memory access to flag). The
+// param VarDecl is annotated at CST→HIR's `lowerVarLikeInto`, same path as a
+// body local — so the init store AND the body read `+ p` both carry the flag.
+// (The `*q` deref is NOT flagged — q's pointee is non-volatile, by construction.)
+TEST(MirLoweringCSubsetVolatile, VolatileAddressTakenParamInitStoreFlagged) {
+    auto L = lowerCSubset(
+        "int rd(volatile int p) { int *q = &p; return *q + p; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // The arg→slot init store of the volatile param must be flagged (≥1: the
+    // init store; the body read `+ p` adds a flagged Load too).
+    EXPECT_GE(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 1u)
+        << "the volatile address-taken param's init store must carry the flag";
+    EXPECT_GE(countOpWithVolatile(m, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "the volatile param's body read must carry the flag";
+}
+
+// Test 8b — control: a NON-volatile address-taken param's init store is NOT
+// flagged (proves test 8 is the qualifier's effect, not address-taking's).
+TEST(MirLoweringCSubsetVolatile, NonVolatileAddressTakenParamInitStoreNotFlagged) {
+    auto L = lowerCSubset(
+        "int rd(int p) { int *q = &p; return *q + p; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 0u)
+        << "a NON-volatile param init store must NOT be flagged";
+    EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+        << "a NON-volatile param read must NOT be flagged";
+}
+
+// Test 9 — a WHOLE-VOLATILE aggregate COPY (`volatile struct S a; a = b;`) flags
+// the structural Load/Store the aggregate-copy lowering emits (field-wise for a
+// flat scalar struct). Without the thread the copy silently drops the volatility.
+// `S` is a flat 2-scalar struct → field-wise copy (Load+Store per field).
+TEST(MirLoweringCSubsetVolatile, WholeVolatileAggregateAssignCopyFlagged) {
+    auto L = lowerCSubset(
+        "struct S { int x; int y; };\n"
+        "struct S b;\n"
+        "int rd(void) { volatile struct S a; a = b; return a.x; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    // The field-wise copy of the 2-field struct emits ≥2 stores into `a` (dest is
+    // the volatile aggregate) — all must be flagged. (The `return a.x` read adds
+    // another flagged Load.)
+    EXPECT_GE(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 2u)
+        << "a whole-volatile aggregate copy's field stores must carry the flag";
+    EXPECT_GE(countOpWithVolatile(m, MirOpcode::Load, /*wantVolatile=*/true), 2u)
+        << "a whole-volatile aggregate copy's field loads must carry the flag";
+}
+
+// Test 9b — control: a NON-volatile aggregate copy has ZERO volatile flags
+// (proves test 9 is the qualifier's effect, and the structural copy defaults
+// None for the by-value/brace-init/return callers that share the helper).
+TEST(MirLoweringCSubsetVolatile, NonVolatileAggregateAssignCopyNotFlagged) {
+    auto L = lowerCSubset(
+        "struct S { int x; int y; };\n"
+        "struct S b;\n"
+        "int rd(void) { struct S a; a = b; return a.x; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 0u)
+        << "a non-volatile aggregate copy must emit NO volatile stores";
+    EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+        << "a non-volatile aggregate copy must emit NO volatile loads";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// c21 review batch — the CO-LOCATED pointee-reject arm (struct/union member) is
+// the SOLE catcher for the SQLite aggregate shape; pin it directly (it was
+// only exercised end-to-end before — the c12/c13 "green over a subset of reject
+// sites" trap). Each asserts S_VolatilePointeeNotSupported AND that the model
+// stays clean (no MIR produced). NOTE (c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR):
+// member pointer stars no longer bind to a head `{repeat StarOp}` (removed so
+// `int *a, b;` types b as int) — a struct/union MEMBER `volatile int *p` is now
+// caught by the PER-DECLARATOR arm, and a TYPEDEF by its own arm; the co-located
+// head arm still serves cast/sizeof type-names. Either way the reject must fire.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+[[nodiscard]] bool hasVolatilePointeeReject(DiagnosticReporter const& r) {
+    for (auto const& d : r.all())
+        if (d.code == DiagnosticCode::S_VolatilePointeeNotSupported) return true;
+    return false;
+}
+} // namespace
+
+// Test 10 — struct MEMBER `volatile int *p` (the SQLite aggregate-shape catcher).
+// Must fail loud. ★ c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR) moved the member
+// pointer star OUT of the head (`typeRefAllowingStruct` no longer consumes
+// `{repeat StarOp}` — stars bind PER-DECLARATOR so `int *a, b;` types b as int).
+// So a member's `volatile int *p` is now caught by the PER-DECLARATOR typing arm
+// (head `volatile` + a declarator `*`), whose diagnostic `actual` is the
+// DECLARATOR text ("*p" — a star but NO base "int"), positioned on the
+// declarator. The reject stays COMPLETE; only the arm/position changed (the
+// co-located head arm is unreachable for a member now that no star lands in the
+// head — it still serves cast/sizeof type-names). Pin the per-declarator shape.
+TEST(MirLoweringCSubsetVolatile, StructMemberPointeeVolatileFailsLoudViaPerDeclaratorArm) {
+    auto L = lowerCSubset("struct S { volatile int *p; };\n"
+                          "int main(void){ return 0; }\n");
+    bool sawReject = false;
+    bool perDeclaratorShape = false;
+    for (auto const& d : L.model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_VolatilePointeeNotSupported) continue;
+        sawReject = true;
+        // The per-declarator arm's `actual` is the DECLARATOR text — a star but
+        // NOT the base type "int" (the head `volatile int` is a sibling). Pin
+        // that shape so a regression re-routing the reject is caught.
+        if (d.actual.find('*') != std::string::npos
+            && d.actual.find("int") == std::string::npos) {
+            perDeclaratorShape = true;
+        }
+    }
+    EXPECT_TRUE(sawReject)
+        << "a `volatile int *` STRUCT MEMBER must fail loud "
+           "(pointer-to-volatile-pointee is unsupported under model B)";
+    EXPECT_TRUE(perDeclaratorShape)
+        << "c23: the member star binds per-declarator, so the reject fires via "
+           "the per-declarator arm (diagnostic `actual` = the declarator `*p`, "
+           "not the whole `volatile int *` type node)";
+}
+
+// Test 11 — union MEMBER `volatile int *p`. Must fail loud.
+TEST(MirLoweringCSubsetVolatile, UnionMemberPointeeVolatileFailsLoud) {
+    auto L = lowerCSubset("union U { volatile int *p; int x; };\n"
+                          "int main(void){ return 0; }\n");
+    EXPECT_TRUE(hasVolatilePointeeReject(L.model.diagnostics()))
+        << "a `volatile int *` UNION MEMBER must fail loud (per-declarator arm)";
+}
+
+// Test 12 — struct MEMBER DOUBLE pointer `volatile int **pp` — must fail loud.
+// c23: both stars bind in the declarator's pointerLayer (the head no longer
+// consumes stars), so the per-declarator arm catches it; the reject must fire.
+TEST(MirLoweringCSubsetVolatile, StructMemberDoublePointeeVolatileFailsLoud) {
+    auto L = lowerCSubset("struct S { volatile int **pp; };\n"
+                          "int main(void){ return 0; }\n");
+    EXPECT_TRUE(hasVolatilePointeeReject(L.model.diagnostics()))
+        << "a `volatile int **` STRUCT MEMBER must fail loud (per-declarator arm)";
+}
+
+// Test 12b (c23 × c21 interaction) — a MULTI-DECLARATOR volatile-pointer LIST
+// `volatile int *a, *b;` must reject EVERY slot. c23's per-declarator arm iterates
+// each declarator; this locks the per-slot iteration so a regression that checks
+// only the first declarator (and silently compiles `*b` with a non-volatile Load)
+// is caught. Both slots are pointer-to-volatile-pointee ⇒ TWO rejects.
+TEST(MirLoweringCSubsetVolatile, StructMemberPointeeVolatileListRejectsEverySlot) {
+    auto L = lowerCSubset("struct S { volatile int *a, *b; };\n"
+                          "int main(void){ return 0; }\n");
+    int rejects = 0;
+    for (auto const& d : L.model.diagnostics().all())
+        if (d.code == DiagnosticCode::S_VolatilePointeeNotSupported) ++rejects;
+    EXPECT_EQ(rejects, 2)
+        << "each slot of `volatile int *a, *b;` is a pointer-to-volatile-pointee "
+           "and must fail loud independently (the per-declarator arm iterates all "
+           "slots — a first-slot-only check would silently miscompile `*b`)";
+}
+
+// Test 13 — TYPEDEF wholesale reject: BOTH `typedef volatile int vint;` (object —
+// model B can't thread typedef-carried volatility) AND `typedef volatile int
+// *vip;` (laundered pointee) fail loud. The typedef arm is the SOLE catcher.
+TEST(MirLoweringCSubsetVolatile, VolatileTypedefFailsLoud) {
+    {
+        auto L = lowerCSubset("typedef volatile int vint;\n"
+                              "int main(void){ return 0; }\n");
+        EXPECT_TRUE(hasVolatilePointeeReject(L.model.diagnostics()))
+            << "`typedef volatile int vint;` (object) must fail loud — model B "
+               "cannot carry typedef volatility";
+    }
+    {
+        auto L = lowerCSubset("typedef volatile int *vip;\n"
+                              "int main(void){ return 0; }\n");
+        EXPECT_TRUE(hasVolatilePointeeReject(L.model.diagnostics()))
+            << "`typedef volatile int *vip;` (laundered pointee) must fail loud";
+    }
 }

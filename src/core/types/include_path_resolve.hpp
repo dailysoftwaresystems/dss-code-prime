@@ -44,8 +44,10 @@ resolveIncludePath(std::string_view filename,
 // FUNNEL the FC15c plan-lock mandates (one chokepoint, no drift). DSS ships a
 // LANGUAGE-NEUTRAL JSON descriptor per system header (`<stdio.h>` ->
 // `stdio.json`), NOT a `.h` source file, so the search is NOT `filename` on the
-// path: it is `stem(filename) + ".json"` on `systemDirs` -- agnostic of the
-// requested extension spelling (`<stdio.h>`, `<stdio>` both map to
+// path: it is the requested path with its extension dropped + `.json`,
+// PRESERVING any subdirectory, on `systemDirs` (`<stdio.h>` -> `stdio.json`;
+// `<sys/types.h>` -> `sys/types.json`, distinct from `<time.h>` -> `time.json`) --
+// agnostic of the requested extension spelling (`<stdio.h>`, `<stdio>` ->
 // `stdio.json`). `#include <stdio.h>` and `__has_include(<stdio.h>)` BOTH call
 // this so their existence answers always agree. Returns the resolved descriptor
 // path, or nullopt on a miss.

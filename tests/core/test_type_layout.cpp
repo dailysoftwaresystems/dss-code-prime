@@ -566,3 +566,47 @@ TEST(TypeLayout, BitFieldAbiExact_StrategiesDivergeRedOnDisable) {
     EXPECT_EQ(g.size, 4u);
     EXPECT_EQ(m.size, 8u);
 }
+
+// ── D-CSUBSET-SELF-REFERENTIAL-STRUCT: incomplete composites + self-ref ──────
+
+TEST(TypeLayout, IncompleteCompositeHasNoLayout) {
+    // An INCOMPLETE composite (forward-minted, never completed) has NO size —
+    // `computeLayout` fails loud (nullopt), the signal a sizeof of it / a by-value
+    // member of it surfaces as a diagnostic. RED-ON-DISABLE: drop the
+    // isIncompleteComposite guard and this returns a (wrong, zero) layout.
+    auto ti = makeInterner(1);
+    const TypeId fwd = ti.forwardComposite(TypeKind::Struct, "Opaque", 1);
+    EXPECT_FALSE(computeLayout(fwd, ti, kNatural16, DataModel::Lp64).has_value());
+}
+
+TEST(TypeLayout, CompleteEmptyStructLaysOutSizeZero) {
+    // A COMPLETE empty struct (`struct E {}`) is a LEGAL zero-field type with size
+    // 0 — it must still lay out (NOT trip the incomplete guard, which keys on the
+    // EXPLICIT incomplete flag, never "operands empty").
+    auto ti = makeInterner(1);
+    const TypeId e = ti.forwardComposite(TypeKind::Struct, "E", 2);
+    ti.completeComposite(e, {});
+    auto const l = computeLayout(e, ti, kNatural16, DataModel::Lp64);
+    ASSERT_TRUE(l.has_value());
+    EXPECT_EQ(l->size, 0u);
+    EXPECT_TRUE(l->fieldOffsets.empty());
+}
+
+TEST(TypeLayout, SelfReferentialStructLaysOutWithPointerField) {
+    // `struct Node { int value; struct Node *next; }` on LP64: value@0 (4 bytes),
+    // next@8 (8-byte pointer, 8-aligned) → size 16, align 8. The self-ref field is
+    // a pointer (pointer size is independent of the pointee's completeness), so the
+    // layout is well-defined even though `next` points back at Node.
+    auto ti = makeInterner(1);
+    const TypeId i32  = ti.primitive(TypeKind::I32);
+    const TypeId node = ti.forwardComposite(TypeKind::Struct, "Node", 3);
+    const TypeId ptrNode = ti.pointer(node);
+    std::array<TypeId, 2> const fields{i32, ptrNode};
+    ti.completeComposite(node, fields);
+    auto const l = layoutOf(node, ti);
+    EXPECT_EQ(l.size, 16u);
+    EXPECT_EQ(l.align.bytes(), 8u);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);   // value
+    EXPECT_EQ(l.fieldOffsets[1], 8u);   // next (pointer, 8-aligned)
+}

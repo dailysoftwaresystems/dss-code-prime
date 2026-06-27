@@ -66,6 +66,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/object_format_kind.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
 #include "tokenizer/token_stream.hpp"
@@ -73,6 +74,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -191,10 +193,19 @@ struct DSS_EXPORT PreprocessResult {
 // `#include <h>`. Defaults to {} so the ~15 test callers + helper compile
 // unchanged; the ONE production call site (compilation_unit.cpp) threads its
 // `systemDirs_` member.
+// c9 (Phase-2): `activeFormat` is the active compile target's object-format, when
+// known (a real per-target compile). It makes `__has_include(<h>)` per-target
+// truthful — a header whose shipped descriptor declares `availableObjectFormats`
+// not containing this format reports NOT available, agreeing with the `#include`
+// semantic gate. Defaults to nullopt (LSP / direct-API / tests / non-C languages)
+// → pure-existence behavior, identical to before. Because `__has_include` (and the
+// descriptor macro-splice) now depend on it, the front-end must be built ONCE PER
+// DISTINCT object-format (the driver groups targets by kind; nullopt builds once).
 [[nodiscard]] DSS_EXPORT PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
     std::span<std::filesystem::path const> includeDirs,
-    std::span<std::filesystem::path const> systemDirs = {});
+    std::span<std::filesystem::path const> systemDirs = {},
+    std::optional<ObjectFormatKind>      activeFormat = std::nullopt);
 
 } // namespace dss

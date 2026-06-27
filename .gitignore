@@ -48,6 +48,9 @@ build-wsl/
 # timed before/after measurements and per-config canary builds).
 build-*/
 tmp_probe/
+# DSS CLI default output dir (target-spec-named subdirs of compiled binaries
+# from ad-hoc `dss-code-prime <src>` runs; not a build-system dir).
+target/
 !scripts/build/
 
 # CTest leftover when ctest is invoked from the repo root (e.g. inside

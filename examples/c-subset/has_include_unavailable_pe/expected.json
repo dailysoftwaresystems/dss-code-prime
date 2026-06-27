@@ -1,0 +1,12 @@
+{
+  "$comment": "c9 per-target __has_include — the UNAVAILABLE arm. The IDENTICAL source as has_include_available, compiled for windows-pe: <sys/time.h> ships availableObjectFormats:[elf,macho] (pe EXCLUDED), so __has_include(<sys/time.h>) is FALSE → the #else branch → exit 7. The pe binary RUNS on the windows leg (local ctest + the windows CI), so exit 7 is a REAL runtime witness that the preprocessor evaluated __has_include per-target (pre-c9 it was pure-existence → true everywhere → exit 42). RED-ON-DISABLE: revert the format-aware hasIncludeCb (or drop sys/time.json's availableObjectFormats) and pe takes the #if branch → exit 42 → this manifest's exit 7 fails. The release arm witnesses the optimizer over the selected branch.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 7,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

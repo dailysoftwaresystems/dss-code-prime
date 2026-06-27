@@ -1,0 +1,42 @@
+{
+  "$comment": "Neutral shipped <pthread.h> (POSIX) — c14e (linux) + c15c (macOS); the mutex API SQLite's mutex_unix.c needs (threadsafe builds) + pthread_self/equal. THE FIRST real consumer of the c15a TYPEDEF-variant + MACRO-variant mechanisms. pthread_mutex_t / pthread_mutexattr_t are OPAQUE per-PLATFORM-sized objects (SQLite only allocates + passes &mutex to libc, never reads the bytes) shipped as a FLAT MAX-size 8-aligned buffer (arr<i64,N> — 8-aligned so libc's internal long/pointer accesses are aligned). The SIZE diverges per format → a typedef `variants` entry per format (verified: linux glibc max 48B = arm64's __SIZEOF_PTHREAD_MUTEX_T, over-allocates x86-64's 40 harmlessly; macOS __PTHREAD_MUTEX_SIZE__=56 + the 8B __sig = 64B). pthread_mutex_t: elf arr<i64,6>=48 / macho arr<i64,8>=64. pthread_mutexattr_t: elf arr<i64,1>=8 (glibc max, arm64's 8) / macho arr<i64,2>=16 (__PTHREAD_MUTEXATTR_SIZE__=8 + 8B __sig). pthread_t = u64 flat (8B both — glibc unsigned-long thread id; macOS is really an opaque-struct POINTER but same 8B value-type ABI, passed to pthread_self/equal). ★ PTHREAD_MUTEX_INITIALIZER DIVERGES: Linux is all-zero {0}, but macOS REQUIRES the magic signature _PTHREAD_MUTEX_SIG_init = 0x32AAABA7 = 850045863 in the first (long __sig) slot ({850045863} zero-fills the opaque tail) — a {0} static mutex is INVALID on macOS → a macro `variants` entry per format. PTHREAD_MUTEX_RECURSIVE = 1 (linux) / 2 (macOS: NORMAL=0,ERRORCHECK=1,RECURSIVE=2) → a constant variant. The mutex/attr pointers are typed ptr<void> (C pointer coercion) so the opaque buffer passes without a fixed-layout signature. Gated availableObjectFormats:[elf,macho] (elf=WSL run target, glibc 2.34+ merged libpthread into libc.so.6; macho=macos-latest leg, pthread is in libSystem).",
+  "header": "pthread.h",
+  "standard": "posix",
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "symbols": [
+    { "name": "pthread_mutex_init",     "signature": "fn(ptr<void>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "pthread_mutex_destroy",  "signature": "fn(ptr<void>) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "pthread_mutex_lock",     "signature": "fn(ptr<void>) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "pthread_mutex_trylock",  "signature": "fn(ptr<void>) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "pthread_mutex_unlock",   "signature": "fn(ptr<void>) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "pthread_mutexattr_init", "signature": "fn(ptr<void>) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "pthread_mutexattr_destroy", "signature": "fn(ptr<void>) -> i32",         "kind": "function", "linkage": "external" },
+    { "name": "pthread_mutexattr_settype", "signature": "fn(ptr<void>, i32) -> i32",    "kind": "function", "linkage": "external" },
+    { "name": "pthread_self",           "signature": "fn() -> u64",                     "kind": "function", "linkage": "external" },
+    { "name": "pthread_equal",          "signature": "fn(u64, u64) -> i32",             "kind": "function", "linkage": "external" }
+  ],
+  "typedefs": [
+    { "name": "pthread_t", "type": "u64" },
+    { "name": "pthread_mutex_t", "variants": [
+      { "when": { "format": "elf" },   "type": "arr<i64, 6>" },
+      { "when": { "format": "macho" }, "type": "arr<i64, 8>" }
+    ] },
+    { "name": "pthread_mutexattr_t", "variants": [
+      { "when": { "format": "elf" },   "type": "arr<i64, 1>" },
+      { "when": { "format": "macho" }, "type": "arr<i64, 2>" }
+    ] }
+  ],
+  "macros": [
+    { "name": "PTHREAD_MUTEX_INITIALIZER", "variants": [
+      { "when": { "format": "elf" },   "replacement": "{0}" },
+      { "when": { "format": "macho" }, "replacement": "{850045863}" }
+    ] }
+  ],
+  "constants": [
+    { "name": "PTHREAD_MUTEX_RECURSIVE", "variants": [
+      { "when": { "format": "elf" },   "value": 1, "type": "i32" },
+      { "when": { "format": "macho" }, "value": 2, "type": "i32" }
+    ] }
+  ]
+}

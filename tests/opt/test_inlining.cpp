@@ -312,6 +312,54 @@ TEST(Inlining, X8SretCalleeWithReadIndirectResultIsNotInlined) {
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
 }
 
+// D-OPT-VARIADIC-RELEASE-MISCOMPILE: a variadic callee that CALLS va_start lowers
+// it to the frame-relative VaRegSaveAreaAddr / VaOverflowArgAreaAddr /
+// VaHomeArgAreaAddr leaves, which materialize (lir_callconv) to `lea reg, [sp +
+// offset]` against the CALLEE's OWN variadic-prologue register-save / overflow
+// area — set up only by the callee's variadic prologue. Inlining would splice that
+// lea into the CALLER's frame (which never spilled any varargs) → `ap` reads
+// garbage. This is the real release-pipeline bug: vsum(3,10,13,19) exits 0/127 not
+// 42 under `release.pipeline.json` (which runs Inlining). The gate MUST refuse.
+// RED-ON-DISABLE: drop the va_start-leaf refusal in inlineLegalityGate and this
+// callee inlines (callsInlined → 1, the Call is gone). Sibling of
+// X8SretCalleeWithReadIndirectResultIsNotInlined.
+TEST(Inlining, VariadicCalleeCallingVaStartIsNotInlined) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, ptr, CallConv::CcSysV);
+    MirBuilder mb;
+    // callee f (SymbolId 50): a variadic-callee shape — its body contains the
+    // VaRegSaveAreaAddr leaf (the SysV va_start register-save-area address) and
+    // returns it. Only the frame-binding leaf matters to the inline decision (the
+    // full va_arg diamond is irrelevant — the leaf IS the frame-binding condition).
+    mb.addFunction(fnSig, SymbolId{50});
+    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(fEntry);
+    MirInstId const va = mb.addInst(MirOpcode::VaRegSaveAreaAddr, {}, ptr);
+    mb.addReturn(va);
+    // main (SymbolId 100): calls f.
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const calleeAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    std::array<MirInstId, 1> callOps{calleeAddr};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, ptr);
+    mb.addReturn(call);
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "a variadic callee that calls va_start (VaRegSaveAreaAddr leaf) MUST NOT "
+           "be inlined — the spliced lea would bind to the caller's frame, not the "
+           "callee's variadic register-save-area";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+}
+
 // ── Argument substitution: a callee taking a parameter is inlined,
 // and the actual argument flows into the spliced body. ─────────────
 // Callee g(int x) { return x + 1; }; main() { return g(41); } → after

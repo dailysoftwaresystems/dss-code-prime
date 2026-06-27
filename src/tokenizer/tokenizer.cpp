@@ -822,7 +822,12 @@ TokenizeResult Tokenizer::tokenize() && {
                 // One token for the whole body (possibly empty, e.g. `""`).
                 emit(CoreTokenKind::Operator, bodyToken.kind, bodyToken.flags);
                 if (sawClose) {
-                    r.advance(closeLen);           // consume close delimiter (no token)
+                    // c22 (D-PP-LINE-COMMENT-BEFORE-DIRECTIVE): an `endsAtExclusive`
+                    // style leaves the close delimiter in the stream (re-lexed as its
+                    // own token); otherwise consume it as the token-less close.
+                    if (!style->endsAtExclusive) {
+                        r.advance(closeLen);       // consume close delimiter (no token)
+                    }
                     if (frames.size() <= 1) {
                         tokenizerFatal("frame stack underflow at coalesced endsAt");
                     }
@@ -849,11 +854,22 @@ TokenizeResult Tokenizer::tokenize() && {
                 if (const auto n = matchEndsAt(r, style->endsAt, suffix,
                                                style->endsAtLongestMatch);
                     n > 0) {
-                    r.advance(n);
-                    emit(CoreTokenKind::Operator, bodyToken.kind, bodyToken.flags);
                     if (frames.size() <= 1) {
                         tokenizerFatal("frame stack underflow at endsAt (main mode is unreachable)");
                     }
+                    // c22 (D-PP-LINE-COMMENT-BEFORE-DIRECTIVE): an `endsAtExclusive`
+                    // style (a `//` line comment) ends AT the delimiter but does NOT
+                    // consume it — the terminating newline must survive as its own
+                    // Newline token so a following `#` directive is seen as
+                    // first-on-line by the preprocessor. The body chars before it
+                    // were already emitted per-codepoint; no token is emitted for the
+                    // left-in-place delimiter, which the main scan re-lexes.
+                    if (style->endsAtExclusive) {
+                        frames.pop_back();
+                        continue;
+                    }
+                    r.advance(n);
+                    emit(CoreTokenKind::Operator, bodyToken.kind, bodyToken.flags);
                     frames.pop_back();
                     continue;
                 }

@@ -3570,8 +3570,9 @@ TEST(LirCallconvLargeFrameImm12, Aapcs64NinthFixedParamLoadUsesScaledLoadU) {
     // `long pad[40]` (320B) forces the frame > 255. An array alloca is never
     // scalar-promoted (mem2reg refuses array allocas), and this pipeline runs
     // NO optimizer anyway (lower -> liveness -> regalloc -> rewrite -> callconv),
-    // so the full reservation survives. `volatile` is NOT used — it fails loud in
-    // the c-subset frontend (S_VolatileNotSupported), which runs before lowering.
+    // so the full reservation survives. `volatile` is NOT needed here (the array
+    // alloca survives on its own); it is implemented since c21 — only a pointer-to-
+    // volatile POINTEE fails loud (S_VolatilePointeeNotSupported).
     auto bundle = lowerThroughRewrite(
         "int sum9(int a, int b, int c, int d, int e, int f, int g, int h, int i,"
         " ...) {\n"

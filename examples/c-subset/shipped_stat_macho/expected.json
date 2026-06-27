@@ -1,0 +1,12 @@
+{
+  "$comment": "c15c shipped <sys/stat.h> on macOS — the per-target struct `variants` macho leg + the RED-ON-DISABLE pin for the SAME-SIZE swap. macOS struct stat is 144B = x86-64-elf's size, so the pin is a FIELD OFFSET (st_size@96 macho vs @48 x86-64-elf) plus the macho-only st_birthtim_sec field — NOT sizeof (which can't tell 144 from 144). Single arm64-macho target → runs on the macos-latest CI leg (native Apple Silicon). exit 42 iff the macho struct stat variant was selected (correct Darwin layout). RED-ON-DISABLE: a broken selector hands macho the x86-64-elf layout → st_birthtim_sec unresolved (compile fail) / st_size@48 → exit 1. Release arm runs the optimizer over the field-offset arithmetic + the fstat call.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

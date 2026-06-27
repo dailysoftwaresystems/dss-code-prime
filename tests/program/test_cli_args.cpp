@@ -15,6 +15,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "program/cli_args.hpp"
 #include "program/input_resolver.hpp"
+#include "program/program.hpp"          // formatWallTime (the --time formatter)
 
 #include <gtest/gtest.h>
 
@@ -100,6 +101,44 @@ TEST(CliArgs, CompileModeWithSingleFile) {
     EXPECT_EQ(r->languageName, "c-subset");
     ASSERT_EQ(r->targets.size(), 1u);
     EXPECT_EQ(r->targets[0], "x86_64:elf64-x86_64-linux");
+}
+
+// ── --time flag (compile wall-clock reporting) ───────────────
+
+TEST(CliArgs, TimeFlagDefaultsFalse) {
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(r->time);
+}
+
+TEST(CliArgs, TimeFlagSetByCli) {   // RED-on-disable: drop the `--time` parse arm and this fails
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux", "--time"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->time);
+}
+
+TEST(CliArgs, TimeFlagAloneIsNoModeError) {   // --time with no mode must fail loud, not be silently dropped
+    Argv a{"dss-code-prime", "--time"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
+}
+
+TEST(CliArgs, FormatWallTimeHumanizesAllBands) {
+    EXPECT_EQ(formatWallTime(0),      "0ms");
+    EXPECT_EQ(formatWallTime(623),    "623ms");
+    EXPECT_EQ(formatWallTime(999),    "999ms");
+    EXPECT_EQ(formatWallTime(1000),   "1.000s");
+    EXPECT_EQ(formatWallTime(2314),   "2.314s");
+    EXPECT_EQ(formatWallTime(59999),  "59.999s");
+    EXPECT_EQ(formatWallTime(60000),  "1m00.000s");
+    EXPECT_EQ(formatWallTime(151231), "2m31.231s");
 }
 
 TEST(CliArgs, CompileModeWithMultipleFiles) {

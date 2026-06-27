@@ -106,7 +106,7 @@ struct DSS_EXPORT ResolutionContext {
     // path via `readShippedLibDescriptor`, interns each symbol's signature into
     // the CU lattice, and mints an extern symbol into scope — the analogue of
     // the builtinFunctions injection. Resolvers append; never cleared.
-    std::vector<std::filesystem::path>&    shippedLibDescriptors;
+    std::vector<ShippedDescriptorRef>&     shippedLibDescriptors;
 };
 
 class DSS_EXPORT ImportResolver {

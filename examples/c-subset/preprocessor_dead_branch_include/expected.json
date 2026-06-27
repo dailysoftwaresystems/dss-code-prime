@@ -1,0 +1,35 @@
+{
+  "$comment": "c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING) runtime witness: the preprocessor FULLY skips a dead #if branch BEFORE the include splice + the global tokenize. The dead `#if 0` block holds lexically illegal chars ($ @ `) AND a quote-#include of a nonexistent header; a `#ifdef SQLITE_OS_WIN` (undefined on linux/macos) guards another missing include -- both must be elided (P0016 + P000E). The live arms set BASE=40, MARGIN=2; add(40,2)=42 -> exit 42. RED-ON-DISABLE: a regressed elision leaves `return 99` live (exit 99), or fails the build with a missing-include (P_PreprocessorIncludeError) or an illegal-char (P_IllegalChar) error. BASE/MARGIN reach add() as function args so the baseline arm keeps a live runtime add (not const-folded), and the optimizedPipelines `release` arm runs the shipped pipeline over the same source.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

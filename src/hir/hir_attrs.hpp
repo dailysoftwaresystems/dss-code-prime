@@ -9,6 +9,7 @@
 #include "hir/attributes/shader_intrinsic.hpp"
 #include "hir/attributes/source_span.hpp"
 #include "hir/attributes/transpile_hints.hpp"
+#include "hir/attributes/volatile_attr.hpp"
 
 // HIR attribute catalog (HR5). The standard per-node side-tables, each a named
 // alias of `HirAttribute<T>` over the value structs in `attributes/`. A consumer
@@ -47,6 +48,16 @@ using HirLinkageMap = HirAttribute<LinkageAttr>;
 // — the input the assembler's section selection consults to route an
 // initialized global to read-only `.rodata` (const) vs writable `.data`.
 using HirMutabilityMap = HirAttribute<MutabilityAttr>;
+
+// c21 (D-CSUBSET-VOLATILE-QUALIFIER): per-ACCESS volatility for object Refs,
+// struct/union MemberAccesses, and VarDecl/Global init stores whose object
+// carried a source `volatile` qualifier. Populated by CST→HIR lowering from the
+// bound symbol's / field's `SymbolRecord.isVolatile`; read by HIR→MIR lowering
+// to OR `MirInstFlags::Volatile` onto that access's Load/Store so the optimizer
+// cannot elide / cache / reorder it. Keyed on the ACCESS node (unlike the
+// declaration-keyed mutability map) and flows to the Load/Store FLAG (unlike
+// mutability's section selection) — genuinely new plumbing.
+using HirVolatileMap = HirAttribute<VolatileAttr>;
 
 // Shader stage / built-in / workgroup / binding data. Populated by shader-shape
 // lowering (plan 17); read by SPIR-V codegen.

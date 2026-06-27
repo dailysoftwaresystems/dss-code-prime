@@ -8,5 +8,8 @@
       "artifact": "main",
       "runOn": ["linux"]
     }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
   ]
 }

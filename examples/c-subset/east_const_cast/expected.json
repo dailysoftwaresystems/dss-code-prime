@@ -1,0 +1,15 @@
+{
+  "$comment": "c11 D-CSUBSET-EAST-CONST-CAST: an east-const cast `(unsigned char const *)` (const between the base type and the stars — the SQLite-pervasive pointer-to-const cast) parses + derefs → exit 42. The cast-type grammar (castTypeRef) gained a post-base ConstKeyword slot, mirroring the declaration head; the const resolver ignores const for type identity so it is a grammar-only change. RED-ON-DISABLE: drop the post-base optional ConstKeyword and `(unsigned char const *)` fails to parse (P0009). The pe arm RUNS on the windows leg (native witness); elf/macho/arm64 on the linux/darwin/qemu legs; the release arm witnesses the optimizer over the cast.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

@@ -1,5 +1,6 @@
 #include "analysis/preprocess/pp_if_eval.hpp"
 
+#include "core/types/char_decode.hpp"
 #include "core/types/hir_lowering_config.hpp"
 #include "core/types/number_decode.hpp"
 #include "core/types/operator_table.hpp"
@@ -157,6 +158,13 @@ public:
         // config -- never a hard-coded "StringStart".
         stringOpenKind_ =
             schema_.schemaTokens().find(schema_.preprocess().quoteIncludeToken);
+        // c12: the char-literal OPENER (`'`) + coalesced BODY kinds, read from
+        // `hirLowering` config (never a hard-coded "CharStart"/"CharLiteral"). A
+        // char constant in `#if` is an INT whose value is the (escape-decoded)
+        // single byte (C 6.10.1p4 + 6.4.4.4). Both invalid ⇒ the language has no
+        // char-literal form (toy/tsql) and the arm never fires.
+        charOpenKind_ = schema_.hirLowering().charStartToken;
+        charBodyKind_ = schema_.hirLowering().charBodyToken;
     }
 
     // Evaluate the whole token run. nullopt on any fail-loud condition (already
@@ -197,6 +205,8 @@ private:
     OperatorTable const&          opTable_;
     NumberStyle const*            numberStyle_ = nullptr;
     SchemaTokenId                 stringOpenKind_{};
+    SchemaTokenId                 charOpenKind_{};   // c12: `'` opener
+    SchemaTokenId                 charBodyKind_{};   // c12: coalesced char body
     std::size_t                   pos_ = 0;
     bool                          failed_ = false;
 
@@ -517,6 +527,37 @@ private:
                     return lv;
                 }
             }
+        }
+
+        // c12: char constant `'A'` / `'\n'` / `'\301'`. It lexes as the OPENER
+        // (`charOpenKind_` = `'`) followed by the COALESCED body token
+        // (`charBodyKind_`), the closing `'` already consumed on mode-pop. The body
+        // text is the raw bytes between the quotes (escapes unresolved); decode it
+        // to a single byte via the SHARED `decodeCharLiteralBody` (the same decoder
+        // char-literal lowering uses — so an escape means the same thing here). The
+        // value is the INT execution-charset code (C 6.10.1p4: char in `#if` is an
+        // int; ASCII 'A' == 65). An empty / multi-byte / malformed body fails loud.
+        if (charOpenKind_.valid() && t.schemaKind == charOpenKind_) {
+            advance();   // consume the `'` opener
+            if (atEnd() || !charBodyKind_.valid()
+                || peek().schemaKind != charBodyKind_) {
+                fail(DiagnosticCode::P_PreprocessorDirective,
+                     "malformed character constant in #if expression");
+                return std::nullopt;
+            }
+            Token const bodyTok = peek();
+            auto cp = decodeCharLiteralBody(textOf(bodyTok));
+            if (!cp.has_value()) {
+                fail(DiagnosticCode::P_PreprocessorDirective,
+                     "character constant in #if is empty, multi-character, or has "
+                     "an unsupported escape: " + std::string{textOf(bodyTok)});
+                return std::nullopt;
+            }
+            advance();   // consume the body
+            HirLiteralValue lv;
+            lv.core  = TypeKind::I32;
+            lv.value = static_cast<std::int64_t>(*cp);
+            return lv;
         }
 
         // Integer literal (real, or a synthetic `defined`-result). NOTE

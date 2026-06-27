@@ -261,6 +261,14 @@ computeLayout(TypeId id, TypeInterner const& interner,
               AggregateLayoutParams params, DataModel dm) {
     TypeKind const kind = interner.kind(id);
 
+    // D-CSUBSET-SELF-REFERENTIAL-STRUCT: an INCOMPLETE composite (a forward-declared
+    // struct/union whose body has not been seen) has NO size — `sizeof` of it, or a
+    // by-value member of it, is ill-formed (C 6.5.3.4 / 6.7.2.1). Fail loud (nullopt
+    // → positioned diagnostic), never a guessed/zero size. This is also the backstop
+    // that keeps layout from recursing on a self-by-value cycle (the semantic phase
+    // leaves such a composite incomplete after emitting S_IncompleteTypeMember).
+    if (interner.isIncompleteComposite(id)) return std::nullopt;
+
     // Scalars + pointers: degenerate layout (no field offsets).
     if (auto const sz = scalarByteSize(kind, dm)) {
         return StructLayout{*sz, scalarAlign(*sz, params), {}, false};

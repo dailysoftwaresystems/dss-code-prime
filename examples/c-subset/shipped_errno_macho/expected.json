@@ -1,0 +1,12 @@
+{
+  "$comment": "c15b shipped <errno.h> on macOS — the proof of the c15a per-target const/macro variant extension. The `errno` macro selects (*__error()) on macho (libSystem) via the per-format MACRO variant; EAGAIN=35 is the Darwin value via the per-format CONSTANT variant (Linux is 11). Single arm64-macho target → runs on the macos-latest CI leg (native Apple Silicon, runs Mach-O). exit 42 iff both per-format selections are correct. RED-ON-DISABLE: a broken variant selector hands macho the elf values (__errno_location → link fails; EAGAIN 11 → exit 1). Release arm runs the optimizer over the macro-expanded call.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

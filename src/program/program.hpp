@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <format>
 #include <optional>
 #include <string>
 #include <vector>
@@ -30,6 +31,19 @@ namespace dss {
 // language / CPU / format identity (the standing agnosticism veto).
 [[nodiscard]] inline bool routesToMultiUnit(std::size_t sourceCount) noexcept {
     return sourceCount > 1;
+}
+
+// Human-readable wall-clock duration for the `--time` CLI flag. Sub-second →
+// "623ms"; under a minute → "2.314s"; a minute or more → "2m31.231s". Pure +
+// deterministic (unit-tested) so the non-deterministic timer VALUE is the only
+// thing that varies at runtime. A universal driver concern — no lang/target/format.
+[[nodiscard]] inline std::string formatWallTime(long long milliseconds) {
+    if (milliseconds < 1000) return std::format("{}ms", milliseconds);
+    double const s = static_cast<double>(milliseconds) / 1000.0;
+    if (s < 60.0) return std::format("{:.3f}s", s);
+    long long const m  = static_cast<long long>(s) / 60;
+    double const rem = s - static_cast<double>(m) * 60.0;
+    return std::format("{}m{:06.3f}s", m, rem);
 }
 
 class DSS_EXPORT Program {

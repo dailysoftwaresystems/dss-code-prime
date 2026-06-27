@@ -26,7 +26,29 @@ namespace {
 // memory ops (the optimizer must not reorder or elide volatile
 // accesses). Terminators are caught by `hasSideEffects` per the
 // opcode table.
+//
+// D-OPT-VARIADIC-RELEASE-ARGINDEX: an `Arg` is the SSA definition of a
+// function PARAMETER — part of the function's fixed ABI signature, NOT a
+// side-effect-free temporary that is dead when its value is unused (LLVM
+// models parameters as non-instruction `Argument` roots for exactly this
+// reason). It is a ROOT: DCE must NOT remove an unused `Arg`. Removing one
+// is both semantically off (the parameter still exists in the ABI) AND
+// breaks an invariant downstream consumers rely on — the MirVerifier bounds
+// an `Arg`'s physical-register ordinal by the COUNT of `Arg` instructions
+// in the function (FC7 D-FC7-SYSV-STRUCT-ARG-MULTIREG), which equals the
+// physical-arg count ONLY while every `Arg` survives. A variadic callee
+// whose later FIXED params (high ordinals, e.g. a 7th int arg on the SysV
+// stack) are read while earlier ones are unused would, after the unused
+// `Arg`s were DCE'd, leave a surviving high-ordinal `Arg` whose payload
+// exceeds the shrunken count → a spurious `I_ArgIndexOutOfRange` reject.
+// Keeping `Arg`s is codegen-SAFE (not codegen-free): an unused parameter's
+// `arg` lowers to a dead `mov`/`load` — a dead vreg with an empty live range,
+// so it adds NO spill pressure and has NO correctness effect, the same
+// harmless dead-definition shape the LIR layer already tolerates (there is no
+// general LIR DCE today; a future one would drop the few bytes). The contract
+// this fix protects is at the MIR tier: DCE must not elide the `Arg`.
 [[nodiscard]] bool isSideEffectRoot(MirOpcode op, MirInstFlags flags) noexcept {
+    if (op == MirOpcode::Arg) return true;
     if (opcodeInfo(op).hasSideEffects) return true;
     if (has(flags, MirInstFlags::Volatile)) return true;
     return false;

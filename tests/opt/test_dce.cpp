@@ -132,6 +132,55 @@ TEST(Dce, PreservesStoreEvenWhenResultUnused) {
     EXPECT_TRUE(sawStore)  << "Store is side-effecting + must survive DCE";
 }
 
+// D-OPT-VARIADIC-RELEASE-ARGINDEX: an `Arg` is the SSA definition of a function
+// PARAMETER — part of the fixed ABI signature, an ABI ROOT, never dead code even
+// when its value is unused. `f(a,b,c)` returning `a + c` leaves `b` (Arg ordinal 1)
+// unused. Before the fix DCE elided b's `Arg`, leaving the NON-CONTIGUOUS surviving
+// set {Arg(0), Arg(2)} — whose COUNT (2) is at/below the highest surviving ordinal
+// (2). The MirVerifier bounds an `Arg`'s physical ordinal by `count(Arg)` (FC7
+// D-FC7-SYSV-STRUCT-ARG-MULTIREG), valid ONLY while every `Arg` survives; the
+// stranded high-ordinal `Arg(2)` then tripped a SPURIOUS `I_ArgIndexOutOfRange`
+// (release-only — the verifier runs between optimizer passes). Keeping every `Arg`
+// holds `count(Arg)` == the physical-arg count. This is GENERAL (any fn with an
+// unused param before a used high-ordinal one — a SysV variadic callee with 7 fixed
+// ints, `varargs_overflow_fixed_stack`, was just the first corpus case). RED-ON-
+// DISABLE: drop the `op == MirOpcode::Arg` root in isSideEffectRoot → b's `Arg` is
+// elided and only 2 of the 3 Args survive.
+TEST(Dce, UnusedParameterArgIsPreservedAsAbiRoot) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    std::array<TypeId, 3> const paramTys{i32, i32, i32};
+    TypeId const fnSig = interner.fnSig(paramTys, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const a = mb.addArg(0, i32);
+    (void)mb.addArg(1, i32);                  // b — the UNUSED parameter
+    MirInstId const c = mb.addArg(2, i32);    // the high-ordinal LIVE Arg
+    MirInstId const addOps[] = {a, c};
+    MirInstId const sum = mb.addInst(MirOpcode::Add, addOps, i32);
+    mb.addReturn(sum);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runDce(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+
+    std::uint32_t argCount = 0;
+    MirFuncId const fn = mir.funcAt(0);
+    MirBlockId const e = mir.funcEntry(fn);
+    std::uint32_t const n = mir.blockInstCount(e);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        if (mir.instOpcode(mir.blockInstAt(e, i)) == MirOpcode::Arg) ++argCount;
+    }
+    EXPECT_EQ(argCount, 3u)
+        << "an unused parameter's Arg must survive DCE (Args are ABI-parameter "
+           "roots); else the surviving high-ordinal Arg strands the verifier's "
+           "count-based ordinal bound";
+}
+
 // Volatile Load: `Load` has hasSideEffects=false, but the Volatile
 // flag MUST keep it alive even when its result feeds no consumer.
 TEST(Dce, PreservesVolatileLoadEvenWhenResultUnused) {

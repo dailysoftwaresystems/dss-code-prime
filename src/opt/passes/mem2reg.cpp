@@ -362,6 +362,73 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
     if (promoted_.empty()) return;
     allocasPromoted_ += promoted_.size();
 
+    // Step 4b — FULLY-PRUNED SSA (Choi/Cytron/Sarkar) — D-OPT-MEM2REG-DEAD-PHI-PRUNE.
+    // Place a Phi for promoted alloca A at an IDF block S ONLY IF A is LIVE-IN at
+    // S. Minimal (un-pruned) SSA places a Phi at EVERY iterated-dominance-frontier
+    // block of A's def-blocks; when A is DEAD at such a block S (not used on any
+    // path out of S before being re-stored), that Phi is dead AND — if A was not
+    // stored on the entry edge into S — its incoming is genuinely undefined, so
+    // the rename walk's empty-stack guard ABORTS. That dead-Phi abort crashed the
+    // release pipeline on (a) a local declared+used entirely inside a loop body
+    // (`while(){ int x=expr; use(x); }` — block-local, dead at the header), AND
+    // (b) the SUBTLER case of a name that IS live somewhere but DEAD at one of its
+    // IDF blocks — e.g. a nested-loop counter `j` re-initialized (`j=0`) each
+    // OUTER iteration before its inner-loop use: `j` is live across the INNER
+    // back-edge (so a mere upward-exposed/semi-pruned test keeps ALL its Phis) yet
+    // DEAD at the OUTER header, where its dead Phi's entry incoming is undefined.
+    // Only true LIVENESS distinguishes (b); semi-pruning does not. Liveness gating
+    // is PROVABLY SAFE + complete: every Phi it KEEPS is at a block where A is
+    // live (its value reaches a real use), so a needed merge is never pruned (no
+    // miscompile); and the genuine-uninitialized-read fatal is PRESERVED — a
+    // truly live-but-undefined alloca (`int x; if(c) x=1; use(x);`) IS live-in at
+    // its use, so the merge Phi survives and still aborts on the undefined path.
+    // Backward dataflow: live_in[B] = use[B] ∪ (live_out[B] \ def[B]);
+    //                    live_out[B] = ∪ live_in[succ];  use=upward-exposed Load,
+    // def=Store. (The Alloca site is NOT a def here — it births the slot with an
+    // undefined value, so a use with no real Store stays live → fatal preserved.)
+    std::unordered_map<std::uint32_t, std::unordered_set<std::uint32_t>> useB, defB;
+    for (MirBlockId const b : rpo) {
+        auto& u = useB[b.v];
+        auto& d = defB[b.v];
+        std::uint32_t const ninst = src_.blockInstCount(b);
+        for (std::uint32_t i = 0; i < ninst; ++i) {
+            MirInstId const id = src_.blockInstAt(b, i);
+            MirOpcode const op = src_.instOpcode(id);
+            if (op == MirOpcode::Load) {
+                auto const ops = src_.instOperands(id);
+                if (ops.size() == 1 && promoted_.count(ops[0].v)
+                    && d.find(ops[0].v) == d.end()) {
+                    u.insert(ops[0].v);  // upward-exposed use (Load before any Store in b)
+                }
+            } else if (op == MirOpcode::Store) {
+                auto const ops = src_.instOperands(id);
+                if (ops.size() == 2 && promoted_.count(ops[1].v)) {
+                    d.insert(ops[1].v);
+                }
+            }
+        }
+    }
+    std::unordered_map<std::uint32_t, std::unordered_set<std::uint32_t>> liveIn;
+    for (bool changed = true; changed; ) {
+        changed = false;
+        // Reverse-RPO: visit successors before predecessors so the fixpoint
+        // converges fast (still correct in any order — iterate to stability).
+        for (auto it = rpo.rbegin(); it != rpo.rend(); ++it) {
+            MirBlockId const b = *it;
+            std::unordered_set<std::uint32_t> in = useB[b.v];  // use[B] ⊆ live_in
+            auto const& d = defB[b.v];
+            for (MirBlockId const s : src_.blockSuccessors(b)) {
+                auto const sit = liveIn.find(s.v);
+                if (sit == liveIn.end()) continue;
+                for (std::uint32_t a : sit->second) {       // live_out[B] \ def[B]
+                    if (d.find(a) == d.end()) in.insert(a);
+                }
+            }
+            auto& cur = liveIn[b.v];
+            if (in != cur) { cur = std::move(in); changed = true; }
+        }
+    }
+
     for (std::uint32_t aid : promoted_) {
         auto const& defs = defBlocksOf[aid];
         if (defs.empty()) {
@@ -377,6 +444,14 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
         }
         auto const idf = mirIteratedDominanceFrontier(defs, df);
         for (MirBlockId const idfB : idf) {
+            // FULLY-PRUNED gate: place the Phi only where `aid` is LIVE-IN
+            // (D-OPT-MEM2REG-DEAD-PHI-PRUNE). A dead Phi here — `aid` not live
+            // at idfB — would, if its entry incoming is undefined, abort the
+            // rename walk (the loop-body-local + nested-loop-counter crashes).
+            auto const lit = liveIn.find(idfB.v);
+            if (lit == liveIn.end() || lit->second.find(aid) == lit->second.end()) {
+                continue;
+            }
             PendingPhi pp;
             pp.allocaOldIdV = aid;
             pp.markerV      = nextMarker_++;

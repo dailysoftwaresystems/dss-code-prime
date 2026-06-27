@@ -1,0 +1,10 @@
+{
+  "$comment": "Neutral shipped <sys/ioctl.h> (POSIX) — c16 (SQLite os_unix). SQLite calls ioctl in a few places (e.g. F2FS / proxy-locking paths). Only the `ioctl` symbol is needed — SQLite passes the request code as a literal, so no TIOC*/FIO* constants are referenced. Verified against glibc misc/sys/ioctl.h + xnu/bsd/sys/ioctl.h: the prototype `int ioctl(int fd, unsigned long request, ...)` is IDENTICAL on glibc and Darwin — variadic, the request arg is `unsigned long` (u64 on LP64) on both → a flat variadic signature `fn(i32, u64, ...) -> i32` (the c14c variadic-extern path). The _IOC/_IOR/_IOW request-ENCODING macros differ per-OS, but SQLite doesn't use this header's macros, so none are shipped (no over-ship). Gated availableObjectFormats:[elf,macho].",
+  "header": "sys/ioctl.h",
+  "standard": "posix",
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "symbols": [
+    { "name": "ioctl", "signature": "fn(i32, u64, ...) -> i32", "kind": "function", "linkage": "external" }
+  ]
+}

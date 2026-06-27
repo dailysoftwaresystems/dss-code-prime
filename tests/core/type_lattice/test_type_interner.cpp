@@ -64,6 +64,109 @@ TEST(TypeInterner, StructIsNominalAndStructural) {
     EXPECT_EQ(ti.name(i32), "");          // structural primitives have no name
 }
 
+// ── D-CSUBSET-SELF-REFERENTIAL-STRUCT: nominal composites ───────────────────
+
+TEST(TypeInterner, SelfReferentialStructForwardMintCompletes) {
+    // The crux: a struct whose field points to ITSELF. Forward-mint the nominal
+    // TypeId FIRST (no fields yet), build `Ptr<N>` against it, then complete with
+    // [Ptr<N>, i32]. field[0] resolves back to N — no un-internable cycle, no wart.
+    auto ti = makeInterner(1);
+    const TypeId i32 = ti.primitive(TypeKind::I32);
+    const TypeId n   = ti.forwardComposite(TypeKind::Struct, "N", /*declSiteKey=*/1001);
+    EXPECT_TRUE(ti.isIncompleteComposite(n));     // forward-only ⇒ incomplete
+    const TypeId ptrN = ti.pointer(n);            // the self-referential field type
+    std::array<TypeId, 2> const fields{ptrN, i32};
+    ti.completeComposite(n, fields);
+    EXPECT_FALSE(ti.isIncompleteComposite(n));     // now complete
+    ASSERT_EQ(ti.operands(n).size(), 2u);
+    EXPECT_EQ(ti.operands(n)[0].v, ptrN.v);        // field[0] = Ptr<N>
+    EXPECT_EQ(ti.operands(n)[1].v, i32.v);
+    EXPECT_EQ(ti.operands(ti.operands(n)[0]).size(), 1u);
+    EXPECT_EQ(ti.operands(ti.operands(n)[0])[0].v, n.v);   // Ptr<N> pointee IS n
+    EXPECT_EQ(ti.kind(n), TypeKind::Struct);
+    EXPECT_EQ(ti.name(n), "N");
+}
+
+TEST(TypeInterner, ForwardCompositeDedupsSameDeclSiteNoDuplicate) {
+    // The byHash-dedup charge: a re-mint of the SAME (kind, name, declSiteKey)
+    // returns the EXISTING forward record — "one composite → one TypeId" — so the
+    // Pass-1.5 completion and the self-ref field never split into two TypeIds.
+    auto ti = makeInterner(1);
+    const std::size_t before = ti.size();
+    const TypeId a = ti.forwardComposite(TypeKind::Struct, "N", 7);
+    const TypeId b = ti.forwardComposite(TypeKind::Struct, "N", 7);   // same decl-site
+    EXPECT_EQ(a.v, b.v);
+    EXPECT_EQ(ti.size(), before + 1);            // exactly ONE new type, not two
+}
+
+TEST(TypeInterner, DeclSiteIdentityKeepsSameNameDistinct) {
+    // IDENTITY-SAFETY: two same-name composites with DIFFERENT decl-sites (e.g. a
+    // file-scope `struct S` and a block-scoped `struct S` of different layout in
+    // ONE CU) must stay DISTINCT TypeIds. A name-only identity would merge them →
+    // wrong field offsets (silent layout miscompile). RED-ON-DISABLE: drop the
+    // declSiteKey from the identity and these become equal.
+    auto ti = makeInterner(1);
+    const TypeId s1 = ti.forwardComposite(TypeKind::Struct, "S", 100);
+    const TypeId s2 = ti.forwardComposite(TypeKind::Struct, "S", 200);
+    EXPECT_NE(s1.v, s2.v);
+    // ...and they carry INDEPENDENT field lists.
+    const TypeId i32 = ti.primitive(TypeKind::I32);
+    const TypeId f64 = ti.primitive(TypeKind::F64);
+    std::array<TypeId, 1> const fa{i32};
+    std::array<TypeId, 2> const fb{i32, f64};
+    ti.completeComposite(s1, fa);
+    ti.completeComposite(s2, fb);
+    EXPECT_EQ(ti.operands(s1).size(), 1u);
+    EXPECT_EQ(ti.operands(s2).size(), 2u);
+}
+
+TEST(TypeInterner, CompleteEmptyStructIsNotIncomplete) {
+    // `struct E {}` is a LEGAL COMPLETE zero-field struct (size 0) — NOT incomplete.
+    // The flag is EXPLICIT, never "operands empty".
+    auto ti = makeInterner(1);
+    const TypeId e = ti.forwardComposite(TypeKind::Struct, "E", 5);
+    EXPECT_TRUE(ti.isIncompleteComposite(e));     // before completion
+    ti.completeComposite(e, {});                  // complete with ZERO fields
+    EXPECT_FALSE(ti.isIncompleteComposite(e));     // a complete empty struct
+    EXPECT_TRUE(ti.operands(e).empty());
+    // A non-composite is never "incomplete" here.
+    EXPECT_FALSE(ti.isIncompleteComposite(ti.primitive(TypeKind::I32)));
+}
+
+TEST(TypeInterner, StructTypeOverloadRoutesToForwardCompleteNoDuplicate) {
+    // The 2-arg/3-arg convenience overloads MUST forward-mint + complete and
+    // CANONICALIZE: two structType("S", sameFields) calls collapse to one TypeId
+    // (so shipped descriptors + reintern stay byte-identical) and the result is
+    // COMPLETE. A duplicate-minting bug would make these distinct or leave the
+    // type incomplete.
+    auto ti = makeInterner(1);
+    const TypeId i32 = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 1> const fields{i32};
+    const std::size_t before = ti.size();
+    const TypeId a = ti.structType("S", fields);
+    const TypeId b = ti.structType("S", fields);   // identical content
+    EXPECT_EQ(a.v, b.v);                            // canonical (no duplicate)
+    EXPECT_EQ(ti.size(), before + 1);              // exactly one new composite
+    EXPECT_FALSE(ti.isIncompleteComposite(a));      // complete-at-once
+    ASSERT_EQ(ti.operands(a).size(), 1u);
+    EXPECT_EQ(ti.operands(a)[0].v, i32.v);
+}
+
+TEST(TypeInternerDeathTest, CompleteCompositeConflictingReCompletionAborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    auto trigger = [] {
+        auto ti = makeInterner(1);
+        const TypeId i32 = ti.primitive(TypeKind::I32);
+        const TypeId f64 = ti.primitive(TypeKind::F64);
+        const TypeId n   = ti.forwardComposite(TypeKind::Struct, "N", 1);
+        std::array<TypeId, 1> const fa{i32};
+        std::array<TypeId, 1> const fb{f64};
+        ti.completeComposite(n, fa);
+        ti.completeComposite(n, fb);   // DIFFERENT fields → caller bug → abort
+    };
+    EXPECT_DEATH({ trigger(); }, "re-completed with different fields");
+}
+
 TEST(TypeInterner, FnSigEncodesResultParamsAndCc) {
     auto ti = makeInterner(1);
     const TypeId i32 = ti.primitive(TypeKind::I32);

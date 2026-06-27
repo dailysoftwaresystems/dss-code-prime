@@ -361,6 +361,29 @@ TEST(StringStyleLoader, WrongTypeBoolFieldIsError) {
     }));
 }
 
+// c22 (D-PP-LINE-COMMENT-BEFORE-DIRECTIVE): the new `endsAtExclusive` bool must
+// be type-validated like the other optional bool fields — a non-bool value is a
+// loud config error, not a silent ignore.
+TEST(StringStyleLoader, WrongTypeEndsAtExclusiveIsError) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "\"": [{ "kind": "StringStart",
+                  "stringStyle": { "escapeKind":      "none",
+                                    "endsAt":          "\"",
+                                    "endsAtExclusive": "yes" } }]
+      },
+      "shapes": { "root": { "sequence": [ "StringStart" ] } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_InvalidStringStyle &&
+               d.path.find("endsAtExclusive") != std::string::npos;
+    }));
+}
+
 TEST(StringStyleLoader, StringStyleWrongTypeIsError) {
     constexpr std::string_view kCfg = R"JSON({
       "dssSchemaVersion": 2,

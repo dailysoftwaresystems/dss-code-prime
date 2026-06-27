@@ -229,7 +229,9 @@ static std::optional<CuMirModule> buildCuMirImpl(
         analyzeVaStrategy = cc->vaListLayout->strategy;
     }
     auto model = analyze(
-        std::move(borrowed), format.dataModel(), analyzeLayout, analyzeVaStrategy);
+        std::move(borrowed), format.dataModel(), analyzeLayout, analyzeVaStrategy,
+        format.kind(),       // c8: the active object-format → per-target availability gate
+        target.name());      // plan 25: the active arch → per-target shipped-struct variant selector
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
         return std::nullopt;
@@ -383,7 +385,8 @@ static std::optional<CuMirModule> buildCuMirImpl(
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,
                           &hir->sourceMap, mirCfg, &ffiMap,
-                          &hir->linkageMap, &hir->mutabilityMap);
+                          &hir->linkageMap, &hir->mutabilityMap,
+                          &hir->volatileMap);
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;
     }

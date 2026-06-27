@@ -186,6 +186,14 @@ lowerToMir(Hir const&               hir,
            // no entry) defaults to mutable — routed to writable `.data`/`.bss`.
            // Read here to stamp MirGlobal.isConst, the input the assembler's
            // section selection consults to pick `.rodata` vs `.data`.
-           HirMutabilityMap const*  mutabilityMap = nullptr);
+           HirMutabilityMap const*  mutabilityMap = nullptr,
+           // c21 (D-CSUBSET-VOLATILE-QUALIFIER): per-ACCESS volatility side-table,
+           // populated by the CST→HIR lowerer from each accessed symbol's / field's
+           // `SymbolRecord.isVolatile`. Optional: nullptr (or an access with no
+           // entry) ⇒ a plain memory access (no flag). Read here to OR
+           // MirInstFlags::Volatile onto the access's Load/Store so the optimizer's
+           // Volatile-aware passes (DCE/CSE/Mem2Reg/LICM) cannot elide / cache /
+           // reorder a volatile access.
+           HirVolatileMap const*    volatileMap = nullptr);
 
 } // namespace dss

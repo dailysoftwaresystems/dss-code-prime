@@ -2,6 +2,7 @@
 
 #include "analysis/preprocess/pp_if_eval.hpp"
 #include "core/types/include_path_resolve.hpp"
+#include "ffi/shipped_lib_descriptor.hpp"
 #include "tokenizer/tokenizer.hpp"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -174,6 +176,146 @@ std::function<void(BufferId&, SourceSpan&)> PreprocessResult::makeRemap() const 
 
 namespace {
 
+// FC14 / c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING): the condition stack frame
+// (C 6.10.1). LIFTED to the anonymous namespace (was nested in `MacroExpander`)
+// so BOTH the macro-expansion pass AND the SynthBuilder pre-scan share ONE
+// frame type + ONE set of transition free functions (`sbHandle*` below). Each
+// open `#if`/`#ifdef`/`#ifndef` pushes a frame; `#elif`/`#else` mutate the TOP;
+// `#endif` pops. A token (or a gated directive / quote-include) is live iff
+// EVERY frame's `thisBranchActive` is true.
+struct CondFrame {
+    bool enclosingActive;   // was the stack active when this frame opened?
+    bool anyBranchTaken;    // has any branch of this group been taken yet?
+    bool thisBranchActive;  // is the CURRENT branch the live one?
+    bool seenElse;          // has a `#else` been seen in this group?
+};
+
+// Which `#if`-family directive opened a frame. The single source of truth:
+// `MacroExpander::IfKind` is a `using`-alias of this. Shared by the free
+// `sbHandle*` functions below.
+enum class SbIfKind { Expr, Ifdef, Ifndef };
+
+// True iff every open conditional frame's current branch is active (empty stack
+// => active). The single liveness predicate for both passes.
+[[nodiscard]] bool sbStackActive(std::vector<CondFrame> const& stack) {
+    for (CondFrame const& f : stack) {
+        if (!f.thisBranchActive) return false;
+    }
+    return true;
+}
+
+// `#if EXPR` / `#ifdef NAME` / `#ifndef NAME`: push a new frame onto `stack`.
+// The branch is live iff the enclosing context is active AND the condition
+// holds. The operand is evaluated ONLY when the enclosing context is active (a
+// dead branch's operand is NOT evaluated -- C 6.10.1p6). The `#if EXPR` value
+// comes from `evalExprCb` (the caller binds it to its own macro state); the
+// `#ifdef`/`#ifndef NAME` definedness from `isDefinedCb`. `textOf` slices a
+// token's spelling (a `Token` is a 16B POD that does not carry its own text;
+// the caller binds it to its buffer slice). `[in, p, end)` are the operand
+// tokens (everything after the directive word up to the line newline). SHARED
+// single-impl: `MacroExpander::handleIf` delegates here (Phase 7).
+void sbHandleIf(std::vector<CondFrame>& stack, std::vector<Token> const& in,
+                std::size_t p, std::size_t end, SbIfKind kind,
+                std::function<std::string_view(Token const&)> const& textOf,
+                std::function<bool(std::string_view)> const& isDefinedCb,
+                std::function<bool(std::vector<Token> const&, std::size_t,
+                                   std::size_t)> const& evalExprCb,
+                DiagnosticReporter& rep, BufferId diagBuffer) {
+    bool const enclosing = sbStackActive(stack);
+    bool cond = false;
+    if (enclosing) {
+        if (kind == SbIfKind::Expr) {
+            cond = evalExprCb(in, p, end);
+        } else {
+            // `#ifdef`/`#ifndef NAME`: the operand is a single macro name.
+            std::size_t q = p;
+            while (q < end && isTrivia(in[q]) && !isNewline(in[q])) ++q;
+            if (q >= end || isNewline(in[q])
+                || in[q].coreKind != CoreTokenKind::Word) {
+                emitPP(rep, DiagnosticCode::P_PreprocessorDirective, diagBuffer,
+                       (q < end ? in[q].span : SourceSpan::empty(0)),
+                       std::string{"#"}
+                           + std::string{kind == SbIfKind::Ifdef ? "ifdef"
+                                                                 : "ifndef"}
+                           + " requires a macro name");
+                // Treat a malformed #ifdef as a false (inactive) branch, but
+                // STILL push a frame so the matching #endif balances.
+                cond = false;
+            } else {
+                bool const def = isDefinedCb(textOf(in[q]));
+                cond = (kind == SbIfKind::Ifdef) ? def : !def;
+            }
+        }
+    }
+    stack.push_back(CondFrame{
+        /*enclosingActive=*/enclosing,
+        /*anyBranchTaken=*/enclosing && cond,
+        /*thisBranchActive=*/enclosing && cond,
+        /*seenElse=*/false});
+}
+
+// `#elif EXPR`: on the TOP frame, take this branch iff the enclosing context is
+// active, NO prior branch of this group was taken, AND the expression holds. The
+// operand is evaluated ONLY when it could be taken (C 6.10.1p6) -- so a dead
+// `#elif`'s operand (e.g. `1/0`) is not evaluated. `atSpan` positions the
+// orphan-directive diagnostics.
+void sbHandleElif(std::vector<CondFrame>& stack, std::vector<Token> const& in,
+                  std::size_t p, std::size_t end, SourceSpan atSpan,
+                  std::function<bool(std::vector<Token> const&, std::size_t,
+                                     std::size_t)> const& evalExprCb,
+                  DiagnosticReporter& rep, BufferId diagBuffer) {
+    if (stack.empty()) {
+        emitPP(rep, DiagnosticCode::P_PreprocessorDirective, diagBuffer, atSpan,
+               "#elif without a matching #if");
+        return;
+    }
+    CondFrame& f = stack.back();
+    if (f.seenElse) {
+        emitPP(rep, DiagnosticCode::P_PreprocessorDirective, diagBuffer, atSpan,
+               "#elif after #else");
+        return;
+    }
+    // A prior active branch latches `anyBranchTaken`.
+    f.anyBranchTaken = f.anyBranchTaken || f.thisBranchActive;
+    bool const mayTake = f.enclosingActive && !f.anyBranchTaken;
+    bool cond = false;
+    if (mayTake) cond = evalExprCb(in, p, end);
+    f.thisBranchActive = mayTake && cond;
+    f.anyBranchTaken   = f.anyBranchTaken || f.thisBranchActive;
+}
+
+// `#else`: take this branch iff the enclosing context is active and no prior
+// branch of this group was taken.
+void sbHandleElse(std::vector<CondFrame>& stack, SourceSpan at,
+                  DiagnosticReporter& rep, BufferId diagBuffer) {
+    if (stack.empty()) {
+        emitPP(rep, DiagnosticCode::P_PreprocessorDirective, diagBuffer, at,
+               "#else without a matching #if");
+        return;
+    }
+    CondFrame& f = stack.back();
+    if (f.seenElse) {
+        emitPP(rep, DiagnosticCode::P_PreprocessorDirective, diagBuffer, at,
+               "#else after #else");
+        return;
+    }
+    f.anyBranchTaken   = f.anyBranchTaken || f.thisBranchActive;
+    f.seenElse         = true;
+    f.thisBranchActive = f.enclosingActive && !f.anyBranchTaken;
+    f.anyBranchTaken   = true;
+}
+
+// `#endif`: pop the top frame.
+void sbHandleEndif(std::vector<CondFrame>& stack, SourceSpan at,
+                   DiagnosticReporter& rep, BufferId diagBuffer) {
+    if (stack.empty()) {
+        emitPP(rep, DiagnosticCode::P_PreprocessorDirective, diagBuffer, at,
+               "#endif without a matching #if");
+        return;
+    }
+    stack.pop_back();
+}
+
 // Recursive synth-text builder. Tokenizes a file to FIND quote includes,
 // splices the recursively-preprocessed header text in place of each quote
 // include directive, and copies everything else (including angle includes)
@@ -181,6 +323,16 @@ namespace {
 struct SynthBuilder {
     std::shared_ptr<GrammarSchema const> schema;
     std::span<fs::path const>            includeDirs;
+    // System (angle-include) descriptor dirs — threaded so an angle `#include
+    // <h>` whose shipped descriptor declares `macros` injects them at PREPROCESS
+    // time (D-PP-DESCRIPTOR-MACRO-INJECT). Empty for non-C languages / callers
+    // without a system path -> the angle-macro branch is inert.
+    std::span<fs::path const>            systemDirs;
+    // c9 (Phase-2): the active object-format when known. Gates the angle-include
+    // macro-splice below to the SAME availability the `__has_include` callback and
+    // the semantic `#include` gate use — an unavailable-on-this-format header is
+    // treated like "no descriptor on the path" (left verbatim), all three agreeing.
+    std::optional<ObjectFormatKind>      activeFormat;
     DiagnosticReporter&                  rep;
     int                                  depth;
     std::vector<fs::path>&               includeStack;
@@ -188,6 +340,25 @@ struct SynthBuilder {
     // splice). Shared by reference across the recursive child builders so
     // a deep-nest truncation at any level reaches `preprocess()`.
     bool&                                fatal;
+    // c17: a SynthBuilder-local object-like macro, tracked from LIVE-branch
+    // `#define`s so a `#if FOO`/`#if FOO == 1` guard gating a quote-`#include`
+    // evaluates with the macro state visible at the include point. Independent
+    // of `MacroExpander`'s authoritative table (which still sees every
+    // verbatim-copied `#define`); divergence is one-directional + fail-loud (a
+    // false-dead skips a live include -> loud missing-symbol downstream, never a
+    // silent wrong include). A FUNCTION-like `#define` records only that the name
+    // is function-like (no replacement) -- an invocation of it in a guard forces
+    // the CONSERVATIVE (skip) direction (FIX-3). NOTE (c17 authoritative dead-
+    // regions): this pre-scan gates ONLY quote-include splicing; the dead-branch
+    // `P_IllegalChar` suppression is driven by the AUTHORITATIVE `MacroExpander`
+    // pass (`deadRanges()`), NOT this pre-scan -- so a guard this weaker eval
+    // mis-reads only ever causes a loud include skip/resolve, never a silent
+    // illegal-char drop.
+    struct SbMacro {
+        bool               functionLike = false;
+        std::vector<Token> replacement;  // object-like body (spans in scanBuf)
+    };
+    std::unordered_map<std::string, SbMacro> localMacros;
 
     PreprocessConfig const& cfg() const { return schema->preprocess(); }
 
@@ -235,6 +406,157 @@ struct SynthBuilder {
         }
     }
 
+    // c17: record a LIVE-branch `#define` into `localMacros` for the pre-scan's
+    // `#if` evaluation. `[nameP, end)` are the directive-line PPTokens AFTER the
+    // `define` word. FUNCTION-like iff the function-like-open token is IMMEDIATELY
+    // ADJACENT to the macro name (C 6.10.3p3: no space) -- recorded as
+    // function-like with NO body (an invocation in a guard then forces the
+    // conservative skip, FIX-3). OBJECT-like records the replacement tokens
+    // (everything after the name, trivia-stripped) whose spans slice against the
+    // scan buffer. A malformed `#define` (no name) is ignored here (the macro
+    // pass reports it authoritatively). Mirrors the redefinition-tolerant table
+    // write (last definition wins; the pre-scan needs no compatibility check).
+    void sbTrackDefine(std::vector<PPToken> const& toks, std::size_t nameP,
+                       std::size_t end) {
+        std::size_t p = nameP;
+        while (p < end && isTrivia(toks[p].tok)) ++p;
+        if (p >= end || isNewline(toks[p].tok)
+            || toks[p].tok.coreKind != CoreTokenKind::Word) {
+            return;   // malformed (no macro name) — macro pass fails loud
+        }
+        std::string const name{toks[p].text};
+        std::size_t const nameIdx = p;
+        ++p;
+        SbMacro m;
+        const auto openKind =
+            schema->schemaTokens().find(cfg().functionLikeOpenToken);
+        if (p < end && openKind.valid()
+            && toks[p].tok.schemaKind == openKind
+            && toks[p].tok.span.start() == toks[nameIdx].tok.span.end()) {
+            m.functionLike = true;
+            // No body needed: a function-like invocation forces the conservative
+            // direction regardless of the replacement.
+        } else {
+            for (std::size_t q = p; q < end; ++q) {
+                if (isNewline(toks[q].tok)) break;
+                if (isTrivia(toks[q].tok)) continue;
+                m.replacement.push_back(toks[q].tok);
+            }
+        }
+        localMacros[name] = std::move(m);
+    }
+
+    // c17: object-like macro expansion over `localMacros` for the
+    // `sbEvalIfOperand` `#if` evaluation. A bounded recursive rescan (so a
+    // `#define A B` / `#define B 1` chain folds, the common object-like case),
+    // with an `active`-set self-reference guard (a `#define X X` freezes to its
+    // own name, matching the full engine) + a depth backstop. FUNCTION-like
+    // names are NEVER expanded here -- an invocation is already detected as
+    // conservative by `sbEvalIfOperand`. Replacement tokens slice against `buf`
+    // (the scan buffer the `#define` came from), so their spans stay valid for
+    // the ICE parser.
+    std::vector<Token> sbExpand(std::vector<Token> const& in,
+                                SourceBuffer const& buf,
+                                std::set<std::string>& active, int depth) const {
+        if (depth > 32) return in;   // backstop (a pathological cycle the guard
+                                     // missed never loops the host)
+        std::vector<Token> outToks;
+        outToks.reserve(in.size());
+        for (Token const& t : in) {
+            if (t.coreKind == CoreTokenKind::Word) {
+                std::string name{buf.slice(t.span)};
+                auto it = localMacros.find(name);
+                if (it != localMacros.end() && !it->second.functionLike
+                    && active.find(name) == active.end()) {
+                    active.insert(name);
+                    std::vector<Token> sub =
+                        sbExpand(it->second.replacement, buf, active, depth + 1);
+                    active.erase(name);
+                    for (Token const& s : sub) outToks.push_back(s);
+                    continue;
+                }
+            }
+            outToks.push_back(t);
+        }
+        return outToks;
+    }
+
+    // c17: evaluate an `#if`/`#elif` controlling expression in the SynthBuilder
+    // pre-scan, to decide whether a quote-`#include` nested under it should be
+    // resolved NOW (the P0016 fix). Reuses the SHARED `evaluateIfExpression`
+    // (the same ICE engine + const-eval core the macro pass uses) with
+    // `localMacros`-backed callbacks; diagnostics go to a SCRATCH reporter (the
+    // authoritative `MacroExpander` pass re-evaluates the same `#if` and reports
+    // any error -- never double-reported here). Returns the BRANCH-TAKEN
+    // boolean. FIX-3 conservative fallback: if the operand invokes a
+    // function-like macro OR the expression cannot be evaluated (nullopt),
+    // `uncertain` is set and the result is FALSE -- the P0016-safe direction
+    // (skip the include; a wrongly-skipped LIVE include fails loud downstream,
+    // never a silent wrong-include). `[p, end)` are the operand tokens; `buf` is
+    // the scan buffer; `includingDir` resolves a `__has_include`.
+    bool sbEvalIfOperand(std::vector<Token> const& toks, std::size_t p,
+                         std::size_t end, SourceBuffer const& buf,
+                         fs::path const& includingDir, bool& uncertain) {
+        uncertain = false;
+        std::size_t last = end;
+        while (last > p && isNewline(toks[last - 1])) --last;
+        std::vector<Token> operand(
+            toks.begin() + static_cast<std::ptrdiff_t>(p),
+            toks.begin() + static_cast<std::ptrdiff_t>(last));
+
+        // FIX-3: a function-like-macro invocation in the guard is NOT evaluated
+        // by this weaker (object-like) pre-scan -- force the conservative
+        // (skip) direction so a divergence can never resolve a DEAD include
+        // (which would re-open P0016).
+        for (Token const& t : operand) {
+            if (t.coreKind != CoreTokenKind::Word) continue;
+            auto it = localMacros.find(std::string{buf.slice(t.span)});
+            if (it != localMacros.end() && it->second.functionLike) {
+                uncertain = true;
+                return false;
+            }
+        }
+
+        PpMacroExpand expandCb =
+            [this, &buf](std::vector<Token> const& in) {
+                std::set<std::string> active;
+                return sbExpand(in, buf, active, 0);
+            };
+        PpIsDefined definedCb = [this](std::string_view n) {
+            return localMacros.find(std::string{n}) != localMacros.end();
+        };
+        // Resolve `__has_include` EXACTLY as the include machinery / the macro
+        // pass's callback does (quote = self-dir + includeDirs; angle =
+        // `<stem>.json` on systemDirs, gated by per-format availability), so the
+        // pre-scan and the authoritative pass never disagree on a header's
+        // existence.
+        PpHasInclude hasIncludeCb =
+            [this, &includingDir](std::string_view filename,
+                                  bool isAngle) -> bool {
+            if (isAngle) {
+                auto descPath = resolveSystemDescriptor(filename, systemDirs);
+                if (!descPath) return false;
+                if (activeFormat.has_value()
+                    && !ffi::shippedHeaderAvailableForFormat(*descPath,
+                                                             *activeFormat)) {
+                    return false;
+                }
+                return true;
+            }
+            return resolveQuote(filename, includingDir).has_value();
+        };
+        PpProductText productCb = []() { return std::string_view{}; };
+
+        DiagnosticReporter scratch;   // discard — re-reported by the macro pass
+        auto v = evaluateIfExpression(operand, *schema, expandCb, definedCb,
+                                      hasIncludeCb, buf, productCb, scratch);
+        if (!v.has_value()) {
+            uncertain = true;   // malformed/unsupported -> conservative (skip)
+            return false;
+        }
+        return *v != 0;
+    }
+
     void build(std::shared_ptr<SourceBuffer> const& source,
                std::string& out, LineMap& map) {
         const char dquote  = '"';
@@ -261,6 +583,8 @@ struct SynthBuilder {
             schema->schemaTokens().find(cfg().directiveIntroToken);
         const auto quoteKind =
             schema->schemaTokens().find(cfg().quoteIncludeToken);
+        const auto angleKind =
+            schema->schemaTokens().find(cfg().angleIncludeToken);
 
         std::size_t copiedUpTo = 0;
         fs::path const includingDir = fs::path{source->name()}.parent_path();
@@ -269,18 +593,274 @@ struct SynthBuilder {
             return hashKind.valid() && t.schemaKind == hashKind;
         };
 
+        // c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING): the SynthBuilder-local
+        // conditional state, used ONLY to gate quote-`#include` splicing (the
+        // P0016 fix). `sbCondStack` mirrors the macro pass's stack so a
+        // quote-`#include` is resolved ONLY when its enclosing branches are all
+        // live; `sbFrameUncertain[k]` marks a frame whose controlling expression
+        // this weaker pre-scan could not confidently evaluate (a function-like-
+        // macro invocation / malformed expr -- FIX-3), in which case NO include in
+        // that whole group resolves (the conservative skip; a wrongly-skipped LIVE
+        // include fails loud downstream, never a silent miscompile). The
+        // dead-branch `P_IllegalChar` suppression is NOT driven from here -- it
+        // uses the AUTHORITATIVE `MacroExpander::deadRanges()` (full macro table),
+        // so a guard this pre-scan mis-reads can only ever cause a loud include
+        // skip/resolve, never a silent illegal-char drop.
+        std::vector<CondFrame> sbCondStack;
+        std::vector<char>      sbFrameUncertain;   // parallel to sbCondStack
+        bool                   sbEvalUncertain = false;   // last eval's verdict
+        auto anyUncertain = [&]() {
+            for (char u : sbFrameUncertain) if (u) return true;
+            return false;
+        };
+        // Include resolution is gated on CONFIDENT-LIVE (active AND nothing
+        // uncertain in the enclosing chain).
+        auto includeResolvable = [&]() {
+            return sbStackActive(sbCondStack) && !anyUncertain();
+        };
+
+        // The token index just past the newline that ends the directive line
+        // starting at token `start` (or toks.size() at EOF). Mirrors
+        // `MacroExpander::lineEnd`.
+        auto sbLineEndTok = [&](std::size_t start) {
+            std::size_t e = start;
+            while (e < toks.size() && !isNewline(toks[e].tok)) ++e;
+            if (e < toks.size()) ++e;   // include the newline token
+            return e;
+        };
+
         for (std::size_t i = 0; i < toks.size(); ++i) {
             if (!isHash(toks[i].tok)) continue;
             std::size_t j = i + 1;
             while (j < toks.size() && isTrivia(toks[j].tok)) ++j;
             if (j >= toks.size()) break;
-            if (toks[j].text != cfg().includeDirective) continue;
+            std::string_view const dirWord = toks[j].text;
+
+            // ── c17: the SIX conditional-compilation directives drive
+            // `sbCondStack` (so the include gate agrees with the authoritative
+            // macro pass on which quote-includes are live), then skip the rest of
+            // the directive LINE (its operand must not be re-scanned as include
+            // syntax). The handler logic is the SHARED `sbHandle*` free functions
+            // (the macro pass drives the same ones). ──
+            bool const isCond = (dirWord == cfg().ifDirective)
+                || (dirWord == cfg().ifdefDirective)
+                || (dirWord == cfg().ifndefDirective)
+                || (dirWord == cfg().elifDirective)
+                || (dirWord == cfg().elseDirective)
+                || (dirWord == cfg().endifDirective);
+            if (isCond) {
+                std::size_t const lineEndTok = sbLineEndTok(i);
+                // The operand starts just after the directive word (token j+1),
+                // bounded by the directive line's last token.
+                auto textOfTok =
+                    [&](Token const& t) { return scanBuf->slice(t.span); };
+                auto isDefinedTok = [&](std::string_view n) {
+                    return localMacros.find(std::string{n}) != localMacros.end();
+                };
+                // The `#if`/`#elif` value comes from the local pre-scan eval;
+                // `sbEvalUncertain` reports whether it was confident.
+                auto evalExprTok = [&](std::vector<Token> const& in,
+                                       std::size_t p, std::size_t end) {
+                    bool unc = false;
+                    bool const taken =
+                        sbEvalIfOperand(in, p, end, *scanBuf, includingDir, unc);
+                    sbEvalUncertain = unc;
+                    return taken;
+                };
+                // Flatten the directive-line PPTokens to a `Token` vector so the
+                // shared handlers (which take `vector<Token>`) can read the
+                // operand. The directive word is at index (j - i) in this slice.
+                std::vector<Token> lineToks;
+                lineToks.reserve(lineEndTok - i);
+                for (std::size_t q = i; q < lineEndTok; ++q) {
+                    lineToks.push_back(toks[q].tok);
+                }
+                std::size_t const wordIdx = j - i;       // directive word
+                std::size_t const opStart = wordIdx + 1; // operand start
+                std::size_t const opEnd   = lineToks.size();
+                sbEvalUncertain = false;
+                if (dirWord == cfg().ifDirective
+                    || dirWord == cfg().ifdefDirective
+                    || dirWord == cfg().ifndefDirective) {
+                    SbIfKind const kind =
+                        (dirWord == cfg().ifDirective)    ? SbIfKind::Expr
+                        : (dirWord == cfg().ifdefDirective) ? SbIfKind::Ifdef
+                                                            : SbIfKind::Ifndef;
+                    bool const enclosingActive = sbStackActive(sbCondStack);
+                    sbHandleIf(sbCondStack, lineToks, opStart, opEnd, kind,
+                               textOfTok, isDefinedTok, evalExprTok, scratch,
+                               scanBuf->id());
+                    // The new frame is uncertain iff its (evaluated) controlling
+                    // expression was uncertain. The eval ran only when the
+                    // enclosing context was active AND it is the `#if`(Expr) form
+                    // (definedness is always confident).
+                    bool const evaluated = enclosingActive
+                        && kind == SbIfKind::Expr;
+                    sbFrameUncertain.push_back(
+                        (evaluated && sbEvalUncertain) ? 1 : 0);
+                } else if (dirWord == cfg().elifDirective) {
+                    SourceSpan const at =
+                        (opStart <= opEnd && opStart > 0
+                             ? lineToks[opStart - 1].span
+                             : SourceSpan::empty(0));
+                    bool const beforeActive = sbStackActive(sbCondStack);
+                    sbHandleElif(sbCondStack, lineToks, opStart, opEnd, at,
+                                 evalExprTok, scratch, scanBuf->id());
+                    // OR uncertainty into the TOP frame (a group is uncertain if
+                    // ANY of its branches' guards was uncertain). The elif
+                    // operand is evaluated only when the group may still take.
+                    if (!sbFrameUncertain.empty() && beforeActive
+                        && sbEvalUncertain) {
+                        sbFrameUncertain.back() = 1;
+                    }
+                } else if (dirWord == cfg().elseDirective) {
+                    sbHandleElse(sbCondStack, toks[j].tok.span, scratch,
+                                 scanBuf->id());
+                } else {   // endif
+                    sbHandleEndif(sbCondStack, toks[j].tok.span, scratch,
+                                  scanBuf->id());
+                    if (!sbFrameUncertain.empty()) sbFrameUncertain.pop_back();
+                }
+                i = lineEndTok - 1;   // skip the operand (++i lands past the line)
+                continue;
+            }
+
+            // ── c17: track STACK-LIVE `#define` / `#undef` into `localMacros` so
+            // a later `#if FOO` guard in THIS file evaluates with the macro state
+            // at the include point. Dead-branch defines are ignored (C 6.10p1).
+            // Gated on `sbStackActive` (the line executes), NOT `includeResolvable`
+            // -- macro state never resolves an include itself (the include gate is
+            // separate), so tracking a define under an uncertain group's live
+            // branch only improves later-guard accuracy, never causes a wrong
+            // include. Then skip the directive line (the replacement list must not
+            // be scanned as include syntax). ──
+            if (sbStackActive(sbCondStack) && dirWord == cfg().defineDirective) {
+                std::size_t const lineEndTok = sbLineEndTok(i);
+                sbTrackDefine(toks, j + 1, lineEndTok);
+                i = lineEndTok - 1;
+                continue;
+            }
+            if (sbStackActive(sbCondStack) && dirWord == cfg().undefDirective) {
+                std::size_t const lineEndTok = sbLineEndTok(i);
+                std::size_t u = j + 1;
+                while (u < lineEndTok && isTrivia(toks[u].tok)) ++u;
+                if (u < lineEndTok && toks[u].tok.coreKind == CoreTokenKind::Word) {
+                    localMacros.erase(std::string{toks[u].text});
+                }
+                i = lineEndTok - 1;
+                continue;
+            }
+
+            if (dirWord != cfg().includeDirective) continue;
             std::size_t k = j + 1;
             while (k < toks.size() && isTrivia(toks[k].tok)) ++k;
             if (k >= toks.size()) continue;
             const bool isQuote =
                 quoteKind.valid() && toks[k].tok.schemaKind == quoteKind;
-            if (!isQuote) continue;
+            if (!isQuote) {
+                // c17: a DEAD-branch (or uncertain-group) angle `#include <h>`
+                // does not splice its macros -- the macro pass elides the line +
+                // the post-parse resolver never sees it (the typed surfaces are
+                // not injected for an elided include), so all three descriptor
+                // consumers stay consistent with the conditional decision. Leave
+                // it verbatim for the macro pass to elide.
+                if (!includeResolvable()) continue;
+                // D-PP-DESCRIPTOR-MACRO-INJECT: an ANGLE `#include <h>` whose
+                // shipped descriptor declares a `macros` surface — splice a
+                // synthetic `#define` for each into the synth buffer BEFORE the
+                // include line, so the macro is in the table for the rest of the
+                // source AND its replacement tokens carry spans valid in the final
+                // buffer (they point into the synthText prefix, like ordinary
+                // source). The include line itself is LEFT in place (copiedUpTo
+                // stays at dirStart) so the post-parse import resolver still
+                // injects the typed surfaces (symbols/constants/typedefs). Inert
+                // when the language declares no angle token or there are no
+                // systemDirs.
+                if (!angleKind.valid() || toks[k].tok.schemaKind != angleKind) {
+                    continue;
+                }
+                if (systemDirs.empty()) continue;
+                // The angle BODY is the coalesced token immediately after the
+                // opener (mirrors the quote-body extraction below).
+                const std::size_t aBody = k + 1;
+                if (aBody >= toks.size() || isTrivia(toks[aBody].tok)
+                    || isNewline(toks[aBody].tok)
+                    || toks[aBody].tok.span.start() != toks[k].tok.span.end()) {
+                    continue;  // malformed/empty angle include — leave verbatim
+                }
+                std::string const angleName{toks[aBody].text};
+                if (angleName.empty()) continue;
+                auto descPath = resolveSystemDescriptor(angleName, systemDirs);
+                if (!descPath) continue;  // no descriptor on the path — leave verbatim
+                // c9 (MUST-FIX-3): if the descriptor declares this header
+                // unavailable on the active object-format, treat it EXACTLY like
+                // "no descriptor on the path" — leave the include verbatim, splice
+                // no macros. The semantic gate then fails loud and `__has_include`
+                // returns false: all three descriptor consumers stay consistent.
+                if (activeFormat.has_value()
+                    && !ffi::shippedHeaderAvailableForFormat(*descPath, *activeFormat)) {
+                    continue;
+                }
+                DiagnosticReporter macroRep;
+                // Pass the active object-format so a per-FORMAT macro variant
+                // (errno's `__errno_location`/elf vs `__error`/macho) selects the
+                // right replacement. nullopt activeFormat ⇒ a variants-only macro
+                // is not injected (a flat macro is unaffected) — same per-format
+                // truth as the availability gate above.
+                auto macros = ffi::readShippedLibMacros(*descPath, macroRep, activeFormat);
+                if (!macros) {
+                    // Malformed descriptor: fail loud (the post-parse resolver
+                    // will also error on the typed side), never silent.
+                    emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
+                           BufferId{}, SourceSpan::empty(0),
+                           std::string{"shipped-header descriptor malformed "
+                                       "(macros): "} + descPath->generic_string());
+                    continue;
+                }
+                if (macros->empty()) continue;  // typed-only descriptor (no macros)
+                const ByteOffset dStart = toks[i].tok.span.start();
+                copyVerbatim(spliced, localMap, copiedUpTo, dStart, out, map);
+                for (auto const& macro : *macros) {
+                    // Reconstruct the neutral macro as a `#define` line; the
+                    // downstream tokenizer + handleDefine build the MacroDef with
+                    // the proven function-like / param / redefinition machinery
+                    // (an identical re-define on a double-include is idempotent).
+                    std::string def = "#define " + macro.name;
+                    if (macro.params.has_value()) {
+                        def += "(";
+                        bool first = true;
+                        for (auto const& pn : *macro.params) {
+                            if (!first) def += ",";
+                            def += pn;
+                            first = false;
+                        }
+                        if (macro.variadic) {
+                            if (!macro.params->empty()) def += ",";
+                            def += "...";
+                        }
+                        def += ")";
+                    }
+                    if (!macro.replacement.empty()) {
+                        def += " ";
+                        def += macro.replacement;
+                    }
+                    def += "\n";
+                    out.append(def);
+                }
+                copiedUpTo = dStart;  // KEEP the include line — final copyVerbatim copies it
+                continue;
+            }
+
+            // ★ c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING, the P0016 fix): a
+            // quote-`#include` is resolved/spliced ONLY when its enclosing
+            // conditional branches are ALL confidently live. In a dead branch
+            // (`#if 0 #include "x.h" #endif`) or an uncertain group (a guard this
+            // pre-scan could not evaluate, FIX-3), the include is LEFT VERBATIM
+            // for the macro pass to elide -- so a dead-branch include never
+            // resolves x.h (and a missing dead-branch include never errors). The
+            // wrongly-skipped LIVE include (only on the conservative uncertain
+            // edge) fails loud downstream as a missing symbol -- never silent.
+            if (!includeResolvable()) continue;
 
             // The quote opener (StringStart) consumed only the opening quote;
             // the coalesced string BODY is the very next token, whose text is
@@ -330,8 +910,8 @@ struct SynthBuilder {
             copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
 
             includeStack.push_back(canon);
-            SynthBuilder child{schema, includeDirs, rep, depth + 1,
-                               includeStack, fatal};
+            SynthBuilder child{schema, includeDirs, systemDirs, activeFormat, rep,
+                               depth + 1, includeStack, fatal};
             child.build(headerBuf, out, map);
             includeStack.pop_back();
 
@@ -461,10 +1041,12 @@ public:
                   LineMap const* lineMap,
                   std::span<fs::path const> includeDirs = {},
                   std::span<fs::path const> systemDirs = {},
+                  std::optional<ObjectFormatKind> activeFormat = {},
                   fs::path includingDir = {})
         : synth_(std::move(synth)), schema_(std::move(schema)), rep_(rep),
           prefixLen_(prefixLen), lineMap_(lineMap),
           includeDirs_(includeDirs), systemDirs_(systemDirs),
+          activeFormat_(activeFormat),
           includingDir_(std::move(includingDir)) {
         // FC15b (predefined macros; C 6.10.8): seed the predefined-macro map
         // (name -> def) from config. An identifier that is NOT a `#define`d
@@ -526,6 +1108,16 @@ public:
     // TRUE iff a fatal nesting-backstop truncated the expansion.
     [[nodiscard]] bool truncated() const noexcept { return truncated_; }
 
+    // c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING, authoritative dead-regions): the
+    // dead conditional byte ranges this pass recorded (see `deadRanges_`).
+    // `preprocess()` consults them to suppress a `P_IllegalChar` whose source
+    // byte is in a DEAD branch -- using THIS pass's authoritative liveness so the
+    // oracle can never disagree with the real branch decision.
+    [[nodiscard]] std::vector<std::pair<ByteOffset, ByteOffset>> const&
+    deadRanges() const noexcept {
+        return deadRanges_;
+    }
+
     // FC15a (A2): the accumulated `#`/`##` PRODUCT spellings, to be appended to
     // the synth text (AFTER `synth_`'s prefix) before the FINAL buffer is frozen.
     // Empty when no product was generated (then the final buffer == the prefix,
@@ -535,11 +1127,75 @@ public:
     }
 
     std::vector<Token> run(std::vector<Token> const& in) {
+        // c18 (positional macro expansion, C 6.10.3): `body` accumulates the live
+        // non-directive tokens since the LAST flush; `out` accumulates the
+        // positionally-expanded result. A `#define`/`#undef` only affects text
+        // AFTER it, so the pending `body` is FLUSHED through `expand()` (with the
+        // table as it stands BEFORE the directive mutates it) at each
+        // table-mutating directive boundary -- a use before a later same-name
+        // `#define` is then NOT retroactively replaced (the bug SQLite's
+        // declare-then-`#define name 0` omit pattern exposed). Pre-c18 this
+        // collected the WHOLE body and expanded once at EOF with the FINAL table.
         std::vector<Token> body;
+        std::vector<Token> out;
         std::size_t i = 0;
+        // c17 (authoritative dead-regions): track the OPEN dead byte-span as the
+        // loop crosses conditional directives. A dead span OPENS at the END of a
+        // controlling directive line that turns the stack inactive and CLOSES at
+        // the START (`#`) of the directive that reactivates it -- one contiguous
+        // byte interval covering EVERY byte of the dead branch, INCLUDING
+        // dead-branch directive LINES (e.g. a `#define X $` nested in `#if 0`,
+        // whose tokens `handleDirective` consumes without pushing). The verdict is
+        // the AUTHORITATIVE `stackActive()` (full `table_`+`predefined_`), so the
+        // illegal-char oracle agrees with the real branch decision. The
+        // controlling directive line stays OUT of the range (it opens at the line
+        // END), so a live `#if 1` whose own line carries an illegal char still
+        // reports, and a per-directive re-sync (every `#if`/`#elif`/`#else`/
+        // `#endif` is a transition check) keeps a live-outer/dead-inner nest from
+        // swallowing the live arm.
+        bool       inDead    = false;
+        ByteOffset deadStart = 0;
         while (i < in.size()) {
             if (isHash(in[i]) && firstOnLine(in, i)) {
-                i = handleDirective(in, i, body);
+                // c18: FLUSH before a directive that mutates the macro table, so
+                // the pending body expands against the PRE-directive table. Only
+                // `#define`/`#undef` (while the stack is active) mutate it -- an
+                // `#include` line is a pass-through (its descriptor macros were
+                // spliced earlier in SynthBuilder), conditionals only read the
+                // table, and a dead-branch define is not processed. A harmless
+                // over-fire is possible (a REJECTED `#define __LINE__ …` keeps
+                // `word==define` yet does not mutate the table) -- it only re-
+                // segments where expand() is called. That is output-neutral for
+                // conforming code (`productText_` is append-only and a hide set
+                // never spans a directive line); the only observable effect is on
+                // a function-like CALL whose argument list spans the directive
+                // line -- undefined behavior (C 6.10.3p11) -- which the extra
+                // flush turns from a mis-expansion into a fail-loud unterminated-
+                // argument error. Never a silent miscompile.
+                if (isMutatingDirective(in, i)) {
+                    flushExpand(body, out);
+                    body.clear();
+                }
+                bool const        wasActive = stackActive();
+                ByteOffset const  dirByte   = in[i].span.start();
+                std::size_t const next      = handleDirective(in, i, body);
+                bool const        nowActive = stackActive();
+                if (wasActive && !nowActive) {
+                    // active -> dead: the dead branch begins just AFTER this
+                    // controlling directive's line.
+                    inDead    = true;
+                    deadStart = (next > 0 && next <= in.size())
+                                    ? in[next - 1].span.end()
+                                    : static_cast<ByteOffset>(synth_->size());
+                } else if (!wasActive && nowActive && inDead) {
+                    // dead -> active: close the span at this reactivating
+                    // directive's `#`.
+                    if (dirByte > deadStart) {
+                        deadRanges_.emplace_back(deadStart, dirByte);
+                    }
+                    inDead = false;
+                }
+                i = next;
                 continue;
             }
             // FC14: a non-directive token is emitted to the body ONLY when every
@@ -548,6 +1204,14 @@ public:
             // precedes `expand` naturally (the dead tokens never reach it).
             if (stackActive()) body.push_back(in[i]);
             ++i;
+        }
+        // c17: close a dead span still open at EOF (an unterminated `#if 0`). The
+        // missing-`#endif` error still fires below; covering the dead bytes up to
+        // EOF stops a dead illegal char there from double-reporting on top of it.
+        if (inDead) {
+            ByteOffset const endB = static_cast<ByteOffset>(synth_->size());
+            if (endB > deadStart) deadRanges_.emplace_back(deadStart, endB);
+            inDead = false;
         }
         // FC14: an unterminated conditional (a `#if`/`#ifdef`/`#ifndef` with no
         // matching `#endif`) is a constraint violation (C 6.10p1) -- fail loud
@@ -558,31 +1222,61 @@ public:
                        static_cast<ByteOffset>(synth_->size())),
                    "unterminated conditional directive (missing #endif)");
         }
-        // Stream-expand the whole directive-stripped body uniformly (object-
-        // AND function-like macros share one cursor-walking engine). Lift the
-        // plain tokens into the ExpToken working set (every token starts with an
-        // EMPTY hide set), run the precise per-token hide-set expander
-        // (Prosser's realization of C 6.10.3.4 -- see `expand`), then DROP the
-        // hide sets back to the plain Token stream the parser consumes.
+        // c18: final flush of the tokens following the last table-mutating
+        // directive (or the whole body, when there was none -- byte-identical to
+        // the pre-c18 single end-expand).
+        flushExpand(body, out);
+        return out;
+    }
+
+    // c18 (positional macro expansion): expand `pending` with the CURRENT `table_`
+    // and APPEND the non-placemarker results to `accumulated`. Called at each
+    // table-mutating directive boundary and once at EOF, so each run expands
+    // against the macro state that held AT ITS POSITION (C 6.10.3). A no-op for an
+    // empty `pending`. `productText_` is shared across every flush: it is
+    // APPEND-ONLY (a product token's span is the absolute `prefixLen_ + offset`,
+    // never rewound), and `preprocess()` appends the whole `productText_` exactly
+    // once, so a `#`/`##` product minted in one flush keeps a valid span after
+    // later flushes (or an `#if`-operand expansion inside `handleDirective`) grow
+    // the buffer further.
+    void flushExpand(std::vector<Token> const& pending,
+                     std::vector<Token>&       accumulated) {
+        if (pending.empty()) return;
+        // Lift each token via fromToken() so it seeds its OWN synth offset as the
+        // invocation anchor (a bare `__LINE__`/`__FILE__` resolves against its real
+        // source position; a macro splice inherits the invoking token's anchor) and
+        // starts with an EMPTY hide set -- a hide set is per-expansion-run and never
+        // needs to span a flush (a directive line terminates the surrounding
+        // construct; a function-like call spanning it fails loud -- in collectArgs
+        // when the name+`(` are in this flush, else at the parser when only the
+        // name precedes the directive -- never a silent mis-expansion).
         std::vector<ExpToken> work;
-        work.reserve(body.size());
-        // FC15b: lift each original body token via fromToken() so it seeds its
-        // OWN synth offset as the invocation anchor -- a bare `__LINE__`/`__FILE__`
-        // then resolves against its real source position, and a macro splice
-        // later inherits the invoking token's anchor.
-        for (Token const& t : body) work.push_back(fromToken(t));
+        work.reserve(pending.size());
+        for (Token const& t : pending) work.push_back(fromToken(t));
         std::vector<ExpToken> expanded = expand(std::move(work), 0);
-        std::vector<Token> out;
-        out.reserve(expanded.size());
-        // FC15 paste residuals: a placemarker is normally consumed (or dropped
-        // at `collapsePastes` return) inside `substitute`; this is a defensive
-        // BACKSTOP so a stray placemarker never reaches the parser as a garbage
-        // (default-constructed) token. The primary drop is in `substitute`.
+        // FC15 paste residuals: a placemarker is normally consumed inside
+        // `substitute`; this BACKSTOP drops any stray one so it never reaches the
+        // parser as a garbage (default-constructed) token.
         for (ExpToken const& et : expanded) {
             if (et.placemarker) continue;
-            out.push_back(et.tok);
+            accumulated.push_back(et.tok);
         }
-        return out;
+    }
+
+    // c18: TRUE iff the directive line at `hashIdx` is a table-MUTATING
+    // `#define`/`#undef` while the conditional stack is active (so it would
+    // actually be processed -- a dead-branch define is gated out in
+    // `handleDirective`). Pure: mirrors `handleDirective`'s own skipTrivia +
+    // word-read (so it sees the SAME directive word) without mutating any state.
+    // `run()` consults it to flush the pending body BEFORE the table changes.
+    [[nodiscard]] bool isMutatingDirective(std::vector<Token> const& in,
+                                           std::size_t hashIdx) const {
+        if (!stackActive()) return false;
+        const std::size_t end = lineEnd(in, hashIdx);
+        const std::size_t p   = skipTrivia(in, hashIdx + 1);
+        if (p >= end || isNewline(in[p])) return false;
+        const std::string_view w = text(in[p]);
+        return w == cfg().defineDirective || w == cfg().undefDirective;
     }
 
 private:
@@ -704,14 +1398,17 @@ private:
         } else if (word == cfg().undefDirective) {
             handleUndef(in, p + 1, end);
         } else if (word == cfg().includeDirective) {
-            // NAMED EXCLUSION (D-PP-CONDITIONAL-INCLUDE-ORDERING): a quote
-            // `#include` inside a conditional was already spliced by
-            // `SynthBuilder` BEFORE this macro pass ran, so `#if 0 #include
-            // "x.h" #endif` already resolved x.h (its TEXT is then elided here,
-            // but the splice side-effect / missing-file error already happened
-            // upstream). The angle-include line is passed through to the
-            // post-parse import resolver as before. Not a silent miscompile: a
-            // missing dead-branch include errors LOUDLY at splice time.
+            // D-PP-CONDITIONAL-INCLUDE-ORDERING (CLOSED, c17): this arm runs
+            // only when the conditional stack is ACTIVE (the dead-branch gate
+            // above already returned for an elided include), so it is reached
+            // ONLY for a LIVE include -- which `SynthBuilder` resolved/spliced
+            // for a quote form (now CONDITIONAL-aware: a DEAD-branch quote
+            // include is left verbatim + reaches HERE only if live) and passed
+            // through for an angle form (to the post-parse import resolver). The
+            // line's text is forwarded so the resolver still sees the angle form
+            // (its tokens are inert to the parser). The former ordering hazard
+            // (a dead-branch quote include resolved upstream) no longer exists:
+            // SynthBuilder gates quote resolution on its own conditional scan.
             for (std::size_t q = start; q < end; ++q) body.push_back(in[q]);
         } else {
             emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported,
@@ -723,127 +1420,59 @@ private:
         return end;
     }
 
-    // FC14: which `#if`-family directive opened a frame.
-    enum class IfKind { Expr, Ifdef, Ifndef };
-
-    // The condition stack (C 6.10.1). Each open `#if`/`#ifdef`/`#ifndef` pushes
-    // a frame; `#elif`/`#else` mutate the TOP; `#endif` pops. A token (or a
-    // gated directive) is live iff EVERY frame's `thisBranchActive` is true.
-    struct CondFrame {
-        bool enclosingActive;   // was the stack active when this frame opened?
-        bool anyBranchTaken;    // has any branch of this group been taken yet?
-        bool thisBranchActive;  // is the CURRENT branch the live one?
-        bool seenElse;          // has a `#else` been seen in this group?
-    };
+    // FC14 / c17: which `#if`-family directive opened a frame. Aliases the
+    // anon-namespace `SbIfKind` so the existing `IfKind::Expr` call sites compile
+    // while the open/close logic is the SHARED free `sbHandle*` (Phase 7).
+    using IfKind = SbIfKind;
 
     // True iff every open conditional frame's current branch is active (empty
     // stack => active). The gate for token emission + non-conditional
-    // directives.
-    [[nodiscard]] bool stackActive() const {
-        for (CondFrame const& f : condStack_) {
-            if (!f.thisBranchActive) return false;
-        }
-        return true;
-    }
+    // directives. Delegates to the shared `sbStackActive`.
+    [[nodiscard]] bool stackActive() const { return sbStackActive(condStack_); }
 
     // True iff `name` is currently a defined macro (C's `defined X` / `#ifdef`).
     [[nodiscard]] bool isDefined(std::string_view name) const {
         return table_.find(std::string{name}) != table_.end();
     }
 
-    // `#if EXPR` / `#ifdef NAME` / `#ifndef NAME`: push a new frame. The branch
-    // is live iff the enclosing context is active AND the condition holds. The
-    // operand/condition is evaluated ONLY when the enclosing context is active
-    // (a dead branch's operand is NOT evaluated -- C 6.10.1p6).
+    // The token-text accessor + the macro-state callbacks the shared `sbHandle*`
+    // free functions need, bound to THIS expander's buffer + macro table. A
+    // `Token` is a 16B POD that does not carry its text, so `textOf` slices it.
+    [[nodiscard]] std::function<std::string_view(Token const&)> textOfCb() {
+        return [this](Token const& t) { return text(t); };
+    }
+    [[nodiscard]] std::function<bool(std::string_view)> isDefinedCb() {
+        return [this](std::string_view n) { return isDefined(n); };
+    }
+    [[nodiscard]] std::function<bool(std::vector<Token> const&, std::size_t,
+                                     std::size_t)>
+    evalExprCb() {
+        return [this](std::vector<Token> const& in, std::size_t p,
+                      std::size_t end) { return evalIfOperand(in, p, end); };
+    }
+
+    // FC14 / c17 (SHARED single-impl): the four conditional-directive handlers
+    // delegate to the anon-namespace `sbHandle*` free functions (which the
+    // SynthBuilder pre-scan ALSO drives), binding this expander's macro table +
+    // buffer via the callbacks above. The `#if EXPR` value is `evalIfOperand`
+    // (the full ICE engine over `table_`); `#ifdef`/`#ifndef` definedness is
+    // `isDefined`. The diagnostics route to `synth_->id()` exactly as before.
     void handleIf(std::vector<Token> const& in, std::size_t p, std::size_t end,
                   IfKind kind) {
-        bool const enclosing = stackActive();
-        bool cond = false;
-        if (enclosing) {
-            if (kind == IfKind::Expr) {
-                cond = evalIfOperand(in, p, end);
-            } else {
-                // `#ifdef`/`#ifndef NAME`: the operand is a single macro name.
-                std::size_t q = skipTrivia(in, p);
-                if (q >= end || isNewline(in[q]) || !isWord(in[q])) {
-                    emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
-                           synth_->id(),
-                           (q < end ? in[q].span : SourceSpan::empty(0)),
-                           std::string{"#"}
-                               + std::string{kind == IfKind::Ifdef ? "ifdef"
-                                                                   : "ifndef"}
-                               + " requires a macro name");
-                    // Treat a malformed #ifdef as a false (inactive) branch, but
-                    // STILL push a frame so the matching #endif balances.
-                    cond = false;
-                } else {
-                    bool const def = isDefined(text(in[q]));
-                    cond = (kind == IfKind::Ifdef) ? def : !def;
-                }
-            }
-        }
-        condStack_.push_back(CondFrame{
-            /*enclosingActive=*/enclosing,
-            /*anyBranchTaken=*/enclosing && cond,
-            /*thisBranchActive=*/enclosing && cond,
-            /*seenElse=*/false});
+        sbHandleIf(condStack_, in, p, end, kind, textOfCb(), isDefinedCb(),
+                   evalExprCb(), rep_, synth_->id());
     }
-
-    // `#elif EXPR`: on the TOP frame, take this branch iff the enclosing context
-    // is active, NO prior branch of this group was taken, AND the expression
-    // holds. The operand is evaluated ONLY when it could be taken (C 6.10.1p6).
     void handleElif(std::vector<Token> const& in, std::size_t p,
                     std::size_t end) {
-        if (condStack_.empty()) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
-                   (p <= end && p > 0 ? in[p - 1].span : SourceSpan::empty(0)),
-                   "#elif without a matching #if");
-            return;
-        }
-        CondFrame& f = condStack_.back();
-        if (f.seenElse) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
-                   (p <= end && p > 0 ? in[p - 1].span : SourceSpan::empty(0)),
-                   "#elif after #else");
-            return;
-        }
-        // A prior active branch latches `anyBranchTaken`.
-        f.anyBranchTaken = f.anyBranchTaken || f.thisBranchActive;
-        bool const mayTake = f.enclosingActive && !f.anyBranchTaken;
-        bool cond = false;
-        if (mayTake) cond = evalIfOperand(in, p, end);
-        f.thisBranchActive = mayTake && cond;
-        f.anyBranchTaken   = f.anyBranchTaken || f.thisBranchActive;
+        sbHandleElif(condStack_, in, p, end,
+                     (p <= end && p > 0 ? in[p - 1].span : SourceSpan::empty(0)),
+                     evalExprCb(), rep_, synth_->id());
     }
-
-    // `#else`: take this branch iff the enclosing context is active and no prior
-    // branch of this group was taken.
     void handleElse(SourceSpan at) {
-        if (condStack_.empty()) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
-                   at, "#else without a matching #if");
-            return;
-        }
-        CondFrame& f = condStack_.back();
-        if (f.seenElse) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
-                   at, "#else after #else");
-            return;
-        }
-        f.anyBranchTaken   = f.anyBranchTaken || f.thisBranchActive;
-        f.seenElse         = true;
-        f.thisBranchActive = f.enclosingActive && !f.anyBranchTaken;
-        f.anyBranchTaken   = true;
+        sbHandleElse(condStack_, at, rep_, synth_->id());
     }
-
-    // `#endif`: pop the top frame.
     void handleEndif(SourceSpan at) {
-        if (condStack_.empty()) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
-                   at, "#endif without a matching #if");
-            return;
-        }
-        condStack_.pop_back();
+        sbHandleEndif(condStack_, at, rep_, synth_->id());
     }
 
     // Evaluate an `#if`/`#elif` controlling expression: slice the operand tokens
@@ -872,7 +1501,18 @@ private:
         PpHasInclude hasIncludeCb =
             [this](std::string_view filename, bool isAngle) -> bool {
             if (isAngle) {
-                return resolveSystemDescriptor(filename, systemDirs_).has_value();
+                auto descPath = resolveSystemDescriptor(filename, systemDirs_);
+                if (!descPath) return false;  // no descriptor on the path
+                // c9 (Phase-2): per-target truth — when the active object-format is
+                // known, a header whose descriptor excludes it reports NOT available
+                // (agreeing with the `#include` semantic gate + the macro-splice).
+                // nullopt activeFormat_ = pure existence (unchanged pre-c9 behavior).
+                if (activeFormat_.has_value()
+                    && !ffi::shippedHeaderAvailableForFormat(*descPath,
+                                                             *activeFormat_)) {
+                    return false;
+                }
+                return true;
             }
             return resolveIncludePath(filename, includingDir_, includeDirs_)
                 .has_value();
@@ -2042,10 +2682,22 @@ private:
     // that input.
     std::span<fs::path const>            includeDirs_;
     std::span<fs::path const>            systemDirs_;
+    std::optional<ObjectFormatKind>      activeFormat_;
     fs::path                             includingDir_;
     // FC14: the conditional-compilation frame stack (one frame per open
     // `#if`/`#ifdef`/`#ifndef`). See CondFrame + handleIf/Elif/Else/Endif.
     std::vector<CondFrame>               condStack_;
+    // c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING, authoritative dead-regions): the
+    // `[start,end)` byte ranges of the synth (prefix) buffer that fall in a DEAD
+    // conditional branch, as determined by THIS authoritative pass's
+    // `stackActive()` (the full `table_`+`predefined_` macro state). `run()`
+    // records them as it crosses conditional directives; `preprocess()` consults
+    // them to suppress a provisional `P_IllegalChar` whose source byte is dead.
+    // Because the verdict comes from the SAME liveness the compiler emits/skips
+    // tokens on, the illegal-char oracle can never diverge from the real branch
+    // decision -- the silent-miscompile class the pre-scan oracle had (it could
+    // not see predefined/header macros) is gone by construction.
+    std::vector<std::pair<ByteOffset, ByteOffset>> deadRanges_;
 };
 
 } // namespace
@@ -2054,7 +2706,8 @@ PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
     std::span<fs::path const>            includeDirs,
-    std::span<fs::path const>            systemDirs) {
+    std::span<fs::path const>            systemDirs,
+    std::optional<ObjectFormatKind>      activeFormat) {
     if (!mainSource || !schema) ppFatal("preprocess: null source or schema");
     if (!schema->preprocess().enabled) {
         ppFatal("preprocess: called with a schema whose preprocess pass is "
@@ -2071,8 +2724,15 @@ PreprocessResult preprocess(
         fs::path canon = fs::weakly_canonical(fs::path{mainSource->name()}, ec);
         includeStack.push_back(ec ? fs::path{mainSource->name()} : canon);
     }
-    SynthBuilder builder{schema, includeDirs, *result.diagnostics, 0,
-                         includeStack, result.fatal};
+    // c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING): the SynthBuilder is conditional-
+    // aware ONLY to gate quote-`#include` splicing (a dead-branch quote include
+    // must not resolve -- the P0016 fix). The dead-region byte set used to
+    // suppress a dead-branch `P_IllegalChar` (the P000E fix) is NOT produced here:
+    // it comes from the AUTHORITATIVE `MacroExpander` pass below (`deadRanges()`),
+    // whose liveness sees the full macro table (predefined + header-supplied), so
+    // the illegal-char oracle can never diverge from the real branch decision.
+    SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
+                         *result.diagnostics, 0, includeStack, result.fatal};
     builder.build(mainSource, synthText, result.lineMap);
 
     // FC15a (A2 reorder): the `#`/`##` operators produce SYNTHETIC tokens whose
@@ -2088,7 +2748,18 @@ PreprocessResult preprocess(
         synthText, std::string{mainSource->name()});
     result.mainSourceId = mainSource->id();
 
-    auto ppToks = tokenizeToPP(prefixBuffer, schema, *result.diagnostics);
+    // c17 (P000E fix): the main tokenize's diagnostics go to a PROVISIONAL
+    // reporter, NOT straight onto `result.diagnostics`. A `P_IllegalChar` whose
+    // source byte falls in a DEAD conditional branch (`#if 0 $ #endif`) must be
+    // SUPPRESSED -- but only after the AUTHORITATIVE conditional pass has run and
+    // recorded its dead byte-ranges. Every OTHER tokenizer diagnostic is forwarded
+    // unconditionally below; a `P_IllegalChar` is promoted via the dead-region
+    // oracle, keyed on the source BYTE's liveness (so a `$` consumed by an ACTIVE
+    // `#define` line / `#`-stringize / an uninvoked LIVE macro body still reports;
+    // a survival oracle keyed on "did the Error token reach the parser" would
+    // wrongly drop those).
+    DiagnosticReporter provisionalTokDiags;
+    auto ppToks = tokenizeToPP(prefixBuffer, schema, provisionalTokDiags);
     std::vector<Token> synthTokens;
     synthTokens.reserve(ppToks.size());
     for (auto const& tk : ppToks) synthTokens.push_back(tk.tok);
@@ -2102,12 +2773,39 @@ PreprocessResult preprocess(
     // systemDirs).
     MacroExpander expander{prefixBuffer,  schema,      *result.diagnostics,
                            prefixLen,     &result.lineMap,
-                           includeDirs,   systemDirs,
+                           includeDirs,   systemDirs,   activeFormat,
                            fs::path{mainSource->name()}.parent_path()};
     std::vector<Token> finalTokens = expander.run(synthTokens);
     // OR in the macro-expansion truncation; the SynthBuilder already wrote
     // `result.fatal` by reference for an include-nesting truncation.
     result.fatal = result.fatal || expander.truncated();
+
+    // c17 (authoritative dead-region oracle): promote the provisional tokenizer
+    // diagnostics. A `P_IllegalChar` is forwarded to the real reporter UNLESS its
+    // source byte (`span.start()`) lies in a DEAD conditional region as recorded
+    // by the AUTHORITATIVE macro pass (`expander.deadRanges()`) -- so an illegal
+    // char in a LIVE region reports no matter how its token is later consumed (a
+    // `#define`-line `$`, a `#`-stringized `$`, an uninvoked live macro body),
+    // including a branch the pre-scan could not evaluate but the full macro table
+    // makes live (e.g. `#if __STDC__`); only a genuinely-dead one (`#if 0 $`) is
+    // suppressed. ALL other tokenizer diagnostics forward unconditionally. The
+    // span ids are unchanged (still the prefix buffer), so the later
+    // `remapBuffers` re-homes them onto the final synth buffer exactly as before.
+    {
+        auto byteInDeadRegion = [&](ByteOffset b) {
+            for (auto const& [ds, de] : expander.deadRanges()) {
+                if (b >= ds && b < de) return true;
+            }
+            return false;
+        };
+        for (ParseDiagnostic const& d : provisionalTokDiags.all()) {
+            if (d.code == DiagnosticCode::P_IllegalChar
+                && byteInDeadRegion(d.span.start())) {
+                continue;   // dead-branch illegal char — elided, no error
+            }
+            result.diagnostics->report(d);
+        }
+    }
 
     // Append the accumulated `#`/`##` product spellings AFTER the prefix, then
     // freeze the FINAL buffer: ONE buffer whose unchanged leading prefix backs

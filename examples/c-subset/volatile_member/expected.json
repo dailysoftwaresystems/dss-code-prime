@@ -1,0 +1,27 @@
+{
+  "$comment": "c21 (D-CSUBSET-VOLATILE-QUALIFIER): negative miscompile pin (verified RED-on-disable in WSL: exit 3 with the flag, exit 2 without). main() reads volatile global g twice across an opaque poke() CALL (padded above the inline threshold so it stays a call). CSE's load-admission scans only Stores -> a Call is not a clobber -> a NON-volatile g would have its 2nd load FOLDED to the 1st (b==a==1 -> exit 2, the miscompile). The MirInstFlags::Volatile thread makes CSE skip the fold -> b re-fetches 2 -> exit 3. The release shippedPipeline arm runs the real optimizer (Inlining/CSE/Mem2Reg), so this is an end-to-end witness. The volatile MEMBER flag is pinned by the MIR test VolatileMemberLoadFlaggedNonVolatileSiblingNot (member GEP loads do not CSE-fold across a call, so the scalar-global form distinguishes fold-vs-not at runtime). No stdout (libc-free); exit code only. arm64-elf runs under qemu.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 3,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

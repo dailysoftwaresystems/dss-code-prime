@@ -152,7 +152,51 @@ public:
     [[nodiscard]] bool isIncompleteArray(TypeId id) const;
     // tuple: operands=[elements...].
     TypeId tuple(std::span<TypeId const> elements);
-    // struct/union: nominal name + operands=[fields/variants...].
+
+    // ── NOMINAL composites (D-CSUBSET-SELF-REFERENTIAL-STRUCT) ──
+    // A struct/union is a NOMINAL type: its identity is (kind, name, decl-site),
+    // NOT its field shape. This is what lets a SELF-REFERENTIAL composite
+    // (`struct N { struct N *next; }`, sqlite's `struct sqlite3`) intern — the
+    // self-ref field is a `Ptr<N>` whose pointee is THIS type's TypeId, minted
+    // BEFORE the body is known. A name-only identity would silently merge two
+    // block-scoped same-name DIFFERENT-layout structs in one CU (a layout
+    // miscompile), so the caller supplies a STABLE per-declaration `declSiteKey`
+    // (a decl-site node-id / scope-id packed into 64 bits — two distinct
+    // definitions never share a key, hence never a TypeId).
+    //
+    // `forwardComposite` mints an INCOMPLETE nominal TypeId (kind+name+declSiteKey,
+    // no fields yet). Re-minting the SAME (kind, name, declSiteKey) returns the
+    // SAME TypeId ("one composite → one TypeId") — the Pass-1.5 completion and the
+    // self-ref field both resolve to it. `completeComposite` attaches the fields
+    // (and bit-field widths) ONCE into the IMMUTABLE side-table — the interned
+    // TypeRecord is NEVER back-patched (its operand pool range stays empty), so the
+    // arena's append-only invariant (arena_container.hpp) holds. After completion
+    // `operands(id)` / `scalars(id)` read the fields from the side-table
+    // transparently, so every existing composite-operand consumer is unchanged.
+    TypeId forwardComposite(TypeKind kind, std::string_view name,
+                            std::uint64_t declSiteKey);
+    // Attach `fields` (+ per-field bit-field widths, `kNotBitfield` for ordinary —
+    // same encoding as the bitfield-aware structType) to a forward-minted composite.
+    // Idempotent for an IDENTICAL re-completion (same fields + widths) — a benign
+    // re-resolution; a CONFLICTING re-completion (different fields) of an already-
+    // complete composite is a caller bug and aborts loud. `id` MUST be a composite
+    // minted by `forwardComposite` (else fatal).
+    void completeComposite(TypeId id, std::span<TypeId const> fields,
+                           std::span<std::int64_t const> fieldBitWidths = {});
+    // True iff `id` is a Struct/Union that was forward-minted but NOT yet completed.
+    // An EXPLICIT flag, NOT "operands empty": `struct E {}` is a LEGAL COMPLETE
+    // zero-field struct (size 0). A non-composite kind is never incomplete here.
+    [[nodiscard]] bool isIncompleteComposite(TypeId id) const;
+
+    // struct/union: nominal name + fields. The 2-arg / 3-arg overloads are the
+    // COMPLETE-AT-ONCE convenience path (shipped descriptors, reintern, text
+    // round-trip): they `forwardComposite` + `completeComposite` in one call,
+    // deriving the `declSiteKey` from the FIELD CONTENT so two complete-at-once
+    // composites with the SAME (name, fields, widths) collapse to one TypeId
+    // (canonicalization preserved) while same-name DIFFERENT-field composites stay
+    // distinct (StructIsNominalAndStructural). The semantic analyzer's
+    // self-referential path uses `forwardComposite` + `completeComposite` directly
+    // with a decl-site key instead.
     TypeId structType(std::string_view name, std::span<TypeId const> fields);
     // FC8 bitfields (D-CSUBSET-BITFIELD): a struct with per-field bitfield widths.
     // `fieldBitWidths[i]` is `kNotBitfield` for an ordinary field, or the field's
@@ -248,6 +292,17 @@ private:
                                     std::span<std::int64_t const> scalars,
                                     TypeNameId name) const;
 
+    // D-CSUBSET-SELF-REFERENTIAL-STRUCT: forward-mint helper. Dedups a composite by
+    // its NOMINAL identity (kind, name, declSiteKey) through `byHash_` — verifying
+    // the candidate's kind+name AND its side-table `declSiteKey` so a hash
+    // collision can never alias two distinct composites. Returns the existing
+    // forward record on a repeat (Pass-1.5 completion / self-ref field find the
+    // same TypeId); else mints a fresh INCOMPLETE record + an incomplete side-table
+    // entry carrying `declSiteKey`. Fields are NOT in the operand pool (the record's
+    // operand range stays empty); they arrive later via `completeComposite`.
+    TypeId internComposite(TypeKind kind, std::string_view name,
+                           std::uint64_t declSiteKey);
+
     // Wrap a raw pool view in a GuardedSpan tagged with the current pool
     // generation (debug) — or return it unchanged (release alias). The single
     // chokepoint every accessor routes through.
@@ -260,14 +315,34 @@ private:
 #endif
     }
 
+    // D-CSUBSET-SELF-REFERENTIAL-STRUCT: the IMMUTABLE field side-table for nominal
+    // composites, keyed by composite TypeId.v. The incomplete entry (fields empty,
+    // complete=false) is created at `forwardComposite`; `completeComposite` fills
+    // `fields` / `bitWidthScalars` ONCE and flips `complete`. `operands(id)` /
+    // `scalars(id)` read it for a Struct/Union, so the interned TypeRecord's own
+    // operand pool range stays EMPTY — the arena stays append-only (no operand-pool
+    // back-patch, the plan-lock's #2 charge). A direct `unordered_map` (not the
+    // auto-promoting ArenaAttribute) so each entry's `fields` vector buffer is
+    // pointer-STABLE across later inserts: a GuardedSpan into it stays valid until
+    // the next pool/side-table mutation bumps `poolGen_` (the usual span contract).
+    struct CompositeFields {
+        std::vector<TypeId>       fields;            // field/variant TypeIds
+        std::vector<std::int64_t> bitWidthScalars;   // (width+1)/0 encoding; EMPTY when
+                                                     // no bit-field (cf. structType)
+        std::uint64_t             declSiteKey = 0;   // the nominal-identity discriminator
+        bool                      complete    = false;
+    };
+
     substrate::ArenaBuilder<TypeRecord, TypeId, CompilationUnitId> arena_;
     std::vector<TypeId>                            operandPool_;
     std::vector<std::int64_t>                      scalarPool_;
-    // Bumped on every pool-mutating intern (D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-
-    // GUARD). A GuardedSpan captures this at creation and aborts on a stale read.
+    // Bumped on every pool-mutating intern AND every composite forward-mint /
+    // completion (D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD). A GuardedSpan
+    // captures this at creation and aborts on a stale read.
     std::uint64_t                                  poolGen_ = 0;
     Interner<TypeNameId>                           names_;
     std::unordered_multimap<std::uint64_t, TypeId> byHash_;
+    std::unordered_map<std::uint32_t, CompositeFields> compositeFields_;
 };
 
 } // namespace dss

@@ -87,6 +87,62 @@ using namespace dss;
 
 } // namespace
 
+// c22 (D-PP-LINE-COMMENT-BEFORE-DIRECTIVE): assert a preprocessed buffer (a)
+// reported NO error, (b) fully consumed the `#define Z 1` directive — no `#`,
+// `define`, or unexpanded `Z` leaked into the parser-visible lexemes — and (c)
+// expanded `Z` to `1`. The line comment's own chars (`//`, `c`) are harmless
+// trivia the parser skips; the load-bearing facts are directive-removal +
+// expansion, asserted robustly rather than over-pinning the comment's spelling.
+[[nodiscard]] ::testing::AssertionResult directiveProcessedToOne(std::string text) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(std::move(text), r);
+    if (r.diagnostics->hasErrors())
+        return ::testing::AssertionFailure()
+               << "preprocess reported an error (directive leaked to the parser)";
+    bool hasOne = false;
+    for (auto const& l : lexs) {
+        if (l == "#" || l == "define")
+            return ::testing::AssertionFailure() << "directive leaked: '" << l << "'";
+        if (l == "Z")
+            return ::testing::AssertionFailure() << "Z was left unexpanded";
+        if (l == "1") hasOne = true;
+    }
+    if (!hasOne)
+        return ::testing::AssertionFailure() << "Z did not expand to 1";
+    return ::testing::AssertionSuccess();
+}
+
+// The bug case: a `//` comment SHARING a line with code, immediately before a
+// directive. The line comment must NOT swallow its terminating newline, else the
+// directive loses its line boundary (firstOnLine sees the code before the
+// comment) and leaks to the parser unrecognized.
+TEST(Preprocessor, LineCommentSharingCodeLineThenDirectiveIsRecognized) {
+    EXPECT_TRUE(directiveProcessedToOne("int a; // c\n#define Z 1\nint b=Z;\n"));
+}
+
+// Control: the forms that already worked must keep working (the fix is newline
+// preservation, not a change to comment recognition); plus a multi-line variant
+// and a line comment at EOF.
+TEST(Preprocessor, LineCommentNewlinePreservedAcrossForms) {
+    // (a) comment ALONE on its own line before a directive.
+    EXPECT_TRUE(directiveProcessedToOne("int a;\n// c\n#define Z 1\nint b=Z;\n"));
+    // (b) trailing comment ON the directive line.
+    EXPECT_TRUE(directiveProcessedToOne("#define Z 1 // c\nint b=Z;\n"));
+    // (c) TWO code lines each with a trailing comment, then a directive.
+    EXPECT_TRUE(directiveProcessedToOne(
+        "int a; // one\nint c; // two\n#define Z 1\nint b=Z;\n"));
+    // (d) a `code // comment` line followed by ordinary (non-directive) code must
+    // still preprocess cleanly — the preserved newline is benign for plain code.
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("int a; // c\nint b;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        bool hasB = false;
+        for (auto const& l : lexs) if (l == "b") hasB = true;
+        EXPECT_TRUE(hasB) << "code after a `code // comment` line must survive";
+    }
+}
+
 TEST(Preprocessor, ObjectMacroExpandsAndDirectiveRemoved) {
     PreprocessResult r;
     auto lexs = ppLexemes("#define X 42\nint v = X;\n", r);
@@ -1230,11 +1286,12 @@ TEST(Preprocessor, DisabledLanguageGatePipelineIsStrictIdentity) {
 // #if 0 elides the whole group -- grammatically GARBAGE tokens inside a dead
 // branch are dropped before the parser sees them (so they never become a parse
 // error). RED-ON-DISABLE: dropping the stackActive gate on the body-push leaves
-// the garbage in the stream. NOTE: the garbage is lexically VALID -- a lexically
-// ILLEGAL character (`@`) would still diagnose, because conditional elision is a
-// token-level pass that runs AFTER the single global tokenize of the synth
-// buffer (same ordering limit as D-PP-CONDITIONAL-INCLUDE-ORDERING); the
-// property under test is that dead-branch *parse*-garbage is elided.
+// the garbage in the stream. NOTE (c17, D-PP-CONDITIONAL-INCLUDE-ORDERING
+// CLOSED): a lexically ILLEGAL character (`$`/`@`) inside this dead branch is
+// now ALSO elided (suppressed by the dead-region oracle) -- see
+// `DeadBranchIllegalCharDoesNotError` below. The property under test HERE is
+// specifically that dead-branch *parse*-garbage (lexically valid tokens) is
+// elided.
 TEST(Preprocessor, IfZeroElidesGarbageBranch) {
     PreprocessResult r;
     auto lexs = ppLexemes(
@@ -2718,4 +2775,534 @@ TEST(Preprocessor, FC15ObjectLikeDanglingPasteFailsLoud) {
     (void)ppLexemes("#define OBJ a ##\nOBJ\n", r);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste))
         << "a `##` at the end of an OBJECT-like replacement must fail loud";
+}
+
+// ============================================================================
+// c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING): the SynthBuilder pre-scan makes the
+// conditional pass skip DEAD `#if` branches BEFORE the include splice + the
+// global tokenize. Two symptoms, both closed:
+//   P0016 -- a quote-`#include` inside `#if 0`/`#if SQLITE_OS_WIN` is no longer
+//            resolved (a missing dead-branch header no longer errors);
+//   P000E -- a `P_IllegalChar` (`$ @ ``) inside a DEAD branch is suppressed,
+//            while an ACTIVE one (a live body, a `#define`/`#if` line, a
+//            `#`-stringized arg, an uninvoked live macro body) STILL reports
+//            (the FIX-1 dead-region oracle keys on the source BYTE's liveness).
+// Every assertion is RED-ON-DISABLE. The completeness pins (tests 2/4/4b/6)
+// prove the fix did not over-suppress.
+// ============================================================================
+
+// (1) P0016 core: a quote-`#include` of a NONEXISTENT header inside `#if 0` is
+// elided -- NO P_PreprocessorIncludeError -- and the rest of the file parses.
+// RED-ON-DISABLE: dropping the SynthBuilder `includeResolvable()` gate on the
+// quote-include resolution re-resolves the dead-branch include -> the missing
+// "nope.h" errors.
+TEST(Preprocessor, DeadBranchQuoteIncludeDoesNotError) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if 0\n#include \"nope.h\"\n#endif\nint x;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a quote-#include inside #if 0 must NOT be resolved (no missing-file "
+           "error)";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "the dead-branch include must not emit an include error";
+    ASSERT_EQ(lexs.size(), 3u) << "expected only: int x ;";
+    EXPECT_EQ(lexs[1], "x");
+}
+
+// (2) COMPLETENESS / FAIL-LOUD: a quote-`#include` of a NONEXISTENT header in a
+// LIVE `#if 1` branch STILL errors loud. RED-ON-DISABLE: gating the include on
+// the WRONG predicate (always-skip) would silence this real missing-include.
+TEST(Preprocessor, LiveBranchQuoteIncludeStillErrorsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#if 1\n#include \"nope.h\"\n#endif\nint x;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "a LIVE-branch missing quote-#include must STILL fail loud";
+}
+
+// (3) P000E core: illegal characters (`$ @ ``) inside `#if 0` are suppressed.
+// RED-ON-DISABLE: dropping the dead-region promotion (forwarding every
+// provisional P_IllegalChar unconditionally) re-errors the dead `$`/`@`.
+TEST(Preprocessor, DeadBranchIllegalCharDoesNotError) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#if 0\n$ @ `\n#endif\nint x;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "illegal chars inside #if 0 must be elided (no P_IllegalChar)";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
+        << "no illegal-char diagnostic for a dead branch";
+    ASSERT_EQ(lexs.size(), 3u) << "expected only: int x ;";
+    EXPECT_EQ(lexs[1], "x");
+}
+
+// (4) COMPLETENESS / FAIL-LOUD (§A.4 pin): a BARE illegal char in a LIVE `#if 1`
+// body STILL errors. RED-ON-DISABLE: a too-broad dead-region (suppressing live
+// bytes) would silence this.
+TEST(Preprocessor, ActiveIllegalCharStillErrorsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#if 1\n$\n#endif\nint x;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
+        << "a LIVE-branch illegal char must STILL fail loud";
+}
+
+// (4b) ★ FIX-1 PROOF (the dead-region oracle, NOT the survival oracle): an
+// illegal char on an ACTIVE `#define` LINE still errors. The `$` is consumed by
+// the directive line (it never survives into the final token stream), so the
+// REJECTED "Error token survived" oracle would WRONGLY drop it. The dead-region
+// oracle reports it because its source byte is in a LIVE region.
+// RED-ON-DISABLE: switching the promotion to the survival oracle drops this.
+TEST(Preprocessor, ActiveIllegalCharOnDefineLineStillErrors) {
+    PreprocessResult r;
+    (void)ppLexemes("#define A 1 $\nint x;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
+        << "an illegal char on an ACTIVE #define line must STILL error (it is "
+           "consumed by the directive, so only the BYTE-liveness oracle catches "
+           "it -- the survival oracle would wrongly drop it)";
+}
+
+// (4c) FIX-1 (the `#`-stringize variant): an illegal char in a STRINGIZED macro
+// argument still errors. c-subset declares `#` (HashOp), so `#define S(x) #x` +
+// `S($)` consumes the `$` into a `#`-product string -- the original `$` token
+// does NOT survive, so again only the dead-region (byte-liveness) oracle catches
+// it. RED-ON-DISABLE: the survival oracle drops it. (If `#` were out of c-subset
+// scope this case would be covered generically by the same byte-liveness
+// predicate and could be skipped.)
+TEST(Preprocessor, ActiveIllegalCharInStringizedArgStillErrors) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define S(x) #x\nint y = S($);\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
+        << "an illegal char in a (live) #-stringized argument must STILL error";
+    // DISCRIMINATOR vs the survival oracle: the `$` was CONSUMED into the
+    // `#`-stringize product (a `"$"` string literal), so it does NOT survive as a
+    // standalone Error token -- yet P_IllegalChar still fired. That co-occurrence
+    // is what only the byte-liveness oracle (not the survival oracle) achieves.
+    bool stringizedDollarPresent = false;
+    for (auto const& s : lexs) {
+        if (s.find('$') != std::string::npos) stringizedDollarPresent = true;
+    }
+    EXPECT_TRUE(stringizedDollarPresent)
+        << "the `$` must appear inside the #-stringized product (proving it was "
+           "consumed, not surviving as a token) -- so the survival oracle would "
+           "have seen nothing while the byte-liveness oracle still reports it";
+}
+
+// (4d) FIX-1 (the uninvoked-live-macro-body variant; an EXPLICIT pinned choice):
+// an illegal char in the replacement of a LIVE-region `#define` that is NEVER
+// invoked STILL errors. The `$` byte is in a live region (the `#define` line),
+// so the byte-liveness oracle reports it -- matching today's behavior (the
+// tokenizer sees every byte of the synth buffer). RED-ON-DISABLE: the survival
+// oracle would drop it (an uninvoked macro body never reaches finalTokens).
+TEST(Preprocessor, ActiveUninvokedMacroBodyIllegalCharStillErrors) {
+    PreprocessResult r;
+    (void)ppLexemes("#define M $\nint x;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
+        << "an illegal char in an uninvoked LIVE macro body still errors (its "
+           "byte is in a live region) -- an explicit, asserted choice";
+}
+
+// (5) P0016 via `#ifdef`: a quote-`#include` guarded by `#ifdef SQLITE_OS_WIN`
+// (UNDEFINED) is skipped (the SQLite cross-compile pattern). RED-ON-DISABLE: the
+// include gate off -> the missing header errors.
+TEST(Preprocessor, DeadBranchViaDefinedMacroSkipsInclude) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#ifdef SQLITE_OS_WIN\n#include \"os_win.h\"\n#endif\nint x;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "#ifdef of an UNDEFINED macro must skip its quote-#include";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError));
+    ASSERT_EQ(lexs.size(), 3u) << "expected only: int x ;";
+    EXPECT_EQ(lexs[1], "x");
+}
+
+// (6) COMPLETENESS / localMacros tracking: a LIVE-branch `#define MYOS 1` makes
+// a following `#if MYOS` guard LIVE, so its quote-`#include` of a MISSING header
+// DOES error -- proving the pre-scan tracks `#define`s in `localMacros` and the
+// include gate is then ON. RED-ON-DISABLE: not tracking the `#define` (MYOS->0)
+// would WRONGLY skip the include and SILENCE this missing-header error.
+TEST(Preprocessor, DefineMakesIfBranchLiveSoIncludeErrors) {
+    PreprocessResult r;
+    (void)ppLexemes(
+        "#define MYOS 1\n#if MYOS\n#include \"still_missing.h\"\n#endif\n"
+        "int x;\n",
+        r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "a #define-driven LIVE #if must resolve (and error on) its missing "
+           "quote-#include -- proves localMacros tracking + the live include gate";
+}
+
+// (FIX-3) the CONSERVATIVE fallback: a guard that INVOKES a FUNCTION-LIKE macro
+// (the pre-scan's weaker eval cannot fold it) takes the P0016-safe direction --
+// the quote-`#include` is SKIPPED, so a missing header does NOT error (a
+// wrongly-skipped LIVE include would instead fail loud downstream as a missing
+// symbol, never a silent wrong include). RED-ON-DISABLE: removing the
+// function-like-invocation detection lets the include resolve -> the missing
+// header errors (P0016 returns in the uncertain direction).
+TEST(Preprocessor, FunctionLikeMacroGuardSkipsIncludeConservatively) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define ENABLED(x) x\n#if ENABLED(1)\n#include \"nope_fn.h\"\n#endif\n"
+        "int x;\n",
+        r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "a function-like-macro guard must take the conservative skip (no "
+           "missing-include error) -- the FIX-3 P0016-safe direction";
+    (void)lexs;
+}
+
+// AGNOSTICISM pin (RED-ON-DISABLE): the dead-branch include skip is driven by
+// the CONFIG conditional words, not a hard-coded "if". Rebind `ifDirective` to
+// "whenever" and reload: a quote-`#include` inside `#whenever 0` must STILL be
+// skipped (no missing-file error), proving the pre-scan reads the directive word
+// from config. RED-ON-DISABLE: hard-coding "if" makes `#whenever 0` an unknown
+// directive that does NOT conditionalize -> the include resolves -> the missing
+// header errors.
+TEST(Preprocessor, DeadBranchIncludeSkipIsConfigDrivenNotHardcoded) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    auto schema = reboundCSubset("\"ifDirective\":         \"if\"",
+                                 "\"ifDirective\":         \"whenever\"",
+                                 "<rebound-if-c17>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->preprocess().ifDirective, "whenever");
+
+    auto buf = SourceBuffer::fromString(
+        std::string{"#whenever 0\n#include \"nope.h\"\n#endif\nint x;\n"},
+        "main.c");
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "the dead-branch include skip must use the CONFIG conditional word "
+           "(#whenever), not a hard-coded #if";
+}
+
+// A `#if 0` block combining ALL c17 symptoms (the corpus pattern in unit form):
+// illegal chars `$ @ ``, a quote-`#include` of a missing header, AND a nested
+// `#ifdef SQLITE_OS_WIN #include` -- the whole group elides cleanly.
+TEST(Preprocessor, DeadBranchCombinedGarbageAndIncludeElides) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if 0\n"
+        "$ @ `\n"
+        "#include \"does_not_exist.h\"\n"
+        "#ifdef SQLITE_OS_WIN\n"
+        "#include \"os_win.h\"\n"
+        "#endif\n"
+        "#endif\n"
+        "int x;\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a dead branch with illegal chars + missing includes must elide "
+           "with NO diagnostics";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_IllegalChar));
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError));
+    ASSERT_EQ(lexs.size(), 3u) << "expected only: int x ;";
+    EXPECT_EQ(lexs[1], "x");
+}
+
+// Nested-dead suppression: an illegal char inside a TAKEN-looking inner branch
+// that is ENCLOSED by a dead `#if 0` must still be suppressed (the inner branch
+// is dead because its enclosing context is dead). RED-ON-DISABLE: a per-frame
+// (rather than whole-stack) dead test would wrongly treat the inner #else as
+// live and re-error the `$`.
+TEST(Preprocessor, NestedDeadBranchIllegalCharSuppressed) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if 0\n#if 1\n$\n#else\n@\n#endif\n#endif\nint x;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "illegal chars in a dead-enclosed nested conditional must be elided";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_IllegalChar));
+    ASSERT_EQ(lexs.size(), 3u) << "expected only: int x ;";
+    EXPECT_EQ(lexs[1], "x");
+}
+
+// The LIVE arm of a conditional keeps its illegal char an ERROR while the DEAD
+// arm's is suppressed -- the two arms are treated independently by byte. `#if 1`
+// -> `$` in the then-arm errors; the `#else` `@` is dead + suppressed.
+TEST(Preprocessor, LiveArmErrorsDeadArmSuppressedInSameGroup) {
+    PreprocessResult r;
+    (void)ppLexemes("#if 1\n$\n#else\n@\n#endif\nint x;\n", r);
+    // Exactly the live `$` reports; the dead `@` does not. We assert at least
+    // the live one fires AND that suppression did not silence it.
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
+        << "the LIVE arm's illegal char must report";
+    // Count: there must be exactly ONE illegal-char diagnostic (the live `$`),
+    // proving the dead `@` was suppressed (not 2).
+    int illegalCount = 0;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.code == DiagnosticCode::P_IllegalChar) ++illegalCount;
+    }
+    EXPECT_EQ(illegalCount, 1)
+        << "exactly the LIVE `$` reports; the DEAD `@` is suppressed";
+}
+
+// ============================================================================
+// c17 Option 1 (authoritative dead-regions): the dead-branch `P_IllegalChar`
+// suppression is keyed on the AUTHORITATIVE `MacroExpander` pass's liveness
+// (full `table_`+`predefined_`), NOT a pre-scan that cannot see predefined or
+// header-supplied macros. These pin the silent-miscompile the pre-scan oracle
+// shipped (a predefined-macro-guarded LIVE branch wrongly recorded dead).
+// ============================================================================
+
+// ★ THE PROVEN c17 SILENT MISCOMPILE, now fixed. `#if __STDC__` is a PREDEFINED-
+// macro guard: the SynthBuilder pre-scan never sees predefined macros, so it
+// folds `__STDC__` -> 0 and calls the branch DEAD -- but the real macro pass
+// materializes `__STDC__` = 1, so the branch is LIVE. A `$` on the live `#define`
+// line is CONSUMED by the directive (it reaches no token stream), so ONLY a
+// byte-liveness oracle keyed on the AUTHORITATIVE pass can catch it. Before
+// Option 1 (the pre-scan dead-region oracle) this compiled SILENTLY. RED-ON-
+// DISABLE: revert the oracle to the pre-scan's `deadRegions` and this `$` is
+// silently dropped again (verified: the pre-scan records the whole `#if __STDC__`
+// body as dead).
+TEST(Preprocessor, PredefinedMacroGuardedLiveIllegalCharStillErrors) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if __STDC__\n#define UNUSED_MACRO $\nint live_in_stdc_branch;\n"
+        "#endif\nint x;\n",
+        r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
+        << "an illegal char in a PREDEFINED-macro-guarded LIVE branch (consumed "
+           "by a #define line) must STILL fail loud -- the AUTHORITATIVE oracle "
+           "catches it where the pre-scan oracle silently dropped it";
+    // GUARD AGAINST FALSE GREEN: prove `#if __STDC__` is genuinely LIVE here, so
+    // the assertion above can't pass for the WRONG reason (the branch going dead).
+    // The live-branch declaration must survive into the token stream.
+    bool sawLiveDecl = false;
+    for (auto const& s : lexs) {
+        if (s == "live_in_stdc_branch") sawLiveDecl = true;
+    }
+    EXPECT_TRUE(sawLiveDecl)
+        << "`#if __STDC__` must be LIVE (its body reaches the parser); otherwise "
+           "the P_IllegalChar above would fire for the wrong reason -- a dead "
+           "branch, not a real live illegal char";
+}
+
+// An UNTERMINATED dead `#if 0` (no `#endif`): the dead illegal chars up to EOF
+// are suppressed (no double-report), but the missing-`#endif` STILL fails loud.
+// RED-ON-DISABLE: dropping the EOF dead-span close re-errors the dead `$`/`@`/`` ` ``;
+// dropping the unterminated-conditional check silences the structural error.
+TEST(Preprocessor, UnterminatedDeadBranchSuppressesCharsButErrorsUnterminated) {
+    PreprocessResult r;
+    (void)ppLexemes("#if 0\n$ @ `\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
+        << "illegal chars in an unterminated dead `#if 0` must be suppressed (the "
+           "EOF dead-span close covers them)";
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "the unterminated conditional (missing #endif) must STILL fail loud";
+}
+
+// A LIVE-outer / DEAD-inner nest: `#if 1 { $ } #if 0 { @ }`. The authoritative
+// recorder must open a dead range ONLY for the inner dead group -- the live-outer
+// `$` is in NO dead range and must report. RED-ON-DISABLE: a per-frame (not
+// whole-stack) or sloppy boundary recorder swallows the live `$`.
+TEST(Preprocessor, LiveOuterDeadInnerNestReportsLiveSuppressesInner) {
+    PreprocessResult r;
+    (void)ppLexemes("#if 1\n$\n#if 0\n@\n#endif\n#endif\nint x;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
+        << "the LIVE-outer `$` must report";
+    int illegalCount = 0;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.code == DiagnosticCode::P_IllegalChar) ++illegalCount;
+    }
+    EXPECT_EQ(illegalCount, 1)
+        << "exactly the live-outer `$` reports; the dead-inner `@` is suppressed";
+}
+
+// (FIX-3, the nullopt arm) a guard the pre-scan cannot evaluate as an ICE (an
+// unbalanced/malformed expr, NOT a function-like macro) -> nullopt -> uncertain
+// -> the quote-`#include` is conservatively SKIPPED (no missing-file error; the
+// malformed `#if` itself errors separately). RED-ON-DISABLE: dropping the
+// nullopt->uncertain handling lets the include resolve -> P0016 returns.
+TEST(Preprocessor, UnevaluableGuardSkipsIncludeConservatively) {
+    PreprocessResult r;
+    (void)ppLexemes("#if (\n#include \"nope_unp.h\"\n#endif\nint x;\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "an unevaluable (nullopt) #if guard must conservatively SKIP its "
+           "quote-#include -- the FIX-3 nullopt arm (P0016-safe direction)";
+}
+
+// AGNOSTICISM (RED-ON-DISABLE), the `#endif` word: the dead-region CLOSE boundary
+// reads `endifDirective` from config, not a hard-coded "endif". Rebind it to
+// "endwhile": after `#endwhile` the `#if 0` reactivates, so a following `$` is
+// LIVE and must report. RED-ON-DISABLE: hard-coding "endif" leaves `#endwhile`
+// unrecognized -> the `#if 0` stays open -> the live `$` is wrongly suppressed.
+TEST(Preprocessor, DeadRegionCloseUsesConfigEndifWordNotHardcoded) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    auto schema = reboundCSubset("\"endifDirective\":      \"endif\"",
+                                 "\"endifDirective\":      \"endwhile\"",
+                                 "<rebound-endif-c17>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->preprocess().endifDirective, "endwhile");
+
+    auto buf = SourceBuffer::fromString(
+        std::string{"#if 0\n#endwhile\n$\nint x;\n"}, "main.c");
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
+        << "the dead-region close must use the CONFIG `#endwhile`, so the `$` "
+           "AFTER it is LIVE and reports -- not a hard-coded `#endif`";
+}
+
+// ============================================================================
+// c18 (positional macro expansion, C 6.10.3): a `#define`/`#undef` affects only
+// text AFTER it. run() now FLUSHES the pending body through expand() at each
+// table-mutating directive, so a use BEFORE a later same-name `#define` is NOT
+// retroactively replaced. (Pre-c18 the whole body was expanded once at EOF with
+// the FINAL table -- the bug SQLite's declare-then-`#define name 0` omit pattern
+// exposed.) Every test is RED-ON-DISABLE: making isMutatingDirective() always
+// return false (reverting to the single end-flush) fails each one.
+// ============================================================================
+
+// ★ THE MINIMAL REPRO (confirmed via CLI on the real compiler): a `#define g 0`
+// must NOT clobber the EARLIER `int g;`. RED-ON-DISABLE: the single end-flush
+// expands `g`->`0` in the declaration -> `int 0 ;` (a parse error downstream).
+TEST(Preprocessor, MacroDefineIsNotRetroactive) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("int g;\n#define g 0\nint x;\n", r);
+    ASSERT_EQ(lexs.size(), 6u) << "expected: int g ; int x ;";
+    EXPECT_EQ(lexs[1], "g")
+        << "the `g` BEFORE `#define g 0` must stay an identifier, not expand to 0";
+    EXPECT_EQ(lexs[4], "x");
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_IllegalChar));
+}
+
+// A use BEFORE the define stays; a use AFTER expands. Pins both directions in one.
+TEST(Preprocessor, MacroDefineAfterUseDoesNotExpandEarlierUse) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("int a = g;\n#define g 0\nint b = g;\n", r);
+    ASSERT_EQ(lexs.size(), 10u) << "int a = g ; int b = 0 ;";
+    EXPECT_EQ(lexs[3], "g") << "the use BEFORE the define stays an identifier";
+    EXPECT_EQ(lexs[8], "0") << "the use AFTER the define expands";
+}
+
+// `#undef` is also positional: a use between `#define X 1` and `#undef X` sees 1;
+// a use after `#undef X` sees X again; a use before `#define X 1` stays X.
+TEST(Preprocessor, UndefBetweenTwoUsesIsPositional) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "int a = X;\n#define X 1\nint b = X;\n#undef X\nint c = X;\n", r);
+    ASSERT_EQ(lexs.size(), 15u);
+    EXPECT_EQ(lexs[3], "X")  << "before #define X 1 -> identifier";
+    EXPECT_EQ(lexs[8], "1")  << "between #define and #undef -> 1";
+    EXPECT_EQ(lexs[13], "X") << "after #undef X -> identifier again";
+}
+
+// Redefinition is positional: use after the first define -> 1, use after the
+// undef+redefine -> 2.
+TEST(Preprocessor, MacroRedefineGivesPositionalValues) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "int a = X;\n#define X 1\nint b = X;\n#undef X\n#define X 2\n"
+        "int c = X;\n",
+        r);
+    ASSERT_EQ(lexs.size(), 15u);
+    EXPECT_EQ(lexs[3], "X");
+    EXPECT_EQ(lexs[8], "1");
+    EXPECT_EQ(lexs[13], "2") << "the redefined value applies to the later use";
+}
+
+// ★ THE SQLITE OMIT PATTERN (the c18 driver): declare an API function, then
+// `#define name 0` to nullify it in a feature-omit build. The declaration must
+// survive as an identifier (a valid function decl), NOT become `void 0(void);`.
+TEST(Preprocessor, SqliteOmitPatternDeclareThenNullify) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("void f(void);\n#define f 0\nint x = 1;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "declare-then-#define-name-0 must leave the declaration intact";
+    ASSERT_GE(lexs.size(), 2u);
+    EXPECT_EQ(lexs[1], "f")
+        << "the declared function name must stay an identifier, not expand to 0";
+}
+
+// Multiple defines: uses before any define stay; uses after both expand.
+TEST(Preprocessor, MultipleDefinesGivePositionalExpansion) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "int a = X;\n#define X 1\n#define Y 2\nint b = X + Y;\n", r);
+    ASSERT_EQ(lexs.size(), 12u);
+    EXPECT_EQ(lexs[3], "X")  << "use before the defines stays an identifier";
+    EXPECT_EQ(lexs[8], "1");
+    EXPECT_EQ(lexs[10], "2");
+}
+
+// ★ THE CRUX (plan-lock fix 1): `#`/`##` PRODUCTS minted in DIFFERENT flushes must
+// all slice correctly from the final buffer. `productText_` is append-only with
+// absolute spans, so a product from flush 1 (`"aa"`) stays valid after later
+// mutations + a product from flush 3 (`foobar`). NOTE: unlike the positional tests
+// above, this one is NOT red-on-disable w.r.t. reverting the flush (a single
+// end-flush makes all products trivially valid); it is a regression guard for the
+// MULTI-flush product accounting itself -- it goes red if a refactor made
+// `productText_` reset/per-flush-local (a stale span -> empty/garbage lexeme).
+TEST(Preprocessor, ProductSpansSurviveAcrossFlush) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define STR(x) #x\n"
+        "const char *a = STR(aa);\n"   // product "aa" minted in flush 1
+        "#define BB 1\n"                // #define mutation -> flush
+        "#define CAT(x,y) x##y\n"       // #define mutation -> flush
+        "int b = CAT(foo,bar);\n"       // product foobar minted in a later flush
+        "int c = BB;\n"                 // BB -> 1
+        "#undef BB\n"                   // #undef mutation -> flush (the erase path)
+        "const char *d = STR(zz);\n",   // product "zz" minted AFTER the undef flush
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // A stringize product is tokenized as a string-literal opener `"` + a BODY
+    // token (+ implied close) -- see reconstructStringLiteral above -- so we check
+    // the distinctive product BODIES (which slice from productText_; an invalid
+    // multi-flush span would yield an empty/garbage lexeme, not the exact body).
+    auto has = [&](std::string_view s) {
+        for (auto const& l : lexs) if (l == s) return true;
+        return false;
+    };
+    EXPECT_TRUE(has("aa"))
+        << "the stringize product BODY from the FIRST flush must keep a valid span "
+           "after later flushes (and an #if-operand expansion) grow productText_";
+    EXPECT_TRUE(has("foobar"))
+        << "the paste product minted in a LATER flush must slice correctly";
+    EXPECT_TRUE(has("1")) << "BB expands to 1 in the final flush";
+    EXPECT_TRUE(has("zz"))
+        << "a stringize product minted AFTER a #undef-triggered flush (the erase "
+           "path) must also slice correctly -- #define and #undef share the flush "
+           "path";
+}
+
+// ★ THE SPANNING-CALL EDGE (plan-lock fix 2): a function-like macro CALL whose
+// argument list spans a `#define` boundary is split by the flush -> collectArgs
+// hits end-of-flush -> FAIL LOUD (unterminated argument list), never a silent
+// mis-expansion. Pins the documented edge as red-on-disable.
+TEST(Preprocessor, FunctionLikeCallSpanningDefineFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes(
+        "#define FOO(a,b) a b\nint q = FOO(1,\n#define X 9\n2);\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroArgument))
+        << "a function-like call whose args span a #define must fail loud "
+           "(unterminated argument list), never silently mis-expand";
+}
+
+// The OTHER spanning sub-case (audit follow-up): only the function-like macro NAME
+// precedes the `#define` (its `(` is after). The first flush sees the bare name
+// with no `(`, so it is emitted VERBATIM (not silently expanded); the call is then
+// rejected downstream at the parser. Pin: the name survives unexpanded at the
+// preprocess stage (no silent mis-expansion), and no unterminated-arg error fires
+// here (collectArgs is never reached -- distinguishing this from the case above).
+TEST(Preprocessor, FunctionLikeMacroNameOnlyAtDefineBoundaryNotMisexpanded) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define F(a) a\nint q = F\n#define X 1\n(5);\n", r);
+    bool sawF = false;
+    for (auto const& l : lexs) if (l == "F") sawF = true;
+    EXPECT_TRUE(sawF)
+        << "the bare macro name at a #define boundary must be emitted VERBATIM "
+           "(not silently expanded) -- its `(` is on the far side of the directive";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroArgument))
+        << "collectArgs is never reached (no `(` in the name's flush), so no "
+           "unterminated-argument error -- unlike the name+`(`-in-flush case";
+}
+
+// Positional expansion inside a LIVE `#if` branch: a use before the `#define` (but
+// inside the same live conditional) stays an identifier; a use after expands. Pins
+// that the positional flush composes with a non-empty conditional stack.
+TEST(Preprocessor, PositionalDefineInsideLiveIfBranch) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#if 1\nint a = X;\n#define X 5\nint b = X;\n#endif\n", r);
+    ASSERT_EQ(lexs.size(), 10u) << "int a = X ; int b = 5 ;";
+    EXPECT_EQ(lexs[3], "X") << "use before the #define (in a live #if) stays";
+    EXPECT_EQ(lexs[8], "5") << "use after the #define (in a live #if) expands";
 }

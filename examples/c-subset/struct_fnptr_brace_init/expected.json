@@ -1,0 +1,15 @@
+{
+  "$comment": "c12 D-CSUBSET-STRUCT-FNPTR-BRACE-INIT: brace-init of a function-pointer struct member (the SQLite vtable idiom). ROOT was a function-to-pointer DECAY gap — the field is Ptr<FnSig> but the bare function name stayed an undecayed FnSig designator. FIX: CST->HIR `coerce` gained an `FnSig -> Ptr<FnSig>` decay arm (synthetic Cast -> MIR Bitcast over the function GlobalAddr), gated on the same-signature predicate isAssignable uses (a signature mismatch stays a loud verifier failure). RED-ON-DISABLE: remove the arm and `struct Ops a = { dbl };` fails (H_VerifierFailure: ConstructAggregate child type mismatch). NOTE: a file-scope/global vtable with a relocation-bearing member is a SEPARATE pre-existing limitation (global aggregate initializer with symbol-address members, the aggregate analog of F5) — out of scope here. The pe arm RUNS on the windows leg; elf/macho/arm64 on the linux/darwin/qemu legs; the release arm witnesses the optimizer over the indirect call.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

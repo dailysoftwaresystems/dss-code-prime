@@ -1,0 +1,127 @@
+{
+  "$comment": "Neutral shipped <sys/stat.h> (POSIX) — the FIRST real consumer of the plan-25 PER-TARGET struct `variants` mechanism. `struct stat` has a byte layout that DIVERGES per target: glibc x86-64-linux is 144 bytes (st_nlink is a 64-bit field at offset 16; st_mode at 24, after a 4-byte __pad0 that 8-aligns st_rdev), while glibc arm64-linux is 128 bytes (st_mode at 16, st_nlink a 32-bit field at 20; st_blksize is 32-bit with a __pad2). libc's fstat() writes the REAL struct and the program reads fields at OUR offsets, so a single layout would silently corrupt data on the other arch — the variant selector picks the field list matching (arch, format). The explicit padding fields (__pad0/__pad1/__pad2/reserved) make the layout engine's natural-alignment derivation reproduce the exact glibc offsets (sizeof = 144 / 128 respectively). The nested `struct timespec` (st_atim/mtim/ctim) is FLATTENED to its two i64 components (_sec/_nsec) here — bit-identical layout (timespec is {i64,i64}, 16 bytes); the real nested-timespec field names are a c14 authoring detail. Field types are RESOLVED hir-text builtins. c15c adds the macОS variant `when:{format:macho}` — the Darwin 64-bit-inode `struct stat` (verified against xnu/bsd/sys/stat.h): 144 bytes, the SAME SIZE as x86-64-linux but a COMPLETELY different layout (st_dev i32@0, st_mode/st_nlink uint16@4/6, st_ino u64@8, st_rdev i32@24 + a 4-byte __pad0@28 to 8-align FOUR timespecs incl. st_birthtimespec@80, st_blksize i32@112, the st_qspare tail) — the dangerous same-size swap the c13 lesson flagged (a size-only check would not catch it; the corpus pins a FIELD offset). arm64-macho and x86_64-macho are byte-identical (all fixed-width) so one `when:{format:macho}` covers both. The S_* constants + S_IS* macros + st_*time macros AGREE Linux↔macOS (the st_*tim_sec flat field names are shared). fstat/lstat/stat are the plain symbols (correct for arm64-macho, the macos-latest CI leg — the 64-bit-inode ABI; the x86_64-macho `$INODE64` asm-label alias is byte-pinned-only, no CI leg). Gated availableObjectFormats:[elf,macho]; a windows-pe `#include <sys/stat.h>` still fails loud (POSIX-on-windows = the separate os_win axis). RED-ON-DISABLE: neuter the variant selector (always variant 0) → the arm64-elf leg compiles the x86-64 144B layout (arm64 corpus sizeof==128 fails) AND the macho leg compiles the x86-64-elf field ORDER (the macho corpus's field-offset assertion fails).",
+  "header": "sys/stat.h",
+  "standard": "posix",
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "symbols": [
+    { "name": "fstat", "signature": "fn(i32, ptr<void>) -> i32",      "kind": "function", "linkage": "external" },
+    { "name": "lstat", "signature": "fn(ptr<char>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "stat",  "signature": "fn(ptr<char>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "mkdir", "signature": "fn(ptr<char>, u32) -> i32",       "kind": "function", "linkage": "external" }
+  ],
+  "macros": [
+    { "name": "S_ISREG", "params": ["m"], "replacement": "(((m) & 61440) == 32768)" },
+    { "name": "S_ISDIR", "params": ["m"], "replacement": "(((m) & 61440) == 16384)" },
+    { "name": "S_ISLNK", "params": ["m"], "replacement": "(((m) & 61440) == 40960)" },
+    { "name": "st_atime", "replacement": "st_atim_sec" },
+    { "name": "st_mtime", "replacement": "st_mtim_sec" },
+    { "name": "st_ctime", "replacement": "st_ctim_sec" }
+  ],
+  "constants": [
+    { "name": "S_IFMT",   "value": 61440, "type": "i32" },
+    { "name": "S_IFSOCK", "value": 49152, "type": "i32" },
+    { "name": "S_IFLNK",  "value": 40960, "type": "i32" },
+    { "name": "S_IFREG",  "value": 32768, "type": "i32" },
+    { "name": "S_IFBLK",  "value": 24576, "type": "i32" },
+    { "name": "S_IFDIR",  "value": 16384, "type": "i32" },
+    { "name": "S_IFCHR",  "value": 8192,  "type": "i32" },
+    { "name": "S_IFIFO",  "value": 4096,  "type": "i32" },
+    { "name": "S_IRWXU",  "value": 448, "type": "i32" },
+    { "name": "S_IRUSR",  "value": 256, "type": "i32" },
+    { "name": "S_IWUSR",  "value": 128, "type": "i32" },
+    { "name": "S_IXUSR",  "value": 64,  "type": "i32" },
+    { "name": "S_IRGRP",  "value": 32, "type": "i32" },
+    { "name": "S_IWGRP",  "value": 16, "type": "i32" },
+    { "name": "S_IXGRP",  "value": 8,  "type": "i32" },
+    { "name": "S_IROTH",  "value": 4, "type": "i32" },
+    { "name": "S_IWOTH",  "value": 2, "type": "i32" },
+    { "name": "S_IXOTH",  "value": 1, "type": "i32" }
+  ],
+  "structs": [
+    {
+      "name": "stat",
+      "variants": [
+        {
+          "when": { "arch": "x86_64", "format": "elf" },
+          "fields": [
+            { "name": "st_dev",      "type": "u64" },
+            { "name": "st_ino",      "type": "u64" },
+            { "name": "st_nlink",    "type": "u64" },
+            { "name": "st_mode",     "type": "u32" },
+            { "name": "st_uid",      "type": "u32" },
+            { "name": "st_gid",      "type": "u32" },
+            { "name": "__pad0",      "type": "i32" },
+            { "name": "st_rdev",     "type": "u64" },
+            { "name": "st_size",     "type": "i64" },
+            { "name": "st_blksize",  "type": "i64" },
+            { "name": "st_blocks",   "type": "i64" },
+            { "name": "st_atim_sec", "type": "i64" },
+            { "name": "st_atim_nsec","type": "i64" },
+            { "name": "st_mtim_sec", "type": "i64" },
+            { "name": "st_mtim_nsec","type": "i64" },
+            { "name": "st_ctim_sec", "type": "i64" },
+            { "name": "st_ctim_nsec","type": "i64" },
+            { "name": "__glibc_reserved0", "type": "i64" },
+            { "name": "__glibc_reserved1", "type": "i64" },
+            { "name": "__glibc_reserved2", "type": "i64" }
+          ]
+        },
+        {
+          "when": { "arch": "arm64", "format": "elf" },
+          "fields": [
+            { "name": "st_dev",      "type": "u64" },
+            { "name": "st_ino",      "type": "u64" },
+            { "name": "st_mode",     "type": "u32" },
+            { "name": "st_nlink",    "type": "u32" },
+            { "name": "st_uid",      "type": "u32" },
+            { "name": "st_gid",      "type": "u32" },
+            { "name": "st_rdev",     "type": "u64" },
+            { "name": "__pad1",      "type": "u64" },
+            { "name": "st_size",     "type": "i64" },
+            { "name": "st_blksize",  "type": "i32" },
+            { "name": "__pad2",      "type": "i32" },
+            { "name": "st_blocks",   "type": "i64" },
+            { "name": "st_atim_sec", "type": "i64" },
+            { "name": "st_atim_nsec","type": "i64" },
+            { "name": "st_mtim_sec", "type": "i64" },
+            { "name": "st_mtim_nsec","type": "i64" },
+            { "name": "st_ctim_sec", "type": "i64" },
+            { "name": "st_ctim_nsec","type": "i64" },
+            { "name": "__glibc_reserved0", "type": "i32" },
+            { "name": "__glibc_reserved1", "type": "i32" }
+          ]
+        },
+        {
+          "when": { "format": "macho" },
+          "fields": [
+            { "name": "st_dev",          "type": "i32" },
+            { "name": "st_mode",         "type": "u16" },
+            { "name": "st_nlink",        "type": "u16" },
+            { "name": "st_ino",          "type": "u64" },
+            { "name": "st_uid",          "type": "u32" },
+            { "name": "st_gid",          "type": "u32" },
+            { "name": "st_rdev",         "type": "i32" },
+            { "name": "__pad0",          "type": "i32" },
+            { "name": "st_atim_sec",     "type": "i64" },
+            { "name": "st_atim_nsec",    "type": "i64" },
+            { "name": "st_mtim_sec",     "type": "i64" },
+            { "name": "st_mtim_nsec",    "type": "i64" },
+            { "name": "st_ctim_sec",     "type": "i64" },
+            { "name": "st_ctim_nsec",    "type": "i64" },
+            { "name": "st_birthtim_sec", "type": "i64" },
+            { "name": "st_birthtim_nsec","type": "i64" },
+            { "name": "st_size",         "type": "i64" },
+            { "name": "st_blocks",       "type": "i64" },
+            { "name": "st_blksize",      "type": "i32" },
+            { "name": "st_flags",        "type": "u32" },
+            { "name": "st_gen",          "type": "u32" },
+            { "name": "st_lspare",       "type": "i32" },
+            { "name": "st_qspare0",      "type": "i64" },
+            { "name": "st_qspare1",      "type": "i64" }
+          ]
+        }
+      ]
+    }
+  ]
+}

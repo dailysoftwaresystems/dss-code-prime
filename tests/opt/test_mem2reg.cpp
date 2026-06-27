@@ -454,6 +454,176 @@ TEST(Mem2Reg, LoopInductionVariablePromoted) {
     }
 }
 
+// D-OPT-MEM2REG-LOOP-BODY-LOCAL-DEAD-PHI: an alloca declared AND used entirely
+// inside a loop body (Store-then-Load in the latch — `int iv = expr;`) is
+// BLOCK-LOCAL: not upward-exposed, so SEMI-PRUNED SSA places NO Phi for it.
+// Minimal (un-pruned) SSA would place a DEAD Phi at the loop HEADER (the body-
+// Store's IDF includes the header via the back-edge); that Phi's entry-
+// predecessor incoming is genuinely undefined (the slot was never stored before
+// the loop) → the rename walk's empty-stack guard ABORTS. That bug crashed the
+// release pipeline on ANY loop-body-local (`vsum`'s `int iv`/`double dv`, the
+// varargs_win64_sum symptom, every plain `while (...) { int x = ...; }`).
+// Here `slot` is a real induction var (Load-before-Store in the latch → upward-
+// exposed → exactly 1 header Phi) and `bl` is a body-local (Store-before-Load →
+// none). RED-ON-DISABLE: revert the upward-exposed gate in mem2reg.cpp and this
+// pass ABORTS on bl's dead header Phi (the test process crashes).
+TEST(Mem2Reg, LoopBodyLocalAllocaNeedsNoPhi) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);  // induction var → GLOBAL
+    MirInstId const bl   = mb.addInst(MirOpcode::Alloca, {}, ptr);  // loop-body-local → block-local
+    MirLiteralValue zero; zero.value = std::int64_t{0}; zero.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(zero, i32);
+    MirInstId const s0[] = {c0, slot};
+    (void)mb.addInst(MirOpcode::Store, s0, InvalidType);
+    mb.addBr(header);
+
+    mb.beginBlock(header);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    mb.addCondBr(cond, body, exitB);
+
+    mb.beginBlock(body);
+    // bl: Store THEN Load within the body (`int bl = 7;`) — block-local.
+    MirLiteralValue seven; seven.value = std::int64_t{7}; seven.core = TypeKind::I32;
+    MirInstId const c7 = mb.addConst(seven, i32);
+    MirInstId const sb[] = {c7, bl};
+    (void)mb.addInst(MirOpcode::Store, sb, InvalidType);
+    MirInstId const blLoadOps[] = {bl};
+    MirInstId const blv = mb.addInst(MirOpcode::Load, blLoadOps, i32);
+    // slot: Load BEFORE its Store in the latch → upward-exposed (induction var).
+    MirInstId const slotLoadOps[] = {slot};
+    MirInstId const ld = mb.addInst(MirOpcode::Load, slotLoadOps, i32);
+    MirInstId const addOps[] = {ld, blv};
+    MirInstId const inc = mb.addInst(MirOpcode::Add, addOps, i32);  // slot' = slot + bl
+    MirInstId const s1[] = {inc, slot};
+    (void)mb.addInst(MirOpcode::Store, s1, InvalidType);
+    mb.addBr(header);  // back-edge
+
+    mb.beginBlock(exitB);
+    MirInstId const exitLoadOps[] = {slot};
+    MirInstId const ld2 = mb.addInst(MirOpcode::Load, exitLoadOps, i32);
+    mb.addReturn(ld2);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runMem2Reg(mir, interner, rep);  // WITHOUT the fix: ABORTS here
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.allocasPromoted, 2u)
+        << "both the induction var and the loop-body-local promote";
+    // ONLY the induction var's header Phi — the block-local gets NONE.
+    EXPECT_EQ(r.phisInserted, 1u)
+        << "a loop-body-local is not upward-exposed → semi-pruned SSA inserts no "
+           "(dead) header Phi for it; only the induction var needs one";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi),    1u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Alloca), 0u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Load),   0u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Store),  0u);
+}
+
+// D-OPT-MEM2REG-DEAD-PHI-PRUNE (the NESTED-LOOP half): the inner counter `ij` is
+// re-initialized (Store 0) at the top of each OUTER iteration, then walked by the
+// inner loop. So `ij` is LIVE across the INNER back-edge (it IS upward-exposed in
+// the inner header → a semi-pruned "global" test keeps ALL its phis) yet DEAD at
+// the OUTER header. Minimal SSA placed a phi for `ij` at the outer header too (its
+// def-blocks {entry, outer-body, inner-body} have the outer header in their IDF via
+// the outer back-edge); that phi's entry incoming is undefined → the rename walk
+// ABORTS. Only true LIVE-IN prunes it — semi-pruning cannot. Fully-pruned SSA keeps
+// exactly the two LIVE header phis (outer-i, inner-j) and drops the dead outer-header
+// inner-j phi. RED-ON-DISABLE: revert the live-in gate in mem2reg.cpp → the pass
+// ABORTS on the dead outer-header phi (the test process crashes).
+TEST(Mem2Reg, NestedLoopInnerCounterNoOuterHeaderPhi) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const oHead  = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const oBody  = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const iHead  = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const iBody  = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const oLatch = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+
+    auto constI = [&](std::int64_t v) {
+        MirLiteralValue lv; lv.value = v; lv.core = TypeKind::I32; return mb.addConst(lv, i32);
+    };
+    auto constTrue = [&]() {
+        MirLiteralValue lv; lv.value = std::int64_t{1}; lv.core = TypeKind::Bool; return mb.addConst(lv, boolT);
+    };
+    auto storeTo = [&](MirInstId v, MirInstId slot) {
+        MirInstId const s[] = {v, slot}; (void)mb.addInst(MirOpcode::Store, s, InvalidType);
+    };
+    auto loadOf = [&](MirInstId slot) {
+        MirInstId const l[] = {slot}; return mb.addInst(MirOpcode::Load, l, i32);
+    };
+    auto incStore = [&](MirInstId slot) {
+        MirInstId const ld = loadOf(slot);
+        MirInstId const a[] = {ld, constI(1)};
+        MirInstId const inc = mb.addInst(MirOpcode::Add, a, i32);
+        storeTo(inc, slot);
+    };
+
+    mb.beginBlock(entry);
+    MirInstId const oi = mb.addInst(MirOpcode::Alloca, {}, ptr);  // outer i (live across outer loop)
+    MirInstId const ij = mb.addInst(MirOpcode::Alloca, {}, ptr);  // inner j (live inner, DEAD at outer header)
+    storeTo(constI(0), oi);
+    mb.addBr(oHead);
+
+    mb.beginBlock(oHead);
+    (void)loadOf(oi);                      // outer-i upward-exposed → live-in here → phi
+    mb.addCondBr(constTrue(), oBody, exitB);
+
+    mb.beginBlock(oBody);
+    storeTo(constI(0), ij);                // j = 0 — kills j before the inner loop
+    mb.addBr(iHead);
+
+    mb.beginBlock(iHead);
+    (void)loadOf(ij);                      // inner-j upward-exposed → live-in here → phi
+    mb.addCondBr(constTrue(), iBody, oLatch);
+
+    mb.beginBlock(iBody);
+    incStore(ij);
+    mb.addBr(iHead);                       // inner back-edge
+
+    mb.beginBlock(oLatch);
+    incStore(oi);
+    mb.addBr(oHead);                       // outer back-edge
+
+    mb.beginBlock(exitB);
+    mb.addReturn(constI(0));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runMem2Reg(mir, interner, rep);  // WITHOUT the fix: ABORTS
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.allocasPromoted, 2u);
+    // EXACTLY two LIVE header phis: outer-i @ outer header + inner-j @ inner header.
+    // The inner counter gets NO phi at the OUTER header (dead there) — that dead phi
+    // was the crash.
+    EXPECT_EQ(r.phisInserted, 2u)
+        << "fully-pruned SSA keeps only the live header phis; the inner counter's "
+           "dead outer-header phi (the un-pruned crash) is gone";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi),    2u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Alloca), 0u);
+}
+
 // Alloca-as-Return-value: escapes the function. Must NOT be promoted.
 // (The function returns a pointer that the caller can read/write
 // through; promoting would erase the storage that pointer references.)

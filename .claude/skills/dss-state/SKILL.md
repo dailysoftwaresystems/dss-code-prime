@@ -96,6 +96,14 @@ exits 0 since 2026-06-12 — the `ptr_swap_through` miscompile is FIXED, see bel
 - **Git velocity is squash-blind**: PRs squash to one main commit, hiding per-cycle commits.
   The plan board is the primary velocity source; the `^v0.0.2` commit count is shown only as
   a floor.
+- **Multiple build dirs — the ctest axis follows the CLI's dir, not `build/`.** This box has
+  both an MSVC `build/` (often STALE/broken — `semantic_analyzer.cpp` overflows COFF sections
+  without `/bigobj`) and a healthy Ninja `build-dbg/`. The driver auto-picks the newest CLI
+  (usually `build-dbg/`) and now derives the ctest dir + `LastTest.log` from that same path
+  (`buildInfoOf()`), so a single-config Ninja dir gets no `-C`. Before this fix the test axis
+  hardcoded `build/` and reported garbage (a `2/2` partial log; a `145/448` from the broken
+  MSVC dir) while the real suite was `448/448` in `build-dbg`. To rebuild the active one:
+  `cmake --build build-dbg --target dss-code-prime` (Ninja, single-config — no `--config`).
 - **The `ptr_swap_through` miscompile is FIXED (2026-06-12)**: the probe's exit-34 was NOT a
   pointer bug — the swap compiled perfectly; `return x - y + 4;` parsed RIGHT-associative
   (`x - (y + 4)`) because same-precedence infix chains nested rightward in the Pratt walker

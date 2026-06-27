@@ -18,6 +18,10 @@
 //
 // THE WALK (C 6.7.6 shapes, by config-resolved ROLE — never by rule name):
 //   initDeclaratorRule  →  descend to its declaratorRule child
+//   memberDeclaratorRule→  descend to its declaratorRule child (c23
+//                          D-CSUBSET-STRUCT-MULTI-DECLARATOR — the struct/
+//                          union member-list slot; OPTIONAL role, absent inner
+//                          declarator ⇒ anonymous bit-field ⇒ no name)
 //   declaratorRule      →  descend to its directRule child
 //                          (pointerLayerRule children are SKIPPED — stars
 //                          carry type structure, never the name)
@@ -73,6 +77,17 @@ template <class View>
             cur = det::firstChildOfRule(v, cur, dc.declaratorRule);
             continue;
         }
+        // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): a struct/union member-list
+        // slot wraps ONE declarator (+ its own bitfield suffix). Descend to the
+        // inner declaratorRule, identical to the initDeclaratorRule arm — an
+        // ABSENT inner declarator (the anonymous bit-field `int : 3;`) yields {}
+        // → abstract → no name, the same legal degrade. Guarded on the OPTIONAL
+        // role so a language without member lists never matches here.
+        if (dc.memberDeclaratorRule.has_value()
+            && r == *dc.memberDeclaratorRule) {
+            cur = det::firstChildOfRule(v, cur, dc.declaratorRule);
+            continue;
+        }
         if (r == dc.declaratorRule) {
             cur = det::firstChildOfRule(v, cur, dc.directRule);
             continue;
@@ -99,8 +114,11 @@ template <class View>
 // list-or-single child, in source order:
 //   listRule node          → its initDeclaratorRule / declaratorRule
 //                            Internal children (commas skipped);
+//   memberListRule node    → its memberDeclaratorRule Internal children
+//                            (commas skipped) — c23 struct/union member list;
 //   initDeclaratorRule or
-//   declaratorRule node    → the node itself (the single-declarator form);
+//   declaratorRule or
+//   memberDeclaratorRule   → the node itself (the single-slot form);
 //   anything else          → nothing (structurally absent / errored decl —
 //                            the caller mints no symbols, the safe degrade).
 template <class View>
@@ -119,7 +137,29 @@ void collectDeclarators(View const& v, NodeId node, DeclaratorConfig const& dc,
         }
         return;
     }
+    // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): a struct/union member
+    // declarator LIST — collect each per-slot `memberDeclaratorRule` child
+    // (commas skipped), in source order. The downstream name/type walks
+    // descend each slot to its inner declarator. Guarded on the OPTIONAL role.
+    if (dc.memberListRule.has_value() && r == *dc.memberListRule) {
+        for (NodeId c : v.children(node)) {
+            if (!v.isVisible(c)) continue;
+            if (v.kind(c) != NodeKind::Internal) continue;
+            if (dc.memberDeclaratorRule.has_value()
+                && v.rule(c) == *dc.memberDeclaratorRule) {
+                out.push_back(c);
+            }
+        }
+        return;
+    }
     if (r == dc.initDeclaratorRule || r == dc.declaratorRule) {
+        out.push_back(node);
+        return;
+    }
+    // c23: a BARE single-slot member declarator (a one-element list the
+    // grammar may collapse to the slot directly) — push self; the caller's
+    // name/type walk descends it to the inner declarator.
+    if (dc.memberDeclaratorRule.has_value() && r == *dc.memberDeclaratorRule) {
         out.push_back(node);
     }
 }

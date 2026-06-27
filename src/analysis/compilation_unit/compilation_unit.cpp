@@ -81,7 +81,7 @@ CompilationUnit::CompilationUnit(PrivateTag,
                                  std::vector<Tree>                    trees,
                                  DiagnosticReporter                   driverDiagnostics,
                                  std::vector<CrossTreeRef>            crossRefs,
-                                 std::vector<std::filesystem::path>   shippedLibDescriptors,
+                                 std::vector<ShippedDescriptorRef>    shippedLibDescriptors,
                                  std::uint32_t                        typeNameReparseCount,
                                  std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers)
     : id_(id)
@@ -102,7 +102,7 @@ CompilationUnitId             CompilationUnit::id()                const noexcep
 std::span<Tree const>         CompilationUnit::trees()             const noexcept { return trees_; }
 DiagnosticReporter const&     CompilationUnit::driverDiagnostics() const noexcept { return driverDiagnostics_; }
 std::span<CrossTreeRef const> CompilationUnit::crossRefs()         const noexcept { return crossRefs_; }
-std::span<std::filesystem::path const>
+std::span<ShippedDescriptorRef const>
 CompilationUnit::shippedLibDescriptors() const noexcept { return shippedLibDescriptors_; }
 std::span<std::shared_ptr<SourceBuffer> const>
 CompilationUnit::auxiliaryBuffers() const noexcept { return auxiliaryBuffers_; }
@@ -231,7 +231,8 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         // FC15c: thread the system-header search path so `__has_include(<h>)`
         // resolves a system descriptor (`<stem>.json`) exactly as the post-parse
         // import resolver does for `#include <h>` (one shared mapping).
-        PreprocessResult pp = preprocess(src, schema, includeDirs_, systemDirs_);
+        PreprocessResult pp = preprocess(src, schema, includeDirs_, systemDirs_,
+                                         activeFormat_);
         auto remap = pp.makeRemap();
         std::shared_ptr<SourceBuffer> synth = pp.synthBuffer;
         // The parser consumes a stream built from a COPY of the preprocessed
@@ -344,6 +345,13 @@ void UnitBuilder::addSystemDir(std::filesystem::path dir) {
         cuFatal("UnitBuilder::addSystemDir called after finish()");
     }
     systemDirs_.push_back(std::move(dir));
+}
+
+void UnitBuilder::setActiveFormat(ObjectFormatKind fmt) {
+    if (finished_) {
+        cuFatal("UnitBuilder::setActiveFormat called after finish()");
+    }
+    activeFormat_ = fmt;
 }
 
 TreeId UnitBuilder::loadAndAdd_(std::filesystem::path const& path, bool& ok,
@@ -474,7 +482,7 @@ CompilationUnit UnitBuilder::finish() && {
     // loadFile callback carries the including tree's schema so an #include loads
     // its target under the same language.
     std::vector<CrossTreeRef> crossRefs;
-    std::vector<std::filesystem::path> shippedLibDescriptors;
+    std::vector<ShippedDescriptorRef> shippedLibDescriptors;
     ResolutionContext context{
         trees_,
         driverDiagnostics_,
@@ -605,7 +613,7 @@ CompilationUnit UnitBuilder::finish() && {
                 crossRefs.clear();
                 DiagnosticReporter scratchDiags{
                     DiagnosticReporter::Config{.dedupWindow = 0}};
-                std::vector<std::filesystem::path> scratchDescriptors;
+                std::vector<ShippedDescriptorRef> scratchDescriptors;
                 ResolutionContext recontext{
                     trees_,
                     scratchDiags,

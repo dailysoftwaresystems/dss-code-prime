@@ -181,6 +181,8 @@ std::string cliHelpText() {
         "  --warnings-as-errors   promote every Warning to Error\n"
         "  --suppress=<code>      suppress a specific diagnostic code "
             "(repeatable; accepts D_FileNotFound or 0xD001)\n"
+        "  --time                 print the compilation wall-clock time to "
+            "stderr after the compile finishes\n"
         "\n"
         "LSP / server mode:\n"
         "  --lsp                  run as a Language Server (stdio)\n"
@@ -455,6 +457,10 @@ parseCliArgs(int argc, char* argv[]) {
             out.warningsAsErrors = true;
             continue;
         }
+        if (a == "--time") {
+            out.time = true;
+            continue;
+        }
         {
             auto m = valueFlag(a, i, "--suppress");
             if (!m) return std::unexpected(m.error());
@@ -522,6 +528,7 @@ parseCliArgs(int argc, char* argv[]) {
          || !out.transpileFiles.empty()
          || !out.suppress.empty()
          || out.warningsAsErrors
+         || out.time
          || out.config != CompileConfig::Debug
          || out.directoryMode != InputResolver::Mode::Recursive;
         if (hasOptions) {

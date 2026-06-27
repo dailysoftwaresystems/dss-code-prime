@@ -341,6 +341,34 @@ TEST(HirText, RoundTripExternWithFfi) {
     EXPECT_NE(text.find("extern_function %1"), std::string::npos);
 }
 
+TEST(HirText, RoundTripVariadicFnSig) {
+    // c14: a variadic extern (`fn(ptr<byte>, i32, ...) -> i32`, the POSIX `open`
+    // shape) round-trips through HIR text — the emitter writes the `, ...` marker
+    // (scalars[1]) and the parser reads it back as variadic. RED-ON-DISABLE: drop
+    // the emitter's `...` clause and the `, ...` vanishes (variadic-ness lost on
+    // reparse) — this assertion fails.
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId i32 = in.primitive(TypeKind::I32);
+    TypeId byteP = in.pointer(in.primitive(TypeKind::Byte));
+    TypeId sig = in.fnSig(std::vector<TypeId>{byteP, i32}, i32, CallConv::CcSysV, /*isVariadic=*/true);
+    ASSERT_TRUE(in.fnIsVariadic(sig));
+
+    HirBuilder b{"c-subset"};
+    HirNodeId p0 = b.makeVarDecl(byteP, 2);
+    HirNodeId p1 = b.makeVarDecl(i32, 3);
+    HirNodeId ext = b.makeExternFunction(sig, 1, std::vector<HirNodeId>{p0, p1});
+    HirNodeId root = b.makeModule(std::vector<HirNodeId>{ext});
+    Hir hir = std::move(b).finish(root);
+
+    HirFfiMap ffi{hir};
+    ffi.set(ext, FfiMetadata{.mangledName = "open", .linkage = FfiLinkage::Strong,
+                             .visibility = FfiVisibility::Default, .importLibrary = "libc.so.6"});
+    std::vector<std::string> names{"", "open", "path", "flags"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names; ctx.ffiMap = &ffi;
+    std::string const text = expectRoundTrip(hir, ctx);
+    EXPECT_NE(text.find(", ...) ->"), std::string::npos) << text;
+}
+
 TEST(HirText, RoundTripAllSideTables) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId i32 = in.primitive(TypeKind::I32);

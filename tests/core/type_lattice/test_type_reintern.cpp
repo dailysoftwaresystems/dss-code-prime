@@ -246,3 +246,48 @@ TEST(TypeReintern, ReinternDedupsStructurallyIdentical) {
         host.interner().primitive(TypeKind::I32));
     EXPECT_EQ(hostDirect.v, hostFromA.v);
 }
+
+// D-CSUBSET-SELF-REFERENTIAL-STRUCT: re-interning a SELF-REFERENTIAL composite
+// must TERMINATE (the field is a Ptr back to the struct's OWN TypeId — a cycle in
+// the operand graph). The reintern walker forward-mints the host composite and
+// memoizes it BEFORE recursing the fields, so the self-ref field resolves to the
+// placeholder instead of looping. Without that (the old memo-after-recursion) this
+// would infinite-loop / stack-overflow. The re-interned type must be structurally
+// the same self-referential shape.
+TEST(TypeReintern, SelfReferentialStructTerminatesAndReproduces) {
+    TypeInterner src{CompilationUnitId{1}};
+    const TypeId i32 = src.primitive(TypeKind::I32);
+    const TypeId n   = src.forwardComposite(TypeKind::Struct, "N", /*declSiteKey=*/9);
+    const TypeId ptrN = src.pointer(n);
+    std::array<TypeId, 2> const fields{ptrN, i32};   // { N* next; int v; }
+    src.completeComposite(n, fields);
+
+    TypeLattice host{CompilationUnitId{2}};
+    std::unordered_map<std::uint32_t, TypeId> remap;
+    const TypeId hostN = reinternType(src, n, host, remap);   // must not hang
+
+    auto const& hi = host.interner();
+    ASSERT_TRUE(hostN.valid());
+    EXPECT_EQ(hi.kind(hostN), TypeKind::Struct);
+    EXPECT_EQ(hi.name(hostN), "N");
+    ASSERT_EQ(hi.operands(hostN).size(), 2u);
+    // field[0] = Ptr<N> whose pointee is the SAME host TypeId (cycle reproduced).
+    ASSERT_EQ(hi.kind(hi.operands(hostN)[0]), TypeKind::Ptr);
+    EXPECT_EQ(hi.operands(hi.operands(hostN)[0])[0].v, hostN.v);
+    EXPECT_EQ(hi.kind(hi.operands(hostN)[1]), TypeKind::I32);
+}
+
+// D-CSUBSET-SELF-REFERENTIAL-STRUCT: an INCOMPLETE source composite (forward-
+// declared, never completed) re-interns to an incomplete host composite (no
+// fields), not a hang or a fabricated body.
+TEST(TypeReintern, IncompleteCompositeReinternsIncomplete) {
+    TypeInterner src{CompilationUnitId{1}};
+    const TypeId fwd = src.forwardComposite(TypeKind::Struct, "Opaque", 3);
+    ASSERT_TRUE(src.isIncompleteComposite(fwd));
+
+    TypeLattice host{CompilationUnitId{2}};
+    std::unordered_map<std::uint32_t, TypeId> remap;
+    const TypeId hostFwd = reinternType(src, fwd, host, remap);
+    EXPECT_EQ(host.interner().kind(hostFwd), TypeKind::Struct);
+    EXPECT_TRUE(host.interner().isIncompleteComposite(hostFwd));
+}

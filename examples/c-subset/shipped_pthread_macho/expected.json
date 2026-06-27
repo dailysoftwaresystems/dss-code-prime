@@ -1,0 +1,12 @@
+{
+  "$comment": "c15c shipped <pthread.h> on macOS — the FIRST real consumer of the c15a typedef-variant AND macro-variant mechanisms: pthread_mutex_t arr<i64,8>=64B macho vs arr<i64,6>=48B elf + PTHREAD_MUTEX_RECURSIVE 2/1 (constant variant) + PTHREAD_MUTEX_INITIALIZER's Darwin __sig magic 0x32AAABA7=850045863 (macro variant, read from a static-init mutex's first word — Linux is {0}). The mutex lifecycle runs via libSystem. Single arm64-macho target → runs on the macos-latest CI leg. exit 42 iff ALL THREE macho variants were selected (64B size, RECURSIVE 2, __sig 850045863). RED-ON-DISABLE: a broken typedef selector gives the elf 48B size (under-allocates the real 64B macOS mutex); a broken macro selector gives the elf {0} initializer → __sig 0 != 850045863 → exit 1. Release arm runs the optimizer over the lifecycle calls.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

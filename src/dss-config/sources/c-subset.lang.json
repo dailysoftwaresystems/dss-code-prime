@@ -123,7 +123,8 @@
     "//": [{
       "kind": "LineCommentStart", "flags": ["EmptySpace"],
       "modeOp": "pushMode", "modeArg": "line-comment",
-      "stringStyle": { "escapeKind": "none", "endsAt": "\n" }
+      "$endsAtExclusiveComment": "c22 (D-PP-LINE-COMMENT-BEFORE-DIRECTIVE): a `//` comment ends AT the newline but EXCLUDES it — the newline must survive as its own Newline token, else a directive on the next line after `code // comment` loses its line boundary and the preprocessor fails to recognize it (firstOnLine sees the comment-consumed newline as a body char, not a boundary).",
+      "stringStyle": { "escapeKind": "none", "endsAt": "\n", "endsAtExclusive": true }
     }],
     "/*": [{
       "kind": "BlockCommentStart", "flags": ["EmptySpace"],
@@ -215,7 +216,7 @@
       { "precedence": 60, "associativity": "left",                       "operators": ["<<", ">>"]                             },
       { "precedence": 65, "associativity": "left",                       "operators": ["+", "-"]                               },
       { "precedence": 70, "associativity": "left",                       "operators": ["*", "/", "%"]                          },
-      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-", "*", "&", "++", "--"]    },
+      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "+", "-", "*", "&", "++", "--"] },
       { "precedence": 95,                            "arity": "postfix",  "operators": ["++", "--"]                            },
       { "precedence": 100,                           "arity": "postfix",  "operators": ["("], "endsAt": ")", "bodyRule": "argList" },
       { "precedence": 100,                           "arity": "postfix",  "operators": ["["], "endsAt": "]", "bodyRule": "expression" },
@@ -316,11 +317,10 @@
     },
 
     "structField": {
-      "$comment": "FC8 D-CSUBSET-BITFIELD: a struct/union field gains an OPTIONAL name + an OPTIONAL `arrayDeclSuffix | bitfieldDeclSuffix` (disjoint FIRST — BracketOpen vs Colon — so the inner alt is non-speculative). The name is OPTIONAL only to admit an ANONYMOUS bit-field (`int : 3;` / zero-width `int : 0;`); the over-admitted nameless non-bitfield forms (`int;`, anonymous `int[3];`) FAIL LOUD at semantic composition (anonymous member must be a bit-field). A named bit-field is `int x : 3;`.",
+      "$comment": "c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR: a struct/union field is a type-specifier HEAD + an OPTIONAL `structMemberDeclaratorList` (a comma-separated list of per-slot declarators sharing the head base type, e.g. `int *a, b[4], *c;` — C 6.7.2.1) + `EndStatement`. SUPERSEDES c10's single `{optional declarator}{optional bitfieldDeclSuffix}`: each slot (`structMemberDeclarator`) now holds its OWN `declarator` AND its OWN `bitfieldDeclSuffix` so `int a:3, b:5;` resolves each width per-slot. Routing the member through the SAME `declarator` every other position uses (params/locals/globals) makes a function-pointer member (`int (*f)(int);`) parse + type-derive identically; the array suffix (`int arr[3];`) lives inside the declarator's OWN directDeclarator suffix chain. The LIST is OPTIONAL to admit the `int ;` declares-nothing form; a single-slot list with absent declarator + present suffix is the anonymous bit-field (`int : 3;` / zero-width `int : 0;`); the over-admitted nameless non-bitfield forms FAIL LOUD at semantic composition (anonymous member must be a bit-field).",
       "sequence": [
         "typeRefAllowingStruct",
-        { "optional": "Identifier" },
-        { "optional": { "alt": [ "arrayDeclSuffix", "bitfieldDeclSuffix" ] } },
+        { "optional": "structMemberDeclaratorList" },
         "EndStatement"
       ]
     },
@@ -330,15 +330,31 @@
       "sequence": [ "Colon", "assignmentExpr" ]
     },
 
+    "structMemberDeclarator": {
+      "$comment": "c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR: ONE slot of a struct/union member list — an OPTIONAL `declarator` (its OWN pointer/array/fn suffixes; the `*` binds PER-SLOT so `int *a, b;` is Ptr<int> then int) + an OPTIONAL `bitfieldDeclSuffix` (now INSIDE the slot so `int a:3, b:5;` resolves widths independently). The declarator is optional to admit an anonymous bit-field (`int : 3;` — absent declarator, present suffix). The engine's `memberDeclaratorRule` role descends to the inner `declarator` for name + type derivation.",
+      "sequence": [
+        { "optional": "declarator" },
+        { "optional": "bitfieldDeclSuffix" }
+      ]
+    },
+
+    "structMemberDeclaratorList": {
+      "$comment": "c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR: `structMemberDeclarator (, structMemberDeclarator)*` — mirrors `initDeclaratorList` for struct/union members. The engine's `memberListRule` role iterates the slot children (commas skipped).",
+      "sequence": [
+        "structMemberDeclarator",
+        { "repeat": { "sequence": [ "Comma", "structMemberDeclarator" ] } }
+      ]
+    },
+
     "structTypeRef": {
       "sequence": [ "StructKeyword", "Identifier" ]
     },
 
     "unionField": {
+      "$comment": "c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR: a union field mirrors `structField` — a type-specifier HEAD + an OPTIONAL `structMemberDeclaratorList` (per-slot declarators sharing the head, e.g. `int *a, b;`) + `EndStatement`. The per-slot `structMemberDeclarator` holds its own declarator (function-pointer-member support: `int (*f)(int);`) AND its own bitfield suffix. The array suffix lives inside the declarator's directDeclarator suffix chain.",
       "sequence": [
         "typeRefAllowingStruct",
-        { "optional": "Identifier" },
-        { "optional": { "alt": [ "arrayDeclSuffix", "bitfieldDeclSuffix" ] } },
+        { "optional": "structMemberDeclaratorList" },
         "EndStatement"
       ]
     },
@@ -649,10 +665,10 @@
     },
 
     "typeRefAllowingStruct": {
+      "$comment": "c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): the struct/union member-head TYPE-SPECIFIER (base type + cv-qualifiers ONLY — NO pointer stars). The head qualifier slot is `{repeat headQualifier}` (= const|volatile) so a member head admits `volatile int isInterrupted;` (the SQLite case) and `const volatile`; mirrors the head-qualifier slots on topLevelHead/declHead/kwDeclHead. ★ The prior `{repeat StarOp}` slot was REMOVED: with the c23 member-declarator LIST, pointer stars MUST bind PER-DECLARATOR (inside each slot's `declarator` pointerLayer) — a head star applies to ALL declarators, so `int *a, b;` would wrongly type b as a pointer too (the silent layout miscompile c23 fixes). Each slot's `declarator` now owns its stars, exactly like every other declaration position (params/locals/globals). A head-position volatile FOLLOWED by a declarator `*` is a pointer-to-volatile-POINTEE — still rejected loud S_VolatilePointeeNotSupported by the per-declarator typing arm (head volatile + declarator star), so the reject stays complete. The trailing `{optional ConstKeyword}` is east const on the BASE (`int const`, west of any declarator star); east const on a pointer (`int * const`) rides the declarator's ptrQualifier.",
       "sequence": [
-        { "optional": "ConstKeyword" },
+        { "repeat": "headQualifier" },
         "typeBaseAllowingStruct",
-        { "repeat": "StarOp" },
         { "optional": "ConstKeyword" }
       ]
     },
@@ -946,11 +962,12 @@
     },
 
     "castTypeRef": {
+      "$comment": "c11 D-CSUBSET-EAST-CONST-CAST: a cast/sizeof type-name admits const PRE-base (`const char *` — west) AND POST-base before the stars (`char const *` — EAST, the SQLite-pervasive form). In a DECLARATION the `*` lives in the declarator so the head `char const` already parsed; a cast bundles base+stars here, so the post-base const slot is what admits east-const. The const resolver IGNORES const for type identity (a cast yields an rvalue), so all forms intern the same pointer type. The two const slots straddle the REQUIRED base token (no ambiguity); a POST-stars const (`char * const`) is dropped — a useless cast form (const on an rvalue pointer ≡ no const), and a 2nd post-stars optional adjacent to the post-base one across the zero-star case is C_AmbiguousAlternatives.",
       "sequence": [
         { "optional": "ConstKeyword" },
         "castTypeBase",
-        { "repeat": "StarOp" },
-        { "optional": "ConstKeyword" }
+        { "optional": "ConstKeyword" },
+        { "repeat": "StarOp" }
       ]
     },
 
@@ -997,7 +1014,10 @@
     "designatedIndex": { "sequence": [ "BracketOpen", "expression", "BracketClose" ] },
 
     "charLiteralExpr":   { "sequence": [ "CharStart",   "CharLiteral"   ] },
-    "stringLiteralExpr": { "sequence": [ "StringStart", "StringLiteral" ] },
+    "stringLiteralExpr": {
+      "$comment": "C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string literals concatenate — `\"a\" \"b\"` is `\"ab\"`. The first StringStart+StringLiteral pair is required; the zero-or-more repeat captures each further pair as FLAT children (sequences inline, no wrapper node), so a lone string yields exactly 2 children, byte-identical to the pre-c20 single-pair rule. Concatenation is at the DECODED-byte level (each body decoded by decodeStringLiteralBody FIRST, then the bytes joined) via the single decodeAdjacentStringBodies chokepoint that every body consumer routes through. Safe in every use site: primaryExpr, attr args (terminate at `)`), externFuncTail (terminates at `;`) — none has StringStart in its follow set.",
+      "sequence": [ "StringStart", "StringLiteral", { "repeat": { "sequence": [ "StringStart", "StringLiteral" ] } } ]
+    },
 
     "argList": {
       "$comment": "FC5: assignmentExpr (NOT expression) — the comma here is an arg SEPARATOR, never a comma-operator, so `f(a, b)` is 2 args. A comma-operator arg is written parenthesized: `f((a, b))`.",
@@ -1013,6 +1033,8 @@
   "semantics": {
     "identifierToken": "Identifier",
     "pointerToken":    "StarOp",
+    "$volatileMarkerComment": "c21 (D-CSUBSET-VOLATILE-QUALIFIER): the language's volatile qualifier token. Read by the type-position resolver's CO-LOCATED pointer arm (castTypeRef cast/sizeof type-names) to reject a pointer-to-volatile-POINTEE (`volatile int *`) position-aware (volatile-before-star = pointee = REJECT; after-the-star = pointer-object = ACCEPT). DECLARATION forms — objects, params, AND struct/union members (c23 removed the head star from typeRefAllowingStruct, so a member's `*` now binds per-declarator like every other declaration position) — reject via the per-declaration-rule volatileMarker (head-volatile + a declarator star); the two arms together make the fail-loud complete.",
+    "volatileMarker":  "VolatileKeyword",
     "$externLibraryByFormatComment": "FF6 Slice 2 + audit fold (2026-06-02): per-format runtime library identity for source-declared externs. compileSingleUnit step 2.5 populates HirAttribute<FfiMetadata> per ExternFunction/ExternGlobal by calling synthesizeFfiFromSourceDecls() with the entry whose key matches objectFormatKindName(format.kind()). Per-LANGUAGE field (not per-declaration-rule) — the post-fold #1 placement on DeclarationRule was fragile; the pipeline first-match-loop would silently pick the wrong rule on grammars with multiple extern-shaped decl rules. Library identities: PE → msvcrt.dll (Win32 C runtime for x86_64 hello-world); ELF → libc.so.6 (glibc on Linux); Mach-O → /usr/lib/libSystem.B.dylib (libSystem dispatcher publishes the libc surface). Per-symbol overrides (`extern \"otherlib.dll\" int foo();`) anchored D-CSUBSET-EXTERN-LIBRARY-SYNTAX.",
     "externLibraryByFormat": {
       "pe":    "msvcrt.dll",
@@ -1045,39 +1067,38 @@
       "variadicMarker":     "EllipsisOp",
       "arraySuffixRule":    "arrayDeclSuffix",
       "initDeclaratorRule": "initDeclarator",
-      "listRule":           "initDeclaratorList"
+      "listRule":           "initDeclaratorList",
+      "memberDeclaratorRule": "structMemberDeclarator",
+      "memberListRule":       "structMemberDeclaratorList"
     },
     "$parametersComment": "C 6.7.6.3p10: a parameter list of exactly `(void)` declares ZERO parameters. The engine applies this at the ONE param-harvest chokepoint when the sole param resolves to lattice Void AND is unnamed; a NAMED void param or void-mixed-with-others is S_InvalidVoidParam. Languages without the flag keep raw param lists.",
     "parameters": { "soleVoidMeansEmpty": true },
     "declarations": [
       { "rule": "varDecl", "head": 0, "declaratorList": 1, "kind": "variable",
-        "constMarker": "ConstKeyword", "warnIfUnused": true,
+        "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword", "warnIfUnused": true,
         "specifierPrefix": "localDeclSpecifiers",
         "requireNamedDeclarators": true,
         "$staticStorageComment": "D-CSUBSET-LOCAL-STATIC: a block-scope `static` confers static storage duration (C 6.2.4). CST→HIR's linkageFrom folds {binding:local, staticStorage:true} from the SAME prefix scan and routes the declaration to a hidden module-global (internal linkage). register/auto/attribute specifiers carry no linkage and are ignored (ignoredKinds/ignoredRules) so they never trip the unknown-specifier diagnostic.",
+        "$volatileComment": "c21 (D-CSUBSET-VOLATILE-QUALIFIER): volatileMarker REPLACES the prior S_VolatileNotSupported gatedMarker — `volatile` is now IMPLEMENTED (per-symbol isVolatile threaded to MirInstFlags::Volatile). A pointer-to-volatile-POINTEE (`volatile int *p`) still fails loud (S_VolatilePointeeNotSupported, the per-declarator typing arm) — model B handles the object/member/pointer-object forms.",
         "linkageSpecifiers": { "static": { "binding": "local", "staticStorage": true } },
         "linkageSpecifierIgnoredKinds": ["RegisterKeyword", "AutoKeyword", "AttributeKeyword", "ParenOpen", "ParenClose"],
-        "linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr"],
-        "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" } ] },
+        "linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr"] },
       { "rule": "identVarDecl", "head": 0, "declaratorList": 1, "kind": "variable",
-        "constMarker": "ConstKeyword", "warnIfUnused": true,
-        "requireNamedDeclarators": true,
-        "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" } ] },
+        "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword", "warnIfUnused": true,
+        "requireNamedDeclarators": true },
       { "rule": "forDecl", "head": 0, "declaratorList": 1, "kind": "variable",
-        "constMarker": "ConstKeyword", "warnIfUnused": true,
+        "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword", "warnIfUnused": true,
         "specifierPrefix": "localDeclSpecifiers",
         "requireNamedDeclarators": true,
-        "$forStaticComment": "D-CSUBSET-LOCAL-STATIC (MF-2): `static` parses in the shared localDeclSpecifiers prefix, but a static (or any non-auto/register) storage class in a for-statement init-declaration is a C 6.8.5p3 constraint violation — gate it LOUD (never silently lower as an automatic loop variable). NO linkageSpecifiers here: a static for-init must error, not route to a hidden global.",
-        "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" }, { "token": "StaticKeyword", "code": "S_StaticStorageInForInit" } ] },
+        "$forStaticComment": "D-CSUBSET-LOCAL-STATIC (MF-2): `static` parses in the shared localDeclSpecifiers prefix, but a static (or any non-auto/register) storage class in a for-statement init-declaration is a C 6.8.5p3 constraint violation — gate it LOUD (never silently lower as an automatic loop variable). NO linkageSpecifiers here: a static for-init must error, not route to a hidden global. The StaticKeyword gatedMarker stays; only the S_VolatileNotSupported gate is removed (volatile is implemented — c21).",
+        "gatedMarkers": [ { "token": "StaticKeyword", "code": "S_StaticStorageInForInit" } ] },
       { "rule": "forIdentDecl", "head": 0, "declaratorList": 1, "kind": "variable",
-        "constMarker": "ConstKeyword", "warnIfUnused": true,
-        "requireNamedDeclarators": true,
-        "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" } ] },
+        "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword", "warnIfUnused": true,
+        "requireNamedDeclarators": true },
       { "rule": "param", "head": 0, "declarator": 1, "kind": "variable",
-        "constMarker": "ConstKeyword",
-        "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" } ] },
+        "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword" },
       { "rule": "topLevelDecl", "head": 0, "declaratorList": 1, "kind": "variable",
-        "constMarker": "ConstKeyword",
+        "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword",
         "requireNamedDeclarators": true,
         "$linkageSpecifiersComment": "D-CSUBSET-LINKAGE-SPECIFIERS: 'static' -> internal (Local) binding; '__attribute__((weak))' -> Weak; FC4 c1 adds the COMPOSITE key 'visibility:hidden' — linkageFrom forms '<identifier>:<decoded-string-body>' when a specifier identifier is immediately followed by a parenthesized string literal (__attribute__((visibility(\"hidden\")))). 'linkageSpecifierIgnoredRules' skips C23 [[...]] stdAttr subtrees wholesale (D14: parsed, ignored).",
         "specifierPrefix": "declSpecifiers",
@@ -1088,7 +1109,6 @@
         },
         "linkageSpecifierIgnoredKinds": ["AttributeKeyword", "ParenOpen", "ParenClose"],
         "linkageSpecifierIgnoredRules": ["stdAttr"],
-        "gatedMarkers": [ { "token": "VolatileKeyword", "code": "S_VolatileNotSupported" } ],
         "kindByChild": {
           "$comment": "Post-strip children: [topLevelHead, initDeclaratorList, topLevelDeclTail]. childPath [2,0] = the tail's sole child — a `block` node (function definition) or the EndStatement token (variable; whenRule never matches a token). paramsPath/bodyPath are ABSENT: in declarator mode the params live inside the declarator's fnSuffix and the matched block IS the body.",
           "childPath": [2, 0],
@@ -1100,6 +1120,7 @@
         "$entryFunctionNamesComment": "FC5: the program ENTRY-point name(s) — read by the driver's entry-symbol resolution. SEPARATE from implicitReturnZeroForFunctionNames (the C main-style return-0 set); for C both are `main`, but declaring them distinctly de-conflates the two concepts (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN).",
         "entryFunctionNames": ["main"] },
       { "rule": "typedefDecl", "head": 1, "declarator": 2, "kind": "type",
+        "volatileMarker": "VolatileKeyword",
         "requireNamedDeclarators": true },
       { "rule": "structSpecifierBody", "name": 1, "kind": "type",
         "anonymousNameAllowed": true,
@@ -1111,13 +1132,13 @@
         "anonymousNameAllowed": true,
         "fieldChildren": { "rule": "enumerator", "compositeKind": "enum",
                            "liftToEnclosingScope": true } },
-      { "rule": "structField", "name": 1, "type": 0, "kind": "variable",
-        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
+      { "rule": "structField", "head": 0, "declaratorList": 1, "kind": "variable",
+        "volatileMarker": "VolatileKeyword",
         "bitfieldSuffix": { "rule": "bitfieldDeclSuffix", "widthChild": 1 },
         "anonymousNameAllowed": true,
         "allowFlexibleArray": true },
-      { "rule": "unionField",  "name": 1, "type": 0, "kind": "variable",
-        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
+      { "rule": "unionField",  "head": 0, "declaratorList": 1, "kind": "variable",
+        "volatileMarker": "VolatileKeyword",
         "bitfieldSuffix": { "rule": "bitfieldDeclSuffix", "widthChild": 1 },
         "anonymousNameAllowed": true },
       { "rule": "enumerator",  "name": 0, "kind": "variable" },
@@ -1367,6 +1388,7 @@
     "unaryOps": [
       { "token": "BangOp",       "target": "Not"       },
       { "token": "TildeOp",      "target": "BitNot"    },
+      { "token": "PlusOp",       "target": "Pos"       },
       { "token": "MinusOp",      "target": "Neg"       },
       { "token": "BitAndOp",     "target": "AddressOf" },
       { "token": "StarOp",       "target": "Deref"     },

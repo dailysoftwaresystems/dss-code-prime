@@ -1,0 +1,13 @@
+{
+  "$comment": "c16 shipped <dlfcn.h> + <sys/ioctl.h> on linux — dlopen/dlsym run on a real libc.so.6 (glibc 2.34+ merged libdl) + ioctl links; RTLD_NOW=2 (agrees) + RTLD_GLOBAL=256 (the ELF per-format constant variant). exit 42 iff the dl* + ioctl symbols resolve+run AND the elf RTLD_GLOBAL value was selected. RED-ON-DISABLE: a broken variant selector hands elf the macho value 8 != 256 → exit 1. Runs on the linux-gcc + native-arm64 legs. Release arm runs the optimizer over the loader calls.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

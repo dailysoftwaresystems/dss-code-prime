@@ -64,6 +64,9 @@ struct Lowerer {
     HirMutabilityMap const*  mutabilityMap; // optional — native-global const-ness
                                            // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL).
                                            // nullptr / no entry ⇒ mutable.
+    HirVolatileMap const*    volatileMap; // optional — per-ACCESS volatility (c21,
+                                           // D-CSUBSET-VOLATILE-QUALIFIER). nullptr /
+                                           // no entry ⇒ plain (non-volatile) access.
     MirBuilder               mir;
     // Extern symbols extracted during the pre-pass. Each extern's
     // SymbolId is also inserted into `functionSymbols` so a `Ref`
@@ -282,6 +285,24 @@ struct Lowerer {
         reporter.report(std::move(d));
     }
 
+    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): the access-volatility funnel. Returns
+    // `MirInstFlags::Volatile` iff `accessNode` carries a VolatileAttr (set by
+    // CST→HIR from the accessed object's / field's `SymbolRecord.isVolatile`),
+    // else `None`. EVERY user-access Load/Store emit site passes its access node
+    // through here, so the flag's coverage is by-construction at one chokepoint —
+    // a missed site would be a silent miscompile (the optimizer elides/caches the
+    // access). For a load the access node is the Ref / MemberAccess being read;
+    // for a store it is the lvalue target (a Ref / MemberAccess) or the
+    // VarDecl/Global whose object the init store targets. nullptr map / no entry
+    // ⇒ a plain access (the optimizer may freely transform it).
+    [[nodiscard]] MirInstFlags volatileFlagFor(HirNodeId accessNode) const {
+        if (volatileMap == nullptr || !accessNode.valid())
+            return MirInstFlags::None;
+        if (auto const* p = volatileMap->tryGet(accessNode); p != nullptr && p->isVolatile)
+            return MirInstFlags::Volatile;
+        return MirInstFlags::None;
+    }
+
     // Map a HIR core operator + operand TypeKind to a MIR opcode. Integer
     // signed/unsigned is type-driven (HirOpKind has only `Div`/`Rem`/`Shr`,
     // not separate signed/unsigned forms — same convention as type_lattice).
@@ -397,6 +418,13 @@ struct Lowerer {
         if (from == TypeKind::Ptr && isInt(to))   return MirOpcode::PtrToInt;
         if (isInt(from)   && to == TypeKind::Ptr) return MirOpcode::IntToPtr;
         if (from == TypeKind::Ptr && to == TypeKind::Ptr) return MirOpcode::Bitcast;
+        // c12 (C 6.3.2.1p4) function-to-pointer decay: a function DESIGNATOR
+        // (FnSig) reaching a Ptr<FnSig> context. CST→HIR's `coerce` emits this
+        // synthetic Cast for a brace-init element (`struct Ops a = { dbl };`); the
+        // operand is a function Ref, which already lowers to a `GlobalAddr` (the
+        // function's code address), so the conversion is representation-free — a
+        // Bitcast that just re-types the pointer-width value as `Ptr<FnSig>`.
+        if (from == TypeKind::FnSig && to == TypeKind::Ptr) return MirOpcode::Bitcast;
         return MirOpcode::Invalid;
     }
 
@@ -531,7 +559,10 @@ struct Lowerer {
                 if (auto it = addressableLocal.find(sym);
                     it != addressableLocal.end()) {
                     std::array<MirInstId, 1> ops{it->second};
-                    return mir.addInst(MirOpcode::Load, ops, t);
+                    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a Ref to a `volatile`
+                    // address-taken local — its rvalue Load carries the flag.
+                    return mir.addInst(MirOpcode::Load, ops, t, /*payload=*/0,
+                                       volatileFlagFor(node));
                 }
                 if (auto it = symbolToValue.find(sym); it != symbolToValue.end()) {
                     return it->second;
@@ -543,7 +574,10 @@ struct Lowerer {
                     TypeId const ptrTy = interner.pointer(t);
                     MirInstId const addr = mir.addGlobalAddr(SymbolId{sym}, ptrTy);
                     std::array<MirInstId, 1> ops{addr};
-                    return mir.addInst(MirOpcode::Load, ops, t);
+                    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a Ref to a `volatile`
+                    // global — its rvalue Load carries the flag.
+                    return mir.addInst(MirOpcode::Load, ops, t, /*payload=*/0,
+                                       volatileFlagFor(node));
                 }
                 if (functionSymbols.contains(sym)) {
                     return mir.addGlobalAddr(SymbolId{sym}, t);
@@ -826,14 +860,20 @@ struct Lowerer {
                 // FC8 D-CSUBSET-BITFIELD: a bit-field read loads the whole
                 // allocation unit (the Gep already targets the unit), then
                 // extracts the field's bits (shift + mask / sign-extend).
+                // c21 (D-CSUBSET-VOLATILE-QUALIFIER): an rvalue read of a
+                // `volatile` struct/union MEMBER (the MemberAccess node carries
+                // the flag; a plain Index / non-volatile member ⇒ None). The unit
+                // Load of a volatile bit-field member is equally volatile.
+                MirInstFlags const vf = volatileFlagFor(node);
                 if (BitFieldPlacement const* bf = bitfieldPlacementOf(node)) {
                     std::array<MirInstId, 1> lo{ptr};
-                    MirInstId const unit = mir.addInst(MirOpcode::Load, lo, t);
+                    MirInstId const unit = mir.addInst(MirOpcode::Load, lo, t,
+                                                       /*payload=*/0, vf);
                     if (!unit.valid()) return InvalidMirInst;
                     return emitBitfieldExtract(unit, *bf, t);
                 }
                 std::array<MirInstId, 1> ops{ptr};
-                return mir.addInst(MirOpcode::Load, ops, t);
+                return mir.addInst(MirOpcode::Load, ops, t, /*payload=*/0, vf);
             }
             case HirKind::Cast: {
                 // children: [operand]. The HIR node's typeId is the target
@@ -2046,13 +2086,19 @@ struct Lowerer {
     // neighbour field packed into the same unit). Computed at the field/unit type.
     [[nodiscard]] bool
     emitBitfieldInsert(MirInstId unitPtr, MirInstId rhsVal,
-                       BitFieldPlacement const& p, TypeId fieldTy) {
+                       BitFieldPlacement const& p, TypeId fieldTy,
+                       MirInstFlags vf = MirInstFlags::None) {
+        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): when the bit-field member is
+        // `volatile`, BOTH halves of the read-modify-write (the unit Load below
+        // and the unit Store at the end) carry the flag — the whole RMW is one
+        // volatile access of the unit, never elided/reordered.
         fieldTy = enumReprType(fieldTy);   // enum bit-field → underlying integer
         std::uint64_t const mask =
             p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
         std::uint64_t const fieldMask = mask << p.bitOffset;
         std::array<MirInstId, 1> lo{unitPtr};
-        MirInstId const unit = mir.addInst(MirOpcode::Load, lo, fieldTy);
+        MirInstId const unit = mir.addInst(MirOpcode::Load, lo, fieldTy,
+                                           /*payload=*/0, vf);
         if (!unit.valid()) return false;
         MirInstId const clrK = constIntOfType(static_cast<std::int64_t>(~fieldMask), fieldTy);
         std::array<MirInstId, 2> ca{unit, clrK};
@@ -2068,7 +2114,7 @@ struct Lowerer {
         std::array<MirInstId, 2> oa{cleared, masked};
         MirInstId const merged = mir.addInst(MirOpcode::Or, oa, fieldTy);
         std::array<MirInstId, 2> st{merged, unitPtr};
-        mir.addInst(MirOpcode::Store, st);
+        mir.addInst(MirOpcode::Store, st, InvalidType, /*payload=*/0, vf);
         return true;
     }
 
@@ -2861,7 +2907,13 @@ struct Lowerer {
     // offset Const feeds both the src and dst GEP (immutable SSA). Returns
     // false on any failure (diagnostic already emitted upstream).
     [[nodiscard]] bool lowerByteWiseCopy(MirInstId srcPtr, MirInstId dstPtr,
-                                         std::uint64_t size) {
+                                         std::uint64_t size,
+                                         MirInstFlags vf = MirInstFlags::None) {
+        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): `vf` is Volatile only for a
+        // WHOLE-VOLATILE-AGGREGATE user copy (`volatile struct S a = b; a = b;` —
+        // every member access of a volatile aggregate is volatile, C 6.7.3), passed
+        // by the AssignStmt/VarDecl-init callers. Every STRUCTURAL caller (brace-
+        // init field copy, by-value arg/return, sret) keeps the default None.
         auto emit = [&](TypeKind chunkKind, std::uint64_t off) -> bool {
             TypeId const chunkTy = interner.primitive(chunkKind);
             TypeId const ptrTy   = interner.pointer(chunkTy);
@@ -2871,13 +2923,14 @@ struct Lowerer {
             MirInstId const sp = mir.addInst(MirOpcode::Gep, sg, ptrTy);
             if (!sp.valid()) return false;
             std::array<MirInstId, 1> ld{sp};
-            MirInstId const v = mir.addInst(MirOpcode::Load, ld, chunkTy);
+            MirInstId const v = mir.addInst(MirOpcode::Load, ld, chunkTy,
+                                            /*payload=*/0, vf);
             if (!v.valid()) return false;
             std::array<MirInstId, 2> dg{dstPtr, offK};
             MirInstId const dp = mir.addInst(MirOpcode::Gep, dg, ptrTy);
             if (!dp.valid()) return false;
             std::array<MirInstId, 2> st{v, dp};
-            mir.addInst(MirOpcode::Store, st);
+            mir.addInst(MirOpcode::Store, st, InvalidType, /*payload=*/0, vf);
             return true;
         };
         std::uint64_t off = 0;
@@ -2905,7 +2958,11 @@ struct Lowerer {
     //     (incl. padding — C 6.2.6.1, harmless), covering every nested byte.
     // Returns false on any failure (diagnostic already emitted).
     [[nodiscard]] bool lowerAggregateCopy(HirNodeId atNode, MirInstId srcPtr,
-                                          MirInstId dstPtr, TypeId aggTy) {
+                                          MirInstId dstPtr, TypeId aggTy,
+                                          MirInstFlags vf = MirInstFlags::None) {
+        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): `vf` is Volatile only when the user
+        // copy target/source is a WHOLE-VOLATILE aggregate (passed by the
+        // AssignStmt/VarDecl-init sites); structural callers default None.
         StructLayout const* layout = cachedLayout(aggTy);
         if (layout == nullptr) {
             unsupported(atNode, "aggregate copy requires a sizeable layout "
@@ -2914,19 +2971,21 @@ struct Lowerer {
         }
         TypeKind const aggKind = interner.kind(aggTy);
         if (aggKind == TypeKind::Union)
-            return lowerByteWiseCopy(srcPtr, dstPtr, layout->size);
+            return lowerByteWiseCopy(srcPtr, dstPtr, layout->size, vf);
         if (aggKind != TypeKind::Struct) {
             unsupported(atNode, "aggregate copy of a non-struct/union value "
                                 "is not supported");
             return false;
         }
-        // COPY the field types out of the interner's pool: `operands` returns a
-        // SPAN into operandPool_, and `interner.pointer(...)` in the field-copy
-        // loop below interns fresh `Ptr<…>` types — an intern can REALLOCATE the
-        // pool, dangling a retained span (a host-STL-growth-dependent
-        // heap-use-after-free; non-Windows release legs misread the freed bytes
-        // as an invalid Load result-type → MirBuilder fatal). The owning vector
-        // is immune. Twin of the FC7-C1c fix at the function-param setup below.
+        // COPY the field types out: `operands(composite)` returns a SPAN into the
+        // interner's composite field side-table (c24 nominal typing; previously
+        // operandPool_), and `interner.pointer(...)` in the field-copy loop below
+        // interns fresh `Ptr<…>` types — a mint bumps the interner generation and
+        // can move backing storage, dangling a retained span (a host-STL-growth-
+        // dependent heap-use-after-free; non-Windows release legs misread the
+        // freed bytes as an invalid Load result-type → MirBuilder fatal). The
+        // owning vector is immune. Twin of the FC7-C1c fix at the function-param
+        // setup below.
         std::vector<TypeId> const fieldTypes = [&] {
             auto const s = interner.operands(aggTy);
             return std::vector<TypeId>(s.begin(), s.end());
@@ -2946,7 +3005,7 @@ struct Lowerer {
             }
         }
         if (anyAggregateField)
-            return lowerByteWiseCopy(srcPtr, dstPtr, layout->size);
+            return lowerByteWiseCopy(srcPtr, dstPtr, layout->size, vf);
 
         // Flat scalar struct — field-wise, width-exact.
         for (std::size_t i = 0; i < fieldTypes.size(); ++i) {
@@ -2960,14 +3019,15 @@ struct Lowerer {
             if (!srcField.valid()) return false;
             std::array<MirInstId, 1> loadOps{srcField};
             MirInstId const v =
-                mir.addInst(MirOpcode::Load, loadOps, fieldTypes[i]);
+                mir.addInst(MirOpcode::Load, loadOps, fieldTypes[i],
+                            /*payload=*/0, vf);
             if (!v.valid()) return false;
             std::array<MirInstId, 2> dstGep{dstPtr, offK};
             MirInstId const dstField =
                 mir.addInst(MirOpcode::Gep, dstGep, fptrTy);
             if (!dstField.valid()) return false;
             std::array<MirInstId, 2> stOps{v, dstField};
-            mir.addInst(MirOpcode::Store, stOps);
+            mir.addInst(MirOpcode::Store, stOps, InvalidType, /*payload=*/0, vf);
         }
         return true;
     }
@@ -5696,13 +5756,25 @@ struct Lowerer {
                         // register.
                         MirInstId const srcPtr = lowerLvalueAddress(*initN);
                         if (!srcPtr.valid()) return false;
-                        if (!lowerAggregateCopy(*initN, srcPtr, alloca, ty))
+                        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a WHOLE-VOLATILE
+                        // aggregate copy flags every structural Load/Store. Either
+                        // side being volatile (the dest local `node` OR the source
+                        // `*initN`) makes the copy volatile — OR them so neither
+                        // side's volatility is dropped (safe-conservative: an
+                        // extra flag only forgoes an optimization).
+                        MirInstFlags const aggVf =
+                            volatileFlagFor(node) | volatileFlagFor(*initN);
+                        if (!lowerAggregateCopy(*initN, srcPtr, alloca, ty, aggVf))
                             return false;
                     } else {
                         MirInstId const initVal = lowerExpr(*initN);
                         if (!initVal.valid()) return false;
                         std::array<MirInstId, 2> ops{initVal, alloca};
-                        mir.addInst(MirOpcode::Store, ops);
+                        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): the init store into a
+                        // `volatile` local's slot carries the flag (the VarDecl node
+                        // was annotated from the object's `isVolatile`).
+                        mir.addInst(MirOpcode::Store, ops, InvalidType, /*payload=*/0,
+                                    volatileFlagFor(node));
                     }
                 }
                 return true;
@@ -5729,21 +5801,34 @@ struct Lowerer {
                     if (!dstPtr.valid()) return false;
                     MirInstId const srcPtr = lowerLvalueAddress(valueN);
                     if (!srcPtr.valid()) return false;
-                    return lowerAggregateCopy(node, srcPtr, dstPtr, valTy);
+                    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a WHOLE-VOLATILE aggregate
+                    // assignment flags every structural Load/Store — either the
+                    // target or the source being volatile makes the copy volatile
+                    // (OR them so neither side's volatility is dropped).
+                    MirInstFlags const aggVf =
+                        volatileFlagFor(targetN) | volatileFlagFor(valueN);
+                    return lowerAggregateCopy(node, srcPtr, dstPtr, valTy, aggVf);
                 }
                 MirInstId const rhs = lowerExpr(valueN);
                 if (!rhs.valid()) return false;
                 MirInstId const ptr = lowerLvalueAddress(targetN);
                 if (!ptr.valid()) return false;
+                // c21 (D-CSUBSET-VOLATILE-QUALIFIER): the store's volatility is the
+                // TARGET lvalue's — `targetN` is a Ref (volatile object/global) or
+                // a MemberAccess (volatile member), both annotated at CST→HIR. A
+                // Deref target (`*p = x`) carries no flag here BY CONSTRUCTION:
+                // pointer-to-volatile-pointee is rejected upstream, and a volatile
+                // pointer OBJECT's volatility is the load of `p` (the Ref site).
+                MirInstFlags const vf = volatileFlagFor(targetN);
                 // FC8 D-CSUBSET-BITFIELD: a bit-field write is a READ-MODIFY-WRITE
                 // of the allocation unit (the Gep targets the unit) — clear the
                 // field's bits, OR in the new value, store back. A plain Store
                 // would overwrite the neighbour bits packed in the same unit.
                 if (BitFieldPlacement const* bf = bitfieldPlacementOf(targetN)) {
-                    return emitBitfieldInsert(ptr, rhs, *bf, hir.typeId(targetN));
+                    return emitBitfieldInsert(ptr, rhs, *bf, hir.typeId(targetN), vf);
                 }
                 std::array<MirInstId, 2> ops{rhs, ptr};
-                mir.addInst(MirOpcode::Store, ops);
+                mir.addInst(MirOpcode::Store, ops, InvalidType, /*payload=*/0, vf);
                 return true;
             }
             case HirKind::IfStmt: {
@@ -6405,7 +6490,13 @@ struct Lowerer {
                     return false;
                 }
                 std::array<MirInstId, 2> ops{arg, slot};
-                mir.addInst(MirOpcode::Store, ops);
+                // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a `volatile` address-taken
+                // scalar PARAM is a volatile object — its incoming-arg→slot init
+                // store carries the flag (the param VarDecl node `p` was annotated
+                // at CST→HIR's `lowerVarLikeInto`, same path as a body local), so
+                // the read side (flagged at the Ref) and the init store agree.
+                mir.addInst(MirOpcode::Store, ops, InvalidType, /*payload=*/0,
+                            volatileFlagFor(p));
             } else {
                 symbolToValue[sym.v] = arg;
             }
@@ -6631,6 +6722,10 @@ struct Lowerer {
         // ⇒ mutable ⇒ writable `.data`/`.bss`). Stamped onto MirGlobal.isConst so
         // the assembler routes an initialized const global to read-only `.rodata`.
         bool                           isConst = false;
+        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): declared volatility (default false).
+        // When set AND the global has a runtime initializer, its load-time init
+        // Store carries MirInstFlags::Volatile.
+        bool                           isVolatile = false;
         // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): init = the LINK-TIME-CONSTANT
         // address of `symbolAddrInit` (+ addend) — a string-literal rodata global,
         // another global, or a function. Routes to a MirSymbolAddrValue literal
@@ -6755,6 +6850,8 @@ struct Lowerer {
                 if (auto const* p = linkageMap->tryGet(decl)) pg.linkage = *p;
             if (mutabilityMap != nullptr)
                 if (auto const* p = mutabilityMap->tryGet(decl)) pg.isConst = p->isConst;
+            if (volatileMap != nullptr)
+                if (auto const* p = volatileMap->tryGet(decl)) pg.isVolatile = p->isVolatile;
             if (auto initN = hir.globalInit(decl); initN.has_value()) {
                 // F5: a symbol-ADDRESS initializer (`int* p = &x;`, `char* g =
                 // "...";`) is a LINK-TIME constant const-eval cannot fold —
@@ -6876,7 +6973,11 @@ struct Lowerer {
                 MirInstId const addr = mir.addGlobalAddr(
                     pg.symbol, interner.pointer(pg.type));
                 std::array<MirInstId, 2> ops{val, addr};
-                mir.addInst(MirOpcode::Store, ops);
+                // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a `volatile` global's
+                // runtime load-time init store carries the flag.
+                mir.addInst(MirOpcode::Store, ops, InvalidType, /*payload=*/0,
+                            pg.isVolatile ? MirInstFlags::Volatile
+                                          : MirInstFlags::None);
             }
             if (!mir.openBlockHasTerminator()) mir.addReturn();
         }
@@ -6969,7 +7070,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           MirLoweringConfig const& config,
                           HirFfiMap const*         ffiMap,
                           HirLinkageMap const*     linkageMap,
-                          HirMutabilityMap const*  mutabilityMap) {
+                          HirMutabilityMap const*  mutabilityMap,
+                          HirVolatileMap const*    volatileMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -6985,6 +7087,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .ffiMap    = ffiMap,
         .linkageMap = linkageMap,
         .mutabilityMap = mutabilityMap,
+        .volatileMap = volatileMap,
         .mir       = MirBuilder{},
     };
     // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: stamp the module-

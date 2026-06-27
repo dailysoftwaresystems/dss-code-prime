@@ -268,10 +268,44 @@ TEST(ImportResolver, CSubsetAngleIncludeResolvesToDescriptorOnSystemDir) {
     ASSERT_EQ(cu.shippedLibDescriptors().size(), 1u)
         << "the angle include must record exactly one descriptor path";
     std::error_code ec;
-    auto const got  = std::filesystem::weakly_canonical(cu.shippedLibDescriptors()[0], ec);
+    auto const got  = std::filesystem::weakly_canonical(cu.shippedLibDescriptors()[0].path, ec);
     auto const want = std::filesystem::weakly_canonical(descPath, ec);
     EXPECT_EQ(got, want)
         << "<api.h> must map to api.json on the system dir";
+}
+
+// FF11 SUBDIRECTORY resolution: `<sys/time.h>` maps to `sys/time.json` (the
+// descriptor name PRESERVES the requested subdir), DISTINCT from a top-level
+// `<time.h>` -> `time.json` on the SAME systemDir. RED-ON-DISABLE: a stem-only
+// mapping (`fs::path(filename).stem()`) sends `<sys/time.h>` to `time.json`,
+// silently resolving the WRONG descriptor — exactly the collision this guards for
+// the POSIX `sys/*` headers (SQLite-readiness Cluster G; <sys/time.h> vs <time.h>).
+TEST(ImportResolver, CSubsetSubdirAngleIncludeResolvesDistinctFromTopLevel) {
+    TempDir srcDir;
+    TempDir sysDir;
+    auto main = srcDir.write("main.c",
+        "#include <sys/time.h>\nint main() { return 0; }\n");
+    // A top-level DECOY with the same stem + the real subdir descriptor.
+    sysDir.write("time.json",
+        R"({ "header": "time.h", "typedefs": [ { "name": "DECOY_TOP", "type": "i32" } ] })");
+    std::error_code mkec;
+    std::filesystem::create_directories(sysDir.path() / "sys", mkec);
+    auto const want = sysDir.write("sys/time.json",
+        R"({ "header": "sys/time.h", "typedefs": [ { "name": "suseconds_t", "type": "i64" } ] })");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addSystemDir(sysDir.path());
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    ASSERT_EQ(cu.trees().size(), 1u);
+    EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors());
+    ASSERT_EQ(cu.shippedLibDescriptors().size(), 1u)
+        << "the angle include must record exactly one descriptor path";
+    std::error_code ec;
+    auto const got = std::filesystem::weakly_canonical(cu.shippedLibDescriptors()[0].path, ec);
+    EXPECT_EQ(got, std::filesystem::weakly_canonical(want, ec))
+        << "<sys/time.h> must resolve to sys/time.json, NOT the top-level decoy time.json";
 }
 
 // A SYSTEM-header miss is a HARD error (F_ShippedHeaderNotFound), NOT the

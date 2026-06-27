@@ -50,11 +50,29 @@ TEST(UnsuppressableCodes, MembershipIncludesCoreArchitecturalCodes) {
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::F_ShippedLibUnsupportedType))
         << "v0.0.2 V2-2: a shipped-lib signature that fails to decode must be "
            "unsuppressable (suppressing it would silently drop the import)";
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::F_ShippedHeaderUnavailableForTarget))
+        << "p18 c8: a header unavailable on the active target's object-format "
+           "must be unsuppressable (suppressing it would resume semantic "
+           "analysis and inject the header's surfaces on the WRONG platform — "
+           "the wrong-platform silent miscompile this gate closes)";
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::F_ShippedStructVariantAmbiguous))
+        << "plan 25: >1 per-target struct `variants` matching the active target "
+           "must be unsuppressable (suppressing it would re-open the silent "
+           "'pick the first' wrong-layout surface — e.g. an under-specified "
+           "when:{arch:\"x86_64\"} matching both x86_64-elf and x86_64-pe → the "
+           "linux struct layout used on windows)";
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::A_ImmediateOperandOutOfRange))
         << "v0.0.2 V2-1: an immediate/offset too wide for its fixed32 slot "
            "must be unsuppressable (suppressing it would silently truncate to "
            "a WRONG machine-code constant — a wrong syscall number / frame "
            "size / stack slot)";
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_IncompleteTypeMember))
+        << "c24 D-CSUBSET-SELF-REFERENTIAL-STRUCT: a DIRECT (non-pointer) member "
+           "of an incomplete composite (a struct-by-value cycle, e.g. "
+           "`struct N { struct N n; }`) must be unsuppressable — suppressing it "
+           "would let the member fold its size to 0 (the incomplete composite has "
+           "no layout), a silent wrong-bytes layout. Named pin (ListSelfConsistent "
+           "would still pass if this member were dropped from the table).";
     EXPECT_FALSE(isUnsuppressable(DiagnosticCode::None))
         << "None must never be a member (guards the array-size-bumped-without-"
            "adding-the-entry bug at runtime too)";

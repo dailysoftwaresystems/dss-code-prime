@@ -1,0 +1,15 @@
+{
+  "$comment": "D-OPT-MEM2REG-DEAD-PHI-PRUNE witness (p18 Cluster G c3) — the nested-loop half: the inner counter `j` is live across the inner back-edge yet DEAD at the outer header, where minimal SSA placed a phi with an undefined incoming → Mem2Reg aborted the release compile. Fully-pruned SSA (gate phi placement on live-in, not just upward-exposure) fixes it; semi-pruning could not. The `release` arm is the witness; baseline always worked (debug runs no Mem2Reg). exit 4 = 2*2 via a mutable global (anti-fold). RED-on-disable: revert the live-in gate in mem2reg.cpp → the release arm Mem2Reg-aborts.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 4,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

@@ -1509,3 +1509,75 @@ TEST(ParserCSubsetSmoke, ExpressionDepthCapStillFiresWhenReimposedAt256) {
         EXPECT_EQ(t.source().slice(d.span), "(");
     }
 }
+
+// ── C 5.1.1.2 phase 6: adjacent string-literal concatenation grammar ────────
+// (D-CSUBSET-ADJACENT-STRING-CONCAT). The `stringLiteralExpr` rule is now
+// `StringStart StringLiteral (StringStart StringLiteral)*` — flat children, no
+// wrapper node. These pin the FLAT child shape the decode chokepoint relies on.
+
+namespace {
+
+// Count visible (non-EmptySpace) TOKEN children of `node`.
+[[nodiscard]] std::size_t visibleTokenChildCount(Tree const& t, NodeId node) {
+    std::size_t n = 0;
+    for (NodeId c : t.children(node)) {
+        if (isEmptySpace(t.flags(c))) continue;
+        if (t.kind(c) == NodeKind::Token) ++n;
+    }
+    return n;
+}
+
+[[nodiscard]] Tree parseCSubset(std::string source) {
+    auto h = loadAndTokenize(std::move(source));
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    return std::move(p).parse().tree;
+}
+
+} // namespace
+
+// Regression: a LONE string literal still produces EXACTLY two token children
+// (StringStart + StringLiteral) — the repeat fires zero times, byte-identical
+// to the pre-c20 single-pair rule. RED if the grammar change perturbed the
+// single-string shape.
+TEST(ParserCSubsetSmoke, SingleStringLiteralHasTwoChildren) {
+    Tree t = parseCSubset("int main() { \"x\"; }");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    NodeId const sle = findFirstNodeWithRule(t, "stringLiteralExpr");
+    ASSERT_TRUE(sle.valid()) << "a lone string must still form a stringLiteralExpr";
+    EXPECT_EQ(visibleTokenChildCount(t, sle), 2u)
+        << "lone string: StringStart + StringLiteral (repeat fires 0×)";
+}
+
+// Two adjacent string literals concatenate into ONE stringLiteralExpr with
+// FOUR token children (StringStart StringLiteral StringStart StringLiteral) —
+// flat, no wrapper. This is the shape `decodeAdjacentStringBodies` walks.
+TEST(ParserCSubsetSmoke, TwoAdjacentStringsHaveFourChildren) {
+    Tree t = parseCSubset("int main() { \"a\" \"b\"; }");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    NodeId const sle = findFirstNodeWithRule(t, "stringLiteralExpr");
+    ASSERT_TRUE(sle.valid());
+    EXPECT_EQ(visibleTokenChildCount(t, sle), 4u)
+        << "\"a\" \"b\" → 4 flat token children (the repeat fires once)";
+    // There must be exactly ONE stringLiteralExpr node — the second pair is
+    // absorbed by the repeat, NOT a separate expression.
+    std::size_t exprCount = 0;
+    RuleId const rid = t.schema().rules().find("stringLiteralExpr");
+    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+        NodeId const id{i};
+        if (t.kind(id) == NodeKind::Internal && t.rule(id).v == rid.v) ++exprCount;
+    }
+    EXPECT_EQ(exprCount, 1u) << "adjacent strings form ONE expression, not two";
+}
+
+// Three adjacent string literals → SIX token children (the repeat fires twice).
+TEST(ParserCSubsetSmoke, ThreeAdjacentStringsHaveSixChildren) {
+    Tree t = parseCSubset("int main() { \"a\" \"b\" \"c\"; }");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    NodeId const sle = findFirstNodeWithRule(t, "stringLiteralExpr");
+    ASSERT_TRUE(sle.valid());
+    EXPECT_EQ(visibleTokenChildCount(t, sle), 6u)
+        << "\"a\" \"b\" \"c\" → 6 flat token children (repeat fires twice)";
+}

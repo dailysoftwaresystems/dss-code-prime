@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 62> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 69> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -86,6 +86,37 @@ constexpr std::array<DiagnosticCode, 62> kUnsuppressableCodes{{
     // MUST NOT reach `makeExternFunction` with InvalidType.
     DiagnosticCode::F_ShippedLibDescriptorMalformed,
     DiagnosticCode::F_ShippedLibUnsupportedType,
+    // F_ShippedHeaderUnavailableForTarget (p18 Cluster G c8, 2026-06-25):
+    // a `#include <h>` whose shipped descriptor declares the header is NOT
+    // available on the active target's object-format (POSIX <sys/time.h> on
+    // windows-pe). Suppressing it would let the semantic phase resume past the
+    // gate and INJECT the header's symbols/structs/typedefs on the wrong
+    // platform — the exact wrong-platform silent miscompile this fail-loud
+    // closes. A direct sibling of the three shipped-header surfaces above.
+    DiagnosticCode::F_ShippedHeaderUnavailableForTarget,
+    // F_ShippedStructVariantAmbiguous (p18 Cluster G, plan 25, 2026-06-26): a
+    // shipped `structs` entry's per-target `variants` had MORE THAN ONE match the
+    // active (arch, format). The selection contract is exactly-one-matches;
+    // suppressing this would re-open the "pick the first" silent wrong-layout
+    // surface (e.g. an under-specified `when:{arch:"x86_64"}` matching both
+    // x86_64-elf and x86_64-pe → the linux struct layout used on windows). A
+    // direct sibling of the four shipped-lib surfaces above — its invariant is the
+    // SAME class (a wrong-bytes import must never ship green).
+    DiagnosticCode::F_ShippedStructVariantAmbiguous,
+    // F_ShippedConstantVariantAmbiguous / F_ShippedTypedefVariantAmbiguous /
+    // F_ShippedMacroVariantAmbiguous (p18 Cluster G, plan 25 extension,
+    // 2026-06-26): the per-target `variants` mechanism extended from `structs` to
+    // the CONSTANTS, TYPEDEFS, and MACROS surfaces — a macOS build can get a
+    // different constant VALUE / typedef WIDTH / macro REPLACEMENT than the linux
+    // build from one descriptor. Each fires when MORE THAN ONE variant matches the
+    // active target. Same selection contract + same silent-miscompile class as the
+    // struct-variant sibling above: an under-specified `when` would silently pick
+    // the first → a wrong constant value / typedef width / macro replacement on
+    // this target. Suppressing any would re-open that "pick the first" wrong-value
+    // surface — so all three are members like F_ShippedStructVariantAmbiguous.
+    DiagnosticCode::F_ShippedConstantVariantAmbiguous,
+    DiagnosticCode::F_ShippedTypedefVariantAmbiguous,
+    DiagnosticCode::F_ShippedMacroVariantAmbiguous,
 
     // H_* HIR-lowering / verifier band — structural invariants (cannot
     // reach MIR codegen without violating downstream contracts). Post-
@@ -218,6 +249,30 @@ constexpr std::array<DiagnosticCode, 62> kUnsuppressableCodes{{
     // truncated to a wrong machine-code constant (e.g. wrong syscall
     // number). Same bytes-on-disk-invariant band as the others above.
     DiagnosticCode::A_ImmediateOperandOutOfRange,
+
+    // S_* semantic band — silent-MISCOMPILE guards.
+    // S_VolatilePointeeNotSupported (c21, D-CSUBSET-VOLATILE-QUALIFIER,
+    // 2026-06-26): a `volatile <base> *` type-name (pointer-to-volatile-POINTEE).
+    // Model B threads `volatile` as a per-symbol/member `isVolatile` (the
+    // access's own Load/Store carries MirInstFlags::Volatile) and CANNOT express
+    // a volatile POINTEE — that volatility rides the DEREFERENCED access, which
+    // needs type-level cv-tracking (model A, deferred → D-CSUBSET-VOLATILE-
+    // POINTEE / c22). The reject fires at the type-name level, at BOTH the
+    // per-declarator typing arm AND the co-located pointer arm, so NO pointer-to-
+    // volatile-pointee TYPE can be built → no Deref can silently drop the flag.
+    // Suppressing it would let `volatile int *p; *p` compile with a NON-volatile
+    // Load that the optimizer is free to elide / cache — exactly the silent
+    // miscompile the whole cycle exists to forbid. A member of the closed table
+    // for the same reason every silent-wrong-bytes guard above is.
+    DiagnosticCode::S_VolatilePointeeNotSupported,
+    // S_IncompleteTypeMember (c24, D-CSUBSET-SELF-REFERENTIAL-STRUCT, 2026-06-27):
+    // a DIRECT (non-pointer) member of an INCOMPLETE composite — e.g.
+    // `struct N { struct N n; }` (a struct containing itself by value, an
+    // infinite-size cycle). Suppressing it would let the member fold its size to
+    // 0 (the incomplete composite has no layout) — a silent wrong-bytes layout.
+    // Same silent-miscompile-guard class as the entries above; a pointer-to-
+    // incomplete (`struct N *`) is legal and is NOT rejected.
+    DiagnosticCode::S_IncompleteTypeMember,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

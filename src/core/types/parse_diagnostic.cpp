@@ -122,6 +122,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::S_IncompatibleRedeclaration: return "S_IncompatibleRedeclaration";
         case DiagnosticCode::S_CaseLabelNotInSwitch:     return "S_CaseLabelNotInSwitch";
         case DiagnosticCode::S_IncDecNeedsModifiableLvalue: return "S_IncDecNeedsModifiableLvalue";
+        case DiagnosticCode::S_VolatilePointeeNotSupported:
+            return "S_VolatilePointeeNotSupported";
+        case DiagnosticCode::S_IncompleteTypeMember:
+            return "S_IncompleteTypeMember";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
@@ -237,6 +241,16 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::F_ShippedHeaderNotFound:        return "F_ShippedHeaderNotFound";
         case DiagnosticCode::F_ShippedLibDescriptorMalformed: return "F_ShippedLibDescriptorMalformed";
         case DiagnosticCode::F_ShippedLibUnsupportedType:    return "F_ShippedLibUnsupportedType";
+        case DiagnosticCode::F_ShippedHeaderUnavailableForTarget:
+            return "F_ShippedHeaderUnavailableForTarget";
+        case DiagnosticCode::F_ShippedStructVariantAmbiguous:
+            return "F_ShippedStructVariantAmbiguous";
+        case DiagnosticCode::F_ShippedConstantVariantAmbiguous:
+            return "F_ShippedConstantVariantAmbiguous";
+        case DiagnosticCode::F_ShippedTypedefVariantAmbiguous:
+            return "F_ShippedTypedefVariantAmbiguous";
+        case DiagnosticCode::F_ShippedMacroVariantAmbiguous:
+            return "F_ShippedMacroVariantAmbiguous";
 
         // Semantic (S_) + assembler (A_) + linker (K_) enumerators added in
         // later cycles but not mirrored here until the per-file -Werror=switch

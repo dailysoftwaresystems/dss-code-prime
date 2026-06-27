@@ -2,12 +2,15 @@
 
 #include "core/export.hpp"
 #include "core/types/data_model.hpp"   // DataModel (signatureByDataModel resolution)
+#include "core/types/object_format_kind.hpp" // ObjectFormatKind (availability predicate)
 #include "core/types/strong_ids.hpp"   // TypeId
 
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -116,6 +119,20 @@ struct DSS_EXPORT ShippedSymbol {
     TypeId               signature;
     ShippedSymbolKind    kind    = ShippedSymbolKind::Function;
     ShippedSymbolLinkage linkage = ShippedSymbolLinkage::External;
+    // Optional per-SYMBOL availability — which object-formats this symbol EXISTS
+    // on, the symbol-granularity sibling of the header-level `availableObjectFormats`
+    // (§ShippedLibDescriptor). EMPTY = every format (back-compat — almost every
+    // symbol). A non-empty set restricts: errno's accessor diverges by NAME per
+    // format (`__errno_location` is glibc-only ["elf"], `__error` is Darwin-only
+    // ["macho"]); the Linux-only fdatasync/fallocate/mremap carry ["elf"]. CRITICAL:
+    // DSS imports EVERY declared shipped extern (referenced or not), so a symbol
+    // absent on the active format must not be DECLARED there or its import is
+    // undefined at load (glibc has no __error; libSystem has no __errno_location).
+    // Gated at semantic injection by `activeFormat` (mirrors the header gate) — a
+    // format-absent symbol is not injected → not imported → a reference fails loud
+    // (undefined name). Keys are the `objectFormatKindFromName` vocabulary; an
+    // unknown name fails loud on read. (D-SHIPPED-SYMBOL-PER-TARGET-AVAILABILITY)
+    std::vector<std::string> availableObjectFormats;
 };
 
 // One decoded named CONSTANT — the neutral form of a header's object-like
@@ -128,6 +145,13 @@ struct DSS_EXPORT ShippedSymbol {
 // `value` is the int64 BIT-PATTERN: for an unsigned `type` it is the uint64
 // value reinterpreted, and the fold re-reads it per `type`'s signedness — so the
 // full unsigned range (e.g. `UINT_MAX`) round-trips losslessly.
+//
+// PER-TARGET VALUE (plan 25 extension): a constant's VALUE/TYPE can diverge per
+// (arch, format) — a per-platform `O_NONBLOCK`. The descriptor declares `variants`
+// (each a `when:{arch?,format?}` + its own {value,type}) INSTEAD of a flat
+// {value,type}; the decoder selects the variant matching the active target and
+// produces THIS same flat shape — no inject-path / fold change. A flat-{value,type}
+// constant (no `variants`) keeps single-value behavior.
 struct DSS_EXPORT ShippedConstant {
     std::string  name;
     std::int64_t value = 0;
@@ -138,9 +162,75 @@ struct DSS_EXPORT ShippedConstant {
 // `size_t`). The semantic phase injects it as a `DeclarationKind::Type` symbol
 // so the name resolves in type position. `type` is any hir-text-decodable type
 // (a scalar, a pointer, a struct ref, a function pointer …).
+//
+// PER-TARGET WIDTH (plan 25 extension): a typedef's TYPE/WIDTH can diverge per
+// (arch, format) — a `wchar_t` that is i32 on elf but i16 on pe. The name is
+// invariant; the descriptor declares `variants` (each `when:{arch?,format?}` + its
+// own `type`) INSTEAD of a flat `type`; the decoder selects the matching variant
+// and produces THIS same flat shape. A flat-`type` typedef keeps single-type behavior.
 struct DSS_EXPORT ShippedTypedef {
     std::string name;
     TypeId      type;
+};
+
+// One decoded preprocessor MACRO — the neutral form of a header's `#define`
+// macro that is NOT a compile-time constant (e.g. `assert(e) -> ((void)0)`).
+// Unlike `constants` (injected SEMANTICALLY + folded at HIR), a macro is a
+// PREPROCESSOR substitution: when `#include <header.h>` is resolved, the
+// preprocessor injects each macro into its macro table (via a synthetic
+// `#define`) so it expands in the rest of the source BEFORE parse. `params`
+// distinguishes the two forms — ABSENT (nullopt) = object-like (`#define X 1`);
+// PRESENT (even empty `[]`) = function-like (`#define F() …` / `assert(e) …`).
+// `replacement` is the replacement token text (may be empty — a null macro).
+// `variadic` marks a trailing `...` catch-all (function-like only).
+//
+// PER-FORMAT REPLACEMENT (plan 25 extension): a macro's replacement can diverge
+// per OBJECT-FORMAT — errno's `(*__errno_location())` on elf vs `(*__error())` on
+// macho. The descriptor declares `variants` (each `when:{format}` + its own
+// {replacement, params?, variadic?}) INSTEAD of a flat body; the decoder selects
+// the variant matching the active format and produces THIS same flat shape.
+// FORMAT-ONLY — arch is not threaded into the preprocessor (a macro variant's
+// `when` carries `format` alone). A flat-body macro keeps single-replacement behavior.
+struct DSS_EXPORT ShippedMacro {
+    std::string                             name;
+    std::optional<std::vector<std::string>> params;   // nullopt = object-like
+    std::string                             replacement;
+    bool                                    variadic = false;
+};
+
+// One field of a shipped STRUCT — a (name, type) pair. `type` is any
+// hir-text-decodable type, spelled as its RESOLVED form (e.g. `i64` for an
+// `off_t` field — parseTypeFromText resolves hir-text builtins, NOT descriptor
+// typedef names like `off_t`).
+struct DSS_EXPORT ShippedField {
+    std::string name;
+    TypeId      type;
+};
+
+// One decoded STRUCT — the neutral form of a header's `struct tag { … };` with
+// NAMED fields (e.g. `struct timeval { i64 tv_sec; i64 tv_usec; }`). The semantic
+// phase interns the struct type and injects the tag into the TAG namespace plus a
+// field scope, so c-subset `struct tag v; v.field` resolves AND lays out at the
+// ABI offsets the layout engine DERIVES from the field sizes (the descriptor
+// declares names + types only — never explicit offsets). `typeId` is the interned
+// struct type (its identity is the name + positional field types).
+//
+// PER-TARGET LAYOUT (plan 25, D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH): a struct's
+// byte layout can diverge per (arch, format) — x86-64-linux `struct stat` = 144B,
+// arm64-linux = 128B with a different field order, macOS differs again. The CRUX
+// (plan-lock-VERIFIED): x86_64 and arm64 `.target.json` have BYTE-IDENTICAL
+// `AggregateLayoutParams` and `computeLayout` is purely param-driven (no arch
+// branch), so the per-target offset difference comes ENTIRELY from the FIELD LIST.
+// Per-target layout is therefore per-target field-LIST SELECTION in the decoder:
+// a descriptor declares `variants` (each a `when:{arch?,format?}` + its own field
+// list) INSTEAD of a flat `fields`; the decoder selects the variant matching the
+// active target and produces THIS same single-`fields`/`typeId` shape — so the
+// injection + layout engine are UNCHANGED. A descriptor with flat `fields` (no
+// `variants`) keeps single-layout behavior (every existing descriptor untouched).
+struct DSS_EXPORT ShippedStruct {
+    std::string               name;     // the struct tag, e.g. "timeval"
+    std::vector<ShippedField> fields;   // the SELECTED variant's (or flat) fields, decl order
+    TypeId                    typeId;   // interned struct type (set on decode)
 };
 
 // A decoded shipped-library descriptor. `header` is the authoritative
@@ -156,6 +246,16 @@ struct DSS_EXPORT ShippedLibDescriptor {
     // ("pe"/"elf"/"macho"). The compile pipeline selects the active target's
     // entry; a missing key inherits `externLibraryByFormat[format]`.
     std::unordered_map<std::string, std::string> library;
+    // Optional per-target AVAILABILITY (which object-formats this header EXISTS
+    // on), the sibling per-format axis to `library` (which IMAGE per format).
+    // EMPTY = available on EVERY format (back-compat — C-standard headers omit
+    // it). A non-empty set restricts: a POSIX header carries {"elf","macho"} (not
+    // "pe"), so `#include <sys/time.h>` fails loud for a windows-pe target and
+    // `__has_include` answers the per-target truth. Keys are the same
+    // `objectFormatKindFromName` vocabulary `library` uses (an unknown name fails
+    // loud on read). AGNOSTIC: a config-declared set the resolver tests membership
+    // against — never an `if (format == ...)`. (D-SHIPPED-HEADER-PER-TARGET-AVAILABILITY)
+    std::vector<std::string>   availableObjectFormats;
     // The full neutral surface a header provides. A descriptor must declare AT
     // LEAST ONE of these non-empty (a descriptor that declares NOTHING is a
     // no-op artifact and fails loud); a header may legitimately carry only
@@ -163,6 +263,8 @@ struct DSS_EXPORT ShippedLibDescriptor {
     std::vector<ShippedSymbol>   symbols;     // extern functions/objects (linked)
     std::vector<ShippedConstant> constants;   // named integer constants (folded)
     std::vector<ShippedTypedef>  typedefs;    // type aliases (resolved in type pos)
+    std::vector<ShippedMacro>    macros;      // preprocessor macros (injected at #include)
+    std::vector<ShippedStruct>   structs;     // named-field structs (tag + field scope)
 };
 
 // Read + decode the neutral descriptor at `path`, interning each symbol's
@@ -191,12 +293,82 @@ struct DSS_EXPORT ShippedLibDescriptor {
 // until that model's first compile). Unknown model keys fail loud.
 // Defaulted for direct-API/unit callers (LP64 = the base-signature
 // identity); the semantic analyzer always passes its threaded model.
+// Plan-25 `activeTarget` / `activeFormat`: the ACTIVE compile target's
+// (arch name, object-format) — the per-target STRUCT-VARIANT selector. A
+// `structs` entry that declares `variants` is decoded by selecting the
+// variant whose `when:{arch?,format?}` MATCHES (arch == `*activeTarget`,
+// format == `objectFormatKindName(*activeFormat)`); EVERY specified key
+// must equal the active value (generic string equality — no arch/format
+// literal in the engine). >1 variant matches ⇒ fail loud
+// (F_ShippedStructVariantAmbiguous). 0 match (variants present) ⇒ the
+// struct is NOT injected (a later reference fails loud as an undefined
+// type). EAGER: every variant's field list is decoded regardless of which
+// is active (a malformed INACTIVE variant fails the whole read on EVERY
+// target — anti-lurking, mirrors `signatureByDataModel`). Both default to
+// nullopt for direct-API/LSP/unit callers ⇒ no variant selection (a
+// flat-`fields` struct decodes exactly as before; a struct that carries
+// ONLY `variants` is not injected when no selector is available).
 [[nodiscard]] DSS_EXPORT std::optional<ShippedLibDescriptor>
-readShippedLibDescriptor(std::filesystem::path const& path,
-                         TypeInterner&                interner,
-                         TypeRegistry&                typeReg,
-                         DiagnosticReporter&          reporter,
-                         DataModel                    dataModel = DataModel::Lp64);
+readShippedLibDescriptor(std::filesystem::path const&    path,
+                         TypeInterner&                   interner,
+                         TypeRegistry&                   typeReg,
+                         DiagnosticReporter&             reporter,
+                         DataModel                       dataModel    = DataModel::Lp64,
+                         std::optional<std::string_view> activeTarget = std::nullopt,
+                         std::optional<ObjectFormatKind> activeFormat = std::nullopt);
+
+// Read ONLY the `macros` surface from the neutral descriptor at `path`, WITHOUT a
+// TypeInterner. Macros are pure preprocessor token text (no types), so the
+// preprocessor — which has no interner — can resolve a `#include <h>` to its
+// descriptor's macros at PREPROCESS time (before parse), injecting each as a
+// synthetic `#define`. Validates the same provenance gate as
+// `readShippedLibDescriptor` (top-level object + non-empty `header`) plus each
+// macro entry. Returns an EMPTY vector when the descriptor declares no `macros`
+// (a typed-surface-only descriptor — the common case); returns std::nullopt and
+// emits `F_ShippedLibDescriptorMalformed` on ANY malformed input. The typed
+// surfaces (symbols/constants/typedefs) are NOT read here — the semantic phase
+// reads those via `readShippedLibDescriptor`.
+//
+// `activeFormat` (plan-25 extension): a macro entry may carry per-FORMAT
+// `variants` (each `when:{format}` + its own replacement — the errno
+// `__errno_location`/elf vs `__error`/macho case). The active object-format
+// selects the matching variant; macros are FORMAT-ONLY (arch is not threaded
+// into the preprocessor), so this is the only selector. nullopt (a test caller
+// / no target) ⇒ a variants-only macro is not injected; a flat macro is
+// unaffected. The single production caller (SynthBuilder::build) passes its
+// active format.
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<ShippedMacro>>
+readShippedLibMacros(std::filesystem::path const&    path,
+                     DiagnosticReporter&             reporter,
+                     std::optional<ObjectFormatKind> activeFormat = std::nullopt);
+
+// Read ONLY the `availableObjectFormats` set from the descriptor at `path`,
+// WITHOUT a TypeInterner — the FRONT-END per-target availability gate (the
+// preprocessor `__has_include` + the import resolver's `#include`). Returns the
+// set of object-format names the header exists on (EMPTY ⇒ available on every
+// format = back-compat); std::nullopt on a broken JSON / malformed availability.
+// The caller tests membership of the active target's `objectFormatKindName`.
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<std::string>>
+readShippedLibAvailability(std::filesystem::path const& path,
+                           DiagnosticReporter&          reporter);
+
+// True iff a header carrying availability set `availableObjectFormats` is
+// available on object-format `fmt`. EMPTY set ⇒ available on EVERY format
+// (back-compat). The SINGLE membership predicate shared by the semantic
+// `#include` availability gate (semantic_analyzer) AND the preprocessor
+// consumers (`__has_include` + the macro-splice) below, so all three can never
+// disagree — the FC15c funnel principle applied to per-target availability.
+[[nodiscard]] DSS_EXPORT bool objectFormatInAvailabilitySet(
+    std::span<std::string const> availableObjectFormats, ObjectFormatKind fmt);
+
+// True iff the shipped header whose descriptor is at `descriptorPath` is
+// available on `fmt`. Reads `availableObjectFormats` interner-free
+// (`readShippedLibAvailability`) then applies `objectFormatInAvailabilitySet`.
+// A MALFORMED descriptor ⇒ available (the header EXISTS; its malformedness is
+// surfaced by the macros / typed reads on the same descriptor, NOT
+// double-reported here). The preprocessor `__has_include` + macro-splice gate.
+[[nodiscard]] DSS_EXPORT bool shippedHeaderAvailableForFormat(
+    std::filesystem::path const& descriptorPath, ObjectFormatKind fmt);
 
 } // namespace ffi
 } // namespace dss
