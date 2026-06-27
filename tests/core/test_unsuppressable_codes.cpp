@@ -66,6 +66,13 @@ TEST(UnsuppressableCodes, MembershipIncludesCoreArchitecturalCodes) {
            "must be unsuppressable (suppressing it would silently truncate to "
            "a WRONG machine-code constant — a wrong syscall number / frame "
            "size / stack slot)";
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_IncompleteTypeMember))
+        << "c24 D-CSUBSET-SELF-REFERENTIAL-STRUCT: a DIRECT (non-pointer) member "
+           "of an incomplete composite (a struct-by-value cycle, e.g. "
+           "`struct N { struct N n; }`) must be unsuppressable — suppressing it "
+           "would let the member fold its size to 0 (the incomplete composite has "
+           "no layout), a silent wrong-bytes layout. Named pin (ListSelfConsistent "
+           "would still pass if this member were dropped from the table).";
     EXPECT_FALSE(isUnsuppressable(DiagnosticCode::None))
         << "None must never be a member (guards the array-size-bumped-without-"
            "adding-the-entry bug at runtime too)";

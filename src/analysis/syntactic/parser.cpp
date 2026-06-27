@@ -718,6 +718,42 @@ struct Parser::Impl {
         return out;
     }
 
+    // ── D-CSUBSET-SELF-REFERENTIAL-STRUCT: mid-frame composite-tag record ──
+    //
+    // P0009 fix. A composite SPECIFIER body (`struct N { … }`) binds its tag only
+    // at frame CLOSE today (closeFrameOnce → extractBinderNames_). But a SELF-
+    // REFERENTIAL member inside the body (`struct sqlite3 { … sqlite3 *m; … }`)
+    // hits the decl-vs-expr triage MID-body, where `sketch.lookup("sqlite3")` is
+    // still Unknown → `sqlite3 *m` mis-triages as a value (a multiply) → P0009.
+    // FIX: the instant the body's TAG identifier is consumed (BEFORE the member
+    // list), record it as a TYPE so the mid-body lookup sees it. The tag is the
+    // ONLY identifier token that is a DIRECT child of a composite-body frame (the
+    // member-field identifiers are nested in `structField` subframes), so a single
+    // "consumed an identifier directly under a composite-body rule" test fires
+    // exactly once, on the tag. `record(name, /*isType=*/true)` floats it to the
+    // innermost non-dominator scope (the body scope itself — non-dominator since it
+    // is an isType binder), giving body visibility; the close-time record then also
+    // binds it in the enclosing scope (the body-scope binding dies with the body —
+    // a benign duplicate). Anonymous `struct { … }` has no tag identifier ⇒ no-op.
+    // Config-driven: a composite-body rule is a binder row that is BOTH isType AND
+    // a scope rule (structSpecifierBody/unionSpecifierBody/enumSpecifierBody);
+    // nothing here hardcodes a keyword.
+    void recordCompositeTagIfApplicable_(SchemaTokenId consumedKind) {
+        if (!sketch.enabled()) return;
+        if (consumedKind.v != identifierKind.v) return;
+        const RuleId rule = builder->currentRule();
+        auto const* decl = sketch.binderFor(rule);
+        if (decl == nullptr || !decl->isType || !sketch.isScopeRule(rule)) return;
+        // The tag is at the row's positional nameChild (e.g. index 1, after the
+        // struct/union/enum keyword). Extract via the SAME positional logic
+        // extractBinderNames_ uses; at this point the only staged visible children
+        // are [keyword, tag], so nameChild resolves to the just-consumed tag.
+        auto names = extractBinderNames_(*decl);
+        for (auto& [name, isType] : names) {
+            sketch.record(std::move(name), isType);
+        }
+    }
+
     // ── FC2 type-name commit triage ─────────────────────────────────────
 
     // Collect non-trivia LEAF nodes under `node` (pre-order), stopping
@@ -1626,6 +1662,10 @@ struct Parser::Impl {
                 builder->pushToken(tok);
                 walker.advance(advanceKind, tok.span,
                                std::optional<RuleId>{builder->currentRule()});
+                // D-CSUBSET-SELF-REFERENTIAL-STRUCT (P0009): if this token was the
+                // TAG of a composite specifier body, bind it as a TYPE NOW so a
+                // self-referential member later in the body triages as a decl.
+                recordCompositeTagIfApplicable_(advanceKind);
                 return StepOutcome::Continue;
             }
 

@@ -2030,6 +2030,32 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         rec.structScope = here;
                     }
 
+                    // D-CSUBSET-SELF-REFERENTIAL-STRUCT: FORWARD-MINT the nominal
+                    // composite TypeId NOW (Pass 1, before the body is walked) so a
+                    // SELF-REFERENTIAL field inside the body (`struct N *next;`) can
+                    // resolve its tag to a VALID `rec.type` at Pass 1.5 field-type
+                    // resolution (the tag-reference arm requires `rec.type.valid()`).
+                    // Identity = (kind, name, decl-site): the decl-site key packs the
+                    // tree id + this declaration's rule node so two distinct
+                    // definitions (incl. block-scoped same-name structs) never share
+                    // a TypeId. Pass 1.5 ATTACHES the fields via `completeComposite`
+                    // on this same TypeId. Struct/Union only — Enum keeps its
+                    // value-typed `enumType` path (no self-reference). The forward
+                    // type stays INCOMPLETE until Pass 1.5 completes it; a direct
+                    // non-pointer member of it then fails loud (incomplete guard).
+                    if (rec.structScope.valid()
+                        && decl.fieldChildren->compositeKind != CompositeKind::Enum) {
+                        TypeKind const compKind =
+                            decl.fieldChildren->compositeKind == CompositeKind::Union
+                                ? TypeKind::Union
+                                : TypeKind::Struct;
+                        std::uint64_t const declSiteKey =
+                            (static_cast<std::uint64_t>(tree.id().v) << 32)
+                            | static_cast<std::uint64_t>(node.v);
+                        rec.type = s.lattice.interner().forwardComposite(
+                            compKind, resolved.name, declSiteKey);
+                    }
+
                     // SE4: const-marking. Scan the type subtree (or the
                     // whole decl subtree when no typeChild) for the
                     // language's const-marker token.
@@ -2660,6 +2686,14 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                 // both). Enums carry no field types. This is the
                                 // positioned SEMANTIC surface; the layout engine's
                                 // non-last-FAM nullopt is the backstop.
+                                // D-CSUBSET-SELF-REFERENTIAL-STRUCT: set when a DIRECT
+                                // member is an incomplete composite (self-by-value /
+                                // forward-only-by-value). The composite is then NOT
+                                // completed (left incomplete), which keeps
+                                // `computeLayout` returning nullopt — avoiding the
+                                // infinite recursion a complete self-by-value type
+                                // would cause (layout(N)→layout(field N)→…).
+                                bool anyIncompleteMember = false;
                                 if (ck == CompositeKind::Struct
                                     || ck == CompositeKind::Union) {
                                     TypeInterner const& in = s.lattice.interner();
@@ -2675,7 +2709,22 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                             d.actual   = std::string{tree.text(fn)};
                                             s.reporter.report(std::move(d));
                                         };
-                                        if (in.isIncompleteArray(ft)) {
+                                        if (in.isIncompleteComposite(ft)) {
+                                            // D-CSUBSET-SELF-REFERENTIAL-STRUCT: a
+                                            // DIRECT (non-pointer) member whose type
+                                            // is an INCOMPLETE composite — a struct
+                                            // that contains ITSELF by value
+                                            // (`struct N { struct N n; }`; its own
+                                            // type is still the incomplete forward
+                                            // type here) or a member of a forward-
+                                            // declared-but-undefined `struct B b;`.
+                                            // Its size is unknowable → fail loud. A
+                                            // POINTER member (`struct N *next;`) is a
+                                            // Ptr (never an incomplete composite) and
+                                            // is correctly NOT flagged.
+                                            famDiag(DiagnosticCode::S_IncompleteTypeMember);
+                                            anyIncompleteMember = true;
+                                        } else if (in.isIncompleteArray(ft)) {
                                             // A direct FAM (struct only — a bare
                                             // union FAM never reaches here): legal
                                             // ONLY as the last AND non-sole member.
@@ -2693,8 +2742,20 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                 }
                                 TypeId compositeTy;
                                 if (ck == CompositeKind::Union) {
-                                    compositeTy = s.lattice.interner().unionType(
-                                        srec.name, fieldTypes, fieldBitWidths);
+                                    // D-CSUBSET-SELF-REFERENTIAL-STRUCT: COMPLETE the
+                                    // nominal TypeId Pass 1 forward-minted (attach
+                                    // the variant fields into the immutable side-
+                                    // table) — do NOT mint a fresh one, or a self-ref
+                                    // variant's `Ptr<U>` would point at a different
+                                    // TypeId than the completed union.
+                                    compositeTy = srec.type;
+                                    // Leave INCOMPLETE if a direct member is itself an
+                                    // incomplete composite (the error was emitted
+                                    // above) — completing would let `computeLayout`
+                                    // recurse infinitely on the self-by-value cycle.
+                                    if (!anyIncompleteMember)
+                                        s.lattice.interner().completeComposite(
+                                            compositeTy, fieldTypes, fieldBitWidths);
                                 } else if (ck == CompositeKind::Enum) {
                                     // D5.5: enum type carries no field-
                                     // operands — only its nominal name +
@@ -2828,8 +2889,15 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                         }
                                     }
                                 } else {
-                                    compositeTy = s.lattice.interner().structType(
-                                        srec.name, fieldTypes, fieldBitWidths);
+                                    // D-CSUBSET-SELF-REFERENTIAL-STRUCT: COMPLETE the
+                                    // Pass-1 forward-minted nominal TypeId (see the
+                                    // Union arm) rather than minting a fresh one.
+                                    // Left incomplete on a self-by-value member (see
+                                    // the Union arm's recursion note).
+                                    compositeTy = srec.type;
+                                    if (!anyIncompleteMember)
+                                        s.lattice.interner().completeComposite(
+                                            compositeTy, fieldTypes, fieldBitWidths);
                                 }
                                 srec.type = compositeTy;
                                 s.nodeToType.set(resolved.node, compositeTy);

@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 68> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 69> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -265,6 +265,14 @@ constexpr std::array<DiagnosticCode, 68> kUnsuppressableCodes{{
     // miscompile the whole cycle exists to forbid. A member of the closed table
     // for the same reason every silent-wrong-bytes guard above is.
     DiagnosticCode::S_VolatilePointeeNotSupported,
+    // S_IncompleteTypeMember (c24, D-CSUBSET-SELF-REFERENTIAL-STRUCT, 2026-06-27):
+    // a DIRECT (non-pointer) member of an INCOMPLETE composite — e.g.
+    // `struct N { struct N n; }` (a struct containing itself by value, an
+    // infinite-size cycle). Suppressing it would let the member fold its size to
+    // 0 (the incomplete composite has no layout) — a silent wrong-bytes layout.
+    // Same silent-miscompile-guard class as the entries above; a pointer-to-
+    // incomplete (`struct N *`) is legal and is NOT rejected.
+    DiagnosticCode::S_IncompleteTypeMember,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

@@ -2977,13 +2977,15 @@ struct Lowerer {
                                 "is not supported");
             return false;
         }
-        // COPY the field types out of the interner's pool: `operands` returns a
-        // SPAN into operandPool_, and `interner.pointer(...)` in the field-copy
-        // loop below interns fresh `Ptr<…>` types — an intern can REALLOCATE the
-        // pool, dangling a retained span (a host-STL-growth-dependent
-        // heap-use-after-free; non-Windows release legs misread the freed bytes
-        // as an invalid Load result-type → MirBuilder fatal). The owning vector
-        // is immune. Twin of the FC7-C1c fix at the function-param setup below.
+        // COPY the field types out: `operands(composite)` returns a SPAN into the
+        // interner's composite field side-table (c24 nominal typing; previously
+        // operandPool_), and `interner.pointer(...)` in the field-copy loop below
+        // interns fresh `Ptr<…>` types — a mint bumps the interner generation and
+        // can move backing storage, dangling a retained span (a host-STL-growth-
+        // dependent heap-use-after-free; non-Windows release legs misread the
+        // freed bytes as an invalid Load result-type → MirBuilder fatal). The
+        // owning vector is immune. Twin of the FC7-C1c fix at the function-param
+        // setup below.
         std::vector<TypeId> const fieldTypes = [&] {
             auto const s = interner.operands(aggTy);
             return std::vector<TypeId>(s.begin(), s.end());

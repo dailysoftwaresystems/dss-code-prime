@@ -94,22 +94,52 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
     // Memo hit: the same source TypeId always maps to the same host TypeId.
     if (auto it = remap.find(srcId.v); it != remap.end()) return it->second;
 
-    // ── Termination precondition: the type operand graph is an ACYCLIC DAG. ──
-    // The TypeInterner has no back-patching builder — every type is interned
-    // bottom-up (children before parents), so an operand TypeId always refers to
-    // an ALREADY-interned (lower) id; there are no forward / mutable operand
-    // edges, hence no cycles. Recursive C structs (`struct N { struct N* next; }`)
-    // do NOT introduce a TypeId cycle: the field is a Ptr whose pointee is the
-    // struct resolved NOMINALLY by name (TypeKind::Struct + the struct's name),
-    // not a TypeId edge back to the parent. That is why memoizing AFTER the
-    // recursion below (the `remap.emplace` near the end) terminates: the recursion
-    // bottoms out at primitives. A FUTURE truly-recursive-type feature (forward-
-    // declared / mutable operand edges) would need memo-insert-BEFORE-recursion
-    // with a placeholder TypeId, then back-patch — do NOT add such a type without
-    // revisiting this memo ordering.
-
     TypeInterner& dst        = dstHost.interner();
     TypeKind const kind      = src.kind(srcId);
+
+    // ── NOMINAL composites (D-CSUBSET-SELF-REFERENTIAL-STRUCT) ──
+    // A composite's field list may CONTAIN A CYCLE — a self-referential
+    // `struct N { struct N *next; }` is a Ptr whose pointee is N's OWN TypeId.
+    // Memoizing only AFTER recursing the fields (the DAG path below) would loop
+    // forever on that edge. So FORWARD-MINT the host composite, INSERT it into the
+    // memo BEFORE recursing the fields, THEN re-intern the fields and complete it —
+    // the self-ref field's recursion hits the memo and resolves to the placeholder.
+    // Host identity is keyed per SOURCE composite (its CU tag + index) so distinct
+    // source composites stay distinct and the same source composite is stable.
+    if (kind == TypeKind::Struct || kind == TypeKind::Union) {
+        std::uint64_t const declSiteKey =
+            (static_cast<std::uint64_t>(srcId.arenaTag) << 32)
+            | static_cast<std::uint64_t>(srcId.v);
+        TypeId const fwd =
+            dst.forwardComposite(kind, src.name(srcId), declSiteKey);
+        remap.emplace(srcId.v, fwd);   // BEFORE recursion → breaks the cycle
+        // An INCOMPLETE source composite (forward-declared, never defined) stays
+        // incomplete in the host: re-intern nothing, leave the placeholder.
+        if (src.isIncompleteComposite(srcId)) return fwd;
+        std::span<TypeId const>       srcFields = src.operands(srcId);
+        std::span<std::int64_t const> srcWidths = src.scalars(srcId);
+        std::vector<TypeId> fields;
+        fields.reserve(srcFields.size());
+        for (TypeId f : srcFields)
+            fields.push_back(reinternType(src, f, dstHost, remap));
+        // Decode the (width+1)/0 scalar form back to the kNotBitfield/width form
+        // completeComposite re-encodes (round-trip identity for a bitfield-free
+        // composite, whose scalars are empty → no per-field widths).
+        std::vector<std::int64_t> widths;
+        if (!srcWidths.empty()) {
+            widths.reserve(srcWidths.size());
+            for (std::int64_t enc : srcWidths)
+                widths.push_back(enc <= 0 ? kNotBitfield : enc - 1);
+        }
+        dst.completeComposite(fwd, fields, widths);
+        return fwd;
+    }
+
+    // ── Termination precondition for the NON-composite DAG: ACYCLIC. ──
+    // Every non-composite type is interned bottom-up (children before parents), so
+    // an operand TypeId always refers to an ALREADY-interned (lower) id; there are
+    // no forward / mutable operand edges among them, hence no cycles. (Composites —
+    // the only types that CAN cycle — are handled above with memo-before-recursion.)
     // The GuardedSpan results decay to raw spans here (D-TYPEINTERNER-OPERAND-
     // SPAN-LIFETIME-GUARD): SAFE — `src` is `const` and every intern below targets
     // `dst`, a DISTINCT interner, so `src`'s pools are never mutated while these
@@ -162,13 +192,13 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
             result = dst.tuple(ops);
             break;
 
-        // ── nominal aggregates: name + operands=[fields/variants...] ──
+        // ── nominal aggregates: handled ABOVE (forward-mint + complete, the
+        //    cycle-safe path). Reaching here means the early composite return
+        //    was bypassed — interner/control-flow corruption. Fail loud. ──
         case TypeKind::Struct:
-            result = dst.structType(src.name(srcId), ops);
-            break;
         case TypeKind::Union:
-            result = dst.unionType(src.name(srcId), ops);
-            break;
+            reinternFatal(kind, "is a nominal composite and must be re-interned via "
+                                "the forward-mint path, not the operand-DAG switch");
 
         // ── enum: NO operands; name + scalars=[(int)underlyingTypeKind] ──
         case TypeKind::Enum:

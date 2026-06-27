@@ -3419,23 +3419,79 @@ TEST(SemanticAnalyzerCSubset, MultiMemberSqliteHashElemRepro) {
     EXPECT_EQ(ti.kind(ti.operands(h)[3]), TypeKind::I32);
 }
 
-// (e-pin) D-CSUBSET-SELF-REFERENTIAL-STRUCT (pre-existing, ORTHOGONAL to c23):
-// an INLINE self-referential struct-tag pointer (`struct N { struct N *next; }`)
-// fails loud with S_UnknownType -- the composite TAG is bound in Pass 1 only
-// AFTER its body's fields are type-resolved (post-order visits fields before the
-// parent), so the inner `struct N` reference resolves to nothing. This holds for
-// a SINGLE declarator (the form below) AND multi-declarator alike, proving the
-// c23 work neither caused nor is blocked by it. RED-ON-DISABLE the day the
-// limitation is fixed (a forward-bind tag pre-pass): this expectation flips and
-// the anchor closes. Fail-loud, never a silent miscompile.
-TEST(SemanticAnalyzerCSubset, SelfReferentialStructStillFailsLoudPreExisting) {
+// (c24-b) D-CSUBSET-SELF-REFERENTIAL-STRUCT (CLOSED): an INLINE self-referential
+// struct-tag pointer (`struct N { struct N *next; }`) now COMPILES — Pass 1
+// FORWARD-MINTS the nominal TypeId before the body is walked, so the inner
+// `struct N` reference resolves to that nominal TypeId, and field[0] is `Ptr<N>`
+// (its pointee IS N). This flipped from the prior fail-loud pin the day the
+// limitation was fixed (this cycle). RED-ON-DISABLE: revert the forward-mint and
+// this fails (the field reverts to S_UnknownType).
+TEST(SemanticAnalyzerCSubset, SelfReferentialStructCompiles) {
     auto model = analyzeShipped("c-subset", {
         "struct N { struct N *next; int v; };\n",
     });
-    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
-        << "an inline self-referential struct-tag pointer is a pre-existing "
-           "fail-loud limitation (the tag is not yet bound when its own field's "
-           "type resolves); tracked by D-CSUBSET-SELF-REFERENTIAL-STRUCT";
+    EXPECT_FALSE(model.hasErrors())
+        << "an inline self-referential struct-tag pointer must compile "
+           "(D-CSUBSET-SELF-REFERENTIAL-STRUCT closed)";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
+    auto const& ti = model.lattice().interner();
+    TypeId const n = composedAggregate(model, "N");
+    ASSERT_TRUE(n.valid()) << "the self-referential struct must compose";
+    EXPECT_FALSE(ti.isIncompleteComposite(n));     // completed
+    ASSERT_EQ(ti.operands(n).size(), 2u);
+    // field[0] = next: Ptr<N> whose pointee IS N (the self-reference).
+    ASSERT_EQ(ti.kind(ti.operands(n)[0]), TypeKind::Ptr);
+    EXPECT_EQ(ti.operands(ti.operands(n)[0])[0].v, n.v)
+        << "the self-ref field's pointee must be the SAME nominal TypeId";
+    // field[1] = v: int.
+    EXPECT_EQ(ti.kind(ti.operands(n)[1]), TypeKind::I32);
+}
+
+// (c24-f) D-CSUBSET-SELF-REFERENTIAL-STRUCT: a DIRECT (non-pointer) self-by-value
+// member is ILL-FORMED (infinite size) — fail loud with S_IncompleteTypeMember.
+// The POINTER form above is the legal one; this is its fail-loud counterpart.
+// RED-ON-DISABLE: drop the incomplete-member guard and this stops erroring.
+TEST(SemanticAnalyzerCSubset, SelfByValueStructMemberFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct N { struct N n; int v; };\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeMember), 1u)
+        << "a struct that contains ITSELF by value has infinite size -- must fail "
+           "loud (S_IncompleteTypeMember), never silently fold its size to 0";
+}
+
+// (c24-c) typedef self-reference: `typedef struct N N; struct N { N *next; };`.
+// The typedef alias `N` resolves (via the tag/typedef) to the same nominal type;
+// `N *next` inside the body is the self-reference through the alias.
+TEST(SemanticAnalyzerCSubset, TypedefSelfReferentialStructCompiles) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef struct N N;\n"
+        "struct N { struct N *next; int v; };\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a typedef-forward-declared self-referential struct must compile";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
+}
+
+// (c24-d) MUTUALLY-recursive structs via the IMPLICIT incomplete-tag form:
+// `struct A { struct B *b; }; struct B { struct A *a; };`. A's body references
+// `struct B` by pointer BEFORE B is defined; Pass-1 forward-mints BOTH tags
+// (whole-tree pre-order) so the pointer resolves to an incomplete `struct B`,
+// completed when B's body is processed, and B then references A. NOTE: a BARE
+// `struct B;` forward-declaration STATEMENT is a SEPARATE, deferred feature
+// (D-CSUBSET-FORWARD-STRUCT-DECLARATION) — it does NOT parse today, so it is
+// deliberately NOT used here (an earlier version of this test included it and
+// was FALSE-GREEN: model.hasErrors() reads only the semantic reporter and was
+// blind to the bare-decl PARSE error).
+TEST(SemanticAnalyzerCSubset, MutuallyRecursiveStructsCompile) {
+    auto model = analyzeShipped("c-subset", {
+        "struct A { struct B *b; int x; };\n"
+        "struct B { struct A *a; int y; };\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "mutually-recursive structs (implicit incomplete tag via pointer) must compile";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
 }
 
 // (e2) Multi-declarator UNION members route through the same member-list

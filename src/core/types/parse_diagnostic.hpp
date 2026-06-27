@@ -442,6 +442,15 @@ enum class DiagnosticCode : std::uint16_t {
     // configured pointer token, never a hardcoded keyword/`*`. Unsuppressable
     // (silent-miscompile guard).
     S_VolatilePointeeNotSupported = 0xE025,
+    // D-CSUBSET-SELF-REFERENTIAL-STRUCT: a DIRECT (non-pointer) member of an
+    // INCOMPLETE composite type — `struct N { struct N n; }` (a struct cannot
+    // contain itself by value; its size would be infinite) or a member of a
+    // forward-declared-but-not-yet-defined `struct B b;` (C 6.7.2.1p3: a struct/
+    // union member shall have a COMPLETE type). A POINTER to an incomplete type
+    // (`struct N *next;`) is LEGAL (pointer size is known) and never trips this.
+    // Positioned at the offending member. Without it a self-by-value member would
+    // silently fold its size to 0 (a silent miscompile).
+    S_IncompleteTypeMember        = 0xE026,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

@@ -6,9 +6,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace dss {
@@ -206,15 +209,11 @@ TypeId TypeInterner::tuple(std::span<TypeId const> elements) {
     return internContent(TypeKind::Tuple, {}, elements, {}, {});
 }
 
-TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> fields) {
-    return internContent(TypeKind::Struct, {}, fields, {}, names_.intern(name));
-}
-
 namespace {
 // FC8 bitfields (D-CSUBSET-BITFIELD): encode the per-field widths into the
-// scalar-pool form — (width + 1) per field, `kNotBitfield` → 0. Returns EMPTY
-// when no field is a bitfield, so a bitfield-free composite interns bit-
-// identically to the 2-arg overload (no TypeId churn). Shared by struct + union.
+// scalar form — (width + 1) per field, `kNotBitfield` → 0. Returns EMPTY
+// when no field is a bitfield, so a bitfield-free composite carries empty
+// scalars (no layout/codegen churn). Shared by struct + union.
 [[nodiscard]] std::vector<std::int64_t>
 encodeFieldBitWidths(std::size_t fieldCount,
                      std::span<std::int64_t const> fieldBitWidths) {
@@ -232,24 +231,152 @@ encodeFieldBitWidths(std::size_t fieldCount,
     }
     return sc;
 }
+
+// D-CSUBSET-SELF-REFERENTIAL-STRUCT: derive a `declSiteKey` for the COMPLETE-AT-
+// ONCE composite path (the 2-arg/3-arg structType/unionType overloads — shipped
+// descriptors, reintern, text round-trip). It hashes the FIELD CONTENT (the field
+// TypeIds + the bit-width scalars) so that, AMONG composites of the same (kind,
+// name), two with identical fields collapse to one TypeId (canonicalization
+// preserved) while same-name DIFFERENT-field composites stay distinct
+// (StructIsNominalAndStructural). The top bit is set so a content-derived key can
+// never collide with a decl-site key (which the semantic analyzer packs from
+// 32-bit tree/node ids — always < 2^63).
+[[nodiscard]] std::uint64_t
+contentDeclSiteKey(std::span<TypeId const> fields,
+                   std::span<std::int64_t const> bitWidthScalars) {
+    std::uint64_t h = kFnvOffset;
+    h = fnvMix(h, fields.size());
+    for (TypeId f : fields) h = fnvMix(h, f.v);
+    h = fnvMix(h, bitWidthScalars.size());
+    for (std::int64_t s : bitWidthScalars) h = fnvMix(h, static_cast<std::uint64_t>(s));
+    return h | (std::uint64_t{1} << 63);
+}
 } // namespace
+
+// ── NOMINAL composites (D-CSUBSET-SELF-REFERENTIAL-STRUCT) ──
+
+TypeId TypeInterner::internComposite(TypeKind kind, std::string_view name,
+                                     std::uint64_t declSiteKey) {
+    if (kind != TypeKind::Struct && kind != TypeKind::Union) {
+        latticeFatal("internComposite: kind must be Struct or Union");
+    }
+    TypeNameId const nameId = names_.intern(name);
+    // Dedup by NOMINAL identity (kind, name, declSiteKey). Hash all three; verify
+    // a candidate against the record's kind+name AND the side-table's declSiteKey
+    // so a hash collision can never alias two distinct composites ("one composite →
+    // one TypeId", the byHash-dedup charge).
+    std::uint64_t h = kFnvOffset;
+    h = fnvMix(h, static_cast<std::uint64_t>(kind));
+    h = fnvMix(h, nameId.v);
+    h = fnvMix(h, declSiteKey);
+    auto const range = byHash_.equal_range(h);
+    for (auto it = range.first; it != range.second; ++it) {
+        TypeRecord const& rec = arena_.at(it->second);
+        if (rec.kind != kind || rec.name != nameId) continue;
+        auto cf = compositeFields_.find(it->second.v);
+        if (cf != compositeFields_.end() && cf->second.declSiteKey == declSiteKey) {
+            return it->second;   // the existing forward record
+        }
+    }
+    // Mint a fresh INCOMPLETE record. Operand/scalar ranges stay empty: fields live
+    // in the side-table, never the operand pool (no back-patch).
+    TypeRecord record;
+    record.kind         = kind;
+    record.name         = nameId;
+    record.operandStart = static_cast<std::uint32_t>(operandPool_.size());
+    record.operandCount = 0;
+    record.scalarStart  = static_cast<std::uint32_t>(scalarPool_.size());
+    record.scalarCount  = 0;
+    const TypeId id = arena_.addNode(record);
+    byHash_.insert({h, id});
+    CompositeFields entry;
+    entry.declSiteKey = declSiteKey;
+    entry.complete    = false;
+    compositeFields_.emplace(id.v, std::move(entry));
+    ++poolGen_;   // a new composite view boundary (incomplete entry created)
+    return id;
+}
+
+TypeId TypeInterner::forwardComposite(TypeKind kind, std::string_view name,
+                                      std::uint64_t declSiteKey) {
+    return internComposite(kind, name, declSiteKey);
+}
+
+void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
+                                     std::span<std::int64_t const> fieldBitWidths) {
+    TypeRecord const& rec = arena_.at(id);
+    if (rec.kind != TypeKind::Struct && rec.kind != TypeKind::Union) {
+        latticeFatal("completeComposite: TypeId is not a Struct/Union");
+    }
+    auto it = compositeFields_.find(id.v);
+    if (it == compositeFields_.end()) {
+        latticeFatal("completeComposite: TypeId was not forward-minted as a composite");
+    }
+    auto sc = encodeFieldBitWidths(fields.size(), fieldBitWidths);
+    if (it->second.complete) {
+        // Idempotent for an IDENTICAL re-completion (a benign re-resolution); a
+        // CONFLICTING re-completion is a caller bug — fail loud rather than
+        // silently keep stale fields or corrupt a shared TypeId.
+        bool same = it->second.fields.size() == fields.size()
+                 && it->second.bitWidthScalars.size() == sc.size();
+        for (std::size_t i = 0; same && i < fields.size(); ++i)
+            if (it->second.fields[i].v != fields[i].v) same = false;
+        for (std::size_t i = 0; same && i < sc.size(); ++i)
+            if (it->second.bitWidthScalars[i] != sc[i]) same = false;
+        if (!same) {
+            latticeFatal("completeComposite: composite re-completed with different "
+                         "fields (double-complete / tag redecl)");
+        }
+        return;
+    }
+    it->second.fields.assign(fields.begin(), fields.end());
+    it->second.bitWidthScalars = std::move(sc);
+    it->second.complete = true;
+    ++poolGen_;   // the field view changed — invalidate any pre-completion span
+}
+
+bool TypeInterner::isIncompleteComposite(TypeId id) const {
+    TypeKind const k = arena_.at(id).kind;
+    if (k != TypeKind::Struct && k != TypeKind::Union) return false;
+    auto it = compositeFields_.find(id.v);
+    // No side-table entry ⇒ never forward-minted (e.g. a composite minted before
+    // this mechanism) ⇒ treat as complete (its fields, if any, live in the pool).
+    // An entry with complete=false is the genuine incomplete (forward-only) case.
+    return it != compositeFields_.end() && !it->second.complete;
+}
+
+TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> fields) {
+    std::span<std::int64_t const> const noWidths{};
+    TypeId const id = internComposite(TypeKind::Struct, name,
+                                      contentDeclSiteKey(fields, noWidths));
+    completeComposite(id, fields, {});
+    return id;
+}
 
 TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> fields,
                                 std::span<std::int64_t const> fieldBitWidths) {
-    // The bit-width is part of the interned content, so a struct with a bitfield
-    // is a distinct type from the same struct without (its layout/size differs).
     auto const sc = encodeFieldBitWidths(fields.size(), fieldBitWidths);
-    return internContent(TypeKind::Struct, {}, fields, sc, names_.intern(name));
+    TypeId const id = internComposite(TypeKind::Struct, name,
+                                      contentDeclSiteKey(fields, sc));
+    completeComposite(id, fields, fieldBitWidths);
+    return id;
 }
 
 TypeId TypeInterner::unionType(std::string_view name, std::span<TypeId const> variants) {
-    return internContent(TypeKind::Union, {}, variants, {}, names_.intern(name));
+    std::span<std::int64_t const> const noWidths{};
+    TypeId const id = internComposite(TypeKind::Union, name,
+                                      contentDeclSiteKey(variants, noWidths));
+    completeComposite(id, variants, {});
+    return id;
 }
 
 TypeId TypeInterner::unionType(std::string_view name, std::span<TypeId const> variants,
                                std::span<std::int64_t const> fieldBitWidths) {
     auto const sc = encodeFieldBitWidths(variants.size(), fieldBitWidths);
-    return internContent(TypeKind::Union, {}, variants, sc, names_.intern(name));
+    TypeId const id = internComposite(TypeKind::Union, name,
+                                      contentDeclSiteKey(variants, sc));
+    completeComposite(id, variants, fieldBitWidths);
+    return id;
 }
 
 TypeId TypeInterner::enumType(std::string_view name, TypeKind underlying) {
@@ -306,11 +433,33 @@ TypeId TypeInterner::extension(TypeKindId kind, std::string_view name,
 
 GuardedSpan<TypeId> TypeInterner::operands(TypeId id) const {
     TypeRecord const& record = arena_.at(id);
+    // D-CSUBSET-SELF-REFERENTIAL-STRUCT: a nominal composite stores its fields in
+    // the side-table, not the operand pool — redirect transparently so every
+    // existing composite-operand consumer (layout/ABI/HIR-verifier/brace-init/
+    // struct-copy/text/reintern/type-checker) is UNCHANGED. The side-table entry's
+    // `fields` vector is pointer-stable; the GuardedSpan still rides `poolGen_`
+    // (bumped on completion) so a span held across a later mutation aborts as usual.
+    if (record.kind == TypeKind::Struct || record.kind == TypeKind::Union) {
+        auto it = compositeFields_.find(id.v);
+        if (it != compositeFields_.end()) {
+            return guard_<TypeId>({it->second.fields.data(), it->second.fields.size()});
+        }
+    }
     return guard_<TypeId>({operandPool_.data() + record.operandStart, record.operandCount});
 }
 
 GuardedSpan<std::int64_t> TypeInterner::scalars(TypeId id) const {
     TypeRecord const& record = arena_.at(id);
+    // Composite bit-field widths likewise live in the side-table (read by the
+    // layout engine's "any bit-field?" test + `fieldBitWidth`); redirect to keep
+    // those consumers unchanged. Enum/FnSig/array scalars stay in the pool.
+    if (record.kind == TypeKind::Struct || record.kind == TypeKind::Union) {
+        auto it = compositeFields_.find(id.v);
+        if (it != compositeFields_.end()) {
+            return guard_<std::int64_t>(
+                {it->second.bitWidthScalars.data(), it->second.bitWidthScalars.size()});
+        }
+    }
     return guard_<std::int64_t>({scalarPool_.data() + record.scalarStart, record.scalarCount});
 }
 
