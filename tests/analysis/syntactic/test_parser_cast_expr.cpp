@@ -667,3 +667,235 @@ TEST(ParserCastExpr, DeepSpeculativeCastRollsBackAndResumesCorrectly) {
     EXPECT_EQ(countNodesWithRule(t, "binaryExpr"), 2u);
 }
 
+// ── c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME — abstract fn-ptr/array
+//    declarator in cast / sizeof / compound-literal / va_arg type-name ───────
+//
+// The fix reuses `abstractDirectDeclarator` (the abstract twin of
+// `directDeclarator`, Identifier base excluded) as the optional tail of
+// `castTypeRef` (the leading stars stay in `{repeat StarOp}`). These pins assert
+// the EXACT subtree the reuse produces — red-on-disable: drop the optional
+// `abstractDirectDeclarator` from `castTypeRef` and every one of these fails to
+// parse (P0009) or loses the `abstractDirectDeclarator`/`parenDeclarator`/
+// `fnSuffix` nesting.
+
+// `(int(*)(void))p` — the canonical abstract fn-pointer cast (the sqlite
+// `osGeteuid` shape). castTypeRef carries the base + an abstractDirectDeclarator
+// whose parenDeclarator holds the abstract `(*)` and whose fnSuffix holds
+// `(void)`.
+TEST(ParserCastExpr, AbstractFnPtrCastExactShape) {
+    auto r = parseCSubset("int main() { return (int(*)(void))p; }");
+    auto const& t = r.tree;
+    ASSERT_FALSE(t.diagnostics().hasErrors());
+    const NodeId cast = findFirstNodeWithRule(t, "castExpr");
+    ASSERT_TRUE(cast.valid());
+    EXPECT_EQ(prettyPrintSubtree(t, cast),
+              "rule:castExpr\n"
+              "  tok:\"(\"\n"
+              "  rule:castTypeRef\n"
+              "    rule:castTypeBase\n"
+              "      rule:typeSpecifierSeq\n"
+              "        tok:\"int\"\n"
+              "    rule:abstractDirectDeclarator\n"
+              "      rule:parenDeclarator\n"
+              "        tok:\"(\"\n"
+              "        rule:declarator\n"
+              "          rule:pointerLayer\n"
+              "            tok:\"*\"\n"
+              "        tok:\")\"\n"
+              "      rule:fnSuffix\n"
+              "        tok:\"(\"\n"
+              "        rule:paramList\n"
+              "          rule:param\n"
+              "            rule:declHeadForParam\n"
+              "              rule:typeSpecifierSeq\n"
+              "                tok:\"void\"\n"
+              "        tok:\")\"\n"
+              "  tok:\")\"\n"
+              "  rule:castOperand\n"
+              "    rule:operand\n"
+              "      tok:\"p\"\n");
+}
+
+// `(int(*)(int))p` — a non-void param list flows through identically; the
+// param's declHeadForParam carries `int`.
+TEST(ParserCastExpr, AbstractFnPtrCastWithIntParamParses) {
+    auto r = parseCSubset("int main() { return (int(*)(int))p; }");
+    auto const& t = r.tree;
+    ASSERT_FALSE(t.diagnostics().hasErrors());
+    const NodeId cast = findFirstNodeWithRule(t, "castExpr");
+    ASSERT_TRUE(cast.valid());
+    // The abstractDirectDeclarator + parenDeclarator(*) + fnSuffix(int) nesting.
+    const std::string pretty = prettyPrintSubtree(t, cast);
+    EXPECT_NE(pretty.find("rule:castTypeRef\n"
+                          "    rule:castTypeBase\n"
+                          "      rule:typeSpecifierSeq\n"
+                          "        tok:\"int\"\n"
+                          "    rule:abstractDirectDeclarator\n"
+                          "      rule:parenDeclarator\n"),
+              std::string::npos) << pretty;
+    EXPECT_NE(pretty.find("tok:\"int\"\n"
+                          "        tok:\")\"\n"),
+              std::string::npos) << pretty;
+}
+
+// `sizeof(int(*)(void))` — the SAME castTypeRef tail under sizeofType (shared
+// rule). The abstractDirectDeclarator nesting must appear below the type child.
+TEST(ParserCastExpr, AbstractFnPtrSizeofExactShape) {
+    auto r = parseCSubset("int main() { return sizeof(int(*)(void)); }");
+    auto const& t = r.tree;
+    ASSERT_FALSE(t.diagnostics().hasErrors());
+    const NodeId so = findFirstNodeWithRule(t, "sizeofType");
+    ASSERT_TRUE(so.valid());
+    EXPECT_EQ(prettyPrintSubtree(t, so),
+              "rule:sizeofType\n"
+              "  tok:\"sizeof\"\n"
+              "  tok:\"(\"\n"
+              "  rule:castTypeRef\n"
+              "    rule:castTypeBase\n"
+              "      rule:typeSpecifierSeq\n"
+              "        tok:\"int\"\n"
+              "    rule:abstractDirectDeclarator\n"
+              "      rule:parenDeclarator\n"
+              "        tok:\"(\"\n"
+              "        rule:declarator\n"
+              "          rule:pointerLayer\n"
+              "            tok:\"*\"\n"
+              "        tok:\")\"\n"
+              "      rule:fnSuffix\n"
+              "        tok:\"(\"\n"
+              "        rule:paramList\n"
+              "          rule:param\n"
+              "            rule:declHeadForParam\n"
+              "              rule:typeSpecifierSeq\n"
+              "                tok:\"void\"\n"
+              "        tok:\")\"\n"
+              "  tok:\")\"\n");
+}
+
+// Compound-literal type position shares castTypeRef: `(int(*)(void)){0}` parses
+// the abstract fn-ptr type then the brace init. The abstractDirectDeclarator
+// must nest under the compoundLiteralExpr's castTypeRef child.
+TEST(ParserCastExpr, AbstractFnPtrCompoundLiteralParses) {
+    auto r = parseCSubset(
+        "int main() { return (int(*)(void)){0} != 0; }");
+    auto const& t = r.tree;
+    ASSERT_FALSE(t.diagnostics().hasErrors());
+    const NodeId cl = findFirstNodeWithRule(t, "compoundLiteralExpr");
+    ASSERT_TRUE(cl.valid());
+    const std::string pretty = prettyPrintSubtree(t, cl);
+    EXPECT_NE(pretty.find("rule:castTypeRef\n"
+                          "    rule:castTypeBase\n"
+                          "      rule:typeSpecifierSeq\n"
+                          "        tok:\"int\"\n"
+                          "    rule:abstractDirectDeclarator\n"
+                          "      rule:parenDeclarator\n"),
+              std::string::npos) << pretty;
+    EXPECT_NE(pretty.find("rule:braceInitList"), std::string::npos) << pretty;
+}
+
+// va_arg type position shares castTypeRef: `va_arg(ap, int(*)(void))` parses the
+// abstract fn-ptr type as the second (type) argument. (`ap` is an ordinary
+// identifier operand here — parsing the TYPE arg is what this pins.)
+TEST(ParserCastExpr, AbstractFnPtrVaArgParses) {
+    auto r = parseCSubset(
+        "int f(int n, ...) {\n"
+        "  return va_arg(n, int(*)(void)) != 0;\n"
+        "}\n");
+    auto const& t = r.tree;
+    ASSERT_FALSE(t.diagnostics().hasErrors());
+    const NodeId va = findFirstNodeWithRule(t, "vaArgExpr");
+    ASSERT_TRUE(va.valid());
+    const std::string pretty = prettyPrintSubtree(t, va);
+    EXPECT_NE(pretty.find("rule:castTypeRef\n"
+                          "    rule:castTypeBase\n"
+                          "      rule:typeSpecifierSeq\n"
+                          "        tok:\"int\"\n"
+                          "    rule:abstractDirectDeclarator\n"
+                          "      rule:parenDeclarator\n"),
+              std::string::npos) << pretty;
+}
+
+// REGRESSION — the base+stars forms must stay byte-identical: the optional
+// abstract declarator does NOT fire for `(int*)` / `(char const *)`. The cast's
+// OWN castTypeRef subtree must carry the star as a flat `tok:"*"` child with NO
+// directDeclarator tail (the `{repeat StarOp}` consumes it; the optional sees
+// the closing `)` and matches nothing). Pins the cast subtree EXACTLY (the
+// tree-wide declarator count is unusable — every decl in the body has one).
+TEST(ParserCastExpr, PointerCastTypeRefHasNoDeclaratorTail) {
+    auto r = parseCSubset("int main() { return (int*)p; }");
+    auto const& t = r.tree;
+    ASSERT_FALSE(t.diagnostics().hasErrors());
+    const NodeId cast = findFirstNodeWithRule(t, "castExpr");
+    ASSERT_TRUE(cast.valid());
+    // Byte-identical to the pre-c26 PointerCastParses pin: castTypeBase + a
+    // FLAT `*`, NO abstractDirectDeclarator.
+    EXPECT_EQ(prettyPrintSubtree(t, cast),
+              "rule:castExpr\n"
+              "  tok:\"(\"\n"
+              "  rule:castTypeRef\n"
+              "    rule:castTypeBase\n"
+              "      rule:typeSpecifierSeq\n"
+              "        tok:\"int\"\n"
+              "    tok:\"*\"\n"
+              "  tok:\")\"\n"
+              "  rule:castOperand\n"
+              "    rule:operand\n"
+              "      tok:\"p\"\n");
+}
+
+// REGRESSION (the c26 abstract-base hazard): `(c * c)` is a parenthesized
+// MULTIPLICATION, NOT a cast. The abstract declarator's base must EXCLUDE the
+// Identifier production — otherwise `(c *<abstract-decl c>)` would speculatively
+// commit a bogus cast (the type child gains >1 leaf → commit triage rule-1).
+// Red-on-disable: add `Identifier` back to abstractDirectDeclarator's base alt
+// and this flips to a (mis-parsed) castExpr. Mirrors the zext_u32_to_u64 corpus
+// example's `(c * c) * (c * c)`.
+TEST(ParserCastExpr, ParenMultiplicationIsNotAnAbstractCast) {
+    auto r = parseCSubset(
+        "unsigned long long f(unsigned long long c) {\n"
+        "  return (c * c) * (c * c);\n"
+        "}\n");
+    auto const& t = r.tree;
+    ASSERT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_FALSE(findFirstNodeWithRule(t, "castExpr").valid())
+        << "(c * c) must parse as a multiplication, never a cast";
+    EXPECT_TRUE(findFirstNodeWithRule(t, "binaryExpr").valid());
+    EXPECT_TRUE(r.typeNameCandidates.empty())
+        << "a known-value parenthesized product records no type-name candidate";
+}
+
+// REGRESSION (the c26 array-base hazard): `sizeof(b[0])` is the VALUE form (an
+// array INDEX), NOT a bare-array abstract type-name `b[0]`. The abstract
+// declarator's base must EXCLUDE the array suffix — otherwise `(b[0])` mis-commits
+// as a type-name (D-CSUBSET-ABSTRACT-ARRAY-TYPE-NAME). Red-on-disable: add
+// `arrayDeclSuffix` to abstractDirectDeclarator's base alt and `sizeof(b[0])`
+// flips to a (mis-typed) sizeofType. Mirrors the sizeof_value_array_dim corpus.
+TEST(ParserCastExpr, SizeofIndexValueIsNotAnAbstractArrayTypeName) {
+    auto r = parseCSubset(
+        "int run() {\n"
+        "  int b[8];\n"
+        "  return (int)(sizeof(b) / sizeof(b[0]));\n"
+        "}\n");
+    auto const& t = r.tree;
+    ASSERT_FALSE(t.diagnostics().hasErrors());
+    // Both sizeofs are the VALUE form; neither commits a sizeofType type-name.
+    EXPECT_FALSE(findFirstNodeWithRule(t, "sizeofType").valid())
+        << "sizeof(b) and sizeof(b[0]) are value forms, not type-names";
+    EXPECT_TRUE(findFirstNodeWithRule(t, "sizeofValue").valid());
+}
+
+// east-const `(char const *)` stays base+const+star with no declarator tail.
+TEST(ParserCastExpr, EastConstPointerCastTypeRefHasNoDeclaratorTail) {
+    auto r = parseCSubset("int main() { return (char const *)p; }");
+    auto const& t = r.tree;
+    ASSERT_FALSE(t.diagnostics().hasErrors());
+    const NodeId cast = findFirstNodeWithRule(t, "castExpr");
+    ASSERT_TRUE(cast.valid());
+    const std::string pretty = prettyPrintSubtree(t, cast);
+    EXPECT_EQ(pretty.find("rule:abstractDirectDeclarator"), std::string::npos)
+        << "the east-const pointer cast must not grow an abstract-declarator tail\n"
+        << pretty;
+    // The east-const star is still a FLAT child of castTypeRef.
+    EXPECT_NE(pretty.find("  tok:\"*\"\n"), std::string::npos) << pretty;
+}
+

@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 69> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 70> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -273,6 +273,15 @@ constexpr std::array<DiagnosticCode, 69> kUnsuppressableCodes{{
     // Same silent-miscompile-guard class as the entries above; a pointer-to-
     // incomplete (`struct N *`) is legal and is NOT rejected.
     DiagnosticCode::S_IncompleteTypeMember,
+    // S_TypeNameDeclaratorNotAbstract (c26, D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME,
+    // 2026-06-27): a TYPE-NAME (cast / sizeof / compound-literal) whose abstract
+    // declarator illegally carries a NAME (`(int x)expr`). NOTE — unlike the
+    // silent-miscompile guards above, suppressing this ships NO wrong bytes: the
+    // type resolves to InvalidType regardless of the emit gate, so the build still
+    // fails. It is closed here so the failure is never SILENT — a suppressed
+    // constraint violation would otherwise fail the build with zero diagnostics
+    // shown (a confusing silent failure REASON), which the closed table forbids.
+    DiagnosticCode::S_TypeNameDeclaratorNotAbstract,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

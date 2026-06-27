@@ -451,6 +451,17 @@ enum class DiagnosticCode : std::uint16_t {
     // Positioned at the offending member. Without it a self-by-value member would
     // silently fold its size to 0 (a silent miscompile).
     S_IncompleteTypeMember        = 0xE026,
+    // c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME: a TYPE-NAME position (a
+    // cast / sizeof / compound-literal / va_arg type — C 6.7.7 type-name) whose
+    // abstract declarator illegally carries a NAME: `(int x)expr`, `sizeof(int
+    // y)`. C type-names are ABSTRACT (declarator without an identifier); a named
+    // one is a constraint violation. The INVERSE of S_DeclarationDeclaresNothing
+    // (which fires when a NAME is required but absent); fired by the type-name
+    // resolver when an abstract declarator (the fn-ptr/array type-name tail)
+    // resolves to a name: the resolver returns InvalidType UNCONDITIONALLY (only
+    // the emit is gated by emitOnMiss; the reject is not), so the name is NEVER
+    // silently dropped and mis-parsed as the bare base type (`(int x)` → `(int)`).
+    S_TypeNameDeclaratorNotAbstract = 0xE027,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

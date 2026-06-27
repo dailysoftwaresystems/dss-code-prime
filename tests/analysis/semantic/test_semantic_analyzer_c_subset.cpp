@@ -2165,6 +2165,121 @@ TEST(SemanticAnalyzerCSubset, StructValueCastsAreRejected) {
         << "struct->int AND ->struct directions must BOTH fail loud";
 }
 
+// ── c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME — fn-ptr cast/sizeof typing ──
+//
+// The shared `castTypeRef` now routes an abstract `directDeclarator` tail
+// through `declaratorDeclaredType` (the SAME path params use), so a cast to an
+// abstract fn-pointer type yields exactly `Ptr<FnSig(params)->base>`. These pins
+// assert the EXACT interned shape (red-on-disable: drop the directDeclaredType
+// fold and the cast mistypes as the bare base `int`).
+
+namespace {
+// Find the first castExpr node across a CU's trees (helper for the typing pins).
+[[nodiscard]] inline std::pair<TreeId, NodeId>
+firstCastNode(CompilationUnit const& cu) {
+    for (auto const& t : cu.trees()) {
+        if (!t.hasSchema()) continue;
+        auto const rid = t.schema().rules().find("castExpr");
+        if (!rid.valid()) continue;
+        for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+            NodeId const n{i};
+            if (t.kind(n) == NodeKind::Internal && t.rule(n).v == rid.v)
+                return {t.id(), n};
+        }
+    }
+    return {TreeId{}, NodeId{}};
+}
+} // namespace
+
+// `(int(*)(void))p` types as `Ptr<FnSig(void)->I32>` — the exact param-position
+// type. Asserts the full interned shape: outer Ptr, inner FnSig, zero params
+// (the C 6.7.6.3p10 `(void)` normalization), I32 result.
+TEST(SemanticAnalyzerCSubset, AbstractFnPtrCastTypesAsPtrToFnVoidInt) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { void* p; return ((int(*)(void))p) != 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    auto [tid, cast] = firstCastNode(*cu);
+    ASSERT_TRUE(cast.valid());
+    TypeId const castTy = model.typeAt(cast);
+    ASSERT_TRUE(castTy.valid()) << "the fn-ptr cast node must be typed";
+    ASSERT_EQ(ti.kind(castTy), TypeKind::Ptr) << "cast result is a pointer";
+    TypeId const pointee = ti.operands(castTy)[0];
+    ASSERT_EQ(ti.kind(pointee), TypeKind::FnSig)
+        << "the pointee must be a function signature (Ptr<Fn ...>)";
+    EXPECT_EQ(ti.fnParams(pointee).size(), 0u)
+        << "(void) normalizes to zero params";
+    EXPECT_EQ(ti.kind(ti.fnResult(pointee)), TypeKind::I32)
+        << "the fn returns int";
+    EXPECT_FALSE(ti.fnIsVariadic(pointee));
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
+// `(int(*)(int))p` — a one-param fn-ptr type: `Ptr<FnSig(int)->I32>`.
+TEST(SemanticAnalyzerCSubset, AbstractFnPtrCastWithParamTypesCorrectly) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { void* p; return ((int(*)(int))p) != 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    auto [tid, cast] = firstCastNode(*cu);
+    ASSERT_TRUE(cast.valid());
+    TypeId const castTy = model.typeAt(cast);
+    ASSERT_EQ(ti.kind(castTy), TypeKind::Ptr);
+    TypeId const fn = ti.operands(castTy)[0];
+    ASSERT_EQ(ti.kind(fn), TypeKind::FnSig);
+    auto params = ti.fnParams(fn);
+    ASSERT_EQ(params.size(), 1u);
+    EXPECT_EQ(ti.kind(params[0]), TypeKind::I32);
+    EXPECT_EQ(ti.kind(ti.fnResult(fn)), TypeKind::I32);
+}
+
+// sizeof of an abstract fn-ptr type stamps size_t and resolves the type (no
+// crash) — the Pass-2 form. (The array-dimension FOLD readback is pinned in the
+// corpus runtime example, which exercises the value end-to-end.)
+TEST(SemanticAnalyzerCSubset, SizeofAbstractFnPtrResolvesCleanly) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { return (int)sizeof(int(*)(void)); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
+// FAIL-LOUD: a NAMED declarator in a type-name position (`(int x)p`) is a C
+// constraint violation (type-names are abstract) — S_TypeNameDeclaratorNotAbstract,
+// never silently parsed as `(int)`. This is the inverse of
+// S_DeclarationDeclaresNothing.
+TEST(SemanticAnalyzerCSubset, NamedCastDeclaratorFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() { int p; return (int (x))p; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeNameDeclaratorNotAbstract), 1u)
+        << "a named type-name declarator must fail loud, never silently "
+           "drop the name and cast to the bare base type";
+}
+
+// FAIL-LOUD: an UNKNOWN base type with an abstract fn-ptr declarator
+// (`(Nope(*)(void))p`) still emits S_UnknownType (the base resolves to nothing —
+// the declarator fold never masks a missing base).
+TEST(SemanticAnalyzerCSubset, AbstractFnPtrCastUnknownBaseStillUnknownType) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() { void* p; return ((Nope(*)(void))p) != 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownType), 1u)
+        << "an unknown base type must still fail loud under an abstract "
+           "fn-ptr declarator";
+}
+
 // Pointer casts: ptr↔ptr, int→ptr (the null-constant idiom and beyond),
 // and ptr→int are all in the explicit-cast matrix (mapCast: Bitcast /
 // IntToPtr / PtrToInt). Zero diagnostics.

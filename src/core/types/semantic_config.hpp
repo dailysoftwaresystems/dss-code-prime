@@ -265,6 +265,17 @@ struct DSS_EXPORT DeclaratorConfig {
     // `declarators` block at all) ⇒ zero behavior change.
     std::optional<RuleId> memberDeclaratorRule;
     std::optional<RuleId> memberListRule;
+    // c26 (D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME): the OPTIONAL abstract twin of
+    // `directRule` — a `direct-abstract-declarator` (C 6.7.7) whose base EXCLUDES
+    // the name token, used in TYPE-NAME position (cast/sizeof/compound/va_arg)
+    // where a name is illegal AND a bare-identifier base would make a parenthesized
+    // multiplication (`(c * c)`) mis-commit as a cast. Its children are the SAME
+    // shared group/fnSuffix/arraySuffix rules, so the semantic `directDeclaredType`
+    // folds it identically to `directRule`, and `declaratorNameNode` treats it like
+    // `directRule` so a NAME nested in its parenDeclarator (`(int (x))`) is still
+    // found and rejected loud. `nullopt` ⇒ no abstract type-name declarator (every
+    // grammar before c26).
+    std::optional<RuleId> directAbstractRule;
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the `...` marker token whose presence
     // in a fnSuffix's param list makes the FnSig C-style variadic. Declarator-level
     // (vs the per-`DeclarationRule` `variadicMarker`) so the SHARED declarator-suffix
@@ -289,6 +300,7 @@ struct DSS_EXPORT DeclaratorConfig {
     std::string   listRuleName;
     std::string   memberDeclaratorRuleName;   // c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR
     std::string   memberListRuleName;         // c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR
+    std::string   directAbstractRuleName;     // c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME
     std::string   variadicMarkerName;
 };
 

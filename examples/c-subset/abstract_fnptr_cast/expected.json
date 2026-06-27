@@ -1,0 +1,34 @@
+{
+  "$comment": "c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME: the runtime witness for an ABSTRACT function-pointer cast (the sqlite osGeteuid shape) — a void* slot cast to `(int(*)(int))` and CALLED. The cast types as Ptr<FnSig(int)->int> (the SAME machinery params use, via the shared castTypeRef directDeclarator tail) and the call lowers through a register. The BASELINE arm witnesses the indirect-call encoding; the `release` arm (shippedPipeline, zero-drift) proves the abstract-cast fn-ptr survives the full optimizer (Mem2Reg may promote `slot` to the GlobalAddr SSA value and devirtualize — still exit 42). exitCode 42 = dbl(20)=40 + 2.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

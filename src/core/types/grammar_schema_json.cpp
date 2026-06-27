@@ -4250,7 +4250,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 14>
+                    static constexpr std::array<std::string_view, 15>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
@@ -4261,6 +4261,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): the OPTIONAL
                             // struct/union member-declarator + member-list roles.
                             "memberDeclaratorRule", "memberListRule",
+                            // c26 (D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME): the OPTIONAL
+                            // abstract direct-declarator role (type-name position).
+                            "directAbstractRule",
                             // FC12a-core (D-FC12A-VARIADIC-CALLEE): declarator-level
                             // `...` marker for variadic function definitions / fn-ptr types.
                             "variadicMarker"};
@@ -4408,6 +4411,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                          dc.memberDeclaratorRuleName);
                     readOptionalRuleRole("memberListRule", dc.memberListRule,
                                          dc.memberListRuleName);
+                    // c26 (D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME): the OPTIONAL
+                    // abstract direct-declarator role — same optional-role
+                    // discipline (absent ⇒ no abstract type-name declarator).
+                    readOptionalRuleRole("directAbstractRule",
+                                         dc.directAbstractRule,
+                                         dc.directAbstractRuleName);
                     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the declarator-level
                     // `...` marker, so the SHARED suffix resolver builds a variadic
                     // FnSig for function DEFINITIONS + fn-pointer types (the legacy

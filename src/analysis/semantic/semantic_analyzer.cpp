@@ -666,6 +666,15 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
     }
 }
 
+// c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME: forward declaration — the shared
+// `directRule`-folding engine (defined alongside `declaratorDeclaredType` below)
+// is consumed early by `resolveTypeNodeImpl`'s type-name path to fold an abstract
+// fn-ptr/array declarator (`(*)(void)`/`[N]`) onto a cast/sizeof base type.
+[[nodiscard]] TypeId
+directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                   NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
+                   bool allowFlexibleArray);
+
 // Resolve a type-position subtree to a TypeId. Walks `typeShapes`
 // recursively (e.g. pointerType[innerType] → Ptr<innerType>) and looks
 // the leaf up in `builtinTypes`. A leaf that is not a built-in type but
@@ -913,11 +922,28 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         }
         std::uint32_t ptrDepth = 0;
         TypeId inner = InvalidType;
+        NodeId absDirect{};   // c26: an abstract-declarator type-name tail
         for (auto child : kids) {
             if (cfg.pointerToken.has_value()
                 && tree.kind(child) == NodeKind::Token
                 && tree.tokenKind(child) == *cfg.pointerToken) {
                 ++ptrDepth;
+                continue;
+            }
+            // c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME: a `directAbstractRule`
+            // child of a type-resolved node is an ABSTRACT declarator in a
+            // type-name position (cast / sizeof / compound-literal / va_arg — C
+            // 6.7.7). It is the dedicated abstract twin (Identifier base excluded)
+            // so a parenthesized multiplication `(c * c)` never reaches here; and
+            // NO declaration path produces one (declarations fold a `directRule`
+            // declarator SEPARATELY via `declaratorDeclaredType`). Captured now,
+            // folded after the base resolves (base + stars = the element type).
+            if (cfg.declarators.has_value()
+                && cfg.declarators->directAbstractRule.has_value()
+                && tree.kind(child) == NodeKind::Internal
+                && tree.rule(child) == *cfg.declarators->directAbstractRule
+                && !absDirect.valid()) {
+                absDirect = child;
                 continue;
             }
             if (!inner.valid()) {
@@ -930,6 +956,32 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         if (inner.valid()) {
             for (std::uint32_t i = 0; i < ptrDepth; ++i)
                 inner = s.lattice.interner().pointer(inner);
+            // c26: fold the abstract declarator (fn-ptr / array type-name) onto the
+            // base+stars via the SHARED `directDeclaredType` engine — the SAME path
+            // a declaration's declarator takes, so `(int(*)(void))` yields exactly
+            // the param-position type `Ptr<Fn(void)->int>`. A type-name MUST be
+            // abstract (C 6.7.7): a NAME on the declarator (`(int x)expr`) is a
+            // constraint violation — fail LOUD (never silently drop the name and
+            // mistype as the bare base). `emitOnMiss` threads the diagnostic gate.
+            if (absDirect.valid()) {
+                if (declaratorNameNode(tree, absDirect, *cfg.declarators)
+                        .valid()) {
+                    if (emitOnMiss) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::
+                            S_TypeNameDeclaratorNotAbstract;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(absDirect);
+                        d.actual   = std::string{tree.text(absDirect)};
+                        s.reporter.report(std::move(d));
+                    }
+                    return InvalidType;
+                }
+                return directDeclaredType(s, cfg, tree, absDirect, inner, scope,
+                                          emitOnMiss,
+                                          /*allowFlexibleArray=*/false);
+            }
             return inner;
         }
         if (emitOnMiss && !specifierDiagnosed) {
@@ -1488,6 +1540,79 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
     return InvalidType;   // caller filters to the two suffix roles
 }
 
+// Fold ONE `directRule` node (`directDeclarator` — the name/group base + its
+// fn/array suffixes) onto the accumulated `base` type. Factored out of
+// `declaratorDeclaredType` (the part AFTER its pointer-layer loop) so it can be
+// reused VERBATIM by the cast/sizeof/compound-literal/va_arg type-name resolver
+// (c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME): there the abstract declarator
+// IS a `directDeclarator` (the leading stars are consumed by the type-name's own
+// `{repeat StarOp}` and folded into `base` before this is called), so there is no
+// `declarator` wrapper node to hand `declaratorDeclaredType`. ONE engine, two
+// entry points — the abstract type-name fold and the declaration-position fold
+// can never drift. `base` already carries the pointer-star depth.
+[[nodiscard]] TypeId
+directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                   NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
+                   bool allowFlexibleArray) {
+    if (!cfg.declarators.has_value()) return InvalidType;
+    DeclaratorConfig const& dc = *cfg.declarators;
+    if (!direct.valid() || !base.valid()) return InvalidType;
+    if (tree.kind(direct) != NodeKind::Internal) return InvalidType;
+    // Accept the concrete `directRule` (declaration position) OR its abstract
+    // twin `directAbstractRule` (c26 type-name position) — both expose the SAME
+    // group/fnSuffix/arraySuffix child rules, so the fold below is identical. The
+    // abstract twin simply cannot carry a top-level name token (Identifier base
+    // excluded by grammar), so the `nameTok` scan below stays empty for it and a
+    // name only appears nested in its group (caught by the caller's reject).
+    RuleId const directR = tree.rule(direct);
+    bool const isDirect = directR == dc.directRule
+        || (dc.directAbstractRule.has_value()
+            && directR == *dc.directAbstractRule);
+    if (!isDirect) return InvalidType;
+    TypeId t = base;
+
+    // The direct's base (name token or group) + suffixes, one scan.
+    NodeId nameTok{};
+    NodeId group{};
+    std::vector<NodeId> suffixes;
+    for (NodeId c : visibleChildren(tree, direct)) {
+        if (tree.kind(c) == NodeKind::Token) {
+            if (tree.tokenKind(c) == dc.nameToken && !nameTok.valid()) {
+                nameTok = c;
+            }
+            continue;
+        }
+        RuleId const cr = tree.rule(c);
+        if (cr == dc.fnSuffixRule || cr == dc.arraySuffixRule) {
+            suffixes.push_back(c);
+            continue;
+        }
+        if (cr == dc.groupRule && !group.valid()) group = c;
+    }
+
+    // Suffixes fold RIGHT-to-LEFT (source-first suffix = outermost type).
+    for (std::size_t i = suffixes.size(); i-- > 0;) {
+        t = applyDeclaratorSuffix(s, cfg, tree, suffixes[i], t, scope,
+                                  emitOnMiss, allowFlexibleArray);
+        if (!t.valid()) return InvalidType;
+    }
+
+    if (nameTok.valid()) return t;   // bound at the name
+    if (group.valid()) {
+        NodeId const inner = declarator_walk_detail::firstChildOfRule(
+            TreeDeclaratorView{tree}, group, dc.declaratorRule);
+        if (!inner.valid()) return InvalidType;   // malformed group
+        // GOTCHA (c10 plan-lock): do NOT propagate the field's FAM-ness into a
+        // grouped/parenthesized inner declarator — a nested fn-ptr param's
+        // array (`int (*f)(int x[]))`) is its OWN declarator and must keep the
+        // ordinary `S_NonConstantArrayLength` behavior; only the field's
+        // top-level array suffix is a flexible array member.
+        return declaratorDeclaredType(s, cfg, tree, inner, t, scope,
+                                      emitOnMiss, /*allowFlexibleArray=*/false);
+    }
+    return t;   // abstract direct — the type itself
+}
+
 TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                               Tree const& tree, NodeId node, TypeId base,
                               ScopeId scope, bool emitOnMiss,
@@ -1541,46 +1666,12 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
     }
     if (!direct.valid()) return t;   // star-only abstract declarator
 
-    // The direct's base (name token or group) + suffixes, one scan.
-    NodeId nameTok{};
-    NodeId group{};
-    std::vector<NodeId> suffixes;
-    for (NodeId c : visibleChildren(tree, direct)) {
-        if (tree.kind(c) == NodeKind::Token) {
-            if (tree.tokenKind(c) == dc.nameToken && !nameTok.valid()) {
-                nameTok = c;
-            }
-            continue;
-        }
-        RuleId const cr = tree.rule(c);
-        if (cr == dc.fnSuffixRule || cr == dc.arraySuffixRule) {
-            suffixes.push_back(c);
-            continue;
-        }
-        if (cr == dc.groupRule && !group.valid()) group = c;
-    }
-
-    // Suffixes fold RIGHT-to-LEFT (source-first suffix = outermost type).
-    for (std::size_t i = suffixes.size(); i-- > 0;) {
-        t = applyDeclaratorSuffix(s, cfg, tree, suffixes[i], t, scope,
-                                  emitOnMiss, allowFlexibleArray);
-        if (!t.valid()) return InvalidType;
-    }
-
-    if (nameTok.valid()) return t;   // bound at the name
-    if (group.valid()) {
-        NodeId const inner = declarator_walk_detail::firstChildOfRule(
-            TreeDeclaratorView{tree}, group, dc.declaratorRule);
-        if (!inner.valid()) return InvalidType;   // malformed group
-        // GOTCHA (c10 plan-lock): do NOT propagate the field's FAM-ness into a
-        // grouped/parenthesized inner declarator — a nested fn-ptr param's
-        // array (`int (*f)(int x[]))`) is its OWN declarator and must keep the
-        // ordinary `S_NonConstantArrayLength` behavior; only the field's
-        // top-level array suffix is a flexible array member.
-        return declaratorDeclaredType(s, cfg, tree, inner, t, scope,
-                                      emitOnMiss, /*allowFlexibleArray=*/false);
-    }
-    return t;   // abstract direct — the type itself
+    // The direct's base (name token or group) + suffixes — folded by the
+    // SHARED `directDeclaredType` engine (the same one the abstract type-name
+    // resolver uses; see its comment). `t` already carries the pointer-star
+    // depth from the loop above.
+    return directDeclaredType(s, cfg, tree, direct, t, scope, emitOnMiss,
+                              allowFlexibleArray);
 }
 
 // FC4 c1 (M5): first token of `kind` in `node`'s subtree in SOURCE order —

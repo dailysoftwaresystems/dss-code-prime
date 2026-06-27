@@ -92,7 +92,17 @@ template <class View>
             cur = det::firstChildOfRule(v, cur, dc.directRule);
             continue;
         }
-        if (r == dc.directRule) {
+        // c26 (D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME): the abstract twin of
+        // `directRule` (type-name position) shares the SAME group/suffix children
+        // but has NO `nameToken` base (Identifier excluded by grammar). Treat it
+        // exactly like `directRule`: the name-token scan finds nothing at this
+        // level (correct — abstract), but a name NESTED in its parenDeclarator
+        // (`(int (x))` — a named declarator illegal in type-name position) is still
+        // recovered via the group descent, so the type-name resolver's reject can
+        // fire. Guarded on the OPTIONAL role (a language without it never matches).
+        if (r == dc.directRule
+            || (dc.directAbstractRule.has_value()
+                && r == *dc.directAbstractRule)) {
             for (NodeId c : v.children(cur)) {
                 if (!v.isVisible(c)) continue;
                 if (v.kind(c) == NodeKind::Token

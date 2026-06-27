@@ -521,6 +521,15 @@
       "sequence": [ "ParenOpen", "declarator", "ParenClose" ]
     },
 
+    "abstractDirectDeclarator": {
+      "$comment": "c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME: the abstract twin of `directDeclarator` for the CAST/sizeof/compound/va_arg type-name tail (C 6.7.7 direct-abstract-declarator). The BASE alt is deliberately ONLY `{fnSuffix, parenDeclarator}` — NOT the full `directDeclarator` base — for two reasons. (1) `Identifier` EXCLUDED: a bare-identifier base would make `(c * c)` (a pervasive multiplication) speculatively commit as a cast `(c *<abstract-decl c>)` — the type child gains >1 leaf so the commit triage's rule-1 'not a lone identifier' fires. (2) `arrayDeclSuffix` EXCLUDED at the BASE (the bare `[N]` form): `(b[0])` (an array-INDEX value expression) would likewise mis-commit as a type-name `b[0]` (base `b` + array suffix). C's direct-abstract-declarator allows a bare `[N]` base, but it collides with the index expression under speculative type-vs-value triage — so the BARE-array type-name (`(int[10])` / `sizeof(int[10])`) is the NAMED LIMITATION D-CSUBSET-ABSTRACT-ARRAY-TYPE-NAME (off the c26 fn-ptr frontier; the `(*)[N]` array-OF-pointer form still works — its base is `parenDeclarator`, the `[N]` rides the suffix repeat). The remaining base forms — `parenDeclarator` (`(*)`/`(*p)` — a nested NAME still parses and is rejected loud at the type-resolve), `fnSuffix` — REUSE the existing declarator sub-rules verbatim, so the SHARED semantic `directDeclaredType` folds it (`(*)(void)`→Ptr<Fn(void)->int>) identically to `directDeclarator`. The suffix repeat KEEPS `arrayDeclSuffix` so `(*)[N]` works. Speculative base (fnSuffix vs parenDeclarator collide on `(`, exactly as directDeclarator).",
+      "sequence": [
+        { "alt": [ "fnSuffix", "parenDeclarator" ],
+          "speculative": true, "lookahead": 64 },
+        { "repeat": { "alt": [ "fnSuffix", "arrayDeclSuffix" ] } }
+      ]
+    },
+
     "fnSuffix": {
       "$comment": "The commit guard fires ONLY when fnSuffix is probed speculatively (the directDeclarator BASE position); the post-base suffix position dispatches non-speculatively on `(` and never consults it. requireKnownType = C 6.7.6.3p11: a lone unknown identifier between the parens rolls back to the parenthesized-declarator reading AND records the ambiguous-type-name candidate for the CU oracle's seeded reparse.",
       "sequence": [ "ParenOpen", { "optional": "paramList" }, "ParenClose" ],
@@ -985,12 +994,13 @@
     },
 
     "castTypeRef": {
-      "$comment": "c11 D-CSUBSET-EAST-CONST-CAST: a cast/sizeof type-name admits const PRE-base (`const char *` — west) AND POST-base before the stars (`char const *` — EAST, the SQLite-pervasive form). In a DECLARATION the `*` lives in the declarator so the head `char const` already parsed; a cast bundles base+stars here, so the post-base const slot is what admits east-const. The const resolver IGNORES const for type identity (a cast yields an rvalue), so all forms intern the same pointer type. The two const slots straddle the REQUIRED base token (no ambiguity); a POST-stars const (`char * const`) is dropped — a useless cast form (const on an rvalue pointer ≡ no const), and a 2nd post-stars optional adjacent to the post-base one across the zero-star case is C_AmbiguousAlternatives.",
+      "$comment": "c11 D-CSUBSET-EAST-CONST-CAST: a cast/sizeof type-name admits const PRE-base (`const char *` — west) AND POST-base before the stars (`char const *` — EAST, the SQLite-pervasive form). In a DECLARATION the `*` lives in the declarator so the head `char const` already parsed; a cast bundles base+stars here, so the post-base const slot is what admits east-const. The const resolver IGNORES const for type identity (a cast yields an rvalue), so all forms intern the same pointer type. The two const slots straddle the REQUIRED base token (no ambiguity); a POST-stars const (`char * const`) is dropped — a useless cast form (const on an rvalue pointer ≡ no const), and a 2nd post-stars optional adjacent to the post-base one across the zero-star case is C_AmbiguousAlternatives. c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME: an ABSTRACT direct-declarator (`(*)(void)`/`(*)(int)`/`[N]`/`(*)[N]`) may follow the base+stars — the fn-pointer/array type-name forms (`(int(*)(void))p`, the sqlite osGeteuid cast). It reuses `abstractDirectDeclarator` (the abstract twin of `directDeclarator`, sharing parenDeclarator+fnSuffix+arrayDeclSuffix), so the semantic resolver folds the type via the SHARED `directDeclaredType` (Ptr<Fn(void)->int>) — the SAME machinery a declaration's declarator takes. It is the ABSTRACT twin (Identifier base EXCLUDED) NOT `directDeclarator` because a bare-identifier base would make `(c * c)` (a multiplication) speculatively commit as a bogus cast; and it is NOT the full `declarator` because the leading POINTER STARS are consumed by `{repeat StarOp}` above (a star-led declarator's FIRST `StarOp` would collide with the repeat — C_AmbiguousAlternatives). OPTIONAL: a star-only cast (`int*`) leaves it empty — none of {fnSuffix,parenDeclarator,arrayDeclSuffix} matches the closing `)`, so `(int*)` stays `castTypeBase`+StarOp, byte-identical to pre-c26. A NAMED declarator with the name NESTED in parens (`(int (x))expr` / `(int(*p)(void))expr`) parses (via parenDeclarator) but is rejected LOUD at the type-resolve via `S_TypeNameDeclaratorNotAbstract` — never silently parsed as the bare base.",
       "sequence": [
         { "optional": "ConstKeyword" },
         "castTypeBase",
         { "optional": "ConstKeyword" },
-        { "repeat": "StarOp" }
+        { "repeat": "StarOp" },
+        { "optional": "abstractDirectDeclarator" }
       ]
     },
 
@@ -1083,6 +1093,7 @@
       "pointerLayerRule":   "pointerLayer",
       "pointerToken":       "StarOp",
       "directRule":         "directDeclarator",
+      "directAbstractRule": "abstractDirectDeclarator",
       "groupRule":          "parenDeclarator",
       "nameToken":          "Identifier",
       "fnSuffixRule":       "fnSuffix",
