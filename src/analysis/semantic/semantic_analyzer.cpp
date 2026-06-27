@@ -893,13 +893,41 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // layers then wrap on top. Config-driven on `cfg.volatileMarker` +
         // `cfg.pointerToken` (no hardcoded keyword). REPLACES the c21 pointee
         // REJECT — volatile pointees now compile (model B → the type system).
+        // The pointer-star run at THIS node takes one of TWO shapes, by rule:
+        //   • a flat `pointerToken` (StarOp) TOKEN run — `typeRef` / `sizeofType`
+        //     (`int **` where the stars are bare `{repeat StarOp}`); and
+        //   • c29 (D-CSUBSET-POST-STAR-CAST-QUALIFIER): `castTypeRef`'s stars are
+        //     `pointerLayer` CHILD nodes (`StarOp {repeat ptrQualifier}`) so a
+        //     POST-star qualifier (`u32 * volatile` / `int * const`) rides INSIDE
+        //     the layer. A volatile inside a pointerLayer is the POINTER OBJECT's
+        //     east qualifier; a cast yields an RVALUE with NO top-level cv (C
+        //     6.5.4), so it is STRIPPED — never folded into the base.
+        // The star-run boundary for the pre-stars-volatile scan is therefore the
+        // FIRST child that is EITHER a bare star token OR a pointerLayer node. A
+        // pointerLayer's subtree is never handed to `subtreeContainsToken` (the
+        // break fires first), so a post-star volatile can NEVER set
+        // `baseIsVolatile` — only the c27 PRE-stars volatile pointee path
+        // (`volatile u32 *`→Ptr<VolatileQual(u32)>) wraps the base, as before.
+        // Config-driven on `cfg.pointerToken` + the declarators'
+        // `pointerLayerRule` (no hardcoded keyword/rule name).
+        bool const haveLayerRule = cfg.declarators.has_value();
+        RuleId const layerRule =
+            haveLayerRule ? cfg.declarators->pointerLayerRule : RuleId{};
+        auto isPointerStar = [&](NodeId child) {
+            if (cfg.pointerToken.has_value()
+                && tree.kind(child) == NodeKind::Token
+                && tree.tokenKind(child) == *cfg.pointerToken) {
+                return true;   // typeRef / sizeofType bare `*`
+            }
+            return haveLayerRule
+                && tree.kind(child) == NodeKind::Internal
+                && tree.rule(child) == layerRule;   // castTypeRef pointerLayer
+        };
         bool baseIsVolatile = false;
         if (cfg.volatileMarker.has_value()) {
             for (auto child : kids) {
-                if (cfg.pointerToken.has_value()
-                    && tree.kind(child) == NodeKind::Token
-                    && tree.tokenKind(child) == *cfg.pointerToken) {
-                    break;   // reached the star run — later volatile is the pointer object's
+                if (isPointerStar(child)) {
+                    break;   // reached the star run — a later volatile is the pointer object's
                 }
                 if (subtreeContainsToken(tree, child, *cfg.volatileMarker,
                                          &s.idx().declByRule)) {
@@ -911,9 +939,14 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         TypeId inner = InvalidType;
         NodeId absDirect{};   // c26: an abstract-declarator type-name tail
         for (auto child : kids) {
-            if (cfg.pointerToken.has_value()
-                && tree.kind(child) == NodeKind::Token
-                && tree.tokenKind(child) == *cfg.pointerToken) {
+            // Each bare star OR pointerLayer child = ONE pointer level. c29: a
+            // pointerLayer's ptrQualifiers (const/volatile/restrict, after the
+            // star) are STRIPPED — a cast pointer is a top-level-cv-less rvalue (C
+            // 6.5.4), so `(int * const)p` and `(int *)p` both yield Ptr<int>, and
+            // `(u32 * volatile)p` builds Ptr<u32> with NO VolatileQual on the
+            // pointer. (The declaration path threads an east volatile into
+            // VolatileQual(Ptr<...>) via `declaratorDeclaredType`; a cast does NOT.)
+            if (isPointerStar(child)) {
                 ++ptrDepth;
                 continue;
             }

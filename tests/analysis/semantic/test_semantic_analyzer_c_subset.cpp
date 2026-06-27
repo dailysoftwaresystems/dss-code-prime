@@ -2280,6 +2280,151 @@ TEST(SemanticAnalyzerCSubset, AbstractFnPtrCastUnknownBaseStillUnknownType) {
            "fn-ptr declarator";
 }
 
+// ── c29 D-CSUBSET-POST-STAR-CAST-QUALIFIER — post-star cast qualifier stripped ──
+//
+// `castTypeRef`'s stars are now `pointerLayer` children; a POST-star qualifier
+// (`int * const` / `u32 * volatile`) rides inside the layer. A cast yields an
+// RVALUE with NO top-level cv (C 6.5.4), so the resolver STRIPS the layer's
+// ptrQualifiers: `(int * const)p` and `(int *)p` intern the SAME Ptr<int>, and a
+// post-star volatile builds Ptr<u32> with NO VolatileQual on the POINTER. The c27
+// PRE-stars volatile pointee path (`volatile u32 *`→Ptr<VolatileQual(u32)>) is
+// SEPARATE and unbroken. Red-on-disable: revert `{repeat pointerLayer}` to
+// `{repeat StarOp}` → the post-star const fails to parse (P0009); keep the layer
+// but fold its volatile into the base → the pointer wrongly carries VolatileQual.
+
+namespace {
+// The k-th (0-based) castExpr node across a CU's trees, source order.
+[[nodiscard]] inline std::pair<TreeId, NodeId>
+nthCastNode(CompilationUnit const& cu, std::size_t k) {
+    std::size_t seen = 0;
+    for (auto const& t : cu.trees()) {
+        if (!t.hasSchema()) continue;
+        auto const rid = t.schema().rules().find("castExpr");
+        if (!rid.valid()) continue;
+        for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+            NodeId const n{i};
+            if (t.kind(n) == NodeKind::Internal && t.rule(n).v == rid.v) {
+                if (seen++ == k) return {t.id(), n};
+            }
+        }
+    }
+    return {TreeId{}, NodeId{}};
+}
+} // namespace
+
+// `(int * const)p` and `(int *)p` resolve to the EXACT SAME TypeId — the post-star
+// const is stripped (a cast pointer is a top-level-cv-less rvalue). Both casts in
+// one CU so the interned ids are directly comparable.
+TEST(SemanticAnalyzerCSubset, PostStarConstCastStripsToPlainPointer) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { int* p;\n"
+        "  int* a = (int * const)p;\n"
+        "  int* b = (int *)p;\n"
+        "  return (a == b); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    auto [tA, cA] = nthCastNode(*cu, 0);
+    auto [tB, cB] = nthCastNode(*cu, 1);
+    ASSERT_TRUE(cA.valid() && cB.valid());
+    TypeId const tyConst = model.typeAt(cA);
+    TypeId const tyPlain = model.typeAt(cB);
+    ASSERT_TRUE(tyConst.valid() && tyPlain.valid());
+    EXPECT_EQ(tyConst, tyPlain)
+        << "(int * const)p and (int *)p must intern the SAME type (post-star "
+           "const stripped)";
+    ASSERT_EQ(ti.kind(tyConst), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(tyConst)[0]), TypeKind::I32);
+    EXPECT_FALSE(ti.isVolatileQualified(tyConst))
+        << "a const cast pointer is not volatile";
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
+// `(u32 * volatile)p` — a POST-star volatile is STRIPPED: the cast types as a
+// plain Ptr<u32>, with NO top-level VolatileQual on the POINTER (a cast rvalue has
+// no top-level cv, C 6.5.4). The pointee is the bare u32 (NOT volatile — the
+// volatile was the pointer object's, dropped).
+TEST(SemanticAnalyzerCSubset, PostStarVolatileCastStripsPointerVolatile) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef unsigned int u32;\n"
+        "int main() { void* p; return ((u32 * volatile)p) != 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    auto [tid, cast] = nthCastNode(*cu, 0);
+    ASSERT_TRUE(cast.valid());
+    TypeId const castTy = model.typeAt(cast);
+    ASSERT_TRUE(castTy.valid());
+    ASSERT_EQ(ti.kind(castTy), TypeKind::Ptr);
+    EXPECT_FALSE(ti.isVolatileQualified(castTy))
+        << "the post-star volatile must be STRIPPED — no VolatileQual on the "
+           "cast pointer";
+    TypeId const pointee = ti.operands(castTy)[0];
+    EXPECT_FALSE(ti.isVolatileQualified(pointee))
+        << "an east `u32 * volatile` does NOT qualify the pointee";
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
+// c27 UNBROKEN: `(volatile u32 *)p` — a PRE-stars volatile qualifies the POINTEE,
+// building Ptr<VolatileQual(u32)>. The pointer itself is NOT volatile; its pointee
+// IS. (The c29 strip applies ONLY to a layer's POST-star qualifier; the pre-stars
+// head volatile path is untouched.)
+TEST(SemanticAnalyzerCSubset, PreStarVolatileCastKeepsPointeeVolatile) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef unsigned int u32;\n"
+        "int main() { void* p; return ((volatile u32 *)p) != 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    auto [tid, cast] = nthCastNode(*cu, 0);
+    ASSERT_TRUE(cast.valid());
+    TypeId const castTy = model.typeAt(cast);
+    ASSERT_TRUE(castTy.valid());
+    ASSERT_EQ(ti.kind(castTy), TypeKind::Ptr);
+    EXPECT_FALSE(ti.isVolatileQualified(castTy))
+        << "the POINTER is not volatile (the pre-stars volatile binds the pointee)";
+    TypeId const pointee = ti.operands(castTy)[0];
+    EXPECT_TRUE(ti.isVolatileQualified(pointee))
+        << "(volatile u32 *) builds Ptr<VolatileQual(u32)> — the pointee IS "
+           "volatile (c27 unbroken)";
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
+// c27 + c29 together: `(volatile u32 **)p` — pre-stars volatile pointee with TWO
+// pointer levels → Ptr<Ptr<VolatileQual(u32)>>. (The sqlite 67392 frontier; both
+// stars are now pointerLayers, neither carries a post-star qualifier.)
+TEST(SemanticAnalyzerCSubset, PreStarVolatileDoublePtrCastBuildsNestedPointee) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef unsigned int u32;\n"
+        "int main() { void* p; return ((volatile u32 **)p) != 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    auto [tid, cast] = nthCastNode(*cu, 0);
+    ASSERT_TRUE(cast.valid());
+    TypeId const outer = model.typeAt(cast);
+    ASSERT_TRUE(outer.valid());
+    ASSERT_EQ(ti.kind(outer), TypeKind::Ptr);
+    TypeId const mid = ti.operands(outer)[0];
+    ASSERT_EQ(ti.kind(mid), TypeKind::Ptr) << "Ptr<Ptr<...>>";
+    TypeId const inner = ti.operands(mid)[0];
+    EXPECT_TRUE(ti.isVolatileQualified(inner))
+        << "innermost pointee is VolatileQual(u32)";
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
 // Pointer casts: ptr↔ptr, int→ptr (the null-constant idiom and beyond),
 // and ptr→int are all in the explicit-cast matrix (mapCast: Bitcast /
 // IntToPtr / PtrToInt). Zero diagnostics.
