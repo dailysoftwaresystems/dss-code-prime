@@ -2609,6 +2609,93 @@ TEST(SemanticAnalyzerCSubset, FunctionDesignatorToIntStillRejected) {
         << "casting a function designator directly to an integer stays rejected";
 }
 
+// ── c38 D-CSUBSET-NESTED-TAG-SCOPE — a tag nested in a struct body has
+// ENCLOSING (block/file) scope (C 6.2.1p4), not the inner struct's member
+// scope. `floatToNamespaceScope` now floats a nested tag PAST the composite
+// body. The single largest sqlite S000D class (WalSegment/sColMap/IdList_item).
+// Red-on-disable: restore the composite-body `break` and c38a/e/f fail
+// S_NotAComposite / S_IncompleteTypeObject.
+
+// c38a — accept: a tag defined nested in Outer is visible BY NAME at file scope.
+TEST(SemanticAnalyzerCSubset, NestedTagReferencedAtFileScopeComposes) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Outer { struct Inner { int x; } m; };\n"
+        "int f(struct Inner *p){ return p->x; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompleteTypeObject), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
+}
+
+// c38b — accept: a value object of the nested tag works (it is COMPLETE at file scope).
+TEST(SemanticAnalyzerCSubset, NestedTagValueObjectWorks) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Outer { struct Inner { int x; } m; };\n"
+        "int main(void){ struct Inner v; v.x = 5; return v.x; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompleteTypeObject), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
+}
+
+// c38c — REGRESSION guard: member composition (`o->m.x`) must STILL work
+// (the nested struct's member TYPE is resolved via structScope, independent of
+// the tag BIND scope — the fix must not break this).
+TEST(SemanticAnalyzerCSubset, NestedTagMemberAccessStillComposes) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Outer { struct Inner { int x; } m; };\n"
+        "int g(struct Outer *o){ return o->m.x; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
+}
+
+// c38d — OVER-FLOAT guard: a nested tag in a BLOCK-local struct floats only to
+// the BLOCK scope, NOT file scope — a file-scope reference must STILL fail.
+TEST(SemanticAnalyzerCSubset, NestedTagInBlockDoesNotLeakToFileScope) {
+    auto model = analyzeShipped("c-subset", {
+        "void f(void){ struct Outer { struct Inner { int x; } m; }; }\n"
+        "int main(void){ struct Inner v; v.x = 0; return v.x; }\n",
+    });
+    // Inner is block-scoped to f's body; at file scope it is unknown/incomplete.
+    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_IncompleteTypeObject)
+              + countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u);
+}
+
+// c38e — union nested tag at file scope.
+TEST(SemanticAnalyzerCSubset, NestedUnionTagComposes) {
+    auto model = analyzeShipped("c-subset", {
+        "union U { struct Item { int v; } it; };\n"
+        "int f(struct Item *p){ return p->v; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompleteTypeObject), 0u);
+}
+
+// c38f — deeply nested (struct in struct in struct): the innermost tag floats
+// all the way to file scope.
+TEST(SemanticAnalyzerCSubset, DeeplyNestedTagComposes) {
+    auto model = analyzeShipped("c-subset", {
+        "struct A { struct B { struct C { int v; } c; } b; };\n"
+        "int f(struct C *p){ return p->v; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompleteTypeObject), 0u);
+}
+
+// c38g — shadowing: a nested tag of the same name as a FILE-scope tag both land
+// in file scope → a redefinition collision (C 6.7p3 — one definition per scope).
+TEST(SemanticAnalyzerCSubset, NestedTagShadowingFileScopeTagCollides) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Inner { int a; };\n"
+        "struct Outer { struct Inner { int x; } m; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u);
+}
+
 // ── c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME — fn-ptr cast/sizeof typing ──
 //
 // The shared `castTypeRef` now routes an abstract `directDeclarator` tail

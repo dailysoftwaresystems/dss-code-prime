@@ -1,0 +1,16 @@
+{
+  "$comment": "c38 D-CSUBSET-NESTED-TAG-SCOPE: a tag (SegInfo) defined nested inside struct WalSeg is referenced BY NAME (struct SegInfo *) in a separate function — the sqlite WalSegment/sColMap/IdList_item shape. C 6.2.1p4: a nested tag has ENCLOSING (file) scope. The by-name pointer and the member &w.info must be the SAME nominal type (c24 decl-site identity). RED-ON-DISABLE: pre-c38 SegInfo was trapped in WalSeg's member scope → S_NotAComposite at s->iNext → would not compile. int fields + arrow access only (no p+n). 3 + 4 + 0 = 7. Release pipeline + all 4 targets.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 7,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -2021,8 +2021,10 @@ findTokenInSubtree(Tree const& tree, NodeId node, SchemaTokenId kind,
 // params — living inside its declarator's fnSuffix — reach the body block); a
 // tag/enumerator minted from a specifier in that scope would VANISH when it pops
 // (invisible to the next declaration). Driven by declByRule/fieldChildren
-// membership — no rule-name identity branch. STOPS at a composite-body scope (a
-// member namespace), a block, or the file/CU root.
+// membership — no rule-name identity branch. STOPS at a block or the file/CU
+// root; floats PAST declarator-dominator scopes AND (c38
+// D-CSUBSET-NESTED-TAG-SCOPE) composite-body (member) scopes — a TAG nested in
+// a struct body belongs to the enclosing block/file scope, not the member one.
 ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
                               Tree const& tree, ScopeId scope) {
     auto const& scs = s.scopes.scopes();
@@ -2033,9 +2035,20 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
         auto dIt = s.idx().declByRule.find(tree.rule(anchorN).v);
         if (dIt == s.idx().declByRule.end())
             break;  // a block / non-declaration scope
-        if (cfg.declarations[dIt->second].fieldChildren.has_value())
-            break;  // a composite body — a member namespace
-        scope = scs[scope.v].parent;  // skip the declarator dominator
+        // c38 (D-CSUBSET-NESTED-TAG-SCOPE): a composite-body scope is a MEMBER
+        // namespace, NOT a tag namespace. C 6.2.1p4: a struct/union/enum TAG
+        // declared inside a struct body belongs to the nearest ENCLOSING block
+        // or file scope, not the member scope — so a nested tag floats PAST a
+        // composite body too (this was a `break`, which TRAPPED a nested tag in
+        // the inner struct's member scope → invisible BY NAME from the enclosing
+        // scope → `struct Inner *p` outside Outer failed S_NotAComposite: the
+        // sqlite `WalSegment`/`sColMap`/`IdList_item`/`ExprList_item` S000D
+        // cascade). A block-LOCAL nested tag still floats only to its BLOCK
+        // scope (the not-in-declByRule break above stops it), staying
+        // block-scoped — never leaking to file scope. Nominal identity (c24
+        // decl-site key) and member composition (c25 structScope=`here`) are
+        // independent of this BIND scope, so only by-name lookup changes.
+        scope = scs[scope.v].parent;  // skip declarator-dominator AND composite-body scopes
     }
     return scope;
 }
