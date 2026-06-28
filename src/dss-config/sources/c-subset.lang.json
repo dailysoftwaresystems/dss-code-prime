@@ -1105,6 +1105,7 @@
       "nameToken":          "Identifier",
       "fnSuffixRule":       "fnSuffix",
       "fnSuffixParamsRule": "paramList",
+      "prototypeParamScopeRule": "paramList",
       "variadicMarker":     "EllipsisOp",
       "arraySuffixRule":    "arrayDeclSuffix",
       "initDeclaratorRule": "initDeclarator",

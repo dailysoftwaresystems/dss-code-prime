@@ -1683,6 +1683,147 @@ TEST(SemanticAnalyzerCSubset, DuplicateParamNamesEmitRedecl) {
     EXPECT_EQ(d->related[0].span.end(),   11u);
 }
 
+// ── c32 D-CSUBSET-FNPTR-PARAM-SCOPE: per-declarator function-prototype scope ──
+//
+// The parameter NAMES of a function-POINTER declarator (and of a bare prototype)
+// have function-prototype scope (C 6.2.1p4) — they terminate at the END of the
+// declarator and must NOT bind into / collide across the enclosing scope. A
+// function DEFINITION's params are EXEMPT (they bind into the definition's scope
+// so they reach the body). Each pin below flips RED if the per-declarator
+// prototype scope-open is reverted (the params would bind into the enclosing
+// struct/file/block scope and collide).
+
+// (1) fn-ptr STRUCT MEMBERS with a SHARED param name → no collision. This is the
+// sqlite3_io_methods frontier (`int (*xRead)(…int iAmt…); int (*xWrite)(…int
+// iAmt…);`). The two `iAmt`/`v` params live in DISTINCT prototype scopes.
+TEST(SemanticAnalyzerCSubset, FnPtrStructMembersSharedParamNameNoRedecl) {
+    auto model = analyzeShipped("c-subset", {
+        "struct M { int (*a)(int v); int (*b)(int v); };\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "sibling fn-ptr members sharing a param name must not collide "
+           "(per-declarator function-prototype scope)";
+}
+
+// (2) fn-ptr TYPEDEFS with a shared param name → no collision.
+TEST(SemanticAnalyzerCSubset, FnPtrTypedefsSharedParamNameNoRedecl) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int (*A)(int x);\n"
+        "typedef int (*B)(int x);\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "two fn-ptr typedefs sharing a param name must not collide";
+}
+
+// (3) fn-ptr PARAMS (of an ordinary function) with a shared param name → no
+// collision. `void h(int (*a)(int x), int (*b)(int x));`
+TEST(SemanticAnalyzerCSubset, FnPtrParamsSharedParamNameNoRedecl) {
+    auto model = analyzeShipped("c-subset", {
+        "void h(int (*a)(int x), int (*b)(int x));\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "fn-ptr parameters sharing a nested param name must not collide";
+}
+
+// (4) NON-LEAK: a fn-ptr's param name must NOT leak into the enclosing scope. A
+// `typedef int (*A)(int gv);` followed by a GLOBAL `int gv;` must NOT collide
+// (no S_RedeclaredSymbol), and the GLOBAL `gv` must remain the usable I32 symbol
+// — the param `gv` neither shadowed nor clashed with it. (Revert the scope-open
+// ⇒ the leaked param `gv` collides with the global ⇒ S_RedeclaredSymbol.)
+TEST(SemanticAnalyzerCSubset, FnPtrParamNameDoesNotLeakToEnclosingScope) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int (*A)(int gv);\n"
+        "int gv;\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "a fn-ptr typedef's param must not leak and collide with a later global";
+    // The surviving `gv` is the GLOBAL int (typed I32), not the leaked param — a
+    // leak would have made the param `gv` (a fn-prototype-scoped name) clash with
+    // the global at file scope. Look it up directly (typeOfSymbol lives later in
+    // this TU's anonymous namespace).
+    auto const& in = model.lattice().interner();
+    SymbolRecord const* gvRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "gv") gvRec = &model.symbols()[i];
+    }
+    ASSERT_NE(gvRec, nullptr) << "the global `gv` must exist and be usable";
+    ASSERT_TRUE(gvRec->type.valid());
+    EXPECT_EQ(in.kind(gvRec->type), TypeKind::I32)
+        << "the surviving `gv` is the GLOBAL int, not the leaked param";
+}
+
+// (4b) ★ THE RESOLVE-FORM LEAK (decisive, distinct from the collision form above):
+// a fn-ptr typedef's param name USED outside its declarator with NO same-named
+// global must be UNDECLARED. A leak would make `gv` resolve to the
+// prototype-scoped param — a SILENT correctness bug (no diagnostic at all), which
+// the collision pin (both names I32) cannot detect. RED-ON-DISABLE: revert the
+// per-declarator prototype scope-open → `gv` resolves to the leaked param → the
+// S_UndeclaredIdentifier vanishes.
+TEST(SemanticAnalyzerCSubset, FnPtrParamNameDoesNotResolveOutsideDeclarator) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int (*A)(int gv);\n"
+        "int main(void){ return gv; }\n",
+    });
+    EXPECT_GT(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "a fn-ptr param name must NOT resolve outside its declarator "
+           "(C 6.2.1p4 function-prototype scope) — `gv` is undeclared here";
+}
+
+// (5) NESTED fn-ptr params: a fn-ptr whose own param is itself a fn-ptr with a
+// shared inner param name, declared twice → no collision at any depth.
+// `int (*a)(int (*p)(int q)); int (*b)(int (*p)(int q));`
+TEST(SemanticAnalyzerCSubset, NestedFnPtrParamsSharedNamesNoRedecl) {
+    auto model = analyzeShipped("c-subset", {
+        "struct N { int (*a)(int (*p)(int q));\n"
+        "           int (*b)(int (*p)(int q)); };\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "nested fn-ptr params (p/q) repeated across siblings must not collide";
+}
+
+// (6) ★ DEFINITION PARAMS STAY BODY-VISIBLE (the trap a wrong fix breaks). A
+// function definition's own params bind into the definition's scope so the body
+// resolves them; a NESTED definition taking two fn-ptr params with a shared inner
+// param name (`e`) keeps cb/cb2 body-visible AND isolates the inner `e`s. Clean
+// analysis (no undeclared `cb`/`cb2`, no redecl on `e`) is the witness.
+TEST(SemanticAnalyzerCSubset, DefinitionParamsRemainBodyVisible) {
+    auto model = analyzeShipped("c-subset", {
+        "int run(int (*cb)(int e), int (*cb2)(int e)){ return cb(41)+cb2(0); }\n"
+        "int g0(int e){return e+1;}\n"
+        "int g1(int e){return e;}\n"
+        "int main(void){ return run(g0,g1); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "definition params must reach the body (cb/cb2 visible) while the "
+           "fn-ptr params' inner `e`s stay isolated";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
+}
+
+// (7) PRESERVE: plain prototypes each with a param named `x` → clean (each
+// prototype is a topLevelDecl scope, so the params already isolate; the c32 path
+// adds a redundant-but-harmless prototype scope and must not change this).
+TEST(SemanticAnalyzerCSubset, PlainPrototypesSharedParamNameClean) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int x);\n"
+        "int g(int x);\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u);
+}
+
+// (8) PRESERVE the genuine-duplicate error: two params named `x` in ONE
+// declarator still collide (they share the SAME prototype scope), in a fn-ptr
+// member too — the isolation is PER-DECLARATOR, not per-param. (The function-
+// DEFINITION form is pinned by DuplicateParamNamesEmitRedecl above.)
+TEST(SemanticAnalyzerCSubset, DuplicateParamNameInSingleFnPtrStillCollides) {
+    auto model = analyzeShipped("c-subset", {
+        "struct M { int (*a)(int x, int x); };\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a genuine duplicate within ONE declarator's param list must still error";
+}
+
 // ── GAP C: break/continue outside loop (loopControls facet) ────────────────
 
 // `while (1) { break; }` — a break inside a loop body → clean.

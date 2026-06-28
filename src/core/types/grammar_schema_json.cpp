@@ -4279,7 +4279,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 15>
+                    static constexpr std::array<std::string_view, 16>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
@@ -4295,7 +4295,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             "directAbstractRule",
                             // FC12a-core (D-FC12A-VARIADIC-CALLEE): declarator-level
                             // `...` marker for variadic function definitions / fn-ptr types.
-                            "variadicMarker"};
+                            "variadicMarker",
+                            // c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): the OPTIONAL param-list
+                            // rule that opens a per-declarator function-prototype scope.
+                            "prototypeParamScopeRule"};
                     bool dOk = true;
                     for (auto it = dj.begin(); it != dj.end(); ++it) {
                         bool known = false;
@@ -4446,6 +4449,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     readOptionalRuleRole("directAbstractRule",
                                          dc.directAbstractRule,
                                          dc.directAbstractRuleName);
+                    // c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): the OPTIONAL param-list
+                    // rule that opens a per-declarator function-prototype scope —
+                    // same optional-role discipline (absent ⇒ params bind into the
+                    // enclosing scope, the prior behavior).
+                    readOptionalRuleRole("prototypeParamScopeRule",
+                                         dc.prototypeParamScopeRule,
+                                         dc.prototypeParamScopeRuleName);
                     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the declarator-level
                     // `...` marker, so the SHARED suffix resolver builds a variadic
                     // FnSig for function DEFINITIONS + fn-pointer types (the legacy

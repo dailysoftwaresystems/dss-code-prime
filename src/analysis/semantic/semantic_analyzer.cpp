@@ -316,6 +316,142 @@ hasFnSuffixOnName(Tree const& tree, NodeId nameNode,
     return false;
 }
 
+// c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): is `directNode` (a `directRule` node) a
+// NAME-bearing direct declarator — i.e. does it have a direct visible child that
+// is the declarator NAME token (`int f(int)` / `int f(int){…}`)? A function
+// POINTER's direct declarator (`int (*fp)(int)`) instead carries a
+// `groupRule`/`parenDeclarator` base (the name is nested INSIDE it), so this is
+// false for it. This is the same name-vs-fnptr distinction `hasFnSuffixOnName`
+// draws, expressed at the direct-declarator node (where the fnSuffix-suffix walk
+// lands) rather than at the name node.
+[[nodiscard]] bool
+directDeclaratorIsNameBearing(Tree const& tree, NodeId directNode,
+                              DeclaratorConfig const& dc) {
+    if (!directNode.valid() || tree.kind(directNode) != NodeKind::Internal
+        || tree.rule(directNode) != dc.directRule) {
+        return false;
+    }
+    for (NodeId c : visibleChildren(tree, directNode)) {
+        if (tree.kind(c) == NodeKind::Token
+            && tree.tokenKind(c) == dc.nameToken) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): is the declaration `decl` at `node` a
+// FUNCTION DEFINITION (a body present) — NOT a prototype/variable/typedef? True
+// iff the kindByChild discriminator resolves to `Function` (the body-block
+// discriminator matched). Factored from the Pass-1.5 isFunctionForm test
+// (resolveDeclTypes) so the two can't drift. A row with no kindByChild can never
+// be a function definition through this path (returns false).
+[[nodiscard]] bool
+declNodeIsFunctionDefinition(DeclarationRule const& decl, Tree const& tree,
+                             NodeId node) {
+    if (!decl.kindByChild.has_value()) return false;
+    auto const& disc = *decl.kindByChild;
+    NodeId const disChild = descendVisibleDecl(tree, node, disc.childPath, decl);
+    return disChild.valid()
+        && tree.kind(disChild) == NodeKind::Internal
+        && tree.rule(disChild) == disc.whenRule
+        && disc.whenKind == DeclarationKind::Function;
+}
+
+[[nodiscard]] bool
+nodeOpensChildScope(EngineState const& s, SemanticConfig const& cfg,
+                    Tree const& tree, NodeId node);
+
+// c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): does `node` (a `prototypeParamScopeRule`
+// param-list node) open a per-declarator FUNCTION-PROTOTYPE scope (C 6.2.1p4)?
+// TRUE for every fn-declarator's param list EXCEPT a function DEFINITION's OWN
+// params — a definition's params must keep binding into the definition's scope so
+// they reach the body. A param list is a definition's own iff its owning fnSuffix
+// sits on a NAME-bearing direct declarator (NOT a function pointer, whose suffix
+// rides a `parenDeclarator` base) AND the enclosing declaration is a function
+// DEFINITION (a body present). So:
+//   * fn-ptr member / typedef / param (`int (*a)(int x)`): base is a
+//     parenDeclarator ⇒ not name-bearing ⇒ OPEN an isolated scope.
+//   * a bare prototype (`int f(int x);`): name-bearing BUT no body ⇒ OPEN an
+//     isolated scope (the proto's params have function-prototype scope; the proto
+//     name itself re-homes to file scope via the separate `isProto` path).
+//   * a function definition (`int add(int x){…}`): name-bearing AND a body ⇒ do
+//     NOT open — its params bind into the topLevelDecl scope, body-visible.
+// Reuses the config-driven `hasFnSuffixOnName`/`directDeclaratorIsNameBearing`
+// shape tests and `declNodeIsFunctionDefinition`; no rule/keyword hardcoded.
+[[nodiscard]] bool
+isPrototypeParamScopeNode(EngineState const& s, SemanticConfig const& cfg,
+                          Tree const& tree, NodeId node) {
+    if (!cfg.declarators.has_value()
+        || !cfg.declarators->prototypeParamScopeRule.has_value()) {
+        return false;
+    }
+    auto const& dc = *cfg.declarators;
+    if (tree.kind(node) != NodeKind::Internal
+        || tree.rule(node) != *dc.prototypeParamScopeRule) {
+        return false;
+    }
+    // paramList → fnSuffix (its direct parent must be the fn-suffix rule).
+    NodeId const fnSuffix = tree.parent(node);
+    if (!fnSuffix.valid() || tree.kind(fnSuffix) != NodeKind::Internal
+        || tree.rule(fnSuffix) != dc.fnSuffixRule) {
+        // Not a function-suffix param list (defensive — the role is the
+        // fnSuffix's param list by construction). Treat as a prototype scope
+        // (the safe direction: isolate the names) only when it IS a fnSuffix;
+        // otherwise leave scoping unchanged.
+        return false;
+    }
+    // fnSuffix → direct declarator. A DEFINITION's own params require the suffix
+    // to sit on a NAME-bearing direct declarator AND the enclosing declaration to
+    // be a function definition (a body). Anything else is a non-definition
+    // declarator's param list → an isolated prototype scope.
+    NodeId const direct = tree.parent(fnSuffix);
+    bool const nameBearing = directDeclaratorIsNameBearing(tree, direct, dc);
+    if (!nameBearing) return true;   // fn-pointer suffix ⇒ isolate
+    // Walk up to the nearest enclosing declaration-row node; it is a function
+    // definition iff its kindByChild resolves to Function (a body present).
+    for (NodeId cur = tree.parent(direct); cur.valid(); cur = tree.parent(cur)) {
+        if (tree.kind(cur) != NodeKind::Internal) continue;
+        auto const it = s.idx().declByRule.find(tree.rule(cur).v);
+        if (it == s.idx().declByRule.end()) continue;
+        // The nearest enclosing declaration row. A function definition's own
+        // params bind into ITS scope (not isolated); a non-definition (a bare
+        // prototype, a typedef, a struct field, a param) isolates.
+        return !declNodeIsFunctionDefinition(cfg.declarations[it->second],
+                                             tree, cur);
+    }
+    // No enclosing declaration row found (defensive) ⇒ isolate (safe direction:
+    // a stray fn-declarator's params never leak into the file scope).
+    return true;
+}
+
+// c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): the SINGLE source of the "does this node
+// open a child scope" decision, shared by ALL THREE scope-deriving passes —
+// Pass 1 (`pass1Node`, which pushes the scope), Pass 1.5 (`resolveDeclTypes`)
+// and Pass 2 (the `pass2` driver), the latter two re-deriving the SAME scope by
+// anchor lookup. Folding the decision here means a param can never bind in one
+// scope (Pass 1) yet be looked up in another (Pass 1.5 / Pass 2). Two ways a
+// node opens a child scope:
+//   (1) it is a `scopes`-rule node that is a DEFINITION here (the c25 dual-mode
+//       `definesWhenChildRule` gate — a body-absent composite specifier opens
+//       none), OR
+//   (2) it is a per-declarator function-prototype param list (c32).
+[[nodiscard]] bool
+nodeOpensChildScope(EngineState const& s, SemanticConfig const& cfg,
+                    Tree const& tree, NodeId node) {
+    if (tree.kind(node) != NodeKind::Internal) return false;
+    auto const rule = tree.rule(node);
+    if (s.idx().scopeByRule.contains(rule.v)) {
+        bool defining = true;
+        if (auto gIt = s.idx().declByRule.find(rule.v);
+            gIt != s.idx().declByRule.end()) {
+            defining = isDefinitionAtNode(cfg.declarations[gIt->second], tree, node);
+        }
+        if (defining) return true;
+    }
+    return isPrototypeParamScopeNode(s, cfg, tree, node);
+}
+
 // Follow a path of visible-child indices from `start`. Returns
 // InvalidNode if any step indexes out of range. Used by the kindByChild
 // facet to resolve params/body paths through a discriminator sub-rule
@@ -1925,7 +2061,13 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 isDefinitionAtNode(cfg.declarations[gIt->second], tree, node);
         }
 
-        if (declIsDefiningHere && s.idx().scopeByRule.contains(rule.v)) {
+        // c32 D-CSUBSET-FNPTR-PARAM-SCOPE: the scope-open decision is the SHARED
+        // `nodeOpensChildScope` predicate (a `scopes`-rule definition OR a
+        // per-declarator prototype param list) so Pass 1.5 / Pass 2 re-derive the
+        // SAME scope by anchor lookup. (Folds the former
+        // `declIsDefiningHere && scopeByRule.contains` test — `declIsDefiningHere`
+        // is still read by the mint guard below.)
+        if (nodeOpensChildScope(s, cfg, tree, node)) {
             here = s.scopes.pushScope(current, node, tree.id());
         }
 
@@ -2378,9 +2520,11 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
     if (!node.valid()) return;
     if (isEmptySpace(tree.flags(node))) return;
 
+    // c32 D-CSUBSET-FNPTR-PARAM-SCOPE: re-derive the child scope via the SAME
+    // `nodeOpensChildScope` predicate Pass 1 used (anchor lookup finds whatever
+    // Pass 1 pushed — `current` when none), so the three passes never diverge.
     ScopeId here = current;
-    if (tree.kind(node) == NodeKind::Internal
-        && s.idx().scopeByRule.contains(tree.rule(node).v)) {
+    if (nodeOpensChildScope(s, cfg, tree, node)) {
         here = childScopeFor(s, tree, node, current);
     }
 
@@ -4019,9 +4163,11 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 continue;
             }
             auto const k = tree.kind(f.node);
+            // c32 D-CSUBSET-FNPTR-PARAM-SCOPE: re-derive via the SHARED predicate
+            // (identical to Pass 1 / Pass 1.5) so a prototype param binds and is
+            // looked up in the SAME scope — anchor lookup finds Pass 1's scope.
             ScopeId here = f.current;
-            if (k == NodeKind::Internal
-                && s.idx().scopeByRule.contains(tree.rule(f.node).v)) {
+            if (nodeOpensChildScope(s, cfg, tree, f.node)) {
                 here = childScopeFor(s, tree, f.node, f.current);
             }
             // GAP C: entering a loop-context subtree raises the depth for the

@@ -248,6 +248,23 @@ struct DSS_EXPORT DeclaratorConfig {
     SchemaTokenId nameToken{};
     RuleId        fnSuffixRule{};
     std::optional<RuleId> fnSuffixParamsRule;
+    // c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): the OPTIONAL param-list rule that opens a
+    // per-declarator FUNCTION-PROTOTYPE scope (C 6.2.1p4). A param in a
+    // NON-definition declarator — a function-POINTER member/typedef/param, or a
+    // bare prototype — has a scope that terminates at the END of that declarator,
+    // so its name must bind into a THROWAWAY scope rather than the enclosing
+    // struct/file/block scope (else sibling fn-ptr declarators collide on a shared
+    // param name and the names LEAK into the enclosing scope). The semantic
+    // analyzer opens this scope for any node of this rule UNLESS it is a function
+    // DEFINITION's OWN param list (the fnSuffix sits on a NAMED direct declarator
+    // AND the enclosing definition has a body) — those keep binding into the
+    // definition's scope so they reach the body. This is typically the SAME RuleId
+    // as `fnSuffixParamsRule` (the two are distinct ROLES — param-type harvest vs
+    // prototype-scope — not distinct rules; the engine discriminates by the
+    // definition test, not rule identity). `nullopt` ⇒ no per-declarator prototype
+    // scope (the prior behavior: every param binds into the enclosing scope).
+    // Toy/tsql declare no `declarators` block at all, so they are unaffected.
+    std::optional<RuleId> prototypeParamScopeRule;
     RuleId        arraySuffixRule{};
     RuleId        initDeclaratorRule{};
     RuleId        listRule{};
@@ -295,6 +312,7 @@ struct DSS_EXPORT DeclaratorConfig {
     std::string   nameTokenName;
     std::string   fnSuffixRuleName;
     std::string   fnSuffixParamsRuleName;
+    std::string   prototypeParamScopeRuleName;   // c32 D-CSUBSET-FNPTR-PARAM-SCOPE
     std::string   arraySuffixRuleName;
     std::string   initDeclaratorRuleName;
     std::string   listRuleName;
