@@ -1937,20 +1937,50 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
     return scope;
 }
 
-// D-CSUBSET-FN-PROTOTYPE + D-CSUBSET-EXTERN-DEFINITION-MERGE: resolve a same-scope
-// REDECLARATION (`prior` already bound `name` in `bindScope`; `newId` is the new
-// symbol). A redeclaration MERGES instead of colliding when both sides name the
-// SAME entity (both functions OR both objects) and are NOT both definitions. A
-// NON-DEFINING declaration — a bare prototype OR an `extern` declaration — names a
-// body/storage that lives elsewhere (or later). The cases, on whether each side is
-// non-defining:
+// c33 (D-CSUBSET-TENTATIVE-DEFINITION): does this declarator-carrier node carry an
+// INITIALIZER (`= expr` / `= {…}`)? A file-scope object declaration WITHOUT one is
+// a TENTATIVE DEFINITION (C 6.9.2) — mergeable with a later real definition and
+// with other tentatives; WITH one it is a REAL definition (collides with a second
+// real definition). `dNode` is a carrier from `collectDeclarators`: either an
+// `initDeclaratorRule` node (`declarator (= initValue)?`) or a bare `declaratorRule`
+// node (the single-slot collapse — never an initializer). For the initDeclarator
+// form the initializer is the lone VISIBLE INTERNAL child that is NOT the inner
+// `declaratorRule` — structurally identical to how the HIR global-init lowering
+// finds the init (cst_to_hir.cpp `lowerVarLikeInto`), so the two cannot drift.
+// Config-driven on the resolved rule ROLES (no keyword / `=`-token identity).
+[[nodiscard]] bool declaratorHasInitializer(Tree const& tree,
+                                            DeclaratorConfig const& dc,
+                                            NodeId dNode) {
+    if (!dNode.valid() || tree.kind(dNode) != NodeKind::Internal) return false;
+    if (tree.rule(dNode) != dc.initDeclaratorRule) return false;  // bare declarator
+    for (NodeId c : visibleChildren(tree, dNode)) {
+        if (tree.kind(c) != NodeKind::Internal) continue;   // skip the `=` token
+        if (tree.rule(c) == dc.declaratorRule) continue;    // the declarator itself
+        return true;   // any other internal child IS the initValue
+    }
+    return false;
+}
+
+// D-CSUBSET-FN-PROTOTYPE + D-CSUBSET-EXTERN-DEFINITION-MERGE + c33
+// D-CSUBSET-TENTATIVE-DEFINITION: resolve a same-scope REDECLARATION (`prior`
+// already bound `name` in `bindScope`; `newId` is the new symbol). A redeclaration
+// MERGES instead of colliding when both sides name the SAME entity (both functions
+// OR both objects) and are NOT both definitions. A NON-DEFINING declaration — a bare
+// prototype, an `extern` declaration, OR a file-scope TENTATIVE object definition
+// (`int g;` with no initializer, C 6.9.2) — names a body/storage that lives
+// elsewhere, later, or is supplied by some/none of the merged declarations. The
+// cases, on whether each side is non-defining:
 //   nonDefining → definition : the DEFINITION wins the binding; the non-defining
-//                 decl is absorbed (proto→def, extern→def).
-//   definition → nonDefining / nonDefining → nonDefining : a redundant declaration;
-//                 KEEP the prior binding, absorb the new one (def→proto, def→extern,
-//                 proto→proto, extern→extern, proto↔extern).
-//   definition → definition : two bodies / two storage definitions (incl. two
-//                 `int g;` tentative defs) → S_RedeclaredSymbol.
+//                 decl is absorbed (proto→def, extern→def, tentative→def).
+//   definition → nonDefining / nonDefining → nonDefining : a redundant/tentative
+//                 declaration; KEEP the prior binding, absorb the new one (def→proto,
+//                 def→extern, proto→proto, extern→extern, proto↔extern,
+//                 def→tentative, tentative→tentative). For two tentatives the kept
+//                 prior is the single surviving object — it lowers to ONE zero-init
+//                 global (C 6.9.2); the absorbed tentative emits no HIR node.
+//   definition → definition : two bodies / two REAL (initialized) object definitions
+//                 → S_RedeclaredSymbol. (`int g=1; int g=2;` collides; `int g; int
+//                 g=5;` does NOT — the tentative is non-defining.)
 // CATEGORY GUARD: a non-defining declaration MERGES only with a declaration of the
 // SAME declaration category — Function, Variable, Type, or Table. A function and an
 // OBJECT (Variable), a typedef (Type) and an object/function, or any future Table vs
@@ -1977,8 +2007,13 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
                                  NodeId nameNode, SymbolId prior, SymbolId newId,
                                  bool newNonDef) {
     auto& priorRec = s.symbols.at(prior);
-    bool const priorNonDef =
-        priorRec.isProtoDeclaration || priorRec.isExternDeclaration;
+    // c33 (D-CSUBSET-TENTATIVE-DEFINITION): a file-scope tentative object definition
+    // is non-defining for merge purposes too — so tentative+def merges (the def
+    // wins) and tentative+tentative merges (one survives). Two REAL definitions stay
+    // a collision: both lack `isTentativeDefinition` ⇒ `bothDefinitions` ⇒ S0002.
+    bool const priorNonDef = priorRec.isProtoDeclaration
+                             || priorRec.isExternDeclaration
+                             || priorRec.isTentativeDefinition;
     // Precise declaration category: a proto (kind Variable + isProtoDeclaration,
     // pre-upgrade) counts as Function; Variable / Type / Table stay distinct.
     auto category = [](SymbolRecord const& r) {
@@ -2012,8 +2047,8 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
             s.mergedFnDecls.push_back({prior, newId});
         }
     } else {
-        // Two real definitions (incl. two tentative object defs), or a cross-category
-        // (function vs object) redeclaration — a genuine collision.
+        // Two real (initialized) definitions, or a cross-category (function vs
+        // object) redeclaration — a genuine collision.
         ParseDiagnostic d;
         d.code     = DiagnosticCode::S_RedeclaredSymbol;
         d.severity = DiagnosticSeverity::Error;
@@ -2187,6 +2222,42 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // non-proto declarator binds in `current` unchanged.
                         ScopeId bindScope = current;
                         if (isProto) bindScope = fileScopeOf(s, tree, current);
+                        // c33 (D-CSUBSET-TENTATIVE-DEFINITION): a FILE-SCOPE object
+                        // declaration with NO initializer is a TENTATIVE DEFINITION
+                        // (C 6.9.2) — it announces an object whose single definition
+                        // merges across all its tentative declarations + at most one
+                        // real (initialized) definition. Treat it like a non-defining
+                        // declaration (extern / proto) so the merge direction table
+                        // below folds it: tentative+def → the def wins (keeps its
+                        // init); tentative+tentative → one zero-init object; the
+                        // real-def+real-def case stays a COLLISION (both carry an
+                        // initializer ⇒ both defining). Conditions, ALL required:
+                        //   (1) a Variable (NOT a function/type; NOT a proto/extern —
+                        //       isProto/isExtern carry those, and a proto is
+                        //       Variable-kind pre-upgrade so it is excluded here);
+                        //   (2) an OBJECT-declaration row — one that declares a
+                        //       declarator LIST (`declaratorListChild`), as
+                        //       file-scope object declarations do. A PARAMETER row
+                        //       uses a SINGLE `declaratorChild` and is EXCLUDED: a
+                        //       prototype param (`int f(int s); int g(int s);`, or
+                        //       two redundant `extern` protos sharing a param name)
+                        //       has no linkage and is never a tentative definition —
+                        //       it must NOT merge across declarators;
+                        //   (3) FILE scope — the bind scope IS this tree's file/CU
+                        //       scope (C 6.9.2 is file-scope only): a block-scope
+                        //       `int x; int x;` and a duplicate struct/union MEMBER
+                        //       (bound in a body scope) MUST stay errors;
+                        //   (4) NO initializer on this declarator (a var WITH one is
+                        //       a real definition, never tentative).
+                        bool const isTentativeDefinition =
+                            (effectiveKind == DeclarationKind::Variable)
+                            && !isProto
+                            && !decl.nonDefiningDeclaration
+                            && decl.declaratorListChild.has_value()
+                            && bindScope == fileScopeOf(s, tree, current)
+                            && cfg.declarators.has_value()
+                            && !declaratorHasInitializer(tree, *cfg.declarators,
+                                                         dNode);
                         SymbolRecord rec;
                         rec.name         = name;
                         rec.scope        = bindScope;
@@ -2225,6 +2296,11 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // declaration that MERGES with an in-TU definition.
                         bool const isExtern = decl.nonDefiningDeclaration;
                         rec.isExternDeclaration = isExtern;
+                        // c33 (D-CSUBSET-TENTATIVE-DEFINITION): record the tentative
+                        // state so a LATER redeclaration sees THIS symbol (as `prior`)
+                        // as non-defining (`priorNonDef`) and merges — a tentative is
+                        // mergeable with both a real definition and another tentative.
+                        rec.isTentativeDefinition = isTentativeDefinition;
                         SymbolId const newId = s.symbols.mint(rec);
                         boundNamed = true;
                         SymbolId const prior =
@@ -2233,10 +2309,13 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             // The new decl's category (Function via Function-kind or a
                             // bare proto, else Variable/Type/Table) is read from its
                             // record inside the helper. A real function definition is
-                            // Function-kind and non-`isExtern`.
+                            // Function-kind and non-`isExtern`. c33: a file-scope
+                            // tentative object definition is ALSO non-defining
+                            // (mergeable) — see `isTentativeDefinition` above.
                             mergeOrCollideRedeclaration(
                                 s, tree, bindScope, name, nameNode, prior, newId,
-                                /*newNonDef=*/isProto || isExtern);
+                                /*newNonDef=*/isProto || isExtern
+                                              || isTentativeDefinition);
                         } else {
                             s.nodeToSymbol.set(nameNode, newId);
                         }

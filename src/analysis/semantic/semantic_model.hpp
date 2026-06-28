@@ -149,6 +149,19 @@ struct DSS_EXPORT SymbolRecord {
     // ExternGlobal node suppressed). Two non-defining declarations are idempotent;
     // two definitions still collide (S_RedeclaredSymbol). Default false.
     bool            isExternDeclaration = false;
+    // c33 (D-CSUBSET-TENTATIVE-DEFINITION): TRUE iff this symbol was minted from a
+    // file-scope OBJECT declaration with NO initializer — a TENTATIVE DEFINITION
+    // (C 6.9.2). Like `extern`/proto it is NON-DEFINING for redeclaration-merge
+    // purposes: it merges with a later real (initialized) definition (the def wins
+    // the binding, the tentative is absorbed) and with other tentatives of the same
+    // name (one of them survives and lowers to a single zero-initialized global).
+    // Two REAL definitions (both initialized) still collide (S_RedeclaredSymbol); a
+    // tentative + a real definition of an INCOMPATIBLE type fails loud after Pass 1.5
+    // (S_IncompatibleRedeclaration) via the shared merged-decl type sweep. Read ONLY
+    // by `mergeOrCollideRedeclaration` (folded into its non-defining test); the HIR
+    // lowering keys off `isAbsorbedProto` (set on whichever side is absorbed), so a
+    // SURVIVING tentative emits its zero-init global unchanged. Default false.
+    bool            isTentativeDefinition = false;
     // D-CSUBSET-ENUM-INT-CONVERSION (FC8): TRUE iff this symbol IS an enumerator
     // constant (bound under a `compositeKind:"enum"` decl, where `enumValue` was
     // set). DISTINGUISHES an enumerator from a storage-backed `enum E e;` local —

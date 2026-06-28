@@ -3467,9 +3467,11 @@ TEST(SemanticAnalyzerCSubset, ExternObjectIncompatibleDefinitionFailsLoud) {
         << "an incompatible extern + definition must fail loud exactly once";
 }
 
-// (g) Negative (fail-loud preserved): TWO real object definitions still collide
-// S_RedeclaredSymbol — the extern merge admits a NON-DEFINING declaration + a
-// definition, never two definitions (incl. two tentative defs).
+// (g) Negative (fail-loud preserved): TWO real (INITIALIZED) object definitions
+// still collide S_RedeclaredSymbol — the merge admits a NON-DEFINING declaration
+// (extern / proto / file-scope tentative) + at most one real definition, never two
+// real definitions. (c33: `int g; int g = 5;` does NOT collide — the tentative is
+// non-defining; only BOTH-initialized collides.)
 TEST(SemanticAnalyzerCSubset, TwoObjectDefinitionsStillCollide) {
     auto model = analyzeShipped("c-subset", {
         "int g = 1;\n"
@@ -3477,8 +3479,8 @@ TEST(SemanticAnalyzerCSubset, TwoObjectDefinitionsStillCollide) {
     });
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_RedeclaredSymbol), 1u)
-        << "two object DEFINITIONS must still collide — only an extern + a "
-           "definition merge";
+        << "two object DEFINITIONS must still collide — only a non-defining "
+           "declaration + at most one definition merge";
 }
 
 // (h) Negative (fail-loud preserved): an extern FUNCTION and a same-named OBJECT
@@ -3544,6 +3546,123 @@ TEST(SemanticAnalyzerCSubset, ExternObjectThenTypedefCrossCategoryCollides) {
                         DiagnosticCode::S_RedeclaredSymbol), 1u)
         << "extern object (Variable) then typedef (Type) of the same name — "
            "different categories, must collide in either order";
+}
+
+// ── c33 D-CSUBSET-TENTATIVE-DEFINITION — a file-scope object declaration WITHOUT
+//    an initializer is a TENTATIVE DEFINITION (C 6.9.2): any number of tentatives
+//    + at most one real (initialized) definition of the same name MERGE into one
+//    object; two REAL definitions still collide. The merge reuses the
+//    non-defining-declaration machinery (the tentative is folded into the
+//    `mergeOrCollideRedeclaration` non-defining test) — same path as extern/proto.
+
+// (1) Tentative definition + a later real definition MERGE: zero diagnostics,
+// exactly one surviving symbol (the definition keeps the binding and its init; the
+// tentative is absorbed). This is the sqlite frontier shape (`u32 t; u32 t = 0;`).
+// RED-ON-DISABLE: drop `isTentativeDefinition` from the Pass-1 `newNonDef` fold ->
+// the tentative is treated as a definition -> S_RedeclaredSymbol fires.
+TEST(SemanticAnalyzerCSubset, TentativeDefinitionThenDefinitionMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "int g;\n"
+        "int g = 5;\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a file-scope tentative definition + a real definition must merge";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u);
+    EXPECT_EQ(countSurvivingSymbols(model, "g"), 1u)
+        << "exactly one surviving symbol for g (the definition); tentative absorbed";
+}
+
+// (2) Two tentative definitions (neither initialized) MERGE into one object (C
+// 6.9.2 — it lowers to a single zero-initialized global). Zero diagnostics, one
+// surviving symbol. RED-ON-DISABLE: drop the tentative fold -> S_RedeclaredSymbol.
+TEST(SemanticAnalyzerCSubset, TwoTentativeDefinitionsMerge) {
+    auto model = analyzeShipped("c-subset", {
+        "int g;\n"
+        "int g;\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "two file-scope tentative definitions must merge into one object";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u);
+    EXPECT_EQ(countSurvivingSymbols(model, "g"), 1u);
+}
+
+// (3) `static` tentative + a `static` real definition MERGE (internal linkage does
+// not change the tentative-definition rule). RED-ON-DISABLE: drop the tentative
+// fold -> S_RedeclaredSymbol.
+TEST(SemanticAnalyzerCSubset, StaticTentativeDefinitionThenDefinitionMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "static int g;\n"
+        "static int g = 5;\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a static tentative definition + a static definition must merge";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u);
+    EXPECT_EQ(countSurvivingSymbols(model, "g"), 1u);
+}
+
+// (4) ★ PRESERVE — two REAL (initialized) definitions still COLLIDE
+// S_RedeclaredSymbol. Both carry an initializer ⇒ both defining ⇒ not tentative.
+// This is the c33 must-stay-an-error case. RED-ON-DISABLE: if the tentative gate
+// stopped requiring "no initializer", an initialized def would be misread as
+// tentative and this collision would vanish.
+TEST(SemanticAnalyzerCSubset, TwoRealDefinitionsStillCollide_Tentative) {
+    auto model = analyzeShipped("c-subset", {
+        "int g = 1;\n"
+        "int g = 2;\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "two REAL object definitions (both initialized) must STILL collide — "
+           "the tentative merge requires an UN-initialized declaration";
+}
+
+// (5) ★ PRESERVE — a BLOCK-SCOPE duplicate is NOT a tentative definition (C 6.9.2
+// is file-scope only): `int y; int y;` inside a body must STILL collide
+// S_RedeclaredSymbol. RED-ON-DISABLE: if the file-scope gate were dropped, the two
+// block locals would merge and this collision would vanish (a real shadowing bug).
+TEST(SemanticAnalyzerCSubset, BlockScopeDuplicateNotTentativeStillCollides) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void){ int y; int y; return y; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a block-scope duplicate is not a tentative definition — it must collide";
+}
+
+// (6) ★ PRESERVE — a tentative definition + an INCOMPATIBLE real definition fail
+// loud with S_IncompatibleRedeclaration (NOT a silent merge). `int g;` then `g`
+// redefined at an incompatible type: the merge runs the SAME post-1.5 type-compat
+// sweep as extern/proto. A pointer-vs-int mismatch is target-independent (unlike
+// int-vs-long, which are the SAME type under LLP64), so it conflicts on every
+// target. RED-ON-DISABLE: disable the merged-decl compat sweep -> silently accepted.
+TEST(SemanticAnalyzerCSubset, TentativeDefinitionIncompatibleTypeFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int g;\n"
+        "int* g = 0;\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "a tentative definition and an incompatible definition must fail loud — "
+           "never a silent type merge";
+}
+
+// (7) PRESERVE (unchanged) — an `extern` declaration + a definition still merge:
+// the tentative work folds ALONGSIDE the existing extern path, not over it. Guards
+// that the extern arm is untouched. (Mirror of ExternObjectThenDefinitionMerges,
+// re-asserted in the c33 block to lock the no-regression contract.)
+TEST(SemanticAnalyzerCSubset, ExternPlusDefinitionStillMerges_TentativeGuard) {
+    auto model = analyzeShipped("c-subset", {
+        "extern int g;\n"
+        "int g = 5;\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an extern declaration + a definition must still merge (c33 must not "
+           "regress the extern path)";
+    EXPECT_EQ(countSurvivingSymbols(model, "g"), 1u);
 }
 
 // ── C 6.2.3 TAG NAMESPACE (closes the tag-namespace residue of

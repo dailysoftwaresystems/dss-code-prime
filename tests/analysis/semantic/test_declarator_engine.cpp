@@ -613,14 +613,25 @@ TEST(DeclaratorInversion, ZeroArrayLengthFailsLoud) {
     EXPECT_FALSE(typeOf(m, "x").valid());
 }
 
-// Two declarators of the same name in one list — the per-declarator bind
-// path reports the redeclaration exactly once.
-TEST(DeclaratorInversion, SameNameTwiceInOneListRedeclares) {
+// c33 (D-CSUBSET-TENTATIVE-DEFINITION): two declarators of the same name in one
+// list, BOTH with no initializer, are two TENTATIVE DEFINITIONS of one file-scope
+// object (C 6.9.2 — real GCC/Clang accept `int x, x;`). The per-declarator bind
+// path MERGES them (one surviving symbol, the other absorbed) rather than emitting
+// S_RedeclaredSymbol. This `vdecl` rule has `kind: variable`, binds at the file/CU
+// scope, and the synthetic grammar has NO initializer production — so every
+// declarator here is necessarily tentative. (A genuine two-REAL-definitions
+// collision needs an initializer, exercised by the c-subset semantic suite where
+// `int x = 1; int x = 2;` still reports S_RedeclaredSymbol.)
+TEST(DeclaratorInversion, SameNameTwiceTentativeDefinitionsMerge) {
     auto cu = buildDeclCu("base x, x;");
     assertNoBuilderErrors(*cu);
     auto m = analyze(cu);
-    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_RedeclaredSymbol),
-              1u);
+    // No collision: the two tentatives MERGE (one binding survives, the other is
+    // absorbed). Both records are still minted — the absorbed one carries no HIR —
+    // so the symbol-table count is unchanged; the contract is the ABSENCE of the
+    // redeclaration error and a resolvable `x`.
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u);
+    EXPECT_TRUE(typeOf(m, "x").valid());
 }
 
 // ── M5: gated markers fire positioned ───────────────────────────────────
