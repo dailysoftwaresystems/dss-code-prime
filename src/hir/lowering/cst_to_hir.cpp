@@ -2381,8 +2381,27 @@ struct Lowerer {
             && interner.kind(lhs.type) == TypeKind::Ptr
             && interner.kind(rhs.type) == TypeKind::Ptr
             && interner.operands(lhs.type)[0] == interner.operands(rhs.type)[0];
+        // c41 (D-CSUBSET-POINTER-INT-ARITHMETIC) C 6.5.6p8: `p + n` / `n + p` /
+        // `p - n` (pointer ± integer → a Ptr). `n + p` is CANONICALIZED here
+        // (swap lc/rc so the Ptr operand is ALWAYS kids[0]) → combineBinaryOp
+        // sees a uniform (Ptr, Int) shape + emits a stride-scaled Gep (reusing
+        // F1's scaleIndexToBytes). `p - n` keeps the pointer LEFT (Sub is
+        // non-commutative; `n - p` has no C 6.5.6 meaning → not handled here).
+        // Mutually exclusive with `ptrSub` (which needs BOTH operands Ptr) and
+        // with F1 p++/p[i] (which never reach combineBinary).
+        if (*op == HirOpKind::Add && lc.type.valid() && rc.type.valid()
+            && interner.kind(lc.type) != TypeKind::Ptr
+            && interner.kind(rc.type) == TypeKind::Ptr) {
+            std::swap(lc, rc);   // n + p → canonicalize: Ptr always left
+        }
+        bool const ptrIntArith =
+            (*op == HirOpKind::Add || *op == HirOpKind::Sub)
+            && lc.type.valid() && rc.type.valid()
+            && interner.kind(lc.type) == TypeKind::Ptr
+            && interner.kind(rc.type) != TypeKind::Ptr;
         TypeId const result = isComparison(*op) ? boolType()
-                            : ptrSub ? interner.primitive(TypeKind::I64)
+                            : ptrSub      ? interner.primitive(TypeKind::I64)
+                            : ptrIntArith ? lc.type   // Ptr<T> (the pointer operand)
                             : (common.valid() ? common
                                               : (lhs.type.valid() ? lhs.type : rhs.type));
         return {track(builder.addParent(HirKind::BinaryOp, std::array{lc.id, rc.id},

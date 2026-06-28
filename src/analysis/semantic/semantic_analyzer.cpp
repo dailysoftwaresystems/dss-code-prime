@@ -5363,6 +5363,16 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 && interner.operands(lt)[0] == interner.operands(rt)[0]) {
                 return interner.primitive(TypeKind::I64);
             }
+            // c41 (D-CSUBSET-POINTER-INT-ARITHMETIC): `n + p` (Int LHS, Ptr RHS,
+            // the commutative add form) is a POINTER, not the integer. `p + n`
+            // and `p - n` already fall through to `lt` (the Ptr) via the default
+            // below. This arm only fixes the int-on-LEFT add (else `n + p` would
+            // wrongly type as Int → a pointer-arg use would fail isAssignable).
+            if (*op == HirOpKind::Add && lt.valid() && rt.valid()
+                && interner.kind(lt) != TypeKind::Ptr
+                && interner.kind(rt) == TypeKind::Ptr) {
+                return rt;   // Ptr<T>
+            }
         }
         TypeId const common = commonArithType(lt, rt);
         if (common.valid()) return common;

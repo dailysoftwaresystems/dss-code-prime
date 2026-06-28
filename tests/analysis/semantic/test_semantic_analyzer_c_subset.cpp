@@ -2747,6 +2747,43 @@ TEST(SemanticAnalyzerCSubset, MismatchedPointeeSubtractionRejectedAsNumericArg) 
     EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
 }
 
+// ── c41 D-CSUBSET-POINTER-INT-ARITHMETIC — `p ± n` is a pointer (C 6.5.6p8) ──
+// `p + n` / `n + p` / `p - n` yield a pointer (Ptr<T>), and the MIR scales n by
+// sizeof(*p). These pins assert the TYPE (the runtime stride is the corpus
+// pointer_int_arith). Red-on-disable for c41b: revert the semantic `n + p` arm
+// and `n + p` types as Int -> assigning it to `int*` fails S_TypeMismatch.
+
+TEST(SemanticAnalyzerCSubset, PointerPlusIntIsCleanPointerTyped) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int* p, int n){ int* q = p + n; return *q; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+// The key commutative case: `n + p` must type as a pointer, not the integer.
+TEST(SemanticAnalyzerCSubset, IntPlusPointerIsCleanPointerTyped) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int* p, int n){ int* q = n + p; return *q; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+TEST(SemanticAnalyzerCSubset, PointerMinusIntIsCleanPointerTyped) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int* p, int n){ int* q = p - n; return *q; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+// GUARD: `int + int` is NOT pointer arithmetic (the Ptr guard is not over-broad).
+TEST(SemanticAnalyzerCSubset, IntPlusIntUnaffectedByPtrArith) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int a, int b){ return a + b; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+
 // ── c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME — fn-ptr cast/sizeof typing ──
 //
 // The shared `castTypeRef` now routes an abstract `directDeclarator` tail

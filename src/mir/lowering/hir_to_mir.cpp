@@ -1123,6 +1123,54 @@ struct Lowerer {
             std::array<MirInstId, 2> da{diff, sc};
             return mir.addInst(MirOpcode::SDiv, da, i64ty);
         }
+        // c41 (D-CSUBSET-POINTER-INT-ARITHMETIC) C 6.5.6p8: `p ± n` → a new
+        // pointer at byte offset n*sizeof(*p). cst_to_hir canonicalizes `n + p`
+        // so kids[0] is ALWAYS the Ptr operand. Fires when the RESULT type is Ptr
+        // (NOT I64 — that is c40's p-q) AND kids[0] is Ptr. Add: scale n, Gep(p,
+        // scaled). Sub (p - n): Neg n, scale, Gep(p, -scaled). Reuses F1's
+        // scaleIndexToBytes (the SAME stride machinery p[i]/p++ use → stride 1
+        // emits no Mul, no double-scaling). `n - p` does not reach here (kids[0]
+        // stays Int, not Ptr). void*/fn-ptr pointee → fail loud (no stride).
+        if ((op == HirOpKind::Add || op == HirOpKind::Sub)
+            && t.valid() && interner.kind(t) == TypeKind::Ptr
+            && operandType.valid() && tk == TypeKind::Ptr) {
+            auto const ptOps = interner.operands(operandType);
+            if (ptOps.empty()) {
+                unsupported(node, "pointer-integer arithmetic: Ptr has no pointee");
+                return InvalidMirInst;
+            }
+            TypeId const pointee = ptOps[0];
+            TypeId const indexTy = hir.typeId(kids[1]);
+            if (!indexTy.valid()) {
+                unsupported(node,
+                    "pointer-integer arithmetic: integer operand has no type");
+                return InvalidMirInst;
+            }
+            // Widen the index to POINTER width (I64) BEFORE Neg/scale: x86-64
+            // 32-bit ops zero-extend into the 64-bit register, so a 32-bit
+            // NEGATIVE byte offset (from `p - n`) would become a huge positive
+            // address → access violation. SExt signed / ZExt unsigned (mapCast)
+            // — the SAME widen the Index path (p[i]) already does (the positive
+            // p+n cases worked only because their high bits were 0).
+            TypeId const i64ty = interner.primitive(TypeKind::I64);
+            MirInstId intIdx = rhs;
+            if (interner.kind(indexTy) != TypeKind::I64) {
+                MirOpcode const ext = mapCast(interner.kind(indexTy), TypeKind::I64);
+                std::array<MirInstId, 1> eo{rhs};
+                intIdx = mir.addInst(ext, eo, i64ty);
+                if (!intIdx.valid()) return InvalidMirInst;
+            }
+            if (op == HirOpKind::Sub) {
+                std::array<MirInstId, 1> ni{intIdx};
+                intIdx = mir.addInst(MirOpcode::Neg, ni, i64ty);
+                if (!intIdx.valid()) return InvalidMirInst;
+            }
+            MirInstId const byteOff =
+                scaleIndexToBytes(intIdx, pointee, node, i64ty);
+            if (!byteOff.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> gepOps{lhs, byteOff};
+            return mir.addInst(MirOpcode::Gep, gepOps, t);
+        }
         MirOpcode const mop = mapBinaryOp(op, tk);
         if (mop == MirOpcode::Invalid) {
             unsupported(node,
