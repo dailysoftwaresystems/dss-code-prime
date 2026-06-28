@@ -1092,6 +1092,37 @@ struct Lowerer {
         TypeId const operandType = hir.typeId(kids[0]);
         TypeKind const tk = operandType.valid()
             ? interner.kind(operandType) : TypeKind::Void;
+        // c40 (D-CSUBSET-POINTER-SUBTRACTION) C 6.5.6p9: the HIR tier types
+        // `p - q` (both Ptr<T>) as I64 (ptrdiff_t) while the OPERANDS stay Ptr —
+        // that (op==Sub, operand kind Ptr, RESULT kind I64) is the signal to
+        // lower as a SIGNED element-count difference: PtrToInt both sides, Sub
+        // (the byte difference), then — unless sizeof(pointee)==1 — SDiv by the
+        // element stride. Signed throughout (q>p ⇒ negative). `p ± n` (Ptr
+        // result, deferred c41) is NOT this path — its result kind is Ptr, not I64.
+        if (op == HirOpKind::Sub && tk == TypeKind::Ptr
+            && t.valid() && interner.kind(t) == TypeKind::I64) {
+            TypeId const i64ty = interner.primitive(TypeKind::I64);
+            std::array<MirInstId, 1> la{lhs};
+            std::array<MirInstId, 1> ra{rhs};
+            MirInstId const li = mir.addInst(MirOpcode::PtrToInt, la, i64ty);
+            MirInstId const ri = mir.addInst(MirOpcode::PtrToInt, ra, i64ty);
+            std::array<MirInstId, 2> sa{li, ri};
+            MirInstId const diff = mir.addInst(MirOpcode::Sub, sa, i64ty);
+            TypeId const pointee = interner.operands(operandType)[0];
+            auto const stride = elementStride(pointee);
+            if (!stride.has_value()) {
+                unsupported(node, std::format(
+                    "pointer subtraction: pointee TypeKind {} has no computable "
+                    "element stride (incomplete/void pointee)",
+                    static_cast<unsigned>(interner.kind(pointee))));
+                return InvalidMirInst;
+            }
+            if (*stride <= 1) return diff;   // 1-byte pointee: byte diff == element count
+            MirInstId const sc =
+                constIntOfType(static_cast<std::int64_t>(*stride), i64ty);
+            std::array<MirInstId, 2> da{diff, sc};
+            return mir.addInst(MirOpcode::SDiv, da, i64ty);
+        }
         MirOpcode const mop = mapBinaryOp(op, tk);
         if (mop == MirOpcode::Invalid) {
             unsupported(node,

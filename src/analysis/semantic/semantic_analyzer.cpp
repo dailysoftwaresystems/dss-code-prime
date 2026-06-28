@@ -5350,6 +5350,19 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 && arith.has_value()) {
                 return shiftResultType(interner, lt, rt, *arith);
             }
+            // c40 (D-CSUBSET-POINTER-SUBTRACTION): mirror cst_to_hir's
+            // combineBinary — `p - q` (both Ptr<T>, same pointee) is ptrdiff_t
+            // (I64) so it passes as a numeric function ARGUMENT. This is the
+            // asymmetry the cycle fixes: a `long n = a - b;` init-check skips the
+            // binary node (no error), but a call-arg's `isAssignable(I64param, …)`
+            // saw Ptr<T> → S_TypeMismatch; now it sees I64. Same-pointee only.
+            if (*op == HirOpKind::Sub
+                && lt.valid() && rt.valid()
+                && interner.kind(lt) == TypeKind::Ptr
+                && interner.kind(rt) == TypeKind::Ptr
+                && interner.operands(lt)[0] == interner.operands(rt)[0]) {
+                return interner.primitive(TypeKind::I64);
+            }
         }
         TypeId const common = commonArithType(lt, rt);
         if (common.valid()) return common;

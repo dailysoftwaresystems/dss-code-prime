@@ -2696,6 +2696,57 @@ TEST(SemanticAnalyzerCSubset, NestedTagShadowingFileScopeTagCollides) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u);
 }
 
+// ── c40 D-CSUBSET-POINTER-SUBTRACTION — `p - q` is ptrdiff_t (C 6.5.6p9) ──
+// p-q (same pointer type) yields a SIGNED integer (ptrdiff_t/I64) = the element
+// count, NOT a pointer. The fix lets it pass as a numeric function ARGUMENT (the
+// sqlite `fmt - bufpt` blocker, ~50x S0003). Red-on-disable: revert and the
+// pointer-difference is typed Ptr<T> → S_TypeMismatch when passed as an arg.
+
+// c40a — the bug: p-q passed as a numeric function arg (char*).
+TEST(SemanticAnalyzerCSubset, PointerSubtractionAsCallArgIsClean) {
+    auto model = analyzeShipped("c-subset", {
+        "void g(long x){ (void)x; }\n"
+        "int f(char* a, char* b){ g(a - b); return 0; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// c40b — int* p-q also passes as a numeric arg (the type is I64 regardless of pointee).
+TEST(SemanticAnalyzerCSubset, PointerSubtractionIntPtrAsCallArgIsClean) {
+    auto model = analyzeShipped("c-subset", {
+        "void g(long x){ (void)x; }\n"
+        "int f(int* a, int* b){ g(a - b); return 0; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// c40c — p-q returned as long (the result type is ptrdiff_t) + assigned.
+TEST(SemanticAnalyzerCSubset, PointerSubtractionReturnAndAssignIsClean) {
+    auto model = analyzeShipped("c-subset", {
+        "long span(char* a, char* b){ long n = a - b; return n; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// c40d — GUARD: MISMATCHED-pointee `char* - int*` does NOT get the ptrdiff rule
+// (same-pointee only) → it stays a Ptr-typed value. When that value is passed to
+// a NUMERIC param the call-arg `isAssignable` rejects it (S_TypeMismatch). NOTE:
+// this is the ARG-CONTEXT catch ONLY — in a non-arg context (`(int)(a-b)`,
+// `long n=a-b`) a mismatched-pointee difference is NOT diagnosed today (a
+// deferred general fail-loud, D-CSUBSET-POINTER-DIFF-EDGE-CASES, flagged by the
+// c40 audit). This pin documents the arg-context behavior, not a universal flag.
+TEST(SemanticAnalyzerCSubset, MismatchedPointeeSubtractionRejectedAsNumericArg) {
+    auto model = analyzeShipped("c-subset", {
+        "void g(long x){ (void)x; }\n"
+        "int f(char* a, int* b){ g(a - b); return 0; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+}
+
 // ── c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME — fn-ptr cast/sizeof typing ──
 //
 // The shared `castTypeRef` now routes an abstract `directDeclarator` tail

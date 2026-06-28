@@ -2360,7 +2360,29 @@ struct Lowerer {
             lc = coerce(lhs, common);
             rc = coerce(rhs, common);
         }
+        // c40 (D-CSUBSET-POINTER-SUBTRACTION) C 6.5.6p9: `p - q` (BOTH operands
+        // Ptr<T>, same pointee) yields ptrdiff_t (a SIGNED integer = the ELEMENT
+        // count), NOT a pointer. Without this the fallback below types it
+        // `lhs.type` (Ptr<T>) → it fails to pass as a numeric function ARGUMENT
+        // (S_TypeMismatch — the sqlite `fmt - bufpt` blocker) and the MIR value
+        // is the raw byte difference. The MIR tier (`combineBinaryOp`) reads this
+        // I64 result type WITH Ptr operands as the signal to emit
+        // PtrToInt+Sub(+SDiv by sizeof(pointee)). Operands stay Ptr<T> (`common`
+        // was InvalidType so no coerce ran). SAME-pointee only: a mismatched
+        // `char* - int*` falls through to a Ptr-typed result — caught ONLY when
+        // coerced to a numeric param (in a non-arg context like `(int)(a-b)` it
+        // is NOT diagnosed today); `p - arrayName` likewise misses (the array
+        // operand never decays to Ptr). Both are a deferred general fail-loud:
+        // D-CSUBSET-POINTER-DIFF-EDGE-CASES. `p ± n` (pointer ± integer → Ptr
+        // result) is a SEPARATE value-scaling fix (deferred c41 — keeps the Ptr
+        // type, only the VALUE scales).
+        bool const ptrSub =
+            *op == HirOpKind::Sub && lhs.type.valid() && rhs.type.valid()
+            && interner.kind(lhs.type) == TypeKind::Ptr
+            && interner.kind(rhs.type) == TypeKind::Ptr
+            && interner.operands(lhs.type)[0] == interner.operands(rhs.type)[0];
         TypeId const result = isComparison(*op) ? boolType()
+                            : ptrSub ? interner.primitive(TypeKind::I64)
                             : (common.valid() ? common
                                               : (lhs.type.valid() ? lhs.type : rhs.type));
         return {track(builder.addParent(HirKind::BinaryOp, std::array{lc.id, rc.id},
