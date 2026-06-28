@@ -4238,3 +4238,139 @@ TEST(SemanticAnalyzerCSubset, C28OrdinaryLocalDeclsUnaffected) {
         EXPECT_TRUE(found) << "local symbol `" << want << "` must be minted";
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// c30 D-CSUBSET-LOCAL-TYPEDEF: a BLOCK-SCOPED `typedef` as a STATEMENT inside a
+// function (sqlite3.c:187603 `typedef void(*LOGFUNC_t)(void*,int,const char*);`).
+// `typedefDecl` is now a `statement` alternative; the alias binds into the
+// enclosing BLOCK scope (Ordinary namespace) and resolves there — the whole
+// typedef-name machinery (Pass-1 bind, the resolver's scope walk, the parse-time
+// BinderSketch oracle) was ALREADY scope-keyed, so the only change was the one
+// grammar line. These pins assert: the NODE SHAPE (a `typedefDecl` nested under
+// the function-body `block`, not a top-level decl), the alias's RESOLVED type +
+// a later local var, the exact sqlite fn-ptr frontier shape, ★ BLOCK-SCOPE
+// NON-LEAK (the c30 silent surface — the block-local alias does NOT escape its
+// block, so an OUTER use of the name resolves to S_UnknownType, IDENTICAL to a
+// never-defined name), and SHADOWING of an outer same-name typedef. Each is
+// red-on-disable (revert the `statement` alt → the block `typedef` is a parse
+// error and these never reach their assertions).
+// ─────────────────────────────────────────────────────────────────────────
+
+// (c30a) NODE SHAPE + RESOLVED TYPE. A block-scoped `typedef int (*FN_t)(int);`
+// parses to a `typedefDecl` nested under the function-body `block`, binds FN_t to
+// a Ptr<Fn(int)->int>, and a later `FN_t f;` resolves `f` to that pointer type.
+TEST(SemanticAnalyzerCSubset, C30LocalTypedefNodeShapeAndType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ typedef int (*FN_t)(int); FN_t f; (void)f; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "a block-scoped fn-ptr typedef + later local var must be clean";
+    // NODE SHAPE: a `typedefDecl` exists as a descendant of the function body `block`.
+    Tree const& tree = cu->trees()[0];
+    RuleId const typedefDecl = tree.schema().rules().find("typedefDecl");
+    RuleId const blockRule   = tree.schema().rules().find("block");
+    ASSERT_TRUE(typedefDecl.valid() && blockRule.valid());
+    bool foundBlockNestedTypedef = false;
+    walkPreOrder(tree, [&](TreeCursor const& cursor){
+        NodeId const n = cursor.current();
+        if (tree.kind(n) != NodeKind::Internal || tree.rule(n).v != blockRule.v)
+            return;
+        walkPreOrder(tree, n, [&](TreeCursor const& inner){
+            NodeId const m = inner.current();
+            if (tree.kind(m) == NodeKind::Internal && tree.rule(m).v == typedefDecl.v)
+                foundBlockNestedTypedef = true;
+        });
+    });
+    EXPECT_TRUE(foundBlockNestedTypedef)
+        << "the local `typedef` must parse to a typedefDecl nested in the function body block";
+    // RESOLVED TYPE: the var `f` is Ptr<Fn(int)->int>.
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* f = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "f") f = &model.symbols()[i];
+    ASSERT_NE(f, nullptr);
+    ASSERT_TRUE(f->type.valid());
+    ASSERT_EQ(ti.kind(f->type), TypeKind::Ptr)
+        << "a fn-ptr typedef'd variable is a pointer";
+    EXPECT_EQ(ti.kind(ti.operands(f->type)[0]), TypeKind::FnSig)
+        << "the pointee is the function type int(int)";
+}
+
+// (c30b) The exact sqlite3.c:187603 frontier shape: a block-scoped fn-ptr typedef
+// with a void return + (void*,int,const char*) params, then a local var of that
+// type. Must be clean (no S_UnknownType for the in-block typedef-name use).
+TEST(SemanticAnalyzerCSubset, C30LocalTypedefFrontierShape) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ typedef void (*LOGFUNC_t)(void*, int, const char*); "
+        "LOGFUNC_t xLog; (void)xLog; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "the sqlite LOGFUNC_t block-scoped fn-ptr typedef must resolve clean";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "the in-block use `LOGFUNC_t xLog;` must find the block-local alias";
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* x = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "xLog") x = &model.symbols()[i];
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->type.valid());
+    EXPECT_EQ(ti.kind(x->type), TypeKind::Ptr);
+}
+
+// (c30c) ★ BLOCK-SCOPE NON-LEAK (the c30 silent surface). A typedef declared in
+// an INNER block must NOT be a type-name OUTSIDE that block. The scope-keyed type
+// resolver binds the alias into the inner block's scope, so an outer use `MyT v;`
+// resolves to NOTHING → S_UnknownType, EXACTLY as if MyT were never defined. (The
+// follower-operator triage commits `MyT v;` as a declaration speculatively — so
+// it is NOT a tree-builder error; the rejection is the scope-keyed resolver at
+// the SEMANTIC tier, mirroring c28c's `struct S w;` → S_UnknownType.) The control
+// (in-block use) analyzes clean; the probe (outer use) does not. RED-ON-DISABLE:
+// if the alias leaked to the enclosing scope, the outer `MyT v;` would resolve `v`
+// to int and S_UnknownType would VANISH — a silent block-scope leak.
+TEST(SemanticAnalyzerCSubset, C30LocalTypedefDoesNotLeakToOuterScope) {
+    // CONTROL: the inner-block typedef + an IN-BLOCK use analyzes clean.
+    auto okModel = analyzeShipped("c-subset", {
+        "int main(void){ { typedef int MyT; MyT a; (void)a; } return 0; }\n",
+    });
+    EXPECT_FALSE(okModel.hasErrors())
+        << "the inner-block typedef + in-block use must analyze clean (control)";
+    // LEAK PROBE: an OUTER use of the block-local name must fail S_UnknownType.
+    auto leakModel = analyzeShipped("c-subset", {
+        "int main(void){ { typedef int MyT; } MyT v; (void)v; return 0; }\n",
+    });
+    EXPECT_TRUE(leakModel.hasErrors())
+        << "the outer `MyT v;` must fail — MyT is block-local to the inner {}";
+    EXPECT_GT(countCode(leakModel.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "a block-scoped typedef must NOT leak — the outer use resolves to "
+           "S_UnknownType, identical to a never-defined name";
+}
+
+// (c30d) SHADOWING: a block-scoped typedef shadows an outer same-name typedef. An
+// outer `typedef long MyT;` (I64) and an inner (block) `typedef int MyT;` (I32):
+// the in-block `MyT a;` resolves to the INNER type (I32), and is NOT an
+// S_RedeclaredSymbol collision. RED-ON-DISABLE: if the block typedef didn't take
+// effect (or leaked/merged into the outer scope), `a` would resolve to I64.
+TEST(SemanticAnalyzerCSubset, C30InnerTypedefShadowsOuterDistinctType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef long MyT;\n"
+        "int main(void){ typedef int MyT; MyT a; (void)a; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "an inner same-name typedef must shadow (not collide with) the outer";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "a block-scoped typedef redefinition is a SHADOW, not a collision";
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") a = &model.symbols()[i];
+    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a->type.valid());
+    EXPECT_EQ(ti.kind(a->type), TypeKind::I32)
+        << "the in-block `MyT a;` resolves to the INNER typedef (int), shadowing the outer (long)";
+}

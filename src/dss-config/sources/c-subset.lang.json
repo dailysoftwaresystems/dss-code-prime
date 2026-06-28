@@ -781,8 +781,10 @@
     },
 
     "statement": {
+      "$c30Comment": "c30 D-CSUBSET-LOCAL-TYPEDEF: `typedefDecl` is admitted as a block item (a BLOCK-SCOPED typedef — `typedef void(*LOGFUNC_t)(void*,int,const char*);` inside a function, sqlite3.c:187603). FIRST = TypedefKeyword, DISJOINT from every other statement alt (varDecl is qualifier/type-keyword/storage-class-led; declOrExprStmt is Identifier-led; the rest are their own keywords), so a unique-production DIRECT DESCENT — NO speculation. The whole typedef-name machinery is ALREADY scope-keyed: Pass-1 binds the alias into `current` (= the enclosing block scope) in the Ordinary namespace; the type resolver (`resolveTypeNodeImpl` SE5 arm) and the parse-time oracle (`BinderSketch`) both walk the scope chain, so a block-scoped typedef-name resolves IN the block, SHADOWS an outer same-name typedef, and does NOT leak out (red-on-disable pins enforce the non-leak). HIR→MIR's `lowerStmtNode` lowers a statement-position TypeDecl as a NO-OP (a typedef emits no code; mirrors the TOP-LEVEL TypeDecl). Mirrors c28 (block-scoped struct/union/enum definition).",
       "alt": [
         "varDecl",
+        "typedefDecl",
         "block",
         "ifStmt",
         "whileStmt",

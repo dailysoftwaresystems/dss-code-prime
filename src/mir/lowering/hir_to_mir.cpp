@@ -6360,6 +6360,13 @@ struct Lowerer {
                 mir.beginBlock(exitBB);
                 return true;
             }
+            case HirKind::TypeDecl:
+                // c30 (D-CSUBSET-LOCAL-TYPEDEF): a BLOCK-SCOPED typedef lowers to
+                // a statement-position TypeDecl. Exactly like the TOP-LEVEL
+                // TypeDecl (a no-op — "interns a type into the lattice but emits
+                // no code"), it has NO MIR runtime effect: the alias was resolved
+                // at semantic time, so the declaration emits nothing. Skip it.
+                return true;
             default: break;
         }
         unsupported(node,
